@@ -635,6 +635,11 @@ pub struct QueueAdmissionTrace {
     pub queue_lane: String,
     /// Optional deny reason.
     pub defect_reason: Option<String>,
+    /// TCK-00532: Cost estimate (in ticks) used for this admission decision.
+    /// Present when the cost model provided the estimate; absent for legacy
+    /// receipts created before cost model integration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_estimate_ticks: Option<u64>,
 }
 
 /// Placeholder trace for RFC-0029 budget admission.
@@ -2403,6 +2408,7 @@ pub mod tests {
                         verdict: "allow".to_string(),
                         queue_lane: "bulk".to_string(),
                         defect_reason: None,
+                        cost_estimate_ticks: None,
                     })
                     .eio29_budget_admission(BudgetAdmissionTrace {
                         verdict: "allow".to_string(),
@@ -2704,6 +2710,7 @@ pub mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -2765,6 +2772,7 @@ pub mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -2801,6 +2809,7 @@ pub mod tests {
             verdict: "deny".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: Some("quarantine required".to_string()),
+            cost_estimate_ticks: None,
         })
         .try_build()
         .expect("receipt with moved_job_path");
@@ -2838,6 +2847,7 @@ pub mod tests {
             verdict: "deny".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: Some("missing authority".to_string()),
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -2872,6 +2882,7 @@ pub mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -2979,6 +2990,7 @@ pub mod tests {
             verdict: "deny".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: Some("denied".to_string()),
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -3736,6 +3748,47 @@ pub mod tests {
         assert_ne!(
             bytes_none, bytes_some,
             "containment=None vs containment=Some must differ"
+        );
+    }
+
+    #[test]
+    fn queue_admission_trace_cost_estimate_ticks_round_trip() {
+        // TCK-00532: Verify that cost_estimate_ticks is preserved through
+        // serde round-trip for audit trail completeness.
+        let trace_with = QueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+            cost_estimate_ticks: Some(600),
+        };
+        let bytes = serde_json::to_vec(&trace_with).expect("serialize");
+        let restored: QueueAdmissionTrace = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(restored.cost_estimate_ticks, Some(600));
+
+        // Verify absent field deserializes correctly (backward compat).
+        let json_without = r#"{"verdict":"allow","queue_lane":"bulk","defect_reason":null}"#;
+        let restored_without: QueueAdmissionTrace =
+            serde_json::from_str(json_without).expect("deserialize without field");
+        assert_eq!(
+            restored_without.cost_estimate_ticks, None,
+            "missing cost_estimate_ticks must default to None"
+        );
+    }
+
+    #[test]
+    fn queue_admission_trace_deny_unknown_fields() {
+        // CTR-1604: fac receipt QueueAdmissionTrace must reject unknown fields.
+        let json = r#"{
+            "verdict": "allow",
+            "queue_lane": "bulk",
+            "defect_reason": null,
+            "cost_estimate_ticks": null,
+            "injected": "data"
+        }"#;
+        let result: Result<QueueAdmissionTrace, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "QueueAdmissionTrace must reject unknown fields"
         );
     }
 }

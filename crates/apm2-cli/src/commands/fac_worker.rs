@@ -1301,6 +1301,7 @@ fn process_job(
             verdict: "allow".to_string(),
             queue_lane: "control".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         };
         let budget_trace: Option<FacBudgetAdmissionTrace> = None;
 
@@ -1757,6 +1758,7 @@ fn process_job(
             verdict: "deny".to_string(),
             queue_lane: spec.queue_lane.clone(),
             defect_reason: Some("admission health gate not passed".to_string()),
+            cost_estimate_ticks: None,
         };
         let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
             .map(|p| {
@@ -4722,6 +4724,7 @@ fn build_queue_admission_trace(decision: &QueueAdmissionDecision) -> JobQueueAdm
         verdict: strip_json_string_quotes(&serialize_to_json_string(&decision.trace.verdict)),
         queue_lane: lane,
         defect_reason: decision.trace.defect.as_ref().map(|d| d.reason.clone()),
+        cost_estimate_ticks: decision.trace.cost_estimate_ticks,
     }
 }
 
@@ -5132,6 +5135,7 @@ mod tests {
             verdict: "allow".to_string(),
             queue_lane: "control".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         };
 
         let receipt_path = emit_job_receipt(
@@ -5363,6 +5367,7 @@ mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         };
         let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
         let containment_trace = apm2_core::fac::containment::ContainmentTrace {
@@ -5440,6 +5445,7 @@ mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         };
         let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
 

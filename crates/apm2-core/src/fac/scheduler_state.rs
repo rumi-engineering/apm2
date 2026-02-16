@@ -37,6 +37,7 @@ const SCHEDULER_STATE_HASH_DOMAIN: &[u8] = b"apm2.fac.scheduler_state.v1";
 
 /// Persisted scheduler state for RFC-0029 anti-starvation continuity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SchedulerStateV1 {
     /// Schema identifier.
     pub schema: String,
@@ -56,6 +57,7 @@ pub struct SchedulerStateV1 {
 
 /// Snapshot of a single lane's scheduler counters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LaneSnapshot {
     /// Lane name (e.g. `stop_revoke`, `control`).
     pub lane: String,
@@ -524,5 +526,35 @@ mod tests {
         let data = serde_json::to_vec_pretty(&state).expect("serialize");
         std::fs::write(&state_path, data).expect("write");
         assert!(load_scheduler_state(dir.path()).is_err());
+    }
+
+    #[test]
+    fn deny_unknown_fields_scheduler_state_v1() {
+        // CTR-1604: boundary objects must reject unknown fields.
+        let json = r#"{
+            "schema": "apm2.scheduler_state.v1",
+            "lane_snapshots": [],
+            "last_evaluation_tick": 0,
+            "persisted_at_secs": 0,
+            "content_hash": "",
+            "unexpected_field": "injected"
+        }"#;
+        let result: Result<SchedulerStateV1, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "SchedulerStateV1 must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn deny_unknown_fields_lane_snapshot() {
+        let json = r#"{
+            "lane": "control",
+            "backlog": 1,
+            "max_wait_ticks": 10,
+            "extra": "data"
+        }"#;
+        let result: Result<LaneSnapshot, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "LaneSnapshot must reject unknown fields");
     }
 }

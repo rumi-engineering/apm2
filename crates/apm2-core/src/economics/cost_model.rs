@@ -181,6 +181,7 @@ pub enum CostModelError {
 /// capacity planning. Calibration can only decrease these values toward
 /// observed reality (monotone-safe).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JobCostEstimate {
     /// Expected execution duration in scheduler ticks.
     pub estimated_ticks: u64,
@@ -195,6 +196,7 @@ pub struct JobCostEstimate {
 /// Recorded in receipts for post-run calibration. All fields are
 /// best-effort: workers report what they can measure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservedJobCost {
     /// Actual wall-clock duration in milliseconds.
     pub duration_ms: u64,
@@ -206,6 +208,7 @@ pub struct ObservedJobCost {
 
 /// Per-kind calibration state tracking EWMA estimates and sample counts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CalibrationState {
     /// EWMA estimate of wall-clock duration in milliseconds.
     pub ewma_wall_ms: u64,
@@ -224,6 +227,7 @@ pub struct CalibrationState {
 /// The model is persisted as part of the scheduler state for continuity
 /// across restarts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CostModelV1 {
     /// Schema identifier.
     pub schema: String,
@@ -945,6 +949,65 @@ mod tests {
         assert!(
             restored.validate().is_ok(),
             "restored model at MAX_JOB_KINDS must validate"
+        );
+    }
+
+    #[test]
+    fn deny_unknown_fields_cost_model_v1() {
+        // CTR-1604: boundary objects must reject unknown fields.
+        let json = r#"{
+            "schema": "apm2.economics.cost_model.v1",
+            "estimates": {},
+            "calibration": {},
+            "content_hash": "",
+            "unexpected_field": "injected"
+        }"#;
+        let result: Result<CostModelV1, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "CostModelV1 must reject unknown fields");
+    }
+
+    #[test]
+    fn deny_unknown_fields_job_cost_estimate() {
+        let json = r#"{
+            "estimated_ticks": 100,
+            "estimated_wall_ms": 1000,
+            "estimated_io_bytes": 500,
+            "extra_field": true
+        }"#;
+        let result: Result<JobCostEstimate, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "JobCostEstimate must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn deny_unknown_fields_observed_job_cost() {
+        let json = r#"{
+            "duration_ms": 100,
+            "cpu_time_ms": 50,
+            "bytes_written": 200,
+            "unknown": 42
+        }"#;
+        let result: Result<ObservedJobCost, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "ObservedJobCost must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn deny_unknown_fields_calibration_state() {
+        let json = r#"{
+            "ewma_wall_ms": 100,
+            "ewma_io_bytes": 200,
+            "sample_count": 5,
+            "injected": "data"
+        }"#;
+        let result: Result<CalibrationState, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "CalibrationState must reject unknown fields"
         );
     }
 }
