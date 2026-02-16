@@ -273,39 +273,6 @@ pub enum FacSubcommand {
     /// Import validates RFC-0028 channel boundary and RFC-0029 economics
     /// receipts, rejecting bundles that fail either check (fail-closed).
     Bundle(BundleArgs),
-    /// Lane-scoped prewarm with receipts.
-    ///
-    /// Enqueues a warm job that pre-populates build caches in the lane
-    /// target namespace to reduce cold-start probability for subsequent
-    /// gates.
-    Warm(WarmArgs),
-}
-
-/// Arguments for `apm2 fac warm`.
-#[derive(Debug, Args)]
-pub struct WarmArgs {
-    /// Comma-separated list of warm phases to run.
-    ///
-    /// Available phases: fetch, build, nextest, clippy, doc.
-    /// Default: fetch,build,nextest,clippy,doc
-    #[arg(long)]
-    pub phases: Option<String>,
-
-    /// Warm only the specified lane (default: worker-assigned).
-    #[arg(long)]
-    pub lane: Option<String>,
-
-    /// Wait for the warm job to complete before returning.
-    #[arg(long, default_value_t = false)]
-    pub wait: bool,
-
-    /// Maximum wait time in seconds (requires --wait).
-    #[arg(long, default_value_t = 1200)]
-    pub wait_timeout_secs: u64,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac warm`.
@@ -1975,7 +1942,6 @@ pub fn run_fac(
             | FacSubcommand::Warm(_)
             | FacSubcommand::Bench(_)
             | FacSubcommand::Bundle(_)
-            | FacSubcommand::Warm(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -2462,13 +2428,6 @@ pub fn run_fac(
                 run_bundle_import(import_args, resolve_json(import_args.json))
             },
         },
-        FacSubcommand::Warm(args) => crate::commands::fac_warm::run_fac_warm(
-            &args.phases,
-            &args.lane,
-            args.wait,
-            args.wait_timeout_secs,
-            resolve_json(args.json),
-        ),
     }
 }
 
