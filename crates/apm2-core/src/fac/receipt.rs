@@ -635,6 +635,11 @@ pub struct QueueAdmissionTrace {
     pub queue_lane: String,
     /// Optional deny reason.
     pub defect_reason: Option<String>,
+    /// TCK-00532: Cost estimate (in ticks) used for this admission decision.
+    /// Present when the cost model provided the estimate; absent for legacy
+    /// receipts created before cost model integration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_estimate_ticks: Option<u64>,
 }
 
 /// Placeholder trace for RFC-0029 budget admission.
@@ -701,6 +706,13 @@ pub struct FacJobReceiptV1 {
     /// auto-disabled due to containment failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub containment: Option<super::containment::ContainmentTrace>,
+    /// RFC-0029 observed runtime cost metrics (TCK-00532).
+    ///
+    /// Best-effort measurement of actual job resource consumption for
+    /// post-run cost model calibration. Workers populate this from
+    /// wall-clock timers and I/O accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_cost: Option<crate::economics::cost_model::ObservedJobCost>,
     /// Epoch timestamp.
     pub timestamp_secs: u64,
     /// BLAKE3 body hash for content-addressed storage.
@@ -712,6 +724,16 @@ impl FacJobReceiptV1 {
     ///
     /// Encodes all fields except `content_hash` in deterministic order with
     /// length-prefixing to prevent canonicalization collisions.
+    ///
+    /// # V1 Immutability Contract
+    ///
+    /// This method represents the V1 canonical form and MUST remain
+    /// bit-for-bit compatible with the historical implementation. Trailing
+    /// optional fields (`moved_job_path`, `containment`, `observed_cost`)
+    /// do NOT emit a `0u8` presence marker when absent; they are simply
+    /// omitted. This matches the original encoding and preserves content
+    /// hashes for all existing persisted receipts. New receipts should
+    /// prefer `canonical_bytes_v2()` which uses proper presence markers.
     ///
     /// # Panics
     ///
@@ -810,11 +832,10 @@ impl FacJobReceiptV1 {
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
-        // Appended at end for backward compatibility with pre-TCK-00514 receipts.
-        // A `0u8` presence marker is intentionally omitted when `moved_job_path`
-        // is `None`, matching the `canonicalizer_tuple_digest` pattern above,
-        // because older receipts encoded without this optional field at all and
-        // adding a trailing `0u8` would change their content hash.
+        // V1 trailing optional fields: NO `0u8` presence marker when absent.
+        // These fields are simply omitted when None, preserving bit-for-bit
+        // hash compatibility with pre-TCK-00514 / pre-TCK-00548 receipts.
+        // Appended at end for backward compatibility.
         if let Some(path) = &self.moved_job_path {
             bytes.push(1u8);
             bytes.extend_from_slice(&(path.len() as u32).to_be_bytes());
@@ -835,6 +856,17 @@ impl FacJobReceiptV1 {
             bytes.push(u8::from(trace.sccache_auto_disabled));
         }
 
+        // TCK-00532: Observed job cost. Appended at end for backward
+        // compatibility. No `0u8` presence marker when absent, matching
+        // the V1 trailing optional field pattern. Old receipts without
+        // this field will produce the same hash as before.
+        if let Some(cost) = &self.observed_cost {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
+        }
+
         bytes
     }
 
@@ -850,7 +882,7 @@ impl FacJobReceiptV1 {
     /// New receipts should use v2. Existing v1 receipts remain verifiable
     /// via `canonical_bytes()`.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     pub fn canonical_bytes_v2(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(512);
 
@@ -949,21 +981,19 @@ impl FacJobReceiptV1 {
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
-        // Appended at end for backward compatibility with pre-TCK-00514 receipts.
-        // A `0u8` presence marker is intentionally omitted when `moved_job_path`
-        // is `None`, matching the `canonicalizer_tuple_digest` pattern above,
-        // because older receipts encoded without this optional field at all and
-        // adding a trailing `0u8` would change their content hash.
+
+        // V2 trailing optional fields: ALL emit presence markers (0u8/1u8)
+        // to prevent canonicalization collisions. V2 is only used for new
+        // receipts, so there is no backward-compatibility constraint.
         if let Some(path) = &self.moved_job_path {
             bytes.push(1u8);
             bytes.extend_from_slice(&(path.len() as u32).to_be_bytes());
             bytes.extend_from_slice(path.as_bytes());
+        } else {
+            bytes.push(0u8);
         }
 
-        // TCK-00548: Containment trace. Appended at end for backward
-        // compatibility with pre-TCK-00548 receipts. No `0u8` presence
-        // marker when absent, matching the pattern for other trailing
-        // optional fields.
+        // TCK-00548: Containment trace with presence marker.
         if let Some(trace) = &self.containment {
             bytes.push(1u8);
             bytes.push(u8::from(trace.verified));
@@ -972,6 +1002,18 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&trace.processes_checked.to_be_bytes());
             bytes.extend_from_slice(&trace.mismatch_count.to_be_bytes());
             bytes.push(u8::from(trace.sccache_auto_disabled));
+        } else {
+            bytes.push(0u8);
+        }
+
+        // TCK-00532: Observed job cost with presence marker.
+        if let Some(cost) = &self.observed_cost {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
+        } else {
+            bytes.push(0u8);
         }
 
         bytes
@@ -1202,6 +1244,7 @@ pub struct FacJobReceiptV1Builder {
     eio29_queue_admission: Option<QueueAdmissionTrace>,
     eio29_budget_admission: Option<BudgetAdmissionTrace>,
     containment: Option<super::containment::ContainmentTrace>,
+    observed_cost: Option<crate::economics::cost_model::ObservedJobCost>,
     timestamp_secs: Option<u64>,
 }
 
@@ -1302,6 +1345,16 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn containment(mut self, trace: super::containment::ContainmentTrace) -> Self {
         self.containment = Some(trace);
+        self
+    }
+
+    /// Sets the observed runtime cost metrics (TCK-00532).
+    #[must_use]
+    pub const fn observed_cost(
+        mut self,
+        cost: crate::economics::cost_model::ObservedJobCost,
+    ) -> Self {
+        self.observed_cost = Some(cost);
         self
     }
 
@@ -1511,6 +1564,7 @@ impl FacJobReceiptV1Builder {
             eio29_queue_admission: self.eio29_queue_admission,
             eio29_budget_admission: self.eio29_budget_admission,
             containment: self.containment,
+            observed_cost: self.observed_cost,
             moved_job_path,
             timestamp_secs,
             content_hash: String::new(),
@@ -2350,6 +2404,7 @@ pub mod tests {
                         verdict: "allow".to_string(),
                         queue_lane: "bulk".to_string(),
                         defect_reason: None,
+                        cost_estimate_ticks: None,
                     })
                     .eio29_budget_admission(BudgetAdmissionTrace {
                         verdict: "allow".to_string(),
@@ -2651,6 +2706,7 @@ pub mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -2712,6 +2768,7 @@ pub mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -2748,6 +2805,7 @@ pub mod tests {
             verdict: "deny".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: Some("quarantine required".to_string()),
+            cost_estimate_ticks: None,
         })
         .try_build()
         .expect("receipt with moved_job_path");
@@ -2785,6 +2843,7 @@ pub mod tests {
             verdict: "deny".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: Some("missing authority".to_string()),
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -2819,6 +2878,7 @@ pub mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -2926,6 +2986,7 @@ pub mod tests {
             verdict: "deny".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: Some("denied".to_string()),
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -3575,6 +3636,159 @@ pub mod tests {
         assert_ne!(
             hash_none, hash_some,
             "v2 canonical_bytes must change when containment trace is set"
+        );
+    }
+
+    #[test]
+    fn test_v1_canonical_bytes_no_collision_across_trailing_optional_fields() {
+        // Regression test for BLOCKER f-705-security-1771265555805010-0:
+        // Verify that different occupancy patterns for trailing optional fields
+        // (moved_job_path, containment, observed_cost) always produce different
+        // canonical bytes, preventing hash collisions in the integrity trail.
+        let mut base = make_valid_receipt();
+        base.moved_job_path = None;
+        base.containment = None;
+        base.observed_cost = None;
+        let bytes_all_none = base.canonical_bytes();
+
+        // moved_job_path set, containment None
+        let mut r1 = base.clone();
+        r1.moved_job_path = Some("quarantine/job.json".to_string());
+        let bytes_moved_only = r1.canonical_bytes();
+
+        // moved_job_path None, containment set
+        let mut r2 = base.clone();
+        r2.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: true,
+            cgroup_path: "quarantine/job.json".to_string(), // same string content
+            processes_checked: 0,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+        });
+        let bytes_containment_only = r2.canonical_bytes();
+
+        // moved_job_path None, observed_cost set
+        let mut r3 = base;
+        r3.observed_cost = Some(crate::economics::cost_model::ObservedJobCost {
+            duration_ms: 1000,
+            cpu_time_ms: 500,
+            bytes_written: 2000,
+        });
+        let bytes_cost_only = r3.canonical_bytes();
+
+        // All four must be distinct (presence markers disambiguate).
+        assert_ne!(
+            bytes_all_none, bytes_moved_only,
+            "all-None vs moved_job_path=Some must differ"
+        );
+        assert_ne!(
+            bytes_all_none, bytes_containment_only,
+            "all-None vs containment=Some must differ"
+        );
+        assert_ne!(
+            bytes_all_none, bytes_cost_only,
+            "all-None vs observed_cost=Some must differ"
+        );
+        assert_ne!(
+            bytes_moved_only, bytes_containment_only,
+            "moved_job_path=Some vs containment=Some must differ (V1: different field structures prevent collision)"
+        );
+        assert_ne!(
+            bytes_moved_only, bytes_cost_only,
+            "moved_job_path=Some vs observed_cost=Some must differ"
+        );
+        assert_ne!(
+            bytes_containment_only, bytes_cost_only,
+            "containment=Some vs observed_cost=Some must differ"
+        );
+    }
+
+    #[test]
+    fn test_v1_canonical_bytes_no_absence_marker_for_moved_job_path() {
+        // V1 immutability contract: moved_job_path=None does NOT emit a 0u8
+        // marker. The field is simply omitted, preserving historical hash
+        // compatibility. Presence is distinguished by the 1u8 tag + data.
+        let mut r = make_valid_receipt();
+        r.moved_job_path = None;
+        r.containment = None;
+        r.observed_cost = None;
+        let bytes_none = r.canonical_bytes();
+
+        r.moved_job_path = Some("quarantine/path".to_string());
+        let bytes_some = r.canonical_bytes();
+
+        // None produces shorter output (no bytes); Some produces 1u8 + len + data.
+        assert!(
+            bytes_some.len() > bytes_none.len(),
+            "moved_job_path=Some must produce longer canonical bytes than None"
+        );
+    }
+
+    #[test]
+    fn test_v1_canonical_bytes_no_absence_marker_for_containment() {
+        // V1 immutability contract: containment=None does NOT emit a 0u8
+        // marker. The field is simply omitted, preserving historical hash
+        // compatibility.
+        let mut r = make_valid_receipt();
+        r.moved_job_path = None;
+        r.containment = None;
+        r.observed_cost = None;
+        let bytes_none = r.canonical_bytes();
+
+        r.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: false,
+            cgroup_path: "/test".to_string(),
+            processes_checked: 0,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+        });
+        let bytes_some = r.canonical_bytes();
+
+        // None produces shorter output (no bytes); Some produces 1u8 + fields.
+        assert!(
+            bytes_some.len() > bytes_none.len(),
+            "containment=Some must produce longer canonical bytes than None"
+        );
+    }
+
+    #[test]
+    fn queue_admission_trace_cost_estimate_ticks_round_trip() {
+        // TCK-00532: Verify that cost_estimate_ticks is preserved through
+        // serde round-trip for audit trail completeness.
+        let trace_with = QueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+            cost_estimate_ticks: Some(600),
+        };
+        let bytes = serde_json::to_vec(&trace_with).expect("serialize");
+        let restored: QueueAdmissionTrace = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(restored.cost_estimate_ticks, Some(600));
+
+        // Verify absent field deserializes correctly (backward compat).
+        let json_without = r#"{"verdict":"allow","queue_lane":"bulk","defect_reason":null}"#;
+        let restored_without: QueueAdmissionTrace =
+            serde_json::from_str(json_without).expect("deserialize without field");
+        assert_eq!(
+            restored_without.cost_estimate_ticks, None,
+            "missing cost_estimate_ticks must default to None"
+        );
+    }
+
+    #[test]
+    fn queue_admission_trace_deny_unknown_fields() {
+        // CTR-1604: fac receipt QueueAdmissionTrace must reject unknown fields.
+        let json = r#"{
+            "verdict": "allow",
+            "queue_lane": "bulk",
+            "defect_reason": null,
+            "cost_estimate_ticks": null,
+            "injected": "data"
+        }"#;
+        let result: Result<QueueAdmissionTrace, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "QueueAdmissionTrace must reject unknown fields"
         );
     }
 }
