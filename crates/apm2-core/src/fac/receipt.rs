@@ -720,6 +720,14 @@ impl FacJobReceiptV1 {
     /// Encodes all fields except `content_hash` in deterministic order with
     /// length-prefixing to prevent canonicalization collisions.
     ///
+    /// # Trailing Optional Field Policy
+    ///
+    /// Fields added before TCK-00532 (`moved_job_path`, `containment`) omit
+    /// the `0u8` absence marker for backward compatibility with persisted
+    /// receipts. Fields added from TCK-00532 onward (`observed_cost`) always
+    /// emit a presence marker (0u8/1u8) to prevent canonicalization
+    /// collisions across trailing optional fields.
+    ///
     /// # Panics
     ///
     /// Panics only if serde serialization for internal enum variants fails.
@@ -817,21 +825,16 @@ impl FacJobReceiptV1 {
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
-        // Appended at end for backward compatibility with pre-TCK-00514 receipts.
-        // A `0u8` presence marker is intentionally omitted when `moved_job_path`
-        // is `None`, matching the `canonicalizer_tuple_digest` pattern above,
-        // because older receipts encoded without this optional field at all and
-        // adding a trailing `0u8` would change their content hash.
+        // Legacy trailing fields (pre-TCK-00532): absence marker omitted for
+        // backward compatibility with persisted receipts.
         if let Some(path) = &self.moved_job_path {
             bytes.push(1u8);
             bytes.extend_from_slice(&(path.len() as u32).to_be_bytes());
             bytes.extend_from_slice(path.as_bytes());
         }
 
-        // TCK-00548: Containment trace. Appended at end for backward
-        // compatibility with pre-TCK-00548 receipts. No `0u8` presence
-        // marker when absent, matching the pattern for other trailing
-        // optional fields.
+        // TCK-00548: Containment trace. Absence marker omitted for backward
+        // compatibility with persisted receipts from TCK-00548.
         if let Some(trace) = &self.containment {
             bytes.push(1u8);
             bytes.push(u8::from(trace.verified));
@@ -842,15 +845,18 @@ impl FacJobReceiptV1 {
             bytes.push(u8::from(trace.sccache_auto_disabled));
         }
 
-        // TCK-00532: Observed job cost. Appended at end for backward
-        // compatibility with pre-TCK-00532 receipts. No `0u8` presence
-        // marker when absent, matching the pattern for other trailing
-        // optional fields.
+        // TCK-00532: Observed job cost. Presence marker ALWAYS emitted
+        // (0u8 for None, 1u8 for Some) to prevent canonicalization
+        // collisions with preceding trailing optional fields. Safe to
+        // enforce because this field is introduced in this PR and no
+        // persisted receipts with it exist yet.
         if let Some(cost) = &self.observed_cost {
             bytes.push(1u8);
             bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
             bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
             bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
+        } else {
+            bytes.push(0u8);
         }
 
         bytes
@@ -868,7 +874,7 @@ impl FacJobReceiptV1 {
     /// New receipts should use v2. Existing v1 receipts remain verifiable
     /// via `canonical_bytes()`.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     pub fn canonical_bytes_v2(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(512);
 
@@ -967,21 +973,19 @@ impl FacJobReceiptV1 {
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
-        // Appended at end for backward compatibility with pre-TCK-00514 receipts.
-        // A `0u8` presence marker is intentionally omitted when `moved_job_path`
-        // is `None`, matching the `canonicalizer_tuple_digest` pattern above,
-        // because older receipts encoded without this optional field at all and
-        // adding a trailing `0u8` would change their content hash.
+
+        // V2 trailing optional fields: ALL emit presence markers (0u8/1u8)
+        // to prevent canonicalization collisions. V2 is only used for new
+        // receipts, so there is no backward-compatibility constraint.
         if let Some(path) = &self.moved_job_path {
             bytes.push(1u8);
             bytes.extend_from_slice(&(path.len() as u32).to_be_bytes());
             bytes.extend_from_slice(path.as_bytes());
+        } else {
+            bytes.push(0u8);
         }
 
-        // TCK-00548: Containment trace. Appended at end for backward
-        // compatibility with pre-TCK-00548 receipts. No `0u8` presence
-        // marker when absent, matching the pattern for other trailing
-        // optional fields.
+        // TCK-00548: Containment trace with presence marker.
         if let Some(trace) = &self.containment {
             bytes.push(1u8);
             bytes.push(u8::from(trace.verified));
@@ -990,17 +994,18 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&trace.processes_checked.to_be_bytes());
             bytes.extend_from_slice(&trace.mismatch_count.to_be_bytes());
             bytes.push(u8::from(trace.sccache_auto_disabled));
+        } else {
+            bytes.push(0u8);
         }
 
-        // TCK-00532: Observed job cost. Appended at end for backward
-        // compatibility with pre-TCK-00532 receipts. No `0u8` presence
-        // marker when absent, matching the pattern for other trailing
-        // optional fields.
+        // TCK-00532: Observed job cost with presence marker.
         if let Some(cost) = &self.observed_cost {
             bytes.push(1u8);
             bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
             bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
             bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
+        } else {
+            bytes.push(0u8);
         }
 
         bytes

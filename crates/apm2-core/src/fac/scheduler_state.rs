@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::determinism::canonicalize_json;
 use crate::economics::cost_model::CostModelV1;
 use crate::economics::queue_admission::QueueLane;
 
@@ -64,17 +65,20 @@ pub struct LaneSnapshot {
     pub max_wait_ticks: u64,
 }
 
-/// Compute the scheduler content hash.
+/// Compute the scheduler content hash using CAC-JSON canonicalization
+/// (SP-INV-004).
 /// # Errors
-/// Returns an error if JSON serialization fails.
+/// Returns an error if JSON serialization or canonicalization fails.
 pub fn compute_scheduler_state_content_hash(state: &SchedulerStateV1) -> Result<String, String> {
     let mut normalized = state.clone();
     normalized.content_hash = String::new();
-    let canonical = serde_json::to_vec(&normalized)
+    let json_str = serde_json::to_string(&normalized)
         .map_err(|e| format!("cannot serialize scheduler state for hashing: {e}"))?;
+    let canonical = canonicalize_json(&json_str)
+        .map_err(|e| format!("cannot canonicalize scheduler state for hashing: {e}"))?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(SCHEDULER_STATE_HASH_DOMAIN);
-    hasher.update(&canonical);
+    hasher.update(canonical.as_bytes());
     Ok(format!("b3-256:{}", hasher.finalize().to_hex()))
 }
 
