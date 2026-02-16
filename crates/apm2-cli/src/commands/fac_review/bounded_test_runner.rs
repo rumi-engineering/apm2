@@ -47,10 +47,6 @@ const SYSTEMD_SETENV_ALLOWLIST_EXACT: &[&str] = &[
     "TMPDIR",
     "USER",
     "LANG",
-    // TCK-00573: TMPDIR is required for per-lane isolation (set by
-    // apply_lane_env_overrides from TCK-00575). Without this, bounded
-    // test commands reject the lane-scoped TMPDIR override.
-    "TMPDIR",
 ];
 
 /// `RUSTC_WRAPPER` and `SCCACHE_*` are intentionally EXCLUDED from the
