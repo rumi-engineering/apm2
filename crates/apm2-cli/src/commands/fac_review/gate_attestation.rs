@@ -4,8 +4,10 @@
 //! produce cache misses, never false-positive reuse.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -237,29 +239,52 @@ fn git_rev_parse(workspace_root: &Path, rev: &str) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-fn file_sha256(path: &Path) -> Option<String> {
-    let metadata = fs::symlink_metadata(path).ok()?;
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
     if !metadata.file_type().is_file() {
-        return None;
+        return Err(format!("path is not a regular file: {}", path.display()));
     }
     if metadata.len() > MAX_ATTESTATION_INPUT_FILE_BYTES {
-        return None;
+        return Err(format!(
+            "file exceeds attestation size limit ({} bytes): {}",
+            metadata.len(),
+            path.display()
+        ));
     }
 
-    let mut file = File::open(path).ok()?;
-    let opened_metadata = file.metadata().ok()?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file: File = options
+        .open(path)
+        .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+
+    let opened_metadata = file
+        .metadata()
+        .map_err(|err| format!("failed to stat opened file {}: {err}", path.display()))?;
     if !opened_metadata.is_file() {
-        return None;
+        return Err(format!(
+            "opened path is not a regular file: {}",
+            path.display()
+        ));
     }
     if opened_metadata.len() > MAX_ATTESTATION_INPUT_FILE_BYTES {
-        return None;
+        return Err(format!(
+            "opened file exceeds attestation size limit ({} bytes): {}",
+            opened_metadata.len(),
+            path.display()
+        ));
     }
 
     let mut hasher = Sha256::new();
     let mut limited = (&mut file).take(MAX_ATTESTATION_INPUT_FILE_BYTES + 1);
     let mut buffer = [0_u8; 8192];
     loop {
-        let read = limited.read(&mut buffer).ok()?;
+        let read = limited
+            .read(&mut buffer)
+            .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
         if read == 0 {
             break;
         }
@@ -267,13 +292,16 @@ fn file_sha256(path: &Path) -> Option<String> {
     }
 
     if limited.limit() == 0 {
-        return None;
+        return Err(format!(
+            "file exceeded attestation streaming limit while hashing: {}",
+            path.display()
+        ));
     }
 
-    Some(format!("{:x}", hasher.finalize()))
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn input_digest(workspace_root: &Path, gate_name: &str) -> String {
+fn input_digest(workspace_root: &Path, gate_name: &str) -> Result<String, String> {
     #[derive(Serialize)]
     struct InputFacts {
         tree: String,
@@ -298,18 +326,20 @@ fn input_digest(workspace_root: &Path, gate_name: &str) -> String {
         // hash-collide with clean committed state.  Using file_sha256
         // ensures the attestation digest captures the real workspace content,
         // closing the dirty-state cache poisoning vector.
-        if let Some(hash) = file_sha256(&abs) {
-            gate_inputs.push(((*rel).to_string(), format!("file_sha256:{hash}")));
-            continue;
+        match file_sha256(&abs) {
+            Ok(hash) => {
+                gate_inputs.push(((*rel).to_string(), format!("file_sha256:{hash}")));
+            },
+            Err(reason) => {
+                return Err(format!("unable to hash gate input `{rel}`: {reason}"));
+            },
         }
-
-        gate_inputs.push(((*rel).to_string(), "unreadable".to_string()));
     }
 
     gate_inputs.sort_by(|a, b| a.0.cmp(&b.0));
     let facts = InputFacts { tree, gate_inputs };
     let canonical = canonical_json_bytes(&facts);
-    sha256_hex(&canonical)
+    Ok(sha256_hex(&canonical))
 }
 
 fn resource_digest(policy: &GateResourcePolicy) -> String {
@@ -343,7 +373,7 @@ pub fn compute_gate_attestation(
 
     let command_digest = command_digest(gate_name, command);
     let environment_digest = environment_digest();
-    let input_digest = input_digest(workspace_root, gate_name);
+    let input_digest = input_digest(workspace_root, gate_name)?;
     let resource_digest = resource_digest(policy);
     let policy_digest = policy_digest();
 
@@ -700,7 +730,7 @@ mod tests {
         file.set_len(super::MAX_ATTESTATION_INPUT_FILE_BYTES + 1)
             .expect("set oversized length");
         assert!(
-            file_sha256(&path).is_none(),
+            file_sha256(&path).is_err(),
             "oversized attestation inputs must be rejected"
         );
     }
@@ -718,7 +748,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &symlink_path).expect("create symlink");
 
         assert!(
-            file_sha256(&symlink_path).is_none(),
+            file_sha256(&symlink_path).is_err(),
             "symlink inputs must be rejected for attestation hashing"
         );
     }
