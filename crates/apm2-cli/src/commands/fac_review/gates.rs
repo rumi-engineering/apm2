@@ -8,7 +8,10 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
-use apm2_core::fac::{FacPolicyV1, LaneProfileV1, build_job_environment, compute_test_env};
+use apm2_core::fac::{
+    FacPolicyV1, LaneProfileV1, apply_lane_env_overrides, build_job_environment, compute_test_env,
+    ensure_lane_env_dirs,
+};
 use sha2::{Digest, Sha256};
 
 use super::bounded_test_runner::{
@@ -599,6 +602,14 @@ fn compute_nextest_test_environment(
     // Build policy-filtered environment from the current process environment.
     let ambient: Vec<(String, String)> = std::env::vars().collect();
     let mut policy_env = build_job_environment(policy, &ambient, apm2_home);
+
+    // TCK-00575: Apply per-lane env isolation (HOME, TMPDIR, XDG_CACHE_HOME,
+    // XDG_CONFIG_HOME). For CLI gates, use the synthetic lane-00 directory
+    // under $APM2_HOME/private/fac/lanes/lane-00.
+    let fac_root = apm2_home.join("private/fac");
+    let lane_dir = fac_root.join("lanes/lane-00");
+    ensure_lane_env_dirs(&lane_dir)?;
+    apply_lane_env_overrides(&mut policy_env, &lane_dir);
 
     // Lane-derived vars (NEXTEST_TEST_THREADS, CARGO_BUILD_JOBS) take
     // precedence over ambient values but env_set overrides in the policy

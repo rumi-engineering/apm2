@@ -507,6 +507,11 @@ emission + move to completed/). Cleanup failures do not change the job
 outcome; they only mark the lane as Corrupt. This decouples job execution
 integrity from infrastructure lifecycle management.
 
+**Cleanup steps**: (1) `git_reset`, (2) `git_clean`, (3) `temp_prune`,
+(3b) `env_dir_prune` (TCK-00575: prune `home/`, `xdg_cache/`,
+`xdg_config/` via `safe_rmtree_v1`; `tmp/` is already handled by step 3),
+(4) `log_quota`.
+
 **Process liveness**: Stale lease detection uses `libc::kill(pid, 0)` with
 errno discrimination: ESRCH = dead (safe to recover), EPERM = alive but
 unpermissioned (mark corrupt), success = alive (mark corrupt if flock held
@@ -652,12 +657,40 @@ user-mode and system-mode execution backends.
 - [INV-SYS-003] `LaneProfileV1` loading failures fail the job path as a denial
   with machine-readable receipt output, not silent continuation.
 
-## Policy Environment Enforcement (TCK-00526)
+## Policy Environment Enforcement (TCK-00526, TCK-00575)
 
 The `policy` module provides centralized environment filtering for all FAC job
 execution paths. `FacPolicyV1` env fields (`env_clear`, `env_allowlist_prefixes`,
 `env_denylist_prefixes`, `env_set`, `deny_ambient_cargo_home`, `cargo_home`,
 `cargo_target_dir`) are enforced at runtime by `build_job_environment()`.
+
+### Per-Lane Env Dir Isolation (TCK-00575)
+
+Per-lane environment directories isolate `HOME`, `TMPDIR`, `XDG_CACHE_HOME`,
+and `XDG_CONFIG_HOME` so that FAC jobs do not write into ambient user
+directories (`~/.cache`, `~/.cargo`, `~/.config`, etc.).
+
+**Constants**:
+- `LANE_ENV_DIR_HOME` (`home`): Per-lane `HOME` directory.
+- `LANE_ENV_DIR_TMP` (`tmp`): Per-lane `TMPDIR` directory.
+- `LANE_ENV_DIR_XDG_CACHE` (`xdg_cache`): Per-lane `XDG_CACHE_HOME` directory.
+- `LANE_ENV_DIR_XDG_CONFIG` (`xdg_config`): Per-lane `XDG_CONFIG_HOME` directory.
+- `LANE_ENV_DIRS`: Slice of all four directory names.
+
+**Key Functions**:
+- `apply_lane_env_overrides(env, lane_dir)`: Sets `HOME`, `TMPDIR`,
+  `XDG_CACHE_HOME`, and `XDG_CONFIG_HOME` to deterministic per-lane paths
+  under `lane_dir`. Must be called AFTER `build_job_environment()` so that
+  per-lane overrides take final precedence.
+- `ensure_lane_env_dirs(lane_dir)`: Creates all four env subdirectories with
+  mode 0o700 on Unix (CTR-2611). Idempotent: verifies ownership and
+  permissions on existing directories.
+
+**Lifecycle**:
+- Created during lane initialization (`LaneManager::ensure_lanes()`).
+- Created before gate execution (`ensure_lane_env_dirs()` in `gates.rs`).
+- Pruned during lane cleanup (Step 3b: `env_dir_prune`).
+- Deleted during lane reset (`apm2 fac lane reset`).
 
 ### Key Functions
 
@@ -693,7 +726,10 @@ execution paths. `FacPolicyV1` env fields (`env_clear`, `env_allowlist_prefixes`
   and managed `CARGO_HOME` creation. Both gates and evidence modules delegate here.
 - **Gates** (`fac_review/gates.rs`): `compute_nextest_test_environment()` loads
   policy via `policy_loader::load_or_create_fac_policy()`, calls
-  `build_job_environment()`, then overlays lane-derived env vars.
+  `build_job_environment()`, then calls `ensure_lane_env_dirs()` and
+  `apply_lane_env_overrides()` to set per-lane `HOME`/`TMPDIR`/`XDG_*` paths
+  (TCK-00575). Lane-derived env vars (`NEXTEST_TEST_THREADS`, `CARGO_BUILD_JOBS`)
+  are overlaid after per-lane env isolation.
   `ensure_managed_cargo_home()` delegates to `policy_loader`.
 - **Pipeline/Evidence** (`fac_review/evidence.rs`): `build_pipeline_test_command()`
   loads policy via `policy_loader::load_or_create_fac_policy()` and builds
@@ -704,6 +740,11 @@ execution paths. `FacPolicyV1` env fields (`env_clear`, `env_allowlist_prefixes`
   `SYSTEMD_SETENV_ALLOWLIST_EXACT` includes `CARGO_HOME`, `RUSTUP_HOME`, `PATH`,
   `HOME`, `USER`, `LANG` for correct toolchain resolution inside systemd transient
   units.
+- **Lane cleanup** (`lane.rs`): Step 3b (`env_dir_prune`) prunes per-lane `home/`,
+  `xdg_cache/`, and `xdg_config/` directories via `safe_rmtree_v1`. The `tmp/`
+  directory is already handled by the existing temp prune step (Step 3).
+- **Lane reset** (`fac.rs`): `run_lane_reset()` deletes all lane subdirectories
+  including `home/`, `tmp/`, `xdg_cache/`, `xdg_config/` (TCK-00575).
 
 ### Security Invariants (TCK-00526)
 
@@ -731,6 +772,16 @@ execution paths. `FacPolicyV1` env fields (`env_clear`, `env_allowlist_prefixes`
 - [INV-ENV-009] Default `env_allowlist_prefixes` use narrow prefixes (`RUSTFLAGS`,
   `RUSTDOCFLAGS`, `RUSTUP_`, `RUST_BACKTRACE`, `RUST_LOG`, `RUST_TEST_THREADS`)
   to prevent broad `RUST` prefix from admitting `RUSTC_WRAPPER`.
+- [INV-ENV-010] Per-lane env dirs (`home/`, `tmp/`, `xdg_cache/`, `xdg_config/`)
+  are created with mode 0o700 on Unix (CTR-2611). Existing directories are
+  verified for current-user ownership and restrictive permissions (no
+  group/other access). Verification failure is fatal.
+- [INV-ENV-011] `apply_lane_env_overrides()` must be called AFTER
+  `build_job_environment()` so that per-lane `HOME`/`TMPDIR`/`XDG_*` values
+  take final precedence over any ambient or policy-set values.
+- [INV-ENV-012] Per-lane env dirs are pruned during lane cleanup (Step 3b,
+  `env_dir_prune`) and deleted during lane reset. Prune failure marks the
+  lane CORRUPT via `LaneCorruptMarkerV1`.
 
 ## Receipt Versioning (TCK-00518)
 

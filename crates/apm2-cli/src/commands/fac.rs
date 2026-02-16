@@ -3693,15 +3693,16 @@ fn run_lane_status(args: &LaneStatusArgs, json_output: bool) -> u8 {
 
 /// Execute `apm2 fac lane reset <lane_id>`.
 ///
-/// Resets a lane by deleting its workspace, target, and logs subdirectories
-/// using `safe_rmtree_v1` (symlink-safe, boundary-enforced deletion).
+/// Resets a lane by deleting its workspace, target, logs, and per-lane env
+/// isolation subdirectories (`home`, `tmp`, `xdg_cache`, `xdg_config`) using
+/// `safe_rmtree_v1` (symlink-safe, boundary-enforced deletion).
 ///
 /// # State Machine
 ///
-/// - IDLE: resets workspace/target/logs, removes lease, remains IDLE.
-/// - CORRUPT: resets workspace/target/logs, removes lease, transitions to IDLE.
-/// - LEASED/CLEANUP: resets workspace/target/logs, removes lease, transitions
-///   to IDLE.
+/// - IDLE: resets all lane subdirs, removes lease, remains IDLE.
+/// - CORRUPT: resets all lane subdirs, removes lease, transitions to IDLE.
+/// - LEASED/CLEANUP: resets all lane subdirs, removes lease, transitions to
+///   IDLE.
 /// - RUNNING: refuses unless `--force` is provided. With `--force`, kills the
 ///   process first, then resets.
 ///
@@ -3799,7 +3800,7 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
         }
     }
 
-    // Perform safe deletion of workspace, target, and logs (under lock)
+    // Perform safe deletion of all lane subdirectories (under lock)
     let lane_dir = manager.lane_dir(&args.lane_id);
     let Some(lanes_root) = lane_dir.parent() else {
         return output_error(
@@ -3813,7 +3814,18 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
         );
     };
 
-    let subdirs = ["workspace", "target", "logs"];
+    // TCK-00575: Include per-lane env isolation directories (home, tmp,
+    // xdg_cache, xdg_config) in the reset so that stale env state does not
+    // persist across lane reuses.
+    let subdirs = [
+        "workspace",
+        "target",
+        "logs",
+        "home",
+        "tmp",
+        "xdg_cache",
+        "xdg_config",
+    ];
     let mut total_files: u64 = 0;
     let mut total_dirs: u64 = 0;
     let mut refused_receipts: Vec<RefusedDeleteReceipt> = Vec::new();

@@ -66,6 +66,7 @@ pub const LANE_CORRUPT_MARKER_SCHEMA: &str = "apm2.fac.lane_corrupt.v1";
 const CLEANUP_STEP_GIT_RESET: &str = "git_reset";
 const CLEANUP_STEP_GIT_CLEAN: &str = "git_clean";
 const CLEANUP_STEP_TEMP_PRUNE: &str = "temp_prune";
+const CLEANUP_STEP_ENV_DIR_PRUNE: &str = "env_dir_prune";
 const CLEANUP_STEP_LOG_QUOTA: &str = "log_quota";
 const CLEANUP_STEP_WORKSPACE_VALIDATION: &str = "workspace_path_validation";
 
@@ -161,6 +162,19 @@ pub enum LaneCleanupError {
         failure_step: Option<String>,
     },
 
+    /// Per-lane environment directory prune failed (TCK-00575).
+    #[error("env directory prune failed during {step}: {reason}")]
+    EnvDirPruneFailed {
+        /// Name of the cleanup step that failed.
+        step: &'static str,
+        /// Human-readable failure detail.
+        reason: String,
+        /// Ordered list of completed steps before failure.
+        steps_completed: Vec<String>,
+        /// The step that caused the failure.
+        failure_step: Option<String>,
+    },
+
     /// Log quota enforcement failed.
     #[error("log quota enforcement failed during {step}: {reason}")]
     LogQuotaFailed {
@@ -190,6 +204,7 @@ impl LaneCleanupError {
         match self {
             Self::GitCommandFailed { failure_step, .. }
             | Self::TempPruneFailed { failure_step, .. }
+            | Self::EnvDirPruneFailed { failure_step, .. }
             | Self::LogQuotaFailed { failure_step, .. } => failure_step.as_deref(),
             Self::Io(_) | Self::InvalidState(_) => None,
         }
@@ -203,6 +218,9 @@ impl LaneCleanupError {
                 steps_completed, ..
             }
             | Self::TempPruneFailed {
+                steps_completed, ..
+            }
+            | Self::EnvDirPruneFailed {
                 steps_completed, ..
             }
             | Self::LogQuotaFailed {
@@ -1147,6 +1165,10 @@ impl LaneManager {
             create_dir_restricted(&lane_dir.join("workspace"))?;
             create_dir_restricted(&lane_dir.join("target"))?;
             create_dir_restricted(&lane_dir.join("logs"))?;
+            // TCK-00575: Create per-lane env isolation directories.
+            for env_subdir in super::policy::LANE_ENV_DIRS {
+                create_dir_restricted(&lane_dir.join(env_subdir))?;
+            }
         }
         // Ensure lock directory exists
         let lock_dir = self.fac_root.join("locks").join("lanes");
@@ -1336,10 +1358,11 @@ impl LaneManager {
     }
 
     /// Run lane cleanup:
-    /// 1) Reset workspace (`git reset --hard HEAD`)
-    /// 2) Remove untracked files (`git clean -ffdxq`)
-    /// 3) Remove temporary directory (`tmp`) via safe deletion
-    /// 4) Enforce log quota by pruning oldest logs to 100 MiB
+    /// 1. Reset workspace (`git reset --hard HEAD`)
+    /// 2. Remove untracked files (`git clean -ffdxq`)
+    /// 3. Remove temporary directory (`tmp`) via safe deletion
+    /// 4. Prune per-lane env dirs (`home/`, `xdg_cache/`, `xdg_config/`)
+    /// 5. Enforce log quota by pruning oldest logs to 100 MiB
     ///
     /// # Errors
     ///
@@ -1482,6 +1505,29 @@ impl LaneManager {
             }
         }
         steps_completed.push(CLEANUP_STEP_TEMP_PRUNE.to_string());
+
+        // Step 3b (TCK-00575): Prune per-lane environment directories
+        // (home, xdg_cache, xdg_config). The `tmp` dir is already handled
+        // above in step 3.
+        for env_subdir in &[
+            super::policy::LANE_ENV_DIR_HOME,
+            super::policy::LANE_ENV_DIR_XDG_CACHE,
+            super::policy::LANE_ENV_DIR_XDG_CONFIG,
+        ] {
+            let env_dir = lanes_dir.join(env_subdir);
+            if env_dir.exists() {
+                if let Err(err) = safe_rmtree_v1(&env_dir, &lanes_dir) {
+                    persist_lease_state(&mut lease, LaneState::Corrupt)?;
+                    return Err(LaneCleanupError::EnvDirPruneFailed {
+                        step: CLEANUP_STEP_ENV_DIR_PRUNE,
+                        reason: format!("failed to prune env dir {}: {err}", env_dir.display()),
+                        steps_completed: steps_completed.clone(),
+                        failure_step: Some(CLEANUP_STEP_ENV_DIR_PRUNE.to_string()),
+                    });
+                }
+            }
+        }
+        steps_completed.push(CLEANUP_STEP_ENV_DIR_PRUNE.to_string());
 
         // Step 4: Enforce log quota.
         if let Err(err) = Self::enforce_log_quota(&lanes_dir.join("logs"), &steps_completed) {
@@ -3097,6 +3143,7 @@ mod tests {
                 CLEANUP_STEP_GIT_RESET.to_string(),
                 CLEANUP_STEP_GIT_CLEAN.to_string(),
                 CLEANUP_STEP_TEMP_PRUNE.to_string(),
+                CLEANUP_STEP_ENV_DIR_PRUNE.to_string(),
                 CLEANUP_STEP_LOG_QUOTA.to_string(),
             ],
             "all steps should be reported",
@@ -3139,6 +3186,7 @@ mod tests {
                 CLEANUP_STEP_GIT_RESET.to_string(),
                 CLEANUP_STEP_GIT_CLEAN.to_string(),
                 CLEANUP_STEP_TEMP_PRUNE.to_string(),
+                CLEANUP_STEP_ENV_DIR_PRUNE.to_string(),
             ]
             .as_slice()
         );
