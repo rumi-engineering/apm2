@@ -841,6 +841,7 @@ mod tests {
                 verdict: "allow".to_string(),
                 queue_lane: "default".to_string(),
                 defect_reason: None,
+                cost_estimate_ticks: None,
             }),
             eio29_budget_admission: None,
             containment: None,

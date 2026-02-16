@@ -635,6 +635,11 @@ pub struct QueueAdmissionTrace {
     pub queue_lane: String,
     /// Optional deny reason.
     pub defect_reason: Option<String>,
+    /// TCK-00532: Cost estimate (in ticks) used for this admission decision.
+    /// Present when the cost model provided the estimate; absent for legacy
+    /// receipts created before cost model integration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_estimate_ticks: Option<u64>,
 }
 
 /// Placeholder trace for RFC-0029 budget admission.
@@ -719,6 +724,16 @@ impl FacJobReceiptV1 {
     ///
     /// Encodes all fields except `content_hash` in deterministic order with
     /// length-prefixing to prevent canonicalization collisions.
+    ///
+    /// # V1 Immutability Contract
+    ///
+    /// This method represents the V1 canonical form and MUST remain
+    /// bit-for-bit compatible with the historical implementation. Trailing
+    /// optional fields (`moved_job_path`, `containment`, `observed_cost`)
+    /// do NOT emit a `0u8` presence marker when absent; they are simply
+    /// omitted. This matches the original encoding and preserves content
+    /// hashes for all existing persisted receipts. New receipts should
+    /// prefer `canonical_bytes_v2()` which uses proper presence markers.
     ///
     /// # Panics
     ///
@@ -817,11 +832,10 @@ impl FacJobReceiptV1 {
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
-        // Appended at end for backward compatibility with pre-TCK-00514 receipts.
-        // A `0u8` presence marker is intentionally omitted when `moved_job_path`
-        // is `None`, matching the `canonicalizer_tuple_digest` pattern above,
-        // because older receipts encoded without this optional field at all and
-        // adding a trailing `0u8` would change their content hash.
+        // V1 trailing optional fields: NO `0u8` presence marker when absent.
+        // These fields are simply omitted when None, preserving bit-for-bit
+        // hash compatibility with pre-TCK-00514 / pre-TCK-00548 receipts.
+        // Appended at end for backward compatibility.
         if let Some(path) = &self.moved_job_path {
             bytes.push(1u8);
             bytes.extend_from_slice(&(path.len() as u32).to_be_bytes());
@@ -866,7 +880,7 @@ impl FacJobReceiptV1 {
     /// New receipts should use v2. Existing v1 receipts remain verifiable
     /// via `canonical_bytes()`.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     pub fn canonical_bytes_v2(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(512);
 
@@ -965,15 +979,16 @@ impl FacJobReceiptV1 {
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
-        // Appended at end for backward compatibility with pre-TCK-00514 receipts.
-        // A `0u8` presence marker is intentionally omitted when `moved_job_path`
-        // is `None`, matching the `canonicalizer_tuple_digest` pattern above,
-        // because older receipts encoded without this optional field at all and
-        // adding a trailing `0u8` would change their content hash.
+
+        // V2 trailing optional fields: ALL emit presence markers (0u8/1u8)
+        // to prevent canonicalization collisions. V2 is only used for new
+        // receipts, so there is no backward-compatibility constraint.
         if let Some(path) = &self.moved_job_path {
             bytes.push(1u8);
             bytes.extend_from_slice(&(path.len() as u32).to_be_bytes());
             bytes.extend_from_slice(path.as_bytes());
+        } else {
+            bytes.push(0u8);
         }
 
         // TCK-00548: Containment trace. Uses type-specific marker `2u8`
@@ -986,6 +1001,18 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&trace.processes_checked.to_be_bytes());
             bytes.extend_from_slice(&trace.mismatch_count.to_be_bytes());
             bytes.push(u8::from(trace.sccache_auto_disabled));
+        } else {
+            bytes.push(0u8);
+        }
+
+        // TCK-00532: Observed job cost with presence marker.
+        if let Some(cost) = &self.observed_cost {
+            bytes.push(1u8);
+            bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
+        } else {
+            bytes.push(0u8);
         }
 
         // TCK-00573: Sandbox hardening hash. Uses type-specific marker
@@ -2440,6 +2467,7 @@ pub mod tests {
                         verdict: "allow".to_string(),
                         queue_lane: "bulk".to_string(),
                         defect_reason: None,
+                        cost_estimate_ticks: None,
                     })
                     .eio29_budget_admission(BudgetAdmissionTrace {
                         verdict: "allow".to_string(),
@@ -2741,6 +2769,7 @@ pub mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -2802,6 +2831,7 @@ pub mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -2838,6 +2868,7 @@ pub mod tests {
             verdict: "deny".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: Some("quarantine required".to_string()),
+            cost_estimate_ticks: None,
         })
         .try_build()
         .expect("receipt with moved_job_path");
@@ -2875,6 +2906,7 @@ pub mod tests {
             verdict: "deny".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: Some("missing authority".to_string()),
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -2909,6 +2941,7 @@ pub mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -3016,6 +3049,7 @@ pub mod tests {
             verdict: "deny".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: Some("denied".to_string()),
+            cost_estimate_ticks: None,
         })
         .try_build();
 
