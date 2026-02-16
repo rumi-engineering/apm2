@@ -811,6 +811,12 @@ execution paths. `FacPolicyV1` env fields (`env_clear`, `env_allowlist_prefixes`
   `SYSTEMD_SETENV_ALLOWLIST_EXACT` includes `CARGO_HOME`, `RUSTUP_HOME`, `PATH`,
   `HOME`, `USER`, `LANG` for correct toolchain resolution inside systemd transient
   units.
+- **Warm phases** (`fac/warm.rs`, `fac_worker.rs`): `execute_warm_job()` builds
+  a hardened environment via `build_job_environment()` before calling
+  `execute_warm()`. All warm subprocesses (phase commands and version probes)
+  execute with `env_clear()` + hardened env (INV-WARM-012). FAC-private state,
+  secrets, and worker authority context are unreachable from untrusted `build.rs`
+  and proc-macro code.
 
 ### Security Invariants (TCK-00526)
 
@@ -1052,8 +1058,9 @@ pre-populating build caches in the lane target namespace.
 - `execute_warm(phases, ...)`: Execute warm phases and produce a `WarmReceiptV1`.
 - `execute_warm_phase(phase, ...)`: Execute a single phase with timeout
   enforcement via `MAX_PHASE_TIMEOUT_SECS` (1800s).
-- `collect_tool_versions()`: Bounded stdout collection from version probe
-  commands (`MAX_VERSION_OUTPUT_BYTES`).
+- `collect_tool_versions(hardened_env)`: Bounded stdout collection from version
+  probe commands (`MAX_VERSION_OUTPUT_BYTES`). Uses hardened environment
+  (INV-WARM-012, defense-in-depth).
 - `WarmReceiptV1::verify_content_hash()`: Constant-time hash verification
   via `subtle::ConstantTimeEq`.
 - `WarmReceiptV1::persist(receipts_dir)`: Atomic write (temp+rename) with
@@ -1083,6 +1090,12 @@ pre-populating build caches in the lane target namespace.
   integrity).
 - [INV-WARM-011] Warm execution inherits systemd transient unit containment
   from the worker (TCK-00529/TCK-00511 cgroup + namespace isolation).
+- [INV-WARM-012] Warm phase subprocesses execute with a hardened environment
+  constructed via `build_job_environment()` (default-deny + policy allowlist).
+  The ambient process environment is NOT inherited. FAC-private state paths
+  and secrets are unreachable from `build.rs` / proc-macro execution.
+  `RUSTC_WRAPPER` and `SCCACHE_*` are unconditionally stripped (INV-ENV-008).
+  Version probe commands also use the hardened environment (defense-in-depth).
 
 ## Control-Lane Exception (TCK-00533)
 
