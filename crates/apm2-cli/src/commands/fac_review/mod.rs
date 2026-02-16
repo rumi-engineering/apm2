@@ -89,6 +89,8 @@ const DOCTOR_EVENT_SCAN_MAX_BYTES_PER_SOURCE: u64 = 8 * 1024 * 1024;
 const DOCTOR_LOG_SCAN_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const DOCTOR_LOG_SCAN_MAX_LINES: u64 = 200_000;
 const DOCTOR_LOG_SCAN_CHUNK_BYTES: usize = 8 * 1024;
+const DOCTOR_ACTIVE_AGENT_IDLE_TIMEOUT_SECONDS: i64 = 300;
+const DOCTOR_DISPATCH_PENDING_WARNING_SECONDS: i64 = 120;
 
 #[derive(Debug, Serialize)]
 struct DoctorHealthItem {
@@ -166,6 +168,14 @@ struct DoctorAgentSection {
     active_agents: usize,
     total_agents: usize,
     entries: Vec<DoctorAgentSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DoctorAgentActivitySummary {
+    active_agents: usize,
+    all_active_idle: bool,
+    max_idle_seconds: Option<i64>,
+    max_dispatched_pending_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -334,7 +344,7 @@ struct DoctorActionInputs<'a> {
     pr_number: u32,
     health: &'a [DoctorHealthItem],
     lifecycle: Option<&'a DoctorLifecycleSnapshot>,
-    agents: Option<&'a DoctorAgentSection>,
+    agent_activity: DoctorAgentActivitySummary,
     reviews: &'a [DoctorReviewSnapshot],
     review_terminal_reasons: &'a std::collections::BTreeMap<String, Option<String>>,
     run_state_diagnostics: &'a [DoctorRunStateDiagnostic],
@@ -487,7 +497,55 @@ pub fn run_doctor(
                 plan.run_state_review_types,
             ) {
                 Ok(summary) => {
-                    repairs_applied.extend(summary.into_doctor_repairs());
+                    let mut doctor_repairs = summary.into_doctor_repairs();
+                    let reaped_stale_agents = doctor_repairs
+                        .iter()
+                        .any(|entry| entry.operation == "reap_stale_agents");
+                    repairs_applied.append(&mut doctor_repairs);
+
+                    let post_repair = run_doctor_inner(repo, pr_number, Vec::new(), true);
+                    if doctor_should_restart_after_repair(&post_repair, reaped_stale_agents) {
+                        let force_restart =
+                            doctor_requires_force_restart_from_summary(&post_repair);
+                        match restart::run_restart_for_doctor_fix(
+                            repo,
+                            pr_number,
+                            force_restart,
+                            true,
+                        ) {
+                            Ok(restart_summary) => {
+                                let dispatched_count = restart_summary
+                                    .reviews_dispatched
+                                    .as_ref()
+                                    .map_or(0, Vec::len);
+                                repairs_applied.push(DoctorRepairApplied {
+                                    operation: "restart_reviews".to_string(),
+                                    before: Some(format!(
+                                        "force={force_restart} reason=reaped_stale_agents_no_active_reviewers"
+                                    )),
+                                    after: Some(format!(
+                                        "strategy={} evidence_passed={} dispatched_reviews={}",
+                                        restart_summary.strategy.label(),
+                                        restart_summary.evidence_passed.map_or_else(
+                                            || "none".to_string(),
+                                            |passed| { passed.to_string() }
+                                        ),
+                                        dispatched_count
+                                    )),
+                                });
+                            },
+                            Err(err) => {
+                                if let Err(emit_err) =
+                                    jsonl::emit_json_error("fac_doctor_fix_restart_failed", &err)
+                                {
+                                    eprintln!(
+                                        "WARNING: failed to emit doctor fix restart error: {emit_err}"
+                                    );
+                                }
+                                return exit_codes::GENERIC_ERROR;
+                            },
+                        }
+                    }
                 },
                 Err(err) => {
                     if let Err(emit_err) = jsonl::emit_json_error("fac_doctor_fix_failed", &err) {
@@ -591,12 +649,14 @@ pub fn run_doctor(
     }
 }
 
-const DOCTOR_WAIT_EXIT_ACTIONS: [&str; 5] = [
+const DOCTOR_WAIT_EXIT_ACTIONS: [&str; 7] = [
     "fix",
     "escalate",
     "merge",
     "dispatch_implementor",
     "restart_reviews",
+    "done",
+    "approve",
 ];
 
 fn normalize_doctor_exit_actions(
@@ -1311,11 +1371,12 @@ fn run_doctor_inner(
                 None
             },
         };
+    let agent_activity = build_doctor_agent_activity_summary(agents.as_ref());
     let recommended_action = build_recommended_action(&DoctorActionInputs {
         pr_number,
         health: &health,
         lifecycle: lifecycle.as_ref(),
-        agents: agents.as_ref(),
+        agent_activity,
         reviews: &reviews,
         review_terminal_reasons: &review_terminal_reasons,
         run_state_diagnostics: &run_state_diagnostics,
@@ -1419,6 +1480,85 @@ fn doctor_requires_force_repair(summary: &DoctorPrSummary) -> bool {
         )
     });
     health_force || run_state_force
+}
+
+fn doctor_requires_force_restart_from_summary(summary: &DoctorPrSummary) -> bool {
+    summary.reviews.iter().any(review_requires_forced_restart)
+}
+
+fn doctor_should_restart_after_repair(
+    summary: &DoctorPrSummary,
+    reaped_stale_agents: bool,
+) -> bool {
+    if !reaped_stale_agents {
+        return false;
+    }
+    let has_pending_verdict = summary
+        .findings_summary
+        .iter()
+        .any(|entry| entry.formal_verdict.eq_ignore_ascii_case("pending"));
+    if !has_pending_verdict {
+        return false;
+    }
+    build_doctor_agent_activity_summary(summary.agents.as_ref()).active_agents == 0
+}
+
+fn build_doctor_agent_activity_summary(
+    agents: Option<&DoctorAgentSection>,
+) -> DoctorAgentActivitySummary {
+    let Some(section) = agents else {
+        return DoctorAgentActivitySummary::default();
+    };
+
+    let mut active_reviewers = 0usize;
+    let mut running_reviewers = 0usize;
+    let mut all_running_idle = true;
+    let mut max_idle_seconds = None;
+    let mut max_dispatched_pending_seconds = None;
+
+    for entry in &section.entries {
+        if doctor_dimension_for_agent(&entry.agent_type).is_none() {
+            continue;
+        }
+        match entry.state.trim().to_ascii_lowercase().as_str() {
+            "running" => {
+                active_reviewers = active_reviewers.saturating_add(1);
+                running_reviewers = running_reviewers.saturating_add(1);
+                let idle_seconds = entry
+                    .last_activity_seconds_ago
+                    .or(entry.elapsed_seconds)
+                    .unwrap_or_default();
+                max_idle_seconds = Some(
+                    max_idle_seconds.map_or(idle_seconds, |current: i64| current.max(idle_seconds)),
+                );
+                if idle_seconds <= DOCTOR_ACTIVE_AGENT_IDLE_TIMEOUT_SECONDS {
+                    all_running_idle = false;
+                }
+            },
+            "dispatched" => {
+                active_reviewers = active_reviewers.saturating_add(1);
+                if let Some(elapsed_seconds) = entry.elapsed_seconds {
+                    max_dispatched_pending_seconds = Some(
+                        max_dispatched_pending_seconds
+                            .map_or(elapsed_seconds, |current: i64| current.max(elapsed_seconds)),
+                    );
+                }
+            },
+            _ => {},
+        }
+    }
+
+    let all_active_idle = active_reviewers > 0
+        && running_reviewers == active_reviewers
+        && all_running_idle
+        && max_idle_seconds.is_some_and(|value| value > DOCTOR_ACTIVE_AGENT_IDLE_TIMEOUT_SECONDS);
+
+    DoctorAgentActivitySummary {
+        active_agents: active_reviewers,
+        all_active_idle,
+        max_idle_seconds,
+        max_dispatched_pending_seconds,
+    }
 }
 
 fn parse_rfc3339_utc(value: &str) -> Option<DateTime<Utc>> {
@@ -2335,6 +2475,11 @@ fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommended
     let push_failure_hint = input
         .latest_push_attempt
         .and_then(format_push_attempt_failure_hint);
+    let escalate_command = format!("apm2 fac doctor --pr {} --json", input.pr_number);
+    let wait_command = format!(
+        "apm2 fac doctor --pr {} --json --wait-for-recommended-action",
+        input.pr_number
+    );
     let has_run_state_repairable = input
         .run_state_diagnostics
         .iter()
@@ -2357,6 +2502,18 @@ fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommended
         };
     }
 
+    if input
+        .lifecycle
+        .is_some_and(|entry| entry.state.eq_ignore_ascii_case("merged"))
+    {
+        return DoctorRecommendedAction {
+            action: "done".to_string(),
+            reason: "PR has been merged to main".to_string(),
+            priority: "low".to_string(),
+            command: None,
+        };
+    }
+
     if input.merge_readiness.merge_ready {
         return DoctorRecommendedAction {
             action: "merge".to_string(),
@@ -2367,36 +2524,76 @@ fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommended
         };
     }
 
+    if input.merge_readiness.all_verdicts_approve {
+        return DoctorRecommendedAction {
+            action: "approve".to_string(),
+            reason: "all review dimensions approve; awaiting auto-merge".to_string(),
+            priority: "low".to_string(),
+            command: Some(wait_command),
+        };
+    }
+
     if input.merge_readiness.merge_conflict_status == DoctorMergeConflictStatus::HasConflicts {
         return DoctorRecommendedAction {
             action: "escalate".to_string(),
             reason: "non-fast-forward merge conflict requires human intervention".to_string(),
             priority: "high".to_string(),
-            command: None,
+            command: Some(escalate_command),
         };
     }
 
+    let all_verdicts_resolved = !input
+        .findings_summary
+        .iter()
+        .any(|entry| entry.formal_verdict.eq_ignore_ascii_case("pending"));
     let requires_implementor_remediation = input.findings_summary.iter().any(|entry| {
         entry.formal_verdict.eq_ignore_ascii_case("deny")
             || entry.counts.blocker > 0
             || entry.counts.major > 0
     });
-    if requires_implementor_remediation {
+    if requires_implementor_remediation && all_verdicts_resolved {
         let push_hint = push_failure_hint
             .unwrap_or_else(|| "review findings require implementor remediation".to_string());
+        let findings_rollup = format_findings_rollup_for_reason(input.findings_summary);
+        let reason = if findings_rollup.is_empty() {
+            push_hint
+        } else {
+            format!("{findings_rollup}; {push_hint}")
+        };
         return DoctorRecommendedAction {
             action: "dispatch_implementor".to_string(),
-            reason: push_hint,
+            reason,
             priority: "high".to_string(),
-            command: None,
+            command: Some(format!(
+                "apm2 fac review findings --pr {} --json",
+                input.pr_number
+            )),
         };
     }
 
-    let active_agents = input.agents.map_or(0, |section| section.active_agents);
     let has_pending_verdict = input
         .findings_summary
         .iter()
         .any(|entry| entry.formal_verdict.eq_ignore_ascii_case("pending"));
+    if input.agent_activity.all_active_idle {
+        let max_idle = input
+            .agent_activity
+            .max_idle_seconds
+            .unwrap_or(DOCTOR_ACTIVE_AGENT_IDLE_TIMEOUT_SECONDS);
+        return DoctorRecommendedAction {
+            action: "restart_reviews".to_string(),
+            reason: format!(
+                "all active reviewer agents are idle (no activity for up to {max_idle}s); recommend restart"
+            ),
+            priority: "high".to_string(),
+            command: Some(format!(
+                "apm2 fac restart --pr {} --force --refresh-identity",
+                input.pr_number
+            )),
+        };
+    }
+
+    let active_agents = input.agent_activity.active_agents;
     if active_agents == 0 && has_pending_verdict {
         let force_restart =
             has_forced_restart_terminal_reason(input.reviews, input.review_terminal_reasons);
@@ -2429,16 +2626,49 @@ fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommended
             action: "escalate".to_string(),
             reason: "lifecycle retry/error budget exhausted".to_string(),
             priority: "high".to_string(),
-            command: None,
+            command: Some(escalate_command),
         };
+    }
+
+    let mut wait_reason = "reviews are in progress or awaiting projection catch-up".to_string();
+    if input
+        .agent_activity
+        .max_dispatched_pending_seconds
+        .is_some_and(|value| value > DOCTOR_DISPATCH_PENDING_WARNING_SECONDS)
+    {
+        let pending_seconds = input
+            .agent_activity
+            .max_dispatched_pending_seconds
+            .unwrap_or(DOCTOR_DISPATCH_PENDING_WARNING_SECONDS);
+        wait_reason.push_str("; reviewer dispatch pending for ");
+        wait_reason.push_str(&pending_seconds.to_string());
+        wait_reason.push_str("s (may be stuck)");
     }
 
     DoctorRecommendedAction {
         action: "wait".to_string(),
-        reason: "reviews are in progress or awaiting projection catch-up".to_string(),
+        reason: wait_reason,
         priority: "low".to_string(),
-        command: None,
+        command: Some(wait_command),
     }
+}
+
+fn format_findings_rollup_for_reason(findings: &[DoctorFindingsDimensionSummary]) -> String {
+    findings
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}={}({}B/{}M/{}m/{}N)",
+                entry.dimension,
+                entry.formal_verdict.to_ascii_lowercase(),
+                entry.counts.blocker,
+                entry.counts.major,
+                entry.counts.minor,
+                entry.counts.nit
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn format_push_attempt_failure_hint(attempt: &DoctorPushAttemptSummary) -> Option<String> {
@@ -5454,6 +5684,108 @@ mod tests {
         ]
     }
 
+    fn findings_summary_entry(
+        dimension: &str,
+        formal_verdict: &str,
+        blocker: u32,
+        major: u32,
+        minor: u32,
+        nit: u32,
+    ) -> super::DoctorFindingsDimensionSummary {
+        super::DoctorFindingsDimensionSummary {
+            dimension: dimension.to_string(),
+            counts: super::DoctorFindingsCounts {
+                blocker,
+                major,
+                minor,
+                nit,
+            },
+            formal_verdict: formal_verdict.to_string(),
+            computed_verdict: if blocker > 0 || major > 0 {
+                "deny".to_string()
+            } else if minor > 0 || nit > 0 {
+                "approve".to_string()
+            } else {
+                "pending".to_string()
+            },
+        }
+    }
+
+    fn reviewer_agent_snapshot(
+        state: &str,
+        elapsed_seconds: Option<i64>,
+        last_activity_seconds_ago: Option<i64>,
+    ) -> super::DoctorAgentSnapshot {
+        super::DoctorAgentSnapshot {
+            agent_type: "reviewer_security".to_string(),
+            state: state.to_string(),
+            run_id: "run-security".to_string(),
+            sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            pid: Some(4242),
+            pid_alive: true,
+            started_at: "2026-02-15T00:00:00Z".to_string(),
+            completion_status: None,
+            completion_summary: None,
+            completion_token_hash: "token".to_string(),
+            completion_token_expires_at: "2026-02-15T01:00:00Z".to_string(),
+            elapsed_seconds,
+            models_attempted: Vec::new(),
+            tool_call_count: None,
+            log_line_count: None,
+            nudge_count: None,
+            last_activity_seconds_ago,
+        }
+    }
+
+    fn doctor_pr_summary_for_restart_tests(
+        findings_summary: Vec<super::DoctorFindingsDimensionSummary>,
+        agents: Option<super::DoctorAgentSection>,
+    ) -> super::DoctorPrSummary {
+        super::DoctorPrSummary {
+            schema: "apm2.fac.review.doctor.v1".to_string(),
+            pr_number: 42,
+            owner_repo: "example/repo".to_string(),
+            identity: super::DoctorIdentitySnapshot {
+                pr_number: 42,
+                branch: None,
+                worktree: None,
+                source: None,
+                local_sha: None,
+                updated_at: None,
+                remote_head_sha: None,
+                stale: false,
+            },
+            lifecycle: None,
+            gates: Vec::new(),
+            reviews: Vec::new(),
+            findings_summary,
+            merge_readiness: doctor_merge_readiness_fixture(
+                super::DoctorMergeConflictStatus::Unknown,
+            ),
+            worktree_status: super::DoctorWorktreeStatus {
+                worktree_exists: false,
+                worktree_clean: false,
+                merge_conflicts: 0,
+            },
+            github_projection: super::DoctorGithubProjectionStatus {
+                auto_merge_enabled: false,
+                last_comment_updated_at: None,
+                projection_lag_seconds: None,
+            },
+            recommended_action: super::DoctorRecommendedAction {
+                action: "wait".to_string(),
+                reason: "fixture".to_string(),
+                priority: "low".to_string(),
+                command: None,
+            },
+            agents,
+            run_state_diagnostics: Vec::new(),
+            repairs_applied: Vec::new(),
+            latest_push_attempt: None,
+            health: Vec::new(),
+        }
+    }
+
     fn doctor_lifecycle_fixture(
         state: &str,
         retry_budget_remaining: u32,
@@ -5514,7 +5846,7 @@ mod tests {
             pr_number,
             health: &[],
             lifecycle,
-            agents,
+            agent_activity: super::build_doctor_agent_activity_summary(agents),
             reviews,
             review_terminal_reasons: &terminal_reasons,
             run_state_diagnostics: &[],
@@ -5559,12 +5891,14 @@ mod tests {
             pr_number: 42,
             health: &[],
             lifecycle: Some(&doctor_lifecycle_fixture("stuck", 0, 9, 100)),
-            agents: Some(&super::DoctorAgentSection {
-                max_active_agents_per_pr: 2,
-                active_agents: 0,
-                total_agents: 0,
-                entries: Vec::new(),
-            }),
+            agent_activity: super::build_doctor_agent_activity_summary(Some(
+                &super::DoctorAgentSection {
+                    max_active_agents_per_pr: 2,
+                    active_agents: 0,
+                    total_agents: 0,
+                    entries: Vec::new(),
+                },
+            )),
             reviews: &[],
             review_terminal_reasons: &terminal_reasons,
             run_state_diagnostics: &[],
@@ -5593,12 +5927,14 @@ mod tests {
             pr_number: 42,
             health: &health,
             lifecycle: Some(&doctor_lifecycle_fixture("stuck", 0, 9, 100)),
-            agents: Some(&super::DoctorAgentSection {
-                max_active_agents_per_pr: 2,
-                active_agents: 0,
-                total_agents: 0,
-                entries: Vec::new(),
-            }),
+            agent_activity: super::build_doctor_agent_activity_summary(Some(
+                &super::DoctorAgentSection {
+                    max_active_agents_per_pr: 2,
+                    active_agents: 0,
+                    total_agents: 0,
+                    entries: Vec::new(),
+                },
+            )),
             reviews: &[],
             review_terminal_reasons: &terminal_reasons,
             run_state_diagnostics: &[],
@@ -5628,12 +5964,14 @@ mod tests {
             pr_number: 42,
             health: &[],
             lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 10)),
-            agents: Some(&super::DoctorAgentSection {
-                max_active_agents_per_pr: 2,
-                active_agents: 1,
-                total_agents: 1,
-                entries: Vec::new(),
-            }),
+            agent_activity: super::build_doctor_agent_activity_summary(Some(
+                &super::DoctorAgentSection {
+                    max_active_agents_per_pr: 2,
+                    active_agents: 1,
+                    total_agents: 1,
+                    entries: Vec::new(),
+                },
+            )),
             reviews: &[],
             review_terminal_reasons: &terminal_reasons,
             run_state_diagnostics: &diagnostics,
@@ -5661,12 +5999,14 @@ mod tests {
             pr_number: 42,
             health: &[],
             lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 10)),
-            agents: Some(&super::DoctorAgentSection {
-                max_active_agents_per_pr: 2,
-                active_agents: 1,
-                total_agents: 1,
-                entries: Vec::new(),
-            }),
+            agent_activity: super::build_doctor_agent_activity_summary(Some(
+                &super::DoctorAgentSection {
+                    max_active_agents_per_pr: 2,
+                    active_agents: 1,
+                    total_agents: 1,
+                    entries: Vec::new(),
+                },
+            )),
             reviews: &[],
             review_terminal_reasons: &terminal_reasons,
             run_state_diagnostics: &diagnostics,
@@ -5719,6 +6059,322 @@ mod tests {
             &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::HasConflicts),
         );
         assert_eq!(action.action, "escalate");
+        let command = action.command.expect("escalate command");
+        assert!(command.contains("apm2 fac doctor --pr 42 --json"));
+    }
+
+    #[test]
+    fn test_build_recommended_action_waits_when_one_dimension_pending_despite_deny() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = vec![
+            findings_summary_entry("security", "deny", 1, 0, 0, 0),
+            findings_summary_entry("code-quality", "pending", 0, 0, 0, 0),
+        ];
+        let agents = super::DoctorAgentSection {
+            max_active_agents_per_pr: 2,
+            active_agents: 1,
+            total_agents: 1,
+            entries: vec![reviewer_agent_snapshot("running", Some(120), Some(10))],
+        };
+        let action = build_recommended_action_for_tests(
+            42,
+            None,
+            Some(&agents),
+            &reviews,
+            &findings,
+            &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
+        );
+        assert_eq!(action.action, "wait");
+        let command = action.command.expect("wait command");
+        assert!(command.contains("--wait-for-recommended-action"));
+    }
+
+    #[test]
+    fn test_build_recommended_action_dispatches_when_all_dimensions_resolved() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = vec![
+            findings_summary_entry("security", "deny", 0, 1, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
+        let action = build_recommended_action_for_tests(
+            42,
+            None,
+            None,
+            &reviews,
+            &findings,
+            &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
+        );
+        assert_eq!(action.action, "dispatch_implementor");
+    }
+
+    #[test]
+    fn test_build_recommended_action_dispatches_when_both_dimensions_deny() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = vec![
+            findings_summary_entry("security", "deny", 1, 0, 0, 0),
+            findings_summary_entry("code-quality", "deny", 0, 1, 0, 0),
+        ];
+        let action = build_recommended_action_for_tests(
+            42,
+            None,
+            None,
+            &reviews,
+            &findings,
+            &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
+        );
+        assert_eq!(action.action, "dispatch_implementor");
+    }
+
+    #[test]
+    fn test_build_recommended_action_returns_done_for_merged_lifecycle() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let action = build_recommended_action_for_tests(
+            42,
+            Some(&doctor_lifecycle_fixture("merged", 3, 0, 1)),
+            Some(&super::DoctorAgentSection {
+                max_active_agents_per_pr: 2,
+                active_agents: 1,
+                total_agents: 1,
+                entries: vec![reviewer_agent_snapshot("running", Some(5), Some(2))],
+            }),
+            &reviews,
+            &pending_findings_summary(),
+            &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
+        );
+        assert_eq!(action.action, "done");
+        assert!(action.command.is_none());
+    }
+
+    #[test]
+    fn test_build_recommended_action_done_takes_priority_over_merge_ready() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let merge_ready = super::DoctorMergeReadiness {
+            merge_ready: true,
+            all_verdicts_approve: true,
+            gates_pass: true,
+            sha_fresh: true,
+            sha_freshness_source: super::DoctorShaFreshnessSource::RemoteMatch,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let action = build_recommended_action_for_tests(
+            42,
+            Some(&doctor_lifecycle_fixture("merged", 3, 0, 1)),
+            None,
+            &reviews,
+            &pending_findings_summary(),
+            &merge_ready,
+        );
+        assert_eq!(action.action, "done");
+    }
+
+    #[test]
+    fn test_build_recommended_action_returns_approve_when_all_verdicts_approve_but_not_merge_ready()
+    {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = vec![
+            findings_summary_entry("security", "approve", 0, 0, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 1),
+        ];
+        let readiness = super::DoctorMergeReadiness {
+            merge_ready: false,
+            all_verdicts_approve: true,
+            gates_pass: false,
+            sha_fresh: true,
+            sha_freshness_source: super::DoctorShaFreshnessSource::RemoteMatch,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let action =
+            build_recommended_action_for_tests(42, None, None, &reviews, &findings, &readiness);
+        assert_eq!(action.action, "approve");
+        let command = action.command.expect("approve command");
+        assert!(command.contains("--wait-for-recommended-action"));
+    }
+
+    #[test]
+    fn test_build_recommended_action_merge_takes_priority_over_approve() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = vec![
+            findings_summary_entry("security", "approve", 0, 0, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
+        let readiness = super::DoctorMergeReadiness {
+            merge_ready: true,
+            all_verdicts_approve: true,
+            gates_pass: true,
+            sha_fresh: true,
+            sha_freshness_source: super::DoctorShaFreshnessSource::RemoteMatch,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let action =
+            build_recommended_action_for_tests(42, None, None, &reviews, &findings, &readiness);
+        assert_eq!(action.action, "merge");
+    }
+
+    #[test]
+    fn test_build_recommended_action_wait_has_command() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = pending_findings_summary();
+        let agents = super::DoctorAgentSection {
+            max_active_agents_per_pr: 2,
+            active_agents: 1,
+            total_agents: 1,
+            entries: vec![reviewer_agent_snapshot("running", Some(20), Some(5))],
+        };
+        let action = build_recommended_action_for_tests(
+            42,
+            Some(&doctor_lifecycle_fixture("review_in_progress", 2, 0, 11)),
+            Some(&agents),
+            &reviews,
+            &findings,
+            &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
+        );
+        assert_eq!(action.action, "wait");
+        let command = action.command.expect("wait command");
+        assert!(command.contains("--wait-for-recommended-action"));
+    }
+
+    #[test]
+    fn test_build_recommended_action_dispatch_implementor_has_command() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = vec![
+            findings_summary_entry("security", "deny", 0, 1, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
+        let action = build_recommended_action_for_tests(
+            42,
+            None,
+            None,
+            &reviews,
+            &findings,
+            &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
+        );
+        assert_eq!(action.action, "dispatch_implementor");
+        let command = action.command.expect("dispatch command");
+        assert!(command.contains("apm2 fac review findings --pr 42"));
+    }
+
+    #[test]
+    fn test_build_recommended_action_dispatch_implementor_reason_includes_dimension_summary() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = vec![
+            findings_summary_entry("security", "deny", 2, 1, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 3),
+        ];
+        let action = build_recommended_action_for_tests(
+            42,
+            None,
+            None,
+            &reviews,
+            &findings,
+            &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
+        );
+        assert_eq!(action.action, "dispatch_implementor");
+        assert!(action.reason.contains("security=deny(2B/1M/0m/0N)"));
+        assert!(action.reason.contains("code-quality=approve(0B/0M/0m/3N)"));
+    }
+
+    #[test]
+    fn test_build_recommended_action_restarts_when_active_reviewers_are_idle() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = pending_findings_summary();
+        let agents = super::DoctorAgentSection {
+            max_active_agents_per_pr: 2,
+            active_agents: 1,
+            total_agents: 1,
+            entries: vec![reviewer_agent_snapshot("running", Some(700), Some(600))],
+        };
+        let action = build_recommended_action_for_tests(
+            42,
+            Some(&doctor_lifecycle_fixture("review_in_progress", 2, 0, 11)),
+            Some(&agents),
+            &reviews,
+            &findings,
+            &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
+        );
+        assert_eq!(action.action, "restart_reviews");
+        let command = action.command.expect("restart command");
+        assert!(command.contains("--force"));
+        assert!(command.contains("--refresh-identity"));
+    }
+
+    #[test]
+    fn test_build_recommended_action_wait_reason_warns_on_stuck_dispatched_agent() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = pending_findings_summary();
+        let agents = super::DoctorAgentSection {
+            max_active_agents_per_pr: 2,
+            active_agents: 1,
+            total_agents: 1,
+            entries: vec![reviewer_agent_snapshot("dispatched", Some(200), None)],
+        };
+        let action = build_recommended_action_for_tests(
+            42,
+            Some(&doctor_lifecycle_fixture("reviews_dispatched", 2, 0, 11)),
+            Some(&agents),
+            &reviews,
+            &findings,
+            &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
+        );
+        assert_eq!(action.action, "wait");
+        assert!(
+            action
+                .reason
+                .contains("reviewer dispatch pending for 200s (may be stuck)")
+        );
+    }
+
+    #[test]
+    fn test_build_recommended_action_budget_escalation_has_command() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = pending_findings_summary();
+        let agents = super::DoctorAgentSection {
+            max_active_agents_per_pr: 2,
+            active_agents: 1,
+            total_agents: 1,
+            entries: vec![reviewer_agent_snapshot("running", Some(30), Some(5))],
+        };
+        let action = build_recommended_action_for_tests(
+            42,
+            Some(&doctor_lifecycle_fixture("stuck", 0, 9, 11)),
+            Some(&agents),
+            &reviews,
+            &findings,
+            &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
+        );
+        assert_eq!(action.action, "escalate");
+        let command = action.command.expect("escalate command");
+        assert!(command.contains("apm2 fac doctor --pr 42 --json"));
+    }
+
+    #[test]
+    fn test_doctor_should_restart_after_repair_requires_reap_pending_and_no_active_reviewers() {
+        let pending_summary = pending_findings_summary();
+        let no_agents_summary = doctor_pr_summary_for_restart_tests(pending_summary.clone(), None);
+        assert!(super::doctor_should_restart_after_repair(
+            &no_agents_summary,
+            true
+        ));
+        assert!(!super::doctor_should_restart_after_repair(
+            &no_agents_summary,
+            false
+        ));
+
+        let active_agents_summary = doctor_pr_summary_for_restart_tests(
+            pending_summary,
+            Some(super::DoctorAgentSection {
+                max_active_agents_per_pr: 2,
+                active_agents: 1,
+                total_agents: 1,
+                entries: vec![reviewer_agent_snapshot("running", Some(20), Some(2))],
+            }),
+        );
+        assert!(!super::doctor_should_restart_after_repair(
+            &active_agents_summary,
+            true
+        ));
     }
 
     #[test]
@@ -5745,7 +6401,7 @@ mod tests {
                 max_active_agents_per_pr: 2,
                 active_agents: 1,
                 total_agents: 1,
-                entries: Vec::new(),
+                entries: vec![reviewer_agent_snapshot("running", Some(20), Some(2))],
             }),
             &reviews,
             &findings,
@@ -5801,17 +6457,10 @@ mod tests {
 
     #[test]
     fn test_build_recommended_action_dispatches_on_formal_deny_without_findings() {
-        let findings = vec![super::DoctorFindingsDimensionSummary {
-            dimension: "security".to_string(),
-            counts: super::DoctorFindingsCounts {
-                blocker: 0,
-                major: 0,
-                minor: 0,
-                nit: 0,
-            },
-            formal_verdict: "deny".to_string(),
-            computed_verdict: "pending".to_string(),
-        }];
+        let findings = vec![
+            findings_summary_entry("security", "deny", 0, 0, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
         let reviews = doctor_reviews_with_terminal_reason(None);
         let action = build_recommended_action_for_tests(
             42,
@@ -5822,21 +6471,15 @@ mod tests {
             &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
         );
         assert_eq!(action.action, "dispatch_implementor");
+        assert!(action.command.is_some());
     }
 
     #[test]
     fn test_build_recommended_action_dispatches_on_major_findings_without_formal_deny() {
-        let findings = vec![super::DoctorFindingsDimensionSummary {
-            dimension: "code-quality".to_string(),
-            counts: super::DoctorFindingsCounts {
-                blocker: 0,
-                major: 1,
-                minor: 0,
-                nit: 0,
-            },
-            formal_verdict: "pending".to_string(),
-            computed_verdict: "deny".to_string(),
-        }];
+        let findings = vec![
+            findings_summary_entry("security", "approve", 0, 0, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 1, 0, 0),
+        ];
         let reviews = doctor_reviews_with_terminal_reason(None);
         let action = build_recommended_action_for_tests(
             42,
@@ -5847,6 +6490,7 @@ mod tests {
             &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
         );
         assert_eq!(action.action, "dispatch_implementor");
+        assert!(action.command.is_some());
     }
 
     #[test]
@@ -5854,6 +6498,8 @@ mod tests {
         let normalized = super::normalize_doctor_exit_actions(&[]).expect("normalize defaults");
         assert!(normalized.contains("escalate"));
         assert!(normalized.contains("fix"));
+        assert!(normalized.contains("done"));
+        assert!(normalized.contains("approve"));
     }
 
     #[test]

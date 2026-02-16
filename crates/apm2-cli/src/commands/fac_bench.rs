@@ -22,12 +22,11 @@
 //!   CTR-2607).
 //! - \[INV-BENCH-005\] All collections are bounded by hard `MAX_*` constants.
 
-use std::env;
-use std::fs;
 use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
+use std::{env, fs};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -172,7 +171,7 @@ pub fn run_fac_bench(
     let overall_start = Instant::now();
 
     // Validate concurrency bound (INV-BENCH-003).
-    let effective_concurrency = concurrency.max(1).min(MAX_CONCURRENCY);
+    let effective_concurrency = concurrency.clamp(1, MAX_CONCURRENCY);
     if concurrency != effective_concurrency {
         emit_warn(
             json_output,
@@ -502,20 +501,17 @@ fn run_gate_measurement(
     let overall = Instant::now();
 
     // Resolve the active CLI binary path to avoid PATH-based resolution.
-    let exe = match env::current_exe() {
-        Ok(path) => path,
-        Err(_) => {
-            return GateRunMeasurement {
-                label: label.to_string(),
-                total_duration_ms: millis_from_elapsed(&overall),
-                all_passed: false,
-                phases: vec![GatePhaseTiming {
-                    name: "exe_resolve_error".to_string(),
-                    duration_ms: 0,
-                    passed: false,
-                }],
-            };
-        },
+    let Ok(exe) = env::current_exe() else {
+        return GateRunMeasurement {
+            label: label.to_string(),
+            total_duration_ms: millis_from_elapsed(&overall),
+            all_passed: false,
+            phases: vec![GatePhaseTiming {
+                name: "exe_resolve_error".to_string(),
+                duration_ms: 0,
+                passed: false,
+            }],
+        };
     };
 
     // Run gates via the active CLI binary to get an isolated measurement.
@@ -688,7 +684,10 @@ fn parse_gate_phases(stdout: &str) -> Vec<GatePhaseTiming> {
 /// Read from a stream with a strict upper bound.
 ///
 /// Returns collected bytes (capped), and whether truncation occurred.
-fn read_stream_with_cap(mut reader: impl Read, max_bytes: usize) -> Result<(Vec<u8>, bool), String> {
+fn read_stream_with_cap(
+    mut reader: impl Read,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, bool), String> {
     let mut output = Vec::new();
     let mut truncated = false;
     let mut chunk = [0u8; 8192];
@@ -740,9 +739,7 @@ fn run_command_with_bounded_output(
         .ok_or_else(|| "missing stdout pipe".to_string())?;
 
     let (stdout, truncated) = read_stream_with_cap(&mut stdout, max_stdout_bytes)?;
-    let status = child
-        .wait()
-        .map_err(|e| format!("wait failed: {e}"))?;
+    let status = child.wait().map_err(|e| format!("wait failed: {e}"))?;
 
     Ok((status, stdout, truncated))
 }
@@ -753,9 +750,14 @@ fn compute_target_collapse_metrics(baseline_bytes: u64, warm_bytes: u64) -> (f64
         return (0.0, 0.0);
     }
 
-    let factor = baseline_bytes as f64 / warm_bytes as f64;
-    let percent =
-        ((baseline_bytes as f64 - warm_bytes as f64) / baseline_bytes as f64) * 100.0;
+    #[allow(clippy::cast_precision_loss)]
+    // Byte counts fit comfortably in f64 mantissa for practical sizes.
+    let baseline_f = baseline_bytes as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let warm_f = warm_bytes as f64;
+
+    let factor = baseline_f / warm_f;
+    let percent = ((baseline_f - warm_f) / baseline_f) * 100.0;
 
     (factor, percent)
 }
@@ -786,20 +788,20 @@ fn measure_many_worktrees_target_baseline() -> u64 {
         }
         entries_scanned = entries_scanned.saturating_add(1);
 
-        let Ok(meta) = entry.symlink_metadata() else {
+        let candidate = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&candidate) else {
             continue;
         };
         if !meta.is_dir() || meta.file_type().is_symlink() {
             continue;
         }
 
-        let candidate = entry.path();
         if !is_worktree_root(&candidate) {
             continue;
         }
 
         let target = candidate.join("target");
-        let Ok(target_meta) = target.symlink_metadata() else {
+        let Ok(target_meta) = fs::symlink_metadata(&target) else {
             continue;
         };
         if !target_meta.is_dir() || target_meta.file_type().is_symlink() {
@@ -958,11 +960,11 @@ fn measure_directory(root: &Path) -> DiskFootprint {
                 continue;
             };
 
-            let Ok(meta) = entry.symlink_metadata() else {
+            let Ok(meta) = fs::symlink_metadata(entry.path()) else {
                 continue;
             };
 
-            let file_type = meta.file_type();
+            let file_type: std::fs::FileType = meta.file_type();
             if file_type.is_symlink() {
                 continue;
             }
@@ -1088,7 +1090,12 @@ fn compute_report_content_hash(report: &BenchReportV1) -> String {
     hasher.update(report.deltas.cold_total_ms.to_le_bytes());
     hasher.update(report.deltas.warm_total_ms.to_le_bytes());
     hasher.update(report.deltas.speedup_factor.to_le_bytes());
-    hasher.update(report.deltas.many_worktrees_target_baseline_bytes.to_le_bytes());
+    hasher.update(
+        report
+            .deltas
+            .many_worktrees_target_baseline_bytes
+            .to_le_bytes(),
+    );
     hasher.update(report.deltas.warm_target_size_bytes.to_le_bytes());
     hasher.update(report.deltas.target_collapse_factor.to_le_bytes());
     hasher.update(report.deltas.target_collapse_percent.to_le_bytes());
@@ -1356,11 +1363,11 @@ mod tests {
     #[test]
     fn test_max_concurrency_clamp() {
         let requested: u8 = 20;
-        let effective = requested.max(1).min(MAX_CONCURRENCY);
+        let effective = requested.clamp(1, MAX_CONCURRENCY);
         assert_eq!(effective, MAX_CONCURRENCY);
 
         let zero_requested: u8 = 0;
-        let zero_effective = zero_requested.max(1).min(MAX_CONCURRENCY);
+        let zero_effective = zero_requested.clamp(1, MAX_CONCURRENCY);
         assert_eq!(zero_effective, 1);
     }
 
@@ -1371,8 +1378,8 @@ mod tests {
         assert!((percent - 75.0).abs() < f64::EPSILON);
 
         let (factor_zero, percent_zero) = compute_target_collapse_metrics(0, 100);
-        assert_eq!(factor_zero, 0.0);
-        assert_eq!(percent_zero, 0.0);
+        assert!(factor_zero.abs() < f64::EPSILON);
+        assert!(percent_zero.abs() < f64::EPSILON);
     }
 
     #[test]
