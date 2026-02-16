@@ -66,7 +66,6 @@ pub enum GcPlanError {
 /// # Errors
 ///
 /// Returns `GcPlanError::Io` when workspace inspection fails.
-#[allow(clippy::too_many_lines)]
 pub fn plan_gc(
     fac_root: &Path,
     lane_manager: &LaneManager,
@@ -85,6 +84,7 @@ pub fn plan_gc(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn plan_gc_with_statuses(
     fac_root: &Path,
     lane_manager: &LaneManager,
