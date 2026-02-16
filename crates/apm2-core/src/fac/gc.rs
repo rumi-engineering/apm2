@@ -956,6 +956,28 @@ mod tests {
         write_file(&target_dir.join("artifact.bin"), 128);
         write_file(&log_dir.join("lane.log"), 32);
 
+        let _lane_lock = lane_manager
+            .try_lock(lane_id)
+            .expect("lock")
+            .expect("acquired");
+        // Use the current process PID so `is_pid_alive` always returns true.
+        // With a dead PID (e.g. 1234) and flock re-entrancy within the same
+        // process, `is_lock_held` may or may not detect our own lock depending
+        // on OFD semantics.  A live PID ensures the lane is never classified
+        // as Idle (it will be Running if the lock is detected, or Corrupt if
+        // not) so `plan_gc` always skips it.
+        let lease = LaneLeaseV1::new(
+            lane_id,
+            "job-001",
+            std::process::id(),
+            LaneState::Running,
+            "2026-01-01T00:00:00Z",
+            "fp-lane",
+            "fp-toolchain",
+        )
+        .expect("lease");
+        lease.persist(&lane_dir).expect("persist lease");
+
         let statuses = vec![LaneStatusV1 {
             lane_id: lane_id.to_string(),
             state: LaneState::Running,
