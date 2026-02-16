@@ -12,7 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use apm2_core::fac::{
-    FacPolicyV1, LaneLockGuard, LaneManager, LaneProfileV1, build_job_environment, compute_test_env,
+    FacPolicyV1, LaneLockGuard, LaneManager, LaneProfileV1, apply_lane_env_overrides,
+    build_job_environment, compute_test_env, ensure_lane_env_dirs,
 };
 use blake3;
 use sha2::{Digest, Sha256};
@@ -847,6 +848,14 @@ fn build_pipeline_test_command(workspace_root: &Path) -> Result<PipelineTestComm
     // TCK-00526: Build policy-filtered environment.
     let ambient: Vec<(String, String)> = std::env::vars().collect();
     let mut policy_env = build_job_environment(&policy, &ambient, &apm2_home);
+
+    // TCK-00575: Apply per-lane env isolation (HOME, TMPDIR, XDG_CACHE_HOME,
+    // XDG_CONFIG_HOME). For pipeline/evidence path, use the synthetic lane-00
+    // directory under $APM2_HOME/private/fac/lanes/lane-00.
+    let lane_dir = fac_root.join("lanes/lane-00");
+    ensure_lane_env_dirs(&lane_dir)?;
+    apply_lane_env_overrides(&mut policy_env, &lane_dir);
+
     for (key, value) in &lane_env {
         policy_env.insert(key.clone(), value.clone());
     }
@@ -902,6 +911,11 @@ fn resolve_evidence_env_remove_keys(opts: Option<&EvidenceGateOptions>) -> Optio
 /// environment. This function is used by `run_evidence_gates` and
 /// `run_evidence_gates_with_status` to apply the same policy to
 /// fmt/clippy/doc and script gates.
+///
+/// TCK-00575: Applies per-lane env isolation (`HOME`, `TMPDIR`,
+/// `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`) so every FAC gate phase runs with
+/// deterministic lane-local values, preventing writes to ambient user
+/// locations.
 fn build_gate_policy_env() -> Result<Vec<(String, String)>, String> {
     let apm2_home = apm2_core::github::resolve_apm2_home()
         .ok_or_else(|| "cannot resolve APM2_HOME for gate env policy enforcement".to_string())?;
@@ -913,7 +927,15 @@ fn build_gate_policy_env() -> Result<Vec<(String, String)>, String> {
     }
 
     let ambient: Vec<(String, String)> = std::env::vars().collect();
-    let policy_env = build_job_environment(&policy, &ambient, &apm2_home);
+    let mut policy_env = build_job_environment(&policy, &ambient, &apm2_home);
+
+    // TCK-00575: Apply per-lane env isolation for all evidence gate phases.
+    // Uses the synthetic lane-00 directory under
+    // $APM2_HOME/private/fac/lanes/lane-00.
+    let lane_dir = fac_root.join("lanes/lane-00");
+    ensure_lane_env_dirs(&lane_dir)?;
+    apply_lane_env_overrides(&mut policy_env, &lane_dir);
+
     Ok(policy_env.into_iter().collect())
 }
 

@@ -782,6 +782,30 @@ directories (`~/.cache`, `~/.cargo`, `~/.config`, etc.).
 - [INV-ENV-012] Per-lane env dirs are pruned during lane cleanup (Step 3b,
   `env_dir_prune`) and deleted during lane reset. Prune failure marks the
   lane CORRUPT via `LaneCorruptMarkerV1`.
+- [INV-LANE-ENV-001] `verify_lane_env_dir_permissions()` and
+  `verify_cargo_home_permissions()` use `symlink_metadata` (not `metadata`)
+  to prevent isolation escape via planted symlinks. A symlink at any lane
+  env directory path (e.g., `home` -> `~/.ssh`) is rejected with an explicit
+  error. This prevents an attacker from redirecting lane-isolated directories
+  to sensitive ambient user locations.
+- [INV-LANE-ENV-002] `ensure_lane_env_dirs()` and `ensure_managed_cargo_home()`
+  use atomic directory creation (mkdir + handle `AlreadyExists`) instead of
+  checking `exists()` first, eliminating the TOCTOU window between stat and
+  create.
+- [INV-LANE-ENV-003] UID comparisons in `verify_lane_env_dir_permissions()`
+  and `verify_cargo_home_permissions()` use `subtle::ConstantTimeEq` for
+  constant-time comparison, consistent with project style (INV-PC-001).
+- [INV-LANE-ENV-004] `apm2 fac gates` acquires an exclusive lane lock on
+  `lane-00` via `LaneManager::acquire_lock()` before any lane operations
+  (env dir creation, gate execution). This prevents concurrent gate runs
+  from colliding on the shared synthetic lane directory.
+- [INV-LANE-ENV-005] `apm2 fac gates` checks lane-00 status before executing.
+  If the lane is CORRUPT (from a previous failed run), gate execution is
+  refused with an error directing the user to run `apm2 fac lane reset lane-00`.
+- [INV-LANE-ENV-006] Per-lane env isolation is applied in ALL FAC execution
+  paths: `gates.rs` (via `compute_nextest_test_environment`), `evidence.rs`
+  (via `build_pipeline_test_command` and `build_gate_policy_env`). Every FAC
+  gate phase runs with deterministic lane-local `HOME`/`TMPDIR`/`XDG_*` values.
 
 ## Receipt Versioning (TCK-00518)
 
