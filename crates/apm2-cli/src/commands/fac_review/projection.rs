@@ -745,14 +745,19 @@ pub fn fetch_pr_head_sha_authoritative(owner_repo: &str, pr_number: u32) -> Resu
 
 pub(super) const GATE_STATUS_START: &str = "<!-- apm2-gate-status:start -->";
 pub(super) const GATE_STATUS_END: &str = "<!-- apm2-gate-status:end -->";
-const GATE_STATUS_SCHEMA: &str = "apm2.gate_status.v1";
+const GATE_STATUS_SCHEMA_V2: &str = "apm2-gate-status:v2";
 const MAX_PREVIOUS_GATE_STATUSES: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct GateResult {
     pub name: String,
-    pub passed: bool,
-    pub duration_secs: u64,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_used: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -762,6 +767,48 @@ struct ShaGateStatus {
     timestamp: String,
     gates: Vec<GateResult>,
     all_passed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyGateResult {
+    name: String,
+    passed: bool,
+    duration_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyShaGateStatus {
+    sha: String,
+    short_sha: Option<String>,
+    timestamp: String,
+    #[serde(default)]
+    gates: Vec<LegacyGateResult>,
+    all_passed: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2CurrentStatusDoc {
+    sha: String,
+    short_sha: Option<String>,
+    timestamp: String,
+    #[serde(default)]
+    gates: Vec<GateResult>,
+    all_passed: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PreviousShasDoc {
+    #[serde(default)]
+    previous_shas: Vec<PreviousShaStatusDoc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PreviousShaStatusDoc {
+    sha: String,
+    timestamp: String,
+    all_passed: Option<bool>,
+    #[serde(default)]
+    gates: Vec<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -799,7 +846,55 @@ fn fetch_pr_body_for_projection(owner_repo: &str, pr_number: u32) -> Result<Stri
     }
 }
 
-fn parse_gate_statuses(section: &str) -> Vec<ShaGateStatus> {
+fn normalize_gate_status(value: &str) -> String {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "RUNNING" => "RUNNING".to_string(),
+        "PASS" => "PASS".to_string(),
+        _ => "FAIL".to_string(),
+    }
+}
+
+fn gate_status_is_pass(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("PASS")
+}
+
+fn normalize_sha_gate_status(mut status: ShaGateStatus) -> Option<ShaGateStatus> {
+    if validate_expected_head_sha(&status.sha).is_err() {
+        return None;
+    }
+    status.sha = status.sha.to_ascii_lowercase();
+    if status.short_sha.is_empty() {
+        status.short_sha = status.sha.chars().take(8).collect();
+    }
+    status.gates = status
+        .gates
+        .into_iter()
+        .map(|mut gate| {
+            gate.status = normalize_gate_status(&gate.status);
+            gate
+        })
+        .collect();
+    if !status.gates.is_empty() {
+        status.all_passed = status
+            .gates
+            .iter()
+            .all(|gate| gate_status_is_pass(&gate.status));
+    }
+    Some(status)
+}
+
+fn dedupe_gate_statuses(statuses: Vec<ShaGateStatus>) -> Vec<ShaGateStatus> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut deduped = Vec::new();
+    for status in statuses {
+        if seen.insert(status.sha.clone()) {
+            deduped.push(status);
+        }
+    }
+    deduped
+}
+
+fn parse_legacy_gate_statuses(section: &str) -> Vec<ShaGateStatus> {
     let Ok(re) = Regex::new(
         r"(?s)<!--\s*apm2-gate-status:sha:([a-fA-F0-9]{40})\s*-->\s*```json\s*(\{.*?\})\s*```",
     ) else {
@@ -815,22 +910,116 @@ fn parse_gate_statuses(section: &str) -> Vec<ShaGateStatus> {
         let Some(json_payload) = captures.get(2).map(|value| value.as_str()) else {
             continue;
         };
-        let Ok(mut parsed) = serde_json::from_str::<ShaGateStatus>(json_payload) else {
+        let Ok(parsed) = serde_json::from_str::<LegacyShaGateStatus>(json_payload) else {
             continue;
         };
-        if validate_expected_head_sha(&parsed.sha).is_err() {
-            continue;
-        }
         if !parsed.sha.eq_ignore_ascii_case(&marker_sha) {
             continue;
         }
-        parsed.sha = parsed.sha.to_ascii_lowercase();
-        if parsed.short_sha.is_empty() {
-            parsed.short_sha = parsed.sha.chars().take(8).collect();
+        let gates = parsed
+            .gates
+            .into_iter()
+            .map(|gate| GateResult {
+                name: gate.name,
+                status: if gate.passed {
+                    "PASS".to_string()
+                } else {
+                    "FAIL".to_string()
+                },
+                duration_secs: Some(gate.duration_secs),
+                tokens_used: None,
+                model: None,
+            })
+            .collect();
+        let candidate = ShaGateStatus {
+            sha: parsed.sha,
+            short_sha: parsed.short_sha.unwrap_or_default(),
+            timestamp: parsed.timestamp,
+            gates,
+            all_passed: parsed.all_passed.unwrap_or(false),
+        };
+        if let Some(normalized) = normalize_sha_gate_status(candidate) {
+            statuses.push(normalized);
         }
-        statuses.push(parsed);
     }
     statuses
+}
+
+fn strip_gate_status_yaml_header(payload: &str) -> &str {
+    let trimmed = payload.trim();
+    let header = format!("# {GATE_STATUS_SCHEMA_V2}");
+    if trimmed.starts_with(&header)
+        && let Some(first_newline) = trimmed.find('\n')
+    {
+        return trimmed[first_newline + 1..].trim();
+    }
+    trimmed
+}
+
+fn parse_v2_gate_statuses(section: &str) -> Vec<ShaGateStatus> {
+    let Ok(re) = Regex::new(r"(?s)```yaml\s*(.*?)\s*```") else {
+        return Vec::new();
+    };
+    let mut statuses = Vec::new();
+    for captures in re.captures_iter(section) {
+        let Some(raw_payload) = captures.get(1).map(|value| value.as_str()) else {
+            continue;
+        };
+        let payload = strip_gate_status_yaml_header(raw_payload);
+        if payload.is_empty() {
+            continue;
+        }
+
+        if let Ok(parsed) = serde_yaml::from_str::<V2CurrentStatusDoc>(payload) {
+            let candidate = ShaGateStatus {
+                sha: parsed.sha,
+                short_sha: parsed.short_sha.unwrap_or_default(),
+                timestamp: parsed.timestamp,
+                gates: parsed.gates,
+                all_passed: parsed.all_passed.unwrap_or(false),
+            };
+            if let Some(normalized) = normalize_sha_gate_status(candidate) {
+                statuses.push(normalized);
+            }
+            continue;
+        }
+
+        if let Ok(parsed_previous) = serde_yaml::from_str::<PreviousShasDoc>(payload) {
+            for previous in parsed_previous.previous_shas {
+                let gates = previous
+                    .gates
+                    .into_iter()
+                    .flat_map(std::iter::IntoIterator::into_iter)
+                    .map(|(name, status)| GateResult {
+                        name,
+                        status,
+                        duration_secs: None,
+                        tokens_used: None,
+                        model: None,
+                    })
+                    .collect::<Vec<_>>();
+                let candidate = ShaGateStatus {
+                    short_sha: previous.sha.chars().take(8).collect(),
+                    sha: previous.sha,
+                    timestamp: previous.timestamp,
+                    all_passed: previous.all_passed.unwrap_or(false),
+                    gates,
+                };
+                if let Some(normalized) = normalize_sha_gate_status(candidate) {
+                    statuses.push(normalized);
+                }
+            }
+        }
+    }
+    statuses
+}
+
+fn parse_gate_statuses(section: &str) -> Vec<ShaGateStatus> {
+    // Prefer v2 payloads when both legacy and v2 records are present for the same
+    // SHA.
+    let mut combined = parse_v2_gate_statuses(section);
+    combined.extend(parse_legacy_gate_statuses(section));
+    dedupe_gate_statuses(combined)
 }
 
 fn fence_delimiter(trimmed_line: &str) -> Option<char> {
@@ -916,54 +1105,79 @@ fn parse_pr_body(body: &str) -> ParsedPrBody {
     }
 }
 
-const fn status_label(passed: bool) -> &'static str {
-    if passed { "PASS" } else { "FAIL" }
+fn yaml_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
-fn render_gate_table(status: &ShaGateStatus) -> String {
+fn render_current_status_yaml(status: &ShaGateStatus) -> String {
     let mut out = String::new();
-    out.push_str("| Gate | Status | Duration (s) |\n");
-    out.push_str("| --- | --- | --- |\n");
-    for gate in &status.gates {
-        let _ = writeln!(
-            out,
-            "| {} | {} | {} |",
-            gate.name,
-            status_label(gate.passed),
-            gate.duration_secs
-        );
+    out.push_str("```yaml\n");
+    let _ = writeln!(out, "# {GATE_STATUS_SCHEMA_V2}");
+    let _ = writeln!(out, "sha: {}", status.sha);
+    let _ = writeln!(out, "short_sha: {}", status.short_sha);
+    let _ = writeln!(out, "timestamp: {}", yaml_quote(&status.timestamp));
+    let _ = writeln!(out, "all_passed: {}", status.all_passed);
+    if status.gates.is_empty() {
+        out.push_str("gates: []\n");
+    } else {
+        out.push_str("gates:\n");
+        for gate in &status.gates {
+            let _ = writeln!(out, "  - name: {}", yaml_quote(&gate.name));
+            let _ = writeln!(out, "    status: {}", normalize_gate_status(&gate.status));
+            if let Some(duration_secs) = gate.duration_secs {
+                let _ = writeln!(out, "    duration_secs: {duration_secs}");
+            }
+            if let Some(tokens_used) = gate.tokens_used {
+                let _ = writeln!(out, "    tokens_used: {tokens_used}");
+            }
+            if let Some(model) = gate.model.as_deref() {
+                let _ = writeln!(out, "    model: {}", yaml_quote(model));
+            }
+        }
     }
+    out.push_str("```");
     out
 }
 
-fn render_status_metadata_block(status: &ShaGateStatus) -> String {
-    let payload = serde_json::json!({
-        "schema": GATE_STATUS_SCHEMA,
-        "sha": status.sha,
-        "short_sha": status.short_sha,
-        "timestamp": status.timestamp,
-        "all_passed": status.all_passed,
-        "gates": status.gates,
-    });
-    let json = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
-    format!(
-        "<!-- apm2-gate-status:sha:{} -->\n```json\n{}\n```",
-        status.sha, json
-    )
+fn render_previous_gates_flow(status: &ShaGateStatus) -> String {
+    if status.gates.is_empty() {
+        return "[]".to_string();
+    }
+    let items = status
+        .gates
+        .iter()
+        .map(|gate| {
+            format!(
+                "{}: {}",
+                yaml_quote(&gate.name),
+                normalize_gate_status(&gate.status)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{items}]")
 }
 
-fn render_previous_status(status: &ShaGateStatus) -> String {
+fn render_previous_statuses(previous: &[ShaGateStatus]) -> String {
+    if previous.is_empty() {
+        return String::new();
+    }
     let mut out = String::new();
     out.push_str("<details>\n");
     let _ = writeln!(
         out,
-        "<summary>Previous SHA <code>{}</code> at {}</summary>\n",
-        status.short_sha, status.timestamp
+        "<summary>Previous SHAs ({})</summary>\n",
+        previous.len()
     );
-    out.push_str(&render_gate_table(status));
-    out.push('\n');
-    out.push_str(&render_status_metadata_block(status));
-    out.push_str("\n</details>\n");
+    out.push_str("```yaml\n");
+    out.push_str("previous_shas:\n");
+    for status in previous {
+        let _ = writeln!(out, "  - sha: {}", status.sha);
+        let _ = writeln!(out, "    timestamp: {}", yaml_quote(&status.timestamp));
+        let _ = writeln!(out, "    all_passed: {}", status.all_passed);
+        let _ = writeln!(out, "    gates: {}", render_previous_gates_flow(status));
+    }
+    out.push_str("```\n\n</details>");
     out
 }
 
@@ -972,24 +1186,20 @@ fn render_gate_status_section(
     previous: &[ShaGateStatus],
 ) -> Result<String, String> {
     validate_expected_head_sha(&latest.sha)?;
+    let previous_valid = previous
+        .iter()
+        .filter_map(|status| normalize_sha_gate_status(status.clone()))
+        .filter(|status| !status.sha.eq_ignore_ascii_case(&latest.sha))
+        .take(MAX_PREVIOUS_GATE_STATUSES)
+        .collect::<Vec<_>>();
+
     let mut out = String::new();
     out.push_str("## FAC Gate Status\n\n");
-    let _ = writeln!(
-        out,
-        "Current SHA `<{}>` recorded at {}.\n",
-        latest.short_sha, latest.timestamp
-    );
-    out.push_str(&render_gate_table(latest));
-    out.push('\n');
-    out.push_str(&render_status_metadata_block(latest));
-    out.push('\n');
+    out.push_str(&render_current_status_yaml(latest));
 
-    for status in previous.iter().take(MAX_PREVIOUS_GATE_STATUSES) {
-        if validate_expected_head_sha(&status.sha).is_err() {
-            continue;
-        }
-        out.push('\n');
-        out.push_str(&render_previous_status(status));
+    if !previous_valid.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&render_previous_statuses(&previous_valid));
     }
 
     Ok(out.trim_end().to_string())
@@ -1033,11 +1243,20 @@ pub(super) fn sync_gate_status_to_pr(
 ) -> Result<(), String> {
     validate_expected_head_sha(sha)?;
     let sha = sha.to_ascii_lowercase();
+    let normalized_gates = gate_results
+        .into_iter()
+        .map(|mut gate| {
+            gate.status = normalize_gate_status(&gate.status);
+            gate
+        })
+        .collect::<Vec<_>>();
     let latest = ShaGateStatus {
         short_sha: sha.chars().take(8).collect(),
         timestamp: now_iso8601(),
-        all_passed: gate_results.iter().all(|gate| gate.passed),
-        gates: gate_results,
+        all_passed: normalized_gates
+            .iter()
+            .all(|gate| gate_status_is_pass(&gate.status)),
+        gates: normalized_gates,
         sha: sha.clone(),
     };
     let existing_body = fetch_pr_body_for_projection(owner_repo, pr_number)?;
@@ -1124,13 +1343,25 @@ mod tests {
             gates: vec![
                 GateResult {
                     name: "rustfmt".to_string(),
-                    passed,
-                    duration_secs: 1,
+                    status: if passed {
+                        "PASS".to_string()
+                    } else {
+                        "FAIL".to_string()
+                    },
+                    duration_secs: Some(1),
+                    tokens_used: None,
+                    model: None,
                 },
                 GateResult {
                     name: "clippy".to_string(),
-                    passed,
-                    duration_secs: 2,
+                    status: if passed {
+                        "PASS".to_string()
+                    } else {
+                        "FAIL".to_string()
+                    },
+                    duration_secs: Some(2),
+                    tokens_used: None,
+                    model: None,
                 },
             ],
         }
@@ -1166,9 +1397,13 @@ mod tests {
         )];
         let rendered = render_gate_status_section(&latest, &previous).expect("rendered");
         assert!(rendered.contains("## FAC Gate Status"));
-        assert!(rendered.contains("| rustfmt | PASS | 1 |"));
+        assert!(rendered.contains("```yaml"));
+        assert!(rendered.contains("# apm2-gate-status:v2"));
+        assert!(rendered.contains("status: PASS"));
+        assert!(!rendered.contains("```json"));
+        assert!(!rendered.contains("| Gate |"));
         assert!(rendered.contains("<details>"));
-        assert!(rendered.contains("Previous SHA <code>bbbbbbbb</code>"));
+        assert!(rendered.contains("<summary>Previous SHAs (1)</summary>"));
     }
 
     #[test]
@@ -1208,7 +1443,46 @@ mod tests {
         );
         let updated = build_updated_pr_body(&existing, &latest).expect("updated");
         let details_count = updated.matches("<details>").count();
-        assert_eq!(details_count, 5);
+        assert_eq!(details_count, 1);
+        assert!(updated.contains("<summary>Previous SHAs (5)</summary>"));
+        assert_eq!(updated.matches("  - sha: ").count(), 5);
+        assert!(!updated.contains("```json"));
+        assert!(!updated.contains("| Gate |"));
+    }
+
+    #[test]
+    fn parse_pr_body_extracts_existing_v2_gate_statuses() {
+        let existing = format!(
+            "intro\n\n{GATE_STATUS_START}\n## FAC Gate Status\n\n```yaml\n# apm2-gate-status:v2\nsha: 0123456789abcdef0123456789abcdef01234567\nshort_sha: 01234567\ntimestamp: '2026-02-12T00:00:00Z'\nall_passed: false\ngates:\n  - name: 'rustfmt'\n    status: PASS\n    duration_secs: 1\n```\n\n<details>\n<summary>Previous SHAs (1)</summary>\n\n```yaml\nprevious_shas:\n  - sha: 89abcdef0123456789abcdef0123456789abcdef\n    timestamp: '2026-02-11T00:00:00Z'\n    all_passed: true\n    gates: ['rustfmt': PASS]\n```\n\n</details>\n{GATE_STATUS_END}\n\ntail\n"
+        );
+        let parsed = parse_pr_body(&existing);
+        assert!(parsed.has_gate_markers);
+        assert_eq!(parsed.existing_gate_statuses.len(), 2);
+        assert_eq!(
+            parsed.existing_gate_statuses[0].sha,
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(
+            parsed.existing_gate_statuses[1].sha,
+            "89abcdef0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn parse_pr_body_prefers_v2_when_duplicate_sha_is_present() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let existing = format!(
+            "{GATE_STATUS_START}\n<!-- apm2-gate-status:sha:{sha} -->\n```json\n{{\"sha\":\"{sha}\",\"short_sha\":\"01234567\",\"timestamp\":\"2026-02-12T00:00:00Z\",\"gates\":[{{\"name\":\"lint\",\"passed\":false,\"duration_secs\":9}}],\"all_passed\":false}}\n```\n```yaml\n# apm2-gate-status:v2\nsha: {sha}\nshort_sha: 01234567\ntimestamp: '2026-02-13T00:00:00Z'\nall_passed: true\ngates:\n  - name: 'lint'\n    status: PASS\n    duration_secs: 3\n```\n{GATE_STATUS_END}\n"
+        );
+        let parsed = parse_pr_body(&existing);
+        assert_eq!(parsed.existing_gate_statuses.len(), 1);
+        assert_eq!(parsed.existing_gate_statuses[0].sha, sha);
+        assert!(parsed.existing_gate_statuses[0].all_passed);
+        assert_eq!(parsed.existing_gate_statuses[0].gates[0].status, "PASS");
+        assert_eq!(
+            parsed.existing_gate_statuses[0].gates[0].duration_secs,
+            Some(3)
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ use uuid::Uuid;
 use super::bounded_test_runner::{
     BoundedTestLimits, build_bounded_test_command as build_systemd_bounded_test_command,
 };
-use super::ci_status::{CiStatus, ThrottledUpdater};
+use super::ci_status::{CiStatus, PrBodyStatusUpdater};
 use super::gate_attestation::{
     GateResourcePolicy, build_nextest_command, compute_gate_attestation,
     gate_command_for_attestation, short_digest,
@@ -1520,9 +1520,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
     Ok((all_passed, gate_results))
 }
 
-/// Run evidence gates with CI status comment updates.
+/// Run evidence gates with PR-body gate status updates.
 ///
-/// Same as [`run_evidence_gates`] but also updates a PR CI status comment
+/// Same as [`run_evidence_gates`] but also updates the PR body gate section
 /// after each gate completes. Checks the per-SHA gate cache before each gate
 /// and skips execution if the gate already passed for this SHA.
 #[allow(clippy::too_many_arguments)]
@@ -1577,7 +1577,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     };
 
     let mut status = CiStatus::new(sha, pr_number);
-    let updater = ThrottledUpdater::new(owner_repo, pr_number);
+    let updater = PrBodyStatusUpdater::new(owner_repo, pr_number);
 
     // Load attested gate cache for this SHA (typically populated by `fac gates`).
     let cache = GateCache::load(sha);
