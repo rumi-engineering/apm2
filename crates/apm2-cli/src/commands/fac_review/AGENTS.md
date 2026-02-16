@@ -40,6 +40,7 @@ apm2 fac review run --pr <N> --type all
        +-- projection.rs     (projection snapshot for GitHub surfaces + PR body gate-status sync)
        +-- projection_store.rs (local canonical projection cache under ~/.apm2/fac_projection)
        +-- github_projection.rs (dedicated GitHub projection writer/read-fallback boundary)
+       +-- github_reads.rs   (read-only GitHub API helpers: default branch, PR data, permissions, head SHA)
        +-- push.rs           (branch push with commit signing)
        +-- target.rs         (review target resolution)
 ```
@@ -66,6 +67,7 @@ apm2 fac review run --pr <N> --type all
 - **Worktree-aware dispatch**: Detached review dispatch resolves and uses the worktree whose `HEAD` matches target SHA (used by restart and dispatch paths; the pipeline path uses mirror-based lane checkout instead, see TCK-00544).
 - **Per-SHA finding comments**: `apm2 fac review comment` writes one finding per comment using an `apm2-finding:v1` marker and `apm2.finding.v1` metadata block.
 - **PR body gate status sync**: `apm2 fac push` writes a marker-bounded gate-status section in the PR body with expanded latest SHA and collapsed previous SHA snapshots.
+- **Non-interactive GitHub CLI** (TCK-00597): All `gh` CLI calls use `apm2_core::fac::gh_command()` for token-based auth (via credential resolution chain) and lane-scoped `GH_CONFIG_DIR`, removing the dependency on `gh auth login` or `~/.config/gh` state.
 
 ## Key Types
 

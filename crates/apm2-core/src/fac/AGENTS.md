@@ -1552,3 +1552,67 @@ require credentials.
   the gate is never called on the `apm2 fac gates` path.
 - Bounded collections: `env_mounts` capped at `MAX_ENV_MOUNTS` (16),
   env var names capped at `MAX_ENV_NAME_LENGTH` (256).
+
+## gh_cli Submodule (TCK-00597)
+
+The `gh_cli` submodule provides a centralized `gh_command()` constructor that
+returns a `GhCommand` wrapper (around `std::process::Command`) pre-configured
+for non-interactive, token-based authentication and lane-scoped config
+directory isolation. All `gh` CLI invocations across the codebase use this
+function instead of raw `Command::new("gh")`.
+
+### Core Capabilities
+
+- `gh_command()`: Builds a `GhCommand` wrapping `Command::new("gh")` with:
+  - `GH_TOKEN` injected from the credential resolution chain (env var ->
+    systemd credential -> APM2 credential file) when available, or set to
+    empty string when no token is resolved (fail-closed: prevents ambient
+    inheritance).
+  - `GH_CONFIG_DIR` set to `$XDG_CONFIG_HOME/gh` when `XDG_CONFIG_HOME` is
+    available (lane-scoped via TCK-00575), or `$HOME/.config/gh` following
+    XDG convention (user-isolated, deterministic). If neither env var is set,
+    uses a non-existent path to fail-closed (RS-41).
+  - `GH_NO_UPDATE_NOTIFIER=1` to suppress interactive update checks.
+  - `NO_COLOR=1` to suppress ANSI color codes for deterministic parsing.
+  - `GH_PROMPT_DISABLED=1` to prevent interactive prompts.
+- `GhCommand`: A newtype wrapper around `Command` that implements
+  `Deref`/`DerefMut` to `Command` for transparent method chaining, and
+  provides a custom `Debug` implementation that redacts `GH_TOKEN` values
+  (CTR-2604).
+
+### Fail-Closed Authentication
+
+`GH_TOKEN` and `GH_CONFIG_DIR` are always explicitly set in the command
+environment. When no token is resolved, `GH_TOKEN` is set to empty string
+and `GH_CONFIG_DIR` is set to a user-isolated, HOME-derived directory
+(`$XDG_CONFIG_HOME/gh` or `$HOME/.config/gh`), preventing inheritance of
+ambient authority from the parent process or `~/.config/gh` state. The
+config directory is created with 0o700 permissions (CTR-2611) and verified
+to not be a symlink before use (INV-GHCLI-007, CWE-377 mitigation).
+Callers that require auth should gate on `require_github_credentials()`
+before invoking `gh`.
+
+### Security Invariants (TCK-00597)
+
+- [INV-GHCLI-001] `GH_TOKEN` is injected only when resolved; no synthetic
+  placeholder is ever emitted.
+- [INV-GHCLI-002] `GH_CONFIG_DIR` is always set to a lane-scoped path when
+  `XDG_CONFIG_HOME` is available, preventing user-global `~/.config/gh` writes.
+- [INV-GHCLI-003] `GH_NO_UPDATE_NOTIFIER` is set to `1` to suppress
+  interactive update prompts.
+- [INV-GHCLI-004] `GH_TOKEN` is always set in the command environment (empty
+  when no token is resolved) to prevent inheritance of ambient `GH_TOKEN`
+  from the parent process.
+- [INV-GHCLI-005] `GH_CONFIG_DIR` is always set (to lane-scoped path or a
+  user-isolated, HOME-derived path) to prevent `gh` from reading
+  `~/.config/gh` ambient state. The fallback uses `$HOME/.config/gh` (XDG
+  convention), never a shared `/tmp` path (CWE-377 mitigation).
+- [INV-GHCLI-006] `GhCommand` redacts `GH_TOKEN` in its `Debug`
+  implementation using `Command::get_envs()`/`get_args()` structured
+  accessors (CTR-2604), preventing secret leakage via tracing or debug
+  formatting without depending on `Command`'s unstable `Debug` format.
+- [INV-GHCLI-007] The `GH_CONFIG_DIR` path is verified to not be a symlink
+  before use, preventing symlink-based arbitrary file write attacks (CWE-377).
+  The directory is created with restrictive 0o700 permissions (CTR-2611) to
+  prevent information disclosure of `gh` configuration or session data to
+  other users on the same host.
