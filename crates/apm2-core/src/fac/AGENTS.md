@@ -657,6 +657,113 @@ user-mode and system-mode execution backends.
 - [INV-SYS-003] `LaneProfileV1` loading failures fail the job path as a denial
   with machine-readable receipt output, not silent continuation.
 
+## evidence_bundle Submodule (TCK-00527)
+
+The `evidence_bundle` submodule implements evidence bundle export/import commands
+exercising RFC-0028 boundary validation and RFC-0029 receipt validation (local-only).
+
+### Key Types
+
+- `EvidenceBundleEnvelopeV1`: Self-describing envelope containing a job receipt,
+  RFC-0028 boundary check reconstruction data, RFC-0029 economics traces, optional
+  policy binding, blob references, and a BLAKE3 content hash.
+- `BundleBoundaryCheckV1`: RFC-0028 boundary check reconstruction data carrying all
+  fields required by `validate_channel_boundary()`.
+- `BundleEconomicsTraceV1`: RFC-0029 economics traces (queue admission + budget
+  admission).
+- `BundleExportConfig`: Configuration for export carrying optional boundary-check
+  substructures (leakage budget, timing channel, disclosure policy, policy binding).
+
+### Core Capabilities
+
+- `build_evidence_bundle_envelope()`: Builds an envelope from a job receipt and
+  export config. Requires RFC-0028 boundary trace, RFC-0029 queue admission trace,
+  and RFC-0029 budget admission trace in the receipt (fail-closed on missing traces).
+  Computes BLAKE3 content hash with domain-separated, length-prefixed encoding over
+  ALL envelope fields using `canonical_bytes_v2()` for the receipt (which includes
+  `unsafe_direct`, `policy_hash`, and `canonicalizer_tuple_digest`), plus boundary
+  check, economics trace, policy binding, and blob refs.
+- `serialize_envelope()`: Serializes the envelope to JSON bytes.
+- `import_evidence_bundle()`: Imports and validates an envelope from JSON bytes.
+  Enforces: bounded read (MAX_ENVELOPE_SIZE=256 KiB), schema verification,
+  per-field length bounds (MAX_JOB_ID_LENGTH, MAX_BLOB_REF_LENGTH), content
+  hash integrity, RFC-0028 boundary validation (core defects required zero;
+  honestly-absent optional sub-evidence tolerated), RFC-0029 economics receipt
+  validation (Allow verdicts required), and policy binding digest matching
+  (including cross-field consistency with receipt's policy_hash and
+  canonicalizer_tuple_digest).
+- `verify_blob_refs()`: Verifies all blob_refs in an imported envelope exist in the
+  bundle directory and their BLAKE3 hashes match declared values. Bounded reads,
+  path traversal prevention, constant-time hash comparison.
+
+### CLI Commands
+
+- `apm2 fac bundle export <job_id>`: Exports an evidence bundle for a job to
+  `$APM2_HOME/private/fac/bundles/<job_id>/`. Validates `job_id` before path
+  construction: rejects empty strings, absolute paths, `..` traversal, path
+  separators, and any characters outside `[A-Za-z0-9._-]` (path confinement).
+  Creates output directory with 0700 mode via `fac_permissions::ensure_dir_with_mode`.
+  Writes all files (envelope, blobs) via `fac_permissions::write_fac_file_with_mode`
+  (0600 mode, `O_NOFOLLOW`, symlink check). Constructs `BundleExportConfig`
+  from authoritative receipt artifacts (policy binding only); leakage budget receipt,
+  timing channel budget, and disclosure policy binding are honestly marked absent
+  (None) because they do not exist in `FacJobReceiptV1`. Fail-closed on malformed
+  policy digests: if `policy_hash` or `canonicalizer_tuple_digest` is absent or
+  cannot be decoded to a verified 32-byte digest, export returns
+  `MalformedPolicyDigest` error instead of fabricating a placeholder. Discovers
+  and exports receipt/spec blobs from the blob store; blob retrieval or write
+  failures are fatal (`BlobExportFailed` error).
+- `apm2 fac bundle import <path>`: Imports and validates an evidence bundle from a
+  file path. Opens with `O_NOFOLLOW` (no symlink following), validates regular file
+  via `fstat`, uses bounded streaming read from the same handle (no TOCTOU).
+  Rejects bundles that fail RFC-0028 or RFC-0029 validation (fail-closed).
+  Verifies all blob_refs exist in the bundle directory and their BLAKE3 hashes
+  match declared values (fail-closed on missing or corrupt blobs).
+
+### Security Invariants (TCK-00527)
+
+- [INV-EB-001] Import refuses when `validate_channel_boundary()` returns any
+  non-tolerated defects (boundary check invalid or policy binding mismatched).
+  Defects from honestly-absent optional sub-evidence (leakage budget, timing
+  budget, disclosure policy) are filtered when the corresponding field is None.
+- [INV-EB-002] Import refuses when economics receipt traces are missing,
+  unverifiable, or carry non-Allow verdicts.
+- [INV-EB-003] Envelope reads are bounded by `MAX_ENVELOPE_SIZE` (256 KiB) before
+  deserialization. Import uses single-handle open + `fstat` + `Read::take` (no
+  TOCTOU between size check and read).
+- [INV-EB-004] Envelope content hash uses `canonical_bytes_v2()` which binds ALL
+  receipt fields including `unsafe_direct`, `policy_hash`, and
+  `canonicalizer_tuple_digest`. Every variable-length field uses length-prefix
+  encoding for deterministic framing. Verified via constant-time comparison.
+- [INV-EB-005] All collection and string fields are bounded
+  (MAX_BUNDLE_BLOB_COUNT=256, MAX_JOB_ID_LENGTH=256, MAX_BLOB_REF_LENGTH=256).
+- [INV-EB-006] Policy binding digest matching uses constant-time comparison
+  (`subtle::ConstantTimeEq::ct_eq()`), including cross-field consistency checks
+  between `receipt.policy_hash` / `receipt.canonicalizer_tuple_digest` and
+  `policy_binding` digest fields.
+- [INV-EB-007] Import opens files with `O_NOFOLLOW` (Unix) to refuse symlinks at the
+  kernel level and validates regular file type via `fstat` on the opened handle.
+- [INV-EB-008] Export fails closed when `policy_hash` or `canonicalizer_tuple_digest`
+  is absent or malformed (non-hex, wrong length). Returns `MalformedPolicyDigest`
+  instead of fabricating placeholder digests.
+- [INV-EB-009] Export fails closed when referenced blobs (content_hash, job_spec_digest)
+  cannot be retrieved from the blob store or written to the output directory. Returns
+  `BlobExportFailed` instead of silently producing an incomplete bundle.
+- [INV-EB-010] Export validates `job_id` before path construction: rejects empty,
+  absolute paths, `..` traversal, path separators, and non-`[A-Za-z0-9._-]` characters.
+  Prevents path confinement escape from FAC root.
+- [INV-EB-011] Export creates output directories with mode 0700 via
+  `fac_permissions::ensure_dir_with_mode` and writes all files with mode 0600 via
+  `fac_permissions::write_fac_file_with_mode` (`O_NOFOLLOW`, symlink check, atomic
+  rename). Never uses `std::fs::create_dir_all` or `std::fs::write` for bundle output.
+- [INV-EB-012] Import verifies all `blob_refs` exist in the bundle directory and their
+  BLAKE3 hashes match declared values. Missing or corrupt blobs cause import failure
+  (fail-closed). Blob reads are bounded by `MAX_BLOB_IMPORT_SIZE` (10 MiB).
+- [INV-EB-013] Export only includes evidence that actually exists in the source
+  receipt. Leakage budget receipt, timing channel budget, and disclosure policy
+  binding are marked absent (None) when not present in `FacJobReceiptV1`, rather
+  than fabricating placeholder data.
+
 ## Policy Environment Enforcement (TCK-00526, TCK-00575)
 
 The `policy` module provides centralized environment filtering for all FAC job
