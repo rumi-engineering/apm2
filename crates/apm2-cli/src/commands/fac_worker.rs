@@ -94,9 +94,9 @@ use apm2_core::fac::{
     FacJobReceiptV1Builder, FacPolicyV1, GateReceipt, GateReceiptBuilder,
     LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1, LaneCorruptMarkerV1,
     LaneProfileV1, MAX_POLICY_SIZE, QueueAdmissionTrace as JobQueueAdmissionTrace,
-    RepoMirrorManager, SystemdUnitProperties, compute_policy_hash, deserialize_policy,
-    load_or_default_boundary_id, parse_policy_hash, persist_content_addressed_receipt,
-    persist_policy, run_preflight,
+    RepoMirrorManager, SystemdUnitProperties, build_job_environment, compute_policy_hash,
+    deserialize_policy, load_or_default_boundary_id, parse_policy_hash,
+    persist_content_addressed_receipt, persist_policy, run_preflight,
 };
 use apm2_core::github::resolve_apm2_home;
 use base64::Engine;
@@ -2455,6 +2455,7 @@ fn process_job(
             containment_trace.as_ref(),
             &lane_mgr,
             &candidate.raw_bytes,
+            policy,
         );
     }
 
@@ -3386,6 +3387,7 @@ fn execute_warm_job(
     containment_trace: Option<&apm2_core::fac::containment::ContainmentTrace>,
     lane_mgr: &LaneManager,
     _raw_bytes: &[u8],
+    policy: &FacPolicyV1,
 ) -> JobOutcome {
     use apm2_core::fac::warm::{WarmPhase, execute_warm};
 
@@ -3515,6 +3517,21 @@ fn execute_warm_job(
         lane_workspace.display(),
     );
 
+    // [INV-WARM-009] Build hardened environment via policy-driven default-deny
+    // construction. This ensures warm subprocesses (which compile untrusted
+    // repository code including build.rs and proc-macros) cannot access
+    // FAC-private state, secrets, or worker authority context.
+    let apm2_home = resolve_apm2_home().unwrap_or_else(|| {
+        // Fallback: derive from fac_root (which is $APM2_HOME/private/fac).
+        fac_root
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf()
+    });
+    let ambient_env: Vec<(String, String)> = std::env::vars().collect();
+    let hardened_env = build_job_environment(policy, &ambient_env, &apm2_home);
+
     // Execute warm phases.
     let start_epoch_secs = current_timestamp_epoch_secs();
     let warm_result = execute_warm(
@@ -3526,6 +3543,7 @@ fn execute_warm_job(
         &cargo_target_dir,
         &spec.source.head_sha,
         start_epoch_secs,
+        &hardened_env,
     );
 
     let receipt = match warm_result {
