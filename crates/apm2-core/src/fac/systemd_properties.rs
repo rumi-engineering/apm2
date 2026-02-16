@@ -227,10 +227,14 @@ impl SandboxHardeningProfile {
         hasher.update(&[u8::from(self.restrict_realtime)]);
         hasher.update(&[u8::from(self.system_call_architectures_native)]);
 
-        // Length-prefixed address families list.
-        let count = self.restrict_address_families.len() as u64;
+        // Length-prefixed address families list. Sorted for canonical
+        // ordering so functionally identical policies (same families,
+        // different insertion order) produce the same digest.
+        let mut sorted_families = self.restrict_address_families.clone();
+        sorted_families.sort();
+        let count = sorted_families.len() as u64;
         hasher.update(&count.to_le_bytes());
-        for af in &self.restrict_address_families {
+        for af in &sorted_families {
             let len = af.len() as u64;
             hasher.update(&len.to_le_bytes());
             hasher.update(af.as_bytes());
@@ -366,10 +370,48 @@ impl SystemdUnitProperties {
             io_weight: resource_profile.io_weight,
             timeout_start_sec,
             runtime_max_sec: timeouts.job_runtime_max_seconds,
-            kill_mode: "control-group".to_string(),
+            kill_mode: Self::DEFAULT_KILL_MODE.to_string(),
             sandbox_hardening: hardening,
         }
     }
+
+    /// Build properties from CLI-provided limits and a policy-driven sandbox
+    /// hardening profile.
+    ///
+    /// This constructor is used by the bounded test runner (CLI) where no
+    /// `LaneProfileV1` is available. It uses the same centralized defaults
+    /// for `io_weight` and `kill_mode` as
+    /// [`Self::from_lane_profile_with_hardening`] to avoid hard-coded
+    /// values at caller sites (INV-SBX-001).
+    ///
+    /// The `timeout_seconds` value is used for both `timeout_start_sec` and
+    /// `runtime_max_sec` since CLI limits express a single timeout.
+    #[must_use]
+    pub fn from_cli_limits_with_hardening(
+        cpu_quota_percent: u32,
+        memory_max_bytes: u64,
+        tasks_max: u32,
+        timeout_seconds: u64,
+        hardening: SandboxHardeningProfile,
+    ) -> Self {
+        Self {
+            cpu_quota_percent,
+            memory_max_bytes,
+            tasks_max,
+            io_weight: Self::DEFAULT_IO_WEIGHT,
+            timeout_start_sec: timeout_seconds,
+            runtime_max_sec: timeout_seconds,
+            kill_mode: Self::DEFAULT_KILL_MODE.to_string(),
+            sandbox_hardening: hardening,
+        }
+    }
+
+    /// Default I/O weight for systemd transient units. Matches the lane
+    /// profile default in `LaneResourceProfileV1::default()`.
+    const DEFAULT_IO_WEIGHT: u32 = 100;
+
+    /// Default kill mode for systemd transient units.
+    const DEFAULT_KILL_MODE: &'static str = "control-group";
 
     /// Render properties as `[Service]` directives.
     #[must_use]

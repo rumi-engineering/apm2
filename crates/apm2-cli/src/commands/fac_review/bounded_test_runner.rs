@@ -119,17 +119,16 @@ fn limits_to_properties(
     let memory_max_bytes = parse_memory_limit(limits.memory_max)?;
     let cpu_quota_percent = parse_cpu_quota_percent(limits.cpu_quota)?;
 
-    Ok(SystemdUnitProperties {
+    let tasks_max = u32::try_from(limits.pids_max)
+        .map_err(|_| format!("pids_max {} exceeds u32 range", limits.pids_max))?;
+
+    Ok(SystemdUnitProperties::from_cli_limits_with_hardening(
         cpu_quota_percent,
         memory_max_bytes,
-        tasks_max: u32::try_from(limits.pids_max)
-            .map_err(|_| format!("pids_max {} exceeds u32 range", limits.pids_max))?,
-        io_weight: 100,
-        timeout_start_sec: limits.timeout_seconds,
-        runtime_max_sec: limits.timeout_seconds,
-        kill_mode: "control-group".to_string(),
+        tasks_max,
+        limits.timeout_seconds,
         sandbox_hardening,
-    })
+    ))
 }
 
 pub fn build_bounded_test_command(
