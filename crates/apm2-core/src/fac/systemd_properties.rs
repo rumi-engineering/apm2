@@ -250,10 +250,10 @@ impl SandboxHardeningProfile {
     /// Render only the user-mode-safe subset of hardening directives.
     ///
     /// User-mode systemd cannot apply directives that require mount namespaces
-    /// (PrivateTmp, ProtectControlGroups, ProtectKernelTunables,
-    /// ProtectKernelLogs) or capability manipulation (RestrictSUIDSGID,
-    /// LockPersonality, RestrictRealtime, RestrictAddressFamilies,
-    /// SystemCallArchitectures). Only `NoNewPrivileges` is safe in user mode
+    /// (`PrivateTmp`, `ProtectControlGroups`, `ProtectKernelTunables`,
+    /// `ProtectKernelLogs`) or capability manipulation (`RestrictSUIDSGID`,
+    /// `LockPersonality`, `RestrictRealtime`, `RestrictAddressFamilies`,
+    /// `SystemCallArchitectures`). Only `NoNewPrivileges` is safe in user mode
     /// because it uses `prctl(PR_SET_NO_NEW_PRIVS)` which is unprivileged.
     #[must_use]
     pub fn to_user_mode_property_strings(&self) -> Vec<String> {

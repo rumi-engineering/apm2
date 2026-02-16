@@ -1109,11 +1109,15 @@ mod tests {
             "RestrictRealtime requires root"
         );
         assert!(
-            !list.iter().any(|p| p.starts_with("RestrictAddressFamilies")),
+            !list
+                .iter()
+                .any(|p| p.starts_with("RestrictAddressFamilies")),
             "RestrictAddressFamilies requires root"
         );
         assert!(
-            !list.iter().any(|p| p.starts_with("SystemCallArchitectures")),
+            !list
+                .iter()
+                .any(|p| p.starts_with("SystemCallArchitectures")),
             "SystemCallArchitectures requires root"
         );
         // Resource accounting/limits must still be present.
