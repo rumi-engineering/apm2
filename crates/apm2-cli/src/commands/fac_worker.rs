@@ -2651,7 +2651,7 @@ fn process_job(
         None,
         policy_hash,
         containment_trace.as_ref(),
-        Some(observed_cost.clone()),
+        Some(observed_cost),
     ) {
         eprintln!("worker: receipt emission failed, cannot complete job: {receipt_err}");
         let _ = LaneLeaseV1::remove(&lane_dir);
@@ -4034,7 +4034,7 @@ fn execute_warm_job(
         None,
         policy_hash,
         containment_trace,
-        Some(observed_cost.clone()),
+        Some(observed_cost),
     ) {
         eprintln!("worker: receipt emission failed for warm job: {receipt_err}");
         let _ = LaneLeaseV1::remove(lane_dir);
@@ -4650,7 +4650,8 @@ fn observed_cost_from_elapsed(
     elapsed: std::time::Duration,
 ) -> apm2_core::economics::cost_model::ObservedJobCost {
     apm2_core::economics::cost_model::ObservedJobCost {
-        duration_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+        duration_ms: u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX)))
+            .unwrap_or(u64::MAX),
         cpu_time_ms: 0,   // best-effort: cgroup CPU accounting not yet wired
         bytes_written: 0, // best-effort: cgroup I/O accounting not yet wired
     }

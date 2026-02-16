@@ -997,6 +997,16 @@ The `FacJobReceiptV1` type supports two canonical byte representations:
 Both representations are length-prefixed. The distinct domain separators ensure
 no hash collision between v1 and v2 hashes for identical receipt content.
 
+### Trailing Optional Field Canonicalization (TCK-00532)
+
+Both v1 and v2 canonical byte representations emit explicit presence markers
+(0u8 for `None`, 1u8 for `Some`) for ALL trailing optional fields
+(`moved_job_path`, `containment`, `observed_cost`). This prevents
+canonicalization collisions where different combinations of `None` fields
+produce identical byte streams. Without markers, e.g., a receipt with only
+`observed_cost=Some(...)` and no containment could collide with one that has
+`containment=Some(...)` and no observed cost.
+
 ## receipt_index Submodule (TCK-00560)
 
 The `receipt_index` submodule implements a non-authoritative, rebuildable index
