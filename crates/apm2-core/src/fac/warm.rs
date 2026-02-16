@@ -1847,6 +1847,8 @@ mod tests {
                 timeout_start_sec: 600,
                 runtime_max_sec: 1800,
                 kill_mode: "control-group".to_string(),
+                sandbox_hardening:
+                    super::super::systemd_properties::SandboxHardeningProfile::default(),
             },
             system_config: None,
         };
