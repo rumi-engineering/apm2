@@ -375,6 +375,7 @@ fn run_gates_inner(
             },
             &default_nextest_command,
             &test_command_environment,
+            policy.sandbox_hardening,
         )
         .map_err(|err| format!("bounded test runner unavailable for FAC gates: {err}"))?;
         bounded = true;

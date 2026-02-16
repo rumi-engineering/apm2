@@ -1185,6 +1185,7 @@ fn process_job(
                 moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for quarantined job: {receipt_err}"
@@ -1220,6 +1221,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
             None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1311,6 +1313,7 @@ fn process_job(
                     moved_path.as_deref(),
                     policy_hash,
                     None,
+                    None,
                 ) {
                     eprintln!(
                         "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -1345,6 +1348,7 @@ fn process_job(
                 Some(canonicalizer_tuple_digest),
                 moved_path.as_deref(),
                 policy_hash,
+                None,
                 None,
             ) {
                 eprintln!(
@@ -1398,6 +1402,7 @@ fn process_job(
                 moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -1449,6 +1454,7 @@ fn process_job(
                 moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -1488,6 +1494,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
             None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1534,6 +1541,7 @@ fn process_job(
                 moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -1572,6 +1580,7 @@ fn process_job(
                 moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -1604,6 +1613,7 @@ fn process_job(
             moved_path.as_deref(),
             policy_hash,
             None,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -1635,6 +1645,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
             None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1679,6 +1690,7 @@ fn process_job(
             moved_path.as_deref(),
             policy_hash,
             None,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -1715,6 +1727,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
             None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1798,6 +1811,7 @@ fn process_job(
             moved_path.as_deref(),
             policy_hash,
             None,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -1850,6 +1864,7 @@ fn process_job(
                 moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for budget-denied job: {receipt_err}"
@@ -1886,6 +1901,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
             None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -1938,6 +1954,7 @@ fn process_job(
             Some(canonicalizer_tuple_digest),
             moved_path.as_deref(),
             policy_hash,
+            None,
             None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
@@ -2019,6 +2036,7 @@ fn process_job(
             moved_path.as_deref(),
             policy_hash,
             None,
+            None,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2061,6 +2079,7 @@ fn process_job(
                 moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -2068,8 +2087,13 @@ fn process_job(
         },
     };
 
-    let lane_systemd_properties =
-        SystemdUnitProperties::from_lane_profile(&lane_profile, Some(&spec.constraints));
+    let lane_systemd_properties = SystemdUnitProperties::from_lane_profile_with_hardening(
+        &lane_profile,
+        Some(&spec.constraints),
+        policy.sandbox_hardening.clone(),
+    );
+    // TCK-00573: Compute sandbox hardening hash for receipt audit binding.
+    let sandbox_hardening_hash_str = lane_systemd_properties.sandbox_hardening.content_hash_hex();
     if print_unit {
         eprintln!(
             "worker: computed systemd properties for job {}",
@@ -2130,6 +2154,7 @@ fn process_job(
                 moved_path.as_deref(),
                 policy_hash,
                 None,
+                Some(&sandbox_hardening_hash_str),
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -2164,6 +2189,7 @@ fn process_job(
             moved_path.as_deref(),
             policy_hash,
             None,
+            Some(&sandbox_hardening_hash_str),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2242,6 +2268,7 @@ fn process_job(
             moved_path.as_deref(),
             policy_hash,
             None,
+            Some(&sandbox_hardening_hash_str),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2295,6 +2322,7 @@ fn process_job(
             moved_path.as_deref(),
             policy_hash,
             None,
+            Some(&sandbox_hardening_hash_str),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2353,6 +2381,7 @@ fn process_job(
             moved_path.as_deref(),
             policy_hash,
             None,
+            Some(&sandbox_hardening_hash_str),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2449,6 +2478,7 @@ fn process_job(
             moved_path.as_deref(),
             policy_hash,
             None,
+            Some(&sandbox_hardening_hash_str),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2567,6 +2597,7 @@ fn process_job(
         None,
         policy_hash,
         containment_trace.as_ref(),
+        Some(&sandbox_hardening_hash_str),
     ) {
         eprintln!("worker: receipt emission failed, cannot complete job: {receipt_err}");
         let _ = LaneLeaseV1::remove(&lane_dir);
@@ -3100,6 +3131,7 @@ fn handle_stop_revoke(
                 moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -3146,6 +3178,7 @@ fn handle_stop_revoke(
                 None,
                 policy_hash,
                 None,
+                None,
             );
             let _ = move_to_dir_safe(
                 claimed_path,
@@ -3175,6 +3208,7 @@ fn handle_stop_revoke(
             Some(canonicalizer_tuple_digest),
             None,
             policy_hash,
+            None,
             None,
         );
         let _ = move_to_dir_safe(
@@ -3221,6 +3255,7 @@ fn handle_stop_revoke(
             Some(canonicalizer_tuple_digest),
             None,
             policy_hash,
+            None,
             None,
         );
         let _ = move_to_dir_safe(
@@ -3297,6 +3332,7 @@ fn handle_stop_revoke(
                     None,
                     policy_hash,
                     None,
+                    None,
                 );
                 let _ = move_to_dir_safe(
                     claimed_path,
@@ -3330,6 +3366,7 @@ fn handle_stop_revoke(
                 Some(canonicalizer_tuple_digest),
                 None,
                 policy_hash,
+                None,
                 None,
             );
             let _ = move_to_dir_safe(
@@ -3366,6 +3403,7 @@ fn handle_stop_revoke(
             None,
             policy_hash,
             None,
+            None,
         );
         let _ = move_to_dir_safe(
             claimed_path,
@@ -3391,6 +3429,7 @@ fn handle_stop_revoke(
         Some(canonicalizer_tuple_digest),
         None,
         policy_hash,
+        None,
         None,
     ) {
         // Fail-closed: completion receipt for stop_revoke itself failed.
@@ -3468,6 +3507,9 @@ fn execute_warm_job(
 ) -> JobOutcome {
     use apm2_core::fac::warm::{WarmContainment, WarmPhase, execute_warm};
 
+    // TCK-00573: Compute sandbox hardening hash for receipt audit binding.
+    let sandbox_hardening_hash_str = lane_systemd_properties.sandbox_hardening.content_hash_hex();
+
     // Parse warm phases from decoded_source (comma-separated phase names).
     let phases: Vec<WarmPhase> = match &spec.actuation.decoded_source {
         Some(phases_csv) if !phases_csv.is_empty() => {
@@ -3509,6 +3551,7 @@ fn execute_warm_job(
                             moved_path.as_deref(),
                             policy_hash,
                             containment_trace,
+                            Some(&sandbox_hardening_hash_str),
                         );
                         return JobOutcome::Denied { reason };
                     },
@@ -3551,6 +3594,7 @@ fn execute_warm_job(
             moved_path.as_deref(),
             policy_hash,
             containment_trace,
+            Some(&sandbox_hardening_hash_str),
         );
         return JobOutcome::Denied { reason };
     }
@@ -3583,6 +3627,7 @@ fn execute_warm_job(
             moved_path.as_deref(),
             policy_hash,
             containment_trace,
+            Some(&sandbox_hardening_hash_str),
         );
         return JobOutcome::Denied { reason };
     }
@@ -3647,6 +3692,7 @@ fn execute_warm_job(
                 moved_path.as_deref(),
                 policy_hash,
                 containment_trace,
+                Some(&sandbox_hardening_hash_str),
             );
             return JobOutcome::Denied { reason };
         }
@@ -3707,6 +3753,7 @@ fn execute_warm_job(
                             moved_path.as_deref(),
                             policy_hash,
                             containment_trace,
+                            Some(&sandbox_hardening_hash_str),
                         );
                         return JobOutcome::Denied { reason };
                     },
@@ -3765,6 +3812,7 @@ fn execute_warm_job(
                     moved_path.as_deref(),
                     policy_hash,
                     containment_trace,
+                    Some(&sandbox_hardening_hash_str),
                 );
                 return JobOutcome::Denied { reason };
             }
@@ -3863,6 +3911,7 @@ fn execute_warm_job(
                 moved_path.as_deref(),
                 policy_hash,
                 containment_trace,
+                Some(&sandbox_hardening_hash_str),
             );
             return JobOutcome::Denied { reason };
         },
@@ -3924,6 +3973,7 @@ fn execute_warm_job(
         None,
         policy_hash,
         containment_trace,
+        Some(&sandbox_hardening_hash_str),
     ) {
         eprintln!("worker: receipt emission failed for warm job: {receipt_err}");
         let _ = LaneLeaseV1::remove(lane_dir);
@@ -4483,6 +4533,7 @@ fn emit_job_receipt(
     moved_job_path: Option<&str>,
     policy_hash: &str,
     containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
+    sandbox_hardening_hash: Option<&str>,
 ) -> Result<PathBuf, String> {
     let mut builder = FacJobReceiptV1Builder::new(
         format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs()),
@@ -4518,6 +4569,10 @@ fn emit_job_receipt(
     }
     if let Some(trace) = containment {
         builder = builder.containment(trace.clone());
+    }
+    // TCK-00573: Bind sandbox hardening hash to receipt for audit.
+    if let Some(hash) = sandbox_hardening_hash {
+        builder = builder.sandbox_hardening_hash(hash);
     }
 
     let receipt = builder
@@ -5017,6 +5072,7 @@ mod tests {
             None,
             &spec.job_spec_digest,
             None,
+            None,
         )
         .expect("emit receipt");
 
@@ -5056,6 +5112,7 @@ mod tests {
             Some(&canonicalizer_tuple_digest),
             None,
             &spec.job_spec_digest,
+            None,
             None,
         )
         .expect("emit receipt");
@@ -5254,6 +5311,7 @@ mod tests {
             None,
             &spec.job_spec_digest,
             Some(&containment_trace),
+            None,
         )
         .expect("emit receipt with containment");
 
@@ -5323,6 +5381,7 @@ mod tests {
             None,
             &spec.job_spec_digest,
             None,
+            None,
         )
         .expect("emit receipt without containment");
 
@@ -5334,6 +5393,126 @@ mod tests {
         assert!(
             receipt_json.get("containment").is_none(),
             "containment field must be absent when None"
+        );
+    }
+
+    /// Verify that `sandbox_hardening_hash` is included in the persisted
+    /// receipt when provided (TCK-00573 regression test).
+    #[test]
+    fn test_emit_job_receipt_includes_sandbox_hardening_hash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
+        let spec = make_receipt_test_spec();
+        let boundary_trace = ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
+        };
+        let queue_trace = JobQueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "control".to_string(),
+            defect_reason: None,
+        };
+
+        let hardening_hash = apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
+
+        let receipt_path = emit_job_receipt(
+            &fac_root,
+            &spec,
+            FacJobOutcome::Completed,
+            None,
+            "completed",
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+            None,
+            Some(&tuple_digest),
+            None,
+            &spec.job_spec_digest,
+            None,
+            Some(&hardening_hash),
+        )
+        .expect("emit receipt with sandbox_hardening_hash");
+
+        let receipt_json = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&receipt_path).expect("read receipt"),
+        )
+        .expect("parse receipt JSON");
+
+        assert_eq!(
+            receipt_json
+                .get("sandbox_hardening_hash")
+                .and_then(|v| v.as_str()),
+            Some(hardening_hash.as_str()),
+            "sandbox_hardening_hash must be present in persisted receipt"
+        );
+        // Verify the hash has the expected b3-256: prefix format.
+        assert!(
+            hardening_hash.starts_with("b3-256:"),
+            "hash must have b3-256: prefix"
+        );
+        assert_eq!(
+            hardening_hash.len(),
+            71,
+            "b3-256:<64hex> must be exactly 71 chars"
+        );
+    }
+
+    /// Verify that `sandbox_hardening_hash` is absent when not provided.
+    #[test]
+    fn test_emit_job_receipt_omits_sandbox_hardening_hash_when_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
+        let spec = make_receipt_test_spec();
+        let boundary_trace = ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
+        };
+        let queue_trace = JobQueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "control".to_string(),
+            defect_reason: None,
+        };
+
+        let receipt_path = emit_job_receipt(
+            &fac_root,
+            &spec,
+            FacJobOutcome::Completed,
+            None,
+            "completed",
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+            None,
+            Some(&tuple_digest),
+            None,
+            &spec.job_spec_digest,
+            None,
+            None,
+        )
+        .expect("emit receipt without sandbox_hardening_hash");
+
+        let receipt_json = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&receipt_path).expect("read receipt"),
+        )
+        .expect("parse receipt JSON");
+
+        assert!(
+            receipt_json.get("sandbox_hardening_hash").is_none(),
+            "sandbox_hardening_hash must be absent when None"
         );
     }
 

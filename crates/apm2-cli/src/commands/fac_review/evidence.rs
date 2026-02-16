@@ -896,6 +896,7 @@ fn build_pipeline_test_command(
         },
         &build_nextest_command(),
         &test_env,
+        policy.sandbox_hardening,
     )
     .map_err(|err| format!("bounded test runner unavailable for FAC pipeline: {err}"))?;
     test_env.extend(bounded_spec.environment);

@@ -635,10 +635,38 @@ user-mode and system-mode execution backends.
   - `timeout_start_sec` → `TimeoutStartSec`
   - `runtime_max_sec` → `RuntimeMaxSec`
   - `kill_mode` → `KillMode` (default `control-group`)
+  - `sandbox_hardening` → `SandboxHardeningProfile` (TCK-00573)
 - Input binding:
-  - `from_lane_profile(&LaneProfileV1, Option<&JobConstraints>)`
+  - `from_lane_profile(&LaneProfileV1, Option<&JobConstraints>)` — uses default hardening
+  - `from_lane_profile_with_hardening(&LaneProfileV1, Option<&JobConstraints>, SandboxHardeningProfile)` — uses policy-driven hardening
 - Override semantics:
   - `memory_max_bytes` and `test_timeout_seconds` use MIN(job, lane).
+  - `sandbox_hardening` is policy-driven via `FacPolicyV1.sandbox_hardening` (TCK-00573).
+
+**Core type**: `SandboxHardeningProfile` (TCK-00573)
+
+Systemd security directives for transient units. Policy-driven via
+`FacPolicyV1.sandbox_hardening`. Default profile enables all hardening.
+
+- Directives: `NoNewPrivileges`, `PrivateTmp`, `ProtectControlGroups`,
+  `ProtectKernelTunables`, `ProtectKernelLogs`, `RestrictSUIDSGID`,
+  `LockPersonality`, `RestrictRealtime`, `RestrictAddressFamilies`,
+  `SystemCallArchitectures=native`.
+- `content_hash()` / `content_hash_hex()`: Deterministic BLAKE3 hash for
+  receipt audit binding. Included in `FacJobReceiptV1.sandbox_hardening_hash`.
+- `to_property_strings()`: Full hardening for system-mode.
+- `to_user_mode_property_strings()`: Only `NoNewPrivileges` for user-mode.
+- `validate()`: Bounds check on address families count and format.
+
+### Security Invariants (TCK-00573)
+
+- [INV-SBX-001] All `SystemdUnitProperties` construction sites in production
+  paths (worker, bounded test runner, pipeline) use `from_lane_profile_with_hardening`
+  with `FacPolicyV1.sandbox_hardening`. Hard-coded defaults are prohibited.
+- [INV-SBX-002] `FacJobReceiptV1.sandbox_hardening_hash` is populated from
+  `SandboxHardeningProfile.content_hash_hex()` in all `emit_job_receipt` paths
+  that have access to the effective hardening profile.
+- [INV-SBX-003] Address families bounded by `MAX_ADDRESS_FAMILIES=16`.
 
 ## Rendering API
 
