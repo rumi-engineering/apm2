@@ -12,10 +12,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use apm2_core::fac::SystemdUnitProperties;
 use apm2_core::fac::execution_backend::{
     ExecutionBackend, SystemModeConfig, build_systemd_run_command, probe_user_bus, select_backend,
 };
+use apm2_core::fac::{SandboxHardeningProfile, SystemdUnitProperties};
 use apm2_daemon::telemetry::is_cgroup_v2_available;
 
 use super::timeout_policy::parse_memory_limit;
@@ -114,8 +114,12 @@ fn parse_cpu_quota_percent(cpu_quota: &str) -> Result<u32, String> {
 /// Convert CLI `BoundedTestLimits` to core `SystemdUnitProperties`.
 ///
 /// Parses string-format limits (e.g., "48G", "200%") into numeric types
-/// used by the core command builder.
-fn limits_to_properties(limits: BoundedTestLimits<'_>) -> Result<SystemdUnitProperties, String> {
+/// used by the core command builder. Uses the provided sandbox hardening
+/// profile (from policy) instead of hard-coding the default (TCK-00573).
+fn limits_to_properties(
+    limits: BoundedTestLimits<'_>,
+    sandbox_hardening: SandboxHardeningProfile,
+) -> Result<SystemdUnitProperties, String> {
     let memory_max_bytes = parse_memory_limit(limits.memory_max)?;
     let cpu_quota_percent = parse_cpu_quota_percent(limits.cpu_quota)?;
 
@@ -128,7 +132,7 @@ fn limits_to_properties(limits: BoundedTestLimits<'_>) -> Result<SystemdUnitProp
         timeout_start_sec: limits.timeout_seconds,
         runtime_max_sec: limits.timeout_seconds,
         kill_mode: "control-group".to_string(),
-        sandbox_hardening: apm2_core::fac::SandboxHardeningProfile::default(),
+        sandbox_hardening,
     })
 }
 
@@ -137,6 +141,7 @@ pub fn build_bounded_test_command(
     limits: BoundedTestLimits<'_>,
     nextest_command: &[String],
     extra_setenv: &[(String, String)],
+    sandbox_hardening: SandboxHardeningProfile,
 ) -> Result<BoundedTestCommandSpec, String> {
     if nextest_command.is_empty() {
         return Err("nextest command cannot be empty".to_string());
@@ -149,8 +154,9 @@ pub fn build_bounded_test_command(
     }
 
     // Convert CLI limits to core properties for unified command
-    // construction.
-    let properties = limits_to_properties(limits)?;
+    // construction. Uses the policy-driven sandbox hardening profile
+    // (TCK-00573) instead of hard-coding defaults.
+    let properties = limits_to_properties(limits, sandbox_hardening)?;
 
     // Select execution backend: user-mode (requires D-Bus session) or
     // system-mode (headless VPS). Controlled by APM2_FAC_EXECUTION_BACKEND.
@@ -341,6 +347,8 @@ fn command_available(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use apm2_core::fac::SandboxHardeningProfile;
+
     use super::{
         BoundedTestLimits, append_systemd_setenv_args, build_bounded_test_command,
         build_systemd_setenv_pairs, default_runtime_dir, limits_to_properties,
@@ -372,6 +380,7 @@ mod tests {
             },
             &[],
             &[],
+            SandboxHardeningProfile::default(),
         )
         .expect_err("empty command must fail");
         assert!(err.contains("nextest command cannot be empty"));
@@ -482,13 +491,33 @@ mod tests {
             pids_max: 512,
             cpu_quota: "200%",
         };
-        let props = limits_to_properties(limits).expect("valid limits");
+        let props =
+            limits_to_properties(limits, SandboxHardeningProfile::default()).expect("valid limits");
         assert_eq!(props.cpu_quota_percent, 200);
         assert_eq!(props.memory_max_bytes, 1024 * 1024 * 1024);
         assert_eq!(props.tasks_max, 512);
         assert_eq!(props.io_weight, 100);
         assert_eq!(props.runtime_max_sec, 600);
         assert_eq!(props.kill_mode, "control-group");
+        assert_eq!(props.sandbox_hardening, SandboxHardeningProfile::default());
+    }
+
+    #[test]
+    fn limits_to_properties_uses_custom_hardening_profile() {
+        let limits = BoundedTestLimits {
+            timeout_seconds: 600,
+            kill_after_seconds: 20,
+            memory_max: "1G",
+            pids_max: 512,
+            cpu_quota: "200%",
+        };
+        let hardening = SandboxHardeningProfile {
+            private_tmp: false,
+            ..Default::default()
+        };
+        let props = limits_to_properties(limits, hardening.clone()).expect("valid limits");
+        assert_eq!(props.sandbox_hardening, hardening);
+        assert!(!props.sandbox_hardening.private_tmp);
     }
 
     #[test]
