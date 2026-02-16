@@ -163,6 +163,18 @@ impl SandboxHardeningProfile {
                 ));
             }
         }
+        // NIT-3: Enforce uniqueness of address families to prevent
+        // accidental duplicate entries from producing surprising hashes.
+        {
+            let mut seen = std::collections::HashSet::new();
+            for (i, af) in self.restrict_address_families.iter().enumerate() {
+                if !seen.insert(af.as_str()) {
+                    return Err(format!(
+                        "restrict_address_families[{i}] is a duplicate: '{af}'"
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -720,6 +732,20 @@ mod tests {
         };
         let err = profile.validate().unwrap_err();
         assert!(err.contains("invalid format"), "error: {err}");
+    }
+
+    #[test]
+    fn hardening_profile_rejects_duplicate_address_families() {
+        let profile = SandboxHardeningProfile {
+            restrict_address_families: vec![
+                "AF_UNIX".to_string(),
+                "AF_INET".to_string(),
+                "AF_UNIX".to_string(),
+            ],
+            ..Default::default()
+        };
+        let err = profile.validate().unwrap_err();
+        assert!(err.contains("duplicate"), "error: {err}");
     }
 
     #[test]

@@ -657,7 +657,9 @@ Systemd security directives for transient units. Policy-driven via
   canonical ordering. Included in `FacJobReceiptV1.sandbox_hardening_hash`.
 - `to_property_strings()`: Full hardening for system-mode.
 - `to_user_mode_property_strings()`: Only `NoNewPrivileges` for user-mode.
-- `validate()`: Bounds check on address families count and format.
+- `validate()`: Bounds check on address families count, format, and uniqueness.
+  Rejects duplicate entries in `restrict_address_families` via `HashSet`-based
+  detection (TCK-00573 NIT-3).
 
 ### Security Invariants (TCK-00573)
 
@@ -671,6 +673,8 @@ Systemd security directives for transient units. Policy-driven via
   `SandboxHardeningProfile.content_hash_hex()` in all `emit_job_receipt` paths
   that have access to the effective hardening profile.
 - [INV-SBX-003] Address families bounded by `MAX_ADDRESS_FAMILIES=16`.
+- [INV-SBX-004] Address families must be unique; `validate()` rejects
+  duplicates with a diagnostic error identifying the offending index.
 
 ## Rendering API
 
@@ -1028,6 +1032,22 @@ The `FacJobReceiptV1` type supports two canonical byte representations:
 
 Both representations are length-prefixed. The distinct domain separators ensure
 no hash collision between v1 and v2 hashes for identical receipt content.
+
+### Injective Trailing Optional Fields (TCK-00573)
+
+Both `canonical_bytes()` and `canonical_bytes_v2()` use type-specific presence
+markers for trailing optional fields to ensure injective encoding:
+
+- `1u8` — `moved_job_path` (TCK-00518)
+- `2u8` — `containment` trace (TCK-00548)
+- `3u8` — `sandbox_hardening_hash` (TCK-00573)
+
+`GateReceipt::canonical_bytes()` uses marker `4u8` for its own
+`sandbox_hardening_hash` optional field.
+
+Each marker is followed by a `u32` big-endian length prefix and the field bytes.
+The distinct per-type markers prevent different optional-field combinations from
+producing identical canonical byte streams (collision resistance).
 
 ## receipt_index Submodule (TCK-00560)
 

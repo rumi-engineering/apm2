@@ -35,6 +35,11 @@ pub struct GateResourcePolicy {
     pub gate_profile: Option<String>,
     pub test_parallelism: Option<u32>,
     pub bounded_runner: bool,
+    /// BLAKE3 hash of the `SandboxHardeningProfile` used for gate execution
+    /// (TCK-00573 MAJOR-3). Ensures the attestation digest changes when the
+    /// hardening profile is modified, preventing stale gate result reuse
+    /// from insecure environments.
+    pub sandbox_hardening: Option<String>,
 }
 
 impl GateResourcePolicy {
@@ -49,6 +54,7 @@ impl GateResourcePolicy {
         bounded_runner: bool,
         gate_profile: Option<&str>,
         test_parallelism: Option<u32>,
+        sandbox_hardening: Option<&str>,
     ) -> Self {
         Self {
             quick_mode,
@@ -59,6 +65,7 @@ impl GateResourcePolicy {
             gate_profile: gate_profile.map(str::to_string),
             test_parallelism,
             bounded_runner,
+            sandbox_hardening: sandbox_hardening.map(str::to_string),
         }
     }
 }
@@ -503,7 +510,7 @@ mod tests {
         let command =
             gate_command_for_attestation(&workspace_root, "rustfmt", None).expect("command");
         let policy =
-            GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true, None, None);
+            GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true, None, None, None);
 
         let one = compute_gate_attestation(
             &workspace_root,
@@ -656,6 +663,7 @@ mod tests {
             true,
             Some("throughput"),
             Some(8),
+            None,
         );
         let conservative = GateResourcePolicy::from_cli(
             false,
@@ -666,6 +674,7 @@ mod tests {
             true,
             Some("conservative"),
             Some(2),
+            None,
         );
         assert_ne!(
             super::resource_digest(&throughput),
@@ -703,7 +712,7 @@ mod tests {
         let command =
             gate_command_for_attestation(&workspace_root, "rustfmt", None).expect("command");
         let policy =
-            GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true, None, None);
+            GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true, None, None, None);
 
         let attestation = compute_gate_attestation(
             &workspace_root,
