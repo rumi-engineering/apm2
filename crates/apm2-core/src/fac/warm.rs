@@ -1055,7 +1055,14 @@ fn version_output(
             if !status.success() {
                 return None;
             }
-            return String::from_utf8(buf).ok().map(|s| s.trim().to_string());
+            let output = String::from_utf8(buf).ok()?;
+            let normalized = output.trim();
+            // Version probe output must be text-like; reject binary NUL payloads
+            // produced by oversized stdout regressions.
+            if normalized.contains('\0') {
+                return None;
+            }
+            return Some(normalized.to_string());
         }
         if Instant::now() >= deadline {
             // Timeout: kill the child directly (no mutex needed).
