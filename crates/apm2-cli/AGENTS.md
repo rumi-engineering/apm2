@@ -139,6 +139,49 @@ Credential management subcommands.
 | `apm2 fac lane reset <lane_id> --force` | Force-reset RUNNING lane (kills process first) |
 | `apm2 fac services status` | Check daemon/worker service status with health verdicts |
 
+### FAC Reconciliation (TCK-00534)
+
+| Command | Description |
+|---------|-------------|
+| `apm2 fac reconcile --dry-run` | Preview crash recovery actions without mutating state |
+| `apm2 fac reconcile --apply` | Apply crash recovery: reconcile stale leases and orphaned claimed jobs |
+
+**Overview:** The `reconcile` subcommand performs deterministic crash recovery
+on worker startup (or on-demand via CLI). After an unclean shutdown (crash,
+SIGKILL, OOM-kill), queue and lane state can become inconsistent. Reconciliation
+detects and repairs these inconsistencies:
+
+1. **Lane reconciliation (Phase 1):** Scans all lanes for stale leases (dead PID
+   + free lock). Stale leases are transitioned through CLEANUP to IDLE with
+   receipts. Ambiguous PID states are marked CORRUPT (fail-closed).
+2. **Queue reconciliation (Phase 2):** Scans `queue/claimed/` for orphaned jobs
+   not backed by any active lane. Orphaned jobs are requeued (moved to
+   `pending/`) or marked failed (moved to `denied/`) based on policy.
+
+**Security Invariants:**
+
+- [INV-RECON-001] No job is silently dropped; all outcomes recorded as receipts.
+  Receipt persistence is mandatory in apply mode for both the final receipt and
+  partial receipts after Phase-1 or Phase-2 failures.
+- [INV-RECON-002] Stale lease detection is fail-closed: ambiguous PID state
+  results in CORRUPT marking, not recovery. Corrupt markers are durably
+  persisted.
+- [INV-RECON-005] Queue reads are bounded by `MAX_CLAIMED_SCAN_ENTRIES`. Every
+  directory entry counts toward the cap before file-type filtering.
+- [INV-RECON-006] Stale lease recovery transitions through CLEANUP to IDLE with
+  durable evidence before lease removal.
+- [INV-RECON-007] Move operations are fail-closed: counters only increment after
+  confirmed rename success.
+- [INV-RECON-008] The `queue/claimed` directory is verified via
+  `symlink_metadata()` before traversal; symlinked directories are rejected.
+- [INV-RECON-012] Reconciliation is exempt from AJC lifecycle (RS-42, RFC-0027)
+  as it runs at startup before the worker accepts any external authority.
+- File operations use `O_NOFOLLOW` and reject symlinks/non-regular files.
+- Directories are created with mode 0o700; files with mode 0o600.
+- Best-effort lane cleanup catches `safe_rmtree_v1` permission failures
+  (e.g., SystemMode 0o770 lanes) and marks the lane CORRUPT instead of
+  aborting worker startup.
+
 **Services Status Enhancements (TCK-00600):**
 - Per-service `health` field: `healthy` / `degraded` / `unhealthy` (deterministic).
 - Per-service `watchdog_sec` field: configured WatchdogSec in seconds.

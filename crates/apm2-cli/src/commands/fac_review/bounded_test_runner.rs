@@ -36,13 +36,15 @@ const SYSTEMD_SETENV_ALLOWLIST_EXACT: &[&str] = &[
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
     "RUSTDOCFLAGS",
-    // TCK-00526: PATH, HOME, USER, and LANG are required for correct
-    // toolchain resolution inside the bounded test unit. These are
+    // TCK-00526/TCK-00575: PATH, HOME, TMPDIR, USER, and LANG are
+    // required for correct toolchain and lane-isolated workspace
+    // resolution inside the bounded test unit. These are
     // included in the FAC policy's default env_allowlist_prefixes and
     // must be forwarded through systemd --setenv to maintain execution
     // correctness.
     "PATH",
     "HOME",
+    "TMPDIR",
     "USER",
     "LANG",
 ];
@@ -396,6 +398,15 @@ mod tests {
                 ("RUSTFLAGS".to_string(), "-Copt-level=1".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn setenv_pairs_accept_tmpdir_lane_override() {
+        let lane_tmpdir = "/tmp/apm2/private/fac/lanes/lane-00/tmp".to_string();
+        let pairs =
+            build_systemd_setenv_pairs(Vec::new(), &[("TMPDIR".to_string(), lane_tmpdir.clone())])
+                .expect("TMPDIR should be allowlisted for lane env isolation");
+        assert_eq!(pairs, vec![("TMPDIR".to_string(), lane_tmpdir)]);
     }
 
     #[test]

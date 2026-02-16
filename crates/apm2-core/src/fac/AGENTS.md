@@ -1274,6 +1274,159 @@ pre-populating build caches in the lane target namespace.
   `execute_warm`/`execute_warm_phase` and runs synchronously on the same
   thread (no cross-thread sharing).
 
+## reconcile Submodule (TCK-00534)
+
+The `reconcile` submodule implements crash recovery reconciliation for FAC queue
+and lane state. After an unclean shutdown (crash, SIGKILL, OOM-kill), the queue
+and lane state can become inconsistent. This module detects and repairs
+inconsistencies deterministically on worker startup.
+
+### Key Types
+
+- `ReconcileError`: Error taxonomy covering lane errors, I/O failures, bounded
+  collection overflow, serialization errors, and move failures (`MoveFailed`).
+- `OrphanedJobPolicy`: Policy enum for handling claimed jobs without a running
+  lane (`Requeue` or `MarkFailed`). Default is `Requeue`.
+- `LaneRecoveryAction`: Per-lane action taken during reconciliation
+  (`StaleLeaseCleared`, `AlreadyConsistent`, `MarkedCorrupt`).
+- `QueueRecoveryAction`: Per-job action taken during queue reconciliation
+  (`Requeued`, `MarkedFailed`, `StillActive`).
+- `ReconcileReceiptV1`: Structured receipt emitted after each reconciliation
+  pass, persisted to `$APM2_HOME/private/fac/receipts/reconcile/` for
+  auditability.
+
+### Core Capabilities
+
+- `reconcile_on_startup(fac_root, queue_root, orphan_policy, dry_run)`: Main
+  entry point. Runs two-phase recovery:
+  1. **Lane reconciliation** (`reconcile_lanes`): Scans all lanes for stale
+     leases (PID dead + lock not held). Stale leases are recovered through
+     the CLEANUP state transition (`recover_stale_lease`) to reach IDLE.
+     Ambiguous PID state (EPERM) triggers durable CORRUPT marking
+     (fail-closed) with `LaneCorruptMarkerV1` persistence.
+  2. **Queue reconciliation** (`reconcile_queue`): Scans `queue/claimed/` for
+     orphaned jobs not backed by any active lane. Rejects symlinks and
+     non-regular file types. Applies configured policy (requeue to `pending/`
+     or mark failed to `denied/`). Move failures are propagated, not swallowed.
+     Returns `QueueReconcileResult` with partial counts and optional error
+     (mirroring Phase 1's `LaneReconcileResult` pattern) so partial receipts
+     include accurate `claimed_files_inspected` counts.
+- `ReconcileReceiptV1::load()`: Bounded receipt deserialization with size cap,
+  schema validation (rejects non-matching `schema` field), and post-parse
+  bounds validation.
+- Dry-run mode: report what would be done without mutating state (receipt
+  persistence is best-effort).
+- Apply mode: receipt persistence is mandatory (fail-closed).
+- Idempotent: running reconciliation multiple times produces correct results.
+- Called automatically on worker startup with `OrphanedJobPolicy::Requeue`.
+  Worker startup aborts if reconciliation fails.
+- CLI: `apm2 fac reconcile --dry-run|--apply [--orphan-policy requeue|mark-failed]`.
+
+### Security Invariants (TCK-00534)
+
+- [INV-RECON-001] No job is silently dropped; all outcomes recorded as receipts.
+  Receipt persistence is mandatory in apply mode (fail-closed); dry-run mode
+  uses best-effort persistence. Worker startup aborts on reconciliation failure
+  to prevent processing jobs with inconsistent queue/lane state. If Phase 1
+  (lane reconciliation) fails after mutating some lanes, a partial receipt
+  containing the completed Phase 1 actions is persisted before the error is
+  propagated. Similarly, if Phase 1 succeeds but Phase 2 (queue reconciliation)
+  fails, a partial receipt containing Phase 1 actions is persisted before the
+  Phase 2 error is propagated. In both cases, this ensures lane and queue
+  recovery mutations are never silently lost. If partial receipt persistence
+  also fails, a combined error is returned that includes both the phase
+  failure context and the persistence failure context, so apply-mode mutations
+  never lack durable receipt evidence.
+- [INV-RECON-002] Stale lease detection is fail-closed: ambiguous PID state
+  (EPERM) marks lane CORRUPT (not recovered). Corrupt marker persistence
+  failure is a hard error in apply mode — ambiguous states must not proceed
+  without durable corruption evidence, because subsequent startups would not
+  see the lane as corrupt and could attempt unsafe recovery. Corrupt lanes
+  with alive PIDs contribute their job_id to the active_job_ids set, preventing
+  queue reconciliation from treating those jobs as orphans.
+- [INV-RECON-003] All in-memory collections are bounded by hard `MAX_*`
+  constants (`MAX_LANE_RECOVERY_ACTIONS=64`,
+  `MAX_QUEUE_RECOVERY_ACTIONS=4096`). Receipt deserialization enforces
+  `MAX_RECEIPT_FILE_SIZE` (1 MiB) via `bounded_read_file` before parsing,
+  plus `MAX_DESERIALIZED_LANE_ACTIONS` and `MAX_DESERIALIZED_QUEUE_ACTIONS`
+  bounds after parsing.
+- [INV-RECON-004] Reconciliation is idempotent and safe to call on every
+  startup.
+- [INV-RECON-005] Queue reads are bounded (`MAX_CLAIMED_SCAN_ENTRIES=4096`).
+  Every directory entry (including symlinks, directories, and special files)
+  counts toward the scan cap BEFORE file-type filtering. This prevents
+  adversarial flooding of non-regular entries to bypass the scan budget.
+- [INV-RECON-006] Stale lease recovery routes through the CLEANUP state
+  transition (`recover_stale_lease`): the lease is persisted as CLEANUP state,
+  best-effort filesystem cleanup runs (tmp/ and per-lane env dir pruning via
+  `safe_rmtree_v1`), then the lease is removed to reach IDLE. This mirrors
+  the normal lane cleanup lifecycle and prevents cross-job contamination from
+  stale files. Git reset/clean is excluded because the workspace path is not
+  stored in the lease record and git state after a crash may be arbitrary
+  (the workspace will be re-checked-out on next job assignment). If any
+  cleanup step fails, the lane is marked CORRUPT via `LaneCorruptMarkerV1`
+  and the worker continues startup (the corrupt marker is the fail-closed
+  safety net — the lane will not accept new jobs until explicitly reset via
+  `apm2 fac lane reset`). This prevents crash loops in SystemMode where
+  `safe_rmtree_v1` rejects 0o770 lane directory permissions
+  (INV-RMTREE-006). CLEANUP persist failure is a hard error — lease
+  removal is blocked without durable CLEANUP evidence to prevent silent
+  lifecycle bypass.
+- [INV-RECON-007] Move operations are fail-closed: `move_file_safe` propagates
+  rename failures as `ReconcileError::MoveFailed`. Queue reconciliation counters
+  only increment after confirmed rename success. Requeue failures attempt
+  fallback to denied before returning an error. Exception: `NotFound` on rename
+  is treated as success ("already handled by another worker") to support
+  concurrent multi-worker reconciliation without startup failures.
+- [INV-RECON-008] Queue scanning rejects non-regular files (symlinks, FIFOs,
+  block/char devices, sockets) via `entry.file_type()` check.
+  `extract_job_id_from_claimed` validates with `symlink_metadata` and reads
+  via `open_file_no_follow` (O_NOFOLLOW) to prevent symlink traversal.
+  The `queue/claimed` directory itself is verified via `symlink_metadata()`
+  before traversal; if it is a symlink, reconciliation fails closed to
+  prevent iterating and moving files from outside the queue tree.
+- [INV-RECON-009] All filesystem writes use hardened I/O from `lane.rs`:
+  directories via `create_dir_restricted` (0o700 on every newly created
+  component, not just the leaf — CTR-2611), files via `atomic_write`
+  (NamedTempFile + 0o600 permissions + `sync_all` + atomic rename). Receipt
+  filenames include nanosecond timestamp + random suffix for collision
+  resistance.
+- [INV-RECON-010] `move_file_safe` destination names are always unique
+  (nanos + random_u32 suffix), eliminating TOCTOU races from
+  exists-then-rename patterns.
+- [INV-RECON-011] CLI JSON error output uses `serde_json::json!()` +
+  `serde_json::to_string()` instead of raw string interpolation, preventing
+  malformed JSON from unsanitized error messages.
+- [INV-RECON-012] Reconciliation is exempt from AJC lifecycle requirements
+  (RS-42, RFC-0027). It runs at startup as an internal crash-recovery
+  mechanism before the worker accepts any external authority — it is itself
+  the authority reset for crash recovery. Boundary conditions: runs before
+  the job-processing loop, no broker tokens issued, mutations limited to
+  local queue/lane filesystem state. See `reconcile_on_startup` doc comment
+  for the full exemption rationale.
+- [INV-RECON-013] `move_file_safe` hardens destination file permissions to
+  0o600 after `fs::rename` to prevent information disclosure from preserved
+  source permissions (CTR-2611). After a successful rename, chmod failure is
+  logged as a warning but does NOT return `Err`, because the file has already
+  been moved — returning `Err` would cause the caller to interpret the move
+  as failed and attempt a fallback move from the original path (which no
+  longer exists), creating unrecorded queue mutations that break
+  INV-RECON-001/007.
+- [INV-RECON-014] In the `LaneState::Corrupt` branch of `reconcile_lanes`,
+  if a durable corrupt marker does not already exist, one is persisted via
+  `persist_corrupt_marker`. This ensures that derived corruption states
+  (e.g., lock free but PID alive) are durably marked so subsequent restarts
+  see the lane as corrupt even if the runtime conditions that triggered the
+  derivation have changed.
+- [INV-RECON-015] `truncate_string(s, max_len)` guarantees the output length
+  is `<= max_len`, including the `"..."` ellipsis suffix when truncation is
+  needed. This ensures truncated strings pass downstream `MAX_STRING_LENGTH`
+  validation (e.g., `LaneCorruptMarkerV1::load` enforces a strict length
+  check on the `reason` field).
+- CTR-2501 deviation: `current_timestamp_rfc3339()` and `wall_clock_nanos()`
+  use wall-clock time for receipt timestamps and file deduplication suffixes.
+  Documented inline with security justification.
+
 ## Control-Lane Exception (TCK-00533)
 
 `stop_revoke` jobs bypass the standard RFC-0028 channel context token and

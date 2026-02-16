@@ -140,6 +140,9 @@ pub mod quarantine;
 mod receipt;
 /// Non-authoritative, rebuildable receipt index for fast job/receipt lookup.
 pub mod receipt_index;
+/// Crash recovery and reconciliation for queue/lane state on worker startup
+/// (TCK-00534).
+pub mod reconcile;
 mod repo_mirror;
 pub mod retry_manager;
 pub mod review_blocked;
@@ -390,6 +393,12 @@ pub use receipt_index::{
     INDEX_FILE_NAME, INDEX_SUBDIR, MAX_INDEX_ENTRIES, MAX_INDEX_FILE_SIZE, MAX_JOB_INDEX_ENTRIES,
     MAX_REBUILD_SCAN_FILES, RECEIPT_INDEX_SCHEMA, ReceiptHeaderV1, ReceiptIndexError,
     ReceiptIndexV1, has_receipt_for_job, list_receipt_headers, lookup_job_receipt,
+};
+// Re-export reconcile types (TCK-00534)
+pub use reconcile::{
+    LaneRecoveryAction, MAX_CLAIMED_SCAN_ENTRIES, MAX_LANE_RECOVERY_ACTIONS,
+    MAX_QUEUE_RECOVERY_ACTIONS, OrphanedJobPolicy, QueueRecoveryAction, RECONCILE_RECEIPT_SCHEMA,
+    ReconcileError, ReconcileReceiptV1, reconcile_on_startup,
 };
 pub use repo_mirror::{
     CheckoutOutcome, MAX_MIRROR_DIR_NAME, MAX_PATCH_SIZE, PatchOutcome, REPO_MIRROR_SCHEMA,
