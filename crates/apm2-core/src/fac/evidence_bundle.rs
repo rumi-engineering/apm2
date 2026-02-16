@@ -42,9 +42,10 @@ use thiserror::Error;
 
 use crate::channel::{
     BoundaryFlowPolicyBinding, ChannelBoundaryCheck, ChannelSource, DeclassificationIntentScope,
-    DisclosurePolicyBinding, LeakageBudgetReceipt, TimingChannelBudget,
+    DisclosurePolicyBinding, LeakageBudgetReceipt, LeakageEstimatorFamily, TimingChannelBudget,
     derive_channel_source_witness, validate_channel_boundary,
 };
+use crate::disclosure::{DisclosureChannelClass, DisclosurePolicyMode};
 use crate::fac::receipt::{BudgetAdmissionTrace, FacJobReceiptV1, QueueAdmissionTrace};
 
 // =============================================================================
@@ -162,6 +163,17 @@ pub enum EvidenceBundleError {
         /// Actual blob count.
         count: usize,
         /// Maximum allowed blob count.
+        max: usize,
+    },
+
+    /// Per-field length bound violated.
+    #[error("field length exceeded: {field} has {actual} bytes, max {max}")]
+    FieldTooLong {
+        /// Field name that exceeded the length limit.
+        field: String,
+        /// Actual length in bytes.
+        actual: usize,
+        /// Maximum allowed length in bytes.
         max: usize,
     },
 }
@@ -409,6 +421,24 @@ pub fn import_evidence_bundle(
         });
     }
 
+    // INV-EB-005: Per-field length bounds.
+    if envelope.receipt.job_id.len() > MAX_JOB_ID_LENGTH {
+        return Err(EvidenceBundleError::FieldTooLong {
+            field: "receipt.job_id".to_string(),
+            actual: envelope.receipt.job_id.len(),
+            max: MAX_JOB_ID_LENGTH,
+        });
+    }
+    for (i, blob_ref) in envelope.blob_refs.iter().enumerate() {
+        if blob_ref.len() > MAX_BLOB_REF_LENGTH {
+            return Err(EvidenceBundleError::FieldTooLong {
+                field: format!("blob_refs[{i}]"),
+                actual: blob_ref.len(),
+                max: MAX_BLOB_REF_LENGTH,
+            });
+        }
+    }
+
     // INV-EB-004: Content hash integrity.
     validate_content_hash(&envelope)?;
 
@@ -429,25 +459,76 @@ pub fn import_evidence_bundle(
 ///
 /// The hash is computed over all fields except `content_hash` to prevent
 /// circular dependency. Uses length-prefixed encoding for determinism.
-fn compute_envelope_content_hash(envelope: &EvidenceBundleEnvelopeV1) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(ENVELOPE_HASH_DOMAIN);
-    hasher.update(envelope.schema.as_bytes());
+/// Length-prefix a variable-length byte slice into the hasher for
+/// deterministic framing (prevents concatenation collisions).
+fn hash_len_prefixed(hasher: &mut blake3::Hasher, data: &[u8]) {
+    hasher.update(&(data.len() as u64).to_le_bytes());
+    hasher.update(data);
+}
 
-    // Hash the receipt canonical bytes.
-    let receipt_bytes = envelope.receipt.canonical_bytes();
-    hasher.update(&(receipt_bytes.len() as u64).to_le_bytes());
-    hasher.update(&receipt_bytes);
+/// Hash an optional byte-slice field with presence tag + length-prefix.
+fn hash_optional_bytes(hasher: &mut blake3::Hasher, opt: Option<&[u8]>) {
+    match opt {
+        Some(data) => {
+            hasher.update(&[1u8]);
+            hash_len_prefixed(hasher, data);
+        },
+        None => {
+            hasher.update(&[0u8]);
+        },
+    }
+}
 
-    // Hash the boundary check.
-    let bc = &envelope.boundary_check;
+/// Hash an optional string field with presence tag + length-prefix.
+fn hash_optional_str(hasher: &mut blake3::Hasher, opt: Option<&str>) {
+    hash_optional_bytes(hasher, opt.map(str::as_bytes));
+}
+
+/// Canonical label for `DeclassificationIntentScope` in hash preimage.
+const fn declassification_intent_label(scope: DeclassificationIntentScope) -> &'static str {
+    match scope {
+        DeclassificationIntentScope::None => "none",
+        DeclassificationIntentScope::RedundancyPurpose => "redundancy_purpose",
+        DeclassificationIntentScope::Unknown => "unknown",
+    }
+}
+
+/// Canonical label for `LeakageEstimatorFamily` in hash preimage.
+const fn leakage_estimator_label(family: LeakageEstimatorFamily) -> &'static str {
+    match family {
+        LeakageEstimatorFamily::MutualInformationUpperBound => "mutual_information_upper_bound",
+        LeakageEstimatorFamily::ChannelCapacityUpperBound => "channel_capacity_upper_bound",
+        LeakageEstimatorFamily::EmpiricalBucketHistogram => "empirical_bucket_histogram",
+        LeakageEstimatorFamily::Unknown => "unknown",
+    }
+}
+
+/// Canonical label for `DisclosurePolicyMode` in hash preimage.
+const fn disclosure_mode_label(mode: DisclosurePolicyMode) -> &'static str {
+    mode.canonical_label()
+}
+
+/// Canonical label for `DisclosureChannelClass` in hash preimage.
+const fn disclosure_channel_label(class: DisclosureChannelClass) -> &'static str {
+    match class {
+        DisclosureChannelClass::Internal => "internal",
+        DisclosureChannelClass::PatentFiling => "patent_filing",
+        DisclosureChannelClass::ProvisionalApplication => "provisional_application",
+        DisclosureChannelClass::ExternalPublication => "external_publication",
+        DisclosureChannelClass::DeclassificationControlled => "declassification_controlled",
+    }
+}
+
+/// Hash all fields of the boundary check into the hasher with deterministic
+/// length-prefix framing for every variable-length field.
+fn hash_boundary_check(hasher: &mut blake3::Hasher, bc: &BundleBoundaryCheckV1) {
     let source_label = match bc.source {
         ChannelSource::TypedToolIntent => "typed_tool_intent",
         ChannelSource::FreeFormOutput => "free_form_output",
         ChannelSource::DirectManifest => "direct_manifest",
         ChannelSource::Unknown => "unknown",
     };
-    hasher.update(source_label.as_bytes());
+    hash_len_prefixed(hasher, source_label.as_bytes());
     hasher.update(&[
         u8::from(bc.broker_verified),
         u8::from(bc.capability_verified),
@@ -457,43 +538,85 @@ fn compute_envelope_content_hash(envelope: &EvidenceBundleEnvelopeV1) -> [u8; 32
         u8::from(bc.classification_allow),
         u8::from(bc.declass_receipt_valid),
     ]);
+    hash_len_prefixed(
+        hasher,
+        declassification_intent_label(bc.declassification_intent).as_bytes(),
+    );
 
-    // Hash boundary check optional substructures (presence flags + key fields).
+    // leakage_budget_receipt — ALL fields
     if let Some(lbr) = &bc.leakage_budget_receipt {
         hasher.update(&[1u8]);
         hasher.update(&lbr.leakage_bits.to_le_bytes());
         hasher.update(&lbr.budget_bits.to_le_bytes());
+        hash_len_prefixed(
+            hasher,
+            leakage_estimator_label(lbr.estimator_family).as_bytes(),
+        );
+        hasher.update(&lbr.confidence_bps.to_le_bytes());
+        hash_len_prefixed(hasher, lbr.confidence_label.as_bytes());
     } else {
         hasher.update(&[0u8]);
     }
+
+    // timing_channel_budget — ALL fields
     if let Some(tcb) = &bc.timing_channel_budget {
         hasher.update(&[1u8]);
         hasher.update(&tcb.release_bucket_ticks.to_le_bytes());
+        hasher.update(&tcb.observed_variance_ticks.to_le_bytes());
         hasher.update(&tcb.budget_ticks.to_le_bytes());
     } else {
         hasher.update(&[0u8]);
     }
+
+    // disclosure_policy_binding — ALL fields
     if let Some(dpb) = &bc.disclosure_policy_binding {
         hasher.update(&[1u8]);
         hasher.update(&[u8::from(dpb.required_for_effect)]);
         hasher.update(&[u8::from(dpb.state_valid)]);
+        hash_len_prefixed(hasher, disclosure_mode_label(dpb.active_mode).as_bytes());
+        hash_len_prefixed(hasher, disclosure_mode_label(dpb.expected_mode).as_bytes());
+        hash_len_prefixed(
+            hasher,
+            disclosure_channel_label(dpb.attempted_channel).as_bytes(),
+        );
         hasher.update(&dpb.policy_snapshot_digest);
+        hasher.update(&dpb.admitted_policy_epoch_root_digest);
+        hasher.update(&dpb.policy_epoch.to_le_bytes());
+        hash_len_prefixed(hasher, dpb.phase_id.as_bytes());
+        hash_len_prefixed(hasher, dpb.state_reason.as_bytes());
     } else {
         hasher.update(&[0u8]);
     }
+}
 
-    // Hash economics trace.
-    hasher.update(envelope.economics_trace.queue_admission.verdict.as_bytes());
-    hasher.update(
-        envelope
-            .economics_trace
-            .queue_admission
-            .queue_lane
-            .as_bytes(),
-    );
-    hasher.update(envelope.economics_trace.budget_admission.verdict.as_bytes());
+/// Hash economics trace fields into the hasher with length-prefix framing.
+fn hash_economics_trace(hasher: &mut blake3::Hasher, trace: &BundleEconomicsTraceV1) {
+    hash_len_prefixed(hasher, trace.queue_admission.verdict.as_bytes());
+    hash_len_prefixed(hasher, trace.queue_admission.queue_lane.as_bytes());
+    hash_optional_str(hasher, trace.queue_admission.defect_reason.as_deref());
+    hash_len_prefixed(hasher, trace.budget_admission.verdict.as_bytes());
+    hash_optional_str(hasher, trace.budget_admission.reason.as_deref());
+}
 
-    // Hash policy binding if present.
+#[allow(clippy::cast_possible_truncation)]
+fn compute_envelope_content_hash(envelope: &EvidenceBundleEnvelopeV1) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(ENVELOPE_HASH_DOMAIN);
+
+    // -- schema (length-prefixed) --
+    hash_len_prefixed(&mut hasher, envelope.schema.as_bytes());
+
+    // -- receipt canonical bytes (length-prefixed) --
+    let receipt_bytes = envelope.receipt.canonical_bytes();
+    hash_len_prefixed(&mut hasher, &receipt_bytes);
+
+    // -- boundary check: ALL fields with deterministic framing --
+    hash_boundary_check(&mut hasher, &envelope.boundary_check);
+
+    // -- economics trace: ALL fields with length-prefix framing --
+    hash_economics_trace(&mut hasher, &envelope.economics_trace);
+
+    // -- policy binding --
     if let Some(binding) = &envelope.policy_binding {
         hasher.update(&[1u8]);
         hasher.update(&binding.policy_digest);
@@ -504,11 +627,10 @@ fn compute_envelope_content_hash(envelope: &EvidenceBundleEnvelopeV1) -> [u8; 32
         hasher.update(&[0u8]);
     }
 
-    // Hash blob references.
+    // -- blob references (length-prefixed array + per-element framing) --
     hasher.update(&(envelope.blob_refs.len() as u64).to_le_bytes());
     for blob_ref in &envelope.blob_refs {
-        hasher.update(&(blob_ref.len() as u64).to_le_bytes());
-        hasher.update(blob_ref.as_bytes());
+        hash_len_prefixed(&mut hasher, blob_ref.as_bytes());
     }
 
     *hasher.finalize().as_bytes()
@@ -655,7 +777,7 @@ fn validate_economics_traces(
 /// Tests for evidence bundle export/import.
 pub mod tests {
     use super::*;
-    use crate::channel::LeakageEstimatorFamily;
+    use crate::channel::{DeclassificationIntentScope, LeakageEstimatorFamily};
     use crate::disclosure::{DisclosureChannelClass, DisclosurePolicyMode};
     use crate::fac::receipt::ChannelBoundaryTrace;
 
@@ -1210,6 +1332,226 @@ pub mod tests {
                 Err(EvidenceBundleError::ChannelBoundaryInvalid { .. })
             ),
             "should reject when disclosure policy binding missing"
+        );
+    }
+
+    // =========================================================================
+    // Negative mutation tests: any field mutation must cause content hash
+    // mismatch when the content_hash is NOT recomputed.
+    // =========================================================================
+
+    /// Helper: build a valid envelope, then mutate a field WITHOUT recomputing
+    /// `content_hash`. The mutated envelope must fail import with
+    /// `ContentHashMismatch`.
+    fn assert_mutation_detected(label: &str, mutator: impl FnOnce(&mut EvidenceBundleEnvelopeV1)) {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let mut envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+
+        // Apply mutation WITHOUT recomputing content_hash.
+        mutator(&mut envelope);
+
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::ContentHashMismatch { .. })),
+            "mutation of {label} should cause ContentHashMismatch, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn mutation_detected_declassification_intent() {
+        assert_mutation_detected("declassification_intent", |env| {
+            env.boundary_check.declassification_intent =
+                DeclassificationIntentScope::RedundancyPurpose;
+        });
+    }
+
+    #[test]
+    fn mutation_detected_timing_observed_variance() {
+        assert_mutation_detected("timing_channel_budget.observed_variance_ticks", |env| {
+            if let Some(ref mut tcb) = env.boundary_check.timing_channel_budget {
+                tcb.observed_variance_ticks = 999_999;
+            }
+        });
+    }
+
+    #[test]
+    fn mutation_detected_leakage_estimator_family() {
+        assert_mutation_detected("leakage_budget_receipt.estimator_family", |env| {
+            if let Some(ref mut lbr) = env.boundary_check.leakage_budget_receipt {
+                lbr.estimator_family = LeakageEstimatorFamily::ChannelCapacityUpperBound;
+            }
+        });
+    }
+
+    #[test]
+    fn mutation_detected_leakage_confidence_bps() {
+        assert_mutation_detected("leakage_budget_receipt.confidence_bps", |env| {
+            if let Some(ref mut lbr) = env.boundary_check.leakage_budget_receipt {
+                lbr.confidence_bps = 5000;
+            }
+        });
+    }
+
+    #[test]
+    fn mutation_detected_leakage_confidence_label() {
+        assert_mutation_detected("leakage_budget_receipt.confidence_label", |env| {
+            if let Some(ref mut lbr) = env.boundary_check.leakage_budget_receipt {
+                lbr.confidence_label = "tampered".to_string();
+            }
+        });
+    }
+
+    #[test]
+    fn mutation_detected_disclosure_active_mode() {
+        assert_mutation_detected("disclosure_policy_binding.active_mode", |env| {
+            if let Some(ref mut dpb) = env.boundary_check.disclosure_policy_binding {
+                dpb.active_mode = DisclosurePolicyMode::SelectiveDisclosure;
+            }
+        });
+    }
+
+    #[test]
+    fn mutation_detected_disclosure_expected_mode() {
+        assert_mutation_detected("disclosure_policy_binding.expected_mode", |env| {
+            if let Some(ref mut dpb) = env.boundary_check.disclosure_policy_binding {
+                dpb.expected_mode = DisclosurePolicyMode::SelectiveDisclosure;
+            }
+        });
+    }
+
+    #[test]
+    fn mutation_detected_disclosure_attempted_channel() {
+        assert_mutation_detected("disclosure_policy_binding.attempted_channel", |env| {
+            if let Some(ref mut dpb) = env.boundary_check.disclosure_policy_binding {
+                dpb.attempted_channel = DisclosureChannelClass::PatentFiling;
+            }
+        });
+    }
+
+    #[test]
+    fn mutation_detected_disclosure_admitted_epoch_root() {
+        assert_mutation_detected(
+            "disclosure_policy_binding.admitted_policy_epoch_root_digest",
+            |env| {
+                if let Some(ref mut dpb) = env.boundary_check.disclosure_policy_binding {
+                    dpb.admitted_policy_epoch_root_digest = [0xFFu8; 32];
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn mutation_detected_disclosure_policy_epoch() {
+        assert_mutation_detected("disclosure_policy_binding.policy_epoch", |env| {
+            if let Some(ref mut dpb) = env.boundary_check.disclosure_policy_binding {
+                dpb.policy_epoch = 999;
+            }
+        });
+    }
+
+    #[test]
+    fn mutation_detected_disclosure_phase_id() {
+        assert_mutation_detected("disclosure_policy_binding.phase_id", |env| {
+            if let Some(ref mut dpb) = env.boundary_check.disclosure_policy_binding {
+                dpb.phase_id = "tampered-phase".to_string();
+            }
+        });
+    }
+
+    #[test]
+    fn mutation_detected_disclosure_state_reason() {
+        assert_mutation_detected("disclosure_policy_binding.state_reason", |env| {
+            if let Some(ref mut dpb) = env.boundary_check.disclosure_policy_binding {
+                dpb.state_reason = "tampered reason".to_string();
+            }
+        });
+    }
+
+    #[test]
+    fn mutation_detected_economics_queue_defect_reason() {
+        assert_mutation_detected("economics_trace.queue_admission.defect_reason", |env| {
+            env.economics_trace.queue_admission.defect_reason = Some("tampered_defect".to_string());
+        });
+    }
+
+    #[test]
+    fn mutation_detected_economics_budget_reason() {
+        assert_mutation_detected("economics_trace.budget_admission.reason", |env| {
+            env.economics_trace.budget_admission.reason =
+                Some("tampered_budget_reason".to_string());
+        });
+    }
+
+    #[test]
+    fn mutation_detected_schema() {
+        // Schema mutation is caught by the schema check (before content hash),
+        // so we verify the import is rejected for either reason.
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let mut envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+        envelope.schema = "apm2.fac.tampered.v1".to_string();
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+        assert!(
+            matches!(
+                result,
+                Err(EvidenceBundleError::SchemaMismatch { .. }
+                    | EvidenceBundleError::ContentHashMismatch { .. })
+            ),
+            "should reject tampered schema, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn mutation_detected_blob_refs() {
+        assert_mutation_detected("blob_refs", |env| {
+            env.blob_refs.push("b3-256:tampered".to_string());
+        });
+    }
+
+    // =========================================================================
+    // Per-field length bounds tests (MINOR fix)
+    // =========================================================================
+
+    #[test]
+    fn import_refuses_overlong_job_id() {
+        let mut receipt = make_valid_receipt();
+        receipt.job_id = "x".repeat(MAX_JOB_ID_LENGTH + 1);
+        let config = make_valid_export_config();
+
+        let mut envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::FieldTooLong { .. })),
+            "should reject overlong job_id, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn import_refuses_overlong_blob_ref() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let overlong_ref = "b".repeat(MAX_BLOB_REF_LENGTH + 1);
+
+        let mut envelope = build_evidence_bundle_envelope(&receipt, &config, &[overlong_ref])
+            .expect("export should succeed");
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::FieldTooLong { .. })),
+            "should reject overlong blob_ref, got: {result:?}"
         );
     }
 }

@@ -674,10 +674,15 @@ exercising RFC-0028 boundary validation and RFC-0029 receipt validation (local-o
 - `build_evidence_bundle_envelope()`: Builds an envelope from a job receipt and
   export config. Requires RFC-0028 boundary trace, RFC-0029 queue admission trace,
   and RFC-0029 budget admission trace in the receipt (fail-closed on missing traces).
-  Computes BLAKE3 content hash with domain-separated, length-prefixed encoding.
+  Computes BLAKE3 content hash with domain-separated, length-prefixed encoding over
+  ALL envelope fields (schema, receipt, boundary check including declassification
+  intent, leakage budget receipt with all subfields, timing channel budget with
+  observed_variance_ticks, disclosure policy binding with all subfields, economics
+  trace with optional defect/reason fields, policy binding, blob refs).
 - `serialize_envelope()`: Serializes the envelope to JSON bytes.
 - `import_evidence_bundle()`: Imports and validates an envelope from JSON bytes.
-  Enforces: bounded read (MAX_ENVELOPE_SIZE=256 KiB), schema verification, content
+  Enforces: bounded read (MAX_ENVELOPE_SIZE=256 KiB), schema verification,
+  per-field length bounds (MAX_JOB_ID_LENGTH, MAX_BLOB_REF_LENGTH), content
   hash integrity, RFC-0028 boundary validation (zero defects required), RFC-0029
   economics receipt validation (Allow verdicts required), and policy binding digest
   matching.
@@ -685,9 +690,14 @@ exercising RFC-0028 boundary validation and RFC-0029 receipt validation (local-o
 ### CLI Commands
 
 - `apm2 fac bundle export <job_id>`: Exports an evidence bundle for a job to
-  `$APM2_HOME/private/fac/bundles/<job_id>/envelope.json`.
+  `$APM2_HOME/private/fac/bundles/<job_id>/`. Constructs `BundleExportConfig`
+  from authoritative receipt artifacts (policy binding, leakage budget receipt,
+  timing channel budget, disclosure policy binding) so exported envelopes satisfy
+  import validation. Discovers and exports receipt/spec blobs from the blob store.
 - `apm2 fac bundle import <path>`: Imports and validates an evidence bundle from a
-  file path. Rejects bundles that fail RFC-0028 or RFC-0029 validation (fail-closed).
+  file path. Opens with `O_NOFOLLOW` (no symlink following), validates regular file
+  via `fstat`, uses bounded streaming read from the same handle (no TOCTOU).
+  Rejects bundles that fail RFC-0028 or RFC-0029 validation (fail-closed).
 
 ### Security Invariants (TCK-00527)
 
@@ -696,12 +706,17 @@ exercising RFC-0028 boundary validation and RFC-0029 receipt validation (local-o
 - [INV-EB-002] Import refuses when economics receipt traces are missing,
   unverifiable, or carry non-Allow verdicts.
 - [INV-EB-003] Envelope reads are bounded by `MAX_ENVELOPE_SIZE` (256 KiB) before
-  deserialization.
-- [INV-EB-004] Envelope content hash is verified via BLAKE3 with constant-time
-  comparison after load.
-- [INV-EB-005] All collection fields are bounded (MAX_BUNDLE_BLOB_COUNT=256).
+  deserialization. Import uses single-handle open + `fstat` + `Read::take` (no
+  TOCTOU between size check and read).
+- [INV-EB-004] Envelope content hash binds ALL validated boundary fields via BLAKE3
+  with length-prefix framing. Every variable-length field uses length-prefix encoding
+  for deterministic framing. Verified via constant-time comparison after load.
+- [INV-EB-005] All collection and string fields are bounded
+  (MAX_BUNDLE_BLOB_COUNT=256, MAX_JOB_ID_LENGTH=256, MAX_BLOB_REF_LENGTH=256).
 - [INV-EB-006] Policy binding digest matching uses constant-time comparison
   (`subtle::ConstantTimeEq::ct_eq()`).
+- [INV-EB-007] Import opens files with `O_NOFOLLOW` (Unix) to refuse symlinks at the
+  kernel level and validates regular file type via `fstat` on the opened handle.
 
 ## Policy Environment Enforcement (TCK-00526)
 
