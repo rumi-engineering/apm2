@@ -12,8 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use apm2_core::fac::{
-    FacPolicyV1, LaneLockGuard, LaneManager, LaneProfileV1, apply_lane_env_overrides,
-    build_job_environment, compute_test_env, ensure_lane_env_dirs,
+    FacPolicyV1, LaneLockGuard, LaneManager, apply_lane_env_overrides, build_job_environment,
+    compute_test_env_for_parallelism, ensure_lane_env_dirs,
 };
 use blake3;
 use sha2::{Digest, Sha256};
@@ -83,7 +83,7 @@ fn compute_gate_env_remove_keys(policy_env: Option<&[(String, String)]>) -> Vec<
     keys
 }
 
-/// Progress event emitted by evidence gate execution at each gate boundary.
+/// Progress events emitted throughout evidence gate execution.
 ///
 /// Callers can provide a callback via [`EvidenceGateOptions::on_gate_progress`]
 /// to receive these events in real time — enabling JSONL streaming of per-gate
@@ -92,6 +92,12 @@ fn compute_gate_env_remove_keys(policy_env: Option<&[(String, String)]>) -> Vec<
 pub enum GateProgressEvent {
     /// Emitted immediately before a gate starts executing.
     Started { gate_name: String },
+    /// Emitted periodically while a gate is still running.
+    Progress {
+        gate_name: String,
+        elapsed_secs: u64,
+        bytes_streamed: u64,
+    },
     /// Emitted immediately after a gate finishes executing.
     Completed {
         gate_name: String,
@@ -124,12 +130,14 @@ pub struct EvidenceGateOptions {
     /// Emit human-oriented status/heartbeat lines to stderr.
     /// JSON streaming callers should set this to `false`.
     pub emit_human_logs: bool,
-    /// Optional callback invoked at each gate boundary during execution.
+    /// Optional callback invoked throughout gate execution.
     ///
     /// When set, this callback receives [`GateProgressEvent::Started`] before
-    /// each gate begins and [`GateProgressEvent::Completed`] after each gate
-    /// finishes. This enables real-time JSONL streaming of per-gate progress
-    /// instead of buffering all events until `run_evidence_gates` returns.
+    /// each gate begins, [`GateProgressEvent::Progress`] heartbeats while a
+    /// gate is running, and [`GateProgressEvent::Completed`] after each gate
+    /// finishes. This enables real-time JSONL streaming of per-gate lifecycle
+    /// progress instead of buffering all events until `run_evidence_gates`
+    /// returns.
     pub on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
 }
 
@@ -181,6 +189,22 @@ fn emit_gate_started_cb(cb: Option<&dyn Fn(GateProgressEvent)>, gate_name: &str)
     if let Some(cb) = cb {
         cb(GateProgressEvent::Started {
             gate_name: gate_name.to_string(),
+        });
+    }
+}
+
+/// Emit a gate-progress heartbeat event via a bare callback reference.
+fn emit_gate_progress_cb(
+    cb: Option<&dyn Fn(GateProgressEvent)>,
+    gate_name: &str,
+    elapsed_secs: u64,
+    bytes_streamed: u64,
+) {
+    if let Some(cb) = cb {
+        cb(GateProgressEvent::Progress {
+            gate_name: gate_name.to_string(),
+            elapsed_secs,
+            bytes_streamed,
         });
     }
 }
@@ -243,7 +267,6 @@ const MONOTONIC_HEARTBEAT_TICK_SECS: u64 = 10;
 const GATE_WAIT_POLL_MILLIS: u64 = 250;
 const MERGE_CONFLICT_GATE_NAME: &str = "merge_conflict_main";
 const DEFAULT_TEST_PIDS_MAX: u64 = 1536;
-const DEFAULT_TEST_CPU_QUOTA: &str = "200%";
 const DEFAULT_TEST_KILL_AFTER_SECONDS: u64 = 20;
 
 struct GateCommandOutput {
@@ -354,6 +377,7 @@ fn run_gate_command_with_heartbeat(
     extra_env: Option<&[(String, String)]>,
     env_remove_keys: Option<&[String]>,
     emit_human_logs: bool,
+    on_gate_progress: Option<&dyn Fn(GateProgressEvent)>,
 ) -> std::io::Result<GateCommandOutput> {
     let mut command = Command::new(cmd);
     command
@@ -437,15 +461,19 @@ fn run_gate_command_with_heartbeat(
         }
 
         let elapsed = started.elapsed();
-        if emit_human_logs && elapsed >= next_heartbeat {
+        if elapsed >= next_heartbeat {
             let elapsed_secs = elapsed.as_secs();
-            eprintln!(
-                "ts={} gate={} status=RUNNING tick={} elapsed_secs={}",
-                now_iso8601(),
-                gate_name,
-                elapsed_secs / MONOTONIC_HEARTBEAT_TICK_SECS,
-                elapsed_secs,
-            );
+            let bytes_streamed = shared_bytes.load(Ordering::SeqCst);
+            emit_gate_progress_cb(on_gate_progress, gate_name, elapsed_secs, bytes_streamed);
+            if emit_human_logs {
+                eprintln!(
+                    "ts={} gate={} status=RUNNING tick={} elapsed_secs={}",
+                    now_iso8601(),
+                    gate_name,
+                    elapsed_secs / MONOTONIC_HEARTBEAT_TICK_SECS,
+                    elapsed_secs,
+                );
+            }
             // Keep heartbeat ticks aligned to fixed wall intervals.
             while elapsed >= next_heartbeat {
                 next_heartbeat += heartbeat_interval;
@@ -652,6 +680,33 @@ fn run_single_evidence_gate_with_env(
     env_remove_keys: Option<&[String]>,
     emit_human_logs: bool,
 ) -> (bool, StreamStats) {
+    run_single_evidence_gate_with_env_and_progress(
+        workspace_root,
+        sha,
+        gate_name,
+        cmd,
+        args,
+        log_path,
+        extra_env,
+        env_remove_keys,
+        emit_human_logs,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_single_evidence_gate_with_env_and_progress(
+    workspace_root: &Path,
+    sha: &str,
+    gate_name: &str,
+    cmd: &str,
+    args: &[&str],
+    log_path: &Path,
+    extra_env: Option<&[(String, String)]>,
+    env_remove_keys: Option<&[String]>,
+    emit_human_logs: bool,
+    on_gate_progress: Option<&dyn Fn(GateProgressEvent)>,
+) -> (bool, StreamStats) {
     let started = Instant::now();
     let output = run_gate_command_with_heartbeat(
         workspace_root,
@@ -662,6 +717,7 @@ fn run_single_evidence_gate_with_env(
         extra_env,
         env_remove_keys,
         emit_human_logs,
+        on_gate_progress,
     );
     let duration = started.elapsed().as_secs();
     match output {
@@ -810,6 +866,9 @@ struct PipelineTestCommand {
     command: Vec<String>,
     bounded_runner: bool,
     effective_timeout_seconds: u64,
+    gate_profile: super::gates::GateThroughputProfile,
+    effective_cpu_quota: String,
+    effective_test_parallelism: u32,
     test_env: Vec<(String, String)>,
     /// Env var keys to remove from the spawned process environment.
     /// Prevents parent env inheritance of `sccache`/`RUSTC_WRAPPER` keys
@@ -851,23 +910,16 @@ fn build_pipeline_test_command(
         ensure_pipeline_managed_cargo_home(&cargo_home)?;
     }
 
-    // Derive the lane_id from the lane_dir for the lane profile. The
-    // lane_id is the final path component (e.g., "lane-00", "lane-01").
-    let lane_id = lane_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            format!(
-                "cannot extract lane_id from lane_dir: {}",
-                lane_dir.display()
-            )
-        })?;
-
     let timeout_decision =
         resolve_bounded_test_timeout(workspace_root, DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS);
-    let profile = LaneProfileV1::new(lane_id, "b3-256:fac-review", "boundary-00")
-        .map_err(|err| format!("failed to construct FAC pipeline lane profile: {err}"))?;
-    let lane_env = compute_test_env(&profile);
+    let gate_profile = super::gates::GateThroughputProfile::Throughput;
+    // Throughput profile is intentionally host-aware and unconstrained by lane
+    // count. Concurrency is controlled by queue admission rather than
+    // per-lane CPU throttling so a single active pipeline can use full machine
+    // capacity.
+    let execution_profile = super::gates::resolve_gate_execution_profile(gate_profile);
+    let effective_cpu_quota = format!("{}%", execution_profile.cpu_quota_percent);
+    let lane_env = compute_test_env_for_parallelism(execution_profile.test_parallelism);
 
     // TCK-00526: Build policy-filtered environment.
     let ambient: Vec<(String, String)> = std::env::vars().collect();
@@ -892,7 +944,7 @@ fn build_pipeline_test_command(
             kill_after_seconds: DEFAULT_TEST_KILL_AFTER_SECONDS,
             memory_max: DEFAULT_TEST_MEMORY_MAX,
             pids_max: DEFAULT_TEST_PIDS_MAX,
-            cpu_quota: DEFAULT_TEST_CPU_QUOTA,
+            cpu_quota: &effective_cpu_quota,
         },
         &build_nextest_command(),
         &test_env,
@@ -905,6 +957,9 @@ fn build_pipeline_test_command(
         command: bounded_spec.command,
         bounded_runner: true,
         effective_timeout_seconds: timeout_decision.effective_seconds,
+        gate_profile,
+        effective_cpu_quota,
+        effective_test_parallelism: execution_profile.test_parallelism,
         test_env,
         env_remove_keys: bounded_spec.env_remove_keys,
     })
@@ -924,6 +979,16 @@ fn resolve_evidence_test_command_environment(
 
 fn resolve_evidence_env_remove_keys(opts: Option<&EvidenceGateOptions>) -> Option<&[String]> {
     opts.and_then(|o| (!o.env_remove_keys.is_empty()).then_some(o.env_remove_keys.as_slice()))
+}
+
+fn resolve_evidence_gate_progress_callback(
+    opts: Option<&EvidenceGateOptions>,
+) -> Option<&dyn Fn(GateProgressEvent)> {
+    opts.and_then(|o| {
+        o.on_gate_progress
+            .as_deref()
+            .map(|cb| cb as &dyn Fn(GateProgressEvent))
+    })
 }
 
 /// Build a policy-filtered environment for all evidence gates (not just
@@ -1200,6 +1265,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
     lane_context: EvidenceLaneContext,
 ) -> Result<(bool, Vec<EvidenceGateResult>), String> {
     let emit_human_logs = opts.is_none_or(|o| o.emit_human_logs);
+    let on_gate_progress = resolve_evidence_gate_progress_callback(opts);
     let logs_dir = lane_context.logs_dir;
 
     // TCK-00526: Build policy-filtered environment for ALL gates (not just
@@ -1288,7 +1354,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
         let log_path = logs_dir.join(format!("{gate_name}.log"));
         emit_gate_started(opts, gate_name);
         let started = Instant::now();
-        let (passed, stream_stats) = run_single_evidence_gate_with_env(
+        let (passed, stream_stats) = run_single_evidence_gate_with_env_and_progress(
             workspace_root,
             sha,
             gate_name,
@@ -1298,6 +1364,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
             Some(&gate_env),
             gate_wrapper_strip_ref,
             emit_human_logs,
+            on_gate_progress,
         );
         let duration = started.elapsed().as_secs();
         let result = build_evidence_gate_result(
@@ -1330,7 +1397,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
         let log_path = logs_dir.join(format!("{gate_name}.log"));
         emit_gate_started(opts, gate_name);
         let started = Instant::now();
-        let (passed, stream_stats) = run_single_evidence_gate_with_env(
+        let (passed, stream_stats) = run_single_evidence_gate_with_env_and_progress(
             workspace_root,
             sha,
             gate_name,
@@ -1340,6 +1407,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
             Some(&gate_env),
             gate_wrapper_strip_ref,
             emit_human_logs,
+            on_gate_progress,
         );
         let duration = started.elapsed().as_secs();
         let result = build_evidence_gate_result(
@@ -1411,7 +1479,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
         let (test_cmd, test_args) = test_command
             .split_first()
             .ok_or_else(|| "test command is empty".to_string())?;
-        let (passed, stream_stats) = run_single_evidence_gate_with_env(
+        let (passed, stream_stats) = run_single_evidence_gate_with_env_and_progress(
             workspace_root,
             sha,
             "test",
@@ -1421,6 +1489,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
             test_env,
             env_remove,
             emit_human_logs,
+            on_gate_progress,
         );
         let test_duration = test_started.elapsed().as_secs();
         let test_result = build_evidence_gate_result(
@@ -1478,7 +1547,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
         let log_path = logs_dir.join(format!("{gate_name}.log"));
         emit_gate_started(opts, gate_name);
         let started = Instant::now();
-        let (passed, stream_stats) = run_single_evidence_gate_with_env(
+        let (passed, stream_stats) = run_single_evidence_gate_with_env_and_progress(
             workspace_root,
             sha,
             gate_name,
@@ -1488,6 +1557,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
             Some(&gate_env),
             gate_wrapper_strip_ref,
             emit_human_logs,
+            on_gate_progress,
         );
         let duration = started.elapsed().as_secs();
         let result = build_evidence_gate_result(
@@ -1589,9 +1659,19 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         pipeline_test_command.effective_timeout_seconds,
         DEFAULT_TEST_MEMORY_MAX,
         DEFAULT_TEST_PIDS_MAX,
-        DEFAULT_TEST_CPU_QUOTA,
+        &pipeline_test_command.effective_cpu_quota,
         pipeline_test_command.bounded_runner,
+        Some(pipeline_test_command.gate_profile.as_str()),
+        Some(pipeline_test_command.effective_test_parallelism),
     );
+    if emit_human_logs {
+        eprintln!(
+            "FAC pipeline test throughput: profile={} cpu_quota={} test_parallelism={}",
+            pipeline_test_command.gate_profile.as_str(),
+            pipeline_test_command.effective_cpu_quota,
+            pipeline_test_command.effective_test_parallelism
+        );
+    }
 
     let gates: &[(&str, &[&str])] = &[
         ("rustfmt", &["cargo", "fmt", "--all", "--check"]),
@@ -1782,7 +1862,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         status.set_running(gate_name);
         updater.update(&status);
         let started = Instant::now();
-        let (passed, stream_stats) = run_single_evidence_gate_with_env(
+        let (passed, stream_stats) = run_single_evidence_gate_with_env_and_progress(
             workspace_root,
             sha,
             gate_name,
@@ -1792,6 +1872,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             Some(&gate_env),
             gate_wrapper_strip_ref,
             emit_human_logs,
+            on_gate_progress,
         );
         let duration = started.elapsed().as_secs();
 
@@ -1938,7 +2019,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         status.set_running(gate_name);
         updater.update(&status);
         let started = Instant::now();
-        let (passed, stream_stats) = run_single_evidence_gate_with_env(
+        let (passed, stream_stats) = run_single_evidence_gate_with_env_and_progress(
             workspace_root,
             sha,
             gate_name,
@@ -1948,6 +2029,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             Some(&gate_env),
             gate_wrapper_strip_ref,
             emit_human_logs,
+            on_gate_progress,
         );
         let duration = started.elapsed().as_secs();
 
@@ -2098,7 +2180,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             } else {
                 Some(pipeline_test_command.env_remove_keys.as_slice())
             };
-            let (passed, stream_stats) = run_single_evidence_gate_with_env(
+            let (passed, stream_stats) = run_single_evidence_gate_with_env_and_progress(
                 workspace_root,
                 sha,
                 gate_name,
@@ -2108,6 +2190,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 Some(&pipeline_test_command.test_env),
                 pipeline_env_remove,
                 emit_human_logs,
+                on_gate_progress,
             );
             let duration = started.elapsed().as_secs();
             status.set_result(gate_name, passed, duration);
@@ -2375,7 +2458,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         status.set_running(gate_name);
         updater.update(&status);
         let started = Instant::now();
-        let (passed, stream_stats) = run_single_evidence_gate_with_env(
+        let (passed, stream_stats) = run_single_evidence_gate_with_env_and_progress(
             workspace_root,
             sha,
             gate_name,
@@ -2385,6 +2468,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             Some(&gate_env),
             gate_wrapper_strip_ref,
             emit_human_logs,
+            on_gate_progress,
         );
         let duration = started.elapsed().as_secs();
         status.set_result(gate_name, passed, duration);
@@ -3060,6 +3144,32 @@ mod tests {
                 assert!(joined.contains("systemd-run"));
                 assert!(joined.contains("cargo nextest run --workspace"));
                 assert!(!joined.contains("run_bounded_tests.sh"));
+                assert_eq!(
+                    command.gate_profile,
+                    crate::commands::fac_review::GateThroughputProfile::Throughput
+                );
+                let host_parallelism = apm2_core::fac::resolve_host_test_parallelism();
+                assert!(command.effective_test_parallelism >= 1);
+                assert!(command.effective_cpu_quota.ends_with('%'));
+                assert_eq!(command.effective_test_parallelism, host_parallelism);
+                assert_eq!(
+                    command.effective_cpu_quota,
+                    format!("{}%", host_parallelism.saturating_mul(100).max(100))
+                );
+                let threads = command
+                    .test_env
+                    .iter()
+                    .find(|(k, _)| k == "NEXTEST_TEST_THREADS")
+                    .and_then(|(_, v)| v.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let build_jobs = command
+                    .test_env
+                    .iter()
+                    .find(|(k, _)| k == "CARGO_BUILD_JOBS")
+                    .and_then(|(_, v)| v.parse::<u32>().ok())
+                    .unwrap_or(0);
+                assert_eq!(threads, command.effective_test_parallelism);
+                assert_eq!(threads, build_jobs);
             },
             Err(err) => {
                 assert!(

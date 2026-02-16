@@ -891,8 +891,8 @@ directories (`~/.cache`, `~/.cargo`, `~/.config`, etc.).
   policy via `policy_loader::load_or_create_fac_policy()`, calls
   `build_job_environment()`, then calls `ensure_lane_env_dirs()` and
   `apply_lane_env_overrides()` to set per-lane `HOME`/`TMPDIR`/`XDG_*` paths
-  (TCK-00575). Lane-derived env vars (`NEXTEST_TEST_THREADS`, `CARGO_BUILD_JOBS`)
-  are overlaid after per-lane env isolation.
+  (TCK-00575). Throughput-profile env vars (`NEXTEST_TEST_THREADS`,
+  `CARGO_BUILD_JOBS`) are overlaid after per-lane env isolation.
   `ensure_managed_cargo_home()` delegates to `policy_loader`.
 - **Pipeline/Evidence** (`fac_review/evidence.rs`): `build_pipeline_test_command()`
   loads policy via `policy_loader::load_or_create_fac_policy()` and builds

@@ -643,7 +643,7 @@ pub use lane::{
     LanePolicy, LaneProfileV1, LaneState, LaneStatusV1, LaneTimeouts, MAX_LANE_COUNT,
     MAX_LANE_ID_LENGTH, MAX_LEASE_FILE_SIZE, MAX_MEMORY_MAX_BYTES, MAX_PROFILE_FILE_SIZE,
     MAX_STRING_LENGTH as MAX_LANE_STRING_LENGTH, MAX_TEST_TIMEOUT_SECONDS, ResourceProfile,
-    compute_test_env,
+    compute_test_env_for_parallelism, resolve_host_test_parallelism,
 };
 // Re-export node identity types (TCK-00556).
 pub use node_identity::{

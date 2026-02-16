@@ -702,16 +702,19 @@ impl LaneProfileV1 {
     }
 }
 
-/// Compute the test runner environment for a lane profile.
-///
-/// Derives:
-/// - `NEXTEST_TEST_THREADS`
-/// - `CARGO_BUILD_JOBS`
-///
-/// `cpu_quota_percent` values lower than 100 still produce one test thread.
+/// Resolve host-parallelism default for FAC test/build execution.
 #[must_use]
-pub fn compute_test_env(profile: &LaneProfileV1) -> Vec<(String, String)> {
-    let cpu_count = std::cmp::max(1, profile.resource_profile.cpu_quota_percent / 100);
+pub fn resolve_host_test_parallelism() -> u32 {
+    std::thread::available_parallelism()
+        .ok()
+        .and_then(|n| u32::try_from(n.get()).ok())
+        .map_or(1, |n| n.max(1))
+}
+
+/// Build test environment variables from an explicit parallelism value.
+#[must_use]
+pub fn compute_test_env_for_parallelism(parallelism: u32) -> Vec<(String, String)> {
+    let cpu_count = parallelism.max(1);
     vec![
         ("NEXTEST_TEST_THREADS".to_string(), cpu_count.to_string()),
         ("CARGO_BUILD_JOBS".to_string(), cpu_count.to_string()),
@@ -2602,17 +2605,37 @@ mod tests {
     }
 
     #[test]
-    fn lane_profile_compute_test_env_uses_cpu_quota() {
-        let mut profile =
-            LaneProfileV1::new("lane-00", "b3-256:abc123", "boundary-00").expect("create profile");
-        profile.resource_profile.cpu_quota_percent = 250;
-        let env = compute_test_env(&profile);
+    fn resolve_host_test_parallelism_is_bounded_and_nonzero() {
+        let parallelism = resolve_host_test_parallelism();
+        assert!(parallelism >= 1);
+    }
+
+    #[test]
+    fn compute_test_env_for_parallelism_sets_both_env_vars() {
+        let env = compute_test_env_for_parallelism(3);
         assert_eq!(env.len(), 2);
+        let threads = env
+            .iter()
+            .find(|(k, _)| k == "NEXTEST_TEST_THREADS")
+            .and_then(|(_, v)| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        let build_jobs = env
+            .iter()
+            .find(|(k, _)| k == "CARGO_BUILD_JOBS")
+            .and_then(|(_, v)| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        assert_eq!(threads, 3);
+        assert_eq!(threads, build_jobs);
+    }
+
+    #[test]
+    fn compute_test_env_for_parallelism_clamps_to_one() {
+        let env = compute_test_env_for_parallelism(0);
         assert!(
             env.iter()
-                .any(|(k, v)| k == "NEXTEST_TEST_THREADS" && v == "2")
+                .any(|(k, v)| k == "NEXTEST_TEST_THREADS" && v == "1")
         );
-        assert!(env.iter().any(|(k, v)| k == "CARGO_BUILD_JOBS" && v == "2"));
+        assert!(env.iter().any(|(k, v)| k == "CARGO_BUILD_JOBS" && v == "1"));
     }
 
     #[test]

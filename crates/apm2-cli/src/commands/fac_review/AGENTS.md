@@ -52,8 +52,10 @@ apm2 fac review run --pr <N> --type all
 - **Liveness monitoring**: Pulse files track reviewer health; stall threshold is 90 seconds.
 - **Idempotent dispatch**: `DispatchIdempotencyKey` prevents duplicate reviews for the same SHA.
 - **SHA freshness**: Reviews are invalidated if PR head moves during execution.
-- **Rust-native bounded tests**: FAC constructs `systemd-run` bounded test execution in Rust with fixed limits:
-  `600s` timeout and `48G` `MemoryMax` for evidence and pipeline test execution.
+- **Rust-native bounded tests**: FAC constructs `systemd-run` bounded test execution in Rust.
+  Timeout and memory containment remain fixed (`600s`, `48G` by default), while CPU
+  quota and test/build parallelism are profile-driven (`throughput`, `balanced`,
+  `conservative`) with host-aware defaults.
   Supports both user-mode (`--user`) and system-mode (`--system`) backends via
   `APM2_FAC_EXECUTION_BACKEND` env var (TCK-00529). On headless VPS without a user
   D-Bus session, auto-mode falls back to system-mode with a dedicated service user.
@@ -272,7 +274,7 @@ pub use types::ReviewRunType;
 | `run_restart(repo, pr, force, json)` | CI-aware pipeline restart |
 | `run_pipeline(repo, pr_number, sha)` | End-to-end: dispatch + project |
 | `run_logs(pr, repo, selector_type, selector, json)` | Retrieve review logs |
-| `run_gates(force, quick, timeout, mem, pids, cpu, json)` | Run pre-review gate checks |
+| `run_gates(force, quick, timeout, mem, pids, cpu, gate_profile, json)` | Run pre-review gate checks |
 
 ## Related Modules
 
@@ -309,7 +311,7 @@ pub use types::ReviewRunType;
   - `run_doctor()` `json_output` parameter is now explicit (no underscore prefix) with documentation that doctor `--pr` intentionally always emits JSON as a machine-readable diagnostic surface.
 - TCK-00526: FAC-managed `CARGO_HOME` + env clearing policy enforcement.
   - `policy_loader.rs` (NEW): Shared module extracted from duplicate implementations in `evidence.rs` and `gates.rs`. Provides `load_or_create_fac_policy()` with bounded I/O (`O_NOFOLLOW` + `Read::take` at `MAX_POLICY_SIZE + 1` bytes, no TOCTOU `exists()` check) and `ensure_managed_cargo_home()` with mode `0o700` in operator mode or `0o770` in system-mode, plus permission verification for existing directories (ownership + mode check, CTR-2611). Both `evidence.rs` and `gates.rs` now delegate to this shared module.
-  - `gates.rs`: `compute_nextest_test_environment()` loads `FacPolicyV1` and calls `build_job_environment()` to produce a policy-filtered environment. Then calls `ensure_lane_env_dirs()` and `apply_lane_env_overrides()` to set per-lane `HOME`/`TMPDIR`/`XDG_CACHE_HOME`/`XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_STATE_HOME`/`XDG_RUNTIME_DIR` paths under `$APM2_HOME/private/fac/lanes/lane-00` (TCK-00575). Lane-derived env vars (`NEXTEST_TEST_THREADS`, `CARGO_BUILD_JOBS`) are overlaid after per-lane env isolation. Policy loading delegates to `policy_loader::load_or_create_fac_policy()`.
+  - `gates.rs`: `compute_nextest_test_environment()` loads `FacPolicyV1` and calls `build_job_environment()` to produce a policy-filtered environment. Then calls `ensure_lane_env_dirs()` and `apply_lane_env_overrides()` to set per-lane `HOME`/`TMPDIR`/`XDG_CACHE_HOME`/`XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_STATE_HOME`/`XDG_RUNTIME_DIR` paths under `$APM2_HOME/private/fac/lanes/lane-00` (TCK-00575). Throughput-profile env vars (`NEXTEST_TEST_THREADS`, `CARGO_BUILD_JOBS`) are overlaid after per-lane env isolation. Policy loading delegates to `policy_loader::load_or_create_fac_policy()`.
   - `evidence.rs`: `build_pipeline_test_command()` loads policy and builds policy-filtered environment for bounded pipeline test execution. Policy loading delegates to `policy_loader::load_or_create_fac_policy()`. `build_gate_policy_env()` added to construct policy-filtered env for non-test gates. `run_evidence_gates()` and `run_evidence_gates_with_status()` now pass the policy-filtered environment to ALL gates (fmt, clippy, doc, script gates, workspace integrity), not just the test gate. `run_gate_command_with_heartbeat()` now calls `env_clear()` before applying `extra_env` to enforce default-deny. `WRAPPER_STRIP_KEYS` and `WRAPPER_STRIP_PREFIXES` constants define `RUSTC_WRAPPER` and `SCCACHE_*` keys that are stripped from ALL gate phases (not just bounded test) via `env_remove_keys` on `Command`. `compute_gate_env_remove_keys()` computes the full removal set from both the ambient process env AND the policy-filtered environment (so policy-introduced SCCACHE_* variables are also discovered).
   - `bounded_test_runner.rs`: `SYSTEMD_SETENV_ALLOWLIST_EXACT` extended with `RUSTUP_HOME`, `PATH`, `HOME`, `USER`, `LANG` for correct toolchain resolution inside systemd transient units. `SYSTEMD_SETENV_ALLOWLIST_PREFIXES` aligned with `FacPolicyV1` default allowlist (`LC_`, `TERM`, `XDG_`) so policy-derived variables are not rejected by the bounded runner's setenv validation.
 - TCK-00575: Per-lane HOME/TMPDIR/XDG env isolation + symlink safety + concurrency.

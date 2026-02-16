@@ -108,6 +108,14 @@ ticket_meta:
       - Use repository toolchain baseline (`rust-toolchain.toml`, nightly-2025-12-01).
       - Use deterministic bounded test settings from `.config/nextest.toml` unless explicitly ratified.
       - No shared mutable build output across concurrent isolated workspaces in this ticket scope.
+    amendments:
+      - amendment_id: "AMD-2026-02-16-FAC-THROUGHPUT-PIVOT"
+        summary: "Containment ceilings remain mandatory, but low fixed throughput defaults are no longer normative for high-capacity hosts."
+        supersedes:
+          - "Interpretation that bounded runner defaults should always operate at conservative CPU throughput."
+        replacement:
+          - "Bounded controls are security containment primitives."
+          - "Throughput defaults are selected by host-aware profile with queue admission to manage contention."
     files: |
       - crates/apm2-daemon/src/gate/mod.rs
       - crates/apm2-daemon/src/gate/orchestrator.rs

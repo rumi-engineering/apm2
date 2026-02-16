@@ -81,6 +81,14 @@ ticket_meta:
       - "`cargo test -p apm2-cli fac_review` — all tests pass."
   notes:
     security: "E2E agent tests that spawn full agent lifecycles are banned from the default test suite; when enabled they must use temp `APM2_HOME`, mock GitHub adapters, and satisfy EVID-HEF-0012. Manual terminate is decision-authority-gated and fails closed without signed decision projection."
+    amendments:
+      - amendment_id: "AMD-2026-02-16-FAC-THROUGHPUT-PIVOT"
+        summary: "Uniform timeout/memory safety policy is retained; throughput defaults move to profile-driven host-aware settings."
+        supersedes:
+          - "Implicit assumption that bounded policy unification implies conservative CPU throughput defaults."
+        replacement:
+          - "Timeout and memory invariants remain standardized and fail-closed."
+          - "CPU quota and test/build parallelism defaults are resolved by gate throughput profile (`throughput|balanced|conservative`)."
     critical_files:
       - "crates/apm2-cli/src/commands/fac_review/backend.rs — Codex/Gemini command builders"
       - "crates/apm2-cli/src/commands/fac_review/decision.rs — terminate_review_agent + call site"

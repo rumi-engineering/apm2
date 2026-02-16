@@ -658,6 +658,37 @@ scope:
           - PR body update count per gate transition is 1 (not 2).
           - Old-format PRs are migrated on next status sync.
 
+    - id: S10_FULL_MACHINE_THROUGHPUT_POLICY
+      title: "Use full host compute for FAC pipeline tests; rely on queue admission for contention"
+      detail: |
+        The throughput pivot requires gates and pipeline to use the same
+        host-aware default compute policy:
+
+        1. In `crates/apm2-cli/src/commands/fac_review/evidence.rs`
+           (`build_pipeline_test_command`), remove the per-lane cap:
+
+               lane_parallelism_cap = host_parallelism / lane_count
+               execution_profile = cap_execution_parallelism(...)
+
+           and resolve throughput directly from host parallelism:
+
+               execution_profile = resolve_gate_execution_profile(Throughput)
+
+        2. Keep containment bounds (`RuntimeMaxSec`, `MemoryMax`,
+           `TasksMax`) unchanged. This change is about throughput policy,
+           not removing containment.
+
+        3. Keep contention control at queue admission / lane scheduling,
+           not at per-job CPU throttling defaults.
+
+        Acceptance:
+          - Pipeline throughput defaults resolve to host parallelism
+            (no `host/lane_count` split).
+          - `NEXTEST_TEST_THREADS` and `CARGO_BUILD_JOBS` in pipeline
+            env equal host parallelism under throughput defaults.
+          - Default pipeline CPU quota equals `host_parallelism * 100%`.
+          - Memory, PID, and timeout containment limits remain enforced.
+
   out_of_scope:
     - "Revoking the merge of PR #692. The PR is already on main; reverting requires a separate coordinated rollback."
     - "Adding a pre-merge verification hook on GitHub (GitHub-side protection rules are outside the CLI's control plane)."
@@ -758,6 +789,18 @@ plan:
         9. Manual: restart reviews for a PR, verify stale-verdict
            window is eliminated.
 
+    - id: STEP_11
+      title: "Align pipeline throughput defaults with full-machine policy"
+      detail: |
+        1. Remove per-lane CPU/test-thread cap from
+           `build_pipeline_test_command`.
+        2. Ensure throughput profile uses host parallelism directly
+           in both `fac gates` and pipeline paths.
+        3. Add/update tests to assert pipeline env (`NEXTEST_TEST_THREADS`,
+           `CARGO_BUILD_JOBS`) and effective CPU quota match host
+           parallelism defaults.
+        4. Verify containment knobs (memory/pids/timeout) are unchanged.
+
 definition_of_done:
   evidence_ids: []
   criteria:
@@ -779,6 +822,9 @@ definition_of_done:
     - "Current SHA full breakdown appears immediately after ticket YAML + commit history in the PR body."
     - "All previous SHAs are in a single `<details>` collapsible with brief one-line-per-gate YAML summary."
     - "Old-format PR bodies (table + JSON) are migrated to new format on next status sync."
+    - "Pipeline throughput defaults use host parallelism directly (no per-lane CPU split)."
+    - "Pipeline default `NEXTEST_TEST_THREADS`/`CARGO_BUILD_JOBS` and effective CPU quota match host parallelism."
+    - "Containment remains bounded (memory, pids, timeout) despite throughput pivot."
     - "`cargo test -p apm2-cli` passes."
 
 notes:
@@ -817,4 +863,11 @@ notes:
     This is safety-critical: the merge gate exists specifically to
     prevent code with unresolved MAJOR/BLOCKER findings from reaching
     main. The stale-verdict bypass undermines this guarantee.
+  amendments:
+    - amendment_id: "AMD-2026-02-16-FAC-THROUGHPUT-PIVOT"
+      summary: "Clarify that references to bounded CPUQuota in this incident are containment concerns, not normative low-throughput defaults."
+      replacement:
+        - "Bounded execution remains mandatory for containment and fail-closed behavior."
+        - "Default gate throughput policy is profile-driven and host-aware, with queue admission controlling contention."
+        - "Pipeline throughput defaults are aligned with gates: full host parallelism by default, no per-lane CPU split."
   security: "default-deny, least privilege, fail-closed"

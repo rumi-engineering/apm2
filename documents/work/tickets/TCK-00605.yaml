@@ -952,3 +952,9 @@ ticket_meta:
 
       The orchestrator-monitor SKILL.md per-PR capacity fix is already done in
       this branch (SATURATION_CHECK, ENFORCE_BACKPRESSURE, invariants updated).
+    amendments:
+      - amendment_id: "AMD-2026-02-16-FAC-THROUGHPUT-PIVOT"
+        summary: "Bounded test execution remains mandatory as containment; throughput defaults move to host-aware profile resolution."
+        replacement:
+          - "Use gate throughput profiles (`throughput`, `balanced`, `conservative`) for CPU/test parallelism defaults."
+          - "Use queue admission as the primary contention control on high-capacity hosts."

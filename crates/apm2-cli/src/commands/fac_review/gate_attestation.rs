@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 /// HEAD:path ignored uncommitted file content (TCK-00544).
 const ATTESTATION_SCHEMA: &str = "apm2.fac.gate_attestation.v2";
 const ATTESTATION_DOMAIN: &str = "apm2.fac.gate.attestation/v2";
-const POLICY_SCHEMA: &str = "apm2.fac.gate_reuse_policy.v1";
+const POLICY_SCHEMA: &str = "apm2.fac.gate_reuse_policy.v2";
 const MAX_ATTESTATION_INPUT_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,11 +32,14 @@ pub struct GateResourcePolicy {
     pub memory_max: Option<String>,
     pub pids_max: Option<u64>,
     pub cpu_quota: Option<String>,
+    pub gate_profile: Option<String>,
+    pub test_parallelism: Option<u32>,
     pub bounded_runner: bool,
 }
 
 impl GateResourcePolicy {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn from_cli(
         quick_mode: bool,
         timeout_seconds: u64,
@@ -44,6 +47,8 @@ impl GateResourcePolicy {
         pids_max: u64,
         cpu_quota: &str,
         bounded_runner: bool,
+        gate_profile: Option<&str>,
+        test_parallelism: Option<u32>,
     ) -> Self {
         Self {
             quick_mode,
@@ -51,6 +56,8 @@ impl GateResourcePolicy {
             memory_max: Some(memory_max.to_string()),
             pids_max: Some(pids_max),
             cpu_quota: Some(cpu_quota.to_string()),
+            gate_profile: gate_profile.map(str::to_string),
+            test_parallelism,
             bounded_runner,
         }
     }
@@ -495,7 +502,8 @@ mod tests {
         let workspace_root = std::env::current_dir().expect("cwd");
         let command =
             gate_command_for_attestation(&workspace_root, "rustfmt", None).expect("command");
-        let policy = GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true);
+        let policy =
+            GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true, None, None);
 
         let one = compute_gate_attestation(
             &workspace_root,
@@ -637,6 +645,35 @@ mod tests {
         assert_ne!(d1, d2, "command_digest must differ when gate name differs");
     }
 
+    #[test]
+    fn resource_digest_binds_throughput_profile_and_parallelism() {
+        let throughput = GateResourcePolicy::from_cli(
+            false,
+            600,
+            "48G",
+            1536,
+            "800%",
+            true,
+            Some("throughput"),
+            Some(8),
+        );
+        let conservative = GateResourcePolicy::from_cli(
+            false,
+            600,
+            "48G",
+            1536,
+            "200%",
+            true,
+            Some("conservative"),
+            Some(2),
+        );
+        assert_ne!(
+            super::resource_digest(&throughput),
+            super::resource_digest(&conservative),
+            "resource digest must change when throughput profile/parallelism changes"
+        );
+    }
+
     // --- TCK-00544: attestation schema version bump + file-content binding ---
 
     #[test]
@@ -665,7 +702,8 @@ mod tests {
         let workspace_root = std::env::current_dir().expect("cwd");
         let command =
             gate_command_for_attestation(&workspace_root, "rustfmt", None).expect("command");
-        let policy = GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true);
+        let policy =
+            GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true, None, None);
 
         let attestation = compute_gate_attestation(
             &workspace_root,

@@ -36,3 +36,11 @@ ticket_meta:
     criteria:
       - "No FAC path executes `cargo test`."
       - "Bounded test runner receives and respects computed env knobs."
+  amendments:
+    - amendment_id: "AMD-2026-02-16-FAC-THROUGHPUT-PIVOT"
+      summary: "Reclassify bounded test controls as containment invariants and decouple default throughput from lane cpu_quota."
+      supersedes:
+        - "Set `NEXTEST_TEST_THREADS` and `CARGO_BUILD_JOBS` based on lane policy."
+      replacement:
+        - "Set `NEXTEST_TEST_THREADS` and `CARGO_BUILD_JOBS` from host-aware throughput profile defaults."
+        - "Containment controls (systemd bounds, timeout, env filtering) remain mandatory fail-closed invariants."

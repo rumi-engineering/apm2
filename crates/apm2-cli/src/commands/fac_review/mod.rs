@@ -65,6 +65,7 @@ pub use finding::{
     ReviewFindingSeverityArg as ReviewCommentSeverityArg, ReviewFindingSeverityArg,
     ReviewFindingTypeArg as ReviewCommentTypeArg, ReviewFindingTypeArg,
 };
+pub use gates::GateThroughputProfile;
 pub use lifecycle::VerdictValueArg;
 use projection::{projection_state_done, projection_state_failed, run_project_inner};
 use serde::Serialize;
@@ -4076,6 +4077,7 @@ pub fn run_gates(
     memory_max: &str,
     pids_max: u64,
     cpu_quota: &str,
+    gate_profile: GateThroughputProfile,
     json_output: bool,
 ) -> u8 {
     gates::run_gates(
@@ -4085,6 +4087,7 @@ pub fn run_gates(
         memory_max,
         pids_max,
         cpu_quota,
+        gate_profile,
         json_output,
     )
 }

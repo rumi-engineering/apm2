@@ -369,8 +369,13 @@ pub struct GatesArgs {
     #[arg(long, default_value_t = 1536)]
     pub pids_max: u64,
 
-    /// CPU quota for bounded test execution.
-    #[arg(long, default_value = "200%")]
+    /// Throughput profile for bounded gate execution.
+    #[arg(long, value_enum, default_value_t = fac_review::GateThroughputProfile::Throughput)]
+    pub gate_profile: fac_review::GateThroughputProfile,
+
+    /// CPU quota for bounded test execution (`auto` resolves from
+    /// --gate-profile).
+    #[arg(long, default_value = "auto")]
     pub cpu_quota: String,
 
     /// Emit JSON output for this command.
@@ -1996,6 +2001,7 @@ pub fn run_fac(
             &args.memory_max,
             args.pids_max,
             &args.cpu_quota,
+            args.gate_profile,
             resolve_json(args.json),
         ),
         FacSubcommand::Work(args) => match &args.subcommand {
@@ -5997,6 +6003,11 @@ mod tests {
         match parsed.subcommand {
             FacSubcommand::Gates(args) => {
                 assert_eq!(args.timeout_seconds, 600);
+                assert_eq!(
+                    args.gate_profile,
+                    fac_review::GateThroughputProfile::Throughput
+                );
+                assert_eq!(args.cpu_quota, "auto");
             },
             other => panic!("expected gates subcommand, got {other:?}"),
         }

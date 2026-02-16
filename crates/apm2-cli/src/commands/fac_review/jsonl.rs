@@ -84,6 +84,15 @@ pub struct GateStartedEvent {
 }
 
 #[derive(Debug, Serialize)]
+pub struct GateProgressTickEvent {
+    pub event: &'static str,
+    pub gate: String,
+    pub elapsed_secs: u64,
+    pub bytes_streamed: u64,
+    pub ts: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct GateCompletedEvent {
     pub event: &'static str,
     pub gate: String,
@@ -209,6 +218,31 @@ mod tests {
         assert_eq!(
             payload.get("elapsed_seconds").and_then(Value::as_u64),
             Some(1200)
+        );
+    }
+
+    #[test]
+    fn gate_progress_tick_serialization_includes_progress_fields() {
+        let payload = serde_json::to_value(GateProgressTickEvent {
+            event: "gate_progress",
+            gate: "test".to_string(),
+            elapsed_secs: 30,
+            bytes_streamed: 4096,
+            ts: "2026-02-16T00:00:00.000Z".to_string(),
+        })
+        .expect("serialize gate progress event");
+        assert_eq!(
+            payload.get("event").and_then(Value::as_str),
+            Some("gate_progress")
+        );
+        assert_eq!(payload.get("gate").and_then(Value::as_str), Some("test"));
+        assert_eq!(
+            payload.get("elapsed_secs").and_then(Value::as_u64),
+            Some(30)
+        );
+        assert_eq!(
+            payload.get("bytes_streamed").and_then(Value::as_u64),
+            Some(4096)
         );
     }
 }
