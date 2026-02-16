@@ -5208,8 +5208,13 @@ mod tests {
 
         for target in &reset_targets {
             assert!(
-                !target.exists(),
-                "target {} should be deleted by lane reset",
+                target.exists(),
+                "target {} should be recreated by lane reset",
+                target.display()
+            );
+            assert!(
+                !target.join("stale-state").exists(),
+                "stale-state in {} should be deleted by lane reset",
                 target.display()
             );
         }
