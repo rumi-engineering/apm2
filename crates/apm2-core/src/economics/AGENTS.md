@@ -339,6 +339,79 @@ All admission decisions require valid temporal authority:
 - `evaluate_queue_admission(request, scheduler, verifier) -> QueueAdmissionDecision` -- Queue admission (must_use)
 - `evaluate_anti_entropy_admission(request, budget, verifier) -> QueueAdmissionDecision` -- Anti-entropy admission (must_use)
 
+## Cost Model (TCK-00532)
+
+The `cost_model` submodule implements per-job-kind cost estimation and post-run calibration for RFC-0029 queue admission.
+
+### Overview
+
+Provides conservative, monotone-safe cost estimates for each job kind. Estimates start at pessimistic defaults and can only be calibrated downward based on observed receipt data. The cost model is persisted as part of `SchedulerStateV1` for continuity across restarts.
+
+```text
+CostModelV1
+    |
+    +--- estimate(kind) --> JobCostEstimate (ticks, wall_ms, io_bytes)
+    |
+    +--- queue_cost(kind) --> u64 (ticks for QueueAdmissionRequest.cost)
+    |
+    +--- calibrate(kind, observed) --> monotone-safe EWMA update
+```
+
+### Key Types
+
+- `CostModelV1` -- Per-job-kind cost model with BTreeMap-ordered estimates and calibration state. Content-addressed via BLAKE3.
+- `JobCostEstimate` -- Deterministic cost estimate tuple (estimated_ticks, estimated_wall_ms, estimated_io_bytes).
+- `ObservedJobCost` -- Observed runtime metrics (duration_ms, cpu_time_ms, bytes_written) recorded in `FacJobReceiptV1`.
+- `CalibrationState` -- Per-kind EWMA tracking state (ewma_wall_ms, ewma_io_bytes, sample_count).
+- `CostModelError` -- Error enum for bounds violations and serialization failures.
+
+### Conservative Defaults
+
+| Kind         | Ticks | Wall (ms) | I/O (bytes) |
+|-------------|-------|-----------|-------------|
+| gates       | 600   | 600,000   | 500,000,000 |
+| warm        | 300   | 300,000   | 1,000,000,000 |
+| bulk        | 900   | 900,000   | 2,000,000,000 |
+| control     | 30    | 30,000    | 10,000,000 |
+| stop_revoke | 10    | 10,000    | 1,000,000 |
+| (unknown)   | 900   | 900,000   | 2,000,000,000 |
+
+### Invariants
+
+- [INV-CM01] Every known job kind has a deterministic cost estimate.
+- [INV-CM02] Calibration never increases cost estimates beyond their initial conservative defaults (bounded-safe: estimates adapt bidirectionally within `[floor, default]` but can never exceed the default).
+- [INV-CM03] Calibration never makes the system less safe (never increases concurrency budgets or admission windows).
+- [INV-CM04] Cost model is bounded: maximum of `MAX_JOB_KINDS` (16) entries.
+- [INV-CM05] Unknown job kinds receive the most conservative (largest) estimate.
+- [INV-CM06] All arithmetic uses checked/saturating operations; EWMA uses u128 intermediates.
+- [INV-CM07] Calibration sample count is bounded by `MAX_CALIBRATION_SAMPLES` (1024).
+- [INV-CM08] `ObservedJobCost` fields are bounded by `u64::MAX`.
+
+### Contracts
+
+- [CTR-CM01] `estimate()` always returns a valid `JobCostEstimate` for any input string (fail-closed to conservative default for unknown kinds).
+- [CTR-CM02] `calibrate()` adjusts estimates bidirectionally within `[floor, default]` bounds (never exceeds the conservative default).
+- [CTR-CM03] `CostModelV1` round-trips through serde deterministically.
+- [CTR-CM04] `canonical_bytes()` produces deterministic output for hashing.
+
+### Integration Points
+
+- `FacJobReceiptV1.observed_cost: Option<ObservedJobCost>` -- Receipt field for post-run calibration data.
+- `SchedulerStateV1.cost_model: Option<CostModelV1>` -- Persistent storage in scheduler state.
+- `QueueAdmissionRequest.cost` -- Populated from `CostModelV1::queue_cost(kind)` instead of hardcoded value.
+- `QueueAdmissionTrace.cost_estimate_ticks` -- Records the cost estimate used for admission decision auditing.
+
+### Public API
+
+- `CostModelV1::with_defaults() -> Self` -- Creates cost model with conservative defaults for all known kinds.
+- `CostModelV1::estimate(kind) -> JobCostEstimate` -- Returns cost estimate for a job kind (fail-closed to conservative default).
+- `CostModelV1::queue_cost(kind) -> u64` -- Returns estimated ticks for queue admission cost field.
+- `CostModelV1::calibrate(kind, observed) -> Result<(), CostModelError>` -- Monotone-safe EWMA calibration from observed cost.
+- `CostModelV1::validate() -> Result<(), CostModelError>` -- Validates cost model structure.
+- `CostModelV1::canonical_bytes() -> Result<Vec<u8>, CostModelError>` -- Deterministic canonical JSON bytes.
+- `CostModelV1::compute_content_hash() -> Result<String, CostModelError>` -- BLAKE3 content hash.
+- `CostModelV1::reset_to_defaults()` -- Reset to conservative defaults, discarding calibration.
+
 ## Replay-Recovery Bounds (REQ-0005)
 
 The `replay_recovery` submodule implements replay-recovery bounds and idempotency closure (RFC-0029 REQ-0005).

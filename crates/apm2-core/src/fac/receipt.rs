@@ -635,6 +635,11 @@ pub struct QueueAdmissionTrace {
     pub queue_lane: String,
     /// Optional deny reason.
     pub defect_reason: Option<String>,
+    /// TCK-00532: Cost estimate (in ticks) used for this admission decision.
+    /// Present when the cost model provided the estimate; absent for legacy
+    /// receipts created before cost model integration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_estimate_ticks: Option<u64>,
 }
 
 /// Placeholder trace for RFC-0029 budget admission.
@@ -865,6 +870,17 @@ impl FacJobReceiptV1 {
     ///
     /// New receipts should use v2. Existing v1 receipts remain verifiable
     /// via `canonical_bytes()`.
+    ///
+    /// # V2 Schema Break (TCK-00573)
+    ///
+    /// The V2 canonical format was intentionally changed from positional
+    /// `0u8`/`1u8` presence markers to type-specific tagged markers
+    /// (`1u8`/`2u8`/`3u8`) for trailing optional fields. This prevents
+    /// canonicalization collisions between different optional field
+    /// combinations (injective encoding). No V2 receipts exist in
+    /// production -- V2 was introduced as a forward-looking format and has
+    /// not been deployed to any production receipt store. This schema break
+    /// is therefore safe and requires no migration.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn canonical_bytes_v2(&self) -> Vec<u8> {
@@ -2440,6 +2456,7 @@ pub mod tests {
                         verdict: "allow".to_string(),
                         queue_lane: "bulk".to_string(),
                         defect_reason: None,
+                        cost_estimate_ticks: None,
                     })
                     .eio29_budget_admission(BudgetAdmissionTrace {
                         verdict: "allow".to_string(),
@@ -2741,6 +2758,7 @@ pub mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -2802,6 +2820,7 @@ pub mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -2838,6 +2857,7 @@ pub mod tests {
             verdict: "deny".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: Some("quarantine required".to_string()),
+            cost_estimate_ticks: None,
         })
         .try_build()
         .expect("receipt with moved_job_path");
@@ -2875,6 +2895,7 @@ pub mod tests {
             verdict: "deny".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: Some("missing authority".to_string()),
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -2909,6 +2930,7 @@ pub mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -3016,6 +3038,7 @@ pub mod tests {
             verdict: "deny".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: Some("denied".to_string()),
+            cost_estimate_ticks: None,
         })
         .try_build();
 
@@ -3697,6 +3720,7 @@ pub mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         })
         .sandbox_hardening_hash(&hash)
         .try_build()
@@ -3778,6 +3802,7 @@ pub mod tests {
             verdict: "allow".to_string(),
             queue_lane: "bulk".to_string(),
             defect_reason: None,
+            cost_estimate_ticks: None,
         })
         .sandbox_hardening_hash("not-a-valid-hash")
         .try_build();
@@ -3927,6 +3952,30 @@ pub mod tests {
         assert!(
             result.is_err(),
             "malformed sandbox_hardening_hash must be rejected by GateReceiptBuilder"
+        );
+    }
+
+    #[test]
+    fn queue_admission_trace_cost_estimate_ticks_round_trip() {
+        // TCK-00532: Verify that cost_estimate_ticks is preserved through
+        // serde round-trip for audit trail completeness.
+        let trace_with = QueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+            cost_estimate_ticks: Some(600),
+        };
+        let bytes = serde_json::to_vec(&trace_with).expect("serialize");
+        let restored: QueueAdmissionTrace = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(restored.cost_estimate_ticks, Some(600));
+
+        // Verify absent field deserializes correctly (backward compat).
+        let json_without = r#"{"verdict":"allow","queue_lane":"bulk","defect_reason":null}"#;
+        let restored_without: QueueAdmissionTrace =
+            serde_json::from_str(json_without).expect("deserialize without field");
+        assert_eq!(
+            restored_without.cost_estimate_ticks, None,
+            "missing cost_estimate_ticks must default to None"
         );
     }
 }
