@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -173,7 +175,12 @@ fn file_is_symlink(path: &Path) -> Result<bool, String> {
 }
 
 fn read_bounded(path: &Path) -> Result<String, String> {
-    let mut file = std::fs::File::open(path)
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
         .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
     let metadata = file
         .metadata()
@@ -191,9 +198,19 @@ fn read_bounded(path: &Path) -> Result<String, String> {
             metadata.len()
         ));
     }
+    let mut file = file;
+    let mut limited = (&mut file).take(MAX_CACHE_READ_BYTES as u64 + 1);
     let mut content = String::new();
-    file.read_to_string(&mut content)
+    limited
+        .read_to_string(&mut content)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    if limited.limit() == 0 {
+        return Err(format!(
+            "refusing oversized cache file {} (> {} bytes)",
+            path.display(),
+            MAX_CACHE_READ_BYTES
+        ));
+    }
     Ok(content)
 }
 
