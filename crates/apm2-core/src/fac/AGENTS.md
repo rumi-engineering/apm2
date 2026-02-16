@@ -1308,6 +1308,9 @@ inconsistencies deterministically on worker startup.
      orphaned jobs not backed by any active lane. Rejects symlinks and
      non-regular file types. Applies configured policy (requeue to `pending/`
      or mark failed to `denied/`). Move failures are propagated, not swallowed.
+     Returns `QueueReconcileResult` with partial counts and optional error
+     (mirroring Phase 1's `LaneReconcileResult` pattern) so partial receipts
+     include accurate `claimed_files_inspected` counts.
 - `ReconcileReceiptV1::load()`: Bounded receipt deserialization with size cap,
   schema validation (rejects non-matching `schema` field), and post-parse
   bounds validation.
@@ -1372,7 +1375,9 @@ inconsistencies deterministically on worker startup.
 - [INV-RECON-007] Move operations are fail-closed: `move_file_safe` propagates
   rename failures as `ReconcileError::MoveFailed`. Queue reconciliation counters
   only increment after confirmed rename success. Requeue failures attempt
-  fallback to denied before returning an error.
+  fallback to denied before returning an error. Exception: `NotFound` on rename
+  is treated as success ("already handled by another worker") to support
+  concurrent multi-worker reconciliation without startup failures.
 - [INV-RECON-008] Queue scanning rejects non-regular files (symlinks, FIFOs,
   block/char devices, sockets) via `entry.file_type()` check.
   `extract_job_id_from_claimed` validates with `symlink_metadata` and reads
