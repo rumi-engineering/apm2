@@ -345,6 +345,8 @@ pub enum DoctorExitActionArg {
     Fix,
     Escalate,
     Merge,
+    Done,
+    Approve,
     DispatchImplementor,
     RestartReviews,
 }
@@ -355,6 +357,8 @@ impl DoctorExitActionArg {
             Self::Fix => "fix",
             Self::Escalate => "escalate",
             Self::Merge => "merge",
+            Self::Done => "done",
+            Self::Approve => "approve",
             Self::DispatchImplementor => "dispatch_implementor",
             Self::RestartReviews => "restart_reviews",
         }
@@ -5099,6 +5103,46 @@ mod tests {
         match parsed.subcommand {
             FacSubcommand::Doctor(args) => {
                 assert_eq!(args.exit_on, vec![DoctorExitActionArg::Escalate]);
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_doctor_wait_exit_on_accepts_done_action() {
+        let parsed = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "doctor",
+            "--pr",
+            "615",
+            "--wait-for-recommended-action",
+            "--exit-on",
+            "done",
+        ])
+        .expect("done should parse as a valid doctor exit action");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert_eq!(args.exit_on, vec![DoctorExitActionArg::Done]);
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_doctor_wait_exit_on_accepts_approve_action() {
+        let parsed = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "doctor",
+            "--pr",
+            "615",
+            "--wait-for-recommended-action",
+            "--exit-on",
+            "approve",
+        ])
+        .expect("approve should parse as a valid doctor exit action");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert_eq!(args.exit_on, vec![DoctorExitActionArg::Approve]);
             },
             other => panic!("expected doctor subcommand, got {other:?}"),
         }

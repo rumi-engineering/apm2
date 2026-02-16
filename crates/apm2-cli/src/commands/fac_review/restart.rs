@@ -272,6 +272,15 @@ fn run_restart_inner(
     })
 }
 
+pub(super) fn run_restart_for_doctor_fix(
+    repo: &str,
+    pr_number: u32,
+    force: bool,
+    refresh_identity: bool,
+) -> Result<RestartSummary, String> {
+    run_restart_inner(repo, Some(pr_number), force, refresh_identity, true)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
