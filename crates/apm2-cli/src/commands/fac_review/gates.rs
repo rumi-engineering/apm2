@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use apm2_core::fac::job_spec::{
     Actuation, FacJobSpecV1, JobConstraints, JobSource, LaneRequirements, MAX_QUEUE_LANE_LENGTH,
-    parse_b3_256_digest, validate_job_spec,
+    validate_job_spec,
 };
 use apm2_core::fac::{
     FacPolicyV1, LaneLockGuard, LaneManager, LaneState, apply_lane_env_overrides,
@@ -292,6 +292,7 @@ fn run_gates_via_worker(
         &lease_id,
         &repo_source.repo_id,
         &repo_source.head_sha,
+        &policy_digest,
         memory_max_bytes,
         &options,
         &boundary_id,
@@ -405,6 +406,7 @@ fn build_gates_job_spec(
     lease_id: &str,
     repo_id: &str,
     head_sha: &str,
+    policy_digest: &[u8; 32],
     memory_max_bytes: u64,
     options: &GatesJobOptionsV1,
     boundary_id: &str,
@@ -449,13 +451,14 @@ fn build_gates_job_spec(
     let digest = spec
         .compute_digest()
         .map_err(|err| format!("compute digest: {err}"))?;
-    let digest_bytes =
-        parse_b3_256_digest(&digest).ok_or_else(|| "invalid computed spec digest".to_string())?;
     spec.job_spec_digest.clone_from(&digest);
     spec.actuation.request_id.clone_from(&digest);
 
+    // Bind policy fields to the admitted FAC policy digest and bind the
+    // specific job through request_id (= spec digest), preserving fail-closed
+    // token verification while avoiding digest-domain mismatch.
     let token = broker
-        .issue_channel_context_token(&digest_bytes, lease_id, &digest, boundary_id)
+        .issue_channel_context_token(policy_digest, lease_id, &digest, boundary_id)
         .map_err(|err| format!("issue channel context token: {err}"))?;
     spec.actuation.channel_context_token = Some(token);
     validate_job_spec(&spec).map_err(|err| format!("validate job spec: {err}"))?;

@@ -1,6 +1,7 @@
 //! Evidence gates (fmt, clippy, doc, test, native checks) for FAC push
 //! pipeline.
 
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -957,11 +958,8 @@ fn build_pipeline_test_command(
         ));
     }
 
-    // TCK-00526: Load FAC policy for environment enforcement in the
-    // pipeline path. Same policy-driven env clearing as the gates path.
-    let apm2_home = apm2_core::github::resolve_apm2_home()
-        .ok_or_else(|| "cannot resolve APM2_HOME for env policy enforcement".to_string())?;
-    let fac_root = apm2_home.join("private/fac");
+    // Derive roots from the locked lane path to avoid ambient env races.
+    let (apm2_home, fac_root) = resolve_pipeline_roots_from_lane_dir(lane_dir)?;
     let policy = load_or_create_pipeline_policy(&fac_root)?;
 
     // Ensure managed CARGO_HOME exists when policy denies ambient.
@@ -1022,6 +1020,52 @@ fn build_pipeline_test_command(
         test_env,
         env_remove_keys: bounded_spec.env_remove_keys,
     })
+}
+
+fn resolve_pipeline_roots_from_lane_dir(lane_dir: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let lane_parent = lane_dir.parent().ok_or_else(|| {
+        format!(
+            "invalid lane dir {}: missing parent lanes directory",
+            lane_dir.display()
+        )
+    })?;
+    if lane_parent.file_name() != Some(OsStr::new("lanes")) {
+        return Err(format!(
+            "invalid lane dir {}: expected parent directory named 'lanes'",
+            lane_dir.display()
+        ));
+    }
+    let fac_root = lane_parent.parent().ok_or_else(|| {
+        format!(
+            "invalid lane dir {}: missing FAC root ancestor",
+            lane_dir.display()
+        )
+    })?;
+    if fac_root.file_name() != Some(OsStr::new("fac")) {
+        return Err(format!(
+            "invalid lane dir {}: expected FAC root ancestor named 'fac'",
+            lane_dir.display()
+        ));
+    }
+    let private_dir = fac_root.parent().ok_or_else(|| {
+        format!(
+            "invalid lane dir {}: missing private directory ancestor",
+            lane_dir.display()
+        )
+    })?;
+    if private_dir.file_name() != Some(OsStr::new("private")) {
+        return Err(format!(
+            "invalid lane dir {}: expected private ancestor named 'private'",
+            lane_dir.display()
+        ));
+    }
+    let apm2_home = private_dir.parent().ok_or_else(|| {
+        format!(
+            "invalid lane dir {}: missing APM2 home ancestor",
+            lane_dir.display()
+        )
+    })?;
+    Ok((apm2_home.to_path_buf(), fac_root.to_path_buf()))
 }
 
 fn resolve_evidence_test_command_override(test_command_override: Option<&[String]>) -> Vec<String> {
@@ -2598,7 +2642,9 @@ mod tests {
     #[test]
     fn pipeline_test_command_uses_rust_bounded_runner_or_surfaces_preflight_error() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let lane_dir = temp_dir.path().join("lane-test");
+        let lane_dir = temp_dir
+            .path()
+            .join("apm2-home/private/fac/lanes/lane-test");
         std::fs::create_dir_all(&lane_dir).expect("create lane dir");
         match build_pipeline_test_command(temp_dir.path(), &lane_dir) {
             Ok(command) => {
@@ -2651,7 +2697,9 @@ mod tests {
         // env_remove_keys from bounded_spec so the pipeline/restart path
         // strips sccache env vars.
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let lane_dir = temp_dir.path().join("lane-test");
+        let lane_dir = temp_dir
+            .path()
+            .join("apm2-home/private/fac/lanes/lane-test");
         std::fs::create_dir_all(&lane_dir).expect("create lane dir");
         if let Ok(command) = build_pipeline_test_command(temp_dir.path(), &lane_dir) {
             // The bounded test runner always strips at least RUSTC_WRAPPER.

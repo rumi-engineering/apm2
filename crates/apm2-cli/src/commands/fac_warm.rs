@@ -30,10 +30,9 @@ use std::time::{Duration, Instant};
 use apm2_core::fac::broker::FacBroker;
 use apm2_core::fac::job_spec::{
     Actuation, FacJobSpecV1, JobConstraints, JobSource, LaneRequirements, MAX_QUEUE_LANE_LENGTH,
-    parse_b3_256_digest,
 };
 use apm2_core::fac::warm::{DEFAULT_WARM_PHASES, MAX_WARM_PHASES, WarmPhase};
-use apm2_core::fac::{check_disk_space, load_or_default_boundary_id};
+use apm2_core::fac::{check_disk_space, load_or_default_boundary_id, lookup_job_receipt};
 
 use crate::commands::fac_queue_submit::{
     current_epoch_secs, enqueue_job, generate_job_suffix, init_broker, load_or_init_policy,
@@ -182,6 +181,7 @@ pub fn run_fac_warm(
         &lease_id,
         &repo_source.repo_id,
         &repo_source.head_sha,
+        &policy_digest,
         &phases,
         &queue_lane,
         &boundary_id,
@@ -354,6 +354,7 @@ fn build_warm_job_spec(
     lease_id: &str,
     repo_id: &str,
     head_sha: &str,
+    policy_digest: &[u8; 32],
     phases: &[WarmPhase],
     queue_lane: &str,
     boundary_id: &str,
@@ -403,18 +404,17 @@ fn build_warm_job_spec(
         .compute_digest()
         .map_err(|e| format!("digest computation: {e}"))?;
 
-    let digest_bytes =
-        parse_b3_256_digest(&digest).ok_or_else(|| "failed to parse spec digest".to_string())?;
-
     spec.job_spec_digest.clone_from(&digest);
     spec.actuation.request_id = digest;
 
     // Issue channel context token from broker.
     // Signature: issue_channel_context_token(&Hash, &str, &str, &str)
     // where Hash = [u8; 32].
+    // Bind token policy fields to the admitted FAC policy digest while
+    // keeping request_id bound to this concrete job spec digest.
     let token = broker
         .issue_channel_context_token(
-            &digest_bytes,
+            policy_digest,
             lease_id,
             &spec.actuation.request_id,
             boundary_id,
@@ -461,18 +461,39 @@ pub fn wait_for_receipt(
             ));
         }
 
-        // Check if a receipt exists for this job.
-        if apm2_core::fac::has_receipt_for_job(&receipts_dir, job_id) {
-            if json_output {
-                let output = serde_json::json!({
-                    "status": "completed",
-                    "job_id": job_id,
-                });
-                println!("{}", serde_json::to_string(&output).unwrap_or_default());
-            } else {
-                eprintln!("warm: job {job_id} completed");
-            }
-            return Ok(());
+        // Resolve the terminal outcome for this job.
+        if let Some(receipt) = lookup_job_receipt(&receipts_dir, job_id) {
+            return match receipt.outcome {
+                apm2_core::fac::FacJobOutcome::Completed => {
+                    if json_output {
+                        let output = serde_json::json!({
+                            "status": "completed",
+                            "job_id": job_id,
+                        });
+                        println!("{}", serde_json::to_string(&output).unwrap_or_default());
+                    } else {
+                        eprintln!("warm: job {job_id} completed");
+                    }
+                    Ok(())
+                },
+                apm2_core::fac::FacJobOutcome::Denied => {
+                    Err(format!("warm job {job_id} denied: {}", receipt.reason))
+                },
+                apm2_core::fac::FacJobOutcome::Quarantined => {
+                    Err(format!("warm job {job_id} quarantined: {}", receipt.reason))
+                },
+                apm2_core::fac::FacJobOutcome::Cancelled => {
+                    Err(format!("warm job {job_id} cancelled: {}", receipt.reason))
+                },
+                apm2_core::fac::FacJobOutcome::CancellationRequested => Err(format!(
+                    "warm job {job_id} cancellation requested: {}",
+                    receipt.reason
+                )),
+                _ => Err(format!(
+                    "warm job {job_id} returned unsupported outcome: {:?}",
+                    receipt.outcome
+                )),
+            };
         }
 
         std::thread::sleep(Duration::from_secs(WAIT_POLL_INTERVAL_SECS));
@@ -526,7 +547,58 @@ fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use apm2_core::fac::{
+        ChannelBoundaryTrace, DenialReasonCode, FacJobOutcome, FacJobReceiptV1Builder,
+        QueueAdmissionTrace, persist_content_addressed_receipt,
+    };
+
     use super::*;
+
+    fn persist_job_receipt(
+        fac_root: &Path,
+        job_id: &str,
+        outcome: FacJobOutcome,
+        reason: &str,
+    ) -> std::path::PathBuf {
+        let receipt_id = format!("test-{job_id}-{}", current_epoch_secs());
+        let job_digest = format!("b3-256:{}", "a".repeat(64));
+        let mut builder = FacJobReceiptV1Builder::new(receipt_id, job_id, job_digest)
+            .outcome(outcome)
+            .reason(reason)
+            .rfc0028_channel_boundary(ChannelBoundaryTrace {
+                passed: outcome == FacJobOutcome::Completed,
+                defect_count: u32::from(outcome != FacJobOutcome::Completed),
+                defect_classes: Vec::new(),
+                token_fac_policy_hash: None,
+                token_canonicalizer_tuple_digest: None,
+                token_boundary_id: None,
+                token_issued_at_tick: None,
+                token_expiry_tick: None,
+            })
+            .eio29_queue_admission(QueueAdmissionTrace {
+                verdict: if outcome == FacJobOutcome::Completed {
+                    "allow".to_string()
+                } else {
+                    "deny".to_string()
+                },
+                queue_lane: "bulk".to_string(),
+                defect_reason: if outcome == FacJobOutcome::Completed {
+                    None
+                } else {
+                    Some(reason.to_string())
+                },
+                cost_estimate_ticks: None,
+            })
+            .timestamp_secs(current_epoch_secs());
+        if outcome != FacJobOutcome::Completed {
+            builder = builder.denial_reason(DenialReasonCode::Cancelled);
+        }
+        let receipt = builder.try_build().expect("build receipt");
+        persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
+            .expect("persist receipt")
+    }
 
     // ─────────────────────────────────────────────────────────────────────
     // validate_lane tests
@@ -643,5 +715,28 @@ mod tests {
     fn test_parse_phases_invalid_phase() {
         let result = parse_phases(&Some("nonexistent_phase".to_string()));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn wait_for_receipt_reports_denied_outcome() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fac_root = temp.path();
+        let job_id = "warm-test-denied";
+        persist_job_receipt(fac_root, job_id, FacJobOutcome::Denied, "denied by worker");
+
+        let result = wait_for_receipt(fac_root, job_id, Duration::from_secs(1), false);
+        let err = result.expect_err("denied outcome should return error");
+        assert!(err.contains("denied"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn wait_for_receipt_accepts_completed_outcome() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fac_root = temp.path();
+        let job_id = "warm-test-completed";
+        persist_job_receipt(fac_root, job_id, FacJobOutcome::Completed, "ok");
+
+        let result = wait_for_receipt(fac_root, job_id, Duration::from_secs(1), false);
+        assert!(result.is_ok(), "unexpected result: {result:?}");
     }
 }

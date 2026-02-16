@@ -211,10 +211,6 @@ pub enum BrokerError {
     #[error("control-plane budget denied: {0}")]
     ControlPlaneBudgetDenied(#[from] ControlPlaneBudgetError),
 
-    /// Job spec digest is zero (not bound).
-    #[error("job_spec_digest is zero (not bound to a job)")]
-    ZeroJobSpecDigest,
-
     /// Lease ID is empty.
     #[error("lease_id is empty")]
     EmptyLeaseId,
@@ -733,8 +729,8 @@ impl FacBroker {
     // RFC-0028: ChannelContextToken issuance
     // -----------------------------------------------------------------------
 
-    /// Issues an RFC-0028 `ChannelContextToken` bound to `job_spec_digest`,
-    /// `lease_id`, and `boundary_id`.
+    /// Issues an RFC-0028 `ChannelContextToken` bound to `request_id`
+    /// (job-spec digest), `lease_id`, and `boundary_id`.
     ///
     /// The token encodes a fully-populated `ChannelBoundaryCheck` with
     /// `broker_verified = true` and all verification flags set, signed by
@@ -757,14 +753,14 @@ impl FacBroker {
     ///
     /// Returns an error if:
     /// - Admission health gate has not been satisfied (INV-BRK-HEALTH-GATE-001)
-    /// - `job_spec_digest` is all-zero (not bound to a job)
+    /// - `policy_digest` is all-zero
     /// - `lease_id` is empty
     /// - `request_id` is empty
     /// - `boundary_id` is empty or exceeds `MAX_BOUNDARY_ID_LENGTH`
     /// - Token serialization or signing fails
     pub fn issue_channel_context_token(
         &mut self,
-        job_spec_digest: &Hash,
+        policy_digest: &Hash,
         lease_id: &str,
         request_id: &str,
         boundary_id: &str,
@@ -784,8 +780,8 @@ impl FacBroker {
         self.control_plane_budget.admit_token_issuance()?;
 
         // Validate inputs (fail-closed)
-        if bool::from(job_spec_digest.ct_eq(&[0u8; 32])) {
-            return Err(BrokerError::ZeroJobSpecDigest);
+        if is_zero_hash(policy_digest) {
+            return Err(BrokerError::ZeroPolicyDigest);
         }
         if lease_id.is_empty() {
             return Err(BrokerError::EmptyLeaseId);
@@ -794,9 +790,9 @@ impl FacBroker {
             return Err(BrokerError::EmptyRequestId);
         }
         validate_boundary_id(boundary_id)?;
-        let Some(policy_root_digest) = self.find_admitted_policy_digest(job_spec_digest) else {
+        let Some(policy_root_digest) = self.find_admitted_policy_digest(policy_digest) else {
             return Err(BrokerError::UnadmittedPolicyDigest {
-                detail: "requested job_spec_digest has not been admitted".to_string(),
+                detail: "requested policy digest has not been admitted".to_string(),
             });
         };
 
@@ -809,8 +805,8 @@ impl FacBroker {
         let disclosure_policy_digest = compute_disclosure_policy_digest(&policy_root_digest);
 
         // Build a fully-verified boundary check (broker is the authority).
-        // The job_spec_digest is embedded in the policy binding to bind
-        // the token to the specific job.
+        // Policy binding carries the admitted FAC policy root digest.
+        // Job binding is enforced by token `request_id`.
         let check = ChannelBoundaryCheck {
             source: ChannelSource::TypedToolIntent,
             channel_source_witness: Some(derive_channel_source_witness(
@@ -826,7 +822,7 @@ impl FacBroker {
             declassification_intent: DeclassificationIntentScope::None,
             redundancy_declassification_receipt: None,
             boundary_flow_policy_binding: Some(crate::channel::BoundaryFlowPolicyBinding {
-                policy_digest: *job_spec_digest,
+                policy_digest: policy_root_digest,
                 admitted_policy_root_digest: policy_root_digest,
                 canonicalizer_tuple_digest,
                 admitted_canonicalizer_tuple_digest: canonicalizer_tuple_digest,
@@ -1606,10 +1602,10 @@ fn is_zero_hash(hash: &Hash) -> bool {
     bool::from(hash.ct_eq(&[0u8; 32]))
 }
 
-fn compute_disclosure_policy_digest(job_spec_digest: &Hash) -> Hash {
+fn compute_disclosure_policy_digest(policy_root_digest: &Hash) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"apm2.fac_broker.disclosure_policy_digest.v1");
-    hasher.update(job_spec_digest);
+    hasher.update(policy_root_digest);
     *hasher.finalize().as_bytes()
 }
 
@@ -1664,20 +1660,20 @@ mod tests {
         broker.set_admission_health_gate_for_test(true);
 
         // Exhaust the token issuance budget.
-        let job_digest = [0x42; 32];
+        let policy_digest = [0x42; 32];
         broker
-            .admit_policy_digest(job_digest)
-            .expect("job digest should admit");
+            .admit_policy_digest(policy_digest)
+            .expect("policy digest should admit");
         let _ = broker
-            .issue_channel_context_token(&job_digest, "l1", "r1", "boundary")
+            .issue_channel_context_token(&policy_digest, "l1", "r1", "boundary")
             .expect("first issuance should succeed");
         let _ = broker
-            .issue_channel_context_token(&job_digest, "l2", "r2", "boundary")
+            .issue_channel_context_token(&policy_digest, "l2", "r2", "boundary")
             .expect("second issuance should succeed");
 
         // Third issuance should be denied (budget exhausted).
         let err = broker
-            .issue_channel_context_token(&job_digest, "l3", "r3", "boundary")
+            .issue_channel_context_token(&policy_digest, "l3", "r3", "boundary")
             .unwrap_err();
         assert!(
             matches!(err, BrokerError::ControlPlaneBudgetDenied(_)),
@@ -1689,7 +1685,7 @@ mod tests {
 
         // Now issuance should succeed again.
         let _ = broker
-            .issue_channel_context_token(&job_digest, "l4", "r4", "boundary")
+            .issue_channel_context_token(&policy_digest, "l4", "r4", "boundary")
             .expect("issuance after tick advance should succeed");
         assert_eq!(broker.control_plane_budget().tokens_issued(), 1);
     }
@@ -1702,15 +1698,15 @@ mod tests {
     fn issue_and_decode_channel_context_token_roundtrip() {
         let mut broker = FacBroker::new();
         broker.set_admission_health_gate_for_test(true);
-        let job_digest = [0x42; 32];
+        let policy_digest = [0x42; 32];
         let lease_id = "lease-broker-001";
         let request_id = "REQ-001";
         broker
-            .admit_policy_digest(job_digest)
-            .expect("job digest should admit");
+            .admit_policy_digest(policy_digest)
+            .expect("policy digest should admit");
 
         let token = broker
-            .issue_channel_context_token(&job_digest, lease_id, request_id, "test-boundary")
+            .issue_channel_context_token(&policy_digest, lease_id, request_id, "test-boundary")
             .expect("token issuance should succeed");
 
         // Decode with broker's verifying key
@@ -1737,6 +1733,14 @@ mod tests {
         let boundary_binding = decoded
             .boundary_flow_policy_binding
             .expect("token should include boundary flow policy binding");
+        assert_eq!(
+            boundary_binding.policy_digest, policy_digest,
+            "policy binding digest must match admitted policy digest"
+        );
+        assert_eq!(
+            boundary_binding.admitted_policy_root_digest, policy_digest,
+            "admitted policy root digest must match admitted policy digest"
+        );
         assert_eq!(
             boundary_binding.canonicalizer_tuple_digest, expected_tuple_digest,
             "token should embed current canonicalizer tuple digest"
@@ -1795,12 +1799,12 @@ mod tests {
     }
 
     #[test]
-    fn issue_channel_context_token_rejects_zero_job_digest() {
+    fn issue_channel_context_token_rejects_zero_policy_digest() {
         let mut broker = FacBroker::new();
         broker.set_admission_health_gate_for_test(true);
         let result =
             broker.issue_channel_context_token(&[0u8; 32], "lease-1", "REQ-1", "test-boundary");
-        assert_eq!(result, Err(BrokerError::ZeroJobSpecDigest));
+        assert_eq!(result, Err(BrokerError::ZeroPolicyDigest));
     }
 
     #[test]
@@ -1809,7 +1813,7 @@ mod tests {
         broker.set_admission_health_gate_for_test(true);
         broker
             .admit_policy_digest([0x11; 32])
-            .expect("job digest should admit");
+            .expect("policy digest should admit");
         let result = broker.issue_channel_context_token(&[0x11; 32], "", "REQ-1", "test-boundary");
         assert_eq!(result, Err(BrokerError::EmptyLeaseId));
     }
@@ -1820,14 +1824,14 @@ mod tests {
         broker.set_admission_health_gate_for_test(true);
         broker
             .admit_policy_digest([0x11; 32])
-            .expect("job digest should admit");
+            .expect("policy digest should admit");
         let result =
             broker.issue_channel_context_token(&[0x11; 32], "lease-1", "", "test-boundary");
         assert_eq!(result, Err(BrokerError::EmptyRequestId));
     }
 
     #[test]
-    fn issue_channel_context_token_rejects_unadmitted_job_digest() {
+    fn issue_channel_context_token_rejects_unadmitted_policy_digest() {
         let mut broker = FacBroker::new();
         broker.set_admission_health_gate_for_test(true);
         let result =

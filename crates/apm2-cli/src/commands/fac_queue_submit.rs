@@ -3,6 +3,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use apm2_core::crypto::Signer;
@@ -31,6 +32,8 @@ const MAX_BROKER_STATE_FILE_SIZE: usize = 1_048_576;
 const UNKNOWN_HEAD_SHA: &str = "0000000000000000000000000000000000000000";
 /// Fallback repository segment when path metadata is unavailable.
 const UNKNOWN_REPO_SEGMENT: &str = "unknown";
+/// Per-process monotonic suffix to prevent same-timestamp collisions.
+static JOB_SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub(super) struct RepoSourceInfo {
@@ -188,9 +191,14 @@ pub(super) fn enqueue_job(queue_root: &Path, spec: &FacJobSpecV1) -> Result<Path
 
 /// Build a deterministic suffix for job and lease identifiers.
 pub(super) fn generate_job_suffix() -> String {
-    let ts = current_epoch_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let ts = now.as_secs();
+    let subsec_nanos = now.subsec_nanos();
     let pid = std::process::id();
-    format!("{ts}-{pid}")
+    let counter = JOB_SUFFIX_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{ts}-{subsec_nanos:09}-{pid}-{counter}")
 }
 
 /// Current Unix epoch seconds.
@@ -372,4 +380,20 @@ fn read_bounded(path: &Path, max_size: usize) -> Result<Vec<u8>, String> {
     }
 
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_job_suffix_is_collision_resistant_per_process() {
+        let a = generate_job_suffix();
+        let b = generate_job_suffix();
+        assert_ne!(a, b, "suffixes must differ across sequential calls");
+        assert!(
+            a.split('-').count() >= 4,
+            "suffix should include timestamp, nanos, pid, and counter"
+        );
+    }
 }

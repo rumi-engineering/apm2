@@ -314,6 +314,55 @@ fn line_text_at(content: &str, line_number: usize) -> String {
         .to_string()
 }
 
+fn is_shell_literal_rule(rule_id: &str) -> bool {
+    matches!(
+        rule_id,
+        "TSG001" | "TSG002" | "TSG007" | "TSG008" | "TSG009"
+    )
+}
+
+fn has_rs_extension(rel: &str) -> bool {
+    Path::new(rel)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+}
+
+fn rule_applies_to_target(rule: &RuleSpec, rel: &str) -> bool {
+    let is_rust = has_rs_extension(rel);
+    if rule.multiline {
+        return is_rust;
+    }
+    if rule.id == "TSG011" {
+        return is_rust;
+    }
+    if is_shell_literal_rule(rule.id) {
+        return !is_rust;
+    }
+    true
+}
+
+fn scan_view_for_rust_target<'a>(rel: &str, content: &'a str) -> (&'a str, usize) {
+    let under_src = rel.starts_with("src/") || rel.contains("/src/");
+    if !has_rs_extension(rel) || !under_src {
+        return (content, 0);
+    }
+    let Some(idx) = content.find("#[cfg(test)]") else {
+        return (content, 0);
+    };
+    let prefix = &content[..idx];
+    let line_base = prefix.bytes().filter(|b| *b == b'\n').count();
+    (&content[idx..], line_base)
+}
+
+fn is_rust_commentish_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("*/")
+}
+
 pub fn run_test_safety_guard(workspace_root: &Path) -> Result<CheckExecution, String> {
     let allowlist_path = workspace_root.join(TEST_SAFETY_ALLOWLIST_REL_PATH);
     let allowlist = parse_allowlist(&allowlist_path)?;
@@ -355,6 +404,9 @@ pub fn run_test_safety_guard(workspace_root: &Path) -> Result<CheckExecution, St
             .map_err(|err| format!("invalid built-in test safety regex {}: {err}", rule.id))?;
 
         for rel in &targets {
+            if !rule_applies_to_target(rule, rel) {
+                continue;
+            }
             let abs = workspace_root.join(rel);
             let bytes = match fs::read(&abs) {
                 Ok(bytes) => bytes,
@@ -366,17 +418,12 @@ pub fn run_test_safety_guard(workspace_root: &Path) -> Result<CheckExecution, St
                 },
             };
             let content = String::from_utf8_lossy(&bytes).into_owned();
+            let (scan_content, line_base) = scan_view_for_rust_target(rel, &content);
+            let is_rust = has_rs_extension(rel);
 
             if rule.multiline {
-                if !Path::new(rel)
-                    .extension()
-                    .and_then(OsStr::to_str)
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
-                {
-                    continue;
-                }
-                for m in regex.find_iter(&content) {
-                    let line_number = line_number_for_offset(&content, m.start());
+                for m in regex.find_iter(scan_content) {
+                    let line_number = line_number_for_offset(scan_content, m.start()) + line_base;
                     let line_text = line_text_at(&content, line_number);
                     if is_allowlisted(&allowlist, rule.id, rel, line_number, &line_text) {
                         continue;
@@ -392,12 +439,16 @@ pub fn run_test_safety_guard(workspace_root: &Path) -> Result<CheckExecution, St
                 continue;
             }
 
-            for (idx, line) in content.lines().enumerate() {
+            for (idx, line) in scan_content.lines().enumerate() {
+                if is_rust && is_rust_commentish_line(line) {
+                    continue;
+                }
                 if !regex.is_match(line) {
                     continue;
                 }
-                let line_number = idx + 1;
-                if is_allowlisted(&allowlist, rule.id, rel, line_number, line) {
+                let line_number = idx + 1 + line_base;
+                let full_line = line_text_at(&content, line_number);
+                if is_allowlisted(&allowlist, rule.id, rel, line_number, &full_line) {
                     continue;
                 }
                 violations.push(Violation {
@@ -405,7 +456,7 @@ pub fn run_test_safety_guard(workspace_root: &Path) -> Result<CheckExecution, St
                     file: rel.clone(),
                     line: line_number,
                     description: rule.description.to_string(),
-                    text: line.to_string(),
+                    text: full_line,
                 });
             }
         }
@@ -1265,6 +1316,69 @@ mod tests {
         let check = run_test_safety_guard(repo).expect("run guard");
         assert!(!check.passed, "expected violation");
         assert!(check.output.contains("[TSG001]"));
+    }
+
+    #[test]
+    fn test_safety_guard_ignores_shell_literal_rules_in_rust_test_code() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        fs::create_dir_all(repo.join("src")).expect("create src");
+        fs::create_dir_all(repo.join(".github/review-gate")).expect("create review-gate");
+        fs::write(
+            repo.join(".github/review-gate/test-safety-allowlist.txt"),
+            b"# empty\n",
+        )
+        .expect("write allowlist");
+        fs::write(
+            repo.join("src/lib.rs"),
+            br#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn literal_fixture_is_data_not_execution() {
+        let _fixture = "rm -rf /";
+        assert_eq!(_fixture, "rm -rf /");
+    }
+}
+"#,
+        )
+        .expect("write rust file");
+
+        let check = run_test_safety_guard(repo).expect("run guard");
+        assert!(check.passed, "unexpected output:\n{}", check.output);
+    }
+
+    #[test]
+    fn test_safety_guard_scans_only_rust_test_region_under_src() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        fs::create_dir_all(repo.join("src")).expect("create src");
+        fs::create_dir_all(repo.join(".github/review-gate")).expect("create review-gate");
+        fs::write(
+            repo.join(".github/review-gate/test-safety-allowlist.txt"),
+            b"# empty\n",
+        )
+        .expect("write allowlist");
+        let fixture = [
+            "pub fn production_exec_path(program_cstr: *const libc::c_char, argv_ptrs: *const *const libc::c_char) {\n",
+            "    unsafe {\n",
+            "        libc::exec",
+            "ve(program_cstr, argv_ptrs, std::ptr::null());\n",
+            "    }\n",
+            "}\n\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    #[test]\n",
+            "    fn smoke() {\n",
+            "        assert!(true);\n",
+            "    }\n",
+            "}\n",
+        ]
+        .join("");
+        fs::write(repo.join("src/lib.rs"), fixture).expect("write rust file");
+
+        let check = run_test_safety_guard(repo).expect("run guard");
+        assert!(check.passed, "unexpected output:\n{}", check.output);
     }
 
     #[test]
