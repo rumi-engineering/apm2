@@ -263,8 +263,9 @@ pub use containment::{
 // Re-export credential gate types (TCK-00596)
 pub use credential_gate::{
     CredentialGateError, CredentialMountV1, CredentialPosture, CredentialSource, EnvMount,
-    FileMountDescriptor, MAX_ENV_MOUNTS, MAX_ENV_NAME_LENGTH, build_github_credential_mount,
-    check_github_credential_posture, require_github_credentials, validate_credential_mount,
+    FileMountDescriptor, MAX_ENV_MOUNTS, MAX_ENV_NAME_LENGTH, MAX_FILE_MOUNTS,
+    MAX_FILE_PATH_LENGTH, build_github_credential_mount, check_github_credential_posture,
+    require_github_credentials, validate_credential_mount,
 };
 // Re-export determinism types
 pub use determinism::{

@@ -915,6 +915,17 @@ const fn default_instances() -> u32 {
 /// file content (SECURITY BLOCKER fix).
 const MAX_CREDENTIAL_FILE_SIZE: u64 = 4096;
 
+/// Source from which `resolve_github_token` resolved a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolvedGitHubTokenSource {
+    /// The token came from the requested environment variable.
+    EnvVar,
+    /// The token came from `$CREDENTIALS_DIRECTORY/gh-token`.
+    SystemdCredential,
+    /// The token came from `$APM2_HOME/private/creds/gh-token`.
+    Apm2CredentialFile,
+}
+
 /// Resolve a GitHub token value from available sources (TCK-00595 MAJOR FIX).
 ///
 /// Resolution order:
@@ -936,10 +947,25 @@ const MAX_CREDENTIAL_FILE_SIZE: u64 = 4096;
 ///   unbounded deserialization / memory exhaustion.
 #[must_use]
 pub fn resolve_github_token(env_var_name: &str) -> Option<secrecy::SecretString> {
+    resolve_github_token_with_source(env_var_name).map(|(token, _source)| token)
+}
+
+/// Resolve a GitHub token and report which source provided it.
+///
+/// This shares the same resolution chain and security controls as
+/// [`resolve_github_token`], while exposing source metadata for callsites that
+/// need fail-closed credential posture reporting.
+#[must_use]
+pub(crate) fn resolve_github_token_with_source(
+    env_var_name: &str,
+) -> Option<(secrecy::SecretString, ResolvedGitHubTokenSource)> {
     // 1. Standard env var
     if let Ok(val) = std::env::var(env_var_name) {
         if !val.is_empty() {
-            return Some(secrecy::SecretString::from(val));
+            return Some((
+                secrecy::SecretString::from(val),
+                ResolvedGitHubTokenSource::EnvVar,
+            ));
         }
     }
 
@@ -947,7 +973,7 @@ pub fn resolve_github_token(env_var_name: &str) -> Option<secrecy::SecretString>
     if let Ok(cred_dir) = std::env::var("CREDENTIALS_DIRECTORY") {
         let cred_path = std::path::Path::new(&cred_dir).join("gh-token");
         if let Some(secret) = read_credential_file_bounded(&cred_path) {
-            return Some(secret);
+            return Some((secret, ResolvedGitHubTokenSource::SystemdCredential));
         }
     }
 
@@ -955,7 +981,7 @@ pub fn resolve_github_token(env_var_name: &str) -> Option<secrecy::SecretString>
     if let Some(apm2_home) = crate::github::resolve_apm2_home() {
         let cred_path = apm2_home.join("private/creds/gh-token");
         if let Some(secret) = read_credential_file_bounded(&cred_path) {
-            return Some(secret);
+            return Some((secret, ResolvedGitHubTokenSource::Apm2CredentialFile));
         }
     }
 
@@ -966,7 +992,9 @@ pub fn resolve_github_token(env_var_name: &str) -> Option<secrecy::SecretString>
 ///
 /// Returns `None` if the file does not exist, is too large, is a symlink
 /// (on Unix), or contains only whitespace.
-fn read_credential_file_bounded(path: &std::path::Path) -> Option<secrecy::SecretString> {
+pub(crate) fn read_credential_file_bounded(
+    path: &std::path::Path,
+) -> Option<secrecy::SecretString> {
     use std::io::Read;
 
     // Open with O_NOFOLLOW on Unix to reject symlinks
@@ -1426,6 +1454,16 @@ mod tests {
             result.is_some(),
             "resolve_github_token should return Some for a set env var"
         );
+    }
+
+    /// TCK-00596: source-aware token resolution reports env source.
+    #[test]
+    fn test_resolve_github_token_with_source_reports_env_var() {
+        let result = super::resolve_github_token_with_source("PATH");
+        assert!(matches!(
+            result,
+            Some((_, super::ResolvedGitHubTokenSource::EnvVar))
+        ));
     }
 
     /// TCK-00595 SECURITY BLOCKER FIX: `resolve_github_token` returns

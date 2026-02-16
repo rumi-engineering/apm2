@@ -87,8 +87,70 @@ pub struct GitHubAppConfig {
 #[must_use]
 pub fn load_github_app_config() -> Option<GitHubAppConfig> {
     let config_path = resolve_config_path()?;
-    let content = std::fs::read_to_string(&config_path).ok()?;
+    let content = read_github_app_config_file_bounded(&config_path).ok()?;
     toml::from_str(&content).ok()
+}
+
+/// Maximum size for `github_app.toml` reads.
+///
+/// The config only stores metadata and short strings; this bound prevents
+/// unbounded allocation on credential posture hot paths.
+const MAX_GITHUB_APP_CONFIG_FILE_SIZE: u64 = 64 * 1024;
+
+/// Reads `github_app.toml` with bounded I/O and symlink protection.
+fn read_github_app_config_file_bounded(path: &Path) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Read};
+
+    let mut file = open_nofollow(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "refusing non-regular github app config path: {}",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.len() > MAX_GITHUB_APP_CONFIG_FILE_SIZE {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "github app config too large: {} > {}",
+                metadata.len(),
+                MAX_GITHUB_APP_CONFIG_FILE_SIZE
+            ),
+        ));
+    }
+
+    let len: usize = usize::try_from(metadata.len()).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "github app config size does not fit usize: {}",
+                metadata.len()
+            ),
+        )
+    })?;
+    let mut content = String::with_capacity(len);
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+/// Open a file for reading, rejecting symlinks on Unix via `O_NOFOLLOW`.
+#[cfg(unix)]
+fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Open a file for reading (non-Unix fallback — no symlink guard available).
+#[cfg(not(unix))]
+fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 /// Returns the path to the config directory (`$APM2_HOME` or `~/.apm2`).
@@ -1059,6 +1121,62 @@ mod unit_tests {
         assert!(
             err.contains("file fallback is disabled"),
             "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_read_github_app_config_file_bounded_reads_valid_file() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let config_path = temp.path().join("github_app.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+app_id = "12345"
+installation_id = "67890"
+"#,
+        )
+        .expect("write config");
+
+        let content = super::read_github_app_config_file_bounded(&config_path)
+            .expect("valid config should be readable");
+        assert!(content.contains("app_id"));
+        assert!(content.contains("installation_id"));
+    }
+
+    #[test]
+    fn test_read_github_app_config_file_bounded_rejects_oversize() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let config_path = temp.path().join("github_app.toml");
+        let oversize_len =
+            usize::try_from(super::MAX_GITHUB_APP_CONFIG_FILE_SIZE + 1).expect("size fits usize");
+        let oversize = "x".repeat(oversize_len);
+        std::fs::write(&config_path, oversize).expect("write oversize config");
+
+        assert!(
+            super::read_github_app_config_file_bounded(&config_path).is_err(),
+            "oversized config must be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_github_app_config_file_bounded_rejects_symlink() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let target = temp.path().join("real.toml");
+        std::fs::write(
+            &target,
+            r#"
+app_id = "12345"
+installation_id = "67890"
+"#,
+        )
+        .expect("write target");
+        let symlink_path = temp.path().join("github_app.toml");
+        std::os::unix::fs::symlink(&target, &symlink_path).expect("create symlink");
+
+        assert!(
+            super::read_github_app_config_file_bounded(&symlink_path).is_err(),
+            "symlinked config must be rejected"
         );
     }
 }

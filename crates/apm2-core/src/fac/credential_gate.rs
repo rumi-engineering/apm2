@@ -39,8 +39,14 @@ use serde::{Deserialize, Serialize};
 /// Maximum number of environment variable mounts in a single credential mount.
 pub const MAX_ENV_MOUNTS: usize = 16;
 
+/// Maximum number of file mounts in a single credential mount.
+pub const MAX_FILE_MOUNTS: usize = 16;
+
 /// Maximum length of an environment variable name in a credential mount.
 pub const MAX_ENV_NAME_LENGTH: usize = 256;
+
+/// Maximum length of a mounted file path in bytes.
+pub const MAX_FILE_PATH_LENGTH: usize = 4096;
 
 /// The source from which a credential was resolved.
 ///
@@ -112,6 +118,7 @@ pub struct CredentialPosture {
 /// # Bounded Collections
 ///
 /// - `env_mounts` is bounded by [`MAX_ENV_MOUNTS`].
+/// - `file_mounts` is bounded by [`MAX_FILE_MOUNTS`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialMountV1 {
     /// Schema identifier for forward-compatible parsing.
@@ -176,10 +183,36 @@ pub enum CredentialGateError {
         count: usize,
     },
 
+    /// Too many file mounts in the credential mount.
+    #[error("too many file mounts: {count} > {}", MAX_FILE_MOUNTS)]
+    TooManyFileMounts {
+        /// The number of file mounts attempted.
+        count: usize,
+    },
+
     /// Environment variable name too long.
     #[error("env var name too long: {length} > {}", MAX_ENV_NAME_LENGTH)]
     EnvNameTooLong {
         /// The length of the env var name.
+        length: usize,
+    },
+
+    /// File mount path too long.
+    #[error("file mount path too long: {length} > {}", MAX_FILE_PATH_LENGTH)]
+    FileMountPathTooLong {
+        /// The length of the file path.
+        length: usize,
+    },
+
+    /// Credential source field exceeds bounded length.
+    #[error(
+        "credential source field {field} too long: {length} > {}",
+        MAX_ENV_NAME_LENGTH
+    )]
+    CredentialSourceFieldTooLong {
+        /// The source field name.
+        field: &'static str,
+        /// The field length.
         length: usize,
     },
 }
@@ -191,72 +224,67 @@ pub enum CredentialGateError {
 /// and from which source. The returned value is safe to log and serialize
 /// (no secret material).
 ///
-/// This function delegates to [`crate::config::resolve_github_token`] for the
-/// actual resolution chain, then discards the secret value immediately.
+/// This function uses the shared secure token resolution path in
+/// `crate::config::resolve_github_token_with_source`, then discards secret
+/// material immediately and reports provenance only.
 #[must_use]
 pub fn check_github_credential_posture() -> CredentialPosture {
-    // Check env vars first (matching resolve_github_token order)
-    if matches!(std::env::var("GITHUB_TOKEN"), Ok(ref v) if !v.is_empty()) {
-        return CredentialPosture {
-            credential_name: "github-token".to_string(),
-            resolved: true,
-            source: Some(CredentialSource::EnvVar {
-                var_name: "GITHUB_TOKEN".to_string(),
-            }),
-        };
+    let github_token_source = crate::config::resolve_github_token_with_source("GITHUB_TOKEN")
+        .map(|(_token, source)| source);
+    if matches!(
+        github_token_source,
+        Some(crate::config::ResolvedGitHubTokenSource::EnvVar)
+    ) {
+        return resolved_posture(CredentialSource::EnvVar {
+            var_name: "GITHUB_TOKEN".to_string(),
+        });
     }
 
-    if matches!(std::env::var("GH_TOKEN"), Ok(ref v) if !v.is_empty()) {
-        return CredentialPosture {
-            credential_name: "github-token".to_string(),
-            resolved: true,
-            source: Some(CredentialSource::EnvVar {
-                var_name: "GH_TOKEN".to_string(),
-            }),
-        };
+    let gh_token_source =
+        crate::config::resolve_github_token_with_source("GH_TOKEN").map(|(_token, source)| source);
+    if matches!(
+        gh_token_source,
+        Some(crate::config::ResolvedGitHubTokenSource::EnvVar)
+    ) {
+        return resolved_posture(CredentialSource::EnvVar {
+            var_name: "GH_TOKEN".to_string(),
+        });
     }
 
-    // Check systemd credentials directory
-    if let Ok(cred_dir) = std::env::var("CREDENTIALS_DIRECTORY") {
-        let cred_path = std::path::Path::new(&cred_dir).join("gh-token");
-        if cred_path.exists() {
-            return CredentialPosture {
-                credential_name: "github-token".to_string(),
-                resolved: true,
-                source: Some(CredentialSource::SystemdCredential {
+    // After env vars, preserve fallback order: systemd credential, then APM2 file.
+    for source in [github_token_source, gh_token_source].into_iter().flatten() {
+        match source {
+            crate::config::ResolvedGitHubTokenSource::EnvVar => {},
+            crate::config::ResolvedGitHubTokenSource::SystemdCredential => {
+                return resolved_posture(CredentialSource::SystemdCredential {
                     credential_name: "gh-token".to_string(),
-                }),
-            };
-        }
-    }
-
-    // Check APM2 credential file
-    if let Some(apm2_home) = crate::github::resolve_apm2_home() {
-        let cred_path = apm2_home.join("private/creds/gh-token");
-        if cred_path.exists() {
-            return CredentialPosture {
-                credential_name: "github-token".to_string(),
-                resolved: true,
-                source: Some(CredentialSource::Apm2CredentialFile {
+                });
+            },
+            crate::config::ResolvedGitHubTokenSource::Apm2CredentialFile => {
+                return resolved_posture(CredentialSource::Apm2CredentialFile {
                     file_name: "gh-token".to_string(),
-                }),
-            };
+                });
+            },
         }
     }
 
     // Check GitHub App config
     if crate::github::load_github_app_config().is_some() {
-        return CredentialPosture {
-            credential_name: "github-token".to_string(),
-            resolved: true,
-            source: Some(CredentialSource::GitHubApp),
-        };
+        return resolved_posture(CredentialSource::GitHubApp);
     }
 
     CredentialPosture {
         credential_name: "github-token".to_string(),
         resolved: false,
         source: None,
+    }
+}
+
+fn resolved_posture(source: CredentialSource) -> CredentialPosture {
+    CredentialPosture {
+        credential_name: "github-token".to_string(),
+        resolved: true,
+        source: Some(source),
     }
 }
 
@@ -349,12 +377,50 @@ pub fn validate_credential_mount(mount: &CredentialMountV1) -> Result<(), Creden
             count: mount.env_mounts.len(),
         });
     }
+    if mount.file_mounts.len() > MAX_FILE_MOUNTS {
+        return Err(CredentialGateError::TooManyFileMounts {
+            count: mount.file_mounts.len(),
+        });
+    }
     for env_mount in &mount.env_mounts {
         if env_mount.env_name.len() > MAX_ENV_NAME_LENGTH {
             return Err(CredentialGateError::EnvNameTooLong {
                 length: env_mount.env_name.len(),
             });
         }
+        validate_credential_source(&env_mount.source)?;
+    }
+    for file_mount in &mount.file_mounts {
+        let path_len = file_mount.path.as_os_str().len();
+        if path_len > MAX_FILE_PATH_LENGTH {
+            return Err(CredentialGateError::FileMountPathTooLong { length: path_len });
+        }
+        validate_credential_source(&file_mount.source)?;
+    }
+    Ok(())
+}
+
+fn validate_credential_source(source: &CredentialSource) -> Result<(), CredentialGateError> {
+    match source {
+        CredentialSource::EnvVar { var_name } => {
+            validate_source_field_length("var_name", var_name.len())
+        },
+        CredentialSource::SystemdCredential { credential_name } => {
+            validate_source_field_length("credential_name", credential_name.len())
+        },
+        CredentialSource::Apm2CredentialFile { file_name } => {
+            validate_source_field_length("file_name", file_name.len())
+        },
+        CredentialSource::GitHubApp => Ok(()),
+    }
+}
+
+const fn validate_source_field_length(
+    field: &'static str,
+    length: usize,
+) -> Result<(), CredentialGateError> {
+    if length > MAX_ENV_NAME_LENGTH {
+        return Err(CredentialGateError::CredentialSourceFieldTooLong { field, length });
     }
     Ok(())
 }
@@ -492,6 +558,66 @@ mod tests {
         assert!(matches!(
             validate_credential_mount(&mount),
             Err(CredentialGateError::EnvNameTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_credential_mount_rejects_too_many_file_mounts() {
+        let file_mounts: Vec<FileMountDescriptor> = (0..=MAX_FILE_MOUNTS)
+            .map(|i| FileMountDescriptor {
+                path: PathBuf::from(format!("/tmp/cred-{i}")),
+                source: CredentialSource::SystemdCredential {
+                    credential_name: "gh-token".to_string(),
+                },
+            })
+            .collect();
+        let mount = CredentialMountV1 {
+            schema: "apm2.fac.credential_mount.v1".to_string(),
+            env_mounts: vec![],
+            file_mounts,
+        };
+        assert!(matches!(
+            validate_credential_mount(&mount),
+            Err(CredentialGateError::TooManyFileMounts { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_credential_mount_rejects_long_file_mount_path() {
+        let mount = CredentialMountV1 {
+            schema: "apm2.fac.credential_mount.v1".to_string(),
+            env_mounts: vec![],
+            file_mounts: vec![FileMountDescriptor {
+                path: PathBuf::from("a".repeat(MAX_FILE_PATH_LENGTH + 1)),
+                source: CredentialSource::Apm2CredentialFile {
+                    file_name: "gh-token".to_string(),
+                },
+            }],
+        };
+        assert!(matches!(
+            validate_credential_mount(&mount),
+            Err(CredentialGateError::FileMountPathTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_credential_mount_rejects_long_source_field() {
+        let mount = CredentialMountV1 {
+            schema: "apm2.fac.credential_mount.v1".to_string(),
+            env_mounts: vec![EnvMount {
+                env_name: "GITHUB_TOKEN".to_string(),
+                source: CredentialSource::EnvVar {
+                    var_name: "Y".repeat(MAX_ENV_NAME_LENGTH + 1),
+                },
+            }],
+            file_mounts: vec![],
+        };
+        assert!(matches!(
+            validate_credential_mount(&mount),
+            Err(CredentialGateError::CredentialSourceFieldTooLong {
+                field: "var_name",
+                ..
+            })
         ));
     }
 
