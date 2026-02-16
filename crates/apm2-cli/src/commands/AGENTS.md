@@ -267,3 +267,7 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
   `execute_warm_job()` accept `sbx_hash: &str` as a parameter instead of recomputing.
   All `emit_job_receipt` calls in `handle_stop_revoke` now pass `Some(sbx_hash)` instead
   of `None`, ensuring stop/revoke receipts bind sandbox posture.
+- **GateReceipt sandbox binding** (`fac_worker.rs`, TCK-00573): Both `GateReceiptBuilder`
+  chains (exec and warm paths) call `.sandbox_hardening_hash(&sbx_hash)` so the
+  cryptographically signed `GateReceipt` binds the hardening profile used during
+  execution. This complements the `FacJobReceiptV1` binding done via `emit_job_receipt`.

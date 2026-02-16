@@ -814,6 +814,7 @@ fn test_gate_receipt_construction() {
     let signer = Signer::generate();
     let evidence_hash = [0x42u8; 32];
 
+    let sbx_hash = "b3-256:abcdef01abcdef01abcdef01abcdef01abcdef01abcdef01abcdef01abcdef01";
     let receipt = GateReceiptBuilder::new("wkr-test-001", "fac-worker-exec", "lease-test")
         .changeset_digest([0xABu8; 32])
         .executor_actor_id("fac-worker")
@@ -823,6 +824,7 @@ fn test_gate_receipt_construction() {
         .payload_hash(evidence_hash)
         .evidence_bundle_hash(evidence_hash)
         .job_spec_digest("b3-256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+        .sandbox_hardening_hash(sbx_hash)
         .passed(true)
         .build_and_sign(&signer);
 
@@ -831,6 +833,13 @@ fn test_gate_receipt_construction() {
     assert_eq!(receipt.lease_id, "lease-test");
     assert_eq!(receipt.executor_actor_id, "fac-worker");
     assert!(receipt.passed, "receipt should pass");
+
+    // TCK-00573: Verify sandbox_hardening_hash is bound in the GateReceipt.
+    assert_eq!(
+        receipt.sandbox_hardening_hash.as_deref(),
+        Some(sbx_hash),
+        "sandbox_hardening_hash must be present in GateReceipt"
+    );
 
     // Verify signature is valid.
     assert!(

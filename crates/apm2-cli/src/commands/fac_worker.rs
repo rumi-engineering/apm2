@@ -2603,6 +2603,7 @@ fn process_job(
             .payload_hash(evidence_hash)
             .evidence_bundle_hash(evidence_hash)
             .job_spec_digest(&spec.job_spec_digest)
+            .sandbox_hardening_hash(&sbx_hash)
             .passed(false)
             .build_and_sign(signer);
 
@@ -3978,6 +3979,7 @@ fn execute_warm_job(
             .payload_hash(warm_receipt_hash)
             .evidence_bundle_hash(warm_receipt_hash)
             .job_spec_digest(&spec.job_spec_digest)
+            .sandbox_hardening_hash(sbx_hash)
             .passed(persist_ok)
             .build_and_sign(signer);
 
