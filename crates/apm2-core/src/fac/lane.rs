@@ -23,7 +23,8 @@
 //! - Lock acquisition is atomic and exclusive via `flock(LOCK_EX | LOCK_NB)`.
 //! - Lease records are persisted via atomic write (temp → rename).
 //! - Stale lease detection uses PID liveness checks (fail-closed).
-//! - Directories are created with mode 0o700 (CTR-2611).
+//! - Directories are created with mode 0o700 in operator mode and 0o770 in
+//!   system-mode (CTR-2611).
 //!
 //! # Invariants
 //!
@@ -48,6 +49,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::execution_backend::{ExecutionBackend, select_backend};
 use super::safe_rmtree::safe_rmtree_v1;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -66,6 +68,7 @@ pub const LANE_CORRUPT_MARKER_SCHEMA: &str = "apm2.fac.lane_corrupt.v1";
 const CLEANUP_STEP_GIT_RESET: &str = "git_reset";
 const CLEANUP_STEP_GIT_CLEAN: &str = "git_clean";
 const CLEANUP_STEP_TEMP_PRUNE: &str = "temp_prune";
+const CLEANUP_STEP_ENV_DIR_PRUNE: &str = "env_dir_prune";
 const CLEANUP_STEP_LOG_QUOTA: &str = "log_quota";
 const CLEANUP_STEP_WORKSPACE_VALIDATION: &str = "workspace_path_validation";
 
@@ -161,6 +164,19 @@ pub enum LaneCleanupError {
         failure_step: Option<String>,
     },
 
+    /// Per-lane environment directory prune failed (TCK-00575).
+    #[error("env directory prune failed during {step}: {reason}")]
+    EnvDirPruneFailed {
+        /// Name of the cleanup step that failed.
+        step: &'static str,
+        /// Human-readable failure detail.
+        reason: String,
+        /// Ordered list of completed steps before failure.
+        steps_completed: Vec<String>,
+        /// The step that caused the failure.
+        failure_step: Option<String>,
+    },
+
     /// Log quota enforcement failed.
     #[error("log quota enforcement failed during {step}: {reason}")]
     LogQuotaFailed {
@@ -190,6 +206,7 @@ impl LaneCleanupError {
         match self {
             Self::GitCommandFailed { failure_step, .. }
             | Self::TempPruneFailed { failure_step, .. }
+            | Self::EnvDirPruneFailed { failure_step, .. }
             | Self::LogQuotaFailed { failure_step, .. } => failure_step.as_deref(),
             Self::Io(_) | Self::InvalidState(_) => None,
         }
@@ -203,6 +220,9 @@ impl LaneCleanupError {
                 steps_completed, ..
             }
             | Self::TempPruneFailed {
+                steps_completed, ..
+            }
+            | Self::EnvDirPruneFailed {
                 steps_completed, ..
             }
             | Self::LogQuotaFailed {
@@ -1135,7 +1155,8 @@ impl LaneManager {
     }
 
     /// Ensure all lane directories and lock parent directories exist with
-    /// mode 0o700 (CTR-2611).
+    /// restrictive permissions (0o700 in operator mode, 0o770 in system-mode)
+    /// (CTR-2611).
     ///
     /// # Errors
     ///
@@ -1147,6 +1168,10 @@ impl LaneManager {
             create_dir_restricted(&lane_dir.join("workspace"))?;
             create_dir_restricted(&lane_dir.join("target"))?;
             create_dir_restricted(&lane_dir.join("logs"))?;
+            // TCK-00575: Create per-lane env isolation directories.
+            for env_subdir in super::policy::LANE_ENV_DIRS {
+                create_dir_restricted(&lane_dir.join(env_subdir))?;
+            }
         }
         // Ensure lock directory exists
         let lock_dir = self.fac_root.join("locks").join("lanes");
@@ -1336,10 +1361,13 @@ impl LaneManager {
     }
 
     /// Run lane cleanup:
-    /// 1) Reset workspace (`git reset --hard HEAD`)
-    /// 2) Remove untracked files (`git clean -ffdxq`)
-    /// 3) Remove temporary directory (`tmp`) via safe deletion
-    /// 4) Enforce log quota by pruning oldest logs to 100 MiB
+    /// 1. Reset workspace (`git reset --hard HEAD`)
+    /// 2. Remove untracked files (`git clean -ffdxq`)
+    /// 3. Remove temporary directory (`tmp`) via safe deletion
+    /// 4. Prune per-lane env dirs from `LANE_ENV_DIRS` (excluding `tmp`):
+    ///    (`home/`, `xdg_cache/`, `xdg_config/`, `xdg_data/`, `xdg_state/`,
+    ///    `xdg_runtime/`)
+    /// 5. Enforce log quota by pruning oldest logs to 100 MiB
     ///
     /// # Errors
     ///
@@ -1482,6 +1510,29 @@ impl LaneManager {
             }
         }
         steps_completed.push(CLEANUP_STEP_TEMP_PRUNE.to_string());
+
+        // Step 3b (TCK-00575): Prune per-lane environment directories from
+        // `LANE_ENV_DIRS`. The `tmp` dir is already handled above in
+        // step 3.
+        for &env_subdir in super::policy::LANE_ENV_DIRS {
+            if env_subdir == super::policy::LANE_ENV_DIR_TMP {
+                continue;
+            }
+
+            let env_dir = lanes_dir.join(env_subdir);
+            if env_dir.exists() {
+                if let Err(err) = safe_rmtree_v1(&env_dir, &lanes_dir) {
+                    persist_lease_state(&mut lease, LaneState::Corrupt)?;
+                    return Err(LaneCleanupError::EnvDirPruneFailed {
+                        step: CLEANUP_STEP_ENV_DIR_PRUNE,
+                        reason: format!("failed to prune env dir {}: {err}", env_dir.display()),
+                        steps_completed: steps_completed.clone(),
+                        failure_step: Some(CLEANUP_STEP_ENV_DIR_PRUNE.to_string()),
+                    });
+                }
+            }
+        }
+        steps_completed.push(CLEANUP_STEP_ENV_DIR_PRUNE.to_string());
 
         // Step 4: Enforce log quota.
         if let Err(err) = Self::enforce_log_quota(&lanes_dir.join("logs"), &steps_completed) {
@@ -1926,6 +1977,7 @@ fn apm2_home_dir() -> Result<PathBuf, String> {
 }
 
 /// Create a directory with restricted permissions (0o700) per CTR-2611.
+/// In system-mode, shared-group execution contexts require 0o770.
 ///
 /// Uses `DirBuilder` with mode set at create-time to avoid TOCTOU window.
 fn create_dir_restricted(path: &Path) -> Result<(), LaneError> {
@@ -1949,7 +2001,13 @@ fn create_dir_restricted(path: &Path) -> Result<(), LaneError> {
         use std::os::unix::fs::DirBuilderExt;
         fs::DirBuilder::new()
             .recursive(true)
-            .mode(0o700)
+            .mode(
+                if matches!(select_backend(), Ok(ExecutionBackend::SystemMode)) {
+                    0o770
+                } else {
+                    0o700
+                },
+            )
             .create(path)
             .map_err(|e| LaneError::io(format!("creating directory {}", path.display()), e))
     }
@@ -2236,6 +2294,7 @@ const fn validate_string_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fac::policy;
 
     fn init_git_workspace(path: &Path) {
         if path.exists() {
@@ -3097,14 +3156,54 @@ mod tests {
                 CLEANUP_STEP_GIT_RESET.to_string(),
                 CLEANUP_STEP_GIT_CLEAN.to_string(),
                 CLEANUP_STEP_TEMP_PRUNE.to_string(),
+                CLEANUP_STEP_ENV_DIR_PRUNE.to_string(),
                 CLEANUP_STEP_LOG_QUOTA.to_string(),
             ],
             "all steps should be reported",
         );
 
+        for &env_subdir in policy::LANE_ENV_DIRS {
+            assert!(
+                !lane_dir.join(env_subdir).exists(),
+                "{env_subdir} should be removed during lane cleanup"
+            );
+        }
+
         let status = manager.lane_status(lane_id).expect("status");
         assert_eq!(status.state, LaneState::Idle);
         assert!(LaneLeaseV1::load(&lane_dir).expect("load lease").is_none());
+    }
+
+    #[test]
+    fn run_lane_cleanup_removes_all_env_dirs() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        for &env_subdir in policy::LANE_ENV_DIRS {
+            let env_dir = lane_dir.join(env_subdir);
+            fs::create_dir_all(&env_dir).expect("create env dir");
+            fs::write(env_dir.join("stale-state"), b"stale").expect("write stale env state");
+        }
+
+        manager
+            .run_lane_cleanup(lane_id, &workspace)
+            .expect("lane cleanup should succeed");
+
+        for &env_subdir in policy::LANE_ENV_DIRS {
+            assert!(
+                !lane_dir.join(env_subdir).exists(),
+                "{env_subdir} should be deleted during cleanup"
+            );
+        }
     }
 
     #[test]
@@ -3139,6 +3238,7 @@ mod tests {
                 CLEANUP_STEP_GIT_RESET.to_string(),
                 CLEANUP_STEP_GIT_CLEAN.to_string(),
                 CLEANUP_STEP_TEMP_PRUNE.to_string(),
+                CLEANUP_STEP_ENV_DIR_PRUNE.to_string(),
             ]
             .as_slice()
         );

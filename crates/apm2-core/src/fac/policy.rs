@@ -20,6 +20,8 @@ use super::job_spec::parse_b3_256_digest;
 use super::policy_resolution::{DeterminismClass, RiskTier};
 use crate::determinism::canonicalize_json;
 use crate::economics::profile::EconomicsProfile;
+#[cfg(unix)]
+use crate::fac::execution_backend::{ExecutionBackend, select_backend};
 
 /// Schema identifier for `FacPolicyV1`.
 pub const POLICY_SCHEMA_ID: &str = "apm2.fac.policy.v1";
@@ -452,6 +454,298 @@ pub fn build_job_environment(
     }
 
     env
+}
+
+/// Per-lane environment directory names created under each lane directory.
+///
+/// These directories isolate `HOME`, `TMPDIR`, `XDG_CACHE_HOME`,
+/// `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, and
+/// `XDG_RUNTIME_DIR` per lane so that FAC jobs do not write into ambient
+/// user directories (`~/.cache`, `~/.cargo`, etc.).
+/// Per-lane `HOME` directory name.
+pub const LANE_ENV_DIR_HOME: &str = "home";
+/// Per-lane `TMPDIR` directory name.
+pub const LANE_ENV_DIR_TMP: &str = "tmp";
+/// Per-lane `XDG_CACHE_HOME` directory name.
+pub const LANE_ENV_DIR_XDG_CACHE: &str = "xdg_cache";
+/// Per-lane `XDG_CONFIG_HOME` directory name.
+pub const LANE_ENV_DIR_XDG_CONFIG: &str = "xdg_config";
+/// Per-lane `XDG_DATA_HOME` directory name.
+pub const LANE_ENV_DIR_XDG_DATA: &str = "xdg_data";
+/// Per-lane `XDG_STATE_HOME` directory name.
+pub const LANE_ENV_DIR_XDG_STATE: &str = "xdg_state";
+/// Per-lane `XDG_RUNTIME_DIR` directory name.
+pub const LANE_ENV_DIR_XDG_RUNTIME: &str = "xdg_runtime";
+
+/// All per-lane environment subdirectory names.
+pub const LANE_ENV_DIRS: &[&str] = &[
+    LANE_ENV_DIR_HOME,
+    LANE_ENV_DIR_TMP,
+    LANE_ENV_DIR_XDG_CACHE,
+    LANE_ENV_DIR_XDG_CONFIG,
+    LANE_ENV_DIR_XDG_DATA,
+    LANE_ENV_DIR_XDG_STATE,
+    LANE_ENV_DIR_XDG_RUNTIME,
+];
+
+/// Apply per-lane environment overrides to an existing job environment map.
+///
+/// Sets `HOME`, `TMPDIR`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`,
+/// `XDG_DATA_HOME`, `XDG_STATE_HOME`, and `XDG_RUNTIME_DIR` to
+/// deterministic per-lane directories under `lane_dir`. This prevents FAC
+/// jobs from writing into ambient user locations (`~/.cache`, `~/.cargo`,
+/// etc.) and provides per-lane isolation (TCK-00575).
+///
+/// This function must be called AFTER [`build_job_environment`] so that
+/// the per-lane overrides take final precedence over any ambient values
+/// that may have been inherited or set by policy.
+///
+/// # Arguments
+///
+/// * `env`      - Mutable reference to the environment map produced by
+///   `build_job_environment`.
+/// * `lane_dir` - Absolute path to the lane directory
+///   (`$APM2_HOME/private/fac/lanes/<lane_id>`).
+pub fn apply_lane_env_overrides(env: &mut BTreeMap<String, String>, lane_dir: &Path) {
+    env.insert(
+        "HOME".to_string(),
+        lane_dir
+            .join(LANE_ENV_DIR_HOME)
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        "TMPDIR".to_string(),
+        lane_dir
+            .join(LANE_ENV_DIR_TMP)
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        "XDG_CACHE_HOME".to_string(),
+        lane_dir
+            .join(LANE_ENV_DIR_XDG_CACHE)
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        lane_dir
+            .join(LANE_ENV_DIR_XDG_CONFIG)
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        "XDG_DATA_HOME".to_string(),
+        lane_dir
+            .join(LANE_ENV_DIR_XDG_DATA)
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        "XDG_STATE_HOME".to_string(),
+        lane_dir
+            .join(LANE_ENV_DIR_XDG_STATE)
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        "XDG_RUNTIME_DIR".to_string(),
+        lane_dir
+            .join(LANE_ENV_DIR_XDG_RUNTIME)
+            .to_string_lossy()
+            .to_string(),
+    );
+}
+
+/// Ensure all per-lane environment directories exist with restrictive
+/// permissions (0o700 in operator mode, 0o770 in system-mode, CTR-2611).
+///
+/// Creates all `LANE_ENV_DIRS` under `lane_dir`. Uses atomic creation
+/// (`mkdir`, handle `AlreadyExists`) to eliminate the TOCTOU window between
+/// existence checks and creation.
+/// Rejects symlinks via `symlink_metadata` to prevent isolation escape
+/// (INV-LANE-ENV-001).
+///
+/// # Errors
+///
+/// Returns a human-readable error when directory creation fails, when
+/// a symlink is detected, or when an existing directory has incorrect
+/// ownership or permissions.
+pub fn ensure_lane_env_dirs(lane_dir: &Path) -> Result<(), String> {
+    for subdir in LANE_ENV_DIRS {
+        let dir_path = lane_dir.join(subdir);
+        // Atomic creation: attempt mkdir first, handle AlreadyExists.
+        // This eliminates the TOCTOU window between exists() and create().
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            match std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(lane_env_dir_mode())
+                .create(&dir_path)
+            {
+                Ok(()) => {
+                    // Directory created successfully — verify it (paranoid
+                    // check against race where attacker replaces with symlink
+                    // between create and verify).
+                    verify_lane_env_dir_permissions(&dir_path)?;
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Already exists — verify permissions and reject symlinks.
+                    verify_lane_env_dir_permissions(&dir_path)?;
+                },
+                Err(e) => {
+                    return Err(format!(
+                        "cannot create lane env dir at {}: {e}",
+                        dir_path.display()
+                    ));
+                },
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match std::fs::create_dir_all(&dir_path) {
+                Ok(()) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
+                Err(e) => {
+                    return Err(format!(
+                        "cannot create lane env dir at {}: {e}",
+                        dir_path.display()
+                    ));
+                },
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verify that a directory has restrictive permissions (operator mode 0o700,
+/// system-mode 0o770), is owned by the active runtime context (CTR-2611),
+/// and is not a symlink
+/// (INV-LANE-ENV-001).
+///
+/// Uses `symlink_metadata` instead of `metadata` to avoid following
+/// symlinks. An attacker could plant a symlink (e.g., `home` -> `~/.ssh`)
+/// to escape isolation; `metadata` would follow it and report the
+/// target's attributes, bypassing the check.
+///
+/// `context` is a human-readable label for error messages (e.g.,
+/// "lane env dir", "managed `CARGO_HOME`") to identify the purpose of the
+/// directory being verified.
+///
+/// This is the shared implementation backing both
+/// `verify_lane_env_dir_permissions` and `verify_cargo_home_permissions`
+/// (TCK-00575 round 2 NIT: deduplicated permission verification).
+///
+/// # Errors
+///
+/// Returns a human-readable error when the path is a symlink, is not a
+/// directory, is owned by the wrong context, or has group/other-accessible
+/// permissions (mode bits beyond 0o700 in operator mode or beyond 0o770 in
+/// system-mode).
+#[cfg(unix)]
+pub fn verify_dir_permissions(dir_path: &Path, context: &str) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    use subtle::ConstantTimeEq;
+
+    // SAFETY: symlink_metadata does NOT follow symlinks, so we detect
+    // symlinks at the path itself rather than their targets.
+    let metadata = std::fs::symlink_metadata(dir_path)
+        .map_err(|e| format!("cannot stat {context} at {}: {e}", dir_path.display()))?;
+
+    // Reject symlinks explicitly — an attacker could create a symlink
+    // pointing to a sensitive directory (e.g., ~/.ssh) to escape isolation.
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{context} at {} is a symlink; refusing to follow — \
+             this may indicate an isolation escape attempt",
+            dir_path.display()
+        ));
+    }
+
+    if !metadata.is_dir() {
+        return Err(format!(
+            "{context} at {} is not a directory",
+            dir_path.display()
+        ));
+    }
+
+    let is_system_mode = matches!(select_backend(), Ok(ExecutionBackend::SystemMode));
+    let disallowed_mode_bits = if is_system_mode { 0o007 } else { 0o077 };
+
+    // Constant-time UID comparison to prevent timing side-channels
+    // consistent with project style (INV-PC-001).
+    let current_uid = nix::unistd::geteuid().as_raw();
+    if is_system_mode {
+        use nix::unistd::getgid;
+        let effective_gid = getgid().as_raw();
+        if metadata.gid() != effective_gid {
+            return Err(format!(
+                "{context} at {} is owned by uid {} and gid {} but current user is uid {} gid {}; \
+                 refusing to use a directory with a non-shared group in system-mode",
+                dir_path.display(),
+                metadata.uid(),
+                metadata.gid(),
+                current_uid,
+                effective_gid,
+            ));
+        }
+    } else {
+        let uid_matches: bool = current_uid
+            .to_le_bytes()
+            .ct_eq(&metadata.uid().to_le_bytes())
+            .into();
+        if !uid_matches {
+            return Err(format!(
+                "{context} at {} is owned by uid {} but current user is uid {}; \
+                 refusing to use a directory owned by another user",
+                dir_path.display(),
+                metadata.uid(),
+                current_uid,
+            ));
+        }
+    }
+
+    let mode = metadata.mode() & 0o777;
+    if mode & disallowed_mode_bits != 0 {
+        let expected_mode = if is_system_mode { "0o770" } else { "0o700" };
+        let chmod_mode = if is_system_mode { "770" } else { "700" };
+        return Err(format!(
+            "{context} at {} has too-permissive mode {:#05o} \
+             (group/other access detected); expected {}. \
+             Fix with: chmod {} {}",
+            dir_path.display(),
+            mode,
+            expected_mode,
+            chmod_mode,
+            dir_path.display(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Verify that an existing lane environment directory has restrictive
+/// permissions (0o700 in operator mode, 0o770 in system-mode),
+/// is owned by the active runtime context (CTR-2611), and is not a symlink
+/// (INV-LANE-ENV-001).
+///
+/// Delegates to [`verify_dir_permissions`] with a "lane env dir" context
+/// label.
+#[cfg(unix)]
+fn verify_lane_env_dir_permissions(dir_path: &Path) -> Result<(), String> {
+    verify_dir_permissions(dir_path, "lane env dir")
+}
+
+#[cfg(unix)]
+fn lane_env_dir_mode() -> u32 {
+    if matches!(select_backend(), Ok(ExecutionBackend::SystemMode)) {
+        0o770
+    } else {
+        0o700
+    }
 }
 
 /// Computes the deterministic policy hash using domain-separated BLAKE3.
@@ -1145,6 +1439,402 @@ mod tests {
         assert!(
             !env.contains_key("SCCACHE_CACHE_SIZE"),
             "env_set must not be able to re-introduce SCCACHE_CACHE_SIZE"
+        );
+    }
+
+    // ── Per-lane env isolation tests (TCK-00575) ──
+
+    #[test]
+    fn test_apply_lane_env_overrides_sets_all_vars() {
+        let lane_dir = Path::new("/fac/lanes/lane-00");
+        let mut env = BTreeMap::new();
+        env.insert("HOME".to_string(), "/home/user".to_string());
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+
+        apply_lane_env_overrides(&mut env, lane_dir);
+
+        assert_eq!(
+            env.get("HOME").map(String::as_str),
+            Some("/fac/lanes/lane-00/home")
+        );
+        assert_eq!(
+            env.get("TMPDIR").map(String::as_str),
+            Some("/fac/lanes/lane-00/tmp")
+        );
+        assert_eq!(
+            env.get("XDG_CACHE_HOME").map(String::as_str),
+            Some("/fac/lanes/lane-00/xdg_cache")
+        );
+        assert_eq!(
+            env.get("XDG_CONFIG_HOME").map(String::as_str),
+            Some("/fac/lanes/lane-00/xdg_config")
+        );
+        assert_eq!(
+            env.get("XDG_DATA_HOME").map(String::as_str),
+            Some("/fac/lanes/lane-00/xdg_data")
+        );
+        assert_eq!(
+            env.get("XDG_STATE_HOME").map(String::as_str),
+            Some("/fac/lanes/lane-00/xdg_state")
+        );
+        assert_eq!(
+            env.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/fac/lanes/lane-00/xdg_runtime")
+        );
+        // PATH should be unaffected.
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
+    }
+
+    #[test]
+    fn test_apply_lane_env_overrides_overwrites_existing_values() {
+        let lane_dir = Path::new("/fac/lanes/lane-01");
+        let mut env = BTreeMap::new();
+        env.insert("HOME".to_string(), "/home/user".to_string());
+        env.insert("TMPDIR".to_string(), "/tmp".to_string());
+        env.insert(
+            "XDG_CACHE_HOME".to_string(),
+            "/home/user/.cache".to_string(),
+        );
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            "/home/user/.config".to_string(),
+        );
+        env.insert(
+            "XDG_DATA_HOME".to_string(),
+            "/home/user/.local/share".to_string(),
+        );
+        env.insert(
+            "XDG_STATE_HOME".to_string(),
+            "/home/user/.local/state".to_string(),
+        );
+        env.insert("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string());
+
+        apply_lane_env_overrides(&mut env, lane_dir);
+
+        // All seven must be overwritten to lane-specific paths.
+        assert_eq!(
+            env.get("HOME").map(String::as_str),
+            Some("/fac/lanes/lane-01/home")
+        );
+        assert_eq!(
+            env.get("TMPDIR").map(String::as_str),
+            Some("/fac/lanes/lane-01/tmp")
+        );
+        assert_eq!(
+            env.get("XDG_CACHE_HOME").map(String::as_str),
+            Some("/fac/lanes/lane-01/xdg_cache")
+        );
+        assert_eq!(
+            env.get("XDG_CONFIG_HOME").map(String::as_str),
+            Some("/fac/lanes/lane-01/xdg_config")
+        );
+        assert_eq!(
+            env.get("XDG_DATA_HOME").map(String::as_str),
+            Some("/fac/lanes/lane-01/xdg_data")
+        );
+        assert_eq!(
+            env.get("XDG_STATE_HOME").map(String::as_str),
+            Some("/fac/lanes/lane-01/xdg_state")
+        );
+        assert_eq!(
+            env.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/fac/lanes/lane-01/xdg_runtime")
+        );
+    }
+
+    #[test]
+    fn test_apply_lane_env_overrides_on_empty_map() {
+        let lane_dir = Path::new("/fac/lanes/lane-02");
+        let mut env = BTreeMap::new();
+        apply_lane_env_overrides(&mut env, lane_dir);
+
+        assert_eq!(env.len(), 7);
+        assert!(env.contains_key("HOME"));
+        assert!(env.contains_key("TMPDIR"));
+        assert!(env.contains_key("XDG_CACHE_HOME"));
+        assert!(env.contains_key("XDG_CONFIG_HOME"));
+        assert!(env.contains_key("XDG_DATA_HOME"));
+        assert!(env.contains_key("XDG_STATE_HOME"));
+        assert!(env.contains_key("XDG_RUNTIME_DIR"));
+    }
+
+    #[test]
+    fn test_lane_env_overrides_after_build_job_environment() {
+        // Integration: apply_lane_env_overrides called after build_job_environment
+        // must override whatever HOME/TMPDIR values were inherited.
+        let policy = FacPolicyV1::default_policy();
+        let apm2_home = Path::new("/home/user/.apm2");
+        let ambient = vec![
+            ("HOME".to_string(), "/home/user".to_string()),
+            ("TMPDIR".to_string(), "/tmp".to_string()),
+            (
+                "XDG_CACHE_HOME".to_string(),
+                "/home/user/.cache".to_string(),
+            ),
+            (
+                "XDG_CONFIG_HOME".to_string(),
+                "/home/user/.config".to_string(),
+            ),
+            (
+                "XDG_DATA_HOME".to_string(),
+                "/home/user/.local/share".to_string(),
+            ),
+            (
+                "XDG_STATE_HOME".to_string(),
+                "/home/user/.local/state".to_string(),
+            ),
+            ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string()),
+        ];
+        let mut env = build_job_environment(&policy, &ambient, apm2_home);
+
+        let lane_dir = Path::new("/home/user/.apm2/private/fac/lanes/lane-00");
+        apply_lane_env_overrides(&mut env, lane_dir);
+
+        assert_eq!(
+            env.get("HOME").map(String::as_str),
+            Some("/home/user/.apm2/private/fac/lanes/lane-00/home"),
+            "HOME must be per-lane after apply_lane_env_overrides"
+        );
+        assert_eq!(
+            env.get("TMPDIR").map(String::as_str),
+            Some("/home/user/.apm2/private/fac/lanes/lane-00/tmp"),
+            "TMPDIR must be per-lane after apply_lane_env_overrides"
+        );
+        assert_eq!(
+            env.get("XDG_CACHE_HOME").map(String::as_str),
+            Some("/home/user/.apm2/private/fac/lanes/lane-00/xdg_cache"),
+            "XDG_CACHE_HOME must be per-lane after apply_lane_env_overrides"
+        );
+        assert_eq!(
+            env.get("XDG_CONFIG_HOME").map(String::as_str),
+            Some("/home/user/.apm2/private/fac/lanes/lane-00/xdg_config"),
+            "XDG_CONFIG_HOME must be per-lane after apply_lane_env_overrides"
+        );
+        assert_eq!(
+            env.get("XDG_DATA_HOME").map(String::as_str),
+            Some("/home/user/.apm2/private/fac/lanes/lane-00/xdg_data"),
+            "XDG_DATA_HOME must be per-lane after apply_lane_env_overrides"
+        );
+        assert_eq!(
+            env.get("XDG_STATE_HOME").map(String::as_str),
+            Some("/home/user/.apm2/private/fac/lanes/lane-00/xdg_state"),
+            "XDG_STATE_HOME must be per-lane after apply_lane_env_overrides"
+        );
+        assert_eq!(
+            env.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/home/user/.apm2/private/fac/lanes/lane-00/xdg_runtime"),
+            "XDG_RUNTIME_DIR must be per-lane after apply_lane_env_overrides"
+        );
+    }
+
+    #[test]
+    fn test_ensure_lane_env_dirs_creates_all_dirs() {
+        let tmp = tempdir().expect("tempdir");
+        let lane_dir = tmp.path().join("lane-00");
+        std::fs::create_dir_all(&lane_dir).expect("create lane dir");
+
+        ensure_lane_env_dirs(&lane_dir).expect("ensure lane env dirs");
+
+        for subdir in LANE_ENV_DIRS {
+            let dir_path = lane_dir.join(subdir);
+            assert!(dir_path.exists(), "{subdir} should exist");
+            assert!(dir_path.is_dir(), "{subdir} should be a directory");
+        }
+    }
+
+    #[test]
+    fn test_ensure_lane_env_dirs_is_idempotent() {
+        let tmp = tempdir().expect("tempdir");
+        let lane_dir = tmp.path().join("lane-00");
+        std::fs::create_dir_all(&lane_dir).expect("create lane dir");
+
+        ensure_lane_env_dirs(&lane_dir).expect("first call");
+        ensure_lane_env_dirs(&lane_dir).expect("second call (idempotent)");
+
+        for subdir in LANE_ENV_DIRS {
+            assert!(lane_dir.join(subdir).is_dir());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_lane_env_dirs_creates_with_restricted_permissions() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempdir().expect("tempdir");
+        let lane_dir = tmp.path().join("lane-00");
+        std::fs::create_dir_all(&lane_dir).expect("create lane dir");
+
+        ensure_lane_env_dirs(&lane_dir).expect("ensure lane env dirs");
+
+        for subdir in LANE_ENV_DIRS {
+            let metadata = std::fs::metadata(lane_dir.join(subdir)).expect("stat");
+            let mode = metadata.mode() & 0o777;
+            let expected_mode = lane_env_dir_mode();
+            assert_eq!(
+                mode, expected_mode,
+                "{subdir} should have mode {expected_mode:#05o}, got {mode:#05o}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_verify_lane_env_dir_rejects_group_world_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().expect("tempdir");
+        let dir_path = tmp.path().join("bad_dir");
+        std::fs::create_dir_all(&dir_path).expect("create dir");
+
+        // Set mode to 0o755 (group+other read/exec).
+        std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o755))
+            .expect("set permissions");
+
+        let err = verify_lane_env_dir_permissions(&dir_path).unwrap_err();
+        assert!(
+            err.contains("too-permissive"),
+            "should report too-permissive mode, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_lane_env_dirs_constant_matches_expected_dirs() {
+        assert_eq!(LANE_ENV_DIRS.len(), 7);
+        assert!(LANE_ENV_DIRS.contains(&"home"));
+        assert!(LANE_ENV_DIRS.contains(&"tmp"));
+        assert!(LANE_ENV_DIRS.contains(&"xdg_cache"));
+        assert!(LANE_ENV_DIRS.contains(&"xdg_config"));
+        assert!(LANE_ENV_DIRS.contains(&"xdg_data"));
+        assert!(LANE_ENV_DIRS.contains(&"xdg_state"));
+        assert!(LANE_ENV_DIRS.contains(&"xdg_runtime"));
+    }
+
+    /// Regression (BLOCKER 3): verify that `ensure_lane_env_dirs` +
+    /// `apply_lane_env_overrides` together produce a deterministic,
+    /// lane-local environment — proving the integration pattern used
+    /// in both `build_gate_policy_env` and `build_pipeline_test_command`
+    /// in evidence.rs.
+    #[test]
+    fn test_ensure_and_apply_lane_env_overrides_integration() {
+        let tmp = tempdir().expect("tempdir");
+        let lane_dir = tmp.path().join("lane-00");
+        std::fs::create_dir_all(&lane_dir).expect("create lane dir");
+
+        // Step 1: ensure dirs for all lane-level env variables.
+        ensure_lane_env_dirs(&lane_dir).expect("ensure_lane_env_dirs");
+
+        // Step 2: build a policy env simulating ambient inherit
+        let policy = FacPolicyV1::default_policy();
+        let apm2_home = tmp.path();
+        let ambient = vec![
+            ("HOME".to_string(), "/home/user".to_string()),
+            ("TMPDIR".to_string(), "/tmp".to_string()),
+            (
+                "XDG_CACHE_HOME".to_string(),
+                "/home/user/.cache".to_string(),
+            ),
+            (
+                "XDG_CONFIG_HOME".to_string(),
+                "/home/user/.config".to_string(),
+            ),
+            (
+                "XDG_DATA_HOME".to_string(),
+                "/home/user/.local/share".to_string(),
+            ),
+            (
+                "XDG_STATE_HOME".to_string(),
+                "/home/user/.local/state".to_string(),
+            ),
+            ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string()),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+        ];
+        let mut env = build_job_environment(&policy, &ambient, apm2_home);
+
+        // Step 3: apply lane overrides (pattern used by evidence.rs)
+        apply_lane_env_overrides(&mut env, &lane_dir);
+
+        // All seven env vars must point to lane-local dirs, not ambient ones.
+        let lane_str = lane_dir.to_str().expect("lane_dir to str");
+        for var in &[
+            "HOME",
+            "TMPDIR",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+        ] {
+            let val = env.get(*var).unwrap_or_else(|| {
+                panic!("{var} must be present in env after apply_lane_env_overrides")
+            });
+            assert!(
+                val.starts_with(lane_str),
+                "{var}={val} should start with lane dir {lane_str}"
+            );
+        }
+
+        // All lane subdirectories must actually exist on disk.
+        for subdir in LANE_ENV_DIRS {
+            assert!(
+                lane_dir.join(subdir).is_dir(),
+                "{subdir} must be a directory"
+            );
+        }
+
+        // PATH should be unaffected by lane overrides.
+        assert!(env.contains_key("PATH"), "PATH should remain in env");
+    }
+
+    /// Regression: a symlink planted in the lane directory (e.g., `home` ->
+    /// `~/.ssh`) must be rejected by `ensure_lane_env_dirs` to prevent
+    /// isolation escape. `verify_lane_env_dir_permissions` uses
+    /// `symlink_metadata` (not `metadata`) so it detects the symlink
+    /// itself rather than following it to the target.
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_lane_env_dirs_rejects_symlink() {
+        let tmp = tempdir().expect("tempdir");
+        let lane_dir = tmp.path().join("lane-sym");
+        std::fs::create_dir_all(&lane_dir).expect("create lane dir");
+
+        // Plant a symlink at `home` -> some other directory (simulating
+        // an attacker pointing `home` to `~/.ssh` or similar).
+        let target = tmp.path().join("attacker_target");
+        std::fs::create_dir_all(&target).expect("create target dir");
+        std::os::unix::fs::symlink(&target, lane_dir.join("home")).expect("create symlink");
+
+        let err = ensure_lane_env_dirs(&lane_dir).expect_err("should reject symlink");
+        assert!(
+            err.contains("symlink"),
+            "error should mention symlink, got: {err}"
+        );
+    }
+
+    /// Regression: `verify_lane_env_dir_permissions` must reject a
+    /// symlink even if the symlink target is a valid directory with
+    /// correct permissions.
+    #[cfg(unix)]
+    #[test]
+    fn test_verify_lane_env_dir_permissions_rejects_symlink_to_valid_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().expect("tempdir");
+        let target = tmp.path().join("valid_target");
+        std::fs::create_dir_all(&target).expect("create target dir");
+        std::fs::set_permissions(
+            &target,
+            std::fs::Permissions::from_mode(lane_env_dir_mode()),
+        )
+        .expect("set target permissions");
+
+        let symlink_path = tmp.path().join("link_to_valid");
+        std::os::unix::fs::symlink(&target, &symlink_path).expect("create symlink");
+
+        let err = verify_lane_env_dir_permissions(&symlink_path).expect_err("should reject");
+        assert!(
+            err.contains("symlink"),
+            "should report symlink rejection, got: {err}"
         );
     }
 }

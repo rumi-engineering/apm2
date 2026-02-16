@@ -8,13 +8,16 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
-use apm2_core::fac::{FacPolicyV1, LaneProfileV1, build_job_environment, compute_test_env};
+use apm2_core::fac::{
+    FacPolicyV1, LaneLockGuard, LaneManager, LaneProfileV1, LaneState, apply_lane_env_overrides,
+    build_job_environment, compute_test_env, ensure_lane_env_dirs,
+};
 use sha2::{Digest, Sha256};
 
 use super::bounded_test_runner::{
     BoundedTestLimits, build_bounded_test_command as build_systemd_bounded_test_command,
 };
-use super::evidence::{EvidenceGateOptions, run_evidence_gates};
+use super::evidence::{EvidenceGateOptions, run_evidence_gates_with_lane_context};
 use super::gate_attestation::{
     GateResourcePolicy, build_nextest_command, compute_gate_attestation,
     gate_command_for_attestation,
@@ -280,6 +283,21 @@ fn run_gates_inner(
         ensure_managed_cargo_home(&cargo_home)?;
     }
 
+    // TCK-00575: Acquire exclusive lane lock on lane-00 before any lane
+    // operations. This prevents concurrent `apm2 fac gates` invocations
+    // from colliding on the shared synthetic lane directory.
+    let lane_manager = LaneManager::from_default_home()
+        .map_err(|e| format!("failed to initialize lane manager: {e}"))?;
+    lane_manager
+        .ensure_directories()
+        .map_err(|e| format!("failed to ensure lane directories: {e}"))?;
+    let lane_guard = acquire_gates_lane_lock(&lane_manager)?;
+
+    // TCK-00575: Check for CORRUPT state before executing gates.
+    // If lane-00 is corrupt (from a previous failed run), refuse to
+    // run gates in a dirty environment. The user must reset first.
+    check_lane_not_corrupt(&lane_manager)?;
+
     // 1. Require clean working tree for full gates only. `--force` allows
     // rerunning gates for the same SHA while local edits are in progress.
     ensure_clean_working_tree(&workspace_root, quick || force)?;
@@ -387,6 +405,9 @@ fn run_gates_inner(
         Some(spec.command)
     };
 
+    let lane_context =
+        super::evidence::allocate_evidence_lane_context(&lane_manager, "lane-00", lane_guard)?;
+
     let opts = EvidenceGateOptions {
         test_command,
         test_command_environment,
@@ -399,7 +420,13 @@ fn run_gates_inner(
 
     // 5. Run evidence gates.
     let started = Instant::now();
-    let (passed, gate_results) = run_evidence_gates(&workspace_root, &sha, None, Some(&opts))?;
+    let (passed, gate_results) = run_evidence_gates_with_lane_context(
+        &workspace_root,
+        &sha,
+        None,
+        Some(&opts),
+        lane_context,
+    )?;
     let total_secs = started.elapsed().as_secs();
 
     // 6. Write attested results to gate cache for full runs only.
@@ -600,6 +627,14 @@ fn compute_nextest_test_environment(
     let ambient: Vec<(String, String)> = std::env::vars().collect();
     let mut policy_env = build_job_environment(policy, &ambient, apm2_home);
 
+    // TCK-00575: Apply per-lane env isolation (HOME, TMPDIR, XDG_CACHE_HOME,
+    // XDG_CONFIG_HOME). For CLI gates, use the synthetic lane-00 directory
+    // under $APM2_HOME/private/fac/lanes/lane-00.
+    let fac_root = apm2_home.join("private/fac");
+    let lane_dir = fac_root.join("lanes/lane-00");
+    ensure_lane_env_dirs(&lane_dir)?;
+    apply_lane_env_overrides(&mut policy_env, &lane_dir);
+
     // Lane-derived vars (NEXTEST_TEST_THREADS, CARGO_BUILD_JOBS) take
     // precedence over ambient values but env_set overrides in the policy
     // are already applied by build_job_environment.
@@ -677,13 +712,52 @@ fn ensure_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
     super::policy_loader::ensure_managed_cargo_home(cargo_home)
 }
 
+/// Acquire an exclusive lock on `lane-00` for gate execution.
+///
+/// `apm2 fac gates` uses a shared synthetic lane directory `lane-00`.
+/// Without an exclusive lock, concurrent gate invocations would collide
+/// on the lane's env dirs, workspace, and target directories.
+fn acquire_gates_lane_lock(lane_manager: &LaneManager) -> Result<LaneLockGuard, String> {
+    lane_manager.acquire_lock("lane-00").map_err(|e| {
+        format!(
+            "cannot acquire exclusive lock on lane-00 for gate execution — \
+             another `apm2 fac gates` process may be running: {e}"
+        )
+    })
+}
+
+/// Check that `lane-00` is not in a CORRUPT state.
+///
+/// If a previous gate run (or worker) marked the lane as corrupt, running
+/// gates in that environment risks non-deterministic results. The user must
+/// run `apm2 fac lane reset lane-00` to clear the corrupt marker first.
+fn check_lane_not_corrupt(lane_manager: &LaneManager) -> Result<(), String> {
+    let status = lane_manager
+        .lane_status("lane-00")
+        .map_err(|e| format!("cannot check lane-00 status: {e}"))?;
+    if status.state == LaneState::Corrupt {
+        let reason = status.corrupt_reason.as_deref().unwrap_or("unknown");
+        return Err(format!(
+            "lane-00 is in CORRUPT state (reason: {reason}). \
+             Cannot run gates in a dirty environment. \
+             Run `apm2 fac lane reset lane-00` to clear the corrupt marker first."
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::Command;
+    use std::sync::{Mutex, OnceLock};
 
     use super::*;
+
+    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
     fn ensure_clean_working_tree_skips_checks_in_quick_mode() {
@@ -848,6 +922,296 @@ mod tests {
         assert_eq!(recorded.len(), 2);
         assert_eq!(recorded[0], "started:test_gate");
         assert_eq!(recorded[1], "completed:test_gate:passed=true");
+    }
+
+    /// Regression (MAJOR 2): `check_lane_not_corrupt` must refuse to run
+    /// gates when `lane-00` has a corrupt marker, preventing execution in
+    /// a known-bad environment.
+    #[test]
+    fn check_lane_not_corrupt_rejects_corrupt_lane() {
+        use apm2_core::fac::{LANE_CORRUPT_MARKER_SCHEMA, LaneCorruptMarkerV1};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root.clone()).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        // Plant a corrupt marker on lane-00.
+        let marker = LaneCorruptMarkerV1 {
+            schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+            lane_id: "lane-00".to_string(),
+            reason: "test corruption".to_string(),
+            cleanup_receipt_digest: None,
+            detected_at: "2026-02-15T00:00:00Z".to_string(),
+        };
+        marker.persist(&fac_root).expect("persist marker");
+
+        let err = check_lane_not_corrupt(&manager).expect_err("should reject corrupt lane");
+        assert!(
+            err.contains("CORRUPT"),
+            "error should mention CORRUPT, got: {err}"
+        );
+        assert!(
+            err.contains("test corruption"),
+            "error should include corrupt reason, got: {err}"
+        );
+    }
+
+    /// Positive case: `check_lane_not_corrupt` should succeed when
+    /// `lane-00` has no corrupt marker.
+    #[test]
+    fn check_lane_not_corrupt_accepts_clean_lane() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        check_lane_not_corrupt(&manager).expect("clean lane should pass");
+    }
+
+    /// Regression (MAJOR 1): `acquire_gates_lane_lock` must acquire an
+    /// exclusive lock preventing concurrent gate invocations from colliding.
+    #[test]
+    fn acquire_gates_lane_lock_succeeds_on_free_lane() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let guard = acquire_gates_lane_lock(&manager).expect("should acquire lock");
+        // Lock is held while guard is alive.
+        drop(guard);
+    }
+
+    /// Regression (BLOCKER 1/2): `run_gates_inner` with `lane_count = 1`
+    /// should run all command-style phases in the same lane-local env context.
+    ///
+    /// This test exercises `run_gates_inner` directly with a custom fake
+    /// `cargo` and log-collecting script gates. It confirms:
+    /// - single-lane mode does not fail due to nested lock acquisition, and
+    /// - all active evidence phases receive the same lane-local HOME/TMPDIR
+    ///   /XDG env values.
+    #[allow(unsafe_code)] // Env var mutation is required for test setup and teardown.
+    #[test]
+    fn run_gates_inner_reuses_single_lane_env_for_all_phases() {
+        use std::env;
+        use std::ffi::OsString;
+
+        struct EnvGuard {
+            vars: Vec<(&'static str, Option<OsString>)>,
+            current_dir: Option<std::path::PathBuf>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (name, value) in self.vars.drain(..) {
+                    if let Some(value) = value {
+                        // SAFETY: serialized via TEST_ENV_LOCK
+                        unsafe { std::env::set_var(name, value) };
+                    } else {
+                        // SAFETY: serialized via TEST_ENV_LOCK
+                        unsafe { std::env::remove_var(name) };
+                    }
+                }
+
+                if let Some(path) = self.current_dir.take() {
+                    let _ = std::env::set_current_dir(path);
+                }
+            }
+        }
+
+        let _guard = TEST_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("serialize env-mutating integration test");
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let repo = temp_dir.path().join("workspace");
+        fs::create_dir_all(&repo).expect("create workspace");
+        let apm2_home = temp_dir.path().join("apm2_home");
+        let bin_dir = temp_dir.path().join("fake-bin");
+        let scripts_dir = repo.join("scripts").join("ci");
+        let log_file = repo.join(".fac_gate_env_log");
+
+        fs::create_dir_all(apm2_home.join("private").join("fac")).expect("create apm2 home");
+        fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+        fs::create_dir_all(&scripts_dir).expect("create scripts dir");
+
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test User"]);
+        fs::write(repo.join("README.md"), "fac gates lane test\n").expect("write repo file");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+        run_git(&repo, &["branch", "-M", "main"]);
+
+        // Shell scripts use $phase / $1 / $HOME etc. — NOT Rust format args.
+        #[allow(clippy::literal_string_with_formatting_args)]
+        let fake_cargo = "#!/bin/sh\necho \"phase=$1|HOME=$HOME|TMPDIR=$TMPDIR|XDG_CACHE_HOME=$XDG_CACHE_HOME|XDG_CONFIG_HOME=$XDG_CONFIG_HOME\" >> \"$PWD/.fac_gate_env_log\"\nexit 0\n";
+        fs::write(bin_dir.join("cargo"), fake_cargo).expect("write fake cargo");
+
+        #[allow(clippy::literal_string_with_formatting_args)]
+        let safety_guard = concat!(
+            "#!/bin/sh\n",
+            "phase=\"test_safety_guard\"\n",
+            "if [ \"$1\" = \"snapshot\" ]; then\n",
+            ":\n",
+            "fi\n",
+            "echo \"phase=$phase|HOME=$HOME|TMPDIR=$TMPDIR|XDG_CACHE_HOME=$XDG_CACHE_HOME|XDG_CONFIG_HOME=$XDG_CONFIG_HOME\" >> \"$PWD/.fac_gate_env_log\"\n",
+            "exit 0\n",
+        );
+        fs::write(scripts_dir.join("test_safety_guard.sh"), safety_guard)
+            .expect("write fake safety guard");
+
+        #[allow(clippy::literal_string_with_formatting_args)]
+        let lint_script = concat!(
+            "#!/bin/sh\n",
+            "phase=\"review_artifact_lint\"\n",
+            "echo \"phase=$phase|HOME=$HOME|TMPDIR=$TMPDIR|XDG_CACHE_HOME=$XDG_CACHE_HOME|XDG_CONFIG_HOME=$XDG_CONFIG_HOME\" >> \"$PWD/.fac_gate_env_log\"\n",
+            "exit 0\n",
+        );
+        fs::write(scripts_dir.join("review_artifact_lint.sh"), lint_script)
+            .expect("write fake lint script");
+
+        #[allow(clippy::literal_string_with_formatting_args)]
+        let integrity_script = concat!(
+            "#!/bin/sh\n",
+            "phase=\"workspace_integrity\"\n",
+            "while [ \"$#\" -gt 0 ]; do\n",
+            "if [ \"$1\" = \"--snapshot-file\" ]; then\n",
+            "shift\n",
+            "mkdir -p \"$(dirname \"$1\")\"\n",
+            ": > \"$1\"\n",
+            "break\n",
+            "fi\n",
+            "shift\n",
+            "done\n",
+            "echo \"phase=$phase|HOME=$HOME|TMPDIR=$TMPDIR|XDG_CACHE_HOME=$XDG_CACHE_HOME|XDG_CONFIG_HOME=$XDG_CONFIG_HOME\" >> \"$PWD/.fac_gate_env_log\"\n",
+            "exit 0\n",
+        );
+        fs::write(
+            scripts_dir.join("workspace_integrity_guard.sh"),
+            integrity_script,
+        )
+        .expect("write fake workspace integrity script");
+
+        let cargo_path = bin_dir.join("cargo");
+        fs::set_permissions(cargo_path, fs::Permissions::from_mode(0o755))
+            .expect("set fake cargo mode");
+        for script in [
+            scripts_dir.join("test_safety_guard.sh"),
+            scripts_dir.join("review_artifact_lint.sh"),
+            scripts_dir.join("workspace_integrity_guard.sh"),
+        ] {
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+                .expect("set script executable");
+        }
+
+        let original_path = env::var_os("PATH");
+        let original_apm2_home = env::var_os("APM2_HOME");
+        let original_lane_count = env::var_os("APM2_FAC_LANE_COUNT");
+        let original_dir = env::current_dir().expect("capture current dir");
+        let path_override = format!(
+            "{}:{}",
+            bin_dir.display(),
+            env::var("PATH").unwrap_or_default()
+        );
+
+        // SAFETY: serialized via TEST_ENV_LOCK
+        unsafe {
+            env::set_var("PATH", path_override);
+            env::set_var("APM2_HOME", &apm2_home);
+            env::set_var("APM2_FAC_LANE_COUNT", "1");
+        }
+        let _env_guard = EnvGuard {
+            vars: vec![
+                ("PATH", original_path),
+                ("APM2_HOME", original_apm2_home),
+                ("APM2_FAC_LANE_COUNT", original_lane_count),
+            ],
+            current_dir: Some(original_dir),
+        };
+
+        env::set_current_dir(&repo).expect("set test repository as cwd");
+
+        let summary = run_gates_inner(false, true, 30, "128M", 128, "100%", false, None)
+            .expect("gates should run in single-lane mode");
+        assert!(summary.passed);
+
+        let lane_dir = apm2_home
+            .join("private")
+            .join("fac")
+            .join("lanes")
+            .join("lane-00");
+        let expected = [
+            lane_dir.join("home").to_string_lossy().into_owned(),
+            lane_dir.join("tmp").to_string_lossy().into_owned(),
+            lane_dir.join("xdg_cache").to_string_lossy().into_owned(),
+            lane_dir.join("xdg_config").to_string_lossy().into_owned(),
+        ];
+
+        let log_contents = fs::read_to_string(&log_file).expect("read env log file");
+        let mut observed_tuples = HashSet::new();
+        let mut phases = HashSet::new();
+        for line in log_contents.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let mut fields = line.split('|');
+            let phase = fields
+                .next()
+                .and_then(|value| value.strip_prefix("phase="))
+                .unwrap_or("unknown");
+            let home = fields
+                .next()
+                .and_then(|value| value.strip_prefix("HOME="))
+                .unwrap_or("");
+            let tmpdir = fields
+                .next()
+                .and_then(|value| value.strip_prefix("TMPDIR="))
+                .unwrap_or("");
+            let xdg_cache = fields
+                .next()
+                .and_then(|value| value.strip_prefix("XDG_CACHE_HOME="))
+                .unwrap_or("");
+            let xdg_config = fields
+                .next()
+                .and_then(|value| value.strip_prefix("XDG_CONFIG_HOME="))
+                .unwrap_or("");
+
+            let tuple = (
+                home.to_string(),
+                tmpdir.to_string(),
+                xdg_cache.to_string(),
+                xdg_config.to_string(),
+            );
+            observed_tuples.insert(tuple);
+            phases.insert(phase.to_string());
+        }
+
+        // Verify that the lane-local env tuple appears (proving the overrides
+        // are applied) and that all cargo-based phases (fmt, clippy, doc) use it.
+        let expected_tuple = (
+            expected[0].clone(),
+            expected[1].clone(),
+            expected[2].clone(),
+            expected[3].clone(),
+        );
+        assert!(
+            observed_tuples.contains(&expected_tuple),
+            "lane-local env tuple not observed; got: {observed_tuples:#?}"
+        );
+
+        // Cargo-based phases must be present.
+        for expected_phase in ["fmt", "clippy", "doc"] {
+            assert!(
+                phases.contains(expected_phase),
+                "missing cargo phase {expected_phase}"
+            );
+        }
     }
 
     fn run_git(repo: &Path, args: &[&str]) {

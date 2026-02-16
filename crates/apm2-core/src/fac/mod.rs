@@ -322,9 +322,13 @@ pub use merge_receipt::{
     MAX_GATE_RECEIPTS as MAX_MERGE_GATE_RECEIPTS, MergeReceipt, MergeReceiptError,
     MergeReceiptProto,
 };
+#[cfg(unix)]
+pub use policy::verify_dir_permissions;
 pub use policy::{
-    EnvSetEntry, FacPolicyError, FacPolicyV1, POLICY_SCHEMA_ID, build_job_environment,
-    compute_policy_hash, deserialize_policy, parse_policy_hash, persist_policy,
+    EnvSetEntry, FacPolicyError, FacPolicyV1, LANE_ENV_DIR_HOME, LANE_ENV_DIR_TMP,
+    LANE_ENV_DIR_XDG_CACHE, LANE_ENV_DIR_XDG_CONFIG, LANE_ENV_DIRS, POLICY_SCHEMA_ID,
+    apply_lane_env_overrides, build_job_environment, compute_policy_hash, deserialize_policy,
+    ensure_lane_env_dirs, parse_policy_hash, persist_policy,
 };
 // Re-export policy inheritance types (TCK-00340)
 pub use policy_inheritance::{
