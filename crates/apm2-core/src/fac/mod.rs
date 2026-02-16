@@ -107,6 +107,9 @@ pub mod containment;
 pub mod determinism;
 mod domain_separator;
 pub mod echo_trap;
+/// Evidence bundle export/import with RFC-0028 boundary validation and RFC-0029
+/// receipt validation (TCK-00527).
+pub mod evidence_bundle;
 /// Execution backend selection for FAC jobs (system-mode and user-mode).
 pub mod execution_backend;
 pub mod flake_class;
