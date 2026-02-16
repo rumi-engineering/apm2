@@ -259,6 +259,14 @@ pub enum FacSubcommand {
     /// target namespace to reduce cold-start probability for subsequent
     /// gates.
     Warm(WarmArgs),
+    /// Benchmark harness: measure cold/warm gate times, disk footprint,
+    /// and concurrency stability.
+    ///
+    /// Runs a standardized sequence: cold gates, warm, warm gates,
+    /// multi-concurrent gates. Records results as artifacts and computes
+    /// headline deltas (cold->warm improvement, target dir size collapse,
+    /// denial rate).
+    Bench(BenchArgs),
 }
 
 /// Arguments for `apm2 fac warm`.
@@ -282,6 +290,40 @@ pub struct WarmArgs {
     /// Maximum wait time in seconds (requires --wait).
     #[arg(long, default_value_t = 1200)]
     pub wait_timeout_secs: u64,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac bench`.
+#[derive(Debug, Args)]
+pub struct BenchArgs {
+    /// Number of concurrent gate runs for stability testing.
+    ///
+    /// Clamped to `MAX_CONCURRENCY` (8).
+    #[arg(long, default_value_t = 2)]
+    pub concurrency: u8,
+
+    /// Skip the warm phase (cold and warm gates still run).
+    #[arg(long, default_value_t = false)]
+    pub skip_warm: bool,
+
+    /// Wall timeout for each gate run (seconds).
+    #[arg(long, default_value_t = 600)]
+    pub timeout_seconds: u64,
+
+    /// Memory ceiling for each gate run.
+    #[arg(long, default_value = "48G")]
+    pub memory_max: String,
+
+    /// PID/task ceiling for each gate run.
+    #[arg(long, default_value_t = 1536)]
+    pub pids_max: u64,
+
+    /// CPU quota for each gate run.
+    #[arg(long, default_value = "200%")]
+    pub cpu_quota: String,
 
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
@@ -1836,6 +1878,7 @@ pub fn run_fac(
             | FacSubcommand::Job(_)
             | FacSubcommand::Verify(_)
             | FacSubcommand::Warm(_)
+            | FacSubcommand::Bench(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -2305,6 +2348,15 @@ pub fn run_fac(
             args.wait_timeout_secs,
             resolve_json(args.json),
         ),
+        FacSubcommand::Bench(args) => crate::commands::fac_bench::run_fac_bench(
+            args.concurrency,
+            args.skip_warm,
+            args.timeout_seconds,
+            &args.memory_max,
+            args.pids_max,
+            &args.cpu_quota,
+            resolve_json(args.json),
+        ),
     }
 }
 
@@ -2333,7 +2385,8 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Gc(_)
         | FacSubcommand::Quarantine(_)
         | FacSubcommand::Verify(_)
-        | FacSubcommand::Warm(_) => true,
+        | FacSubcommand::Warm(_)
+        | FacSubcommand::Bench(_) => true,
     }
 }
 

@@ -23,6 +23,7 @@ All command functions return a `u8` exit code or `anyhow::Result<()>`, using val
 | `capability.rs` | `apm2 capability request` | Capability token issuance |
 | `consensus.rs` | `apm2 consensus *` | Consensus query operations |
 | `fac.rs` | `apm2 fac *` | FAC (Factory Automation Cycle) top-level dispatcher |
+| `fac_bench.rs` | `apm2 fac bench` | Benchmark harness: cold/warm gate times, disk footprint, concurrency stability |
 | `fac_pr/` | `apm2 fac pr *` | GitHub App credential management for PR operations |
 | `fac_review/` | `apm2 fac review *` | Review orchestration (security + quality reviews) |
 | `factory/` | `apm2 factory *` | Factory pipeline (CCP, Impact Map, RFC, Tickets) |
@@ -77,6 +78,8 @@ pub enum FacSubcommand {
     Restart(RestartArgs),
     Logs(LogsArgs),
     Pipeline(PipelineArgs),
+    Warm(WarmArgs),
+    Bench(BenchArgs),
 }
 ```
 
@@ -244,3 +247,24 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
   is derived from the effective timeout (`timeout / poll_interval + headroom`), not a fixed
   constant. Callers passing `--wait-timeout-secs` above the default (1200s) are no longer
   cut short by the iteration cap.
+
+## Bench Command Invariants (Added for TCK-00552)
+
+- **Bounded directory traversal** (`fac_bench.rs`): `measure_directory` uses iterative BFS
+  with `MAX_DIR_WALK_DEPTH` (64) and `MAX_DIR_WALK_ENTRIES` (100,000) caps. Symlinks are
+  not followed. This prevents denial-of-service via deep/wide directory trees.
+- **Bounded gate phase collection** (`fac_bench.rs`): `parse_gate_phases` collects at most
+  `MAX_GATE_PHASES` (32) phases, preventing unbounded memory growth from malformed JSONL.
+- **Concurrency clamp** (`fac_bench.rs`): The `--concurrency` value is clamped to
+  `MAX_CONCURRENCY` (8) before spawning threads. A zero value is treated as 1.
+- **Monotonic timing** (`fac_bench.rs`): All duration measurements use `std::time::Instant`
+  (monotonic clock) per INV-2501. `SystemTime` is used only for the report timestamp.
+- **Atomic persistence** (`fac_bench.rs`): `persist_bench_report` writes to a temporary file
+  then renames into place (CTR-2607). Directory permissions are 0o700, file permissions are
+  0o600 (CTR-2611).
+- **Content-addressed receipts** (`fac_bench.rs`): `compute_report_content_hash` uses SHA-256
+  with a domain separator (`apm2.fac.bench_report.content_hash.v1\0`) and length-prefixed
+  injective framing to prevent cross-domain collisions.
+- **Safe numeric conversions** (`fac_bench.rs`): `millis_from_elapsed` and `secs_f64_to_millis`
+  handle overflow (saturating to `u64::MAX`), NaN, and negative inputs. No bare `as` casts
+  on untrusted values.
