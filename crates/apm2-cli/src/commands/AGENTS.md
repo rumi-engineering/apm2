@@ -458,3 +458,10 @@ Security invariants:
   mismatch, oversized file) denies the job with
   `DenialReasonCode::EconomicsAdmissionDenied`. Previously, all load errors were treated
   as "no root" which allowed admission bypass via root file tampering (INV-EADOPT-004).
+
+## Worker Pipeline Commit Fix (TCK-00601)
+
+- **Missing network_policy_hash argument** (`fac_worker.rs`): The `commit_claimed_job_via_pipeline`
+  call in the warm-job denial path at line ~2280 was missing the 18th argument
+  (`network_policy_hash`). Added `None` to match the function signature and prevent build
+  failures.
