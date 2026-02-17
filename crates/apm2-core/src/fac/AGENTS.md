@@ -1222,6 +1222,108 @@ trail. Usernames containing only unsafe characters fall back to hex encoding.
 - [INV-PADOPT-012] Rotation logic reads the current root via bounded
   `load_bounded_json` (not unbounded `fs::read`) to prevent memory exhaustion.
 
+## economics_adoption Submodule (TCK-00584)
+
+The `economics_adoption` module implements broker-admitted `EconomicsProfile`
+hash rotation with receipts and rollback. The broker maintains an admitted
+economics profile digest under
+`$APM2_HOME/private/fac/broker/admitted_economics_profile.v1.json` (digest only;
+non-secret). Adoption is atomic (temp + rename + fsync per CTR-2607), with the
+previous digest retained in `admitted_economics_profile.prev.v1.json` for
+rollback.
+
+### Types
+
+- `AdmittedEconomicsProfileRootV1`: Persisted admitted economics profile root
+  (schema, hash, timestamp, actor). Uses `#[serde(deny_unknown_fields)]`.
+- `EconomicsAdoptionAction`: Enum (`Adopt`, `Rollback`).
+- `EconomicsAdoptionReceiptV1`: Durable receipt for adoption/rollback events.
+  Contains `old_digest`, `new_digest`, actor, reason, timestamp, and
+  domain-separated BLAKE3 content hash.
+- `EconomicsAdoptionError`: Error enum (via `thiserror`) covering validation,
+  persistence, I/O, serialization, size-limit, string-bound, and duplicate
+  adoption failures.
+
+### Key Functions
+
+- `load_admitted_economics_profile_root(fac_root) -> Result<AdmittedEconomicsProfileRootV1>`:
+  Reads the current admitted root with bounded I/O (CTR-1603) and symlink rejection.
+- `is_economics_profile_hash_admitted(fac_root, hash) -> bool`: Constant-time
+  comparison (via `subtle::ConstantTimeEq`) of a profile hash against the
+  admitted root. Returns `false` when no root exists (fail-closed, INV-EADOPT-004).
+- `validate_economics_profile_bytes(bytes) -> Result<(EconomicsProfile, String)>`:
+  Validates framed profile bytes (domain-prefix check) and computes BLAKE3 hash.
+- `validate_economics_profile_json_bytes(bytes) -> Result<(EconomicsProfile, String)>`:
+  Validates raw JSON profile bytes, adds domain framing, and computes BLAKE3 hash.
+- `adopt_economics_profile(fac_root, bytes, actor, reason) -> Result<(Root, Receipt)>`:
+  Full adoption lifecycle: validate, check for duplicate, persist atomically
+  (current -> prev, new -> current), emit receipt.
+- `rollback_economics_profile(fac_root, actor, reason) -> Result<(Root, Receipt)>`:
+  Restores the previous admitted root atomically and emits a rollback receipt.
+- `deserialize_adoption_receipt(bytes) -> Result<EconomicsAdoptionReceiptV1>`:
+  Bounded deserialization of adoption receipts.
+
+### CLI Commands (fac_economics.rs)
+
+- `apm2 fac economics show [--json]`: Display the currently admitted economics
+  profile root.
+- `apm2 fac economics adopt [<path|->] [--reason <reason>] [--json]`: Adopt a
+  new economics profile (atomic, with receipt). Accepts a file path or `-` for
+  stdin. Auto-detects framed vs raw JSON input.
+- `apm2 fac economics rollback [--reason <reason>] [--json]`: Rollback to the
+  previous admitted economics profile (with receipt).
+
+### Worker Integration (fac_worker.rs)
+
+The worker admission path includes a Step 2.6 economics profile hash check
+after the existing policy admission check (Step 2.5). The worker formats
+`policy.economics_profile_hash` as `b3-256:<hex>`, loads the admitted root, and
+denies with `DenialReasonCode::EconomicsAdmissionDenied` on mismatch.
+Error handling is fail-closed by error variant:
+- `NoAdmittedRoot` + non-zero `economics_profile_hash`: DENY the job. The
+  policy requires economics enforcement but there is no admitted root to
+  verify against. Prevents admission bypass via root file deletion.
+- `NoAdmittedRoot` + zero `economics_profile_hash`: skip check (backwards
+  compatibility for installations that have not adopted an economics profile
+  and whose policies don't require one).
+- Any other load error (I/O, corruption, schema mismatch, oversized file):
+  deny the job. Treating non-`NoAdmittedRoot` errors as "no root" would allow
+  an attacker to bypass admission by tampering with the admitted-economics root
+  file (INV-EADOPT-004).
+
+### Security Invariants (TCK-00584)
+
+- [INV-EADOPT-001] Adoption requires schema + hash validation before acceptance
+  (no arbitrary file acceptance).
+- [INV-EADOPT-002] Atomic persistence via `NamedTempFile` + fsync + `persist()`
+  (CTR-2607, RSK-1502). `NamedTempFile` uses `O_EXCL` + random names to
+  eliminate symlink TOCTOU on temp file creation. The prev-file backup also
+  uses temp + rename (not `fs::copy`).
+- [INV-EADOPT-003] Rollback to `prev` is atomic and emits a receipt.
+- [INV-EADOPT-004] Workers refuse actuation tokens whose economics profile hash
+  mismatches the admitted digest (fail-closed). The worker loads the admitted
+  root via `load_admitted_economics_profile_root` and branches on the error
+  variant: `NoAdmittedRoot` denies the job if the policy's
+  `economics_profile_hash` is non-zero (policy requires economics but no root
+  exists — prevents bypass via root file deletion), skips only if the hash is
+  zero (no economics binding required); successful load triggers constant-time
+  hash comparison; any other error (I/O, corruption, schema mismatch, oversized)
+  denies the job. This prevents admission bypass via root file tampering.
+- [INV-EADOPT-005] Receipt content hash uses domain-separated BLAKE3 with
+  injective length-prefix framing (CTR-2612).
+- [INV-EADOPT-006] All string fields are bounded for DoS prevention (CTR-1303).
+- [INV-EADOPT-007] File reads use the open-once pattern: `O_NOFOLLOW | O_CLOEXEC`
+  at `open(2)` atomically refuses symlinks at the kernel level, `fstat` on the
+  opened fd verifies regular file type, and `take(max_size+1)` bounds reads
+  (CTR-1603). This eliminates the TOCTOU gap between symlink check and read.
+- [INV-EADOPT-008] All persistence paths (admitted root, prev root, receipt
+  files, broker dir, receipts dir) reject symlinks via `reject_symlink()`
+  before writes. Read paths use `O_NOFOLLOW` at the kernel level.
+- [INV-EADOPT-009] Actor identity in receipts is resolved from the calling
+  process environment, not hard-coded. Username is sanitized to safe chars.
+- [INV-EADOPT-010] Receipts directory is synced after atomic rename for
+  durability (CTR-2607, CTR-1502).
+
 ## Receipt Versioning (TCK-00518)
 
 The `FacJobReceiptV1` type supports two canonical byte representations:

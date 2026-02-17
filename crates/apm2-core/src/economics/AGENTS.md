@@ -738,6 +738,7 @@ Ensures reconstruction of mandatory artifact tiers (source snapshots, policy roo
 - [`apm2_core::budget`](../budget/AGENTS.md) -- Budget tracking and enforcement at the session level
 - [`apm2_core::pcac::temporal_arbitration`](../pcac/AGENTS.md) -- `TemporalPredicateId` enum (TpEio29001/002/003/004/005/007/008/009) used for predicate tracking in admission traces
 - [`apm2_core::fac::domain_separator`](../fac/AGENTS.md) -- `sign_with_domain` / `verify_with_domain` for domain-separated receipt signatures
+- [`apm2_core::fac::economics_adoption`](../fac/AGENTS.md) -- Broker-admitted economics profile hash rotation with receipts (TCK-00584). Workers deny budget admissions when the profile hash mismatches the admitted digest.
 
 ## References
 

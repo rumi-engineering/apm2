@@ -602,6 +602,11 @@ pub enum DenialReasonCode {
     /// policy digest (INV-PADOPT-004, TCK-00561). Workers fail-closed
     /// when the policy hash is not admitted.
     PolicyAdmissionDenied,
+    /// The economics profile hash from the FAC policy does not match the
+    /// broker-admitted economics profile digest (INV-EADOPT-004,
+    /// TCK-00584). Workers fail-closed when the economics profile hash is
+    /// not admitted.
+    EconomicsAdmissionDenied,
 }
 
 /// Trace of the RFC-0028 channel boundary check.
@@ -3182,6 +3187,10 @@ pub mod tests {
             (
                 DenialReasonCode::PolicyAdmissionDenied,
                 "\"policy_admission_denied\"",
+            ),
+            (
+                DenialReasonCode::EconomicsAdmissionDenied,
+                "\"economics_admission_denied\"",
             ),
         ];
 
