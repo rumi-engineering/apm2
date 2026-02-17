@@ -116,8 +116,22 @@ fn should_dedupe_on_lease_contention(
     }
     existing_state.is_some_and(|state| {
         state.head_sha.eq_ignore_ascii_case(current_head_sha)
-            && state.pid.is_some_and(super::state::is_process_alive)
+            && state_references_live_process_identity(state)
     })
+}
+
+fn state_references_live_process_identity(state: &ReviewRunState) -> bool {
+    let Some(pid) = state.pid else {
+        return false;
+    };
+    if !super::state::is_process_alive(pid) {
+        return false;
+    }
+    let Some(expected_start) = state.proc_start_time else {
+        return false;
+    };
+    super::state::get_process_start_time(pid)
+        .is_some_and(|observed_start| observed_start == expected_start)
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -853,6 +867,10 @@ fn run_single_review(
                     "existing_pid": existing.as_ref().map(|entry| entry.pid),
                     "existing_sha": existing.as_ref().map(|entry| entry.head_sha.clone()),
                     "existing_run_id": existing_state.as_ref().map(|state| state.run_id.clone()),
+                    "existing_state_pid": existing_state.as_ref().and_then(|state| state.pid),
+                    "existing_state_proc_start_time": existing_state
+                        .as_ref()
+                        .and_then(|state| state.proc_start_time),
                 }),
             )?;
             let model = existing
@@ -1835,6 +1853,13 @@ mod tests {
         }
     }
 
+    fn sample_run_state_with_pid(pid: u32, proc_start_time: Option<u64>) -> ReviewRunState {
+        let mut state = sample_run_state();
+        state.pid = Some(pid);
+        state.proc_start_time = proc_start_time;
+        state
+    }
+
     #[test]
     fn required_verdict_command_uses_code_quality_dimension_for_quality_reviews() {
         let command = required_verdict_command(ReviewKind::Quality);
@@ -1925,6 +1950,72 @@ mod tests {
             None,
             Some(&entry),
         ));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn lease_contention_with_identity_matched_state_dedupes() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .expect("spawn helper process");
+        let proc_start_time =
+            crate::commands::fac_review::state::get_process_start_time(child.id())
+                .expect("read process start time");
+        let state = sample_run_state_with_pid(child.id(), Some(proc_start_time));
+
+        assert!(should_dedupe_on_lease_contention(
+            "0123456789abcdef0123456789abcdef01234567",
+            Some(&state),
+            None,
+        ));
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn lease_contention_with_pid_reuse_style_mismatch_must_not_dedupe() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .expect("spawn helper process");
+        let proc_start_time =
+            crate::commands::fac_review::state::get_process_start_time(child.id())
+                .expect("read process start time");
+        let state = sample_run_state_with_pid(child.id(), Some(proc_start_time + 1));
+
+        assert!(
+            !should_dedupe_on_lease_contention(
+                "0123456789abcdef0123456789abcdef01234567",
+                Some(&state),
+                None,
+            ),
+            "mismatched proc_start_time must not dedupe"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn lease_contention_with_missing_proc_start_time_must_not_dedupe() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .expect("spawn helper process");
+        let state = sample_run_state_with_pid(child.id(), None);
+
+        assert!(
+            !should_dedupe_on_lease_contention(
+                "0123456789abcdef0123456789abcdef01234567",
+                Some(&state),
+                None,
+            ),
+            "missing proc_start_time must not dedupe state-only contention"
+        );
+
         let _ = child.kill();
         let _ = child.wait();
     }
