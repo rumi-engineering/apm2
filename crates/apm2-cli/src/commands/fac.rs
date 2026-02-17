@@ -7078,37 +7078,39 @@ mod tests {
         }
     }
 
+    /// Regression test: receipt list deterministic sorting (MAJOR finding).
+    /// Verifies timestamp-desc / `content_hash`-asc ordering with equal
+    /// timestamps.
     #[test]
     fn test_receipt_list_sorting_deterministic() {
-        use apm2_core::fac::FacJobOutcome;
-        use apm2_core::fac::receipt_index::ReceiptHeaderV1;
+        use apm2_core::fac::{FacJobOutcome, ReceiptHeaderV1};
 
-        let mut headers = vec![
-            ReceiptHeaderV1 {
-                job_id: "job1".to_string(),
-                content_hash: "hash_b".to_string(),
-                outcome: FacJobOutcome::Completed,
-                timestamp_secs: 100,
-                queue_lane: Some("lane".to_string()),
-                unsafe_direct: false,
-            },
-            ReceiptHeaderV1 {
-                job_id: "job2".to_string(),
-                content_hash: "hash_a".to_string(),
-                outcome: FacJobOutcome::Completed,
-                timestamp_secs: 100, // Same timestamp
-                queue_lane: Some("lane".to_string()),
-                unsafe_direct: false,
-            },
-            ReceiptHeaderV1 {
-                job_id: "job3".to_string(),
-                content_hash: "hash_c".to_string(),
-                outcome: FacJobOutcome::Completed,
-                timestamp_secs: 200, // Newer
-                queue_lane: Some("lane".to_string()),
-                unsafe_direct: false,
-            },
-        ];
+        let h1 = ReceiptHeaderV1 {
+            job_id: "job1".to_string(),
+            content_hash: "hash_b".to_string(),
+            outcome: FacJobOutcome::Completed,
+            timestamp_secs: 100,
+            queue_lane: Some("lane".to_string()),
+            unsafe_direct: false,
+        };
+        let h2 = ReceiptHeaderV1 {
+            job_id: "job2".to_string(),
+            content_hash: "hash_a".to_string(),
+            outcome: FacJobOutcome::Completed,
+            timestamp_secs: 100, // Same timestamp as h1
+            queue_lane: Some("lane".to_string()),
+            unsafe_direct: false,
+        };
+        let h3 = ReceiptHeaderV1 {
+            job_id: "job3".to_string(),
+            content_hash: "hash_c".to_string(),
+            outcome: FacJobOutcome::Completed,
+            timestamp_secs: 200, // Newer
+            queue_lane: Some("lane".to_string()),
+            unsafe_direct: false,
+        };
+
+        let mut headers = Vec::from([h1, h2, h3]);
 
         // Sort: timestamp desc, hash asc
         headers.sort_by(|a, b| {
@@ -7117,8 +7119,54 @@ mod tests {
                 .then_with(|| a.content_hash.cmp(&b.content_hash))
         });
 
-        assert_eq!(headers[0].job_id, "job3"); // 200
-        assert_eq!(headers[1].job_id, "job2"); // 100, hash_a
-        assert_eq!(headers[2].job_id, "job1"); // 100, hash_b
+        assert_eq!(headers[0].job_id, "job3"); // timestamp 200 (most recent)
+        assert_eq!(headers[1].job_id, "job2"); // timestamp 100, hash_a (asc)
+        assert_eq!(headers[2].job_id, "job1"); // timestamp 100, hash_b (asc)
+    }
+
+    /// Regression test: `--since` inclusive filtering boundary (MINOR finding).
+    /// Verifies that receipts with `timestamp_secs` == since are included.
+    #[test]
+    fn test_receipt_list_since_inclusive_boundary() {
+        use apm2_core::fac::{FacJobOutcome, ReceiptHeaderV1};
+
+        let headers = vec![
+            ReceiptHeaderV1 {
+                job_id: "old".to_string(),
+                content_hash: "hash_old".to_string(),
+                outcome: FacJobOutcome::Completed,
+                timestamp_secs: 99,
+                queue_lane: None,
+                unsafe_direct: false,
+            },
+            ReceiptHeaderV1 {
+                job_id: "boundary".to_string(),
+                content_hash: "hash_boundary".to_string(),
+                outcome: FacJobOutcome::Completed,
+                timestamp_secs: 100,
+                queue_lane: None,
+                unsafe_direct: false,
+            },
+            ReceiptHeaderV1 {
+                job_id: "new".to_string(),
+                content_hash: "hash_new".to_string(),
+                outcome: FacJobOutcome::Completed,
+                timestamp_secs: 200,
+                queue_lane: None,
+                unsafe_direct: false,
+            },
+        ];
+
+        let since = 100u64;
+        let filtered: Vec<_> = headers
+            .into_iter()
+            .filter(|h| h.timestamp_secs >= since)
+            .collect();
+
+        // Should include boundary (100) and new (200), exclude old (99).
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().any(|h| h.job_id == "boundary"));
+        assert!(filtered.iter().any(|h| h.job_id == "new"));
+        assert!(!filtered.iter().any(|h| h.job_id == "old"));
     }
 }

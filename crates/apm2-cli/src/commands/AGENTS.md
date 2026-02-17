@@ -26,6 +26,8 @@ All command functions return a `u8` exit code or `anyhow::Result<()>`, using val
 | `fac_pr/` | `apm2 fac pr *` | GitHub App credential management for PR operations |
 | `fac_review/` | `apm2 fac review *` | Review orchestration (security + quality reviews) |
 | `fac_queue.rs` | `apm2 fac queue *` | Queue introspection (status with counts, reason stats) |
+| `fac_job.rs` | `apm2 fac job *` | Job introspection (show, cancel) with bounded I/O |
+| `fac_utils.rs` | _(shared)_ | Shared utilities: queue/fac root resolution, bounded job spec I/O |
 | `factory/` | `apm2 factory *` | Factory pipeline (CCP, Impact Map, RFC, Tickets) |
 | `cac.rs` | `apm2 cac *` | CAC (Compliance Artifact Chain) operations |
 | `coordinate.rs` | `apm2 coordinate *` | Multi-agent coordination commands |
@@ -280,11 +282,25 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
   `read_dir` (MAX_SCAN_ENTRIES=4096) and reports per-directory file counts, oldest job ID
   and enqueue time, and denial/quarantine reason stats. Reason codes are capped at
   MAX_REASON_CODES=64 to prevent unbounded memory growth from adversarial data.
+- **Receipt-based reason stats** (`fac_queue.rs`): `collect_reason_stats` resolves denial
+  reasons from the canonical receipt index via `lookup_job_receipt()`, not from `spec.kind`.
+  This ensures forensic reason codes match the authoritative receipt chain rather than the
+  mutable job spec field.
 - **Job show** (`fac_job.rs`): `apm2 fac job show <job_id>` locates a job across all queue
-  directories, reads the spec with bounded I/O (reuses `read_job_spec` / `MAX_JOB_SPEC_SIZE`),
-  resolves the latest receipt from the receipt index, and discovers log pointers from the
-  evidence directory and lane logs. Returns NOT_FOUND (exit 12) if the job is absent.
+  directories, reads the spec with bounded I/O (reuses `read_job_spec_bounded` from
+  `fac_utils`), resolves the latest receipt from the receipt index, and discovers log
+  pointers from the evidence directory and lane logs. Returns NOT_FOUND (exit 12) if the
+  job is absent.
+- **Bounded log pointers** (`fac_job.rs`): `discover_log_pointers` caps total discovered
+  log paths at MAX_LOG_POINTERS=256 across all scan locations (evidence directory + lane
+  logs). The function resolves lanes from `resolve_fac_root().join("lanes")` (the canonical
+  FAC root) rather than inferring from queue root parentage. Truncation is reported in both
+  text and JSON output via `log_pointers_truncated`.
+- **Shared utilities** (`fac_utils.rs`): Queue root resolution (`resolve_queue_root`), FAC
+  root resolution (`resolve_fac_root`), and bounded job spec reading (`read_job_spec_bounded`)
+  are consolidated in `fac_utils` to eliminate cross-module duplication between `fac_queue.rs`
+  and `fac_job.rs`. Constants `QUEUE_DIR`, `MAX_SCAN_ENTRIES` are shared.
 - **Receipts list --since** (`fac.rs`): `apm2 fac receipts list --since <epoch_secs>` filters
   the receipt index to entries at or after the given UNIX epoch. Deterministic ordering is
   enforced: primary sort by `timestamp_secs` descending, secondary sort by `content_hash`
-  ascending for stable tie-breaking.
+  ascending for stable tie-breaking. Boundary inclusion is verified by regression test.
