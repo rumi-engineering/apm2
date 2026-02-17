@@ -12,7 +12,7 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use apm2_core::config::default_data_dir;
 use apm2_core::fac::execution_backend::{probe_user_bus, select_backend};
-use apm2_core::github::resolve_apm2_home;
+use apm2_core::github::{GitHubAppTokenProvider, resolve_apm2_home};
 use apm2_daemon::telemetry::is_cgroup_v2_available;
 use tracing::info;
 
@@ -752,13 +752,60 @@ pub fn collect_doctor_checks(
             "GitHub App not configured, but token auth is available (OK as alternative)".to_string()
         } else {
             "GitHub App not configured (no github_app.toml found). \
-             Remediation: run `apm2 fac pr auth-setup` to configure GitHub App credentials, \
+             Remediation: run `apm2 fac pr auth-setup` to configure GitHub App credentials \
+             (on headless hosts use `apm2 fac pr auth-setup --for-systemd`), \
              or export GITHUB_TOKEN as an alternative"
                 .to_string()
         },
     });
     if app_status == "ERROR" {
         has_error = true;
+    }
+
+    // TCK-00598: When --full/--include-secrets is set and App config exists,
+    // verify the private key is actually resolvable. A config file that
+    // references an inaccessible key should not report OK.
+    if full {
+        if let Some(ref cfg) = app_config {
+            let allow_file_fallback = cfg.allow_private_key_file_fallback.unwrap_or(false);
+            let key_result = GitHubAppTokenProvider::resolve_private_key(
+                &cfg.app_id,
+                "APM2_GITHUB_APP_PRIVATE_KEY",
+                Some(cfg),
+                cfg.keyring_service.as_deref(),
+                cfg.keyring_account.as_deref(),
+                allow_file_fallback,
+            );
+            let (secret_status, secret_message) = match key_result {
+                Ok(_) => (
+                    "OK",
+                    "GitHub App private key resolved successfully".to_string(),
+                ),
+                Err(err) => {
+                    has_error = true;
+                    (
+                        "ERROR",
+                        format!("GitHub App private key could not be resolved. {err}"),
+                    )
+                },
+            };
+            checks.push(DaemonDoctorCheck {
+                name: "creds_github_app_secret".to_string(),
+                status: secret_status,
+                message: secret_message,
+            });
+        } else if !unified_token_available {
+            // No app config and no token — secret check is not applicable but
+            // surfaces guidance for users who have neither credential source.
+            checks.push(DaemonDoctorCheck {
+                name: "creds_github_app_secret".to_string(),
+                status: "WARN",
+                message: "GitHub App private key check skipped (no github_app.toml). \
+                          Remediation: run `apm2 fac pr auth-setup` \
+                          (on headless hosts use `apm2 fac pr auth-setup --for-systemd`)"
+                    .to_string(),
+            });
+        }
     }
 
     // Systemd credential file for GH token — supplementary; only ERROR

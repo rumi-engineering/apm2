@@ -319,6 +319,37 @@ lease.revoke(
 assert!(lease.is_terminal());
 ```
 
+## Systemd Credential Resolution (TCK-00598)
+
+The module provides `resolve_systemd_credential()` and `read_private_key_file_bounded()` for
+headless private key resolution via systemd's `LoadCredential=` mechanism:
+
+- **`resolve_systemd_credential(name)`**: Reads `$CREDENTIALS_DIRECTORY/<name>`, rejecting symlinks
+  and empty files. Returns `SecretString`.
+- **`read_private_key_file_bounded(path)`**: Reads a PEM file with symlink rejection and 16 KiB size
+  cap to prevent resource exhaustion.
+- **`read_private_key_file_secure(path)`**: Config-file fallback PEM read with the same open-once
+  bounded strategy: symlink rejection via `O_NOFOLLOW` and 16 KiB size cap.
+- **`SYSTEMD_GITHUB_APP_KEY_NAME`**: Canonical credential name (`"github-app-key"`).
+
+The private key resolution order in `GitHubAppTokenProvider::resolve_private_key()` is:
+1. Environment variable (`APM2_GITHUB_APP_PRIVATE_KEY`)
+2. Systemd credential (`$CREDENTIALS_DIRECTORY/github-app-key`)
+3. OS keyring
+4. PEM file fallback (only if `allow_private_key_file_fallback` is enabled)
+
+**Invariants:**
+- [INV-0910] All private key read paths use the open-once strategy: open with `O_NOFOLLOW`,
+  validate metadata on the file handle, read bounded content from the same descriptor. This
+  eliminates TOCTOU gaps between validation and read (CWE-367 mitigation).
+
+**Contracts:**
+- [CTR-0901] `resolve_systemd_credential` rejects symlinks atomically via `O_NOFOLLOW` (CWE-61)
+- [CTR-0902] `read_private_key_file_bounded` enforces 16 KiB max size (CTR-1603/RSK-1601)
+- [CTR-0903] Empty/whitespace-only credential files are rejected
+- [CTR-0904] `read_private_key_file_secure` uses the same open-once bounded strategy as
+  `read_private_key_file_bounded` for consistent TOCTOU and DoS protection
+
 ## Remote URL Parsing (TCK-00595)
 
 The module provides utility functions for parsing GitHub remote URLs:
