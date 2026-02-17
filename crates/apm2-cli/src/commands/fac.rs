@@ -288,6 +288,16 @@ pub enum FacSubcommand {
     /// Shows job counts by directory, oldest pending job, and
     /// denial/quarantine reason code distributions.
     Queue(QueueArgs),
+    /// One-shot compute-host provisioning for `FESv1`.
+    ///
+    /// Creates the required `$APM2_HOME/private/fac/**` directory tree with
+    /// correct permissions and ownership, writes a minimal default
+    /// `FacPolicyV1` (safe no-secrets posture), initializes lanes, and
+    /// optionally installs systemd services. Runs doctor checks and fails
+    /// with actionable output if the host cannot support `FESv1`.
+    ///
+    /// Idempotent: safe to re-run without destroying existing state.
+    Bootstrap(crate::commands::fac_bootstrap::BootstrapArgs),
 }
 
 /// Arguments for `apm2 fac warm`.
@@ -2152,6 +2162,7 @@ pub fn run_fac(
             | FacSubcommand::Bundle(_)
             | FacSubcommand::Reconcile(_)
             | FacSubcommand::Queue(_)
+            | FacSubcommand::Bootstrap(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -2671,6 +2682,9 @@ pub fn run_fac(
             },
         },
         FacSubcommand::Reconcile(args) => run_reconcile(args, resolve_json(args.json)),
+        FacSubcommand::Bootstrap(args) => {
+            crate::commands::fac_bootstrap::run_bootstrap(args, operator_socket, config_path)
+        },
     }
 }
 
@@ -2800,7 +2814,8 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Bench(_)
         | FacSubcommand::Bundle(_)
         | FacSubcommand::Reconcile(_)
-        | FacSubcommand::Queue(_) => true,
+        | FacSubcommand::Queue(_)
+        | FacSubcommand::Bootstrap(_) => true,
     }
 }
 
