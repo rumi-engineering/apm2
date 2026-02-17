@@ -229,7 +229,7 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
   errno discrimination (ESRCH vs EPERM) instead of shell `kill -0` with `status.success()`.
   EPERM means the process exists but is unpermissioned; the lane is marked corrupt, not idle.
 
-## Warm Command Invariants (Updated for TCK-00525)
+## Warm Command Invariants (Updated for TCK-00579)
 
 - **Lane encoding** (`fac_warm.rs`): The `--lane` flag value is validated using the same
   character set the worker enforces (`[A-Za-z0-9_-]`), length-checked against
@@ -271,3 +271,8 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
   chains (exec and warm paths) call `.sandbox_hardening_hash(&sbx_hash)` so the
   cryptographically signed `GateReceipt` binds the hardening profile used during
   execution. This complements the `FacJobReceiptV1` binding done via `emit_job_receipt`.
+- **Policy-aware warm spec validation** (`fac_warm.rs`, TCK-00579): The warm enqueue path
+  derives a `JobSpecValidationPolicy` from the loaded FAC policy and validates the warm
+  spec via `validate_job_spec_with_policy()` before enqueue, failing closed on validation
+  error. This enforces repo_id allowlist, bytes_backend allowlist, and filesystem-path
+  rejection at enqueue time, matching the gates enqueue path (INV-WARM-CLI-005).

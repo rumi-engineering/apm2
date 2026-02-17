@@ -23,13 +23,18 @@
 //! - [INV-WARM-CLI-003] Queue writes are atomic (temp + rename).
 //! - [INV-WARM-CLI-004] Broker health gate is opened before token issuance
 //!   (fail-closed on missing/stale authority).
+//! - [INV-WARM-CLI-005] Warm specs are validated against the FAC policy-derived
+//!   `JobSpecValidationPolicy` before enqueue (TCK-00579). This enforces
+//!   `repo_id` allowlist, `bytes_backend` allowlist, and filesystem-path
+//!   rejection at enqueue time, matching the gates enqueue path.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use apm2_core::fac::broker::FacBroker;
 use apm2_core::fac::job_spec::{
-    Actuation, FacJobSpecV1, JobConstraints, JobSource, LaneRequirements, MAX_QUEUE_LANE_LENGTH,
+    Actuation, FacJobSpecV1, JobConstraints, JobSource, JobSpecValidationPolicy, LaneRequirements,
+    MAX_QUEUE_LANE_LENGTH, validate_job_spec_with_policy,
 };
 use apm2_core::fac::warm::{DEFAULT_WARM_PHASES, MAX_WARM_PHASES, WarmPhase};
 use apm2_core::fac::{check_disk_space, load_or_default_boundary_id, lookup_job_receipt};
@@ -146,13 +151,28 @@ pub fn run_fac_warm(
     };
 
     // Load or initialize policy.
-    let (policy_hash, policy_digest, _policy) = match load_or_init_policy(&fac_root) {
+    let (policy_hash, policy_digest, fac_policy) = match load_or_init_policy(&fac_root) {
         Ok(p) => p,
         Err(msg) => {
             return output_error(
                 json_output,
                 "warm_policy_load_failed",
                 &msg,
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // TCK-00579: Derive job spec validation policy from FAC policy for
+    // enqueue-time enforcement of repo_id allowlist, bytes_backend
+    // allowlist, and filesystem-path rejection.
+    let job_spec_policy = match fac_policy.job_spec_validation_policy() {
+        Ok(p) => p,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "warm_job_spec_policy_failed",
+                &format!("cannot derive job spec validation policy: {e}"),
                 exit_codes::GENERIC_ERROR,
             );
         },
@@ -186,6 +206,7 @@ pub fn run_fac_warm(
         &queue_lane,
         &boundary_id,
         &mut broker,
+        &job_spec_policy,
     ) {
         Ok(s) => s,
         Err(msg) => {
@@ -359,6 +380,7 @@ fn build_warm_job_spec(
     queue_lane: &str,
     boundary_id: &str,
     broker: &mut FacBroker,
+    job_spec_policy: &JobSpecValidationPolicy,
 ) -> Result<FacJobSpecV1, String> {
     let enqueue_time = format_iso8601(current_epoch_secs());
     let phases_csv = phases
@@ -421,6 +443,12 @@ fn build_warm_job_spec(
         )
         .map_err(|e| format!("broker token issuance: {e}"))?;
     spec.actuation.channel_context_token = Some(token);
+
+    // TCK-00579: Validate the warm spec against the policy-derived validation
+    // policy before enqueue, failing closed on validation error.  This mirrors
+    // the gates enqueue path (INV-JS-005).
+    validate_job_spec_with_policy(&spec, job_spec_policy)
+        .map_err(|e| format!("validate warm job spec: {e}"))?;
 
     Ok(spec)
 }
