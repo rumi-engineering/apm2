@@ -17,8 +17,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use apm2_core::fac::economics_adoption::{
-    MAX_ECONOMICS_PROFILE_SIZE, adopt_economics_profile, is_economics_profile_hash_admitted,
-    load_admitted_economics_profile_root, read_bounded_file, rollback_economics_profile,
+    MAX_ECONOMICS_PROFILE_SIZE, adopt_economics_profile, adopt_economics_profile_by_hash,
+    is_economics_profile_hash_admitted, load_admitted_economics_profile_root, looks_like_digest,
+    read_bounded_file, rollback_economics_profile, validate_digest_string,
     validate_economics_profile_bytes,
 };
 use clap::{Args, Subcommand};
@@ -59,9 +60,14 @@ pub struct EconomicsShowArgs {
 /// Arguments for `apm2 fac economics adopt`.
 #[derive(Debug, Args)]
 pub struct EconomicsAdoptArgs {
-    /// Path to the economics profile file to adopt, or "-" for stdin.
-    /// The file must be in framed format (domain prefix + canonical JSON).
-    pub path: Option<PathBuf>,
+    /// Hash digest or path to the economics profile file to adopt.
+    ///
+    /// Accepts one of:
+    /// - A `b3-256:<64-hex>` digest string (hash-only adoption).
+    /// - A file path to an economics profile (framed or raw JSON).
+    /// - `"-"` to read from stdin.
+    /// - Omitted to read from stdin.
+    pub hash_or_path: Option<String>,
 
     /// Reason for the adoption (for the receipt).
     #[arg(long, default_value = "operator adoption")]
@@ -153,8 +159,19 @@ fn run_adopt(args: &EconomicsAdoptArgs, json_global: bool) -> u8 {
     let fac_root = resolve_fac_root();
     let actor_id = resolve_operator_identity();
 
+    // Route: if the positional argument looks like a `b3-256:` digest,
+    // use hash-only adoption. Otherwise, treat as file path / stdin.
+    if let Some(ref input) = args.hash_or_path {
+        if looks_like_digest(input) {
+            return run_adopt_by_hash(input, &fac_root, &actor_id, &args.reason, json);
+        }
+    }
+
+    // File / stdin path: convert hash_or_path to a Path reference.
+    let path_ref: Option<&Path> = args.hash_or_path.as_deref().map(Path::new);
+
     // Read from path or stdin (CTR-1603 bounded).
-    let bytes = match read_profile_input(args.path.as_deref()) {
+    let bytes = match read_profile_input(path_ref) {
         Ok(b) => b,
         Err(msg) => {
             if json {
@@ -218,41 +235,92 @@ fn run_adopt(args: &EconomicsAdoptArgs, json_global: bool) -> u8 {
 
     match adopt_economics_profile(&fac_root, &framed_bytes, &actor_id, &args.reason) {
         Ok((root, receipt)) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "adopted": true,
-                        "admitted_profile_hash": root.admitted_profile_hash,
-                        "receipt_content_hash": receipt.content_hash,
-                        "old_digest": receipt.old_digest,
-                        "action": format!("{}", receipt.action),
-                    })
-                );
-            } else {
-                println!("Economics profile adopted successfully.");
-                println!("  new hash:      {}", root.admitted_profile_hash);
-                if !receipt.old_digest.is_empty() {
-                    println!("  old hash:      {}", receipt.old_digest);
-                }
-                println!("  receipt hash:  {}", receipt.content_hash);
-            }
+            emit_adopt_success(json, &root, &receipt);
             exit_codes::SUCCESS
         },
         Err(e) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "adopted": false,
-                        "error": format!("{e}")
-                    })
-                );
-            } else {
-                eprintln!("Economics profile adoption failed: {e}");
-            }
+            emit_adopt_error(json, &e);
             exit_codes::VALIDATION_ERROR
         },
+    }
+}
+
+/// Handle hash-only adoption: validate digest format, adopt by hash,
+/// emit result.
+fn run_adopt_by_hash(
+    digest: &str,
+    fac_root: &Path,
+    actor_id: &str,
+    reason: &str,
+    json: bool,
+) -> u8 {
+    // Validate digest format first to give clear errors for malformed input.
+    if let Err(e) = validate_digest_string(digest) {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "adopted": false,
+                    "error": format!("{e}"),
+                })
+            );
+        } else {
+            eprintln!("Invalid digest: {e}");
+        }
+        return exit_codes::VALIDATION_ERROR;
+    }
+
+    match adopt_economics_profile_by_hash(fac_root, digest, actor_id, reason) {
+        Ok((root, receipt)) => {
+            emit_adopt_success(json, &root, &receipt);
+            exit_codes::SUCCESS
+        },
+        Err(e) => {
+            emit_adopt_error(json, &e);
+            exit_codes::VALIDATION_ERROR
+        },
+    }
+}
+
+/// Emit adoption success output (shared by file and hash adoption paths).
+fn emit_adopt_success(
+    json: bool,
+    root: &apm2_core::fac::economics_adoption::AdmittedEconomicsProfileRootV1,
+    receipt: &apm2_core::fac::economics_adoption::EconomicsAdoptionReceiptV1,
+) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "adopted": true,
+                "admitted_profile_hash": root.admitted_profile_hash,
+                "receipt_content_hash": receipt.content_hash,
+                "old_digest": receipt.old_digest,
+                "action": format!("{}", receipt.action),
+            })
+        );
+    } else {
+        println!("Economics profile adopted successfully.");
+        println!("  new hash:      {}", root.admitted_profile_hash);
+        if !receipt.old_digest.is_empty() {
+            println!("  old hash:      {}", receipt.old_digest);
+        }
+        println!("  receipt hash:  {}", receipt.content_hash);
+    }
+}
+
+/// Emit adoption error output (shared by file and hash adoption paths).
+fn emit_adopt_error(json: bool, e: &apm2_core::fac::economics_adoption::EconomicsAdoptionError) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "adopted": false,
+                "error": format!("{e}")
+            })
+        );
+    } else {
+        eprintln!("Economics profile adoption failed: {e}");
     }
 }
 

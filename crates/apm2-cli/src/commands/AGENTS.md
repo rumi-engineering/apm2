@@ -430,10 +430,13 @@ Security invariants:
 
 ## Economics CLI Invariants (TCK-00584)
 
-- **Stdin support** (`fac_economics.rs`): `apm2 fac economics adopt` accepts `<path|->` as
-  an optional positional argument. When the argument is omitted or is `-`, input is read from
-  stdin with bounded semantics (`MAX_ECONOMICS_PROFILE_SIZE` cap via `take()` on the stdin
-  handle, CTR-1603). Auto-detects framed vs raw JSON input and adds domain framing if needed.
+- **Hash-or-path input** (`fac_economics.rs`): `apm2 fac economics adopt` accepts
+  `<hash|path|->` as an optional positional argument. When the argument starts with `b3-256:`,
+  it is treated as a digest for hash-only adoption (validates `b3-256:<64-lowercase-hex>`
+  format, records the hash directly without loading a profile file). When it is a path or `-`,
+  input is read from file or stdin with bounded semantics (`MAX_ECONOMICS_PROFILE_SIZE` cap
+  via `take()` on the stdin handle, CTR-1603). Auto-detects framed vs raw JSON input and adds
+  domain framing if needed.
 - **Operator identity resolution** (`fac_economics.rs`): `run_adopt` and `run_rollback`
   resolve the operator identity from `$USER` / `$LOGNAME` (POSIX), falling back to numeric
   UID on Unix via `nix::unistd::getuid()` (safe wrapper, no `unsafe` block). The identity

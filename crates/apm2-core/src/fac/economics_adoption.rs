@@ -193,6 +193,14 @@ pub enum EconomicsAdoptionError {
         /// Supported version(s).
         supported: &'static str,
     },
+
+    /// The provided digest string is malformed (wrong prefix, invalid hex,
+    /// wrong length).
+    #[error("invalid digest: {detail}")]
+    InvalidDigest {
+        /// Detail about the validation failure.
+        detail: String,
+    },
 }
 
 impl From<EconomicsProfileError> for EconomicsAdoptionError {
@@ -528,6 +536,144 @@ pub fn adopt_economics_profile(
     )?;
 
     // Step 6: persist new admitted root atomically (only after receipt).
+    persist_admitted_root_atomic(fac_root, &new_root)?;
+
+    Ok((new_root, receipt))
+}
+
+/// Prefix for BLAKE3-256 digest strings.
+const B3_256_PREFIX: &str = "b3-256:";
+
+/// Validate that a digest string is a well-formed `b3-256:<64-hex>` value.
+///
+/// Returns the validated digest string on success.
+///
+/// # Errors
+///
+/// Returns [`EconomicsAdoptionError::InvalidDigest`] if:
+/// - The string does not start with `b3-256:`.
+/// - The hex portion is not exactly 64 characters.
+/// - The hex portion contains non-hex characters.
+pub fn validate_digest_string(digest: &str) -> Result<(), EconomicsAdoptionError> {
+    let hex_part = digest.strip_prefix(B3_256_PREFIX).ok_or_else(|| {
+        EconomicsAdoptionError::InvalidDigest {
+            detail: format!(
+                "digest must start with '{B3_256_PREFIX}', got: {}",
+                digest.chars().take(20).collect::<String>()
+            ),
+        }
+    })?;
+
+    if hex_part.len() != 64 {
+        return Err(EconomicsAdoptionError::InvalidDigest {
+            detail: format!(
+                "digest hex portion must be exactly 64 characters, got {} characters",
+                hex_part.len()
+            ),
+        });
+    }
+
+    // Validate hex characters (lowercase only for canonical form).
+    if !hex_part
+        .bytes()
+        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(EconomicsAdoptionError::InvalidDigest {
+            detail: "digest hex portion must contain only lowercase hex characters (0-9, a-f)"
+                .to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Returns `true` if the given string looks like a `b3-256:` digest.
+///
+/// This is a quick syntactic check (prefix match) used to distinguish
+/// digest arguments from file paths in CLI argument routing.
+#[must_use]
+pub fn looks_like_digest(s: &str) -> bool {
+    s.starts_with(B3_256_PREFIX)
+}
+
+/// Adopt an economics profile by its pre-computed digest hash.
+///
+/// Unlike [`adopt_economics_profile`], this function does NOT require the
+/// full profile bytes. It accepts a validated `b3-256:<hex>` digest string
+/// and records it as the admitted economics profile hash. This is useful
+/// when the operator already knows the digest (e.g., from a policy or
+/// upstream coordination) and does not have the profile file locally.
+///
+/// 1. Validates the digest format (`b3-256:<64-hex-lowercase>`).
+/// 2. Checks against the current admitted root (rejects no-op adoption).
+/// 3. Persists the new admitted root via temp + rename (CTR-2607).
+/// 4. Retains the previous root for rollback.
+/// 5. Emits an `EconomicsAdoptionReceiptV1`.
+///
+/// # Errors
+///
+/// Returns [`EconomicsAdoptionError`] on validation, persistence, or
+/// serialization failures.
+pub fn adopt_economics_profile_by_hash(
+    fac_root: &Path,
+    digest: &str,
+    actor_id: &str,
+    reason: &str,
+) -> Result<(AdmittedEconomicsProfileRootV1, EconomicsAdoptionReceiptV1), EconomicsAdoptionError> {
+    validate_bounded_string("actor_id", actor_id, MAX_ACTOR_ID_LENGTH)?;
+    validate_bounded_string("reason", reason, MAX_REASON_LENGTH)?;
+
+    // Step 1: validate digest format.
+    validate_digest_string(digest)?;
+
+    // Step 2: load current admitted root and check for no-op.
+    let old_digest = match load_admitted_economics_profile_root(fac_root) {
+        Ok(root) => {
+            let old_bytes = root.admitted_profile_hash.as_bytes();
+            let new_bytes = digest.as_bytes();
+            if old_bytes.len() == new_bytes.len() && bool::from(old_bytes.ct_eq(new_bytes)) {
+                return Err(EconomicsAdoptionError::AlreadyAdmitted {
+                    hash: digest.to_string(),
+                });
+            }
+            root.admitted_profile_hash
+        },
+        Err(EconomicsAdoptionError::NoAdmittedRoot { .. }) => String::new(),
+        Err(e) => return Err(e),
+    };
+
+    // CTR-2501 deviation: `SystemTime::now()` for adoption timestamp
+    // (wall-clock anchored audit trail). Documented inline.
+    #[allow(clippy::disallowed_methods)]
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Step 3: build new admitted root.
+    let new_root = AdmittedEconomicsProfileRootV1 {
+        schema: ADMITTED_ECONOMICS_PROFILE_SCHEMA.to_string(),
+        schema_version: "1.0.0".to_string(),
+        admitted_profile_hash: digest.to_string(),
+        adopted_at_unix_secs: now_secs,
+        actor_id: actor_id.to_string(),
+    };
+    new_root.validate()?;
+
+    // Step 4: emit receipt BEFORE persisting root.
+    // Transactional ordering: receipt-before-root ensures the durable
+    // receipt invariant is maintained (same as adopt_economics_profile).
+    let receipt = build_and_persist_receipt(
+        fac_root,
+        EconomicsAdoptionAction::Adopt,
+        &old_digest,
+        digest,
+        actor_id,
+        reason,
+        now_secs,
+    )?;
+
+    // Step 5: persist new admitted root atomically (only after receipt).
     persist_admitted_root_atomic(fac_root, &new_root)?;
 
     Ok((new_root, receipt))
@@ -1810,6 +1956,249 @@ mod tests {
         assert!(
             !matches!(result, Err(EconomicsAdoptionError::NoAdmittedRoot { .. })),
             "empty JSON must NOT be reported as NoAdmittedRoot (would allow fail-open bypass)"
+        );
+    }
+
+    // =================================================================
+    // Digest validation tests (TCK-00584 fix round 3)
+    // =================================================================
+
+    #[test]
+    fn test_validate_digest_string_valid() {
+        let valid = "b3-256:aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233";
+        assert!(validate_digest_string(valid).is_ok());
+    }
+
+    #[test]
+    fn test_validate_digest_string_wrong_prefix() {
+        let result = validate_digest_string(
+            "sha256:aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233",
+        );
+        assert!(
+            matches!(result, Err(EconomicsAdoptionError::InvalidDigest { .. })),
+            "wrong prefix should fail, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_digest_string_too_short() {
+        let result = validate_digest_string("b3-256:aabbccdd");
+        assert!(
+            matches!(result, Err(EconomicsAdoptionError::InvalidDigest { .. })),
+            "short hex should fail, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_digest_string_too_long() {
+        let result = validate_digest_string(
+            "b3-256:aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd0011223300",
+        );
+        assert!(
+            matches!(result, Err(EconomicsAdoptionError::InvalidDigest { .. })),
+            "long hex should fail, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_digest_string_uppercase_hex() {
+        let result = validate_digest_string(
+            "b3-256:AABBCCDD00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233",
+        );
+        assert!(
+            matches!(result, Err(EconomicsAdoptionError::InvalidDigest { .. })),
+            "uppercase hex should fail, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_digest_string_non_hex_chars() {
+        let result = validate_digest_string(
+            "b3-256:gghhiijj00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233",
+        );
+        assert!(
+            matches!(result, Err(EconomicsAdoptionError::InvalidDigest { .. })),
+            "non-hex chars should fail, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_digest_string_empty() {
+        let result = validate_digest_string("");
+        assert!(
+            matches!(result, Err(EconomicsAdoptionError::InvalidDigest { .. })),
+            "empty string should fail, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_looks_like_digest() {
+        assert!(looks_like_digest("b3-256:aa"));
+        assert!(looks_like_digest(
+            "b3-256:aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233"
+        ));
+        assert!(!looks_like_digest("./profile.json"));
+        assert!(!looks_like_digest("/tmp/profile.json"));
+        assert!(!looks_like_digest("-"));
+        assert!(!looks_like_digest(""));
+    }
+
+    // =================================================================
+    // Hash-only adoption tests (TCK-00584 fix round 3)
+    // =================================================================
+
+    #[test]
+    fn test_adopt_by_hash_creates_admitted_root() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let digest = "b3-256:aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233";
+
+        let (root, receipt) =
+            adopt_economics_profile_by_hash(fac_root, digest, "operator:local", "hash adoption")
+                .expect("adopt by hash");
+
+        assert_eq!(root.admitted_profile_hash, digest);
+        assert_eq!(root.schema, ADMITTED_ECONOMICS_PROFILE_SCHEMA);
+        assert_eq!(receipt.action, EconomicsAdoptionAction::Adopt);
+        assert!(receipt.old_digest.is_empty());
+        assert_eq!(receipt.new_digest, digest);
+        assert_eq!(receipt.actor_id, "operator:local");
+
+        // Verify the admitted root persisted correctly.
+        let loaded = load_admitted_economics_profile_root(fac_root).expect("load admitted root");
+        assert_eq!(loaded.admitted_profile_hash, digest);
+    }
+
+    #[test]
+    fn test_adopt_by_hash_rejects_duplicate() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let digest = "b3-256:aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233";
+
+        adopt_economics_profile_by_hash(fac_root, digest, "operator:local", "first")
+            .expect("first adopt by hash");
+
+        let result =
+            adopt_economics_profile_by_hash(fac_root, digest, "operator:local", "duplicate");
+        assert!(
+            matches!(result, Err(EconomicsAdoptionError::AlreadyAdmitted { .. })),
+            "should reject duplicate hash adoption, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_adopt_by_hash_rejects_malformed_digest() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+
+        // Wrong prefix.
+        let result = adopt_economics_profile_by_hash(
+            fac_root,
+            "sha256:aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233",
+            "operator:local",
+            "bad prefix",
+        );
+        assert!(
+            matches!(result, Err(EconomicsAdoptionError::InvalidDigest { .. })),
+            "wrong prefix should fail, got: {result:?}"
+        );
+
+        // Too short.
+        let result =
+            adopt_economics_profile_by_hash(fac_root, "b3-256:aabb", "operator:local", "short");
+        assert!(
+            matches!(result, Err(EconomicsAdoptionError::InvalidDigest { .. })),
+            "short hex should fail, got: {result:?}"
+        );
+
+        // Uppercase hex.
+        let result = adopt_economics_profile_by_hash(
+            fac_root,
+            "b3-256:AABBCCDD00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233",
+            "operator:local",
+            "uppercase",
+        );
+        assert!(
+            matches!(result, Err(EconomicsAdoptionError::InvalidDigest { .. })),
+            "uppercase hex should fail, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_adopt_by_hash_rotates_to_prev() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let digest1 = "b3-256:1111111100112233aabbccdd00112233aabbccdd00112233aabbccdd00112233";
+        let digest2 = "b3-256:2222222200112233aabbccdd00112233aabbccdd00112233aabbccdd00112233";
+
+        let (first_root, _) =
+            adopt_economics_profile_by_hash(fac_root, digest1, "operator:local", "first")
+                .expect("first adopt");
+
+        let (second_root, receipt) =
+            adopt_economics_profile_by_hash(fac_root, digest2, "operator:local", "second")
+                .expect("second adopt");
+
+        assert_ne!(
+            first_root.admitted_profile_hash,
+            second_root.admitted_profile_hash
+        );
+        assert_eq!(receipt.old_digest, first_root.admitted_profile_hash);
+        assert_eq!(receipt.new_digest, second_root.admitted_profile_hash);
+
+        // Verify prev file exists with first hash.
+        let prev = load_bounded_json::<AdmittedEconomicsProfileRootV1>(
+            &prev_root_path(fac_root),
+            MAX_ADMITTED_ROOT_FILE_SIZE,
+        )
+        .expect("load prev");
+        assert_eq!(prev.admitted_profile_hash, first_root.admitted_profile_hash);
+    }
+
+    #[test]
+    fn test_adopt_by_hash_receipt_persisted() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let digest = "b3-256:aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233";
+
+        let (_, receipt) =
+            adopt_economics_profile_by_hash(fac_root, digest, "operator:local", "test")
+                .expect("adopt by hash");
+
+        let receipts = receipts_dir(fac_root);
+        assert!(receipts.exists(), "receipts directory should exist");
+
+        let entries: Vec<_> = fs::read_dir(&receipts)
+            .expect("read receipts dir")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one receipt should be persisted");
+
+        let receipt_bytes = fs::read(entries[0].path()).expect("read receipt");
+        let loaded = deserialize_adoption_receipt(&receipt_bytes).expect("deserialize");
+        assert_eq!(loaded.content_hash, receipt.content_hash);
+    }
+
+    /// Verify that hash-adopted profiles are admitted by
+    /// `is_economics_profile_hash_admitted` (worker path).
+    #[test]
+    fn test_hash_adopted_profile_is_admitted() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let digest = "b3-256:aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233";
+
+        adopt_economics_profile_by_hash(fac_root, digest, "operator:local", "test")
+            .expect("adopt by hash");
+
+        assert!(
+            is_economics_profile_hash_admitted(fac_root, digest),
+            "hash-adopted profile must be admitted"
+        );
+
+        let wrong = "b3-256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        assert!(
+            !is_economics_profile_hash_admitted(fac_root, wrong),
+            "wrong hash must not be admitted"
         );
     }
 }
