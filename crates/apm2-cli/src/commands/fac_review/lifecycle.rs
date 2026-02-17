@@ -50,7 +50,6 @@ const RUN_SECRET_MAX_FILE_BYTES: u64 = 128;
 const RUN_SECRET_LEN_BYTES: usize = 32;
 const RUN_SECRET_MAX_ENCODED_CHARS: usize = 128;
 const LIFECYCLE_HMAC_ERROR: &str = "lifecycle state integrity check failed";
-const FAC_REQUIRED_STATUS_CONTEXT: &str = "apm2 / Forge Admission Cycle";
 const FAC_STATUS_DESCRIPTION_PENDING: &str = "Forge Admission Cycle pending reviewer verdicts";
 const FAC_STATUS_DESCRIPTION_SUCCESS: &str = "Forge Admission Cycle approved";
 const FAC_STATUS_DESCRIPTION_DENIED: &str = "Forge Admission Cycle denied";
@@ -2353,6 +2352,30 @@ fn derive_fac_required_status_projection(
     }
 }
 
+fn load_fac_required_status_contexts() -> Result<Vec<String>, String> {
+    let contexts = crate::commands::fac_pr::load_local_required_status_contexts(None)?;
+    if contexts.is_empty() {
+        return Err("local required-status policy contains no contexts".to_string());
+    }
+    Ok(contexts)
+}
+
+fn project_fac_required_status_to_contexts_with<F>(
+    contexts: &[String],
+    mut project_context: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str) -> Result<(), String>,
+{
+    if contexts.is_empty() {
+        return Err("cannot project required status without at least one context".to_string());
+    }
+    for context in contexts {
+        project_context(context)?;
+    }
+    Ok(())
+}
+
 fn project_fac_required_status(
     owner_repo: &str,
     pr_number: u32,
@@ -2364,15 +2387,18 @@ fn project_fac_required_status(
                 format!("missing verdict projection snapshot for PR #{pr_number} SHA {head_sha}")
             })?;
     let projection = derive_fac_required_status_projection(&snapshot);
+    let required_status_contexts = load_fac_required_status_contexts()?;
     let target_url = format!("https://github.com/{owner_repo}/pull/{pr_number}");
-    github_projection::upsert_commit_status(
-        owner_repo,
-        head_sha,
-        FAC_REQUIRED_STATUS_CONTEXT,
-        projection.state,
-        projection.description,
-        Some(&target_url),
-    )
+    project_fac_required_status_to_contexts_with(&required_status_contexts, |context| {
+        github_projection::upsert_commit_status(
+            owner_repo,
+            head_sha,
+            context,
+            projection.state,
+            projection.description,
+            Some(&target_url),
+        )
+    })
 }
 
 fn finalize_projected_verdict(
@@ -3511,7 +3537,8 @@ mod tests {
         PrLifecycleState, TrackedAgentState, acquire_registry_lock, active_agents_for_pr,
         apply_event, bind_reviewer_runtime, derive_auto_verdict_decision_from_findings,
         derive_fac_required_status_projection, enforce_pr_capacity,
-        finalize_auto_verdict_candidate, load_registry, register_agent_spawn,
+        finalize_auto_verdict_candidate, load_fac_required_status_contexts, load_registry,
+        project_fac_required_status_to_contexts_with, register_agent_spawn,
         register_reviewer_dispatch, save_registry, sync_local_main_with_origin, token_hash,
         try_fast_forward_main,
     };
@@ -3600,6 +3627,39 @@ mod tests {
         let snapshot = verdict_snapshot("approve", true);
         let projection = derive_fac_required_status_projection(&snapshot);
         assert_eq!(projection.state, "failure");
+    }
+
+    #[test]
+    fn required_status_projection_contexts_come_from_local_authoritative_policy() {
+        let expected = crate::commands::fac_pr::load_local_required_status_contexts(None)
+            .expect("load authoritative contexts");
+        let actual = load_fac_required_status_contexts().expect("load projection contexts");
+        assert_eq!(actual, expected);
+        assert!(
+            !actual.is_empty(),
+            "projection requires at least one context"
+        );
+    }
+
+    #[test]
+    fn required_status_projection_projects_every_context() {
+        let contexts = vec!["ctx/one".to_string(), "ctx/two".to_string()];
+        let seen = std::cell::RefCell::new(Vec::new());
+
+        project_fac_required_status_to_contexts_with(&contexts, |context| {
+            seen.borrow_mut().push(context.to_string());
+            Ok(())
+        })
+        .expect("projection to contexts should succeed");
+
+        assert_eq!(&*seen.borrow(), &contexts);
+    }
+
+    #[test]
+    fn required_status_projection_rejects_empty_context_list() {
+        let err = project_fac_required_status_to_contexts_with(&[], |_| Ok(()))
+            .expect_err("empty context set must fail");
+        assert!(err.contains("at least one context"));
     }
 
     fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
