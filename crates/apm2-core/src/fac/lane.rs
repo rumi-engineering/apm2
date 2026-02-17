@@ -1449,6 +1449,11 @@ impl LaneManager {
 
     /// Reconcile a single lane: repair missing directories/profiles and mark
     /// CORRUPT on unrecoverable failures.
+    ///
+    /// Corrupt-marked lanes are skipped immediately — no repair attempts are
+    /// made. This preserves the quarantine contract: operators must explicitly
+    /// clear the corrupt marker via `apm2 fac lane reset` before the lane is
+    /// eligible for repair.
     fn reconcile_single_lane(
         fac_root: &Path,
         lane_dir: &Path,
@@ -1457,6 +1462,21 @@ impl LaneManager {
         boundary_id: &str,
         actions: &mut Vec<LaneReconcileAction>,
     ) {
+        // Check for existing corrupt marker FIRST — corrupt-marked lanes are
+        // quarantined and must not be repaired until the marker is cleared.
+        let corrupt_marker_path = lane_dir.join("corrupt.v1.json");
+        if corrupt_marker_path.exists() {
+            actions.push(LaneReconcileAction {
+                lane_id: lane_id.to_string(),
+                action: "existing_corrupt_marker".to_string(),
+                outcome: LaneReconcileOutcome::Skipped,
+                detail: Some(
+                    "corrupt marker present; use `apm2 fac lane reset` to clear".to_string(),
+                ),
+            });
+            return;
+        }
+
         let mut lane_repaired = false;
         let mut lane_failed = false;
 
@@ -1500,26 +1520,13 @@ impl LaneManager {
             );
         }
 
-        // Check for existing corrupt marker.
-        let corrupt_marker_path = lane_dir.join("corrupt.v1.json");
-        if corrupt_marker_path.exists() {
-            actions.push(LaneReconcileAction {
-                lane_id: lane_id.to_string(),
-                action: "existing_corrupt_marker".to_string(),
-                outcome: LaneReconcileOutcome::Skipped,
-                detail: Some(
-                    "corrupt marker present; use `apm2 fac lane reset` to clear".to_string(),
-                ),
-            });
-        }
-
-        // Mark CORRUPT if any repair failed and no marker exists yet.
-        if lane_failed && !corrupt_marker_path.exists() {
+        // Mark CORRUPT if any repair failed.
+        if lane_failed {
             Self::mark_lane_corrupt(fac_root, lane_id, actions);
         }
 
-        // If repaired without failure and no prior corrupt marker, note OK.
-        if !lane_failed && !lane_repaired && !corrupt_marker_path.exists() {
+        // If no repairs were needed and no failures occurred, note OK.
+        if !lane_failed && !lane_repaired {
             actions.push(LaneReconcileAction {
                 lane_id: lane_id.to_string(),
                 action: "inspect".to_string(),
@@ -1643,26 +1650,45 @@ impl LaneManager {
     }
 
     /// Build the reconcile receipt from accumulated actions.
+    ///
+    /// Aggregates outcomes **per lane** rather than per action, so that
+    /// `lanes_repaired` etc. never exceed `lanes_inspected`. Each lane
+    /// contributes to exactly one counter based on its worst action outcome:
+    ///   `Failed` > `MarkedCorrupt` > `Repaired` > `Ok` > `Skipped`
     fn build_reconcile_receipt(
         lane_ids: &[String],
         actions: Vec<LaneReconcileAction>,
     ) -> LaneReconcileReceiptV1 {
-        let lanes_ok = actions
-            .iter()
-            .filter(|a| a.outcome == LaneReconcileOutcome::Ok)
-            .count();
-        let lanes_repaired = actions
-            .iter()
-            .filter(|a| a.outcome == LaneReconcileOutcome::Repaired)
-            .count();
-        let lanes_marked_corrupt = actions
-            .iter()
-            .filter(|a| a.outcome == LaneReconcileOutcome::MarkedCorrupt)
-            .count();
-        let lanes_failed = actions
-            .iter()
-            .filter(|a| a.outcome == LaneReconcileOutcome::Failed)
-            .count();
+        use std::collections::HashMap;
+
+        // Determine per-lane summary outcome.
+        // Priority (worst wins): Failed > MarkedCorrupt > Repaired > Ok > Skipped
+        let mut lane_outcomes: HashMap<&str, LaneReconcileOutcome> =
+            HashMap::with_capacity(lane_ids.len());
+
+        for action in &actions {
+            let entry = lane_outcomes
+                .entry(action.lane_id.as_str())
+                .or_insert(action.outcome);
+            // Promote to worse outcome when applicable.
+            *entry = worse_outcome(*entry, action.outcome);
+        }
+
+        let mut lanes_ok: usize = 0;
+        let mut lanes_repaired: usize = 0;
+        let mut lanes_marked_corrupt: usize = 0;
+        let mut lanes_failed: usize = 0;
+
+        for lane_id in lane_ids {
+            match lane_outcomes.get(lane_id.as_str()) {
+                Some(LaneReconcileOutcome::Ok) => lanes_ok += 1,
+                Some(LaneReconcileOutcome::Repaired) => lanes_repaired += 1,
+                Some(LaneReconcileOutcome::MarkedCorrupt) => lanes_marked_corrupt += 1,
+                Some(LaneReconcileOutcome::Failed) => lanes_failed += 1,
+                // Skipped lanes (corrupt-marked) are not counted in ok/repaired/failed.
+                Some(LaneReconcileOutcome::Skipped) | None => {},
+            }
+        }
 
         LaneReconcileReceiptV1 {
             schema: LANE_RECONCILE_RECEIPT_SCHEMA.to_string(),
@@ -2838,6 +2864,23 @@ const fn validate_string_field(
         });
     }
     Ok(())
+}
+
+/// Return the worse (higher-priority) of two reconcile outcomes.
+///
+/// Priority order: `Failed` > `MarkedCorrupt` > `Repaired` > `Ok` > `Skipped`.
+/// Used to aggregate per-action outcomes into a single per-lane summary.
+const fn worse_outcome(a: LaneReconcileOutcome, b: LaneReconcileOutcome) -> LaneReconcileOutcome {
+    const fn severity(o: LaneReconcileOutcome) -> u8 {
+        match o {
+            LaneReconcileOutcome::Skipped => 0,
+            LaneReconcileOutcome::Ok => 1,
+            LaneReconcileOutcome::Repaired => 2,
+            LaneReconcileOutcome::MarkedCorrupt => 3,
+            LaneReconcileOutcome::Failed => 4,
+        }
+    }
+    if severity(b) > severity(a) { b } else { a }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4696,5 +4739,220 @@ mod tests {
         let deserialized: LaneReconcileReceiptV1 =
             serde_json::from_str(&json).expect("deserialize");
         assert_eq!(receipt, deserialized);
+    }
+
+    // ── Regression tests for review findings (PR #719 code-quality round) ───
+
+    /// Regression: corrupt-marked lane with missing workspace/profile must NOT
+    /// be repaired. Only a single Skipped action should be emitted and no
+    /// directories or profiles should be recreated.
+    #[test]
+    fn reconcile_skips_corrupt_lane_no_repair_even_with_missing_dirs() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root.clone()).expect("create manager");
+
+        // Init first to create a healthy pool.
+        manager.init_lanes().expect("init_lanes");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+
+        // Place a corrupt marker.
+        let marker = LaneCorruptMarkerV1 {
+            schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+            lane_id: lane_id.to_string(),
+            reason: "test corruption".to_string(),
+            cleanup_receipt_digest: None,
+            detected_at: "1234567890".to_string(),
+        };
+        marker.persist(&fac_root).expect("persist corrupt marker");
+
+        // Delete the workspace dir AND the profile to simulate missing state.
+        let workspace = lane_dir.join("workspace");
+        let profile = lane_dir.join("profile.v1.json");
+        fs::remove_dir_all(&workspace).expect("remove workspace");
+        fs::remove_file(&profile).expect("remove profile");
+
+        // Reconcile.
+        let receipt = manager.reconcile_lanes().expect("reconcile_lanes");
+
+        // Only a single Skipped action for this lane, no repair actions.
+        let lane_actions: Vec<_> = receipt
+            .actions
+            .iter()
+            .filter(|a| a.lane_id == lane_id)
+            .collect();
+        assert_eq!(
+            lane_actions.len(),
+            1,
+            "corrupt-marked lane must emit exactly one action, got: {lane_actions:?}"
+        );
+        assert_eq!(lane_actions[0].outcome, LaneReconcileOutcome::Skipped);
+        assert_eq!(lane_actions[0].action, "existing_corrupt_marker");
+
+        // Verify no files were recreated.
+        assert!(
+            !workspace.exists(),
+            "workspace must NOT be recreated for corrupt-marked lane"
+        );
+        assert!(
+            !profile.exists(),
+            "profile must NOT be recreated for corrupt-marked lane"
+        );
+    }
+
+    /// Regression: lane counters are lane-level, not action-level. A single
+    /// lane with multiple repairs (e.g., missing workspace + missing profile)
+    /// must report exactly 1 repaired lane, and counters must never exceed
+    /// `lanes_inspected`.
+    #[test]
+    fn reconcile_receipt_counts_lanes_not_actions() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        // Init first.
+        manager.init_lanes().expect("init_lanes");
+
+        let lane_id = &LaneManager::default_lane_ids()[0];
+        let lane_dir = manager.lane_dir(lane_id);
+
+        // Delete BOTH workspace dir AND profile to trigger multiple repairs on
+        // a single lane.
+        let workspace = lane_dir.join("workspace");
+        let profile = lane_dir.join("profile.v1.json");
+        fs::remove_dir_all(&workspace).expect("remove workspace");
+        fs::remove_file(&profile).expect("remove profile");
+
+        let receipt = manager.reconcile_lanes().expect("reconcile_lanes");
+
+        // Verify lane-level counters.
+        let total = receipt.lanes_ok
+            + receipt.lanes_repaired
+            + receipt.lanes_marked_corrupt
+            + receipt.lanes_failed;
+        assert!(
+            total <= receipt.lanes_inspected,
+            "lane counters ({total}) must not exceed lanes_inspected ({})",
+            receipt.lanes_inspected
+        );
+
+        // The single lane with multiple repairs should count as exactly 1
+        // repaired lane.
+        assert_eq!(
+            receipt.lanes_repaired, 1,
+            "one lane with multiple repairs should count as exactly 1 repaired lane"
+        );
+
+        // Remaining lanes are OK (no damage).
+        let expected_ok = LaneManager::lane_count() - 1;
+        assert_eq!(
+            receipt.lanes_ok, expected_ok,
+            "remaining lanes should be OK"
+        );
+
+        // Per-action detail should still record both individual repairs.
+        let repair_actions: Vec<_> = receipt
+            .actions
+            .iter()
+            .filter(|a| a.lane_id == *lane_id && a.outcome == LaneReconcileOutcome::Repaired)
+            .collect();
+        assert!(
+            repair_actions.len() >= 2,
+            "per-action detail should record at least 2 repair actions for the lane, got {}",
+            repair_actions.len()
+        );
+    }
+
+    /// Regression: verify `build_reconcile_receipt` aggregates per-lane with
+    /// the `worse_outcome` priority (`Failed` > `MarkedCorrupt` >
+    /// `Repaired` > `Ok` > `Skipped`).
+    #[test]
+    fn build_receipt_aggregates_per_lane_worst_outcome() {
+        let lane_ids = vec!["lane-00".to_string(), "lane-01".to_string()];
+        let actions = vec![
+            // lane-00: two Repaired actions → should count as 1 repaired lane.
+            LaneReconcileAction {
+                lane_id: "lane-00".to_string(),
+                action: "create_dir_workspace".to_string(),
+                outcome: LaneReconcileOutcome::Repaired,
+                detail: None,
+            },
+            LaneReconcileAction {
+                lane_id: "lane-00".to_string(),
+                action: "write_default_profile".to_string(),
+                outcome: LaneReconcileOutcome::Repaired,
+                detail: None,
+            },
+            // lane-01: one Ok action → should count as 1 ok lane.
+            LaneReconcileAction {
+                lane_id: "lane-01".to_string(),
+                action: "inspect".to_string(),
+                outcome: LaneReconcileOutcome::Ok,
+                detail: None,
+            },
+        ];
+
+        let receipt = LaneManager::build_reconcile_receipt(&lane_ids, actions);
+
+        assert_eq!(receipt.lanes_inspected, 2);
+        assert_eq!(receipt.lanes_ok, 1);
+        assert_eq!(receipt.lanes_repaired, 1);
+        assert_eq!(receipt.lanes_marked_corrupt, 0);
+        assert_eq!(receipt.lanes_failed, 0);
+
+        // Counters never exceed lanes_inspected.
+        let total = receipt.lanes_ok
+            + receipt.lanes_repaired
+            + receipt.lanes_marked_corrupt
+            + receipt.lanes_failed;
+        assert!(total <= receipt.lanes_inspected);
+    }
+
+    /// Regression: verify `worse_outcome` escalation ordering.
+    #[test]
+    fn worse_outcome_priority_ordering() {
+        // Failed dominates everything.
+        assert_eq!(
+            worse_outcome(LaneReconcileOutcome::Repaired, LaneReconcileOutcome::Failed),
+            LaneReconcileOutcome::Failed
+        );
+        assert_eq!(
+            worse_outcome(LaneReconcileOutcome::Failed, LaneReconcileOutcome::Ok),
+            LaneReconcileOutcome::Failed
+        );
+
+        // MarkedCorrupt dominates Repaired/Ok/Skipped.
+        assert_eq!(
+            worse_outcome(
+                LaneReconcileOutcome::Repaired,
+                LaneReconcileOutcome::MarkedCorrupt
+            ),
+            LaneReconcileOutcome::MarkedCorrupt
+        );
+
+        // Repaired dominates Ok.
+        assert_eq!(
+            worse_outcome(LaneReconcileOutcome::Ok, LaneReconcileOutcome::Repaired),
+            LaneReconcileOutcome::Repaired
+        );
+
+        // Ok dominates Skipped.
+        assert_eq!(
+            worse_outcome(LaneReconcileOutcome::Skipped, LaneReconcileOutcome::Ok),
+            LaneReconcileOutcome::Ok
+        );
+
+        // Same outcome is idempotent.
+        assert_eq!(
+            worse_outcome(
+                LaneReconcileOutcome::Repaired,
+                LaneReconcileOutcome::Repaired
+            ),
+            LaneReconcileOutcome::Repaired
+        );
     }
 }

@@ -573,15 +573,23 @@ bootstrap and recovery commands exposed via `apm2 fac lane init` and
 
 **Reconcile** (`LaneManager::reconcile_lanes`):
 - Inspects each configured lane and repairs missing directories/profiles.
-- Lanes with existing corrupt markers are reported as `Skipped`.
+- Lanes with existing corrupt markers are skipped immediately at the start of
+  `reconcile_single_lane` -- no repair attempts are made. This preserves the
+  quarantine contract: operators must clear the marker via `apm2 fac lane reset`
+  before the lane is eligible for repair.
 - Lanes that cannot be repaired are marked CORRUPT via `LaneCorruptMarkerV1`.
+- Receipt counters (`lanes_ok`, `lanes_repaired`, `lanes_marked_corrupt`,
+  `lanes_failed`) are aggregated **per lane** using worst-outcome priority
+  (`Failed` > `MarkedCorrupt` > `Repaired` > `Ok` > `Skipped`), so counters
+  never exceed `lanes_inspected`. Per-action detail is preserved in the
+  `actions` list.
 - Emits a `LaneReconcileReceiptV1` persisted under
   `$APM2_HOME/private/fac/evidence/`.
 - Receipt types: `LaneReconcileReceiptV1`, `LaneReconcileAction`,
   `LaneReconcileOutcome`.
 - Decomposed into helper methods (`reconcile_single_lane`, `reconcile_dir`,
-  `reconcile_profile`, `mark_lane_corrupt`, `build_reconcile_receipt`) to stay
-  under the 100-line clippy limit.
+  `reconcile_profile`, `mark_lane_corrupt`, `build_reconcile_receipt`,
+  `worse_outcome`) to stay under the 100-line clippy limit.
 
 **Schema constants**:
 - `LANE_INIT_RECEIPT_SCHEMA = "apm2.fac.lane_init_receipt.v1"`
@@ -596,6 +604,12 @@ bootstrap and recovery commands exposed via `apm2 fac lane init` and
 - [INV-LANE-RECON-002] Corrupt marker `detected_at` uses `SystemTime::now()`
   with `#[allow(clippy::disallowed_methods)]` and inline CTR-2501 justification.
 - [INV-LANE-RECON-003] Receipt persistence uses atomic write (CTR-2607).
+- [INV-LANE-RECON-004] Corrupt-marked lanes are skipped at the START of
+  `reconcile_single_lane` before any directory or profile repair checks.
+  No files are recreated for quarantined lanes.
+- [INV-LANE-RECON-005] Receipt lane counters are aggregated per lane (not per
+  action). A single lane with multiple repairs counts as exactly one repaired
+  lane. Counters never exceed `lanes_inspected`.
 
 ### `repo_mirror` — Node-Local Bare Mirror + Lane Checkout
 
