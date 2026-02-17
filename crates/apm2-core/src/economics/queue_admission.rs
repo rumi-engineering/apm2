@@ -1145,9 +1145,13 @@ pub const DENY_SIGNATURE_VERIFICATION_NOT_CONFIGURED: &str =
 
 /// Trait for cryptographic signature verification against envelope signatures.
 ///
-/// Callers must inject a concrete implementation. The default
-/// [`NoOpVerifier`] always returns `Err` (fail-closed) so that
+/// Callers must inject a concrete implementation. When no verifier is
+/// provided, the envelope validation path denies fail-closed so that
 /// `tp001_passed` is never `true` without real cryptographic verification.
+///
+/// The `NoOpVerifier` type (available only under `cfg(test)` or
+/// `feature = "unsafe_no_verify"`) implements this trait as a fail-closed
+/// stub for testing.
 pub trait SignatureVerifier: Send + Sync {
     /// Verifies that `signature` over `message` was produced by
     /// `signer_id`.
@@ -1167,8 +1171,17 @@ pub trait SignatureVerifier: Send + Sync {
 /// `Err("signature_verification_not_configured")`.
 ///
 /// This ensures `tp001_passed` is never `true` without a real verifier.
+///
+/// # Availability
+///
+/// `NoOpVerifier` is gated behind `#[cfg(any(test, feature =
+/// "unsafe_no_verify"))]`. Default builds **cannot** reference this type,
+/// enforcing the CI guardrail that production code must inject a real
+/// `SignatureVerifier` (TCK-00550).
+#[cfg(any(test, feature = "unsafe_no_verify"))]
 pub struct NoOpVerifier;
 
+#[cfg(any(test, feature = "unsafe_no_verify"))]
 impl SignatureVerifier for NoOpVerifier {
     fn verify(
         &self,
@@ -1233,7 +1246,12 @@ pub fn validate_envelope_tp001(
     }
 
     // Cryptographic signature verification (fail-closed when no verifier).
-    let sig_verifier = verifier.unwrap_or(&NoOpVerifier);
+    // When verifier is None, deny immediately — NoOpVerifier is gated behind
+    // cfg(test)/feature="unsafe_no_verify" (TCK-00550).
+    let sig_verifier: &dyn SignatureVerifier = match verifier {
+        Some(v) => v,
+        None => return Err(DENY_SIGNATURE_VERIFICATION_NOT_CONFIGURED),
+    };
     let canonical = envelope_signature_canonical_bytes(envelope);
     for sig in &envelope.signature_set {
         sig_verifier.verify(&sig.signer_id, &canonical, &sig.signature)?;
@@ -1391,7 +1409,8 @@ pub fn validate_convergence_horizon_tp003(
 /// deny fail-closed.
 ///
 /// `verifier` is used for cryptographic signature verification in
-/// TP-EIO29-001. Pass `None` to use the fail-closed [`NoOpVerifier`].
+/// TP-EIO29-001. Pass `None` to deny fail-closed (signature verification
+/// not configured).
 #[must_use]
 pub fn evaluate_queue_admission(
     request: &QueueAdmissionRequest,
@@ -1608,7 +1627,8 @@ fn check_structural_constraints(
 /// enforced.
 ///
 /// `verifier` is used for cryptographic signature verification in
-/// TP-EIO29-001. Pass `None` to use the fail-closed [`NoOpVerifier`].
+/// TP-EIO29-001. Pass `None` to deny fail-closed (signature verification
+/// not configured).
 #[must_use]
 pub fn evaluate_anti_entropy_admission(
     request: &AntiEntropyAdmissionRequest,

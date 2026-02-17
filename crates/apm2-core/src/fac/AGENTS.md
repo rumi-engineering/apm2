@@ -33,7 +33,9 @@ default mode.
   limits, persistence, and deserialization failures.
 - `BrokerSignatureVerifier`: Implements `SignatureVerifier` trait from
   `economics::queue_admission` using the broker's Ed25519 public key. Workers use
-  this instead of `NoOpVerifier` in default mode.
+  this instead of `NoOpVerifier` in default mode. Note: `NoOpVerifier` is gated
+  behind `cfg(test)/feature="unsafe_no_verify"` and not available in default
+  builds (TCK-00550).
 
 ### Core Capabilities
 
