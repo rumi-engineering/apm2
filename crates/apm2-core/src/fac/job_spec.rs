@@ -903,8 +903,19 @@ pub fn validate_job_spec_with_policy(
 /// Validates a `stop_revoke` job spec with policy-driven constraints
 /// (TCK-00579).
 ///
-/// Performs all checks from [`validate_job_spec_control_lane`] plus the
-/// same policy checks as [`validate_job_spec_with_policy`].
+/// Performs all checks from [`validate_job_spec_control_lane`] plus
+/// patch `bytes_backend` allowlist and filesystem path rejection.
+///
+/// **`allowed_repo_ids` bypass**: The `repo_id` allowlist is intentionally
+/// NOT enforced for control-lane `stop_revoke` jobs.  `stop_revoke` specs
+/// use a well-known placeholder `repo_id` (`"internal/control"`) — they do
+/// not check out a repository.  Authority is proven via filesystem
+/// capability (queue directory write access), not repo identity.  Enforcing
+/// the workload `repo_id` allowlist here would silently disable job
+/// cancellation whenever an operator restricts `allowed_repo_ids` to
+/// workload repos, leaving runaway jobs uncontrollable.
+///
+/// See [`CONTROL_LANE_EXCEPTION_AUDITED`] for the compile-time audit marker.
 ///
 /// # Errors
 ///
@@ -915,14 +926,14 @@ pub fn validate_job_spec_control_lane_with_policy(
 ) -> Result<(), JobSpecError> {
     validate_job_spec_control_lane(spec)?;
 
-    // Policy-driven repo_id allowlist (INV-JS-005).
-    if let Some(ref allowed) = policy.allowed_repo_ids {
-        if !allowed.iter().any(|a| a == &spec.source.repo_id) {
-            return Err(JobSpecError::DisallowedRepoId {
-                repo_id: spec.source.repo_id.clone(),
-            });
-        }
-    }
+    // CONTROL_LANE_EXCEPTION: repo_id allowlist is deliberately skipped for
+    // stop_revoke jobs.  Their repo_id is a fixed internal placeholder, not
+    // a workload repo identity.  Enforcing allowed_repo_ids here would
+    // break cancellation under restrictive policies.
+    //
+    // Authority for control-lane jobs is verified via queue directory
+    // ownership (filesystem capability), not repo identity.
+    let _ = &policy.allowed_repo_ids; // Acknowledge the field is intentionally unused.
 
     // Patch bytes_backend allowlist (INV-JS-005).
     validate_patch_bytes_backend(&spec.source)?;
@@ -2093,35 +2104,79 @@ mod tests {
     }
 
     #[test]
-    fn policy_validation_control_lane_with_allowlist() {
+    fn policy_validation_control_lane_bypasses_repo_allowlist() {
+        // Use the internal/control repo_id that build_stop_revoke_spec uses
+        // in production.  This is the actual repo_id for stop_revoke jobs.
+        let control_source = JobSource {
+            kind: "mirror_commit".to_string(),
+            repo_id: "internal/control".to_string(),
+            head_sha: "0".repeat(40),
+            patch: None,
+        };
         let spec = FacJobSpecV1Builder::new(
             "sr-1",
             "stop_revoke",
             "control",
             "2026-02-12T00:00:00Z",
             "L1",
-            sample_source(),
+            control_source,
         )
         .cancel_target_job_id("target-123")
         .build()
         .expect("valid stop_revoke spec");
 
-        // Accepted: repo in allowlist.
-        let policy = JobSpecValidationPolicy::with_allowed_repos(vec!["org-repo".to_string()])
-            .expect("valid policy");
-        let result = validate_job_spec_control_lane_with_policy(&spec, &policy);
-        assert!(
-            result.is_ok(),
-            "control-lane policy validation should accept: {result:?}"
+        assert_eq!(
+            spec.source.repo_id, "internal/control",
+            "stop_revoke spec must use internal/control repo_id"
         );
 
-        // Rejected: repo not in allowlist.
-        let deny_policy = JobSpecValidationPolicy::with_allowed_repos(vec!["other".to_string()])
-            .expect("valid policy");
-        let result = validate_job_spec_control_lane_with_policy(&spec, &deny_policy);
+        // CRITICAL: allowlist contains only workload repos — stop_revoke must
+        // still pass because the control-lane bypasses repo_id enforcement.
+        let workload_only_policy =
+            JobSpecValidationPolicy::with_allowed_repos(vec!["org/workload-repo".to_string()])
+                .expect("valid policy");
+        let result = validate_job_spec_control_lane_with_policy(&spec, &workload_only_policy);
+        assert!(
+            result.is_ok(),
+            "control-lane stop_revoke must bypass repo_id allowlist: {result:?}"
+        );
+
+        // Even an empty allowlist (deny-all for workloads) must not block
+        // cancellation.
+        let deny_all_policy =
+            JobSpecValidationPolicy::with_allowed_repos(vec![]).expect("valid policy");
+        let result = validate_job_spec_control_lane_with_policy(&spec, &deny_all_policy);
+        assert!(
+            result.is_ok(),
+            "control-lane stop_revoke must pass even with empty allowlist: {result:?}"
+        );
+
+        // Open policy (no allowlist) also passes.
+        let open_policy = JobSpecValidationPolicy::open();
+        let result = validate_job_spec_control_lane_with_policy(&spec, &open_policy);
+        assert!(
+            result.is_ok(),
+            "control-lane stop_revoke must pass with open policy: {result:?}"
+        );
+    }
+
+    /// Regression test: workload `validate_job_spec_with_policy` still
+    /// enforces `allowed_repo_ids` (only the control-lane path bypasses).
+    #[test]
+    fn workload_policy_still_enforces_repo_allowlist() {
+        let spec = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("valid spec");
+
+        // Rejected: workload repo not in allowlist.
+        let policy =
+            JobSpecValidationPolicy::with_allowed_repos(vec!["other-org/other-repo".to_string()])
+                .expect("valid policy");
+        let result = validate_job_spec_with_policy(&spec, &policy);
         assert!(
             matches!(result, Err(JobSpecError::DisallowedRepoId { .. })),
-            "control-lane should reject non-matching repo: {result:?}"
+            "workload validation must still enforce repo_id allowlist: {result:?}"
         );
     }
 

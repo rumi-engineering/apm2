@@ -1521,8 +1521,12 @@ policy bypass from malformed or adversarial job specs.
 - `validate_job_spec_with_policy()`: Full validation including structural,
   digest, token, repo_id allowlist, bytes_backend allowlist, and filesystem
   path rejection.
-- `validate_job_spec_control_lane_with_policy()`: Same as above but for
-  `stop_revoke` control-lane jobs (no token required).
+- `validate_job_spec_control_lane_with_policy()`: Control-lane variant for
+  `stop_revoke` jobs (no token required, **no repo_id allowlist**).  The
+  `repo_id` allowlist is intentionally bypassed because `stop_revoke` specs
+  use a fixed internal placeholder (`"internal/control"`), not a workload
+  repo.  Enforcing the workload allowlist here would silently disable job
+  cancellation under restrictive policies.
 - `validate_patch_bytes_backend()`: Rejects unknown or non-string
   `bytes_backend` values in patch descriptors.
 - `reject_filesystem_paths()`: Detects Unix absolute, Windows drive-letter,
@@ -1544,7 +1548,10 @@ policy bypass from malformed or adversarial job specs.
 
 - [INV-JS-005] Policy-driven `repo_id` allowlist rejects unknown repos when
   configured. Empty allowlist means deny-all (fail-closed). `None` means
-  open (backwards-compatible default).
+  open (backwards-compatible default).  **Exception**: control-lane
+  `stop_revoke` jobs bypass the `repo_id` allowlist — their authority is
+  proven via filesystem capability (queue directory ownership), not repo
+  identity.  See `CONTROL_LANE_EXCEPTION_AUDITED`.
 - [INV-JS-006] Filesystem paths (absolute, Windows drive, UNC, tilde, dot-slash)
   are rejected in `repo_id` and `job_id` to ensure these remain logical
   identifiers.

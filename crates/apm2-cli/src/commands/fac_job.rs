@@ -1120,4 +1120,116 @@ mod tests {
         );
         assert_eq!(exit_code, exit_codes::GENERIC_ERROR);
     }
+
+    /// Integration test: `stop_revoke` spec built by `build_stop_revoke_spec`
+    /// passes control-lane policy validation even when the repo allowlist
+    /// contains only workload repos (the control-lane bypasses `repo_id`
+    /// enforcement).
+    ///
+    /// This is the canonical regression test for the MAJOR finding:
+    /// "Repo allowlist can disable control-lane `stop_revoke` cancellation".
+    #[test]
+    fn test_stop_revoke_passes_policy_validation_with_workload_only_allowlist() {
+        use apm2_core::fac::job_spec::{
+            JobSpecValidationPolicy, validate_job_spec_control_lane_with_policy,
+        };
+
+        let spec = build_stop_revoke_spec("target-job-789", "operator cancellation")
+            .expect("should build stop_revoke spec");
+
+        // Confirm the spec uses the internal/control repo_id.
+        assert_eq!(
+            spec.source.repo_id, "internal/control",
+            "stop_revoke must use internal/control repo_id"
+        );
+
+        // Policy: allowlist restricted to workload repos only — no
+        // "internal/control" entry.
+        let workload_policy = JobSpecValidationPolicy::with_allowed_repos(vec![
+            "org/workload-repo".to_string(),
+            "team/another-repo".to_string(),
+        ])
+        .expect("valid policy");
+
+        // CRITICAL: stop_revoke must pass validation despite repo_id not
+        // appearing in the workload allowlist.  This proves cancellation
+        // remains operable under restrictive policies.
+        let result = validate_job_spec_control_lane_with_policy(&spec, &workload_policy);
+        assert!(
+            result.is_ok(),
+            "stop_revoke spec must pass control-lane validation with workload-only allowlist: {result:?}"
+        );
+
+        // Also verify: empty allowlist (deny-all for workloads) still
+        // allows cancellation.
+        let deny_all = JobSpecValidationPolicy::with_allowed_repos(vec![]).expect("valid policy");
+        let result = validate_job_spec_control_lane_with_policy(&spec, &deny_all);
+        assert!(
+            result.is_ok(),
+            "stop_revoke spec must pass even with empty (deny-all) allowlist: {result:?}"
+        );
+    }
+
+    /// Integration test: the full enqueue-then-cancel-claimed flow passes
+    /// control-lane validation with a restricted policy.  This exercises
+    /// `build_stop_revoke_spec` -> enqueue ->
+    /// `validate_job_spec_control_lane_with_policy`.
+    #[test]
+    fn test_claimed_job_cancellation_with_allowlist_enabled_policy() {
+        use apm2_core::fac::job_spec::{
+            JobSpecValidationPolicy, deserialize_job_spec,
+            validate_job_spec_control_lane_with_policy,
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = tmp.path().join("queue");
+        let fac_root = tmp.path().join("fac");
+        fs::create_dir_all(queue_root.join(PENDING_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(CLAIMED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(CANCELLED_DIR)).unwrap();
+        fs::create_dir_all(fac_root.join(FAC_RECEIPTS_DIR)).unwrap();
+
+        // Create a workload job spec in claimed/ (simulates claimed job).
+        let workload_spec = build_stop_revoke_spec("workload-job-42", "test").expect("spec builds");
+        let spec_json = serde_json::to_vec_pretty(&workload_spec).unwrap();
+        let file_name = format!("{}.json", workload_spec.job_id);
+        let claimed_path = queue_root.join(CLAIMED_DIR).join(&file_name);
+        fs::write(&claimed_path, &spec_json).unwrap();
+
+        // Cancel claimed job (enqueues stop_revoke to pending/).
+        let exit_code = cancel_claimed_job(
+            &claimed_path,
+            &workload_spec.job_id,
+            "policy-allowlist regression test",
+            &queue_root,
+            &fac_root,
+            false,
+        );
+        assert_eq!(exit_code, exit_codes::SUCCESS);
+
+        // Read the enqueued stop_revoke spec from pending/.
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let entries: Vec<_> = fs::read_dir(&pending_dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one stop_revoke in pending/");
+
+        let stop_bytes = fs::read(entries[0].path()).unwrap();
+        let stop_spec =
+            deserialize_job_spec(&stop_bytes).expect("stop_revoke spec should deserialize");
+        assert_eq!(stop_spec.kind, "stop_revoke");
+        assert_eq!(stop_spec.source.repo_id, "internal/control");
+
+        // Validate with a workload-only policy — the control-lane bypass
+        // must keep cancellation operable.
+        let policy =
+            JobSpecValidationPolicy::with_allowed_repos(vec!["org/production-repo".to_string()])
+                .expect("valid policy");
+        let result = validate_job_spec_control_lane_with_policy(&stop_spec, &policy);
+        assert!(
+            result.is_ok(),
+            "enqueued stop_revoke must pass control-lane validation with workload-only policy: {result:?}"
+        );
+    }
 }
