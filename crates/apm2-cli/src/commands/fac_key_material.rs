@@ -3,7 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use apm2_core::crypto::Signer;
@@ -51,15 +51,15 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    fs::create_dir_all(parent)
-        .map_err(|err| format!("create parent {}: {err}", parent.display()))?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o700);
-        fs::set_permissions(parent, perms)
-            .map_err(|err| format!("set parent permissions {}: {err}", parent.display()))?;
+        builder.mode(0o700);
     }
+    builder
+        .create(parent)
+        .map_err(|err| format!("create parent {}: {err}", parent.display()))?;
     fsync_parent_dir(path)?;
     Ok(())
 }
@@ -121,6 +121,8 @@ pub fn load_or_generate_persistent_signer(fac_root: &Path) -> Result<Signer, Str
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::thread;
 
@@ -158,5 +160,35 @@ mod tests {
         let on_disk = fac_secure_io::read_bounded(&fac_root.join("signing_key"), SIGNING_KEY_SIZE)
             .expect("read key");
         assert_eq!(on_disk, first);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_parent_directory_with_0700_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac-new");
+        let _ = load_or_generate_persistent_signer(&fac_root).expect("create signer");
+
+        let mode = fs::metadata(&fac_root)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "fac root mode must be 0700, got {mode:04o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reject_symlink_parent_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real-fac");
+        fs::create_dir_all(&real).expect("create real");
+        let link = dir.path().join("fac-link");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+
+        let Err(err) = load_or_generate_persistent_signer(&link) else {
+            panic!("symlink parent must be rejected");
+        };
+        assert!(err.contains("symlink"), "unexpected error: {err}");
     }
 }

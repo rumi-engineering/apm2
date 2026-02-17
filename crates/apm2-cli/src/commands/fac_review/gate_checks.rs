@@ -1014,7 +1014,17 @@ fn tracked_files(workspace_root: &Path) -> Result<Vec<String>, String> {
         if raw.is_empty() {
             continue;
         }
-        files.push(String::from_utf8_lossy(raw).to_string());
+        let tracked = std::str::from_utf8(raw).map_err(|_| {
+            let mut hex = String::with_capacity(raw.len().saturating_mul(2));
+            for byte in raw {
+                let _ = write!(&mut hex, "{byte:02x}");
+            }
+            format!(
+                "git ls-files returned non-UTF8 tracked path bytes (hex={hex}); \
+                 workspace integrity scan fails closed"
+            )
+        })?;
+        files.push(tracked.to_string());
     }
     files.sort();
     Ok(files)
@@ -1220,6 +1230,9 @@ pub fn verify_workspace_integrity(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+
     use super::*;
 
     fn run_git(repo: &Path, args: &[&str]) {
@@ -1304,6 +1317,25 @@ mod tests {
         snapshot_workspace_integrity(repo, &snapshot).expect("snapshot");
         let loaded = read_manifest(&snapshot).expect("read snapshot");
         assert!(loaded.contains_key("sub/file.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_files_fail_closed_on_non_utf8_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo(repo);
+
+        let non_utf8 = std::ffi::OsString::from_vec(vec![0x66, 0x6f, 0x80, 0x2e, 0x72, 0x73]);
+        fs::write(
+            repo.join(std::path::PathBuf::from(non_utf8)),
+            b"fn main() {}\n",
+        )
+        .expect("write non-utf8 path");
+        run_git(repo, &["add", "."]);
+
+        let err = tracked_files(repo).expect_err("non-utf8 tracked path must fail closed");
+        assert!(err.contains("non-UTF8"), "unexpected error: {err}");
     }
 
     #[test]
