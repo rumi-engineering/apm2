@@ -595,6 +595,9 @@ pub enum DenialReasonCode {
     InvalidCanonicalizerDigest,
     /// Control-plane rate limit or quota exceeded (TCK-00568).
     ControlPlaneBudgetDenied,
+    /// Job spec policy violation: disallowed `repo_id`, `bytes_backend`, or
+    /// filesystem path detected (TCK-00579).
+    PolicyViolation,
 }
 
 /// Trace of the RFC-0028 channel boundary check.
@@ -3066,6 +3069,7 @@ pub mod tests {
                 DenialReasonCode::InvalidCanonicalizerDigest,
                 "\"invalid_canonicalizer_digest\"",
             ),
+            (DenialReasonCode::PolicyViolation, "\"policy_violation\""),
         ];
 
         for (variant, expected) in map {

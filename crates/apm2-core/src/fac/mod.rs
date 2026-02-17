@@ -315,14 +315,16 @@ pub use harness_sandbox::{
     MAX_STRING_LENGTH as MAX_HARNESS_SANDBOX_STRING_LENGTH, NetworkPolicyProfile,
     NetworkPolicyProfileBuilder, Protocol,
 };
-// Re-export job spec types (TCK-00512)
+// Re-export job spec types (TCK-00512, TCK-00579)
 pub use job_spec::{
     Actuation, CONTROL_LANE_EXCEPTION_AUDITED, FacJobSpecV1, FacJobSpecV1Builder,
-    JOB_SPEC_SCHEMA_ID, JobConstraints, JobSource, JobSpecError, LaneRequirements,
-    MAX_CHANNEL_CONTEXT_TOKEN_LENGTH, MAX_DECODED_SOURCE_LENGTH, MAX_HEAD_SHA_LENGTH,
-    MAX_JOB_ID_LENGTH, MAX_JOB_SPEC_SIZE, MAX_KIND_LENGTH, MAX_LEASE_ID_LENGTH,
-    MAX_QUEUE_LANE_LENGTH, MAX_REPO_ID_LENGTH, MAX_REQUEST_ID_LENGTH, MAX_SOURCE_KIND_LENGTH,
+    JOB_SPEC_SCHEMA_ID, JobConstraints, JobSource, JobSpecError, JobSpecValidationPolicy,
+    LaneRequirements, MAX_CHANNEL_CONTEXT_TOKEN_LENGTH, MAX_DECODED_SOURCE_LENGTH,
+    MAX_HEAD_SHA_LENGTH, MAX_JOB_ID_LENGTH, MAX_JOB_SPEC_SIZE, MAX_KIND_LENGTH,
+    MAX_LEASE_ID_LENGTH, MAX_QUEUE_LANE_LENGTH, MAX_REPO_ALLOWLIST_SIZE, MAX_REPO_ID_LENGTH,
+    MAX_REQUEST_ID_LENGTH, MAX_SOURCE_KIND_LENGTH, VALID_PATCH_BYTES_BACKENDS,
     deserialize_job_spec, parse_b3_256_digest, validate_job_spec, validate_job_spec_control_lane,
+    validate_job_spec_control_lane_with_policy, validate_job_spec_with_policy,
 };
 // Re-export key policy types
 pub use key_policy::{

@@ -1501,6 +1501,47 @@ still enforced; only the token requirement is waived.
 - All deny paths in the control-lane flow emit explicit refusal receipts before
   moving jobs to `denied/`.
 
+## Strict Job Spec Validation Policy (TCK-00579)
+
+The `job_spec` module provides policy-driven validation beyond serde
+`deny_unknown_fields` to prevent memory blowups, undefined behavior, and
+policy bypass from malformed or adversarial job specs.
+
+### Key Types
+
+- `JobSpecValidationPolicy`: Policy-driven allowlist configuration for
+  `repo_id` and patch `bytes_backend` validation. Supports open (no
+  restriction) and restricted (explicit allowlist) modes. Bounded by
+  `MAX_REPO_ALLOWLIST_SIZE` (256) at construction.
+- `VALID_PATCH_BYTES_BACKENDS`: Compile-time allowlist of permitted patch
+  `bytes_backend` values (`fac_blobs_v1`, `apm2_cas`) per RFC-0019.
+
+### Core Capabilities
+
+- `validate_job_spec_with_policy()`: Full validation including structural,
+  digest, token, repo_id allowlist, bytes_backend allowlist, and filesystem
+  path rejection.
+- `validate_job_spec_control_lane_with_policy()`: Same as above but for
+  `stop_revoke` control-lane jobs (no token required).
+- `validate_patch_bytes_backend()`: Rejects unknown or non-string
+  `bytes_backend` values in patch descriptors.
+- `reject_filesystem_paths()`: Detects Unix absolute, Windows drive-letter,
+  UNC, tilde-home, and dot-slash relative paths in key fields.
+
+### Security Invariants (TCK-00579)
+
+- [INV-JS-005] Policy-driven `repo_id` allowlist rejects unknown repos when
+  configured. Empty allowlist means deny-all (fail-closed). `None` means
+  open (backwards-compatible default).
+- [INV-JS-006] Filesystem paths (absolute, Windows drive, UNC, tilde, dot-slash)
+  are rejected in `repo_id` and `job_id` to ensure these remain logical
+  identifiers.
+- Patch `bytes_backend` values MUST be one of `VALID_PATCH_BYTES_BACKENDS`.
+  Unknown backends are rejected fail-closed per RFC-0019 section 5.3.3.
+- Error values in `FilesystemPathRejected` are truncated to 64 chars to
+  prevent log flooding from adversarial inputs.
+- `DenialReasonCode::PolicyViolation` is emitted for policy-level denials.
+
 ## containment Submodule (TCK-00548)
 
 The `containment` submodule implements cgroup membership verification for

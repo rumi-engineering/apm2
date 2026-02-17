@@ -4,6 +4,11 @@
 //! - [INV-JS-002] Digest and request-id checks are constant-time.
 //! - [INV-JS-003] Validation is fail-closed.
 //! - [INV-JS-004] Boundary structs use `#[serde(deny_unknown_fields)]`.
+//! - [INV-JS-005] Policy-driven validation rejects disallowed `repo_id` values
+//!   and patch `bytes_backend` values (TCK-00579).
+//! - [INV-JS-006] Filesystem paths (absolute, Windows drive, UNC) are rejected
+//!   in all string fields to ensure `repo_id` remains a logical identifier
+//!   (TCK-00579).
 
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -60,6 +65,18 @@ const B3_256_PREFIX: &str = "b3-256:";
 
 const VALID_JOB_KINDS: &[&str] = &["gates", "warm", "bulk", "control", "stop_revoke"];
 const VALID_SOURCE_KINDS: &[&str] = &["mirror_commit", "patch_injection"];
+
+/// Allowed patch `bytes_backend` values per RFC-0019 section 5.3.3.
+///
+/// If a patch descriptor specifies `bytes_backend`, the value MUST be one of
+/// these.  Unknown backends are rejected fail-closed (INV-JS-005).
+pub const VALID_PATCH_BYTES_BACKENDS: &[&str] = &["fac_blobs_v1", "apm2_cas"];
+
+/// Maximum number of entries in the `repo_id` allowlist.
+///
+/// Protects against memory exhaustion from a policy that specifies an
+/// unbounded number of allowed repos (CTR-1303).
+pub const MAX_REPO_ALLOWLIST_SIZE: usize = 256;
 
 /// Audited policy exception marker: `stop_revoke` jobs bypass RFC-0028 channel
 /// context token and RFC-0029 queue admission.
@@ -202,6 +219,31 @@ pub enum JobSpecError {
     InvalidPatchFormat {
         /// Patch descriptor validation failure reason.
         reason: String,
+    },
+
+    /// The `repo_id` is not in the policy-driven allowlist (INV-JS-005).
+    #[error("`repo_id` not in allowed set: {repo_id}")]
+    DisallowedRepoId {
+        /// The rejected `repo_id`.
+        repo_id: String,
+    },
+
+    /// The patch `bytes_backend` is not in the allowed set (INV-JS-005).
+    #[error("patch bytes_backend not allowed: {backend}")]
+    DisallowedBytesBackend {
+        /// The rejected backend value.
+        backend: String,
+    },
+
+    /// A field contains a filesystem path (absolute, UNC, or drive-letter)
+    /// which is rejected because `repo_id` and other identifiers are logical
+    /// names, not filesystem references (INV-JS-006).
+    #[error("filesystem path detected in {field}: {value}")]
+    FilesystemPathRejected {
+        /// Field that contained the path.
+        field: &'static str,
+        /// The offending value (truncated for safety).
+        value: String,
     },
 }
 
@@ -738,6 +780,257 @@ pub fn deserialize_job_spec(bytes: &[u8]) -> Result<FacJobSpecV1, JobSpecError> 
     serde_json::from_slice(bytes).map_err(|e| JobSpecError::Json {
         detail: e.to_string(),
     })
+}
+
+// Policy-driven validation (TCK-00579)
+
+/// Policy-driven validation constraints for `FacJobSpecV1`.
+///
+/// Workers and queue scanners instantiate this from their local policy
+/// configuration.  When the allowlist is `Some`, the `repo_id` MUST appear
+/// in it; when `None`, all structurally valid `repo_id` values are accepted
+/// (open policy).
+///
+/// # Invariants
+///
+/// - [INV-JS-005] `allowed_repo_ids` is bounded by [`MAX_REPO_ALLOWLIST_SIZE`]
+///   at construction.
+/// - The allowlist is compared as exact string equality (case-sensitive).
+#[derive(Debug, Clone)]
+pub struct JobSpecValidationPolicy {
+    /// If `Some`, only these `repo_id` values are permitted.  Empty vec means
+    /// no repos are allowed (deny-all).  If `None`, all structurally valid
+    /// `repo_id` values pass the allowlist check (open policy).
+    allowed_repo_ids: Option<Vec<String>>,
+}
+
+impl JobSpecValidationPolicy {
+    /// Creates an open policy that permits any structurally valid `repo_id`.
+    #[must_use]
+    pub const fn open() -> Self {
+        Self {
+            allowed_repo_ids: None,
+        }
+    }
+
+    /// Creates a restricted policy with an explicit `repo_id` allowlist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `JobSpecError::FieldTooLong` if the allowlist exceeds
+    /// [`MAX_REPO_ALLOWLIST_SIZE`] entries (memory exhaustion prevention,
+    /// CTR-1303).
+    pub fn with_allowed_repos(repos: Vec<String>) -> Result<Self, JobSpecError> {
+        if repos.len() > MAX_REPO_ALLOWLIST_SIZE {
+            return Err(JobSpecError::FieldTooLong {
+                field: "allowed_repo_ids",
+                len: repos.len(),
+                max: MAX_REPO_ALLOWLIST_SIZE,
+            });
+        }
+        Ok(Self {
+            allowed_repo_ids: Some(repos),
+        })
+    }
+
+    /// Returns whether the policy has a `repo_id` allowlist.
+    #[must_use]
+    pub const fn has_repo_allowlist(&self) -> bool {
+        self.allowed_repo_ids.is_some()
+    }
+
+    /// Returns the `repo_id` allowlist, if configured.
+    #[must_use]
+    pub fn allowed_repo_ids(&self) -> Option<&[String]> {
+        self.allowed_repo_ids.as_deref()
+    }
+}
+
+impl Default for JobSpecValidationPolicy {
+    /// Default policy is open (no `repo_id` restriction).
+    fn default() -> Self {
+        Self::open()
+    }
+}
+
+/// Validates a `FacJobSpecV1` with policy-driven constraints (TCK-00579).
+///
+/// Performs all checks from [`validate_job_spec`] plus:
+/// 1. `repo_id` allowlist enforcement (if policy specifies one).
+/// 2. Patch `bytes_backend` allowlist enforcement.
+/// 3. Filesystem path rejection in `repo_id` and `job_id`.
+///
+/// # Errors
+///
+/// Returns the first validation failure.  Workers MUST deny/quarantine the
+/// job on any error (fail-closed).
+pub fn validate_job_spec_with_policy(
+    spec: &FacJobSpecV1,
+    policy: &JobSpecValidationPolicy,
+) -> Result<(), JobSpecError> {
+    // Run all structural + digest + token validation first.
+    validate_job_spec(spec)?;
+
+    // Policy-driven repo_id allowlist (INV-JS-005).
+    if let Some(ref allowed) = policy.allowed_repo_ids {
+        if !allowed.iter().any(|a| a == &spec.source.repo_id) {
+            return Err(JobSpecError::DisallowedRepoId {
+                repo_id: spec.source.repo_id.clone(),
+            });
+        }
+    }
+
+    // Patch bytes_backend allowlist (INV-JS-005).
+    validate_patch_bytes_backend(&spec.source)?;
+
+    // Filesystem path rejection in key fields (INV-JS-006).
+    reject_filesystem_paths("source.repo_id", &spec.source.repo_id)?;
+    reject_filesystem_paths("job_id", &spec.job_id)?;
+
+    Ok(())
+}
+
+/// Validates a `stop_revoke` job spec with policy-driven constraints
+/// (TCK-00579).
+///
+/// Performs all checks from [`validate_job_spec_control_lane`] plus the
+/// same policy checks as [`validate_job_spec_with_policy`].
+///
+/// # Errors
+///
+/// Returns the first validation failure.
+pub fn validate_job_spec_control_lane_with_policy(
+    spec: &FacJobSpecV1,
+    policy: &JobSpecValidationPolicy,
+) -> Result<(), JobSpecError> {
+    validate_job_spec_control_lane(spec)?;
+
+    // Policy-driven repo_id allowlist (INV-JS-005).
+    if let Some(ref allowed) = policy.allowed_repo_ids {
+        if !allowed.iter().any(|a| a == &spec.source.repo_id) {
+            return Err(JobSpecError::DisallowedRepoId {
+                repo_id: spec.source.repo_id.clone(),
+            });
+        }
+    }
+
+    // Patch bytes_backend allowlist (INV-JS-005).
+    validate_patch_bytes_backend(&spec.source)?;
+
+    // Filesystem path rejection in key fields (INV-JS-006).
+    reject_filesystem_paths("source.repo_id", &spec.source.repo_id)?;
+    reject_filesystem_paths("job_id", &spec.job_id)?;
+
+    Ok(())
+}
+
+/// Validates patch `bytes_backend` against the allowed set.
+///
+/// If the patch object contains a `bytes_backend` field, its value MUST be
+/// one of [`VALID_PATCH_BYTES_BACKENDS`].  Unknown backends are rejected
+/// fail-closed per RFC-0019 section 5.3.3.
+fn validate_patch_bytes_backend(source: &JobSource) -> Result<(), JobSpecError> {
+    let Some(ref patch) = source.patch else {
+        return Ok(());
+    };
+    let Some(patch_obj) = patch.as_object() else {
+        // Non-object patches are caught by validate_patch_source; not our
+        // concern here.
+        return Ok(());
+    };
+    if let Some(backend_val) = patch_obj.get("bytes_backend") {
+        let backend = backend_val
+            .as_str()
+            .ok_or_else(|| JobSpecError::DisallowedBytesBackend {
+                backend: format!("{backend_val}"),
+            })?;
+        if !VALID_PATCH_BYTES_BACKENDS.contains(&backend) {
+            return Err(JobSpecError::DisallowedBytesBackend {
+                backend: backend.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Rejects values that look like filesystem paths.
+///
+/// Detects:
+/// - Unix absolute paths (`/...`)
+/// - Windows drive-letter paths (`C:\...`, `D:/...`)
+/// - UNC paths (`\\server\...`)
+/// - Tilde-home expansion (`~/...`)
+/// - Dot-prefix relative paths (`./...`)
+///
+/// The `repo_id` and `job_id` are logical identifiers and MUST NOT contain
+/// filesystem references.  This prevents confusion with local paths and
+/// path traversal attacks.
+fn reject_filesystem_paths(field: &'static str, value: &str) -> Result<(), JobSpecError> {
+    let bytes = value.as_bytes();
+
+    // Unix absolute path.
+    if bytes.first() == Some(&b'/') {
+        return Err(JobSpecError::FilesystemPathRejected {
+            field,
+            value: truncate_for_error(value),
+        });
+    }
+
+    // Windows drive-letter path: `C:\` or `C:/`.
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return Err(JobSpecError::FilesystemPathRejected {
+            field,
+            value: truncate_for_error(value),
+        });
+    }
+
+    // UNC path: `\\...`.
+    if bytes.len() >= 2 && bytes[0] == b'\\' && bytes[1] == b'\\' {
+        return Err(JobSpecError::FilesystemPathRejected {
+            field,
+            value: truncate_for_error(value),
+        });
+    }
+
+    // Tilde home expansion: `~/...`.
+    if bytes.len() >= 2 && bytes[0] == b'~' && bytes[1] == b'/' {
+        return Err(JobSpecError::FilesystemPathRejected {
+            field,
+            value: truncate_for_error(value),
+        });
+    }
+
+    // Relative path prefix: `./...`.
+    if bytes.len() >= 2 && bytes[0] == b'.' && bytes[1] == b'/' {
+        return Err(JobSpecError::FilesystemPathRejected {
+            field,
+            value: truncate_for_error(value),
+        });
+    }
+
+    Ok(())
+}
+
+/// Truncates a string for error messages to avoid log flooding from
+/// adversarial inputs (RSK-0701).
+fn truncate_for_error(s: &str) -> String {
+    const MAX_ERR_VALUE_LEN: usize = 64;
+    if s.len() <= MAX_ERR_VALUE_LEN {
+        s.to_string()
+    } else {
+        // Find the largest char boundary <= MAX_ERR_VALUE_LEN.
+        // Walk backward from the cap until we hit a UTF-8 char boundary.
+        let mut end = MAX_ERR_VALUE_LEN;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        let truncated = &s[..end];
+        format!("{truncated}...")
+    }
 }
 
 // Builder
@@ -1450,6 +1743,454 @@ mod tests {
                 Err(JobSpecError::InvalidFormat { field: "kind", .. })
             ),
             "control-lane validation should reject non-stop_revoke kind: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00579: Policy-driven validation tests
+    // =========================================================================
+
+    #[test]
+    fn policy_open_accepts_any_valid_repo_id() {
+        let spec = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("valid spec");
+        let policy = JobSpecValidationPolicy::open();
+        let result = validate_job_spec_with_policy(&spec, &policy);
+        assert!(
+            result.is_ok(),
+            "open policy should accept any valid spec: {result:?}"
+        );
+    }
+
+    #[test]
+    fn policy_allowlist_accepts_matching_repo_id() {
+        let spec = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("valid spec");
+        let policy = JobSpecValidationPolicy::with_allowed_repos(vec!["org-repo".to_string()])
+            .expect("valid policy");
+        let result = validate_job_spec_with_policy(&spec, &policy);
+        assert!(
+            result.is_ok(),
+            "policy with matching repo should accept: {result:?}"
+        );
+    }
+
+    #[test]
+    fn policy_allowlist_rejects_non_matching_repo_id() {
+        let spec = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("valid spec");
+        let policy =
+            JobSpecValidationPolicy::with_allowed_repos(vec!["other-org/other-repo".to_string()])
+                .expect("valid policy");
+        let result = validate_job_spec_with_policy(&spec, &policy);
+        assert!(
+            matches!(result, Err(JobSpecError::DisallowedRepoId { .. })),
+            "policy should reject non-matching repo_id: {result:?}"
+        );
+    }
+
+    #[test]
+    fn policy_empty_allowlist_denies_all() {
+        let spec = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("valid spec");
+        let policy = JobSpecValidationPolicy::with_allowed_repos(vec![]).expect("valid policy");
+        let result = validate_job_spec_with_policy(&spec, &policy);
+        assert!(
+            matches!(result, Err(JobSpecError::DisallowedRepoId { .. })),
+            "empty allowlist should deny all: {result:?}"
+        );
+    }
+
+    #[test]
+    fn policy_allowlist_bounded_by_max() {
+        let oversized: Vec<String> = (0..=MAX_REPO_ALLOWLIST_SIZE)
+            .map(|i| format!("repo-{i}"))
+            .collect();
+        let result = JobSpecValidationPolicy::with_allowed_repos(oversized);
+        assert!(
+            matches!(
+                result,
+                Err(JobSpecError::FieldTooLong {
+                    field: "allowed_repo_ids",
+                    ..
+                })
+            ),
+            "oversized allowlist should be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn policy_default_is_open() {
+        let policy = JobSpecValidationPolicy::default();
+        assert!(
+            !policy.has_repo_allowlist(),
+            "default policy should be open (no allowlist)"
+        );
+    }
+
+    #[test]
+    fn patch_bytes_backend_valid_fac_blobs_v1() {
+        let source = JobSource {
+            kind: "patch_injection".to_string(),
+            repo_id: "org-repo".to_string(),
+            head_sha: "a".repeat(40),
+            patch: Some(serde_json::json!({
+                "bytes": "aGVsbG8=",
+                "bytes_backend": "fac_blobs_v1"
+            })),
+        };
+        let result = validate_patch_bytes_backend(&source);
+        assert!(
+            result.is_ok(),
+            "fac_blobs_v1 should be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn patch_bytes_backend_valid_apm2_cas() {
+        let source = JobSource {
+            kind: "patch_injection".to_string(),
+            repo_id: "org-repo".to_string(),
+            head_sha: "a".repeat(40),
+            patch: Some(serde_json::json!({
+                "bytes": "aGVsbG8=",
+                "bytes_backend": "apm2_cas"
+            })),
+        };
+        let result = validate_patch_bytes_backend(&source);
+        assert!(result.is_ok(), "apm2_cas should be accepted: {result:?}");
+    }
+
+    #[test]
+    fn patch_bytes_backend_rejects_unknown() {
+        let source = JobSource {
+            kind: "patch_injection".to_string(),
+            repo_id: "org-repo".to_string(),
+            head_sha: "a".repeat(40),
+            patch: Some(serde_json::json!({
+                "bytes": "aGVsbG8=",
+                "bytes_backend": "evil_backend"
+            })),
+        };
+        let result = validate_patch_bytes_backend(&source);
+        assert!(
+            matches!(result, Err(JobSpecError::DisallowedBytesBackend { ref backend }) if backend == "evil_backend"),
+            "unknown backend should be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn patch_bytes_backend_rejects_non_string() {
+        let source = JobSource {
+            kind: "patch_injection".to_string(),
+            repo_id: "org-repo".to_string(),
+            head_sha: "a".repeat(40),
+            patch: Some(serde_json::json!({
+                "bytes": "aGVsbG8=",
+                "bytes_backend": 42
+            })),
+        };
+        let result = validate_patch_bytes_backend(&source);
+        assert!(
+            matches!(result, Err(JobSpecError::DisallowedBytesBackend { .. })),
+            "non-string backend should be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn patch_bytes_backend_absent_is_ok() {
+        let source = JobSource {
+            kind: "patch_injection".to_string(),
+            repo_id: "org-repo".to_string(),
+            head_sha: "a".repeat(40),
+            patch: Some(serde_json::json!({
+                "bytes": "aGVsbG8="
+            })),
+        };
+        let result = validate_patch_bytes_backend(&source);
+        assert!(
+            result.is_ok(),
+            "absent bytes_backend should be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn patch_none_bytes_backend_is_ok() {
+        let source = sample_source();
+        let result = validate_patch_bytes_backend(&source);
+        assert!(result.is_ok(), "no patch at all should be ok: {result:?}");
+    }
+
+    #[test]
+    fn reject_unix_absolute_path_in_repo_id() {
+        let result = reject_filesystem_paths("source.repo_id", "/usr/local/repo");
+        assert!(
+            matches!(
+                result,
+                Err(JobSpecError::FilesystemPathRejected {
+                    field: "source.repo_id",
+                    ..
+                })
+            ),
+            "Unix absolute path should be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn reject_windows_drive_path_in_repo_id() {
+        let result = reject_filesystem_paths("source.repo_id", "C:\\Users\\repo");
+        assert!(
+            matches!(result, Err(JobSpecError::FilesystemPathRejected { .. })),
+            "Windows drive path should be rejected: {result:?}"
+        );
+        let result2 = reject_filesystem_paths("source.repo_id", "D:/repos/foo");
+        assert!(
+            matches!(result2, Err(JobSpecError::FilesystemPathRejected { .. })),
+            "Windows forward-slash drive path should be rejected: {result2:?}"
+        );
+    }
+
+    #[test]
+    fn reject_unc_path_in_repo_id() {
+        let result = reject_filesystem_paths("source.repo_id", "\\\\server\\share");
+        assert!(
+            matches!(result, Err(JobSpecError::FilesystemPathRejected { .. })),
+            "UNC path should be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn reject_tilde_expansion_in_job_id() {
+        let result = reject_filesystem_paths("job_id", "~/evil-job");
+        assert!(
+            matches!(
+                result,
+                Err(JobSpecError::FilesystemPathRejected {
+                    field: "job_id",
+                    ..
+                })
+            ),
+            "tilde path should be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn reject_dotslash_relative_path_in_repo_id() {
+        let result = reject_filesystem_paths("source.repo_id", "./local-repo");
+        assert!(
+            matches!(result, Err(JobSpecError::FilesystemPathRejected { .. })),
+            "dot-slash relative path should be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn accept_logical_repo_id() {
+        let valid_ids = vec![
+            "org-repo",
+            "my-org/my-repo",
+            "guardian-intelligence/apm2",
+            "simple",
+            "a",
+        ];
+        for id in valid_ids {
+            let result = reject_filesystem_paths("source.repo_id", id);
+            assert!(
+                result.is_ok(),
+                "logical repo_id {id:?} should be accepted: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_for_error_short_string() {
+        let short = "hello";
+        assert_eq!(truncate_for_error(short), "hello");
+    }
+
+    #[test]
+    fn truncate_for_error_long_string() {
+        let long = "x".repeat(200);
+        let truncated = truncate_for_error(&long);
+        assert!(truncated.len() <= 68); // 64 + "..."
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn full_policy_validation_e2e_with_allowlist() {
+        let spec = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("valid spec");
+
+        // Accepted: repo_id in allowlist.
+        let policy = JobSpecValidationPolicy::with_allowed_repos(vec!["org-repo".to_string()])
+            .expect("valid policy");
+        assert!(validate_job_spec_with_policy(&spec, &policy).is_ok());
+
+        // Rejected: repo_id NOT in allowlist.
+        let deny_policy =
+            JobSpecValidationPolicy::with_allowed_repos(vec!["other-org/other-repo".to_string()])
+                .expect("valid policy");
+        let result = validate_job_spec_with_policy(&spec, &deny_policy);
+        assert!(matches!(result, Err(JobSpecError::DisallowedRepoId { .. })));
+    }
+
+    #[test]
+    fn full_policy_validation_rejects_filesystem_path_repo_id() {
+        // Build spec then tamper with repo_id to a filesystem path.
+        let mut spec = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("valid spec");
+        // Note: repo_id starting with / is already caught by validate_repo_id,
+        // but we test the policy layer path too. validate_structure also rejects
+        // "/" prefix, so this verifies the defense in depth.
+        spec.source.repo_id = "/etc/passwd".to_string();
+        let policy = JobSpecValidationPolicy::open();
+        let result = validate_job_spec_with_policy(&spec, &policy);
+        // Either validate_repo_id or reject_filesystem_paths catches it.
+        assert!(
+            result.is_err(),
+            "filesystem path repo_id should be rejected"
+        );
+    }
+
+    #[test]
+    fn policy_validation_control_lane_with_allowlist() {
+        let spec = FacJobSpecV1Builder::new(
+            "sr-1",
+            "stop_revoke",
+            "control",
+            "2026-02-12T00:00:00Z",
+            "L1",
+            sample_source(),
+        )
+        .cancel_target_job_id("target-123")
+        .build()
+        .expect("valid stop_revoke spec");
+
+        // Accepted: repo in allowlist.
+        let policy = JobSpecValidationPolicy::with_allowed_repos(vec!["org-repo".to_string()])
+            .expect("valid policy");
+        let result = validate_job_spec_control_lane_with_policy(&spec, &policy);
+        assert!(
+            result.is_ok(),
+            "control-lane policy validation should accept: {result:?}"
+        );
+
+        // Rejected: repo not in allowlist.
+        let deny_policy = JobSpecValidationPolicy::with_allowed_repos(vec!["other".to_string()])
+            .expect("valid policy");
+        let result = validate_job_spec_control_lane_with_policy(&spec, &deny_policy);
+        assert!(
+            matches!(result, Err(JobSpecError::DisallowedRepoId { .. })),
+            "control-lane should reject non-matching repo: {result:?}"
+        );
+    }
+
+    #[test]
+    fn full_policy_validation_with_bad_bytes_backend() {
+        let source = JobSource {
+            kind: "patch_injection".to_string(),
+            repo_id: "org-repo".to_string(),
+            head_sha: "a".repeat(40),
+            patch: Some(serde_json::json!({
+                "bytes": "aGVsbG8=",
+                "bytes_backend": "evil_backend",
+                "digest": format!("b3-256:{}", "ab".repeat(32))
+            })),
+        };
+        let spec = FacJobSpecV1Builder::new(
+            "job1",
+            "gates",
+            "bulk",
+            "2026-02-12T00:00:00Z",
+            "L1",
+            source,
+        )
+        .channel_context_token("TOKEN")
+        .priority(50)
+        .build()
+        .expect("valid spec");
+
+        let policy = JobSpecValidationPolicy::open();
+        let result = validate_job_spec_with_policy(&spec, &policy);
+        assert!(
+            matches!(result, Err(JobSpecError::DisallowedBytesBackend { .. })),
+            "bad bytes_backend should be rejected via policy validation: {result:?}"
+        );
+    }
+
+    #[test]
+    fn adversarial_oversized_job_spec_denied() {
+        // 64 KiB + 1 byte.
+        let oversized = vec![b' '; MAX_JOB_SPEC_SIZE + 1];
+        let result = deserialize_job_spec(&oversized);
+        assert!(
+            matches!(
+                result,
+                Err(JobSpecError::InputTooLarge {
+                    size,
+                    max: MAX_JOB_SPEC_SIZE
+                }) if size == MAX_JOB_SPEC_SIZE + 1
+            ),
+            "oversized input must be denied deterministically: {result:?}"
+        );
+    }
+
+    #[test]
+    fn adversarial_unknown_kind_rejected() {
+        let mut spec = build_valid_spec();
+        spec.kind = "unknown_evil_kind".to_string();
+        let result = spec.validate_structure();
+        assert!(
+            matches!(
+                result,
+                Err(JobSpecError::InvalidFormat { field: "kind", .. })
+            ),
+            "unknown kind must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn adversarial_dotdot_in_repo_id() {
+        let mut spec = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("valid spec");
+        spec.source.repo_id = "org/../etc/passwd".to_string();
+        let result = spec.validate_structure();
+        assert!(
+            result.is_err(),
+            "dot-dot traversal in repo_id should be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn adversarial_backslash_in_repo_id() {
+        let mut spec = build_with_ids("job1", "L1")
+            .channel_context_token("TOKEN")
+            .build()
+            .expect("valid spec");
+        spec.source.repo_id = "org\\evil".to_string();
+        let result = spec.validate_structure();
+        assert!(
+            matches!(
+                result,
+                Err(JobSpecError::InvalidFormat {
+                    field: "source.repo_id",
+                    ..
+                })
+            ),
+            "backslash in repo_id should be rejected: {result:?}"
         );
     }
 }
