@@ -1148,6 +1148,14 @@ All receipt-touching hot paths consult the index first:
   after the optional prefix. This ensures `lookup_job_receipt`, `has_receipt_for_job`,
   and `find_receipt_for_job` correctly use index-backed O(1) lookups for receipts
   with canonical `b3-256:`-prefixed content hashes (TCK-00564).
+- [INV-IDX-010] `scan_receipt_for_job` (fallback directory scan) verifies
+  receipt content-addressed integrity before returning. The expected digest is
+  derived from the filename stem (which is the content hash in the receipt
+  store's naming convention). Only receipts that pass `verify_receipt_integrity`
+  (BLAKE3 v1/v2 hash match via constant-time comparison) are included in results.
+  This prevents unverified or tampered receipts from driving terminal routing in
+  worker duplicate handling and reconcile torn-state repair (MAJOR-1 round 8 fix,
+  TCK-00564).
 
 ## sd_notify Submodule (TCK-00600)
 
@@ -1421,9 +1429,12 @@ for receipt IDs constructed from job IDs (MAJOR-3/MINOR security fixes).
 - [INV-PIPE-011] `receipt_id` in `RecoveryReceiptV1::persist` is validated
   against path traversal via `validate_receipt_id_for_filename` (BLOCKER security).
 - [INV-PIPE-012] `receipt_id` length is bounded by truncating `job_id` to
-  `MAX_FILE_NAME_LENGTH - 44` chars, accounting for full filename framing
-  overhead ("recovery-{receipt_id}.json" prefix/suffix) to keep the final
-  filename within the 255-byte filesystem limit (MINOR-1 security fix).
+  `MAX_FILE_NAME_LENGTH - 44` **bytes** (not chars), accounting for full
+  filename framing overhead ("recovery-{receipt_id}.json" prefix/suffix) to
+  keep the final filename within the 255-byte filesystem limit. Uses
+  `truncate_to_byte_budget` which iterates chars accumulating `len_utf8()`
+  bytes, ensuring multibyte UTF-8 job IDs are truncated at char boundaries
+  without exceeding the byte budget (MINOR-1 round 8 fix).
 - [INV-PIPE-013] `RecoveryReceiptV1::persist` validates the final constructed
   filename (`"recovery-{receipt_id}.json"`) against `MAX_FILE_NAME_LENGTH`
   before writing, preventing `ENAMETOOLONG` errors that could bypass recovery
