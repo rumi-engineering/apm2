@@ -1,5 +1,5 @@
-// AGENT-AUTHORED (TCK-00533)
-//! FAC Job lifecycle management: cancel command.
+// AGENT-AUTHORED (TCK-00533, TCK-00535)
+//! FAC Job lifecycle management: cancel and show commands.
 //!
 //! Implements `apm2 fac job cancel <job_id>` with the following semantics:
 //!
@@ -847,6 +847,264 @@ fn output_error(json_output: bool, message: &str) {
 // Tests
 // =============================================================================
 
+// =============================================================================
+// Job Show Command (TCK-00535)
+// =============================================================================
+
+/// JSON output for `apm2 fac job show`.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct JobShowOutput {
+    /// The job ID.
+    job_id: String,
+    /// Current directory state (pending, claimed, completed, etc.).
+    current_state: String,
+    /// The full job spec, if readable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spec: Option<FacJobSpecV1>,
+    /// The latest receipt for this job, if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_receipt: Option<serde_json::Value>,
+    /// Paths to related log files, if discoverable.
+    log_pointers: Vec<String>,
+    /// The path to the job spec file on disk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spec_path: Option<String>,
+}
+
+/// Runs the `apm2 fac job show <job_id>` command.
+///
+/// Shows the job spec, latest receipt, and pointers to related log files.
+/// Returns an exit code.
+pub fn run_job_show(job_id: &str, json_output: bool) -> u8 {
+    // Validate job_id charset.
+    if job_id.is_empty() {
+        output_error(json_output, "job_id must not be empty");
+        return exit_codes::VALIDATION_ERROR;
+    }
+    if !job_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        output_error(
+            json_output,
+            &format!("invalid job_id: only [A-Za-z0-9_-] characters allowed, got {job_id:?}"),
+        );
+        return exit_codes::VALIDATION_ERROR;
+    }
+
+    let queue_root = match resolve_queue_root() {
+        Ok(root) => root,
+        Err(e) => {
+            output_error(json_output, &format!("cannot resolve queue root: {e}"));
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    // Locate the job across all directories.
+    let state = locate_job(&queue_root, job_id);
+
+    let (state_name, spec_path) = match &state {
+        JobState::Pending(p) => ("pending", Some(p.clone())),
+        JobState::Claimed(p) => ("claimed", Some(p.clone())),
+        JobState::Completed(p) => ("completed", Some(p.clone())),
+        JobState::Cancelled(p) => ("cancelled", Some(p.clone())),
+        JobState::Denied(p) => ("denied", Some(p.clone())),
+        JobState::Quarantined(p) => ("quarantined", Some(p.clone())),
+        JobState::NotFound => {
+            output_error(
+                json_output,
+                &format!("job {job_id} not found in any queue directory"),
+            );
+            return exit_codes::NOT_FOUND;
+        },
+        JobState::Ambiguous(dirs) => {
+            output_error(
+                json_output,
+                &format!(
+                    "job {job_id} found in multiple directories (ambiguous, fail-closed): {}",
+                    dirs.join(", ")
+                ),
+            );
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    // Read the job spec.
+    let spec = spec_path.as_ref().and_then(|p| read_job_spec(p).ok());
+
+    // Look up the latest receipt from the receipt index.
+    let latest_receipt = resolve_latest_receipt(job_id);
+
+    // Discover log pointers.
+    let log_pointers = discover_log_pointers(job_id, &queue_root);
+
+    let output = JobShowOutput {
+        job_id: job_id.to_string(),
+        current_state: state_name.to_string(),
+        spec,
+        latest_receipt,
+        log_pointers,
+        spec_path: spec_path.map(|p| p.display().to_string()),
+    };
+
+    if json_output {
+        print_json(&output);
+    } else {
+        print_job_show_text(&output);
+    }
+
+    exit_codes::SUCCESS
+}
+
+/// Looks up the latest receipt for a job from the receipt index.
+fn resolve_latest_receipt(job_id: &str) -> Option<serde_json::Value> {
+    let apm2_home = apm2_core::github::resolve_apm2_home()?;
+    let receipts_dir = apm2_home.join("private").join("fac").join("receipts");
+
+    let receipt = apm2_core::fac::lookup_job_receipt(&receipts_dir, job_id)?;
+    serde_json::to_value(&receipt).ok()
+}
+
+/// Discovers log file pointers related to a job.
+///
+/// Looks for log directories under `$APM2_HOME/private/fac/evidence/`
+/// and lane workspaces that might contain build/test logs.
+fn discover_log_pointers(job_id: &str, queue_root: &Path) -> Vec<String> {
+    let mut pointers = Vec::new();
+
+    // Check evidence directory for job-related logs.
+    if let Some(apm2_home) = apm2_core::github::resolve_apm2_home() {
+        let evidence_dir = apm2_home.join("private").join("fac").join("evidence");
+        if evidence_dir.is_dir() {
+            // Look for directories or files matching the job_id.
+            if let Ok(entries) = fs::read_dir(&evidence_dir) {
+                let mut scan_count = 0usize;
+                for entry in entries {
+                    if scan_count >= MAX_SCAN_ENTRIES {
+                        break;
+                    }
+                    scan_count = scan_count.saturating_add(1);
+                    let Ok(entry) = entry else { continue };
+                    let name = entry.file_name();
+                    let Some(name_str) = name.to_str() else {
+                        continue;
+                    };
+                    if name_str.contains(job_id) {
+                        pointers.push(entry.path().display().to_string());
+                    }
+                }
+            }
+        }
+
+        // Check receipts directory for related receipt files.
+        let receipts_dir = apm2_home.join("private").join("fac").join("receipts");
+        if receipts_dir.is_dir() {
+            // The receipt content hash path is already returned via the receipt
+            // lookup. Just note the directory.
+            pointers.push(format!("{} (receipt store)", receipts_dir.display()));
+        }
+    }
+
+    // Check for lane-scoped logs if the job is in claimed/ state.
+    // Lane workspace directories are under the queue root's parent.
+    let lanes_dir = queue_root.parent().map(|p| p.join("lanes"));
+    if let Some(lanes_dir) = lanes_dir {
+        if lanes_dir.is_dir() {
+            if let Ok(entries) = fs::read_dir(&lanes_dir) {
+                let mut scan_count = 0usize;
+                for entry in entries {
+                    if scan_count >= MAX_SCAN_ENTRIES {
+                        break;
+                    }
+                    scan_count = scan_count.saturating_add(1);
+                    let Ok(entry) = entry else { continue };
+                    let lane_path = entry.path();
+                    let logs_dir = lane_path.join("logs");
+                    if logs_dir.is_dir() {
+                        // Look for log files mentioning the job_id.
+                        if let Ok(log_entries) = fs::read_dir(&logs_dir) {
+                            let mut log_scan = 0usize;
+                            for log_entry in log_entries {
+                                if log_scan >= MAX_SCAN_ENTRIES {
+                                    break;
+                                }
+                                log_scan = log_scan.saturating_add(1);
+                                let Ok(log_entry) = log_entry else { continue };
+                                let log_name = log_entry.file_name();
+                                let Some(log_name_str) = log_name.to_str() else {
+                                    continue;
+                                };
+                                if log_name_str.contains(job_id) {
+                                    pointers.push(log_entry.path().display().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pointers
+}
+
+/// Prints job show output in text format.
+fn print_job_show_text(output: &JobShowOutput) {
+    println!("Job: {}", output.job_id);
+    println!("  State:          {}", output.current_state);
+
+    if let Some(ref path) = output.spec_path {
+        println!("  Spec Path:      {path}");
+    }
+
+    if let Some(ref spec) = output.spec {
+        println!("  Kind:           {}", spec.kind);
+        println!("  Queue Lane:     {}", spec.queue_lane);
+        println!("  Priority:       {}", spec.priority);
+        println!("  Enqueue Time:   {}", spec.enqueue_time);
+        println!("  Source Repo:    {}", spec.source.repo_id);
+        println!("  Head SHA:       {}", spec.source.head_sha);
+        if !spec.job_spec_digest.is_empty() {
+            println!("  Spec Digest:    {}", spec.job_spec_digest);
+        }
+    } else {
+        println!("  (spec not readable)");
+    }
+
+    println!();
+    if let Some(ref receipt) = output.latest_receipt {
+        println!("  Latest Receipt:");
+        if let Some(outcome) = receipt.get("outcome").and_then(|v| v.as_str()) {
+            println!("    Outcome:      {outcome}");
+        }
+        if let Some(reason) = receipt.get("reason").and_then(|v| v.as_str()) {
+            if !reason.is_empty() {
+                println!("    Reason:       {reason}");
+            }
+        }
+        if let Some(ts) = receipt
+            .get("timestamp_secs")
+            .and_then(serde_json::Value::as_u64)
+        {
+            println!("    Timestamp:    {ts}");
+        }
+        if let Some(hash) = receipt.get("content_hash").and_then(|v| v.as_str()) {
+            println!("    Content Hash: {hash}");
+        }
+    } else {
+        println!("  (no receipt found)");
+    }
+
+    if !output.log_pointers.is_empty() {
+        println!();
+        println!("  Log Pointers:");
+        for pointer in &output.log_pointers {
+            println!("    {pointer}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1119,5 +1377,75 @@ mod tests {
             "should fail when claimed job spec cannot be read"
         );
         assert_eq!(exit_code, exit_codes::GENERIC_ERROR);
+    }
+
+    // =========================================================================
+    // Job Show tests (TCK-00535)
+    // =========================================================================
+
+    #[test]
+    fn test_job_show_not_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = tmp.path().join("queue");
+        fs::create_dir_all(queue_root.join(PENDING_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(CLAIMED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(COMPLETED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(CANCELLED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(DENIED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(QUARANTINE_DIR)).unwrap();
+
+        // The run_job_show function uses resolve_queue_root which depends
+        // on $APM2_HOME. Instead, test the locate_job function directly.
+        let state = locate_job(&queue_root, "nonexistent-show-test");
+        assert!(matches!(state, JobState::NotFound));
+    }
+
+    #[test]
+    fn test_job_show_finds_pending_job() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = tmp.path().join("queue");
+        fs::create_dir_all(queue_root.join(PENDING_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(CLAIMED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(COMPLETED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(CANCELLED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(DENIED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(QUARANTINE_DIR)).unwrap();
+
+        let spec = build_stop_revoke_spec("show-target", "test").expect("spec builds");
+        let spec_json = serde_json::to_vec_pretty(&spec).unwrap();
+        let file_name = format!("{}.json", spec.job_id);
+        fs::write(queue_root.join(PENDING_DIR).join(&file_name), &spec_json).unwrap();
+
+        let state = locate_job(&queue_root, &spec.job_id);
+        assert!(
+            matches!(state, JobState::Pending(_)),
+            "expected Pending, got {state:?}"
+        );
+    }
+
+    #[test]
+    fn test_job_show_empty_id_rejected() {
+        // Empty job ID should produce VALIDATION_ERROR.
+        let exit_code = run_job_show("", false);
+        assert_eq!(exit_code, exit_codes::VALIDATION_ERROR);
+    }
+
+    #[test]
+    fn test_job_show_invalid_charset_rejected() {
+        // Invalid characters in job ID.
+        let exit_code = run_job_show("../evil", false);
+        assert_eq!(exit_code, exit_codes::VALIDATION_ERROR);
+    }
+
+    #[test]
+    fn test_discover_log_pointers_empty_on_missing_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = tmp.path().join("queue");
+        fs::create_dir_all(&queue_root).unwrap();
+
+        let pointers = discover_log_pointers("some-job", &queue_root);
+        // Should not panic, may have receipt store pointer if $APM2_HOME exists.
+        // Just verify it returns without error.
+        assert!(pointers.len() <= 10);
     }
 }

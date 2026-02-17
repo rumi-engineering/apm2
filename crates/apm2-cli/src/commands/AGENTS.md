@@ -25,6 +25,7 @@ All command functions return a `u8` exit code or `anyhow::Result<()>`, using val
 | `fac.rs` | `apm2 fac *` | FAC (Factory Automation Cycle) top-level dispatcher |
 | `fac_pr/` | `apm2 fac pr *` | GitHub App credential management for PR operations |
 | `fac_review/` | `apm2 fac review *` | Review orchestration (security + quality reviews) |
+| `fac_queue.rs` | `apm2 fac queue *` | Queue introspection (status with counts, reason stats) |
 | `factory/` | `apm2 factory *` | Factory pipeline (CCP, Impact Map, RFC, Tickets) |
 | `cac.rs` | `apm2 cac *` | CAC (Compliance Artifact Chain) operations |
 | `coordinate.rs` | `apm2 coordinate *` | Multi-agent coordination commands |
@@ -271,3 +272,19 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
   chains (exec and warm paths) call `.sandbox_hardening_hash(&sbx_hash)` so the
   cryptographically signed `GateReceipt` binds the hardening profile used during
   execution. This complements the `FacJobReceiptV1` binding done via `emit_job_receipt`.
+
+## Introspection CLI Invariants (Updated for TCK-00535)
+
+- **Queue status** (`fac_queue.rs`): `apm2 fac queue status` scans the six queue directories
+  (`pending`, `claimed`, `completed`, `denied`, `quarantine`, `cancelled`) with bounded
+  `read_dir` (MAX_SCAN_ENTRIES=4096) and reports per-directory file counts, oldest job ID
+  and enqueue time, and denial/quarantine reason stats. Reason codes are capped at
+  MAX_REASON_CODES=64 to prevent unbounded memory growth from adversarial data.
+- **Job show** (`fac_job.rs`): `apm2 fac job show <job_id>` locates a job across all queue
+  directories, reads the spec with bounded I/O (reuses `read_job_spec` / `MAX_JOB_SPEC_SIZE`),
+  resolves the latest receipt from the receipt index, and discovers log pointers from the
+  evidence directory and lane logs. Returns NOT_FOUND (exit 12) if the job is absent.
+- **Receipts list --since** (`fac.rs`): `apm2 fac receipts list --since <epoch_secs>` filters
+  the receipt index to entries at or after the given UNIX epoch. Deterministic ordering is
+  enforced: primary sort by `timestamp_secs` descending, secondary sort by `content_hash`
+  ascending for stable tie-breaking.
