@@ -661,13 +661,27 @@ Applies security hardening to lane workspace git config after checkout:
 **Key types**:
 - `GitHardeningReceipt`: Audit receipt recording hooks, safe.directory, and config scan status
 - `GitHardeningOutcome`: Enum (`Hardened`, `Failed`, `Rejected`)
-- `GitHardeningError`: Error taxonomy for hardening failures
+- `GitHardeningError`: Error taxonomy for hardening failures. Includes:
+  - `HooksDirCreationFailed`: hooks directory could not be created
+  - `HooksDirValidationFailed`: pre-existing hooks directory failed validation
+    (symlink, wrong owner, wrong permissions, non-empty)
+  - `ConfigScanCommandFailed`: `git config --local --list` exited non-zero
+    (fail-closed; includes stdout/stderr for diagnostics)
+  - `UnsafeConfigDetected`: unsafe config keys found; carries a `GitHardeningReceipt`
+    with `Rejected` outcome for audit trail
 
 **Security invariants**:
 - [INV-GH-001] After hardening, no repository-shipped hook can execute
 - [INV-GH-002] Hooks directory is empty, FAC-controlled, mode 0o700, outside workspace tree
 - [INV-GH-003] Unsafe filter/smudge/fsmonitor/sshcommand configs are detected and rejected
 - [INV-GH-004] All hardening results recorded in `GitHardeningReceipt` for evidence
+- [INV-GH-005] Pre-existing hooks directories are validated before reuse: must not be
+  a symlink, must be owned by current uid, must have mode 0o700, must be empty. Failure
+  on any check returns `Err` (fail-closed; do not reuse attacker-controlled directories).
+- [INV-GH-006] `git config --local --list` failure is fail-closed: returns `Err` with
+  diagnostics instead of silently passing the config scan.
+- [INV-GH-007] When unsafe config is detected and rejected, a `GitHardeningReceipt`
+  with `outcome: Rejected` is included in the error for audit trail persistence.
 
 **Integration**: Called automatically by `checkout_to_lane()` after checkout completes.
 Receipt is included in `CheckoutOutcome::git_hardening`.

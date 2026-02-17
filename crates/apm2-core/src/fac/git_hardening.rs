@@ -114,6 +114,8 @@ pub enum GitHardeningError {
         count: usize,
         /// The offending config keys (bounded to 64 entries max).
         keys: Vec<String>,
+        /// The hardening receipt with `Rejected` outcome for audit trail.
+        receipt: GitHardeningReceipt,
     },
 
     /// The workspace path does not exist or is not a directory.
@@ -130,6 +132,27 @@ pub enum GitHardeningError {
         size: u64,
         /// Maximum allowed.
         max: u64,
+    },
+
+    /// `git config --local --list` command failed (non-zero exit).
+    /// Fail-closed: we cannot verify the config is safe.
+    #[error("git config scan command failed (exit {exit_code}): stdout={stdout}, stderr={stderr}")]
+    ConfigScanCommandFailed {
+        /// Exit code from the git config command.
+        exit_code: String,
+        /// Standard output captured.
+        stdout: String,
+        /// Standard error captured.
+        stderr: String,
+    },
+
+    /// Pre-existing hooks directory failed validation.
+    #[error("pre-existing hooks directory validation failed at {path}: {reason}")]
+    HooksDirValidationFailed {
+        /// Path to the hooks directory.
+        path: String,
+        /// Why validation failed.
+        reason: String,
     },
 
     /// I/O error.
@@ -254,20 +277,24 @@ pub fn harden_lane_workspace(
 
     if !config_scan_passed && refuse_unsafe_configs {
         let count = unsafe_keys.len();
+        let rejected_receipt = GitHardeningReceipt {
+            schema: GIT_HARDENING_RECEIPT_SCHEMA.to_string(),
+            hooks_disabled,
+            hooks_path: hooks_dir.display().to_string(),
+            safe_directory_set,
+            config_scan_passed: false,
+            unsafe_config_keys: unsafe_keys.clone(),
+            outcome: GitHardeningOutcome::Rejected,
+        };
         return Err(GitHardeningError::UnsafeConfigDetected {
             count,
             keys: unsafe_keys,
+            receipt: rejected_receipt,
         });
     }
 
-    let outcome = if config_scan_passed {
-        GitHardeningOutcome::Hardened
-    } else if refuse_unsafe_configs {
-        // unreachable due to early return above, but be explicit
-        GitHardeningOutcome::Rejected
-    } else {
-        GitHardeningOutcome::Hardened
-    };
+    // If we reach here, either scan passed or refuse_unsafe_configs is false.
+    let outcome = GitHardeningOutcome::Hardened;
 
     Ok(GitHardeningReceipt {
         schema: GIT_HARDENING_RECEIPT_SCHEMA.to_string(),
@@ -282,21 +309,22 @@ pub fn harden_lane_workspace(
 
 /// Create an empty directory for hooks under `parent`.
 ///
-/// The directory is created with mode 0o700 on Unix. If it already exists
-/// and is empty, this is a no-op. If it exists and contains files, they
-/// are NOT removed (fail-closed: the directory was not created by us).
+/// The directory is created with mode 0o700 on Unix. If it already exists,
+/// it MUST be validated: not a symlink, owned by current uid, permissions
+/// are exactly 0o700, and the directory is empty. If ANY check fails,
+/// an error is returned (fail-closed: do not reuse attacker-controlled
+/// directories).
+///
+/// # Security Invariants
+///
+/// - [INV-GH-005] Pre-existing hooks directories are validated before reuse:
+///   symlink check, uid ownership, mode 0o700, emptiness.
 fn create_empty_hooks_dir(parent: &Path) -> Result<PathBuf, GitHardeningError> {
     let hooks_dir = parent.join("empty_hooks");
 
     if hooks_dir.exists() {
-        if !hooks_dir.is_dir() {
-            return Err(GitHardeningError::HooksDirCreationFailed {
-                path: hooks_dir.display().to_string(),
-                reason: "path exists but is not a directory".to_string(),
-            });
-        }
-        // Already exists as a directory — acceptable.
-        return Ok(hooks_dir);
+        // Validate the pre-existing directory thoroughly.
+        return validate_existing_hooks_dir(&hooks_dir);
     }
 
     #[cfg(unix)]
@@ -323,6 +351,78 @@ fn create_empty_hooks_dir(parent: &Path) -> Result<PathBuf, GitHardeningError> {
     }
 
     Ok(hooks_dir)
+}
+
+/// Validate a pre-existing hooks directory.
+///
+/// Checks: (a) not a symlink, (b) is a directory, (c) owned by current uid
+/// (Unix), (d) permissions are exactly 0o700 (Unix), (e) directory is empty.
+fn validate_existing_hooks_dir(hooks_dir: &Path) -> Result<PathBuf, GitHardeningError> {
+    let display_path = hooks_dir.display().to_string();
+
+    // (a) Check for symlinks — use symlink_metadata to avoid following the link.
+    let symlink_meta = std::fs::symlink_metadata(hooks_dir).map_err(|e| {
+        GitHardeningError::HooksDirValidationFailed {
+            path: display_path.clone(),
+            reason: format!("failed to read symlink metadata: {e}"),
+        }
+    })?;
+
+    if symlink_meta.file_type().is_symlink() {
+        return Err(GitHardeningError::HooksDirValidationFailed {
+            path: display_path,
+            reason: "path is a symlink (potential attack vector)".to_string(),
+        });
+    }
+
+    // (b) Verify it is a directory (not a file, FIFO, device, etc.)
+    if !symlink_meta.is_dir() {
+        return Err(GitHardeningError::HooksDirCreationFailed {
+            path: display_path,
+            reason: "path exists but is not a directory".to_string(),
+        });
+    }
+
+    // (c) + (d) Unix-specific: ownership and permissions checks.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let current_uid = nix::unistd::getuid().as_raw();
+        let dir_uid = symlink_meta.uid();
+        if dir_uid != current_uid {
+            return Err(GitHardeningError::HooksDirValidationFailed {
+                path: display_path,
+                reason: format!(
+                    "directory owned by uid {dir_uid}, expected current uid {current_uid}"
+                ),
+            });
+        }
+
+        let mode = symlink_meta.mode() & 0o777;
+        if mode != 0o700 {
+            return Err(GitHardeningError::HooksDirValidationFailed {
+                path: display_path,
+                reason: format!("directory permissions are {mode:#o}, expected 0o700"),
+            });
+        }
+    }
+
+    // (e) Verify the directory is empty.
+    let mut entries =
+        std::fs::read_dir(hooks_dir).map_err(|e| GitHardeningError::HooksDirValidationFailed {
+            path: display_path.clone(),
+            reason: format!("failed to read directory entries: {e}"),
+        })?;
+
+    if entries.next().is_some() {
+        return Err(GitHardeningError::HooksDirValidationFailed {
+            path: display_path,
+            reason: "directory is not empty (potential attacker-placed hooks)".to_string(),
+        });
+    }
+
+    Ok(hooks_dir.to_path_buf())
 }
 
 /// Set a git config value in the local (workspace) scope.
@@ -393,12 +493,27 @@ fn scan_unsafe_configs(workspace: &Path) -> Result<Vec<String>, GitHardeningErro
         .map_err(GitHardeningError::Io)?;
 
     if !output.status.success() {
-        // If git config --list fails, treat as no config (fail-open on
-        // read failure would be wrong, but `--list` on a valid repo
-        // should not fail; if it does, the workspace is likely corrupt).
-        // Return empty — the hardening steps (hooks disabled, etc.) still
-        // apply. The scan is a secondary defense.
-        return Ok(Vec::new());
+        // Fail-closed: if git-config command fails, we cannot verify the
+        // config is safe. Return an error instead of silently passing.
+        // A failed git-config may indicate adversarial state, malformed
+        // config, or a corrupted repository.
+        let exit_code = output
+            .status
+            .code()
+            .map_or_else(|| "signal".to_string(), |c| c.to_string());
+        let stdout = String::from_utf8_lossy(&output.stdout)
+            .chars()
+            .take(512)
+            .collect::<String>();
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(512)
+            .collect::<String>();
+        return Err(GitHardeningError::ConfigScanCommandFailed {
+            exit_code,
+            stdout,
+            stderr,
+        });
     }
 
     let config_text = String::from_utf8_lossy(&output.stdout);
@@ -620,13 +735,22 @@ mod tests {
             "expected UnsafeConfigDetected, got: {result:?}"
         );
 
-        if let Err(GitHardeningError::UnsafeConfigDetected { count, keys }) = result {
+        if let Err(GitHardeningError::UnsafeConfigDetected {
+            count,
+            keys,
+            receipt,
+        }) = result
+        {
             assert_eq!(count, 1);
             assert_eq!(keys.len(), 1);
             assert!(
                 keys[0].contains("filter.evil.smudge"),
                 "expected filter.evil.smudge in keys, got: {keys:?}"
             );
+            // Verify the rejected receipt is populated (MINOR fix: receipt in error).
+            assert_eq!(receipt.outcome, GitHardeningOutcome::Rejected);
+            assert!(!receipt.config_scan_passed);
+            assert_eq!(receipt.unsafe_config_keys.len(), 1);
         }
     }
 
@@ -921,11 +1045,236 @@ mod tests {
 
         let result = harden_lane_workspace(&workspace, &hooks_parent, true);
         match result {
-            Err(GitHardeningError::UnsafeConfigDetected { count, keys }) => {
+            Err(GitHardeningError::UnsafeConfigDetected {
+                count,
+                keys,
+                receipt,
+            }) => {
                 assert_eq!(count, 3, "expected 3 unsafe keys, got {count}");
                 assert_eq!(keys.len(), 3);
+                assert_eq!(receipt.outcome, GitHardeningOutcome::Rejected);
             },
             other => panic!("expected UnsafeConfigDetected, got: {other:?}"),
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Regression tests for review fix round (MAJOR #1, MAJOR #2, MINOR)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// MAJOR #1 regression: pre-existing non-empty hooks directory must cause
+    /// `harden_lane_workspace` to return an error.
+    #[test]
+    fn preexisting_nonempty_hooks_dir_causes_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let hooks_parent = temp.path().join("fac_hooks");
+        fs::create_dir_all(&hooks_parent).expect("hooks parent");
+
+        let _sha = create_test_repo(&workspace);
+
+        // Pre-create the hooks directory with an attacker-placed file.
+        let hooks_dir = hooks_parent.join("empty_hooks");
+        fs::create_dir_all(&hooks_dir).expect("create hooks dir");
+        fs::write(hooks_dir.join("post-commit"), "#!/bin/sh\nmalicious").expect("write hook file");
+
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true);
+        assert!(
+            matches!(
+                result,
+                Err(GitHardeningError::HooksDirValidationFailed { .. })
+            ),
+            "expected HooksDirValidationFailed for non-empty hooks dir, got: {result:?}"
+        );
+    }
+
+    /// MAJOR #1 regression: symlinked hooks directory is rejected.
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_hooks_dir_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let hooks_parent = temp.path().join("fac_hooks");
+        fs::create_dir_all(&hooks_parent).expect("hooks parent");
+
+        let _sha = create_test_repo(&workspace);
+
+        // Create a real directory somewhere else, then symlink to it.
+        let attacker_dir = temp.path().join("attacker_hooks");
+        fs::create_dir_all(&attacker_dir).expect("attacker dir");
+        let hooks_link = hooks_parent.join("empty_hooks");
+        std::os::unix::fs::symlink(&attacker_dir, &hooks_link).expect("symlink");
+
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true);
+        assert!(
+            matches!(
+                result,
+                Err(GitHardeningError::HooksDirValidationFailed { .. })
+            ),
+            "expected HooksDirValidationFailed for symlinked hooks dir, got: {result:?}"
+        );
+    }
+
+    /// MAJOR #1 regression: hooks directory with wrong permissions is rejected.
+    #[test]
+    #[cfg(unix)]
+    fn hooks_dir_wrong_permissions_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let hooks_parent = temp.path().join("fac_hooks");
+        fs::create_dir_all(&hooks_parent).expect("hooks parent");
+
+        let _sha = create_test_repo(&workspace);
+
+        // Create hooks dir with overly permissive mode.
+        let hooks_dir = hooks_parent.join("empty_hooks");
+        fs::create_dir_all(&hooks_dir).expect("create hooks dir");
+        fs::set_permissions(&hooks_dir, fs::Permissions::from_mode(0o755))
+            .expect("set wrong perms");
+
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true);
+        assert!(
+            matches!(
+                result,
+                Err(GitHardeningError::HooksDirValidationFailed { .. })
+            ),
+            "expected HooksDirValidationFailed for wrong permissions, got: {result:?}"
+        );
+    }
+
+    /// MAJOR #2 regression: simulate git-config command failure causes
+    /// `scan_unsafe_configs` to return an error (not silently pass).
+    /// We test `scan_unsafe_configs` directly because corrupting the config
+    /// file would also break the preceding `set_git_config_local` calls in
+    /// `harden_lane_workspace`.
+    #[test]
+    fn git_config_command_failure_causes_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+
+        let _sha = create_test_repo(&workspace);
+
+        // Corrupt the .git/config to cause git-config --list to exit non-zero.
+        // Writing invalid binary content causes git config --list to exit non-zero.
+        let config_path = workspace.join(".git").join("config");
+        fs::write(&config_path, b"\x00\x01\x02INVALID_GIT_CONFIG\xff\xfe").expect("corrupt config");
+
+        // Call scan_unsafe_configs directly — it should return Err, not Ok(empty).
+        let result = scan_unsafe_configs(&workspace);
+        assert!(
+            matches!(
+                result,
+                Err(GitHardeningError::ConfigScanCommandFailed { .. })
+            ),
+            "expected ConfigScanCommandFailed for corrupted git config, got: {result:?}"
+        );
+    }
+
+    /// MAJOR #2 regression (end-to-end): When the config scan fails,
+    /// `harden_lane_workspace` propagates the error (not silently succeed).
+    /// We corrupt the config after a valid repo is set up, then verify.
+    #[test]
+    fn harden_fails_on_corrupt_git_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let hooks_parent = temp.path().join("fac_hooks");
+        fs::create_dir_all(&hooks_parent).expect("hooks parent");
+
+        let _sha = create_test_repo(&workspace);
+
+        // First harden successfully to set up hooks path etc.
+        let receipt = harden_lane_workspace(&workspace, &hooks_parent, true)
+            .expect("initial hardening should succeed");
+        assert_eq!(receipt.outcome, GitHardeningOutcome::Hardened);
+
+        // Now corrupt the config file.
+        let config_path = workspace.join(".git").join("config");
+        fs::write(&config_path, b"\x00\x01\x02INVALID_GIT_CONFIG\xff\xfe").expect("corrupt config");
+
+        // Second harden attempt should fail due to config scan failure.
+        // Note: the hooks dir already exists from the first call, but since
+        // it's valid (empty, correct perms, correct owner), it passes
+        // validation. The git config set calls will also fail since the
+        // config is corrupt — this is expected.
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true);
+        assert!(
+            result.is_err(),
+            "expected error for corrupted git config, got: {result:?}"
+        );
+    }
+
+    /// MINOR regression: rejected receipt has `Rejected` outcome and includes
+    /// unsafe config keys.
+    #[test]
+    fn rejected_receipt_has_correct_outcome_and_keys() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let hooks_parent = temp.path().join("fac_hooks");
+        fs::create_dir_all(&hooks_parent).expect("hooks parent");
+
+        let _sha = create_test_repo(&workspace);
+
+        // Inject an unsafe config.
+        let cfg = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["config", "--local", "core.fsmonitor", "/usr/bin/evil"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("set config");
+        assert!(cfg.status.success());
+
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true);
+        match result {
+            Err(GitHardeningError::UnsafeConfigDetected {
+                count,
+                keys,
+                receipt,
+            }) => {
+                assert_eq!(count, 1);
+                assert_eq!(keys.len(), 1);
+                // Verify receipt outcome is Rejected (not Failed or Hardened).
+                assert_eq!(receipt.outcome, GitHardeningOutcome::Rejected);
+                assert!(!receipt.config_scan_passed);
+                assert!(!receipt.unsafe_config_keys.is_empty());
+                // Verify the receipt has correct schema.
+                assert_eq!(receipt.schema, GIT_HARDENING_RECEIPT_SCHEMA);
+                // Verify hardening steps were recorded in receipt.
+                assert!(receipt.hooks_disabled);
+                assert!(receipt.safe_directory_set);
+            },
+            other => panic!("expected UnsafeConfigDetected with receipt, got: {other:?}"),
+        }
+    }
+
+    /// MAJOR #1 regression: pre-existing EMPTY hooks dir with correct
+    /// permissions and ownership is accepted (positive case).
+    #[test]
+    #[cfg(unix)]
+    fn preexisting_empty_hooks_dir_with_correct_perms_accepted() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let hooks_parent = temp.path().join("fac_hooks");
+        fs::create_dir_all(&hooks_parent).expect("hooks parent");
+
+        let _sha = create_test_repo(&workspace);
+
+        // Create empty hooks dir with correct 0o700 perms (owned by us).
+        let hooks_dir = hooks_parent.join("empty_hooks");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&hooks_dir)
+            .expect("create hooks dir");
+
+        // Should succeed — the directory is valid.
+        let receipt = harden_lane_workspace(&workspace, &hooks_parent, true)
+            .expect("hardening should succeed for valid pre-existing hooks dir");
+        assert_eq!(receipt.outcome, GitHardeningOutcome::Hardened);
+        assert!(receipt.hooks_disabled);
     }
 }
