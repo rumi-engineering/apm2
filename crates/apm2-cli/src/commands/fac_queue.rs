@@ -24,33 +24,27 @@
 //!   order, stats aggregated from bounded scans.
 
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::Path;
 
-use apm2_core::fac::job_spec::{FacJobSpecV1, MAX_JOB_SPEC_SIZE};
-use apm2_core::github::resolve_apm2_home;
 use serde::Serialize;
 
 use crate::commands::fac::QueueStatusArgs;
+use crate::commands::fac_utils::{
+    MAX_SCAN_ENTRIES, read_job_spec_bounded, resolve_fac_root, resolve_queue_root,
+};
 use crate::exit_codes::codes as exit_codes;
 
 // =============================================================================
 // Constants
 // =============================================================================
 
-/// Queue subdirectory under `$APM2_HOME`.
-const QUEUE_DIR: &str = "queue";
 const PENDING_DIR: &str = "pending";
 const CLAIMED_DIR: &str = "claimed";
 const COMPLETED_DIR: &str = "completed";
 const CANCELLED_DIR: &str = "cancelled";
 const DENIED_DIR: &str = "denied";
 const QUARANTINE_DIR: &str = "quarantine";
-
-/// Maximum number of directory entries to scan per directory.
-/// Prevents unbounded memory growth (INV-QSTAT-001).
-const MAX_SCAN_ENTRIES: usize = 4096;
 
 /// Maximum number of denial reason codes to track in the distribution.
 /// Prevents unbounded `HashMap` growth from adversarial reason codes.
@@ -129,6 +123,14 @@ pub fn run_queue_status(args: &QueueStatusArgs, json_output: bool) -> u8 {
             return exit_codes::GENERIC_ERROR;
         },
     };
+    let fac_root = match resolve_fac_root() {
+        Ok(root) => root,
+        Err(e) => {
+            output_error(json_output, &format!("cannot resolve FAC root: {e}"));
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+    let receipts_dir = fac_root.join("receipts");
 
     if !queue_root.is_dir() {
         output_error(
@@ -156,7 +158,7 @@ pub fn run_queue_status(args: &QueueStatusArgs, json_output: bool) -> u8 {
             } else {
                 &mut quarantine_reasons
             };
-            collect_reason_stats(&dir_path, reasons);
+            collect_reason_stats(&dir_path, &receipts_dir, reasons);
         }
 
         directories.push(status);
@@ -257,7 +259,7 @@ fn scan_directory(dir_path: &Path, dir_name: &str) -> DirectoryStatus {
 ///
 /// Bounded by `MAX_SCAN_ENTRIES` reads and `MAX_REASON_CODES` distinct
 /// reason codes to prevent unbounded `HashMap` growth.
-fn collect_reason_stats(dir_path: &Path, reasons: &mut HashMap<String, usize>) {
+fn collect_reason_stats(dir_path: &Path, receipts_dir: &Path, reasons: &mut HashMap<String, usize>) {
     if !dir_path.is_dir() {
         return;
     }
@@ -278,10 +280,18 @@ fn collect_reason_stats(dir_path: &Path, reasons: &mut HashMap<String, usize>) {
             continue;
         }
 
-        // Best-effort: try to read the spec and extract the kind.
-        // Specs in denied/quarantine may have the job kind as a reason proxy.
+        // Best-effort: try to read the spec.
         if let Ok(spec) = read_job_spec_bounded(&path) {
-            let reason_key = spec.kind.clone();
+            // Default to kind if receipt lookup fails.
+            let mut reason_key = spec.kind.clone();
+
+            // Try to resolve receipt for better reason (TCK-00535/Major-1).
+            if let Some(receipt) = apm2_core::fac::lookup_job_receipt(receipts_dir, &spec.job_id) {
+                if let Some(dr) = receipt.denial_reason {
+                    reason_key = format!("{:?}", dr);
+                }
+            }
+
             if reasons.len() < MAX_REASON_CODES || reasons.contains_key(&reason_key) {
                 *reasons.entry(reason_key).or_insert(0) += 1;
             }
@@ -308,35 +318,6 @@ fn to_sorted_reason_stats(reasons: &HashMap<String, usize>) -> Vec<ReasonStat> {
 
     stats.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.reason.cmp(&b.reason)));
     stats
-}
-
-/// Resolves the queue root directory from `$APM2_HOME/queue`.
-fn resolve_queue_root() -> Result<PathBuf, String> {
-    let home = resolve_apm2_home().ok_or_else(|| "could not resolve APM2 home".to_string())?;
-    Ok(home.join(QUEUE_DIR))
-}
-
-/// Reads and deserializes a job spec from a file with bounded I/O.
-///
-/// Uses `File::open().take(MAX_JOB_SPEC_SIZE + 1)` to enforce the size
-/// limit on the actual read operation. Prevents denial-of-service via
-/// special files (INV-QSTAT-002).
-fn read_job_spec_bounded(path: &Path) -> Result<FacJobSpecV1, String> {
-    let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    let limit = (MAX_JOB_SPEC_SIZE as u64).saturating_add(1);
-    let mut bounded_reader = file.take(limit);
-    let mut bytes = Vec::with_capacity(MAX_JOB_SPEC_SIZE.min(8192));
-    bounded_reader
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    if bytes.len() > MAX_JOB_SPEC_SIZE {
-        return Err(format!(
-            "file content {} exceeds max {}",
-            bytes.len(),
-            MAX_JOB_SPEC_SIZE
-        ));
-    }
-    serde_json::from_slice(&bytes).map_err(|e| format!("cannot parse {}: {e}", path.display()))
 }
 
 /// Prints text-formatted queue status.
@@ -410,6 +391,7 @@ fn output_error(json_output: bool, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apm2_core::fac::job_spec::{FacJobSpecV1, MAX_JOB_SPEC_SIZE};
 
     #[test]
     fn test_scan_empty_directory() {

@@ -46,19 +46,20 @@
 //! - [INV-CANCEL-008] Claimed-job cancel emits `CancellationRequested` (non-
 //!   terminal); terminal `Cancelled` receipt is emitted only by the worker.
 
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use apm2_core::fac::job_spec::{FacJobSpecV1, JobSource, LaneRequirements, MAX_JOB_SPEC_SIZE};
+use apm2_core::fac::job_spec::{FacJobSpecV1, JobSource, LaneRequirements};
 use apm2_core::fac::{
     DenialReasonCode, FacJobOutcome, FacJobReceiptV1Builder, persist_content_addressed_receipt,
 };
-use apm2_core::github::resolve_apm2_home;
 use serde::Serialize;
 
 use crate::commands::fac::CancelArgs;
+use crate::commands::fac_utils::{
+    self, MAX_SCAN_ENTRIES, read_job_spec_bounded, resolve_fac_root, resolve_queue_root,
+};
 use crate::exit_codes::codes as exit_codes;
 
 // =============================================================================
@@ -67,7 +68,6 @@ use crate::exit_codes::codes as exit_codes;
 
 /// Queue subdirectory names (duplicated from `fac_worker` for module
 /// isolation).
-const QUEUE_DIR: &str = "queue";
 const PENDING_DIR: &str = "pending";
 const CLAIMED_DIR: &str = "claimed";
 const COMPLETED_DIR: &str = "completed";
@@ -77,10 +77,6 @@ const QUARANTINE_DIR: &str = "quarantine";
 
 /// FAC receipt directory under `$APM2_HOME/private/fac`.
 const FAC_RECEIPTS_DIR: &str = "receipts";
-
-/// Maximum number of directory entries to scan when locating a job.
-/// Prevents unbounded memory growth.
-const MAX_SCAN_ENTRIES: usize = 4096;
 
 // =============================================================================
 // Output types
@@ -289,7 +285,7 @@ fn cancel_pending_job(
     let file_name = file_name.to_string();
 
     // Read the spec for receipt emission.
-    let spec = match read_job_spec(path) {
+    let spec = match read_job_spec_bounded(path) {
         Ok(spec) => spec,
         Err(e) => {
             output_error(json_output, &format!("cannot read job spec: {e}"));
@@ -408,11 +404,11 @@ fn cancel_claimed_job(
     // The final Cancelled receipt will be emitted by the worker when
     // stop_revoke completes.
     //
-    // MAJOR-2 fix: If read_job_spec fails, treat as a HARD failure.
+    // MAJOR-2 fix: If read_job_spec_bounded fails, treat as a HARD failure.
     // A cancellation MUST NOT complete without a cancellation-requested receipt.
     // The stop_revoke spec is already enqueued, but we return an error exit
     // code to signal that the receipt could not be emitted.
-    let spec_for_receipt = match read_job_spec(claimed_path) {
+    let spec_for_receipt = match read_job_spec_bounded(claimed_path) {
         Ok(spec) => spec,
         Err(e) => {
             output_error(
@@ -537,7 +533,7 @@ fn find_job_in_dir(dir: &Path, job_id: &str) -> Option<PathBuf> {
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
             if file_name.contains(job_id) {
                 // Verify by reading the actual spec.
-                if let Ok(spec) = read_job_spec(&path) {
+                if let Ok(spec) = read_job_spec_bounded(&path) {
                     if spec.job_id == job_id {
                         return Some(path);
                     }
@@ -547,7 +543,7 @@ fn find_job_in_dir(dir: &Path, job_id: &str) -> Option<PathBuf> {
 
         // If filename doesn't match, try reading the spec anyway
         // (filenames may use collision-safe suffixes).
-        if let Ok(spec) = read_job_spec(&path) {
+        if let Ok(spec) = read_job_spec_bounded(&path) {
             if spec.job_id == job_id {
                 return Some(path);
             }
@@ -691,45 +687,6 @@ fn emit_cancellation_requested_receipt(
 // =============================================================================
 // Filesystem helpers
 // =============================================================================
-
-/// Resolves the queue root directory from `$APM2_HOME/queue`.
-fn resolve_queue_root() -> Result<PathBuf, String> {
-    let home = resolve_apm2_home().ok_or_else(|| "could not resolve APM2 home".to_string())?;
-    Ok(home.join(QUEUE_DIR))
-}
-
-/// Resolves the FAC root directory at `$APM2_HOME/private/fac`.
-fn resolve_fac_root() -> Result<PathBuf, String> {
-    let home = resolve_apm2_home().ok_or_else(|| "could not resolve APM2 home".to_string())?;
-    Ok(home.join("private").join("fac"))
-}
-
-/// Reads and deserializes a job spec from a file with bounded I/O.
-///
-/// BLOCKER-1 fix: Uses `File::open().take(MAX_JOB_SPEC_SIZE + 1)` to enforce
-/// the size limit on the actual read operation.  This prevents
-/// denial-of-service via special files (e.g. `/dev/zero`, procfs, FIFOs) where
-/// `metadata.len()` may report zero or misleading sizes while producing
-/// unbounded data on read.
-fn read_job_spec(path: &Path) -> Result<FacJobSpecV1, String> {
-    let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    // Read at most MAX_JOB_SPEC_SIZE + 1 bytes.  If we get more than
-    // MAX_JOB_SPEC_SIZE, the file is over the limit.
-    let limit = (MAX_JOB_SPEC_SIZE as u64).saturating_add(1);
-    let mut bounded_reader = file.take(limit);
-    let mut bytes = Vec::with_capacity(MAX_JOB_SPEC_SIZE.min(8192));
-    bounded_reader
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    if bytes.len() > MAX_JOB_SPEC_SIZE {
-        return Err(format!(
-            "file content {} exceeds max {}",
-            bytes.len(),
-            MAX_JOB_SPEC_SIZE
-        ));
-    }
-    serde_json::from_slice(&bytes).map_err(|e| format!("cannot parse {}: {e}", path.display()))
-}
 
 /// Moves a file to a destination directory with collision-safe naming.
 ///
@@ -931,7 +888,7 @@ pub fn run_job_show(job_id: &str, json_output: bool) -> u8 {
     };
 
     // Read the job spec.
-    let spec = spec_path.as_ref().and_then(|p| read_job_spec(p).ok());
+    let spec = spec_path.as_ref().and_then(|p| read_job_spec_bounded(p).ok());
 
     // Look up the latest receipt from the receipt index.
     let latest_receipt = resolve_latest_receipt(job_id);
@@ -970,7 +927,7 @@ fn resolve_latest_receipt(job_id: &str) -> Option<serde_json::Value> {
 ///
 /// Looks for log directories under `$APM2_HOME/private/fac/evidence/`
 /// and lane workspaces that might contain build/test logs.
-fn discover_log_pointers(job_id: &str, queue_root: &Path) -> Vec<String> {
+fn discover_log_pointers(job_id: &str, _queue_root: &Path) -> Vec<String> {
     let mut pointers = Vec::new();
 
     // Check evidence directory for job-related logs.
@@ -1007,14 +964,16 @@ fn discover_log_pointers(job_id: &str, queue_root: &Path) -> Vec<String> {
     }
 
     // Check for lane-scoped logs if the job is in claimed/ state.
-    // Lane workspace directories are under the queue root's parent.
-    let lanes_dir = queue_root.parent().map(|p| p.join("lanes"));
+    // Lane workspace directories are under the FAC root (private/fac/lanes).
+    let lanes_dir = fac_utils::resolve_fac_root().ok().map(|p| p.join("lanes"));
     if let Some(lanes_dir) = lanes_dir {
         if lanes_dir.is_dir() {
             if let Ok(entries) = fs::read_dir(&lanes_dir) {
                 let mut scan_count = 0usize;
+                let mut truncated = false;
                 for entry in entries {
                     if scan_count >= MAX_SCAN_ENTRIES {
+                        truncated = true;
                         break;
                     }
                     scan_count = scan_count.saturating_add(1);
@@ -1027,6 +986,7 @@ fn discover_log_pointers(job_id: &str, queue_root: &Path) -> Vec<String> {
                             let mut log_scan = 0usize;
                             for log_entry in log_entries {
                                 if log_scan >= MAX_SCAN_ENTRIES {
+                                    eprintln!("warning: log scan truncated for lane {}", lane_path.display());
                                     break;
                                 }
                                 log_scan = log_scan.saturating_add(1);
@@ -1041,6 +1001,9 @@ fn discover_log_pointers(job_id: &str, queue_root: &Path) -> Vec<String> {
                             }
                         }
                     }
+                }
+                if truncated {
+                    eprintln!("warning: lane scan truncated at {MAX_SCAN_ENTRIES} entries");
                 }
             }
         }
@@ -1108,6 +1071,8 @@ fn print_job_show_text(output: &JobShowOutput) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::fac_utils::read_job_spec_bounded;
+    use apm2_core::fac::job_spec::MAX_JOB_SPEC_SIZE;
 
     #[test]
     fn test_format_iso8601() {
@@ -1313,17 +1278,17 @@ mod tests {
         );
     }
 
-    /// BLOCKER-1 regression: `read_job_spec` must reject files exceeding
+    /// BLOCKER-1 regression: `read_job_spec_bounded` must reject files exceeding
     /// `MAX_JOB_SPEC_SIZE` via bounded read, not metadata check.
     #[test]
-    fn test_read_job_spec_rejects_oversized_file() {
+    fn test_read_job_spec_bounded_rejects_oversized_file() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let oversized_path = tmp.path().join("oversized.json");
         // Write a file that exceeds MAX_JOB_SPEC_SIZE.
         let oversized_content = vec![b'{'; MAX_JOB_SPEC_SIZE + 100];
         fs::write(&oversized_path, &oversized_content).unwrap();
 
-        let result = read_job_spec(&oversized_path);
+        let result = read_job_spec_bounded(&oversized_path);
         assert!(result.is_err(), "should reject oversized file");
         let err_msg = result.unwrap_err();
         assert!(
@@ -1332,16 +1297,16 @@ mod tests {
         );
     }
 
-    /// BLOCKER-1 regression: `read_job_spec` must work for valid small files.
+    /// BLOCKER-1 regression: `read_job_spec_bounded` must work for valid small files.
     #[test]
-    fn test_read_job_spec_accepts_valid_spec() {
+    fn test_read_job_spec_bounded_accepts_valid_spec() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let spec = build_stop_revoke_spec("bounded-read-test", "test").expect("spec builds");
         let spec_json = serde_json::to_vec_pretty(&spec).unwrap();
         let spec_path = tmp.path().join("valid.json");
         fs::write(&spec_path, &spec_json).unwrap();
 
-        let result = read_job_spec(&spec_path);
+        let result = read_job_spec_bounded(&spec_path);
         assert!(result.is_ok(), "should accept valid spec: {result:?}");
         assert_eq!(result.unwrap().job_id, spec.job_id);
     }
