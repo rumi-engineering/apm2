@@ -235,6 +235,112 @@ pub fn build_bounded_test_command(
     })
 }
 
+/// Build a bounded gate command for non-test evidence gates (rustfmt, clippy,
+/// doc) that applies network policy isolation via `systemd-run` (TCK-00574).
+///
+/// This ensures ALL evidence gate phases — not only the bounded test phase —
+/// run under network-deny when the default policy is active. Uses the same
+/// execution backend infrastructure as `build_bounded_test_command` so that
+/// system-mode and user-mode backends are handled consistently.
+///
+/// # Arguments
+///
+/// * `workspace_root` — Working directory for the transient unit.
+/// * `limits` — Resource caps enforced by systemd unit properties (same caps as
+///   the test gate to maintain consistent containment).
+/// * `gate_command` — The gate command to execute inside the unit (e.g.,
+///   `["cargo", "fmt", "--all", "--check"]`).
+/// * `policy_env` — Pre-computed environment from `FacPolicyV1` via
+///   `build_job_environment()`. Forwarded via `--setenv` to the transient unit.
+/// * `sandbox_hardening` — Policy-driven sandbox hardening profile.
+/// * `network_policy` — Policy-driven network access posture. When deny, the
+///   transient unit receives `PrivateNetwork=yes` + `IPAddressDeny=any` (system
+///   mode) or `RestrictAddressFamilies=AF_UNIX` (user mode).
+///
+/// # Errors
+///
+/// Returns `Err` if cgroup v2 is unavailable, `systemd-run` is not on PATH,
+/// or backend selection/command construction fails.
+pub fn build_bounded_gate_command(
+    workspace_root: &Path,
+    limits: BoundedTestLimits<'_>,
+    gate_command: &[String],
+    policy_env: &[(String, String)],
+    sandbox_hardening: SandboxHardeningProfile,
+    network_policy: NetworkPolicy,
+) -> Result<BoundedTestCommandSpec, String> {
+    if gate_command.is_empty() {
+        return Err("gate command cannot be empty".to_string());
+    }
+    if !is_cgroup_v2_available() {
+        return Err("cgroup v2 controllers not found (bounded runner unavailable)".to_string());
+    }
+    if !command_available("systemd-run") {
+        return Err("systemd-run not found on PATH".to_string());
+    }
+
+    let properties = limits_to_properties(limits, sandbox_hardening, network_policy)?;
+    let backend =
+        select_backend().map_err(|e| format!("execution backend selection failed: {e}"))?;
+    let setenv_pairs = build_policy_setenv_pairs(policy_env)?;
+
+    let environment = match backend {
+        ExecutionBackend::UserMode => {
+            if !probe_user_bus() {
+                return Err("user D-Bus session bus not found for bounded runner. \
+                     Set APM2_FAC_EXECUTION_BACKEND=system for headless environments"
+                    .to_string());
+            }
+            normalized_runtime_environment()
+        },
+        ExecutionBackend::SystemMode => Vec::new(),
+    };
+
+    let system_config = if backend == ExecutionBackend::SystemMode {
+        Some(SystemModeConfig::from_env().map_err(|e| format!("system-mode config error: {e}"))?)
+    } else {
+        None
+    };
+
+    let core_cmd = build_systemd_run_command(
+        backend,
+        &properties,
+        workspace_root,
+        None,
+        system_config.as_ref(),
+        gate_command,
+    )
+    .map_err(|e| format!("systemd-run command construction failed: {e}"))?;
+
+    let mut command = Vec::with_capacity(core_cmd.args.len() + setenv_pairs.len() * 2);
+    let property_start = core_cmd
+        .args
+        .iter()
+        .position(|a| a == "--property")
+        .unwrap_or(core_cmd.args.len());
+    command.extend(core_cmd.args[..property_start].iter().cloned());
+    append_systemd_setenv_args(&mut command, &setenv_pairs);
+    command.extend(core_cmd.args[property_start..].iter().cloned());
+
+    let mut env_remove_keys: Vec<String> = SCCACHE_ENV_STRIP_KEYS
+        .iter()
+        .map(|k| (*k).to_string())
+        .collect();
+    for (key, _) in std::env::vars() {
+        if key.starts_with("SCCACHE_") && !env_remove_keys.contains(&key) {
+            env_remove_keys.push(key);
+        }
+    }
+
+    Ok(BoundedTestCommandSpec {
+        command,
+        environment,
+        setenv_pairs,
+        env_remove_keys,
+        backend,
+    })
+}
+
 fn append_systemd_setenv_args(command: &mut Vec<String>, setenv_pairs: &[(String, String)]) {
     for (key, value) in setenv_pairs {
         command.push("--setenv".to_string());
@@ -326,8 +432,8 @@ mod tests {
 
     use super::{
         BoundedTestLimits, MAX_SETENV_PAIRS, append_systemd_setenv_args,
-        build_bounded_test_command, build_policy_setenv_pairs, default_runtime_dir,
-        limits_to_properties, parse_cpu_quota_percent,
+        build_bounded_gate_command, build_bounded_test_command, build_policy_setenv_pairs,
+        default_runtime_dir, limits_to_properties, parse_cpu_quota_percent,
     };
 
     #[test]
@@ -503,6 +609,32 @@ mod tests {
         assert_eq!(
             command,
             vec!["--setenv".to_string(), "TOKEN=abcd".to_string()]
+        );
+    }
+
+    // --- TCK-00574 BLOCKER: bounded gate command for non-test gates ---
+
+    #[test]
+    fn bounded_gate_command_rejects_empty_gate_command() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let err = build_bounded_gate_command(
+            temp_dir.path(),
+            BoundedTestLimits {
+                timeout_seconds: 600,
+                kill_after_seconds: 20,
+                memory_max: "48G",
+                pids_max: 1536,
+                cpu_quota: "200%",
+            },
+            &[],
+            &[],
+            SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
+        )
+        .expect_err("empty gate command must fail");
+        assert!(
+            err.contains("gate command cannot be empty"),
+            "expected empty command error, got: {err}"
         );
     }
 }

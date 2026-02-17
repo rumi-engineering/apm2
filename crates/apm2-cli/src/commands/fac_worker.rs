@@ -1847,11 +1847,15 @@ fn process_job(
     // instead of re-computing it in every denial path.
     let sbx_hash = policy.sandbox_hardening.content_hash_hex();
 
-    // TCK-00574: Compute the network policy hash for the resolved network
-    // policy. This is deferred until the actual job kind is known (after spec
-    // parsing), but we declare the variable here. For denial paths before
-    // spec parsing, we use the default-deny hash since spec.kind is unknown.
-    let default_net_hash = apm2_core::fac::NetworkPolicy::deny().content_hash_hex();
+    // TCK-00574 MAJOR-2 fix: Resolve the network policy hash immediately
+    // using spec.kind (always available since spec is parsed before
+    // process_job is called). This ensures ALL receipt commits — including
+    // early post-parse denial paths — use the correct resolved hash for the
+    // job kind, not the default-deny hash. The operator policy override is
+    // threaded through to preserve FacPolicyV1.network_policy configuration.
+    let resolved_net_hash =
+        apm2_core::fac::resolve_network_policy(&spec.kind, policy.network_policy.as_ref())
+            .content_hash_hex();
 
     // Step 1+2: Use the bounded bytes already loaded by scan_pending.
     //
@@ -1896,7 +1900,7 @@ fn process_job(
                 None,
                 None,
                 Some(&sbx_hash),
-                Some(&default_net_hash),
+                Some(&resolved_net_hash),
             ) {
                 eprintln!(
                     "worker: WARNING: pipeline commit failed for quarantined job: {commit_err}"
@@ -1942,7 +1946,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
-            Some(&default_net_hash),
+            Some(&resolved_net_hash),
         ) {
             eprintln!("worker: WARNING: pipeline commit failed for denied job: {commit_err}");
             // Job stays in pending/ for reconciliation.
@@ -2042,7 +2046,7 @@ fn process_job(
                     policy_hash,
                     None,
                     Some(&sbx_hash),
-                    Some(&default_net_hash),
+                    Some(&resolved_net_hash),
                 ) {
                     eprintln!(
                         "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -2080,7 +2084,7 @@ fn process_job(
                 policy_hash,
                 None,
                 Some(&sbx_hash),
-                Some(&default_net_hash),
+                Some(&resolved_net_hash),
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -2125,7 +2129,7 @@ fn process_job(
                 None,
                 None,
                 Some(&sbx_hash),
-                Some(&default_net_hash),
+                Some(&resolved_net_hash),
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -2152,7 +2156,7 @@ fn process_job(
             canonicalizer_tuple_digest,
             policy_hash,
             &sbx_hash,
-            &default_net_hash,
+            &resolved_net_hash,
             job_wall_start,
         );
     }
@@ -2185,7 +2189,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
-            None, // network_policy_hash: denied before execution
+            Some(&resolved_net_hash),
         ) {
             eprintln!(
                 "worker: WARNING: pipeline commit failed for policy-admission-denied job: {commit_err}"
@@ -2228,7 +2232,7 @@ fn process_job(
                 policy_hash,
                 None,
                 Some(&sbx_hash),
-                Some(&default_net_hash),
+                Some(&resolved_net_hash),
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -2271,7 +2275,7 @@ fn process_job(
             policy_hash,
             None,
             Some(&sbx_hash),
-            Some(&default_net_hash),
+            Some(&resolved_net_hash),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2319,7 +2323,7 @@ fn process_job(
                 policy_hash,
                 None,
                 Some(&sbx_hash),
-                Some(&default_net_hash),
+                Some(&resolved_net_hash),
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -2360,7 +2364,7 @@ fn process_job(
                 policy_hash,
                 None,
                 Some(&sbx_hash),
-                Some(&default_net_hash),
+                Some(&resolved_net_hash),
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -2395,7 +2399,7 @@ fn process_job(
             policy_hash,
             None,
             Some(&sbx_hash),
-            Some(&default_net_hash),
+            Some(&resolved_net_hash),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2430,7 +2434,7 @@ fn process_job(
             policy_hash,
             None,
             Some(&sbx_hash),
-            Some(&default_net_hash),
+            Some(&resolved_net_hash),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2476,7 +2480,7 @@ fn process_job(
             policy_hash,
             None,
             Some(&sbx_hash),
-            Some(&default_net_hash),
+            Some(&resolved_net_hash),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2517,7 +2521,7 @@ fn process_job(
             policy_hash,
             None,
             Some(&sbx_hash),
-            Some(&default_net_hash),
+            Some(&resolved_net_hash),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2602,7 +2606,7 @@ fn process_job(
             policy_hash,
             None,
             Some(&sbx_hash),
-            Some(&default_net_hash),
+            Some(&resolved_net_hash),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2657,7 +2661,7 @@ fn process_job(
                 policy_hash,
                 None,
                 Some(&sbx_hash),
-                Some(&default_net_hash),
+                Some(&resolved_net_hash),
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for budget-denied job: {receipt_err}"
@@ -2697,7 +2701,7 @@ fn process_job(
             policy_hash,
             None,
             Some(&sbx_hash),
-            Some(&default_net_hash),
+            Some(&resolved_net_hash),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2743,7 +2747,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
-            Some(&default_net_hash),
+            Some(&resolved_net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -2761,9 +2765,8 @@ fn process_job(
     // Avoid acquiring a second worker lane here: `fac gates` already uses its
     // own lane lock/containment strategy for heavy phases.
     if spec.kind == "gates" {
-        let gates_net_hash =
-            apm2_core::fac::resolve_network_policy(&spec.kind, policy.network_policy.as_ref())
-                .content_hash_hex();
+        // TCK-00574 MAJOR-2: Use the resolved net hash computed at the top
+        // of process_job (same resolve_network_policy call, now deduplicated).
         return execute_queued_gates_job(
             spec,
             &claimed_path,
@@ -2776,7 +2779,7 @@ fn process_job(
             canonicalizer_tuple_digest,
             policy_hash,
             &sbx_hash,
-            &gates_net_hash,
+            &resolved_net_hash,
         );
     }
 
@@ -2844,7 +2847,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
-            Some(&default_net_hash),
+            Some(&resolved_net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -2884,7 +2887,7 @@ fn process_job(
                 None,
                 None,
                 Some(&sbx_hash),
-                Some(&default_net_hash),
+                Some(&resolved_net_hash),
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -2899,11 +2902,10 @@ fn process_job(
     };
 
     // Resolve network policy for this job kind (TCK-00574).
-    // Pass the operator's policy override (if explicitly set) to allow
-    // global network posture configuration via FacPolicyV1.network_policy.
+    // The hash was already computed at the top of process_job (resolved_net_hash).
+    // We still need the full NetworkPolicy struct here for SystemdUnitProperties.
     let job_network_policy =
         apm2_core::fac::resolve_network_policy(&spec.kind, policy.network_policy.as_ref());
-    let net_hash = job_network_policy.content_hash_hex();
     let lane_systemd_properties = SystemdUnitProperties::from_lane_profile_with_hardening(
         &lane_profile,
         Some(&spec.constraints),
@@ -2963,7 +2965,7 @@ fn process_job(
                 None,
                 None,
                 Some(&sbx_hash),
-                Some(&net_hash),
+                Some(&resolved_net_hash),
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -2997,7 +2999,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
-            Some(&net_hash),
+            Some(&resolved_net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3045,7 +3047,7 @@ fn process_job(
             canonicalizer_tuple_digest,
             policy_hash,
             &sbx_hash,
-            &net_hash,
+            &resolved_net_hash,
             job_wall_start,
         );
     }
@@ -3078,7 +3080,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
-            Some(&net_hash),
+            Some(&resolved_net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3131,7 +3133,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
-            Some(&net_hash),
+            Some(&resolved_net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3189,7 +3191,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
-            Some(&net_hash),
+            Some(&resolved_net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3285,7 +3287,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
-            Some(&net_hash),
+            Some(&resolved_net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3368,7 +3370,7 @@ fn process_job(
             policy,
             &lane_systemd_properties,
             &sbx_hash,
-            &net_hash,
+            &resolved_net_hash,
             heartbeat_cycle_count,
             heartbeat_jobs_completed,
             heartbeat_jobs_denied,
@@ -3397,7 +3399,7 @@ fn process_job(
             .evidence_bundle_hash(evidence_hash)
             .job_spec_digest(&spec.job_spec_digest)
             .sandbox_hardening_hash(&sbx_hash)
-            .network_policy_hash(&net_hash)
+            .network_policy_hash(&resolved_net_hash)
             .passed(false)
             .build_and_sign(signer);
 
@@ -3427,7 +3429,7 @@ fn process_job(
         containment_trace.as_ref(),
         Some(observed_cost),
         Some(&sbx_hash),
-        Some(&net_hash),
+        Some(&resolved_net_hash),
     ) {
         eprintln!("worker: pipeline commit failed, cannot complete job: {commit_err}");
         let _ = LaneLeaseV1::remove(&lane_dir);
@@ -7581,6 +7583,62 @@ mod tests {
         assert!(
             matches!(outcome, JobOutcome::Skipped { .. }),
             "outcome should be Skipped, got: {outcome:?}"
+        );
+    }
+
+    // --- TCK-00574 MAJOR-2: resolved network policy hash consistency ---
+
+    #[test]
+    fn resolve_network_policy_hash_matches_for_gates_kind() {
+        // Regression: the resolved network policy hash for "gates" kind
+        // must match the hash produced by resolve_network_policy("gates", None).
+        // This validates that the early-resolve approach in process_job
+        // produces the same hash as the later resolve_network_policy call.
+        let resolved = apm2_core::fac::resolve_network_policy("gates", None);
+        let expected_deny = apm2_core::fac::NetworkPolicy::deny();
+        assert_eq!(
+            resolved, expected_deny,
+            "gates kind should resolve to deny policy by default"
+        );
+        assert_eq!(
+            resolved.content_hash_hex(),
+            expected_deny.content_hash_hex(),
+            "hash of resolved policy must match deny policy hash"
+        );
+    }
+
+    #[test]
+    fn resolve_network_policy_hash_matches_for_warm_kind() {
+        // The resolved network policy for "warm" kind must be allow.
+        let resolved = apm2_core::fac::resolve_network_policy("warm", None);
+        let expected_allow = apm2_core::fac::NetworkPolicy::allow();
+        assert_eq!(
+            resolved, expected_allow,
+            "warm kind should resolve to allow policy by default"
+        );
+        // Verify the hashes differ between deny and allow.
+        let deny_hash = apm2_core::fac::NetworkPolicy::deny().content_hash_hex();
+        assert_ne!(
+            resolved.content_hash_hex(),
+            deny_hash,
+            "warm (allow) hash must differ from gates (deny) hash"
+        );
+    }
+
+    #[test]
+    fn resolve_network_policy_hash_with_override() {
+        // When an operator override is provided, it takes precedence
+        // over the default kind-based mapping.
+        let override_allow = apm2_core::fac::NetworkPolicy::allow();
+        let resolved = apm2_core::fac::resolve_network_policy("gates", Some(&override_allow));
+        assert_eq!(
+            resolved, override_allow,
+            "operator override must take precedence over kind default"
+        );
+        assert_eq!(
+            resolved.content_hash_hex(),
+            override_allow.content_hash_hex(),
+            "hash must match the override policy, not the default deny"
         );
     }
 }
