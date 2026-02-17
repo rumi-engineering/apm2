@@ -29,6 +29,7 @@ All command functions return a `u8` exit code or `anyhow::Result<()>`, using val
 | `fac_review/` | `apm2 fac review *` | Review orchestration (security + quality reviews) |
 | `fac_queue.rs` | `apm2 fac queue *` | Queue introspection (status with counts, reason stats) |
 | `fac_job.rs` | `apm2 fac job *` | Job introspection (show, cancel) with bounded I/O |
+| `fac_config.rs` | `apm2 fac config *` | FAC configuration introspection (pure read-only; no state mutation) |
 | `fac_utils.rs` | _(shared)_ | Shared utilities: queue/fac root resolution, bounded job spec I/O |
 | `factory/` | `apm2 factory *` | Factory pipeline (CCP, Impact Map, RFC, Tickets) |
 | `cac.rs` | `apm2 cac *` | CAC (Compliance Artifact Chain) operations |
@@ -417,6 +418,21 @@ Security invariants:
   and parse failures. Deterministic presentation ordering: `timestamp_secs` descending,
   `content_hash` ascending for tiebreaking. All reads are bounded by `MAX_MERGE_SCAN_FILES`
   (65,536). Writes use atomic temp+rename. Supports `--json` output.
+
+## Config Show Invariants (TCK-00590)
+
+- **Pure introspection** (`fac_config.rs`): `apm2 fac config show` is a read-only
+  introspection command. It MUST NOT create files, directories, or persist state.
+  All filesystem lookups use non-mutating read paths.
+- **Non-mutating boundary_id read** (`fac_config.rs`): The boundary_id lookup uses
+  `read_boundary_id()` (non-mutating bounded read-if-present) instead of
+  `load_or_default_boundary_id()` (which creates parent directories and persists
+  a default boundary_id when the file is missing). Missing boundary_id is reported
+  as a warning with a `<not set>` placeholder.
+- **Regression test** (`fac_config.rs`):
+  `config_show_boundary_id_does_not_create_files_or_directories` proves that
+  `read_boundary_id` against an empty APM2 home does not create the `private/`,
+  `private/fac/`, or `boundary_id` paths.
 
 ## Policy CLI Invariants (Updated for TCK-00561 fix round 2)
 

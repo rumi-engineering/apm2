@@ -474,8 +474,10 @@ pub use reconcile::{
     ReconcileError, ReconcileReceiptV1, reconcile_on_startup,
 };
 pub use repo_mirror::{
-    CheckoutOutcome, MAX_MIRROR_DIR_NAME, MAX_PATCH_SIZE, PatchOutcome, REPO_MIRROR_SCHEMA,
-    RepoMirrorError, RepoMirrorManager,
+    CheckoutOutcome, DEFAULT_CLONE_TIMEOUT_SECS, DEFAULT_FETCH_TIMEOUT_SECS,
+    MAX_ALLOWED_URL_PATTERNS, MAX_MIRROR_DIR_NAME, MAX_PATCH_SIZE, MAX_RECEIPT_REFS,
+    MIRROR_LOCK_TIMEOUT_SECS, MIRROR_UPDATE_RECEIPT_SCHEMA, MirrorPolicy, MirrorUpdateReceiptV1,
+    PatchOutcome, REPO_MIRROR_SCHEMA, RepoMirrorError, RepoMirrorManager,
 };
 // Re-export retry manager types
 pub use retry_manager::{
@@ -716,7 +718,7 @@ pub use lane::{
 pub use node_identity::{
     DEFAULT_BOUNDARY_ID, MAX_BOUNDARY_ID_LENGTH as NODE_IDENTITY_MAX_BOUNDARY_ID_LENGTH,
     NODE_IDENTITY_SCHEMA_ID, NodeIdentityError, derive_node_fingerprint,
-    load_or_default_boundary_id, load_or_derive_node_fingerprint,
+    load_or_default_boundary_id, load_or_derive_node_fingerprint, read_boundary_id,
 };
 pub use preflight::{PreflightError, PreflightStatus, check_disk_space, run_preflight};
 // Re-export safe rmtree types (TCK-00516)
