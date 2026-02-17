@@ -647,6 +647,30 @@ bootstrap and recovery commands exposed via `apm2 fac lane init` and
 - `core.symlinks=false` prevents symlink creation in workspaces
 - `--no-hardlinks` prevents object sharing between mirror and workspace
 - Path traversal prevention delegated to `git apply` (standard git safety)
+- Post-checkout git hardening disables hooks and refuses unsafe configs (TCK-00580)
+
+### `git_hardening` — Git Safety Hardening for Lane Workspaces (TCK-00580)
+
+**Core function**: `harden_lane_workspace(workspace, hooks_parent, refuse_unsafe_configs)`
+
+Applies security hardening to lane workspace git config after checkout:
+1. Sets `core.hooksPath` to an empty FAC-controlled directory (disables hooks)
+2. Enforces `safe.directory` for the workspace path
+3. Scans `.git/config` for unsafe filter/smudge/command entries
+
+**Key types**:
+- `GitHardeningReceipt`: Audit receipt recording hooks, safe.directory, and config scan status
+- `GitHardeningOutcome`: Enum (`Hardened`, `Failed`, `Rejected`)
+- `GitHardeningError`: Error taxonomy for hardening failures
+
+**Security invariants**:
+- [INV-GH-001] After hardening, no repository-shipped hook can execute
+- [INV-GH-002] Hooks directory is empty, FAC-controlled, mode 0o700, outside workspace tree
+- [INV-GH-003] Unsafe filter/smudge/fsmonitor/sshcommand configs are detected and rejected
+- [INV-GH-004] All hardening results recorded in `GitHardeningReceipt` for evidence
+
+**Integration**: Called automatically by `checkout_to_lane()` after checkout completes.
+Receipt is included in `CheckoutOutcome::git_hardening`.
 
 ### `execution_backend` — System-mode and user-mode execution backend selection (TCK-00529)
 
