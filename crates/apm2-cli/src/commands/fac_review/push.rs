@@ -468,27 +468,17 @@ where
 }
 
 fn expected_gate_names_for_workspace(workspace_root: &Path) -> BTreeSet<String> {
-    let mut expected = BTreeSet::from([
+    let _ = workspace_root;
+    BTreeSet::from([
         "merge_conflict_main".to_string(),
         "rustfmt".to_string(),
         "clippy".to_string(),
         "doc".to_string(),
         "test".to_string(),
+        "test_safety_guard".to_string(),
         "workspace_integrity".to_string(),
-    ]);
-    if workspace_root
-        .join("scripts/ci/test_safety_guard.sh")
-        .exists()
-    {
-        expected.insert("test_safety_guard".to_string());
-    }
-    if workspace_root
-        .join("scripts/ci/review_artifact_lint.sh")
-        .exists()
-    {
-        expected.insert("review_artifact_lint".to_string());
-    }
-    expected
+        "review_artifact_lint".to_string(),
+    ])
 }
 
 fn validate_gate_results_for_pass(

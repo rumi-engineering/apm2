@@ -35,7 +35,7 @@ flowchart TD
 
 ## Baseline CI gate check (APM2 reality)
 
-APM2 has a canonical “single entrypoint” for local CI: `scripts/ci/run_local_ci_orchestrator.sh`.
+APM2 has a canonical “single entrypoint” for local CI: `apm2 fac gates`.
 
 ```yaml
 baseline_expected_gates_for_rust_changes:

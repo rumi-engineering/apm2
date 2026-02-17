@@ -10,9 +10,8 @@ prd_evidence_artifact:
   verification:
     commands:
     - id: CMD-0006
-      shell: bash
-      command: ./scripts/evidence/run_simulation_suite.sh --suite holon_faults --out
-        evidence/prd/PRD-0001/simulations
+      shell: cargo
+      command: cargo test --workspace --all-features -- simulation::
       expected_exit_code: 0
       cwd: .
       timeout_seconds: 1800

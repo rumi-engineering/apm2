@@ -47,7 +47,7 @@ audit_config:
           - provenance_logged: true     # commands + hashes captured for audit
         authority: SUPPLEMENTARY        # CI remains authoritative; local runs only support diagnosis
         preferred_entrypoint:
-          - "./scripts/ci/run_local_ci_orchestrator.sh"
+          - "apm2 fac gates"
         forbidden:
           - "ad-hoc curl | sh installers"
           - "executing PR code in pull_request_target context with privileged tokens"

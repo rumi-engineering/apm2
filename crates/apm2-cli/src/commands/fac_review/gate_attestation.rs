@@ -16,6 +16,8 @@ use apm2_core::determinism::canonicalize_json;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::gate_checks;
+
 /// V2 attestation schema: uses file-content hashing instead of HEAD:path git
 /// blob hashing for input bindings.  This version bump invalidates all pre-v2
 /// cache entries, closing the dirty-state cache poisoning vector where
@@ -160,9 +162,17 @@ fn gate_input_paths(gate_name: &str) -> &'static [&'static str] {
             "crates/apm2-cli/src/commands/fac_review/timeout_policy.rs",
             ".cargo/config.toml",
         ],
-        "test_safety_guard" => &["scripts/ci/test_safety_guard.sh"],
-        "workspace_integrity" => &["scripts/ci/workspace_integrity_guard.sh"],
-        "review_artifact_lint" => &["scripts/ci/review_artifact_lint.sh"],
+        "test_safety_guard" => &[
+            "crates/apm2-cli/src/commands/fac_review/gate_checks.rs",
+            ".github/review-gate/test-safety-allowlist.txt",
+        ],
+        "workspace_integrity" => &["crates/apm2-cli/src/commands/fac_review/gate_checks.rs"],
+        "review_artifact_lint" => &[
+            "crates/apm2-cli/src/commands/fac_review/gate_checks.rs",
+            "documents/reviews/CODE_QUALITY_PROMPT.cac.json",
+            "documents/reviews/SECURITY_REVIEW_PROMPT.cac.json",
+            ".github/review-gate/trusted-reviewers.json",
+        ],
         _ => &[],
     }
 }
@@ -447,29 +457,23 @@ pub fn gate_command_for_attestation(
             "--no-deps".to_string(),
         ]),
         "test" => Some(test_command_override.map_or_else(build_nextest_command, <[_]>::to_vec)),
-        "test_safety_guard" => {
-            let path = workspace_root.join("scripts/ci/test_safety_guard.sh");
-            path.exists()
-                .then(|| vec!["bash".to_string(), path.to_string_lossy().to_string()])
-        },
+        "test_safety_guard" => Some(vec![
+            "apm2-internal-gate".to_string(),
+            "test_safety_guard".to_string(),
+        ]),
         "workspace_integrity" => {
-            let script = workspace_root.join("scripts/ci/workspace_integrity_guard.sh");
-            let snapshot = workspace_root.join("target/ci/workspace_integrity.snapshot.tsv");
-            script.exists().then(|| {
-                vec![
-                    "bash".to_string(),
-                    script.to_string_lossy().to_string(),
-                    "verify".to_string(),
-                    "--snapshot-file".to_string(),
-                    snapshot.to_string_lossy().to_string(),
-                ]
-            })
+            let snapshot = workspace_root.join(gate_checks::WORKSPACE_INTEGRITY_SNAPSHOT_REL_PATH);
+            Some(vec![
+                "apm2-internal-gate".to_string(),
+                "workspace_integrity".to_string(),
+                "--snapshot-file".to_string(),
+                snapshot.to_string_lossy().to_string(),
+            ])
         },
-        "review_artifact_lint" => {
-            let path = workspace_root.join("scripts/ci/review_artifact_lint.sh");
-            path.exists()
-                .then(|| vec!["bash".to_string(), path.to_string_lossy().to_string()])
-        },
+        "review_artifact_lint" => Some(vec![
+            "apm2-internal-gate".to_string(),
+            "review_artifact_lint".to_string(),
+        ]),
         MERGE_CONFLICT_GATE_NAME => Some(vec![
             "git".to_string(),
             "merge-tree".to_string(),

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00596"
     title: "Secrets & credentials management for FAC (systemd credentials + no dotfile preconditions)"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

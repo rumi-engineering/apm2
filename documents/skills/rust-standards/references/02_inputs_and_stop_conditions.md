@@ -112,7 +112,7 @@ QCP-specific evidence requirements are evaluated later once QCP is computed (see
 ```yaml
 baseline_ci_definition:
   acceptable_evidence:
-    - "A passing run of ./scripts/ci/run_local_ci_orchestrator.sh"
+    - "A passing run of apm2 fac gates"
     - "Equivalent CI checks with logs/artifacts attached"
 
   minimum_expected_signals_for_rust_changes:

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00532"
     title: "RFC-0029 cost model: job cost estimation + post-run calibration from receipts"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

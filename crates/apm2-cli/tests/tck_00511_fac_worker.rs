@@ -21,6 +21,15 @@ mod exit_codes {
     }
 }
 
+#[path = "../src/commands/fac_gates_job.rs"]
+pub mod fac_gates_job;
+
+#[path = "../src/commands/fac_secure_io.rs"]
+pub mod fac_secure_io;
+
+#[path = "../src/commands/fac_key_material.rs"]
+pub mod fac_key_material;
+
 #[path = "../src/commands/fac_worker.rs"]
 mod fac_worker;
 
@@ -760,14 +769,16 @@ fn test_collision_safe_file_movement() {
     assert_eq!(new_data, "new data");
 }
 
-#[allow(unsafe_code)]
 #[test]
 fn test_fac_worker_e2e_once_mode_processes_job() {
+    let _env_lock = fac_worker::env_var_test_lock()
+        .lock()
+        .expect("serialize env mutating test");
     let (tmp, queue_root) = setup_queue_env();
 
     let apm2_home = tmp.path().to_path_buf();
     let previous_apm2_home = std::env::var_os("APM2_HOME");
-    unsafe { std::env::set_var("APM2_HOME", &apm2_home) };
+    set_env_var_for_test("APM2_HOME", &apm2_home);
 
     let signer = Signer::generate();
     let fac_root = apm2_home.join("private").join("fac");
@@ -801,9 +812,19 @@ fn test_fac_worker_e2e_once_mode_processes_job() {
     );
 
     match previous_apm2_home {
-        Some(value) => unsafe { std::env::set_var("APM2_HOME", value) },
-        None => unsafe { std::env::remove_var("APM2_HOME") },
+        Some(value) => set_env_var_for_test("APM2_HOME", value),
+        None => remove_env_var_for_test("APM2_HOME"),
     }
+}
+
+#[allow(unsafe_code)]
+fn set_env_var_for_test<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
+    unsafe { std::env::set_var(key, value) };
+}
+
+#[allow(unsafe_code)]
+fn remove_env_var_for_test<K: AsRef<std::ffi::OsStr>>(key: K) {
+    unsafe { std::env::remove_var(key) };
 }
 
 /// Test 13: Gate receipt is properly constructed with all required fields.

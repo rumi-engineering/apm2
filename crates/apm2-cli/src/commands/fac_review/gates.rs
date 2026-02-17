@@ -6,13 +6,18 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use apm2_core::fac::job_spec::{
+    Actuation, FacJobSpecV1, JobConstraints, JobSource, LaneRequirements, MAX_QUEUE_LANE_LENGTH,
+    validate_job_spec,
+};
 use apm2_core::fac::{
     FacPolicyV1, LaneLockGuard, LaneManager, LaneState, apply_lane_env_overrides,
     build_job_environment, compute_test_env_for_parallelism, ensure_lane_env_dirs,
-    resolve_host_test_parallelism,
+    lookup_job_receipt, resolve_host_test_parallelism,
 };
+use chrono::{SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
 
 use super::bounded_test_runner::{
@@ -24,14 +29,16 @@ use super::gate_attestation::{
     gate_command_for_attestation,
 };
 use super::gate_cache::GateCache;
-use super::jsonl::{
-    GateCompletedEvent, GateErrorEvent, GateProgressTickEvent, GateStartedEvent, StageEvent,
-    emit_jsonl, emit_jsonl_error, read_log_error_hint, ts_now,
-};
+use super::jsonl::read_log_error_hint;
 use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
 use super::timeout_policy::{
     MAX_MANUAL_TIMEOUT_SECONDS, TEST_TIMEOUT_SLA_MESSAGE, max_memory_bytes, parse_memory_limit,
     resolve_bounded_test_timeout,
+};
+use crate::commands::fac_gates_job::GatesJobOptionsV1;
+use crate::commands::fac_queue_submit::{
+    enqueue_job, generate_job_suffix, init_broker, load_or_init_policy, resolve_fac_root,
+    resolve_queue_root, resolve_repo_source_info,
 };
 use crate::exit_codes::codes as exit_codes;
 
@@ -39,6 +46,16 @@ const DEFAULT_TEST_KILL_AFTER_SECONDS: u64 = 20;
 const BALANCED_MIN_PARALLELISM: u32 = 4;
 const BALANCED_MAX_PARALLELISM: u32 = 16;
 const CONSERVATIVE_PARALLELISM: u32 = 2;
+const DEFAULT_GATES_WAIT_TIMEOUT_SECS: u64 = 1200;
+const GATES_WAIT_POLL_INTERVAL_SECS: u64 = 5;
+const INLINE_WORKER_POLL_INTERVAL_SECS: u64 = 1;
+const GATES_QUEUE_LANE: &str = "consume";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueProcessingMode {
+    ExternalWorker,
+    InlineSingleJob,
+}
 
 /// Throughput profile for bounded FAC gate execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
@@ -126,15 +143,9 @@ pub(super) fn resolve_effective_execution_profile(
     ))
 }
 
-/// Run all evidence gates locally with optional bounded test execution.
-///
-/// 1. Requires clean working tree for full mode (`--quick` bypasses this)
-/// 2. Resolves HEAD SHA
-/// 3. Runs merge-conflict gate first (always recomputed)
-/// 4. Runs evidence gates (with bounded test runner if available)
-/// 5. Writes attested gate cache receipts for full runs
-/// 6. Prints summary table
+/// Enqueue FAC gates as a worker job.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::fn_params_excessive_bools)]
 pub fn run_gates(
     force: bool,
     quick: bool,
@@ -144,125 +155,39 @@ pub fn run_gates(
     cpu_quota: &str,
     gate_profile: GateThroughputProfile,
     json_output: bool,
+    wait: bool,
+    wait_timeout_secs: u64,
 ) -> u8 {
-    let overall_started = Instant::now();
+    run_gates_via_worker(
+        force,
+        quick,
+        timeout_seconds,
+        memory_max,
+        pids_max,
+        cpu_quota,
+        gate_profile,
+        wait,
+        wait_timeout_secs,
+        json_output,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn run_gates_local_worker(
+    force: bool,
+    quick: bool,
+    timeout_seconds: u64,
+    memory_max: &str,
+    pids_max: u64,
+    cpu_quota: &str,
+    gate_profile: GateThroughputProfile,
+    workspace_root: &Path,
+) -> Result<u8, String> {
     let (resolved_profile, effective_cpu_quota) =
-        match resolve_effective_execution_profile(cpu_quota, gate_profile) {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                if json_output {
-                    let _ = emit_jsonl_error("gate_error", &err);
-                } else {
-                    let payload = serde_json::json!({
-                        "error": "gate_error",
-                        "message": err,
-                        "passed": false,
-                    });
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
-                            "{\"error\":\"serialization_failure\"}".to_string()
-                        })
-                    );
-                }
-                return exit_codes::GENERIC_ERROR;
-            },
-        };
-    if json_output {
-        let _ = emit_jsonl(&StageEvent {
-            event: "gates_started".to_string(),
-            ts: ts_now(),
-            extra: serde_json::json!({
-                "quick": quick,
-                "force": force,
-                "timeout_seconds": timeout_seconds,
-                "memory_max": memory_max,
-                "pids_max": pids_max,
-                "requested_cpu_quota": cpu_quota,
-                "effective_cpu_quota": effective_cpu_quota,
-                "gate_profile": gate_profile.as_str(),
-                "effective_test_parallelism": resolved_profile.test_parallelism,
-            }),
-        });
-    }
-
-    // Build a real-time gate progress callback for JSON mode. Events are
-    // emitted to stdout as each gate starts, heartbeats while running, and
-    // finishes, providing streaming observability instead of buffering until
-    // all gates complete.
-    let gate_progress_callback: Option<Box<dyn Fn(super::evidence::GateProgressEvent) + Send>> =
-        if json_output {
-            Some(Box::new(
-                |event: super::evidence::GateProgressEvent| match event {
-                    super::evidence::GateProgressEvent::Started { gate_name } => {
-                        let _ = emit_jsonl(&GateStartedEvent {
-                            event: "gate_started",
-                            gate: gate_name,
-                            ts: ts_now(),
-                        });
-                    },
-                    super::evidence::GateProgressEvent::Progress {
-                        gate_name,
-                        elapsed_secs,
-                        bytes_streamed,
-                    } => {
-                        let _ = emit_jsonl(&GateProgressTickEvent {
-                            event: "gate_progress",
-                            gate: gate_name,
-                            elapsed_secs,
-                            bytes_streamed,
-                            ts: ts_now(),
-                        });
-                    },
-                    super::evidence::GateProgressEvent::Completed {
-                        gate_name,
-                        passed,
-                        duration_secs,
-                        log_path,
-                        bytes_written,
-                        bytes_total,
-                        was_truncated,
-                        log_bundle_hash,
-                        error_hint,
-                    } => {
-                        let status = if passed { "pass" } else { "fail" }.to_string();
-                        let _ = emit_jsonl(&GateCompletedEvent {
-                            event: "gate_completed",
-                            gate: gate_name.clone(),
-                            status,
-                            duration_secs,
-                            log_path: log_path.clone(),
-                            bytes_written,
-                            bytes_total,
-                            was_truncated,
-                            log_bundle_hash: log_bundle_hash.clone(),
-                            error_hint: error_hint.clone(),
-                            ts: ts_now(),
-                        });
-                        if !passed {
-                            let _ = emit_jsonl(&GateErrorEvent {
-                                event: "gate_error",
-                                gate: gate_name,
-                                error: error_hint.unwrap_or_else(|| {
-                                    "gate failed (see log for details)".to_string()
-                                }),
-                                log_path,
-                                duration_secs: Some(duration_secs),
-                                bytes_written,
-                                bytes_total,
-                                was_truncated,
-                                log_bundle_hash,
-                                ts: ts_now(),
-                            });
-                        }
-                    },
-                },
-            ))
-        } else {
-            None
-        };
-
-    match run_gates_inner(
+        resolve_effective_execution_profile(cpu_quota, gate_profile)?;
+    let summary = run_gates_inner(
+        workspace_root,
         force,
         quick,
         timeout_seconds,
@@ -271,78 +196,383 @@ pub fn run_gates(
         &effective_cpu_quota,
         gate_profile,
         resolved_profile.test_parallelism,
-        !json_output,
-        gate_progress_callback,
-    ) {
-        Ok(summary) => {
-            if json_output {
-                // Gate-level events were already streamed in real-time via the
-                // callback. Only the summary/completion events are emitted here.
-                let _ = emit_jsonl(&StageEvent {
-                    event: "gates_completed".to_string(),
-                    ts: ts_now(),
-                    extra: serde_json::json!({
-                        "passed": summary.passed,
-                        "duration_secs": overall_started.elapsed().as_secs(),
-                        "gate_count": summary.gates.len(),
-                    }),
-                });
-                let summary_value =
-                    serde_json::to_value(&summary).unwrap_or_else(|_| serde_json::json!({}));
-                let _ = emit_jsonl(&StageEvent {
-                    event: "gates_summary".to_string(),
-                    ts: ts_now(),
-                    extra: summary_value,
-                });
-            } else {
-                // JSON-only: emit the summary as pretty-printed JSON.
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&summary)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            }
-            if summary.passed {
-                exit_codes::SUCCESS
-            } else {
-                exit_codes::GENERIC_ERROR
-            }
-        },
+        false,
+        None,
+    )?;
+    Ok(if summary.passed {
+        exit_codes::SUCCESS
+    } else {
+        exit_codes::GENERIC_ERROR
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::fn_params_excessive_bools)]
+fn run_gates_via_worker(
+    force: bool,
+    quick: bool,
+    timeout_seconds: u64,
+    memory_max: &str,
+    pids_max: u64,
+    cpu_quota: &str,
+    gate_profile: GateThroughputProfile,
+    wait: bool,
+    wait_timeout_secs: u64,
+    json_output: bool,
+) -> u8 {
+    if let Err(err) = validate_timeout_seconds(timeout_seconds) {
+        return output_worker_enqueue_error(json_output, &err, exit_codes::VALIDATION_ERROR);
+    }
+    let memory_max_bytes = match parse_memory_limit(memory_max) {
+        Ok(bytes) => bytes,
         Err(err) => {
-            if json_output {
-                let _ = emit_jsonl_error("gate_error", &err);
-                let _ = emit_jsonl(&StageEvent {
-                    event: "gates_completed".to_string(),
-                    ts: ts_now(),
-                    extra: serde_json::json!({
-                        "passed": false,
-                        "duration_secs": overall_started.elapsed().as_secs(),
-                        "error": err,
-                    }),
-                });
-                let _ = emit_jsonl(&StageEvent {
-                    event: "gates_summary".to_string(),
-                    ts: ts_now(),
-                    extra: serde_json::json!({
-                        "passed": false,
-                        "error": err,
-                    }),
-                });
-            } else {
-                // JSON-only: emit the error as a structured JSON object.
-                let payload = serde_json::json!({
-                    "error": "gate_error",
-                    "message": err,
-                    "passed": false,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            }
-            exit_codes::GENERIC_ERROR
+            return output_worker_enqueue_error(json_output, &err, exit_codes::VALIDATION_ERROR);
         },
+    };
+    if memory_max_bytes > max_memory_bytes() {
+        return output_worker_enqueue_error(
+            json_output,
+            &format!(
+                "--memory-max {memory_max} exceeds FAC test memory cap of {max_bytes}",
+                max_bytes = max_memory_bytes()
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+    if let Err(err) = resolve_effective_execution_profile(cpu_quota, gate_profile) {
+        return output_worker_enqueue_error(json_output, &err, exit_codes::VALIDATION_ERROR);
+    }
+
+    let fac_root = match resolve_fac_root() {
+        Ok(path) => path,
+        Err(err) => {
+            return output_worker_enqueue_error(
+                json_output,
+                &format!("cannot resolve FAC root: {err}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+    if !wait && !has_live_worker_heartbeat(&fac_root) {
+        return output_worker_enqueue_error(
+            json_output,
+            "cannot run fac gates with --no-wait when no active FAC worker is detected \
+             (stale/missing heartbeat). Start `apm2 fac worker` or run with wait mode.",
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+    let boundary_id = apm2_core::fac::load_or_default_boundary_id(&fac_root)
+        .unwrap_or_else(|_| "local".to_string());
+    let mut broker = match init_broker(&fac_root, &boundary_id) {
+        Ok(broker) => broker,
+        Err(err) => {
+            return output_worker_enqueue_error(
+                json_output,
+                &format!("cannot initialize broker: {err}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+    let (policy_hash, policy_digest, _) = match load_or_init_policy(&fac_root) {
+        Ok(result) => result,
+        Err(err) => {
+            return output_worker_enqueue_error(
+                json_output,
+                &format!("cannot load FAC policy: {err}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+    if let Err(err) = broker.admit_policy_digest(policy_digest) {
+        return output_worker_enqueue_error(
+            json_output,
+            &format!("cannot admit FAC policy digest: {err}"),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    let job_id = format!("gates-{}", generate_job_suffix());
+    let lease_id = format!("gates-lease-{}", generate_job_suffix());
+    let repo_source = resolve_repo_source_info();
+    let options = GatesJobOptionsV1::new(
+        force,
+        quick,
+        timeout_seconds,
+        memory_max,
+        pids_max,
+        cpu_quota,
+        gate_profile.as_str(),
+        &repo_source.workspace_root,
+    );
+    let spec = match build_gates_job_spec(
+        &job_id,
+        &lease_id,
+        &repo_source.repo_id,
+        &repo_source.head_sha,
+        &policy_digest,
+        memory_max_bytes,
+        &options,
+        &boundary_id,
+        &mut broker,
+    ) {
+        Ok(spec) => spec,
+        Err(err) => {
+            return output_worker_enqueue_error(
+                json_output,
+                &format!("cannot build gates job spec: {err}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let queue_root = match resolve_queue_root() {
+        Ok(path) => path,
+        Err(err) => {
+            return output_worker_enqueue_error(
+                json_output,
+                &format!("cannot resolve queue root: {err}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+    if let Err(err) = enqueue_job(&queue_root, &spec) {
+        return output_worker_enqueue_error(
+            json_output,
+            &format!("failed to enqueue gates job: {err}"),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    if json_output {
+        let payload = serde_json::json!({
+            "status": "enqueued",
+            "job_kind": "gates",
+            "job_id": job_id,
+            "queue_lane": spec.queue_lane,
+            "policy_hash": policy_hash,
+            "head_sha": repo_source.head_sha,
+            "options": options,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+        );
+    } else {
+        eprintln!(
+            "fac gates: enqueued worker job {job_id} lane={} head_sha={}",
+            spec.queue_lane, repo_source.head_sha
+        );
+    }
+
+    if wait {
+        let timeout_secs = if wait_timeout_secs == 0 {
+            DEFAULT_GATES_WAIT_TIMEOUT_SECS
+        } else {
+            wait_timeout_secs
+        };
+        let timeout = Duration::from_secs(timeout_secs);
+        match wait_for_gates_job_receipt(&fac_root, &job_id, timeout) {
+            Ok(()) => {
+                if json_output {
+                    let payload = serde_json::json!({
+                        "status": "completed",
+                        "job_kind": "gates",
+                        "job_id": job_id,
+                    });
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| {
+                            "{\"error\":\"serialization_failure\"}".to_string()
+                        })
+                    );
+                } else {
+                    eprintln!("fac gates: worker job {job_id} completed");
+                }
+            },
+            Err(err) => {
+                return output_worker_enqueue_error(json_output, &err, exit_codes::GENERIC_ERROR);
+            },
+        }
+    }
+
+    exit_codes::SUCCESS
+}
+
+fn output_worker_enqueue_error(json_output: bool, message: &str, code: u8) -> u8 {
+    if json_output {
+        let payload = serde_json::json!({
+            "status": "error",
+            "error": "fac_gates_worker_enqueue_failed",
+            "message": message,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+        );
+    } else {
+        eprintln!("ERROR: {message}");
+    }
+    code
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_gates_job_spec(
+    job_id: &str,
+    lease_id: &str,
+    repo_id: &str,
+    head_sha: &str,
+    policy_digest: &[u8; 32],
+    memory_max_bytes: u64,
+    options: &GatesJobOptionsV1,
+    boundary_id: &str,
+    broker: &mut apm2_core::fac::broker::FacBroker,
+) -> Result<FacJobSpecV1, String> {
+    if GATES_QUEUE_LANE.is_empty() || GATES_QUEUE_LANE.len() > MAX_QUEUE_LANE_LENGTH {
+        return Err("invalid gates queue lane configuration".to_string());
+    }
+
+    let enqueue_time = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let patch = serde_json::to_value(options).map_err(|err| format!("serialize patch: {err}"))?;
+    let mut spec = FacJobSpecV1 {
+        schema: apm2_core::fac::job_spec::JOB_SPEC_SCHEMA_ID.to_string(),
+        job_id: job_id.to_string(),
+        job_spec_digest: String::new(),
+        kind: "gates".to_string(),
+        queue_lane: GATES_QUEUE_LANE.to_string(),
+        priority: 40,
+        enqueue_time,
+        actuation: Actuation {
+            lease_id: lease_id.to_string(),
+            request_id: String::new(),
+            channel_context_token: None,
+            decoded_source: Some("fac_gates_worker".to_string()),
+        },
+        source: JobSource {
+            kind: "mirror_commit".to_string(),
+            repo_id: repo_id.to_string(),
+            head_sha: head_sha.to_string(),
+            patch: Some(patch),
+        },
+        lane_requirements: LaneRequirements {
+            lane_profile_hash: None,
+        },
+        constraints: JobConstraints {
+            require_nextest: !options.quick,
+            test_timeout_seconds: Some(options.timeout_seconds),
+            memory_max_bytes: Some(memory_max_bytes),
+        },
+        cancel_target_job_id: None,
+    };
+    let digest = spec
+        .compute_digest()
+        .map_err(|err| format!("compute digest: {err}"))?;
+    spec.job_spec_digest.clone_from(&digest);
+    spec.actuation.request_id.clone_from(&digest);
+
+    // Bind policy fields to the admitted FAC policy digest and bind the
+    // specific job through request_id (= spec digest), preserving fail-closed
+    // token verification while avoiding digest-domain mismatch.
+    let token = broker
+        .issue_channel_context_token(policy_digest, lease_id, &digest, boundary_id)
+        .map_err(|err| format!("issue channel context token: {err}"))?;
+    spec.actuation.channel_context_token = Some(token);
+    validate_job_spec(&spec).map_err(|err| format!("validate job spec: {err}"))?;
+    Ok(spec)
+}
+
+fn wait_for_gates_job_receipt(
+    fac_root: &Path,
+    job_id: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let receipts_dir = fac_root.join("receipts");
+    let start = Instant::now();
+    loop {
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "gates job {job_id} did not reach terminal receipt within {}s",
+                timeout.as_secs()
+            ));
+        }
+        if let Some(receipt) = lookup_job_receipt(&receipts_dir, job_id) {
+            return match receipt.outcome {
+                apm2_core::fac::FacJobOutcome::Completed => Ok(()),
+                apm2_core::fac::FacJobOutcome::Denied => {
+                    Err(format!("gates job {job_id} denied: {}", receipt.reason))
+                },
+                apm2_core::fac::FacJobOutcome::Quarantined => Err(format!(
+                    "gates job {job_id} quarantined: {}",
+                    receipt.reason
+                )),
+                apm2_core::fac::FacJobOutcome::Cancelled => {
+                    Err(format!("gates job {job_id} cancelled: {}", receipt.reason))
+                },
+                apm2_core::fac::FacJobOutcome::CancellationRequested => Err(format!(
+                    "gates job {job_id} cancellation requested: {}",
+                    receipt.reason
+                )),
+                _ => Err(format!(
+                    "gates job {job_id} returned unsupported outcome: {:?}",
+                    receipt.outcome
+                )),
+            };
+        }
+        match detect_queue_processing_mode(fac_root) {
+            QueueProcessingMode::ExternalWorker => {
+                std::thread::sleep(Duration::from_secs(GATES_WAIT_POLL_INTERVAL_SECS));
+            },
+            QueueProcessingMode::InlineSingleJob => {
+                run_inline_worker_cycle()?;
+            },
+        }
+    }
+}
+
+fn detect_queue_processing_mode(fac_root: &Path) -> QueueProcessingMode {
+    if has_live_worker_heartbeat(fac_root) {
+        QueueProcessingMode::ExternalWorker
+    } else {
+        QueueProcessingMode::InlineSingleJob
+    }
+}
+
+fn has_live_worker_heartbeat(fac_root: &Path) -> bool {
+    let heartbeat = apm2_core::fac::worker_heartbeat::read_heartbeat(fac_root);
+    if !heartbeat.found || !heartbeat.fresh || heartbeat.pid == 0 {
+        return false;
+    }
+    if heartbeat.pid == std::process::id() {
+        return false;
+    }
+    is_pid_running(heartbeat.pid)
+}
+
+#[cfg(target_os = "linux")]
+fn is_pid_running(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).is_dir()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_pid_running(pid: u32) -> bool {
+    pid > 0
+}
+
+fn run_inline_worker_cycle() -> Result<(), String> {
+    let code = crate::commands::fac_worker::run_fac_worker(
+        true,
+        INLINE_WORKER_POLL_INTERVAL_SECS,
+        1,
+        false,
+        false,
+    );
+    if code == exit_codes::SUCCESS {
+        Ok(())
+    } else {
+        Err(format!(
+            "inline FAC worker cycle failed with exit code {code}"
+        ))
     }
 }
 
@@ -383,6 +613,7 @@ struct GateResult {
 
 #[allow(clippy::too_many_arguments)]
 fn run_gates_inner(
+    workspace_root: &Path,
     force: bool,
     quick: bool,
     timeout_seconds: u64,
@@ -403,9 +634,7 @@ fn run_gates_inner(
         ));
     }
 
-    let workspace_root =
-        std::env::current_dir().map_err(|e| format!("failed to resolve cwd: {e}"))?;
-    let timeout_decision = resolve_bounded_test_timeout(&workspace_root, timeout_seconds);
+    let timeout_decision = resolve_bounded_test_timeout(workspace_root, timeout_seconds);
 
     // TCK-00526: Load FAC policy for environment enforcement.
     let apm2_home = apm2_core::github::resolve_apm2_home()
@@ -437,12 +666,12 @@ fn run_gates_inner(
 
     // 1. Require clean working tree for full gates only. `--force` allows
     // rerunning gates for the same SHA while local edits are in progress.
-    ensure_clean_working_tree(&workspace_root, quick || force)?;
+    ensure_clean_working_tree(workspace_root, quick || force)?;
 
     // 2. Resolve HEAD SHA.
     let sha_output = Command::new("git")
         .args(["rev-parse", "HEAD"])
-        .current_dir(&workspace_root)
+        .current_dir(workspace_root)
         .output()
         .map_err(|e| format!("failed to run git rev-parse HEAD: {e}"))?;
     if !sha_output.status.success() {
@@ -462,7 +691,7 @@ fn run_gates_inner(
             gate_name: "merge_conflict_main".to_string(),
         });
     }
-    let merge_gate = evaluate_merge_conflict_gate(&workspace_root, &sha, emit_human_logs)?;
+    let merge_gate = evaluate_merge_conflict_gate(workspace_root, &sha, emit_human_logs)?;
     // Emit gate_completed immediately after the merge gate finishes.
     if let Some(ref cb) = on_gate_progress {
         cb(super::evidence::GateProgressEvent::Completed {
@@ -506,7 +735,7 @@ fn run_gates_inner(
         None
     } else {
         let spec = build_systemd_bounded_test_command(
-            &workspace_root,
+            workspace_root,
             BoundedTestLimits {
                 timeout_seconds: timeout_decision.effective_seconds,
                 kill_after_seconds: DEFAULT_TEST_KILL_AFTER_SECONDS,
@@ -559,7 +788,7 @@ fn run_gates_inner(
     // 5. Run evidence gates.
     let started = Instant::now();
     let (passed, gate_results) = run_evidence_gates_with_lane_context(
-        &workspace_root,
+        workspace_root,
         &sha,
         None,
         Some(&opts),
@@ -582,12 +811,12 @@ fn run_gates_inner(
         let mut cache = GateCache::new(&sha);
         for result in &gate_results {
             let command = gate_command_for_attestation(
-                &workspace_root,
+                workspace_root,
                 &result.gate_name,
                 opts.test_command.as_deref(),
             );
             let attestation_digest = command.and_then(|cmd| {
-                compute_gate_attestation(&workspace_root, &sha, &result.gate_name, &cmd, &policy)
+                compute_gate_attestation(workspace_root, &sha, &result.gate_name, &cmd, &policy)
                     .ok()
                     .map(|attestation| attestation.attestation_digest)
             });
@@ -895,11 +1124,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::Command;
-    use std::sync::{Mutex, OnceLock};
 
     use super::*;
-
-    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
     fn gate_execution_profile_resolves_auto_quota_from_profile() {
@@ -948,6 +1174,81 @@ mod tests {
         assert!(balanced.test_parallelism >= 1);
         assert!(balanced.test_parallelism <= host);
         assert!(balanced.test_parallelism <= BALANCED_MAX_PARALLELISM.min(host));
+    }
+
+    #[test]
+    fn detect_queue_processing_mode_defaults_inline_without_heartbeat() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            detect_queue_processing_mode(temp.path()),
+            QueueProcessingMode::InlineSingleJob
+        );
+    }
+
+    #[test]
+    fn has_live_worker_heartbeat_rejects_self_pid() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let heartbeat = serde_json::json!({
+            "schema": apm2_core::fac::worker_heartbeat::HEARTBEAT_SCHEMA,
+            "pid": std::process::id(),
+            "timestamp_epoch_secs": now,
+            "cycle_count": 1,
+            "jobs_completed": 0,
+            "jobs_denied": 0,
+            "jobs_quarantined": 0,
+            "health_status": "healthy",
+        });
+        fs::write(
+            temp.path()
+                .join(apm2_core::fac::worker_heartbeat::HEARTBEAT_FILENAME),
+            serde_json::to_vec_pretty(&heartbeat).expect("serialize heartbeat"),
+        )
+        .expect("write heartbeat");
+
+        assert!(!has_live_worker_heartbeat(temp.path()));
+        assert_eq!(
+            detect_queue_processing_mode(temp.path()),
+            QueueProcessingMode::InlineSingleJob
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn has_live_worker_heartbeat_accepts_foreign_live_pid() {
+        if !Path::new("/proc/1").is_dir() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let heartbeat = serde_json::json!({
+            "schema": apm2_core::fac::worker_heartbeat::HEARTBEAT_SCHEMA,
+            "pid": 1_u32,
+            "timestamp_epoch_secs": now,
+            "cycle_count": 7,
+            "jobs_completed": 3,
+            "jobs_denied": 0,
+            "jobs_quarantined": 0,
+            "health_status": "healthy",
+        });
+        fs::write(
+            temp.path()
+                .join(apm2_core::fac::worker_heartbeat::HEARTBEAT_FILENAME),
+            serde_json::to_vec_pretty(&heartbeat).expect("serialize heartbeat"),
+        )
+        .expect("write heartbeat");
+
+        assert!(has_live_worker_heartbeat(temp.path()));
+        assert_eq!(
+            detect_queue_processing_mode(temp.path()),
+            QueueProcessingMode::ExternalWorker
+        );
     }
 
     #[test]
@@ -1196,7 +1497,7 @@ mod tests {
     /// should run all command-style phases in the same lane-local env context.
     ///
     /// This test exercises `run_gates_inner` directly with a custom fake
-    /// `cargo` and log-collecting script gates. It confirms:
+    /// `cargo` and native gate prerequisites. It confirms:
     /// - single-lane mode does not fail due to nested lock acquisition, and
     /// - all active evidence phases receive the same lane-local HOME/TMPDIR
     ///   /XDG env values.
@@ -1214,10 +1515,10 @@ mod tests {
             fn drop(&mut self) {
                 for (name, value) in self.vars.drain(..) {
                     if let Some(value) = value {
-                        // SAFETY: serialized via TEST_ENV_LOCK
+                        // SAFETY: serialized via crate::commands::env_var_test_lock
                         unsafe { std::env::set_var(name, value) };
                     } else {
-                        // SAFETY: serialized via TEST_ENV_LOCK
+                        // SAFETY: serialized via crate::commands::env_var_test_lock
                         unsafe { std::env::remove_var(name) };
                     }
                 }
@@ -1228,8 +1529,7 @@ mod tests {
             }
         }
 
-        let _guard = TEST_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
+        let _guard = crate::commands::env_var_test_lock()
             .lock()
             .expect("serialize env-mutating integration test");
 
@@ -1238,12 +1538,14 @@ mod tests {
         fs::create_dir_all(&repo).expect("create workspace");
         let apm2_home = temp_dir.path().join("apm2_home");
         let bin_dir = temp_dir.path().join("fake-bin");
-        let scripts_dir = repo.join("scripts").join("ci");
+        let review_dir = repo.join("documents").join("reviews");
+        let review_gate_dir = repo.join(".github").join("review-gate");
         let log_file = repo.join(".fac_gate_env_log");
 
         fs::create_dir_all(apm2_home.join("private").join("fac")).expect("create apm2 home");
         fs::create_dir_all(&bin_dir).expect("create fake bin dir");
-        fs::create_dir_all(&scripts_dir).expect("create scripts dir");
+        fs::create_dir_all(&review_dir).expect("create review dir");
+        fs::create_dir_all(&review_gate_dir).expect("create review gate dir");
 
         run_git(&repo, &["init"]);
         run_git(&repo, &["config", "user.email", "test@example.com"]);
@@ -1257,63 +1559,42 @@ mod tests {
         #[allow(clippy::literal_string_with_formatting_args)]
         let fake_cargo = "#!/bin/sh\necho \"phase=$1|HOME=$HOME|TMPDIR=$TMPDIR|XDG_CACHE_HOME=$XDG_CACHE_HOME|XDG_CONFIG_HOME=$XDG_CONFIG_HOME\" >> \"$PWD/.fac_gate_env_log\"\nexit 0\n";
         fs::write(bin_dir.join("cargo"), fake_cargo).expect("write fake cargo");
-
-        #[allow(clippy::literal_string_with_formatting_args)]
-        let safety_guard = concat!(
-            "#!/bin/sh\n",
-            "phase=\"test_safety_guard\"\n",
-            "if [ \"$1\" = \"snapshot\" ]; then\n",
-            ":\n",
-            "fi\n",
-            "echo \"phase=$phase|HOME=$HOME|TMPDIR=$TMPDIR|XDG_CACHE_HOME=$XDG_CACHE_HOME|XDG_CONFIG_HOME=$XDG_CONFIG_HOME\" >> \"$PWD/.fac_gate_env_log\"\n",
-            "exit 0\n",
-        );
-        fs::write(scripts_dir.join("test_safety_guard.sh"), safety_guard)
-            .expect("write fake safety guard");
-
-        #[allow(clippy::literal_string_with_formatting_args)]
-        let lint_script = concat!(
-            "#!/bin/sh\n",
-            "phase=\"review_artifact_lint\"\n",
-            "echo \"phase=$phase|HOME=$HOME|TMPDIR=$TMPDIR|XDG_CACHE_HOME=$XDG_CACHE_HOME|XDG_CONFIG_HOME=$XDG_CONFIG_HOME\" >> \"$PWD/.fac_gate_env_log\"\n",
-            "exit 0\n",
-        );
-        fs::write(scripts_dir.join("review_artifact_lint.sh"), lint_script)
-            .expect("write fake lint script");
-
-        #[allow(clippy::literal_string_with_formatting_args)]
-        let integrity_script = concat!(
-            "#!/bin/sh\n",
-            "phase=\"workspace_integrity\"\n",
-            "while [ \"$#\" -gt 0 ]; do\n",
-            "if [ \"$1\" = \"--snapshot-file\" ]; then\n",
-            "shift\n",
-            "mkdir -p \"$(dirname \"$1\")\"\n",
-            ": > \"$1\"\n",
-            "break\n",
-            "fi\n",
-            "shift\n",
-            "done\n",
-            "echo \"phase=$phase|HOME=$HOME|TMPDIR=$TMPDIR|XDG_CACHE_HOME=$XDG_CACHE_HOME|XDG_CONFIG_HOME=$XDG_CONFIG_HOME\" >> \"$PWD/.fac_gate_env_log\"\n",
-            "exit 0\n",
-        );
         fs::write(
-            scripts_dir.join("workspace_integrity_guard.sh"),
-            integrity_script,
+            review_gate_dir.join("test-safety-allowlist.txt"),
+            b"# empty\n",
         )
-        .expect("write fake workspace integrity script");
+        .expect("write allowlist");
+
+        let prompt = concat!(
+            "{\n",
+            "  \"payload\": {\n",
+            "    \"commands\": {\n",
+            "      \"binary_prefix\": \"cargo run -p apm2-cli --\",\n",
+            "      \"prepare\": \"cargo run -p apm2-cli -- fac review prepare --json\",\n",
+            "      \"finding\": \"cargo run -p apm2-cli -- fac review finding --json\",\n",
+            "      \"verdict\": \"cargo run -p apm2-cli -- fac review verdict set --json\"\n",
+            "    },\n",
+            "    \"constraints\": {\n",
+            "      \"forbidden_operations\": [\n",
+            "        \"Do not pass --sha manually; CLI auto-derives the SHA and SHA is managed by the CLI.\"\n",
+            "      ],\n",
+            "      \"invariants\": [\n",
+            "        \"SHA is managed by the CLI\"\n",
+            "      ]\n",
+            "    }\n",
+            "  }\n",
+            "}\n"
+        );
+        fs::write(review_dir.join("CODE_QUALITY_PROMPT.cac.json"), prompt)
+            .expect("write code quality prompt");
+        fs::write(review_dir.join("SECURITY_REVIEW_PROMPT.cac.json"), prompt)
+            .expect("write security prompt");
+        fs::write(review_gate_dir.join("trusted-reviewers.json"), b"[]\n")
+            .expect("write trusted reviewers");
 
         let cargo_path = bin_dir.join("cargo");
         fs::set_permissions(cargo_path, fs::Permissions::from_mode(0o755))
             .expect("set fake cargo mode");
-        for script in [
-            scripts_dir.join("test_safety_guard.sh"),
-            scripts_dir.join("review_artifact_lint.sh"),
-            scripts_dir.join("workspace_integrity_guard.sh"),
-        ] {
-            fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
-                .expect("set script executable");
-        }
 
         let original_path = env::var_os("PATH");
         let original_apm2_home = env::var_os("APM2_HOME");
@@ -1325,7 +1606,7 @@ mod tests {
             env::var("PATH").unwrap_or_default()
         );
 
-        // SAFETY: serialized via TEST_ENV_LOCK
+        // SAFETY: serialized via crate::commands::env_var_test_lock
         unsafe {
             env::set_var("PATH", path_override);
             env::set_var("APM2_HOME", &apm2_home);
@@ -1343,6 +1624,7 @@ mod tests {
         env::set_current_dir(&repo).expect("set test repository as cwd");
 
         let summary = run_gates_inner(
+            &repo,
             false,
             true,
             30,

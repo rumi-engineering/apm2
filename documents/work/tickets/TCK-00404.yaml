@@ -27,7 +27,7 @@ ticket_meta:
     in_scope:
       - "Add a repository flake (`flake.nix`) with a default devShell that provides the required local developer toolchain for apm2 CLI + daemon work (Rust toolchain compatibility, protoc, cargo helper tools, git/rsync/ripgrep)."
       - "Add lockfile management for deterministic Nix inputs (`flake.lock`) and document update procedure."
-      - "Create a path-agnostic skills runtime sync command (for example `scripts/dev/skills_runtime_sync.sh`) that treats `documents/skills` as the single source of truth."
+      - "Create a path-agnostic skills runtime sync command (for example `apm2 dev skills-runtime-sync`) that treats `documents/skills` as the single source of truth."
       - "Implement global runtime materialization under `${XDG_STATE_HOME:-$HOME/.local/state}/apm2/skills/<repo_id>/<worktree_id>` so multiple worktrees do not clobber each other."
       - "Replace copy-based `.claude/skills` behavior with symlink-based behavior (`.claude/skills -> global runtime materialization path`)."
       - "Update `xtask start-ticket` worktree bootstrap flow to stop recursively copying `.claude` into each worktree and instead invoke link/sync setup for the target worktree."
@@ -43,7 +43,7 @@ ticket_meta:
     steps:
       - "Author `flake.nix` with `devShells.default`; include required tools and environment defaults needed by existing commands in CI expectations and local agent workflows."
       - "Generate and commit `flake.lock`."
-      - "Create `scripts/dev/skills_runtime_sync.sh` with subcommands or flags: `sync` (default), `--check`, and optional `--verbose`."
+      - "Create `apm2 dev skills-runtime-sync` with subcommands or flags: `sync` (default), `--check`, and optional `--verbose`."
       - "In sync mode: resolve repo root dynamically, compute stable `repo_id` and `worktree_id`, rsync `documents/skills/` into the per-worktree global path, and atomically update `.claude/skills` symlink."
       - "In check mode: compare `documents/skills` and runtime path; exit non-zero on drift."
       - "Retire hard-coded path behavior from `.claude/sync-skills.sh` by replacing it with a thin wrapper to the new script or deleting it with migration notes."
@@ -80,7 +80,7 @@ ticket_meta:
     files: |
       - flake.nix
       - flake.lock
-      - scripts/dev/skills_runtime_sync.sh
+      - apm2 dev skills-runtime-sync
       - .claude/sync-skills.sh
       - xtask/src/tasks/start_ticket.rs
       - README.md

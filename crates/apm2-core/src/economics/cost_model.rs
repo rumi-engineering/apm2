@@ -4,8 +4,8 @@
 //! - [`CostModelV1`]: per-job-kind cost estimates for queue admission.
 //! - [`JobCostEstimate`]: deterministic cost estimate for a single job kind.
 //! - [`ObservedJobCost`]: observed runtime cost metrics recorded in receipts.
-//! - [`calibrate`]: bounded, monotone-safe calibration from receipt
-//!   observations.
+//! - [`CostModelV1::calibrate`]: bounded, monotone-safe calibration from
+//!   receipt observations.
 //!
 //! # Invariants
 //!

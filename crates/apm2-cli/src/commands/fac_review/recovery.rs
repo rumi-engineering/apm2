@@ -3,6 +3,7 @@
 //! Recovery intentionally bypasses reducer transition validation and pre-write
 //! HMAC verification so operators can repair corrupt/stuck local state.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -18,8 +19,9 @@ use super::types::{
 use super::{lifecycle, projection_store};
 use crate::exit_codes::codes as exit_codes;
 
-const RECOVER_SUMMARY_SCHEMA: &str = "apm2.fac.recover_summary.v3";
+const RECOVER_SUMMARY_SCHEMA: &str = "apm2.fac.recover_summary.v4";
 const OPERATION_REPAIR_RUN_STATE: &str = "repair_run_state";
+const OPERATION_REPAIR_REGISTRY: &str = "repair_registry_integrity";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,6 +96,8 @@ pub(super) struct RecoverSummary {
     refreshed_identity: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     lifecycle_reset: Option<lifecycle::BypassLifecycleResetOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registry_repair: Option<lifecycle::BypassRegistryRepairOutcome>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     run_state_repairs: Vec<RunStateRepairOutcome>,
 }
@@ -120,6 +124,27 @@ impl RecoverSummary {
                 operation: "reset_lifecycle".to_string(),
                 before: Some(reset.before_state),
                 after: Some(reset.after_state),
+            });
+        }
+        if let Some(registry) = self.registry_repair {
+            let before = format!(
+                "active_agents={} total_entries={}",
+                registry.before_active_agents, registry.before_total_entries
+            );
+            let mut after = format!(
+                "active_agents={} total_entries={} reaped_agents={}",
+                registry.after_active_agents, registry.after_total_entries, registry.reaped_agents
+            );
+            if let Some(path) = registry.quarantined_registry_path.as_deref() {
+                let _ = write!(after, " quarantined={path}");
+            }
+            if let Some(reason) = registry.quarantine_reason.as_deref() {
+                let _ = write!(after, " quarantine_reason={reason}");
+            }
+            repairs.push(super::DoctorRepairApplied {
+                operation: OPERATION_REPAIR_REGISTRY.to_string(),
+                before: Some(before),
+                after: Some(after),
             });
         }
         for repair in self.run_state_repairs {
@@ -153,24 +178,27 @@ const fn resolve_operation_set(
     refresh_identity: bool,
     reap_stale_agents: bool,
     reset_lifecycle: bool,
+    repair_registry_integrity: bool,
     all: bool,
-) -> (bool, bool, bool) {
+) -> (bool, bool, bool, bool) {
     let mut do_reap = reap_stale_agents;
     let mut do_refresh = refresh_identity;
     let mut do_reset = reset_lifecycle || force;
+    let mut do_repair_registry = repair_registry_integrity;
 
     if all {
         do_reap = true;
         do_refresh = true;
         do_reset = true;
-    } else if !do_reap && !do_refresh && !do_reset {
+        do_repair_registry = true;
+    } else if !do_reap && !do_refresh && !do_reset && !do_repair_registry {
         // Safe default: recover staleness and identity drift without mutating
         // lifecycle state unless explicitly requested.
         do_reap = true;
         do_refresh = true;
     }
 
-    (do_reap, do_refresh, do_reset)
+    (do_reap, do_refresh, do_reset, do_repair_registry)
 }
 
 fn canonical_review_type(value: &str) -> Option<&'static str> {
@@ -628,6 +656,7 @@ pub fn run_recover(
         refresh_identity,
         reap_stale_agents,
         reset_lifecycle,
+        false,
         all,
         run_state_review_types,
     ) {
@@ -661,6 +690,7 @@ fn run_recover_inner(
     refresh_identity: bool,
     reap_stale_agents: bool,
     reset_lifecycle: bool,
+    repair_registry_integrity: bool,
     all: bool,
     run_state_review_types: Vec<String>,
 ) -> Result<RecoverSummary, String> {
@@ -668,11 +698,12 @@ fn run_recover_inner(
     let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
     let home = apm2_home_dir()?;
 
-    let (do_reap, do_refresh, do_reset) = resolve_operation_set(
+    let (do_reap, do_refresh, do_reset, do_repair_registry) = resolve_operation_set(
         force,
         refresh_identity,
         reap_stale_agents,
         reset_lifecycle,
+        repair_registry_integrity,
         all,
     );
     let run_state_review_types = normalize_run_state_review_types(run_state_review_types)?;
@@ -701,8 +732,20 @@ fn run_recover_inner(
     let mut applied_operations = Vec::new();
     let mut reaped_agents = None;
     let mut lifecycle_reset = None;
+    let mut registry_repair = None;
     let mut refreshed_identity = false;
     let mut run_state_repairs = Vec::new();
+
+    if do_repair_registry {
+        requested_operations.push(OPERATION_REPAIR_REGISTRY.to_string());
+        let outcome = lifecycle::repair_registry_integrity_for_pr_bypass_hmac(
+            &owner_repo,
+            resolved_pr,
+            force,
+        )?;
+        registry_repair = Some(outcome);
+        applied_operations.push(OPERATION_REPAIR_REGISTRY.to_string());
+    }
 
     if do_run_state_repair {
         requested_operations.push(OPERATION_REPAIR_RUN_STATE.to_string());
@@ -771,6 +814,7 @@ fn run_recover_inner(
         reaped_agents,
         refreshed_identity,
         lifecycle_reset,
+        registry_repair,
         run_state_repairs,
     })
 }
@@ -783,6 +827,7 @@ pub(super) fn run_repair_plan(
     refresh_identity: bool,
     reap_stale_agents: bool,
     reset_lifecycle: bool,
+    repair_registry_integrity: bool,
     all: bool,
     run_state_review_types: Vec<String>,
 ) -> Result<RecoverSummary, String> {
@@ -793,6 +838,7 @@ pub(super) fn run_repair_plan(
         refresh_identity,
         reap_stale_agents,
         reset_lifecycle,
+        repair_registry_integrity,
         all,
         run_state_review_types,
     )
@@ -801,8 +847,10 @@ pub(super) fn run_repair_plan(
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_run_state_review_types, repair_run_state_for_review_type, resolve_operation_set,
+        OPERATION_REPAIR_REGISTRY, RecoverSummary, normalize_run_state_review_types,
+        repair_run_state_for_review_type, resolve_operation_set,
     };
+    use crate::commands::fac_review::lifecycle::BypassRegistryRepairOutcome;
     use crate::commands::fac_review::state::{
         self, load_review_run_state_for_home, review_run_state_path_for_home,
         write_review_run_state_for_home,
@@ -837,34 +885,85 @@ mod tests {
 
     #[test]
     fn default_recover_operation_set_runs_all() {
-        let (reap, refresh, reset) = resolve_operation_set(false, false, false, false, false);
+        let (reap, refresh, reset, repair_registry) =
+            resolve_operation_set(false, false, false, false, false, false);
         assert!(reap);
         assert!(refresh);
         assert!(!reset);
+        assert!(!repair_registry);
     }
 
     #[test]
     fn explicit_operation_set_respects_flags() {
-        let (reap, refresh, reset) = resolve_operation_set(false, true, true, false, false);
+        let (reap, refresh, reset, repair_registry) =
+            resolve_operation_set(false, true, true, false, false, false);
         assert!(reap);
         assert!(refresh);
         assert!(!reset);
+        assert!(!repair_registry);
     }
 
     #[test]
     fn force_implies_lifecycle_reset() {
-        let (reap, refresh, reset) = resolve_operation_set(true, false, false, false, false);
+        let (reap, refresh, reset, repair_registry) =
+            resolve_operation_set(true, false, false, false, false, false);
         assert!(!reap);
         assert!(!refresh);
         assert!(reset);
+        assert!(!repair_registry);
     }
 
     #[test]
     fn all_flag_enables_everything() {
-        let (reap, refresh, reset) = resolve_operation_set(false, false, false, false, true);
+        let (reap, refresh, reset, repair_registry) =
+            resolve_operation_set(false, false, false, false, false, true);
         assert!(reap);
         assert!(refresh);
         assert!(reset);
+        assert!(repair_registry);
+    }
+
+    #[test]
+    fn explicit_registry_repair_respects_flag() {
+        let (reap, refresh, reset, repair_registry) =
+            resolve_operation_set(false, false, false, false, true, false);
+        assert!(!reap);
+        assert!(!refresh);
+        assert!(!reset);
+        assert!(repair_registry);
+    }
+
+    #[test]
+    fn recover_summary_reports_registry_repair_operation() {
+        let summary = RecoverSummary {
+            schema: "apm2.fac.recover_summary.v4".to_string(),
+            owner_repo: "example/repo".to_string(),
+            pr_number: 444,
+            head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            requested_operations: vec![OPERATION_REPAIR_REGISTRY.to_string()],
+            applied_operations: vec![OPERATION_REPAIR_REGISTRY.to_string()],
+            reaped_agents: None,
+            refreshed_identity: false,
+            lifecycle_reset: None,
+            registry_repair: Some(BypassRegistryRepairOutcome {
+                before_active_agents: 1,
+                after_active_agents: 0,
+                before_total_entries: 2,
+                after_total_entries: 0,
+                reaped_agents: 1,
+                quarantined_registry_path: Some("/tmp/registry.quarantine".to_string()),
+                quarantine_reason: Some("agent registry integrity check failed".to_string()),
+            }),
+            run_state_repairs: Vec::new(),
+        };
+
+        let repairs = summary.into_doctor_repairs();
+        assert!(
+            repairs
+                .iter()
+                .any(|entry| entry.operation == OPERATION_REPAIR_REGISTRY),
+            "registry repair operation should be surfaced in doctor repair summaries"
+        );
     }
 
     #[test]

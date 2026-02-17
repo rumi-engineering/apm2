@@ -10,9 +10,8 @@ prd_evidence_artifact:
   verification:
     commands:
     - id: CMD-0008
-      shell: bash
-      command: ./scripts/evidence/verify_wire_compat.sh --schema v1 --compat_window
-        2
+      shell: cargo
+      command: cargo test --workspace --all-features -- wire_compat
       expected_exit_code: 0
       cwd: .
       timeout_seconds: 1200

@@ -8,7 +8,7 @@
 #   RULE_ID|re:<bash-regex>
 #
 # Notes:
-# - `RULE_ID` values come from scripts/ci/test_safety_guard.sh.
+# - `RULE_ID` values come from crates/apm2-cli/src/commands/fac_review/gate_checks.rs.
 # - `*` matches every rule.
 # - Regex entries are matched against:
 #     RULE_ID|path:line|line_text

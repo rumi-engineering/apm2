@@ -49,12 +49,17 @@ pub mod export;
 pub mod fac;
 pub mod fac_bench;
 pub mod fac_broker;
+mod fac_gates_job;
 pub mod fac_gc;
 pub mod fac_job;
+pub mod fac_key_material;
 pub mod fac_permissions;
 pub mod fac_pr;
+pub mod fac_preflight;
 pub mod fac_quarantine;
+mod fac_queue_submit;
 pub mod fac_review;
+pub mod fac_secure_io;
 pub mod fac_warm;
 pub mod fac_worker;
 pub mod factory;
@@ -63,3 +68,11 @@ pub mod process;
 pub mod role_launch;
 pub mod tool;
 pub mod work;
+
+#[cfg(test)]
+pub fn env_var_test_lock() -> &'static std::sync::Mutex<()> {
+    use std::sync::{Mutex, OnceLock};
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}

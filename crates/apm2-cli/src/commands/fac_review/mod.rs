@@ -23,6 +23,7 @@ mod findings;
 mod findings_store;
 mod gate_attestation;
 mod gate_cache;
+mod gate_checks;
 mod gates;
 mod github_auth;
 mod github_projection;
@@ -94,6 +95,7 @@ const DOCTOR_ACTIVE_AGENT_IDLE_TIMEOUT_SECONDS: i64 = 300;
 const DOCTOR_DISPATCH_PENDING_WARNING_SECONDS: i64 = 120;
 const DOCTOR_WAIT_TIMEOUT_DEFAULT_SECONDS: u64 = 1200;
 const DOCTOR_WAIT_TIMEOUT_EXIT_CODE: u8 = 2;
+const DOCTOR_FIX_MAX_PASSES: usize = 3;
 
 #[derive(Debug, Serialize)]
 struct DoctorHealthItem {
@@ -481,14 +483,25 @@ pub fn run_doctor(
 ) -> u8 {
     let mut repairs_applied = Vec::new();
     if fix {
-        let pre_repair = run_doctor_inner(repo, pr_number, Vec::new(), false);
-        let plan = derive_doctor_repair_plan(&pre_repair);
-        let force_repair = doctor_requires_force_repair(&pre_repair);
-        if plan.reap_stale_agents
-            || plan.refresh_identity
-            || plan.reset_lifecycle
-            || !plan.run_state_review_types.is_empty()
-        {
+        let mut attempted_plan_fingerprints = std::collections::BTreeSet::new();
+        for pass in 1..=DOCTOR_FIX_MAX_PASSES {
+            let pre_repair = run_doctor_inner(repo, pr_number, Vec::new(), false);
+            let plan = derive_doctor_repair_plan(&pre_repair);
+            if !plan.has_operations() {
+                break;
+            }
+            let plan_fingerprint = plan.fingerprint();
+            if !attempted_plan_fingerprints.insert(plan_fingerprint.clone()) {
+                let err = format!(
+                    "doctor fix did not converge for PR #{pr_number}; repeated repair plan `{plan_fingerprint}`"
+                );
+                if let Err(emit_err) = jsonl::emit_json_error("fac_doctor_fix_incomplete", &err) {
+                    eprintln!("WARNING: failed to emit doctor fix convergence error: {emit_err}");
+                }
+                return exit_codes::GENERIC_ERROR;
+            }
+
+            let force_repair = doctor_requires_force_repair(&pre_repair);
             match recovery::run_repair_plan(
                 repo,
                 Some(pr_number),
@@ -496,6 +509,7 @@ pub fn run_doctor(
                 plan.refresh_identity,
                 plan.reap_stale_agents,
                 plan.reset_lifecycle,
+                plan.repair_registry_integrity,
                 false,
                 plan.run_state_review_types,
             ) {
@@ -548,6 +562,30 @@ pub fn run_doctor(
                                 return exit_codes::GENERIC_ERROR;
                             },
                         }
+                    }
+
+                    let follow_up = run_doctor_inner(repo, pr_number, Vec::new(), true);
+                    if follow_up.recommended_action.action != "fix" {
+                        break;
+                    }
+                    let follow_up_plan = derive_doctor_repair_plan(&follow_up);
+                    if !follow_up_plan.has_operations() {
+                        break;
+                    }
+                    if pass == DOCTOR_FIX_MAX_PASSES {
+                        let err = format!(
+                            "doctor fix exhausted {DOCTOR_FIX_MAX_PASSES} passes for PR #{pr_number} \
+                             while additional repair operations remain (`{}`)",
+                            follow_up_plan.fingerprint()
+                        );
+                        if let Err(emit_err) =
+                            jsonl::emit_json_error("fac_doctor_fix_incomplete", &err)
+                        {
+                            eprintln!(
+                                "WARNING: failed to emit doctor fix max-pass error: {emit_err}"
+                            );
+                        }
+                        return exit_codes::GENERIC_ERROR;
                     }
                 },
                 Err(err) => {
@@ -1431,11 +1469,45 @@ fn run_doctor_inner(
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 struct DoctorRepairPlan {
     reap_stale_agents: bool,
     refresh_identity: bool,
     reset_lifecycle: bool,
+    repair_registry_integrity: bool,
     run_state_review_types: Vec<String>,
+}
+
+impl DoctorRepairPlan {
+    fn has_operations(&self) -> bool {
+        self.reap_stale_agents
+            || self.refresh_identity
+            || self.reset_lifecycle
+            || self.repair_registry_integrity
+            || !self.run_state_review_types.is_empty()
+    }
+
+    fn fingerprint(&self) -> String {
+        format!(
+            "reap={} refresh={} reset={} repair_registry={} run_state={}",
+            self.reap_stale_agents,
+            self.refresh_identity,
+            self.reset_lifecycle,
+            self.repair_registry_integrity,
+            self.run_state_review_types.join(",")
+        )
+    }
+}
+
+fn message_signals_registry_issue(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    (message.contains("agent registry") || message.contains("registry snapshot"))
+        && (message.contains("integrity")
+            || message.contains("failed to load")
+            || message.contains("failed to parse")
+            || message.contains("failed to read")
+            || message.contains("unexpected")
+            || message.contains("missing"))
 }
 
 fn derive_doctor_repair_plan(summary: &DoctorPrSummary) -> DoctorRepairPlan {
@@ -1454,14 +1526,21 @@ fn derive_doctor_repair_plan(summary: &DoctorPrSummary) -> DoctorRepairPlan {
             "stuck" | "recovering" | "quarantined"
         )
     });
-    let fixable_health_signal = summary.health.iter().any(|item| {
+    let lifecycle_health_signal = summary.health.iter().any(|item| {
         let message = item.message.to_ascii_lowercase();
         message.contains("failed to read lifecycle")
             || message.contains("failed to parse lifecycle")
-            || message.contains("failed to load agent registry")
-            || message.contains("unexpected agent registry schema")
             || message.contains("unexpected lifecycle state schema")
     });
+    let registry_health_signal = summary
+        .health
+        .iter()
+        .any(|item| message_signals_registry_issue(&item.message))
+        || summary
+            .latest_push_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.error_hint.as_deref())
+            .is_some_and(message_signals_registry_issue);
     let run_state_review_types = summary
         .run_state_diagnostics
         .iter()
@@ -1474,7 +1553,8 @@ fn derive_doctor_repair_plan(summary: &DoctorPrSummary) -> DoctorRepairPlan {
     DoctorRepairPlan {
         reap_stale_agents: has_dead_running_agent || exceeds_capacity,
         refresh_identity: summary.identity.stale || summary.identity.local_sha.is_none(),
-        reset_lifecycle: lifecycle_needs_reset || fixable_health_signal,
+        reset_lifecycle: lifecycle_needs_reset || lifecycle_health_signal,
+        repair_registry_integrity: registry_health_signal,
         run_state_review_types,
     }
 }
@@ -1484,17 +1564,21 @@ fn doctor_requires_force_repair(summary: &DoctorPrSummary) -> bool {
         let message = item.message.to_ascii_lowercase();
         message.contains("failed to parse lifecycle")
             || message.contains("failed to read lifecycle")
-            || message.contains("failed to load agent registry")
-            || message.contains("unexpected agent registry schema")
             || message.contains("unexpected lifecycle state schema")
+            || message_signals_registry_issue(&message)
     });
+    let push_attempt_force = summary
+        .latest_push_attempt
+        .as_ref()
+        .and_then(|attempt| attempt.error_hint.as_deref())
+        .is_some_and(message_signals_registry_issue);
     let run_state_force = summary.run_state_diagnostics.iter().any(|entry| {
         matches!(
             entry.condition,
             DoctorRunStateCondition::Corrupt | DoctorRunStateCondition::Ambiguous
         )
     });
-    health_force || run_state_force
+    health_force || push_attempt_force || run_state_force
 }
 
 fn doctor_requires_force_restart_from_summary(summary: &DoctorPrSummary) -> bool {
@@ -4070,6 +4154,7 @@ pub fn run_logs(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::fn_params_excessive_bools)]
 pub fn run_gates(
     force: bool,
     quick: bool,
@@ -4079,6 +4164,8 @@ pub fn run_gates(
     cpu_quota: &str,
     gate_profile: GateThroughputProfile,
     json_output: bool,
+    wait: bool,
+    wait_timeout_secs: u64,
 ) -> u8 {
     gates::run_gates(
         force,
@@ -4089,6 +4176,32 @@ pub fn run_gates(
         cpu_quota,
         gate_profile,
         json_output,
+        wait,
+        wait_timeout_secs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn run_gates_local_worker(
+    force: bool,
+    quick: bool,
+    timeout_seconds: u64,
+    memory_max: &str,
+    pids_max: u64,
+    cpu_quota: &str,
+    gate_profile: GateThroughputProfile,
+    workspace_root: &Path,
+) -> Result<u8, String> {
+    gates::run_gates_local_worker(
+        force,
+        quick,
+        timeout_seconds,
+        memory_max,
+        pids_max,
+        cpu_quota,
+        gate_profile,
+        workspace_root,
     )
 }
 
@@ -6000,6 +6113,60 @@ mod tests {
             merge_readiness,
             latest_push_attempt: None,
         })
+    }
+
+    fn doctor_summary_for_repair_plan_tests() -> super::DoctorPrSummary {
+        let mut summary = doctor_pr_summary_for_restart_tests(pending_findings_summary(), None);
+        summary.identity.local_sha = Some("0123456789abcdef0123456789abcdef01234567".to_string());
+        summary.identity.stale = false;
+        summary.lifecycle = Some(doctor_lifecycle_fixture("pushed", 3, 0, 1));
+        summary
+    }
+
+    #[test]
+    fn test_derive_doctor_repair_plan_flags_registry_integrity_repair() {
+        let mut summary = doctor_summary_for_repair_plan_tests();
+        summary.health.push(super::DoctorHealthItem {
+            severity: "high",
+            message:
+                "failed to load agent registry snapshot: agent registry integrity check failed"
+                    .to_string(),
+            remediation: "run doctor fix".to_string(),
+        });
+
+        let plan = super::derive_doctor_repair_plan(&summary);
+        assert!(plan.repair_registry_integrity);
+        assert!(!plan.reset_lifecycle);
+    }
+
+    #[test]
+    fn test_derive_doctor_repair_plan_uses_push_attempt_registry_hint() {
+        let mut summary = doctor_summary_for_repair_plan_tests();
+        summary.latest_push_attempt = Some(super::DoctorPushAttemptSummary {
+            ts: "2026-02-17T00:00:00Z".to_string(),
+            sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            failed_stage: Some("dispatch".to_string()),
+            exit_code: Some(1),
+            duration_s: Some(5),
+            error_hint: Some("agent registry integrity check failed".to_string()),
+        });
+
+        let plan = super::derive_doctor_repair_plan(&summary);
+        assert!(plan.repair_registry_integrity);
+    }
+
+    #[test]
+    fn test_doctor_requires_force_repair_for_registry_integrity_issue() {
+        let mut summary = doctor_summary_for_repair_plan_tests();
+        summary.health.push(super::DoctorHealthItem {
+            severity: "medium",
+            message:
+                "failed to load agent registry snapshot: missing agent registry integrity_hmac"
+                    .to_string(),
+            remediation: "run doctor fix".to_string(),
+        });
+
+        assert!(super::doctor_requires_force_repair(&summary));
     }
 
     #[test]
