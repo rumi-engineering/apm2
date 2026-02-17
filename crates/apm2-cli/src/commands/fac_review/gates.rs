@@ -1007,6 +1007,30 @@ fn run_gates_inner(
             Some(&sandbox_hardening_hash),
         );
         let mut cache = GateCache::new(&sha);
+        let merge_command = gate_command_for_attestation(
+            workspace_root,
+            &merge_gate.name,
+            opts.test_command.as_deref(),
+        );
+        let merge_attestation_digest = merge_command.and_then(|cmd| {
+            compute_gate_attestation(workspace_root, &sha, &merge_gate.name, &cmd, &policy)
+                .ok()
+                .map(|attestation| attestation.attestation_digest)
+        });
+        let merge_evidence_log_digest = merge_gate
+            .log_path
+            .as_deref()
+            .map(Path::new)
+            .and_then(gate_log_digest);
+        cache.set_with_attestation(
+            &merge_gate.name,
+            merge_gate.status == "PASS",
+            merge_gate.duration_secs,
+            merge_attestation_digest,
+            quick,
+            merge_evidence_log_digest,
+            merge_gate.log_path.clone(),
+        );
         for result in &gate_results {
             let command = gate_command_for_attestation(
                 workspace_root,
@@ -1036,6 +1060,14 @@ fn run_gates_inner(
                     .map(str::to_string),
             );
         }
+        cache.backfill_evidence_metadata(
+            &merge_gate.name,
+            merge_gate.log_bundle_hash.as_deref(),
+            merge_gate.bytes_written,
+            merge_gate.bytes_total,
+            merge_gate.was_truncated,
+            merge_gate.log_path.as_deref(),
+        );
         for result in &gate_results {
             cache.backfill_evidence_metadata(
                 &result.gate_name,
