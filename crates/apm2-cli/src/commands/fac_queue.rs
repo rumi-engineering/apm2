@@ -86,8 +86,14 @@ struct QueueStatusOutput {
 struct DirectoryStatus {
     /// Directory name (e.g., "pending").
     name: String,
-    /// Number of `.json` job spec files found (bounded by scan limit).
+    /// Number of valid `.json` job spec files successfully parsed.
+    /// Only incremented after `read_job_spec_bounded` succeeds, so
+    /// malformed/unreadable entries are excluded (Finding 4).
     count: usize,
+    /// Number of `.json` files that failed to parse (malformed, oversized,
+    /// non-regular file types, etc.). Recorded separately so operators can
+    /// detect queue corruption without inflating job counts.
+    malformed: usize,
     /// Whether the scan was truncated at the limit.
     scan_truncated: bool,
     /// Oldest job ID (by `enqueue_time`), if any.
@@ -197,6 +203,7 @@ fn scan_directory(dir_path: &Path, dir_name: &str) -> DirectoryStatus {
         return DirectoryStatus {
             name: dir_name.to_string(),
             count: 0,
+            malformed: 0,
             scan_truncated: false,
             oldest_job_id: None,
             oldest_enqueue_time: None,
@@ -207,6 +214,7 @@ fn scan_directory(dir_path: &Path, dir_name: &str) -> DirectoryStatus {
         return DirectoryStatus {
             name: dir_name.to_string(),
             count: 0,
+            malformed: 0,
             scan_truncated: false,
             oldest_job_id: None,
             oldest_enqueue_time: None,
@@ -214,6 +222,7 @@ fn scan_directory(dir_path: &Path, dir_name: &str) -> DirectoryStatus {
     };
 
     let mut count: usize = 0;
+    let mut malformed: usize = 0;
     let mut scan_truncated = false;
     let mut oldest_job_id: Option<String> = None;
     let mut oldest_enqueue_time: Option<String> = None;
@@ -227,28 +236,34 @@ fn scan_directory(dir_path: &Path, dir_name: &str) -> DirectoryStatus {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
 
-        // Only count .json files (job specs).
+        // Only consider .json files (job specs).
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
 
-        count = count.saturating_add(1);
-
-        // Try to read the spec for `enqueue_time` tracking.
-        if let Ok(spec) = read_job_spec_bounded(&path) {
-            let should_update = oldest_enqueue_time
-                .as_ref()
-                .is_none_or(|current_oldest| spec.enqueue_time < *current_oldest);
-            if should_update {
-                oldest_job_id = Some(spec.job_id.clone());
-                oldest_enqueue_time = Some(spec.enqueue_time.clone());
-            }
+        // Count only after successful parse — malformed .json entries
+        // must not inflate job counts (Finding 4).
+        match read_job_spec_bounded(&path) {
+            Ok(spec) => {
+                count = count.saturating_add(1);
+                let should_update = oldest_enqueue_time
+                    .as_ref()
+                    .is_none_or(|current_oldest| spec.enqueue_time < *current_oldest);
+                if should_update {
+                    oldest_job_id = Some(spec.job_id.clone());
+                    oldest_enqueue_time = Some(spec.enqueue_time.clone());
+                }
+            },
+            Err(_) => {
+                malformed = malformed.saturating_add(1);
+            },
         }
     }
 
     DirectoryStatus {
         name: dir_name.to_string(),
         count,
+        malformed,
         scan_truncated,
         oldest_job_id,
         oldest_enqueue_time,
@@ -361,8 +376,13 @@ fn print_text_status(output: &QueueStatusOutput, _args: &QueueStatusArgs) {
             .collect::<String>();
         let time_display = dir.oldest_enqueue_time.as_deref().unwrap_or("-");
         let truncated_marker = if dir.scan_truncated { "+" } else { "" };
+        let malformed_marker = if dir.malformed > 0 {
+            format!(" ({} malformed)", dir.malformed)
+        } else {
+            String::new()
+        };
         println!(
-            "  {:<14} {:>6}{:<1}  {:<40} {time_display}",
+            "  {:<14} {:>6}{:<1}  {:<40} {time_display}{malformed_marker}",
             dir.name, dir.count, truncated_marker, oldest_display
         );
     }
@@ -423,6 +443,7 @@ mod tests {
         let status = scan_directory(&dir_path, "pending");
         assert_eq!(status.name, "pending");
         assert_eq!(status.count, 0);
+        assert_eq!(status.malformed, 0);
         assert!(!status.scan_truncated);
         assert!(status.oldest_job_id.is_none());
         assert!(status.oldest_enqueue_time.is_none());
@@ -568,6 +589,39 @@ mod tests {
             "expected 'unknown' fallback for missing receipt: {reasons:?}"
         );
         assert_eq!(reasons["unknown"], 1);
+    }
+
+    /// Finding 4 regression: malformed `.json` files must NOT inflate the
+    /// job count. They must be tracked separately in the `malformed` field.
+    #[test]
+    fn test_scan_directory_counts_malformed_separately() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir_path = tmp.path().join("pending");
+        fs::create_dir_all(&dir_path).unwrap();
+
+        // One valid job spec.
+        let spec = make_test_spec("valid-job", "2026-02-15T10:00:00Z");
+        let json = serde_json::to_string_pretty(&spec).unwrap();
+        fs::write(dir_path.join("valid-job.json"), &json).unwrap();
+
+        // One malformed .json file (invalid JSON).
+        fs::write(dir_path.join("corrupt.json"), b"not valid json").unwrap();
+
+        // One .json file with valid JSON but wrong schema.
+        fs::write(dir_path.join("wrong-schema.json"), b"{\"foo\": \"bar\"}").unwrap();
+
+        let status = scan_directory(&dir_path, "pending");
+        // Only the valid job spec should be counted.
+        assert_eq!(
+            status.count, 1,
+            "only valid specs should be counted as jobs"
+        );
+        // The two malformed entries should be tracked separately.
+        assert_eq!(
+            status.malformed, 2,
+            "malformed .json files must be tracked separately"
+        );
+        assert_eq!(status.oldest_job_id.as_deref(), Some("valid-job"));
     }
 
     /// Create a minimal test job spec for unit tests.
