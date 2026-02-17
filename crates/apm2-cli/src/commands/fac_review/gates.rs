@@ -48,7 +48,14 @@ const BALANCED_MAX_PARALLELISM: u32 = 16;
 const CONSERVATIVE_PARALLELISM: u32 = 2;
 const DEFAULT_GATES_WAIT_TIMEOUT_SECS: u64 = 1200;
 const GATES_WAIT_POLL_INTERVAL_SECS: u64 = 5;
+const INLINE_WORKER_POLL_INTERVAL_SECS: u64 = 1;
 const GATES_QUEUE_LANE: &str = "consume";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueProcessingMode {
+    ExternalWorker,
+    InlineSingleJob,
+}
 
 /// Throughput profile for bounded FAC gate execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
@@ -246,6 +253,14 @@ fn run_gates_via_worker(
             );
         },
     };
+    if !wait && !has_live_worker_heartbeat(&fac_root) {
+        return output_worker_enqueue_error(
+            json_output,
+            "cannot run fac gates with --no-wait when no active FAC worker is detected \
+             (stale/missing heartbeat). Start `apm2 fac worker` or run with wait mode.",
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
     let boundary_id = apm2_core::fac::load_or_default_boundary_id(&fac_root)
         .unwrap_or_else(|_| "local".to_string());
     let mut broker = match init_broker(&fac_root, &boundary_id) {
@@ -504,7 +519,60 @@ fn wait_for_gates_job_receipt(
                 )),
             };
         }
-        std::thread::sleep(Duration::from_secs(GATES_WAIT_POLL_INTERVAL_SECS));
+        match detect_queue_processing_mode(fac_root) {
+            QueueProcessingMode::ExternalWorker => {
+                std::thread::sleep(Duration::from_secs(GATES_WAIT_POLL_INTERVAL_SECS));
+            },
+            QueueProcessingMode::InlineSingleJob => {
+                run_inline_worker_cycle()?;
+            },
+        }
+    }
+}
+
+fn detect_queue_processing_mode(fac_root: &Path) -> QueueProcessingMode {
+    if has_live_worker_heartbeat(fac_root) {
+        QueueProcessingMode::ExternalWorker
+    } else {
+        QueueProcessingMode::InlineSingleJob
+    }
+}
+
+fn has_live_worker_heartbeat(fac_root: &Path) -> bool {
+    let heartbeat = apm2_core::fac::worker_heartbeat::read_heartbeat(fac_root);
+    if !heartbeat.found || !heartbeat.fresh || heartbeat.pid == 0 {
+        return false;
+    }
+    if heartbeat.pid == std::process::id() {
+        return false;
+    }
+    is_pid_running(heartbeat.pid)
+}
+
+#[cfg(target_os = "linux")]
+fn is_pid_running(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).is_dir()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_pid_running(pid: u32) -> bool {
+    pid > 0
+}
+
+fn run_inline_worker_cycle() -> Result<(), String> {
+    let code = crate::commands::fac_worker::run_fac_worker(
+        true,
+        INLINE_WORKER_POLL_INTERVAL_SECS,
+        1,
+        false,
+        false,
+    );
+    if code == exit_codes::SUCCESS {
+        Ok(())
+    } else {
+        Err(format!(
+            "inline FAC worker cycle failed with exit code {code}"
+        ))
     }
 }
 
@@ -1106,6 +1174,81 @@ mod tests {
         assert!(balanced.test_parallelism >= 1);
         assert!(balanced.test_parallelism <= host);
         assert!(balanced.test_parallelism <= BALANCED_MAX_PARALLELISM.min(host));
+    }
+
+    #[test]
+    fn detect_queue_processing_mode_defaults_inline_without_heartbeat() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            detect_queue_processing_mode(temp.path()),
+            QueueProcessingMode::InlineSingleJob
+        );
+    }
+
+    #[test]
+    fn has_live_worker_heartbeat_rejects_self_pid() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let heartbeat = serde_json::json!({
+            "schema": apm2_core::fac::worker_heartbeat::HEARTBEAT_SCHEMA,
+            "pid": std::process::id(),
+            "timestamp_epoch_secs": now,
+            "cycle_count": 1,
+            "jobs_completed": 0,
+            "jobs_denied": 0,
+            "jobs_quarantined": 0,
+            "health_status": "healthy",
+        });
+        fs::write(
+            temp.path()
+                .join(apm2_core::fac::worker_heartbeat::HEARTBEAT_FILENAME),
+            serde_json::to_vec_pretty(&heartbeat).expect("serialize heartbeat"),
+        )
+        .expect("write heartbeat");
+
+        assert!(!has_live_worker_heartbeat(temp.path()));
+        assert_eq!(
+            detect_queue_processing_mode(temp.path()),
+            QueueProcessingMode::InlineSingleJob
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn has_live_worker_heartbeat_accepts_foreign_live_pid() {
+        if !Path::new("/proc/1").is_dir() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let heartbeat = serde_json::json!({
+            "schema": apm2_core::fac::worker_heartbeat::HEARTBEAT_SCHEMA,
+            "pid": 1_u32,
+            "timestamp_epoch_secs": now,
+            "cycle_count": 7,
+            "jobs_completed": 3,
+            "jobs_denied": 0,
+            "jobs_quarantined": 0,
+            "health_status": "healthy",
+        });
+        fs::write(
+            temp.path()
+                .join(apm2_core::fac::worker_heartbeat::HEARTBEAT_FILENAME),
+            serde_json::to_vec_pretty(&heartbeat).expect("serialize heartbeat"),
+        )
+        .expect("write heartbeat");
+
+        assert!(has_live_worker_heartbeat(temp.path()));
+        assert_eq!(
+            detect_queue_processing_mode(temp.path()),
+            QueueProcessingMode::ExternalWorker
+        );
     }
 
     #[test]

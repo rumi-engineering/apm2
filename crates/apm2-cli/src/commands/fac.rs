@@ -387,11 +387,15 @@ pub struct GatesArgs {
     #[arg(long, default_value_t = false)]
     pub json: bool,
 
-    /// Wait for queued gates job completion.
-    #[arg(long, default_value_t = false)]
+    /// Wait for queued gates job completion (default).
+    #[arg(long, default_value_t = true)]
     pub wait: bool,
 
-    /// Maximum wait time in seconds when `--wait` is enabled.
+    /// Disable wait mode and return immediately after enqueue.
+    #[arg(long, default_value_t = false, conflicts_with = "wait")]
+    pub no_wait: bool,
+
+    /// Maximum wait time in seconds when wait mode is enabled.
     #[arg(long, default_value_t = 1200)]
     pub wait_timeout_secs: u64,
 }
@@ -2056,7 +2060,7 @@ pub fn run_fac(
             &args.cpu_quota,
             args.gate_profile,
             resolve_json(args.json),
-            args.wait,
+            args.wait && !args.no_wait,
             args.wait_timeout_secs,
         ),
         FacSubcommand::Preflight(args) => match &args.subcommand {
@@ -6081,7 +6085,8 @@ mod tests {
                     fac_review::GateThroughputProfile::Throughput
                 );
                 assert_eq!(args.cpu_quota, "auto");
-                assert!(!args.wait);
+                assert!(args.wait);
+                assert!(!args.no_wait);
                 assert_eq!(args.wait_timeout_secs, 1200);
             },
             other => panic!("expected gates subcommand, got {other:?}"),
@@ -6101,7 +6106,21 @@ mod tests {
         match parsed.subcommand {
             FacSubcommand::Gates(args) => {
                 assert!(args.wait);
+                assert!(!args.no_wait);
                 assert_eq!(args.wait_timeout_secs, 90);
+            },
+            other => panic!("expected gates subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_gates_no_wait_flag_parse() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "gates", "--no-wait"])
+            .expect("gates parser should accept --no-wait");
+        match parsed.subcommand {
+            FacSubcommand::Gates(args) => {
+                assert!(args.wait);
+                assert!(args.no_wait);
             },
             other => panic!("expected gates subcommand, got {other:?}"),
         }
