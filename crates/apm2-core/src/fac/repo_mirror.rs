@@ -42,6 +42,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use super::flock_util;
@@ -68,6 +69,24 @@ pub const MAX_PATCH_SIZE: usize = 10_485_760;
 pub const MAX_RECEIPT_REFS: usize = 4096;
 /// Maximum number of allowed URL patterns in a mirror policy (DoS bound).
 pub const MAX_ALLOWED_URL_PATTERNS: usize = 256;
+
+/// Maximum allowed length for receipt `mirror_path` string field (DoS bound).
+pub const MAX_RECEIPT_MIRROR_PATH_LENGTH: usize = 4096;
+/// Maximum allowed length for receipt `operation` string field (DoS bound).
+pub const MAX_RECEIPT_OPERATION_LENGTH: usize = 64;
+/// Maximum allowed length for receipt `failure_reason` string field (DoS
+/// bound).
+pub const MAX_RECEIPT_FAILURE_REASON_LENGTH: usize = 4096;
+
+/// Maximum byte-size cap for git command stdout (DoS bound, CTR-1603).
+///
+/// Applied to both `git_command` and `git_command_with_timeout` to prevent
+/// unbounded memory consumption from git processes producing large output.
+const GIT_STDOUT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Default timeout for bounded git commands that do not need a long-running
+/// fetch/clone timeout (e.g., `git show-ref`, `git rev-parse`).
+const GIT_COMMAND_DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Default wall-clock timeout for git fetch operations (seconds).
 ///
@@ -187,11 +206,25 @@ pub struct MirrorUpdateReceiptV1 {
 
 impl MirrorUpdateReceiptV1 {
     /// Verify that the receipt is structurally valid.
+    ///
+    /// Validates both collection sizes and string field lengths to prevent
+    /// memory exhaustion from oversized deserialized receipts (S-5).
     pub fn is_valid(&self) -> bool {
         self.schema == MIRROR_UPDATE_RECEIPT_SCHEMA
             && !self.repo_id.is_empty()
+            && self.repo_id.len() <= MAX_REPO_ID_LENGTH
             && !self.mirror_path.is_empty()
+            && self.mirror_path.len() <= MAX_RECEIPT_MIRROR_PATH_LENGTH
             && !self.operation.is_empty()
+            && self.operation.len() <= MAX_RECEIPT_OPERATION_LENGTH
+            && self
+                .failure_reason
+                .as_ref()
+                .is_none_or(|r| r.len() <= MAX_RECEIPT_FAILURE_REASON_LENGTH)
+            && self
+                .remote_url
+                .as_ref()
+                .is_none_or(|u| u.len() <= MAX_RECEIPT_MIRROR_PATH_LENGTH)
             && self.refs_before.len() <= MAX_RECEIPT_REFS
             && self.refs_after.len() <= MAX_RECEIPT_REFS
     }
@@ -448,6 +481,13 @@ impl RepoMirrorManager {
         let mirror_path = self.mirror_path(repo_id);
         ensure_dir_mode_0700(&self.mirror_root)?;
 
+        // S-2: Validate symlink components BEFORE any I/O (including
+        // snapshot_refs) to prevent git commands running against a symlink
+        // target before the validation check fires.
+        if mirror_path.exists() {
+            validate_no_symlinks_in_path(&mirror_path)?;
+        }
+
         // Acquire exclusive lock before any mirror mutation.
         let _lock_guard = self.acquire_mirror_lock(repo_id)?;
 
@@ -526,6 +566,20 @@ impl RepoMirrorManager {
                 },
                 None => {
                     if mirror_has_remote(mirror_path)? {
+                        // CQ-1: When remote_url is None, read the existing
+                        // origin URL and validate it against the policy
+                        // allowlist before fetching. Fail closed if the URL
+                        // is absent or out-of-policy.
+                        let existing_url = get_remote_origin_url(mirror_path)?;
+                        validate_remote_url(&existing_url)?;
+                        if !self.policy.is_url_allowed(&existing_url) {
+                            return Err(RepoMirrorError::PolicyDenied {
+                                reason: format!(
+                                    "existing origin URL '{existing_url}' does not match \
+                                     any allowed pattern in mirror policy"
+                                ),
+                            });
+                        }
                         git_fetch_bounded(mirror_path, self.policy.effective_fetch_timeout())?;
                         Ok("fetch".to_string())
                     } else {
@@ -647,7 +701,9 @@ impl RepoMirrorManager {
             },
         )?;
         let actual_sha = actual_sha.trim().to_string();
-        if actual_sha != head_sha {
+        // S-3 / INV-PC-001: Use constant-time comparison for SHA digests
+        // to prevent timing side-channel leakage of expected values.
+        if !constant_time_str_eq(&actual_sha, head_sha) {
             return Err(RepoMirrorError::ShaMismatch {
                 expected: head_sha.to_string(),
                 actual: actual_sha,
@@ -714,7 +770,9 @@ impl RepoMirrorManager {
         let outcome = self.apply_patch(lane_workspace, patch_bytes)?;
 
         // Step 3: Verify digest binding
-        if outcome.patch_digest != patch_digest {
+        // S-3 / INV-PC-001: Use constant-time comparison for cryptographic
+        // digests to prevent timing side-channel leakage.
+        if !constant_time_str_eq(&outcome.patch_digest, &patch_digest) {
             return Err(RepoMirrorError::PatchApplyFailed {
                 reason: format!(
                     "patch digest mismatch after apply: expected {patch_digest}, got {}",
@@ -827,34 +885,55 @@ impl RepoMirrorManager {
 // Filesystem helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// S-4: Use `symlink_metadata` instead of `path.exists()` to avoid TOCTOU and
+/// symlink-following. If the path exists and is a symlink, we refuse it.
 #[cfg(unix)]
 fn ensure_dir_mode_0700(path: &Path) -> Result<(), RepoMirrorError> {
-    if path.exists() {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .map_err(RepoMirrorError::Io)?;
-        return Ok(());
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            // Refuse symlinks — fail-closed (S-4).
+            if meta.file_type().is_symlink() {
+                return Err(RepoMirrorError::SymlinkInPath {
+                    reason: format!("directory path is a symlink: {}", path.display()),
+                });
+            }
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .map_err(RepoMirrorError::Io)?;
+            Ok(())
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .map_err(RepoMirrorError::Io),
+        Err(e) => Err(RepoMirrorError::Io(e)),
     }
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-        .map_err(RepoMirrorError::Io)
 }
 
 #[cfg(not(unix))]
 fn ensure_dir_mode_0700(path: &Path) -> Result<(), RepoMirrorError> {
-    if path.exists() {
-        return Ok(());
+    match std::fs::symlink_metadata(path) {
+        Ok(_meta) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path).map_err(RepoMirrorError::Io)
+        },
+        Err(e) => Err(RepoMirrorError::Io(e)),
     }
-    std::fs::create_dir_all(path).map_err(RepoMirrorError::Io)
 }
 
 /// Open (or create) a lock file with restrictive permissions.
+///
+/// S-4: Uses `O_NOFOLLOW` on Unix to refuse opening symlinks, preventing
+/// symlink-based attacks on the lock file path.
 fn open_lock_file(path: &Path) -> Result<File, RepoMirrorError> {
     let mut opts = OpenOptions::new();
     opts.read(true).write(true).create(true);
     #[cfg(unix)]
-    opts.mode(0o600);
+    {
+        opts.mode(0o600);
+        // O_NOFOLLOW: refuse to open if path is a symlink (S-4).
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
     opts.open(path).map_err(|e| RepoMirrorError::LockFailed {
         reason: format!("cannot open lock file {}: {e}", path.display()),
     })
@@ -905,9 +984,11 @@ fn validate_no_symlinks_in_path(path: &Path) -> Result<(), RepoMirrorError> {
 
 /// Snapshot all refs in a bare mirror via `git show-ref`.
 ///
-/// Returns a map of ref-name -> SHA. The output is bounded by
-/// `MAX_RECEIPT_REFS` to prevent DoS from repositories with an extremely
-/// large number of refs.
+/// Returns a map of ref-name -> SHA. The output is double-bounded:
+/// 1. **Byte cap**: `git_command` delegates to `git_command_with_timeout` which
+///    caps stdout at `GIT_STDOUT_MAX_BYTES` (4 MiB) — preventing OOM from repos
+///    with millions of refs (S-1, CQ-2).
+/// 2. **Entry cap**: Only the first `MAX_RECEIPT_REFS` lines are parsed.
 fn snapshot_refs(mirror_path: &Path) -> Result<HashMap<String, String>, RepoMirrorError> {
     let output = git_command(
         &["-C", mirror_path.to_string_lossy().as_ref(), "show-ref"],
@@ -945,35 +1026,18 @@ fn snapshot_refs(mirror_path: &Path) -> Result<HashMap<String, String>, RepoMirr
 // Git command helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// S-1 / CTR-1603: All git command stdout reads are bounded to
+/// `GIT_STDOUT_MAX_BYTES` to prevent OOM from commands producing
+/// unexpectedly large output (e.g., `git show-ref` on repos with
+/// millions of refs).
+///
+/// Delegates to `git_command_with_timeout` with `GIT_COMMAND_DEFAULT_TIMEOUT`.
 fn git_command(
     args: &[&str],
     cwd: Option<&Path>,
     make_error: impl Fn(&str) -> RepoMirrorError,
 ) -> Result<String, RepoMirrorError> {
-    let mut cmd = Command::new("git");
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-    cmd.args(args);
-
-    let output = cmd
-        .output()
-        .map_err(|e| make_error(&format!("failed to spawn git: {e}")))?;
-
-    if !output.status.success() {
-        let mut reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if reason.is_empty() {
-            reason = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        }
-        if reason.is_empty() {
-            reason = "git command failed with no output".to_string();
-        }
-        return Err(make_error(&reason));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    git_command_with_timeout(args, cwd, GIT_COMMAND_DEFAULT_TIMEOUT, make_error)
 }
 
 /// Run a git command with a wall-clock timeout using `Instant` (monotonic).
@@ -1014,8 +1078,9 @@ fn git_command_with_timeout(
                     .take()
                     .map(|mut r| {
                         let mut buf = Vec::new();
-                        // Bounded read: at most 4 MiB of stdout.
-                        let _ = std::io::Read::take(&mut r, 4 * 1024 * 1024).read_to_end(&mut buf);
+                        // Bounded read: at most GIT_STDOUT_MAX_BYTES of stdout (S-1).
+                        let _ =
+                            std::io::Read::take(&mut r, GIT_STDOUT_MAX_BYTES).read_to_end(&mut buf);
                         buf
                     })
                     .unwrap_or_default();
@@ -1024,7 +1089,8 @@ fn git_command_with_timeout(
                     .take()
                     .map(|mut r| {
                         let mut buf = Vec::new();
-                        let _ = std::io::Read::take(&mut r, 4 * 1024 * 1024).read_to_end(&mut buf);
+                        let _ =
+                            std::io::Read::take(&mut r, GIT_STDOUT_MAX_BYTES).read_to_end(&mut buf);
                         buf
                     })
                     .unwrap_or_default();
@@ -1265,6 +1331,48 @@ fn git_clone_bare_bounded(
         },
     )
     .map(|_| ())
+}
+
+/// Read the existing `remote.origin.url` from a mirror's git config.
+///
+/// Used by CQ-1 to validate existing origin URLs against policy when
+/// `remote_url` is `None`.
+fn get_remote_origin_url(mirror_path: &Path) -> Result<String, RepoMirrorError> {
+    let url = git_command(
+        &[
+            "-C",
+            mirror_path.to_string_lossy().as_ref(),
+            "remote",
+            "get-url",
+            "origin",
+        ],
+        None,
+        |reason| RepoMirrorError::MirrorInitFailed {
+            reason: format!("failed to read origin URL: {reason}"),
+        },
+    )?;
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err(RepoMirrorError::PolicyDenied {
+            reason: "existing origin URL is empty; cannot validate against policy".to_string(),
+        });
+    }
+    Ok(url)
+}
+
+/// S-3 / INV-PC-001: Constant-time string comparison for cryptographic
+/// digests and SHA values.
+///
+/// Decodes both hex strings to bytes and compares using
+/// `subtle::ConstantTimeEq::ct_eq` to prevent timing side-channel leakage.
+/// Falls back to byte-level constant-time comparison on the raw UTF-8 bytes
+/// if hex decoding fails (e.g., for prefixed digest strings like "b3-256:...").
+fn constant_time_str_eq(a: &str, b: &str) -> bool {
+    // Fast reject: different lengths cannot be equal, and length is not secret.
+    if a.len() != b.len() {
+        return false;
+    }
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 fn validate_remote_url(remote_url: &str) -> Result<(), RepoMirrorError> {
@@ -2291,5 +2399,201 @@ mod tests {
         };
         assert_eq!(custom.effective_fetch_timeout(), Duration::from_secs(60));
         assert_eq!(custom.effective_clone_timeout(), Duration::from_secs(120));
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix round 1: Regression tests for S-1..S-5, CQ-1, CQ-2
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_constant_time_str_eq_matching() {
+        assert!(constant_time_str_eq("abc", "abc"));
+        assert!(constant_time_str_eq("", ""));
+        assert!(!constant_time_str_eq("abc", "abd"));
+        assert!(!constant_time_str_eq("abc", "ab"));
+        assert!(!constant_time_str_eq("ab", "abc"));
+    }
+
+    #[test]
+    fn test_constant_time_str_eq_hex_digests() {
+        let digest_a = format!("b3-256:{}", blake3::hash(b"hello").to_hex());
+        let digest_b = format!("b3-256:{}", blake3::hash(b"hello").to_hex());
+        let digest_c = format!("b3-256:{}", blake3::hash(b"world").to_hex());
+
+        assert!(constant_time_str_eq(&digest_a, &digest_b));
+        assert!(!constant_time_str_eq(&digest_a, &digest_c));
+    }
+
+    #[test]
+    fn test_receipt_rejects_oversized_repo_id() {
+        let receipt = MirrorUpdateReceiptV1 {
+            schema: MIRROR_UPDATE_RECEIPT_SCHEMA.to_string(),
+            repo_id: "x".repeat(MAX_REPO_ID_LENGTH + 1),
+            remote_url: None,
+            mirror_path: "/tmp/mirror/test.git".to_string(),
+            refs_before: HashMap::new(),
+            refs_after: HashMap::new(),
+            success: true,
+            operation: "clone".to_string(),
+            duration_ms: 0,
+            failure_reason: None,
+        };
+        assert!(
+            !receipt.is_valid(),
+            "oversized repo_id should fail is_valid"
+        );
+    }
+
+    #[test]
+    fn test_receipt_rejects_oversized_mirror_path() {
+        let receipt = MirrorUpdateReceiptV1 {
+            schema: MIRROR_UPDATE_RECEIPT_SCHEMA.to_string(),
+            repo_id: "test".to_string(),
+            remote_url: None,
+            mirror_path: "x".repeat(MAX_RECEIPT_MIRROR_PATH_LENGTH + 1),
+            refs_before: HashMap::new(),
+            refs_after: HashMap::new(),
+            success: true,
+            operation: "clone".to_string(),
+            duration_ms: 0,
+            failure_reason: None,
+        };
+        assert!(
+            !receipt.is_valid(),
+            "oversized mirror_path should fail is_valid"
+        );
+    }
+
+    #[test]
+    fn test_receipt_rejects_oversized_operation() {
+        let receipt = MirrorUpdateReceiptV1 {
+            schema: MIRROR_UPDATE_RECEIPT_SCHEMA.to_string(),
+            repo_id: "test".to_string(),
+            remote_url: None,
+            mirror_path: "/tmp/mirror/test.git".to_string(),
+            refs_before: HashMap::new(),
+            refs_after: HashMap::new(),
+            success: true,
+            operation: "x".repeat(MAX_RECEIPT_OPERATION_LENGTH + 1),
+            duration_ms: 0,
+            failure_reason: None,
+        };
+        assert!(
+            !receipt.is_valid(),
+            "oversized operation should fail is_valid"
+        );
+    }
+
+    #[test]
+    fn test_receipt_rejects_oversized_failure_reason() {
+        let receipt = MirrorUpdateReceiptV1 {
+            schema: MIRROR_UPDATE_RECEIPT_SCHEMA.to_string(),
+            repo_id: "test".to_string(),
+            remote_url: None,
+            mirror_path: "/tmp/mirror/test.git".to_string(),
+            refs_before: HashMap::new(),
+            refs_after: HashMap::new(),
+            success: false,
+            operation: "error".to_string(),
+            duration_ms: 0,
+            failure_reason: Some("x".repeat(MAX_RECEIPT_FAILURE_REASON_LENGTH + 1)),
+        };
+        assert!(
+            !receipt.is_valid(),
+            "oversized failure_reason should fail is_valid"
+        );
+    }
+
+    #[test]
+    fn test_receipt_rejects_oversized_remote_url() {
+        let receipt = MirrorUpdateReceiptV1 {
+            schema: MIRROR_UPDATE_RECEIPT_SCHEMA.to_string(),
+            repo_id: "test".to_string(),
+            remote_url: Some("x".repeat(MAX_RECEIPT_MIRROR_PATH_LENGTH + 1)),
+            mirror_path: "/tmp/mirror/test.git".to_string(),
+            refs_before: HashMap::new(),
+            refs_after: HashMap::new(),
+            success: true,
+            operation: "clone".to_string(),
+            duration_ms: 0,
+            failure_reason: None,
+        };
+        assert!(
+            !receipt.is_valid(),
+            "oversized remote_url should fail is_valid"
+        );
+    }
+
+    #[test]
+    fn test_policy_none_path_validates_existing_origin() {
+        // CQ-1: When remote_url is None and policy is restrictive, the
+        // existing origin URL must be validated against the policy.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_repo = temp.path().join("source_repo");
+        let _head_sha = create_git_repo_with_commit(&source_repo, "README.md", "hello");
+
+        let local_url = source_repo.to_string_lossy().to_string();
+
+        // First, clone with default (permissive) policy so mirror exists.
+        let fac_root = temp.path().join("private").join("fac");
+        let permissive_mgr = RepoMirrorManager::new(&fac_root);
+        let (_path, receipt) = permissive_mgr
+            .ensure_mirror("sample", Some(&local_url))
+            .expect("ensure mirror with permissive policy");
+        assert!(receipt.success);
+        assert_eq!(receipt.operation, "clone");
+
+        // Now create a restrictive policy that does NOT allow the local URL.
+        let strict_policy = MirrorPolicy {
+            allowed_url_patterns: vec!["https://github.com/only-this/".to_string()],
+            fetch_timeout_secs: 300,
+            clone_timeout_secs: 600,
+        };
+        let strict_mgr =
+            RepoMirrorManager::with_policy(&fac_root, strict_policy).expect("strict policy");
+
+        // Calling ensure_mirror with None should fail because the existing
+        // origin URL does not match the strict policy.
+        let result = strict_mgr.ensure_mirror("sample", None);
+        assert!(
+            matches!(result, Err(RepoMirrorError::PolicyDenied { .. })),
+            "expected PolicyDenied for existing origin URL, got: {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_lock_file_refuses_symlink() {
+        // S-4: open_lock_file must refuse symlinks via O_NOFOLLOW.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real_file = temp.path().join("real.lock");
+        fs::write(&real_file, b"").expect("create real file");
+
+        let symlink_file = temp.path().join("symlink.lock");
+        symlink(&real_file, &symlink_file).expect("create symlink");
+
+        let result = open_lock_file(&symlink_file);
+        assert!(
+            result.is_err(),
+            "open_lock_file should refuse symlinks: {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_ensure_dir_mode_0700_refuses_symlink() {
+        // S-4: ensure_dir_mode_0700 must refuse symlinks.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real_dir = temp.path().join("real_dir");
+        fs::create_dir_all(&real_dir).expect("create real dir");
+
+        let symlink_dir = temp.path().join("symlink_dir");
+        symlink(&real_dir, &symlink_dir).expect("create symlink");
+
+        let result = ensure_dir_mode_0700(&symlink_dir);
+        assert!(
+            matches!(result, Err(RepoMirrorError::SymlinkInPath { .. })),
+            "ensure_dir_mode_0700 should refuse symlinks: {result:?}"
+        );
     }
 }
