@@ -15,11 +15,11 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use super::dispatch::dispatch_single_review;
-use super::evidence::{
-    EvidenceGateOptions, EvidenceGateResult, LANE_EVIDENCE_GATES, run_evidence_gates,
-    run_evidence_gates_with_status,
-};
+use super::evidence::{EvidenceGateResult, LANE_EVIDENCE_GATES};
 use super::gate_cache::GateCache;
+#[cfg(test)]
+use super::gates::QueuedGatesOutcome;
+use super::gates::{GateThroughputProfile, QueuedGatesRequest, run_queued_gates_and_collect};
 use super::jsonl::{
     GateCompletedEvent, GateErrorEvent, StageEvent, emit_jsonl, read_log_error_hint, ts_now,
 };
@@ -40,6 +40,11 @@ const RETRY_BACKOFF_BASE_MS: u64 = 0;
 const RETRY_BACKOFF_MAX_MS: u64 = 2_000;
 #[cfg(test)]
 const RETRY_BACKOFF_MAX_MS: u64 = 0;
+const PUSH_QUEUE_GATES_TIMEOUT_SECONDS: u64 = 600;
+const PUSH_QUEUE_GATES_MEMORY_MAX: &str = "48G";
+const PUSH_QUEUE_GATES_PIDS_MAX: u64 = 1536;
+const PUSH_QUEUE_GATES_CPU_QUOTA: &str = "auto";
+const PUSH_QUEUE_GATES_WAIT_TIMEOUT_SECS: u64 = 1200;
 
 /// Extract `TCK-xxxxx` from arbitrary text.
 fn extract_tck_from_text(input: &str) -> Option<String> {
@@ -387,84 +392,58 @@ where
 fn run_blocking_evidence_gates(
     workspace_root: &Path,
     sha: &str,
-    owner_repo: &str,
-    pr_number: Option<u32>,
-    emit_human_logs: bool,
+    _owner_repo: &str,
+    _pr_number: Option<u32>,
+    _emit_human_logs: bool,
 ) -> Result<Vec<EvidenceGateResult>, String> {
-    run_blocking_evidence_gates_with(
-        workspace_root,
-        sha,
-        owner_repo,
-        pr_number,
-        |workspace_root, sha, owner_repo, pr_number| {
-            pr_number.map_or_else(
-                || {
-                    let opts = EvidenceGateOptions {
-                        test_command: None,
-                        test_command_environment: Vec::new(),
-                        env_remove_keys: Vec::new(),
-                        skip_test_gate: false,
-                        skip_merge_conflict_gate: false,
-                        emit_human_logs,
-                        on_gate_progress: None,
-                    };
-                    run_evidence_gates(workspace_root, sha, None, Some(&opts))
-                },
-                |pr_number| {
-                    run_evidence_gates_with_status(
-                        workspace_root,
-                        sha,
-                        owner_repo,
-                        pr_number,
-                        None,
-                        emit_human_logs,
-                        None,
-                    )
-                },
-            )
-        },
-    )
+    let request = QueuedGatesRequest {
+        force: false,
+        quick: false,
+        timeout_seconds: PUSH_QUEUE_GATES_TIMEOUT_SECONDS,
+        memory_max: PUSH_QUEUE_GATES_MEMORY_MAX.to_string(),
+        pids_max: PUSH_QUEUE_GATES_PIDS_MAX,
+        cpu_quota: PUSH_QUEUE_GATES_CPU_QUOTA.to_string(),
+        gate_profile: GateThroughputProfile::Throughput,
+        wait_timeout_secs: PUSH_QUEUE_GATES_WAIT_TIMEOUT_SECS,
+        require_external_worker: true,
+    };
+    let outcome = run_queued_gates_and_collect(&request)?;
+    if outcome.job_id.trim().is_empty() {
+        return Err("queued gates returned empty job_id".to_string());
+    }
+    if !outcome.head_sha.eq_ignore_ascii_case(sha) {
+        return Err(format!(
+            "queued gates completed for unexpected sha (requested={sha}, actual={})",
+            outcome.head_sha
+        ));
+    }
+    validate_gate_results_for_pass(workspace_root, sha, &outcome.gate_results)?;
+    Ok(outcome.gate_results)
 }
 
+#[cfg(test)]
 fn run_blocking_evidence_gates_with<F>(
     workspace_root: &Path,
     sha: &str,
     owner_repo: &str,
     pr_number: Option<u32>,
-    mut run_with_status_fn: F,
+    mut run_queued_gates_fn: F,
 ) -> Result<Vec<EvidenceGateResult>, String>
 where
-    F: FnMut(&Path, &str, &str, Option<u32>) -> Result<(bool, Vec<EvidenceGateResult>), String>,
+    F: FnMut(&Path, &str, &str, Option<u32>) -> Result<QueuedGatesOutcome, String>,
 {
-    let (passed, mut gate_results) =
-        run_with_status_fn(workspace_root, sha, owner_repo, pr_number)?;
-
-    if passed {
-        validate_gate_results_for_pass(workspace_root, sha, &gate_results)?;
-        return Ok(gate_results);
+    let outcome = run_queued_gates_fn(workspace_root, sha, owner_repo, pr_number)?;
+    if outcome.job_id.trim().is_empty() {
+        return Err("queued gates returned empty job_id".to_string());
     }
-
-    let failed_gates = gate_results
-        .iter()
-        .filter(|result| !result.passed)
-        .map(|result| result.gate_name.as_str())
-        .collect::<Vec<_>>();
-    let failed_summary = if failed_gates.is_empty() {
-        "unknown".to_string()
-    } else {
-        failed_gates.join(",")
-    };
-    if gate_results.is_empty() {
-        gate_results.push(EvidenceGateResult {
-            gate_name: "unknown".to_string(),
-            passed: false,
-            duration_secs: 0,
-            ..Default::default()
-        });
+    if !outcome.head_sha.eq_ignore_ascii_case(sha) {
+        return Err(format!(
+            "queued gates completed for unexpected sha (requested={sha}, actual={})",
+            outcome.head_sha
+        ));
     }
-    Err(format!(
-        "evidence gates failed for sha={sha}; failing gates: {failed_summary}"
-    ))
+    validate_gate_results_for_pass(workspace_root, sha, &outcome.gate_results)?;
+    Ok(outcome.gate_results)
 }
 
 fn expected_gate_names_for_workspace(workspace_root: &Path) -> BTreeSet<String> {
@@ -1518,7 +1497,7 @@ pub fn run_push(
 
     let existing_pr_number = find_existing_pr(repo, &branch);
     attempt_pr_number = existing_pr_number;
-    human_log!("fac push: running evidence gates (blocking, cache-aware)");
+    human_log!("fac push: enqueuing evidence gates job (external worker, blocking)");
     emit_stage("gates_started", serde_json::json!({}));
     let gates_started = Instant::now();
     let gate_results = match run_blocking_evidence_gates(
@@ -2264,7 +2243,13 @@ mod tests {
             &sha,
             "guardian-intelligence/apm2",
             Some(615),
-            |_, _, _, _| Ok((true, results.clone())),
+            |_, _, _, _| {
+                Ok(QueuedGatesOutcome {
+                    job_id: "gates-test-pass".to_string(),
+                    head_sha: sha.clone(),
+                    gate_results: results.clone(),
+                })
+            },
         )
         .expect("pass should return reported rows");
 
@@ -2283,7 +2268,13 @@ mod tests {
             &sha,
             "guardian-intelligence/apm2",
             Some(616),
-            |_, _, _, _| Ok((true, Vec::new())),
+            |_, _, _, _| {
+                Ok(QueuedGatesOutcome {
+                    job_id: "gates-test-empty".to_string(),
+                    head_sha: sha.clone(),
+                    gate_results: Vec::new(),
+                })
+            },
         )
         .expect_err("missing gate artifacts on PASS must fail closed");
         assert!(err.contains("no gate result artifacts"));
@@ -2299,9 +2290,10 @@ mod tests {
             "guardian-intelligence/apm2",
             Some(617),
             |_, _, _, _| {
-                Ok((
-                    false,
-                    vec![
+                Ok(QueuedGatesOutcome {
+                    job_id: "gates-test-failed".to_string(),
+                    head_sha: sha.clone(),
+                    gate_results: vec![
                         EvidenceGateResult {
                             gate_name: "rustfmt".to_string(),
                             passed: false,
@@ -2315,7 +2307,7 @@ mod tests {
                             ..Default::default()
                         },
                     ],
-                ))
+                })
             },
         )
         .expect_err("failed gate should surface reported failing names");
@@ -2340,7 +2332,13 @@ mod tests {
             &sha,
             "guardian-intelligence/apm2",
             Some(618),
-            |_, _, _, _| Ok((true, results.clone())),
+            |_, _, _, _| {
+                Ok(QueuedGatesOutcome {
+                    job_id: "gates-test-pass-with-fail-row".to_string(),
+                    head_sha: sha.clone(),
+                    gate_results: results.clone(),
+                })
+            },
         )
         .expect_err("pass path must fail when reported gate row is FAIL");
         assert!(err.contains("reported gate rows include FAIL"));
@@ -2372,11 +2370,43 @@ mod tests {
             &sha,
             "guardian-intelligence/apm2",
             Some(619),
-            |_, _, _, _| Ok((true, incomplete_results.clone())),
+            |_, _, _, _| {
+                Ok(QueuedGatesOutcome {
+                    job_id: "gates-test-incomplete".to_string(),
+                    head_sha: sha.clone(),
+                    gate_results: incomplete_results.clone(),
+                })
+            },
         )
         .expect_err("pass path must fail on incomplete reported gate set");
         assert!(err.contains("required gate set"));
         assert!(err.contains("missing="));
+    }
+
+    #[test]
+    fn run_blocking_evidence_gates_with_rejects_mismatched_head_sha() {
+        let sha = "2".repeat(40);
+        let mismatch_sha = "3".repeat(40);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace_root = temp.path();
+        let results = seed_required_pass_results(workspace_root);
+
+        let err = run_blocking_evidence_gates_with(
+            workspace_root,
+            &sha,
+            "guardian-intelligence/apm2",
+            Some(620),
+            |_, _, _, _| {
+                Ok(QueuedGatesOutcome {
+                    job_id: "gates-test-sha-mismatch".to_string(),
+                    head_sha: mismatch_sha.clone(),
+                    gate_results: results.clone(),
+                })
+            },
+        )
+        .expect_err("sha mismatch must fail closed");
+        assert!(err.contains("unexpected sha"));
+        assert!(err.contains(&mismatch_sha));
     }
 
     #[test]
