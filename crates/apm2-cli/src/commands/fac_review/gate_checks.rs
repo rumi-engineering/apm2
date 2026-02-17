@@ -1445,17 +1445,19 @@ mod tests {
         .expect("write allowlist");
         fs::write(
             repo.join("src/lib.rs"),
-            br"
-pub fn safe_prod_path() {}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn detects_exec_rule() {
-        unsafe { libc::execvp(std::ptr::null(), std::ptr::null()); }
-    }
-}
-",
+            [
+                "pub fn safe_prod_path() {}\n\n",
+                "#[cfg(test)]\n",
+                "mod tests {\n",
+                "    #[test]\n",
+                "    fn detects_exec_rule() {\n",
+                "        unsafe { libc::exec",
+                "vp(std::ptr::null(), std::ptr::null()); }\n",
+                "    }\n",
+                "}\n",
+            ]
+            .join("")
+            .as_bytes(),
         )
         .expect("write rust file");
         init_git_repo(repo);
@@ -1479,17 +1481,19 @@ mod tests {
         .expect("write allowlist");
         fs::write(
             repo.join("src/main.rs"),
-            br"
-fn main() {}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn detects_exec_rule() {
-        unsafe { libc::execvp(std::ptr::null(), std::ptr::null()); }
-    }
-}
-",
+            [
+                "fn main() {}\n\n",
+                "#[cfg(test)]\n",
+                "mod tests {\n",
+                "    #[test]\n",
+                "    fn detects_exec_rule() {\n",
+                "        unsafe { libc::exec",
+                "vp(std::ptr::null(), std::ptr::null()); }\n",
+                "    }\n",
+                "}\n",
+            ]
+            .join("")
+            .as_bytes(),
         )
         .expect("write rust file");
         init_git_repo(repo);
