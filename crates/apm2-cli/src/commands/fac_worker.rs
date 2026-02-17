@@ -2186,26 +2186,52 @@ fn process_job(
     // policy continue to authorize budget decisions after a new economics
     // profile has been adopted.
     //
-    // Skip check when no admitted economics profile exists (fail-open for
-    // backwards compatibility: existing installations that have not
-    // adopted an economics profile should not break).
+    // Error handling is fail-closed by error variant:
+    // - NoAdmittedRoot: skip check (backwards compatibility for installations that
+    //   have not adopted an economics profile).
+    // - Any other error (Io, Serialization, FileTooLarge, SchemaMismatch,
+    //   UnsupportedSchemaVersion, etc.): DENY the job. Treating I/O/corruption
+    //   errors as "no root" would let an attacker bypass admission by tampering
+    //   with or removing the admitted-economics root file.
     {
         let profile_hash_str = format!("b3-256:{}", hex::encode(policy.economics_profile_hash));
         let fac_root_for_econ = fac_root;
-        if apm2_core::fac::economics_adoption::load_admitted_economics_profile_root(
-            fac_root_for_econ,
-        )
-        .is_ok()
-            && !apm2_core::fac::economics_adoption::is_economics_profile_hash_admitted(
+        let econ_load_result =
+            apm2_core::fac::economics_adoption::load_admitted_economics_profile_root(
                 fac_root_for_econ,
-                &profile_hash_str,
-            )
-        {
-            let reason = format!(
-                "economics profile hash not admitted (INV-EADOPT-004): \
-                 policy economics_profile_hash={profile_hash_str} is not \
-                 the currently admitted digest"
             );
+        let econ_denial_reason: Option<String> = match econ_load_result {
+            Ok(root) => {
+                // Root loaded successfully: constant-time compare hashes.
+                let admitted_bytes = root.admitted_profile_hash.as_bytes();
+                let check_bytes = profile_hash_str.as_bytes();
+                let matches = admitted_bytes.len() == check_bytes.len()
+                    && bool::from(admitted_bytes.ct_eq(check_bytes));
+                if matches {
+                    None // admitted -- proceed
+                } else {
+                    Some(format!(
+                        "economics profile hash not admitted (INV-EADOPT-004): \
+                         policy economics_profile_hash={profile_hash_str} is not \
+                         the currently admitted digest"
+                    ))
+                }
+            },
+            Err(apm2_core::fac::EconomicsAdoptionError::NoAdmittedRoot { .. }) => {
+                // No admitted root exists yet: backwards-compatible skip.
+                None
+            },
+            Err(load_err) => {
+                // Any other error (I/O, corruption, schema mismatch,
+                // oversized file, etc.) is fail-closed: deny the job
+                // to prevent admission bypass via root tampering.
+                Some(format!(
+                    "economics admission denied (INV-EADOPT-004, fail-closed): \
+                     cannot load admitted economics root: {load_err}"
+                ))
+            },
+        };
+        if let Some(reason) = econ_denial_reason {
             if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
                 queue_root,

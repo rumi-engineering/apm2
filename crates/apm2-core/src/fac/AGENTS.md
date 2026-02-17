@@ -1237,7 +1237,13 @@ The worker admission path includes a Step 2.6 economics profile hash check
 after the existing policy admission check (Step 2.5). The worker formats
 `policy.economics_profile_hash` as `b3-256:<hex>`, loads the admitted root, and
 denies with `DenialReasonCode::EconomicsAdmissionDenied` on mismatch.
-Backwards compatible: check is skipped when no admitted economics profile exists.
+Error handling is fail-closed by error variant:
+- `NoAdmittedRoot`: skip check (backwards compatibility for installations that
+  have not adopted an economics profile).
+- Any other load error (I/O, corruption, schema mismatch, oversized file):
+  deny the job. Treating non-`NoAdmittedRoot` errors as "no root" would allow
+  an attacker to bypass admission by tampering with the admitted-economics root
+  file (INV-EADOPT-004).
 
 ### Security Invariants (TCK-00584)
 
@@ -1249,9 +1255,12 @@ Backwards compatible: check is skipped when no admitted economics profile exists
   uses temp + rename (not `fs::copy`).
 - [INV-EADOPT-003] Rollback to `prev` is atomic and emits a receipt.
 - [INV-EADOPT-004] Workers refuse actuation tokens whose economics profile hash
-  mismatches the admitted digest (fail-closed). The worker calls
-  `is_economics_profile_hash_admitted` before processing non-control-lane jobs
-  and denies with `DenialReasonCode::EconomicsAdmissionDenied` on mismatch.
+  mismatches the admitted digest (fail-closed). The worker loads the admitted
+  root via `load_admitted_economics_profile_root` and branches on the error
+  variant: `NoAdmittedRoot` skips the check (backwards compatibility);
+  successful load triggers constant-time hash comparison; any other error
+  (I/O, corruption, schema mismatch, oversized) denies the job. This prevents
+  admission bypass via root file tampering.
 - [INV-EADOPT-005] Receipt content hash uses domain-separated BLAKE3 with
   injective length-prefix framing (CTR-2612).
 - [INV-EADOPT-006] All string fields are bounded for DoS prevention (CTR-1303).

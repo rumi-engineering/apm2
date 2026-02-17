@@ -1660,4 +1660,143 @@ mod tests {
             "should have 3 receipts (2 adopts + 1 rollback)"
         );
     }
+
+    // =================================================================
+    // Fail-closed regression tests (fix round 1: f-726-security,
+    // f-726-code_quality)
+    //
+    // These tests prove that corrupted or tampered admitted-economics root
+    // files produce hard errors distinct from NoAdmittedRoot, so the worker
+    // admission path can distinguish "root not yet adopted" (backwards-compat
+    // skip) from "root load failed" (fail-closed deny).
+    // =================================================================
+
+    /// Corrupted (non-JSON) root file must return a `Serialization` error,
+    /// NOT `NoAdmittedRoot`. This is the core regression for INV-EADOPT-004
+    /// fail-closed behavior: if the worker treated corruption as "no root",
+    /// it would bypass admission.
+    #[test]
+    fn test_load_corrupted_root_returns_serialization_error() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let broker = broker_dir(fac_root);
+        fs::create_dir_all(&broker).expect("create broker dir");
+
+        // Write garbage bytes to the admitted root path.
+        let root_path = admitted_root_path(fac_root);
+        fs::write(&root_path, b"THIS IS NOT JSON").expect("write corrupted root");
+
+        let result = load_admitted_economics_profile_root(fac_root);
+        assert!(
+            matches!(result, Err(EconomicsAdoptionError::Serialization { .. })),
+            "corrupted root must return Serialization error, got: {result:?}"
+        );
+    }
+
+    /// Truncated JSON root file must return a Serialization error.
+    #[test]
+    fn test_load_truncated_root_returns_serialization_error() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let broker = broker_dir(fac_root);
+        fs::create_dir_all(&broker).expect("create broker dir");
+
+        // Write truncated JSON.
+        let root_path = admitted_root_path(fac_root);
+        fs::write(&root_path, b"{\"schema\": \"apm2.fac.admitted_econ").expect("write truncated");
+
+        let result = load_admitted_economics_profile_root(fac_root);
+        assert!(
+            matches!(result, Err(EconomicsAdoptionError::Serialization { .. })),
+            "truncated root must return Serialization error, got: {result:?}"
+        );
+    }
+
+    /// Valid JSON but wrong schema in root file must return `SchemaMismatch`.
+    #[test]
+    fn test_load_root_wrong_schema_returns_schema_mismatch() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let broker = broker_dir(fac_root);
+        fs::create_dir_all(&broker).expect("create broker dir");
+
+        let bad_root = AdmittedEconomicsProfileRootV1 {
+            schema: "attacker.injected.schema".to_string(),
+            schema_version: "1.0.0".to_string(),
+            admitted_profile_hash: "b3-256:aa".to_string(),
+            adopted_at_unix_secs: 0,
+            actor_id: "test".to_string(),
+        };
+        let bytes = serde_json::to_vec_pretty(&bad_root).expect("serialize");
+        let root_path = admitted_root_path(fac_root);
+        fs::write(&root_path, &bytes).expect("write bad-schema root");
+
+        let result = load_admitted_economics_profile_root(fac_root);
+        assert!(
+            matches!(result, Err(EconomicsAdoptionError::SchemaMismatch { .. })),
+            "wrong-schema root must return SchemaMismatch, got: {result:?}"
+        );
+    }
+
+    /// Oversized root file must return `FileTooLarge`.
+    #[test]
+    fn test_load_oversized_root_returns_file_too_large() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let broker = broker_dir(fac_root);
+        fs::create_dir_all(&broker).expect("create broker dir");
+
+        // Write a file that exceeds MAX_ADMITTED_ROOT_FILE_SIZE.
+        let root_path = admitted_root_path(fac_root);
+        let oversized = vec![b' '; MAX_ADMITTED_ROOT_FILE_SIZE + 1];
+        fs::write(&root_path, &oversized).expect("write oversized root");
+
+        let result = load_admitted_economics_profile_root(fac_root);
+        assert!(
+            matches!(result, Err(EconomicsAdoptionError::FileTooLarge { .. })),
+            "oversized root must return FileTooLarge, got: {result:?}"
+        );
+    }
+
+    /// `is_economics_profile_hash_admitted` must return false when the
+    /// root file is corrupted (not just when it is missing). This is the
+    /// regression test for the function that the worker calls.
+    #[test]
+    fn test_is_economics_profile_hash_admitted_false_on_corrupted_root() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let broker = broker_dir(fac_root);
+        fs::create_dir_all(&broker).expect("create broker dir");
+
+        // Write garbage to the root file.
+        let root_path = admitted_root_path(fac_root);
+        fs::write(&root_path, b"CORRUPTED").expect("write corrupted root");
+
+        assert!(
+            !is_economics_profile_hash_admitted(fac_root, "b3-256:aa"),
+            "corrupted root must cause admission to return false (fail-closed)"
+        );
+    }
+
+    /// Verify that the error variant from
+    /// `load_admitted_economics_profile_root` for a corrupted file is NOT
+    /// `NoAdmittedRoot`. This proves the worker can distinguish corruption
+    /// from absence and deny accordingly.
+    #[test]
+    fn test_corrupted_root_error_is_not_no_admitted_root() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let broker = broker_dir(fac_root);
+        fs::create_dir_all(&broker).expect("create broker dir");
+
+        let root_path = admitted_root_path(fac_root);
+        fs::write(&root_path, b"{}").expect("write empty JSON");
+
+        let result = load_admitted_economics_profile_root(fac_root);
+        assert!(result.is_err(), "empty JSON should fail validation");
+        assert!(
+            !matches!(result, Err(EconomicsAdoptionError::NoAdmittedRoot { .. })),
+            "empty JSON must NOT be reported as NoAdmittedRoot (would allow fail-open bypass)"
+        );
+    }
 }
