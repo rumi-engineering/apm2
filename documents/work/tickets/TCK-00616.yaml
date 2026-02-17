@@ -44,6 +44,37 @@ ticket_meta:
       drift and push-before-gates behavior must be resolved before resuming
       high-throughput orchestration.
 
+    incidents:
+      - id: "INC-2026-02-17-PR726-MERGE-PAST-DENIAL"
+        severity: "SEV-1"
+        pr: 726
+        title: "PR #726 merged despite blocking FAC security denial verdict"
+        timeline:
+          - at: "2026-02-17T19:25:50Z"
+            event: "Evidence gates pass (clippy, doc, test, rustfmt, workspace_integrity, merge_conflict_main)"
+          - at: "2026-02-17T19:28:03Z"
+            event: "PR merged by Anveio — FAC commit status not yet posted on commit"
+          - at: "2026-02-17T19:31:34Z"
+            event: "FAC security denial verdict projected as commit status failure — 3 minutes AFTER merge"
+        root_cause: |
+          Two compounding failures:
+          1. Push-before-gates ordering: code was pushed and PR became merge-eligible
+             before the security review verdict was projected as a GitHub commit status.
+             The denial arrived 3 minutes after merge had already completed.
+          2. Non-strict status policy: ruleset had `strict_required_status_checks_policy: false`,
+             which means GitHub treats absent/pending required status checks as "allow merge"
+             instead of "block merge". Since the FAC status did not exist on the commit at
+             merge time, GitHub did not block.
+        remediation_applied:
+          - at: "2026-02-17T19:40:22Z"
+            action: "Set strict_required_status_checks_policy=true on ruleset 12586011 via GitHub API"
+            effect: "Absent/pending FAC status now blocks merge. Race window closed for future PRs."
+        remaining_gap: |
+          Strict policy closes the absent-status race window, but the fundamental
+          push-before-gates ordering (S4) still means there is a window where code
+          is pushed and a PR exists before gates/review verdict is projected.
+          S4 (gates-before-push) eliminates this window entirely.
+
 scope:
   in_scope:
     - id: "S1_LOCAL_RULESET_AUTHORITATIVE"

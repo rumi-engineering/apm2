@@ -4,7 +4,17 @@ ticket_meta:
   ticket:
     id: "TCK-00613"
     title: "FAC gates architecture alignment + security hardening (throughput-profile model)"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 708
+        merge_commit: "4002520be210a75b9bf85c4b0ccde969744db507"
+        merged_at: "2026-02-17T02:32:41Z"
+      - pr: 709
+        merge_commit: "dad68b183f24301a52b67b7796bf632460fbe43c"
+        merged_at: "2026-02-17T02:44:34Z"
+      - pr: 710
+        merge_commit: "cba6a9455450b892200ab6a4685157687ffddca2"
+        merged_at: "2026-02-17T03:24:30Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

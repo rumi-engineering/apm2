@@ -4,7 +4,11 @@ ticket_meta:
   ticket:
     id: "TCK-00539"
     title: "Lane init/reconcile: create lanes, write profiles, and repair missing lane roots (operator-friendly bootstrap)"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 719
+        merge_commit: "7a86d426880884d88b0fa99fba2f1b5d439f060d"
+        merged_at: "2026-02-17T16:11:40Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

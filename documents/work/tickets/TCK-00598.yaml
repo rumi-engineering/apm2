@@ -4,7 +4,11 @@ ticket_meta:
   ticket:
     id: "TCK-00598"
     title: "Headless GitHub App auth for `apm2 fac pr` (eliminate `APM2_GITHUB_APP_ID` flakiness)"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 725
+        merge_commit: "c49a6b095b1b40a3b840ee0d8389e3e47e9aedfe"
+        merged_at: "2026-02-17T19:30:47Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

@@ -4,7 +4,14 @@ ticket_meta:
   ticket:
     id: "TCK-00576"
     title: "Signed receipts: broker/worker signature on receipts + verification tooling + gate-cache requires valid signature in default mode"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 720
+        merge_commit: "7481d4086863cd5dd66cc7aaae88b553b1b8bc1f"
+        merged_at: "2026-02-17T15:05:26Z"
+      - pr: 721
+        merge_commit: "7bb49a4bd5d70ddc22b7357b91fa3d5248a37910"
+        merged_at: "2026-02-17T15:30:49Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

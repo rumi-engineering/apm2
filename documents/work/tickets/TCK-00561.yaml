@@ -4,7 +4,11 @@ ticket_meta:
   ticket:
     id: "TCK-00561"
     title: "Policy update + adoption protocol: broker-admitted FacPolicyHash rotation with receipts + rollback"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 722
+        merge_commit: "81d8dae647a31cc002bc9a8a23a94a345325a9d7"
+        merged_at: "2026-02-17T18:16:33Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

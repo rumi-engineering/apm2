@@ -4,7 +4,11 @@ ticket_meta:
   ticket:
     id: "TCK-00573"
     title: "Job unit sandbox hardening: NoNewPrivileges, PrivateTmp, Protect*, Restrict*, safe defaults without breaking builds"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 711
+        merge_commit: "7f17f7da2906cb173f64286a28b640f679c62117"
+        merged_at: "2026-02-17T04:11:16Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

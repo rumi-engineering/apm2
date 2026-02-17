@@ -4,7 +4,11 @@ ticket_meta:
   ticket:
     id: "TCK-00564"
     title: "Receipt write pipeline: emit receipt + update index + link job state atomically (avoid torn states)"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 715
+        merge_commit: "8f13d51560622e130aa36955823d08daf57a5a03"
+        merged_at: "2026-02-17T11:41:56Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"
