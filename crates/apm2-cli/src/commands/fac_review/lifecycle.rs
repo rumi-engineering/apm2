@@ -342,6 +342,19 @@ pub(super) struct BypassLifecycleResetOutcome {
     pub current_event_seq: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct BypassRegistryRepairOutcome {
+    pub before_active_agents: usize,
+    pub after_active_agents: usize,
+    pub before_total_entries: usize,
+    pub after_total_entries: usize,
+    pub reaped_agents: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantined_registry_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_reason: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct AutoVerdictCandidate {
     owner_repo: String,
@@ -2760,6 +2773,95 @@ pub(super) fn reap_stale_agents_for_pr_bypass_hmac(
         auto_verdict_pending: auto_outcome.pending,
         auto_verdict_skipped_existing: auto_outcome.skipped_existing,
         auto_verdict_failed: auto_outcome.failed,
+    })
+}
+
+pub(super) fn repair_registry_integrity_for_pr_bypass_hmac(
+    owner_repo: &str,
+    pr_number: u32,
+    force: bool,
+) -> Result<BypassRegistryRepairOutcome, String> {
+    let (_lock, mut registry, quarantined_registry_path, quarantine_reason) = {
+        let lock = acquire_registry_lock()?;
+        let path = registry_path()?;
+        let bytes = match fs::read(&path) {
+            Ok(value) => Some(value),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(format!(
+                    "failed to read agent registry {}: {err}",
+                    path.display()
+                ));
+            },
+        };
+
+        let mut quarantined_registry_path = None;
+        let mut quarantine_reason = None;
+        let mut registry = AgentRegistry::default();
+
+        if let Some(bytes) = bytes {
+            match serde_json::from_slice::<AgentRegistry>(&bytes) {
+                Ok(parsed) if parsed.schema != AGENT_REGISTRY_SCHEMA => {
+                    if !force {
+                        return Err(format!(
+                            "unexpected agent registry schema {} at {}",
+                            parsed.schema,
+                            path.display()
+                        ));
+                    }
+                    quarantined_registry_path =
+                        quarantine_registry()?.map(|value| value.display().to_string());
+                    quarantine_reason = Some(format!(
+                        "unexpected agent registry schema {}",
+                        parsed.schema
+                    ));
+                },
+                Ok(parsed) => match verify_registry_integrity_without_rotation(&parsed) {
+                    Ok(()) => {
+                        registry = parsed;
+                    },
+                    Err(err) => {
+                        if !force {
+                            return Err(err);
+                        }
+                        quarantined_registry_path =
+                            quarantine_registry()?.map(|value| value.display().to_string());
+                        quarantine_reason = Some(err);
+                    },
+                },
+                Err(err) => {
+                    if !force {
+                        return Err(format!(
+                            "failed to parse agent registry {}: {err}",
+                            path.display()
+                        ));
+                    }
+                    quarantined_registry_path =
+                        quarantine_registry()?.map(|value| value.display().to_string());
+                    quarantine_reason = Some(format!("failed to parse agent registry: {err}"));
+                },
+            }
+        }
+
+        (lock, registry, quarantined_registry_path, quarantine_reason)
+    };
+
+    let before_total_entries = registry.entries.len();
+    let before_active_agents = active_agents_for_pr(&registry, owner_repo, pr_number);
+    let reap_result =
+        reap_registry_stale_entries_scoped(&mut registry, Some((owner_repo, pr_number)));
+    save_registry_bypass_hmac(&registry)?;
+    let after_total_entries = registry.entries.len();
+    let after_active_agents = active_agents_for_pr(&registry, owner_repo, pr_number);
+
+    Ok(BypassRegistryRepairOutcome {
+        before_active_agents,
+        after_active_agents,
+        before_total_entries,
+        after_total_entries,
+        reaped_agents: reap_result.reaped,
+        quarantined_registry_path,
+        quarantine_reason,
     })
 }
 
