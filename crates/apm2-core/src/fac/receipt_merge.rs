@@ -14,11 +14,14 @@
 //! same digest-derived filename already exists there. This is idempotent
 //! and preserves provenance — the original receipt bytes are never modified.
 //!
-//! # Deterministic Ordering
+//! # Deterministic Ordering (RFC-0019 section 8.4)
 //!
-//! Merged receipts are presented in deterministic order:
-//! - Primary sort: `timestamp_secs` descending (most recent first).
-//! - Tiebreaker: `content_hash` ascending (lexicographic).
+//! Merged receipts are presented in deterministic order per the RFC-0019
+//! ordering contract:
+//! - Primary: HTF time envelope stamp descending (when present; RFC-0016).
+//! - Fallback (when HTF is absent): `timestamp_secs` descending, then
+//!   `node_fingerprint` ascending, then `content_hash` ascending.
+//! - Receipts with HTF stamps sort before receipts without.
 //!
 //! # Audit Report
 //!
@@ -139,6 +142,10 @@ pub struct ParseFailure {
 }
 
 /// Merged receipt header for deterministic output ordering.
+///
+/// Fields support the full RFC-0019 section 8.4 ordering contract:
+/// 1. Primary: `htf_time_envelope_ns` (when present)
+/// 2. Fallback: `timestamp_secs` > `node_fingerprint` > `content_hash`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MergedReceiptHeader {
@@ -148,6 +155,18 @@ pub struct MergedReceiptHeader {
     pub job_id: String,
     /// Epoch timestamp (seconds).
     pub timestamp_secs: u64,
+    /// HTF time envelope stamp in nanoseconds (RFC-0016, TCK-00543).
+    ///
+    /// When present, this is the primary sort key for deterministic
+    /// receipt ordering per RFC-0019 section 8.4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub htf_time_envelope_ns: Option<u64>,
+    /// Node fingerprint for deterministic ordering fallback (TCK-00543).
+    ///
+    /// Second component of the fallback ordering tuple per RFC-0019
+    /// section 8.4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_fingerprint: Option<String>,
     /// Origin: "source", "target", or "both".
     pub origin: String,
 }
@@ -224,6 +243,18 @@ fn load_receipt_bounded(path: &Path) -> Result<FacJobReceiptV1, String> {
         ));
     }
     serde_json::from_slice::<FacJobReceiptV1>(&buf).map_err(|e| format!("JSON parse failed: {e}"))
+}
+
+/// Compare two optional string values in ascending order, treating
+/// `None` as greater than `Some` (receipts with a node fingerprint sort
+/// before those without).
+fn cmp_option_str_asc(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a_s), Some(b_s)) => a_s.cmp(b_s),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
 }
 
 /// Normalize a digest filename stem to canonical `b3-256:<hex>` form.
@@ -425,6 +456,7 @@ fn atomic_write_receipt(
 ///
 /// Returns `ReceiptMergeError` if directory I/O fails or scan limits are
 /// exceeded.
+#[allow(clippy::too_many_lines)] // Sequential merge pipeline with inline comparator; splitting obscures the unified ordering contract.
 pub fn merge_receipt_dirs(
     source_dir: &Path,
     target_dir: &Path,
@@ -474,6 +506,8 @@ pub fn merge_receipt_dirs(
                 content_hash: digest.clone(),
                 job_id: receipt.job_id.clone(),
                 timestamp_secs: receipt.timestamp_secs,
+                htf_time_envelope_ns: receipt.htf_time_envelope_ns,
+                node_fingerprint: receipt.node_fingerprint.clone(),
                 origin: "target".to_string(),
             },
         );
@@ -511,18 +545,56 @@ pub fn merge_receipt_dirs(
                     content_hash: digest.clone(),
                     job_id: source_receipt.job_id.clone(),
                     timestamp_secs: source_receipt.timestamp_secs,
+                    htf_time_envelope_ns: source_receipt.htf_time_envelope_ns,
+                    node_fingerprint: source_receipt.node_fingerprint.clone(),
                     origin: "source".to_string(),
                 },
             );
         }
     }
 
-    // Build deterministic ordering: timestamp_secs desc, content_hash asc.
+    // Build deterministic ordering per RFC-0019 section 8.4:
+    //   1. Primary: HTF time envelope stamp desc (when present).
+    //   2. Fallback: timestamp_secs desc > node_fingerprint asc > content_hash asc.
+    //
+    // Receipts with HTF stamps sort before receipts without (HTF-bearing
+    // receipts carry stronger provenance). Within the HTF group, sort by
+    // HTF ns descending. Within the no-HTF group, fall back to the
+    // monotonic timestamp + node fingerprint + digest tuple.
     let mut merged_headers: Vec<MergedReceiptHeader> = all_headers.into_values().collect();
     merged_headers.sort_by(|a, b| {
-        b.timestamp_secs
-            .cmp(&a.timestamp_secs)
-            .then_with(|| a.content_hash.cmp(&b.content_hash))
+        // HTF-bearing receipts sort before non-HTF receipts.
+        // Within HTF group: descending by htf_time_envelope_ns.
+        // Within non-HTF group: fallback tuple.
+        match (a.htf_time_envelope_ns, b.htf_time_envelope_ns) {
+            (Some(a_htf), Some(b_htf)) => {
+                // Both have HTF: sort desc by HTF, then fallback.
+                b_htf
+                    .cmp(&a_htf)
+                    .then_with(|| b.timestamp_secs.cmp(&a.timestamp_secs))
+                    .then_with(|| {
+                        cmp_option_str_asc(
+                            a.node_fingerprint.as_deref(),
+                            b.node_fingerprint.as_deref(),
+                        )
+                    })
+                    .then_with(|| a.content_hash.cmp(&b.content_hash))
+            },
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => {
+                // Neither has HTF: fallback tuple.
+                b.timestamp_secs
+                    .cmp(&a.timestamp_secs)
+                    .then_with(|| {
+                        cmp_option_str_asc(
+                            a.node_fingerprint.as_deref(),
+                            b.node_fingerprint.as_deref(),
+                        )
+                    })
+                    .then_with(|| a.content_hash.cmp(&b.content_hash))
+            },
+        }
     });
 
     let total_target_receipts = target_receipts.len().saturating_add(receipts_copied);
@@ -982,6 +1054,232 @@ mod tests {
                 .map(std::fs::DirEntry::path)
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Create a test receipt with HTF and/or `node_fingerprint` for
+    /// deterministic ordering tests (TCK-00543).
+    fn make_test_receipt_with_provenance(
+        job_id: &str,
+        timestamp_secs: u64,
+        htf_time_envelope_ns: Option<u64>,
+        node_fingerprint: Option<&str>,
+    ) -> FacJobReceiptV1 {
+        let receipt_id = format!("test-receipt-{job_id}-{timestamp_secs}");
+        let digest = "b3-256:".to_string() + &"ab".repeat(32);
+        let mut builder = FacJobReceiptV1Builder::new(&receipt_id, job_id, &digest)
+            .outcome(FacJobOutcome::Denied)
+            .denial_reason(DenialReasonCode::MalformedSpec)
+            .reason("test merge receipt with provenance")
+            .timestamp_secs(timestamp_secs);
+        if let Some(ns) = htf_time_envelope_ns {
+            builder = builder.htf_time_envelope_ns(ns);
+        }
+        if let Some(fp) = node_fingerprint {
+            builder = builder.node_fingerprint(fp);
+        }
+        let mut receipt = builder
+            .try_build()
+            .expect("test receipt build should succeed");
+        let hash = compute_job_receipt_content_hash_v2(&receipt);
+        receipt.content_hash = hash;
+        receipt
+    }
+
+    /// TCK-00543: Two receipts with the same timestamp but different HTF
+    /// envelopes must sort by HTF (descending).
+    #[test]
+    fn test_htf_ordering_same_timestamp_different_htf() {
+        let source = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+
+        // Same timestamp, different HTF stamps.
+        let r1 = make_test_receipt_with_provenance("job-htf-low", 1000, Some(100_000), None);
+        let r2 = make_test_receipt_with_provenance("job-htf-high", 1000, Some(200_000), None);
+
+        persist_receipt(source.path(), &r1);
+        persist_receipt(source.path(), &r2);
+
+        let report =
+            merge_receipt_dirs(source.path(), target.path()).expect("merge should succeed");
+
+        assert_eq!(report.merged_headers.len(), 2);
+        // Higher HTF value sorts first (descending).
+        assert_eq!(
+            report.merged_headers[0].htf_time_envelope_ns,
+            Some(200_000),
+            "receipt with higher HTF should sort first"
+        );
+        assert_eq!(
+            report.merged_headers[1].htf_time_envelope_ns,
+            Some(100_000),
+            "receipt with lower HTF should sort second"
+        );
+    }
+
+    /// TCK-00543: Receipts with HTF stamps sort before receipts without,
+    /// regardless of timestamp.
+    #[test]
+    fn test_htf_receipts_sort_before_non_htf() {
+        let source = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+
+        // Non-HTF receipt with a higher timestamp.
+        let r_no_htf =
+            make_test_receipt_with_provenance("job-no-htf", 9999, None, Some("node-aaa"));
+        // HTF receipt with a lower timestamp.
+        let r_htf = make_test_receipt_with_provenance("job-htf", 1, Some(1_000), Some("node-bbb"));
+
+        persist_receipt(source.path(), &r_no_htf);
+        persist_receipt(source.path(), &r_htf);
+
+        let report =
+            merge_receipt_dirs(source.path(), target.path()).expect("merge should succeed");
+
+        assert_eq!(report.merged_headers.len(), 2);
+        // HTF receipt sorts first despite lower timestamp.
+        assert!(
+            report.merged_headers[0].htf_time_envelope_ns.is_some(),
+            "HTF-bearing receipt must sort before non-HTF"
+        );
+        assert!(
+            report.merged_headers[1].htf_time_envelope_ns.is_none(),
+            "non-HTF receipt must sort after HTF-bearing"
+        );
+    }
+
+    /// TCK-00543: Two receipts with same timestamp and no HTF sort by
+    /// `node_fingerprint` ascending.
+    #[test]
+    fn test_no_htf_same_timestamp_sort_by_node_fingerprint() {
+        let source = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+
+        let r1 = make_test_receipt_with_provenance("job-node-z", 1000, None, Some("node-zzz"));
+        let r2 = make_test_receipt_with_provenance("job-node-a", 1000, None, Some("node-aaa"));
+
+        persist_receipt(source.path(), &r1);
+        persist_receipt(source.path(), &r2);
+
+        let report =
+            merge_receipt_dirs(source.path(), target.path()).expect("merge should succeed");
+
+        assert_eq!(report.merged_headers.len(), 2);
+        // Same timestamp, no HTF: sorted by node_fingerprint ascending.
+        assert_eq!(
+            report.merged_headers[0].node_fingerprint.as_deref(),
+            Some("node-aaa"),
+            "lower node_fingerprint should sort first"
+        );
+        assert_eq!(
+            report.merged_headers[1].node_fingerprint.as_deref(),
+            Some("node-zzz"),
+            "higher node_fingerprint should sort second"
+        );
+    }
+
+    /// TCK-00543: Receipts with `node_fingerprint` sort before those without
+    /// when timestamps are equal and no HTF is present.
+    #[test]
+    fn test_no_htf_same_timestamp_fingerprint_before_no_fingerprint() {
+        let source = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+
+        let r_with_fp = make_test_receipt_with_provenance("job-fp", 1000, None, Some("node-xxx"));
+        let r_no_fp = make_test_receipt_with_provenance("job-no-fp", 1000, None, None);
+
+        persist_receipt(source.path(), &r_with_fp);
+        persist_receipt(source.path(), &r_no_fp);
+
+        let report =
+            merge_receipt_dirs(source.path(), target.path()).expect("merge should succeed");
+
+        assert_eq!(report.merged_headers.len(), 2);
+        // Receipt with fingerprint sorts before receipt without.
+        assert!(
+            report.merged_headers[0].node_fingerprint.is_some(),
+            "receipt with node_fingerprint sorts first"
+        );
+        assert!(
+            report.merged_headers[1].node_fingerprint.is_none(),
+            "receipt without node_fingerprint sorts second"
+        );
+    }
+
+    /// TCK-00543: Full fallback chain is deterministic — same inputs always
+    /// produce the same ordering regardless of insertion order.
+    #[test]
+    fn test_full_ordering_determinism() {
+        let source = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+
+        // Mix of HTF, non-HTF, with/without node_fingerprint.
+        let r_htf_high =
+            make_test_receipt_with_provenance("job-htf-hi", 5000, Some(500_000), Some("node-aaa"));
+        let r_htf_low =
+            make_test_receipt_with_provenance("job-htf-lo", 5000, Some(100_000), Some("node-bbb"));
+        let r_no_htf_a =
+            make_test_receipt_with_provenance("job-no-htf-a", 3000, None, Some("node-aaa"));
+        let r_no_htf_z =
+            make_test_receipt_with_provenance("job-no-htf-z", 3000, None, Some("node-zzz"));
+        let r_no_htf_none = make_test_receipt_with_provenance("job-no-htf-none", 3000, None, None);
+
+        persist_receipt(source.path(), &r_htf_high);
+        persist_receipt(source.path(), &r_htf_low);
+        persist_receipt(source.path(), &r_no_htf_a);
+        persist_receipt(source.path(), &r_no_htf_z);
+        persist_receipt(target.path(), &r_no_htf_none);
+
+        let report =
+            merge_receipt_dirs(source.path(), target.path()).expect("merge should succeed");
+
+        assert_eq!(report.merged_headers.len(), 5);
+
+        // Expected order:
+        // 1. HTF high (500k ns) — HTF receipts first, descending
+        // 2. HTF low (100k ns) — HTF receipts first, descending
+        // 3. no-HTF, ts=3000, node-aaa — fallback: ts desc, fingerprint asc
+        // 4. no-HTF, ts=3000, node-zzz — fallback: ts desc, fingerprint asc
+        // 5. no-HTF, ts=3000, no fingerprint — None sorts after Some
+        assert_eq!(report.merged_headers[0].htf_time_envelope_ns, Some(500_000));
+        assert_eq!(report.merged_headers[1].htf_time_envelope_ns, Some(100_000));
+        assert!(report.merged_headers[2].htf_time_envelope_ns.is_none());
+        assert_eq!(
+            report.merged_headers[2].node_fingerprint.as_deref(),
+            Some("node-aaa")
+        );
+        assert!(report.merged_headers[3].htf_time_envelope_ns.is_none());
+        assert_eq!(
+            report.merged_headers[3].node_fingerprint.as_deref(),
+            Some("node-zzz")
+        );
+        assert!(report.merged_headers[4].htf_time_envelope_ns.is_none());
+        assert!(report.merged_headers[4].node_fingerprint.is_none());
+
+        // Run again and verify identical ordering (determinism).
+        let source2 = tempfile::tempdir().expect("tempdir");
+        let target2 = tempfile::tempdir().expect("tempdir");
+        // Persist in reverse order to test ordering independence.
+        persist_receipt(target2.path(), &r_no_htf_none);
+        persist_receipt(target2.path(), &r_no_htf_z);
+        persist_receipt(source2.path(), &r_no_htf_a);
+        persist_receipt(source2.path(), &r_htf_low);
+        persist_receipt(source2.path(), &r_htf_high);
+
+        let report2 =
+            merge_receipt_dirs(source2.path(), target2.path()).expect("merge should succeed");
+
+        assert_eq!(report2.merged_headers.len(), 5);
+        for (i, (h1, h2)) in report
+            .merged_headers
+            .iter()
+            .zip(report2.merged_headers.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                h1.content_hash, h2.content_hash,
+                "determinism: position {i} content_hash mismatch"
+            );
+        }
     }
 
     /// Regression test: mixed forms in the reverse direction (prefixed in

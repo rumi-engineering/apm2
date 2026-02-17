@@ -905,6 +905,8 @@ mod tests {
             observed_cost: None,
             sandbox_hardening_hash: None,
             network_policy_hash: None,
+            htf_time_envelope_ns: None,
+            node_fingerprint: None,
             timestamp_secs: timestamp,
             content_hash: content_hash.to_string(),
         }
