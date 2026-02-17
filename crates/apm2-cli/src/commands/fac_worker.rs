@@ -92,13 +92,14 @@ use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_st
 use apm2_core::fac::{
     BlobStore, BudgetAdmissionTrace as FacBudgetAdmissionTrace, CanonicalizerTupleV1,
     ChannelBoundaryTrace, DenialReasonCode, ExecutionBackend, FAC_LANE_CLEANUP_RECEIPT_SCHEMA,
-    FacJobOutcome, FacJobReceiptV1Builder, FacPolicyV1, GateReceipt, GateReceiptBuilder,
-    LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1, LaneCorruptMarkerV1,
-    LaneProfileV1, MAX_POLICY_SIZE, QueueAdmissionTrace as JobQueueAdmissionTrace,
-    RepoMirrorManager, SystemModeConfig, SystemdUnitProperties, apply_credential_mount_to_env,
+    FacJobOutcome, FacJobReceiptV1, FacJobReceiptV1Builder, FacPolicyV1, GateReceipt,
+    GateReceiptBuilder, LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1,
+    LaneCorruptMarkerV1, LaneProfileV1, MAX_POLICY_SIZE,
+    QueueAdmissionTrace as JobQueueAdmissionTrace, ReceiptWritePipeline, RepoMirrorManager,
+    SystemModeConfig, SystemdUnitProperties, apply_credential_mount_to_env,
     build_github_credential_mount, build_job_environment, compute_policy_hash, deserialize_policy,
-    load_or_default_boundary_id, parse_policy_hash, persist_content_addressed_receipt,
-    persist_policy, run_preflight, select_and_validate_backend,
+    load_or_default_boundary_id, outcome_to_terminal_state, parse_policy_hash,
+    persist_content_addressed_receipt, persist_policy, run_preflight, select_and_validate_backend,
 };
 use apm2_core::github::{parse_github_remote_url, resolve_apm2_home};
 use base64::Engine;
@@ -1499,21 +1500,13 @@ fn execute_queued_gates_job(
     let options = match parse_gates_job_options(spec) {
         Ok(options) => options,
         Err(reason) => {
-            let moved_path = move_to_dir_safe(
-                claimed_path,
-                &queue_root.join(DENIED_DIR),
-                claimed_file_name,
-            )
-            .map(|p| {
-                p.strip_prefix(queue_root)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .ok();
-            if let Err(receipt_err) = emit_job_receipt(
+            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            let _ = commit_claimed_job_via_pipeline(
                 fac_root,
+                queue_root,
                 spec,
+                claimed_path,
+                claimed_file_name,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -1522,15 +1515,11 @@ fn execute_queued_gates_job(
                 budget_trace,
                 None,
                 Some(canonicalizer_tuple_digest),
-                moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
                 Some(sbx_hash),
-            ) {
-                eprintln!(
-                    "worker: WARNING: receipt emission failed for denied gates job: {receipt_err}"
-                );
-            }
+            );
             return JobOutcome::Denied { reason };
         },
     };
@@ -1542,21 +1531,13 @@ fn execute_queued_gates_job(
                 "cannot resolve workspace HEAD for {}: {err}",
                 options.workspace_root.display()
             );
-            let moved_path = move_to_dir_safe(
-                claimed_path,
-                &queue_root.join(DENIED_DIR),
-                claimed_file_name,
-            )
-            .map(|p| {
-                p.strip_prefix(queue_root)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .ok();
-            if let Err(receipt_err) = emit_job_receipt(
+            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            let _ = commit_claimed_job_via_pipeline(
                 fac_root,
+                queue_root,
                 spec,
+                claimed_path,
+                claimed_file_name,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -1565,15 +1546,11 @@ fn execute_queued_gates_job(
                 budget_trace,
                 None,
                 Some(canonicalizer_tuple_digest),
-                moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
                 Some(sbx_hash),
-            ) {
-                eprintln!(
-                    "worker: WARNING: receipt emission failed for denied gates job: {receipt_err}"
-                );
-            }
+            );
             return JobOutcome::Denied { reason };
         },
     };
@@ -1582,21 +1559,13 @@ fn execute_queued_gates_job(
             "gates job head mismatch: worker workspace HEAD {current_head} does not match job head {}",
             spec.source.head_sha
         );
-        let moved_path = move_to_dir_safe(
-            claimed_path,
-            &queue_root.join(DENIED_DIR),
-            claimed_file_name,
-        )
-        .map(|p| {
-            p.strip_prefix(queue_root)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .to_string()
-        })
-        .ok();
-        if let Err(receipt_err) = emit_job_receipt(
+        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        let _ = commit_claimed_job_via_pipeline(
             fac_root,
+            queue_root,
             spec,
+            claimed_path,
+            claimed_file_name,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::ValidationFailed),
             &reason,
@@ -1605,15 +1574,11 @@ fn execute_queued_gates_job(
             budget_trace,
             None,
             Some(canonicalizer_tuple_digest),
-            moved_path.as_deref(),
             policy_hash,
             None,
+            None,
             Some(sbx_hash),
-        ) {
-            eprintln!(
-                "worker: WARNING: receipt emission failed for denied gates job: {receipt_err}"
-            );
-        }
+        );
         return JobOutcome::Denied { reason };
     }
 
@@ -1621,21 +1586,13 @@ fn execute_queued_gates_job(
         Ok(code) => code,
         Err(err) => {
             let reason = format!("failed to execute gates in workspace: {err}");
-            let moved_path = move_to_dir_safe(
-                claimed_path,
-                &queue_root.join(DENIED_DIR),
-                claimed_file_name,
-            )
-            .map(|p| {
-                p.strip_prefix(queue_root)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .ok();
-            if let Err(receipt_err) = emit_job_receipt(
+            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            let _ = commit_claimed_job_via_pipeline(
                 fac_root,
+                queue_root,
                 spec,
+                claimed_path,
+                claimed_file_name,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -1644,24 +1601,24 @@ fn execute_queued_gates_job(
                 budget_trace,
                 None,
                 Some(canonicalizer_tuple_digest),
-                moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
                 Some(sbx_hash),
-            ) {
-                eprintln!(
-                    "worker: WARNING: receipt emission failed for denied gates job: {receipt_err}"
-                );
-            }
+            );
             return JobOutcome::Denied { reason };
         },
     };
 
     if exit_code == exit_codes::SUCCESS {
         let observed_cost = observed_cost_from_elapsed(job_wall_start.elapsed());
-        if let Err(receipt_err) = emit_job_receipt_with_observed_cost(
+        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
+            queue_root,
             spec,
+            claimed_path,
+            claimed_file_name,
             FacJobOutcome::Completed,
             None,
             "gates completed",
@@ -1670,13 +1627,12 @@ fn execute_queued_gates_job(
             budget_trace,
             None,
             Some(canonicalizer_tuple_digest),
-            None,
             policy_hash,
             None,
-            observed_cost,
+            Some(observed_cost),
             Some(sbx_hash),
         ) {
-            eprintln!("worker: receipt emission failed for gates job: {receipt_err}");
+            eprintln!("worker: pipeline commit failed for gates job: {commit_err}");
             if let Err(move_err) = move_to_dir_safe(
                 claimed_path,
                 &queue_root.join(PENDING_DIR),
@@ -1687,16 +1643,7 @@ fn execute_queued_gates_job(
                 );
             }
             return JobOutcome::Skipped {
-                reason: "receipt emission failed for gates job".to_string(),
-            };
-        }
-        if let Err(err) = move_to_dir_safe(
-            claimed_path,
-            &queue_root.join(COMPLETED_DIR),
-            claimed_file_name,
-        ) {
-            return JobOutcome::Skipped {
-                reason: format!("move gates job to completed failed: {err}"),
+                reason: format!("pipeline commit failed for gates job: {commit_err}"),
             };
         }
         return JobOutcome::Completed {
@@ -1705,22 +1652,15 @@ fn execute_queued_gates_job(
         };
     }
 
+    // Gates failed: commit claimed job to denied via pipeline.
     let reason = format!("gates failed with exit code {exit_code}");
-    let moved_path = move_to_dir_safe(
-        claimed_path,
-        &queue_root.join(DENIED_DIR),
-        claimed_file_name,
-    )
-    .map(|p| {
-        p.strip_prefix(queue_root)
-            .unwrap_or(&p)
-            .to_string_lossy()
-            .to_string()
-    })
-    .ok();
-    if let Err(receipt_err) = emit_job_receipt(
+    // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+    if let Err(commit_err) = commit_claimed_job_via_pipeline(
         fac_root,
+        queue_root,
         spec,
+        claimed_path,
+        claimed_file_name,
         FacJobOutcome::Denied,
         Some(DenialReasonCode::ValidationFailed),
         &reason,
@@ -1729,12 +1669,12 @@ fn execute_queued_gates_job(
         budget_trace,
         None,
         Some(canonicalizer_tuple_digest),
-        moved_path.as_deref(),
         policy_hash,
+        None,
         None,
         Some(sbx_hash),
     ) {
-        eprintln!("worker: WARNING: receipt emission failed for denied gates job: {receipt_err}");
+        eprintln!("worker: WARNING: pipeline commit failed for denied gates job: {commit_err}");
     }
     JobOutcome::Denied { reason }
 }
@@ -2043,23 +1983,13 @@ fn process_job(
         // PCAC consume.
         if let Err(e) = consume_authority(queue_root, &spec.job_id, &spec.job_spec_digest) {
             let reason = format!("PCAC consume failed: {e}");
-            // MAJOR-3 fix: Emit explicit refusal receipt before moving to denied/.
-            let moved_path = move_to_dir_safe(
-                &claimed_path,
-                &queue_root.join(DENIED_DIR),
-                &claimed_file_name,
-            )
-            .map(|p| {
-                p.strip_prefix(queue_root)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .ok();
-            // (sbx_hash computed once at top of process_job)
-            if let Err(receipt_err) = emit_job_receipt(
+            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            let _ = commit_claimed_job_via_pipeline(
                 fac_root,
+                queue_root,
                 spec,
+                &claimed_path,
+                &claimed_file_name,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::PcacConsumeFailed),
                 &reason,
@@ -2068,15 +1998,11 @@ fn process_job(
                 budget_trace.as_ref(),
                 None,
                 Some(canonicalizer_tuple_digest),
-                moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
                 Some(&sbx_hash),
-            ) {
-                eprintln!(
-                    "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
-                );
-            }
+            );
             return JobOutcome::Denied { reason };
         }
 
@@ -2609,25 +2535,16 @@ fn process_job(
         .map_or_else(|| file_name.clone(), |n| n.to_string_lossy().to_string());
 
     // PCAC lifecycle: durable consume after atomic claim; if this fails the claimed
-    // job is moved to denied/.
+    // job is committed to denied/ via pipeline.
     if let Err(e) = consume_authority(queue_root, &spec.job_id, &spec.job_spec_digest) {
         let reason = format!("PCAC consume failed: {e}");
-        let moved_path = move_to_dir_safe(
-            &claimed_path,
-            &queue_root.join(DENIED_DIR),
-            &claimed_file_name,
-        )
-        .map(|p| {
-            p.strip_prefix(queue_root)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .to_string()
-        })
-        .ok();
-        // (sbx_hash computed once at top of process_job)
-        if let Err(receipt_err) = emit_job_receipt(
+        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        let _ = commit_claimed_job_via_pipeline(
             fac_root,
+            queue_root,
             spec,
+            &claimed_path,
+            &claimed_file_name,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::PcacConsumeFailed),
             &reason,
@@ -2636,13 +2553,11 @@ fn process_job(
             budget_trace.as_ref(),
             None,
             Some(canonicalizer_tuple_digest),
-            moved_path.as_deref(),
             policy_hash,
             None,
+            None,
             Some(&sbx_hash),
-        ) {
-            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
-        }
+        );
         return JobOutcome::Denied { reason };
     }
 
@@ -2710,26 +2625,14 @@ fn process_job(
         u64::from(policy.quarantine_ttl_days).saturating_mul(86400),
         u64::from(policy.denied_ttl_days).saturating_mul(86400),
     ) {
-        let moved_path = move_to_dir_safe(
-            &claimed_path,
-            &queue_root.join(DENIED_DIR),
-            &claimed_file_name,
-        )
-        .map(|p| {
-            p.strip_prefix(queue_root)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .to_string()
-        })
-        .ok();
-        if moved_path.is_none() {
-            eprintln!("worker: WARNING: failed to move job to denied");
-        }
         let reason = format!("preflight failed: {error:?}");
-        // (sbx_hash computed once at top of process_job)
-        if let Err(receipt_err) = emit_job_receipt(
+        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        let _ = commit_claimed_job_via_pipeline(
             fac_root,
+            queue_root,
             spec,
+            &claimed_path,
+            &claimed_file_name,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::InsufficientDiskSpace),
             &reason,
@@ -2738,16 +2641,12 @@ fn process_job(
             budget_trace.as_ref(),
             None,
             Some(canonicalizer_tuple_digest),
-            moved_path.as_deref(),
             policy_hash,
             None,
+            None,
             Some(&sbx_hash),
-        ) {
-            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
-        }
-        return JobOutcome::Denied {
-            reason: format!("preflight failed: {error:?}"),
-        };
+        );
+        return JobOutcome::Denied { reason };
     }
 
     // Step 7: Compute authoritative Systemd properties for the acquired lane.
@@ -2758,22 +2657,13 @@ fn process_job(
         Ok(profile) => profile,
         Err(e) => {
             let reason = format!("lane profile load failed for {acquired_lane_id}: {e}");
-            let moved_path = move_to_dir_safe(
-                &claimed_path,
-                &queue_root.join(DENIED_DIR),
-                &claimed_file_name,
-            )
-            .map(|p| {
-                p.strip_prefix(queue_root)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .ok();
-            // (sbx_hash computed once at top of process_job)
-            if let Err(receipt_err) = emit_job_receipt(
+            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            let _ = commit_claimed_job_via_pipeline(
                 fac_root,
+                queue_root,
                 spec,
+                &claimed_path,
+                &claimed_file_name,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -2782,13 +2672,11 @@ fn process_job(
                 budget_trace.as_ref(),
                 None,
                 Some(canonicalizer_tuple_digest),
-                moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
                 Some(&sbx_hash),
-            ) {
-                eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
-            }
+            );
             return JobOutcome::Denied { reason };
         },
     };
@@ -2832,21 +2720,13 @@ fn process_job(
         Ok(lease) => lease,
         Err(e) => {
             let reason = format!("failed to create lane lease: {e}");
-            let moved_path = move_to_dir_safe(
-                &claimed_path,
-                &queue_root.join(DENIED_DIR),
-                &claimed_file_name,
-            )
-            .map(|p| {
-                p.strip_prefix(queue_root)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .ok();
-            if let Err(receipt_err) = emit_job_receipt(
+            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            let _ = commit_claimed_job_via_pipeline(
                 fac_root,
+                queue_root,
                 spec,
+                &claimed_path,
+                &claimed_file_name,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -2855,33 +2735,23 @@ fn process_job(
                 budget_trace.as_ref(),
                 None,
                 Some(canonicalizer_tuple_digest),
-                moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
                 Some(&sbx_hash),
-            ) {
-                eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
-            }
+            );
             return JobOutcome::Denied { reason };
         },
     };
     if let Err(e) = lane_lease.persist(&lane_dir) {
         let reason = format!("failed to persist lane lease: {e}");
-        let moved_path = move_to_dir_safe(
-            &claimed_path,
-            &queue_root.join(DENIED_DIR),
-            &claimed_file_name,
-        )
-        .map(|p| {
-            p.strip_prefix(queue_root)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .to_string()
-        })
-        .ok();
-        if let Err(receipt_err) = emit_job_receipt(
+        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        let _ = commit_claimed_job_via_pipeline(
             fac_root,
+            queue_root,
             spec,
+            &claimed_path,
+            &claimed_file_name,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::ValidationFailed),
             &reason,
@@ -2890,13 +2760,11 @@ fn process_job(
             budget_trace.as_ref(),
             None,
             Some(canonicalizer_tuple_digest),
-            moved_path.as_deref(),
             policy_hash,
             None,
+            None,
             Some(&sbx_hash),
-        ) {
-            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
-        }
+        );
         return JobOutcome::Denied { reason };
     }
 
@@ -2948,21 +2816,13 @@ fn process_job(
     if let Err(e) = mirror_manager.ensure_mirror(&spec.source.repo_id, None) {
         let reason = format!("mirror ensure failed: {e}");
         let _ = LaneLeaseV1::remove(&lane_dir);
-        let moved_path = move_to_dir_safe(
-            &claimed_path,
-            &queue_root.join(DENIED_DIR),
-            &claimed_file_name,
-        )
-        .map(|p| {
-            p.strip_prefix(queue_root)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .to_string()
-        })
-        .ok();
-        if let Err(receipt_err) = emit_job_receipt(
+        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        let _ = commit_claimed_job_via_pipeline(
             fac_root,
+            queue_root,
             spec,
+            &claimed_path,
+            &claimed_file_name,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::ValidationFailed),
             &reason,
@@ -2971,13 +2831,11 @@ fn process_job(
             budget_trace.as_ref(),
             None,
             Some(canonicalizer_tuple_digest),
-            moved_path.as_deref(),
             policy_hash,
             None,
+            None,
             Some(&sbx_hash),
-        ) {
-            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
-        }
+        );
         return JobOutcome::Denied { reason };
     }
 
@@ -3002,21 +2860,13 @@ fn process_job(
             // Lane is already marked CORRUPT by execute_lane_cleanup on
             // failure.
         }
-        let moved_path = move_to_dir_safe(
-            &claimed_path,
-            &queue_root.join(DENIED_DIR),
-            &claimed_file_name,
-        )
-        .map(|p| {
-            p.strip_prefix(queue_root)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .to_string()
-        })
-        .ok();
-        if let Err(receipt_err) = emit_job_receipt(
+        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        let _ = commit_claimed_job_via_pipeline(
             fac_root,
+            queue_root,
             spec,
+            &claimed_path,
+            &claimed_file_name,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::ValidationFailed),
             &reason,
@@ -3025,13 +2875,11 @@ fn process_job(
             budget_trace.as_ref(),
             None,
             Some(canonicalizer_tuple_digest),
-            moved_path.as_deref(),
             policy_hash,
             None,
+            None,
             Some(&sbx_hash),
-        ) {
-            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
-        }
+        );
         return JobOutcome::Denied { reason };
     }
 
@@ -3061,21 +2909,13 @@ fn process_job(
             // failure. The denial receipt is still emitted below so
             // the job has a terminal receipt.
         }
-        let moved_path = move_to_dir_safe(
-            &claimed_path,
-            &queue_root.join(DENIED_DIR),
-            &claimed_file_name,
-        )
-        .map(|p| {
-            p.strip_prefix(queue_root)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .to_string()
-        })
-        .ok();
-        if let Err(receipt_err) = emit_job_receipt(
+        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        let _ = commit_claimed_job_via_pipeline(
             fac_root,
+            queue_root,
             spec,
+            &claimed_path,
+            &claimed_file_name,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::ValidationFailed),
             reason,
@@ -3084,13 +2924,11 @@ fn process_job(
             budget_trace.as_ref(),
             None,
             Some(canonicalizer_tuple_digest),
-            moved_path.as_deref(),
             policy_hash,
             None,
+            None,
             Some(&sbx_hash),
-        ) {
-            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
-        }
+        );
         JobOutcome::Denied {
             reason: reason.to_string(),
         }
@@ -3158,21 +2996,13 @@ fn process_job(
             // Lane is already marked CORRUPT by execute_lane_cleanup on
             // failure.
         }
-        let moved_path = move_to_dir_safe(
-            &claimed_path,
-            &queue_root.join(DENIED_DIR),
-            &claimed_file_name,
-        )
-        .map(|p| {
-            p.strip_prefix(queue_root)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .to_string()
-        })
-        .ok();
-        if let Err(receipt_err) = emit_job_receipt(
+        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        let _ = commit_claimed_job_via_pipeline(
             fac_root,
+            queue_root,
             spec,
+            &claimed_path,
+            &claimed_file_name,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::ValidationFailed),
             &reason,
@@ -3181,13 +3011,11 @@ fn process_job(
             budget_trace.as_ref(),
             None,
             Some(canonicalizer_tuple_digest),
-            moved_path.as_deref(),
             policy_hash,
             None,
+            None,
             Some(&sbx_hash),
-        ) {
-            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
-        }
+        );
         return JobOutcome::Denied { reason };
     }
 
@@ -3294,9 +3122,18 @@ fn process_job(
 
     let observed_cost = observed_cost_from_elapsed(job_wall_start.elapsed());
 
-    if let Err(receipt_err) = emit_job_receipt_with_observed_cost(
+    // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+    // This ensures receipt persistence, index update, and job move happen
+    // in a crash-safe order via a single ReceiptWritePipeline::commit() call.
+    // Persist the gate receipt alongside the completed job (before atomic commit).
+    write_gate_receipt(queue_root, &claimed_file_name, &gate_receipt);
+
+    if let Err(commit_err) = commit_claimed_job_via_pipeline(
         fac_root,
+        queue_root,
         spec,
+        &claimed_path,
+        &claimed_file_name,
         FacJobOutcome::Completed,
         None,
         "completed",
@@ -3305,13 +3142,12 @@ fn process_job(
         budget_trace.as_ref(),
         patch_digest.as_deref(),
         Some(canonicalizer_tuple_digest),
-        None,
         policy_hash,
         containment_trace.as_ref(),
-        observed_cost,
+        Some(observed_cost),
         Some(&sbx_hash),
     ) {
-        eprintln!("worker: receipt emission failed, cannot complete job: {receipt_err}");
+        eprintln!("worker: pipeline commit failed, cannot complete job: {commit_err}");
         let _ = LaneLeaseV1::remove(&lane_dir);
         if let Err(move_err) = move_to_dir_safe(
             &claimed_path,
@@ -3321,22 +3157,7 @@ fn process_job(
             eprintln!("worker: WARNING: failed to return claimed job to pending: {move_err}");
         }
         return JobOutcome::Skipped {
-            reason: "receipt emission failed".to_string(),
-        };
-    }
-
-    // Persist the gate receipt alongside the completed job.
-    write_gate_receipt(queue_root, &claimed_file_name, &gate_receipt);
-
-    // Move to completed.
-    if let Err(e) = move_to_dir_safe(
-        &claimed_path,
-        &queue_root.join(COMPLETED_DIR),
-        &claimed_file_name,
-    ) {
-        let _ = LaneLeaseV1::remove(&lane_dir);
-        return JobOutcome::Skipped {
-            reason: format!("move to completed failed: {e}"),
+            reason: format!("pipeline commit failed: {commit_err}"),
         };
     }
 
@@ -3819,22 +3640,13 @@ fn handle_stop_revoke(
                 "worker: stop_revoke job {} missing cancel_target_job_id",
                 spec.job_id
             );
-            // MAJOR-3 fix: Emit explicit refusal receipt before moving to denied/.
-            let moved_path = move_to_dir_safe(
-                claimed_path,
-                &queue_root.join(DENIED_DIR),
-                claimed_file_name,
-            )
-            .map(|p| {
-                p.strip_prefix(queue_root)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .ok();
-            if let Err(receipt_err) = emit_job_receipt(
+            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            let _ = commit_claimed_job_via_pipeline(
                 fac_root,
+                queue_root,
                 spec,
+                claimed_path,
+                claimed_file_name,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::MalformedSpec),
                 &reason,
@@ -3843,15 +3655,11 @@ fn handle_stop_revoke(
                 budget_trace,
                 None,
                 Some(canonicalizer_tuple_digest),
-                moved_path.as_deref(),
                 policy_hash,
                 None,
+                None,
                 Some(sbx_hash),
-            ) {
-                eprintln!(
-                    "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
-                );
-            }
+            );
             return JobOutcome::Denied { reason };
         },
     };
@@ -3878,11 +3686,14 @@ fn handle_stop_revoke(
             eprintln!(
                 "worker: stop_revoke: target {target_job_id} already in {terminal_state}/, treating as success"
             );
-            // Emit completion receipt for the stop_revoke job itself.
+            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             let observed = observed_cost_from_elapsed(job_wall_start.elapsed());
-            let _ = emit_job_receipt_with_observed_cost(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
+                queue_root,
                 spec,
+                claimed_path,
+                claimed_file_name,
                 FacJobOutcome::Completed,
                 None,
                 &format!("stop_revoke: target {target_job_id} already {terminal_state}"),
@@ -3891,17 +3702,18 @@ fn handle_stop_revoke(
                 budget_trace,
                 None,
                 Some(canonicalizer_tuple_digest),
-                None,
                 policy_hash,
                 None,
-                observed,
+                Some(observed),
                 Some(sbx_hash),
-            );
-            let _ = move_to_dir_safe(
-                claimed_path,
-                &queue_root.join(COMPLETED_DIR),
-                claimed_file_name,
-            );
+            ) {
+                eprintln!(
+                    "worker: pipeline commit failed for stop_revoke (target already terminal): {commit_err}"
+                );
+                return JobOutcome::Skipped {
+                    reason: format!("pipeline commit failed: {commit_err}"),
+                };
+            }
             return JobOutcome::Completed {
                 job_id: spec.job_id.clone(),
                 observed_cost: Some(observed),
@@ -3913,9 +3725,13 @@ fn handle_stop_revoke(
             "stop_revoke: target job {target_job_id} not found in claimed/ or any terminal directory"
         );
         eprintln!("worker: {reason}");
-        let _ = emit_job_receipt(
+        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        let _ = commit_claimed_job_via_pipeline(
             fac_root,
+            queue_root,
             spec,
+            claimed_path,
+            claimed_file_name,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::ValidationFailed),
             &reason,
@@ -3924,15 +3740,10 @@ fn handle_stop_revoke(
             budget_trace,
             None,
             Some(canonicalizer_tuple_digest),
-            None,
             policy_hash,
             None,
+            None,
             Some(sbx_hash),
-        );
-        let _ = move_to_dir_safe(
-            claimed_path,
-            &queue_root.join(DENIED_DIR),
-            claimed_file_name,
         );
         return JobOutcome::Denied { reason };
     };
@@ -3960,9 +3771,13 @@ fn handle_stop_revoke(
         // MAJOR 3 fail-closed: if systemctl stop fails, emit failure receipt.
         let reason =
             format!("stop_revoke failed: systemctl stop failed for target {target_job_id}: {e}");
-        let _ = emit_job_receipt(
+        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        let _ = commit_claimed_job_via_pipeline(
             fac_root,
+            queue_root,
             spec,
+            claimed_path,
+            claimed_file_name,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::ValidationFailed),
             &reason,
@@ -3971,15 +3786,10 @@ fn handle_stop_revoke(
             budget_trace,
             None,
             Some(canonicalizer_tuple_digest),
-            None,
             policy_hash,
             None,
+            None,
             Some(sbx_hash),
-        );
-        let _ = move_to_dir_safe(
-            claimed_path,
-            &queue_root.join(DENIED_DIR),
-            claimed_file_name,
         );
         return JobOutcome::Denied { reason };
     }
@@ -4031,14 +3841,18 @@ fn handle_stop_revoke(
         let receipt = match builder.try_build() {
             Ok(r) => r,
             Err(e) => {
-                // Fail-closed: cannot build receipt → deny stop_revoke.
+                // Fail-closed: cannot build receipt -> deny stop_revoke.
                 let deny_reason = format!(
                     "stop_revoke failed: cannot build cancellation receipt for target {target_job_id}: {e}"
                 );
                 eprintln!("worker: {deny_reason}");
-                let _ = emit_job_receipt(
+                // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+                let _ = commit_claimed_job_via_pipeline(
                     fac_root,
+                    queue_root,
                     spec,
+                    claimed_path,
+                    claimed_file_name,
                     FacJobOutcome::Denied,
                     Some(DenialReasonCode::StopRevokeFailed),
                     &deny_reason,
@@ -4047,15 +3861,10 @@ fn handle_stop_revoke(
                     budget_trace,
                     None,
                     Some(canonicalizer_tuple_digest),
-                    None,
                     policy_hash,
                     None,
+                    None,
                     Some(sbx_hash),
-                );
-                let _ = move_to_dir_safe(
-                    claimed_path,
-                    &queue_root.join(DENIED_DIR),
-                    claimed_file_name,
                 );
                 return JobOutcome::Denied {
                     reason: deny_reason,
@@ -4066,14 +3875,18 @@ fn handle_stop_revoke(
         if let Err(e) =
             persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
         {
-            // Fail-closed: cannot persist receipt → deny stop_revoke.
+            // Fail-closed: cannot persist receipt -> deny stop_revoke.
             let deny_reason = format!(
                 "stop_revoke failed: cannot persist cancellation receipt for target {target_job_id}: {e}"
             );
             eprintln!("worker: {deny_reason}");
-            let _ = emit_job_receipt(
+            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            let _ = commit_claimed_job_via_pipeline(
                 fac_root,
+                queue_root,
                 spec,
+                claimed_path,
+                claimed_file_name,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::StopRevokeFailed),
                 &deny_reason,
@@ -4082,15 +3895,10 @@ fn handle_stop_revoke(
                 budget_trace,
                 None,
                 Some(canonicalizer_tuple_digest),
-                None,
                 policy_hash,
                 None,
+                None,
                 Some(sbx_hash),
-            );
-            let _ = move_to_dir_safe(
-                claimed_path,
-                &queue_root.join(DENIED_DIR),
-                claimed_file_name,
             );
             return JobOutcome::Denied {
                 reason: deny_reason,
@@ -4107,9 +3915,13 @@ fn handle_stop_revoke(
         let reason =
             format!("stop_revoke failed: cannot move target {target_job_id} to cancelled: {e}");
         eprintln!("worker: {reason}");
-        let _ = emit_job_receipt(
+        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        let _ = commit_claimed_job_via_pipeline(
             fac_root,
+            queue_root,
             spec,
+            claimed_path,
+            claimed_file_name,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::StopRevokeFailed),
             &reason,
@@ -4118,26 +3930,25 @@ fn handle_stop_revoke(
             budget_trace,
             None,
             Some(canonicalizer_tuple_digest),
-            None,
             policy_hash,
             None,
+            None,
             Some(sbx_hash),
-        );
-        let _ = move_to_dir_safe(
-            claimed_path,
-            &queue_root.join(DENIED_DIR),
-            claimed_file_name,
         );
         return JobOutcome::Denied { reason };
     }
     eprintln!("worker: stop_revoke: moved target {target_job_id} to cancelled/");
 
-    // Step 4a: Emit completion receipt for the stop_revoke job itself
-    // BEFORE moving it to completed/.
+    // Step 4: TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+    // Receipt persistence, index update, and job move happen in a crash-safe
+    // order via a single ReceiptWritePipeline::commit() call.
     let observed = observed_cost_from_elapsed(job_wall_start.elapsed());
-    if let Err(receipt_err) = emit_job_receipt_with_observed_cost(
+    if let Err(commit_err) = commit_claimed_job_via_pipeline(
         fac_root,
+        queue_root,
         spec,
+        claimed_path,
+        claimed_file_name,
         FacJobOutcome::Completed,
         None,
         &format!("stop_revoke completed for target {target_job_id}"),
@@ -4146,39 +3957,18 @@ fn handle_stop_revoke(
         budget_trace,
         None,
         Some(canonicalizer_tuple_digest),
-        None,
         policy_hash,
         None,
-        observed,
+        Some(observed),
         Some(sbx_hash),
     ) {
-        // Fail-closed: completion receipt for stop_revoke itself failed.
-        // The target is already cancelled (receipt persisted), but the
-        // stop_revoke job cannot transition to completed without its own
-        // receipt.  Move to denied/ instead.
+        // Fail-closed: pipeline commit failed — stop_revoke job stays in claimed/.
         let reason = format!(
-            "stop_revoke receipt persistence failed for job {}: {receipt_err}",
+            "stop_revoke pipeline commit failed for job {}: {commit_err}",
             spec.job_id
         );
         eprintln!("worker: {reason}");
-        let _ = move_to_dir_safe(
-            claimed_path,
-            &queue_root.join(DENIED_DIR),
-            claimed_file_name,
-        );
-        return JobOutcome::Denied { reason };
-    }
-
-    // Step 4b: Move the stop_revoke job itself to completed/ — receipt is
-    // already persisted.
-    if let Err(e) = move_to_dir_safe(
-        claimed_path,
-        &queue_root.join(COMPLETED_DIR),
-        claimed_file_name,
-    ) {
-        return JobOutcome::Skipped {
-            reason: format!("move stop_revoke to completed failed: {e}"),
-        };
+        return JobOutcome::Skipped { reason };
     }
 
     JobOutcome::Completed {
@@ -4681,9 +4471,19 @@ fn execute_warm_job(
             .build_and_sign(signer);
 
     let observed_cost = observed_cost_from_elapsed(job_wall_start.elapsed());
-    if let Err(receipt_err) = emit_job_receipt_with_observed_cost(
+
+    // Persist the gate receipt alongside the completed job (before atomic commit).
+    write_gate_receipt(queue_root, claimed_file_name, &gate_receipt);
+
+    // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+    // Receipt persistence, index update, and job move happen in a crash-safe
+    // order via a single ReceiptWritePipeline::commit() call.
+    if let Err(commit_err) = commit_claimed_job_via_pipeline(
         fac_root,
+        queue_root,
         spec,
+        claimed_path,
+        claimed_file_name,
         FacJobOutcome::Completed,
         None,
         "warm completed",
@@ -4692,13 +4492,12 @@ fn execute_warm_job(
         budget_trace,
         patch_digest,
         Some(canonicalizer_tuple_digest),
-        None,
         policy_hash,
         containment_trace,
-        observed_cost,
+        Some(observed_cost),
         Some(sbx_hash),
     ) {
-        eprintln!("worker: receipt emission failed for warm job: {receipt_err}");
+        eprintln!("worker: pipeline commit failed for warm job: {commit_err}");
         let _ = LaneLeaseV1::remove(lane_dir);
         if let Err(move_err) = move_to_dir_safe(
             claimed_path,
@@ -4708,22 +4507,7 @@ fn execute_warm_job(
             eprintln!("worker: WARNING: failed to return claimed warm job to pending: {move_err}");
         }
         return JobOutcome::Skipped {
-            reason: "receipt emission failed".to_string(),
-        };
-    }
-
-    // Persist the gate receipt alongside the completed job.
-    write_gate_receipt(queue_root, claimed_file_name, &gate_receipt);
-
-    // Move to completed.
-    if let Err(e) = move_to_dir_safe(
-        claimed_path,
-        &queue_root.join(COMPLETED_DIR),
-        claimed_file_name,
-    ) {
-        let _ = LaneLeaseV1::remove(lane_dir);
-        return JobOutcome::Skipped {
-            reason: format!("move warm job to completed failed: {e}"),
+            reason: format!("pipeline commit failed for warm job: {commit_err}"),
         };
     }
 
@@ -5230,7 +5014,12 @@ fn emit_job_receipt(
 }
 
 /// Emit a unified `FacJobReceiptV1` with observed runtime cost metrics.
+///
+/// Note: Most callers have been migrated to `commit_claimed_job_via_pipeline`
+/// (TCK-00564 BLOCKER-1). This function is retained for future non-pipeline
+/// receipt emission paths.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn emit_job_receipt_with_observed_cost(
     fac_root: &Path,
     spec: &FacJobSpecV1,
@@ -5267,9 +5056,12 @@ fn emit_job_receipt_with_observed_cost(
     )
 }
 
+/// Build a `FacJobReceiptV1` from the given parameters without persisting.
+///
+/// This is the shared receipt construction logic used by both the direct
+/// persist path and the `ReceiptWritePipeline` commit path (TCK-00564).
 #[allow(clippy::too_many_arguments)]
-fn emit_job_receipt_internal(
-    fac_root: &Path,
+fn build_job_receipt(
     spec: &FacJobSpecV1,
     outcome: FacJobOutcome,
     denial_reason: Option<DenialReasonCode>,
@@ -5284,7 +5076,7 @@ fn emit_job_receipt_internal(
     containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
     observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<&str>,
-) -> Result<PathBuf, String> {
+) -> Result<FacJobReceiptV1, String> {
     let mut builder = FacJobReceiptV1Builder::new(
         format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs()),
         &spec.job_id,
@@ -5328,10 +5120,100 @@ fn emit_job_receipt_internal(
         builder = builder.sandbox_hardening_hash(hash);
     }
 
-    let receipt = builder
+    builder
         .try_build()
-        .map_err(|e| format!("cannot build job receipt: {e}"))?;
+        .map_err(|e| format!("cannot build job receipt: {e}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_job_receipt_internal(
+    fac_root: &Path,
+    spec: &FacJobSpecV1,
+    outcome: FacJobOutcome,
+    denial_reason: Option<DenialReasonCode>,
+    reason: &str,
+    rfc0028_channel_boundary: Option<&ChannelBoundaryTrace>,
+    eio29_queue_admission: Option<&JobQueueAdmissionTrace>,
+    eio29_budget_admission: Option<&FacBudgetAdmissionTrace>,
+    patch_digest: Option<&str>,
+    canonicalizer_tuple_digest: Option<&str>,
+    moved_job_path: Option<&str>,
+    policy_hash: &str,
+    containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
+    observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
+    sandbox_hardening_hash: Option<&str>,
+) -> Result<PathBuf, String> {
+    let receipt = build_job_receipt(
+        spec,
+        outcome,
+        denial_reason,
+        reason,
+        rfc0028_channel_boundary,
+        eio29_queue_admission,
+        eio29_budget_admission,
+        patch_digest,
+        canonicalizer_tuple_digest,
+        moved_job_path,
+        policy_hash,
+        containment,
+        observed_cost,
+        sandbox_hardening_hash,
+    )?;
     persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
+}
+
+/// Commit a claimed job through the `ReceiptWritePipeline`: persist receipt,
+/// update index, move job atomically (TCK-00564 BLOCKER-1).
+///
+/// Returns the terminal path of the moved job file, or an error string.
+#[allow(clippy::too_many_arguments)]
+fn commit_claimed_job_via_pipeline(
+    fac_root: &Path,
+    queue_root: &Path,
+    spec: &FacJobSpecV1,
+    claimed_path: &Path,
+    claimed_file_name: &str,
+    outcome: FacJobOutcome,
+    denial_reason: Option<DenialReasonCode>,
+    reason: &str,
+    rfc0028_channel_boundary: Option<&ChannelBoundaryTrace>,
+    eio29_queue_admission: Option<&JobQueueAdmissionTrace>,
+    eio29_budget_admission: Option<&FacBudgetAdmissionTrace>,
+    patch_digest: Option<&str>,
+    canonicalizer_tuple_digest: Option<&str>,
+    policy_hash: &str,
+    containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
+    observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
+    sandbox_hardening_hash: Option<&str>,
+) -> Result<PathBuf, String> {
+    let terminal_state = outcome_to_terminal_state(outcome)
+        .ok_or_else(|| format!("non-terminal outcome {outcome:?} cannot be committed"))?;
+
+    let receipt = build_job_receipt(
+        spec,
+        outcome,
+        denial_reason,
+        reason,
+        rfc0028_channel_boundary,
+        eio29_queue_admission,
+        eio29_budget_admission,
+        patch_digest,
+        canonicalizer_tuple_digest,
+        None, // moved_job_path: not known before move
+        policy_hash,
+        containment,
+        observed_cost,
+        sandbox_hardening_hash,
+    )?;
+
+    let pipeline =
+        ReceiptWritePipeline::new(fac_root.join(FAC_RECEIPTS_DIR), queue_root.to_path_buf());
+
+    let result = pipeline
+        .commit(&receipt, claimed_path, claimed_file_name, terminal_state)
+        .map_err(|e| format!("pipeline commit failed: {e}"))?;
+
+    Ok(result.job_terminal_path)
 }
 
 /// Compute observed job cost from wall-clock elapsed time.

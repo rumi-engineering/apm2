@@ -409,7 +409,8 @@ pub use receipt::{
 pub use receipt_index::{
     INDEX_FILE_NAME, INDEX_SUBDIR, MAX_INDEX_ENTRIES, MAX_INDEX_FILE_SIZE, MAX_JOB_INDEX_ENTRIES,
     MAX_REBUILD_SCAN_FILES, RECEIPT_INDEX_SCHEMA, ReceiptHeaderV1, ReceiptIndexError,
-    ReceiptIndexV1, has_receipt_for_job, list_receipt_headers, lookup_job_receipt,
+    ReceiptIndexV1, find_receipt_for_job, has_receipt_for_job, list_receipt_headers,
+    lookup_job_receipt,
 };
 // Re-export receipt pipeline types (TCK-00564)
 pub use receipt_pipeline::{

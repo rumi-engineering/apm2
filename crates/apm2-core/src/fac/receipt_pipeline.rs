@@ -261,6 +261,26 @@ impl RecoveryReceiptV1 {
                 self.job_id.len()
             )));
         }
+        // MINOR-1 (f-715-code_quality-1771314538466341-0): Require non-empty
+        // b3-256 digest format (must start with "b3-256:" and have hex suffix).
+        if self.original_receipt_hash.is_empty() {
+            return Err(ReceiptPipelineError::RecoveryValidation(
+                "original_receipt_hash is empty (required for audit binding)".to_string(),
+            ));
+        }
+        if !self.original_receipt_hash.starts_with("b3-256:") {
+            return Err(ReceiptPipelineError::RecoveryValidation(format!(
+                "original_receipt_hash must start with 'b3-256:', got '{}'",
+                truncate_for_display(&self.original_receipt_hash, 64),
+            )));
+        }
+        let hex_suffix = &self.original_receipt_hash["b3-256:".len()..];
+        if hex_suffix.is_empty() || !hex_suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(ReceiptPipelineError::RecoveryValidation(format!(
+                "original_receipt_hash has invalid hex suffix: '{}'",
+                truncate_for_display(hex_suffix, 64),
+            )));
+        }
         if self.original_receipt_hash.len() > MAX_HASH_LENGTH {
             return Err(ReceiptPipelineError::RecoveryValidation(format!(
                 "original_receipt_hash too long: {} > {MAX_HASH_LENGTH}",
@@ -320,7 +340,25 @@ impl RecoveryReceiptV1 {
             });
         }
 
-        std::fs::create_dir_all(receipts_dir).map_err(ReceiptPipelineError::RecoveryIo)?;
+        // INV-PIPE-004 / CTR-2611: Create receipts directory with mode 0o700.
+        #[cfg(unix)]
+        {
+            use std::fs::DirBuilder;
+            use std::os::unix::fs::DirBuilderExt;
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(receipts_dir)
+                .map_err(ReceiptPipelineError::RecoveryIo)?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(receipts_dir).map_err(ReceiptPipelineError::RecoveryIo)?;
+        }
+
+        // SECURITY (f-715-security-1771314598779527-0): Sanitize receipt_id to prevent
+        // path traversal. Reject path separators, dot-segments, and null bytes.
+        validate_receipt_id_for_filename(&self.receipt_id)?;
 
         let final_name = format!("recovery-{}.json", self.receipt_id);
         let final_path = receipts_dir.join(&final_name);
@@ -483,17 +521,23 @@ impl ReceiptWritePipeline {
         validate_file_name(file_name)?;
 
         let dest_dir = self.queue_root.join(terminal_state.dir_name());
-        let dest_path = move_job_to_terminal(claimed_path, &dest_dir, file_name).map_err(|e| {
-            ReceiptPipelineError::JobMoveFailed {
-                from: claimed_path.to_string_lossy().to_string(),
-                to: dest_dir.to_string_lossy().to_string(),
-                reason: e,
-            }
-        })?;
 
+        // SECURITY (f-715-security-1771314368412388-0,
+        // f-715-code_quality-1771314528176542-0): Persist the recovery receipt
+        // BEFORE moving the job to terminal. Receipt durability is the commit
+        // point. If persist() fails, the job remains in claimed/ and no
+        // unreceipted state change occurs.
+        let dest_path_preview = dest_dir.join(file_name);
+
+        // MINOR security (f-715-security-1771314598909139-0): Compute receipt_id with
+        // length awareness. The prefix "recovery-" (9 chars) and suffix "-{timestamp}"
+        // (~20 chars) leave up to MAX_ID_LENGTH - 30 chars for the job_id
+        // portion.
+        let max_job_id_chars = MAX_ID_LENGTH.saturating_sub(30);
+        let truncated_job_id: String = receipt.job_id.chars().take(max_job_id_chars).collect();
         let recovery_receipt = RecoveryReceiptV1 {
             schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
-            receipt_id: format!("recovery-{}-{timestamp_secs}", receipt.job_id),
+            receipt_id: format!("recovery-{truncated_job_id}-{timestamp_secs}"),
             job_id: receipt.job_id.clone(),
             original_receipt_hash: receipt.content_hash.clone(),
             detected_state: format!(
@@ -502,11 +546,23 @@ impl ReceiptWritePipeline {
             ),
             repair_action: format!("moved job to {}/{}", terminal_state.dir_name(), file_name),
             source_path: claimed_path.to_string_lossy().to_string(),
-            destination_path: dest_path.to_string_lossy().to_string(),
+            destination_path: dest_path_preview.to_string_lossy().to_string(),
             timestamp_secs,
         };
 
+        // Step 1: Persist recovery receipt (commit point for auditability).
         recovery_receipt.persist(&self.receipts_dir)?;
+
+        // Step 2: Move job to terminal directory. Recovery receipt is already durable,
+        // so even if this fails, the repair is documented. The caller can retry the
+        // move.
+        let _dest_path = move_job_to_terminal(claimed_path, &dest_dir, file_name).map_err(|e| {
+            ReceiptPipelineError::JobMoveFailed {
+                from: claimed_path.to_string_lossy().to_string(),
+                to: dest_dir.to_string_lossy().to_string(),
+                reason: e,
+            }
+        })?;
 
         Ok(recovery_receipt)
     }
@@ -533,9 +589,10 @@ fn validate_file_name(file_name: &str) -> Result<(), ReceiptPipelineError> {
         });
     }
     if file_name.len() > MAX_FILE_NAME_LENGTH {
+        // Use char-boundary-safe truncation (RSK-0701: no panic on multibyte UTF-8).
+        let truncated: String = file_name.chars().take(64).collect();
         return Err(ReceiptPipelineError::InvalidFileName {
-            // Truncate for safety in error display.
-            file_name: file_name[..64].to_string(),
+            file_name: truncated,
             reason: "file name exceeds maximum length",
         });
     }
@@ -561,6 +618,53 @@ fn validate_file_name(file_name: &str) -> Result<(), ReceiptPipelineError> {
     Ok(())
 }
 
+/// Truncate a string for display purposes, safely handling multibyte UTF-8.
+fn truncate_for_display(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{truncated}...")
+    }
+}
+
+/// Validate that a `receipt_id` is safe for use in a filename.
+///
+/// Rejects path separators, dot-segments, null bytes, and overlength values
+/// to prevent path traversal when constructing `recovery-{receipt_id}.json`.
+///
+/// # Errors
+///
+/// Returns [`ReceiptPipelineError::RecoveryValidation`] if the ID is unsafe.
+fn validate_receipt_id_for_filename(receipt_id: &str) -> Result<(), ReceiptPipelineError> {
+    if receipt_id.is_empty() {
+        return Err(ReceiptPipelineError::RecoveryValidation(
+            "receipt_id is empty".to_string(),
+        ));
+    }
+    if receipt_id.contains('/') || receipt_id.contains('\\') {
+        return Err(ReceiptPipelineError::RecoveryValidation(
+            "receipt_id contains path separator (path traversal rejected)".to_string(),
+        ));
+    }
+    if receipt_id.contains('\0') {
+        return Err(ReceiptPipelineError::RecoveryValidation(
+            "receipt_id contains null byte".to_string(),
+        ));
+    }
+    if receipt_id == "." || receipt_id == ".." {
+        return Err(ReceiptPipelineError::RecoveryValidation(
+            "receipt_id is a dot-segment (path traversal rejected)".to_string(),
+        ));
+    }
+    if receipt_id.contains("..") {
+        return Err(ReceiptPipelineError::RecoveryValidation(
+            "receipt_id contains '..' (path traversal rejected)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Move a job file to a terminal directory with collision-safe naming.
 ///
 /// Creates the destination directory if it does not exist (mode 0o700).
@@ -571,22 +675,67 @@ fn validate_file_name(file_name: &str) -> Result<(), ReceiptPipelineError> {
 ///
 /// Returns an error string if the move fails.
 fn move_job_to_terminal(src: &Path, dest_dir: &Path, file_name: &str) -> Result<PathBuf, String> {
-    if !dest_dir.exists() {
-        #[cfg(unix)]
-        {
-            use std::fs::DirBuilder;
-            use std::os::unix::fs::DirBuilderExt;
-            DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dest_dir)
-                .map_err(|e| format!("cannot create {}: {e}", dest_dir.display()))?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::create_dir_all(dest_dir)
-                .map_err(|e| format!("cannot create {}: {e}", dest_dir.display()))?;
-        }
+    // SECURITY (f-715-security-1771314374402491-0): Symlink-safe terminal move.
+    // Check dest_dir via symlink_metadata before creating or using it.
+    // Reject symlinks on destination path to prevent queue confinement escape.
+    match std::fs::symlink_metadata(dest_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "destination directory is a symlink (confinement escape rejected): {}",
+                    dest_dir.display()
+                ));
+            }
+            if !meta.is_dir() {
+                return Err(format!(
+                    "destination path exists but is not a directory: {}",
+                    dest_dir.display()
+                ));
+            }
+            // Verify ownership and mode on Unix.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let uid = meta.uid();
+                // SAFETY: geteuid() is a pure read of the process effective UID.
+                // No memory is read or written. Always safe to call.
+                #[allow(unsafe_code)]
+                let euid = unsafe { libc::geteuid() };
+                if uid != euid {
+                    return Err(format!(
+                        "destination directory owned by uid {} but process euid is {} \
+                         (ownership mismatch rejected): {}",
+                        uid,
+                        euid,
+                        dest_dir.display()
+                    ));
+                }
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Directory does not exist — create it with restrictive mode.
+            #[cfg(unix)]
+            {
+                use std::fs::DirBuilder;
+                use std::os::unix::fs::DirBuilderExt;
+                DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(dest_dir)
+                    .map_err(|e| format!("cannot create {}: {e}", dest_dir.display()))?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::create_dir_all(dest_dir)
+                    .map_err(|e| format!("cannot create {}: {e}", dest_dir.display()))?;
+            }
+        },
+        Err(e) => {
+            return Err(format!(
+                "cannot stat destination directory {}: {e}",
+                dest_dir.display()
+            ));
+        },
     }
 
     let dest = dest_dir.join(file_name);
@@ -713,14 +862,16 @@ mod tests {
     use super::*;
     use crate::fac::receipt::{FacJobOutcome, FacJobReceiptV1, QueueAdmissionTrace};
 
+    /// Canonical test b3-256 hash for use in tests.
+    const TEST_B3_HASH: &str =
+        "b3-256:0000000000000000000000000000000000000000000000000000000000000000";
+
     fn make_receipt(job_id: &str, outcome: FacJobOutcome) -> FacJobReceiptV1 {
-        FacJobReceiptV1 {
+        let mut receipt = FacJobReceiptV1 {
             schema: "apm2.fac.job_receipt.v1".to_string(),
             receipt_id: format!("test-rcpt-{job_id}"),
             job_id: job_id.to_string(),
-            job_spec_digest:
-                "b3-256:0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
+            job_spec_digest: TEST_B3_HASH.to_string(),
             policy_hash: None,
             patch_digest: None,
             canonicalizer_tuple_digest: None,
@@ -742,7 +893,10 @@ mod tests {
             sandbox_hardening_hash: None,
             timestamp_secs: 1000,
             content_hash: String::new(),
-        }
+        };
+        // Compute real content hash so recovery receipts can reference it.
+        receipt.content_hash = compute_job_receipt_content_hash(&receipt);
+        receipt
     }
 
     fn setup_claimed_job(queue_root: &Path, job_id: &str) -> PathBuf {
@@ -1016,7 +1170,7 @@ mod tests {
             schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
             receipt_id: "test-recovery-1".to_string(),
             job_id: "job-1".to_string(),
-            original_receipt_hash: "hash-1".to_string(),
+            original_receipt_hash: TEST_B3_HASH.to_string(),
             detected_state: "receipt exists, job in claimed/".to_string(),
             repair_action: "moved to completed/".to_string(),
             source_path: "/tmp/claimed/job-1.json".to_string(),
@@ -1072,6 +1226,7 @@ mod tests {
         let mut receipt_2 = make_receipt("dupe", FacJobOutcome::Completed);
         receipt_2.timestamp_secs = 2000;
         receipt_2.receipt_id = "test-rcpt-dupe-2".to_string();
+        receipt_2.content_hash = compute_job_receipt_content_hash(&receipt_2);
 
         // Second commit should succeed with a collision-safe name.
         let result_2 = pipeline
@@ -1276,7 +1431,7 @@ mod tests {
             schema: "wrong-schema".to_string(),
             receipt_id: "test-recovery-typed".to_string(),
             job_id: "job-typed".to_string(),
-            original_receipt_hash: "hash-typed".to_string(),
+            original_receipt_hash: TEST_B3_HASH.to_string(),
             detected_state: "test".to_string(),
             repair_action: "test".to_string(),
             source_path: "/tmp/test".to_string(),
@@ -1299,7 +1454,7 @@ mod tests {
             schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
             receipt_id: String::new(), // empty — should fail
             job_id: "job-1".to_string(),
-            original_receipt_hash: "hash-1".to_string(),
+            original_receipt_hash: TEST_B3_HASH.to_string(),
             detected_state: "test".to_string(),
             repair_action: "test".to_string(),
             source_path: "/tmp/test".to_string(),
@@ -1328,7 +1483,7 @@ mod tests {
             schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
             receipt_id: "x".repeat(MAX_ID_LENGTH + 1),
             job_id: "job-1".to_string(),
-            original_receipt_hash: "hash-1".to_string(),
+            original_receipt_hash: TEST_B3_HASH.to_string(),
             detected_state: "test".to_string(),
             repair_action: "test".to_string(),
             source_path: "/tmp/test".to_string(),
@@ -1348,7 +1503,7 @@ mod tests {
             schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
             receipt_id: "test-id".to_string(),
             job_id: "j".repeat(MAX_ID_LENGTH + 1),
-            original_receipt_hash: "hash-1".to_string(),
+            original_receipt_hash: TEST_B3_HASH.to_string(),
             detected_state: "test".to_string(),
             repair_action: "test".to_string(),
             source_path: "/tmp/test".to_string(),
@@ -1368,7 +1523,8 @@ mod tests {
             schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
             receipt_id: "test-id".to_string(),
             job_id: "job-1".to_string(),
-            original_receipt_hash: "h".repeat(MAX_HASH_LENGTH + 1),
+            // Use a b3-256: prefix with oversized hex suffix to trigger the length check.
+            original_receipt_hash: format!("b3-256:{}", "a".repeat(MAX_HASH_LENGTH)),
             detected_state: "test".to_string(),
             repair_action: "test".to_string(),
             source_path: "/tmp/test".to_string(),
@@ -1388,7 +1544,7 @@ mod tests {
             schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
             receipt_id: "test-id".to_string(),
             job_id: "job-1".to_string(),
-            original_receipt_hash: "hash-1".to_string(),
+            original_receipt_hash: TEST_B3_HASH.to_string(),
             detected_state: "test".to_string(),
             repair_action: "test".to_string(),
             source_path: "/".repeat(MAX_PATH_LENGTH + 1),
@@ -1408,7 +1564,7 @@ mod tests {
             schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
             receipt_id: "test-id".to_string(),
             job_id: "job-1".to_string(),
-            original_receipt_hash: "hash-1".to_string(),
+            original_receipt_hash: TEST_B3_HASH.to_string(),
             detected_state: "test".to_string(),
             repair_action: "test".to_string(),
             source_path: "/tmp/test".to_string(),
@@ -1429,7 +1585,8 @@ mod tests {
             schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
             receipt_id: "x".repeat(MAX_ID_LENGTH),
             job_id: "j".repeat(MAX_ID_LENGTH),
-            original_receipt_hash: "h".repeat(MAX_HASH_LENGTH),
+            // Use a valid b3-256 hash at maximum length.
+            original_receipt_hash: format!("b3-256:{}", "a".repeat(MAX_HASH_LENGTH - 7)),
             detected_state: "d".repeat(MAX_RECOVERY_REASON_LENGTH),
             repair_action: "r".repeat(MAX_RECOVERY_REASON_LENGTH),
             source_path: "s".repeat(MAX_PATH_LENGTH),
@@ -1473,5 +1630,285 @@ mod tests {
             result.unwrap_err(),
             ReceiptPipelineError::InvalidFileName { reason, .. } if reason.contains("maximum length")
         ));
+    }
+
+    // =========================================================================
+    // MAJOR-3 regression: multibyte UTF-8 overlength → Err not panic
+    // =========================================================================
+
+    #[test]
+    fn test_validate_file_name_overlength_multibyte_no_panic() {
+        // Build a >255-byte filename from 4-byte CJK characters.
+        // Each character is 3 bytes in UTF-8, so 100 chars = 300 bytes > 255.
+        let multibyte_name: String = "\u{4e16}".repeat(100);
+        assert!(
+            multibyte_name.len() > MAX_FILE_NAME_LENGTH,
+            "test precondition: name must exceed MAX_FILE_NAME_LENGTH in bytes"
+        );
+        let result = validate_file_name(&multibyte_name);
+        assert!(
+            result.is_err(),
+            "overlength multibyte filename must be rejected"
+        );
+        // Must NOT panic — the error path uses char-boundary-safe truncation.
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptPipelineError::InvalidFileName { reason, .. } if reason.contains("maximum length")
+        ));
+    }
+
+    // =========================================================================
+    // MINOR-1 regression: empty/invalid original_receipt_hash → Err
+    // =========================================================================
+
+    #[test]
+    fn test_validate_rejects_empty_original_receipt_hash() {
+        let receipt = RecoveryReceiptV1 {
+            schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
+            receipt_id: "test-id".to_string(),
+            job_id: "job-1".to_string(),
+            original_receipt_hash: String::new(),
+            detected_state: "test".to_string(),
+            repair_action: "test".to_string(),
+            source_path: "/tmp/test".to_string(),
+            destination_path: "/tmp/test2".to_string(),
+            timestamp_secs: 1000,
+        };
+        let err = receipt.validate().unwrap_err();
+        assert!(
+            matches!(err, ReceiptPipelineError::RecoveryValidation(ref s) if s.contains("empty")),
+            "empty original_receipt_hash must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_non_b3_256_original_receipt_hash() {
+        let receipt = RecoveryReceiptV1 {
+            schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
+            receipt_id: "test-id".to_string(),
+            job_id: "job-1".to_string(),
+            original_receipt_hash: "sha256:abcdef".to_string(),
+            detected_state: "test".to_string(),
+            repair_action: "test".to_string(),
+            source_path: "/tmp/test".to_string(),
+            destination_path: "/tmp/test2".to_string(),
+            timestamp_secs: 1000,
+        };
+        let err = receipt.validate().unwrap_err();
+        assert!(
+            matches!(err, ReceiptPipelineError::RecoveryValidation(ref s) if s.contains("b3-256:")),
+            "non-b3-256 original_receipt_hash must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_b3_256_with_invalid_hex() {
+        let receipt = RecoveryReceiptV1 {
+            schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
+            receipt_id: "test-id".to_string(),
+            job_id: "job-1".to_string(),
+            original_receipt_hash: "b3-256:not_hex_data!".to_string(),
+            detected_state: "test".to_string(),
+            repair_action: "test".to_string(),
+            source_path: "/tmp/test".to_string(),
+            destination_path: "/tmp/test2".to_string(),
+            timestamp_secs: 1000,
+        };
+        let err = receipt.validate().unwrap_err();
+        assert!(
+            matches!(err, ReceiptPipelineError::RecoveryValidation(ref s) if s.contains("invalid hex")),
+            "invalid hex suffix must be rejected, got: {err}"
+        );
+    }
+
+    // =========================================================================
+    // BLOCKER (security): Path traversal in recovery receipt_id → Err
+    // =========================================================================
+
+    #[test]
+    fn test_recovery_receipt_persist_rejects_traversal_in_receipt_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+
+        let receipt = RecoveryReceiptV1 {
+            schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
+            receipt_id: "../evil-escape".to_string(),
+            job_id: "job-1".to_string(),
+            original_receipt_hash: TEST_B3_HASH.to_string(),
+            detected_state: "test".to_string(),
+            repair_action: "test".to_string(),
+            source_path: "/tmp/test".to_string(),
+            destination_path: "/tmp/test2".to_string(),
+            timestamp_secs: 1000,
+        };
+
+        let result = receipt.persist(&receipts_dir);
+        assert!(
+            result.is_err(),
+            "path traversal in receipt_id must be rejected"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptPipelineError::RecoveryValidation(ref s) if s.contains("path traversal")
+        ));
+    }
+
+    #[test]
+    fn test_recovery_receipt_persist_rejects_slash_in_receipt_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+
+        let receipt = RecoveryReceiptV1 {
+            schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
+            receipt_id: "recovery/evil".to_string(),
+            job_id: "job-1".to_string(),
+            original_receipt_hash: TEST_B3_HASH.to_string(),
+            detected_state: "test".to_string(),
+            repair_action: "test".to_string(),
+            source_path: "/tmp/test".to_string(),
+            destination_path: "/tmp/test2".to_string(),
+            timestamp_secs: 1000,
+        };
+
+        let result = receipt.persist(&receipts_dir);
+        assert!(result.is_err(), "slash in receipt_id must be rejected");
+    }
+
+    // =========================================================================
+    // MAJOR-2 regression: symlink on terminal directory → Err
+    // =========================================================================
+
+    #[cfg(unix)]
+    #[test]
+    fn test_move_job_to_terminal_rejects_symlinked_dest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = tmp.path().join("queue");
+        let claimed_path = setup_claimed_job(&queue_root, "job-symlink");
+
+        // Create a symlink as the destination directory.
+        let real_dir = tmp.path().join("real_target");
+        std::fs::create_dir_all(&real_dir).expect("create real dir");
+        let symlink_dir = queue_root.join("completed");
+        std::os::unix::fs::symlink(&real_dir, &symlink_dir).expect("create symlink");
+
+        let result = move_job_to_terminal(&claimed_path, &symlink_dir, "job-symlink.json");
+        assert!(result.is_err(), "symlinked destination must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("symlink"),
+            "error must mention symlink, got: {err}"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR-4 regression: directory mode is 0o700
+    // =========================================================================
+
+    #[cfg(unix)]
+    #[test]
+    fn test_recovery_receipt_dir_mode_0o700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("new_receipts_dir");
+
+        let receipt = RecoveryReceiptV1 {
+            schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
+            receipt_id: "test-mode-check".to_string(),
+            job_id: "job-mode".to_string(),
+            original_receipt_hash: TEST_B3_HASH.to_string(),
+            detected_state: "test".to_string(),
+            repair_action: "test".to_string(),
+            source_path: "/tmp/test".to_string(),
+            destination_path: "/tmp/test2".to_string(),
+            timestamp_secs: 1000,
+        };
+
+        receipt
+            .persist(&receipts_dir)
+            .expect("persist should succeed");
+
+        // Verify the directory was created with mode 0o700.
+        let meta = std::fs::metadata(&receipts_dir).expect("stat receipts dir");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "receipts directory must be created with mode 0o700, got {mode:o}"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR-1 regression: recovery receipt persisted BEFORE move
+    // =========================================================================
+
+    #[test]
+    fn test_recover_torn_state_receipt_durable_before_move() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        let queue_root = tmp.path().join("queue");
+        let claimed_path = setup_claimed_job(&queue_root, "job-order-check");
+
+        let receipt = make_receipt("job-order-check", FacJobOutcome::Completed);
+        let _receipt_path =
+            persist_content_addressed_receipt(&receipts_dir, &receipt).expect("persist");
+
+        let pipeline = ReceiptWritePipeline::new(receipts_dir.clone(), queue_root);
+        let recovery = pipeline
+            .recover_torn_state(
+                &claimed_path,
+                "job-order-check.json",
+                &receipt,
+                TerminalState::Completed,
+                5000,
+            )
+            .expect("recovery should succeed");
+
+        // Recovery receipt must be persisted.
+        let recovery_path = receipts_dir.join(format!("recovery-{}.json", recovery.receipt_id));
+        assert!(recovery_path.exists(), "recovery receipt must be persisted");
+
+        // Job must have moved.
+        assert!(!claimed_path.exists(), "job must be gone from claimed/");
+    }
+
+    // =========================================================================
+    // MINOR security: receipt_id length overflow for long job_ids
+    // =========================================================================
+
+    #[test]
+    fn test_recover_torn_state_handles_long_job_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        let queue_root = tmp.path().join("queue");
+        // Use a short file_name even though the job_id in the receipt is long.
+        let claimed_path = setup_claimed_job(&queue_root, "long-id");
+
+        let mut receipt = make_receipt("long-id", FacJobOutcome::Completed);
+        // Override the job_id to be very long.
+        receipt.job_id = "j".repeat(MAX_ID_LENGTH);
+        receipt.content_hash = compute_job_receipt_content_hash(&receipt);
+        let _receipt_path =
+            persist_content_addressed_receipt(&receipts_dir, &receipt).expect("persist");
+
+        let pipeline = ReceiptWritePipeline::new(receipts_dir, queue_root);
+        let result = pipeline.recover_torn_state(
+            &claimed_path,
+            "long-id.json",
+            &receipt,
+            TerminalState::Completed,
+            9999,
+        );
+        // Should succeed without receipt_id validation failure.
+        assert!(
+            result.is_ok(),
+            "recovery must succeed for long job_id, got: {:?}",
+            result.err()
+        );
+        let recovery = result.unwrap();
+        assert!(
+            recovery.receipt_id.len() <= MAX_ID_LENGTH,
+            "receipt_id must not exceed MAX_ID_LENGTH, got: {}",
+            recovery.receipt_id.len()
+        );
     }
 }

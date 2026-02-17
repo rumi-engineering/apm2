@@ -1364,14 +1364,21 @@ the content-addressed receipt store.
 
 When reconciliation (via `reconcile` submodule) detects a claimed job that
 already has a receipt in the store, it calls `recover_torn_state()` which:
-1. Moves the job to its terminal directory.
-2. Emits a `RecoveryReceiptV1` documenting the detected inconsistency and the
-   repair action taken.
+1. Persists a `RecoveryReceiptV1` documenting the detected inconsistency and
+   the repair action (receipt-before-move ordering, MAJOR-1 fix).
+2. Moves the job to its correct terminal directory based on the receipt outcome.
+
+The `recover_torn_state` method enforces symlink-safe moves (MAJOR-2),
+validates file name confinement (CTR-1504), and uses UTF-8-safe truncation
+for receipt IDs constructed from job IDs (MAJOR-3/MINOR security fixes).
 
 ### Helper Functions
 
 - `receipt_exists_for_job(receipts_dir, job_id)`: O(1) index lookup with
-  fallback to directory scan. Used by reconciliation to detect torn states.
+  fallback to directory scan. Used by worker duplicate detection.
+- `find_receipt_for_job(receipts_dir, job_id)`: O(1) index lookup with
+  fallback to directory scan. Returns the full receipt. Used by reconciliation
+  to detect torn states and determine the correct terminal directory.
 - `outcome_to_terminal_state(outcome)`: Maps `FacJobOutcome` to `TerminalState`.
 
 ### Security Invariants (TCK-00564)
@@ -1390,6 +1397,19 @@ already has a receipt in the store, it calls `recover_torn_state()` which:
   name is generated.
 - [INV-PIPE-006] Wall-clock time for collision avoidance is narrowly bypassed
   with documented CTR-2501 security justification.
+- [INV-PIPE-007] Recovery receipt persistence occurs BEFORE job move (MAJOR-1
+  fix). If persist fails, job stays in claimed/ and no unreceipted state change
+  occurs.
+- [INV-PIPE-008] `move_job_to_terminal` rejects symlinked destination directories
+  via `symlink_metadata` check (MAJOR-2 fix, CTR-1503).
+- [INV-PIPE-009] `validate_file_name` uses char-boundary-safe UTF-8 truncation
+  (MAJOR-3 fix, RSK-0701: no panic on multibyte input).
+- [INV-PIPE-010] `original_receipt_hash` is validated as non-empty with `b3-256:`
+  prefix and hex suffix (MINOR-1 fix).
+- [INV-PIPE-011] `receipt_id` in `RecoveryReceiptV1::persist` is validated
+  against path traversal via `validate_receipt_id_for_filename` (BLOCKER security).
+- [INV-PIPE-012] `receipt_id` length is bounded by truncating `job_id` to prevent
+  overflow (MINOR security fix).
 
 ## reconcile Submodule (TCK-00534)
 

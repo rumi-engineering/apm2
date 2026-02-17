@@ -711,6 +711,36 @@ pub fn has_receipt_for_job(receipts_dir: &Path, job_id: &str) -> bool {
     scan_receipt_for_job(receipts_dir, job_id).is_some()
 }
 
+/// Find and return a verified receipt for a given `job_id`, if one exists.
+///
+/// Performs the same lookup and integrity verification as
+/// [`has_receipt_for_job`], but returns the full receipt rather than just a
+/// boolean. This is used by reconciliation to recover torn states where a
+/// receipt was persisted but the job was not moved to its terminal directory
+/// (TCK-00564 BLOCKER-2).
+///
+/// The receipt's `content_hash` is verified against the recomputed hash to
+/// prevent tampered receipts from driving recovery actions.
+#[must_use]
+pub fn find_receipt_for_job(receipts_dir: &Path, job_id: &str) -> Option<FacJobReceiptV1> {
+    // Try the index first -- O(1) lookup with full verification.
+    if let Ok(index) = ReceiptIndexV1::load_or_rebuild(receipts_dir) {
+        if let Some(digest) = index.latest_digest_for_job(job_id) {
+            if is_valid_digest(digest) {
+                let receipt_path = receipts_dir.join(format!("{digest}.json"));
+                if let Some(receipt) = load_receipt_bounded(&receipt_path) {
+                    if receipt.job_id == job_id && verify_receipt_integrity(&receipt, digest) {
+                        return Some(receipt);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: bounded directory scan.
+    scan_receipt_for_job(receipts_dir, job_id)
+}
+
 /// Validate that a digest string is a well-formed BLAKE3-256 hex digest.
 ///
 /// Must be exactly 64 lowercase hex characters. Rejects path separators,
