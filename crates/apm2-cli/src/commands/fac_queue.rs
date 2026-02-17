@@ -257,9 +257,19 @@ fn scan_directory(dir_path: &Path, dir_name: &str) -> DirectoryStatus {
 
 /// Collects denial/quarantine reason stats from job specs in a directory.
 ///
+/// Uses canonical `denial_reason` from receipts (via `lookup_job_receipt`)
+/// as the aggregation key.  Falls back to an explicit `"unknown"` bucket
+/// only when receipt data is unavailable. This satisfies the forensics-first
+/// requirement: operators see denial/quarantine *cause taxonomy*, not job
+/// types (BLOCKER finding: spec.kind is a job type, not a reason code).
+///
 /// Bounded by `MAX_SCAN_ENTRIES` reads and `MAX_REASON_CODES` distinct
 /// reason codes to prevent unbounded `HashMap` growth.
-fn collect_reason_stats(dir_path: &Path, receipts_dir: &Path, reasons: &mut HashMap<String, usize>) {
+fn collect_reason_stats(
+    dir_path: &Path,
+    receipts_dir: &Path,
+    reasons: &mut HashMap<String, usize>,
+) {
     if !dir_path.is_dir() {
         return;
     }
@@ -280,17 +290,12 @@ fn collect_reason_stats(dir_path: &Path, receipts_dir: &Path, reasons: &mut Hash
             continue;
         }
 
-        // Best-effort: try to read the spec.
+        // Best-effort: try to read the spec to get the job_id.
         if let Ok(spec) = read_job_spec_bounded(&path) {
-            // Default to kind if receipt lookup fails.
-            let mut reason_key = spec.kind.clone();
-
-            // Try to resolve receipt for better reason (TCK-00535/Major-1).
-            if let Some(receipt) = apm2_core::fac::lookup_job_receipt(receipts_dir, &spec.job_id) {
-                if let Some(dr) = receipt.denial_reason {
-                    reason_key = format!("{:?}", dr);
-                }
-            }
+            // Primary: resolve canonical denial_reason from receipt.
+            let reason_key = apm2_core::fac::lookup_job_receipt(receipts_dir, &spec.job_id)
+                .and_then(|receipt| receipt.denial_reason)
+                .map_or_else(|| "unknown".to_string(), |dr| format!("{dr:?}"));
 
             if reasons.len() < MAX_REASON_CODES || reasons.contains_key(&reason_key) {
                 *reasons.entry(reason_key).or_insert(0) += 1;
@@ -390,8 +395,9 @@ fn output_error(json_output: bool, message: &str) {
 
 #[cfg(test)]
 mod tests {
+    use apm2_core::fac::job_spec::FacJobSpecV1;
+
     use super::*;
-    use apm2_core::fac::job_spec::{FacJobSpecV1, MAX_JOB_SPEC_SIZE};
 
     #[test]
     fn test_scan_empty_directory() {
@@ -476,6 +482,8 @@ mod tests {
 
     #[test]
     fn test_read_job_spec_bounded_rejects_oversized() {
+        use apm2_core::fac::job_spec::MAX_JOB_SPEC_SIZE;
+
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("oversized.json");
         let oversized = vec![b'{'; MAX_JOB_SPEC_SIZE + 100];
@@ -484,6 +492,66 @@ mod tests {
         let result = read_job_spec_bounded(&path);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("exceeds max"));
+    }
+
+    /// Regression test: `collect_reason_stats` uses receipt-based
+    /// `denial_reason` as the aggregation key, NOT `spec.kind` (BLOCKER
+    /// finding from review). When no receipt exists for a job, it falls
+    /// back to `"unknown"`.
+    #[test]
+    fn test_collect_reason_stats_uses_receipt_denial_reason() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let denied_dir = tmp.path().join("denied");
+        let receipts_dir = tmp.path().join("receipts");
+        fs::create_dir_all(&denied_dir).unwrap();
+        fs::create_dir_all(&receipts_dir).unwrap();
+
+        // Create a job spec in denied/ with kind="gates".
+        // Without a receipt, it should aggregate under "unknown" -- NOT "gates".
+        let spec = make_test_spec("no-receipt-job", "2026-02-15T10:00:00Z");
+        let json = serde_json::to_string_pretty(&spec).unwrap();
+        fs::write(denied_dir.join("no-receipt-job.json"), &json).unwrap();
+
+        // Create another job spec with a receipt that has a denial_reason.
+        let spec2 = make_test_spec("has-receipt-job", "2026-02-15T11:00:00Z");
+        let json2 = serde_json::to_string_pretty(&spec2).unwrap();
+        fs::write(denied_dir.join("has-receipt-job.json"), &json2).unwrap();
+
+        // Persist a receipt with a denial reason for the second job.
+        let fake_digest = format!("b3-256:{}", "a".repeat(64));
+        let builder = apm2_core::fac::FacJobReceiptV1Builder::new(
+            "receipt-1",
+            "has-receipt-job",
+            &fake_digest,
+        )
+        .outcome(apm2_core::fac::FacJobOutcome::Denied)
+        .denial_reason(apm2_core::fac::DenialReasonCode::DigestMismatch)
+        .reason("test denial")
+        .timestamp_secs(1_700_000_000);
+        let receipt = builder.try_build().expect("receipt builds");
+        apm2_core::fac::persist_content_addressed_receipt(&receipts_dir, &receipt)
+            .expect("persist receipt");
+
+        let mut reasons = HashMap::new();
+        collect_reason_stats(&denied_dir, &receipts_dir, &mut reasons);
+
+        // The job with a receipt should be keyed by "DigestMismatch" (Debug format).
+        assert!(
+            reasons.contains_key("DigestMismatch"),
+            "expected DigestMismatch reason key, got: {reasons:?}"
+        );
+        assert_eq!(reasons["DigestMismatch"], 1);
+
+        // The job without a receipt should be keyed by "unknown", NOT "gates".
+        assert!(
+            !reasons.contains_key("gates"),
+            "spec.kind must NOT be used as reason key: {reasons:?}"
+        );
+        assert!(
+            reasons.contains_key("unknown"),
+            "expected 'unknown' fallback for missing receipt: {reasons:?}"
+        );
+        assert_eq!(reasons["unknown"], 1);
     }
 
     /// Create a minimal test job spec for unit tests.

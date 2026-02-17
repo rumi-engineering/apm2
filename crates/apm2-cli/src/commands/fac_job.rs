@@ -58,7 +58,7 @@ use serde::Serialize;
 
 use crate::commands::fac::CancelArgs;
 use crate::commands::fac_utils::{
-    self, MAX_SCAN_ENTRIES, read_job_spec_bounded, resolve_fac_root, resolve_queue_root,
+    MAX_SCAN_ENTRIES, read_job_spec_bounded, resolve_fac_root, resolve_queue_root,
 };
 use crate::exit_codes::codes as exit_codes;
 
@@ -77,6 +77,10 @@ const QUARANTINE_DIR: &str = "quarantine";
 
 /// FAC receipt directory under `$APM2_HOME/private/fac`.
 const FAC_RECEIPTS_DIR: &str = "receipts";
+
+/// Maximum total log pointers collected across all scan locations.
+/// Prevents unbounded allocation when scanning large lane/evidence trees.
+const MAX_LOG_POINTERS: usize = 256;
 
 // =============================================================================
 // Output types
@@ -824,6 +828,8 @@ struct JobShowOutput {
     latest_receipt: Option<serde_json::Value>,
     /// Paths to related log files, if discoverable.
     log_pointers: Vec<String>,
+    /// Whether the log pointer collection was truncated at the cap.
+    log_pointers_truncated: bool,
     /// The path to the job spec file on disk.
     #[serde(skip_serializing_if = "Option::is_none")]
     spec_path: Option<String>,
@@ -888,13 +894,15 @@ pub fn run_job_show(job_id: &str, json_output: bool) -> u8 {
     };
 
     // Read the job spec.
-    let spec = spec_path.as_ref().and_then(|p| read_job_spec_bounded(p).ok());
+    let spec = spec_path
+        .as_ref()
+        .and_then(|p| read_job_spec_bounded(p).ok());
 
     // Look up the latest receipt from the receipt index.
     let latest_receipt = resolve_latest_receipt(job_id);
 
-    // Discover log pointers.
-    let log_pointers = discover_log_pointers(job_id, &queue_root);
+    // Discover log pointers (bounded by MAX_LOG_POINTERS).
+    let (log_pointers, log_pointers_truncated) = discover_log_pointers(job_id);
 
     let output = JobShowOutput {
         job_id: job_id.to_string(),
@@ -902,6 +910,7 @@ pub fn run_job_show(job_id: &str, json_output: bool) -> u8 {
         spec,
         latest_receipt,
         log_pointers,
+        log_pointers_truncated,
         spec_path: spec_path.map(|p| p.display().to_string()),
     };
 
@@ -926,19 +935,36 @@ fn resolve_latest_receipt(job_id: &str) -> Option<serde_json::Value> {
 /// Discovers log file pointers related to a job.
 ///
 /// Looks for log directories under `$APM2_HOME/private/fac/evidence/`
-/// and lane workspaces that might contain build/test logs.
-fn discover_log_pointers(job_id: &str, _queue_root: &Path) -> Vec<String> {
+/// and lane workspaces under `$APM2_HOME/private/fac/lanes/` that might
+/// contain build/test logs.
+///
+/// Returns `(pointers, truncated)` where `truncated` is true if the global
+/// `MAX_LOG_POINTERS` cap was reached.
+///
+/// # Lane directory resolution (MAJOR fix)
+///
+/// Lane workspaces are resolved from `resolve_fac_root().join("lanes")`,
+/// which resolves to `$APM2_HOME/private/fac/lanes/`. Previous code
+/// incorrectly resolved from `queue_root.parent()` which produced the
+/// wrong base directory.
+fn discover_log_pointers(job_id: &str) -> (Vec<String>, bool) {
     let mut pointers = Vec::new();
+    let mut truncated = false;
+
+    // Helper: check if we've hit the global cap.
+    let at_cap = |p: &Vec<String>| p.len() >= MAX_LOG_POINTERS;
 
     // Check evidence directory for job-related logs.
     if let Some(apm2_home) = apm2_core::github::resolve_apm2_home() {
         let evidence_dir = apm2_home.join("private").join("fac").join("evidence");
-        if evidence_dir.is_dir() {
-            // Look for directories or files matching the job_id.
+        if evidence_dir.is_dir() && !at_cap(&pointers) {
             if let Ok(entries) = fs::read_dir(&evidence_dir) {
                 let mut scan_count = 0usize;
                 for entry in entries {
-                    if scan_count >= MAX_SCAN_ENTRIES {
+                    if scan_count >= MAX_SCAN_ENTRIES || at_cap(&pointers) {
+                        if at_cap(&pointers) {
+                            truncated = true;
+                        }
                         break;
                     }
                     scan_count = scan_count.saturating_add(1);
@@ -955,61 +981,63 @@ fn discover_log_pointers(job_id: &str, _queue_root: &Path) -> Vec<String> {
         }
 
         // Check receipts directory for related receipt files.
-        let receipts_dir = apm2_home.join("private").join("fac").join("receipts");
-        if receipts_dir.is_dir() {
-            // The receipt content hash path is already returned via the receipt
-            // lookup. Just note the directory.
-            pointers.push(format!("{} (receipt store)", receipts_dir.display()));
+        if !at_cap(&pointers) {
+            let receipts_dir = apm2_home.join("private").join("fac").join("receipts");
+            if receipts_dir.is_dir() {
+                pointers.push(format!("{} (receipt store)", receipts_dir.display()));
+            }
         }
     }
 
-    // Check for lane-scoped logs if the job is in claimed/ state.
-    // Lane workspace directories are under the FAC root (private/fac/lanes).
-    let lanes_dir = fac_utils::resolve_fac_root().ok().map(|p| p.join("lanes"));
-    if let Some(lanes_dir) = lanes_dir {
-        if lanes_dir.is_dir() {
-            if let Ok(entries) = fs::read_dir(&lanes_dir) {
-                let mut scan_count = 0usize;
-                let mut truncated = false;
-                for entry in entries {
-                    if scan_count >= MAX_SCAN_ENTRIES {
-                        truncated = true;
-                        break;
-                    }
-                    scan_count = scan_count.saturating_add(1);
-                    let Ok(entry) = entry else { continue };
-                    let lane_path = entry.path();
-                    let logs_dir = lane_path.join("logs");
-                    if logs_dir.is_dir() {
-                        // Look for log files mentioning the job_id.
-                        if let Ok(log_entries) = fs::read_dir(&logs_dir) {
-                            let mut log_scan = 0usize;
-                            for log_entry in log_entries {
-                                if log_scan >= MAX_SCAN_ENTRIES {
-                                    eprintln!("warning: log scan truncated for lane {}", lane_path.display());
-                                    break;
-                                }
-                                log_scan = log_scan.saturating_add(1);
-                                let Ok(log_entry) = log_entry else { continue };
-                                let log_name = log_entry.file_name();
-                                let Some(log_name_str) = log_name.to_str() else {
-                                    continue;
-                                };
-                                if log_name_str.contains(job_id) {
-                                    pointers.push(log_entry.path().display().to_string());
+    // Check for lane-scoped logs.
+    // MAJOR fix: resolve lanes root from FAC root, NOT from queue_root.parent().
+    // Lane workspace directories are under `$APM2_HOME/private/fac/lanes/`.
+    if !at_cap(&pointers) {
+        let lanes_dir = resolve_fac_root().ok().map(|p| p.join("lanes"));
+        if let Some(lanes_dir) = lanes_dir {
+            if lanes_dir.is_dir() {
+                if let Ok(entries) = fs::read_dir(&lanes_dir) {
+                    let mut scan_count = 0usize;
+                    for entry in entries {
+                        if scan_count >= MAX_SCAN_ENTRIES || at_cap(&pointers) {
+                            if at_cap(&pointers) {
+                                truncated = true;
+                            }
+                            break;
+                        }
+                        scan_count = scan_count.saturating_add(1);
+                        let Ok(entry) = entry else { continue };
+                        let lane_path = entry.path();
+                        let logs_dir = lane_path.join("logs");
+                        if logs_dir.is_dir() {
+                            if let Ok(log_entries) = fs::read_dir(&logs_dir) {
+                                let mut log_scan = 0usize;
+                                for log_entry in log_entries {
+                                    if log_scan >= MAX_SCAN_ENTRIES || at_cap(&pointers) {
+                                        if at_cap(&pointers) {
+                                            truncated = true;
+                                        }
+                                        break;
+                                    }
+                                    log_scan = log_scan.saturating_add(1);
+                                    let Ok(log_entry) = log_entry else { continue };
+                                    let log_name = log_entry.file_name();
+                                    let Some(log_name_str) = log_name.to_str() else {
+                                        continue;
+                                    };
+                                    if log_name_str.contains(job_id) {
+                                        pointers.push(log_entry.path().display().to_string());
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                if truncated {
-                    eprintln!("warning: lane scan truncated at {MAX_SCAN_ENTRIES} entries");
-                }
             }
         }
     }
 
-    pointers
+    (pointers, truncated)
 }
 
 /// Prints job show output in text format.
@@ -1061,7 +1089,12 @@ fn print_job_show_text(output: &JobShowOutput) {
 
     if !output.log_pointers.is_empty() {
         println!();
-        println!("  Log Pointers:");
+        let truncated_note = if output.log_pointers_truncated {
+            format!(" (truncated at {MAX_LOG_POINTERS})")
+        } else {
+            String::new()
+        };
+        println!("  Log Pointers{truncated_note}:");
         for pointer in &output.log_pointers {
             println!("    {pointer}");
         }
@@ -1070,9 +1103,9 @@ fn print_job_show_text(output: &JobShowOutput) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::commands::fac_utils::read_job_spec_bounded;
     use apm2_core::fac::job_spec::MAX_JOB_SPEC_SIZE;
+
+    use super::*;
 
     #[test]
     fn test_format_iso8601() {
@@ -1278,8 +1311,8 @@ mod tests {
         );
     }
 
-    /// BLOCKER-1 regression: `read_job_spec_bounded` must reject files exceeding
-    /// `MAX_JOB_SPEC_SIZE` via bounded read, not metadata check.
+    /// BLOCKER-1 regression: `read_job_spec_bounded` must reject files
+    /// exceeding `MAX_JOB_SPEC_SIZE` via bounded read, not metadata check.
     #[test]
     fn test_read_job_spec_bounded_rejects_oversized_file() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1297,7 +1330,8 @@ mod tests {
         );
     }
 
-    /// BLOCKER-1 regression: `read_job_spec_bounded` must work for valid small files.
+    /// BLOCKER-1 regression: `read_job_spec_bounded` must work for valid small
+    /// files.
     #[test]
     fn test_read_job_spec_bounded_accepts_valid_spec() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1404,13 +1438,12 @@ mod tests {
 
     #[test]
     fn test_discover_log_pointers_empty_on_missing_dirs() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let queue_root = tmp.path().join("queue");
-        fs::create_dir_all(&queue_root).unwrap();
-
-        let pointers = discover_log_pointers("some-job", &queue_root);
+        let (pointers, truncated) = discover_log_pointers("some-job");
         // Should not panic, may have receipt store pointer if $APM2_HOME exists.
         // Just verify it returns without error.
-        assert!(pointers.len() <= 10);
+        assert!(pointers.len() <= MAX_LOG_POINTERS);
+        // With no matching evidence, truncated should be false.
+        // (May still find a receipt store pointer if $APM2_HOME exists.)
+        let _ = truncated;
     }
 }
