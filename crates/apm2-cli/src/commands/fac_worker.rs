@@ -1658,7 +1658,7 @@ fn execute_queued_gates_job(
 
     if exit_code == exit_codes::SUCCESS {
         let observed_cost = observed_cost_from_elapsed(job_wall_start.elapsed());
-        if let Err(receipt_err) = emit_job_receipt(
+        if let Err(receipt_err) = emit_job_receipt_with_observed_cost(
             fac_root,
             spec,
             FacJobOutcome::Completed,
@@ -1672,7 +1672,8 @@ fn execute_queued_gates_job(
             None,
             policy_hash,
             None,
-            Some(observed_cost),
+            observed_cost,
+            None,
         ) {
             eprintln!("worker: receipt emission failed for gates job: {receipt_err}");
             if let Err(move_err) = move_to_dir_safe(
