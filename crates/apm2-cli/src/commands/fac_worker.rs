@@ -2185,6 +2185,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
+            None, // network_policy_hash: denied before execution
         ) {
             eprintln!(
                 "worker: WARNING: pipeline commit failed for policy-admission-denied job: {commit_err}"
