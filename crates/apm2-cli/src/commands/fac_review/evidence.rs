@@ -1267,6 +1267,49 @@ fn attach_log_bundle_hash(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn finalize_status_gate_run(
+    projection_log: Option<&mut File>,
+    evidence_lines: &[String],
+    gate_results: &mut [EvidenceGateResult],
+    logs_dir: &Path,
+    gate_cache: &mut GateCache,
+    updater: &PrBodyStatusUpdater,
+    status: &CiStatus,
+) -> Result<(), String> {
+    attach_log_bundle_hash(gate_results, logs_dir)?;
+
+    // Backfill truncation and log-bundle metadata into durable gate receipts
+    // so the persisted cache carries the same observability data as the
+    // in-memory EvidenceGateResult.
+    for result in gate_results {
+        gate_cache.backfill_evidence_metadata(
+            &result.gate_name,
+            result.log_bundle_hash.as_deref(),
+            result.bytes_written,
+            result.bytes_total,
+            result.was_truncated,
+            result.log_path.as_ref().and_then(|p| p.to_str()),
+        );
+    }
+
+    // Force a final update to ensure all gate results are posted.
+    updater.force_update(status);
+
+    // Persist gate cache so future pipeline runs can reuse results.
+    gate_cache
+        .save()
+        .map_err(|err| format!("failed to persist attested gate cache: {err}"))?;
+
+    if let Some(file) = projection_log {
+        for line in evidence_lines {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    Ok(())
+}
+
 /// Maximum bytes to read from a single log file during bundle hashing.
 /// Slightly larger than `LOG_STREAM_MAX_BYTES` to account for stream prefixes
 /// (`=== stdout ===\n`, `=== stderr ===\n`) and any separator overhead that the
@@ -1361,6 +1404,7 @@ fn compute_log_bundle_hash(logs_dir: &Path) -> Result<String, String> {
 ///
 /// When `opts` is provided, `test_command` overrides the default
 /// `cargo nextest run --workspace` invocation (e.g., to use a bounded runner).
+#[allow(dead_code)]
 pub fn run_evidence_gates(
     workspace_root: &Path,
     sha: &str,
@@ -1425,7 +1469,6 @@ pub(super) fn run_evidence_gates_with_lane_context(
     // Native gates that run AFTER tests (ordering dependency on test).
     let post_test_native_gates: &[&str] = &["review_artifact_lint"];
 
-    let mut all_passed = true;
     let mut evidence_lines = Vec::new();
     let mut gate_results = Vec::new();
 
@@ -1445,9 +1488,6 @@ pub(super) fn run_evidence_gates_with_lane_context(
         );
         emit_gate_completed(opts, &merge_result);
         gate_results.push(merge_result);
-        if !merge_passed {
-            all_passed = false;
-        }
         evidence_lines.push(merge_line);
         if !merge_passed {
             if let Some(file) = projection_log {
@@ -1488,15 +1528,21 @@ pub(super) fn run_evidence_gates_with_lane_context(
         );
         emit_gate_completed(opts, &result);
         gate_results.push(result);
-        if !passed {
-            all_passed = false;
-        }
         let ts = now_iso8601();
         let status = if passed { "PASS" } else { "FAIL" };
         evidence_lines.push(format!(
             "ts={ts} sha={sha} gate={gate_name} status={status} log={}",
             log_path.display()
         ));
+        if !passed {
+            if let Some(file) = projection_log {
+                for line in &evidence_lines {
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+            attach_log_bundle_hash(&mut gate_results, &logs_dir)?;
+            return Ok((false, gate_results));
+        }
     }
 
     // Phase 2: pre-test native gates.
@@ -1516,15 +1562,21 @@ pub(super) fn run_evidence_gates_with_lane_context(
         );
         emit_gate_completed(opts, &result);
         gate_results.push(result);
-        if !passed {
-            all_passed = false;
-        }
         let ts = now_iso8601();
         let status = if passed { "PASS" } else { "FAIL" };
         evidence_lines.push(format!(
             "ts={ts} sha={sha} gate={gate_name} status={status} log={}",
             log_path.display()
         ));
+        if !passed {
+            if let Some(file) = projection_log {
+                for line in &evidence_lines {
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+            attach_log_bundle_hash(&mut gate_results, &logs_dir)?;
+            return Ok((false, gate_results));
+        }
     }
 
     // Phase 3: workspace integrity snapshot → test (optional) → verify.
@@ -1598,15 +1650,21 @@ pub(super) fn run_evidence_gates_with_lane_context(
         );
         emit_gate_completed(opts, &test_result);
         gate_results.push(test_result);
-        if !passed {
-            all_passed = false;
-        }
         let ts = now_iso8601();
         let status = if passed { "PASS" } else { "FAIL" };
         evidence_lines.push(format!(
             "ts={ts} sha={sha} gate=test status={status} log={}",
             test_log.display()
         ));
+        if !passed {
+            if let Some(file) = projection_log {
+                for line in &evidence_lines {
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+            attach_log_bundle_hash(&mut gate_results, &logs_dir)?;
+            return Ok((false, gate_results));
+        }
     }
 
     emit_gate_started(opts, "workspace_integrity");
@@ -1624,10 +1682,16 @@ pub(super) fn run_evidence_gates_with_lane_context(
     );
     emit_gate_completed(opts, &wi_result);
     gate_results.push(wi_result);
-    if !wi_passed {
-        all_passed = false;
-    }
     evidence_lines.push(wi_line);
+    if !wi_passed {
+        if let Some(file) = projection_log {
+            for line in &evidence_lines {
+                let _ = writeln!(file, "{line}");
+            }
+        }
+        attach_log_bundle_hash(&mut gate_results, &logs_dir)?;
+        return Ok((false, gate_results));
+    }
 
     // Phase 4: post-test native gates.
     for gate_name in post_test_native_gates {
@@ -1646,15 +1710,21 @@ pub(super) fn run_evidence_gates_with_lane_context(
         );
         emit_gate_completed(opts, &result);
         gate_results.push(result);
-        if !passed {
-            all_passed = false;
-        }
         let ts = now_iso8601();
         let status = if passed { "PASS" } else { "FAIL" };
         evidence_lines.push(format!(
             "ts={ts} sha={sha} gate={gate_name} status={status} log={}",
             log_path.display()
         ));
+        if !passed {
+            if let Some(file) = projection_log {
+                for line in &evidence_lines {
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+            attach_log_bundle_hash(&mut gate_results, &logs_dir)?;
+            return Ok((false, gate_results));
+        }
     }
 
     if let Some(file) = projection_log {
@@ -1664,7 +1734,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
     }
 
     attach_log_bundle_hash(&mut gate_results, &logs_dir)?;
-    Ok((all_passed, gate_results))
+    Ok((true, gate_results))
 }
 
 /// Run evidence gates with PR-body gate status updates.
@@ -1779,7 +1849,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     // Native gates that run AFTER tests (ordering dependency on test).
     let post_test_native_gates: &[&str] = &["review_artifact_lint"];
 
-    let mut all_passed = true;
     let mut evidence_lines = Vec::new();
     let mut gate_results = Vec::new();
 
@@ -1818,24 +1887,15 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             log_path.to_str().map(str::to_string),
         );
         if !passed {
-            updater.force_update(&status);
-            if let Some(file) = projection_log {
-                for line in &evidence_lines {
-                    let _ = writeln!(file, "{line}");
-                }
-            }
-            attach_log_bundle_hash(&mut gate_results, &logs_dir)?;
-            for result in &gate_results {
-                gate_cache.backfill_evidence_metadata(
-                    &result.gate_name,
-                    result.log_bundle_hash.as_deref(),
-                    result.bytes_written,
-                    result.bytes_total,
-                    result.was_truncated,
-                    result.log_path.as_ref().and_then(|p| p.to_str()),
-                );
-            }
-            let _ = gate_cache.save();
+            finalize_status_gate_run(
+                projection_log,
+                &evidence_lines,
+                &mut gate_results,
+                &logs_dir,
+                &mut gate_cache,
+                &updater,
+                &status,
+            )?;
             return Ok((false, gate_results));
         }
     }
@@ -1912,19 +1972,27 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 gate_name,
                 false,
                 0,
-                attestation_digest.clone(),
+                attestation_digest,
                 false,
                 None,
                 log_path.to_str().map(str::to_string),
             );
-            all_passed = false;
             evidence_lines.push(format!(
                 "ts={} sha={} gate={} status=FAIL reuse_status=miss reuse_reason=inconsistent_cache_entry",
                 now_iso8601(),
                 sha,
                 gate_name
             ));
-            continue;
+            finalize_status_gate_run(
+                projection_log,
+                &evidence_lines,
+                &mut gate_results,
+                &logs_dir,
+                &mut gate_cache,
+                &updater,
+                &status,
+            )?;
+            return Ok((false, gate_results));
         }
 
         if emit_human_logs {
@@ -1977,9 +2045,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             sha256_file_hex(&log_path),
             log_path.to_str().map(str::to_string),
         );
-        if !passed {
-            all_passed = false;
-        }
         let gate_status = if passed { "PASS" } else { "FAIL" };
         evidence_lines.push(format!(
             "ts={} sha={} gate={} status={} log={} reuse_status=miss reuse_reason={}",
@@ -1990,6 +2055,18 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             log_path.display(),
             reuse.reason,
         ));
+        if !passed {
+            finalize_status_gate_run(
+                projection_log,
+                &evidence_lines,
+                &mut gate_results,
+                &logs_dir,
+                &mut gate_cache,
+                &updater,
+                &status,
+            )?;
+            return Ok((false, gate_results));
+        }
     }
 
     // Phase 2: pre-test native gates.
@@ -2064,19 +2141,27 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 gate_name,
                 false,
                 0,
-                attestation_digest.clone(),
+                attestation_digest,
                 false,
                 None,
                 log_path.to_str().map(str::to_string),
             );
-            all_passed = false;
             evidence_lines.push(format!(
                 "ts={} sha={} gate={} status=FAIL reuse_status=miss reuse_reason=inconsistent_cache_entry",
                 now_iso8601(),
                 sha,
                 gate_name
             ));
-            continue;
+            finalize_status_gate_run(
+                projection_log,
+                &evidence_lines,
+                &mut gate_results,
+                &logs_dir,
+                &mut gate_cache,
+                &updater,
+                &status,
+            )?;
+            return Ok((false, gate_results));
         }
 
         if emit_human_logs {
@@ -2119,9 +2204,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             sha256_file_hex(&log_path),
             log_path.to_str().map(str::to_string),
         );
-        if !passed {
-            all_passed = false;
-        }
         let gate_status = if passed { "PASS" } else { "FAIL" };
         evidence_lines.push(format!(
             "ts={} sha={} gate={} status={} log={} reuse_status=miss reuse_reason={}",
@@ -2132,6 +2214,18 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             log_path.display(),
             reuse.reason,
         ));
+        if !passed {
+            finalize_status_gate_run(
+                projection_log,
+                &evidence_lines,
+                &mut gate_results,
+                &logs_dir,
+                &mut gate_cache,
+                &updater,
+                &status,
+            )?;
+            return Ok((false, gate_results));
+        }
     }
 
     // Phase 3: workspace integrity snapshot → test → verify.
@@ -2215,13 +2309,22 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     None,
                     log_path.to_str().map(str::to_string),
                 );
-                all_passed = false;
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=FAIL reuse_status=miss reuse_reason=inconsistent_cache_entry",
                     now_iso8601(),
                     sha,
                     gate_name
                 ));
+                finalize_status_gate_run(
+                    projection_log,
+                    &evidence_lines,
+                    &mut gate_results,
+                    &logs_dir,
+                    &mut gate_cache,
+                    &updater,
+                    &status,
+                )?;
+                return Ok((false, gate_results));
             }
         } else {
             if emit_human_logs {
@@ -2279,9 +2382,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 sha256_file_hex(&log_path),
                 log_path.to_str().map(str::to_string),
             );
-            if !passed {
-                all_passed = false;
-            }
             let gate_status = if passed { "PASS" } else { "FAIL" };
             evidence_lines.push(format!(
                 "ts={} sha={} gate={} status={} log={} reuse_status=miss reuse_reason={}",
@@ -2292,6 +2392,18 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 log_path.display(),
                 reuse.reason,
             ));
+            if !passed {
+                finalize_status_gate_run(
+                    projection_log,
+                    &evidence_lines,
+                    &mut gate_results,
+                    &logs_dir,
+                    &mut gate_cache,
+                    &updater,
+                    &status,
+                )?;
+                return Ok((false, gate_results));
+            }
         }
     }
 
@@ -2368,13 +2480,22 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     None,
                     log_path.to_str().map(str::to_string),
                 );
-                all_passed = false;
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=FAIL reuse_status=miss reuse_reason=inconsistent_cache_entry",
                     now_iso8601(),
                     sha,
                     gate_name
                 ));
+                finalize_status_gate_run(
+                    projection_log,
+                    &evidence_lines,
+                    &mut gate_results,
+                    &logs_dir,
+                    &mut gate_cache,
+                    &updater,
+                    &status,
+                )?;
+                return Ok((false, gate_results));
             }
         } else {
             let started = Instant::now();
@@ -2401,13 +2522,22 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 sha256_file_hex(&log_path),
                 log_path.to_str().map(str::to_string),
             );
-            if !passed {
-                all_passed = false;
-            }
             evidence_lines.push(format!(
                 "{} reuse_status=miss reuse_reason={}",
                 line, reuse.reason
             ));
+            if !passed {
+                finalize_status_gate_run(
+                    projection_log,
+                    &evidence_lines,
+                    &mut gate_results,
+                    &logs_dir,
+                    &mut gate_cache,
+                    &updater,
+                    &status,
+                )?;
+                return Ok((false, gate_results));
+            }
         }
     }
 
@@ -2483,19 +2613,27 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 gate_name,
                 false,
                 0,
-                attestation_digest.clone(),
+                attestation_digest,
                 false,
                 None,
                 log_path.to_str().map(str::to_string),
             );
-            all_passed = false;
             evidence_lines.push(format!(
                 "ts={} sha={} gate={} status=FAIL reuse_status=miss reuse_reason=inconsistent_cache_entry",
                 now_iso8601(),
                 sha,
                 gate_name
             ));
-            continue;
+            finalize_status_gate_run(
+                projection_log,
+                &evidence_lines,
+                &mut gate_results,
+                &logs_dir,
+                &mut gate_cache,
+                &updater,
+                &status,
+            )?;
+            return Ok((false, gate_results));
         }
 
         if emit_human_logs {
@@ -2537,9 +2675,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             sha256_file_hex(&log_path),
             log_path.to_str().map(str::to_string),
         );
-        if !passed {
-            all_passed = false;
-        }
         let gate_status = if passed { "PASS" } else { "FAIL" };
         evidence_lines.push(format!(
             "ts={} sha={} gate={} status={} log={} reuse_status=miss reuse_reason={}",
@@ -2550,39 +2685,29 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             log_path.display(),
             reuse.reason,
         ));
-    }
-
-    attach_log_bundle_hash(&mut gate_results, &logs_dir)?;
-
-    // Backfill truncation and log-bundle metadata into durable gate receipts
-    // so the persisted cache carries the same observability data as the
-    // in-memory EvidenceGateResult.
-    for result in &gate_results {
-        gate_cache.backfill_evidence_metadata(
-            &result.gate_name,
-            result.log_bundle_hash.as_deref(),
-            result.bytes_written,
-            result.bytes_total,
-            result.was_truncated,
-            result.log_path.as_ref().and_then(|p| p.to_str()),
-        );
-    }
-
-    // Force a final update to ensure all gate results are posted.
-    updater.force_update(&status);
-
-    // Persist gate cache so future pipeline runs can reuse results.
-    gate_cache
-        .save()
-        .map_err(|err| format!("failed to persist attested gate cache: {err}"))?;
-
-    if let Some(file) = projection_log {
-        for line in &evidence_lines {
-            let _ = writeln!(file, "{line}");
+        if !passed {
+            finalize_status_gate_run(
+                projection_log,
+                &evidence_lines,
+                &mut gate_results,
+                &logs_dir,
+                &mut gate_cache,
+                &updater,
+                &status,
+            )?;
+            return Ok((false, gate_results));
         }
     }
-
-    Ok((all_passed, gate_results))
+    finalize_status_gate_run(
+        projection_log,
+        &evidence_lines,
+        &mut gate_results,
+        &logs_dir,
+        &mut gate_cache,
+        &updater,
+        &status,
+    )?;
+    Ok((true, gate_results))
 }
 
 #[cfg(test)]
