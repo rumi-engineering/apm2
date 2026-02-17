@@ -10,8 +10,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use apm2_core::fac::job_spec::{
-    Actuation, FacJobSpecV1, JobConstraints, JobSource, LaneRequirements, MAX_QUEUE_LANE_LENGTH,
-    validate_job_spec,
+    Actuation, FacJobSpecV1, JobConstraints, JobSource, JobSpecValidationPolicy, LaneRequirements,
+    MAX_QUEUE_LANE_LENGTH, validate_job_spec_with_policy,
 };
 use apm2_core::fac::{
     FacPolicyV1, LaneLockGuard, LaneManager, LaneState, apply_lane_env_overrides,
@@ -287,11 +287,18 @@ fn prepare_queued_gates_job(
         .unwrap_or_else(|_| "local".to_string());
     let mut broker = init_broker(&fac_root, &boundary_id)
         .map_err(|err| format!("cannot initialize broker: {err}"))?;
-    let (policy_hash, policy_digest, _) =
+    let (policy_hash, policy_digest, fac_policy) =
         load_or_init_policy(&fac_root).map_err(|err| format!("cannot load FAC policy: {err}"))?;
     broker
         .admit_policy_digest(policy_digest)
         .map_err(|err| format!("cannot admit FAC policy digest: {err}"))?;
+
+    // TCK-00579: Derive job spec validation policy from FAC policy for
+    // enqueue-time enforcement of repo_id allowlist, bytes_backend
+    // allowlist, and filesystem-path rejection.
+    let job_spec_policy = fac_policy
+        .job_spec_validation_policy()
+        .map_err(|err| format!("cannot derive job spec validation policy: {err}"))?;
 
     let job_id = format!("gates-{}", generate_job_suffix());
     let lease_id = format!("gates-lease-{}", generate_job_suffix());
@@ -316,6 +323,7 @@ fn prepare_queued_gates_job(
         &options,
         &boundary_id,
         &mut broker,
+        &job_spec_policy,
     )
     .map_err(|err| format!("cannot build gates job spec: {err}"))?;
 
@@ -569,6 +577,7 @@ fn build_gates_job_spec(
     options: &GatesJobOptionsV1,
     boundary_id: &str,
     broker: &mut apm2_core::fac::broker::FacBroker,
+    job_spec_policy: &JobSpecValidationPolicy,
 ) -> Result<FacJobSpecV1, String> {
     if GATES_QUEUE_LANE.is_empty() || GATES_QUEUE_LANE.len() > MAX_QUEUE_LANE_LENGTH {
         return Err("invalid gates queue lane configuration".to_string());
@@ -619,7 +628,8 @@ fn build_gates_job_spec(
         .issue_channel_context_token(policy_digest, lease_id, &digest, boundary_id)
         .map_err(|err| format!("issue channel context token: {err}"))?;
     spec.actuation.channel_context_token = Some(token);
-    validate_job_spec(&spec).map_err(|err| format!("validate job spec: {err}"))?;
+    validate_job_spec_with_policy(&spec, job_spec_policy)
+        .map_err(|err| format!("validate job spec: {err}"))?;
     Ok(spec)
 }
 
