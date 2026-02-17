@@ -21,7 +21,26 @@
 //! isolation and apply bounded wall-clock timeouts to detect hangs.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// Process-wide lock for tests that mutate environment variables.
+/// Env vars are process-global state; concurrent mutations cause data races.
+/// All env-mutating tests in this module MUST hold this lock.
+fn env_var_test_lock() -> &'static Mutex<()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[allow(unsafe_code)]
+fn set_env_var_for_test<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
+    unsafe { std::env::set_var(key, value) };
+}
+
+#[allow(unsafe_code)]
+fn remove_env_var_for_test<K: AsRef<std::ffi::OsStr>>(key: K) {
+    unsafe { std::env::remove_var(key) };
+}
 
 /// Maximum wall-clock time any single subprocess test is allowed to run
 /// before we consider it a hang regression. 30 seconds is generous; actual
@@ -132,6 +151,19 @@ fn run_apm2_subprocess(
     apm2_home: &std::path::Path,
     keep_github_creds: bool,
 ) -> (Option<i32>, String, String) {
+    run_apm2_subprocess_with_env(args, apm2_home, keep_github_creds, &[])
+}
+
+/// Extended version of `run_apm2_subprocess` that also injects additional
+/// environment variables into the subprocess. Used by secret-leakage tests
+/// to inject synthetic canary secrets and verify they are excluded from
+/// output/receipts.
+fn run_apm2_subprocess_with_env(
+    args: &[&str],
+    apm2_home: &std::path::Path,
+    keep_github_creds: bool,
+    extra_env: &[(&str, &str)],
+) -> (Option<i32>, String, String) {
     let bin = apm2_bin();
     let path_env = std::env::var("PATH").unwrap_or_default();
 
@@ -165,6 +197,12 @@ fn run_apm2_subprocess(
         }
     }
     // When keep_github_creds is false, env_clear() already removed them.
+
+    // Inject any additional env vars requested by the caller (e.g.,
+    // synthetic canary secrets for leakage verification).
+    for (key, val) in extra_env {
+        cmd.env(key, val);
+    }
 
     let start = Instant::now();
     let mut child = cmd
@@ -642,13 +680,48 @@ fn require_github_credentials_fails_fast_no_hang() {
 // =========================================================================
 
 /// Verifies that the `CredentialGateError::GitHubCredentialsMissing`
-/// error message does not contain any actual secret values.
+/// error message does not contain any actual secret values, even when
+/// synthetic canary secrets are present in the process environment.
+///
+/// Canary values are injected into `GITHUB_TOKEN` and `GH_TOKEN` before
+/// formatting the error, proving that the error's Display impl does not
+/// resolve and embed env var values into its output.
 #[test]
 fn credential_error_message_contains_no_secrets() {
+    // Serialize env-mutating tests to prevent data races.
+    let _env_lock = env_var_test_lock()
+        .lock()
+        .expect("serialize env-mutating test");
+
+    // Inject canary secrets into the env vars referenced by the error.
+    let env_canaries: &[(&str, &str)] = &[
+        ("GITHUB_TOKEN", "ghp_CRED_ERR_CANARY_00601_abcdef1234"),
+        ("GH_TOKEN", "ghs_CRED_ERR_CANARY_00601_zyxwvu9876"),
+    ];
+    let previous_values: Vec<(&str, Option<String>)> = env_canaries
+        .iter()
+        .map(|(name, _)| (*name, std::env::var(name).ok()))
+        .collect();
+    for (name, value) in env_canaries {
+        set_env_var_for_test(name, value);
+    }
+
     let error = apm2_core::fac::credential_gate::CredentialGateError::GitHubCredentialsMissing;
     let message = error.to_string();
 
+    // Restore environment before assertions.
+    for (name, prev) in &previous_values {
+        match prev {
+            Some(val) => set_env_var_for_test(name, val),
+            None => remove_env_var_for_test(name),
+        }
+    }
+
+    // Check that neither the env canary values nor generic token patterns
+    // appear in the error message.
     let synthetic_secrets: Vec<(&str, &str)> = vec![
+        ("GITHUB_TOKEN", "ghp_CRED_ERR_CANARY_00601_abcdef1234"),
+        ("GH_TOKEN", "ghs_CRED_ERR_CANARY_00601_zyxwvu9876"),
         ("ghp_token", "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
         ("ghs_token", "ghs_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
         ("bearer_token", "v1.abc123def456"),
@@ -657,9 +730,23 @@ fn credential_error_message_contains_no_secrets() {
 }
 
 /// Verifies that `CredentialPosture` Debug output does not contain
-/// raw token-like strings.
+/// raw token-like strings, even when a canary secret value is present
+/// in the process environment for the referenced variable.
+///
+/// A synthetic canary value is injected into `GITHUB_TOKEN` before
+/// constructing the posture, proving the Debug impl does not resolve
+/// and leak the actual env value.
 #[test]
 fn credential_posture_debug_no_secret_leakage() {
+    // Serialize env-mutating tests to prevent data races.
+    let _env_lock = env_var_test_lock()
+        .lock()
+        .expect("serialize env-mutating test");
+
+    let canary_value = "ghp_POSTURE_DEBUG_CANARY_00601_secretval";
+    let previous_github_token = std::env::var("GITHUB_TOKEN").ok();
+    set_env_var_for_test("GITHUB_TOKEN", canary_value);
+
     let posture = apm2_core::fac::credential_gate::CredentialPosture {
         credential_name: "github-token".to_string(),
         resolved: true,
@@ -670,9 +757,19 @@ fn credential_posture_debug_no_secret_leakage() {
 
     let debug = format!("{posture:?}");
 
+    // Restore environment before assertions.
+    match &previous_github_token {
+        Some(val) => set_env_var_for_test("GITHUB_TOKEN", val),
+        None => remove_env_var_for_test("GITHUB_TOKEN"),
+    }
+
     assert!(
         debug.contains("GITHUB_TOKEN"),
         "Debug should show env var name"
+    );
+    assert!(
+        !debug.contains(canary_value),
+        "Debug must not contain the actual canary secret value"
     );
     assert!(
         !debug.contains("ghp_"),
@@ -686,8 +783,27 @@ fn credential_posture_debug_no_secret_leakage() {
 
 /// Verifies that job receipts produced via the builder do not contain
 /// any secret environment variable values.
+///
+/// Part 1 (library): Injects synthetic canary secrets into the test
+/// process environment, then builds a receipt and validates that the
+/// serialized JSON does not embed any of the injected canary values or
+/// token-like prefixes. This proves the receipt builder's
+/// redaction/exclusion logic is effective against secrets that ARE
+/// present in the environment, not just that ambient env vars happen to
+/// be absent.
+///
+/// Part 2 (subprocess): Runs `apm2 fac gates --quick` as a subprocess
+/// with the same synthetic canary secrets injected via `.env()` on the
+/// `Command` builder, then verifies that neither stdout nor stderr
+/// contains the injected canary values.
 #[test]
 fn receipts_contain_no_secret_env_values() {
+    // Serialize env-mutating tests to prevent data races on process-global
+    // environment variables (env vars are shared mutable state).
+    let _env_lock = env_var_test_lock()
+        .lock()
+        .expect("serialize env-mutating test");
+
     let (_tmp, home) = setup_apm2_home_broker_only();
     let fac_root = home.join("private/fac");
     let receipts_dir = fac_root.join("receipts");
@@ -706,6 +822,20 @@ fn receipts_contain_no_secret_env_values() {
         ),
     ];
 
+    // --- Part 1: Library-level receipt builder check ---
+    //
+    // Inject synthetic canary secrets into the test process environment
+    // so the receipt builder executes with known secret values present.
+    // Save previous values for restoration.
+    let previous_values: Vec<(&str, Option<String>)> = synthetic_secrets
+        .iter()
+        .map(|(name, _)| (*name, std::env::var(name).ok()))
+        .collect();
+
+    for (name, value) in synthetic_secrets {
+        set_env_var_for_test(name, value);
+    }
+
     let receipt = apm2_core::fac::FacJobReceiptV1Builder::new(
         "test-receipt-001",
         "test-job-001",
@@ -719,6 +849,15 @@ fn receipts_contain_no_secret_env_values() {
 
     let receipt_json = serde_json::to_string_pretty(&receipt).expect("serialize receipt");
 
+    // Restore previous environment state before assertions (cleanup first
+    // so panics in assertions don't leave stale env vars).
+    for (name, prev) in &previous_values {
+        match prev {
+            Some(val) => set_env_var_for_test(name, val),
+            None => remove_env_var_for_test(name),
+        }
+    }
+
     for (name, value) in synthetic_secrets {
         assert!(
             !receipt_json.contains(value),
@@ -726,6 +865,10 @@ fn receipts_contain_no_secret_env_values() {
         );
     }
 
+    // Verify canary values are present in the environment during the
+    // assertion window (they were set above and should have been read
+    // by the receipt builder; now restored, so this loop checks the
+    // ambient host env only).
     for env_name in SECRET_ENV_NAMES {
         if let Ok(value) = std::env::var(env_name) {
             if !value.is_empty() {
@@ -754,26 +897,77 @@ fn receipts_contain_no_secret_env_values() {
         receipt_json.contains("test denied"),
         "receipt should contain reason"
     );
+
+    // --- Part 2: Subprocess check with injected canary secrets ---
+    //
+    // Run `apm2 fac gates --quick` with the synthetic canary secrets
+    // injected into the subprocess environment. The CLI will fail (no
+    // real workspace), but we verify that the error output does not
+    // leak any of the injected secret values.
+
+    let (_exit_code, stdout, stderr) = run_apm2_subprocess_with_env(
+        &["fac", "gates", "--quick"],
+        &home,
+        false,
+        synthetic_secrets,
+    );
+
+    let combined = format!("{stdout}\n{stderr}");
+
+    assert_no_secret_leakage(
+        &combined,
+        synthetic_secrets,
+        "subprocess gates output with injected canary secrets",
+    );
+
+    assert!(
+        !combined.contains("ghp_"),
+        "subprocess output should not contain GitHub PAT prefix"
+    );
+    assert!(
+        !combined.contains("ghs_"),
+        "subprocess output should not contain GitHub App token prefix"
+    );
 }
 
 /// Verifies that subprocess `apm2 fac gates` error output in a bare
 /// environment does not leak any secret environment variable values.
+///
+/// Synthetic canary secrets are injected into the subprocess environment
+/// via `.env()` on the `Command` builder. The test then verifies that
+/// these injected values do NOT appear anywhere in stdout or stderr,
+/// proving the CLI's redaction/exclusion logic is effective against
+/// secrets present in the process environment.
 #[test]
 fn subprocess_gates_error_output_contains_no_secrets() {
     let (_tmp, home) = setup_bare_apm2_home();
 
-    let (_exit_code, stdout, stderr) =
-        run_apm2_subprocess(&["fac", "gates", "--quick"], &home, false);
+    // Canary secrets injected into the subprocess environment.
+    let synthetic_secrets: &[(&str, &str)] = &[
+        ("GITHUB_TOKEN", "ghp_SYNTHETIC_TEST_TOKEN_00601_abcdef1234"),
+        ("GH_TOKEN", "ghs_SYNTHETIC_GH_TOKEN_00601_zyxwvu9876"),
+        ("APM2_GITHUB_PAT", "ghp_APM2PAT_SYNTHETIC_00601_testval"),
+        ("APM2_FAC_PAT", "v1.synth_fac_pat_00601_secret_value"),
+        ("GH_PAT", "ghp_GHPAT_SYNTHETIC_00601_canary_value"),
+        ("GITHUB_PAT", "ghp_GITHUBPAT_SYNTHETIC_00601_canary"),
+        (
+            "PERSONAL_ACCESS_TOKEN",
+            "ghp_PERSONALAT_SYNTHETIC_00601_val",
+        ),
+    ];
+
+    let (_exit_code, stdout, stderr) = run_apm2_subprocess_with_env(
+        &["fac", "gates", "--quick"],
+        &home,
+        false,
+        synthetic_secrets,
+    );
 
     let combined = format!("{stdout}\n{stderr}");
 
-    let synthetic_secrets = vec![
-        ("GITHUB_TOKEN", "ghp_test_should_not_appear"),
-        ("GH_TOKEN", "ghs_test_should_not_appear"),
-    ];
     assert_no_secret_leakage(
         &combined,
-        &synthetic_secrets,
+        synthetic_secrets,
         "subprocess gates error output",
     );
 
