@@ -1766,16 +1766,25 @@ fn process_job(
     // job_id. This avoids redundant processing of already-completed jobs
     // and replaces full directory scans with an O(1) index lookup.
     //
-    // When a duplicate is detected, the pending file is moved to completed/
-    // so it is not re-scanned every cycle (queue-pinning DoS prevention).
+    // When a duplicate is detected, the pending file is moved to the correct
+    // terminal directory based on the receipt outcome (completed, denied,
+    // cancelled, quarantine). This is outcome-aware to prevent denied jobs
+    // from being routed to completed/ (TCK-00564 MAJOR-1 fix round 4).
     let spec = &candidate.spec;
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
-    if apm2_core::fac::has_receipt_for_job(&receipts_dir, &spec.job_id) {
-        let _ = move_to_dir_safe(path, &queue_root.join(COMPLETED_DIR), &file_name);
+    if let Some(existing_receipt) =
+        apm2_core::fac::find_receipt_for_job(&receipts_dir, &spec.job_id)
+    {
+        let terminal_dir = apm2_core::fac::outcome_to_terminal_state(existing_receipt.outcome)
+            .map_or_else(
+                || queue_root.join(COMPLETED_DIR),
+                |ts| queue_root.join(ts.dir_name()),
+            );
+        let _ = move_to_dir_safe(path, &terminal_dir, &file_name);
         return JobOutcome::Skipped {
             reason: format!(
-                "receipt already exists for job {} (index lookup)",
-                spec.job_id
+                "receipt already exists for job {} (index lookup, outcome={:?})",
+                spec.job_id, existing_receipt.outcome,
             ),
         };
     }
@@ -5385,32 +5394,30 @@ fn commit_claimed_job_via_pipeline(
 /// Handle a pipeline commit failure for a denial/failure path.
 ///
 /// When `commit_claimed_job_via_pipeline` fails, the job has no terminal
-/// receipt and no terminal queue transition. To avoid leaving the job claimed
-/// indefinitely, this function:
+/// receipt and no terminal queue transition. This function:
 /// 1. Logs the commit error prominently via `eprintln!`.
-/// 2. Attempts to return the claimed job to `pending/` for re-processing.
+/// 2. Leaves the job in `claimed/` for reconcile to repair.
 /// 3. Returns `JobOutcome::Skipped` so the caller does NOT report a terminal
 ///    outcome that was never durably persisted.
 ///
-/// This ensures that denied outcomes are only reported after successful atomic
-/// commit and receipt materialization (TCK-00564 MAJOR-1 fix round 3).
+/// The job is intentionally left in `claimed/` rather than moved to `pending/`.
+/// If the receipt was persisted before the commit failed (torn state),
+/// reconcile will detect the receipt and route the job to the correct terminal
+/// directory based on the receipt outcome (completed, denied, etc.) via
+/// `recover_torn_state`. If the receipt was not persisted, the orphan policy
+/// applies. Moving to `pending/` would cause the outcome-blind duplicate
+/// detection in `process_job` to route all receipted jobs to `completed/`,
+/// masking denied outcomes (TCK-00564 MAJOR-1 fix round 4).
 fn handle_pipeline_commit_failure(
     commit_err: &str,
     context: &str,
-    claimed_path: &Path,
-    queue_root: &Path,
-    claimed_file_name: &str,
+    _claimed_path: &Path,
+    _queue_root: &Path,
+    _claimed_file_name: &str,
 ) -> JobOutcome {
     eprintln!("worker: pipeline commit failed for {context}: {commit_err}");
-    if let Err(move_err) = move_to_dir_safe(
-        claimed_path,
-        &queue_root.join(PENDING_DIR),
-        claimed_file_name,
-    ) {
-        eprintln!(
-            "worker: WARNING: failed to return claimed job to pending after commit failure: {move_err}"
-        );
-    }
+    // Job stays in claimed/ — reconcile will repair torn states or the orphan
+    // policy will handle unreceipted failures.
     JobOutcome::Skipped {
         reason: format!("pipeline commit failed for {context}: {commit_err}"),
     }
@@ -7124,6 +7131,138 @@ mod tests {
         assert!(
             marker.reason.contains("lane cleanup failed"),
             "corrupt marker should describe cleanup failure"
+        );
+    }
+
+    /// TCK-00564 MAJOR-1 regression: denied receipt + pending job must route
+    /// to denied/, NOT completed/.
+    ///
+    /// Prior to fix round 4, the duplicate detection in `process_job` used
+    /// `has_receipt_for_job` (boolean) and unconditionally moved duplicates
+    /// to `completed/`. This masked denied outcomes. The fix uses
+    /// `find_receipt_for_job` and routes to the correct terminal directory
+    /// via `outcome_to_terminal_state`.
+    #[test]
+    fn test_duplicate_detection_routes_denied_receipt_to_denied_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let queue_root = dir.path().join("queue");
+        ensure_queue_dirs(&queue_root).expect("create queue dirs");
+
+        let spec = make_receipt_test_spec();
+
+        // Step 1: Emit a Denied receipt for the job.
+        let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
+        emit_job_receipt(
+            &fac_root,
+            &spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::ValidationFailed),
+            "test: validation failed",
+            None,
+            None,
+            None,
+            None,
+            Some(&tuple_digest),
+            None,
+            &spec.job_spec_digest,
+            None,
+            None,
+        )
+        .expect("emit denied receipt");
+
+        // Step 2: Place a pending job file simulating a requeued job.
+        let pending_file = queue_root.join(PENDING_DIR).join("test-denied-job.json");
+        let spec_bytes = serde_json::to_vec(&spec).expect("serialize spec");
+        fs::write(&pending_file, &spec_bytes).expect("write pending job");
+
+        // Step 3: Verify that find_receipt_for_job returns the denied receipt.
+        let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
+        let found_receipt = apm2_core::fac::find_receipt_for_job(&receipts_dir, &spec.job_id)
+            .expect("receipt must be found");
+        assert_eq!(
+            found_receipt.outcome,
+            FacJobOutcome::Denied,
+            "found receipt must have Denied outcome"
+        );
+
+        // Step 4: Verify outcome_to_terminal_state routes to Denied.
+        let terminal_state = apm2_core::fac::outcome_to_terminal_state(found_receipt.outcome)
+            .expect("Denied must have a terminal state");
+        assert_eq!(
+            terminal_state.dir_name(),
+            DENIED_DIR,
+            "Denied outcome must route to denied/ directory, not completed/"
+        );
+
+        // Step 5: Execute the outcome-aware routing (same logic as process_job).
+        let terminal_dir = queue_root.join(terminal_state.dir_name());
+        move_to_dir_safe(&pending_file, &terminal_dir, "test-denied-job.json")
+            .expect("move to terminal dir");
+
+        // Step 6: Assert the job landed in denied/, NOT completed/.
+        assert!(
+            queue_root
+                .join(DENIED_DIR)
+                .join("test-denied-job.json")
+                .exists(),
+            "denied receipt must route job to denied/"
+        );
+        assert!(
+            !queue_root
+                .join(COMPLETED_DIR)
+                .join("test-denied-job.json")
+                .exists(),
+            "denied receipt must NOT route job to completed/"
+        );
+        assert!(
+            !pending_file.exists(),
+            "pending file must be removed after routing"
+        );
+    }
+
+    /// TCK-00564 MAJOR-1 regression: `handle_pipeline_commit_failure` must
+    /// leave the job in claimed/ rather than moving it to pending/.
+    ///
+    /// Prior to fix round 4, commit failures moved jobs from claimed/ to
+    /// pending/, which caused the outcome-blind duplicate detection to
+    /// route them to completed/ regardless of the receipt outcome. The fix
+    /// leaves the job in claimed/ for reconcile to repair via
+    /// `recover_torn_state`.
+    #[test]
+    fn test_handle_pipeline_commit_failure_leaves_job_in_claimed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        ensure_queue_dirs(&queue_root).expect("create queue dirs");
+
+        // Place a job file in claimed/.
+        let claimed_path = queue_root.join(CLAIMED_DIR).join("commit-fail.json");
+        fs::write(&claimed_path, b"{}").expect("write claimed job");
+
+        // Call handle_pipeline_commit_failure.
+        let outcome = handle_pipeline_commit_failure(
+            "test commit error",
+            "test context",
+            &claimed_path,
+            &queue_root,
+            "commit-fail.json",
+        );
+
+        // The job should still be in claimed/, NOT in pending/.
+        assert!(
+            claimed_path.exists(),
+            "job must remain in claimed/ after commit failure"
+        );
+        assert!(
+            !queue_root
+                .join(PENDING_DIR)
+                .join("commit-fail.json")
+                .exists(),
+            "job must NOT be moved to pending/ after commit failure"
+        );
+        assert!(
+            matches!(outcome, JobOutcome::Skipped { .. }),
+            "outcome should be Skipped, got: {outcome:?}"
         );
     }
 }

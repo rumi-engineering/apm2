@@ -271,10 +271,15 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
   chains (exec and warm paths) call `.sandbox_hardening_hash(&sbx_hash)` so the
   cryptographically signed `GateReceipt` binds the hardening profile used during
   execution. This complements the `FacJobReceiptV1` binding done via `emit_job_receipt`.
-- **Pipeline commit failure handling** (`fac_worker.rs`, TCK-00564 fix round 3): Every
+- **Pipeline commit failure handling** (`fac_worker.rs`, TCK-00564 fix round 4): Every
   `commit_claimed_job_via_pipeline` call site checks the returned `Result`. On commit
-  failure, the `handle_pipeline_commit_failure` helper logs the error via `eprintln!`,
-  attempts to return the claimed job to `pending/` for re-processing, and returns
-  `JobOutcome::Skipped` instead of a terminal outcome. This prevents denied/failed
-  outcomes from being reported without durable terminal receipts, which would leave jobs
-  claimed indefinitely without reconciliation recourse.
+  failure, the `handle_pipeline_commit_failure` helper logs the error via `eprintln!`
+  and leaves the job in `claimed/` for reconcile to repair. If the receipt was persisted
+  before the commit failed (torn state), `recover_torn_state` routes the job to the
+  correct terminal directory based on the receipt outcome. If the receipt was not
+  persisted, the orphan policy applies. This avoids the outcome-blind duplicate detection
+  bug where requeuing to `pending/` caused denied jobs to be routed to `completed/`.
+- **Outcome-aware duplicate detection** (`fac_worker.rs`, TCK-00564 fix round 4): The
+  duplicate receipt check in `process_job` uses `find_receipt_for_job` instead of
+  `has_receipt_for_job` and routes to the correct terminal directory via
+  `outcome_to_terminal_state`. Denied receipts route to `denied/`, not `completed/`.
