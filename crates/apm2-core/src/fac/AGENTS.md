@@ -651,11 +651,15 @@ bootstrap and recovery commands exposed via `apm2 fac lane init` and
 
 ### `git_hardening` — Git Safety Hardening for Lane Workspaces (TCK-00580)
 
-**Core function**: `harden_lane_workspace(workspace, hooks_parent, refuse_unsafe_configs)`
+**Core function**: `harden_lane_workspace(workspace, hooks_parent, refuse_unsafe_configs, global_config_file)`
 
 Applies security hardening to lane workspace git config after checkout:
-1. Sets `core.hooksPath` to an empty FAC-controlled directory (disables hooks)
-2. Enforces `safe.directory` for the workspace path
+1. Enforces `safe.directory` in the **global** user git config (`--global` or `--file`).
+   Git ignores `safe.directory` in local scope (CVE-2022-24765). This is done **first**
+   because local config writes fail on mismatched-owner workspaces until `safe.directory`
+   is set. The `global_config_file` parameter allows test isolation (`Some(temp_file)`)
+   vs. production use (`None` for real `~/.gitconfig`).
+2. Sets `core.hooksPath` to an empty FAC-controlled directory (disables hooks)
 3. Scans `.git/config` for unsafe filter/smudge/command entries
 
 **Key types**:
@@ -673,7 +677,7 @@ Applies security hardening to lane workspace git config after checkout:
 **Security invariants**:
 - [INV-GH-001] After hardening, no repository-shipped hook can execute
 - [INV-GH-002] Hooks directory is empty, FAC-controlled, mode 0o700, outside workspace tree
-- [INV-GH-003] Unsafe filter/smudge/fsmonitor/sshcommand configs are detected and rejected
+- [INV-GH-003] Unsafe filter/smudge/fsmonitor/sshcommand/editor/pager/askpass/gitproxy/alias configs are detected and rejected
 - [INV-GH-004] All hardening results recorded in `GitHardeningReceipt` for evidence
 - [INV-GH-005] Pre-existing hooks directories are validated before reuse: must not be
   a symlink, must be owned by current uid, must have mode 0o700, must be empty. Failure
@@ -682,6 +686,9 @@ Applies security hardening to lane workspace git config after checkout:
   diagnostics instead of silently passing the config scan.
 - [INV-GH-007] When unsafe config is detected and rejected, a `GitHardeningReceipt`
   with `outcome: Rejected` is included in the error for audit trail persistence.
+- [INV-GH-008] `safe.directory` is set in global git config scope, never local.
+  Git ignores `safe.directory` in local scope per CVE-2022-24765 security property.
+  This prevents denial-of-service on mismatched-owner workspaces.
 
 **Integration**: Called automatically by `checkout_to_lane()` after checkout completes.
 Receipt is included in `CheckoutOutcome::git_hardening`.

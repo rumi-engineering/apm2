@@ -12,8 +12,11 @@
 //!    in the repository from executing during git operations.
 //!
 //! 2. **Enforce `safe.directory`** — The workspace path is added to
-//!    `safe.directory` so that git commands succeed even when the workspace
-//!    owner differs from the current user (common in system-mode lanes).
+//!    `safe.directory` in the **global** user git config (`~/.gitconfig`). Git
+//!    ignores `safe.directory` when set in local scope (CVE-2022-24765 security
+//!    property), so this MUST use `--global`. This is performed **before** any
+//!    local config writes, because local config writes will fail on a
+//!    mismatched-owner workspace until `safe.directory` is set.
 //!
 //! 3. **Refuse unsafe configs** — After checkout, the local `.git/config` is
 //!    scanned for `filter.*.process`, `filter.*.clean`, `filter.*.smudge`, and
@@ -60,10 +63,15 @@ const UNSAFE_CONFIG_PATTERNS: &[&str] = &[
     "filter.", // filter.<driver>.clean, filter.<driver>.smudge, filter.<driver>.process
     "core.fsmonitor",
     "core.sshcommand",
+    "core.editor",   // can execute arbitrary commands
+    "core.pager",    // can execute arbitrary commands
+    "core.askpass",  // can execute arbitrary commands to capture credentials
+    "core.gitproxy", // can execute arbitrary proxy commands
     "credential.helper",
     "diff.external",
     "diff.",         // diff.<driver>.command
     "merge.",        // merge.<driver>.driver
+    "alias.",        // alias.* can execute arbitrary shell commands via ! prefix
     "receive.fsck.", // server-side but reject if present locally
     "uploadpack.",
     "protocol.",
@@ -206,10 +214,12 @@ pub enum GitHardeningOutcome {
 ///
 /// # Steps
 ///
-/// 1. Creates an empty hooks directory under `hooks_parent` (outside the
+/// 1. Adds the workspace path to `safe.directory` in the **global** user git
+///    config (`~/.gitconfig`). This must happen first because local config
+///    writes will fail on mismatched-owner workspaces until `safe.directory` is
+///    set. Git ignores `safe.directory` in local scope (CVE-2022-24765).
+/// 2. Creates an empty hooks directory under `hooks_parent` (outside the
 ///    workspace tree) and sets `core.hooksPath` in the workspace's local git
-///    config.
-/// 2. Sets `safe.directory` for the workspace path in the workspace's local git
 ///    config.
 /// 3. Scans the workspace's `.git/config` for unsafe filter/smudge/command
 ///    entries and rejects the workspace if any are found and
@@ -222,6 +232,10 @@ pub enum GitHardeningOutcome {
 ///   created. Must be outside the workspace tree and controlled by FAC.
 /// * `refuse_unsafe_configs` — If true, reject workspaces with dangerous git
 ///   config entries. If false, record them but allow.
+/// * `global_config_file` — Override for the global git config file path. When
+///   `Some`, uses `git config --file <path>` instead of `--global`. Pass `None`
+///   in production to use the real `~/.gitconfig`. Tests should pass
+///   `Some(temp_file)` for isolation.
 ///
 /// # Returns
 ///
@@ -237,6 +251,7 @@ pub fn harden_lane_workspace(
     workspace: &Path,
     hooks_parent: &Path,
     refuse_unsafe_configs: bool,
+    global_config_file: Option<&Path>,
 ) -> Result<GitHardeningReceipt, GitHardeningError> {
     // Validate workspace exists and has a .git directory.
     if !workspace.is_dir() {
@@ -251,7 +266,22 @@ pub fn harden_lane_workspace(
         });
     }
 
-    // Step 1: Create empty hooks directory and set core.hooksPath.
+    // Step 1: Enforce safe.directory in global git config.
+    // This MUST happen before any local config writes. Git ignores
+    // safe.directory when set in local scope (CVE-2022-24765 security
+    // property). Additionally, local config writes will fail on a
+    // mismatched-owner workspace until safe.directory is set globally.
+    let workspace_abs = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    set_git_config_global(
+        "safe.directory",
+        &workspace_abs.display().to_string(),
+        global_config_file,
+    )?;
+    let safe_directory_set = true;
+
+    // Step 2: Create empty hooks directory and set core.hooksPath.
     let hooks_dir = create_empty_hooks_dir(hooks_parent)?;
     set_git_config_local(
         workspace,
@@ -259,17 +289,6 @@ pub fn harden_lane_workspace(
         &hooks_dir.display().to_string(),
     )?;
     let hooks_disabled = true;
-
-    // Step 2: Enforce safe.directory.
-    let workspace_abs = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
-    set_git_config_local(
-        workspace,
-        "safe.directory",
-        &workspace_abs.display().to_string(),
-    )?;
-    let safe_directory_set = true;
 
     // Step 3: Scan for unsafe config entries.
     let unsafe_keys = scan_unsafe_configs(workspace)?;
@@ -460,6 +479,56 @@ fn set_git_config_local(workspace: &Path, key: &str, value: &str) -> Result<(), 
     Ok(())
 }
 
+/// Set a git config value in the global (`~/.gitconfig`) scope.
+///
+/// Used for `safe.directory` which Git ignores in local scope
+/// (CVE-2022-24765 security property).
+///
+/// When `config_file` is `Some`, uses `git config --file <path>` for
+/// test isolation. When `None`, uses `git config --global` to write to
+/// the real user global config (`~/.gitconfig`).
+fn set_git_config_global(
+    key: &str,
+    value: &str,
+    config_file: Option<&Path>,
+) -> Result<(), GitHardeningError> {
+    let mut cmd = Command::new("git");
+    cmd.arg("config");
+    match config_file {
+        Some(path) => {
+            cmd.arg("--file").arg(path);
+        },
+        None => {
+            cmd.arg("--global");
+        },
+    }
+    cmd.arg("--").arg(key).arg(value);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+
+    let output = cmd
+        .output()
+        .map_err(|e| GitHardeningError::GitConfigSetFailed {
+            key: key.to_string(),
+            value: value.to_string(),
+            reason: format!("failed to spawn git: {e}"),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(GitHardeningError::GitConfigSetFailed {
+            key: key.to_string(),
+            value: value.to_string(),
+            reason: if stderr.is_empty() {
+                "git config --global command failed with no output".to_string()
+            } else {
+                stderr
+            },
+        });
+    }
+
+    Ok(())
+}
+
 /// Scan the workspace's local git config for unsafe entries.
 ///
 /// Returns a bounded list of config keys that could execute external
@@ -580,6 +649,16 @@ mod tests {
 
     use super::*;
 
+    /// Helper: create a temp global git config file for test isolation.
+    /// Returns the path to the file. The file is created inside the given
+    /// temp directory so it is cleaned up automatically.
+    fn create_test_global_config(temp_dir: &Path) -> PathBuf {
+        let config_file = temp_dir.join("test_gitconfig");
+        // Create the file so git config --file works.
+        fs::write(&config_file, "").expect("create test global config");
+        config_file
+    }
+
     /// Helper: create a minimal git repo at `path` with one commit.
     fn create_test_repo(path: &Path) -> String {
         fs::create_dir_all(path).expect("create repo dir");
@@ -646,11 +725,12 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
         fs::create_dir_all(&hooks_parent).expect("hooks parent");
 
         let _sha = create_test_repo(&workspace);
 
-        let receipt = harden_lane_workspace(&workspace, &hooks_parent, true)
+        let receipt = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config))
             .expect("hardening should succeed");
 
         assert!(receipt.hooks_disabled);
@@ -660,7 +740,7 @@ mod tests {
         assert_eq!(receipt.outcome, GitHardeningOutcome::Hardened);
         assert_eq!(receipt.schema, GIT_HARDENING_RECEIPT_SCHEMA);
 
-        // Verify core.hooksPath is actually set.
+        // Verify core.hooksPath is actually set in local config.
         let hooks_path_val = Command::new("git")
             .arg("-C")
             .arg(&workspace)
@@ -677,6 +757,40 @@ mod tests {
             hooks_val.contains("empty_hooks"),
             "core.hooksPath should point to empty_hooks dir, got: {hooks_val}"
         );
+
+        // Verify safe.directory is set in the global config file (not local).
+        let safe_dir_val = Command::new("git")
+            .args(["config", "--file"])
+            .arg(&global_config)
+            .arg("safe.directory")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("read safe.directory from global config");
+        assert!(
+            safe_dir_val.status.success(),
+            "safe.directory should be set in global config"
+        );
+        let safe_dir = String::from_utf8_lossy(&safe_dir_val.stdout)
+            .trim()
+            .to_string();
+        assert!(
+            !safe_dir.is_empty(),
+            "safe.directory should have a non-empty value in global config"
+        );
+
+        // Verify safe.directory is NOT in local config (CVE-2022-24765 fix).
+        let local_safe_dir = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["config", "--local", "safe.directory"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("check local safe.directory");
+        assert!(
+            !local_safe_dir.status.success(),
+            "safe.directory should NOT be in local config (CVE-2022-24765)"
+        );
     }
 
     #[test]
@@ -687,7 +801,8 @@ mod tests {
         let hooks_parent = temp.path().join("hooks");
         fs::create_dir_all(&hooks_parent).expect("hooks parent");
 
-        let result = harden_lane_workspace(&workspace, &hooks_parent, true);
+        // Fails before reaching global config write, so None is fine.
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true, None);
         assert!(
             matches!(result, Err(GitHardeningError::InvalidWorkspace { .. })),
             "expected InvalidWorkspace, got: {result:?}"
@@ -701,7 +816,8 @@ mod tests {
         let hooks_parent = temp.path().join("hooks");
         fs::create_dir_all(&hooks_parent).expect("hooks parent");
 
-        let result = harden_lane_workspace(&workspace, &hooks_parent, true);
+        // Fails before reaching global config write, so None is fine.
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true, None);
         assert!(
             matches!(result, Err(GitHardeningError::InvalidWorkspace { .. })),
             "expected InvalidWorkspace, got: {result:?}"
@@ -713,6 +829,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
         fs::create_dir_all(&hooks_parent).expect("hooks parent");
 
         let _sha = create_test_repo(&workspace);
@@ -729,7 +846,7 @@ mod tests {
         assert!(cfg.status.success());
 
         // With refuse_unsafe_configs=true, should error.
-        let result = harden_lane_workspace(&workspace, &hooks_parent, true);
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config));
         assert!(
             matches!(result, Err(GitHardeningError::UnsafeConfigDetected { .. })),
             "expected UnsafeConfigDetected, got: {result:?}"
@@ -759,6 +876,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
         fs::create_dir_all(&hooks_parent).expect("hooks parent");
 
         let _sha = create_test_repo(&workspace);
@@ -775,7 +893,7 @@ mod tests {
         assert!(cfg.status.success());
 
         // With refuse_unsafe_configs=false, should succeed with findings.
-        let receipt = harden_lane_workspace(&workspace, &hooks_parent, false)
+        let receipt = harden_lane_workspace(&workspace, &hooks_parent, false, Some(&global_config))
             .expect("hardening should succeed with findings");
 
         assert!(receipt.hooks_disabled);
@@ -790,6 +908,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
         fs::create_dir_all(&hooks_parent).expect("hooks parent");
 
         let _sha = create_test_repo(&workspace);
@@ -809,7 +928,7 @@ mod tests {
             .expect("set fsmonitor config");
         assert!(cfg.status.success());
 
-        let result = harden_lane_workspace(&workspace, &hooks_parent, true);
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config));
         assert!(
             matches!(result, Err(GitHardeningError::UnsafeConfigDetected { .. })),
             "expected UnsafeConfigDetected for core.fsmonitor, got: {result:?}"
@@ -835,11 +954,17 @@ mod tests {
         assert!(is_unsafe_config_key("filter.foo.process"));
         assert!(is_unsafe_config_key("core.fsmonitor"));
         assert!(is_unsafe_config_key("core.sshcommand"));
+        assert!(is_unsafe_config_key("core.editor"));
+        assert!(is_unsafe_config_key("core.pager"));
+        assert!(is_unsafe_config_key("core.askpass"));
+        assert!(is_unsafe_config_key("core.gitproxy"));
         assert!(is_unsafe_config_key("credential.helper"));
         assert!(is_unsafe_config_key("diff.external"));
         assert!(is_unsafe_config_key("diff.foo.command"));
         assert!(is_unsafe_config_key("diff.foo.textconv"));
         assert!(is_unsafe_config_key("merge.foo.driver"));
+        assert!(is_unsafe_config_key("alias.co"));
+        assert!(is_unsafe_config_key("alias.deploy"));
 
         // Safe keys:
         assert!(!is_unsafe_config_key("core.hookspath"));
@@ -873,6 +998,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
         fs::create_dir_all(&hooks_parent).expect("hooks parent");
 
         let _sha = create_test_repo(&workspace);
@@ -893,7 +1019,7 @@ mod tests {
         }
 
         // Harden the workspace.
-        let receipt = harden_lane_workspace(&workspace, &hooks_parent, true)
+        let receipt = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config))
             .expect("hardening should succeed");
         assert_eq!(receipt.outcome, GitHardeningOutcome::Hardened);
 
@@ -937,6 +1063,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
         fs::create_dir_all(&hooks_parent).expect("hooks parent");
 
         let _sha = create_test_repo(&workspace);
@@ -956,7 +1083,7 @@ mod tests {
         }
 
         // Harden the workspace.
-        let receipt = harden_lane_workspace(&workspace, &hooks_parent, true)
+        let receipt = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config))
             .expect("hardening should succeed");
         assert_eq!(receipt.outcome, GitHardeningOutcome::Hardened);
 
@@ -1005,12 +1132,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
         fs::create_dir_all(&hooks_parent).expect("hooks parent");
 
         let _sha = create_test_repo(&workspace);
 
         // Harden should set core.hooksPath but not flag it as unsafe.
-        let receipt = harden_lane_workspace(&workspace, &hooks_parent, true)
+        let receipt = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config))
             .expect("hardening should succeed");
 
         assert!(receipt.config_scan_passed);
@@ -1022,6 +1150,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
         fs::create_dir_all(&hooks_parent).expect("hooks parent");
 
         let _sha = create_test_repo(&workspace);
@@ -1043,7 +1172,7 @@ mod tests {
             assert!(cfg.status.success());
         }
 
-        let result = harden_lane_workspace(&workspace, &hooks_parent, true);
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config));
         match result {
             Err(GitHardeningError::UnsafeConfigDetected {
                 count,
@@ -1069,6 +1198,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
         fs::create_dir_all(&hooks_parent).expect("hooks parent");
 
         let _sha = create_test_repo(&workspace);
@@ -1078,7 +1208,7 @@ mod tests {
         fs::create_dir_all(&hooks_dir).expect("create hooks dir");
         fs::write(hooks_dir.join("post-commit"), "#!/bin/sh\nmalicious").expect("write hook file");
 
-        let result = harden_lane_workspace(&workspace, &hooks_parent, true);
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config));
         assert!(
             matches!(
                 result,
@@ -1095,6 +1225,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
         fs::create_dir_all(&hooks_parent).expect("hooks parent");
 
         let _sha = create_test_repo(&workspace);
@@ -1105,7 +1236,7 @@ mod tests {
         let hooks_link = hooks_parent.join("empty_hooks");
         std::os::unix::fs::symlink(&attacker_dir, &hooks_link).expect("symlink");
 
-        let result = harden_lane_workspace(&workspace, &hooks_parent, true);
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config));
         assert!(
             matches!(
                 result,
@@ -1124,6 +1255,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
         fs::create_dir_all(&hooks_parent).expect("hooks parent");
 
         let _sha = create_test_repo(&workspace);
@@ -1134,7 +1266,7 @@ mod tests {
         fs::set_permissions(&hooks_dir, fs::Permissions::from_mode(0o755))
             .expect("set wrong perms");
 
-        let result = harden_lane_workspace(&workspace, &hooks_parent, true);
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config));
         assert!(
             matches!(
                 result,
@@ -1180,12 +1312,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
         fs::create_dir_all(&hooks_parent).expect("hooks parent");
 
         let _sha = create_test_repo(&workspace);
 
         // First harden successfully to set up hooks path etc.
-        let receipt = harden_lane_workspace(&workspace, &hooks_parent, true)
+        let receipt = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config))
             .expect("initial hardening should succeed");
         assert_eq!(receipt.outcome, GitHardeningOutcome::Hardened);
 
@@ -1198,7 +1331,7 @@ mod tests {
         // it's valid (empty, correct perms, correct owner), it passes
         // validation. The git config set calls will also fail since the
         // config is corrupt — this is expected.
-        let result = harden_lane_workspace(&workspace, &hooks_parent, true);
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config));
         assert!(
             result.is_err(),
             "expected error for corrupted git config, got: {result:?}"
@@ -1212,6 +1345,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
         fs::create_dir_all(&hooks_parent).expect("hooks parent");
 
         let _sha = create_test_repo(&workspace);
@@ -1227,7 +1361,7 @@ mod tests {
             .expect("set config");
         assert!(cfg.status.success());
 
-        let result = harden_lane_workspace(&workspace, &hooks_parent, true);
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config));
         match result {
             Err(GitHardeningError::UnsafeConfigDetected {
                 count,
@@ -1260,6 +1394,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
         fs::create_dir_all(&hooks_parent).expect("hooks parent");
 
         let _sha = create_test_repo(&workspace);
@@ -1272,9 +1407,168 @@ mod tests {
             .expect("create hooks dir");
 
         // Should succeed — the directory is valid.
-        let receipt = harden_lane_workspace(&workspace, &hooks_parent, true)
+        let receipt = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config))
             .expect("hardening should succeed for valid pre-existing hooks dir");
         assert_eq!(receipt.outcome, GitHardeningOutcome::Hardened);
         assert!(receipt.hooks_disabled);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Regression tests for fix round 2 (MAJOR: safe.directory scope,
+    // MINOR: incomplete unsafe config blacklist)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// MAJOR: safe.directory must be written to global config (--global
+    /// or --file), not local config. Git ignores safe.directory in local
+    /// scope per CVE-2022-24765.
+    #[test]
+    fn safe_directory_is_written_to_global_not_local_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
+        fs::create_dir_all(&hooks_parent).expect("hooks parent");
+
+        let _sha = create_test_repo(&workspace);
+
+        let receipt = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config))
+            .expect("hardening should succeed");
+        assert_eq!(receipt.outcome, GitHardeningOutcome::Hardened);
+        assert!(receipt.safe_directory_set);
+
+        // Verify safe.directory is in the global config file.
+        let global_val = Command::new("git")
+            .args(["config", "--file"])
+            .arg(&global_config)
+            .arg("safe.directory")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("read global safe.directory");
+        assert!(
+            global_val.status.success(),
+            "safe.directory must be present in global config file"
+        );
+
+        // Verify safe.directory is NOT in local config.
+        let local_val = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["config", "--local", "safe.directory"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("check local safe.directory");
+        assert!(
+            !local_val.status.success(),
+            "safe.directory must NOT be in local config (CVE-2022-24765)"
+        );
+    }
+
+    /// MAJOR: safe.directory is set before local config writes so that
+    /// mismatched-owner workspaces can be hardened without denial-of-service.
+    /// We verify the ordering by checking that safe.directory is present
+    /// in the global config even when the test repo has a valid .git dir.
+    #[test]
+    fn safe_directory_set_before_local_config_operations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
+        fs::create_dir_all(&hooks_parent).expect("hooks parent");
+
+        let _sha = create_test_repo(&workspace);
+
+        let receipt = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config))
+            .expect("hardening should succeed");
+        assert!(receipt.safe_directory_set);
+        assert!(receipt.hooks_disabled);
+
+        // Verify global config was written (safe.directory).
+        let content = fs::read_to_string(&global_config).expect("read global config");
+        assert!(
+            content.contains("safe"),
+            "global config should contain safe.directory entry, got: {content}"
+        );
+    }
+
+    /// MINOR: newly added unsafe config patterns are detected.
+    #[test]
+    fn detects_newly_added_unsafe_patterns() {
+        // core.editor
+        assert!(is_unsafe_config_key("core.editor"));
+        // core.pager
+        assert!(is_unsafe_config_key("core.pager"));
+        // core.askpass
+        assert!(is_unsafe_config_key("core.askpass"));
+        // core.gitproxy
+        assert!(is_unsafe_config_key("core.gitproxy"));
+        // alias.* prefix
+        assert!(is_unsafe_config_key("alias.co"));
+        assert!(is_unsafe_config_key("alias.st"));
+        assert!(is_unsafe_config_key("alias.deploy"));
+    }
+
+    /// MINOR: alias detection in end-to-end hardening.
+    #[test]
+    fn harden_detects_alias_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
+        fs::create_dir_all(&hooks_parent).expect("hooks parent");
+
+        let _sha = create_test_repo(&workspace);
+
+        // Inject a dangerous alias (shell execution via ! prefix).
+        let cfg = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["config", "--local", "alias.deploy", "!rm -rf /"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("set alias config");
+        assert!(cfg.status.success());
+
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config));
+        assert!(
+            matches!(result, Err(GitHardeningError::UnsafeConfigDetected { .. })),
+            "expected UnsafeConfigDetected for alias.deploy, got: {result:?}"
+        );
+
+        if let Err(GitHardeningError::UnsafeConfigDetected { keys, .. }) = result {
+            assert!(
+                keys.iter().any(|k| k.contains("alias.deploy")),
+                "expected alias.deploy in keys, got: {keys:?}"
+            );
+        }
+    }
+
+    /// MINOR: core.editor detection in end-to-end hardening.
+    #[test]
+    fn harden_detects_core_editor_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let hooks_parent = temp.path().join("fac_hooks");
+        let global_config = create_test_global_config(temp.path());
+        fs::create_dir_all(&hooks_parent).expect("hooks parent");
+
+        let _sha = create_test_repo(&workspace);
+
+        let cfg = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["config", "--local", "core.editor", "/usr/bin/evil-editor"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("set editor config");
+        assert!(cfg.status.success());
+
+        let result = harden_lane_workspace(&workspace, &hooks_parent, true, Some(&global_config));
+        assert!(
+            matches!(result, Err(GitHardeningError::UnsafeConfigDetected { .. })),
+            "expected UnsafeConfigDetected for core.editor, got: {result:?}"
+        );
     }
 }

@@ -329,6 +329,7 @@ impl RepoMirrorManager {
             lane_workspace,
             allowed_parent,
             true, // refuse_unsafe_configs: fail-closed by default
+            None, // use real ~/.gitconfig for safe.directory
         )?;
 
         Ok(CheckoutOutcome {
