@@ -8,6 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use apm2_core::fac::gh_command;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -16,6 +17,8 @@ use crate::exit_codes::codes as exit_codes;
 
 const DEFAULT_RULESET_FILE: &str = ".github/rulesets/protect-main.json";
 const RULESET_SYNC_SCHEMA: &str = "apm2.fac.pr.ruleset_sync.v1";
+const MAX_LOCAL_RULESET_FILE_BYTES: usize = 1024 * 1024;
+const MAX_GH_API_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RequiredStatusPolicy {
@@ -168,6 +171,14 @@ pub fn sync_required_status_ruleset(
     })
 }
 
+pub fn load_local_required_status_contexts(
+    ruleset_file: Option<&Path>,
+) -> Result<Vec<String>, String> {
+    let ruleset_file = resolve_ruleset_file_path(ruleset_file)?;
+    let policy = read_required_status_policy_from_file(&ruleset_file)?;
+    Ok(policy.sorted_contexts())
+}
+
 fn resolve_repo_root() -> Result<PathBuf, String> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -187,26 +198,62 @@ fn resolve_repo_root() -> Result<PathBuf, String> {
 }
 
 fn resolve_ruleset_file_path(path: Option<&Path>) -> Result<PathBuf, String> {
+    let repo_root = resolve_repo_root()?;
+    let repo_root_canonical = repo_root.canonicalize().map_err(|err| {
+        format!(
+            "failed to canonicalize repository root {}: {err}",
+            repo_root.display()
+        )
+    })?;
+
     let resolved = match path {
         Some(path) if path.is_absolute() => path.to_path_buf(),
         Some(path) => std::env::current_dir()
             .map_err(|err| format!("failed to resolve current working directory: {err}"))?
             .join(path),
-        None => resolve_repo_root()?.join(DEFAULT_RULESET_FILE),
+        None => repo_root.join(DEFAULT_RULESET_FILE),
     };
-    if !resolved.exists() {
+
+    let metadata = std::fs::symlink_metadata(&resolved).map_err(|err| {
+        format!(
+            "failed to stat local ruleset file {}: {err}",
+            resolved.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
         return Err(format!(
-            "local ruleset file does not exist: {}",
+            "local ruleset file must not be a symlink: {}",
             resolved.display()
         ));
     }
-    Ok(resolved)
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "local ruleset file must be a regular file: {}",
+            resolved.display()
+        ));
+    }
+
+    let resolved_canonical = resolved.canonicalize().map_err(|err| {
+        format!(
+            "failed to canonicalize local ruleset file {}: {err}",
+            resolved.display()
+        )
+    })?;
+    if !resolved_canonical.starts_with(&repo_root_canonical) {
+        return Err(format!(
+            "local ruleset file must stay within repository root {}: {}",
+            repo_root_canonical.display(),
+            resolved_canonical.display()
+        ));
+    }
+
+    Ok(resolved_canonical)
 }
 
 fn read_required_status_policy_from_file(path: &Path) -> Result<RequiredStatusPolicy, String> {
-    let raw = std::fs::read_to_string(path)
+    let raw = crate::commands::fac_secure_io::read_bounded(path, MAX_LOCAL_RULESET_FILE_BYTES)
         .map_err(|err| format!("failed to read ruleset file {}: {err}", path.display()))?;
-    let value: Value = serde_json::from_str(&raw)
+    let value: Value = serde_json::from_slice(&raw)
         .map_err(|err| format!("failed to parse ruleset JSON {}: {err}", path.display()))?;
     read_required_status_policy_from_ruleset(&value, &path.display().to_string())
 }
@@ -330,6 +377,22 @@ fn ruleset_targets_main_branch(ruleset: &Value) -> bool {
     })
 }
 
+fn parse_bounded_json_response<T: DeserializeOwned>(
+    bytes: &[u8],
+    max_bytes: usize,
+    source: &str,
+) -> Result<T, String> {
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "{source} response too large: {} > {}",
+            bytes.len(),
+            max_bytes
+        ));
+    }
+    serde_json::from_slice::<T>(bytes)
+        .map_err(|err| format!("failed to parse {source} response JSON: {err}"))
+}
+
 fn fetch_ruleset_catalog(repo: &str) -> Result<Vec<RulesetCatalogEntry>, String> {
     let endpoint = format!("/repos/{repo}/rulesets");
     let output = gh_command()
@@ -342,8 +405,11 @@ fn fetch_ruleset_catalog(repo: &str) -> Result<Vec<RulesetCatalogEntry>, String>
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    serde_json::from_slice::<Vec<RulesetCatalogEntry>>(&output.stdout)
-        .map_err(|err| format!("failed to parse ruleset list response: {err}"))
+    parse_bounded_json_response::<Vec<RulesetCatalogEntry>>(
+        &output.stdout,
+        MAX_GH_API_RESPONSE_BYTES,
+        "ruleset list",
+    )
 }
 
 fn fetch_ruleset(repo: &str, ruleset_id: u64) -> Result<Value, String> {
@@ -358,8 +424,11 @@ fn fetch_ruleset(repo: &str, ruleset_id: u64) -> Result<Value, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    serde_json::from_slice::<Value>(&output.stdout)
-        .map_err(|err| format!("failed to parse ruleset {ruleset_id} response JSON: {err}"))
+    parse_bounded_json_response::<Value>(
+        &output.stdout,
+        MAX_GH_API_RESPONSE_BYTES,
+        &format!("ruleset {ruleset_id}"),
+    )
 }
 
 fn build_ruleset_update_payload(
@@ -478,11 +547,18 @@ fn update_ruleset(repo: &str, ruleset_id: u64, payload: &Value) -> Result<(), St
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
     use serde_json::json;
+    use tempfile::{NamedTempFile, tempdir};
 
     use super::{
-        RequiredStatusPolicy, apply_required_status_policy, build_ruleset_update_payload,
-        read_required_status_policy_from_ruleset, ruleset_targets_main_branch,
+        MAX_GH_API_RESPONSE_BYTES, MAX_LOCAL_RULESET_FILE_BYTES, RequiredStatusPolicy,
+        apply_required_status_policy, build_ruleset_update_payload, parse_bounded_json_response,
+        read_required_status_policy_from_file, read_required_status_policy_from_ruleset,
+        resolve_ruleset_file_path, ruleset_targets_main_branch,
     };
 
     #[test]
@@ -641,5 +717,50 @@ mod tests {
             }
         });
         assert!(ruleset_targets_main_branch(&ruleset));
+    }
+
+    #[test]
+    fn resolve_ruleset_file_path_rejects_outside_repo_root() {
+        let temp = NamedTempFile::new().expect("temp file");
+        let err =
+            resolve_ruleset_file_path(Some(temp.path())).expect_err("outside-repo file must fail");
+        assert!(err.contains("must stay within repository root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_ruleset_file_path_rejects_symlink() {
+        let dir = tempdir().expect("temp dir");
+        let target = dir.path().join("target.json");
+        let link = dir.path().join("link.json");
+        fs::write(&target, "{}").expect("write target");
+        symlink(&target, &link).expect("create symlink");
+
+        let err = resolve_ruleset_file_path(Some(&link)).expect_err("symlink must fail");
+        assert!(err.contains("must not be a symlink"));
+    }
+
+    #[test]
+    fn read_required_status_policy_from_file_rejects_oversized_input() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("oversized.json");
+        let oversized = vec![b'a'; MAX_LOCAL_RULESET_FILE_BYTES + 1];
+        fs::write(&path, oversized).expect("write oversized file");
+
+        let err =
+            read_required_status_policy_from_file(&path).expect_err("oversized file must fail");
+        assert!(err.contains("too large"));
+    }
+
+    #[test]
+    fn parse_bounded_json_response_rejects_oversized_payload() {
+        let payload = vec![b' '; MAX_GH_API_RESPONSE_BYTES + 1];
+        let err = parse_bounded_json_response::<serde_json::Value>(
+            &payload,
+            MAX_GH_API_RESPONSE_BYTES,
+            "fixture",
+        )
+        .expect_err("oversized payload must fail");
+        assert!(err.contains("response too large"));
     }
 }

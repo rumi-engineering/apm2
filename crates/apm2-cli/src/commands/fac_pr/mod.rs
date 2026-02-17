@@ -14,7 +14,7 @@ mod auth_setup;
 mod ruleset_sync;
 
 // Re-export for potential external callers.
-pub use ruleset_sync::sync_required_status_ruleset;
+pub use ruleset_sync::{load_local_required_status_contexts, sync_required_status_ruleset};
 #[allow(unused_imports)]
 pub use types::AuthInfo;
 

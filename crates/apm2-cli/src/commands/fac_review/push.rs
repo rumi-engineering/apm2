@@ -806,6 +806,7 @@ pub(super) struct PushAttemptRecord {
     pub schema: String,
     pub ts: String,
     pub sha: String,
+    pub ruleset_sync: PushAttemptStage,
     pub git_push: PushAttemptStage,
     pub gate_fmt: PushAttemptStage,
     pub gate_clippy: PushAttemptStage,
@@ -829,6 +830,7 @@ impl PushAttemptRecord {
             schema: PUSH_ATTEMPT_SCHEMA.to_string(),
             ts: now_iso8601(),
             sha: sha.to_ascii_lowercase(),
+            ruleset_sync: skipped_stage(),
             git_push: skipped_stage(),
             gate_fmt: skipped_stage(),
             gate_clippy: skipped_stage(),
@@ -841,6 +843,7 @@ impl PushAttemptRecord {
 
     fn stage_mut(&mut self, stage: &str) -> Option<&mut PushAttemptStage> {
         match stage {
+            "ruleset_sync" => Some(&mut self.ruleset_sync),
             "git_push" => Some(&mut self.git_push),
             "gate_fmt" => Some(&mut self.gate_fmt),
             "gate_clippy" => Some(&mut self.gate_clippy),
@@ -882,11 +885,12 @@ impl PushAttemptRecord {
 
     pub(super) fn first_failed_stage(&self) -> Option<PushAttemptFailedStage> {
         for (stage, details) in [
-            ("git_push", &self.git_push),
             ("gate_fmt", &self.gate_fmt),
             ("gate_clippy", &self.gate_clippy),
             ("gate_test", &self.gate_test),
             ("gate_doc", &self.gate_doc),
+            ("ruleset_sync", &self.ruleset_sync),
+            ("git_push", &self.git_push),
             ("pr_update", &self.pr_update),
             ("dispatch", &self.dispatch),
         ] {
@@ -1414,6 +1418,10 @@ pub fn run_push(
     let mut git_push_exit_code: Option<i32> = None;
     let mut git_push_error_hint: Option<String> = None;
     let mut git_push_executed = false;
+    let mut ruleset_sync_duration_secs = 0_u64;
+    let mut ruleset_sync_error_hint: Option<String> = None;
+    let mut ruleset_sync_executed = false;
+    let mut ruleset_sync_passed = false;
     let gate_results = match run_pre_push_sequence_with(
         || {
             human_log!("fac push: enqueuing evidence gates job (external worker, blocking)");
@@ -1625,12 +1633,17 @@ pub fn run_push(
             let sync_started = Instant::now();
             match sync_required_status_ruleset(repo, None, None, false) {
                 Ok(sync_outcome) => {
+                    let duration_secs = sync_started.elapsed().as_secs();
+                    ruleset_sync_duration_secs = duration_secs;
+                    ruleset_sync_error_hint = None;
+                    ruleset_sync_executed = true;
+                    ruleset_sync_passed = true;
                     let required_status_contexts = sync_outcome.contexts.clone();
                     emit_stage(
                         "ruleset_sync_completed",
                         serde_json::json!({
                             "status": "pass",
-                            "duration_secs": sync_started.elapsed().as_secs(),
+                            "duration_secs": duration_secs,
                             "ruleset_id": sync_outcome.ruleset_id,
                             "drift_detected": sync_outcome.drift_detected,
                             "changed": sync_outcome.changed,
@@ -1651,11 +1664,16 @@ pub fn run_push(
                     Ok(())
                 },
                 Err(err) => {
+                    let duration_secs = sync_started.elapsed().as_secs();
+                    ruleset_sync_duration_secs = duration_secs;
+                    ruleset_sync_error_hint = normalize_error_hint(&err);
+                    ruleset_sync_executed = true;
+                    ruleset_sync_passed = false;
                     emit_stage(
                         "ruleset_sync_completed",
                         serde_json::json!({
                             "status": "fail",
-                            "duration_secs": sync_started.elapsed().as_secs(),
+                            "duration_secs": duration_secs,
                             "error": err.as_str(),
                         }),
                     );
@@ -1722,6 +1740,9 @@ pub fn run_push(
         },
     ) {
         Ok(results) => {
+            if ruleset_sync_executed && ruleset_sync_passed {
+                attempt.set_stage_pass("ruleset_sync", ruleset_sync_duration_secs);
+            }
             if git_push_executed {
                 attempt.set_stage_pass("git_push", git_push_duration_secs);
             }
@@ -1731,6 +1752,16 @@ pub fn run_push(
             fail_with_attempt!("fac_push_gates_failed", err);
         },
         Err(PrePushExecutionError::RulesetSync(err)) => {
+            if ruleset_sync_executed {
+                attempt.set_stage_fail(
+                    "ruleset_sync",
+                    ruleset_sync_duration_secs,
+                    None,
+                    ruleset_sync_error_hint.or_else(|| normalize_error_hint(&err)),
+                );
+            } else {
+                attempt.set_stage_fail("ruleset_sync", 0, None, normalize_error_hint(&err));
+            }
             fail_with_attempt!("fac_push_ruleset_sync_failed", err);
         },
         Err(PrePushExecutionError::GitPush(err)) => {
@@ -1982,6 +2013,29 @@ mod tests {
         assert_eq!(failed.duration_s, 15);
         assert_eq!(failed.exit_code, Some(1));
         assert_eq!(failed.error_hint.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn push_attempt_record_reports_ruleset_sync_failure_stage() {
+        let mut record = PushAttemptRecord::new("0123456789abcdef0123456789abcdef01234567");
+        record.set_stage_pass("gate_fmt", 1);
+        record.set_stage_pass("gate_clippy", 2);
+        record.set_stage_pass("gate_test", 3);
+        record.set_stage_pass("gate_doc", 4);
+        record.set_stage_fail(
+            "ruleset_sync",
+            5,
+            None,
+            Some("ruleset drift not synchronized".to_string()),
+        );
+
+        let failed = record.first_failed_stage().expect("failed stage");
+        assert_eq!(failed.stage, "ruleset_sync");
+        assert_eq!(failed.duration_s, 5);
+        assert_eq!(
+            failed.error_hint.as_deref(),
+            Some("ruleset drift not synchronized")
+        );
     }
 
     #[test]
