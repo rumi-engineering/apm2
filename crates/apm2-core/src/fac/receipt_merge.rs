@@ -323,14 +323,6 @@ fn scan_receipt_dir(
         if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
             continue;
         }
-        // Skip index subdirectory files.
-        if path
-            .parent()
-            .and_then(|p| p.file_name())
-            .is_some_and(|name| name == "index")
-        {
-            continue;
-        }
 
         // Derive expected digest from filename.
         let Some(digest_os) = path.file_stem() else {
