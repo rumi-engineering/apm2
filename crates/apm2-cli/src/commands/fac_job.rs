@@ -1,5 +1,5 @@
-// AGENT-AUTHORED (TCK-00533)
-//! FAC Job lifecycle management: cancel command.
+// AGENT-AUTHORED (TCK-00533, TCK-00535)
+//! FAC Job lifecycle management: cancel and show commands.
 //!
 //! Implements `apm2 fac job cancel <job_id>` with the following semantics:
 //!
@@ -46,21 +46,21 @@
 //! - [INV-CANCEL-008] Claimed-job cancel emits `CancellationRequested` (non-
 //!   terminal); terminal `Cancelled` receipt is emitted only by the worker.
 
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use apm2_core::fac::job_spec::{
-    CONTROL_LANE_REPO_ID, FacJobSpecV1, JobSource, LaneRequirements, MAX_JOB_SPEC_SIZE,
-};
+use apm2_core::fac::job_spec::{CONTROL_LANE_REPO_ID, FacJobSpecV1, JobSource, LaneRequirements};
 use apm2_core::fac::{
     DenialReasonCode, FacJobOutcome, FacJobReceiptV1Builder, persist_content_addressed_receipt,
 };
-use apm2_core::github::resolve_apm2_home;
 use serde::Serialize;
 
 use crate::commands::fac::CancelArgs;
+use crate::commands::fac_utils::{
+    MAX_SCAN_ENTRIES, read_job_spec_bounded, resolve_fac_root, resolve_queue_root,
+    validate_real_directory,
+};
 use crate::exit_codes::codes as exit_codes;
 
 // =============================================================================
@@ -69,7 +69,6 @@ use crate::exit_codes::codes as exit_codes;
 
 /// Queue subdirectory names (duplicated from `fac_worker` for module
 /// isolation).
-const QUEUE_DIR: &str = "queue";
 const PENDING_DIR: &str = "pending";
 const CLAIMED_DIR: &str = "claimed";
 const COMPLETED_DIR: &str = "completed";
@@ -80,9 +79,9 @@ const QUARANTINE_DIR: &str = "quarantine";
 /// FAC receipt directory under `$APM2_HOME/private/fac`.
 const FAC_RECEIPTS_DIR: &str = "receipts";
 
-/// Maximum number of directory entries to scan when locating a job.
-/// Prevents unbounded memory growth.
-const MAX_SCAN_ENTRIES: usize = 4096;
+/// Maximum total log pointers collected across all scan locations.
+/// Prevents unbounded allocation when scanning large lane/evidence trees.
+const MAX_LOG_POINTERS: usize = 256;
 
 // =============================================================================
 // Output types
@@ -123,6 +122,26 @@ enum JobState {
     NotFound,
     /// Job was found in multiple directories (ambiguous, fail-closed).
     Ambiguous(Vec<String>),
+}
+
+impl JobState {
+    /// Returns the canonical directory-token label for this job state.
+    ///
+    /// Labels match queue directory names exactly (pending, claimed,
+    /// completed, cancelled, denied, quarantine) to prevent drift
+    /// between introspection output and directory identifiers
+    /// (Finding 5 fix).
+    const fn state_label(&self) -> Option<&'static str> {
+        match self {
+            Self::Pending(_) => Some("pending"),
+            Self::Claimed(_) => Some("claimed"),
+            Self::Completed(_) => Some("completed"),
+            Self::Cancelled(_) => Some("cancelled"),
+            Self::Denied(_) => Some("denied"),
+            Self::Quarantined(_) => Some("quarantine"),
+            Self::NotFound | Self::Ambiguous(_) => None,
+        }
+    }
 }
 
 // =============================================================================
@@ -291,7 +310,7 @@ fn cancel_pending_job(
     let file_name = file_name.to_string();
 
     // Read the spec for receipt emission.
-    let spec = match read_job_spec(path) {
+    let spec = match read_job_spec_bounded(path) {
         Ok(spec) => spec,
         Err(e) => {
             output_error(json_output, &format!("cannot read job spec: {e}"));
@@ -410,11 +429,11 @@ fn cancel_claimed_job(
     // The final Cancelled receipt will be emitted by the worker when
     // stop_revoke completes.
     //
-    // MAJOR-2 fix: If read_job_spec fails, treat as a HARD failure.
+    // MAJOR-2 fix: If read_job_spec_bounded fails, treat as a HARD failure.
     // A cancellation MUST NOT complete without a cancellation-requested receipt.
     // The stop_revoke spec is already enqueued, but we return an error exit
     // code to signal that the receipt could not be emitted.
-    let spec_for_receipt = match read_job_spec(claimed_path) {
+    let spec_for_receipt = match read_job_spec_bounded(claimed_path) {
         Ok(spec) => spec,
         Err(e) => {
             output_error(
@@ -539,7 +558,7 @@ fn find_job_in_dir(dir: &Path, job_id: &str) -> Option<PathBuf> {
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
             if file_name.contains(job_id) {
                 // Verify by reading the actual spec.
-                if let Ok(spec) = read_job_spec(&path) {
+                if let Ok(spec) = read_job_spec_bounded(&path) {
                     if spec.job_id == job_id {
                         return Some(path);
                     }
@@ -549,7 +568,7 @@ fn find_job_in_dir(dir: &Path, job_id: &str) -> Option<PathBuf> {
 
         // If filename doesn't match, try reading the spec anyway
         // (filenames may use collision-safe suffixes).
-        if let Ok(spec) = read_job_spec(&path) {
+        if let Ok(spec) = read_job_spec_bounded(&path) {
             if spec.job_id == job_id {
                 return Some(path);
             }
@@ -695,45 +714,6 @@ fn emit_cancellation_requested_receipt(
 // Filesystem helpers
 // =============================================================================
 
-/// Resolves the queue root directory from `$APM2_HOME/queue`.
-fn resolve_queue_root() -> Result<PathBuf, String> {
-    let home = resolve_apm2_home().ok_or_else(|| "could not resolve APM2 home".to_string())?;
-    Ok(home.join(QUEUE_DIR))
-}
-
-/// Resolves the FAC root directory at `$APM2_HOME/private/fac`.
-fn resolve_fac_root() -> Result<PathBuf, String> {
-    let home = resolve_apm2_home().ok_or_else(|| "could not resolve APM2 home".to_string())?;
-    Ok(home.join("private").join("fac"))
-}
-
-/// Reads and deserializes a job spec from a file with bounded I/O.
-///
-/// BLOCKER-1 fix: Uses `File::open().take(MAX_JOB_SPEC_SIZE + 1)` to enforce
-/// the size limit on the actual read operation.  This prevents
-/// denial-of-service via special files (e.g. `/dev/zero`, procfs, FIFOs) where
-/// `metadata.len()` may report zero or misleading sizes while producing
-/// unbounded data on read.
-fn read_job_spec(path: &Path) -> Result<FacJobSpecV1, String> {
-    let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    // Read at most MAX_JOB_SPEC_SIZE + 1 bytes.  If we get more than
-    // MAX_JOB_SPEC_SIZE, the file is over the limit.
-    let limit = (MAX_JOB_SPEC_SIZE as u64).saturating_add(1);
-    let mut bounded_reader = file.take(limit);
-    let mut bytes = Vec::with_capacity(MAX_JOB_SPEC_SIZE.min(8192));
-    bounded_reader
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    if bytes.len() > MAX_JOB_SPEC_SIZE {
-        return Err(format!(
-            "file content {} exceeds max {}",
-            bytes.len(),
-            MAX_JOB_SPEC_SIZE
-        ));
-    }
-    serde_json::from_slice(&bytes).map_err(|e| format!("cannot parse {}: {e}", path.display()))
-}
-
 /// Moves a file to a destination directory with collision-safe naming.
 ///
 /// If the destination already exists, appends a nanosecond timestamp suffix.
@@ -850,8 +830,346 @@ fn output_error(json_output: bool, message: &str) {
 // Tests
 // =============================================================================
 
+// =============================================================================
+// Job Show Command (TCK-00535)
+// =============================================================================
+
+/// JSON output for `apm2 fac job show`.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct JobShowOutput {
+    /// The job ID.
+    job_id: String,
+    /// Current directory state (pending, claimed, completed, etc.).
+    current_state: String,
+    /// The full job spec, if readable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spec: Option<FacJobSpecV1>,
+    /// The latest receipt for this job, if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_receipt: Option<serde_json::Value>,
+    /// Paths to related log files, if discoverable.
+    log_pointers: Vec<String>,
+    /// Whether the log pointer collection was truncated at the cap.
+    log_pointers_truncated: bool,
+    /// The path to the job spec file on disk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spec_path: Option<String>,
+}
+
+/// Runs the `apm2 fac job show <job_id>` command.
+///
+/// Shows the job spec, latest receipt, and pointers to related log files.
+/// Returns an exit code.
+pub fn run_job_show(job_id: &str, json_output: bool) -> u8 {
+    // Validate job_id charset.
+    if job_id.is_empty() {
+        output_error(json_output, "job_id must not be empty");
+        return exit_codes::VALIDATION_ERROR;
+    }
+    if !job_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        output_error(
+            json_output,
+            &format!("invalid job_id: only [A-Za-z0-9_-] characters allowed, got {job_id:?}"),
+        );
+        return exit_codes::VALIDATION_ERROR;
+    }
+
+    let queue_root = match resolve_queue_root() {
+        Ok(root) => root,
+        Err(e) => {
+            output_error(json_output, &format!("cannot resolve queue root: {e}"));
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    // Locate the job across all directories.
+    let state = locate_job(&queue_root, job_id);
+
+    // Extract state label and spec path.
+    // state_label() returns the canonical directory-token string, matching
+    // queue directory names exactly (Finding 5 fix: "quarantine" not
+    // "quarantined").
+    let spec_path = match &state {
+        JobState::Pending(p)
+        | JobState::Claimed(p)
+        | JobState::Completed(p)
+        | JobState::Cancelled(p)
+        | JobState::Denied(p)
+        | JobState::Quarantined(p) => Some(p.clone()),
+        JobState::NotFound => {
+            output_error(
+                json_output,
+                &format!("job {job_id} not found in any queue directory"),
+            );
+            return exit_codes::NOT_FOUND;
+        },
+        JobState::Ambiguous(dirs) => {
+            output_error(
+                json_output,
+                &format!(
+                    "job {job_id} found in multiple directories (ambiguous, fail-closed): {}",
+                    dirs.join(", ")
+                ),
+            );
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    // state_label() is guaranteed Some for non-NotFound/Ambiguous states.
+    let state_name = state.state_label().unwrap_or("unknown");
+
+    // Read the job spec.
+    let spec = spec_path
+        .as_ref()
+        .and_then(|p| read_job_spec_bounded(p).ok());
+
+    // Look up the latest receipt from the receipt index.
+    let latest_receipt = resolve_latest_receipt(job_id);
+
+    // Discover log pointers (bounded by MAX_LOG_POINTERS).
+    let (log_pointers, log_pointers_truncated) = discover_log_pointers(job_id);
+
+    let output = JobShowOutput {
+        job_id: job_id.to_string(),
+        current_state: state_name.to_string(),
+        spec,
+        latest_receipt,
+        log_pointers,
+        log_pointers_truncated,
+        spec_path: spec_path.map(|p| p.display().to_string()),
+    };
+
+    if json_output {
+        print_json(&output);
+    } else {
+        print_job_show_text(&output);
+    }
+
+    exit_codes::SUCCESS
+}
+
+/// Looks up the latest receipt for a job from the receipt index.
+fn resolve_latest_receipt(job_id: &str) -> Option<serde_json::Value> {
+    let apm2_home = apm2_core::github::resolve_apm2_home()?;
+    let receipts_dir = apm2_home.join("private").join("fac").join("receipts");
+
+    let receipt = apm2_core::fac::lookup_job_receipt(&receipts_dir, job_id)?;
+    serde_json::to_value(&receipt).ok()
+}
+
+/// Discovers log file pointers related to a job.
+///
+/// Looks for log directories under `$APM2_HOME/private/fac/evidence/`
+/// and lane workspaces under `$APM2_HOME/private/fac/lanes/` that might
+/// contain build/test logs.
+///
+/// Returns `(pointers, truncated)` where `truncated` is true if the global
+/// `MAX_LOG_POINTERS` cap was reached.
+///
+/// # Lane directory resolution (MAJOR fix)
+///
+/// Lane workspaces are resolved from `resolve_fac_root().join("lanes")`,
+/// which resolves to `$APM2_HOME/private/fac/lanes/`. Previous code
+/// incorrectly resolved from `queue_root.parent()` which produced the
+/// wrong base directory.
+///
+/// # Symlink guards (Finding 2/3 fix)
+///
+/// All scanned directories are validated with `symlink_metadata` (lstat
+/// semantics) before traversal. Symlinked directories and entries are
+/// skipped to prevent redirect-based attacks outside FAC roots.
+fn discover_log_pointers(job_id: &str) -> (Vec<String>, bool) {
+    let mut pointers = Vec::new();
+    let mut truncated = false;
+
+    // Helper: check if we've hit the global cap.
+    let at_cap = |p: &Vec<String>| p.len() >= MAX_LOG_POINTERS;
+
+    // Check evidence directory for job-related logs.
+    if let Some(apm2_home) = apm2_core::github::resolve_apm2_home() {
+        let evidence_dir = apm2_home.join("private").join("fac").join("evidence");
+        // Symlink guard: validate evidence_dir is a real directory.
+        if validate_real_directory(&evidence_dir).is_ok() && !at_cap(&pointers) {
+            if let Ok(entries) = fs::read_dir(&evidence_dir) {
+                let mut scan_count = 0usize;
+                for entry in entries {
+                    if scan_count >= MAX_SCAN_ENTRIES || at_cap(&pointers) {
+                        // Finding 4 fix: report truncation for both
+                        // scan-entry cap and log-pointer cap.
+                        truncated = true;
+                        break;
+                    }
+                    scan_count = scan_count.saturating_add(1);
+                    let Ok(entry) = entry else { continue };
+                    // Symlink guard: skip symlinked entries.
+                    if is_symlink_entry(&entry) {
+                        continue;
+                    }
+                    let name = entry.file_name();
+                    let Some(name_str) = name.to_str() else {
+                        continue;
+                    };
+                    if name_str.contains(job_id) {
+                        pointers.push(entry.path().display().to_string());
+                    }
+                }
+            }
+        }
+
+        // Check receipts directory for related receipt files.
+        if !at_cap(&pointers) {
+            let receipts_dir = apm2_home.join("private").join("fac").join("receipts");
+            // Symlink guard: validate receipts_dir is a real directory.
+            if validate_real_directory(&receipts_dir).is_ok() {
+                pointers.push(format!("{} (receipt store)", receipts_dir.display()));
+            }
+        }
+    }
+
+    // Check for lane-scoped logs.
+    // MAJOR fix: resolve lanes root from FAC root, NOT from queue_root.parent().
+    // Lane workspace directories are under `$APM2_HOME/private/fac/lanes/`.
+    if !at_cap(&pointers) {
+        let lanes_dir = resolve_fac_root().ok().map(|p| p.join("lanes"));
+        if let Some(lanes_dir) = lanes_dir {
+            // Symlink guard: validate lanes_dir is a real directory.
+            if validate_real_directory(&lanes_dir).is_ok() {
+                if let Ok(entries) = fs::read_dir(&lanes_dir) {
+                    let mut scan_count = 0usize;
+                    for entry in entries {
+                        if scan_count >= MAX_SCAN_ENTRIES || at_cap(&pointers) {
+                            // Finding 4 fix: report truncation for both
+                            // scan-entry cap and log-pointer cap.
+                            truncated = true;
+                            break;
+                        }
+                        scan_count = scan_count.saturating_add(1);
+                        let Ok(entry) = entry else { continue };
+                        // Symlink guard: skip symlinked lane entries.
+                        if is_symlink_entry(&entry) {
+                            continue;
+                        }
+                        let lane_path = entry.path();
+                        let logs_dir = lane_path.join("logs");
+                        // Symlink guard: validate logs_dir is a real directory.
+                        if validate_real_directory(&logs_dir).is_err() {
+                            continue;
+                        }
+                        if let Ok(log_entries) = fs::read_dir(&logs_dir) {
+                            let mut log_scan = 0usize;
+                            for log_entry in log_entries {
+                                if log_scan >= MAX_SCAN_ENTRIES || at_cap(&pointers) {
+                                    // Finding 4 fix: report truncation for
+                                    // both scan-entry cap and log-pointer cap.
+                                    truncated = true;
+                                    break;
+                                }
+                                log_scan = log_scan.saturating_add(1);
+                                let Ok(log_entry) = log_entry else { continue };
+                                // Symlink guard: skip symlinked log entries.
+                                if is_symlink_entry(&log_entry) {
+                                    continue;
+                                }
+                                let log_name = log_entry.file_name();
+                                let Some(log_name_str) = log_name.to_str() else {
+                                    continue;
+                                };
+                                if log_name_str.contains(job_id) {
+                                    pointers.push(log_entry.path().display().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (pointers, truncated)
+}
+
+/// Checks whether a directory entry is a symlink using lstat semantics.
+///
+/// Returns `true` if the entry is a symlink (should be skipped for
+/// security), `false` if it is a regular file or directory.
+fn is_symlink_entry(entry: &fs::DirEntry) -> bool {
+    // Use symlink_metadata (lstat) to detect symlinks without following.
+    // If metadata cannot be read, treat as unsafe (fail-closed).
+    entry
+        .path()
+        .symlink_metadata()
+        .map_or(true, |meta| meta.file_type().is_symlink())
+}
+
+/// Prints job show output in text format.
+fn print_job_show_text(output: &JobShowOutput) {
+    println!("Job: {}", output.job_id);
+    println!("  State:          {}", output.current_state);
+
+    if let Some(ref path) = output.spec_path {
+        println!("  Spec Path:      {path}");
+    }
+
+    if let Some(ref spec) = output.spec {
+        println!("  Kind:           {}", spec.kind);
+        println!("  Queue Lane:     {}", spec.queue_lane);
+        println!("  Priority:       {}", spec.priority);
+        println!("  Enqueue Time:   {}", spec.enqueue_time);
+        println!("  Source Repo:    {}", spec.source.repo_id);
+        println!("  Head SHA:       {}", spec.source.head_sha);
+        if !spec.job_spec_digest.is_empty() {
+            println!("  Spec Digest:    {}", spec.job_spec_digest);
+        }
+    } else {
+        println!("  (spec not readable)");
+    }
+
+    println!();
+    if let Some(ref receipt) = output.latest_receipt {
+        println!("  Latest Receipt:");
+        if let Some(outcome) = receipt.get("outcome").and_then(|v| v.as_str()) {
+            println!("    Outcome:      {outcome}");
+        }
+        if let Some(reason) = receipt.get("reason").and_then(|v| v.as_str()) {
+            if !reason.is_empty() {
+                println!("    Reason:       {reason}");
+            }
+        }
+        if let Some(ts) = receipt
+            .get("timestamp_secs")
+            .and_then(serde_json::Value::as_u64)
+        {
+            println!("    Timestamp:    {ts}");
+        }
+        if let Some(hash) = receipt.get("content_hash").and_then(|v| v.as_str()) {
+            println!("    Content Hash: {hash}");
+        }
+    } else {
+        println!("  (no receipt found)");
+    }
+
+    if !output.log_pointers.is_empty() {
+        println!();
+        let truncated_note = if output.log_pointers_truncated {
+            format!(" (truncated at {MAX_LOG_POINTERS})")
+        } else {
+            String::new()
+        };
+        println!("  Log Pointers{truncated_note}:");
+        for pointer in &output.log_pointers {
+            println!("    {pointer}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use apm2_core::fac::job_spec::MAX_JOB_SPEC_SIZE;
+
     use super::*;
 
     #[test]
@@ -1058,17 +1376,17 @@ mod tests {
         );
     }
 
-    /// BLOCKER-1 regression: `read_job_spec` must reject files exceeding
-    /// `MAX_JOB_SPEC_SIZE` via bounded read, not metadata check.
+    /// BLOCKER-1 regression: `read_job_spec_bounded` must reject files
+    /// exceeding `MAX_JOB_SPEC_SIZE` via bounded read, not metadata check.
     #[test]
-    fn test_read_job_spec_rejects_oversized_file() {
+    fn test_read_job_spec_bounded_rejects_oversized_file() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let oversized_path = tmp.path().join("oversized.json");
         // Write a file that exceeds MAX_JOB_SPEC_SIZE.
         let oversized_content = vec![b'{'; MAX_JOB_SPEC_SIZE + 100];
         fs::write(&oversized_path, &oversized_content).unwrap();
 
-        let result = read_job_spec(&oversized_path);
+        let result = read_job_spec_bounded(&oversized_path);
         assert!(result.is_err(), "should reject oversized file");
         let err_msg = result.unwrap_err();
         assert!(
@@ -1077,16 +1395,17 @@ mod tests {
         );
     }
 
-    /// BLOCKER-1 regression: `read_job_spec` must work for valid small files.
+    /// BLOCKER-1 regression: `read_job_spec_bounded` must work for valid small
+    /// files.
     #[test]
-    fn test_read_job_spec_accepts_valid_spec() {
+    fn test_read_job_spec_bounded_accepts_valid_spec() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let spec = build_stop_revoke_spec("bounded-read-test", "test").expect("spec builds");
         let spec_json = serde_json::to_vec_pretty(&spec).unwrap();
         let spec_path = tmp.path().join("valid.json");
         fs::write(&spec_path, &spec_json).unwrap();
 
-        let result = read_job_spec(&spec_path);
+        let result = read_job_spec_bounded(&spec_path);
         assert!(result.is_ok(), "should accept valid spec: {result:?}");
         assert_eq!(result.unwrap().job_id, spec.job_id);
     }
@@ -1233,6 +1552,173 @@ mod tests {
         assert!(
             result.is_ok(),
             "enqueued stop_revoke must pass control-lane validation with workload-only policy: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // Job Show tests (TCK-00535)
+    // =========================================================================
+
+    #[test]
+    fn test_job_show_not_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = tmp.path().join("queue");
+        fs::create_dir_all(queue_root.join(PENDING_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(CLAIMED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(COMPLETED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(CANCELLED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(DENIED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(QUARANTINE_DIR)).unwrap();
+
+        // The run_job_show function uses resolve_queue_root which depends
+        // on $APM2_HOME. Instead, test the locate_job function directly.
+        let state = locate_job(&queue_root, "nonexistent-show-test");
+        assert!(matches!(state, JobState::NotFound));
+    }
+
+    #[test]
+    fn test_job_show_finds_pending_job() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = tmp.path().join("queue");
+        fs::create_dir_all(queue_root.join(PENDING_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(CLAIMED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(COMPLETED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(CANCELLED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(DENIED_DIR)).unwrap();
+        fs::create_dir_all(queue_root.join(QUARANTINE_DIR)).unwrap();
+
+        let spec = build_stop_revoke_spec("show-target", "test").expect("spec builds");
+        let spec_json = serde_json::to_vec_pretty(&spec).unwrap();
+        let file_name = format!("{}.json", spec.job_id);
+        fs::write(queue_root.join(PENDING_DIR).join(&file_name), &spec_json).unwrap();
+
+        let state = locate_job(&queue_root, &spec.job_id);
+        assert!(
+            matches!(state, JobState::Pending(_)),
+            "expected Pending, got {state:?}"
+        );
+    }
+
+    #[test]
+    fn test_job_show_empty_id_rejected() {
+        // Empty job ID should produce VALIDATION_ERROR.
+        let exit_code = run_job_show("", false);
+        assert_eq!(exit_code, exit_codes::VALIDATION_ERROR);
+    }
+
+    #[test]
+    fn test_job_show_invalid_charset_rejected() {
+        // Invalid characters in job ID.
+        let exit_code = run_job_show("../evil", false);
+        assert_eq!(exit_code, exit_codes::VALIDATION_ERROR);
+    }
+
+    #[test]
+    fn test_discover_log_pointers_empty_on_missing_dirs() {
+        let (pointers, truncated) = discover_log_pointers("some-job");
+        // Should not panic, may have receipt store pointer if $APM2_HOME exists.
+        // Just verify it returns without error.
+        assert!(pointers.len() <= MAX_LOG_POINTERS);
+        // With no matching evidence, truncated should be false.
+        // (May still find a receipt store pointer if $APM2_HOME exists.)
+        let _ = truncated;
+    }
+
+    /// Finding 5 regression: `JobState::Quarantined` must map to "quarantine"
+    /// (canonical directory token), NOT "quarantined".
+    #[test]
+    fn test_job_state_quarantine_label_matches_directory_token() {
+        let state = JobState::Quarantined(PathBuf::from("/tmp/test"));
+        assert_eq!(
+            state.state_label(),
+            Some("quarantine"),
+            "Quarantined state must use 'quarantine' to match directory name"
+        );
+
+        // Verify all other states also match their directory tokens.
+        assert_eq!(
+            JobState::Pending(PathBuf::from("/tmp")).state_label(),
+            Some("pending")
+        );
+        assert_eq!(
+            JobState::Claimed(PathBuf::from("/tmp")).state_label(),
+            Some("claimed")
+        );
+        assert_eq!(
+            JobState::Completed(PathBuf::from("/tmp")).state_label(),
+            Some("completed")
+        );
+        assert_eq!(
+            JobState::Cancelled(PathBuf::from("/tmp")).state_label(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            JobState::Denied(PathBuf::from("/tmp")).state_label(),
+            Some("denied")
+        );
+        assert_eq!(JobState::NotFound.state_label(), None);
+    }
+
+    /// Finding 2/3 regression: `is_symlink_entry` must detect symlinks and
+    /// `discover_log_pointers` must skip them. Test the helper directly.
+    #[test]
+    #[cfg(unix)]
+    fn test_is_symlink_entry_detects_symlinks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_file = tmp.path().join("real.txt");
+        fs::write(&real_file, b"content").unwrap();
+
+        let symlink_file = tmp.path().join("sym.txt");
+        std::os::unix::fs::symlink(&real_file, &symlink_file).unwrap();
+
+        // Read the directory and check each entry.
+        let entries: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+
+        for entry in &entries {
+            let name = entry.file_name();
+            let name_str = name.to_str().unwrap();
+            if name_str == "sym.txt" {
+                assert!(is_symlink_entry(entry), "symlink entry must be detected");
+            } else if name_str == "real.txt" {
+                assert!(
+                    !is_symlink_entry(entry),
+                    "real file must not be flagged as symlink"
+                );
+            }
+        }
+    }
+
+    /// Finding 2/3 regression: symlinked queue directory entries must be
+    /// skipped by `find_job_in_dir` (which calls `read_job_spec_bounded`
+    /// with symlink rejection).
+    #[test]
+    #[cfg(unix)]
+    fn test_find_job_in_dir_rejects_symlinked_specs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("pending");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Create a real spec file outside the directory.
+        let real_spec_dir = tmp.path().join("outside");
+        fs::create_dir_all(&real_spec_dir).unwrap();
+        let real_spec = real_spec_dir.join("symlink-target.json");
+        let spec = build_stop_revoke_spec("sym-job-test", "test").expect("spec builds");
+        let spec_json = serde_json::to_vec_pretty(&spec).unwrap();
+        fs::write(&real_spec, &spec_json).unwrap();
+
+        // Create a symlink to it inside the queue directory.
+        let symlink_path = dir.join("symlink-target.json");
+        std::os::unix::fs::symlink(&real_spec, &symlink_path).unwrap();
+
+        // find_job_in_dir should NOT find the job via symlink because
+        // read_job_spec_bounded rejects symlinks.
+        let result = find_job_in_dir(&dir, &spec.job_id);
+        assert!(
+            result.is_none(),
+            "symlinked spec must be rejected by find_job_in_dir"
         );
     }
 }

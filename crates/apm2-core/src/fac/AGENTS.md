@@ -1142,6 +1142,20 @@ All receipt-touching hot paths consult the index first:
   recomputing the BLAKE3 hash (v1 and v2 schemes) of loaded receipts against the
   index key using constant-time comparison (`subtle::ConstantTimeEq`, INV-PC-001).
   Hash mismatch triggers fallback to directory scan (fail-closed).
+- [INV-IDX-009] `is_valid_digest` accepts both bare 64-char hex and `b3-256:`-prefixed
+  71-char digests (the canonical format from `compute_job_receipt_content_hash`).
+  Path traversal prevention applies to both formats: only hex characters are allowed
+  after the optional prefix. This ensures `lookup_job_receipt`, `has_receipt_for_job`,
+  and `find_receipt_for_job` correctly use index-backed O(1) lookups for receipts
+  with canonical `b3-256:`-prefixed content hashes (TCK-00564).
+- [INV-IDX-010] `scan_receipt_for_job` (fallback directory scan) verifies
+  receipt content-addressed integrity before returning. The expected digest is
+  derived from the filename stem (which is the content hash in the receipt
+  store's naming convention). Only receipts that pass `verify_receipt_integrity`
+  (BLAKE3 v1/v2 hash match via constant-time comparison) are included in results.
+  This prevents unverified or tampered receipts from driving terminal routing in
+  worker duplicate handling and reconcile torn-state repair (MAJOR-1 round 8 fix,
+  TCK-00564).
 
 ## sd_notify Submodule (TCK-00600)
 
@@ -1326,6 +1340,114 @@ pre-populating build caches in the lane target namespace.
   state during warm phases. The callback is passed from the worker into
   `execute_warm`/`execute_warm_phase` and runs synchronously on the same
   thread (no cross-thread sharing).
+
+## receipt_pipeline Submodule (TCK-00564)
+
+The `receipt_pipeline` submodule implements an atomic commit protocol for job
+completion that ensures crash safety. The protocol guarantees that no job is ever
+marked done (moved to a terminal directory) without its receipt being present in
+the content-addressed receipt store.
+
+### Key Types
+
+- `ReceiptWritePipeline`: The main pipeline struct. Created with a receipts
+  directory and queue root path. Provides `commit()` for normal job completion
+  and `recover_torn_state()` for reconciliation of incomplete commits.
+- `TerminalState`: Enum of terminal directories a job can transition to:
+  `Completed`, `Denied`, `Cancelled`, `Quarantined`.
+- `RecoveryReceiptV1`: Schema-versioned receipt emitted when reconciliation
+  detects and repairs a torn state. Persisted to the receipts directory with
+  atomic write protocol (temp + fsync + rename, CTR-2607).
+- `CommitResult`: Result of a successful pipeline commit, containing receipt
+  path, content hash, and terminal job path.
+- `ReceiptPipelineError`: Error taxonomy covering receipt persistence failures,
+  job move failures, and torn state detection.
+
+### Commit Protocol (Crash-Safe Ordering)
+
+1. **Write receipt** (content-addressed file) -- after this point, the receipt
+   is durable in the receipt store. Uses `persist_content_addressed_receipt`.
+2. **Update receipt index** (best-effort) -- non-authoritative cache update. On
+   failure, the stale index is deleted to force rebuild on next read.
+3. **Move job file** (`claimed/` -> terminal/) -- this is the commit point.
+   Uses `rename_noreplace` (`renameat2(RENAME_NOREPLACE)` on Linux) for
+   collision-safe atomic moves. On collision, generates a timestamped fallback
+   name.
+
+### Recovery Protocol
+
+When reconciliation (via `reconcile` submodule) detects a claimed job that
+already has a receipt in the store, it calls `recover_torn_state()` which:
+1. Persists a `RecoveryReceiptV1` documenting the detected inconsistency and
+   the repair action (receipt-before-move ordering, MAJOR-1 fix).
+2. Moves the job to its correct terminal directory based on the receipt outcome.
+
+The `recover_torn_state` method enforces symlink-safe moves (MAJOR-2),
+validates file name confinement (CTR-1504), and uses UTF-8-safe truncation
+for receipt IDs constructed from job IDs (MAJOR-3/MINOR security fixes).
+
+### Helper Functions
+
+- `receipt_exists_for_job(receipts_dir, job_id)`: O(1) index lookup with
+  fallback to directory scan. Used by worker duplicate detection.
+- `find_receipt_for_job(receipts_dir, job_id)`: O(1) index lookup with
+  fallback to directory scan. Returns the full receipt. Used by reconciliation
+  to detect torn states and determine the correct terminal directory.
+- `outcome_to_terminal_state(outcome)`: Maps `FacJobOutcome` to `TerminalState`.
+- `move_job_to_terminal(src, dest_dir, file_name)`: Hardened file move with
+  symlink rejection, ownership verification, and collision-safe naming.
+  All callers that move job files to terminal directories MUST use this
+  function instead of `move_to_dir_safe` (which lacks security checks).
+- `rename_noreplace(src, dest)`: Single canonical atomic no-replace rename.
+  Uses `renameat2(RENAME_NOREPLACE)` on Linux. Do NOT duplicate this function.
+
+### Security Invariants (TCK-00564)
+
+- [INV-PIPE-001] No job is moved to a terminal directory without its receipt
+  being present in the content-addressed receipt store. Guaranteed by ordering:
+  receipt write (step 1) always precedes job move (step 3).
+- [INV-PIPE-002] Recovery receipts document all torn-state repairs with schema,
+  job ID, original receipt hash, detected state, and repair action.
+- [INV-PIPE-003] All string fields in `RecoveryReceiptV1` are bounded
+  (`MAX_RECOVERY_REASON_LENGTH = 1024`). Serialized size is bounded
+  (`MAX_RECOVERY_RECEIPT_SIZE = 65536`).
+- [INV-PIPE-004] Directory creation uses mode 0o700 (CTR-2611).
+- [INV-PIPE-005] File moves use `rename_noreplace` (`renameat2(RENAME_NOREPLACE)`
+  on Linux) to prevent silent overwrites. On collision, a timestamped fallback
+  name is generated.
+- [INV-PIPE-006] Wall-clock time for collision avoidance is narrowly bypassed
+  with documented CTR-2501 security justification.
+- [INV-PIPE-007] Recovery receipt persistence occurs BEFORE job move (MAJOR-1
+  fix). If persist fails, job stays in claimed/ and no unreceipted state change
+  occurs.
+- [INV-PIPE-008] `move_job_to_terminal` rejects symlinked destination directories
+  via `symlink_metadata` check (MAJOR-2 fix, CTR-1503).
+- [INV-PIPE-009] `validate_file_name` uses char-boundary-safe UTF-8 truncation
+  (MAJOR-3 fix, RSK-0701: no panic on multibyte input).
+- [INV-PIPE-010] `original_receipt_hash` is validated as non-empty with `b3-256:`
+  prefix and hex suffix (MINOR-1 fix).
+- [INV-PIPE-011] `receipt_id` in `RecoveryReceiptV1::persist` is validated
+  against path traversal via `validate_receipt_id_for_filename` (BLOCKER security).
+- [INV-PIPE-012] `receipt_id` length is bounded by truncating `job_id` to
+  `MAX_FILE_NAME_LENGTH - 44` **bytes** (not chars), accounting for full
+  filename framing overhead ("recovery-{receipt_id}.json" prefix/suffix) to
+  keep the final filename within the 255-byte filesystem limit. Uses
+  `truncate_to_byte_budget` which iterates chars accumulating `len_utf8()`
+  bytes, ensuring multibyte UTF-8 job IDs are truncated at char boundaries
+  without exceeding the byte budget (MINOR-1 round 8 fix).
+- [INV-PIPE-013] `RecoveryReceiptV1::persist` validates the final constructed
+  filename (`"recovery-{receipt_id}.json"`) against `MAX_FILE_NAME_LENGTH`
+  before writing, preventing `ENAMETOOLONG` errors that could bypass recovery
+  receipt persistence (MINOR-1 security fix).
+- [INV-PIPE-014] `RecoveryReceiptV1::persist` propagates `set_permissions` errors
+  instead of ignoring them (MINOR-1 round 7). Failed permission setting is logged
+  via `tracing::warn!` and returned as `ReceiptPipelineError::RecoveryIo`.
+- [INV-PIPE-015] `rename_noreplace` is the single canonical implementation shared
+  between `receipt_pipeline.rs` and all CLI callers (MAJOR-3 round 7). No
+  duplicate platform-specific rename logic exists.
+- [INV-PIPE-016] Receipt pipeline index update failures are logged via
+  `tracing::warn!` instead of `eprintln!` (MAJOR-1 round 7). Libraries do not
+  write directly to stderr.
 
 ## reconcile Submodule (TCK-00534)
 

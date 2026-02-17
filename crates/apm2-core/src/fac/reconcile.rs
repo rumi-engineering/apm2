@@ -75,6 +75,8 @@ use super::lane::{
     LANE_CORRUPT_MARKER_SCHEMA, LaneCorruptMarkerV1, LaneLeaseV1, LaneManager, LaneState,
     MAX_STRING_LENGTH, atomic_write, create_dir_restricted, is_pid_alive,
 };
+use super::receipt_index::find_receipt_for_job;
+use super::receipt_pipeline::{ReceiptWritePipeline, outcome_to_terminal_state};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -246,6 +248,17 @@ pub enum QueueRecoveryAction {
         /// Lane ID processing this job.
         lane_id: String,
     },
+    /// Torn state recovered: receipt existed but job was still in claimed/.
+    /// The job was moved to its correct terminal directory (TCK-00564
+    /// BLOCKER-2).
+    TornStateRecovered {
+        /// Job ID.
+        job_id: String,
+        /// Original filename.
+        file_name: String,
+        /// Terminal directory the job was moved to.
+        terminal_dir: String,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -277,6 +290,10 @@ pub struct ReconcileReceiptV1 {
     pub orphaned_jobs_requeued: usize,
     /// Number of orphaned jobs marked failed.
     pub orphaned_jobs_failed: usize,
+    /// Number of torn states recovered (receipt existed but job still in
+    /// claimed/). Added by TCK-00564 BLOCKER-2.
+    #[serde(default)]
+    pub torn_states_recovered: usize,
     /// Number of lanes marked corrupt.
     pub lanes_marked_corrupt: usize,
 }
@@ -422,6 +439,9 @@ struct QueueReconcileResult {
     claimed_files_inspected: usize,
     orphaned_jobs_requeued: usize,
     orphaned_jobs_failed: usize,
+    /// Count of torn states recovered (receipt existed but job still in
+    /// claimed/).
+    torn_states_recovered: usize,
     /// If queue reconciliation encountered an error after inspecting some
     /// files, the error is captured here alongside the partial counts so
     /// the caller can include the actual `claimed_files_inspected` in the
@@ -527,6 +547,7 @@ pub fn reconcile_on_startup(
                 stale_leases_recovered: lane_result.stale_leases_recovered,
                 orphaned_jobs_requeued: 0,
                 orphaned_jobs_failed: 0,
+                torn_states_recovered: 0,
                 lanes_marked_corrupt: lane_result.lanes_marked_corrupt,
             };
             // INV-RECON-001 (fail-closed): Partial receipt persistence
@@ -556,6 +577,7 @@ pub fn reconcile_on_startup(
     // receipt includes the actual claimed_files_inspected count rather
     // than a misleading 0 (MINOR audit trail fix).
     let queue_result = reconcile_queue(
+        fac_root,
         queue_root,
         &lane_result.active_job_ids,
         orphan_policy,
@@ -579,6 +601,7 @@ pub fn reconcile_on_startup(
                 stale_leases_recovered: lane_result.stale_leases_recovered,
                 orphaned_jobs_requeued: queue_result.orphaned_jobs_requeued,
                 orphaned_jobs_failed: queue_result.orphaned_jobs_failed,
+                torn_states_recovered: queue_result.torn_states_recovered,
                 lanes_marked_corrupt: lane_result.lanes_marked_corrupt,
             };
             // INV-RECON-001 (fail-closed): Partial receipt persistence
@@ -611,6 +634,7 @@ pub fn reconcile_on_startup(
         stale_leases_recovered: lane_result.stale_leases_recovered,
         orphaned_jobs_requeued: queue_result.orphaned_jobs_requeued,
         orphaned_jobs_failed: queue_result.orphaned_jobs_failed,
+        torn_states_recovered: queue_result.torn_states_recovered,
         lanes_marked_corrupt: lane_result.lanes_marked_corrupt,
     };
 
@@ -1094,6 +1118,7 @@ fn persist_corrupt_marker(
 /// increment after confirmed rename success.
 #[allow(clippy::too_many_lines)] // recovery logic with fallback branches is inherently branchy
 fn reconcile_queue(
+    fac_root: &Path,
     queue_root: &Path,
     active_job_ids: &HashSet<String>,
     orphan_policy: OrphanedJobPolicy,
@@ -1102,10 +1127,12 @@ fn reconcile_queue(
     let claimed_dir = queue_root.join("claimed");
     let pending_dir = queue_root.join("pending");
     let denied_dir = queue_root.join("denied");
+    let receipts_dir = fac_root.join("receipts");
 
     let mut actions: Vec<QueueRecoveryAction> = Vec::new();
     let mut orphaned_jobs_requeued: usize = 0;
     let mut orphaned_jobs_failed: usize = 0;
+    let mut torn_states_recovered: usize = 0;
     let mut claimed_files_inspected: usize = 0;
 
     // Helper macro to build QueueReconcileResult with current partial counts.
@@ -1118,6 +1145,7 @@ fn reconcile_queue(
                 claimed_files_inspected,
                 orphaned_jobs_requeued,
                 orphaned_jobs_failed,
+                torn_states_recovered,
                 partial_error: $err,
             }
         };
@@ -1246,6 +1274,68 @@ fn reconcile_queue(
                 lane_id: "unknown".to_string(),
             });
             continue;
+        }
+
+        // TCK-00564 BLOCKER-2: Detect and repair torn receipt states.
+        //
+        // Before applying the orphan policy, check if a receipt already exists
+        // for this job. If a receipt exists, the worker completed the job and
+        // persisted the receipt, but crashed before moving the job file to its
+        // terminal directory. This is a "torn state" that should be repaired
+        // by moving the job to its correct terminal directory, not by requeuing
+        // or marking as failed (which would lose the completed work).
+        if let Some(receipt) = find_receipt_for_job(&receipts_dir, &job_id) {
+            if let Some(terminal_state) = outcome_to_terminal_state(receipt.outcome) {
+                let terminal_dir_name = terminal_state.dir_name().to_string();
+                if !dry_run {
+                    let pipeline =
+                        ReceiptWritePipeline::new(receipts_dir.clone(), queue_root.to_path_buf());
+                    // SECURITY JUSTIFICATION: Wall-clock time is acceptable here because
+                    // reconciliation is an operational recovery task at startup, not a
+                    // coordinated consensus operation. The timestamp is used only for
+                    // recovery receipt labelling.
+                    #[allow(clippy::disallowed_methods)]
+                    let timestamp_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    match pipeline.recover_torn_state(
+                        &path,
+                        &file_name,
+                        &receipt,
+                        terminal_state,
+                        timestamp_secs,
+                    ) {
+                        Ok(_recovery_receipt) => {
+                            eprintln!(
+                                "reconcile: recovered torn state for job {job_id}: \
+                                 moved claimed/{file_name} to {terminal_dir_name}/"
+                            );
+                        },
+                        Err(e) => {
+                            eprintln!(
+                                "reconcile: WARNING: torn state recovery failed for job {job_id}: {e}"
+                            );
+                            // Fall through to normal orphan handling below.
+                            // The job stays in claimed/ and the orphan policy applies.
+                            #[allow(clippy::needless_continue)]
+                            {
+                                // Do NOT continue here; fall through to orphan
+                                // policy.
+                            }
+                        },
+                    }
+                }
+                // If we reach here in dry_run mode, or recovery succeeded:
+                if dry_run || !path.exists() {
+                    actions.push(QueueRecoveryAction::TornStateRecovered {
+                        job_id,
+                        file_name,
+                        terminal_dir: terminal_dir_name,
+                    });
+                    torn_states_recovered += 1;
+                    continue;
+                }
+            }
         }
 
         // Orphaned claimed job — apply policy.

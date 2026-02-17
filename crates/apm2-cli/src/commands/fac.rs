@@ -282,6 +282,11 @@ pub enum FacSubcommand {
     /// Detects stale lane leases (PID dead, lock released), orphaned claimed
     /// jobs, and recovers them deterministically. All actions emit receipts.
     Reconcile(ReconcileArgs),
+    /// Introspect FAC queue state (forensics-first UX).
+    ///
+    /// Shows job counts by directory, oldest pending job, and
+    /// denial/quarantine reason code distributions.
+    Queue(QueueArgs),
 }
 
 /// Arguments for `apm2 fac warm`.
@@ -663,6 +668,15 @@ pub struct ReceiptListArgs {
     #[arg(long, default_value_t = 50)]
     pub limit: usize,
 
+    /// Only show receipts with timestamp >= this epoch (seconds).
+    ///
+    /// Filters the receipt list to show only receipts created at or after
+    /// the given Unix epoch timestamp. Deterministic ordering: receipts
+    /// are sorted by timestamp descending, then by content hash ascending
+    /// for equal timestamps.
+    #[arg(long)]
+    pub since: Option<u64>,
+
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -856,6 +870,24 @@ pub enum JobSubcommand {
     /// Cancellation never deletes evidence or logs; it only stops execution
     /// and writes receipts.
     Cancel(CancelArgs),
+
+    /// Show detailed information about a job.
+    ///
+    /// Displays the job spec, latest receipt, current queue directory state,
+    /// and pointers to related log files. Supports `--json` for machine-
+    /// readable output.
+    Show(JobShowArgs),
+}
+
+/// Arguments for `apm2 fac job show`.
+#[derive(Debug, Args)]
+pub struct JobShowArgs {
+    /// The job ID to inspect.
+    pub job_id: String,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac job cancel`.
@@ -868,6 +900,33 @@ pub struct CancelArgs {
     #[arg(long, default_value = "operator-initiated cancellation")]
     pub reason: String,
 
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac queue`.
+#[derive(Debug, Args)]
+pub struct QueueArgs {
+    #[command(subcommand)]
+    pub subcommand: QueueSubcommand,
+}
+
+/// Queue introspection subcommands.
+#[derive(Debug, Subcommand)]
+pub enum QueueSubcommand {
+    /// Show queue status: counts by directory, oldest jobs, denial/quarantine
+    /// stats.
+    ///
+    /// Scans queue directories with bounded reads and reports per-directory
+    /// job counts, the oldest job in each directory, and denial/quarantine
+    /// reason code distributions.
+    Status(QueueStatusArgs),
+}
+
+/// Arguments for `apm2 fac queue status`.
+#[derive(Debug, Args)]
+pub struct QueueStatusArgs {
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -2043,6 +2102,7 @@ pub fn run_fac(
             | FacSubcommand::Bench(_)
             | FacSubcommand::Bundle(_)
             | FacSubcommand::Reconcile(_)
+            | FacSubcommand::Queue(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -2508,6 +2568,16 @@ pub fn run_fac(
             JobSubcommand::Cancel(cancel_args) => {
                 crate::commands::fac_job::run_cancel(cancel_args, resolve_json(cancel_args.json))
             },
+            JobSubcommand::Show(show_args) => crate::commands::fac_job::run_job_show(
+                &show_args.job_id,
+                resolve_json(show_args.json),
+            ),
+        },
+        FacSubcommand::Queue(args) => match &args.subcommand {
+            QueueSubcommand::Status(status_args) => crate::commands::fac_queue::run_queue_status(
+                status_args,
+                resolve_json(status_args.json),
+            ),
         },
         FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
         FacSubcommand::Broker(args) => fac_broker::run_broker(args, json_output),
@@ -2671,7 +2741,8 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Warm(_)
         | FacSubcommand::Bench(_)
         | FacSubcommand::Bundle(_)
-        | FacSubcommand::Reconcile(_) => true,
+        | FacSubcommand::Reconcile(_)
+        | FacSubcommand::Queue(_) => true,
     }
 }
 
@@ -3398,6 +3469,15 @@ fn detect_receipt_type(json: &serde_json::Value) -> String {
 ///
 /// Uses the receipt index for O(1) access instead of scanning the receipt
 /// directory. Common operations no longer require full directory scans.
+///
+/// # Deterministic Ordering (TCK-00535)
+///
+/// Receipts are sorted by `timestamp_secs` descending (most recent first).
+/// For equal timestamps, receipts are sorted by `content_hash` ascending
+/// to ensure deterministic output across runs.
+///
+/// When `--since` is provided, only receipts with `timestamp_secs >= since`
+/// are included.
 fn run_receipt_list(args: &ReceiptListArgs, json_output: bool) -> u8 {
     let Some(apm2_home) = apm2_core::github::resolve_apm2_home() else {
         return output_error(
@@ -3409,14 +3489,37 @@ fn run_receipt_list(args: &ReceiptListArgs, json_output: bool) -> u8 {
     };
 
     let receipts_dir = apm2_home.join("private").join("fac").join("receipts");
-    let headers = apm2_core::fac::list_receipt_headers(&receipts_dir);
-    let display_count = headers.len().min(args.limit);
-    let display_headers = &headers[..display_count];
+    let mut headers = apm2_core::fac::list_receipt_headers(&receipts_dir);
+
+    // Deterministic ordering: timestamp descending, content_hash ascending
+    // for equal timestamps. This ensures stable output across runs.
+    headers.sort_by(|a, b| {
+        b.timestamp_secs
+            .cmp(&a.timestamp_secs)
+            .then_with(|| a.content_hash.cmp(&b.content_hash))
+    });
+
+    let total_indexed = headers.len();
+
+    // Apply --since filter if provided.
+    let since_epoch = args.since;
+    let filtered_headers: Vec<_> = if let Some(since) = since_epoch {
+        headers
+            .into_iter()
+            .filter(|h| h.timestamp_secs >= since)
+            .collect()
+    } else {
+        headers
+    };
+
+    let filtered_total = filtered_headers.len();
+    let display_count = filtered_total.min(args.limit);
+    let display_headers = &filtered_headers[..display_count];
 
     if json_output {
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "status": "ok",
-            "total_indexed": headers.len(),
+            "total_indexed": total_indexed,
             "displayed": display_count,
             "receipts": display_headers.iter().map(|h| {
                 serde_json::json!({
@@ -3429,16 +3532,18 @@ fn run_receipt_list(args: &ReceiptListArgs, json_output: bool) -> u8 {
                 })
             }).collect::<Vec<_>>(),
         });
+        if let Some(since) = since_epoch {
+            result["since_epoch"] = serde_json::Value::Number(since.into());
+            result["filtered_total"] = serde_json::Value::Number(filtered_total.into());
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&result).unwrap_or_default()
         );
     } else {
-        println!(
-            "Receipt Index ({} total, showing {})",
-            headers.len(),
-            display_count
-        );
+        let filter_note =
+            since_epoch.map_or_else(String::new, |since| format!(" (since epoch {since})"));
+        println!("Receipt Index ({total_indexed} total{filter_note}, showing {display_count})");
         println!();
         if display_headers.is_empty() {
             println!("  (no receipts indexed)");
@@ -6592,6 +6697,7 @@ mod tests {
         match parsed.subcommand {
             FacSubcommand::Job(args) => match args.subcommand {
                 JobSubcommand::Cancel(cancel_args) => assert!(cancel_args.json),
+                JobSubcommand::Show(_) => panic!("expected cancel subcommand, got show"),
             },
             other => panic!("expected job command, got {other:?}"),
         }
@@ -6645,7 +6751,7 @@ mod tests {
         use apm2_core::fac::evidence_bundle::EVIDENCE_BUNDLE_ENVELOPE_SCHEMA;
         use apm2_core::fac::{
             BlobStore, BudgetAdmissionTrace, ChannelBoundaryTrace, FacJobOutcome, FacJobReceiptV1,
-            QueueAdmissionTrace,
+            QueueAdmissionTrace, compute_job_receipt_content_hash,
         };
 
         let home = tempfile::tempdir().expect("temp dir");
@@ -6664,6 +6770,13 @@ mod tests {
             .store(&job_spec_blob)
             .expect("store job spec blob");
 
+        // The receipt's `content_hash` field references a blob stored in the
+        // CAS (plain BLAKE3), used by the export function to retrieve the blob.
+        // The receipt *file* is named by `compute_job_receipt_content_hash`
+        // (domain-separated BLAKE3 of canonical bytes), which the fallback
+        // scan verifies for integrity (MAJOR-1 fix, TCK-00564 round 8).
+        // These two hashes are intentionally different: `content_hash` is a
+        // CAS reference, while the filename is the integrity digest.
         let receipt = FacJobReceiptV1 {
             schema: "apm2.fac.job_receipt.v1".to_string(),
             receipt_id: "test-rt-receipt".to_string(),
@@ -6698,7 +6811,10 @@ mod tests {
             ..Default::default()
         };
 
-        let receipt_file = receipts_dir.join(format!("{}.json", hex::encode(receipt_blob_hash)));
+        // Name the receipt file by the domain-separated integrity hash so that
+        // the fallback scan's verify_receipt_integrity check passes.
+        let integrity_hash = compute_job_receipt_content_hash(&receipt);
+        let receipt_file = receipts_dir.join(format!("{integrity_hash}.json"));
         let bytes = serde_json::to_vec_pretty(&receipt).expect("serialize receipt for store");
         std::fs::write(&receipt_file, bytes).expect("write receipt to store");
 
@@ -6970,5 +7086,97 @@ mod tests {
                 result.unwrap_err()
             );
         }
+    }
+
+    /// Regression test: receipt list deterministic sorting (MAJOR finding).
+    /// Verifies timestamp-desc / `content_hash`-asc ordering with equal
+    /// timestamps.
+    #[test]
+    fn test_receipt_list_sorting_deterministic() {
+        use apm2_core::fac::{FacJobOutcome, ReceiptHeaderV1};
+
+        let h1 = ReceiptHeaderV1 {
+            job_id: "job1".to_string(),
+            content_hash: "hash_b".to_string(),
+            outcome: FacJobOutcome::Completed,
+            timestamp_secs: 100,
+            queue_lane: Some("lane".to_string()),
+            unsafe_direct: false,
+        };
+        let h2 = ReceiptHeaderV1 {
+            job_id: "job2".to_string(),
+            content_hash: "hash_a".to_string(),
+            outcome: FacJobOutcome::Completed,
+            timestamp_secs: 100, // Same timestamp as h1
+            queue_lane: Some("lane".to_string()),
+            unsafe_direct: false,
+        };
+        let h3 = ReceiptHeaderV1 {
+            job_id: "job3".to_string(),
+            content_hash: "hash_c".to_string(),
+            outcome: FacJobOutcome::Completed,
+            timestamp_secs: 200, // Newer
+            queue_lane: Some("lane".to_string()),
+            unsafe_direct: false,
+        };
+
+        let mut headers = Vec::from([h1, h2, h3]);
+
+        // Sort: timestamp desc, hash asc
+        headers.sort_by(|a, b| {
+            b.timestamp_secs
+                .cmp(&a.timestamp_secs)
+                .then_with(|| a.content_hash.cmp(&b.content_hash))
+        });
+
+        assert_eq!(headers[0].job_id, "job3"); // timestamp 200 (most recent)
+        assert_eq!(headers[1].job_id, "job2"); // timestamp 100, hash_a (asc)
+        assert_eq!(headers[2].job_id, "job1"); // timestamp 100, hash_b (asc)
+    }
+
+    /// Regression test: `--since` inclusive filtering boundary (MINOR finding).
+    /// Verifies that receipts with `timestamp_secs` == since are included.
+    #[test]
+    fn test_receipt_list_since_inclusive_boundary() {
+        use apm2_core::fac::{FacJobOutcome, ReceiptHeaderV1};
+
+        let headers = vec![
+            ReceiptHeaderV1 {
+                job_id: "old".to_string(),
+                content_hash: "hash_old".to_string(),
+                outcome: FacJobOutcome::Completed,
+                timestamp_secs: 99,
+                queue_lane: None,
+                unsafe_direct: false,
+            },
+            ReceiptHeaderV1 {
+                job_id: "boundary".to_string(),
+                content_hash: "hash_boundary".to_string(),
+                outcome: FacJobOutcome::Completed,
+                timestamp_secs: 100,
+                queue_lane: None,
+                unsafe_direct: false,
+            },
+            ReceiptHeaderV1 {
+                job_id: "new".to_string(),
+                content_hash: "hash_new".to_string(),
+                outcome: FacJobOutcome::Completed,
+                timestamp_secs: 200,
+                queue_lane: None,
+                unsafe_direct: false,
+            },
+        ];
+
+        let since = 100u64;
+        let filtered: Vec<_> = headers
+            .into_iter()
+            .filter(|h| h.timestamp_secs >= since)
+            .collect();
+
+        // Should include boundary (100) and new (200), exclude old (99).
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().any(|h| h.job_id == "boundary"));
+        assert!(filtered.iter().any(|h| h.job_id == "new"));
+        assert!(!filtered.iter().any(|h| h.job_id == "old"));
     }
 }
