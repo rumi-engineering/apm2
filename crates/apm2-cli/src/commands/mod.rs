@@ -61,6 +61,7 @@ pub mod fac_queue;
 mod fac_queue_submit;
 pub mod fac_review;
 pub mod fac_secure_io;
+pub mod fac_utils;
 pub mod fac_warm;
 pub mod fac_worker;
 pub mod factory;
