@@ -69,6 +69,7 @@ pub struct PrAuthCheckCliArgs {
     pub json: bool,
 }
 
+#[allow(clippy::struct_excessive_bools)] // CLI flags are inherently boolean
 #[derive(Debug, Args)]
 pub struct PrAuthSetupCliArgs {
     /// GitHub App ID.
@@ -95,6 +96,19 @@ pub struct PrAuthSetupCliArgs {
     /// Keep the source key file instead of deleting it.
     #[arg(long, default_value_t = false)]
     pub keep_private_key_file: bool,
+
+    /// Headless mode for systemd-managed compute hosts.
+    ///
+    /// Skips OS keyring entirely, copies the private key into
+    /// `$APM2_HOME/app-{app_id}.pem` with mode 0600, and enables
+    /// file-based fallback in `github_app.toml`.
+    ///
+    /// The resulting config is compatible with systemd credential
+    /// injection via `LoadCredential=github-app-key:/path/to/key.pem`.
+    /// When that is set up, the file fallback is not needed because
+    /// `resolve_private_key` checks `$CREDENTIALS_DIRECTORY` first.
+    #[arg(long, default_value_t = false)]
+    pub for_systemd: bool,
 
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]

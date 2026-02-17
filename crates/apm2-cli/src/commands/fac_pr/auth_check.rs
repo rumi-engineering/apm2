@@ -109,6 +109,7 @@ fn env_or_config_str(env_name: &str, config_value: Option<&str>) -> Result<Strin
     }
 
     Err(format!(
-        "missing {env_name}: set the env var or run `apm2 fac pr auth-setup`"
+        "missing {env_name}: set the env var, run `apm2 fac pr auth-setup`, \
+         or for headless hosts run `apm2 fac pr auth-setup --for-systemd`"
     ))
 }

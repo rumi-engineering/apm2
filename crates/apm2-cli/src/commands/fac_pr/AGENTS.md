@@ -6,23 +6,33 @@
 
 The `fac_pr` module implements the `apm2 fac pr` subcommands for bootstrapping and verifying GitHub App credentials. It targets headless VPS environments where the OS keyring is session-scoped, providing secure credential storage with keyring-first resolution and optional PEM file fallback.
 
-The module contains three sub-files:
+The module contains four sub-files:
 - **`mod.rs`**: CLI argument types, dispatcher, and error output helper.
-- **`auth_setup.rs`**: `apm2 fac pr auth-setup` -- stores GitHub App private key in OS keyring and writes `~/.apm2/github_app.toml`.
+- **`auth_setup.rs`**: `apm2 fac pr auth-setup` -- stores GitHub App private key in OS keyring (default) or file-only mode (`--for-systemd`) and writes `~/.apm2/github_app.toml`.
 - **`auth_check.rs`**: `apm2 fac pr auth-check` -- verifies that GitHub App credentials are configured and resolvable.
 - **`types.rs`**: Shared response types.
+- **`ruleset_sync.rs`**: `apm2 fac pr ruleset-sync` -- syncs GitHub required-status rulesets.
 
 ### Credential Resolution Order
 
 1. Environment variable (e.g., `APM2_GITHUB_APP_ID`)
 2. Config file (`~/.apm2/github_app.toml`)
-3. Error if neither is available
+3. Error if neither is available (error message includes remediation guidance for `--for-systemd` and systemd credentials)
 
 ### Private Key Resolution Order
 
 1. Environment variable (`APM2_GITHUB_APP_PRIVATE_KEY`)
-2. OS keyring (`keyring_service` / `keyring_account`)
-3. PEM file fallback (only if `allow_private_key_file_fallback` is enabled)
+2. Systemd credential (`$CREDENTIALS_DIRECTORY/github-app-key`, via `LoadCredential=`)
+3. OS keyring (`keyring_service` / `keyring_account`)
+4. PEM file fallback (only if `allow_private_key_file_fallback` is enabled)
+
+### Headless Setup (`--for-systemd`)
+
+The `--for-systemd` flag on `auth-setup` enables headless provisioning for systemd-managed compute hosts:
+- Skips OS keyring entirely (no desktop session required)
+- Copies private key PEM to `$APM2_HOME/app-{app_id}.pem` with mode 0600
+- Writes `github_app.toml` with `allow_private_key_file_fallback = true`
+- Compatible with systemd `LoadCredential=github-app-key:/path/to/key.pem` injection
 
 ## Key Types
 
@@ -74,14 +84,19 @@ pub struct PrAuthSetupCliArgs {
     pub allow_private_key_file_fallback: bool,
     #[arg(long, default_value_t = false)]
     pub keep_private_key_file: bool,
+    #[arg(long, default_value_t = false)]
+    pub for_systemd: bool,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 ```
 
 **Invariants:**
-- [INV-SETUP-001] Private key is stored in OS keyring before any config file is written.
+- [INV-SETUP-001] Private key is stored in OS keyring before any config file is written (keyring mode).
 - [INV-SETUP-002] Config file and fallback PEM are written with mode 0600 (owner read/write only).
 - [INV-SETUP-003] Symlink targets are rejected for private key paths to prevent symlink attacks.
 - [INV-SETUP-004] Source PEM file is deleted after keyring import unless `--keep-private-key-file` is specified.
+- [INV-SETUP-005] In `--for-systemd` mode, keyring is skipped entirely and PEM is written to `$APM2_HOME/app-{app_id}.pem`.
 
 ### `AuthInfo` (types.rs)
 
@@ -110,7 +125,8 @@ Shared response type representing forge provider authentication status.
 
 | Function (auth_setup.rs) | Description |
 |--------------------------|-------------|
-| `run_pr_auth_setup(args, json)` | Store private key in keyring, write config, optionally delete source PEM |
+| `run_pr_auth_setup(args, json)` | Store private key in keyring or file-only mode, write config, optionally delete source PEM |
+| `run_pr_auth_setup_headless(args, json)` | Headless file-only setup for `--for-systemd` (skips keyring) |
 
 ## Related Modules
 
