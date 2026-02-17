@@ -743,11 +743,14 @@ pub fn find_receipt_for_job(receipts_dir: &Path, job_id: &str) -> Option<FacJobR
 
 /// Validate that a digest string is a well-formed BLAKE3-256 hex digest.
 ///
-/// Must be exactly 64 lowercase hex characters. Rejects path separators,
-/// `..`, and any non-hex characters to prevent path traversal when the
-/// digest is used as a filename component.
+/// Accepts both bare 64-char lowercase hex strings and `b3-256:`-prefixed
+/// 71-char strings (the canonical format used by
+/// `compute_job_receipt_content_hash` and persisted in receipt `content_hash`
+/// fields). Rejects path separators, `..`, and any non-hex characters to
+/// prevent path traversal when the digest is used as a filename component.
 fn is_valid_digest(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    let hex_part = s.strip_prefix("b3-256:").unwrap_or(s);
+    hex_part.len() == 64 && hex_part.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Verify content-addressed integrity of a loaded receipt against its
@@ -1603,5 +1606,140 @@ mod tests {
             !verify_receipt_integrity(&receipt, fake_digest),
             "must not trust receipt's self-reported content_hash"
         );
+    }
+
+    // =========================================================================
+    // TCK-00564 MAJOR-1 regression: is_valid_digest must accept b3-256: prefix
+    // =========================================================================
+
+    #[test]
+    fn test_is_valid_digest_accepts_b3_256_prefixed() {
+        // Canonical format used by compute_job_receipt_content_hash.
+        assert!(is_valid_digest(
+            "b3-256:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2"
+        ));
+        assert!(is_valid_digest(
+            "b3-256:0000000000000000000000000000000000000000000000000000000000000000"
+        ));
+        assert!(is_valid_digest(
+            "b3-256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        ));
+    }
+
+    #[test]
+    fn test_is_valid_digest_rejects_malformed_b3_256() {
+        // Wrong prefix.
+        assert!(!is_valid_digest(
+            "b3-512:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2"
+        ));
+        // Prefix with too-short hex.
+        assert!(!is_valid_digest("b3-256:abcdef"));
+        // Prefix with non-hex chars.
+        assert!(!is_valid_digest(
+            "b3-256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        ));
+        // Prefix with path traversal.
+        assert!(!is_valid_digest("b3-256:../../../etc/passwd"));
+    }
+
+    #[test]
+    fn test_lookup_job_receipt_succeeds_with_b3_256_prefixed_content_hash() {
+        // Regression test for MAJOR-1 (TCK-00564): index lookup must succeed
+        // when receipt content_hash uses the canonical b3-256: prefix format.
+        use crate::fac::receipt::compute_job_receipt_content_hash;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create a receipt with a correct b3-256:-prefixed content hash.
+        let mut receipt = make_receipt("job-b3-prefix", "placeholder", 5000);
+        let hash = compute_job_receipt_content_hash(&receipt);
+        assert!(
+            hash.starts_with("b3-256:"),
+            "content hash must be b3-256:-prefixed"
+        );
+        receipt.content_hash = hash.clone();
+
+        // Persist receipt file using the prefixed hash as filename (production format).
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{hash}.json")), &bytes).expect("write");
+
+        // Build index with b3-256:-prefixed content_hash (via from_receipt).
+        let mut index = ReceiptIndexV1::new();
+        let header = ReceiptHeaderV1::from_receipt(&receipt);
+        assert!(
+            header.content_hash.starts_with("b3-256:"),
+            "header content_hash must preserve b3-256: prefix"
+        );
+        index.upsert(header).expect("upsert");
+        index.persist(receipts_dir).expect("persist");
+
+        // lookup_job_receipt must succeed via the index path, NOT the fallback scan.
+        let found = lookup_job_receipt(receipts_dir, "job-b3-prefix");
+        assert!(
+            found.is_some(),
+            "lookup must succeed for b3-256:-prefixed digest in index"
+        );
+        let found_receipt = found.unwrap();
+        assert_eq!(found_receipt.job_id, "job-b3-prefix");
+        assert_eq!(found_receipt.content_hash, hash);
+    }
+
+    #[test]
+    fn test_has_receipt_for_job_succeeds_with_b3_256_prefixed_content_hash() {
+        // Regression test for MAJOR-1 (TCK-00564): has_receipt_for_job must
+        // succeed when receipt content_hash uses the canonical b3-256: prefix.
+        use crate::fac::receipt::compute_job_receipt_content_hash;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let mut receipt = make_receipt("job-has-b3", "placeholder", 6000);
+        let hash = compute_job_receipt_content_hash(&receipt);
+        receipt.content_hash = hash.clone();
+
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{hash}.json")), &bytes).expect("write");
+
+        let mut index = ReceiptIndexV1::new();
+        index
+            .upsert(ReceiptHeaderV1::from_receipt(&receipt))
+            .expect("upsert");
+        index.persist(receipts_dir).expect("persist");
+
+        assert!(
+            has_receipt_for_job(receipts_dir, "job-has-b3"),
+            "has_receipt_for_job must succeed for b3-256:-prefixed digest in index"
+        );
+    }
+
+    #[test]
+    fn test_find_receipt_for_job_succeeds_with_b3_256_prefixed_content_hash() {
+        // Regression test for MAJOR-1 (TCK-00564): find_receipt_for_job must
+        // succeed when receipt content_hash uses the canonical b3-256: prefix.
+        use crate::fac::receipt::compute_job_receipt_content_hash;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let mut receipt = make_receipt("job-find-b3", "placeholder", 7000);
+        let hash = compute_job_receipt_content_hash(&receipt);
+        receipt.content_hash = hash.clone();
+
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{hash}.json")), &bytes).expect("write");
+
+        let mut index = ReceiptIndexV1::new();
+        index
+            .upsert(ReceiptHeaderV1::from_receipt(&receipt))
+            .expect("upsert");
+        index.persist(receipts_dir).expect("persist");
+
+        let found = find_receipt_for_job(receipts_dir, "job-find-b3");
+        assert!(
+            found.is_some(),
+            "find_receipt_for_job must succeed for b3-256:-prefixed digest in index"
+        );
+        assert_eq!(found.unwrap().job_id, "job-find-b3");
     }
 }

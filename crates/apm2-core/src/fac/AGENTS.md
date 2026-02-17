@@ -1142,6 +1142,12 @@ All receipt-touching hot paths consult the index first:
   recomputing the BLAKE3 hash (v1 and v2 schemes) of loaded receipts against the
   index key using constant-time comparison (`subtle::ConstantTimeEq`, INV-PC-001).
   Hash mismatch triggers fallback to directory scan (fail-closed).
+- [INV-IDX-009] `is_valid_digest` accepts both bare 64-char hex and `b3-256:`-prefixed
+  71-char digests (the canonical format from `compute_job_receipt_content_hash`).
+  Path traversal prevention applies to both formats: only hex characters are allowed
+  after the optional prefix. This ensures `lookup_job_receipt`, `has_receipt_for_job`,
+  and `find_receipt_for_job` correctly use index-backed O(1) lookups for receipts
+  with canonical `b3-256:`-prefixed content hashes (TCK-00564).
 
 ## sd_notify Submodule (TCK-00600)
 
