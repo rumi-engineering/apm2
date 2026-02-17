@@ -897,6 +897,9 @@ message GateReceipt {
   // BLAKE3 digest of the job spec that authorized this gate execution.
   // Present when the gate was triggered from a FacJobSpecV1 queue item.
   optional string job_spec_digest = 14;
+  // BLAKE3 digest of the sandbox hardening profile used for gate execution.
+  // Present when gate execution is bound to a materialized hardening profile.
+  optional string sandbox_hardening_hash = 15;
   // Ed25519 signature over canonical bytes with GATE_RECEIPT: domain (64 bytes)
   bytes receipt_signature = 11;
   // HTF time envelope reference for temporal authority (RFC-0016).

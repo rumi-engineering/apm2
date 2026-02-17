@@ -934,6 +934,10 @@ struct PipelineTestCommand {
     /// Prevents parent env inheritance of `sccache`/`RUSTC_WRAPPER` keys
     /// that could bypass the bounded test's cgroup containment (TCK-00548).
     env_remove_keys: Vec<String>,
+    /// BLAKE3 hex hash of the effective `SandboxHardeningProfile` used for
+    /// bounded test execution. Carried through so attestation binds to the
+    /// actual policy-driven profile, not a default (TCK-00573 MAJOR-1 fix).
+    sandbox_hardening_hash: String,
 }
 
 /// Build the pipeline test command with policy-filtered environment.
@@ -994,6 +998,11 @@ fn build_pipeline_test_command(
     }
     let mut test_env: Vec<(String, String)> = policy_env.into_iter().collect();
 
+    // TCK-00573 MAJOR-1 fix: compute the effective sandbox hardening hash
+    // BEFORE the profile is moved into build_systemd_bounded_test_command,
+    // so attestation binds to the actual policy-driven profile.
+    let sandbox_hardening_hash = policy.sandbox_hardening.content_hash_hex();
+
     let bounded_spec = build_systemd_bounded_test_command(
         workspace_root,
         BoundedTestLimits {
@@ -1005,6 +1014,7 @@ fn build_pipeline_test_command(
         },
         &build_nextest_command(),
         &test_env,
+        policy.sandbox_hardening,
     )
     .map_err(|err| format!("bounded test runner unavailable for FAC pipeline: {err}"))?;
     test_env.extend(bounded_spec.environment);
@@ -1019,6 +1029,7 @@ fn build_pipeline_test_command(
         effective_test_parallelism: execution_profile.test_parallelism,
         test_env,
         env_remove_keys: bounded_spec.env_remove_keys,
+        sandbox_hardening_hash,
     })
 }
 
@@ -1720,6 +1731,11 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     let mut gate_cache = GateCache::new(sha);
     let pipeline_test_command =
         build_pipeline_test_command(workspace_root, &lane_context.lane_dir)?;
+    // TCK-00573 MAJOR-3: Include sandbox hardening hash in gate attestation
+    // to prevent stale gate results from insecure environments being reused.
+    // Uses the effective policy-driven profile carried through
+    // PipelineTestCommand (MAJOR-1 fix: was previously default()).
+    let sandbox_hardening_hash = &pipeline_test_command.sandbox_hardening_hash;
     let policy = GateResourcePolicy::from_cli(
         false,
         pipeline_test_command.effective_timeout_seconds,
@@ -1729,6 +1745,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         pipeline_test_command.bounded_runner,
         Some(pipeline_test_command.gate_profile.as_str()),
         Some(pipeline_test_command.effective_test_parallelism),
+        Some(sandbox_hardening_hash.as_str()),
     );
     if emit_human_logs {
         eprintln!(
@@ -2684,8 +2701,7 @@ mod tests {
                     err.contains("bounded test runner unavailable")
                         || err.contains("systemd-run not found")
                         || err.contains("cgroup v2")
-                        || err.contains("D-Bus socket")
-                        || err.contains("invalid FAC policy"),
+                        || err.contains("D-Bus socket"),
                     "unexpected error: {err}"
                 );
             },

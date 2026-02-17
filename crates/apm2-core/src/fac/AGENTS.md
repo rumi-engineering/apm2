@@ -635,10 +635,46 @@ user-mode and system-mode execution backends.
   - `timeout_start_sec` → `TimeoutStartSec`
   - `runtime_max_sec` → `RuntimeMaxSec`
   - `kill_mode` → `KillMode` (default `control-group`)
+  - `sandbox_hardening` → `SandboxHardeningProfile` (TCK-00573)
 - Input binding:
-  - `from_lane_profile(&LaneProfileV1, Option<&JobConstraints>)`
+  - `from_lane_profile_with_hardening(&LaneProfileV1, Option<&JobConstraints>, SandboxHardeningProfile)` — primary constructor for lane-driven paths; requires explicit policy-driven hardening profile (INV-SBX-001)
+  - `from_cli_limits_with_hardening(cpu_quota_percent, memory_max_bytes, tasks_max, timeout_seconds, SandboxHardeningProfile)` — CLI-driven constructor for bounded test runner where no `LaneProfileV1` is available; uses centralized `DEFAULT_IO_WEIGHT` and `DEFAULT_KILL_MODE` constants shared with the lane constructor (INV-SBX-001)
 - Override semantics:
   - `memory_max_bytes` and `test_timeout_seconds` use MIN(job, lane).
+  - `sandbox_hardening` is policy-driven via `FacPolicyV1.sandbox_hardening` (TCK-00573).
+
+**Core type**: `SandboxHardeningProfile` (TCK-00573)
+
+Systemd security directives for transient units. Policy-driven via
+`FacPolicyV1.sandbox_hardening`. Default profile enables all hardening.
+
+- Directives: `NoNewPrivileges`, `PrivateTmp`, `ProtectControlGroups`,
+  `ProtectKernelTunables`, `ProtectKernelLogs`, `RestrictSUIDSGID`,
+  `LockPersonality`, `RestrictRealtime`, `RestrictAddressFamilies`,
+  `SystemCallArchitectures=native`.
+- `content_hash()` / `content_hash_hex()`: Deterministic BLAKE3 hash for
+  receipt audit binding. Address families are sorted before hashing for
+  canonical ordering. Included in `FacJobReceiptV1.sandbox_hardening_hash`.
+- `to_property_strings()`: Full hardening for system-mode.
+- `to_user_mode_property_strings()`: Only `NoNewPrivileges` for user-mode.
+- `validate()`: Bounds check on address families count, format, and uniqueness.
+  Rejects duplicate entries in `restrict_address_families` via `HashSet`-based
+  detection (TCK-00573 NIT-3).
+
+### Security Invariants (TCK-00573)
+
+- [INV-SBX-001] All `SystemdUnitProperties` construction sites in production
+  paths (worker, bounded test runner, pipeline) use `from_lane_profile_with_hardening`
+  or `from_cli_limits_with_hardening` with `FacPolicyV1.sandbox_hardening`.
+  Hard-coded defaults for `io_weight` and `kill_mode` are prohibited at
+  caller sites; both constructors use shared `DEFAULT_IO_WEIGHT` and
+  `DEFAULT_KILL_MODE` constants.
+- [INV-SBX-002] `FacJobReceiptV1.sandbox_hardening_hash` is populated from
+  `SandboxHardeningProfile.content_hash_hex()` in all `emit_job_receipt` paths
+  that have access to the effective hardening profile.
+- [INV-SBX-003] Address families bounded by `MAX_ADDRESS_FAMILIES=16`.
+- [INV-SBX-004] Address families must be unique; `validate()` rejects
+  duplicates with a diagnostic error identifying the offending index.
 
 ## Rendering API
 
@@ -997,15 +1033,21 @@ The `FacJobReceiptV1` type supports two canonical byte representations:
 Both representations are length-prefixed. The distinct domain separators ensure
 no hash collision between v1 and v2 hashes for identical receipt content.
 
-### Trailing Optional Field Canonicalization (TCK-00532)
+### Injective Trailing Optional Fields (TCK-00573)
 
-Both v1 and v2 canonical byte representations emit explicit presence markers
-(0u8 for `None`, 1u8 for `Some`) for ALL trailing optional fields
-(`moved_job_path`, `containment`, `observed_cost`). This prevents
-canonicalization collisions where different combinations of `None` fields
-produce identical byte streams. Without markers, e.g., a receipt with only
-`observed_cost=Some(...)` and no containment could collide with one that has
-`containment=Some(...)` and no observed cost.
+Both `canonical_bytes()` and `canonical_bytes_v2()` use type-specific presence
+markers for trailing optional fields to ensure injective encoding:
+
+- `1u8` — `moved_job_path` (TCK-00518)
+- `2u8` — `containment` trace (TCK-00548)
+- `3u8` — `sandbox_hardening_hash` (TCK-00573)
+
+`GateReceipt::canonical_bytes()` uses marker `4u8` for its own
+`sandbox_hardening_hash` optional field.
+
+Each marker is followed by a `u32` big-endian length prefix and the field bytes.
+The distinct per-type markers prevent different optional-field combinations from
+producing identical canonical byte streams (collision resistance).
 
 ## receipt_index Submodule (TCK-00560)
 
@@ -1098,7 +1140,8 @@ All receipt-touching hot paths consult the index first:
   `O_NOFOLLOW` + bounded streaming reads (no stat-then-read TOCTOU).
 - [INV-IDX-008] `lookup_job_receipt` verifies content-addressed integrity by
   recomputing the BLAKE3 hash (v1 and v2 schemes) of loaded receipts against the
-  index key. Hash mismatch triggers fallback to directory scan (fail-closed).
+  index key using constant-time comparison (`subtle::ConstantTimeEq`, INV-PC-001).
+  Hash mismatch triggers fallback to directory scan (fail-closed).
 
 ## sd_notify Submodule (TCK-00600)
 

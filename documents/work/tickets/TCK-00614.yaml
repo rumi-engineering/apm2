@@ -1,0 +1,129 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00614"
+    title: "FAC projection-model merge safety: required status simplification + regression tests"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY", "DOMAIN_CI"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00613"
+        reason: "Continuation of FAC hardening; this ticket scopes CI/ruleset enforcement invariants for projection mode."
+  root_cause_analysis:
+    summary: |
+      INCIDENT: INC-2026-02-17-FAC-AUTOMERGE-FAILOPEN (SEV-1)
+
+      The structural failure was not auto-merge itself; it was that GitHub did not
+      treat failing/pending FAC-related signals as required merge blockers.
+
+      In GitHub, auto-merge only waits on REQUIRED checks. If a check is failing but
+      not required, merge can still proceed when required checks are satisfied.
+
+      For PRs #704/#709/#710, FAC/preflight signals were failing or skipped while
+      merge still proceeded. In projection terms, authoritative merge state was not
+      mapped to a single required status context.
+
+      Resolution in this branch is to simplify CI wiring so GitHub is projection-only
+      and blocks strictly on one authoritative status: `apm2 / Forge Admission Cycle`.
+
+scope:
+  in_scope:
+    - id: "S1_REVERT_BRANCH_STATE"
+      title: "Revert PR #711 merge commit on this branch"
+      detail: |
+        Reverted commit `7f17f7da2906cb173f64286a28b640f679c62117` using
+        `git revert -m 1`, producing commit `f2370301...`, to remove the immediate
+        merge-behavior change from this branch baseline before hardening.
+
+    - id: "S2_SIMPLIFY_FAC_WORKFLOW"
+      title: "Make Forge Admission Cycle GitHub workflow projection-only"
+      detail: |
+        `.github/workflows/forge-admission-cycle.yml` was simplified:
+        - removed `pull_request_target` trigger path
+        - removed Rust FAC execution path (`cargo run ... apm2-cli ...`)
+        - kept a manual `workflow_dispatch` projection diagnostic job
+
+        GitHub no longer computes FAC verdicts in this workflow.
+
+    - id: "S3_REQUIRE_SINGLE_AUTHORITATIVE_STATUS"
+      title: "Require only `apm2 / Forge Admission Cycle` on main ruleset"
+      detail: |
+        `.github/rulesets/protect-main.json` now requires exactly one status check:
+        - `apm2 / Forge Admission Cycle`
+
+        `strict_required_status_checks_policy` remains enabled.
+
+    - id: "S4_REGRESSION_TESTS_FOR_CI_POLICY"
+      title: "Add CI merge-policy invariants test suite"
+      detail: |
+        Added `crates/apm2-cli/tests/ci_merge_policy_invariants.rs` to assert:
+        - protect-main ruleset requires only `apm2 / Forge Admission Cycle`
+        - strict required checks policy is true
+        - forge-admission-cycle workflow is projection-only (no PR trigger,
+          no CLI-driven FAC execution in workflow)
+
+    - id: "S5_COMPILE_FIX_UNBLOCKING_VALIDATION"
+      title: "Fix receipt call type mismatch to unblock workspace validation"
+      detail: |
+        In `crates/apm2-cli/src/commands/fac_worker.rs`, updated a receipt emission
+        call to use `emit_job_receipt_with_observed_cost(...)` so the observed cost
+        type matches the function contract.
+
+  out_of_scope:
+    - "Changing CLI auto-merge behavior in fac push."
+    - "Reintroducing GitHub-side FAC verdict computation via Rust binary execution."
+    - "Adding additional required checks beyond `apm2 / Forge Admission Cycle` in this ticket."
+
+plan:
+  steps:
+    - id: "STEP_01"
+      title: "Reset branch to intended baseline"
+      detail: "Revert PR #711 merge commit from this branch."
+    - id: "STEP_02"
+      title: "Simplify projection workflow"
+      detail: "Replace FAC workflow logic with projection-only manual diagnostics."
+    - id: "STEP_03"
+      title: "Harden required-check policy"
+      detail: "Set main ruleset to one authoritative required status context."
+    - id: "STEP_04"
+      title: "Lock behavior with regression tests"
+      detail: "Add tests that fail on workflow/ruleset drift away from projection model."
+    - id: "STEP_05"
+      title: "Run full validation gates"
+      detail: |
+        Validate with:
+        - `cargo fmt --all`
+        - `cargo test -p apm2-cli`
+        - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+        - `cargo doc --workspace --no-deps`
+        - `cargo test --workspace`
+
+definition_of_done:
+  evidence_ids: []
+  criteria:
+    - "Branch contains revert commit for PR #711 merge commit."
+    - "Forge Admission Cycle workflow is projection-only and not triggered by PR events."
+    - "Main ruleset requires only `apm2 / Forge Admission Cycle` with strict required checks enabled."
+    - "Regression tests assert workflow/ruleset invariants and pass."
+    - "Workspace validation commands complete successfully."
+
+notes:
+  context: |
+    This ticket update intentionally narrows scope to what is implemented in this
+    branch. It records the decision to treat GitHub as projection-only and to bind
+    merge blocking to one authoritative FAC status context emitted by apm2 logic.
+
+    Modified files tied to this ticket:
+    - `.github/workflows/forge-admission-cycle.yml`
+    - `.github/rulesets/protect-main.json`
+    - `crates/apm2-cli/tests/ci_merge_policy_invariants.rs`
+    - `crates/apm2-cli/src/commands/fac_worker.rs`
+  security: "default-deny, fail-closed required status enforcement"

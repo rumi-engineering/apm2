@@ -72,57 +72,14 @@ pub fn plan_gc(
     quarantine_ttl_secs: u64,
     denied_ttl_secs: u64,
 ) -> Result<GcPlan, GcPlanError> {
-    let statuses = lane_manager
-        .all_lane_statuses()
-        .map_err(|error| GcPlanError::Io(error.to_string()))?;
-    plan_gc_with_statuses(
-        fac_root,
-        lane_manager,
-        statuses,
-        quarantine_ttl_secs,
-        denied_ttl_secs,
-    )
-}
-
-#[allow(clippy::too_many_lines)]
-fn plan_gc_with_statuses(
-    fac_root: &Path,
-    lane_manager: &LaneManager,
-    statuses: Vec<LaneStatusV1>,
-    quarantine_ttl_secs: u64,
-    denied_ttl_secs: u64,
-) -> Result<GcPlan, GcPlanError> {
-    let mut targets = Vec::new();
     let effective_quarantine_ttl =
         effective_retention_seconds(quarantine_ttl_secs, QUARANTINE_RETENTION_SECS);
     let effective_denied_ttl = effective_retention_seconds(denied_ttl_secs, DENIED_RETENTION_SECS);
     let now_secs = current_wall_clock_secs();
+    let known_lane_ids = LaneManager::default_lane_ids();
 
-    for status in statuses {
-        if status.state != LaneState::Idle {
-            continue;
-        }
-        let lane_dir = lane_manager.lane_dir(&status.lane_id);
-        let target_dir = lane_dir.join("target");
-        let log_dir = lane_dir.join("logs");
-
-        if target_dir.exists() {
-            targets.push(GcTarget {
-                path: target_dir.clone(),
-                allowed_parent: lane_dir.clone(),
-                kind: crate::fac::gc_receipt::GcActionKind::LaneTarget,
-                estimated_bytes: estimate_dir_size(&target_dir),
-            });
-        }
-        if log_dir.exists() {
-            targets.push(GcTarget {
-                path: log_dir.clone(),
-                allowed_parent: lane_dir.clone(),
-                kind: crate::fac::gc_receipt::GcActionKind::LaneLog,
-                estimated_bytes: estimate_dir_size(&log_dir),
-            });
-        }
-    }
+    let statuses = load_lane_statuses(lane_manager, &known_lane_ids)?;
+    let mut targets = collect_idle_lane_targets(lane_manager, &statuses);
 
     let gate_cache_root = fac_root.join("gate_cache_v2");
     if let Ok(entries) = std::fs::read_dir(&gate_cache_root) {
@@ -231,6 +188,53 @@ fn plan_gc_with_statuses(
 
     targets.sort_by(|a, b| b.estimated_bytes.cmp(&a.estimated_bytes));
     Ok(GcPlan { targets })
+}
+
+fn load_lane_statuses(
+    lane_manager: &LaneManager,
+    lane_ids: &[String],
+) -> Result<Vec<LaneStatusV1>, GcPlanError> {
+    lane_ids
+        .iter()
+        .map(|lane_id| {
+            lane_manager
+                .lane_status(lane_id)
+                .map_err(|error| GcPlanError::Io(error.to_string()))
+        })
+        .collect()
+}
+
+fn collect_idle_lane_targets(
+    lane_manager: &LaneManager,
+    statuses: &[LaneStatusV1],
+) -> Vec<GcTarget> {
+    let mut targets = Vec::with_capacity(statuses.len().saturating_mul(2));
+    for status in statuses {
+        if status.state != LaneState::Idle {
+            continue;
+        }
+        let lane_dir = lane_manager.lane_dir(&status.lane_id);
+        let target_dir = lane_dir.join("target");
+        let log_dir = lane_dir.join("logs");
+
+        if target_dir.exists() {
+            targets.push(GcTarget {
+                path: target_dir.clone(),
+                allowed_parent: lane_dir.clone(),
+                kind: crate::fac::gc_receipt::GcActionKind::LaneTarget,
+                estimated_bytes: estimate_dir_size(&target_dir),
+            });
+        }
+        if log_dir.exists() {
+            targets.push(GcTarget {
+                path: log_dir.clone(),
+                allowed_parent: lane_dir.clone(),
+                kind: crate::fac::gc_receipt::GcActionKind::LaneLog,
+                estimated_bytes: estimate_dir_size(&log_dir),
+            });
+        }
+    }
+    targets
 }
 
 /// Create a focused quarantine/denied GC plan with TTL and quota policy.
@@ -939,51 +943,68 @@ mod tests {
         FileTime::from_unix_time(i64::try_from(seconds).expect("timestamp fits i64"), 0)
     }
 
+    fn lane_status(lane_id: &str, state: LaneState) -> LaneStatusV1 {
+        LaneStatusV1 {
+            lane_id: lane_id.to_string(),
+            state,
+            job_id: None,
+            pid: None,
+            started_at: None,
+            toolchain_fingerprint: None,
+            lane_profile_hash: None,
+            corrupt_reason: None,
+            lock_held: false,
+            pid_alive: None,
+        }
+    }
+
     #[test]
     fn test_gc_plan_skips_running_lanes() {
         let dir = tempdir().expect("tmp");
         let fac_root = dir.path().join("fac");
         std::fs::create_dir_all(&fac_root).expect("fac");
-        let lane_manager = LaneManager::new(fac_root.clone()).expect("manager");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
         lane_manager.ensure_directories().expect("dir setup");
+        let lane_ids = LaneManager::default_lane_ids();
+        let running_lane_id = lane_ids.first().cloned().expect("at least one lane");
+        let maybe_idle_lane_id = lane_ids.get(1).cloned();
 
-        let lane_id = "lane-00";
-        let lane_dir = lane_manager.lane_dir(lane_id);
-        let target_dir = lane_dir.join("target");
-        let log_dir = lane_dir.join("logs");
-        std::fs::create_dir_all(&target_dir).expect("target dir");
-        std::fs::create_dir_all(&log_dir).expect("log dir");
-        write_file(&target_dir.join("artifact.bin"), 128);
-        write_file(&log_dir.join("lane.log"), 32);
+        // ensure_directories() creates target/ and logs/ for every lane,
+        // so collect_idle_lane_targets will find them for idle lanes.
+        // Write files so estimated_bytes > 0 (non-trivial GC targets).
+        for lane_id in &lane_ids {
+            let lane_dir = lane_manager.lane_dir(lane_id);
+            std::fs::write(lane_dir.join("target").join("build_artifact"), b"artifact")
+                .expect("write target file");
+            std::fs::write(lane_dir.join("logs").join("build.log"), b"log data")
+                .expect("write log file");
+        }
 
-        let statuses = vec![LaneStatusV1 {
-            lane_id: lane_id.to_string(),
-            state: LaneState::Running,
-            job_id: Some("job-001".to_string()),
-            pid: Some(1234),
-            started_at: Some("2026-01-01T00:00:00Z".to_string()),
-            toolchain_fingerprint: Some("fp-toolchain".to_string()),
-            lane_profile_hash: Some("fp-lane".to_string()),
-            corrupt_reason: None,
-            lock_held: true,
-            pid_alive: Some(true),
-        }];
+        let mut statuses = vec![lane_status(&running_lane_id, LaneState::Running)];
+        if let Some(idle_lane_id) = &maybe_idle_lane_id {
+            statuses.push(lane_status(idle_lane_id, LaneState::Idle));
+        }
+        let targets = collect_idle_lane_targets(&lane_manager, &statuses);
+        let running_lane_dir = lane_manager.lane_dir(&running_lane_id);
 
-        let plan = plan_gc_with_statuses(
-            &fac_root,
-            &lane_manager,
-            statuses,
-            QUARANTINE_RETENTION_SECS,
-            DENIED_RETENTION_SECS,
-        )
-        .expect("plan");
         assert!(
-            !plan
-                .targets
+            !targets
                 .iter()
-                .any(|target| target.path == target_dir || target.path == log_dir),
+                .any(|target| target.path.starts_with(&running_lane_dir)),
             "running lanes must be skipped"
         );
+        if let Some(idle_lane_id) = maybe_idle_lane_id {
+            let idle_lane_dir = lane_manager.lane_dir(&idle_lane_id);
+            let idle_targets: Vec<_> = targets
+                .iter()
+                .filter(|target| target.path.starts_with(&idle_lane_dir))
+                .collect();
+            assert_eq!(
+                idle_targets.len(),
+                2,
+                "idle lane must contribute exactly target and logs directories, got {idle_targets:?}"
+            );
+        }
     }
 
     #[test]

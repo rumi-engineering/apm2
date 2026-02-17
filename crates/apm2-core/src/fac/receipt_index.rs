@@ -56,6 +56,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq as _;
 
 use super::receipt::{
     FacJobOutcome, FacJobReceiptV1, MAX_JOB_RECEIPT_SIZE, compute_job_receipt_content_hash,
@@ -729,13 +730,15 @@ fn is_valid_digest(s: &str) -> bool {
 /// an attacker could set it to any value to bypass verification.
 fn verify_receipt_integrity(receipt: &FacJobReceiptV1, expected_digest: &str) -> bool {
     // Try v1 hash first (most common for existing receipts).
+    // Use constant-time comparison (INV-PC-001) to avoid timing
+    // side-channels on digest comparisons.
     let v1_hash = compute_job_receipt_content_hash(receipt);
-    if v1_hash == expected_digest {
+    if v1_hash.as_bytes().ct_eq(expected_digest.as_bytes()).into() {
         return true;
     }
     // Try v2 hash (includes unsafe_direct).
     let v2_hash = compute_job_receipt_content_hash_v2(receipt);
-    if v2_hash == expected_digest {
+    if v2_hash.as_bytes().ct_eq(expected_digest.as_bytes()).into() {
         return true;
     }
     // Never trust receipt.content_hash — must always recompute.
@@ -843,6 +846,7 @@ mod tests {
             eio29_budget_admission: None,
             containment: None,
             observed_cost: None,
+            sandbox_hardening_hash: None,
             timestamp_secs: timestamp,
             content_hash: content_hash.to_string(),
         }
