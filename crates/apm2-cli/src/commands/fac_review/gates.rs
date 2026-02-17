@@ -16,7 +16,7 @@ use apm2_core::fac::job_spec::{
 use apm2_core::fac::{
     FacPolicyV1, LaneLockGuard, LaneManager, LaneState, apply_lane_env_overrides,
     build_job_environment, compute_test_env_for_parallelism, ensure_lane_env_dirs,
-    lookup_job_receipt, parse_policy_hash, resolve_host_test_parallelism,
+    lookup_job_receipt, parse_b3_256_digest, parse_policy_hash, resolve_host_test_parallelism,
 };
 use chrono::{SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
@@ -845,6 +845,75 @@ struct GateResult {
     error_hint: Option<String>,
 }
 
+fn canonical_log_bundle_hash(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn bind_merge_gate_log_bundle_hash(
+    merge_gate: &mut GateResult,
+    gate_results: &[EvidenceGateResult],
+) -> Result<(), String> {
+    if let Some(existing) = canonical_log_bundle_hash(merge_gate.log_bundle_hash.as_deref()) {
+        if parse_b3_256_digest(&existing).is_none() {
+            return Err(format!(
+                "merge_conflict_main gate emitted invalid log bundle hash `{existing}`"
+            ));
+        }
+        merge_gate.log_bundle_hash = Some(existing);
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    let mut invalid = Vec::new();
+    let mut shared_hash: Option<String> = None;
+
+    for gate in gate_results {
+        let Some(hash) = canonical_log_bundle_hash(gate.log_bundle_hash.as_deref()) else {
+            missing.push(gate.gate_name.clone());
+            continue;
+        };
+        if parse_b3_256_digest(&hash).is_none() {
+            invalid.push(format!("{}={hash}", gate.gate_name));
+            continue;
+        }
+        if let Some(existing) = shared_hash.as_ref() {
+            if existing != &hash {
+                return Err(format!(
+                    "evidence gates produced inconsistent log bundle hashes while binding merge_conflict_main (expected={existing}, observed={hash}, gate={})",
+                    gate.gate_name
+                ));
+            }
+        } else {
+            shared_hash = Some(hash);
+        }
+    }
+
+    if !missing.is_empty() || !invalid.is_empty() {
+        let missing_summary = if missing.is_empty() {
+            "-".to_string()
+        } else {
+            missing.join(",")
+        };
+        let invalid_summary = if invalid.is_empty() {
+            "-".to_string()
+        } else {
+            invalid.join(",")
+        };
+        return Err(format!(
+            "cannot bind merge_conflict_main to log bundle hash (missing={missing_summary}, invalid={invalid_summary})"
+        ));
+    }
+
+    let shared_hash = shared_hash.ok_or_else(|| {
+        "cannot bind merge_conflict_main to log bundle hash because no evidence gate hashes were present"
+            .to_string()
+    })?;
+    merge_gate.log_bundle_hash = Some(shared_hash);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_gates_inner(
     workspace_root: &Path,
@@ -925,7 +994,7 @@ fn run_gates_inner(
             gate_name: "merge_conflict_main".to_string(),
         });
     }
-    let merge_gate = evaluate_merge_conflict_gate(workspace_root, &sha, emit_human_logs)?;
+    let mut merge_gate = evaluate_merge_conflict_gate(workspace_root, &sha, emit_human_logs)?;
     // Emit gate_completed immediately after the merge gate finishes.
     if let Some(ref cb) = on_gate_progress {
         cb(super::evidence::GateProgressEvent::Completed {
@@ -1042,6 +1111,7 @@ fn run_gates_inner(
         Some(&opts),
         lane_context,
     )?;
+    bind_merge_gate_log_bundle_hash(&mut merge_gate, &gate_results)?;
     let total_secs = started.elapsed().as_secs();
 
     // 6. Write attested results to gate cache for full runs only.
@@ -1798,6 +1868,131 @@ mod tests {
         let gate = test_gates[0];
         assert_eq!(gate.status, "SKIP");
         assert_eq!(gate.log_path.as_deref(), Some("/tmp/test.log"));
+    }
+
+    #[test]
+    fn bind_merge_gate_log_bundle_hash_populates_from_evidence_results() {
+        let shared = format!("b3-256:{}", "a".repeat(64));
+        let mut merge_gate = GateResult {
+            name: "merge_conflict_main".to_string(),
+            status: "PASS".to_string(),
+            duration_secs: 1,
+            log_path: None,
+            bytes_written: None,
+            bytes_total: None,
+            was_truncated: None,
+            log_bundle_hash: None,
+            error_hint: None,
+        };
+        let evidence = vec![
+            EvidenceGateResult {
+                gate_name: "rustfmt".to_string(),
+                passed: true,
+                duration_secs: 1,
+                log_path: None,
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_bundle_hash: Some(shared.clone()),
+            },
+            EvidenceGateResult {
+                gate_name: "clippy".to_string(),
+                passed: true,
+                duration_secs: 1,
+                log_path: None,
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_bundle_hash: Some(shared.clone()),
+            },
+        ];
+
+        bind_merge_gate_log_bundle_hash(&mut merge_gate, &evidence)
+            .expect("merge gate hash should bind from evidence gates");
+        assert_eq!(merge_gate.log_bundle_hash.as_deref(), Some(shared.as_str()));
+    }
+
+    #[test]
+    fn bind_merge_gate_log_bundle_hash_rejects_missing_or_invalid_hashes() {
+        let mut merge_gate = GateResult {
+            name: "merge_conflict_main".to_string(),
+            status: "PASS".to_string(),
+            duration_secs: 1,
+            log_path: None,
+            bytes_written: None,
+            bytes_total: None,
+            was_truncated: None,
+            log_bundle_hash: None,
+            error_hint: None,
+        };
+        let evidence = vec![
+            EvidenceGateResult {
+                gate_name: "rustfmt".to_string(),
+                passed: true,
+                duration_secs: 1,
+                log_path: None,
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_bundle_hash: None,
+            },
+            EvidenceGateResult {
+                gate_name: "clippy".to_string(),
+                passed: true,
+                duration_secs: 1,
+                log_path: None,
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_bundle_hash: Some("b3-256:nothex".to_string()),
+            },
+        ];
+
+        let err = bind_merge_gate_log_bundle_hash(&mut merge_gate, &evidence)
+            .expect_err("missing/invalid evidence hashes must fail closed");
+        assert!(err.contains("missing=rustfmt"));
+        assert!(err.contains("invalid=clippy=b3-256:nothex"));
+    }
+
+    #[test]
+    fn bind_merge_gate_log_bundle_hash_rejects_inconsistent_hashes() {
+        let mut merge_gate = GateResult {
+            name: "merge_conflict_main".to_string(),
+            status: "PASS".to_string(),
+            duration_secs: 1,
+            log_path: None,
+            bytes_written: None,
+            bytes_total: None,
+            was_truncated: None,
+            log_bundle_hash: None,
+            error_hint: None,
+        };
+        let evidence = vec![
+            EvidenceGateResult {
+                gate_name: "rustfmt".to_string(),
+                passed: true,
+                duration_secs: 1,
+                log_path: None,
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_bundle_hash: Some(format!("b3-256:{}", "b".repeat(64))),
+            },
+            EvidenceGateResult {
+                gate_name: "clippy".to_string(),
+                passed: true,
+                duration_secs: 1,
+                log_path: None,
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_bundle_hash: Some(format!("b3-256:{}", "c".repeat(64))),
+            },
+        ];
+
+        let err = bind_merge_gate_log_bundle_hash(&mut merge_gate, &evidence)
+            .expect_err("inconsistent evidence hashes must fail closed");
+        assert!(err.contains("inconsistent log bundle hashes"));
     }
 
     /// Verify that the `on_gate_progress` callback in [`EvidenceGateOptions`]
