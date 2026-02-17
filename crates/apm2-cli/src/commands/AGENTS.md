@@ -146,6 +146,7 @@ pub enum EventSubcommand {
 3. **Toolchain**: cargo, cargo-nextest, systemd-run availability
 4. **Security Posture**: FAC root permissions (0700/ownership), socket permissions (0600), lane symlink detection
 5. **Credentials Posture** (WARN-only): GITHUB_TOKEN/GH_TOKEN, GitHub App config, systemd credential file
+6. **Secret Verification** (--full only, TCK-00598): When `full` is set, `creds_github_app_secret` attempts to resolve the GitHub App private key via `GitHubAppTokenProvider::resolve_private_key` and reports ERROR if the key is inaccessible. Remediation messages include `--for-systemd` guidance for headless hosts.
 
 Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK), and `message` (including actionable remediation). Credentials checks are WARN-only to avoid blocking local-only workflows.
 
