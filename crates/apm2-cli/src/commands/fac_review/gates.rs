@@ -16,7 +16,7 @@ use apm2_core::fac::job_spec::{
 use apm2_core::fac::{
     FacPolicyV1, LaneLockGuard, LaneManager, LaneState, apply_lane_env_overrides,
     build_job_environment, compute_test_env_for_parallelism, ensure_lane_env_dirs,
-    lookup_job_receipt, resolve_host_test_parallelism,
+    lookup_job_receipt, parse_policy_hash, resolve_host_test_parallelism,
 };
 use chrono::{SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
@@ -85,6 +85,8 @@ pub(super) struct QueuedGatesRequest {
 #[derive(Debug, Clone)]
 pub(super) struct QueuedGatesOutcome {
     pub(super) job_id: String,
+    pub(super) job_receipt_id: String,
+    pub(super) policy_hash: String,
     pub(super) head_sha: String,
     pub(super) gate_results: Vec<EvidenceGateResult>,
 }
@@ -234,10 +236,44 @@ pub(super) fn run_queued_gates_and_collect(
         Duration::from_secs(timeout_secs),
         WorkerExecutionMode::RequireExternalWorker,
     )?;
+    let receipts_dir = prepared.fac_root.join("receipts");
+    let job_receipt = lookup_job_receipt(&receipts_dir, &prepared.job_id).ok_or_else(|| {
+        format!(
+            "queued gates job {} completed but no FAC job receipt was found",
+            prepared.job_id
+        )
+    })?;
+    let job_receipt_id = job_receipt.receipt_id.trim().to_string();
+    if job_receipt_id.is_empty() {
+        return Err(format!(
+            "queued gates job {} completed with empty receipt_id",
+            prepared.job_id
+        ));
+    }
+    let policy_hash = job_receipt
+        .policy_hash
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "queued gates job {} completed without policy_hash in authoritative receipt",
+                prepared.job_id
+            )
+        })?
+        .to_string();
+    if parse_policy_hash(&policy_hash).is_none() {
+        return Err(format!(
+            "queued gates job {} returned invalid policy_hash `{policy_hash}` in authoritative receipt",
+            prepared.job_id
+        ));
+    }
 
     let gate_results = load_gate_results_from_cache_for_sha(&prepared.head_sha)?;
     Ok(QueuedGatesOutcome {
         job_id: prepared.job_id,
+        job_receipt_id,
+        policy_hash,
         head_sha: prepared.head_sha,
         gate_results,
     })
