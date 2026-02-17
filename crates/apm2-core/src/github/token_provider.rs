@@ -1291,9 +1291,11 @@ mod unit_tests {
         let result = super::resolve_systemd_credential("github-app-key");
         assert!(result.is_err(), "should reject symlink credential");
         let err = result.unwrap_err();
+        // O_NOFOLLOW produces OS-level "Too many levels of symbolic links"
+        // which is the atomic rejection we want (no TOCTOU gap).
         assert!(
-            err.contains("symlink"),
-            "error should mention symlink: {err}"
+            err.contains("symlink") || err.contains("symbolic link"),
+            "error should mention symlink rejection: {err}"
         );
 
         match prev {
