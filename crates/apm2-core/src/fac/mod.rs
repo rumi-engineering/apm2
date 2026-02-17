@@ -709,7 +709,7 @@ pub use lane::{
 pub use node_identity::{
     DEFAULT_BOUNDARY_ID, MAX_BOUNDARY_ID_LENGTH as NODE_IDENTITY_MAX_BOUNDARY_ID_LENGTH,
     NODE_IDENTITY_SCHEMA_ID, NodeIdentityError, derive_node_fingerprint,
-    load_or_default_boundary_id, load_or_derive_node_fingerprint,
+    load_or_default_boundary_id, load_or_derive_node_fingerprint, read_boundary_id,
 };
 pub use preflight::{PreflightError, PreflightStatus, check_disk_space, run_preflight};
 // Re-export safe rmtree types (TCK-00516)

@@ -21,7 +21,7 @@ use apm2_core::fac::economics_adoption::EconomicsAdoptionError;
 use apm2_core::fac::execution_backend::{ExecutionBackend, select_backend};
 use apm2_core::fac::{
     CanonicalizerTupleV1, DEFAULT_LANE_COUNT, LaneManager, MAX_LANE_COUNT,
-    load_admitted_economics_profile_root, load_admitted_policy_root, load_or_default_boundary_id,
+    load_admitted_economics_profile_root, load_admitted_policy_root, read_boundary_id,
 };
 use apm2_core::github::resolve_apm2_home;
 use clap::{Args, Subcommand};
@@ -225,12 +225,20 @@ fn build_config_show_response() -> ConfigShowResponse {
                 },
             });
 
-    // -- Boundary ID --
+    // -- Boundary ID (non-mutating read; never creates files/directories) --
     let boundary_id = if let Some(home) = resolve_apm2_home() {
-        load_or_default_boundary_id(&home).unwrap_or_else(|e| {
-            warnings.push(format!("boundary_id: {e}"));
-            "<error>".to_string()
-        })
+        match read_boundary_id(&home) {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                warnings
+                    .push("boundary_id file not found (run bootstrap to initialize)".to_string());
+                "<not set>".to_string()
+            },
+            Err(e) => {
+                warnings.push(format!("boundary_id: {e}"));
+                "<error>".to_string()
+            },
+        }
     } else {
         warnings.push("cannot resolve APM2 home for boundary_id".to_string());
         "<unresolvable>".to_string()
@@ -518,5 +526,40 @@ mod tests {
         let response = build_config_show_response();
         // This would panic if the format strings are broken.
         print_human_readable(&response);
+    }
+
+    /// Regression: `read_boundary_id` (used by config show) must NOT create
+    /// the `boundary_id` file or its parent directories when run against an
+    /// empty APM2 home directory. This proves the read-only introspection
+    /// invariant required by TCK-00590 (`out_of_scope: "Editing config"`).
+    #[test]
+    fn config_show_boundary_id_does_not_create_files_or_directories() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let fac_dir = home.path().join("private/fac");
+        let boundary_file = fac_dir.join("boundary_id");
+
+        // Pre-condition: empty APM2 home — no FAC identity artifacts.
+        assert!(
+            !home.path().join("private").exists(),
+            "precondition: private/ must not exist"
+        );
+
+        // Exercise the non-mutating read path used by `build_config_show_response`.
+        let result = read_boundary_id(home.path()).expect("read_boundary_id must not error");
+        assert_eq!(result, None, "must return None for missing boundary_id");
+
+        // Post-condition: no state mutation occurred.
+        assert!(
+            !home.path().join("private").exists(),
+            "config show must NOT create private/ directory"
+        );
+        assert!(
+            !fac_dir.exists(),
+            "config show must NOT create private/fac/ directory"
+        );
+        assert!(
+            !boundary_file.exists(),
+            "config show must NOT create boundary_id file"
+        );
     }
 }
