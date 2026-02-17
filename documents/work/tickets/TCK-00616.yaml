@@ -12,6 +12,7 @@ ticket_meta:
     evidence_artifacts:
       - "EXEC-2026-02-17-RULESET-SYNC"
       - "EXEC-2026-02-17-GATES-BEFORE-PUSH"
+      - "EXEC-2026-02-17-FAC-STATUS-PROJECTION"
       - "EXEC-2026-02-17-WORKSPACE-VALIDATION"
   custody:
     agent_roles: ["AGENT_IMPLEMENTER"]
@@ -133,6 +134,7 @@ definition_of_done:
   evidence_ids:
     - "EXEC-2026-02-17-RULESET-SYNC"
     - "EXEC-2026-02-17-GATES-BEFORE-PUSH"
+    - "EXEC-2026-02-17-FAC-STATUS-PROJECTION"
     - "EXEC-2026-02-17-E2E-REHEARSAL"
     - "EXEC-2026-02-17-WORKSPACE-VALIDATION"
   criteria:
@@ -141,6 +143,7 @@ definition_of_done:
     - "Barrier removed from required live contexts."
     - "`fac push` runs gates before git push; gate failure prevents any remote side effects."
     - "GitHub projection is compatibility-only; local forge completion is authoritative."
+    - "When verdict projection resolves to deny, required context `apm2 / Forge Admission Cycle` is projected as GitHub commit status `failure`."
     - "Regression tests pass for drift detection, push ordering, gate failure isolation, and projection checks."
     - "End-to-end rehearsal PR validates both failure and success paths."
     - "Workspace validation commands complete successfully."
@@ -160,6 +163,14 @@ notes:
     - EXEC-2026-02-17-GATES-BEFORE-PUSH:
       `cargo test -p apm2-cli run_pre_push_sequence_with -- --nocapture`
       and `cargo test -p apm2-cli ruleset_sync -- --nocapture`.
+    - EXEC-2026-02-17-FAC-STATUS-PROJECTION:
+      `cargo run -p apm2-cli -- fac review verdict set --pr 715 --dimension code-quality --verdict deny --reason "FAIL: 2 major findings (Path Traversal Risk, Untyped Errors), 1 minor finding" --json`
+      followed by:
+      `gh pr view 715 --repo guardian-intelligence/apm2 --json statusCheckRollup`
+      and
+      `gh api /repos/guardian-intelligence/apm2/commits/a5405ffb5edca920224337c65f444633baa8aeca/status`.
+      Result: context `apm2 / Forge Admission Cycle` = `failure` with description
+      `Forge Admission Cycle denied`.
     - EXEC-2026-02-17-WORKSPACE-VALIDATION:
       `cargo fmt --all`, `cargo test -p apm2-cli --test ci_merge_policy_invariants`,
       `cargo test -p apm2-cli`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,

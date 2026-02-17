@@ -9,10 +9,107 @@ use std::io::Write;
 use apm2_core::fac::gh_command;
 use serde::Deserialize;
 
+const MAX_COMMIT_STATUS_DESCRIPTION_CHARS: usize = 140;
+
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct IssueCommentResponse {
     pub(super) id: u64,
     pub(super) html_url: String,
+}
+
+fn clamp_commit_status_description(description: &str) -> String {
+    description
+        .chars()
+        .take(MAX_COMMIT_STATUS_DESCRIPTION_CHARS)
+        .collect()
+}
+
+fn validate_commit_status_state(state: &str) -> Result<&'static str, String> {
+    match state {
+        "error" => Ok("error"),
+        "failure" => Ok("failure"),
+        "pending" => Ok("pending"),
+        "success" => Ok("success"),
+        other => Err(format!(
+            "invalid commit status state `{other}` (expected error|failure|pending|success)"
+        )),
+    }
+}
+
+pub(super) fn upsert_commit_status(
+    owner_repo: &str,
+    head_sha: &str,
+    context: &str,
+    state: &str,
+    description: &str,
+    target_url: Option<&str>,
+) -> Result<(), String> {
+    let state = validate_commit_status_state(state)?;
+    let context = context.trim();
+    if context.is_empty() {
+        return Err("commit status context cannot be empty".to_string());
+    }
+    let head_sha = head_sha.trim();
+    if head_sha.is_empty() {
+        return Err("commit status head_sha cannot be empty".to_string());
+    }
+
+    let description = clamp_commit_status_description(description);
+    if description.is_empty() {
+        return Err("commit status description cannot be empty".to_string());
+    }
+
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "state".to_string(),
+        serde_json::Value::String(state.to_string()),
+    );
+    payload.insert(
+        "context".to_string(),
+        serde_json::Value::String(context.to_string()),
+    );
+    payload.insert(
+        "description".to_string(),
+        serde_json::Value::String(description),
+    );
+    if let Some(target_url) = target_url.map(str::trim).filter(|value| !value.is_empty()) {
+        payload.insert(
+            "target_url".to_string(),
+            serde_json::Value::String(target_url.to_string()),
+        );
+    }
+
+    let mut payload_file = tempfile::NamedTempFile::new()
+        .map_err(|err| format!("failed to create temp payload for commit status: {err}"))?;
+    let payload_text = serde_json::to_string(&serde_json::Value::Object(payload))
+        .map_err(|err| format!("failed to serialize commit status payload: {err}"))?;
+    payload_file
+        .write_all(payload_text.as_bytes())
+        .map_err(|err| format!("failed to write commit status payload: {err}"))?;
+    payload_file
+        .flush()
+        .map_err(|err| format!("failed to flush commit status payload: {err}"))?;
+
+    let endpoint = format!("/repos/{owner_repo}/statuses/{head_sha}");
+    let output = gh_command()
+        .args([
+            "api",
+            &endpoint,
+            "--method",
+            "POST",
+            "--input",
+            &payload_file.path().display().to_string(),
+        ])
+        .output()
+        .map_err(|err| format!("failed to execute gh api for commit status projection: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh api failed setting commit status `{context}` on {head_sha}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(())
 }
 
 pub(super) fn create_issue_comment(
@@ -317,7 +414,25 @@ pub(super) fn enable_auto_merge(repo: &str, pr_number: u32) -> Result<(), String
 
 #[cfg(test)]
 mod tests {
-    use super::{auto_merge_already_enabled, strategy_rejected_by_repo_policy};
+    use super::{
+        MAX_COMMIT_STATUS_DESCRIPTION_CHARS, auto_merge_already_enabled,
+        clamp_commit_status_description, strategy_rejected_by_repo_policy,
+        validate_commit_status_state,
+    };
+
+    #[test]
+    fn commit_status_description_is_truncated_to_github_limit() {
+        let input = "x".repeat(MAX_COMMIT_STATUS_DESCRIPTION_CHARS + 32);
+        let output = clamp_commit_status_description(&input);
+        assert_eq!(output.chars().count(), MAX_COMMIT_STATUS_DESCRIPTION_CHARS);
+    }
+
+    #[test]
+    fn commit_status_state_rejects_unknown_values() {
+        let err =
+            validate_commit_status_state("flaky").expect_err("invalid state should be rejected");
+        assert!(err.contains("expected error|failure|pending|success"));
+    }
 
     #[test]
     fn strategy_rejected_by_repo_policy_detects_merge_disabled() {
