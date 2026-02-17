@@ -711,13 +711,46 @@ pub fn has_receipt_for_job(receipts_dir: &Path, job_id: &str) -> bool {
     scan_receipt_for_job(receipts_dir, job_id).is_some()
 }
 
+/// Find and return a verified receipt for a given `job_id`, if one exists.
+///
+/// Performs the same lookup and integrity verification as
+/// [`has_receipt_for_job`], but returns the full receipt rather than just a
+/// boolean. This is used by reconciliation to recover torn states where a
+/// receipt was persisted but the job was not moved to its terminal directory
+/// (TCK-00564 BLOCKER-2).
+///
+/// The receipt's `content_hash` is verified against the recomputed hash to
+/// prevent tampered receipts from driving recovery actions.
+#[must_use]
+pub fn find_receipt_for_job(receipts_dir: &Path, job_id: &str) -> Option<FacJobReceiptV1> {
+    // Try the index first -- O(1) lookup with full verification.
+    if let Ok(index) = ReceiptIndexV1::load_or_rebuild(receipts_dir) {
+        if let Some(digest) = index.latest_digest_for_job(job_id) {
+            if is_valid_digest(digest) {
+                let receipt_path = receipts_dir.join(format!("{digest}.json"));
+                if let Some(receipt) = load_receipt_bounded(&receipt_path) {
+                    if receipt.job_id == job_id && verify_receipt_integrity(&receipt, digest) {
+                        return Some(receipt);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: bounded directory scan.
+    scan_receipt_for_job(receipts_dir, job_id)
+}
+
 /// Validate that a digest string is a well-formed BLAKE3-256 hex digest.
 ///
-/// Must be exactly 64 lowercase hex characters. Rejects path separators,
-/// `..`, and any non-hex characters to prevent path traversal when the
-/// digest is used as a filename component.
+/// Accepts both bare 64-char lowercase hex strings and `b3-256:`-prefixed
+/// 71-char strings (the canonical format used by
+/// `compute_job_receipt_content_hash` and persisted in receipt `content_hash`
+/// fields). Rejects path separators, `..`, and any non-hex characters to
+/// prevent path traversal when the digest is used as a filename component.
 fn is_valid_digest(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    let hex_part = s.strip_prefix("b3-256:").unwrap_or(s);
+    hex_part.len() == 64 && hex_part.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Verify content-addressed integrity of a loaded receipt against its
@@ -763,6 +796,12 @@ fn load_receipt_bounded(path: &Path) -> Option<FacJobReceiptV1> {
 
 /// Bounded fallback scan: iterate the receipt directory looking for a specific
 /// job ID. Bounded by `MAX_REBUILD_SCAN_FILES`.
+///
+/// Each candidate receipt is verified against its expected digest (derived
+/// from the filename, which is the content hash). Receipts that fail
+/// integrity verification are skipped — this prevents unverified data from
+/// driving terminal routing in worker duplicate handling and reconcile
+/// torn-state repair (MAJOR-1 fix, TCK-00564 round 8).
 fn scan_receipt_for_job(receipts_dir: &Path, job_id: &str) -> Option<FacJobReceiptV1> {
     let entries = std::fs::read_dir(receipts_dir).ok()?;
     let mut visited: usize = 0;
@@ -781,10 +820,28 @@ fn scan_receipt_for_job(receipts_dir: &Path, job_id: &str) -> Option<FacJobRecei
         if path.is_dir() {
             continue;
         }
+        // Derive the expected digest from the filename stem. The receipt
+        // store uses content-addressed naming: `{digest}.json`.
+        let Some(digest_os) = path.file_stem() else {
+            continue;
+        };
+        let Some(expected_digest) = digest_os.to_str() else {
+            continue;
+        };
+        // Reject malformed digests before loading (path traversal + validity).
+        if !is_valid_digest(expected_digest) {
+            continue;
+        }
         let Some(receipt) = load_receipt_bounded(&path) else {
             continue;
         };
         if receipt.job_id != job_id {
+            continue;
+        }
+        // Verify content-addressed integrity: recompute BLAKE3 hash and
+        // compare against the filename-derived digest. Never trust the
+        // receipt's self-reported content_hash field (INV-PC-001).
+        if !verify_receipt_integrity(&receipt, expected_digest) {
             continue;
         }
         // Keep the receipt with the latest timestamp.
@@ -850,6 +907,25 @@ mod tests {
             timestamp_secs: timestamp,
             content_hash: content_hash.to_string(),
         }
+    }
+
+    /// Create a receipt with a properly computed content hash and persist it
+    /// to the receipt store with the correct content-addressed filename.
+    /// Returns the receipt (with `content_hash` set) and the filename stem
+    /// (the integrity digest).
+    fn make_and_persist_receipt(
+        receipts_dir: &std::path::Path,
+        job_id: &str,
+        timestamp: u64,
+    ) -> (FacJobReceiptV1, String) {
+        use crate::fac::receipt::compute_job_receipt_content_hash;
+
+        let mut receipt = make_receipt(job_id, "", timestamp);
+        let integrity_hash = compute_job_receipt_content_hash(&receipt);
+        receipt.content_hash = integrity_hash.clone();
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{integrity_hash}.json")), &bytes).expect("write");
+        (receipt, integrity_hash)
     }
 
     #[test]
@@ -1199,10 +1275,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let receipts_dir = tmp.path();
 
-        // Write a receipt file.
-        let r1 = make_receipt("job-1", "hash-1", 1000);
-        let bytes = serde_json::to_vec_pretty(&r1).expect("ser");
-        std::fs::write(receipts_dir.join("hash-1.json"), &bytes).expect("write");
+        // Write a receipt file with correct content-addressed filename.
+        let (r1, _digest) = make_and_persist_receipt(receipts_dir, "job-1", 1000);
 
         // Build the index.
         let index = ReceiptIndexV1::rebuild_from_store(receipts_dir).expect("rebuild");
@@ -1213,7 +1287,7 @@ mod tests {
         assert!(found.is_some(), "should find receipt for job-1");
         let receipt = found.unwrap();
         assert_eq!(receipt.job_id, "job-1");
-        assert_eq!(receipt.content_hash, "hash-1");
+        assert_eq!(receipt.content_hash, r1.content_hash);
     }
 
     #[test]
@@ -1221,10 +1295,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let receipts_dir = tmp.path();
 
-        // Write a receipt file but do NOT build the index.
-        let r1 = make_receipt("job-fallback", "hash-fallback", 2000);
-        let bytes = serde_json::to_vec_pretty(&r1).expect("ser");
-        std::fs::write(receipts_dir.join("hash-fallback.json"), &bytes).expect("write");
+        // Write a receipt file with correct content-addressed filename
+        // but do NOT build the index.
+        let (_r1, _digest) = make_and_persist_receipt(receipts_dir, "job-fallback", 2000);
 
         // Lookup should still work via fallback scan (and auto-rebuild).
         let found = lookup_job_receipt(receipts_dir, "job-fallback");
@@ -1281,9 +1354,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let receipts_dir = tmp.path();
 
-        let r1 = make_receipt("job-exists", "hash-exists", 1000);
-        let bytes = serde_json::to_vec_pretty(&r1).expect("ser");
-        std::fs::write(receipts_dir.join("hash-exists.json"), &bytes).expect("write");
+        let (_r1, _digest) = make_and_persist_receipt(receipts_dir, "job-exists", 1000);
 
         // Build the index.
         let index = ReceiptIndexV1::rebuild_from_store(receipts_dir).expect("rebuild");
@@ -1309,10 +1380,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let receipts_dir = tmp.path();
 
-        // Write receipt file but do NOT build the index.
-        let r1 = make_receipt("job-scan", "hash-scan", 2000);
-        let bytes = serde_json::to_vec_pretty(&r1).expect("ser");
-        std::fs::write(receipts_dir.join("hash-scan.json"), &bytes).expect("write");
+        // Write receipt file with correct content-addressed filename
+        // but do NOT build the index.
+        let (_r1, _digest) = make_and_persist_receipt(receipts_dir, "job-scan", 2000);
 
         assert!(
             has_receipt_for_job(receipts_dir, "job-scan"),
@@ -1572,6 +1642,254 @@ mod tests {
         assert!(
             !verify_receipt_integrity(&receipt, fake_digest),
             "must not trust receipt's self-reported content_hash"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00564 MAJOR-1 regression: is_valid_digest must accept b3-256: prefix
+    // =========================================================================
+
+    #[test]
+    fn test_is_valid_digest_accepts_b3_256_prefixed() {
+        // Canonical format used by compute_job_receipt_content_hash.
+        assert!(is_valid_digest(
+            "b3-256:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2"
+        ));
+        assert!(is_valid_digest(
+            "b3-256:0000000000000000000000000000000000000000000000000000000000000000"
+        ));
+        assert!(is_valid_digest(
+            "b3-256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        ));
+    }
+
+    #[test]
+    fn test_is_valid_digest_rejects_malformed_b3_256() {
+        // Wrong prefix.
+        assert!(!is_valid_digest(
+            "b3-512:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2"
+        ));
+        // Prefix with too-short hex.
+        assert!(!is_valid_digest("b3-256:abcdef"));
+        // Prefix with non-hex chars.
+        assert!(!is_valid_digest(
+            "b3-256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        ));
+        // Prefix with path traversal.
+        assert!(!is_valid_digest("b3-256:../../../etc/passwd"));
+    }
+
+    #[test]
+    fn test_lookup_job_receipt_succeeds_with_b3_256_prefixed_content_hash() {
+        // Regression test for MAJOR-1 (TCK-00564): index lookup must succeed
+        // when receipt content_hash uses the canonical b3-256: prefix format.
+        use crate::fac::receipt::compute_job_receipt_content_hash;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create a receipt with a correct b3-256:-prefixed content hash.
+        let mut receipt = make_receipt("job-b3-prefix", "placeholder", 5000);
+        let hash = compute_job_receipt_content_hash(&receipt);
+        assert!(
+            hash.starts_with("b3-256:"),
+            "content hash must be b3-256:-prefixed"
+        );
+        receipt.content_hash = hash.clone();
+
+        // Persist receipt file using the prefixed hash as filename (production format).
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{hash}.json")), &bytes).expect("write");
+
+        // Build index with b3-256:-prefixed content_hash (via from_receipt).
+        let mut index = ReceiptIndexV1::new();
+        let header = ReceiptHeaderV1::from_receipt(&receipt);
+        assert!(
+            header.content_hash.starts_with("b3-256:"),
+            "header content_hash must preserve b3-256: prefix"
+        );
+        index.upsert(header).expect("upsert");
+        index.persist(receipts_dir).expect("persist");
+
+        // lookup_job_receipt must succeed via the index path, NOT the fallback scan.
+        let found = lookup_job_receipt(receipts_dir, "job-b3-prefix");
+        assert!(
+            found.is_some(),
+            "lookup must succeed for b3-256:-prefixed digest in index"
+        );
+        let found_receipt = found.unwrap();
+        assert_eq!(found_receipt.job_id, "job-b3-prefix");
+        assert_eq!(found_receipt.content_hash, hash);
+    }
+
+    #[test]
+    fn test_has_receipt_for_job_succeeds_with_b3_256_prefixed_content_hash() {
+        // Regression test for MAJOR-1 (TCK-00564): has_receipt_for_job must
+        // succeed when receipt content_hash uses the canonical b3-256: prefix.
+        use crate::fac::receipt::compute_job_receipt_content_hash;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let mut receipt = make_receipt("job-has-b3", "placeholder", 6000);
+        let hash = compute_job_receipt_content_hash(&receipt);
+        receipt.content_hash = hash.clone();
+
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{hash}.json")), &bytes).expect("write");
+
+        let mut index = ReceiptIndexV1::new();
+        index
+            .upsert(ReceiptHeaderV1::from_receipt(&receipt))
+            .expect("upsert");
+        index.persist(receipts_dir).expect("persist");
+
+        assert!(
+            has_receipt_for_job(receipts_dir, "job-has-b3"),
+            "has_receipt_for_job must succeed for b3-256:-prefixed digest in index"
+        );
+    }
+
+    #[test]
+    fn test_find_receipt_for_job_succeeds_with_b3_256_prefixed_content_hash() {
+        // Regression test for MAJOR-1 (TCK-00564): find_receipt_for_job must
+        // succeed when receipt content_hash uses the canonical b3-256: prefix.
+        use crate::fac::receipt::compute_job_receipt_content_hash;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let mut receipt = make_receipt("job-find-b3", "placeholder", 7000);
+        let hash = compute_job_receipt_content_hash(&receipt);
+        receipt.content_hash = hash.clone();
+
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{hash}.json")), &bytes).expect("write");
+
+        let mut index = ReceiptIndexV1::new();
+        index
+            .upsert(ReceiptHeaderV1::from_receipt(&receipt))
+            .expect("upsert");
+        index.persist(receipts_dir).expect("persist");
+
+        let found = find_receipt_for_job(receipts_dir, "job-find-b3");
+        assert!(
+            found.is_some(),
+            "find_receipt_for_job must succeed for b3-256:-prefixed digest in index"
+        );
+        assert_eq!(found.unwrap().job_id, "job-find-b3");
+    }
+
+    // =========================================================================
+    // MAJOR-1 round 8: fallback scan verifies receipt integrity
+    // =========================================================================
+
+    #[test]
+    fn test_fallback_scan_rejects_tampered_receipt() {
+        // Regression test for MAJOR-1 (TCK-00564 round 8): the fallback scan
+        // path in find_receipt_for_job and has_receipt_for_job must verify
+        // receipt integrity against the filename-derived digest. A tampered
+        // receipt whose content does not match its filename hash must be
+        // rejected.
+        use crate::fac::receipt::compute_job_receipt_content_hash;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create a valid receipt and compute its real content hash.
+        let mut receipt = make_receipt("job-tampered-scan", "placeholder", 8000);
+        let real_hash = compute_job_receipt_content_hash(&receipt);
+        receipt.content_hash = real_hash.clone();
+
+        // Write the receipt with the CORRECT filename.
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{real_hash}.json")), &bytes).expect("write");
+
+        // Tamper with the receipt payload: change the reason field so the
+        // content no longer matches the filename hash.
+        receipt.reason = "tampered-payload-should-not-verify".to_string();
+        let tampered_bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        // Overwrite the file with tampered content (filename stays the same).
+        std::fs::write(
+            receipts_dir.join(format!("{real_hash}.json")),
+            &tampered_bytes,
+        )
+        .expect("write");
+
+        // Do NOT build an index — force the fallback scan path.
+        // find_receipt_for_job must reject the tampered receipt.
+        let found = find_receipt_for_job(receipts_dir, "job-tampered-scan");
+        assert!(
+            found.is_none(),
+            "fallback scan must reject receipt with tampered payload"
+        );
+
+        // has_receipt_for_job must also reject it.
+        assert!(
+            !has_receipt_for_job(receipts_dir, "job-tampered-scan"),
+            "has_receipt_for_job must reject tampered receipt in fallback scan"
+        );
+    }
+
+    #[test]
+    fn test_fallback_scan_accepts_valid_receipt() {
+        // Positive test: fallback scan accepts a receipt whose content matches
+        // its filename-derived digest.
+        use crate::fac::receipt::compute_job_receipt_content_hash;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create a receipt with correct content hash as filename.
+        let mut receipt = make_receipt("job-valid-scan", "placeholder", 9000);
+        let hash = compute_job_receipt_content_hash(&receipt);
+        receipt.content_hash = hash.clone();
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{hash}.json")), &bytes).expect("write");
+
+        // Do NOT build an index — force fallback scan.
+        let found = find_receipt_for_job(receipts_dir, "job-valid-scan");
+        assert!(
+            found.is_some(),
+            "fallback scan must accept receipt with valid integrity"
+        );
+        assert_eq!(found.unwrap().job_id, "job-valid-scan");
+
+        assert!(
+            has_receipt_for_job(receipts_dir, "job-valid-scan"),
+            "has_receipt_for_job must accept valid receipt in fallback scan"
+        );
+    }
+
+    #[test]
+    fn test_fallback_scan_with_index_miss_and_tampered_receipt() {
+        // Regression test: index exists but doesn't have the job (index miss),
+        // fallback scan finds a tampered receipt — must reject it.
+        use crate::fac::receipt::compute_job_receipt_content_hash;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create and write a valid receipt.
+        let mut receipt = make_receipt("job-index-miss", "placeholder", 10000);
+        let hash = compute_job_receipt_content_hash(&receipt);
+        receipt.content_hash = hash.clone();
+
+        // Write tampered content under the correct hash filename.
+        receipt.reason = "tampered-after-write".to_string();
+        let tampered_bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{hash}.json")), &tampered_bytes).expect("write");
+
+        // Build an index that does NOT contain this job (simulating index miss).
+        let index = ReceiptIndexV1::new();
+        index.persist(receipts_dir).expect("persist");
+
+        // find_receipt_for_job must reject the tampered receipt even when
+        // the index exists but doesn't have this job.
+        let found = find_receipt_for_job(receipts_dir, "job-index-miss");
+        assert!(
+            found.is_none(),
+            "must reject tampered receipt after index miss"
         );
     }
 }

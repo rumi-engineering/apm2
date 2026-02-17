@@ -145,6 +145,8 @@ pub mod quarantine;
 mod receipt;
 /// Non-authoritative, rebuildable receipt index for fast job/receipt lookup.
 pub mod receipt_index;
+/// Atomic receipt write pipeline for crash-safe job completion (TCK-00564).
+pub mod receipt_pipeline;
 /// Crash recovery and reconciliation for queue/lane state on worker startup
 /// (TCK-00534).
 pub mod reconcile;
@@ -409,7 +411,14 @@ pub use receipt::{
 pub use receipt_index::{
     INDEX_FILE_NAME, INDEX_SUBDIR, MAX_INDEX_ENTRIES, MAX_INDEX_FILE_SIZE, MAX_JOB_INDEX_ENTRIES,
     MAX_REBUILD_SCAN_FILES, RECEIPT_INDEX_SCHEMA, ReceiptHeaderV1, ReceiptIndexError,
-    ReceiptIndexV1, has_receipt_for_job, list_receipt_headers, lookup_job_receipt,
+    ReceiptIndexV1, find_receipt_for_job, has_receipt_for_job, list_receipt_headers,
+    lookup_job_receipt,
+};
+// Re-export receipt pipeline types (TCK-00564)
+pub use receipt_pipeline::{
+    CommitResult, RECOVERY_RECEIPT_SCHEMA, ReceiptPipelineError, ReceiptWritePipeline,
+    RecoveryReceiptV1, TerminalState, move_job_to_terminal, outcome_to_terminal_state,
+    receipt_exists_for_job, rename_noreplace,
 };
 // Re-export reconcile types (TCK-00534)
 pub use reconcile::{

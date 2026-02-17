@@ -29,11 +29,12 @@ use super::state::{
     write_review_run_completion_receipt_for_home, write_review_run_state,
 };
 use super::types::{
-    ExecutionContext, LIVENESS_REPORT_INTERVAL, LOOP_SLEEP, MAX_RESTART_ATTEMPTS,
-    PULSE_POLL_INTERVAL, ReviewKind, ReviewModelSelection, ReviewRunState, ReviewRunStatus,
-    ReviewRunSummary, ReviewRunType, ReviewStateEntry, STALL_THRESHOLD, SingleReviewResult,
-    SingleReviewSummary, SpawnMode, apm2_home_dir, is_verdict_finalized_agent_stop_reason,
-    now_iso8601, split_owner_repo, validate_expected_head_sha,
+    DISPATCH_LOCK_ACQUIRE_TIMEOUT, ExecutionContext, LIVENESS_REPORT_INTERVAL, LOOP_SLEEP,
+    MAX_RESTART_ATTEMPTS, PULSE_POLL_INTERVAL, ReviewKind, ReviewModelSelection, ReviewRunState,
+    ReviewRunStatus, ReviewRunSummary, ReviewRunType, ReviewStateEntry, STALL_THRESHOLD,
+    SingleReviewResult, SingleReviewSummary, SpawnMode, apm2_home_dir,
+    is_verdict_finalized_agent_stop_reason, now_iso8601, split_owner_repo,
+    validate_expected_head_sha,
 };
 use super::verdict_projection::resolve_completion_signal_from_projection_for_home;
 
@@ -42,6 +43,7 @@ const MAX_MISSING_VERDICT_NUDGES: u32 = 1;
 const MISSING_VERDICT_NUDGE_PROMPT_MAX_BYTES: u64 = 64 * 1024;
 const MISSING_VERDICT_NUDGE_PROMPT_MAX_CHARS: usize = 4_000;
 const MISSING_VERDICT_NUDGE_DISABLE_ENV: &str = "APM2_FAC_DISABLE_NUDGE";
+const REVIEW_LEASE_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STALE_TEMP_FILE_PREFIXES: [&str; 3] = [
     "apm2_fac_review_",
     "apm2_fac_prompt_",
@@ -80,6 +82,56 @@ fn required_verdict_command(review_kind: ReviewKind) -> String {
         "cargo run -p apm2-cli -- fac review verdict set --dimension {} --verdict <approve|deny> --reason \"<your synthesized reasoning>\" --json",
         verdict_dimension_for_kind(review_kind)
     )
+}
+
+fn seeded_pending_run_identity(
+    existing_state: Option<&ReviewRunState>,
+    current_head_sha: &str,
+    pr_number: u32,
+    review_type: &str,
+) -> Option<(u32, String)> {
+    let state = existing_state?;
+    if !state.head_sha.eq_ignore_ascii_case(current_head_sha) {
+        return None;
+    }
+    if state.status != ReviewRunStatus::Pending || state.pid.is_some() {
+        return None;
+    }
+    let sequence_number = state.sequence_number.max(1);
+    let run_id = if state.run_id.trim().is_empty() {
+        build_review_run_id(pr_number, review_type, sequence_number, current_head_sha)
+    } else {
+        state.run_id.clone()
+    };
+    Some((sequence_number, run_id))
+}
+
+fn should_dedupe_on_lease_contention(
+    current_head_sha: &str,
+    existing_state: Option<&ReviewRunState>,
+    existing_entry: Option<&ReviewStateEntry>,
+) -> bool {
+    if existing_entry.is_some() {
+        return true;
+    }
+    existing_state.is_some_and(|state| {
+        state.head_sha.eq_ignore_ascii_case(current_head_sha)
+            && state_references_live_process_identity(state)
+    })
+}
+
+fn state_references_live_process_identity(state: &ReviewRunState) -> bool {
+    let Some(pid) = state.pid else {
+        return false;
+    };
+    if !super::state::is_process_alive(pid) {
+        return false;
+    }
+    let Some(expected_start) = state.proc_start_time else {
+        return false;
+    };
+    super::state::get_process_start_time(pid)
+        .is_some_and(|observed_start| observed_start == expected_start)
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -726,9 +778,8 @@ fn run_single_review(
     let mut restart_count: u32 = 0;
     let review_started = Instant::now();
     let review_type = review_kind.as_str();
-    let sequence_number = next_review_sequence_number(pr_number, review_type)?;
-    let run_id = build_review_run_id(pr_number, review_type, sequence_number, &current_head_sha);
-    if let Some(previous) = load_review_run_state_strict(pr_number, review_type)? {
+    let previous_state = load_review_run_state_strict(pr_number, review_type)?;
+    if let Some(previous) = previous_state.as_ref() {
         if previous.head_sha.eq_ignore_ascii_case(&current_head_sha)
             && previous.status.is_terminal()
             && !force
@@ -741,6 +792,19 @@ fn run_single_review(
             ));
         }
     }
+    let (sequence_number, run_id) = if let Some(identity) = seeded_pending_run_identity(
+        previous_state.as_ref(),
+        &current_head_sha,
+        pr_number,
+        review_type,
+    ) {
+        identity
+    } else {
+        let sequence_number = next_review_sequence_number(pr_number, review_type)?;
+        let run_id =
+            build_review_run_id(pr_number, review_type, sequence_number, &current_head_sha);
+        (sequence_number, run_id)
+    };
     let mut run_state = ReviewRunState {
         run_id: run_id.clone(),
         owner_repo: owner_repo.to_string(),
@@ -783,48 +847,80 @@ fn run_single_review(
             )
         };
 
-    let Some(_lease) = try_acquire_review_lease(owner_repo, pr_number, review_type)? else {
+    let lease_wait_started = Instant::now();
+    let _lease = loop {
+        if let Some(lease) = try_acquire_review_lease(owner_repo, pr_number, review_type)? {
+            break lease;
+        }
         let existing_state = load_review_run_state_strict(pr_number, review_type)?;
         let existing = find_active_review_entry(pr_number, review_type, Some(&current_head_sha))?;
-        emit_run_event(
-            "run_deduplicated",
+        if should_dedupe_on_lease_contention(
             &current_head_sha,
-            serde_json::json!({
-                "reason": "active_review_for_same_type",
-                "existing_pid": existing.as_ref().map(|entry| entry.pid),
-                "existing_sha": existing.as_ref().map(|entry| entry.head_sha.clone()),
-                "existing_run_id": existing_state.as_ref().map(|state| state.run_id.clone()),
-            }),
-        )?;
-        let model = existing
-            .as_ref()
-            .map_or_else(|| current_model.model.clone(), |entry| entry.model.clone());
-        let backend = existing.as_ref().map_or_else(
-            || current_model.backend.as_str().to_string(),
-            |entry| entry.backend.as_str().to_string(),
-        );
-        let restart_count = existing.as_ref().map_or(0, |entry| entry.restart_count);
-        return Ok(SingleReviewResult {
-            summary: build_single_review_summary(
-                existing_state
-                    .as_ref()
-                    .map_or(&run_id, |state| state.run_id.as_str()),
-                existing_state
-                    .as_ref()
-                    .map_or(sequence_number, |state| state.sequence_number),
-                ReviewRunStatus::Alive,
-                review_type,
-                true,
-                "DEDUPED".to_string(),
-                Some("active_review_for_same_type".to_string()),
-                &model,
-                &backend,
-                review_started.elapsed().as_secs(),
-                restart_count,
-                None,
-            ),
-            final_head_sha: current_head_sha,
-        });
+            existing_state.as_ref(),
+            existing.as_ref(),
+        ) {
+            emit_run_event(
+                "run_deduplicated",
+                &current_head_sha,
+                serde_json::json!({
+                    "reason": "active_review_for_same_type",
+                    "existing_pid": existing.as_ref().map(|entry| entry.pid),
+                    "existing_sha": existing.as_ref().map(|entry| entry.head_sha.clone()),
+                    "existing_run_id": existing_state.as_ref().map(|state| state.run_id.clone()),
+                    "existing_state_pid": existing_state.as_ref().and_then(|state| state.pid),
+                    "existing_state_proc_start_time": existing_state
+                        .as_ref()
+                        .and_then(|state| state.proc_start_time),
+                }),
+            )?;
+            let model = existing
+                .as_ref()
+                .map_or_else(|| current_model.model.clone(), |entry| entry.model.clone());
+            let backend = existing.as_ref().map_or_else(
+                || current_model.backend.as_str().to_string(),
+                |entry| entry.backend.as_str().to_string(),
+            );
+            let restart_count = existing.as_ref().map_or(0, |entry| entry.restart_count);
+            return Ok(SingleReviewResult {
+                summary: build_single_review_summary(
+                    existing_state
+                        .as_ref()
+                        .map_or(&run_id, |state| state.run_id.as_str()),
+                    existing_state
+                        .as_ref()
+                        .map_or(sequence_number, |state| state.sequence_number),
+                    ReviewRunStatus::Alive,
+                    review_type,
+                    true,
+                    "DEDUPED".to_string(),
+                    Some("active_review_for_same_type".to_string()),
+                    &model,
+                    &backend,
+                    review_started.elapsed().as_secs(),
+                    restart_count,
+                    None,
+                ),
+                final_head_sha: current_head_sha,
+            });
+        }
+        if lease_wait_started.elapsed() >= DISPATCH_LOCK_ACQUIRE_TIMEOUT {
+            let state_detail = existing_state.as_ref().map_or_else(
+                || "state=none".to_string(),
+                |state| {
+                    format!(
+                        "state.run_id={} state.status={} state.pid={:?} state.head_sha={}",
+                        state.run_id,
+                        state.status.as_str(),
+                        state.pid,
+                        state.head_sha,
+                    )
+                },
+            );
+            return Err(format!(
+                "review lease contention unresolved for PR #{pr_number} type={review_type} head={current_head_sha} after {DISPATCH_LOCK_ACQUIRE_TIMEOUT:?}; {state_detail}"
+            ));
+        }
+        thread::sleep(REVIEW_LEASE_HANDOFF_POLL_INTERVAL);
     };
     write_pulse_file(pr_number, review_type, &current_head_sha, Some(&run_id))?;
     let run_key = build_run_key(pr_number, review_type, &current_head_sha);
@@ -1697,10 +1793,72 @@ fn run_single_review(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use chrono::Utc;
+
     use super::{
         MISSING_VERDICT_NUDGE_PROMPT_MAX_CHARS, ReviewKind, build_missing_verdict_nudge_message,
-        required_verdict_command,
+        required_verdict_command, seeded_pending_run_identity, should_dedupe_on_lease_contention,
     };
+    use crate::commands::fac_review::types::{
+        ReviewBackend, ReviewRunState, ReviewRunStatus, ReviewStateEntry,
+    };
+
+    fn sample_run_state() -> ReviewRunState {
+        ReviewRunState {
+            run_id: "pr441-security-s2-01234567".to_string(),
+            owner_repo: "example/repo".to_string(),
+            pr_number: 441,
+            head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            review_type: "security".to_string(),
+            reviewer_role: "fac_reviewer".to_string(),
+            started_at: "2026-02-17T00:00:00Z".to_string(),
+            status: ReviewRunStatus::Pending,
+            terminal_reason: None,
+            model_id: Some("gpt-5.3-codex".to_string()),
+            backend_id: Some("codex".to_string()),
+            restart_count: 0,
+            nudge_count: 0,
+            sequence_number: 2,
+            previous_run_id: None,
+            previous_head_sha: None,
+            pid: None,
+            proc_start_time: None,
+            integrity_hmac: None,
+        }
+    }
+
+    fn sample_review_entry(pid: u32) -> ReviewStateEntry {
+        ReviewStateEntry {
+            pid,
+            started_at: Utc::now(),
+            log_file: PathBuf::from("/tmp/review.log"),
+            prompt_file: None,
+            last_message_file: None,
+            review_type: "security".to_string(),
+            pr_number: 441,
+            owner_repo: "example/repo".to_string(),
+            head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            restart_count: 0,
+            model: "gpt-5.3-codex".to_string(),
+            backend: ReviewBackend::Codex,
+            temp_files: Vec::new(),
+            run_id: "pr441-security-s2-01234567".to_string(),
+            sequence_number: 2,
+            terminal_reason: None,
+            model_id: Some("gpt-5.3-codex".to_string()),
+            backend_id: Some("codex".to_string()),
+            status: ReviewRunStatus::Alive,
+        }
+    }
+
+    fn sample_run_state_with_pid(pid: u32, proc_start_time: Option<u64>) -> ReviewRunState {
+        let mut state = sample_run_state();
+        state.pid = Some(pid);
+        state.proc_start_time = proc_start_time;
+        state
+    }
 
     #[test]
     fn required_verdict_command_uses_code_quality_dimension_for_quality_reviews() {
@@ -1723,5 +1881,142 @@ mod tests {
         assert!(message.contains("cargo run -p apm2-cli -- fac review verdict set"));
         assert!(message.contains("--dimension security"));
         assert!(message.contains("...[truncated]"));
+    }
+
+    #[test]
+    fn seeded_pending_run_identity_reuses_seeded_state() {
+        let state = sample_run_state();
+        let identity = seeded_pending_run_identity(
+            Some(&state),
+            "0123456789abcdef0123456789abcdef01234567",
+            441,
+            "security",
+        )
+        .expect("expected seeded identity");
+        assert_eq!(identity.0, 2);
+        assert_eq!(identity.1, "pr441-security-s2-01234567");
+    }
+
+    #[test]
+    fn seeded_pending_run_identity_rejects_non_pending_or_pid_bound_state() {
+        let mut terminal = sample_run_state();
+        terminal.status = ReviewRunStatus::Done;
+        assert!(
+            seeded_pending_run_identity(
+                Some(&terminal),
+                "0123456789abcdef0123456789abcdef01234567",
+                441,
+                "security",
+            )
+            .is_none()
+        );
+
+        let mut pid_bound = sample_run_state();
+        pid_bound.pid = Some(std::process::id());
+        assert!(
+            seeded_pending_run_identity(
+                Some(&pid_bound),
+                "0123456789abcdef0123456789abcdef01234567",
+                441,
+                "security",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn lease_contention_without_active_reviewer_must_not_dedupe() {
+        let state = sample_run_state();
+        assert!(
+            !should_dedupe_on_lease_contention(
+                "0123456789abcdef0123456789abcdef01234567",
+                Some(&state),
+                None,
+            ),
+            "pending/no-pid state without active entry must not dedupe"
+        );
+    }
+
+    #[test]
+    fn lease_contention_with_active_entry_dedupes() {
+        // Spawn an ephemeral process to provide a known-live pid.
+        let mut child = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .expect("spawn helper process");
+        let entry = sample_review_entry(child.id());
+        assert!(should_dedupe_on_lease_contention(
+            "0123456789abcdef0123456789abcdef01234567",
+            None,
+            Some(&entry),
+        ));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn lease_contention_with_identity_matched_state_dedupes() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .expect("spawn helper process");
+        let proc_start_time =
+            crate::commands::fac_review::state::get_process_start_time(child.id())
+                .expect("read process start time");
+        let state = sample_run_state_with_pid(child.id(), Some(proc_start_time));
+
+        assert!(should_dedupe_on_lease_contention(
+            "0123456789abcdef0123456789abcdef01234567",
+            Some(&state),
+            None,
+        ));
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn lease_contention_with_pid_reuse_style_mismatch_must_not_dedupe() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .expect("spawn helper process");
+        let proc_start_time =
+            crate::commands::fac_review::state::get_process_start_time(child.id())
+                .expect("read process start time");
+        let state = sample_run_state_with_pid(child.id(), Some(proc_start_time + 1));
+
+        assert!(
+            !should_dedupe_on_lease_contention(
+                "0123456789abcdef0123456789abcdef01234567",
+                Some(&state),
+                None,
+            ),
+            "mismatched proc_start_time must not dedupe"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn lease_contention_with_missing_proc_start_time_must_not_dedupe() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .expect("spawn helper process");
+        let state = sample_run_state_with_pid(child.id(), None);
+
+        assert!(
+            !should_dedupe_on_lease_contention(
+                "0123456789abcdef0123456789abcdef01234567",
+                Some(&state),
+                None,
+            ),
+            "missing proc_start_time must not dedupe state-only contention"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
