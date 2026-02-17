@@ -1659,6 +1659,49 @@ pre-populating build caches in the lane target namespace.
   `execute_warm`/`execute_warm_phase` and runs synchronously on the same
   thread (no cross-thread sharing).
 
+## receipt_merge Submodule (TCK-00543)
+
+The `receipt_merge` submodule implements set-union merge for receipt directories.
+It copies receipts from a source directory into a target directory, skipping
+duplicates (same digest already present). The merge emits a structured audit
+report containing: receipts copied, duplicates skipped, job_id mismatches
+(same digest with different job_id, which should never happen and indicates
+corruption), and parse failures.
+
+### Key Types
+
+- `MergeAuditReport`: Full merge result with statistics and anomalies.
+- `MergedReceiptHeader`: Per-receipt header with origin tracking (`source`,
+  `target`, or `both`).
+- `JobIdMismatch`: Corruption indicator: same digest, different job_id.
+- `ParseFailure`: File that could not be parsed as a valid receipt.
+- `ReceiptMergeError`: Error taxonomy for merge operations.
+
+### Core Capabilities
+
+- Set-union merge on receipt digests (idempotent).
+- Deterministic presentation ordering: `timestamp_secs` descending, then
+  `content_hash` ascending for tiebreaking.
+- Atomic writes using temp+rename protocol.
+- Bounded directory scans (`MAX_MERGE_SCAN_FILES = 65,536`).
+- Content-hash integrity verification (recomputes BLAKE3, never trusts
+  self-reported `content_hash`).
+- Symlink-safe reads via `O_NOFOLLOW`.
+
+### Security Invariants (TCK-00543)
+
+- [INV-MERGE-001] All receipt reads are bounded by `MAX_JOB_RECEIPT_SIZE`
+  (64 KiB) to prevent memory exhaustion.
+- [INV-MERGE-002] Digest filenames are validated before use as filesystem
+  path components (path traversal prevention).
+- [INV-MERGE-003] Content-hash integrity is verified by recomputing the
+  BLAKE3 hash (v1 and v2) before accepting any receipt.
+- [INV-MERGE-004] Directory scans are bounded by `MAX_MERGE_SCAN_FILES`
+  to prevent unbounded traversal.
+- [INV-MERGE-005] Writes use atomic temp+rename to prevent partial files.
+- [INV-MERGE-006] Parse failures and job_id mismatches are bounded in the
+  audit report (`MAX_PARSE_FAILURES`, `MAX_JOB_ID_MISMATCHES`).
+
 ## receipt_pipeline Submodule (TCK-00564)
 
 The `receipt_pipeline` submodule implements an atomic commit protocol for job

@@ -410,6 +410,13 @@ Security invariants:
   the receipt index to entries at or after the given UNIX epoch. Deterministic ordering is
   enforced: primary sort by `timestamp_secs` descending, secondary sort by `content_hash`
   ascending for stable tie-breaking. Boundary inclusion is verified by regression test.
+- **Receipts merge** (`fac.rs`, TCK-00543): `apm2 fac receipts merge --from <dir> --into <dir>`
+  performs set-union merge on receipt digests. Copies receipts from the source directory into
+  the target directory only if they do not already exist there. Emits an audit report with:
+  duplicates skipped, receipts copied, job_id mismatches (same digest, different job_id),
+  and parse failures. Deterministic presentation ordering: `timestamp_secs` descending,
+  `content_hash` ascending for tiebreaking. All reads are bounded by `MAX_MERGE_SCAN_FILES`
+  (65,536). Writes use atomic temp+rename. Supports `--json` output.
 
 ## Policy CLI Invariants (Updated for TCK-00561 fix round 2)
 
