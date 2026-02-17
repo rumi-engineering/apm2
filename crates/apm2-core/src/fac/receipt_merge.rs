@@ -354,7 +354,12 @@ fn scan_receipt_dir(
             continue;
         }
 
-        receipts.insert(expected_digest.to_string(), receipt);
+        // Normalize digest to canonical `b3-256:<hex>` form so that
+        // bare-hex and prefixed filenames for the same hash map to the
+        // same key. This prevents duplicate-detection bypass when source
+        // and target use different filename forms for the same receipt.
+        let canonical_key = normalize_digest(expected_digest);
+        receipts.insert(canonical_key, receipt);
     }
 
     Ok(receipts)
@@ -903,5 +908,117 @@ mod tests {
             !target_meta.file_type().is_symlink(),
             "target path should be a regular file, not a symlink"
         );
+    }
+
+    /// Regression test for f-732-security-1771363955822169-0:
+    /// Mixed digest filename forms (bare hex vs `b3-256:`-prefixed) for the
+    /// same logical receipt must be detected as duplicates.
+    ///
+    /// Previously, scan maps used the raw filename stem as the key, so a
+    /// bare-hex file in source and a `b3-256:`-prefixed file in target (or
+    /// vice versa) would not match. This test asserts that
+    /// `duplicates_skipped` increments and no extra copy occurs when the
+    /// same receipt hash appears in mixed filename forms across source and
+    /// target.
+    #[test]
+    fn test_mixed_digest_filename_forms_detected_as_duplicate() {
+        let source = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+
+        let receipt = make_test_receipt("job-mixed-form", 9000);
+        let prefixed_hash = &receipt.content_hash; // `b3-256:<hex>`
+        let bare_hex = prefixed_hash
+            .strip_prefix("b3-256:")
+            .expect("hash should have b3-256: prefix");
+
+        // Persist to source using bare-hex filename form.
+        let bare_path = source.path().join(format!("{bare_hex}.json"));
+        let body = serde_json::to_vec_pretty(&receipt).expect("serialize");
+        fs::write(&bare_path, &body).expect("write bare-hex receipt to source");
+
+        // Persist to target using `b3-256:`-prefixed filename form.
+        let prefixed_path = target.path().join(format!("{prefixed_hash}.json"));
+        fs::write(&prefixed_path, &body).expect("write prefixed receipt to target");
+
+        let report =
+            merge_receipt_dirs(source.path(), target.path()).expect("merge should succeed");
+
+        // The same logical receipt in mixed forms must be detected as a
+        // duplicate, not treated as a new receipt.
+        assert_eq!(
+            report.duplicates_skipped, 1,
+            "mixed-form duplicate must be detected: got {report:?}"
+        );
+        assert_eq!(
+            report.receipts_copied, 0,
+            "no extra copy should occur for mixed-form duplicate: got {report:?}"
+        );
+        assert!(
+            report.parse_failures.is_empty(),
+            "no parse failures expected: {:?}",
+            report.parse_failures
+        );
+        // Only one merged header since it is the same logical receipt.
+        assert_eq!(
+            report.merged_headers.len(),
+            1,
+            "only one merged header for a single logical receipt: got {report:?}"
+        );
+        assert_eq!(report.merged_headers[0].origin, "both");
+
+        // Verify no extra file was written to target: only the original
+        // prefixed file should exist (no bare-hex copy).
+        let target_files: Vec<_> = fs::read_dir(target.path())
+            .expect("read target dir")
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        assert_eq!(
+            target_files.len(),
+            1,
+            "target should contain exactly one receipt file, not a duplicate: {:?}",
+            target_files
+                .iter()
+                .map(std::fs::DirEntry::path)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression test: mixed forms in the reverse direction (prefixed in
+    /// source, bare-hex in target) must also be detected as duplicates.
+    #[test]
+    fn test_mixed_digest_filename_forms_reverse_direction() {
+        let source = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+
+        let receipt = make_test_receipt("job-mixed-reverse", 8000);
+        let prefixed_hash = &receipt.content_hash;
+        let bare_hex = prefixed_hash
+            .strip_prefix("b3-256:")
+            .expect("hash should have b3-256: prefix");
+
+        // Persist to source using `b3-256:`-prefixed filename form.
+        let prefixed_path = source.path().join(format!("{prefixed_hash}.json"));
+        let body = serde_json::to_vec_pretty(&receipt).expect("serialize");
+        fs::write(&prefixed_path, &body).expect("write prefixed receipt to source");
+
+        // Persist to target using bare-hex filename form.
+        let bare_path = target.path().join(format!("{bare_hex}.json"));
+        fs::write(&bare_path, &body).expect("write bare-hex receipt to target");
+
+        let report =
+            merge_receipt_dirs(source.path(), target.path()).expect("merge should succeed");
+
+        assert_eq!(
+            report.duplicates_skipped, 1,
+            "reverse mixed-form duplicate must be detected: got {report:?}"
+        );
+        assert_eq!(
+            report.receipts_copied, 0,
+            "no extra copy for reverse mixed-form duplicate: got {report:?}"
+        );
+        assert!(report.parse_failures.is_empty());
+        assert_eq!(report.merged_headers.len(), 1);
+        assert_eq!(report.merged_headers[0].origin, "both");
     }
 }

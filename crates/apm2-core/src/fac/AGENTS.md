@@ -1724,7 +1724,10 @@ corruption), and parse failures.
 
 ### Core Capabilities
 
-- Set-union merge on receipt digests (idempotent).
+- Set-union merge on receipt digests (idempotent). Scan maps key receipts
+  by canonical `b3-256:<hex>` form so that bare-hex and prefixed filenames
+  for the same logical receipt map to the same key, preventing duplicate-
+  detection bypass via mixed filename forms.
 - Deterministic presentation ordering: `timestamp_secs` descending, then
   `content_hash` ascending for tiebreaking.
 - Atomic writes using `tempfile::NamedTempFile::new_in()` + `persist()` for
@@ -1759,6 +1762,11 @@ corruption), and parse failures.
 - [INV-MERGE-007] Directory entry type checks use `entry.file_type()`
   (`lstat`) instead of `path.is_dir()` (`stat`) to avoid following
   symlinks and the associated TOCTOU / hang risk.
+- [INV-MERGE-008] Scan map keys are normalized to canonical `b3-256:<hex>`
+  form before insertion, so that bare-hex and `b3-256:`-prefixed filenames
+  for the same receipt hash are deduplicated correctly. Without this,
+  an attacker could store the same logical receipt under both forms to
+  bypass duplicate detection and inflate receipt stores.
 
 ## receipt_pipeline Submodule (TCK-00564)
 
