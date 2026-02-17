@@ -6787,7 +6787,14 @@ mod tests {
         let receipt_file = fs::read_dir(fac_root.join(FAC_RECEIPTS_DIR))
             .expect("receipts dir")
             .flatten()
-            .find(|entry| entry.file_type().is_ok_and(|ty| ty.is_file()))
+            .find(|entry| {
+                entry.file_type().is_ok_and(|ty| ty.is_file())
+                    && entry
+                        .path()
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| !n.contains(".sig."))
+            })
             .expect("at least one receipt emitted");
         let receipt_json = serde_json::from_slice::<serde_json::Value>(
             &fs::read(receipt_file.path()).expect("read receipt"),
