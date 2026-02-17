@@ -1,261 +1,44 @@
-name: Forge Admission Cycle
+name: Forge Admission Cycle (Projection)
 
 on:
-  pull_request_target:
-    branches: [main]
-    types: [opened, reopened, synchronize, ready_for_review]
   workflow_dispatch:
     inputs:
       pr_number:
-        description: "Pull request number to process"
-        required: true
+        description: "Optional PR number for projection diagnostics"
+        required: false
         type: string
-
-concurrency:
-  group: forge-admission-cycle-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.run_id }}
-  cancel-in-progress: true
 
 permissions:
   contents: read
-  issues: read
   pull-requests: read
 
 jobs:
-  barrier:
-    name: Guardian Intelligence / Barrier
+  projection-note:
+    name: Forge Admission Cycle Projection Note
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Validate event envelope
+      - name: Explain projection mode
         env:
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          INPUT_PR: ${{ github.event.inputs.pr_number }}
         run: |
           set -euo pipefail
 
-          fail() {
-            echo "fac-barrier: decision=DENY reason=$1 stage=barrier" >&2
-            exit 1
-          }
+          echo "forge-admission-cycle: projection-only mode"
+          echo "GitHub does not compute FAC verdicts in this workflow."
+          echo "Authoritative FAC logic must publish commit status context: apm2 / Forge Admission Cycle"
 
-          case "$GITHUB_EVENT_NAME" in
-            pull_request_target)
-              pr_number="$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH")"
-              [[ "$pr_number" =~ ^[0-9]+$ ]] || fail "missing_or_invalid_pull_request_number"
-              echo "fac-barrier: decision=ALLOW stage=barrier event=pull_request_target pr=${pr_number}"
-              ;;
-            workflow_dispatch)
-              pr_number="$(jq -r '.inputs.pr_number // .client_payload.pr_number // empty' "$GITHUB_EVENT_PATH")"
-              [[ "$pr_number" =~ ^[0-9]+$ ]] || fail "workflow_dispatch_requires_numeric_pr_number"
-              echo "fac-barrier: decision=ALLOW stage=barrier event=workflow_dispatch pr=${pr_number}"
-              ;;
-            *)
-              fail "unsupported_event=${GITHUB_EVENT_NAME}"
-              ;;
-          esac
+          if [[ -n "${INPUT_PR}" ]]; then
+            if [[ ! "${INPUT_PR}" =~ ^[0-9]+$ ]]; then
+              echo "invalid pr_number: ${INPUT_PR}" >&2
+              exit 1
+            fi
 
-  preflight-authorization:
-    name: Guardian Intelligence / Preflight Authorization
-    needs: [barrier]
-    if: ${{ needs.barrier.result == 'success' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Checkout trusted workflow policy
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 1
-
-      - name: Enforce FAC credential posture lint
-        run: |
-          set -euo pipefail
-          cargo run --quiet -p apm2-cli -- \
-            fac preflight credential lint \
-            .github/workflows/forge-admission-cycle.yml \
-            crates/apm2-cli/src/commands/fac_preflight.rs
-
-      - name: Evaluate trusted workflow context
-        env:
-          APM2_FAC_CREDENTIAL_SOURCE: github_token
-          APM2_CREDENTIAL_HARDENING_STAGE: preflight
-          GITHUB_TOKEN: ${{ github.token }}
-          GITHUB_ACTOR: ${{ github.actor }}
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          GITHUB_EVENT_PATH: ${{ github.event_path }}
-          GITHUB_REF_NAME: ${{ github.ref_name }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          cargo run --quiet -p apm2-cli -- fac preflight authorization
-
-  forge-admission-cycle:
-    name: apm2 / Forge Admission Cycle
-    needs: [barrier, preflight-authorization]
-    if: ${{ needs.barrier.result == 'success' && needs.preflight-authorization.result == 'success' }}
-    runs-on:
-      - self-hosted
-      - linux
-      - x64
-      - fac-ovh
-    timeout-minutes: 90
-    steps:
-      - name: Checkout base branch
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 1
-
-      - name: Kickoff trusted FAC projection dispatch
-        run: |
-          set -euo pipefail
-          echo "fac-kickoff: decision=ALLOW reason=preflight_success dispatch_target=self-hosted stage=kickoff"
-
-      - name: Resolve PR context
-        id: pr-context
-        env:
-          APM2_FAC_CREDENTIAL_SOURCE: github_token
-          APM2_CREDENTIAL_HARDENING_STAGE: projection_context
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          cargo run --quiet -p apm2-cli -- fac preflight credential runtime
-
-          if [[ "${{ github.event_name }}" == "pull_request_target" ]]; then
-            pr_number="${{ github.event.pull_request.number }}"
-            head_sha="${{ github.event.pull_request.head.sha }}"
-          else
-            pr_number="${{ github.event.inputs.pr_number }}"
-            head_sha="$(gh api "repos/${{ github.repository }}/pulls/${pr_number}" --jq '.head.sha')"
+            head_sha="$(gh api "/repos/${REPO}/pulls/${INPUT_PR}" --jq '.head.sha')"
+            echo "pr=${INPUT_PR} head_sha=${head_sha}"
+            echo "current commit statuses for ${head_sha}:"
+            gh api "/repos/${REPO}/commits/${head_sha}/status" \
+              --jq '.statuses[] | {context,state,description}'
           fi
-          echo "pr_number=${pr_number}" >> "$GITHUB_OUTPUT"
-          echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
-          echo "fac-context: pr=${pr_number} sha=${head_sha}"
-
-      - name: Poll review gate
-        env:
-          APM2_FAC_CREDENTIAL_SOURCE: github_token
-          APM2_CREDENTIAL_HARDENING_STAGE: projection_poll
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          cargo run --quiet -p apm2-cli -- fac preflight credential runtime
-
-          repo="${{ github.repository }}"
-          pr_number="${{ steps.pr-context.outputs.pr_number }}"
-          head_sha="${{ steps.pr-context.outputs.head_sha }}"
-          max_wait=4800
-          poll_interval=30
-
-          to_projection_status() {
-            local decision="${1:-unknown}"
-            case "$decision" in
-              approve) echo "PASS" ;;
-              deny) echo "FAIL" ;;
-              pending|unknown) echo "pending" ;;
-              *) echo "FAIL" ;;
-            esac
-          }
-
-          is_integrity_failure() {
-            local msg="${1,,}"
-            [[ "$msg" == *integrity* ]] || [[ "$msg" == *hmac* ]] || [[ "$msg" == *corrupt* ]] || [[ "$msg" == *fail_closed* ]]
-          }
-
-          parse_dimension_decision() {
-            local payload="$1"
-            local review_type="$2"
-            [[ -n "$payload" ]] || { echo "unknown"; return; }
-            echo "$payload" | jq -r \
-              --arg review_type "$review_type" '
-                if (type == "object") and (.schema? == "apm2.review.verdict.v1") then
-                  ((.dimensions // [])
-                    | map(select(.dimension == $review_type))
-                    | first
-                    | .decision // "unknown")
-                else
-                  "unknown"
-                end' 2>/dev/null || echo "unknown"
-          }
-
-          if command -v apm2 >/dev/null 2>&1; then
-            fac_cmd=(apm2)
-          elif [[ -x "./target/release/apm2" ]]; then
-            fac_cmd=(./target/release/apm2)
-          else
-            echo "fac-gate: apm2 binary not found on PATH; building local release binary"
-            cargo build --quiet -p apm2-cli --release
-            fac_cmd=(./target/release/apm2)
-          fi
-
-          deadline=$((SECONDS + max_wait))
-          echo "fac-gate: polling pr=${pr_number} sha=${head_sha} deadline=${max_wait}s"
-
-          while [[ $SECONDS -lt $deadline ]]; do
-            # Staleness check: if the PR HEAD has moved past our SHA, this run
-            # is superseded.  Exit cleanly so the concurrency slot is released
-            # for the run that matches the new HEAD.
-            current_head="$(gh api "repos/${repo}/pulls/${pr_number}" --jq '.head.sha' 2>/dev/null || true)"
-            if [[ -n "$current_head" && "$current_head" != "$head_sha" ]]; then
-              echo "fac-gate: STALE sha=${head_sha} superseded by ${current_head}"
-              exit 0
-            fi
-
-            set +e
-            verdict_payload="$("${fac_cmd[@]}" fac review verdict show \
-              --pr "${pr_number}" \
-              --sha "${head_sha}" \
-              --json 2>/dev/null)"
-            verdict_rc=$?
-            set -e
-            if [[ $verdict_rc -ge 126 ]]; then
-              echo "fac-gate: FAIL reason=fac_cli_unavailable rc=${verdict_rc}"
-              exit 1
-            fi
-            if [[ $verdict_rc -ne 0 ]]; then
-              message="$(echo "$verdict_payload" | jq -r '.message // .error // "unavailable"' 2>/dev/null || echo "unavailable")"
-              if is_integrity_failure "$message"; then
-                echo "fac-gate: FAIL reason=verdict_integrity_failure message=${message}"
-                exit 1
-              fi
-              echo "fac-gate: WARN reason=verdict_read_pending rc=${verdict_rc} message=${message}"
-              verdict_payload='{}'
-            fi
-            if ! echo "$verdict_payload" | jq -e 'type == "object"' >/dev/null 2>&1; then
-              echo "fac-gate: FAIL reason=verdict_payload_malformed"
-              exit 1
-            fi
-            if echo "$verdict_payload" | jq -e '.error? != null' >/dev/null 2>&1; then
-              message="$(echo "$verdict_payload" | jq -r '.message // .error' 2>/dev/null || echo "projection_error")"
-              if is_integrity_failure "$message"; then
-                echo "fac-gate: FAIL reason=verdict_integrity_failure message=${message}"
-                exit 1
-              fi
-              echo "fac-gate: WARN reason=verdict_payload_error message=${message}"
-            fi
-            if echo "$verdict_payload" | jq -e '.fail_closed? == true' >/dev/null 2>&1; then
-              echo "fac-gate: FAIL reason=verdict_integrity_failure (fail_closed=true)"
-              exit 1
-            fi
-            sec_decision="$(parse_dimension_decision "$verdict_payload" "security")"
-            qual_decision="$(parse_dimension_decision "$verdict_payload" "code-quality")"
-            sec_v="$(to_projection_status "$sec_decision")"
-            qual_v="$(to_projection_status "$qual_decision")"
-
-            ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-            echo "ts=${ts} sha=${head_sha} security=${sec_v} quality=${qual_v}"
-
-            if [[ "$sec_v" == "FAIL" || "$qual_v" == "FAIL" ]]; then
-              echo "fac-gate: FAIL security=${sec_v} quality=${qual_v}"
-              exit 1
-            fi
-            if [[ "$sec_v" == "PASS" && "$qual_v" == "PASS" ]]; then
-              echo "fac-gate: PASS security=PASS quality=PASS"
-              exit 0
-            fi
-
-            sleep "$poll_interval"
-          done
-
-          echo "fac-gate: FAIL reason=timeout after ${max_wait}s"
-          exit 1
