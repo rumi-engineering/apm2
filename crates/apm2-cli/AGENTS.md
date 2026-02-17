@@ -343,6 +343,23 @@ Commands surface daemon errors and exit non-zero on failure.
 - [`apm2_core::config`](../apm2-core/src/config/AGENTS.md) - `EcosystemConfig` for socket path resolution
 - [`apm2_daemon`](../apm2-daemon/AGENTS.md) - Server-side implementation
 
+## E2E Test Coverage (TCK-00601)
+
+- `tests/tck_00601_e2e_deterministic_failures.rs`: 15 tests covering FAC gates
+  deterministic failure modes and secrets posture.
+  - **Deterministic failures**: Broker absent fails fast (no hang), worker absent
+    heartbeat returns false immediately, bounded receipt wait times out within
+    bounds, heartbeat reads on missing/malformed files complete in < 1s.
+  - **Credential posture separation**: Gates path (broker init) does NOT require
+    GitHub credentials; push path requires them. `require_github_credentials`
+    error includes actionable remediation (env vars, systemd, file path,
+    auth-setup command).
+  - **Secrets posture**: Error messages, Debug output, and serialized receipts
+    are verified to not leak token values (ghp_, ghs_ prefixes). Known secret
+    env var values are checked against receipt JSON.
+  - All tests use hermetic `tempdir`-based `APM2_HOME` isolation.
+  - Hang guard: `TEST_HANG_GUARD_SECS = 30` enforced via `assert_no_hang` wrapper.
+
 ## References
 
 - [Clap Derive Tutorial](https://docs.rs/clap/latest/clap/_derive/_tutorial/index.html)
