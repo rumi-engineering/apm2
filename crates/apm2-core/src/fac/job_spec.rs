@@ -567,7 +567,17 @@ impl FacJobSpecV1 {
             .ok_or_else(|| JobSpecError::InvalidPatchFormat {
                 reason: "patch must be a JSON object".to_string(),
             })?;
-        if !patch_obj.contains_key("bytes") {
+
+        // RFC-0019 Amendment A1: non-inline backends (fac_blobs_v1, apm2_cas)
+        // store bytes outside the job spec.  When a valid `bytes_backend` is
+        // present, the `bytes` field is not required.  Inline patches (no
+        // `bytes_backend`) still require `bytes`.
+        let has_valid_backend = patch_obj
+            .get("bytes_backend")
+            .and_then(|v| v.as_str())
+            .is_some_and(|b| VALID_PATCH_BYTES_BACKENDS.contains(&b));
+
+        if !has_valid_backend && !patch_obj.contains_key("bytes") {
             return Err(JobSpecError::InvalidPatchFormat {
                 reason: "patch descriptor must contain 'bytes' field for inline patch data"
                     .to_string(),
@@ -1006,6 +1016,25 @@ fn reject_filesystem_paths(field: &'static str, value: &str) -> Result<(), JobSp
 
     // Relative path prefix: `./...`.
     if bytes.len() >= 2 && bytes[0] == b'.' && bytes[1] == b'/' {
+        return Err(JobSpecError::FilesystemPathRejected {
+            field,
+            value: truncate_for_error(value),
+        });
+    }
+
+    // Backslash anywhere: prevents Windows-style path separators and
+    // ensures the identifier remains a logical name (INV-JS-006).
+    if value.contains('\\') {
+        return Err(JobSpecError::FilesystemPathRejected {
+            field,
+            value: truncate_for_error(value),
+        });
+    }
+
+    // Dot-dot segments (`..`): prevents path traversal attacks.  Checks
+    // for `..` as a standalone value or as a segment delimited by `/`.
+    if value == ".." || value.starts_with("../") || value.ends_with("/..") || value.contains("/../")
+    {
         return Err(JobSpecError::FilesystemPathRejected {
             field,
             value: truncate_for_error(value),
@@ -2192,5 +2221,127 @@ mod tests {
             ),
             "backslash in repo_id should be rejected: {result:?}"
         );
+    }
+
+    // =========================================================================
+    // Round 2 fix: validate_patch_source allows non-inline backends
+    // =========================================================================
+
+    #[test]
+    fn patch_injection_non_inline_backend_accepts_missing_bytes() {
+        // A `patch_injection` job with a valid `bytes_backend` (e.g.,
+        // `fac_blobs_v1`) should NOT require the `bytes` field because
+        // bytes are stored externally (RFC-0019 Amendment A1).
+        let mut spec = build_valid_spec();
+        spec.source.kind = "patch_injection".to_string();
+        spec.source.patch = Some(serde_json::json!({
+            "bytes_backend": "fac_blobs_v1",
+            "digest": format!("b3-256:{}", "ab".repeat(32))
+        }));
+        let result = spec.validate_structure();
+        assert!(
+            result.is_ok(),
+            "non-inline backend should accept missing bytes: {result:?}"
+        );
+    }
+
+    #[test]
+    fn patch_injection_apm2_cas_backend_accepts_missing_bytes() {
+        let mut spec = build_valid_spec();
+        spec.source.kind = "patch_injection".to_string();
+        spec.source.patch = Some(serde_json::json!({
+            "bytes_backend": "apm2_cas",
+            "digest": format!("b3-256:{}", "cd".repeat(32))
+        }));
+        let result = spec.validate_structure();
+        assert!(
+            result.is_ok(),
+            "apm2_cas backend should accept missing bytes: {result:?}"
+        );
+    }
+
+    #[test]
+    fn patch_injection_non_inline_backend_with_bytes_also_accepted() {
+        // Even with a valid backend, having `bytes` present is fine.
+        let mut spec = build_valid_spec();
+        spec.source.kind = "patch_injection".to_string();
+        spec.source.patch = Some(serde_json::json!({
+            "bytes": "aGVsbG8=",
+            "bytes_backend": "fac_blobs_v1",
+            "digest": format!("b3-256:{}", "ab".repeat(32))
+        }));
+        let result = spec.validate_structure();
+        assert!(
+            result.is_ok(),
+            "backend with bytes present should also be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn patch_injection_unknown_backend_still_requires_bytes() {
+        // An unknown `bytes_backend` does not exempt from the `bytes`
+        // requirement.  The patch should be rejected for missing `bytes`.
+        let mut spec = build_valid_spec();
+        spec.source.kind = "patch_injection".to_string();
+        spec.source.patch = Some(serde_json::json!({
+            "bytes_backend": "unknown_backend"
+        }));
+        let result = spec.validate_structure();
+        assert!(
+            matches!(result, Err(JobSpecError::InvalidPatchFormat { .. })),
+            "unknown backend without bytes should be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn patch_injection_inline_still_requires_bytes() {
+        // Inline patches (no `bytes_backend`) must still have `bytes`.
+        let mut spec = build_valid_spec();
+        spec.source.kind = "patch_injection".to_string();
+        spec.source.patch = Some(serde_json::json!({
+            "format": "git_diff_v1"
+        }));
+        let result = spec.validate_structure();
+        assert!(
+            matches!(result, Err(JobSpecError::InvalidPatchFormat { .. })),
+            "inline patch without bytes should be rejected: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // Round 2 fix: reject_filesystem_paths rejects `..` and backslashes
+    // =========================================================================
+
+    #[test]
+    fn reject_dotdot_traversal_in_job_id() {
+        for bad_id in &["../etc/passwd", "a/../b", "foo/bar/..", ".."] {
+            let result = reject_filesystem_paths("job_id", bad_id);
+            assert!(
+                matches!(result, Err(JobSpecError::FilesystemPathRejected { .. })),
+                "job_id {bad_id:?} with '..' should be rejected: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_backslash_in_job_id() {
+        for bad_id in &["org\\evil", "a\\b\\c", "job\\..\\secret"] {
+            let result = reject_filesystem_paths("job_id", bad_id);
+            assert!(
+                matches!(result, Err(JobSpecError::FilesystemPathRejected { .. })),
+                "job_id {bad_id:?} with backslash should be rejected: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_valid_job_id_without_traversal() {
+        for good_id in &["my-job-123", "org/repo/build-42", "abc_def", "a-b-c"] {
+            let result = reject_filesystem_paths("job_id", good_id);
+            assert!(
+                result.is_ok(),
+                "valid job_id {good_id:?} should be accepted: {result:?}"
+            );
+        }
     }
 }

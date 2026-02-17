@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::job_spec::parse_b3_256_digest;
+use super::job_spec::{MAX_REPO_ALLOWLIST_SIZE, parse_b3_256_digest};
 use super::policy_resolution::{DeterminismClass, RiskTier};
 use super::systemd_properties::SandboxHardeningProfile;
 use crate::determinism::canonicalize_json;
@@ -395,6 +395,20 @@ impl FacPolicyV1 {
                 field: "sandbox_hardening",
                 value: e,
             })?;
+
+        // Validate allowed_repo_ids length for early detection during policy
+        // loading (TCK-00579).  The same bound is enforced during policy
+        // derivation in `job_spec_validation_policy()`, but checking here
+        // ensures oversized allowlists are caught at deserialization time.
+        if let Some(ref repos) = self.allowed_repo_ids {
+            if repos.len() > MAX_REPO_ALLOWLIST_SIZE {
+                return Err(FacPolicyError::VectorTooLarge {
+                    field: "allowed_repo_ids",
+                    actual: repos.len(),
+                    max: MAX_REPO_ALLOWLIST_SIZE,
+                });
+            }
+        }
 
         Ok(())
     }
@@ -2010,5 +2024,66 @@ mod tests {
         let bytes = serde_json::to_vec_pretty(&policy).expect("serialize");
         let restored = deserialize_policy(&bytes).expect("deserialize");
         assert_eq!(restored.allowed_repo_ids, None);
+    }
+
+    /// Round 2 NIT: `FacPolicyV1::validate()` must reject oversized
+    /// `allowed_repo_ids` for early detection during policy loading.
+    #[test]
+    fn test_validate_rejects_oversized_allowed_repo_ids() {
+        let mut policy = FacPolicyV1::default_policy();
+        policy.allowed_repo_ids = Some(
+            (0..=super::MAX_REPO_ALLOWLIST_SIZE)
+                .map(|i| format!("repo-{i}"))
+                .collect(),
+        );
+        let result = policy.validate();
+        assert!(
+            matches!(
+                result,
+                Err(FacPolicyError::VectorTooLarge {
+                    field: "allowed_repo_ids",
+                    ..
+                })
+            ),
+            "oversized allowed_repo_ids should be rejected by validate(): {result:?}"
+        );
+    }
+
+    /// Round 2 NIT: `FacPolicyV1::validate()` accepts within-bounds
+    /// `allowed_repo_ids`.
+    #[test]
+    fn test_validate_accepts_valid_allowed_repo_ids() {
+        let mut policy = FacPolicyV1::default_policy();
+        policy.allowed_repo_ids = Some(vec!["org/repo".to_string(), "other/repo".to_string()]);
+        let result = policy.validate();
+        assert!(
+            result.is_ok(),
+            "valid allowed_repo_ids should pass validate(): {result:?}"
+        );
+    }
+
+    /// Round 2 NIT: `deserialize_policy` catches oversized
+    /// `allowed_repo_ids` early because `validate()` is called during
+    /// deserialization.
+    #[test]
+    fn test_deserialize_policy_rejects_oversized_allowed_repo_ids() {
+        let mut policy = FacPolicyV1::default_policy();
+        policy.allowed_repo_ids = Some(
+            (0..=super::MAX_REPO_ALLOWLIST_SIZE)
+                .map(|i| format!("repo-{i}"))
+                .collect(),
+        );
+        let bytes = serde_json::to_vec_pretty(&policy).expect("serialize");
+        let result = deserialize_policy(&bytes);
+        assert!(
+            matches!(
+                result,
+                Err(FacPolicyError::VectorTooLarge {
+                    field: "allowed_repo_ids",
+                    ..
+                })
+            ),
+            "deserialize_policy should reject oversized allowed_repo_ids: {result:?}"
+        );
     }
 }
