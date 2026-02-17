@@ -378,7 +378,7 @@ tables are printed by default via `print_lane_init_receipt()` and
   enforced: primary sort by `timestamp_secs` descending, secondary sort by `content_hash`
   ascending for stable tie-breaking. Boundary inclusion is verified by regression test.
 
-## Policy CLI Invariants (Updated for TCK-00561 fix round 1)
+## Policy CLI Invariants (Updated for TCK-00561 fix round 2)
 
 - **Stdin support** (`fac_policy.rs`): `apm2 fac policy validate` and `apm2 fac policy adopt`
   accept `<path|->` as an optional positional argument. When the argument is omitted or is `-`,
@@ -386,6 +386,11 @@ tables are printed by default via `print_lane_init_receipt()` and
   stdin handle, CTR-1603). Empty stdin returns an explicit error.
 - **Operator identity resolution** (`fac_policy.rs`): `run_adopt` and `run_rollback` resolve
   the operator identity from `$USER` / `$LOGNAME` (POSIX), falling back to numeric UID on Unix
-  when neither is set. The identity is formatted as `operator:<username>` and passed to the
-  core `adopt_policy`/`rollback_policy` APIs. This replaces the hard-coded `"operator:local"`
-  actor ID (f-722-security-1771347580085305-0).
+  via `nix::unistd::getuid()` (safe wrapper, no `unsafe` block). The identity is formatted as
+  `operator:<username>` and passed to the core `adopt_policy`/`rollback_policy` APIs. The
+  username is sanitized to `[a-zA-Z0-9._@-]` to prevent control character injection.
+- **FAC root resolution** (`fac_policy.rs`): Uses shared `fac_utils::resolve_fac_root()` helper
+  instead of a custom implementation with predictable `/tmp` fallback (RSK-1502).
+- **Bounded file reads** (`fac_policy.rs`): `read_bounded_file` uses the open-once pattern
+  (`O_NOFOLLOW | O_CLOEXEC` at `open(2)` + `fstat` + `take()`) to eliminate the TOCTOU gap
+  between symlink validation and file read.
