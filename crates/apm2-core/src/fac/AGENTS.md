@@ -1528,6 +1528,18 @@ policy bypass from malformed or adversarial job specs.
 - `reject_filesystem_paths()`: Detects Unix absolute, Windows drive-letter,
   UNC, tilde-home, and dot-slash relative paths in key fields.
 
+### Runtime Wiring
+
+- **Worker pre-claim**: `process_job()` in `fac_worker.rs` calls
+  `validate_job_spec_with_policy()` / `validate_job_spec_control_lane_with_policy()`
+  with a `JobSpecValidationPolicy` derived from `FacPolicyV1::job_spec_validation_policy()`.
+- **Enqueue admission**: `build_gates_job_spec()` in `fac_review/gates.rs` calls
+  `validate_job_spec_with_policy()` before writing to `pending/`.
+- `FacPolicyV1::allowed_repo_ids` feeds the policy; when absent (default), the
+  policy is open but bytes_backend and filesystem-path checks still run.
+- `DenialReasonCode::PolicyViolation` is mapped for `DisallowedRepoId`,
+  `DisallowedBytesBackend`, and `FilesystemPathRejected` errors.
+
 ### Security Invariants (TCK-00579)
 
 - [INV-JS-005] Policy-driven `repo_id` allowlist rejects unknown repos when

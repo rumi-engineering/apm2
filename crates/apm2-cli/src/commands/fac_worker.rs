@@ -85,7 +85,7 @@ use apm2_core::fac::broker::{BrokerError, BrokerSignatureVerifier, FacBroker};
 use apm2_core::fac::broker_health::WorkerHealthPolicy;
 use apm2_core::fac::job_spec::{
     FacJobSpecV1, JobSpecError, MAX_JOB_SPEC_SIZE, deserialize_job_spec, job_kind_to_budget_key,
-    parse_b3_256_digest, validate_job_spec, validate_job_spec_control_lane,
+    parse_b3_256_digest, validate_job_spec_control_lane_with_policy, validate_job_spec_with_policy,
 };
 use apm2_core::fac::lane::{LaneLeaseV1, LaneLockGuard, LaneManager, LaneState};
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
@@ -527,6 +527,20 @@ pub fn run_fac_worker(
         },
     };
 
+    // TCK-00579: Derive job spec validation policy from FAC policy.
+    // This enables repo_id allowlist, bytes_backend allowlist, and
+    // filesystem-path rejection at worker pre-claim time.
+    let job_spec_policy = match policy.job_spec_validation_policy() {
+        Ok(p) => p,
+        Err(e) => {
+            output_worker_error(
+                json_output,
+                &format!("cannot derive job spec validation policy: {e}"),
+            );
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
     let budget_cas = MemoryCas::new();
     let baseline_profile = EconomicsProfile::default_baseline();
     if let Err(e) = baseline_profile.store_in_cas(&budget_cas) {
@@ -802,6 +816,7 @@ pub fn run_fac_worker(
                     &policy_hash,
                     &policy_digest,
                     &policy,
+                    &job_spec_policy,
                     &budget_cas,
                     candidates.len(),
                     print_unit,
@@ -1759,6 +1774,7 @@ fn process_job(
     policy_hash: &str,
     policy_digest: &[u8; 32],
     policy: &FacPolicyV1,
+    job_spec_policy: &apm2_core::fac::JobSpecValidationPolicy,
     budget_cas: &MemoryCas,
     _candidates_count: usize,
     print_unit: bool,
@@ -1816,9 +1832,9 @@ fn process_job(
     // ownership) instead of an RFC-0028 channel context token.
     let is_control_lane = spec.kind == "stop_revoke";
     let validation_result = if is_control_lane {
-        validate_job_spec_control_lane(spec)
+        validate_job_spec_control_lane_with_policy(spec, job_spec_policy)
     } else {
-        validate_job_spec(spec)
+        validate_job_spec_with_policy(spec, job_spec_policy)
     };
     if let Err(e) = validation_result {
         let is_digest_error = matches!(
@@ -1870,6 +1886,11 @@ fn process_job(
         let reason_code = match e {
             JobSpecError::MissingToken { .. } => DenialReasonCode::MissingChannelToken,
             JobSpecError::InvalidDigest { .. } => DenialReasonCode::MalformedSpec,
+            // TCK-00579: Policy-specific variants map to PolicyViolation
+            // for distinct audit signal and automated triage.
+            JobSpecError::DisallowedRepoId { .. }
+            | JobSpecError::DisallowedBytesBackend { .. }
+            | JobSpecError::FilesystemPathRejected { .. } => DenialReasonCode::PolicyViolation,
             _ => DenialReasonCode::ValidationFailed,
         };
         // (sbx_hash computed once at top of process_job)
@@ -7042,6 +7063,93 @@ mod tests {
         assert!(
             marker.reason.contains("lane cleanup failed"),
             "corrupt marker should describe cleanup failure"
+        );
+    }
+
+    // ── TCK-00579: DenialReasonCode mapping assertions ──
+
+    /// Helper to map `JobSpecError` to `DenialReasonCode` using the same
+    /// logic as the worker denial path.
+    fn map_job_spec_error_to_denial_reason(e: &JobSpecError) -> DenialReasonCode {
+        match e {
+            JobSpecError::MissingToken { .. } => DenialReasonCode::MissingChannelToken,
+            JobSpecError::InvalidDigest { .. } => DenialReasonCode::MalformedSpec,
+            JobSpecError::DisallowedRepoId { .. }
+            | JobSpecError::DisallowedBytesBackend { .. }
+            | JobSpecError::FilesystemPathRejected { .. } => DenialReasonCode::PolicyViolation,
+            _ => DenialReasonCode::ValidationFailed,
+        }
+    }
+
+    #[test]
+    fn test_disallowed_repo_id_maps_to_policy_violation() {
+        let err = JobSpecError::DisallowedRepoId {
+            repo_id: "evil-org/evil-repo".to_string(),
+        };
+        assert_eq!(
+            map_job_spec_error_to_denial_reason(&err),
+            DenialReasonCode::PolicyViolation,
+            "DisallowedRepoId must map to PolicyViolation"
+        );
+    }
+
+    #[test]
+    fn test_disallowed_bytes_backend_maps_to_policy_violation() {
+        let err = JobSpecError::DisallowedBytesBackend {
+            backend: "evil_backend".to_string(),
+        };
+        assert_eq!(
+            map_job_spec_error_to_denial_reason(&err),
+            DenialReasonCode::PolicyViolation,
+            "DisallowedBytesBackend must map to PolicyViolation"
+        );
+    }
+
+    #[test]
+    fn test_filesystem_path_rejected_maps_to_policy_violation() {
+        let err = JobSpecError::FilesystemPathRejected {
+            field: "source.repo_id",
+            value: "/etc/passwd".to_string(),
+        };
+        assert_eq!(
+            map_job_spec_error_to_denial_reason(&err),
+            DenialReasonCode::PolicyViolation,
+            "FilesystemPathRejected must map to PolicyViolation"
+        );
+    }
+
+    #[test]
+    fn test_missing_token_maps_to_missing_channel_token() {
+        let err = JobSpecError::MissingToken {
+            field: "actuation.channel_context_token",
+        };
+        assert_eq!(
+            map_job_spec_error_to_denial_reason(&err),
+            DenialReasonCode::MissingChannelToken,
+            "MissingToken must map to MissingChannelToken"
+        );
+    }
+
+    #[test]
+    fn test_invalid_digest_maps_to_malformed_spec() {
+        let err = JobSpecError::InvalidDigest {
+            field: "job_spec_digest",
+            value: "bad".to_string(),
+        };
+        assert_eq!(
+            map_job_spec_error_to_denial_reason(&err),
+            DenialReasonCode::MalformedSpec,
+            "InvalidDigest must map to MalformedSpec"
+        );
+    }
+
+    #[test]
+    fn test_other_errors_map_to_validation_failed() {
+        let err = JobSpecError::EmptyField { field: "job_id" };
+        assert_eq!(
+            map_job_spec_error_to_denial_reason(&err),
+            DenialReasonCode::ValidationFailed,
+            "generic errors must map to ValidationFailed"
         );
     }
 }

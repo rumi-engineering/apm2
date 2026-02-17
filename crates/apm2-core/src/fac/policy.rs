@@ -229,6 +229,20 @@ pub struct FacPolicyV1 {
     /// that preserve build execution.
     #[serde(default)]
     pub sandbox_hardening: SandboxHardeningProfile,
+
+    /// Optional `repo_id` allowlist for job spec validation (TCK-00579).
+    ///
+    /// When `Some`, only the listed `repo_id` values are accepted by
+    /// policy-aware job spec validators.  When `None` (the default), any
+    /// structurally valid `repo_id` passes the allowlist check (open policy).
+    ///
+    /// Note: `serde(default)` is safe here because `None` is the MOST
+    /// permissive option for this field, and the default is correct for
+    /// existing persisted policies that predate TCK-00579.  The remaining
+    /// policy checks (`bytes_backend` allowlist, filesystem-path rejection)
+    /// are unconditional and do not depend on this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_repo_ids: Option<Vec<String>>,
 }
 
 impl Default for FacPolicyV1 {
@@ -302,7 +316,28 @@ impl FacPolicyV1 {
             determinism_class: DeterminismClass::SoftDeterministic,
             economics_profile_hash,
             sandbox_hardening: SandboxHardeningProfile::default(),
+            allowed_repo_ids: None,
         }
+    }
+
+    /// Derives a [`super::job_spec::JobSpecValidationPolicy`] from this
+    /// policy's `allowed_repo_ids` field (TCK-00579).
+    ///
+    /// This is the canonical way to obtain a validation policy for use with
+    /// [`super::job_spec::validate_job_spec_with_policy`] and
+    /// [`super::job_spec::validate_job_spec_control_lane_with_policy`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `JobSpecError::FieldTooLong` if the allowlist exceeds the
+    /// maximum size bound.
+    pub fn job_spec_validation_policy(
+        &self,
+    ) -> Result<super::job_spec::JobSpecValidationPolicy, super::job_spec::JobSpecError> {
+        self.allowed_repo_ids.as_ref().map_or_else(
+            || Ok(super::job_spec::JobSpecValidationPolicy::open()),
+            |repos| super::job_spec::JobSpecValidationPolicy::with_allowed_repos(repos.clone()),
+        )
     }
 
     /// Validates policy fields and returns an error when constraints are
@@ -1927,5 +1962,53 @@ mod tests {
             err.contains("symlink"),
             "should report symlink rejection, got: {err}"
         );
+    }
+
+    // ── TCK-00579: job_spec_validation_policy tests ──
+
+    #[test]
+    fn test_job_spec_validation_policy_open_by_default() {
+        let policy = FacPolicyV1::default_policy();
+        assert!(policy.allowed_repo_ids.is_none());
+        let jsp = policy.job_spec_validation_policy().expect("derive policy");
+        assert!(
+            !jsp.has_repo_allowlist(),
+            "default policy should produce open job spec policy"
+        );
+    }
+
+    #[test]
+    fn test_job_spec_validation_policy_with_allowlist() {
+        let mut policy = FacPolicyV1::default_policy();
+        policy.allowed_repo_ids = Some(vec!["org/repo".to_string()]);
+        let jsp = policy.job_spec_validation_policy().expect("derive policy");
+        assert!(jsp.has_repo_allowlist());
+        assert_eq!(jsp.allowed_repo_ids().unwrap(), &["org/repo".to_string()]);
+    }
+
+    #[test]
+    fn test_job_spec_validation_policy_empty_allowlist_denies_all() {
+        let mut policy = FacPolicyV1::default_policy();
+        policy.allowed_repo_ids = Some(vec![]);
+        let jsp = policy.job_spec_validation_policy().expect("derive policy");
+        assert!(jsp.has_repo_allowlist());
+        assert_eq!(jsp.allowed_repo_ids().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_policy_roundtrip_with_allowed_repo_ids() {
+        let mut policy = FacPolicyV1::default_policy();
+        policy.allowed_repo_ids = Some(vec!["org/repo".to_string(), "other/repo".to_string()]);
+        let bytes = serde_json::to_vec_pretty(&policy).expect("serialize");
+        let restored = deserialize_policy(&bytes).expect("deserialize");
+        assert_eq!(restored.allowed_repo_ids, policy.allowed_repo_ids);
+    }
+
+    #[test]
+    fn test_policy_roundtrip_without_allowed_repo_ids() {
+        let policy = FacPolicyV1::default_policy();
+        let bytes = serde_json::to_vec_pretty(&policy).expect("serialize");
+        let restored = deserialize_policy(&bytes).expect("deserialize");
+        assert_eq!(restored.allowed_repo_ids, None);
     }
 }
