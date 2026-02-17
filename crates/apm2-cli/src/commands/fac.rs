@@ -6751,7 +6751,7 @@ mod tests {
         use apm2_core::fac::evidence_bundle::EVIDENCE_BUNDLE_ENVELOPE_SCHEMA;
         use apm2_core::fac::{
             BlobStore, BudgetAdmissionTrace, ChannelBoundaryTrace, FacJobOutcome, FacJobReceiptV1,
-            QueueAdmissionTrace,
+            QueueAdmissionTrace, compute_job_receipt_content_hash,
         };
 
         let home = tempfile::tempdir().expect("temp dir");
@@ -6770,6 +6770,13 @@ mod tests {
             .store(&job_spec_blob)
             .expect("store job spec blob");
 
+        // The receipt's `content_hash` field references a blob stored in the
+        // CAS (plain BLAKE3), used by the export function to retrieve the blob.
+        // The receipt *file* is named by `compute_job_receipt_content_hash`
+        // (domain-separated BLAKE3 of canonical bytes), which the fallback
+        // scan verifies for integrity (MAJOR-1 fix, TCK-00564 round 8).
+        // These two hashes are intentionally different: `content_hash` is a
+        // CAS reference, while the filename is the integrity digest.
         let receipt = FacJobReceiptV1 {
             schema: "apm2.fac.job_receipt.v1".to_string(),
             receipt_id: "test-rt-receipt".to_string(),
@@ -6804,7 +6811,10 @@ mod tests {
             ..Default::default()
         };
 
-        let receipt_file = receipts_dir.join(format!("{}.json", hex::encode(receipt_blob_hash)));
+        // Name the receipt file by the domain-separated integrity hash so that
+        // the fallback scan's verify_receipt_integrity check passes.
+        let integrity_hash = compute_job_receipt_content_hash(&receipt);
+        let receipt_file = receipts_dir.join(format!("{integrity_hash}.json"));
         let bytes = serde_json::to_vec_pretty(&receipt).expect("serialize receipt for store");
         std::fs::write(&receipt_file, bytes).expect("write receipt to store");
 

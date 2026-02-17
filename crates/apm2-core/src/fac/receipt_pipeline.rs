@@ -549,16 +549,17 @@ impl ReceiptWritePipeline {
         // unreceipted state change occurs.
         let dest_path_preview = dest_dir.join(file_name);
 
-        // MINOR-1 fix (f-715-security): Compute receipt_id with full filename
-        // budget awareness. The persist() filename format is:
-        //   "recovery-{receipt_id}.json"  (9 prefix + 5 suffix = 14 framing)
+        // MINOR-1 fix round 8 (f-715-code_quality): Compute receipt_id with
+        // byte-aware filename budget. Filesystem filename limits are 255 *bytes*,
+        // not chars. The persist() filename format is:
+        //   "recovery-{receipt_id}.json"  (9 prefix + 5 suffix = 14 bytes framing)
         // The receipt_id format here is:
         //   "recovery-{truncated_job_id}-{timestamp_secs}"
-        //   (9 + 1 + up to 20 digits for timestamp = ~30 framing)
-        // Combined total framing from persist filename: 14 + 30 = 44 chars.
-        // Budget for job_id portion: MAX_FILE_NAME_LENGTH - 44.
-        let max_job_id_chars = MAX_FILE_NAME_LENGTH.saturating_sub(44);
-        let truncated_job_id: String = receipt.job_id.chars().take(max_job_id_chars).collect();
+        //   (9 + 1 + up to 20 digits for u64 timestamp = 30 bytes framing)
+        // Combined total framing: 14 + 30 = 44 bytes.
+        // Byte budget for job_id portion: MAX_FILE_NAME_LENGTH - 44.
+        let max_job_id_bytes = MAX_FILE_NAME_LENGTH.saturating_sub(44);
+        let truncated_job_id: String = truncate_to_byte_budget(&receipt.job_id, max_job_id_bytes);
         let recovery_receipt = RecoveryReceiptV1 {
             schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
             receipt_id: format!("recovery-{truncated_job_id}-{timestamp_secs}"),
@@ -650,6 +651,29 @@ fn truncate_for_display(s: &str, max_chars: usize) -> String {
         let truncated: String = s.chars().take(max_chars).collect();
         format!("{truncated}...")
     }
+}
+
+/// Truncate a string to fit within a byte budget, respecting UTF-8 char
+/// boundaries.
+///
+/// Iterates chars, accumulating `len_utf8()` bytes until the budget is
+/// reached. This ensures the result is always valid UTF-8 and never exceeds
+/// `max_bytes` bytes. Used for filesystem filename construction where limits
+/// are byte-based (255 bytes) rather than char-based (MINOR-1 fix, TCK-00564
+/// round 8).
+fn truncate_to_byte_budget(s: &str, max_bytes: usize) -> String {
+    let mut byte_count: usize = 0;
+    let mut result = String::new();
+    for ch in s.chars() {
+        let ch_bytes = ch.len_utf8();
+        let next = byte_count.saturating_add(ch_bytes);
+        if next > max_bytes {
+            break;
+        }
+        byte_count = next;
+        result.push(ch);
+    }
+    result
 }
 
 /// Validate that a `receipt_id` is safe for use in a filename.
@@ -2076,5 +2100,142 @@ mod tests {
             final_name.len(),
             final_name,
         );
+    }
+
+    // =========================================================================
+    // MINOR-1 round 8: byte-aware truncation for multibyte UTF-8 job IDs
+    // =========================================================================
+
+    #[test]
+    fn test_recover_torn_state_multibyte_job_id_stays_within_byte_limit() {
+        // Regression test for MINOR-1 (TCK-00564 round 8): A job_id composed
+        // of multibyte UTF-8 chars must produce a recovery receipt filename
+        // that fits within the 255-byte filesystem limit. With char-based
+        // truncation, 64 4-byte emoji chars would use 256 bytes for the
+        // job_id portion, plus 44 bytes framing = 300 bytes total — over the
+        // 255-byte limit. Byte-aware truncation correctly limits the output.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        let queue_root = tmp.path().join("queue");
+        let claimed_path = setup_claimed_job(&queue_root, "mb-test");
+
+        // Use a job_id of 64 4-byte emoji chars = 256 bytes, which is exactly
+        // at MAX_ID_LENGTH. The truncated job_id portion in the filename
+        // budget is MAX_FILE_NAME_LENGTH - 44 = 211 bytes. With char-based
+        // truncation, all 64 chars (256 bytes) would be kept — exceeding the
+        // 211-byte budget. Byte-aware truncation correctly stops at 52 chars
+        // (208 bytes).
+        let emoji_job_id: String = "\u{1F600}".repeat(64); // 64 smiley faces = 256 bytes
+        assert_eq!(
+            emoji_job_id.len(),
+            MAX_ID_LENGTH,
+            "test precondition: job_id must be at MAX_ID_LENGTH"
+        );
+
+        let mut receipt = make_receipt("mb-test", FacJobOutcome::Completed);
+        receipt.job_id = emoji_job_id;
+        receipt.content_hash = compute_job_receipt_content_hash(&receipt);
+        let _receipt_path =
+            persist_content_addressed_receipt(&receipts_dir, &receipt).expect("persist");
+
+        let pipeline = ReceiptWritePipeline::new(receipts_dir, queue_root);
+        let result = pipeline.recover_torn_state(
+            &claimed_path,
+            "mb-test.json",
+            &receipt,
+            TerminalState::Completed,
+            9_999_999_999,
+        );
+        assert!(
+            result.is_ok(),
+            "recovery must succeed with multibyte job_id, got: {:?}",
+            result.err()
+        );
+        let recovery = result.unwrap();
+        let final_name = format!("recovery-{}.json", recovery.receipt_id);
+        assert!(
+            final_name.len() <= MAX_FILE_NAME_LENGTH,
+            "recovery receipt filename must not exceed {} bytes with multibyte job_id, \
+             got: {} bytes for '{}'",
+            MAX_FILE_NAME_LENGTH,
+            final_name.len(),
+            final_name,
+        );
+    }
+
+    #[test]
+    fn test_recover_torn_state_2byte_utf8_job_id_within_byte_limit() {
+        // Test with 2-byte UTF-8 characters (e.g., Latin Extended).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        let queue_root = tmp.path().join("queue");
+        let claimed_path = setup_claimed_job(&queue_root, "2byte-test");
+
+        // 128 * 2 bytes = 256 bytes = MAX_ID_LENGTH. The truncated job_id
+        // portion budget is 211 bytes. With char-based truncation, all 128
+        // chars (256 bytes) would be kept — exceeding the budget. Byte-aware
+        // truncation correctly stops at 105 chars (210 bytes).
+        let two_byte_job_id: String = "\u{00E9}".repeat(128); // e-acute
+        assert_eq!(
+            two_byte_job_id.len(),
+            MAX_ID_LENGTH,
+            "test precondition: 2-byte job_id must be at MAX_ID_LENGTH"
+        );
+
+        let mut receipt = make_receipt("2byte-test", FacJobOutcome::Completed);
+        receipt.job_id = two_byte_job_id;
+        receipt.content_hash = compute_job_receipt_content_hash(&receipt);
+        let _receipt_path =
+            persist_content_addressed_receipt(&receipts_dir, &receipt).expect("persist");
+
+        let pipeline = ReceiptWritePipeline::new(receipts_dir, queue_root);
+        let result = pipeline.recover_torn_state(
+            &claimed_path,
+            "2byte-test.json",
+            &receipt,
+            TerminalState::Completed,
+            1000,
+        );
+        assert!(
+            result.is_ok(),
+            "recovery must succeed with 2-byte UTF-8 job_id, got: {:?}",
+            result.err()
+        );
+        let recovery = result.unwrap();
+        let final_name = format!("recovery-{}.json", recovery.receipt_id);
+        assert!(
+            final_name.len() <= MAX_FILE_NAME_LENGTH,
+            "recovery receipt filename must not exceed {} bytes with 2-byte UTF-8, \
+             got: {} bytes for '{}'",
+            MAX_FILE_NAME_LENGTH,
+            final_name.len(),
+            final_name,
+        );
+    }
+
+    #[test]
+    fn test_truncate_to_byte_budget_unit() {
+        // Unit test for the truncate_to_byte_budget helper.
+
+        // ASCII: 1 byte per char.
+        assert_eq!(truncate_to_byte_budget("abcdef", 3), "abc");
+        assert_eq!(truncate_to_byte_budget("abcdef", 6), "abcdef");
+        assert_eq!(truncate_to_byte_budget("abcdef", 100), "abcdef");
+        assert_eq!(truncate_to_byte_budget("", 10), "");
+        assert_eq!(truncate_to_byte_budget("abc", 0), "");
+
+        // 2-byte UTF-8 (e.g., e-acute U+00E9).
+        let two_byte = "\u{00E9}\u{00E9}\u{00E9}"; // 6 bytes total
+        assert_eq!(truncate_to_byte_budget(two_byte, 6), two_byte);
+        assert_eq!(truncate_to_byte_budget(two_byte, 5), "\u{00E9}\u{00E9}");
+        assert_eq!(truncate_to_byte_budget(two_byte, 4), "\u{00E9}\u{00E9}");
+        assert_eq!(truncate_to_byte_budget(two_byte, 1), "");
+
+        // 4-byte UTF-8 (emoji U+1F600).
+        let emoji = "\u{1F600}\u{1F600}"; // 8 bytes total
+        assert_eq!(truncate_to_byte_budget(emoji, 8), emoji);
+        assert_eq!(truncate_to_byte_budget(emoji, 7), "\u{1F600}");
+        assert_eq!(truncate_to_byte_budget(emoji, 4), "\u{1F600}");
+        assert_eq!(truncate_to_byte_budget(emoji, 3), "");
     }
 }
