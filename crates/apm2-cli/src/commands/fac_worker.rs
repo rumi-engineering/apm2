@@ -4247,21 +4247,14 @@ fn execute_warm_job(
                         let reason = format!("invalid warm phase '{name}': {e}");
                         eprintln!("worker: warm job {}: {reason}", spec.job_id);
                         let _ = LaneLeaseV1::remove(lane_dir);
-                        let moved_path = move_to_dir_safe(
-                            claimed_path,
-                            &queue_root.join(DENIED_DIR),
-                            claimed_file_name,
-                        )
-                        .map(|p| {
-                            p.strip_prefix(queue_root)
-                                .unwrap_or(&p)
-                                .to_string_lossy()
-                                .to_string()
-                        })
-                        .ok();
-                        let _ = emit_job_receipt(
+                        // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
+                        // (claimed/ -> denied/ transition).
+                        if let Err(commit_err) = commit_claimed_job_via_pipeline(
                             fac_root,
+                            queue_root,
                             spec,
+                            claimed_path,
+                            claimed_file_name,
                             FacJobOutcome::Denied,
                             Some(DenialReasonCode::ValidationFailed),
                             &reason,
@@ -4270,11 +4263,19 @@ fn execute_warm_job(
                             budget_trace,
                             patch_digest,
                             Some(canonicalizer_tuple_digest),
-                            moved_path.as_deref(),
                             policy_hash,
                             containment_trace,
+                            None,
                             Some(sbx_hash),
-                        );
+                        ) {
+                            return handle_pipeline_commit_failure(
+                                &commit_err,
+                                "denied warm job (invalid phase)",
+                                claimed_path,
+                                queue_root,
+                                claimed_file_name,
+                            );
+                        }
                         return JobOutcome::Denied { reason };
                     },
                 }
@@ -4290,21 +4291,14 @@ fn execute_warm_job(
     if let Err(e) = std::fs::create_dir_all(&cargo_home) {
         let reason = format!("cannot create lane CARGO_HOME: {e}");
         let _ = LaneLeaseV1::remove(lane_dir);
-        let moved_path = move_to_dir_safe(
-            claimed_path,
-            &queue_root.join(DENIED_DIR),
-            claimed_file_name,
-        )
-        .map(|p| {
-            p.strip_prefix(queue_root)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .to_string()
-        })
-        .ok();
-        let _ = emit_job_receipt(
+        // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
+        // (claimed/ -> denied/ transition).
+        if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
+            queue_root,
             spec,
+            claimed_path,
+            claimed_file_name,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::ValidationFailed),
             &reason,
@@ -4313,31 +4307,32 @@ fn execute_warm_job(
             budget_trace,
             patch_digest,
             Some(canonicalizer_tuple_digest),
-            moved_path.as_deref(),
             policy_hash,
             containment_trace,
+            None,
             Some(sbx_hash),
-        );
+        ) {
+            return handle_pipeline_commit_failure(
+                &commit_err,
+                "denied warm job (CARGO_HOME creation failed)",
+                claimed_path,
+                queue_root,
+                claimed_file_name,
+            );
+        }
         return JobOutcome::Denied { reason };
     }
     if let Err(e) = std::fs::create_dir_all(&cargo_target_dir) {
         let reason = format!("cannot create lane CARGO_TARGET_DIR: {e}");
         let _ = LaneLeaseV1::remove(lane_dir);
-        let moved_path = move_to_dir_safe(
-            claimed_path,
-            &queue_root.join(DENIED_DIR),
-            claimed_file_name,
-        )
-        .map(|p| {
-            p.strip_prefix(queue_root)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .to_string()
-        })
-        .ok();
-        let _ = emit_job_receipt(
+        // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
+        // (claimed/ -> denied/ transition).
+        if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
+            queue_root,
             spec,
+            claimed_path,
+            claimed_file_name,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::ValidationFailed),
             &reason,
@@ -4346,11 +4341,19 @@ fn execute_warm_job(
             budget_trace,
             patch_digest,
             Some(canonicalizer_tuple_digest),
-            moved_path.as_deref(),
             policy_hash,
             containment_trace,
+            None,
             Some(sbx_hash),
-        );
+        ) {
+            return handle_pipeline_commit_failure(
+                &commit_err,
+                "denied warm job (CARGO_TARGET_DIR creation failed)",
+                claimed_path,
+                queue_root,
+                claimed_file_name,
+            );
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -4388,21 +4391,14 @@ fn execute_warm_job(
             let reason = format!("credential mount injection failed: {error}");
             eprintln!("worker: warm job {}: {reason}", spec.job_id);
             let _ = LaneLeaseV1::remove(lane_dir);
-            let moved_path = move_to_dir_safe(
-                claimed_path,
-                &queue_root.join(DENIED_DIR),
-                claimed_file_name,
-            )
-            .map(|p| {
-                p.strip_prefix(queue_root)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .ok();
-            let _ = emit_job_receipt(
+            // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
+            // (claimed/ -> denied/ transition).
+            if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
+                queue_root,
                 spec,
+                claimed_path,
+                claimed_file_name,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -4411,11 +4407,19 @@ fn execute_warm_job(
                 budget_trace,
                 patch_digest,
                 Some(canonicalizer_tuple_digest),
-                moved_path.as_deref(),
                 policy_hash,
                 containment_trace,
+                None,
                 Some(sbx_hash),
-            );
+            ) {
+                return handle_pipeline_commit_failure(
+                    &commit_err,
+                    "denied warm job (credential mount injection failed)",
+                    claimed_path,
+                    queue_root,
+                    claimed_file_name,
+                );
+            }
             return JobOutcome::Denied { reason };
         }
     }
@@ -4449,21 +4453,14 @@ fn execute_warm_job(
                         );
                         eprintln!("worker: warm job {}: {reason}", spec.job_id);
                         let _ = LaneLeaseV1::remove(lane_dir);
-                        let moved_path = move_to_dir_safe(
-                            claimed_path,
-                            &queue_root.join(DENIED_DIR),
-                            claimed_file_name,
-                        )
-                        .map(|p| {
-                            p.strip_prefix(queue_root)
-                                .unwrap_or(&p)
-                                .to_string_lossy()
-                                .to_string()
-                        })
-                        .ok();
-                        let _ = emit_job_receipt(
+                        // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
+                        // (claimed/ -> denied/ transition).
+                        if let Err(commit_err) = commit_claimed_job_via_pipeline(
                             fac_root,
+                            queue_root,
                             spec,
+                            claimed_path,
+                            claimed_file_name,
                             FacJobOutcome::Denied,
                             Some(DenialReasonCode::ValidationFailed),
                             &reason,
@@ -4472,11 +4469,19 @@ fn execute_warm_job(
                             budget_trace,
                             patch_digest,
                             Some(canonicalizer_tuple_digest),
-                            moved_path.as_deref(),
                             policy_hash,
                             containment_trace,
+                            None,
                             Some(sbx_hash),
-                        );
+                        ) {
+                            return handle_pipeline_commit_failure(
+                                &commit_err,
+                                "denied warm job (system-mode config error)",
+                                claimed_path,
+                                queue_root,
+                                claimed_file_name,
+                            );
+                        }
                         return JobOutcome::Denied { reason };
                     },
                 }
@@ -4508,21 +4513,14 @@ fn execute_warm_job(
                 );
                 eprintln!("worker: warm job {}: {reason}", spec.job_id);
                 let _ = LaneLeaseV1::remove(lane_dir);
-                let moved_path = move_to_dir_safe(
-                    claimed_path,
-                    &queue_root.join(DENIED_DIR),
-                    claimed_file_name,
-                )
-                .map(|p| {
-                    p.strip_prefix(queue_root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .ok();
-                let _ = emit_job_receipt(
+                // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
+                // (claimed/ -> denied/ transition).
+                if let Err(commit_err) = commit_claimed_job_via_pipeline(
                     fac_root,
+                    queue_root,
                     spec,
+                    claimed_path,
+                    claimed_file_name,
                     FacJobOutcome::Denied,
                     Some(DenialReasonCode::ValidationFailed),
                     &reason,
@@ -4531,11 +4529,19 @@ fn execute_warm_job(
                     budget_trace,
                     patch_digest,
                     Some(canonicalizer_tuple_digest),
-                    moved_path.as_deref(),
                     policy_hash,
                     containment_trace,
+                    None,
                     Some(sbx_hash),
-                );
+                ) {
+                    return handle_pipeline_commit_failure(
+                        &commit_err,
+                        "denied warm job (backend configuration error)",
+                        claimed_path,
+                        queue_root,
+                        claimed_file_name,
+                    );
+                }
                 return JobOutcome::Denied { reason };
             }
         },
@@ -4607,21 +4613,14 @@ fn execute_warm_job(
             // just some may have failed). But structural errors (too many phases,
             // field too long) are denials.
             let _ = LaneLeaseV1::remove(lane_dir);
-            let moved_path = move_to_dir_safe(
-                claimed_path,
-                &queue_root.join(DENIED_DIR),
-                claimed_file_name,
-            )
-            .map(|p| {
-                p.strip_prefix(queue_root)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .ok();
-            let _ = emit_job_receipt(
+            // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
+            // (claimed/ -> denied/ transition).
+            if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
+                queue_root,
                 spec,
+                claimed_path,
+                claimed_file_name,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -4630,11 +4629,19 @@ fn execute_warm_job(
                 budget_trace,
                 patch_digest,
                 Some(canonicalizer_tuple_digest),
-                moved_path.as_deref(),
                 policy_hash,
                 containment_trace,
+                None,
                 Some(sbx_hash),
-            );
+            ) {
+                return handle_pipeline_commit_failure(
+                    &commit_err,
+                    "denied warm job (execution failed)",
+                    claimed_path,
+                    queue_root,
+                    claimed_file_name,
+                );
+            }
             return JobOutcome::Denied { reason };
         },
     };

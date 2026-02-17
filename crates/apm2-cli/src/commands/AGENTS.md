@@ -238,10 +238,13 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
   character set the worker enforces (`[A-Za-z0-9_-]`), length-checked against
   `MAX_QUEUE_LANE_LENGTH`, and encoded in the job spec's `queue_lane` field. Defaults to
   `"bulk"` when omitted. The worker uses `queue_lane` for lane scheduling admission.
-- **Deterministic denial queue move** (`fac_worker.rs`): All warm job denial paths in
-  `execute_warm_job` (CARGO_HOME/CARGO_TARGET_DIR creation failure, phase validation failure,
-  and warm execution failure) move the claimed file to `denied/` via `move_to_dir_safe`
-  and report `moved_job_path` in the denial receipt. No denial returns without a terminal
+- **Atomic denial pipeline in execute_warm_job** (`fac_worker.rs`, TCK-00564 fix round 9):
+  All warm job denial paths in `execute_warm_job` (phase validation failure,
+  CARGO_HOME/CARGO_TARGET_DIR creation failure, credential mount injection failure,
+  containment backend/config errors, and warm execution failure) use
+  `commit_claimed_job_via_pipeline` for crash-safe receipt-before-move ordering. Pipeline
+  commit failures are handled via `handle_pipeline_commit_failure` which leaves the job
+  in `claimed/` for reconcile to repair. No denial returns without an atomic terminal
   queue state transition.
 - **Systemd-run containment** (`fac_worker.rs`, `warm.rs`): Warm phase subprocesses
   (which compile untrusted repository code including `build.rs` and proc-macros) are
