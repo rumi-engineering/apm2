@@ -62,6 +62,12 @@ pub const LANE_PROFILE_V1_SCHEMA: &str = "apm2.fac.lane_profile.v1";
 /// Schema identifier for lane lease v1.
 pub const LANE_LEASE_V1_SCHEMA: &str = "apm2.fac.lane_lease.v1";
 
+/// Schema identifier for lane init receipt v1 (TCK-00539).
+pub const LANE_INIT_RECEIPT_SCHEMA: &str = "apm2.fac.lane_init_receipt.v1";
+
+/// Schema identifier for lane reconcile receipt v1 (TCK-00539).
+pub const LANE_RECONCILE_RECEIPT_SCHEMA: &str = "apm2.fac.lane_reconcile_receipt.v1";
+
 /// Schema identifier for corrupt marker files.
 pub const LANE_CORRUPT_MARKER_SCHEMA: &str = "apm2.fac.lane_corrupt.v1";
 
@@ -1024,6 +1030,99 @@ impl LaneCorruptMarkerV1 {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Lane Init / Reconcile Receipt Types (TCK-00539)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Receipt for `apm2 fac lane init` (TCK-00539).
+///
+/// Records the lanes that were created vs already existed, profile hashes,
+/// and node identity used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaneInitReceiptV1 {
+    /// Schema identifier.
+    pub schema: String,
+    /// Total number of lanes configured.
+    pub lane_count: usize,
+    /// Lane IDs that were newly created (profile written).
+    pub lanes_created: Vec<String>,
+    /// Lane IDs that already existed (profile untouched).
+    pub lanes_existing: Vec<String>,
+    /// Per-lane profile hash information.
+    pub profiles: Vec<LaneInitProfileEntry>,
+    /// Node fingerprint used for profile generation.
+    pub node_fingerprint: String,
+    /// Boundary ID used for profile generation.
+    pub boundary_id: String,
+}
+
+/// Per-lane profile entry in the init receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaneInitProfileEntry {
+    /// Lane identifier.
+    pub lane_id: String,
+    /// `b3-256:<hex>` profile hash.
+    pub profile_hash: String,
+    /// Whether the profile was newly created (`true`) or already existed
+    /// (`false`).
+    pub created: bool,
+}
+
+/// Receipt for `apm2 fac lane reconcile` (TCK-00539).
+///
+/// Records all reconciliation actions taken, lanes inspected, and outcomes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaneReconcileReceiptV1 {
+    /// Schema identifier.
+    pub schema: String,
+    /// Total lanes inspected.
+    pub lanes_inspected: usize,
+    /// Lanes that were already healthy.
+    pub lanes_ok: usize,
+    /// Lanes that had missing dirs/profiles repaired.
+    pub lanes_repaired: usize,
+    /// Lanes marked CORRUPT because repair failed.
+    pub lanes_marked_corrupt: usize,
+    /// Lanes where repair actions failed.
+    pub lanes_failed: usize,
+    /// Individual reconciliation actions taken.
+    pub actions: Vec<LaneReconcileAction>,
+}
+
+/// A single reconciliation action for a lane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaneReconcileAction {
+    /// Lane identifier affected.
+    pub lane_id: String,
+    /// Action taken (e.g., `create_dir_workspace`, `write_default_profile`).
+    pub action: String,
+    /// Outcome of the action.
+    pub outcome: LaneReconcileOutcome,
+    /// Optional detail (e.g., error message on failure).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Outcome of a single reconciliation action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneReconcileOutcome {
+    /// Lane was already healthy; no action needed.
+    Ok,
+    /// Missing resource was successfully repaired.
+    Repaired,
+    /// Repair failed; lane marked CORRUPT.
+    MarkedCorrupt,
+    /// Repair failed and corrupt marker also could not be written.
+    Failed,
+    /// Action was skipped (e.g., existing corrupt marker).
+    Skipped,
+}
+
 impl fmt::Display for LaneStatusV1 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:<12} {:<10}", self.lane_id, self.state)?;
@@ -1180,6 +1279,400 @@ impl LaneManager {
         let lock_dir = self.fac_root.join("locks").join("lanes");
         create_dir_restricted(&lock_dir)?;
         Ok(())
+    }
+
+    /// Initialize all lanes: create directories, write default profiles, and
+    /// emit an init receipt.
+    ///
+    /// This is the operator-friendly bootstrap command for `apm2 fac lane
+    /// init`. After this returns successfully, a fresh `$APM2_HOME` has a
+    /// ready lane pool.
+    ///
+    /// If a profile already exists for a lane, it is left untouched
+    /// (idempotent).
+    ///
+    /// # Errors
+    ///
+    /// Returns `LaneError::Io` on filesystem errors, or
+    /// `LaneError::Serialization` if profile serialization fails.
+    pub fn init_lanes(&self) -> Result<LaneInitReceiptV1, LaneError> {
+        let apm2_home = self
+            .fac_root
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or_else(|| {
+                LaneError::HomeResolution("fac_root must be $APM2_HOME/private/fac".to_string())
+            })?;
+        let node_fingerprint = super::node_identity::load_or_derive_node_fingerprint(apm2_home)
+            .map_err(|e| {
+                LaneError::HomeResolution(format!("node fingerprint derivation failed: {e}"))
+            })?;
+        let boundary_id =
+            super::node_identity::load_or_default_boundary_id(apm2_home).map_err(|e| {
+                LaneError::HomeResolution(format!("boundary ID resolution failed: {e}"))
+            })?;
+
+        // Ensure all directories exist first.
+        self.ensure_directories()?;
+
+        let lane_ids = Self::default_lane_ids();
+        let mut lanes_created: Vec<String> = Vec::with_capacity(lane_ids.len());
+        let mut lanes_existing: Vec<String> = Vec::with_capacity(lane_ids.len());
+        let mut profile_hashes: Vec<LaneInitProfileEntry> = Vec::with_capacity(lane_ids.len());
+
+        for lane_id in &lane_ids {
+            let lane_dir = self.lane_dir(lane_id);
+            let profile_path = lane_dir.join("profile.v1.json");
+
+            if profile_path.exists() {
+                // Profile already exists -- leave it.
+                let existing = LaneProfileV1::load(&lane_dir)?;
+                let hash = existing
+                    .compute_hash()
+                    .unwrap_or_else(|_| "unknown".to_string());
+                profile_hashes.push(LaneInitProfileEntry {
+                    lane_id: lane_id.clone(),
+                    profile_hash: hash,
+                    created: false,
+                });
+                lanes_existing.push(lane_id.clone());
+            } else {
+                let profile = LaneProfileV1::new(lane_id, &node_fingerprint, &boundary_id)?;
+                profile.persist(&lane_dir)?;
+                let hash = profile
+                    .compute_hash()
+                    .unwrap_or_else(|_| "unknown".to_string());
+                profile_hashes.push(LaneInitProfileEntry {
+                    lane_id: lane_id.clone(),
+                    profile_hash: hash,
+                    created: true,
+                });
+                lanes_created.push(lane_id.clone());
+            }
+        }
+
+        let receipt = LaneInitReceiptV1 {
+            schema: LANE_INIT_RECEIPT_SCHEMA.to_string(),
+            lane_count: lane_ids.len(),
+            lanes_created,
+            lanes_existing,
+            profiles: profile_hashes,
+            node_fingerprint,
+            boundary_id,
+        };
+
+        // Persist receipt under evidence directory.
+        let receipt_dir = self.fac_root.join("evidence");
+        create_dir_restricted(&receipt_dir)?;
+        let receipt_bytes = serde_json::to_vec_pretty(&receipt)
+            .map_err(|e| LaneError::Serialization(e.to_string()))?;
+        let receipt_hash = blake3::hash(&receipt_bytes);
+        let receipt_filename = format!("lane_init_{}.json", &receipt_hash.to_hex()[..16]);
+        let receipt_path = receipt_dir.join(&receipt_filename);
+        atomic_write(&receipt_path, &receipt_bytes)?;
+
+        Ok(receipt)
+    }
+
+    /// Reconcile lane state: repair missing directories and profiles, mark
+    /// lanes CORRUPT if unrecoverable.
+    ///
+    /// This is the operator recovery command for `apm2 fac lane reconcile`.
+    /// It inspects each configured lane and repairs what it can:
+    ///
+    /// - Missing lane directories are recreated with `0o700` permissions.
+    /// - Missing profiles are regenerated with defaults.
+    /// - Lanes with corrupt markers are reported but not cleared.
+    /// - Lanes that cannot be repaired (e.g., permissions errors) are marked
+    ///   CORRUPT.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LaneError::Io` on filesystem errors, or
+    /// `LaneError::HomeResolution` if identity resolution fails.
+    pub fn reconcile_lanes(&self) -> Result<LaneReconcileReceiptV1, LaneError> {
+        let apm2_home = self
+            .fac_root
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or_else(|| {
+                LaneError::HomeResolution("fac_root must be $APM2_HOME/private/fac".to_string())
+            })?;
+        let node_fingerprint = super::node_identity::load_or_derive_node_fingerprint(apm2_home)
+            .map_err(|e| {
+                LaneError::HomeResolution(format!("node fingerprint derivation failed: {e}"))
+            })?;
+        let boundary_id =
+            super::node_identity::load_or_default_boundary_id(apm2_home).map_err(|e| {
+                LaneError::HomeResolution(format!("boundary ID resolution failed: {e}"))
+            })?;
+
+        let lane_ids = Self::default_lane_ids();
+        let mut actions: Vec<LaneReconcileAction> = Vec::with_capacity(lane_ids.len());
+
+        // Ensure lock directory exists.
+        let lock_dir = self.fac_root.join("locks").join("lanes");
+        if let Err(e) = create_dir_restricted(&lock_dir) {
+            actions.push(LaneReconcileAction {
+                lane_id: "locks/lanes".to_string(),
+                action: "create_lock_dir".to_string(),
+                outcome: LaneReconcileOutcome::Failed,
+                detail: Some(format!("failed to create lock directory: {e}")),
+            });
+        }
+
+        for lane_id in &lane_ids {
+            Self::reconcile_single_lane(
+                &self.fac_root,
+                &self.lane_dir(lane_id),
+                lane_id,
+                &node_fingerprint,
+                &boundary_id,
+                &mut actions,
+            );
+        }
+
+        let receipt = Self::build_reconcile_receipt(&lane_ids, actions);
+
+        // Persist receipt under evidence directory.
+        let receipt_dir = self.fac_root.join("evidence");
+        create_dir_restricted(&receipt_dir)?;
+        let receipt_bytes = serde_json::to_vec_pretty(&receipt)
+            .map_err(|e| LaneError::Serialization(e.to_string()))?;
+        let receipt_hash = blake3::hash(&receipt_bytes);
+        let receipt_filename = format!("lane_reconcile_{}.json", &receipt_hash.to_hex()[..16]);
+        let receipt_path = receipt_dir.join(&receipt_filename);
+        atomic_write(&receipt_path, &receipt_bytes)?;
+
+        Ok(receipt)
+    }
+
+    /// Reconcile a single lane: repair missing directories/profiles and mark
+    /// CORRUPT on unrecoverable failures.
+    fn reconcile_single_lane(
+        fac_root: &Path,
+        lane_dir: &Path,
+        lane_id: &str,
+        node_fingerprint: &str,
+        boundary_id: &str,
+        actions: &mut Vec<LaneReconcileAction>,
+    ) {
+        let mut lane_repaired = false;
+        let mut lane_failed = false;
+
+        // Check and repair lane subdirectories.
+        for subdir in &["workspace", "target", "logs"] {
+            Self::reconcile_dir(
+                lane_dir,
+                lane_id,
+                subdir,
+                &format!("create_dir_{subdir}"),
+                &mut lane_repaired,
+                &mut lane_failed,
+                actions,
+            );
+        }
+
+        // Check and repair per-lane env dirs.
+        for env_subdir in super::policy::LANE_ENV_DIRS {
+            Self::reconcile_dir(
+                lane_dir,
+                lane_id,
+                env_subdir,
+                &format!("create_env_{env_subdir}"),
+                &mut lane_repaired,
+                &mut lane_failed,
+                actions,
+            );
+        }
+
+        // Check and repair missing profile.
+        let profile_path = lane_dir.join("profile.v1.json");
+        if !profile_path.exists() {
+            Self::reconcile_profile(
+                lane_dir,
+                lane_id,
+                node_fingerprint,
+                boundary_id,
+                &mut lane_repaired,
+                &mut lane_failed,
+                actions,
+            );
+        }
+
+        // Check for existing corrupt marker.
+        let corrupt_marker_path = lane_dir.join("corrupt.v1.json");
+        if corrupt_marker_path.exists() {
+            actions.push(LaneReconcileAction {
+                lane_id: lane_id.to_string(),
+                action: "existing_corrupt_marker".to_string(),
+                outcome: LaneReconcileOutcome::Skipped,
+                detail: Some(
+                    "corrupt marker present; use `apm2 fac lane reset` to clear".to_string(),
+                ),
+            });
+        }
+
+        // Mark CORRUPT if any repair failed and no marker exists yet.
+        if lane_failed && !corrupt_marker_path.exists() {
+            Self::mark_lane_corrupt(fac_root, lane_id, actions);
+        }
+
+        // If repaired without failure and no prior corrupt marker, note OK.
+        if !lane_failed && !lane_repaired && !corrupt_marker_path.exists() {
+            actions.push(LaneReconcileAction {
+                lane_id: lane_id.to_string(),
+                action: "inspect".to_string(),
+                outcome: LaneReconcileOutcome::Ok,
+                detail: None,
+            });
+        }
+    }
+
+    /// Check and repair a single subdirectory during reconciliation.
+    fn reconcile_dir(
+        lane_dir: &Path,
+        lane_id: &str,
+        subdir: &str,
+        action_name: &str,
+        lane_repaired: &mut bool,
+        lane_failed: &mut bool,
+        actions: &mut Vec<LaneReconcileAction>,
+    ) {
+        let subdir_path = lane_dir.join(subdir);
+        if !subdir_path.exists() {
+            match create_dir_restricted(&subdir_path) {
+                Ok(()) => {
+                    actions.push(LaneReconcileAction {
+                        lane_id: lane_id.to_string(),
+                        action: action_name.to_string(),
+                        outcome: LaneReconcileOutcome::Repaired,
+                        detail: None,
+                    });
+                    *lane_repaired = true;
+                },
+                Err(e) => {
+                    actions.push(LaneReconcileAction {
+                        lane_id: lane_id.to_string(),
+                        action: action_name.to_string(),
+                        outcome: LaneReconcileOutcome::Failed,
+                        detail: Some(e.to_string()),
+                    });
+                    *lane_failed = true;
+                },
+            }
+        }
+    }
+
+    /// Attempt to write a default profile during reconciliation.
+    fn reconcile_profile(
+        lane_dir: &Path,
+        lane_id: &str,
+        node_fingerprint: &str,
+        boundary_id: &str,
+        lane_repaired: &mut bool,
+        lane_failed: &mut bool,
+        actions: &mut Vec<LaneReconcileAction>,
+    ) {
+        match LaneProfileV1::new(lane_id, node_fingerprint, boundary_id) {
+            Ok(profile) => match profile.persist(lane_dir) {
+                Ok(()) => {
+                    actions.push(LaneReconcileAction {
+                        lane_id: lane_id.to_string(),
+                        action: "write_default_profile".to_string(),
+                        outcome: LaneReconcileOutcome::Repaired,
+                        detail: None,
+                    });
+                    *lane_repaired = true;
+                },
+                Err(e) => {
+                    actions.push(LaneReconcileAction {
+                        lane_id: lane_id.to_string(),
+                        action: "write_default_profile".to_string(),
+                        outcome: LaneReconcileOutcome::Failed,
+                        detail: Some(e.to_string()),
+                    });
+                    *lane_failed = true;
+                },
+            },
+            Err(e) => {
+                actions.push(LaneReconcileAction {
+                    lane_id: lane_id.to_string(),
+                    action: "write_default_profile".to_string(),
+                    outcome: LaneReconcileOutcome::Failed,
+                    detail: Some(e.to_string()),
+                });
+                *lane_failed = true;
+            },
+        }
+    }
+
+    /// Write a CORRUPT marker for a lane that could not be repaired.
+    // SECURITY JUSTIFICATION (CTR-2501): Lane reconciliation corrupt-marker
+    // timestamps use wall-clock time because reconciliation is an operational
+    // recovery task, not a coordinated consensus operation. The timestamp is
+    // used only for corrupt marker labelling.
+    #[allow(clippy::disallowed_methods)]
+    fn mark_lane_corrupt(fac_root: &Path, lane_id: &str, actions: &mut Vec<LaneReconcileAction>) {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let marker = LaneCorruptMarkerV1 {
+            schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+            lane_id: lane_id.to_string(),
+            reason: "lane reconcile failed to repair missing directories/profile".to_string(),
+            cleanup_receipt_digest: None,
+            detected_at: now.to_string(),
+        };
+        if let Err(e) = marker.persist(fac_root) {
+            actions.push(LaneReconcileAction {
+                lane_id: lane_id.to_string(),
+                action: "mark_corrupt".to_string(),
+                outcome: LaneReconcileOutcome::Failed,
+                detail: Some(format!("failed to persist corrupt marker: {e}")),
+            });
+        } else {
+            actions.push(LaneReconcileAction {
+                lane_id: lane_id.to_string(),
+                action: "mark_corrupt".to_string(),
+                outcome: LaneReconcileOutcome::MarkedCorrupt,
+                detail: None,
+            });
+        }
+    }
+
+    /// Build the reconcile receipt from accumulated actions.
+    fn build_reconcile_receipt(
+        lane_ids: &[String],
+        actions: Vec<LaneReconcileAction>,
+    ) -> LaneReconcileReceiptV1 {
+        let lanes_ok = actions
+            .iter()
+            .filter(|a| a.outcome == LaneReconcileOutcome::Ok)
+            .count();
+        let lanes_repaired = actions
+            .iter()
+            .filter(|a| a.outcome == LaneReconcileOutcome::Repaired)
+            .count();
+        let lanes_marked_corrupt = actions
+            .iter()
+            .filter(|a| a.outcome == LaneReconcileOutcome::MarkedCorrupt)
+            .count();
+        let lanes_failed = actions
+            .iter()
+            .filter(|a| a.outcome == LaneReconcileOutcome::Failed)
+            .count();
+
+        LaneReconcileReceiptV1 {
+            schema: LANE_RECONCILE_RECEIPT_SCHEMA.to_string(),
+            lanes_inspected: lane_ids.len(),
+            lanes_ok,
+            lanes_repaired,
+            lanes_marked_corrupt,
+            lanes_failed,
+            actions,
+        }
     }
 
     /// Try to acquire an exclusive lock on a lane (non-blocking).
@@ -3984,5 +4477,224 @@ mod tests {
             steps.contains(&CLEANUP_STEP_GIT_CLEAN.to_string()),
             "git clean should have completed"
         );
+    }
+
+    // ── Init and Reconcile Tests (TCK-00539) ────────────────────────────
+
+    #[test]
+    fn init_lanes_creates_profiles_and_directories() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root.clone()).expect("create manager");
+
+        let receipt = manager.init_lanes().expect("init_lanes");
+
+        // Verify receipt structure.
+        assert_eq!(receipt.schema, LANE_INIT_RECEIPT_SCHEMA);
+        assert_eq!(receipt.lane_count, LaneManager::lane_count());
+        assert!(!receipt.lanes_created.is_empty());
+        assert!(receipt.lanes_existing.is_empty());
+        assert_eq!(receipt.profiles.len(), receipt.lane_count);
+
+        // Verify all profiles were created.
+        for entry in &receipt.profiles {
+            assert!(entry.created);
+            assert!(entry.profile_hash.starts_with("b3-256:"));
+        }
+
+        // Verify directories exist on disk.
+        let lane_ids = LaneManager::default_lane_ids();
+        for lane_id in &lane_ids {
+            let lane_dir = manager.lane_dir(lane_id);
+            assert!(lane_dir.join("workspace").is_dir());
+            assert!(lane_dir.join("target").is_dir());
+            assert!(lane_dir.join("logs").is_dir());
+            assert!(lane_dir.join("profile.v1.json").is_file());
+        }
+
+        // Verify receipt was persisted.
+        let evidence_dir = fac_root.join("evidence");
+        assert!(evidence_dir.is_dir());
+        let entry_count = fs::read_dir(&evidence_dir)
+            .expect("read evidence dir")
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("lane_init_"))
+            .count();
+        assert_eq!(entry_count, 1, "exactly one init receipt should exist");
+    }
+
+    #[test]
+    fn init_lanes_is_idempotent() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        let first = manager.init_lanes().expect("first init");
+        let second = manager.init_lanes().expect("second init");
+
+        // Second run should find all lanes existing, none created.
+        assert!(second.lanes_created.is_empty());
+        assert_eq!(second.lanes_existing.len(), first.lane_count);
+
+        // Profile hashes should match.
+        for (a, b) in first.profiles.iter().zip(second.profiles.iter()) {
+            assert_eq!(a.lane_id, b.lane_id);
+            assert_eq!(a.profile_hash, b.profile_hash);
+        }
+    }
+
+    #[test]
+    fn reconcile_lanes_reports_ok_for_healthy_pool() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        // Init first to create a healthy pool.
+        manager.init_lanes().expect("init_lanes");
+
+        let receipt = manager.reconcile_lanes().expect("reconcile_lanes");
+
+        assert_eq!(receipt.schema, LANE_RECONCILE_RECEIPT_SCHEMA);
+        assert_eq!(receipt.lanes_inspected, LaneManager::lane_count());
+        assert_eq!(receipt.lanes_ok, LaneManager::lane_count());
+        assert_eq!(receipt.lanes_repaired, 0);
+        assert_eq!(receipt.lanes_marked_corrupt, 0);
+        assert_eq!(receipt.lanes_failed, 0);
+    }
+
+    #[test]
+    fn reconcile_repairs_missing_profile() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        // Init first.
+        manager.init_lanes().expect("init_lanes");
+
+        // Delete one profile.
+        let lane_id = &LaneManager::default_lane_ids()[0];
+        let profile_path = manager.lane_dir(lane_id).join("profile.v1.json");
+        fs::remove_file(&profile_path).expect("remove profile");
+
+        // Reconcile should repair it.
+        let receipt = manager.reconcile_lanes().expect("reconcile_lanes");
+
+        assert!(receipt.lanes_repaired > 0);
+        assert!(profile_path.is_file(), "profile should be recreated");
+    }
+
+    #[test]
+    fn reconcile_repairs_missing_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        // Init first.
+        manager.init_lanes().expect("init_lanes");
+
+        // Delete the workspace dir of the first lane.
+        let lane_id = &LaneManager::default_lane_ids()[0];
+        let workspace = manager.lane_dir(lane_id).join("workspace");
+        fs::remove_dir_all(&workspace).expect("remove workspace");
+
+        // Reconcile should repair it.
+        let receipt = manager.reconcile_lanes().expect("reconcile_lanes");
+
+        assert!(receipt.lanes_repaired > 0);
+        assert!(workspace.is_dir(), "workspace should be recreated");
+    }
+
+    #[test]
+    fn reconcile_reports_existing_corrupt_markers() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root.clone()).expect("create manager");
+
+        // Init first.
+        manager.init_lanes().expect("init_lanes");
+
+        // Create a corrupt marker on lane-00.
+        let lane_id = "lane-00";
+        let marker = LaneCorruptMarkerV1 {
+            schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+            lane_id: lane_id.to_string(),
+            reason: "test corruption".to_string(),
+            cleanup_receipt_digest: None,
+            detected_at: "1234567890".to_string(),
+        };
+        marker.persist(&fac_root).expect("persist corrupt marker");
+
+        let receipt = manager.reconcile_lanes().expect("reconcile_lanes");
+
+        // Should report the corrupt marker as skipped.
+        let skip_count = receipt
+            .actions
+            .iter()
+            .filter(|a| {
+                a.lane_id == lane_id
+                    && a.action == "existing_corrupt_marker"
+                    && a.outcome == LaneReconcileOutcome::Skipped
+            })
+            .count();
+        assert_eq!(skip_count, 1, "should report existing corrupt marker");
+    }
+
+    #[test]
+    fn init_receipt_roundtrips_through_json() {
+        let receipt = LaneInitReceiptV1 {
+            schema: LANE_INIT_RECEIPT_SCHEMA.to_string(),
+            lane_count: 3,
+            lanes_created: vec!["lane-00".to_string()],
+            lanes_existing: vec!["lane-01".to_string(), "lane-02".to_string()],
+            profiles: vec![
+                LaneInitProfileEntry {
+                    lane_id: "lane-00".to_string(),
+                    profile_hash: "b3-256:abcd".to_string(),
+                    created: true,
+                },
+                LaneInitProfileEntry {
+                    lane_id: "lane-01".to_string(),
+                    profile_hash: "b3-256:ef01".to_string(),
+                    created: false,
+                },
+            ],
+            node_fingerprint:
+                "b3-256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+            boundary_id: "apm2.fac.local".to_string(),
+        };
+
+        let json = serde_json::to_string(&receipt).expect("serialize");
+        let deserialized: LaneInitReceiptV1 = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(receipt, deserialized);
+    }
+
+    #[test]
+    fn reconcile_receipt_roundtrips_through_json() {
+        let receipt = LaneReconcileReceiptV1 {
+            schema: LANE_RECONCILE_RECEIPT_SCHEMA.to_string(),
+            lanes_inspected: 3,
+            lanes_ok: 2,
+            lanes_repaired: 1,
+            lanes_marked_corrupt: 0,
+            lanes_failed: 0,
+            actions: vec![LaneReconcileAction {
+                lane_id: "lane-00".to_string(),
+                action: "create_dir_workspace".to_string(),
+                outcome: LaneReconcileOutcome::Repaired,
+                detail: None,
+            }],
+        };
+
+        let json = serde_json::to_string(&receipt).expect("serialize");
+        let deserialized: LaneReconcileReceiptV1 =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(receipt, deserialized);
     }
 }

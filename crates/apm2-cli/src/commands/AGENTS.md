@@ -80,6 +80,7 @@ pub enum FacSubcommand {
     Restart(RestartArgs),
     Logs(LogsArgs),
     Pipeline(PipelineArgs),
+    Lane(LaneArgs),
 }
 ```
 
@@ -176,6 +177,21 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
 | Function | Description |
 |----------|-------------|
 | `run_fac(cmd, operator_socket, session_socket)` | Route FAC subcommands; returns exit code |
+
+### Lane Init/Reconcile Commands (fac.rs, TCK-00539)
+
+| Subcommand | Function | Description |
+|------------|----------|-------------|
+| `apm2 fac lane init` | `run_lane_init()` | Bootstrap a fresh lane pool with directories and default profiles |
+| `apm2 fac lane reconcile` | `run_lane_reconcile()` | Repair missing lane directories/profiles, mark unrecoverable lanes CORRUPT |
+
+Both subcommands accept a `--json` flag for structured output. Human-readable
+tables are printed by default via `print_lane_init_receipt()` and
+`print_lane_reconcile_receipt()`.
+
+**LaneSubcommand** enum variants added:
+- `Init(LaneInitArgs)` -- `--json` flag
+- `Reconcile(LaneReconcileArgs)` -- `--json` flag
 
 ### Work (work.rs)
 

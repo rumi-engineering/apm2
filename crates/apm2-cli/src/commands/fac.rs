@@ -56,10 +56,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use apm2_core::fac::{
-    LANE_ENV_DIRS, LaneCorruptMarkerV1, LaneLeaseV1, LaneManager, LaneState, LaneStatusV1,
-    PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt,
-    SUMMARY_RECEIPT_SCHEMA, SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA,
-    TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1, safe_rmtree_v1,
+    LANE_ENV_DIRS, LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1, LaneManager,
+    LaneReconcileReceiptV1, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
+    REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA,
+    SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
+    safe_rmtree_v1,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
@@ -792,6 +793,20 @@ pub enum LaneSubcommand {
     /// cleaning up. Uses `safe_rmtree_v1` which refuses symlink
     /// traversal and crossing filesystem boundaries.
     Reset(LaneResetArgs),
+    /// Initialize the lane pool: create directories and write default profiles.
+    ///
+    /// Bootstraps a fresh `$APM2_HOME` into a ready lane pool with one
+    /// command. Existing profiles are left untouched (idempotent).
+    /// Lane count is configurable via `$APM2_FAC_LANE_COUNT` (default: 3,
+    /// max: 32).
+    Init(LaneInitArgs),
+    /// Reconcile lane state: repair missing directories and profiles.
+    ///
+    /// Inspects all configured lanes and repairs missing directories or
+    /// profiles. Lanes that cannot be repaired are marked CORRUPT.
+    /// Existing corrupt markers are reported but not cleared (use
+    /// `apm2 fac lane reset` to clear them).
+    Reconcile(LaneReconcileArgs),
 }
 
 /// Arguments for `apm2 fac lane status`.
@@ -817,6 +832,22 @@ pub struct LaneResetArgs {
     #[arg(long, default_value_t = false)]
     pub force: bool,
 
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac lane init` (TCK-00539).
+#[derive(Debug, Args)]
+pub struct LaneInitArgs {
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac lane reconcile` (TCK-00539).
+#[derive(Debug, Args)]
+pub struct LaneReconcileArgs {
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -2324,6 +2355,12 @@ pub fn run_fac(
             },
             LaneSubcommand::Reset(reset_args) => {
                 run_lane_reset(reset_args, resolve_json(reset_args.json))
+            },
+            LaneSubcommand::Init(init_args) => {
+                run_lane_init(init_args, resolve_json(init_args.json))
+            },
+            LaneSubcommand::Reconcile(reconcile_args) => {
+                run_lane_reconcile(reconcile_args, resolve_json(reconcile_args.json))
             },
         },
         FacSubcommand::Push(args) => {
@@ -4596,6 +4633,165 @@ fn persist_corrupt_lease(manager: &LaneManager, lane_id: &str, reason: &str) {
         Err(e) => {
             eprintln!("WARNING: failed to create CORRUPT lease for lane {lane_id}: {e}");
         },
+    }
+}
+
+// =============================================================================
+// Lane Init Command (TCK-00539)
+// =============================================================================
+
+/// Execute `apm2 fac lane init`.
+///
+/// Creates all configured lane directories and writes default profiles.
+/// Existing profiles are left untouched (idempotent). Emits a receipt
+/// recording lanes created vs already existing.
+fn run_lane_init(_args: &LaneInitArgs, json_output: bool) -> u8 {
+    let manager = match LaneManager::from_default_home() {
+        Ok(m) => m,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "lane_error",
+                &format!("Failed to initialize lane manager: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let receipt = match manager.init_lanes() {
+        Ok(r) => r,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "lane_init_error",
+                &format!("Lane init failed: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    if json_output {
+        match serde_json::to_string_pretty(&receipt) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                return output_error(
+                    json_output,
+                    "serialization_error",
+                    &format!("Failed to serialize init receipt: {e}"),
+                    exit_codes::GENERIC_ERROR,
+                );
+            },
+        }
+    } else {
+        print_lane_init_receipt(&receipt);
+    }
+
+    exit_codes::SUCCESS
+}
+
+/// Print a human-readable init receipt.
+fn print_lane_init_receipt(receipt: &LaneInitReceiptV1) {
+    println!("Lane pool initialized ({} lanes)", receipt.lane_count);
+    println!();
+    println!("  Node fingerprint: {}", receipt.node_fingerprint);
+    println!("  Boundary ID:      {}", receipt.boundary_id);
+    println!();
+
+    if !receipt.lanes_created.is_empty() {
+        println!("  Created:");
+        for entry in &receipt.profiles {
+            if entry.created {
+                println!("    {:<12} {}", entry.lane_id, entry.profile_hash);
+            }
+        }
+    }
+
+    if !receipt.lanes_existing.is_empty() {
+        println!("  Already existing:");
+        for entry in &receipt.profiles {
+            if !entry.created {
+                println!("    {:<12} {}", entry.lane_id, entry.profile_hash);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Lane Reconcile Command (TCK-00539)
+// =============================================================================
+
+/// Execute `apm2 fac lane reconcile`.
+///
+/// Inspects all lanes and repairs missing directories or profiles. Lanes
+/// that cannot be repaired are marked CORRUPT.
+fn run_lane_reconcile(_args: &LaneReconcileArgs, json_output: bool) -> u8 {
+    let manager = match LaneManager::from_default_home() {
+        Ok(m) => m,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "lane_error",
+                &format!("Failed to initialize lane manager: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let receipt = match manager.reconcile_lanes() {
+        Ok(r) => r,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "lane_reconcile_error",
+                &format!("Lane reconcile failed: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    if json_output {
+        match serde_json::to_string_pretty(&receipt) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                return output_error(
+                    json_output,
+                    "serialization_error",
+                    &format!("Failed to serialize reconcile receipt: {e}"),
+                    exit_codes::GENERIC_ERROR,
+                );
+            },
+        }
+    } else {
+        print_lane_reconcile_receipt(&receipt);
+    }
+
+    if receipt.lanes_marked_corrupt > 0 || receipt.lanes_failed > 0 {
+        exit_codes::GENERIC_ERROR
+    } else {
+        exit_codes::SUCCESS
+    }
+}
+
+/// Print a human-readable reconcile receipt.
+fn print_lane_reconcile_receipt(receipt: &LaneReconcileReceiptV1) {
+    println!("Lane reconciliation complete");
+    println!();
+    println!("  Lanes inspected:      {}", receipt.lanes_inspected);
+    println!("  Lanes OK:             {}", receipt.lanes_ok);
+    println!("  Lanes repaired:       {}", receipt.lanes_repaired);
+    println!("  Lanes marked corrupt: {}", receipt.lanes_marked_corrupt);
+    println!("  Lanes failed:         {}", receipt.lanes_failed);
+
+    if !receipt.actions.is_empty() {
+        println!();
+        println!("  Actions:");
+        for action in &receipt.actions {
+            let detail = action.detail.as_deref().unwrap_or("");
+            println!(
+                "    {:<12} {:<30} {:?} {}",
+                action.lane_id, action.action, action.outcome, detail
+            );
+        }
     }
 }
 

@@ -129,10 +129,14 @@ Credential management subcommands.
 | `apm2 status <name>` | Show process details |
 | `apm2 logs <name>` | Tail process logs |
 
-### FAC Lane Management (TCK-00515, TCK-00516)
+### FAC Lane Management (TCK-00515, TCK-00516, TCK-00539)
 
 | Command | Description |
 |---------|-------------|
+| `apm2 fac lane init` | Bootstrap a fresh lane pool with directories and default profiles |
+| `apm2 fac lane init --json` | Same, with JSON receipt output |
+| `apm2 fac lane reconcile` | Repair missing lane directories/profiles, mark unrecoverable lanes CORRUPT |
+| `apm2 fac lane reconcile --json` | Same, with JSON receipt output |
 | `apm2 fac lane status` | Show all lane states (lock + lease + PID liveness) |
 | `apm2 fac lane status --state RUNNING` | Filter lanes by state |
 | `apm2 fac lane reset <lane_id>` | Reset lane: delete workspace/target/logs, remove lease |
