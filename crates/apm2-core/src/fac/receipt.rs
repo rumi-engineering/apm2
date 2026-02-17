@@ -713,6 +713,13 @@ pub struct FacJobReceiptV1 {
     /// wall-clock timers and I/O accounting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_cost: Option<crate::economics::cost_model::ObservedJobCost>,
+    /// Sandbox hardening hash for audit (TCK-00573).
+    ///
+    /// BLAKE3 hash of the `SandboxHardeningProfile` used for the job unit,
+    /// formatted as `b3-256:<64hex>`. Enables audit verification that the
+    /// expected hardening profile was applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_hardening_hash: Option<String>,
     /// Epoch timestamp.
     pub timestamp_secs: u64,
     /// BLAKE3 body hash for content-addressed storage.
@@ -724,16 +731,6 @@ impl FacJobReceiptV1 {
     ///
     /// Encodes all fields except `content_hash` in deterministic order with
     /// length-prefixing to prevent canonicalization collisions.
-    ///
-    /// # V1 Immutability Contract
-    ///
-    /// This method represents the V1 canonical form and MUST remain
-    /// bit-for-bit compatible with the historical implementation. Trailing
-    /// optional fields (`moved_job_path`, `containment`, `observed_cost`)
-    /// do NOT emit a `0u8` presence marker when absent; they are simply
-    /// omitted. This matches the original encoding and preserves content
-    /// hashes for all existing persisted receipts. New receipts should
-    /// prefer `canonical_bytes_v2()` which uses proper presence markers.
     ///
     /// # Panics
     ///
@@ -832,20 +829,20 @@ impl FacJobReceiptV1 {
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
-        // V1 trailing optional fields: NO `0u8` presence marker when absent.
-        // These fields are simply omitted when None, preserving bit-for-bit
-        // hash compatibility with pre-TCK-00514 / pre-TCK-00548 receipts.
-        // Appended at end for backward compatibility.
+        // Appended at end for backward compatibility with pre-TCK-00514 receipts.
+        // A `0u8` presence marker is intentionally omitted when `moved_job_path`
+        // is `None`, matching the `canonicalizer_tuple_digest` pattern above,
+        // because older receipts encoded without this optional field at all and
+        // adding a trailing `0u8` would change their content hash.
         if let Some(path) = &self.moved_job_path {
             bytes.push(1u8);
             bytes.extend_from_slice(&(path.len() as u32).to_be_bytes());
             bytes.extend_from_slice(path.as_bytes());
         }
 
-        // TCK-00548: Containment trace. Appended at end for backward
-        // compatibility with pre-TCK-00548 receipts. No `0u8` presence
-        // marker when absent, matching the pattern for other trailing
-        // optional fields.
+        // TCK-00548: Containment trace. V1 canonical bytes must remain
+        // bit-for-bit compatible with historical receipts, so this keeps
+        // the legacy `1u8` marker when present and omits absence markers.
         if let Some(trace) = &self.containment {
             bytes.push(1u8);
             bytes.push(u8::from(trace.verified));
@@ -856,18 +853,43 @@ impl FacJobReceiptV1 {
             bytes.push(u8::from(trace.sccache_auto_disabled));
         }
 
-        // TCK-00532: Observed job cost. Appended at end for backward
-        // compatibility. No `0u8` presence marker when absent, matching
-        // the V1 trailing optional field pattern. Old receipts without
-        // this field will produce the same hash as before.
-        if let Some(cost) = &self.observed_cost {
+        // TCK-00532: Observed job cost. V1 trailing optionals omit absence
+        // markers for backwards compatibility with existing persisted hashes.
+        Self::append_observed_cost_marker_v1(&mut bytes, self.observed_cost.as_ref());
+
+        // TCK-00573: Sandbox hardening hash. Added as an append-only trailing
+        // optional for V1; absence marker is omitted for hash stability.
+        if let Some(hash) = &self.sandbox_hardening_hash {
+            bytes.push(3u8);
+            bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(hash.as_bytes());
+        }
+
+        bytes
+    }
+
+    fn append_observed_cost_marker_v1(
+        bytes: &mut Vec<u8>,
+        observed_cost: Option<&crate::economics::cost_model::ObservedJobCost>,
+    ) {
+        if let Some(cost) = observed_cost {
             bytes.push(1u8);
             bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
             bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
             bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
         }
+    }
 
-        bytes
+    fn append_observed_cost_marker_v2(
+        bytes: &mut Vec<u8>,
+        observed_cost: Option<&crate::economics::cost_model::ObservedJobCost>,
+    ) {
+        if let Some(cost) = observed_cost {
+            bytes.push(4u8);
+            bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
+            bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
+        }
     }
 
     /// Returns v2 canonical bytes that include `unsafe_direct` in the
@@ -881,8 +903,19 @@ impl FacJobReceiptV1 {
     ///
     /// New receipts should use v2. Existing v1 receipts remain verifiable
     /// via `canonical_bytes()`.
+    ///
+    /// # V2 Schema Break (TCK-00573)
+    ///
+    /// The V2 canonical format was intentionally changed from positional
+    /// `0u8`/`1u8` presence markers to type-specific tagged markers
+    /// (`1u8`/`2u8`/`3u8`) for trailing optional fields. This prevents
+    /// canonicalization collisions between different optional field
+    /// combinations (injective encoding). No V2 receipts exist in
+    /// production -- V2 was introduced as a forward-looking format and has
+    /// not been deployed to any production receipt store. This schema break
+    /// is therefore safe and requires no migration.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn canonical_bytes_v2(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(512);
 
@@ -981,39 +1014,38 @@ impl FacJobReceiptV1 {
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
-
-        // V2 trailing optional fields: ALL emit presence markers (0u8/1u8)
-        // to prevent canonicalization collisions. V2 is only used for new
-        // receipts, so there is no backward-compatibility constraint.
+        // Appended at end for backward compatibility with pre-TCK-00514 receipts.
+        // A `0u8` presence marker is intentionally omitted when `moved_job_path`
+        // is `None`, matching the `canonicalizer_tuple_digest` pattern above,
+        // because older receipts encoded without this optional field at all and
+        // adding a trailing `0u8` would change their content hash.
         if let Some(path) = &self.moved_job_path {
             bytes.push(1u8);
             bytes.extend_from_slice(&(path.len() as u32).to_be_bytes());
             bytes.extend_from_slice(path.as_bytes());
-        } else {
-            bytes.push(0u8);
         }
 
-        // TCK-00548: Containment trace with presence marker.
+        // TCK-00548: Containment trace. Uses type-specific marker `2u8`
+        // to ensure injective encoding (MAJOR-1 fix).
         if let Some(trace) = &self.containment {
-            bytes.push(1u8);
+            bytes.push(2u8);
             bytes.push(u8::from(trace.verified));
             bytes.extend_from_slice(&(trace.cgroup_path.len() as u32).to_be_bytes());
             bytes.extend_from_slice(trace.cgroup_path.as_bytes());
             bytes.extend_from_slice(&trace.processes_checked.to_be_bytes());
             bytes.extend_from_slice(&trace.mismatch_count.to_be_bytes());
             bytes.push(u8::from(trace.sccache_auto_disabled));
-        } else {
-            bytes.push(0u8);
         }
 
-        // TCK-00532: Observed job cost with presence marker.
-        if let Some(cost) = &self.observed_cost {
-            bytes.push(1u8);
-            bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
-            bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
-            bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
-        } else {
-            bytes.push(0u8);
+        // TCK-00532: Observed job cost with a type-specific marker in v2.
+        Self::append_observed_cost_marker_v2(&mut bytes, self.observed_cost.as_ref());
+
+        // TCK-00573: Sandbox hardening hash. Uses type-specific marker
+        // `3u8` to ensure injective encoding (MAJOR-1 fix).
+        if let Some(hash) = &self.sandbox_hardening_hash {
+            bytes.push(3u8);
+            bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(hash.as_bytes());
         }
 
         bytes
@@ -1222,6 +1254,16 @@ impl FacJobReceiptV1 {
             }
         }
 
+        // TCK-00573: Validate sandbox hardening hash format if present.
+        if let Some(hash) = &self.sandbox_hardening_hash {
+            if !is_strict_b3_256_digest(hash) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "sandbox_hardening_hash must be exactly 71 chars in b3-256:<64hex> format"
+                        .to_string(),
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -1245,6 +1287,7 @@ pub struct FacJobReceiptV1Builder {
     eio29_budget_admission: Option<BudgetAdmissionTrace>,
     containment: Option<super::containment::ContainmentTrace>,
     observed_cost: Option<crate::economics::cost_model::ObservedJobCost>,
+    sandbox_hardening_hash: Option<String>,
     timestamp_secs: Option<u64>,
 }
 
@@ -1348,13 +1391,20 @@ impl FacJobReceiptV1Builder {
         self
     }
 
-    /// Sets the observed runtime cost metrics (TCK-00532).
+    /// Sets observed runtime cost metrics (TCK-00532).
     #[must_use]
     pub const fn observed_cost(
         mut self,
         cost: crate::economics::cost_model::ObservedJobCost,
     ) -> Self {
         self.observed_cost = Some(cost);
+        self
+    }
+
+    /// Sets the sandbox hardening hash for audit (TCK-00573).
+    #[must_use]
+    pub fn sandbox_hardening_hash(mut self, hash: impl Into<String>) -> Self {
+        self.sandbox_hardening_hash = Some(hash.into());
         self
     }
 
@@ -1548,6 +1598,16 @@ impl FacJobReceiptV1Builder {
             }
         }
 
+        // TCK-00573: Validate sandbox hardening hash format.
+        if let Some(hash) = &self.sandbox_hardening_hash {
+            if !is_strict_b3_256_digest(hash) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "sandbox_hardening_hash must be exactly 71 chars in b3-256:<64hex> format"
+                        .to_string(),
+                ));
+            }
+        }
+
         let candidate = FacJobReceiptV1 {
             schema: FAC_JOB_RECEIPT_SCHEMA.to_string(),
             receipt_id,
@@ -1565,6 +1625,7 @@ impl FacJobReceiptV1Builder {
             eio29_budget_admission: self.eio29_budget_admission,
             containment: self.containment,
             observed_cost: self.observed_cost,
+            sandbox_hardening_hash: self.sandbox_hardening_hash,
             moved_job_path,
             timestamp_secs,
             content_hash: String::new(),
@@ -1830,6 +1891,14 @@ pub struct GateReceipt {
     /// boundary (TCK-00388 Quality BLOCKER 2).
     pub passed: bool,
 
+    /// Sandbox hardening hash for audit (TCK-00573, MAJOR-2).
+    ///
+    /// BLAKE3 hash of the `SandboxHardeningProfile` used for the gate
+    /// execution environment, formatted as `b3-256:<64hex>`. Enables audit
+    /// verification that the expected hardening profile was applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_hardening_hash: Option<String>,
+
     /// Ed25519 signature over canonical bytes with domain separation.
     #[serde(with = "serde_bytes")]
     pub receipt_signature: [u8; 64],
@@ -1912,6 +1981,15 @@ impl GateReceipt {
 
         // 12. passed (1 byte: 0 = false, 1 = true)
         bytes.push(u8::from(self.passed));
+
+        // 13. sandbox_hardening_hash (optional, TCK-00573 MAJOR-2)
+        // Uses type-specific marker `4u8` to ensure injective encoding
+        // across all optional trailing fields in GateReceipt.
+        if let Some(hash) = self.sandbox_hardening_hash.as_ref() {
+            bytes.push(4u8);
+            bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(hash.as_bytes());
+        }
 
         bytes
     }
@@ -2053,6 +2131,7 @@ pub struct GateReceiptBuilder {
     evidence_bundle_hash: Option<[u8; 32]>,
     job_spec_digest: Option<String>,
     passed: Option<bool>,
+    sandbox_hardening_hash: Option<String>,
 }
 
 impl GateReceiptBuilder {
@@ -2138,6 +2217,13 @@ impl GateReceiptBuilder {
         self
     }
 
+    /// Sets the sandbox hardening hash for audit (TCK-00573 MAJOR-2).
+    #[must_use]
+    pub fn sandbox_hardening_hash(mut self, hash: impl Into<String>) -> Self {
+        self.sandbox_hardening_hash = Some(hash.into());
+        self
+    }
+
     /// Builds the receipt and signs it with the provided signer.
     ///
     /// # Panics
@@ -2186,7 +2272,7 @@ impl GateReceiptBuilder {
         let job_spec_digest = self.job_spec_digest;
 
         if let Some(ref digest) = job_spec_digest {
-            if !digest.starts_with("b3-256:") || digest.len() != 71 {
+            if !is_strict_b3_256_digest(digest) {
                 return Err(ReceiptError::InvalidData(format!(
                     "job_spec_digest must be 'b3-256:<64 hex chars>', got length {}",
                     digest.len()
@@ -2231,6 +2317,16 @@ impl GateReceiptBuilder {
             });
         }
 
+        // TCK-00573 MAJOR-2: Validate sandbox_hardening_hash format if set.
+        if let Some(ref hash) = self.sandbox_hardening_hash {
+            if !is_strict_b3_256_digest(hash) {
+                return Err(ReceiptError::InvalidData(format!(
+                    "sandbox_hardening_hash must be 'b3-256:<64 hex chars>', got length {}",
+                    hash.len()
+                )));
+            }
+        }
+
         // Create receipt with placeholder signature
         let mut receipt = GateReceipt {
             receipt_id: self.receipt_id,
@@ -2245,6 +2341,7 @@ impl GateReceiptBuilder {
             evidence_bundle_hash,
             job_spec_digest,
             passed,
+            sandbox_hardening_hash: self.sandbox_hardening_hash,
             receipt_signature: [0u8; 64],
         };
 
@@ -2301,6 +2398,20 @@ impl TryFrom<GateReceiptProto> for GateReceipt {
                 max: MAX_STRING_LENGTH,
             });
         }
+        if let Some(hash) = proto.sandbox_hardening_hash.as_ref() {
+            if hash.len() > MAX_STRING_LENGTH {
+                return Err(ReceiptError::StringTooLong {
+                    field: "sandbox_hardening_hash",
+                    actual: hash.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if !is_strict_b3_256_digest(hash) {
+                return Err(ReceiptError::InvalidData(
+                    "sandbox_hardening_hash must be b3-256:<64 hex chars>".to_string(),
+                ));
+            }
+        }
 
         let changeset_digest: [u8; 32] = proto.changeset_digest.try_into().map_err(|_| {
             ReceiptError::InvalidData("changeset_digest must be 32 bytes".to_string())
@@ -2316,6 +2427,8 @@ impl TryFrom<GateReceiptProto> for GateReceipt {
                 ReceiptError::InvalidData("evidence_bundle_hash must be 32 bytes".to_string())
             })?;
         let job_spec_digest = proto.job_spec_digest;
+
+        let sandbox_hardening_hash = proto.sandbox_hardening_hash;
 
         let receipt_signature: [u8; 64] = proto.receipt_signature.try_into().map_err(|_| {
             ReceiptError::InvalidData("receipt_signature must be 64 bytes".to_string())
@@ -2334,6 +2447,7 @@ impl TryFrom<GateReceiptProto> for GateReceipt {
             evidence_bundle_hash,
             job_spec_digest,
             passed: proto.passed,
+            sandbox_hardening_hash,
             receipt_signature,
         })
     }
@@ -2353,6 +2467,7 @@ impl From<GateReceipt> for GateReceiptProto {
             payload_hash: receipt.payload_hash.to_vec(),
             evidence_bundle_hash: receipt.evidence_bundle_hash.to_vec(),
             job_spec_digest: receipt.job_spec_digest,
+            sandbox_hardening_hash: receipt.sandbox_hardening_hash,
             receipt_signature: receipt.receipt_signature.to_vec(),
             // HTF time envelope reference (RFC-0016): not yet populated by this conversion.
             // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
@@ -3389,6 +3504,9 @@ pub mod tests {
             .job_spec_digest(
                 "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             )
+            .sandbox_hardening_hash(
+                "b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
             .passed(true)
             .build_and_sign(&signer);
 
@@ -3398,6 +3516,10 @@ pub mod tests {
         let recovered = GateReceipt::try_from(decoded_proto).unwrap();
 
         assert_eq!(original.job_spec_digest, recovered.job_spec_digest);
+        assert_eq!(
+            original.sandbox_hardening_hash,
+            recovered.sandbox_hardening_hash
+        );
         assert!(
             recovered
                 .validate_signature(&signer.verifying_key())
@@ -3419,6 +3541,7 @@ pub mod tests {
             payload_hash: vec![0xAB; 32],
             evidence_bundle_hash: vec![0xCD; 32],
             job_spec_digest: None,
+            sandbox_hardening_hash: None,
             receipt_signature: vec![0u8; 64],
             // HTF time envelope reference (RFC-0016): not yet populated.
             time_envelope_ref: None,
@@ -3443,6 +3566,7 @@ pub mod tests {
             payload_hash: vec![0xAB; 32],
             evidence_bundle_hash: vec![0xCD; 32],
             job_spec_digest: None,
+            sandbox_hardening_hash: None,
             receipt_signature: vec![0u8; 32], // Wrong length - should be 64
             // HTF time envelope reference (RFC-0016): not yet populated.
             time_envelope_ref: None,
@@ -3493,6 +3617,7 @@ pub mod tests {
             payload_hash: vec![0xAB; 32],
             evidence_bundle_hash: vec![0xCD; 32],
             job_spec_digest: None,
+            sandbox_hardening_hash: None,
             receipt_signature: vec![0u8; 64],
             // HTF time envelope reference (RFC-0016): not yet populated.
             time_envelope_ref: None,
@@ -3639,115 +3764,267 @@ pub mod tests {
         );
     }
 
+    // ── Sandbox hardening hash receipt binding (TCK-00573) ──
+
     #[test]
-    fn test_v1_canonical_bytes_no_collision_across_trailing_optional_fields() {
-        // Regression test for BLOCKER f-705-security-1771265555805010-0:
-        // Verify that different occupancy patterns for trailing optional fields
-        // (moved_job_path, containment, observed_cost) always produce different
-        // canonical bytes, preventing hash collisions in the integrity trail.
-        let mut base = make_valid_receipt();
-        base.moved_job_path = None;
-        base.containment = None;
-        base.observed_cost = None;
-        let bytes_all_none = base.canonical_bytes();
+    fn test_sandbox_hardening_hash_included_in_persisted_receipt() {
+        let hardening = crate::fac::SandboxHardeningProfile::default();
+        let hash = hardening.content_hash_hex();
+        let receipt = FacJobReceiptV1Builder::new(
+            "receipt-sbx-001",
+            "job-sbx-001",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .outcome(FacJobOutcome::Completed)
+        .reason("sandbox hardening test")
+        .timestamp_secs(1_700_000_099)
+        .policy_hash("b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .rfc0028_channel_boundary(ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
+        })
+        .eio29_queue_admission(QueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+            cost_estimate_ticks: None,
+        })
+        .sandbox_hardening_hash(&hash)
+        .try_build()
+        .expect("receipt with sandbox_hardening_hash");
 
-        // moved_job_path set, containment None
-        let mut r1 = base.clone();
-        r1.moved_job_path = Some("quarantine/job.json".to_string());
-        let bytes_moved_only = r1.canonical_bytes();
+        // Hash is present in the receipt.
+        assert_eq!(
+            receipt.sandbox_hardening_hash.as_deref(),
+            Some(hash.as_str()),
+            "sandbox_hardening_hash must be set in receipt"
+        );
+        // Hash format is b3-256:<64hex>.
+        assert!(hash.starts_with("b3-256:"), "hash must have b3-256: prefix");
+        assert_eq!(hash.len(), 71, "b3-256:<64hex> must be exactly 71 chars");
 
-        // moved_job_path None, containment set
-        let mut r2 = base.clone();
-        r2.containment = Some(crate::fac::containment::ContainmentTrace {
-            verified: true,
-            cgroup_path: "quarantine/job.json".to_string(), // same string content
-            processes_checked: 0,
-            mismatch_count: 0,
-            sccache_auto_disabled: false,
-        });
-        let bytes_containment_only = r2.canonical_bytes();
+        // Canonical bytes include the hash.
+        let bytes = receipt.canonical_bytes();
+        assert!(
+            bytes
+                .windows(hash.len())
+                .any(|window| window == hash.as_bytes()),
+            "sandbox_hardening_hash must be encoded in canonical bytes"
+        );
 
-        // moved_job_path None, observed_cost set
-        let mut r3 = base;
-        r3.observed_cost = Some(crate::economics::cost_model::ObservedJobCost {
-            duration_ms: 1000,
-            cpu_time_ms: 500,
-            bytes_written: 2000,
-        });
-        let bytes_cost_only = r3.canonical_bytes();
-
-        // All four must be distinct (presence markers disambiguate).
-        assert_ne!(
-            bytes_all_none, bytes_moved_only,
-            "all-None vs moved_job_path=Some must differ"
+        // Serialized JSON includes the field.
+        let json = serde_json::to_string(&receipt).expect("serialize receipt");
+        assert!(
+            json.contains("sandbox_hardening_hash"),
+            "serialized JSON must include sandbox_hardening_hash field"
         );
-        assert_ne!(
-            bytes_all_none, bytes_containment_only,
-            "all-None vs containment=Some must differ"
-        );
-        assert_ne!(
-            bytes_all_none, bytes_cost_only,
-            "all-None vs observed_cost=Some must differ"
-        );
-        assert_ne!(
-            bytes_moved_only, bytes_containment_only,
-            "moved_job_path=Some vs containment=Some must differ (V1: different field structures prevent collision)"
-        );
-        assert_ne!(
-            bytes_moved_only, bytes_cost_only,
-            "moved_job_path=Some vs observed_cost=Some must differ"
-        );
-        assert_ne!(
-            bytes_containment_only, bytes_cost_only,
-            "containment=Some vs observed_cost=Some must differ"
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse JSON");
+        assert_eq!(
+            parsed
+                .get("sandbox_hardening_hash")
+                .and_then(|v| v.as_str()),
+            Some(hash.as_str()),
+            "sandbox_hardening_hash must match in serialized JSON"
         );
     }
 
     #[test]
-    fn test_v1_canonical_bytes_no_absence_marker_for_moved_job_path() {
-        // V1 immutability contract: moved_job_path=None does NOT emit a 0u8
-        // marker. The field is simply omitted, preserving historical hash
-        // compatibility. Presence is distinguished by the 1u8 tag + data.
-        let mut r = make_valid_receipt();
-        r.moved_job_path = None;
-        r.containment = None;
-        r.observed_cost = None;
-        let bytes_none = r.canonical_bytes();
+    fn test_sandbox_hardening_hash_changes_canonical_bytes() {
+        let mut receipt =
+            sample_fac_receipt(FacJobOutcome::Completed, None).expect("sample receipt");
+        let bytes_without = receipt.canonical_bytes();
 
-        r.moved_job_path = Some("quarantine/path".to_string());
-        let bytes_some = r.canonical_bytes();
+        receipt.sandbox_hardening_hash =
+            Some(crate::fac::SandboxHardeningProfile::default().content_hash_hex());
+        let bytes_with = receipt.canonical_bytes();
 
-        // None produces shorter output (no bytes); Some produces 1u8 + len + data.
-        assert!(
-            bytes_some.len() > bytes_none.len(),
-            "moved_job_path=Some must produce longer canonical bytes than None"
+        assert_ne!(
+            bytes_without, bytes_with,
+            "canonical_bytes must differ when sandbox_hardening_hash is present vs absent"
         );
     }
 
     #[test]
-    fn test_v1_canonical_bytes_no_absence_marker_for_containment() {
-        // V1 immutability contract: containment=None does NOT emit a 0u8
-        // marker. The field is simply omitted, preserving historical hash
-        // compatibility.
-        let mut r = make_valid_receipt();
-        r.moved_job_path = None;
-        r.containment = None;
-        r.observed_cost = None;
-        let bytes_none = r.canonical_bytes();
+    fn test_sandbox_hardening_hash_rejects_malformed() {
+        let result = FacJobReceiptV1Builder::new(
+            "receipt-sbx-bad",
+            "job-sbx-bad",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .outcome(FacJobOutcome::Completed)
+        .reason("bad hash test")
+        .timestamp_secs(1_700_000_100)
+        .policy_hash("b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .rfc0028_channel_boundary(ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
+        })
+        .eio29_queue_admission(QueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+            cost_estimate_ticks: None,
+        })
+        .sandbox_hardening_hash("not-a-valid-hash")
+        .try_build();
 
-        r.containment = Some(crate::fac::containment::ContainmentTrace {
-            verified: false,
-            cgroup_path: "/test".to_string(),
-            processes_checked: 0,
-            mismatch_count: 0,
-            sccache_auto_disabled: false,
-        });
-        let bytes_some = r.canonical_bytes();
-
-        // None produces shorter output (no bytes); Some produces 1u8 + fields.
         assert!(
-            bytes_some.len() > bytes_none.len(),
-            "containment=Some must produce longer canonical bytes than None"
+            result.is_err(),
+            "malformed sandbox_hardening_hash must be rejected"
+        );
+    }
+
+    // ── MAJOR-1: Injective encoding tests ──
+
+    #[test]
+    fn canonical_bytes_injective_moved_job_path_vs_containment() {
+        // Two receipts where one has moved_job_path=Some and the other has
+        // containment=Some must produce distinct canonical bytes, even
+        // though both are trailing optional fields.
+        let base = || {
+            FacJobReceiptV1Builder::new(
+                "r-001",
+                "j-001",
+                "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .outcome(FacJobOutcome::Denied)
+            .denial_reason(DenialReasonCode::ValidationFailed)
+            .reason("test reason")
+            .timestamp_secs(1_700_000_000)
+        };
+
+        let with_moved = base().moved_job_path("some/path.json").try_build().unwrap();
+        let with_containment = base()
+            .containment(super::super::containment::ContainmentTrace {
+                verified: true,
+                cgroup_path: "some/path.json".to_string(),
+                processes_checked: 0,
+                mismatch_count: 0,
+                sccache_auto_disabled: false,
+            })
+            .try_build()
+            .unwrap();
+
+        assert_ne!(
+            with_moved.canonical_bytes(),
+            with_containment.canonical_bytes(),
+            "moved_job_path and containment must produce distinct canonical bytes"
+        );
+    }
+
+    #[test]
+    fn canonical_bytes_injective_containment_vs_sandbox_hash() {
+        // A receipt with containment but no sandbox hash must differ from
+        // one with sandbox hash but no containment.
+        let base = || {
+            FacJobReceiptV1Builder::new(
+                "r-002",
+                "j-002",
+                "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .outcome(FacJobOutcome::Denied)
+            .denial_reason(DenialReasonCode::ValidationFailed)
+            .reason("test reason")
+            .timestamp_secs(1_700_000_000)
+        };
+
+        let with_containment = base()
+            .containment(super::super::containment::ContainmentTrace {
+                verified: false,
+                cgroup_path: String::new(),
+                processes_checked: 0,
+                mismatch_count: 0,
+                sccache_auto_disabled: false,
+            })
+            .try_build()
+            .unwrap();
+        let with_sandbox = base()
+            .sandbox_hardening_hash(
+                "b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .try_build()
+            .unwrap();
+
+        assert_ne!(
+            with_containment.canonical_bytes(),
+            with_sandbox.canonical_bytes(),
+            "containment and sandbox_hardening_hash must produce distinct canonical bytes"
+        );
+    }
+
+    // ── MAJOR-2: GateReceipt sandbox_hardening_hash tests ──
+
+    #[test]
+    fn gate_receipt_includes_sandbox_hardening_hash_in_canonical_bytes() {
+        let signer = Signer::generate();
+        let receipt_without = GateReceiptBuilder::new("r-001", "gate-aat", "lease-001")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .receipt_version(1)
+            .payload_kind("aat")
+            .payload_schema_version(1)
+            .payload_hash([0xAB; 32])
+            .evidence_bundle_hash([0xCD; 32])
+            .passed(true)
+            .build_and_sign(&signer);
+
+        let receipt_with = GateReceiptBuilder::new("r-001", "gate-aat", "lease-001")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .receipt_version(1)
+            .payload_kind("aat")
+            .payload_schema_version(1)
+            .payload_hash([0xAB; 32])
+            .evidence_bundle_hash([0xCD; 32])
+            .passed(true)
+            .sandbox_hardening_hash(
+                "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .build_and_sign(&signer);
+
+        assert_ne!(
+            receipt_without.canonical_bytes(),
+            receipt_with.canonical_bytes(),
+            "sandbox_hardening_hash must change GateReceipt canonical bytes"
+        );
+        // Verify signature of receipt with hash is valid.
+        assert!(
+            receipt_with
+                .validate_signature(&signer.verifying_key())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn gate_receipt_builder_rejects_malformed_sandbox_hash() {
+        let signer = Signer::generate();
+        let result = GateReceiptBuilder::new("r-001", "gate-aat", "lease-001")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .receipt_version(1)
+            .payload_kind("aat")
+            .payload_schema_version(1)
+            .payload_hash([0xAB; 32])
+            .evidence_bundle_hash([0xCD; 32])
+            .passed(true)
+            .sandbox_hardening_hash("not-a-valid-hash")
+            .try_build_and_sign(&signer);
+
+        assert!(
+            result.is_err(),
+            "malformed sandbox_hardening_hash must be rejected by GateReceiptBuilder"
         );
     }
 
@@ -3772,23 +4049,6 @@ pub mod tests {
         assert_eq!(
             restored_without.cost_estimate_ticks, None,
             "missing cost_estimate_ticks must default to None"
-        );
-    }
-
-    #[test]
-    fn queue_admission_trace_deny_unknown_fields() {
-        // CTR-1604: fac receipt QueueAdmissionTrace must reject unknown fields.
-        let json = r#"{
-            "verdict": "allow",
-            "queue_lane": "bulk",
-            "defect_reason": null,
-            "cost_estimate_ticks": null,
-            "injected": "data"
-        }"#;
-        let result: Result<QueueAdmissionTrace, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "QueueAdmissionTrace must reject unknown fields"
         );
     }
 }

@@ -1248,6 +1248,10 @@ pub struct GateReceipt {
     /// Present when the gate was triggered from a FacJobSpecV1 queue item.
     #[prost(string, optional, tag = "14")]
     pub job_spec_digest: ::core::option::Option<::prost::alloc::string::String>,
+    /// BLAKE3 digest of the sandbox hardening profile used for gate execution.
+    /// Present when gate execution is bound to a materialized hardening profile.
+    #[prost(string, optional, tag = "15")]
+    pub sandbox_hardening_hash: ::core::option::Option<::prost::alloc::string::String>,
     /// Ed25519 signature over canonical bytes with GATE_RECEIPT: domain (64 bytes)
     #[prost(bytes = "vec", tag = "11")]
     pub receipt_signature: ::prost::alloc::vec::Vec<u8>,
