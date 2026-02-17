@@ -637,17 +637,41 @@ bootstrap and recovery commands exposed via `apm2 fac lane init` and
 - Command injection prevention: URL protocol allowlist, `--` separators
 
 **Key methods**:
-- `ensure_mirror(repo_id, remote_url)` — Initialize or update bare mirror
+- `new(fac_root)` — Create manager with default policy (no URL allowlist)
+- `with_policy(fac_root, MirrorPolicy)` — Create manager with explicit policy; rejects if `allowed_url_patterns` exceeds `MAX_ALLOWED_URL_PATTERNS` (256)
+- `ensure_mirror(repo_id, remote_url)` — Initialize or update bare mirror. Returns `(PathBuf, MirrorUpdateReceiptV1)` with before/after ref snapshots (TCK-00582)
 - `checkout_to_lane(repo_id, head_sha, workspace, allowed_parent)` — Checkout specific SHA to lane workspace
 - `apply_patch(workspace, patch_bytes)` — Apply patch via stdin to git apply, returns BLAKE3 digest
+
+**TCK-00582 hardening** (locked updates, bounded fetch, remote URL allowlist, receipts):
+- **File lock**: Per-mirror `flock(LOCK_EX|LOCK_NB)` under `$FAC_ROOT/locks/mirrors/<repo_id>.lock` with monotonic timeout polling (`MIRROR_LOCK_TIMEOUT_SECS=120`)
+- **Remote URL allowlist**: `MirrorPolicy.allowed_url_patterns` — prefix-match allowlist. Empty list = built-in protocol validation only (pre-TCK-00582 behavior)
+- **Bounded fetch/clone**: Wall-clock timeout via `Instant` (monotonic, per CTR-2501). Defaults: `DEFAULT_FETCH_TIMEOUT_SECS=300`, `DEFAULT_CLONE_TIMEOUT_SECS=600`. Child processes killed on timeout
+- **Symlink path validation**: `validate_no_symlinks_in_path` uses `symlink_metadata` (not `metadata`) to detect symlink components in mirror paths
+- **Mirror update receipts**: `MirrorUpdateReceiptV1` captures `refs_before`, `refs_after`, `operation` (clone/fetch/noop), `duration_ms`, `success`, `failure_reason`. Schema: `apm2.fac.mirror_update_receipt.v1`. Bounded by `MAX_RECEIPT_REFS=4096`
+- **Error variants**: `PolicyDenied`, `LockFailed`, `Timeout`, `SymlinkInPath` (all fail-closed)
 
 **Security invariants**:
 - All git commands use `std::process::Command` (no shell expansion)
 - `GIT_TERMINAL_PROMPT=0` prevents interactive prompts
+- `GIT_CONFIG_NOSYSTEM=1` prevents system-level git config injection
 - `core.symlinks=false` prevents symlink creation in workspaces
 - `--no-hardlinks` prevents object sharing between mirror and workspace
 - Path traversal prevention delegated to `git apply` (standard git safety)
 - Post-checkout git hardening disables hooks and refuses unsafe configs (TCK-00580)
+- Mirror updates are serialized via per-mirror file lock (TCK-00582)
+- Remote URLs validated against policy-driven allowlist (TCK-00582)
+- Git fetch/clone bounded by wall-clock timeout (TCK-00582)
+- Mirror paths validated for no symlink components (TCK-00582)
+- Mirror updates emit auditable receipts with before/after refs (TCK-00582)
+- [INV-RM-S1] All git command stdout reads are bounded to `GIT_STDOUT_MAX_BYTES` (4 MiB) via `git_command_with_timeout` (CTR-1603). `git_command` delegates to `git_command_with_timeout` with `GIT_COMMAND_DEFAULT_TIMEOUT` (60s). Stdout/stderr are read on background threads via `bounded_read_pipe` which drains excess output to prevent pipe blocking. Prevents OOM from commands producing large output (e.g., `git show-ref` on repos with millions of refs)
+- [INV-RM-S2] Symlink validation (`validate_no_symlinks_in_path`) runs BEFORE any I/O on the mirror path, including `snapshot_refs`. Prevents git commands from running against symlink targets before validation
+- [INV-RM-S3] All cryptographic digest and SHA comparisons use `subtle::ConstantTimeEq` via `constant_time_str_eq()` (INV-PC-001). Applies to `checkout_to_lane` SHA verification and `apply_patch_hardened` digest binding
+- [INV-RM-S4] `ensure_dir_mode_0700` uses `nix::fcntl::open(O_RDONLY | O_NOFOLLOW | O_DIRECTORY)` to atomically open the directory without following symlinks, then applies permissions via `nix::sys::stat::fchmod` on the fd — eliminating the TOCTOU window between symlink check and chmod (CQ-B1). `open_lock_file` uses `O_NOFOLLOW` via `libc::O_NOFOLLOW` custom flags to prevent symlink-based attacks
+- [INV-RM-S5] `MirrorUpdateReceiptV1::is_valid()` validates string field lengths (`repo_id`, `mirror_path`, `operation`, `failure_reason`, `remote_url`) against `MAX_*` constants to prevent memory exhaustion from oversized deserialized receipts
+- [INV-RM-CQ1] When `remote_url` is `None` and the mirror has a remote, the existing `remote.origin.url` is read via `get_remote_origin_url` and validated against `MirrorPolicy` before `git_fetch_bounded`. Fails closed if the URL is absent or out-of-policy
+- [INV-RM-CQ-M1] `validate_remote_url` enforces `MAX_RECEIPT_MIRROR_PATH_LENGTH` (4096) as a length bound on remote URLs, preventing URLs that would produce invalid receipts (violating S-5 `is_valid()`)
+- [INV-RM-CQ-m1] `git_command_with_timeout` reads stdout/stderr on background threads via `bounded_read_pipe`. After reading up to `GIT_STDOUT_MAX_BYTES`, excess output is drained and discarded so the child never blocks on a full pipe buffer. Prevents timeout-duration hangs when commands produce large output
 
 ### `git_hardening` — Git Safety Hardening for Lane Workspaces (TCK-00580)
 
