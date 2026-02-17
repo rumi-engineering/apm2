@@ -2,9 +2,10 @@
 //! `apm2 fac bootstrap` — one-shot compute-host provisioning.
 //!
 //! Creates the required `$APM2_HOME/private/fac/**` directory tree with
-//! correct permissions (0o700), writes a minimal default `FacPolicyV1` (safe
-//! no-secrets posture), initializes lanes, optionally installs systemd
-//! services, and runs doctor checks to verify host readiness.
+//! correct permissions (0o700 user-mode, 0o770 system-mode), writes a minimal
+//! default `FacPolicyV1` (safe no-secrets posture), initializes lanes,
+//! optionally installs systemd services, and runs doctor checks to verify host
+//! readiness.
 //!
 //! # Design
 //!
@@ -19,8 +20,9 @@
 //!
 //! # Security Invariants
 //!
-//! - [INV-BOOT-001] All directories are created with 0o700 permissions
-//!   (CTR-2611). No TOCTOU window between create and chmod.
+//! - [INV-BOOT-001] All directories are created with restricted permissions via
+//!   `create_dir_restricted` (0o700 user-mode, 0o770 system-mode) (CTR-2611).
+//!   No TOCTOU window between create and chmod.
 //! - [INV-BOOT-002] Policy files are written with 0o600 permissions.
 //! - [INV-BOOT-003] Existing state is never destroyed — bootstrap is
 //!   additive-only.
@@ -29,12 +31,12 @@
 
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use apm2_core::fac::policy::FacPolicyV1;
-use apm2_core::fac::{LaneManager, persist_policy};
+use apm2_core::fac::{LaneManager, create_dir_restricted, persist_policy};
 use serde::Serialize;
 
 use crate::exit_codes::codes as exit_codes;
@@ -301,10 +303,12 @@ fn create_directory_tree(
     Ok(())
 }
 
-/// Create a directory with 0o700 permissions if it does not already exist.
+/// Create a directory with restricted permissions if it does not already exist.
 ///
-/// Uses `DirBuilder` with mode set at create-time to avoid TOCTOU window
-/// between create and chmod (CTR-2611).
+/// Delegates to `apm2_core::fac::create_dir_restricted` which is recursive,
+/// enforces permissions on all intermediate components, and selects
+/// 0o700 (user-mode) or 0o770 (system-mode) based on `select_backend()`
+/// (CTR-2611). Symlink paths are rejected (INV-BOOT-001).
 fn create_dir_idempotent(
     path: &Path,
     actions: &mut Vec<BootstrapAction>,
@@ -312,7 +316,9 @@ fn create_dir_idempotent(
     existing: &mut usize,
 ) -> Result<(), String> {
     // Check if path already exists using lstat (symlink_metadata) to avoid
-    // following symlinks (INV-BOOT-001).
+    // following symlinks (INV-BOOT-001). This check drives the
+    // created/existing counters; create_dir_restricted also does its own
+    // lstat-based check internally.
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.is_dir() {
@@ -338,18 +344,21 @@ fn create_dir_idempotent(
         },
     }
 
-    // Create directory with restrictive permissions at create-time.
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    builder.mode(0o700);
-    builder
-        .create(path)
+    // Delegate to the robust create_dir_restricted from apm2-core which:
+    // - Is recursive (creates missing intermediate directories)
+    // - Enforces permissions on all newly created components
+    // - Selects 0o700 (user-mode) or 0o770 (system-mode) via select_backend()
+    // - Rejects symlink paths (INV-BOOT-001, CTR-2611)
+    create_dir_restricted(path)
         .map_err(|e| format!("cannot create directory {}: {e}", path.display()))?;
 
     *created += 1;
     actions.push(BootstrapAction {
         kind: "create_dir",
-        description: format!("created directory: {} (mode 0700)", path.display()),
+        description: format!(
+            "created directory: {} (restricted permissions)",
+            path.display()
+        ),
         skipped: false,
     });
 
@@ -443,18 +452,28 @@ fn install_services(user_mode: bool, actions: &mut Vec<BootstrapAction>) -> Resu
     };
 
     // Find the repo root to locate contrib/ templates.
-    let repo_root = find_repo_root().ok_or_else(|| {
-        format!(
-            "cannot find repository root for systemd unit templates; \
-             expected {source_dir}/ in ancestor directory. \
-             Remediation: run bootstrap from within the apm2 repository"
-        )
-    })?;
+    // Graceful degradation: if not in a git repository (e.g. binary release),
+    // skip service installation with a warning instead of failing fatally.
+    let Some(repo_root) = find_repo_root() else {
+        actions.push(BootstrapAction {
+            kind: "install_service",
+            description: format!(
+                "cannot find repository root for systemd unit templates; \
+                 expected {source_dir}/ in ancestor directory. \
+                 Skipping service installation. \
+                 Remediation: run bootstrap from within the apm2 repository, \
+                 or manually copy unit files from contrib/systemd/"
+            ),
+            skipped: true,
+        });
+        return Ok(false);
+    };
 
-    let units = &[
+    let units: &[&str] = &[
         "apm2-daemon.service",
         "apm2-daemon.socket",
         "apm2-worker.service",
+        "apm2-worker@.service",
     ];
 
     // Ensure target directory exists.
@@ -462,7 +481,10 @@ fn install_services(user_mode: bool, actions: &mut Vec<BootstrapAction>) -> Resu
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]
-        builder.mode(0o755);
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o755);
+        }
         builder.create(&target_dir).map_err(|e| {
             format!(
                 "cannot create systemd unit directory {}: {e}",
@@ -558,6 +580,9 @@ fn install_services(user_mode: bool, actions: &mut Vec<BootstrapAction>) -> Resu
     }
 
     // Enable units (but do not start).
+    // Note: apm2-worker@.service is a template and is instantiated
+    // on-demand (e.g. apm2-worker@lane_00.service), so it is not
+    // enabled here.
     for unit_name in &[
         "apm2-daemon.socket",
         "apm2-daemon.service",
@@ -697,13 +722,19 @@ fn plan_directories(
         if actions.len() >= MAX_PLANNED_ACTIONS {
             return;
         }
-        let exists = path.exists();
+        // Use symlink_metadata to match actual-run logic (lstat, not stat).
+        // path.exists() follows symlinks, which would give inconsistent
+        // reporting when symlinks are present at candidate paths.
+        let exists = fs::symlink_metadata(path).is_ok();
         actions.push(BootstrapAction {
             kind: "create_dir",
             description: if exists {
                 format!("[skip] directory already exists: {}", path.display())
             } else {
-                format!("[plan] create directory: {} (mode 0700)", path.display())
+                format!(
+                    "[plan] create directory: {} (restricted permissions)",
+                    path.display()
+                )
             },
             skipped: exists,
         });
@@ -1031,6 +1062,7 @@ mod tests {
         #[cfg(unix)]
         {
             let meta = fs::metadata(&test_path).expect("metadata");
+            // In user-mode (no service user), create_dir_restricted uses 0o700.
             assert_eq!(meta.permissions().mode() & 0o777, 0o700);
         }
     }
@@ -1048,6 +1080,32 @@ mod tests {
         let result = create_dir_idempotent(&file_path, &mut actions, &mut created, &mut existing);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not a directory"));
+    }
+
+    #[test]
+    fn test_create_dir_idempotent_creates_intermediates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Deep path where intermediate directories do not exist.
+        let deep_path = dir.path().join("a").join("b").join("c");
+        let mut actions = Vec::new();
+        let mut created = 0usize;
+        let mut existing = 0usize;
+
+        create_dir_idempotent(&deep_path, &mut actions, &mut created, &mut existing)
+            .expect("create deep path");
+        assert_eq!(created, 1);
+        assert!(deep_path.is_dir());
+
+        // Verify intermediate directories also have restricted permissions.
+        #[cfg(unix)]
+        {
+            let meta_a = fs::metadata(dir.path().join("a")).expect("metadata a");
+            let meta_b = fs::metadata(dir.path().join("a").join("b")).expect("metadata b");
+            let meta_c = fs::metadata(&deep_path).expect("metadata c");
+            assert_eq!(meta_a.permissions().mode() & 0o777, 0o700);
+            assert_eq!(meta_b.permissions().mode() & 0o777, 0o700);
+            assert_eq!(meta_c.permissions().mode() & 0o777, 0o700);
+        }
     }
 
     #[test]
