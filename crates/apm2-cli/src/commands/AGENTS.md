@@ -23,6 +23,7 @@ All command functions return a `u8` exit code or `anyhow::Result<()>`, using val
 | `capability.rs` | `apm2 capability request` | Capability token issuance |
 | `consensus.rs` | `apm2 consensus *` | Consensus query operations |
 | `fac.rs` | `apm2 fac *` | FAC (Factory Automation Cycle) top-level dispatcher |
+| `fac_bootstrap.rs` | `apm2 fac bootstrap` | One-shot compute-host provisioning for FESv1 |
 | `fac_pr/` | `apm2 fac pr *` | GitHub App credential management for PR operations |
 | `fac_review/` | `apm2 fac review *` | Review orchestration (security + quality reviews) |
 | `fac_queue.rs` | `apm2 fac queue *` | Queue introspection (status with counts, reason stats) |
@@ -81,6 +82,7 @@ pub enum FacSubcommand {
     Logs(LogsArgs),
     Pipeline(PipelineArgs),
     Lane(LaneArgs),
+    Bootstrap(BootstrapArgs),
 }
 ```
 
@@ -195,6 +197,29 @@ tables are printed by default via `print_lane_init_receipt()` and
 **LaneSubcommand** enum variants added:
 - `Init(LaneInitArgs)` -- `--json` flag
 - `Reconcile(LaneReconcileArgs)` -- `--json` flag
+
+### Bootstrap (fac_bootstrap.rs, TCK-00599)
+
+| Subcommand | Function | Description |
+|------------|----------|-------------|
+| `apm2 fac bootstrap` | `run_bootstrap()` | One-shot compute-host provisioning for FESv1 |
+
+Five-phase provisioning sequence:
+1. **Directories**: creates `$APM2_HOME/private/fac/**` tree via `create_dir_restricted` (0o700 user-mode, 0o770 system-mode) (CTR-2611)
+2. **Policy**: writes default `FacPolicyV1` (safe no-secrets posture) via `persist_policy()`
+3. **Lanes**: initializes lane pool via `LaneManager::init_lanes()`
+4. **Services** (optional): installs systemd templates from `contrib/systemd/` (`--user` or `--system`)
+5. **Doctor**: runs `collect_doctor_checks()` and gates exit code on result
+
+Flags: `--dry-run` (show planned actions), `--user`/`--system` (systemd install mode), `--json`.
+
+Security invariants:
+- [INV-BOOT-001] Directories created via `create_dir_restricted` with restricted permissions at create-time (no TOCTOU chmod window). Uses 0o700 in user-mode, 0o770 in system-mode. Recursive: intermediate directories also get restricted permissions. Symlink paths rejected.
+- [INV-BOOT-002] Policy files written with 0o600 permissions
+- [INV-BOOT-003] Existing state never destroyed (additive-only)
+- [INV-BOOT-004] Doctor checks gate the exit code (fail-closed)
+- [INV-BOOT-005] Phase 4 (service installation) degrades gracefully when not in a git repository (e.g. binary releases). Missing templates are skipped with a warning, not fatal.
+- [INV-BOOT-006] Installs `apm2-worker@.service` template unit alongside non-templated units for parallel lane-specific workers.
 
 ### Work (work.rs)
 
@@ -382,3 +407,20 @@ tables are printed by default via `print_lane_init_receipt()` and
   the receipt index to entries at or after the given UNIX epoch. Deterministic ordering is
   enforced: primary sort by `timestamp_secs` descending, secondary sort by `content_hash`
   ascending for stable tie-breaking. Boundary inclusion is verified by regression test.
+
+## Policy CLI Invariants (Updated for TCK-00561 fix round 2)
+
+- **Stdin support** (`fac_policy.rs`): `apm2 fac policy validate` and `apm2 fac policy adopt`
+  accept `<path|->` as an optional positional argument. When the argument is omitted or is `-`,
+  input is read from stdin with bounded semantics (`MAX_POLICY_SIZE` cap via `take()` on the
+  stdin handle, CTR-1603). Empty stdin returns an explicit error.
+- **Operator identity resolution** (`fac_policy.rs`): `run_adopt` and `run_rollback` resolve
+  the operator identity from `$USER` / `$LOGNAME` (POSIX), falling back to numeric UID on Unix
+  via `nix::unistd::getuid()` (safe wrapper, no `unsafe` block). The identity is formatted as
+  `operator:<username>` and passed to the core `adopt_policy`/`rollback_policy` APIs. The
+  username is sanitized to `[a-zA-Z0-9._@-]` to prevent control character injection.
+- **FAC root resolution** (`fac_policy.rs`): Uses shared `fac_utils::resolve_fac_root()` helper
+  instead of a custom implementation with predictable `/tmp` fallback (RSK-1502).
+- **Bounded file reads** (`fac_policy.rs`): `read_bounded_file` uses the open-once pattern
+  (`O_NOFOLLOW | O_CLOEXEC` at `open(2)` + `fstat` + `take()`) to eliminate the TOCTOU gap
+  between symlink validation and file read.

@@ -2574,7 +2574,14 @@ fn apm2_home_dir() -> Result<PathBuf, String> {
 /// In system-mode, shared-group execution contexts require 0o770.
 ///
 /// Uses `DirBuilder` with mode set at create-time to avoid TOCTOU window.
-pub(crate) fn create_dir_restricted(path: &Path) -> Result<(), LaneError> {
+/// Recursive: creates missing intermediate directories, each with the
+/// restricted mode. Symlink paths are rejected via `ensure_safe_path`.
+///
+/// # Errors
+///
+/// Returns `LaneError::Io` on filesystem errors, or if the path contains
+/// symlinks, or if an ancestor exists but is not a directory.
+pub fn create_dir_restricted(path: &Path) -> Result<(), LaneError> {
     ensure_safe_path(path, "create_dir_restricted")?;
 
     if let Ok(metadata) = fs::symlink_metadata(path) {
