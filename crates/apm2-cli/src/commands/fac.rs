@@ -679,6 +679,13 @@ pub enum ReceiptSubcommand {
     /// verifies the Ed25519 signature against the persistent broker key.
     /// Exits with 0 on success, non-zero on verification failure.
     Verify(ReceiptVerifyArgs),
+    /// Merge receipts from one directory into another (TCK-00543).
+    ///
+    /// Performs set-union merge on receipt digests: copies receipts from
+    /// the source directory into the target directory only if they do not
+    /// already exist there. Emits an audit report with duplicates, parse
+    /// failures, and `job_id` mismatches.
+    Merge(ReceiptMergeArgs),
 }
 
 /// Arguments for `apm2 fac receipts show`.
@@ -738,6 +745,22 @@ pub struct ReceiptVerifyArgs {
     /// Receipt content hash (BLAKE3 hex, with or without `b3-256:` prefix)
     /// or path to a `.sig.json` signed envelope file.
     pub digest_or_path: String,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac receipts merge` (TCK-00543).
+#[derive(Debug, Args)]
+pub struct ReceiptMergeArgs {
+    /// Source receipt directory to merge from.
+    #[arg(long)]
+    pub from: std::path::PathBuf,
+
+    /// Target receipt directory to merge into.
+    #[arg(long)]
+    pub into: std::path::PathBuf,
 
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
@@ -2366,6 +2389,9 @@ pub fn run_fac(
             ReceiptSubcommand::Verify(verify_args) => {
                 run_receipt_verify(verify_args, resolve_json(verify_args.json))
             },
+            ReceiptSubcommand::Merge(merge_args) => {
+                run_receipt_merge(merge_args, resolve_json(merge_args.json))
+            },
         },
         FacSubcommand::Context(args) => match &args.subcommand {
             ContextSubcommand::Rebuild(rebuild_args) => run_context_rebuild(
@@ -3945,6 +3971,68 @@ fn run_receipt_verify(args: &ReceiptVerifyArgs, json_output: bool) -> u8 {
             "verification_failed",
             &format!("Signature verification failed: {e}"),
             exit_codes::VALIDATION_ERROR,
+        ),
+    }
+}
+
+// =============================================================================
+// Receipt Merge Command (TCK-00543)
+// =============================================================================
+
+/// Execute the receipt merge command: set-union merge with audit report.
+fn run_receipt_merge(args: &ReceiptMergeArgs, json_output: bool) -> u8 {
+    let source_dir = &args.from;
+    let target_dir = &args.into;
+
+    match apm2_core::fac::merge_receipt_dirs(source_dir, target_dir) {
+        Ok(report) => {
+            if json_output {
+                let result = serde_json::json!({
+                    "status": "ok",
+                    "receipts_copied": report.receipts_copied,
+                    "duplicates_skipped": report.duplicates_skipped,
+                    "total_target_receipts": report.total_target_receipts,
+                    "job_id_mismatches": report.job_id_mismatches,
+                    "parse_failures": report.parse_failures,
+                    "merged_headers": report.merged_headers,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_default()
+                );
+            } else {
+                println!(
+                    "receipt merge: {} copied, {} duplicates skipped, {} total in target",
+                    report.receipts_copied, report.duplicates_skipped, report.total_target_receipts,
+                );
+
+                if !report.job_id_mismatches.is_empty() {
+                    println!(
+                        "\nWARNING: {} job_id mismatch(es) detected (same digest, different job_id):",
+                        report.job_id_mismatches.len()
+                    );
+                    for m in &report.job_id_mismatches {
+                        println!(
+                            "  digest={} source_job_id={} target_job_id={}",
+                            m.content_hash, m.source_job_id, m.target_job_id
+                        );
+                    }
+                }
+
+                if !report.parse_failures.is_empty() {
+                    println!("\n{} parse failure(s):", report.parse_failures.len());
+                    for f in &report.parse_failures {
+                        println!("  {}: {}", f.path, f.reason);
+                    }
+                }
+            }
+            exit_codes::SUCCESS
+        },
+        Err(e) => output_error(
+            json_output,
+            "merge_failed",
+            &format!("Receipt merge failed: {e}"),
+            exit_codes::GENERIC_ERROR,
         ),
     }
 }
@@ -7089,6 +7177,32 @@ mod tests {
                     );
                 },
                 other => panic!("expected receipts verify subcommand, got {other:?}"),
+            },
+            other => panic!("expected receipts command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_receipts_merge_json_flag_parses() {
+        let merge = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "receipts",
+            "merge",
+            "--from",
+            "/tmp/source",
+            "--into",
+            "/tmp/target",
+            "--json",
+        ])
+        .expect("receipts merge --json should parse");
+        match merge.subcommand {
+            FacSubcommand::Receipts(args) => match args.subcommand {
+                ReceiptSubcommand::Merge(merge_args) => {
+                    assert!(merge_args.json);
+                    assert_eq!(merge_args.from, std::path::PathBuf::from("/tmp/source"));
+                    assert_eq!(merge_args.into, std::path::PathBuf::from("/tmp/target"));
+                },
+                other => panic!("expected receipts merge subcommand, got {other:?}"),
             },
             other => panic!("expected receipts command, got {other:?}"),
         }

@@ -154,6 +154,9 @@ pub mod quarantine;
 mod receipt;
 /// Non-authoritative, rebuildable receipt index for fast job/receipt lookup.
 pub mod receipt_index;
+/// Receipt stream merge: set-union merge with deterministic ordering and
+/// conflict audit report (TCK-00543).
+pub mod receipt_merge;
 /// Atomic receipt write pipeline for crash-safe job completion (TCK-00564).
 pub mod receipt_pipeline;
 /// Crash recovery and reconciliation for queue/lane state on worker startup
@@ -446,6 +449,12 @@ pub use receipt_index::{
     MAX_REBUILD_SCAN_FILES, RECEIPT_INDEX_SCHEMA, ReceiptHeaderV1, ReceiptIndexError,
     ReceiptIndexV1, find_receipt_for_job, has_receipt_for_job, list_receipt_headers,
     lookup_job_receipt,
+};
+// Re-export receipt merge types (TCK-00543)
+pub use receipt_merge::{
+    JobIdMismatch, MAX_JOB_ID_MISMATCHES, MAX_MERGE_SCAN_FILES as MAX_RECEIPT_MERGE_SCAN_FILES,
+    MAX_PARSE_FAILURES, MergeAuditReport, MergedReceiptHeader, ParseFailure, ReceiptMergeError,
+    merge_receipt_dirs,
 };
 // Re-export receipt pipeline types (TCK-00564)
 pub use receipt_pipeline::{
