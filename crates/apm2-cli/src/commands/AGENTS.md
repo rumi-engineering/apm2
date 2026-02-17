@@ -24,6 +24,7 @@ All command functions return a `u8` exit code or `anyhow::Result<()>`, using val
 | `consensus.rs` | `apm2 consensus *` | Consensus query operations |
 | `fac.rs` | `apm2 fac *` | FAC (Factory Automation Cycle) top-level dispatcher |
 | `fac_bootstrap.rs` | `apm2 fac bootstrap` | One-shot compute-host provisioning for FESv1 |
+| `fac_economics.rs` | `apm2 fac economics *` | Economics profile adoption, rollback, and inspection (TCK-00584) |
 | `fac_pr/` | `apm2 fac pr *` | GitHub App credential management for PR operations |
 | `fac_review/` | `apm2 fac review *` | Review orchestration (security + quality reviews) |
 | `fac_queue.rs` | `apm2 fac queue *` | Queue introspection (status with counts, reason stats) |
@@ -83,6 +84,7 @@ pub enum FacSubcommand {
     Pipeline(PipelineArgs),
     Lane(LaneArgs),
     Bootstrap(BootstrapArgs),
+    Economics(EconomicsArgs),
 }
 ```
 
@@ -417,5 +419,23 @@ Security invariants:
 - **FAC root resolution** (`fac_policy.rs`): Uses shared `fac_utils::resolve_fac_root()` helper
   instead of a custom implementation with predictable `/tmp` fallback (RSK-1502).
 - **Bounded file reads** (`fac_policy.rs`): `read_bounded_file` uses the open-once pattern
+  (`O_NOFOLLOW | O_CLOEXEC` at `open(2)` + `fstat` + `take()`) to eliminate the TOCTOU gap
+  between symlink validation and file read.
+
+## Economics CLI Invariants (TCK-00584)
+
+- **Stdin support** (`fac_economics.rs`): `apm2 fac economics adopt` accepts `<path|->` as
+  an optional positional argument. When the argument is omitted or is `-`, input is read from
+  stdin with bounded semantics (`MAX_ECONOMICS_PROFILE_SIZE` cap via `take()` on the stdin
+  handle, CTR-1603). Auto-detects framed vs raw JSON input and adds domain framing if needed.
+- **Operator identity resolution** (`fac_economics.rs`): `run_adopt` and `run_rollback`
+  resolve the operator identity from `$USER` / `$LOGNAME` (POSIX), falling back to numeric
+  UID on Unix via `nix::unistd::getuid()` (safe wrapper, no `unsafe` block). The identity
+  is formatted as `operator:<username>` and passed to the core
+  `adopt_economics_profile`/`rollback_economics_profile` APIs. The username is sanitized to
+  `[a-zA-Z0-9._@-]` to prevent control character injection.
+- **FAC root resolution** (`fac_economics.rs`): Uses shared `fac_utils::resolve_fac_root()`
+  helper instead of a custom implementation with predictable `/tmp` fallback (RSK-1502).
+- **Bounded file reads** (`fac_economics.rs`): `read_bounded_file` uses the open-once pattern
   (`O_NOFOLLOW | O_CLOEXEC` at `open(2)` + `fstat` + `take()`) to eliminate the TOCTOU gap
   between symlink validation and file read.
