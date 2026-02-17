@@ -45,6 +45,8 @@ scope:
         - `QueuedGatesOutcome`
         - `run_queued_gates_and_collect(...)`
         - fail-closed cache loading and required gate-set verification
+        - persisted `merge_conflict_main` into the write-through gate cache so
+          queue consumers and push validation see a complete required gate set
 
         This path waits for queue execution and materializes authoritative
         per-gate rows from attested gate cache for the target SHA.
