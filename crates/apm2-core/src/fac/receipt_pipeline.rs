@@ -75,6 +75,18 @@ const MAX_RECOVERY_REASON_LENGTH: usize = 1024;
 /// Maximum serialized size of a recovery receipt (bytes).
 pub const MAX_RECOVERY_RECEIPT_SIZE: usize = 65_536;
 
+/// Maximum length for `receipt_id` and `job_id` fields.
+const MAX_ID_LENGTH: usize = 256;
+
+/// Maximum length for hash fields (`original_receipt_hash`).
+const MAX_HASH_LENGTH: usize = 512;
+
+/// Maximum length for path fields (`source_path`, `destination_path`).
+const MAX_PATH_LENGTH: usize = 4096;
+
+/// Maximum length for a file name component (CTR-1504).
+const MAX_FILE_NAME_LENGTH: usize = 255;
+
 // =============================================================================
 // Error Types
 // =============================================================================
@@ -108,6 +120,36 @@ pub enum ReceiptPipelineError {
         receipt_path: PathBuf,
         /// Reason the move failed.
         reason: String,
+    },
+
+    /// File name failed confinement validation (CTR-1504).
+    #[error("invalid file name: {reason}")]
+    InvalidFileName {
+        /// The rejected file name (truncated for safety).
+        file_name: String,
+        /// Reason for rejection.
+        reason: &'static str,
+    },
+
+    /// Recovery receipt validation failed.
+    #[error("recovery receipt validation failed: {0}")]
+    RecoveryValidation(String),
+
+    /// Recovery receipt serialization failed.
+    #[error("recovery receipt serialization failed: {0}")]
+    RecoverySerialization(#[source] serde_json::Error),
+
+    /// Recovery receipt I/O failed.
+    #[error("recovery receipt I/O failed: {0}")]
+    RecoveryIo(#[source] std::io::Error),
+
+    /// Recovery receipt exceeds maximum size.
+    #[error("recovery receipt too large: {size} > {max}")]
+    RecoveryTooLarge {
+        /// Actual size.
+        size: usize,
+        /// Maximum allowed size.
+        max: usize,
     },
 }
 
@@ -182,36 +224,77 @@ pub struct RecoveryReceiptV1 {
 impl RecoveryReceiptV1 {
     /// Validate boundedness constraints.
     ///
+    /// Checks schema, non-empty required fields, and explicit length
+    /// bounds on all string fields to prevent denial-of-service via oversized
+    /// data (RSK-1601).
+    ///
     /// # Errors
     ///
-    /// Returns error if any field exceeds bounds.
-    pub fn validate(&self) -> Result<(), String> {
+    /// Returns [`ReceiptPipelineError::RecoveryValidation`] if any field
+    /// fails validation.
+    pub fn validate(&self) -> Result<(), ReceiptPipelineError> {
         if self.schema != RECOVERY_RECEIPT_SCHEMA {
-            return Err(format!(
+            return Err(ReceiptPipelineError::RecoveryValidation(format!(
                 "schema mismatch: expected '{RECOVERY_RECEIPT_SCHEMA}', got '{}'",
                 self.schema,
-            ));
+            )));
         }
         if self.receipt_id.is_empty() {
-            return Err("receipt_id is empty".to_string());
+            return Err(ReceiptPipelineError::RecoveryValidation(
+                "receipt_id is empty".to_string(),
+            ));
+        }
+        if self.receipt_id.len() > MAX_ID_LENGTH {
+            return Err(ReceiptPipelineError::RecoveryValidation(format!(
+                "receipt_id too long: {} > {MAX_ID_LENGTH}",
+                self.receipt_id.len()
+            )));
         }
         if self.job_id.is_empty() {
-            return Err("job_id is empty".to_string());
+            return Err(ReceiptPipelineError::RecoveryValidation(
+                "job_id is empty".to_string(),
+            ));
+        }
+        if self.job_id.len() > MAX_ID_LENGTH {
+            return Err(ReceiptPipelineError::RecoveryValidation(format!(
+                "job_id too long: {} > {MAX_ID_LENGTH}",
+                self.job_id.len()
+            )));
+        }
+        if self.original_receipt_hash.len() > MAX_HASH_LENGTH {
+            return Err(ReceiptPipelineError::RecoveryValidation(format!(
+                "original_receipt_hash too long: {} > {MAX_HASH_LENGTH}",
+                self.original_receipt_hash.len()
+            )));
         }
         if self.detected_state.len() > MAX_RECOVERY_REASON_LENGTH {
-            return Err(format!(
+            return Err(ReceiptPipelineError::RecoveryValidation(format!(
                 "detected_state too long: {} > {MAX_RECOVERY_REASON_LENGTH}",
                 self.detected_state.len()
-            ));
+            )));
         }
         if self.repair_action.len() > MAX_RECOVERY_REASON_LENGTH {
-            return Err(format!(
+            return Err(ReceiptPipelineError::RecoveryValidation(format!(
                 "repair_action too long: {} > {MAX_RECOVERY_REASON_LENGTH}",
                 self.repair_action.len()
-            ));
+            )));
+        }
+        if self.source_path.len() > MAX_PATH_LENGTH {
+            return Err(ReceiptPipelineError::RecoveryValidation(format!(
+                "source_path too long: {} > {MAX_PATH_LENGTH}",
+                self.source_path.len()
+            )));
+        }
+        if self.destination_path.len() > MAX_PATH_LENGTH {
+            return Err(ReceiptPipelineError::RecoveryValidation(format!(
+                "destination_path too long: {} > {MAX_PATH_LENGTH}",
+                self.destination_path.len()
+            )));
         }
         if self.timestamp_secs == 0 {
-            return Err("timestamp_secs must be non-zero".to_string());
+            return Err(ReceiptPipelineError::RecoveryValidation(
+                "timestamp_secs must be non-zero".to_string(),
+            ));
         }
         Ok(())
     }
@@ -222,29 +305,29 @@ impl RecoveryReceiptV1 {
     ///
     /// # Errors
     ///
-    /// Returns error if serialization or I/O fails.
-    pub fn persist(&self, receipts_dir: &Path) -> Result<PathBuf, String> {
+    /// Returns [`ReceiptPipelineError`] if validation, serialization,
+    /// or I/O fails.
+    pub fn persist(&self, receipts_dir: &Path) -> Result<PathBuf, ReceiptPipelineError> {
         self.validate()?;
 
-        let bytes = serde_json::to_vec_pretty(self)
-            .map_err(|e| format!("cannot serialize recovery receipt: {e}"))?;
+        let bytes =
+            serde_json::to_vec_pretty(self).map_err(ReceiptPipelineError::RecoverySerialization)?;
 
         if bytes.len() > MAX_RECOVERY_RECEIPT_SIZE {
-            return Err(format!(
-                "recovery receipt too large: {} > {MAX_RECOVERY_RECEIPT_SIZE}",
-                bytes.len()
-            ));
+            return Err(ReceiptPipelineError::RecoveryTooLarge {
+                size: bytes.len(),
+                max: MAX_RECOVERY_RECEIPT_SIZE,
+            });
         }
 
-        std::fs::create_dir_all(receipts_dir)
-            .map_err(|e| format!("cannot create receipts dir: {e}"))?;
+        std::fs::create_dir_all(receipts_dir).map_err(ReceiptPipelineError::RecoveryIo)?;
 
         let final_name = format!("recovery-{}.json", self.receipt_id);
         let final_path = receipts_dir.join(&final_name);
 
         // Atomic write: NamedTempFile + fsync + rename (CTR-2607).
         let temp = tempfile::NamedTempFile::new_in(receipts_dir)
-            .map_err(|e| format!("cannot create temp file: {e}"))?;
+            .map_err(ReceiptPipelineError::RecoveryIo)?;
 
         #[cfg(unix)]
         {
@@ -257,13 +340,12 @@ impl RecoveryReceiptV1 {
             use std::io::Write;
             let mut file = temp.as_file();
             file.write_all(&bytes)
-                .map_err(|e| format!("cannot write recovery receipt: {e}"))?;
-            file.sync_all()
-                .map_err(|e| format!("cannot sync recovery receipt: {e}"))?;
+                .map_err(ReceiptPipelineError::RecoveryIo)?;
+            file.sync_all().map_err(ReceiptPipelineError::RecoveryIo)?;
         }
 
         temp.persist(&final_path)
-            .map_err(|e| format!("cannot persist recovery receipt: {}", e.error))?;
+            .map_err(|e| ReceiptPipelineError::RecoveryIo(e.error))?;
 
         Ok(final_path)
     }
@@ -341,6 +423,9 @@ impl ReceiptWritePipeline {
         file_name: &str,
         terminal_state: TerminalState,
     ) -> Result<CommitResult, ReceiptPipelineError> {
+        // Validate file_name confinement before any mutation (CTR-1504).
+        validate_file_name(file_name)?;
+
         // Step 1: Persist the receipt (content-addressed, idempotent).
         let receipt_path = persist_content_addressed_receipt(&self.receipts_dir, receipt)
             .map_err(ReceiptPipelineError::ReceiptPersistFailed)?;
@@ -384,7 +469,8 @@ impl ReceiptWritePipeline {
     ///
     /// # Errors
     ///
-    /// Returns error if the move or recovery receipt persistence fails.
+    /// Returns [`ReceiptPipelineError`] if file name validation, the move,
+    /// or recovery receipt persistence fails.
     pub fn recover_torn_state(
         &self,
         claimed_path: &Path,
@@ -392,10 +478,18 @@ impl ReceiptWritePipeline {
         receipt: &FacJobReceiptV1,
         terminal_state: TerminalState,
         timestamp_secs: u64,
-    ) -> Result<RecoveryReceiptV1, String> {
+    ) -> Result<RecoveryReceiptV1, ReceiptPipelineError> {
+        // Validate file_name confinement before any mutation (CTR-1504).
+        validate_file_name(file_name)?;
+
         let dest_dir = self.queue_root.join(terminal_state.dir_name());
-        let dest_path = move_job_to_terminal(claimed_path, &dest_dir, file_name)
-            .map_err(|e| format!("recovery move failed: {e}"))?;
+        let dest_path = move_job_to_terminal(claimed_path, &dest_dir, file_name).map_err(|e| {
+            ReceiptPipelineError::JobMoveFailed {
+                from: claimed_path.to_string_lossy().to_string(),
+                to: dest_dir.to_string_lossy().to_string(),
+                reason: e,
+            }
+        })?;
 
         let recovery_receipt = RecoveryReceiptV1 {
             schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
@@ -421,6 +515,51 @@ impl ReceiptWritePipeline {
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/// Validate that a file name is a safe, single-component file name.
+///
+/// Rejects names that contain path separators, parent-directory traversal
+/// components (`..`), are empty, or exceed `MAX_FILE_NAME_LENGTH`.
+/// This enforces CTR-1504 filesystem confinement.
+///
+/// # Errors
+///
+/// Returns [`ReceiptPipelineError::InvalidFileName`] if the name is invalid.
+fn validate_file_name(file_name: &str) -> Result<(), ReceiptPipelineError> {
+    if file_name.is_empty() {
+        return Err(ReceiptPipelineError::InvalidFileName {
+            file_name: String::new(),
+            reason: "file name is empty",
+        });
+    }
+    if file_name.len() > MAX_FILE_NAME_LENGTH {
+        return Err(ReceiptPipelineError::InvalidFileName {
+            // Truncate for safety in error display.
+            file_name: file_name[..64].to_string(),
+            reason: "file name exceeds maximum length",
+        });
+    }
+    if file_name == "." || file_name == ".." {
+        return Err(ReceiptPipelineError::InvalidFileName {
+            file_name: file_name.to_string(),
+            reason: "file name is a dot-segment",
+        });
+    }
+    if file_name.contains('/') || file_name.contains('\\') {
+        return Err(ReceiptPipelineError::InvalidFileName {
+            file_name: file_name.to_string(),
+            reason: "file name contains path separator",
+        });
+    }
+    // Also reject embedded null bytes (would truncate C-string paths).
+    if file_name.contains('\0') {
+        return Err(ReceiptPipelineError::InvalidFileName {
+            file_name: file_name.replace('\0', "\\0"),
+            reason: "file name contains null byte",
+        });
+    }
+    Ok(())
+}
 
 /// Move a job file to a terminal directory with collision-safe naming.
 ///
@@ -985,5 +1124,354 @@ mod tests {
         assert_eq!(TerminalState::Denied.dir_name(), "denied");
         assert_eq!(TerminalState::Cancelled.dir_name(), "cancelled");
         assert_eq!(TerminalState::Quarantined.dir_name(), "quarantine");
+    }
+
+    // =========================================================================
+    // MAJOR-1 regression: path traversal via file_name → Err
+    // =========================================================================
+
+    #[test]
+    fn test_commit_rejects_path_traversal_dot_dot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        let queue_root = tmp.path().join("queue");
+        let claimed_path = setup_claimed_job(&queue_root, "job-pt");
+
+        let pipeline = ReceiptWritePipeline::new(receipts_dir, queue_root);
+        let receipt = make_receipt("job-pt", FacJobOutcome::Completed);
+
+        let result = pipeline.commit(
+            &receipt,
+            &claimed_path,
+            "../escape.json",
+            TerminalState::Completed,
+        );
+        assert!(result.is_err(), "path traversal must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ReceiptPipelineError::InvalidFileName { .. }),
+            "error must be InvalidFileName, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_commit_rejects_path_separator_in_file_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        let queue_root = tmp.path().join("queue");
+        let claimed_path = setup_claimed_job(&queue_root, "job-sep");
+
+        let pipeline = ReceiptWritePipeline::new(receipts_dir, queue_root);
+        let receipt = make_receipt("job-sep", FacJobOutcome::Completed);
+
+        let result = pipeline.commit(
+            &receipt,
+            &claimed_path,
+            "subdir/escape.json",
+            TerminalState::Completed,
+        );
+        assert!(result.is_err(), "path separator must be rejected");
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptPipelineError::InvalidFileName { .. }
+        ));
+    }
+
+    #[test]
+    fn test_commit_rejects_empty_file_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        let queue_root = tmp.path().join("queue");
+        let claimed_path = setup_claimed_job(&queue_root, "job-empty");
+
+        let pipeline = ReceiptWritePipeline::new(receipts_dir, queue_root);
+        let receipt = make_receipt("job-empty", FacJobOutcome::Completed);
+
+        let result = pipeline.commit(&receipt, &claimed_path, "", TerminalState::Completed);
+        assert!(result.is_err(), "empty file name must be rejected");
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptPipelineError::InvalidFileName { .. }
+        ));
+    }
+
+    #[test]
+    fn test_commit_rejects_dot_dot_file_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        let queue_root = tmp.path().join("queue");
+        let claimed_path = setup_claimed_job(&queue_root, "job-dots");
+
+        let pipeline = ReceiptWritePipeline::new(receipts_dir, queue_root);
+        let receipt = make_receipt("job-dots", FacJobOutcome::Completed);
+
+        let result = pipeline.commit(&receipt, &claimed_path, "..", TerminalState::Completed);
+        assert!(result.is_err(), "'..' file name must be rejected");
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptPipelineError::InvalidFileName { .. }
+        ));
+    }
+
+    #[test]
+    fn test_recover_torn_state_rejects_path_traversal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        let queue_root = tmp.path().join("queue");
+        let claimed_path = setup_claimed_job(&queue_root, "job-rec-pt");
+
+        let receipt = make_receipt("job-rec-pt", FacJobOutcome::Completed);
+        let pipeline = ReceiptWritePipeline::new(receipts_dir, queue_root);
+
+        let result = pipeline.recover_torn_state(
+            &claimed_path,
+            "../evil.json",
+            &receipt,
+            TerminalState::Completed,
+            3000,
+        );
+        assert!(
+            result.is_err(),
+            "path traversal in recovery must be rejected"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptPipelineError::InvalidFileName { .. }
+        ));
+    }
+
+    #[test]
+    fn test_commit_rejects_backslash_path_separator() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        let queue_root = tmp.path().join("queue");
+        let claimed_path = setup_claimed_job(&queue_root, "job-bs");
+
+        let pipeline = ReceiptWritePipeline::new(receipts_dir, queue_root);
+        let receipt = make_receipt("job-bs", FacJobOutcome::Completed);
+
+        let result = pipeline.commit(
+            &receipt,
+            &claimed_path,
+            "sub\\dir.json",
+            TerminalState::Completed,
+        );
+        assert!(result.is_err(), "backslash in file name must be rejected");
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptPipelineError::InvalidFileName { .. }
+        ));
+    }
+
+    // =========================================================================
+    // MAJOR-2 regression: typed errors from persist/validate
+    // =========================================================================
+
+    #[test]
+    fn test_recovery_receipt_persist_returns_typed_error_on_validation_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+
+        let receipt = RecoveryReceiptV1 {
+            schema: "wrong-schema".to_string(),
+            receipt_id: "test-recovery-typed".to_string(),
+            job_id: "job-typed".to_string(),
+            original_receipt_hash: "hash-typed".to_string(),
+            detected_state: "test".to_string(),
+            repair_action: "test".to_string(),
+            source_path: "/tmp/test".to_string(),
+            destination_path: "/tmp/test2".to_string(),
+            timestamp_secs: 1000,
+        };
+
+        let result = receipt.persist(&receipts_dir);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ReceiptPipelineError::RecoveryValidation(_)),
+            "validation failure must return RecoveryValidation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_recovery_receipt_validate_returns_typed_error() {
+        let receipt = RecoveryReceiptV1 {
+            schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
+            receipt_id: String::new(), // empty — should fail
+            job_id: "job-1".to_string(),
+            original_receipt_hash: "hash-1".to_string(),
+            detected_state: "test".to_string(),
+            repair_action: "test".to_string(),
+            source_path: "/tmp/test".to_string(),
+            destination_path: "/tmp/test2".to_string(),
+            timestamp_secs: 1000,
+        };
+
+        let result = receipt.validate();
+        assert!(result.is_err());
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                ReceiptPipelineError::RecoveryValidation(_)
+            ),
+            "empty receipt_id must yield RecoveryValidation"
+        );
+    }
+
+    // =========================================================================
+    // MINOR-1 regression: oversized fields → Err
+    // =========================================================================
+
+    #[test]
+    fn test_validate_rejects_oversized_receipt_id() {
+        let receipt = RecoveryReceiptV1 {
+            schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
+            receipt_id: "x".repeat(MAX_ID_LENGTH + 1),
+            job_id: "job-1".to_string(),
+            original_receipt_hash: "hash-1".to_string(),
+            detected_state: "test".to_string(),
+            repair_action: "test".to_string(),
+            source_path: "/tmp/test".to_string(),
+            destination_path: "/tmp/test2".to_string(),
+            timestamp_secs: 1000,
+        };
+        let err = receipt.validate().unwrap_err();
+        assert!(
+            matches!(err, ReceiptPipelineError::RecoveryValidation(ref s) if s.contains("receipt_id too long")),
+            "oversized receipt_id must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_oversized_job_id() {
+        let receipt = RecoveryReceiptV1 {
+            schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
+            receipt_id: "test-id".to_string(),
+            job_id: "j".repeat(MAX_ID_LENGTH + 1),
+            original_receipt_hash: "hash-1".to_string(),
+            detected_state: "test".to_string(),
+            repair_action: "test".to_string(),
+            source_path: "/tmp/test".to_string(),
+            destination_path: "/tmp/test2".to_string(),
+            timestamp_secs: 1000,
+        };
+        let err = receipt.validate().unwrap_err();
+        assert!(
+            matches!(err, ReceiptPipelineError::RecoveryValidation(ref s) if s.contains("job_id too long")),
+            "oversized job_id must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_oversized_hash() {
+        let receipt = RecoveryReceiptV1 {
+            schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
+            receipt_id: "test-id".to_string(),
+            job_id: "job-1".to_string(),
+            original_receipt_hash: "h".repeat(MAX_HASH_LENGTH + 1),
+            detected_state: "test".to_string(),
+            repair_action: "test".to_string(),
+            source_path: "/tmp/test".to_string(),
+            destination_path: "/tmp/test2".to_string(),
+            timestamp_secs: 1000,
+        };
+        let err = receipt.validate().unwrap_err();
+        assert!(
+            matches!(err, ReceiptPipelineError::RecoveryValidation(ref s) if s.contains("original_receipt_hash too long")),
+            "oversized original_receipt_hash must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_oversized_source_path() {
+        let receipt = RecoveryReceiptV1 {
+            schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
+            receipt_id: "test-id".to_string(),
+            job_id: "job-1".to_string(),
+            original_receipt_hash: "hash-1".to_string(),
+            detected_state: "test".to_string(),
+            repair_action: "test".to_string(),
+            source_path: "/".repeat(MAX_PATH_LENGTH + 1),
+            destination_path: "/tmp/test2".to_string(),
+            timestamp_secs: 1000,
+        };
+        let err = receipt.validate().unwrap_err();
+        assert!(
+            matches!(err, ReceiptPipelineError::RecoveryValidation(ref s) if s.contains("source_path too long")),
+            "oversized source_path must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_oversized_destination_path() {
+        let receipt = RecoveryReceiptV1 {
+            schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
+            receipt_id: "test-id".to_string(),
+            job_id: "job-1".to_string(),
+            original_receipt_hash: "hash-1".to_string(),
+            detected_state: "test".to_string(),
+            repair_action: "test".to_string(),
+            source_path: "/tmp/test".to_string(),
+            destination_path: "/".repeat(MAX_PATH_LENGTH + 1),
+            timestamp_secs: 1000,
+        };
+        let err = receipt.validate().unwrap_err();
+        assert!(
+            matches!(err, ReceiptPipelineError::RecoveryValidation(ref s) if s.contains("destination_path too long")),
+            "oversized destination_path must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_fields_at_exact_bounds() {
+        // Fields at exactly the maximum length should be accepted.
+        let receipt = RecoveryReceiptV1 {
+            schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
+            receipt_id: "x".repeat(MAX_ID_LENGTH),
+            job_id: "j".repeat(MAX_ID_LENGTH),
+            original_receipt_hash: "h".repeat(MAX_HASH_LENGTH),
+            detected_state: "d".repeat(MAX_RECOVERY_REASON_LENGTH),
+            repair_action: "r".repeat(MAX_RECOVERY_REASON_LENGTH),
+            source_path: "s".repeat(MAX_PATH_LENGTH),
+            destination_path: "p".repeat(MAX_PATH_LENGTH),
+            timestamp_secs: 1000,
+        };
+        assert!(
+            receipt.validate().is_ok(),
+            "fields at exact bounds must be accepted"
+        );
+    }
+
+    // =========================================================================
+    // validate_file_name unit tests
+    // =========================================================================
+
+    #[test]
+    fn test_validate_file_name_accepts_valid_names() {
+        assert!(validate_file_name("job-1.json").is_ok());
+        assert!(validate_file_name("a").is_ok());
+        assert!(validate_file_name("recovery-job-torn-2000.json").is_ok());
+        assert!(validate_file_name(".hidden").is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_name_rejects_null_byte() {
+        let result = validate_file_name("job\0evil.json");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptPipelineError::InvalidFileName { reason, .. } if reason.contains("null byte")
+        ));
+    }
+
+    #[test]
+    fn test_validate_file_name_rejects_overlength() {
+        let long_name = "a".repeat(MAX_FILE_NAME_LENGTH + 1);
+        let result = validate_file_name(&long_name);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptPipelineError::InvalidFileName { reason, .. } if reason.contains("maximum length")
+        ));
     }
 }
