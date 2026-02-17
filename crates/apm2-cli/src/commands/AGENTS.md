@@ -279,8 +279,10 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
 
 - **Queue status** (`fac_queue.rs`): `apm2 fac queue status` scans the six queue directories
   (`pending`, `claimed`, `completed`, `denied`, `quarantine`, `cancelled`) with bounded
-  `read_dir` (MAX_SCAN_ENTRIES=4096) and reports per-directory file counts, oldest job ID
-  and enqueue time, and denial/quarantine reason stats. Reason codes are capped at
+  `read_dir` (MAX_SCAN_ENTRIES=4096) and reports per-directory valid job counts, malformed
+  entry counts, oldest job ID and enqueue time, and denial/quarantine reason stats. Job
+  counts only increment after successful `read_job_spec_bounded` parse; malformed `.json`
+  files are tracked separately to avoid inflating job counts. Reason codes are capped at
   MAX_REASON_CODES=64 to prevent unbounded memory growth from adversarial data.
 - **Receipt-based reason stats** (`fac_queue.rs`): `collect_reason_stats` resolves denial
   reasons from the canonical receipt index via `lookup_job_receipt()`, not from `spec.kind`.
@@ -297,14 +299,17 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
   logs). The function resolves lanes from `resolve_fac_root().join("lanes")` (the canonical
   FAC root) rather than inferring from queue root parentage. Truncation is reported in both
   text and JSON output via `log_pointers_truncated`.
-- **Symlink guards** (`fac_utils.rs`, `fac_job.rs`): `read_job_spec_bounded` uses an
-  open-once pattern with `O_NOFOLLOW | O_CLOEXEC` (via `OpenOptionsExt::custom_flags` on
-  Unix) to atomically refuse symlinks at the kernel level, then calls `fstat` on the opened
-  fd (via `File::metadata()`) to verify the target is a regular file. This eliminates the
-  TOCTOU race between `symlink_metadata()` and `File::open()` that existed previously,
-  matching the established pattern in `fac_secure_io::read_bounded`. `discover_log_pointers`
-  validates all scanned directories with `validate_real_directory` and skips symlinked
-  entries via `is_symlink_entry`, both using lstat semantics.
+- **Symlink and FIFO guards** (`fac_utils.rs`, `fac_job.rs`): `read_job_spec_bounded` uses
+  an open-once pattern with `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK` (via
+  `OpenOptionsExt::custom_flags` on Unix) to atomically refuse symlinks at the kernel level
+  and prevent blocking on FIFOs (named pipes), then calls `fstat` on the opened fd (via
+  `File::metadata()`) to verify the target is a regular file. `O_NONBLOCK` prevents a local
+  DoS where a FIFO queue entry would block the open(2) call indefinitely waiting for a
+  writer; for regular files, `O_NONBLOCK` has no effect. This eliminates the TOCTOU race
+  between `symlink_metadata()` and `File::open()` that existed previously, matching the
+  established pattern in `fac_secure_io::read_bounded`. `discover_log_pointers` validates
+  all scanned directories with `validate_real_directory` and skips symlinked entries via
+  `is_symlink_entry`, both using lstat semantics.
 - **Reason code overflow** (`fac_queue.rs`): When `MAX_REASON_CODES` distinct reason keys
   are reached in `collect_reason_stats`, new reason codes are aggregated into an `"other"`
   bucket rather than silently dropped, ensuring total counts remain accurate.
