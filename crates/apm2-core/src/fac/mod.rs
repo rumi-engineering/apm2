@@ -415,7 +415,8 @@ pub use receipt_index::{
 // Re-export receipt pipeline types (TCK-00564)
 pub use receipt_pipeline::{
     CommitResult, RECOVERY_RECEIPT_SCHEMA, ReceiptPipelineError, ReceiptWritePipeline,
-    RecoveryReceiptV1, TerminalState, outcome_to_terminal_state, receipt_exists_for_job,
+    RecoveryReceiptV1, TerminalState, move_job_to_terminal, outcome_to_terminal_state,
+    receipt_exists_for_job, rename_noreplace,
 };
 // Re-export reconcile types (TCK-00534)
 pub use reconcile::{

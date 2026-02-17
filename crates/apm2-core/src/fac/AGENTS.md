@@ -1386,6 +1386,12 @@ for receipt IDs constructed from job IDs (MAJOR-3/MINOR security fixes).
   fallback to directory scan. Returns the full receipt. Used by reconciliation
   to detect torn states and determine the correct terminal directory.
 - `outcome_to_terminal_state(outcome)`: Maps `FacJobOutcome` to `TerminalState`.
+- `move_job_to_terminal(src, dest_dir, file_name)`: Hardened file move with
+  symlink rejection, ownership verification, and collision-safe naming.
+  All callers that move job files to terminal directories MUST use this
+  function instead of `move_to_dir_safe` (which lacks security checks).
+- `rename_noreplace(src, dest)`: Single canonical atomic no-replace rename.
+  Uses `renameat2(RENAME_NOREPLACE)` on Linux. Do NOT duplicate this function.
 
 ### Security Invariants (TCK-00564)
 
@@ -1422,6 +1428,15 @@ for receipt IDs constructed from job IDs (MAJOR-3/MINOR security fixes).
   filename (`"recovery-{receipt_id}.json"`) against `MAX_FILE_NAME_LENGTH`
   before writing, preventing `ENAMETOOLONG` errors that could bypass recovery
   receipt persistence (MINOR-1 security fix).
+- [INV-PIPE-014] `RecoveryReceiptV1::persist` propagates `set_permissions` errors
+  instead of ignoring them (MINOR-1 round 7). Failed permission setting is logged
+  via `tracing::warn!` and returned as `ReceiptPipelineError::RecoveryIo`.
+- [INV-PIPE-015] `rename_noreplace` is the single canonical implementation shared
+  between `receipt_pipeline.rs` and all CLI callers (MAJOR-3 round 7). No
+  duplicate platform-specific rename logic exists.
+- [INV-PIPE-016] Receipt pipeline index update failures are logged via
+  `tracing::warn!` instead of `eprintln!` (MAJOR-1 round 7). Libraries do not
+  write directly to stderr.
 
 ## reconcile Submodule (TCK-00534)
 

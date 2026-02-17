@@ -384,7 +384,14 @@ impl RecoveryReceiptV1 {
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o600);
-            let _ = std::fs::set_permissions(temp.path(), perms);
+            std::fs::set_permissions(temp.path(), perms).map_err(|e| {
+                tracing::warn!(
+                    path = %temp.path().display(),
+                    error = %e,
+                    "failed to set recovery receipt permissions to 0o600"
+                );
+                ReceiptPipelineError::RecoveryIo(e)
+            })?;
         }
 
         {
@@ -487,7 +494,7 @@ impl ReceiptWritePipeline {
         // Index failure does not block the commit. On failure, delete the
         // stale index to force rebuild on next read.
         if let Err(e) = ReceiptIndexV1::incremental_update(&self.receipts_dir, receipt) {
-            eprintln!("WARN: receipt pipeline index update failed: {e}");
+            tracing::warn!(error = %e, "receipt pipeline index update failed");
             let index_path = ReceiptIndexV1::index_path(&self.receipts_dir);
             let _ = std::fs::remove_file(&index_path);
         }
@@ -688,10 +695,22 @@ fn validate_receipt_id_for_filename(receipt_id: &str) -> Result<(), ReceiptPipel
 /// Uses `rename_noreplace` for atomicity on the same filesystem. On
 /// collision (file already exists), generates a timestamped name.
 ///
+/// This function includes hardened security checks:
+/// - Rejects symlinked destination directories (confinement escape prevention).
+/// - Verifies destination directory ownership matches the process EUID (Unix).
+/// - Creates directories with mode 0o700.
+///
+/// All callers that move job files to terminal directories MUST use this
+/// function instead of `move_to_dir_safe` (which lacks these checks).
+///
 /// # Errors
 ///
 /// Returns an error string if the move fails.
-fn move_job_to_terminal(src: &Path, dest_dir: &Path, file_name: &str) -> Result<PathBuf, String> {
+pub fn move_job_to_terminal(
+    src: &Path,
+    dest_dir: &Path,
+    file_name: &str,
+) -> Result<PathBuf, String> {
     // SECURITY (f-715-security-1771314374402491-0): Symlink-safe terminal move.
     // Check dest_dir via symlink_metadata before creating or using it.
     // Reject symlinks on destination path to prevent queue confinement escape.
@@ -788,9 +807,17 @@ fn move_job_to_terminal(src: &Path, dest_dir: &Path, file_name: &str) -> Result<
 
 /// Atomic rename that fails (instead of overwriting) when the destination
 /// already exists. Uses Linux `renameat2(RENAME_NOREPLACE)`.
+///
+/// This is the single canonical implementation of no-replace rename.
+/// Do NOT duplicate this function; import it from this module instead.
+///
+/// # Errors
+///
+/// Returns [`std::io::Error`] with `EEXIST` or `AlreadyExists` when the
+/// destination already exists, or any other I/O error from the rename syscall.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn rename_noreplace(src: &Path, dest: &Path) -> std::io::Result<()> {
+pub fn rename_noreplace(src: &Path, dest: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -823,8 +850,11 @@ fn rename_noreplace(src: &Path, dest: &Path) -> std::io::Result<()> {
 /// Best-effort fallback for non-Linux: check + rename with inherent TOCTOU
 /// window. Acceptable because the nanosecond-timestamped collision path
 /// provides a secondary safety net.
+///
+/// This is the single canonical implementation of no-replace rename.
+/// Do NOT duplicate this function; import it from this module instead.
 #[cfg(not(target_os = "linux"))]
-fn rename_noreplace(src: &Path, dest: &Path) -> std::io::Result<()> {
+pub fn rename_noreplace(src: &Path, dest: &Path) -> std::io::Result<()> {
     if dest.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,

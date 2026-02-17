@@ -95,11 +95,12 @@ use apm2_core::fac::{
     FacJobOutcome, FacJobReceiptV1, FacJobReceiptV1Builder, FacPolicyV1, GateReceipt,
     GateReceiptBuilder, LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1,
     LaneCorruptMarkerV1, LaneProfileV1, MAX_POLICY_SIZE,
-    QueueAdmissionTrace as JobQueueAdmissionTrace, ReceiptWritePipeline, RepoMirrorManager,
-    SystemModeConfig, SystemdUnitProperties, apply_credential_mount_to_env,
+    QueueAdmissionTrace as JobQueueAdmissionTrace, ReceiptPipelineError, ReceiptWritePipeline,
+    RepoMirrorManager, SystemModeConfig, SystemdUnitProperties, apply_credential_mount_to_env,
     build_github_credential_mount, build_job_environment, compute_policy_hash, deserialize_policy,
-    load_or_default_boundary_id, outcome_to_terminal_state, parse_policy_hash,
-    persist_content_addressed_receipt, persist_policy, run_preflight, select_and_validate_backend,
+    load_or_default_boundary_id, move_job_to_terminal, outcome_to_terminal_state,
+    parse_policy_hash, persist_content_addressed_receipt, persist_policy, rename_noreplace,
+    run_preflight, select_and_validate_backend,
 };
 use apm2_core::github::{parse_github_remote_url, resolve_apm2_home};
 use base64::Engine;
@@ -1775,15 +1776,31 @@ fn process_job(
     if let Some(existing_receipt) =
         apm2_core::fac::find_receipt_for_job(&receipts_dir, &spec.job_id)
     {
-        let terminal_dir = apm2_core::fac::outcome_to_terminal_state(existing_receipt.outcome)
-            .map_or_else(
-                || queue_root.join(COMPLETED_DIR),
-                |ts| queue_root.join(ts.dir_name()),
+        // BLOCKER-1 fix (round 7): Handle non-terminal outcomes explicitly.
+        // If the receipt outcome is non-terminal (e.g., CancellationRequested),
+        // do NOT move the job — skip it and log a warning. Only terminal
+        // outcomes produce a valid target directory.
+        let Some(terminal_state) =
+            apm2_core::fac::outcome_to_terminal_state(existing_receipt.outcome)
+        else {
+            eprintln!(
+                "worker: duplicate job {} has non-terminal receipt outcome {:?}, \
+                 skipping move (job stays in pending/ for reconciliation)",
+                spec.job_id, existing_receipt.outcome,
             );
-        // MAJOR-1 fix (f-715-code_quality): Handle move failure — do NOT discard
-        // the Result. On failure, log and return Skipped with the error so the
-        // duplicate stays visible for reconciliation.
-        if let Err(move_err) = move_to_dir_safe(path, &terminal_dir, &file_name) {
+            return JobOutcome::Skipped {
+                reason: format!(
+                    "receipt already exists for job {} with non-terminal outcome {:?}, \
+                     skipped (no terminal directory for this outcome)",
+                    spec.job_id, existing_receipt.outcome,
+                ),
+            };
+        };
+        let terminal_dir = queue_root.join(terminal_state.dir_name());
+        // BLOCKER-2 fix (round 7): Use hardened move_job_to_terminal instead
+        // of move_to_dir_safe. move_job_to_terminal includes symlink checks,
+        // ownership verification, and restrictive directory creation mode.
+        if let Err(move_err) = move_job_to_terminal(path, &terminal_dir, &file_name) {
             eprintln!(
                 "worker: duplicate job {} detected but move to terminal failed: {move_err}",
                 spec.job_id,
@@ -1828,17 +1845,16 @@ fn process_job(
         );
         if is_digest_error {
             let reason = format!("digest validation failed: {e}");
-            let moved_path = move_to_dir_safe(path, &queue_root.join(QUARANTINE_DIR), &file_name)
-                .map(|p| {
-                    p.strip_prefix(queue_root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .ok();
-            if let Err(receipt_err) = emit_job_receipt(
+            // BLOCKER-3 fix (round 7): Use ReceiptWritePipeline for atomic
+            // commit even for pre-claim paths. The pipeline persists the
+            // receipt, updates the index, and moves the job to the terminal
+            // directory using the hardened move_job_to_terminal.
+            if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
+                queue_root,
                 spec,
+                path,
+                &file_name,
                 FacJobOutcome::Quarantined,
                 Some(DenialReasonCode::DigestMismatch),
                 &reason,
@@ -1847,36 +1863,37 @@ fn process_job(
                 None,
                 None,
                 Some(canonicalizer_tuple_digest),
-                moved_path.as_deref(),
                 policy_hash,
+                None,
                 None,
                 Some(&sbx_hash),
             ) {
                 eprintln!(
-                    "worker: WARNING: receipt emission failed for quarantined job: {receipt_err}"
+                    "worker: WARNING: pipeline commit failed for quarantined job: {commit_err}"
                 );
+                // Job stays in pending/ for reconciliation.
+                return JobOutcome::Skipped {
+                    reason: format!(
+                        "pipeline commit failed for quarantined job (digest mismatch): {commit_err}"
+                    ),
+                };
             }
             return JobOutcome::Quarantined { reason };
         }
         // Other validation errors (missing token, schema, etc.) -> deny.
         let reason = format!("validation failed: {e}");
-        let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-            .map(|p| {
-                p.strip_prefix(queue_root)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .ok();
         let reason_code = match e {
             JobSpecError::MissingToken { .. } => DenialReasonCode::MissingChannelToken,
             JobSpecError::InvalidDigest { .. } => DenialReasonCode::MalformedSpec,
             _ => DenialReasonCode::ValidationFailed,
         };
-        // (sbx_hash computed once at top of process_job)
-        if let Err(receipt_err) = emit_job_receipt(
+        // BLOCKER-3 fix (round 7): Use ReceiptWritePipeline for atomic commit.
+        if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
+            queue_root,
             spec,
+            path,
+            &file_name,
             FacJobOutcome::Denied,
             Some(reason_code),
             &reason,
@@ -1885,12 +1902,18 @@ fn process_job(
             None,
             None,
             Some(canonicalizer_tuple_digest),
-            moved_path.as_deref(),
             policy_hash,
+            None,
             None,
             Some(&sbx_hash),
         ) {
-            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+            eprintln!("worker: WARNING: pipeline commit failed for denied job: {commit_err}");
+            // Job stays in pending/ for reconciliation.
+            return JobOutcome::Skipped {
+                reason: format!(
+                    "pipeline commit failed for denied job (validation failed): {commit_err}"
+                ),
+            };
         }
         return JobOutcome::Denied { reason };
     }
@@ -5028,50 +5051,10 @@ fn move_to_dir_safe(src: &Path, dest_dir: &Path, file_name: &str) -> Result<Path
     result
 }
 
-/// Atomic rename that fails (instead of overwriting) when the destination
-/// already exists.  Uses Linux `renameat2(RENAME_NOREPLACE)`.
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-fn rename_noreplace(src: &Path, dest: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let src_c = CString::new(src.as_os_str().as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let dest_c = CString::new(dest.as_os_str().as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-
-    // SAFETY: paths are valid C strings, AT_FDCWD means use current directory
-    // for relative paths.
-    let ret = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            src_c.as_ptr(),
-            libc::AT_FDCWD,
-            dest_c.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-/// Best-effort fallback for non-Linux: check + rename with inherent TOCTOU
-/// window.  Acceptable because the nanosecond-timestamped collision path in
-/// `move_to_dir_safe` provides a secondary safety net.
-#[cfg(not(target_os = "linux"))]
-fn rename_noreplace(src: &Path, dest: &Path) -> std::io::Result<()> {
-    if dest.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "destination already exists",
-        ));
-    }
-    fs::rename(src, dest)
-}
+// NOTE: `rename_noreplace` is imported from `apm2_core::fac::rename_noreplace`
+// (MAJOR-3 fix round 7: unified into single canonical implementation in
+// receipt_pipeline.rs to avoid behavioral drift and security maintenance
+// burden).
 
 /// Emit a structured job receipt for scan failures (typically malformed input).
 #[allow(clippy::too_many_arguments)]
@@ -5354,7 +5337,10 @@ fn emit_job_receipt_internal(
 /// Commit a claimed job through the `ReceiptWritePipeline`: persist receipt,
 /// update index, move job atomically (TCK-00564 BLOCKER-1).
 ///
-/// Returns the terminal path of the moved job file, or an error string.
+/// Returns the terminal path of the moved job file, or a structured
+/// [`ReceiptPipelineError`] that preserves error specificity (including
+/// [`ReceiptPipelineError::TornState`]) for callers to decide recovery
+/// strategy.
 #[allow(clippy::too_many_arguments)]
 fn commit_claimed_job_via_pipeline(
     fac_root: &Path,
@@ -5374,9 +5360,12 @@ fn commit_claimed_job_via_pipeline(
     containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
     observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<&str>,
-) -> Result<PathBuf, String> {
-    let terminal_state = outcome_to_terminal_state(outcome)
-        .ok_or_else(|| format!("non-terminal outcome {outcome:?} cannot be committed"))?;
+) -> Result<PathBuf, ReceiptPipelineError> {
+    let terminal_state = outcome_to_terminal_state(outcome).ok_or_else(|| {
+        ReceiptPipelineError::ReceiptPersistFailed(format!(
+            "non-terminal outcome {outcome:?} cannot be committed"
+        ))
+    })?;
 
     let receipt = build_job_receipt(
         spec,
@@ -5393,14 +5382,13 @@ fn commit_claimed_job_via_pipeline(
         containment,
         observed_cost,
         sandbox_hardening_hash,
-    )?;
+    )
+    .map_err(ReceiptPipelineError::ReceiptPersistFailed)?;
 
     let pipeline =
         ReceiptWritePipeline::new(fac_root.join(FAC_RECEIPTS_DIR), queue_root.to_path_buf());
 
-    let result = pipeline
-        .commit(&receipt, claimed_path, claimed_file_name, terminal_state)
-        .map_err(|e| format!("pipeline commit failed: {e}"))?;
+    let result = pipeline.commit(&receipt, claimed_path, claimed_file_name, terminal_state)?;
 
     Ok(result.job_terminal_path)
 }
@@ -5423,7 +5411,7 @@ fn commit_claimed_job_via_pipeline(
 /// detection in `process_job` to route all receipted jobs to `completed/`,
 /// masking denied outcomes (TCK-00564 MAJOR-1 fix round 4).
 fn handle_pipeline_commit_failure(
-    commit_err: &str,
+    commit_err: &ReceiptPipelineError,
     context: &str,
     _claimed_path: &Path,
     _queue_root: &Path,
@@ -7253,9 +7241,10 @@ mod tests {
         let claimed_path = queue_root.join(CLAIMED_DIR).join("commit-fail.json");
         fs::write(&claimed_path, b"{}").expect("write claimed job");
 
-        // Call handle_pipeline_commit_failure.
+        // Call handle_pipeline_commit_failure with a structured error.
+        let test_err = ReceiptPipelineError::ReceiptPersistFailed("test commit error".to_string());
         let outcome = handle_pipeline_commit_failure(
-            "test commit error",
+            &test_err,
             "test context",
             &claimed_path,
             &queue_root,

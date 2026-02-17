@@ -274,21 +274,31 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
   chains (exec and warm paths) call `.sandbox_hardening_hash(&sbx_hash)` so the
   cryptographically signed `GateReceipt` binds the hardening profile used during
   execution. This complements the `FacJobReceiptV1` binding done via `emit_job_receipt`.
-- **Pipeline commit failure handling** (`fac_worker.rs`, TCK-00564 fix round 4): Every
-  `commit_claimed_job_via_pipeline` call site checks the returned `Result`. On commit
-  failure, the `handle_pipeline_commit_failure` helper logs the error via `eprintln!`
-  and leaves the job in `claimed/` for reconcile to repair. If the receipt was persisted
-  before the commit failed (torn state), `recover_torn_state` routes the job to the
-  correct terminal directory based on the receipt outcome. If the receipt was not
-  persisted, the orphan policy applies. This avoids the outcome-blind duplicate detection
-  bug where requeuing to `pending/` caused denied jobs to be routed to `completed/`.
-- **Outcome-aware duplicate detection** (`fac_worker.rs`, TCK-00564 fix round 4): The
-  duplicate receipt check in `process_job` uses `find_receipt_for_job` instead of
-  `has_receipt_for_job` and routes to the correct terminal directory via
-  `outcome_to_terminal_state`. Denied receipts route to `denied/`, not `completed/`.
-  Move failures during duplicate terminalization are logged via `eprintln!` and
-  surfaced in the `JobOutcome::Skipped` reason (MAJOR-1 fix round 5), ensuring
-  the duplicate stays visible for reconciliation instead of being silently orphaned.
+- **Pipeline commit failure handling** (`fac_worker.rs`, TCK-00564 fix round 4, updated
+  round 7): Every `commit_claimed_job_via_pipeline` call site checks the returned
+  `Result<PathBuf, ReceiptPipelineError>`. On commit failure, the
+  `handle_pipeline_commit_failure` helper logs the structured error via `eprintln!` and
+  leaves the job in `claimed/` for reconcile to repair. The error type preserves
+  specificity (including `TornState` variant) for callers to decide recovery strategy
+  (MAJOR-2 fix round 7). If the receipt was persisted before the commit failed (torn
+  state), `recover_torn_state` routes the job to the correct terminal directory based
+  on the receipt outcome. If the receipt was not persisted, the orphan policy applies.
+- **Outcome-aware duplicate detection** (`fac_worker.rs`, TCK-00564 fix round 4, updated
+  round 7): The duplicate receipt check in `process_job` uses `find_receipt_for_job`
+  instead of `has_receipt_for_job` and routes to the correct terminal directory via
+  `outcome_to_terminal_state`. Non-terminal outcomes (e.g., `CancellationRequested`)
+  are explicitly handled: the job is skipped without moving and a warning is logged
+  (BLOCKER-1 fix round 7). Duplicate moves use the hardened `move_job_to_terminal`
+  from `receipt_pipeline.rs` with symlink checks and ownership verification instead of
+  `move_to_dir_safe` (BLOCKER-2 fix round 7).
+- **Pre-claim validation paths use pipeline** (`fac_worker.rs`, TCK-00564 fix round 7):
+  DigestMismatch and ValidationFailed paths that reject jobs before claiming now use
+  `commit_claimed_job_via_pipeline` for atomic receipt + move, ensuring no job reaches
+  a terminal directory without a persisted receipt (BLOCKER-3 fix round 7).
+- **Unified rename_noreplace** (`fac_worker.rs`, TCK-00564 fix round 7): The local
+  `rename_noreplace` implementation has been removed. All callers now use the single
+  canonical `rename_noreplace` from `apm2_core::fac::receipt_pipeline` (MAJOR-3 fix
+  round 7).
 
 ## Introspection CLI Invariants (Updated for TCK-00535)
 
