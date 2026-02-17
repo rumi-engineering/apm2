@@ -162,11 +162,35 @@ pub enum PolicyAdoptionError {
         /// The hash that is already admitted.
         hash: String,
     },
+
+    /// Schema identifier does not match the expected value.
+    #[error("schema mismatch: expected {expected}, got {actual}")]
+    SchemaMismatch {
+        /// Expected schema identifier.
+        expected: &'static str,
+        /// Actual schema identifier.
+        actual: String,
+    },
+
+    /// Schema version is not supported.
+    #[error("unsupported schema version: {version} (supported: {supported})")]
+    UnsupportedSchemaVersion {
+        /// Actual version found.
+        version: String,
+        /// Supported version(s).
+        supported: &'static str,
+    },
 }
 
 // =============================================================================
 // Types
 // =============================================================================
+
+/// Supported schema version for `AdmittedPolicyRootV1`.
+const ADMITTED_ROOT_SUPPORTED_VERSION: &str = "1.0.0";
+
+/// Supported schema version for `PolicyAdoptionReceiptV1`.
+const ADOPTION_RECEIPT_SUPPORTED_VERSION: &str = "1.0.0";
 
 /// Persisted admitted policy root. Stored as a small JSON file containing
 /// only the admitted policy hash and schema metadata.
@@ -186,8 +210,21 @@ pub struct AdmittedPolicyRootV1 {
 }
 
 impl AdmittedPolicyRootV1 {
-    /// Validate all field bounds.
+    /// Validate schema identity, version compatibility, and field bounds
+    /// (f-722-code_quality-1771350756136698-0).
     fn validate(&self) -> Result<(), PolicyAdoptionError> {
+        if self.schema != ADMITTED_POLICY_ROOT_SCHEMA {
+            return Err(PolicyAdoptionError::SchemaMismatch {
+                expected: ADMITTED_POLICY_ROOT_SCHEMA,
+                actual: self.schema.clone(),
+            });
+        }
+        if self.schema_version != ADMITTED_ROOT_SUPPORTED_VERSION {
+            return Err(PolicyAdoptionError::UnsupportedSchemaVersion {
+                version: self.schema_version.clone(),
+                supported: ADMITTED_ROOT_SUPPORTED_VERSION,
+            });
+        }
         validate_bounded_string("schema", &self.schema, MAX_SCHEMA_STRING_LENGTH)?;
         validate_bounded_string(
             "schema_version",
@@ -251,8 +288,21 @@ pub struct PolicyAdoptionReceiptV1 {
 }
 
 impl PolicyAdoptionReceiptV1 {
-    /// Validate all field bounds.
+    /// Validate schema identity, version compatibility, and field bounds
+    /// (f-722-code_quality-1771350756136698-0).
     fn validate(&self) -> Result<(), PolicyAdoptionError> {
+        if self.schema != POLICY_ADOPTION_RECEIPT_SCHEMA {
+            return Err(PolicyAdoptionError::SchemaMismatch {
+                expected: POLICY_ADOPTION_RECEIPT_SCHEMA,
+                actual: self.schema.clone(),
+            });
+        }
+        if self.schema_version != ADOPTION_RECEIPT_SUPPORTED_VERSION {
+            return Err(PolicyAdoptionError::UnsupportedSchemaVersion {
+                version: self.schema_version.clone(),
+                supported: ADOPTION_RECEIPT_SUPPORTED_VERSION,
+            });
+        }
         validate_bounded_string("schema", &self.schema, MAX_SCHEMA_STRING_LENGTH)?;
         validate_bounded_string(
             "schema_version",
@@ -403,9 +453,11 @@ pub fn adopt_policy(
     };
     new_root.validate()?;
 
-    persist_admitted_root_atomic(fac_root, &new_root)?;
-
-    // Step 6: emit receipt.
+    // Step 5: emit receipt BEFORE persisting root.
+    // Transactional ordering: if receipt persistence fails, the root is
+    // never committed, so the durable receipt invariant is maintained.
+    // If receipt succeeds but root fails, the receipt is an orphan (safe).
+    // (f-722-code_quality-1771350743593522-0)
     let receipt = build_and_persist_receipt(
         fac_root,
         PolicyAdoptionAction::Adopt,
@@ -415,6 +467,9 @@ pub fn adopt_policy(
         reason,
         now_secs,
     )?;
+
+    // Step 6: persist new admitted root atomically (only after receipt).
+    persist_admitted_root_atomic(fac_root, &new_root)?;
 
     Ok((new_root, receipt))
 }
@@ -471,13 +526,11 @@ pub fn rollback_policy(
     };
     rolled_back_root.validate()?;
 
-    // Persist as current root (atomic).
-    // Note: we do NOT update prev — the prev file stays as the last
-    // rollback point. A subsequent adopt will overwrite prev with the
-    // current root.
-    persist_admitted_root_atomic(fac_root, &rolled_back_root)?;
-
-    // Emit rollback receipt.
+    // Emit rollback receipt BEFORE persisting root.
+    // Transactional ordering: receipt-before-root ensures the durable
+    // receipt invariant is never violated. An orphan receipt (receipt
+    // written but root fails) is safe; a committed root without a receipt
+    // is not. (f-722-code_quality-1771350743593522-0)
     let receipt = build_and_persist_receipt(
         fac_root,
         PolicyAdoptionAction::Rollback,
@@ -487,6 +540,12 @@ pub fn rollback_policy(
         reason,
         now_secs,
     )?;
+
+    // Persist as current root (atomic) — only after receipt.
+    // Note: we do NOT update prev — the prev file stays as the last
+    // rollback point. A subsequent adopt will overwrite prev with the
+    // current root.
+    persist_admitted_root_atomic(fac_root, &rolled_back_root)?;
 
     Ok((rolled_back_root, receipt))
 }
@@ -758,28 +817,46 @@ fn compute_adoption_receipt_hash(
     format!("b3-256:{}", hasher.finalize().to_hex())
 }
 
-/// Read and deserialize a bounded JSON file using the open-once pattern.
+/// Read a bounded file using the open-once pattern.
 ///
-/// Opens with `O_NOFOLLOW | O_CLOEXEC` (Unix) to atomically refuse symlinks
-/// at the kernel level, then verifies via `fstat` (handle-based) that the fd
-/// is a regular file. Reads at most `max_size + 1` bytes via `take()` to
-/// enforce the size limit without a TOCTOU gap between stat and read
+/// Opens with `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK` (Unix) to:
+/// - Atomically refuse symlinks at the kernel level (`O_NOFOLLOW`).
+/// - Prevent inherited fd leaks (`O_CLOEXEC`).
+/// - Prevent indefinite blocking on FIFOs/named pipes (`O_NONBLOCK`), ensuring
+///   the `fstat` `is_file()` check rejects them before any data read
+///   (f-722-code_quality-1771350762686151-0).
+///
+/// After `fstat` confirms a regular file, `O_NONBLOCK` is cleared via
+/// `fcntl(F_SETFL)` so that subsequent reads use normal blocking
+/// semantics (this is safe because regular files ignore `O_NONBLOCK`
+/// on Linux, but clearing it is portable best practice).
+///
+/// Reads at most `max_size + 1` bytes via `take()` to enforce the size
+/// limit without a TOCTOU gap between stat and read
 /// (f-722-security-1771348928218169-0, CTR-1603, INV-PADOPT-007).
-fn load_bounded_json<T: serde::de::DeserializeOwned>(
-    path: &Path,
-    max_size: usize,
-) -> Result<T, PolicyAdoptionError> {
+///
+/// This is the shared implementation backing both `load_bounded_json`
+/// (core) and the CLI's file read path, eliminating the duplicate
+/// open-once pattern (f-722-security-1771350572106666-0).
+///
+/// # Errors
+///
+/// Returns [`PolicyAdoptionError::NoAdmittedRoot`] if the file does not
+/// exist, [`PolicyAdoptionError::FileTooLarge`] if it exceeds `max_size`,
+/// [`PolicyAdoptionError::Io`] on other I/O failures.
+pub fn read_bounded_file(path: &Path, max_size: usize) -> Result<Vec<u8>, PolicyAdoptionError> {
     use std::fs::OpenOptions;
     use std::io::Read as _;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
-    // Open-once: O_NOFOLLOW rejects symlinks at open(2), no TOCTOU gap.
+    // Open-once: O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK.
+    // O_NONBLOCK prevents indefinite blocking on FIFOs before fstat.
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
 
     let file = options.open(path).map_err(|e| {
@@ -799,6 +876,7 @@ fn load_bounded_json<T: serde::de::DeserializeOwned>(
 
     // fstat on the opened fd -- not the path -- to verify regular file.
     // This cannot race because the fd is already bound to the inode.
+    // FIFOs are rejected here (is_file() returns false for named pipes).
     let metadata = file.metadata().map_err(|e| PolicyAdoptionError::Io {
         detail: format!("cannot fstat {}: {e}", path.display()),
     })?;
@@ -806,6 +884,25 @@ fn load_bounded_json<T: serde::de::DeserializeOwned>(
         return Err(PolicyAdoptionError::Io {
             detail: format!("not a regular file (fail-closed): {}", path.display()),
         });
+    }
+
+    // Clear O_NONBLOCK now that fstat confirmed regular file.
+    // Regular files ignore O_NONBLOCK on Linux, but clearing is portable
+    // best practice for other Unix variants
+    // (f-722-code_quality-1771350762686151-0).
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        // Safety: `fcntl(F_GETFL)` and `fcntl(F_SETFL)` are safe system
+        // calls on a valid, open file descriptor. The fd is guaranteed
+        // valid here because we just opened it successfully above.
+        #[allow(unsafe_code)]
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags != -1 {
+            #[allow(unsafe_code)]
+            let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+        }
     }
 
     let file_size = metadata.len();
@@ -833,6 +930,18 @@ fn load_bounded_json<T: serde::de::DeserializeOwned>(
         });
     }
 
+    Ok(bytes)
+}
+
+/// Read and deserialize a bounded JSON file using the open-once pattern.
+///
+/// Delegates to [`read_bounded_file`] for the open-once + bounded-read
+/// pattern, then deserializes the result as JSON.
+fn load_bounded_json<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    max_size: usize,
+) -> Result<T, PolicyAdoptionError> {
+    let bytes = read_bounded_file(path, max_size)?;
     serde_json::from_slice(&bytes).map_err(|e| PolicyAdoptionError::Serialization {
         detail: format!("cannot parse {}: {e}", path.display()),
     })
@@ -1599,5 +1708,288 @@ mod tests {
             result.is_err(),
             "should reject oversized current root during rotation: {result:?}"
         );
+    }
+
+    // =====================================================================
+    // Receipt-before-root transactional ordering tests
+    // (f-722-code_quality-1771350743593522-0)
+    // =====================================================================
+
+    /// Verify that `adopt_policy` persists the receipt before the root
+    /// by checking that a receipt exists even when the root is freshly
+    /// written (regression for transactional ordering).
+    #[test]
+    fn test_adopt_receipt_exists_before_root_on_success() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let policy_bytes = make_default_policy_bytes();
+
+        let (root, receipt) =
+            adopt_policy(fac_root, &policy_bytes, "operator:local", "ordering test")
+                .expect("adopt");
+
+        // Both receipt and root should exist on success.
+        let receipts = receipts_dir(fac_root);
+        let receipt_entries: Vec<_> = fs::read_dir(&receipts)
+            .expect("read receipts dir")
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            !receipt_entries.is_empty(),
+            "receipt must be persisted on successful adoption"
+        );
+        let loaded_root = load_admitted_policy_root(fac_root).expect("load root");
+        assert_eq!(loaded_root.admitted_policy_hash, root.admitted_policy_hash);
+        assert_eq!(receipt.action, PolicyAdoptionAction::Adopt);
+    }
+
+    /// Verify that `rollback_policy` persists the receipt before the root
+    /// (regression for transactional ordering).
+    #[test]
+    fn test_rollback_receipt_exists_before_root_on_success() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let policy_bytes = make_default_policy_bytes();
+
+        let (first_root, _) = adopt_policy(fac_root, &policy_bytes, "operator:local", "initial")
+            .expect("first adopt");
+
+        let mut policy = FacPolicyV1::default_policy();
+        policy.deny_ambient_cargo_home = false;
+        let second_bytes = serde_json::to_vec_pretty(&policy).expect("serialize");
+        adopt_policy(fac_root, &second_bytes, "operator:local", "update").expect("second adopt");
+
+        let (rolled_back, receipt) =
+            rollback_policy(fac_root, "operator:local", "rollback ordering test")
+                .expect("rollback");
+
+        assert_eq!(
+            rolled_back.admitted_policy_hash,
+            first_root.admitted_policy_hash
+        );
+        assert_eq!(receipt.action, PolicyAdoptionAction::Rollback);
+
+        // Count receipts: initial adopt + update adopt + rollback = 3.
+        let receipts = receipts_dir(fac_root);
+        let receipt_entries: Vec<_> = fs::read_dir(&receipts)
+            .expect("read receipts dir")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            receipt_entries.len(),
+            3,
+            "should have 3 receipts (2 adopts + 1 rollback)"
+        );
+    }
+
+    // =====================================================================
+    // Schema/version validation tests
+    // (f-722-code_quality-1771350756136698-0)
+    // =====================================================================
+
+    /// Verify that `AdmittedPolicyRootV1::validate` rejects wrong schema.
+    #[test]
+    fn test_admitted_root_rejects_wrong_schema() {
+        let root = AdmittedPolicyRootV1 {
+            schema: "wrong.schema.id".to_string(),
+            schema_version: "1.0.0".to_string(),
+            admitted_policy_hash: "b3-256:aa".to_string(),
+            adopted_at_unix_secs: 0,
+            actor_id: "test".to_string(),
+        };
+        let result = root.validate();
+        assert!(
+            matches!(result, Err(PolicyAdoptionError::SchemaMismatch { .. })),
+            "should reject wrong schema, got: {result:?}"
+        );
+    }
+
+    /// Verify that `AdmittedPolicyRootV1::validate` rejects wrong version.
+    #[test]
+    fn test_admitted_root_rejects_wrong_version() {
+        let root = AdmittedPolicyRootV1 {
+            schema: ADMITTED_POLICY_ROOT_SCHEMA.to_string(),
+            schema_version: "99.0.0".to_string(),
+            admitted_policy_hash: "b3-256:aa".to_string(),
+            adopted_at_unix_secs: 0,
+            actor_id: "test".to_string(),
+        };
+        let result = root.validate();
+        assert!(
+            matches!(
+                result,
+                Err(PolicyAdoptionError::UnsupportedSchemaVersion { .. })
+            ),
+            "should reject wrong version, got: {result:?}"
+        );
+    }
+
+    /// Verify that `AdmittedPolicyRootV1::validate` accepts correct schema
+    /// and version.
+    #[test]
+    fn test_admitted_root_accepts_correct_schema_and_version() {
+        let root = AdmittedPolicyRootV1 {
+            schema: ADMITTED_POLICY_ROOT_SCHEMA.to_string(),
+            schema_version: "1.0.0".to_string(),
+            admitted_policy_hash: "b3-256:aa".to_string(),
+            adopted_at_unix_secs: 0,
+            actor_id: "test".to_string(),
+        };
+        assert!(
+            root.validate().is_ok(),
+            "correct schema+version should pass"
+        );
+    }
+
+    /// Verify that `PolicyAdoptionReceiptV1::validate` rejects wrong schema.
+    #[test]
+    fn test_receipt_rejects_wrong_schema() {
+        let receipt = PolicyAdoptionReceiptV1 {
+            schema: "wrong.receipt.schema".to_string(),
+            schema_version: "1.0.0".to_string(),
+            action: PolicyAdoptionAction::Adopt,
+            old_digest: String::new(),
+            new_digest: "b3-256:aa".to_string(),
+            actor_id: "test".to_string(),
+            reason: "test".to_string(),
+            timestamp_unix_secs: 0,
+            content_hash: "b3-256:bb".to_string(),
+        };
+        let result = receipt.validate();
+        assert!(
+            matches!(result, Err(PolicyAdoptionError::SchemaMismatch { .. })),
+            "should reject wrong receipt schema, got: {result:?}"
+        );
+    }
+
+    /// Verify that `PolicyAdoptionReceiptV1::validate` rejects wrong version.
+    #[test]
+    fn test_receipt_rejects_wrong_version() {
+        let receipt = PolicyAdoptionReceiptV1 {
+            schema: POLICY_ADOPTION_RECEIPT_SCHEMA.to_string(),
+            schema_version: "2.0.0".to_string(),
+            action: PolicyAdoptionAction::Adopt,
+            old_digest: String::new(),
+            new_digest: "b3-256:aa".to_string(),
+            actor_id: "test".to_string(),
+            reason: "test".to_string(),
+            timestamp_unix_secs: 0,
+            content_hash: "b3-256:bb".to_string(),
+        };
+        let result = receipt.validate();
+        assert!(
+            matches!(
+                result,
+                Err(PolicyAdoptionError::UnsupportedSchemaVersion { .. })
+            ),
+            "should reject wrong receipt version, got: {result:?}"
+        );
+    }
+
+    /// Verify that `PolicyAdoptionReceiptV1::validate` accepts correct
+    /// schema and version.
+    #[test]
+    fn test_receipt_accepts_correct_schema_and_version() {
+        let receipt = PolicyAdoptionReceiptV1 {
+            schema: POLICY_ADOPTION_RECEIPT_SCHEMA.to_string(),
+            schema_version: "1.0.0".to_string(),
+            action: PolicyAdoptionAction::Adopt,
+            old_digest: String::new(),
+            new_digest: "b3-256:aa".to_string(),
+            actor_id: "test".to_string(),
+            reason: "test".to_string(),
+            timestamp_unix_secs: 0,
+            content_hash: "b3-256:bb".to_string(),
+        };
+        assert!(
+            receipt.validate().is_ok(),
+            "correct receipt schema+version should pass"
+        );
+    }
+
+    // =====================================================================
+    // FIFO / named pipe rejection tests
+    // (f-722-code_quality-1771350762686151-0)
+    // =====================================================================
+
+    /// Verify that `read_bounded_file` rejects FIFOs (named pipes).
+    /// `O_NONBLOCK` prevents indefinite blocking on the open, and
+    /// `fstat.is_file()` rejects the non-regular file type.
+    #[cfg(unix)]
+    #[test]
+    fn test_read_bounded_file_rejects_fifo() {
+        let tmp = tempdir().expect("tempdir");
+        let fifo_path = tmp.path().join("test.fifo");
+        nix::unistd::mkfifo(&fifo_path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+
+        let result = read_bounded_file(&fifo_path, 4096);
+        assert!(result.is_err(), "FIFO must be rejected: {result:?}");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("not a regular file"),
+            "FIFO rejection should indicate non-regular file, got: {err}"
+        );
+    }
+
+    /// Verify that `load_bounded_json` rejects FIFOs via the shared
+    /// `read_bounded_file` (`O_NONBLOCK` prevents blocking, fstat rejects).
+    #[cfg(unix)]
+    #[test]
+    fn test_load_bounded_json_rejects_fifo() {
+        let tmp = tempdir().expect("tempdir");
+        let fifo_path = tmp.path().join("test.fifo");
+        nix::unistd::mkfifo(&fifo_path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+
+        let result: Result<AdmittedPolicyRootV1, _> =
+            load_bounded_json(&fifo_path, MAX_ADMITTED_ROOT_FILE_SIZE);
+        assert!(result.is_err(), "FIFO must be rejected: {result:?}");
+    }
+
+    // =====================================================================
+    // read_bounded_file public API tests
+    // (f-722-security-1771350572106666-0)
+    // =====================================================================
+
+    /// Verify that the public `read_bounded_file` works correctly for
+    /// valid regular files.
+    #[test]
+    fn test_read_bounded_file_succeeds_on_regular_file() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("valid.json");
+        let content = b"{\"test\": true}";
+        fs::write(&path, content).expect("write");
+
+        let bytes = read_bounded_file(&path, 4096).expect("read should succeed");
+        assert_eq!(bytes, content);
+    }
+
+    /// Verify that `read_bounded_file` rejects oversized files.
+    #[test]
+    fn test_read_bounded_file_rejects_oversized() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("big.bin");
+        let large = vec![b'x'; 200];
+        fs::write(&path, &large).expect("write");
+
+        let result = read_bounded_file(&path, 100);
+        assert!(
+            matches!(result, Err(PolicyAdoptionError::FileTooLarge { .. })),
+            "should reject oversized file: {result:?}"
+        );
+    }
+
+    /// Verify that `read_bounded_file` rejects symlinks via `O_NOFOLLOW`.
+    #[cfg(unix)]
+    #[test]
+    fn test_read_bounded_file_rejects_symlink() {
+        let tmp = tempdir().expect("tempdir");
+        let real = tmp.path().join("real.txt");
+        fs::write(&real, b"data").expect("write");
+
+        let link = tmp.path().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let result = read_bounded_file(&link, 4096);
+        assert!(result.is_err(), "symlink should be rejected");
     }
 }

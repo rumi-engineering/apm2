@@ -13,16 +13,13 @@
 //! - Actor identity is resolved from the calling process environment, not
 //!   hard-coded (f-722-security-1771347580085305-0).
 
-use std::fs::OpenOptions;
 use std::io::Read;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use apm2_core::fac::policy::MAX_POLICY_SIZE;
 use apm2_core::fac::policy_adoption::{
-    adopt_policy, is_policy_hash_admitted, load_admitted_policy_root, rollback_policy,
-    validate_policy_bytes,
+    adopt_policy, is_policy_hash_admitted, load_admitted_policy_root, read_bounded_file,
+    rollback_policy, validate_policy_bytes,
 };
 use clap::{Args, Subcommand};
 
@@ -415,67 +412,17 @@ fn read_policy_input(path: Option<&Path>) -> Result<Vec<u8>, String> {
     match path {
         None => read_bounded_stdin(MAX_POLICY_SIZE),
         Some(p) if p.as_os_str() == "-" => read_bounded_stdin(MAX_POLICY_SIZE),
-        Some(p) => read_bounded_file(p, MAX_POLICY_SIZE),
+        Some(p) => cli_read_bounded_file(p, MAX_POLICY_SIZE),
     }
 }
 
 /// Read a file with a size cap before reading into memory (CTR-1603).
 ///
-/// Uses the open-once pattern: `O_NOFOLLOW | O_CLOEXEC` at open(2)
-/// atomically refuses symlinks at the kernel level, then `fstat` on
-/// the opened fd verifies regular file type. This eliminates the
-/// TOCTOU gap between `symlink_metadata` and `fs::read`
-/// (f-722-security-1771348928218169-0).
-fn read_bounded_file(path: &Path, max_size: usize) -> Result<Vec<u8>, String> {
-    // Open-once: O_NOFOLLOW rejects symlinks at open(2), no TOCTOU gap.
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-
-    let file = options.open(path).map_err(|e| {
-        format!(
-            "cannot open {} (symlink rejected fail-closed): {e}",
-            path.display()
-        )
-    })?;
-
-    // fstat on the opened fd -- not the path -- to verify regular file.
-    let metadata = file
-        .metadata()
-        .map_err(|e| format!("cannot fstat {}: {e}", path.display()))?;
-    if !metadata.is_file() {
-        return Err(format!(
-            "not a regular file (fail-closed): {}",
-            path.display()
-        ));
-    }
-
-    let file_size = metadata.len();
-    if file_size > max_size as u64 {
-        return Err(format!(
-            "file size {file_size} exceeds maximum {max_size} bytes"
-        ));
-    }
-
-    // Bounded read via take() -- never reads more than max_size + 1 bytes.
-    let limit = (max_size as u64).saturating_add(1);
-    let mut bounded_reader = file.take(limit);
-    #[allow(clippy::cast_possible_truncation)]
-    let mut bytes = Vec::with_capacity((file_size as usize).min(max_size));
-    bounded_reader
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    if bytes.len() > max_size {
-        return Err(format!(
-            "file size {} exceeds maximum {max_size} bytes",
-            bytes.len()
-        ));
-    }
-
-    Ok(bytes)
+/// Delegates to the shared `read_bounded_file` in `policy_adoption`,
+/// eliminating the duplicated open-once pattern
+/// (f-722-security-1771350572106666-0).
+fn cli_read_bounded_file(path: &Path, max_size: usize) -> Result<Vec<u8>, String> {
+    read_bounded_file(path, max_size).map_err(|e| format!("{e}"))
 }
 
 /// Read from stdin with bounded semantics (CTR-1603).
@@ -555,8 +502,10 @@ mod tests {
         assert_eq!(result, "operator:hex:010203");
     }
 
+    /// Tests now exercise the shared `read_bounded_file` from core via CLI
+    /// delegation (f-722-security-1771350572106666-0).
     #[test]
-    fn test_read_bounded_file_rejects_symlink() {
+    fn test_cli_read_bounded_file_rejects_symlink() {
         use tempfile::tempdir;
 
         let tmp = tempdir().expect("tempdir");
@@ -567,7 +516,7 @@ mod tests {
         {
             let symlink = tmp.path().join("link.json");
             std::os::unix::fs::symlink(&real_file, &symlink).expect("symlink");
-            let result = read_bounded_file(&symlink, 1024);
+            let result = cli_read_bounded_file(&symlink, 1024);
             assert!(result.is_err());
             let err = result.unwrap_err();
             // O_NOFOLLOW produces ELOOP on Linux, which maps to
@@ -580,14 +529,14 @@ mod tests {
     }
 
     #[test]
-    fn test_read_bounded_file_rejects_oversized() {
+    fn test_cli_read_bounded_file_rejects_oversized() {
         use tempfile::tempdir;
 
         let tmp = tempdir().expect("tempdir");
         let path = tmp.path().join("big.json");
         std::fs::write(&path, vec![b' '; 100]).expect("write");
 
-        let result = read_bounded_file(&path, 50);
+        let result = cli_read_bounded_file(&path, 50);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("exceeds maximum"));
     }
