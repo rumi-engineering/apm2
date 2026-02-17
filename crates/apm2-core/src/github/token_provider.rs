@@ -357,17 +357,21 @@ fn resolve_systemd_credential(credential_name: &str) -> Result<SecretString, Str
 
 /// Read a PEM private key file with bounded I/O and symlink rejection.
 ///
+/// Opens the file atomically with `O_NOFOLLOW` (rejecting symlinks), then
+/// validates metadata on the opened file descriptor, and reads bounded
+/// content from the same descriptor. This eliminates the TOCTOU gap that
+/// would exist if metadata were checked by path and then re-opened for read.
+///
 /// The file must be a regular file (no symlinks), and its size must not
 /// exceed [`MAX_PRIVATE_KEY_FILE_SIZE`] (CTR-1603, RSK-1601).
 fn read_private_key_file_bounded(path: &Path) -> Result<SecretString, String> {
-    let metadata = std::fs::symlink_metadata(path)
+    use std::io::Read;
+
+    let mut file =
+        open_nofollow(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    let metadata = file
+        .metadata()
         .map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "refusing symlink path for private key file: {}",
-            path.display()
-        ));
-    }
     if !metadata.file_type().is_file() {
         return Err(format!(
             "refusing non-regular path for private key file: {}",
@@ -383,7 +387,15 @@ fn read_private_key_file_bounded(path: &Path) -> Result<SecretString, String> {
         ));
     }
 
-    let content = std::fs::read_to_string(path)
+    let len: usize = usize::try_from(metadata.len()).map_err(|_| {
+        format!(
+            "private key file size does not fit usize: {} ({})",
+            metadata.len(),
+            path.display()
+        )
+    })?;
+    let mut content = String::with_capacity(len);
+    file.read_to_string(&mut content)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -392,23 +404,45 @@ fn read_private_key_file_bounded(path: &Path) -> Result<SecretString, String> {
     Ok(SecretString::new(trimmed.to_string().into_boxed_str()))
 }
 
+/// Read a config-file fallback PEM private key with bounded I/O and symlink
+/// rejection.
+///
+/// Uses the same open-once bounded strategy as
+/// [`read_private_key_file_bounded`]: opens with `O_NOFOLLOW`, validates
+/// metadata on the handle, reads from the same descriptor. This keeps TOCTOU
+/// and bounded-I/O guarantees consistent across all private key read paths.
 fn read_private_key_file_secure(path: &Path) -> Result<SecretString, String> {
-    let metadata = std::fs::symlink_metadata(path)
+    use std::io::Read;
+
+    let mut file = open_nofollow(path)
+        .map_err(|err| format!("failed to open key path {}: {err}", path.display()))?;
+    let metadata = file
+        .metadata()
         .map_err(|err| format!("failed to inspect key path {}: {err}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "refusing symlink path for private key file: {}",
-            path.display()
-        ));
-    }
     if !metadata.file_type().is_file() {
         return Err(format!(
             "refusing non-regular path for private key file: {}",
             path.display()
         ));
     }
+    if metadata.len() > MAX_PRIVATE_KEY_FILE_SIZE {
+        return Err(format!(
+            "config private key file too large: {} bytes > {} max ({})",
+            metadata.len(),
+            MAX_PRIVATE_KEY_FILE_SIZE,
+            path.display()
+        ));
+    }
 
-    let content = std::fs::read_to_string(path)
+    let len: usize = usize::try_from(metadata.len()).map_err(|_| {
+        format!(
+            "config private key file size does not fit usize: {} ({})",
+            metadata.len(),
+            path.display()
+        )
+    })?;
+    let mut content = String::with_capacity(len);
+    file.read_to_string(&mut content)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -1405,5 +1439,132 @@ installation_id = "67890"
             super::read_github_app_config_file_bounded(&symlink_path).is_err(),
             "symlinked config must be rejected"
         );
+    }
+
+    // =========================================================================
+    // TOCTOU fix regression tests: open-once bounded read strategy
+    // =========================================================================
+
+    #[test]
+    fn test_read_private_key_file_bounded_reads_valid_file() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let pem_file = temp.path().join("valid.pem");
+        std::fs::write(
+            &pem_file,
+            "-----BEGIN RSA PRIVATE KEY-----\ntest-data\n-----END RSA PRIVATE KEY-----\n",
+        )
+        .expect("write pem file");
+
+        let result = super::read_private_key_file_bounded(&pem_file);
+        assert!(
+            result.is_ok(),
+            "valid PEM file should be readable: {result:?}"
+        );
+        let secret = result.unwrap();
+        assert!(
+            secret.expose_secret().contains("BEGIN RSA PRIVATE KEY"),
+            "should contain PEM content"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_private_key_file_bounded_rejects_symlink_via_open_nofollow() {
+        // Verifies that open_nofollow (O_NOFOLLOW) atomically rejects symlinks
+        // at open time, preventing TOCTOU between check and read.
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let real_file = temp.path().join("real-key.pem");
+        std::fs::write(
+            &real_file,
+            "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n",
+        )
+        .expect("write real file");
+        let link = temp.path().join("symlinked-key.pem");
+        std::os::unix::fs::symlink(&real_file, &link).expect("create symlink");
+
+        let result = super::read_private_key_file_bounded(&link);
+        assert!(
+            result.is_err(),
+            "symlink should be rejected atomically at open: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_private_key_file_secure_reads_valid_file() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let pem_file = temp.path().join("config-key.pem");
+        std::fs::write(
+            &pem_file,
+            "-----BEGIN PRIVATE KEY-----\nconfig-test\n-----END PRIVATE KEY-----\n",
+        )
+        .expect("write pem file");
+
+        let result = super::read_private_key_file_secure(&pem_file);
+        assert!(
+            result.is_ok(),
+            "valid config-fallback PEM should be readable: {result:?}"
+        );
+        let secret = result.unwrap();
+        assert!(
+            secret.expose_secret().contains("BEGIN PRIVATE KEY"),
+            "should contain PEM content"
+        );
+    }
+
+    #[test]
+    fn test_read_private_key_file_secure_rejects_oversize() {
+        // Verifies that config-file fallback reads enforce the same
+        // MAX_PRIVATE_KEY_FILE_SIZE bound as systemd credential reads.
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let oversize_file = temp.path().join("huge-config.pem");
+        let oversize_len =
+            usize::try_from(super::MAX_PRIVATE_KEY_FILE_SIZE + 1).expect("size fits usize");
+        let oversize = "x".repeat(oversize_len);
+        std::fs::write(&oversize_file, oversize).expect("write oversize file");
+
+        let result = super::read_private_key_file_secure(&oversize_file);
+        assert!(
+            result.is_err(),
+            "oversized config key file must be rejected"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("too large"),
+            "error should mention too large: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_private_key_file_secure_rejects_symlink_via_open_nofollow() {
+        // Verifies that config-file fallback reads use open_nofollow for
+        // atomic symlink rejection, consistent with systemd credential reads.
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let real_file = temp.path().join("real-config-key.pem");
+        std::fs::write(
+            &real_file,
+            "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n",
+        )
+        .expect("write real file");
+        let link = temp.path().join("symlinked-config-key.pem");
+        std::os::unix::fs::symlink(&real_file, &link).expect("create symlink");
+
+        let result = super::read_private_key_file_secure(&link);
+        assert!(
+            result.is_err(),
+            "symlink should be rejected atomically at open: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_private_key_file_secure_rejects_empty() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let empty_file = temp.path().join("empty-config.pem");
+        std::fs::write(&empty_file, "  \n  ").expect("write empty file");
+
+        let result = super::read_private_key_file_secure(&empty_file);
+        assert!(result.is_err(), "empty config key file must be rejected");
+        let err = result.unwrap_err();
+        assert!(err.contains("empty"), "error should mention empty: {err}");
     }
 }
