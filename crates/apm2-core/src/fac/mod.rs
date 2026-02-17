@@ -133,6 +133,9 @@ mod lease;
 pub mod merge_receipt;
 mod node_identity;
 pub mod policy;
+/// Policy adoption protocol: broker-admitted `FacPolicyHash` rotation with
+/// receipts and rollback (TCK-00561).
+pub mod policy_adoption;
 pub mod policy_inheritance;
 mod policy_resolution;
 /// Disk preflight and auto-GC escalation policy.
@@ -353,6 +356,13 @@ pub use policy::{
     LANE_ENV_DIR_XDG_CACHE, LANE_ENV_DIR_XDG_CONFIG, LANE_ENV_DIRS, POLICY_SCHEMA_ID,
     apply_lane_env_overrides, build_job_environment, compute_policy_hash, deserialize_policy,
     ensure_lane_env_dirs, parse_policy_hash, persist_policy,
+};
+// Re-export policy adoption types (TCK-00561)
+pub use policy_adoption::{
+    ADMITTED_POLICY_ROOT_SCHEMA, AdmittedPolicyRootV1, POLICY_ADOPTION_RECEIPT_SCHEMA,
+    PolicyAdoptionAction, PolicyAdoptionError, PolicyAdoptionReceiptV1, adopt_policy,
+    deserialize_adoption_receipt, is_policy_hash_admitted, load_admitted_policy_root,
+    rollback_policy, validate_policy_bytes,
 };
 // Re-export policy inheritance types (TCK-00340)
 pub use policy_inheritance::{
