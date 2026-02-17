@@ -745,8 +745,9 @@ fail-closed (deny all network). Policy-driven via
 - `content_hash()` / `content_hash_hex()`: Deterministic BLAKE3 hash with
   domain separation `apm2.fac.network_policy.v1\0` for receipt audit binding.
 - `to_property_strings()`: Full network isolation for system-mode.
-- `to_user_mode_property_strings()`: Returns empty (no reliable user-mode
-  network enforcement available).
+- `to_user_mode_property_strings()`: Emits `RestrictAddressFamilies=AF_UNIX`
+  as partial mitigation when `allow_network=false` (requires
+  `NoNewPrivileges=yes` from sandbox hardening). Returns empty when allowed.
 - `enabled_directive_count()`: Returns 3 for deny, 0 for allow.
 
 **Resolver**: `resolve_network_policy(job_kind, policy_override) -> NetworkPolicy`
@@ -781,8 +782,9 @@ Maps job kind to network policy with explicit override support:
 - [INV-NET-003] Only `"warm"` job kind resolves to `NetworkPolicy::allow()`;
   all other job kinds (gates, bulk, control, stop_revoke) default to deny.
 - [INV-NET-004] Network policy directives (`PrivateNetwork`, `IPAddressDeny`,
-  `IPAddressAllow`) are emitted in system-mode only; user-mode returns empty
-  (no reliable enforcement path).
+  `IPAddressAllow`) are emitted in system-mode only. In user-mode,
+  `RestrictAddressFamilies=AF_UNIX` is emitted as a partial mitigation to
+  block IP sockets, provided `NoNewPrivileges=yes` is active.
 - [INV-NET-005] `FacPolicyV1.network_policy` field uses `#[serde(default)]`
   for backward compatibility; missing field deserializes to deny-all.
 
