@@ -314,9 +314,9 @@ pub use echo_trap::{
 pub use economics_adoption::{
     ADMITTED_ECONOMICS_PROFILE_SCHEMA, AdmittedEconomicsProfileRootV1,
     ECONOMICS_ADOPTION_RECEIPT_SCHEMA, EconomicsAdoptionAction, EconomicsAdoptionError,
-    EconomicsAdoptionReceiptV1, adopt_economics_profile, is_economics_profile_hash_admitted,
-    load_admitted_economics_profile_root, rollback_economics_profile,
-    validate_economics_profile_bytes,
+    EconomicsAdoptionReceiptV1, adopt_economics_profile, adopt_economics_profile_by_hash,
+    is_economics_profile_hash_admitted, load_admitted_economics_profile_root, looks_like_digest,
+    rollback_economics_profile, validate_digest_string, validate_economics_profile_bytes,
 };
 // Re-export flake classification routing types
 pub use flake_class::FlakeRouting;

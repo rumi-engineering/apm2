@@ -868,3 +868,118 @@ fn test_gate_receipt_construction() {
         "receipt signature should be valid"
     );
 }
+
+// =============================================================================
+// Economics admission tests (TCK-00584)
+// =============================================================================
+
+/// Test 14: Economics admission denies mismatched hash (INV-EADOPT-004).
+///
+/// Simulates the worker's economics admission check by:
+/// 1. Adopting an economics profile.
+/// 2. Checking a different hash against the admitted root.
+/// 3. Verifying denial (fail-closed).
+#[test]
+fn test_economics_admission_denies_mismatched_hash() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fac_root = tmp.path();
+
+    // Adopt an economics profile by hash.
+    let admitted_hash = "b3-256:1111111100112233aabbccdd00112233aabbccdd00112233aabbccdd00112233";
+    apm2_core::fac::economics_adoption::adopt_economics_profile_by_hash(
+        fac_root,
+        admitted_hash,
+        "operator:local",
+        "test adoption",
+    )
+    .expect("adopt by hash");
+
+    // The admitted hash should be admitted.
+    assert!(
+        apm2_core::fac::economics_adoption::is_economics_profile_hash_admitted(
+            fac_root,
+            admitted_hash
+        ),
+        "admitted hash must be recognized"
+    );
+
+    // A different hash must be denied (worker fail-closed path).
+    let mismatched_hash = "b3-256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    assert!(
+        !apm2_core::fac::economics_adoption::is_economics_profile_hash_admitted(
+            fac_root,
+            mismatched_hash
+        ),
+        "mismatched hash must be denied (INV-EADOPT-004 fail-closed)"
+    );
+}
+
+/// Test 15: Economics admission denies when admitted root is missing and
+/// policy requires economics binding (non-zero hash).
+#[test]
+fn test_economics_admission_denies_missing_root_with_nonzero_policy_hash() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fac_root = tmp.path();
+
+    // No admitted root exists. Any non-zero hash check must return false
+    // (fail-closed: worker denies if policy requires economics binding
+    // but no admitted root exists).
+    let policy_hash = "b3-256:aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233";
+    assert!(
+        !apm2_core::fac::economics_adoption::is_economics_profile_hash_admitted(
+            fac_root,
+            policy_hash
+        ),
+        "missing admitted root must cause hash check to return false"
+    );
+
+    // Verify the load function returns NoAdmittedRoot (not corruption).
+    let load_result =
+        apm2_core::fac::economics_adoption::load_admitted_economics_profile_root(fac_root);
+    assert!(
+        matches!(
+            load_result,
+            Err(apm2_core::fac::EconomicsAdoptionError::NoAdmittedRoot { .. })
+        ),
+        "missing root must return NoAdmittedRoot, got: {load_result:?}"
+    );
+}
+
+/// Test 16: Economics admission denies when admitted root is corrupted
+/// (fail-closed on tampered root file).
+#[test]
+fn test_economics_admission_denies_corrupted_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fac_root = tmp.path();
+
+    // Create a corrupted admitted root file.
+    let broker_dir = fac_root.join("broker");
+    fs::create_dir_all(&broker_dir).expect("create broker dir");
+    fs::write(
+        broker_dir.join("admitted_economics_profile.v1.json"),
+        b"CORRUPTED DATA",
+    )
+    .expect("write corrupted root");
+
+    // Hash check must return false (fail-closed).
+    let policy_hash = "b3-256:aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233";
+    assert!(
+        !apm2_core::fac::economics_adoption::is_economics_profile_hash_admitted(
+            fac_root,
+            policy_hash
+        ),
+        "corrupted root must cause hash check to return false (fail-closed)"
+    );
+
+    // Verify the error is NOT NoAdmittedRoot (corruption must be
+    // distinguishable from absence for correct worker branching).
+    let load_result =
+        apm2_core::fac::economics_adoption::load_admitted_economics_profile_root(fac_root);
+    assert!(
+        !matches!(
+            load_result,
+            Err(apm2_core::fac::EconomicsAdoptionError::NoAdmittedRoot { .. })
+        ),
+        "corrupted root must NOT be reported as NoAdmittedRoot"
+    );
+}

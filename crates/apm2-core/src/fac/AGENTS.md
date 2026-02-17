@@ -1241,8 +1241,8 @@ rollback.
   Contains `old_digest`, `new_digest`, actor, reason, timestamp, and
   domain-separated BLAKE3 content hash.
 - `EconomicsAdoptionError`: Error enum (via `thiserror`) covering validation,
-  persistence, I/O, serialization, size-limit, string-bound, and duplicate
-  adoption failures.
+  persistence, I/O, serialization, size-limit, string-bound, duplicate
+  adoption, and invalid digest format failures.
 
 ### Key Functions
 
@@ -1258,6 +1258,14 @@ rollback.
 - `adopt_economics_profile(fac_root, bytes, actor, reason) -> Result<(Root, Receipt)>`:
   Full adoption lifecycle: validate, check for duplicate, persist atomically
   (current -> prev, new -> current), emit receipt.
+- `adopt_economics_profile_by_hash(fac_root, digest, actor, reason) -> Result<(Root, Receipt)>`:
+  Hash-only adoption: validates the digest format (`b3-256:<64-lowercase-hex>`),
+  checks for duplicate, persists the hash as the admitted root atomically, and
+  emits a receipt. Does not require the full profile file.
+- `validate_digest_string(digest) -> Result<()>`: Validates that a digest string
+  conforms to `b3-256:<64-lowercase-hex>` format.
+- `looks_like_digest(s) -> bool`: Quick syntactic check (prefix match) to
+  distinguish digest arguments from file paths in CLI argument routing.
 - `rollback_economics_profile(fac_root, actor, reason) -> Result<(Root, Receipt)>`:
   Restores the previous admitted root atomically and emits a rollback receipt.
 - `deserialize_adoption_receipt(bytes) -> Result<EconomicsAdoptionReceiptV1>`:
@@ -1267,9 +1275,11 @@ rollback.
 
 - `apm2 fac economics show [--json]`: Display the currently admitted economics
   profile root.
-- `apm2 fac economics adopt [<path|->] [--reason <reason>] [--json]`: Adopt a
-  new economics profile (atomic, with receipt). Accepts a file path or `-` for
-  stdin. Auto-detects framed vs raw JSON input.
+- `apm2 fac economics adopt [<hash|path|->] [--reason <reason>] [--json]`: Adopt
+  a new economics profile (atomic, with receipt). Accepts a `b3-256:<hex>` digest
+  for hash-only adoption, a file path, or `-` for stdin. When given a digest,
+  validates the format and records it directly without loading a profile file.
+  Auto-detects framed vs raw JSON for file/stdin input.
 - `apm2 fac economics rollback [--reason <reason>] [--json]`: Rollback to the
   previous admitted economics profile (with receipt).
 

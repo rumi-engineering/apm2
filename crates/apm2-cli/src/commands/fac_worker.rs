@@ -2295,6 +2295,7 @@ fn process_job(
                 None,
                 None,
                 Some(&sbx_hash),
+                Some(&resolved_net_hash),
             ) {
                 eprintln!(
                     "worker: WARNING: pipeline commit failed for \
