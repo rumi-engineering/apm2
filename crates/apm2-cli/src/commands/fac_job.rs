@@ -51,7 +51,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use apm2_core::fac::job_spec::{FacJobSpecV1, JobSource, LaneRequirements, MAX_JOB_SPEC_SIZE};
+use apm2_core::fac::job_spec::{
+    CONTROL_LANE_REPO_ID, FacJobSpecV1, JobSource, LaneRequirements, MAX_JOB_SPEC_SIZE,
+};
 use apm2_core::fac::{
     DenialReasonCode, FacJobOutcome, FacJobReceiptV1Builder, persist_content_addressed_receipt,
 };
@@ -576,11 +578,12 @@ fn build_stop_revoke_spec(target_job_id: &str, reason: &str) -> Result<FacJobSpe
     let now = current_timestamp_epoch_secs();
     let stop_revoke_job_id = format!("stop-revoke-{target_job_id}-{now}");
 
-    // For stop_revoke jobs, we use a placeholder source since the job
-    // doesn't need repo checkout -- it only needs to kill a unit.
+    // For stop_revoke jobs, we use the well-known control-lane placeholder
+    // since the job doesn't need repo checkout -- it only needs to kill a unit.
+    // validate_job_spec_control_lane enforces this exact repo_id (INV-JS-007).
     let source = JobSource {
         kind: "mirror_commit".to_string(),
-        repo_id: "internal/control".to_string(),
+        repo_id: CONTROL_LANE_REPO_ID.to_string(),
         head_sha: "0".repeat(40),
         patch: None,
     };
@@ -1137,14 +1140,14 @@ mod tests {
         let spec = build_stop_revoke_spec("target-job-789", "operator cancellation")
             .expect("should build stop_revoke spec");
 
-        // Confirm the spec uses the internal/control repo_id.
+        // Confirm the spec uses the CONTROL_LANE_REPO_ID constant.
         assert_eq!(
-            spec.source.repo_id, "internal/control",
-            "stop_revoke must use internal/control repo_id"
+            spec.source.repo_id, CONTROL_LANE_REPO_ID,
+            "stop_revoke must use CONTROL_LANE_REPO_ID"
         );
 
         // Policy: allowlist restricted to workload repos only — no
-        // "internal/control" entry.
+        // CONTROL_LANE_REPO_ID entry.
         let workload_policy = JobSpecValidationPolicy::with_allowed_repos(vec![
             "org/workload-repo".to_string(),
             "team/another-repo".to_string(),
@@ -1219,7 +1222,7 @@ mod tests {
         let stop_spec =
             deserialize_job_spec(&stop_bytes).expect("stop_revoke spec should deserialize");
         assert_eq!(stop_spec.kind, "stop_revoke");
-        assert_eq!(stop_spec.source.repo_id, "internal/control");
+        assert_eq!(stop_spec.source.repo_id, CONTROL_LANE_REPO_ID);
 
         // Validate with a workload-only policy — the control-lane bypass
         // must keep cancellation operable.

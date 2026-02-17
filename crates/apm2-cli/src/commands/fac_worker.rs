@@ -1890,7 +1890,8 @@ fn process_job(
             // for distinct audit signal and automated triage.
             JobSpecError::DisallowedRepoId { .. }
             | JobSpecError::DisallowedBytesBackend { .. }
-            | JobSpecError::FilesystemPathRejected { .. } => DenialReasonCode::PolicyViolation,
+            | JobSpecError::FilesystemPathRejected { .. }
+            | JobSpecError::InvalidControlLaneRepoId { .. } => DenialReasonCode::PolicyViolation,
             _ => DenialReasonCode::ValidationFailed,
         };
         // (sbx_hash computed once at top of process_job)
@@ -7076,7 +7077,8 @@ mod tests {
             JobSpecError::InvalidDigest { .. } => DenialReasonCode::MalformedSpec,
             JobSpecError::DisallowedRepoId { .. }
             | JobSpecError::DisallowedBytesBackend { .. }
-            | JobSpecError::FilesystemPathRejected { .. } => DenialReasonCode::PolicyViolation,
+            | JobSpecError::FilesystemPathRejected { .. }
+            | JobSpecError::InvalidControlLaneRepoId { .. } => DenialReasonCode::PolicyViolation,
             _ => DenialReasonCode::ValidationFailed,
         }
     }
