@@ -143,6 +143,37 @@ Credential management subcommands.
 | `apm2 fac lane reset <lane_id> --force` | Force-reset RUNNING lane (kills process first) |
 | `apm2 fac services status` | Check daemon/worker service status with health verdicts |
 
+### FAC Configuration Introspection (TCK-00590)
+
+| Command | Description |
+|---------|-------------|
+| `apm2 fac config show` | Show resolved FAC configuration (human-readable) |
+| `apm2 fac config show --json` | Show resolved FAC configuration (JSON) |
+
+**Overview:** The `config show` subcommand aggregates resolved FAC policy,
+boundary identity, execution backend, lane configuration, admitted digests,
+and queue bounds from broker and filesystem state. It is an operator
+correctness tool -- read-only, no state mutations.
+
+**Output fields (JSON):**
+- `fac_policy_hash`: Admitted policy hash (b3-256 hex) or null.
+- `policy_path`: On-disk path to the policy file.
+- `admitted_policy_root`: Adoption details (hash, timestamp, actor) or null.
+- `canonicalizer_tuple_digest`: Canonicalizer tuple digest (b3-256 hex).
+- `admitted_economics_profile_hash`: Economics profile hash or null.
+- `boundary_id`: Node boundary identity.
+- `execution_backend`: `"user"` or `"system"`.
+- `lane_count`: Number of configured lanes.
+- `lane_ids`: List of lane ID strings.
+- `queue_bounds`: Token issuance, enqueue ops, and byte limits.
+- `warnings`: Non-fatal diagnostic warnings (omitted when empty).
+
+**Security Invariants:**
+- [INV-CFG-001] All file reads are bounded (CTR-1603).
+- [INV-CFG-002] Read-only introspection; no state mutations.
+- [INV-CFG-003] Fail-closed: unresolvable fields report errors inline rather
+  than omitting or synthesising default values.
+
 ### FAC Reconciliation (TCK-00534)
 
 | Command | Description |
