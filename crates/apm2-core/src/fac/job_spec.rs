@@ -9,6 +9,9 @@
 //! - [INV-JS-006] Filesystem paths (absolute, Windows drive, UNC) are rejected
 //!   in all string fields to ensure `repo_id` remains a logical identifier
 //!   (TCK-00579).
+//! - [INV-JS-007] Control-lane `stop_revoke` jobs MUST carry `repo_id ==
+//!   "internal/control"` ([`CONTROL_LANE_REPO_ID`]).  Arbitrary repo IDs are
+//!   rejected fail-closed to prevent audit-trail corruption (TCK-00579).
 
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -77,6 +80,14 @@ pub const VALID_PATCH_BYTES_BACKENDS: &[&str] = &["fac_blobs_v1", "apm2_cas"];
 /// Protects against memory exhaustion from a policy that specifies an
 /// unbounded number of allowed repos (CTR-1303).
 pub const MAX_REPO_ALLOWLIST_SIZE: usize = 256;
+
+/// Well-known `repo_id` for control-lane `stop_revoke` jobs.
+///
+/// Control-lane jobs do not check out a repository.  They use this fixed
+/// placeholder to identify themselves as internal control operations.
+/// [`validate_job_spec_control_lane`] enforces that control-lane specs carry
+/// exactly this value; arbitrary repo IDs are rejected fail-closed.
+pub const CONTROL_LANE_REPO_ID: &str = "internal/control";
 
 /// Audited policy exception marker: `stop_revoke` jobs bypass RFC-0028 channel
 /// context token and RFC-0029 queue admission.
@@ -244,6 +255,19 @@ pub enum JobSpecError {
         field: &'static str,
         /// The offending value (truncated for safety).
         value: String,
+    },
+
+    /// Control-lane `stop_revoke` job has an unexpected `repo_id`.
+    ///
+    /// Control-lane jobs MUST use [`CONTROL_LANE_REPO_ID`]
+    /// (`"internal/control"`).  Arbitrary repo IDs are rejected to prevent
+    /// audit-trail corruption and policy bypass.
+    #[error("control-lane repo_id must be \"{expected}\", got \"{actual}\"")]
+    InvalidControlLaneRepoId {
+        /// Expected `repo_id` value.
+        expected: String,
+        /// Actual `repo_id` value.
+        actual: String,
     },
 }
 
@@ -686,6 +710,14 @@ pub fn validate_job_spec(spec: &FacJobSpecV1) -> Result<(), JobSpecError> {
 /// verify local-origin authority (queue directory ownership) instead of an
 /// RFC-0028 token.
 ///
+/// # `repo_id` enforcement
+///
+/// Control-lane jobs MUST carry `repo_id == "internal/control"`
+/// ([`CONTROL_LANE_REPO_ID`]).  The workload `allowed_repo_ids` allowlist is
+/// NOT applied (it would break cancellation under restrictive policies), but
+/// the fixed placeholder is enforced fail-closed to prevent arbitrary repo IDs
+/// from passing validation and corrupting audit trails.
+///
 /// # `AUDITED_CONTROL_LANE_EXCEPTION`: RFC-0028/0029 bypass justification
 ///
 /// Control-lane cancellation (`stop_revoke`) uses local operator authority
@@ -727,6 +759,16 @@ pub fn validate_job_spec_control_lane(spec: &FacJobSpecV1) -> Result<(), JobSpec
                 "validate_job_spec_control_lane only accepts stop_revoke, got {}",
                 spec.kind
             ),
+        });
+    }
+
+    // Enforce fixed control-lane repo_id.  Control-lane jobs bypass the
+    // workload repo_id allowlist, so we MUST verify the expected placeholder
+    // to prevent arbitrary repo IDs from passing validation (fail-closed).
+    if spec.source.repo_id != CONTROL_LANE_REPO_ID {
+        return Err(JobSpecError::InvalidControlLaneRepoId {
+            expected: CONTROL_LANE_REPO_ID.to_string(),
+            actual: spec.source.repo_id.clone(),
         });
     }
 
@@ -906,14 +948,12 @@ pub fn validate_job_spec_with_policy(
 /// Performs all checks from [`validate_job_spec_control_lane`] plus
 /// patch `bytes_backend` allowlist and filesystem path rejection.
 ///
-/// **`allowed_repo_ids` bypass**: The `repo_id` allowlist is intentionally
-/// NOT enforced for control-lane `stop_revoke` jobs.  `stop_revoke` specs
-/// use a well-known placeholder `repo_id` (`"internal/control"`) — they do
-/// not check out a repository.  Authority is proven via filesystem
-/// capability (queue directory write access), not repo identity.  Enforcing
-/// the workload `repo_id` allowlist here would silently disable job
-/// cancellation whenever an operator restricts `allowed_repo_ids` to
-/// workload repos, leaving runaway jobs uncontrollable.
+/// **`allowed_repo_ids` bypass**: The workload `repo_id` allowlist is
+/// intentionally NOT enforced for control-lane `stop_revoke` jobs.
+/// Instead, [`validate_job_spec_control_lane`] enforces that the `repo_id`
+/// equals [`CONTROL_LANE_REPO_ID`] (`"internal/control"`).  This prevents
+/// arbitrary repo IDs from passing validation while allowing cancellation
+/// to work under restrictive workload policies.
 ///
 /// See [`CONTROL_LANE_EXCEPTION_AUDITED`] for the compile-time audit marker.
 ///
@@ -924,15 +964,11 @@ pub fn validate_job_spec_control_lane_with_policy(
     spec: &FacJobSpecV1,
     policy: &JobSpecValidationPolicy,
 ) -> Result<(), JobSpecError> {
+    // validate_job_spec_control_lane enforces CONTROL_LANE_REPO_ID, so the
+    // workload allowlist is not needed here.  The repo_id is pinned, not
+    // unchecked.
     validate_job_spec_control_lane(spec)?;
 
-    // CONTROL_LANE_EXCEPTION: repo_id allowlist is deliberately skipped for
-    // stop_revoke jobs.  Their repo_id is a fixed internal placeholder, not
-    // a workload repo identity.  Enforcing allowed_repo_ids here would
-    // break cancellation under restrictive policies.
-    //
-    // Authority for control-lane jobs is verified via queue directory
-    // ownership (filesystem capability), not repo identity.
     let _ = &policy.allowed_repo_ids; // Acknowledge the field is intentionally unused.
 
     // Patch bytes_backend allowlist (INV-JS-005).
@@ -1366,6 +1402,15 @@ mod tests {
         }
     }
 
+    fn control_lane_source() -> JobSource {
+        JobSource {
+            kind: "mirror_commit".to_string(),
+            repo_id: CONTROL_LANE_REPO_ID.to_string(),
+            head_sha: "0".repeat(40),
+            patch: None,
+        }
+    }
+
     fn build_with_ids(job_id: &str, lease_id: &str) -> FacJobSpecV1Builder {
         FacJobSpecV1Builder::new(
             job_id,
@@ -1748,7 +1793,7 @@ mod tests {
             "control",
             "2026-02-12T00:00:00Z",
             "L1",
-            sample_source(),
+            control_lane_source(),
         )
         .cancel_target_job_id("target-123")
         .build()
@@ -2105,29 +2150,22 @@ mod tests {
 
     #[test]
     fn policy_validation_control_lane_bypasses_repo_allowlist() {
-        // Use the internal/control repo_id that build_stop_revoke_spec uses
-        // in production.  This is the actual repo_id for stop_revoke jobs.
-        let control_source = JobSource {
-            kind: "mirror_commit".to_string(),
-            repo_id: "internal/control".to_string(),
-            head_sha: "0".repeat(40),
-            patch: None,
-        };
+        // Use CONTROL_LANE_REPO_ID — the canonical repo_id for stop_revoke jobs.
         let spec = FacJobSpecV1Builder::new(
             "sr-1",
             "stop_revoke",
             "control",
             "2026-02-12T00:00:00Z",
             "L1",
-            control_source,
+            control_lane_source(),
         )
         .cancel_target_job_id("target-123")
         .build()
         .expect("valid stop_revoke spec");
 
         assert_eq!(
-            spec.source.repo_id, "internal/control",
-            "stop_revoke spec must use internal/control repo_id"
+            spec.source.repo_id, CONTROL_LANE_REPO_ID,
+            "stop_revoke spec must use CONTROL_LANE_REPO_ID"
         );
 
         // CRITICAL: allowlist contains only workload repos — stop_revoke must
@@ -2398,5 +2436,149 @@ mod tests {
                 "valid job_id {good_id:?} should be accepted: {result:?}"
             );
         }
+    }
+
+    // =========================================================================
+    // Round 4 fix: enforce CONTROL_LANE_REPO_ID in control-lane validation
+    // (INV-JS-007, TCK-00579 security review finding)
+    // =========================================================================
+
+    #[test]
+    fn control_lane_rejects_arbitrary_repo_id() {
+        // An attacker with queue write access submits a stop_revoke job
+        // claiming an arbitrary repo_id.  This MUST be rejected.
+        let bad_source = JobSource {
+            kind: "mirror_commit".to_string(),
+            repo_id: "attacker/evil-repo".to_string(),
+            head_sha: "0".repeat(40),
+            patch: None,
+        };
+        let spec = FacJobSpecV1Builder::new(
+            "sr-evil",
+            "stop_revoke",
+            "control",
+            "2026-02-12T00:00:00Z",
+            "L1",
+            bad_source,
+        )
+        .cancel_target_job_id("target-123")
+        .build()
+        .expect("builder should succeed (structural validation only)");
+
+        let result = validate_job_spec_control_lane(&spec);
+        assert!(
+            matches!(result, Err(JobSpecError::InvalidControlLaneRepoId { .. })),
+            "arbitrary repo_id in control lane must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn control_lane_rejects_workload_repo_id() {
+        // A stop_revoke job using a real workload repo_id (not internal/control)
+        // must be rejected even though it would pass the workload allowlist.
+        let workload_source = JobSource {
+            kind: "mirror_commit".to_string(),
+            repo_id: "org-repo".to_string(),
+            head_sha: "a".repeat(40),
+            patch: None,
+        };
+        let spec = FacJobSpecV1Builder::new(
+            "sr-bad",
+            "stop_revoke",
+            "control",
+            "2026-02-12T00:00:00Z",
+            "L1",
+            workload_source,
+        )
+        .cancel_target_job_id("target-456")
+        .build()
+        .expect("builder should succeed");
+
+        let result = validate_job_spec_control_lane(&spec);
+        assert!(
+            matches!(result, Err(JobSpecError::InvalidControlLaneRepoId { .. })),
+            "workload repo_id in control lane must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn control_lane_with_policy_rejects_arbitrary_repo_id() {
+        // Even with an open policy, control-lane validation must reject
+        // arbitrary repo_ids.
+        let bad_source = JobSource {
+            kind: "mirror_commit".to_string(),
+            repo_id: "sneaky/repo".to_string(),
+            head_sha: "0".repeat(40),
+            patch: None,
+        };
+        let spec = FacJobSpecV1Builder::new(
+            "sr-sneaky",
+            "stop_revoke",
+            "control",
+            "2026-02-12T00:00:00Z",
+            "L1",
+            bad_source,
+        )
+        .cancel_target_job_id("target-789")
+        .build()
+        .expect("builder should succeed");
+
+        let open_policy = JobSpecValidationPolicy::open();
+        let result = validate_job_spec_control_lane_with_policy(&spec, &open_policy);
+        assert!(
+            matches!(result, Err(JobSpecError::InvalidControlLaneRepoId { .. })),
+            "policy variant must also reject arbitrary repo_id: {result:?}"
+        );
+    }
+
+    #[test]
+    fn control_lane_accepts_correct_repo_id() {
+        // Confirm the happy path: CONTROL_LANE_REPO_ID passes validation.
+        let spec = FacJobSpecV1Builder::new(
+            "sr-ok",
+            "stop_revoke",
+            "control",
+            "2026-02-12T00:00:00Z",
+            "L1",
+            control_lane_source(),
+        )
+        .cancel_target_job_id("target-ok")
+        .build()
+        .expect("valid stop_revoke spec");
+
+        assert_eq!(spec.source.repo_id, CONTROL_LANE_REPO_ID);
+        let result = validate_job_spec_control_lane(&spec);
+        assert!(
+            result.is_ok(),
+            "correct control-lane repo_id must be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn control_lane_repo_id_case_sensitive() {
+        // "Internal/Control" (wrong casing) must be rejected.
+        let wrong_case_source = JobSource {
+            kind: "mirror_commit".to_string(),
+            repo_id: "Internal/Control".to_string(),
+            head_sha: "0".repeat(40),
+            patch: None,
+        };
+        let spec = FacJobSpecV1Builder::new(
+            "sr-case",
+            "stop_revoke",
+            "control",
+            "2026-02-12T00:00:00Z",
+            "L1",
+            wrong_case_source,
+        )
+        .cancel_target_job_id("target-case")
+        .build()
+        .expect("builder should succeed");
+
+        let result = validate_job_spec_control_lane(&spec);
+        assert!(
+            matches!(result, Err(JobSpecError::InvalidControlLaneRepoId { .. })),
+            "case-mismatched control-lane repo_id must be rejected: {result:?}"
+        );
     }
 }
