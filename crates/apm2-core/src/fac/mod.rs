@@ -128,6 +128,8 @@ pub mod gc;
 pub mod gc_receipt;
 /// Non-interactive, lane-scoped GitHub CLI command builder (TCK-00597).
 pub mod gh_cli;
+/// Git safety hardening for lane workspaces (TCK-00580).
+pub mod git_hardening;
 pub mod harness_sandbox;
 pub mod job_spec;
 mod key_policy;
@@ -330,6 +332,9 @@ pub use gc_receipt::{
 };
 // Re-export gh_cli (TCK-00597)
 pub use gh_cli::{GhCommand, gh_command};
+pub use git_hardening::{
+    GIT_HARDENING_RECEIPT_SCHEMA, GitHardeningError, GitHardeningOutcome, GitHardeningReceipt,
+};
 // Re-export harness sandbox types
 pub use harness_sandbox::{
     EgressRule, HarnessSandboxError, MAX_EGRESS_RULES, MAX_HOST_LENGTH,
