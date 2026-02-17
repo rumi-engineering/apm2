@@ -110,6 +110,9 @@ pub mod credential_gate;
 pub mod determinism;
 mod domain_separator;
 pub mod echo_trap;
+/// Economics profile adoption protocol: broker-admitted economics_profile_hash
+/// rotation with rollback and durable receipts (TCK-00584).
+pub mod economics_adoption;
 /// Evidence bundle export/import with RFC-0028 boundary validation and RFC-0029
 /// receipt validation (TCK-00527).
 pub mod evidence_bundle;
@@ -306,6 +309,14 @@ pub use echo_trap::{
     ECHO_TRAP_THRESHOLD, EchoTrapDetector, EchoTrapError, EchoTrapEvent, FindingSignature,
     MAX_SIGNATURE_LENGTH, MAX_SIGNATURES as MAX_ECHO_TRAP_SIGNATURES, SessionTermination,
     TerminationRationale,
+};
+// Re-export economics adoption types (TCK-00584)
+pub use economics_adoption::{
+    ADMITTED_ECONOMICS_PROFILE_SCHEMA, AdmittedEconomicsProfileRootV1,
+    ECONOMICS_ADOPTION_RECEIPT_SCHEMA, EconomicsAdoptionAction, EconomicsAdoptionError,
+    EconomicsAdoptionReceiptV1, adopt_economics_profile, is_economics_profile_hash_admitted,
+    load_admitted_economics_profile_root, rollback_economics_profile,
+    validate_economics_profile_bytes,
 };
 // Re-export flake classification routing types
 pub use flake_class::FlakeRouting;
