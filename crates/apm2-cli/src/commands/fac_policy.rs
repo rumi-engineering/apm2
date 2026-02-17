@@ -547,13 +547,10 @@ mod tests {
         assert!(sanitized.is_empty());
         // Would produce hex fallback.
         use std::fmt::Write as _;
-        let hex = raw
-            .as_bytes()
-            .iter()
-            .fold(String::new(), |mut acc, b| {
-                let _ = write!(acc, "{b:02x}");
-                acc
-            });
+        let hex = raw.as_bytes().iter().fold(String::new(), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
         let result = format!("operator:hex:{hex}");
         assert_eq!(result, "operator:hex:010203");
     }

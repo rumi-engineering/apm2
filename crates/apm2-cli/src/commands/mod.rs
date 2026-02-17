@@ -48,6 +48,7 @@ pub mod evidence;
 pub mod export;
 pub mod fac;
 pub mod fac_bench;
+pub mod fac_bootstrap;
 pub mod fac_broker;
 mod fac_gates_job;
 pub mod fac_gc;
