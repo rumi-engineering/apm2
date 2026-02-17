@@ -101,7 +101,7 @@ const MAX_GITHUB_APP_CONFIG_FILE_SIZE: u64 = 64 * 1024;
 fn read_github_app_config_file_bounded(path: &Path) -> std::io::Result<String> {
     use std::io::{Error, ErrorKind, Read};
 
-    let mut file = open_nofollow(path)?;
+    let file = open_nofollow(path)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(Error::new(
@@ -123,17 +123,12 @@ fn read_github_app_config_file_bounded(path: &Path) -> std::io::Result<String> {
         ));
     }
 
-    let len: usize = usize::try_from(metadata.len()).map_err(|_| {
-        Error::new(
-            ErrorKind::InvalidData,
-            format!(
-                "github app config size does not fit usize: {}",
-                metadata.len()
-            ),
-        )
-    })?;
-    let mut content = String::with_capacity(len);
-    file.read_to_string(&mut content)?;
+    // Use `.take()` to strictly enforce the read bound, eliminating the
+    // TOCTOU gap where the file could grow between the metadata check and
+    // the read (NIT: f-725-code_quality-1771354943013491-0).
+    let mut content = String::new();
+    file.take(MAX_GITHUB_APP_CONFIG_FILE_SIZE)
+        .read_to_string(&mut content)?;
     Ok(content)
 }
 
@@ -367,7 +362,7 @@ fn resolve_systemd_credential(credential_name: &str) -> Result<SecretString, Str
 fn read_private_key_file_bounded(path: &Path) -> Result<SecretString, String> {
     use std::io::Read;
 
-    let mut file =
+    let file =
         open_nofollow(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
     let metadata = file
         .metadata()
@@ -387,15 +382,12 @@ fn read_private_key_file_bounded(path: &Path) -> Result<SecretString, String> {
         ));
     }
 
-    let len: usize = usize::try_from(metadata.len()).map_err(|_| {
-        format!(
-            "private key file size does not fit usize: {} ({})",
-            metadata.len(),
-            path.display()
-        )
-    })?;
-    let mut content = String::with_capacity(len);
-    file.read_to_string(&mut content)
+    // Use `.take()` to strictly enforce the read bound, eliminating the
+    // TOCTOU gap where the file could grow between the metadata check and
+    // the read (NIT: f-725-code_quality-1771354943013491-0).
+    let mut content = String::new();
+    file.take(MAX_PRIVATE_KEY_FILE_SIZE)
+        .read_to_string(&mut content)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -414,7 +406,7 @@ fn read_private_key_file_bounded(path: &Path) -> Result<SecretString, String> {
 fn read_private_key_file_secure(path: &Path) -> Result<SecretString, String> {
     use std::io::Read;
 
-    let mut file = open_nofollow(path)
+    let file = open_nofollow(path)
         .map_err(|err| format!("failed to open key path {}: {err}", path.display()))?;
     let metadata = file
         .metadata()
@@ -434,15 +426,12 @@ fn read_private_key_file_secure(path: &Path) -> Result<SecretString, String> {
         ));
     }
 
-    let len: usize = usize::try_from(metadata.len()).map_err(|_| {
-        format!(
-            "config private key file size does not fit usize: {} ({})",
-            metadata.len(),
-            path.display()
-        )
-    })?;
-    let mut content = String::with_capacity(len);
-    file.read_to_string(&mut content)
+    // Use `.take()` to strictly enforce the read bound, eliminating the
+    // TOCTOU gap where the file could grow between the metadata check and
+    // the read (NIT: f-725-code_quality-1771354943013491-0).
+    let mut content = String::new();
+    file.take(MAX_PRIVATE_KEY_FILE_SIZE)
+        .read_to_string(&mut content)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -793,6 +782,7 @@ impl<P: TokenProvider> TokenProvider for RateLimitedTokenProvider<P> {
 #[cfg(test)]
 mod unit_tests {
     use secrecy::ExposeSecret;
+    use serial_test::serial;
 
     use super::*;
 
@@ -1215,6 +1205,7 @@ mod unit_tests {
     }
 
     #[test]
+    #[serial]
     #[allow(unsafe_code)] // Env var mutation is required for test setup and teardown.
     fn test_resolve_systemd_credential_reads_valid_file() {
         let temp = tempfile::tempdir().expect("create tempdir");
@@ -1246,6 +1237,7 @@ mod unit_tests {
     }
 
     #[test]
+    #[serial]
     #[allow(unsafe_code)] // Env var mutation is required for test setup and teardown.
     fn test_resolve_systemd_credential_rejects_empty_file() {
         let temp = tempfile::tempdir().expect("create tempdir");
@@ -1272,6 +1264,7 @@ mod unit_tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     #[allow(unsafe_code)] // Env var mutation is required for test setup and teardown.
     fn test_resolve_systemd_credential_rejects_symlink() {
         let temp = tempfile::tempdir().expect("create tempdir");

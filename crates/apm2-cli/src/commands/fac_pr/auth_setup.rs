@@ -384,7 +384,7 @@ fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
 fn read_private_key_secret(path: &Path) -> Result<SecretString, String> {
     use std::io::Read;
 
-    let mut file =
+    let file =
         open_nofollow(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
     let metadata = file
         .metadata()
@@ -404,15 +404,12 @@ fn read_private_key_secret(path: &Path) -> Result<SecretString, String> {
         ));
     }
 
-    let len: usize = usize::try_from(metadata.len()).map_err(|_| {
-        format!(
-            "private key file size does not fit usize: {} ({})",
-            metadata.len(),
-            path.display()
-        )
-    })?;
-    let mut content = String::with_capacity(len);
-    file.read_to_string(&mut content)
+    // Use `.take()` to strictly enforce the read bound, eliminating the
+    // TOCTOU gap where the file could grow between the metadata check and
+    // the read (NIT: f-725-code_quality-1771354943013491-0).
+    let mut content = String::new();
+    file.take(MAX_PRIVATE_KEY_FILE_SIZE)
+        .read_to_string(&mut content)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -503,6 +500,8 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    use serial_test::serial;
 
     use super::{ensure_regular_file_no_symlink, validate_github_id};
 
@@ -651,6 +650,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     #[allow(unsafe_code)] // Env var mutation is required for test setup and teardown.
     fn headless_setup_writes_config_and_pem() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -740,6 +740,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     #[allow(unsafe_code)]
     fn headless_setup_source_equals_dest_skips_deletion() {
         // When the source PEM path is the same as the destination
@@ -816,6 +817,7 @@ mod tests {
     /// depend on. Missing GitHub App config does not affect gate execution.
     #[cfg(unix)]
     #[test]
+    #[serial]
     #[allow(unsafe_code)]
     fn gates_prerequisites_work_without_github_app_config() {
         use apm2_core::github::resolve_apm2_home;
@@ -875,6 +877,7 @@ mod tests {
     /// without any keyring or desktop session.
     #[cfg(unix)]
     #[test]
+    #[serial]
     #[allow(unsafe_code)]
     fn headless_dod_command_succeeds_with_for_systemd() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -977,6 +980,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     #[allow(unsafe_code)]
     fn headless_setup_rejects_path_traversal_app_id() {
         let tmp = tempfile::tempdir().expect("tempdir");

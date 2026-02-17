@@ -71,6 +71,8 @@ secrecy.workspace = true
 # Cryptographic hashing
 blake3.workspace = true
 
+[dev-dependencies]
+serial_test.workspace = true
 
 [lints]
 workspace = true
