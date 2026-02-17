@@ -10,8 +10,8 @@
 //!
 //! Test coverage:
 //! - Broker absent → fail fast with actionable error (no hang)
-//! - Broker present, worker absent → bounded wait then fail with
-//!   worker-absent error (no indefinite blocking)
+//! - Broker present, worker absent → bounded wait then fail with worker-absent
+//!   error (no indefinite blocking)
 //! - Missing GitHub creds does NOT prevent `gates`
 //! - GitHub-facing command fails fast with explicit credential remediation
 //! - No secrets appear in receipts/logs under test
@@ -57,14 +57,20 @@ fn setup_apm2_home_broker_only() -> (tempfile::TempDir, PathBuf) {
 
     // Create queue directories.
     let queue_root = home.join("queue");
-    for sub in ["pending", "claimed", "completed", "denied", "quarantine", "receipts"] {
+    for sub in [
+        "pending",
+        "claimed",
+        "completed",
+        "denied",
+        "quarantine",
+        "receipts",
+    ] {
         std::fs::create_dir_all(queue_root.join(sub)).expect("create queue dir");
     }
 
     // Write a default policy so broker init can succeed.
     let default_policy = apm2_core::fac::FacPolicyV1::default();
-    apm2_core::fac::persist_policy(&fac_root, &default_policy)
-        .expect("persist default policy");
+    apm2_core::fac::persist_policy(&fac_root, &default_policy).expect("persist default policy");
 
     (tmp, home)
 }
@@ -135,8 +141,7 @@ fn broker_absent_fails_fast_no_hang() {
         // With a bare setup (no queue dirs, no lanes), the broker init
         // itself should succeed (it creates defaults), but enqueue will
         // fail because queue dirs don't exist.
-        let broker_result = test_init_broker_at(&fac_root, boundary_id);
-        broker_result
+        test_init_broker_at(&fac_root, boundary_id)
     });
 
     // Whether broker init succeeds or fails, it should not hang.
@@ -152,7 +157,7 @@ fn broker_absent_fails_fast_no_hang() {
     // The critical assertion is that assert_no_hang did not trip.
 }
 
-/// Direct broker init test: initializes FacBroker at a given fac_root.
+/// Direct broker init test: initializes `FacBroker` at a given `fac_root`.
 ///
 /// This exercises the broker construction path that `apm2 fac gates` uses:
 /// create a signer, build a broker with default state, and load or init
@@ -230,12 +235,14 @@ fn bounded_wait_for_receipt_times_out_deterministically() {
     // Must complete within timeout + small margin (no hang).
     assert!(
         elapsed < short_timeout + Duration::from_secs(5),
-        "bounded wait took {elapsed:?}, expected <= {:?} + margin",
-        short_timeout
+        "bounded wait took {elapsed:?}, expected <= {short_timeout:?} + margin"
     );
 
     // Must fail with a timeout-like error, not succeed.
-    assert!(result.is_err(), "expected timeout error for non-existent job");
+    assert!(
+        result.is_err(),
+        "expected timeout error for non-existent job"
+    );
     let err = result.unwrap_err();
     assert!(
         err.contains("did not") || err.contains("timeout") || err.contains("not found"),
@@ -244,7 +251,8 @@ fn bounded_wait_for_receipt_times_out_deterministically() {
 }
 
 /// Simplified bounded-wait implementation matching the gates pattern.
-/// Uses the same monotonic clock + poll pattern as `wait_for_gates_job_receipt`.
+/// Uses the same monotonic clock + poll pattern as
+/// `wait_for_gates_job_receipt`.
 fn bounded_wait_for_receipt(
     receipts_dir: &Path,
     job_id: &str,
@@ -345,8 +353,8 @@ fn github_credential_posture_unresolved_when_no_creds() {
 /// remediation instructions when no GitHub credentials are available.
 ///
 /// The error message must mention:
-/// - GITHUB_TOKEN/GH_TOKEN env vars
-/// - systemd LoadCredential
+/// - `GITHUB_TOKEN`/`GH_TOKEN` env vars
+/// - systemd `LoadCredential`
 /// - $APM2_HOME/private/creds/gh-token
 /// - `apm2 fac pr auth-setup`
 #[test]
@@ -477,8 +485,7 @@ fn receipts_contain_no_secret_env_values() {
     .try_build()
     .expect("build receipt");
 
-    let receipt_json =
-        serde_json::to_string_pretty(&receipt).expect("serialize receipt");
+    let receipt_json = serde_json::to_string_pretty(&receipt).expect("serialize receipt");
 
     // Receipt must not contain any of the known secret env var names
     // as raw values (guards against accidental env var value injection).
@@ -585,7 +592,7 @@ fn heartbeat_read_malformed_file_completes_immediately() {
 // =========================================================================
 
 /// When no worker heartbeat exists, the queue processing mode detection
-/// should return InlineSingleJob (or equivalent), never block.
+/// should return `InlineSingleJob` (or equivalent), never block.
 #[test]
 fn queue_processing_mode_no_heartbeat_returns_inline() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -613,7 +620,8 @@ fn queue_processing_mode_no_heartbeat_returns_inline() {
 /// This test verifies the architectural invariant that gates and push
 /// have different credential requirements:
 ///
-/// - Gates path: `prepare_queued_gates_job` → `init_broker` (NO credential check)
+/// - Gates path: `prepare_queued_gates_job` → `init_broker` (NO credential
+///   check)
 /// - Push path: `run_push` → `require_github_credentials` (credential check)
 ///
 /// We verify this by confirming:
