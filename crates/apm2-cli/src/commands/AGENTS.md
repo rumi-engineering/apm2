@@ -271,3 +271,10 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
   chains (exec and warm paths) call `.sandbox_hardening_hash(&sbx_hash)` so the
   cryptographically signed `GateReceipt` binds the hardening profile used during
   execution. This complements the `FacJobReceiptV1` binding done via `emit_job_receipt`.
+- **Pipeline commit failure handling** (`fac_worker.rs`, TCK-00564 fix round 3): Every
+  `commit_claimed_job_via_pipeline` call site checks the returned `Result`. On commit
+  failure, the `handle_pipeline_commit_failure` helper logs the error via `eprintln!`,
+  attempts to return the claimed job to `pending/` for re-processing, and returns
+  `JobOutcome::Skipped` instead of a terminal outcome. This prevents denied/failed
+  outcomes from being reported without durable terminal receipts, which would leave jobs
+  claimed indefinitely without reconciliation recourse.

@@ -1501,7 +1501,7 @@ fn execute_queued_gates_job(
         Ok(options) => options,
         Err(reason) => {
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            let _ = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
                 queue_root,
                 spec,
@@ -1519,7 +1519,15 @@ fn execute_queued_gates_job(
                 None,
                 None,
                 Some(sbx_hash),
-            );
+            ) {
+                return handle_pipeline_commit_failure(
+                    &commit_err,
+                    "denied gates job (parse options)",
+                    claimed_path,
+                    queue_root,
+                    claimed_file_name,
+                );
+            }
             return JobOutcome::Denied { reason };
         },
     };
@@ -1532,7 +1540,7 @@ fn execute_queued_gates_job(
                 options.workspace_root.display()
             );
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            let _ = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
                 queue_root,
                 spec,
@@ -1550,7 +1558,15 @@ fn execute_queued_gates_job(
                 None,
                 None,
                 Some(sbx_hash),
-            );
+            ) {
+                return handle_pipeline_commit_failure(
+                    &commit_err,
+                    "denied gates job (resolve HEAD)",
+                    claimed_path,
+                    queue_root,
+                    claimed_file_name,
+                );
+            }
             return JobOutcome::Denied { reason };
         },
     };
@@ -1560,7 +1576,7 @@ fn execute_queued_gates_job(
             spec.source.head_sha
         );
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        let _ = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
             queue_root,
             spec,
@@ -1578,7 +1594,15 @@ fn execute_queued_gates_job(
             None,
             None,
             Some(sbx_hash),
-        );
+        ) {
+            return handle_pipeline_commit_failure(
+                &commit_err,
+                "denied gates job (head mismatch)",
+                claimed_path,
+                queue_root,
+                claimed_file_name,
+            );
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -1587,7 +1611,7 @@ fn execute_queued_gates_job(
         Err(err) => {
             let reason = format!("failed to execute gates in workspace: {err}");
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            let _ = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
                 queue_root,
                 spec,
@@ -1605,7 +1629,15 @@ fn execute_queued_gates_job(
                 None,
                 None,
                 Some(sbx_hash),
-            );
+            ) {
+                return handle_pipeline_commit_failure(
+                    &commit_err,
+                    "denied gates job (execution error)",
+                    claimed_path,
+                    queue_root,
+                    claimed_file_name,
+                );
+            }
             return JobOutcome::Denied { reason };
         },
     };
@@ -1674,7 +1706,13 @@ fn execute_queued_gates_job(
         None,
         Some(sbx_hash),
     ) {
-        eprintln!("worker: WARNING: pipeline commit failed for denied gates job: {commit_err}");
+        return handle_pipeline_commit_failure(
+            &commit_err,
+            "denied gates job (gate failure)",
+            claimed_path,
+            queue_root,
+            claimed_file_name,
+        );
     }
     JobOutcome::Denied { reason }
 }
@@ -1984,7 +2022,7 @@ fn process_job(
         if let Err(e) = consume_authority(queue_root, &spec.job_id, &spec.job_spec_digest) {
             let reason = format!("PCAC consume failed: {e}");
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            let _ = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
                 queue_root,
                 spec,
@@ -2002,7 +2040,15 @@ fn process_job(
                 None,
                 None,
                 Some(&sbx_hash),
-            );
+            ) {
+                return handle_pipeline_commit_failure(
+                    &commit_err,
+                    "denied job (PCAC consume failed)",
+                    &claimed_path,
+                    queue_root,
+                    &claimed_file_name,
+                );
+            }
             return JobOutcome::Denied { reason };
         }
 
@@ -2539,7 +2585,7 @@ fn process_job(
     if let Err(e) = consume_authority(queue_root, &spec.job_id, &spec.job_spec_digest) {
         let reason = format!("PCAC consume failed: {e}");
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        let _ = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
             queue_root,
             spec,
@@ -2557,7 +2603,15 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
-        );
+        ) {
+            return handle_pipeline_commit_failure(
+                &commit_err,
+                "denied warm job (PCAC consume failed)",
+                &claimed_path,
+                queue_root,
+                &claimed_file_name,
+            );
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -2627,7 +2681,7 @@ fn process_job(
     ) {
         let reason = format!("preflight failed: {error:?}");
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        let _ = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
             queue_root,
             spec,
@@ -2645,7 +2699,15 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
-        );
+        ) {
+            return handle_pipeline_commit_failure(
+                &commit_err,
+                "denied warm job (preflight failed)",
+                &claimed_path,
+                queue_root,
+                &claimed_file_name,
+            );
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -2658,7 +2720,7 @@ fn process_job(
         Err(e) => {
             let reason = format!("lane profile load failed for {acquired_lane_id}: {e}");
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            let _ = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
                 queue_root,
                 spec,
@@ -2676,7 +2738,15 @@ fn process_job(
                 None,
                 None,
                 Some(&sbx_hash),
-            );
+            ) {
+                return handle_pipeline_commit_failure(
+                    &commit_err,
+                    "denied warm job (lane profile load)",
+                    &claimed_path,
+                    queue_root,
+                    &claimed_file_name,
+                );
+            }
             return JobOutcome::Denied { reason };
         },
     };
@@ -2721,7 +2791,7 @@ fn process_job(
         Err(e) => {
             let reason = format!("failed to create lane lease: {e}");
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            let _ = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
                 queue_root,
                 spec,
@@ -2739,14 +2809,22 @@ fn process_job(
                 None,
                 None,
                 Some(&sbx_hash),
-            );
+            ) {
+                return handle_pipeline_commit_failure(
+                    &commit_err,
+                    "denied warm job (lane lease creation)",
+                    &claimed_path,
+                    queue_root,
+                    &claimed_file_name,
+                );
+            }
             return JobOutcome::Denied { reason };
         },
     };
     if let Err(e) = lane_lease.persist(&lane_dir) {
         let reason = format!("failed to persist lane lease: {e}");
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        let _ = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
             queue_root,
             spec,
@@ -2764,7 +2842,15 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
-        );
+        ) {
+            return handle_pipeline_commit_failure(
+                &commit_err,
+                "denied warm job (lane lease persist)",
+                &claimed_path,
+                queue_root,
+                &claimed_file_name,
+            );
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -2817,7 +2903,7 @@ fn process_job(
         let reason = format!("mirror ensure failed: {e}");
         let _ = LaneLeaseV1::remove(&lane_dir);
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        let _ = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
             queue_root,
             spec,
@@ -2835,7 +2921,15 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
-        );
+        ) {
+            return handle_pipeline_commit_failure(
+                &commit_err,
+                "denied warm job (mirror ensure)",
+                &claimed_path,
+                queue_root,
+                &claimed_file_name,
+            );
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -2861,7 +2955,7 @@ fn process_job(
             // failure.
         }
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        let _ = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
             queue_root,
             spec,
@@ -2879,7 +2973,15 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
-        );
+        ) {
+            return handle_pipeline_commit_failure(
+                &commit_err,
+                "denied warm job (checkout failure)",
+                &claimed_path,
+                queue_root,
+                &claimed_file_name,
+            );
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -2910,7 +3012,7 @@ fn process_job(
             // the job has a terminal receipt.
         }
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        let _ = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
             queue_root,
             spec,
@@ -2928,7 +3030,15 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
-        );
+        ) {
+            return handle_pipeline_commit_failure(
+                &commit_err,
+                "denied warm job (post-checkout denial)",
+                &claimed_path,
+                queue_root,
+                &claimed_file_name,
+            );
+        }
         JobOutcome::Denied {
             reason: reason.to_string(),
         }
@@ -2997,7 +3107,7 @@ fn process_job(
             // failure.
         }
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        let _ = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
             queue_root,
             spec,
@@ -3015,7 +3125,15 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
-        );
+        ) {
+            return handle_pipeline_commit_failure(
+                &commit_err,
+                "denied warm job (unsupported source kind)",
+                &claimed_path,
+                queue_root,
+                &claimed_file_name,
+            );
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -3641,7 +3759,7 @@ fn handle_stop_revoke(
                 spec.job_id
             );
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            let _ = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
                 queue_root,
                 spec,
@@ -3659,7 +3777,15 @@ fn handle_stop_revoke(
                 None,
                 None,
                 Some(sbx_hash),
-            );
+            ) {
+                return handle_pipeline_commit_failure(
+                    &commit_err,
+                    "denied stop_revoke (missing target)",
+                    claimed_path,
+                    queue_root,
+                    claimed_file_name,
+                );
+            }
             return JobOutcome::Denied { reason };
         },
     };
@@ -3726,7 +3852,7 @@ fn handle_stop_revoke(
         );
         eprintln!("worker: {reason}");
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        let _ = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
             queue_root,
             spec,
@@ -3744,7 +3870,15 @@ fn handle_stop_revoke(
             None,
             None,
             Some(sbx_hash),
-        );
+        ) {
+            return handle_pipeline_commit_failure(
+                &commit_err,
+                "denied stop_revoke (target not found)",
+                claimed_path,
+                queue_root,
+                claimed_file_name,
+            );
+        }
         return JobOutcome::Denied { reason };
     };
 
@@ -3772,7 +3906,7 @@ fn handle_stop_revoke(
         let reason =
             format!("stop_revoke failed: systemctl stop failed for target {target_job_id}: {e}");
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        let _ = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
             queue_root,
             spec,
@@ -3790,7 +3924,15 @@ fn handle_stop_revoke(
             None,
             None,
             Some(sbx_hash),
-        );
+        ) {
+            return handle_pipeline_commit_failure(
+                &commit_err,
+                "denied stop_revoke (systemctl stop failed)",
+                claimed_path,
+                queue_root,
+                claimed_file_name,
+            );
+        }
         return JobOutcome::Denied { reason };
     }
 
@@ -3847,7 +3989,7 @@ fn handle_stop_revoke(
                 );
                 eprintln!("worker: {deny_reason}");
                 // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-                let _ = commit_claimed_job_via_pipeline(
+                if let Err(commit_err) = commit_claimed_job_via_pipeline(
                     fac_root,
                     queue_root,
                     spec,
@@ -3865,7 +4007,15 @@ fn handle_stop_revoke(
                     None,
                     None,
                     Some(sbx_hash),
-                );
+                ) {
+                    return handle_pipeline_commit_failure(
+                        &commit_err,
+                        "denied stop_revoke (receipt build failed)",
+                        claimed_path,
+                        queue_root,
+                        claimed_file_name,
+                    );
+                }
                 return JobOutcome::Denied {
                     reason: deny_reason,
                 };
@@ -3881,7 +4031,7 @@ fn handle_stop_revoke(
             );
             eprintln!("worker: {deny_reason}");
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            let _ = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
                 queue_root,
                 spec,
@@ -3899,7 +4049,15 @@ fn handle_stop_revoke(
                 None,
                 None,
                 Some(sbx_hash),
-            );
+            ) {
+                return handle_pipeline_commit_failure(
+                    &commit_err,
+                    "denied stop_revoke (receipt persist failed)",
+                    claimed_path,
+                    queue_root,
+                    claimed_file_name,
+                );
+            }
             return JobOutcome::Denied {
                 reason: deny_reason,
             };
@@ -3916,7 +4074,7 @@ fn handle_stop_revoke(
             format!("stop_revoke failed: cannot move target {target_job_id} to cancelled: {e}");
         eprintln!("worker: {reason}");
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        let _ = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
             queue_root,
             spec,
@@ -3934,7 +4092,15 @@ fn handle_stop_revoke(
             None,
             None,
             Some(sbx_hash),
-        );
+        ) {
+            return handle_pipeline_commit_failure(
+                &commit_err,
+                "denied stop_revoke (move to cancelled failed)",
+                claimed_path,
+                queue_root,
+                claimed_file_name,
+            );
+        }
         return JobOutcome::Denied { reason };
     }
     eprintln!("worker: stop_revoke: moved target {target_job_id} to cancelled/");
@@ -5214,6 +5380,40 @@ fn commit_claimed_job_via_pipeline(
         .map_err(|e| format!("pipeline commit failed: {e}"))?;
 
     Ok(result.job_terminal_path)
+}
+
+/// Handle a pipeline commit failure for a denial/failure path.
+///
+/// When `commit_claimed_job_via_pipeline` fails, the job has no terminal
+/// receipt and no terminal queue transition. To avoid leaving the job claimed
+/// indefinitely, this function:
+/// 1. Logs the commit error prominently via `eprintln!`.
+/// 2. Attempts to return the claimed job to `pending/` for re-processing.
+/// 3. Returns `JobOutcome::Skipped` so the caller does NOT report a terminal
+///    outcome that was never durably persisted.
+///
+/// This ensures that denied outcomes are only reported after successful atomic
+/// commit and receipt materialization (TCK-00564 MAJOR-1 fix round 3).
+fn handle_pipeline_commit_failure(
+    commit_err: &str,
+    context: &str,
+    claimed_path: &Path,
+    queue_root: &Path,
+    claimed_file_name: &str,
+) -> JobOutcome {
+    eprintln!("worker: pipeline commit failed for {context}: {commit_err}");
+    if let Err(move_err) = move_to_dir_safe(
+        claimed_path,
+        &queue_root.join(PENDING_DIR),
+        claimed_file_name,
+    ) {
+        eprintln!(
+            "worker: WARNING: failed to return claimed job to pending after commit failure: {move_err}"
+        );
+    }
+    JobOutcome::Skipped {
+        reason: format!("pipeline commit failed for {context}: {commit_err}"),
+    }
 }
 
 /// Compute observed job cost from wall-clock elapsed time.
