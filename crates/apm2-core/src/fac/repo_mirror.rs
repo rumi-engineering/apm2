@@ -20,6 +20,8 @@
 //! - prompts are disabled (`GIT_TERMINAL_PROMPT=0`)
 //! - path inputs are validated before shell interaction
 //! - workspaces are fully cleaned with `safe_rmtree_v1` before checkout
+//! - post-checkout git hardening disables hooks and refuses unsafe configs
+//!   (TCK-00580)
 
 use std::io::Write;
 #[cfg(unix)]
@@ -32,6 +34,7 @@ use std::time::SystemTime;
 
 use thiserror::Error;
 
+use super::git_hardening::{self, GitHardeningError, GitHardeningReceipt};
 use super::safe_rmtree::{SafeRmtreeError, safe_rmtree_v1};
 
 /// Schema identifier for repository mirror metadata.
@@ -55,6 +58,8 @@ pub struct CheckoutOutcome {
     pub repo_id: String,
     pub head_sha: String,
     pub workspace_path: PathBuf,
+    /// Git hardening receipt recording security posture of the workspace.
+    pub git_hardening: GitHardeningReceipt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +132,10 @@ pub enum RepoMirrorError {
         /// Why the remote URL was rejected.
         reason: String,
     },
+
+    /// Git hardening failed after checkout (TCK-00580).
+    #[error("git hardening failed: {0}")]
+    GitHardeningFailed(#[from] GitHardeningError),
 }
 
 impl RepoMirrorManager {
@@ -312,10 +321,21 @@ impl RepoMirrorManager {
             });
         }
 
+        // TCK-00580: Harden the lane workspace git config immediately after
+        // checkout and before any further git operations. The hooks directory
+        // is placed under `allowed_parent` (the lanes root), outside the
+        // workspace tree. Policy default: refuse unsafe configs.
+        let hardening_receipt = git_hardening::harden_lane_workspace(
+            lane_workspace,
+            allowed_parent,
+            true, // refuse_unsafe_configs: fail-closed by default
+        )?;
+
         Ok(CheckoutOutcome {
             repo_id: repo_id.to_string(),
             head_sha: head_sha.to_string(),
             workspace_path: lane_workspace.to_path_buf(),
+            git_hardening: hardening_receipt,
         })
     }
 
