@@ -1088,6 +1088,12 @@ pub struct LaneReconcileReceiptV1 {
     pub lanes_marked_corrupt: usize,
     /// Lanes where repair actions failed.
     pub lanes_failed: usize,
+    /// Infrastructure-level failures (e.g., lock-dir creation) that are not
+    /// attributable to any specific lane but indicate a broken control plane.
+    /// Any non-zero value here means the reconcile run should be treated as
+    /// failed.
+    #[serde(default)]
+    pub infrastructure_failures: usize,
     /// Individual reconciliation actions taken.
     pub actions: Vec<LaneReconcileAction>,
 }
@@ -1537,6 +1543,10 @@ impl LaneManager {
     }
 
     /// Check and repair a single subdirectory during reconciliation.
+    ///
+    /// Validates existing paths using `symlink_metadata` to ensure they are
+    /// real directories. Files, symlinks, and other non-directory entries are
+    /// treated as failures that mark the lane corrupt (Finding 2, PR #719).
     fn reconcile_dir(
         lane_dir: &Path,
         lane_id: &str,
@@ -1547,27 +1557,69 @@ impl LaneManager {
         actions: &mut Vec<LaneReconcileAction>,
     ) {
         let subdir_path = lane_dir.join(subdir);
-        if !subdir_path.exists() {
-            match create_dir_restricted(&subdir_path) {
-                Ok(()) => {
-                    actions.push(LaneReconcileAction {
-                        lane_id: lane_id.to_string(),
-                        action: action_name.to_string(),
-                        outcome: LaneReconcileOutcome::Repaired,
-                        detail: None,
-                    });
-                    *lane_repaired = true;
-                },
-                Err(e) => {
+
+        // Use symlink_metadata to detect the true entry type without
+        // following symlinks. This catches files, symlinks, and other
+        // non-directory entries that `.exists()` alone would treat as
+        // valid (common-review-findings.md § 9: use symlink_metadata).
+        match std::fs::symlink_metadata(&subdir_path) {
+            Ok(meta) => {
+                if !meta.file_type().is_dir() {
+                    // Path exists but is NOT a real directory (file, symlink,
+                    // FIFO, etc.). This is an invalid lane state.
+                    let kind = if meta.file_type().is_symlink() {
+                        "symlink"
+                    } else if meta.file_type().is_file() {
+                        "regular file"
+                    } else {
+                        "non-directory entry"
+                    };
                     actions.push(LaneReconcileAction {
                         lane_id: lane_id.to_string(),
                         action: action_name.to_string(),
                         outcome: LaneReconcileOutcome::Failed,
-                        detail: Some(e.to_string()),
+                        detail: Some(format!(
+                            "expected directory but found {kind} at {}",
+                            subdir_path.display()
+                        )),
                     });
                     *lane_failed = true;
-                },
-            }
+                }
+                // If it is a directory, it is healthy — no action needed.
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Path does not exist — attempt to create it.
+                match create_dir_restricted(&subdir_path) {
+                    Ok(()) => {
+                        actions.push(LaneReconcileAction {
+                            lane_id: lane_id.to_string(),
+                            action: action_name.to_string(),
+                            outcome: LaneReconcileOutcome::Repaired,
+                            detail: None,
+                        });
+                        *lane_repaired = true;
+                    },
+                    Err(e) => {
+                        actions.push(LaneReconcileAction {
+                            lane_id: lane_id.to_string(),
+                            action: action_name.to_string(),
+                            outcome: LaneReconcileOutcome::Failed,
+                            detail: Some(e.to_string()),
+                        });
+                        *lane_failed = true;
+                    },
+                }
+            },
+            Err(e) => {
+                // Other I/O errors (e.g., permission denied).
+                actions.push(LaneReconcileAction {
+                    lane_id: lane_id.to_string(),
+                    action: action_name.to_string(),
+                    outcome: LaneReconcileOutcome::Failed,
+                    detail: Some(format!("failed to stat {}: {e}", subdir_path.display())),
+                });
+                *lane_failed = true;
+            },
         }
     }
 
@@ -1655,11 +1707,26 @@ impl LaneManager {
     /// `lanes_repaired` etc. never exceed `lanes_inspected`. Each lane
     /// contributes to exactly one counter based on its worst action outcome:
     ///   `Failed` > `MarkedCorrupt` > `Repaired` > `Ok` > `Skipped`
+    ///
+    /// Actions whose `lane_id` is not in the configured `lane_ids` set are
+    /// counted as infrastructure failures (e.g., lock-dir creation). These
+    /// are tracked separately in `infrastructure_failures` to ensure the
+    /// receipt (and exit code) reflects non-lane control-plane failures.
     fn build_reconcile_receipt(
         lane_ids: &[String],
         actions: Vec<LaneReconcileAction>,
     ) -> LaneReconcileReceiptV1 {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
+
+        let lane_id_set: HashSet<&str> = lane_ids.iter().map(String::as_str).collect();
+
+        // Count infrastructure failures: actions with lane_id NOT in the
+        // configured lane set that have a Failed outcome.
+        let infrastructure_failures = actions
+            .iter()
+            .filter(|a| !lane_id_set.contains(a.lane_id.as_str()))
+            .filter(|a| a.outcome == LaneReconcileOutcome::Failed)
+            .count();
 
         // Determine per-lane summary outcome.
         // Priority (worst wins): Failed > MarkedCorrupt > Repaired > Ok > Skipped
@@ -1667,6 +1734,10 @@ impl LaneManager {
             HashMap::with_capacity(lane_ids.len());
 
         for action in &actions {
+            // Only aggregate actions that belong to configured lanes.
+            if !lane_id_set.contains(action.lane_id.as_str()) {
+                continue;
+            }
             let entry = lane_outcomes
                 .entry(action.lane_id.as_str())
                 .or_insert(action.outcome);
@@ -1697,6 +1768,7 @@ impl LaneManager {
             lanes_repaired,
             lanes_marked_corrupt,
             lanes_failed,
+            infrastructure_failures,
             actions,
         }
     }
@@ -4727,6 +4799,7 @@ mod tests {
             lanes_repaired: 1,
             lanes_marked_corrupt: 0,
             lanes_failed: 0,
+            infrastructure_failures: 0,
             actions: vec![LaneReconcileAction {
                 lane_id: "lane-00".to_string(),
                 action: "create_dir_workspace".to_string(),
@@ -4954,5 +5027,252 @@ mod tests {
             ),
             LaneReconcileOutcome::Repaired
         );
+    }
+
+    // ── Regression tests for PR #719 round 2 findings ─────────────────────
+
+    /// Regression (Finding 1 & 3): lock-dir creation failure must be counted
+    /// as an infrastructure failure and cause the reconcile receipt to report
+    /// non-zero `infrastructure_failures`. Simulated by placing a regular file
+    /// at the lock-dir path so `create_dir_restricted` fails.
+    #[test]
+    fn reconcile_lock_dir_failure_counts_infrastructure_failure() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root.clone()).expect("create manager");
+
+        // Init first so lanes exist and are healthy.
+        manager.init_lanes().expect("init_lanes");
+
+        // Place a regular file at `locks/lanes` so that the lock-dir
+        // creation path fails (cannot create a directory where a file
+        // exists).
+        let lock_dir = fac_root.join("locks").join("lanes");
+        // Remove the existing directory first.
+        fs::remove_dir_all(&lock_dir).expect("remove lock dir");
+        // Create the parent if needed.
+        fs::create_dir_all(lock_dir.parent().unwrap()).expect("create locks dir");
+        // Place a file where the directory should be.
+        fs::write(&lock_dir, b"blocking file").expect("write blocking file");
+
+        let receipt = manager.reconcile_lanes().expect("reconcile_lanes");
+
+        // Infrastructure failures must be > 0.
+        assert!(
+            receipt.infrastructure_failures > 0,
+            "infrastructure_failures must be non-zero when lock-dir creation fails, \
+             got: {}",
+            receipt.infrastructure_failures
+        );
+
+        // There must be a create_lock_dir action with Failed outcome.
+        let lock_action = receipt
+            .actions
+            .iter()
+            .find(|a| a.action == "create_lock_dir");
+        assert!(
+            lock_action.is_some(),
+            "receipt must contain a create_lock_dir action"
+        );
+        assert_eq!(
+            lock_action.unwrap().outcome,
+            LaneReconcileOutcome::Failed,
+            "create_lock_dir action must have Failed outcome"
+        );
+
+        // Lane-level counters should still report lanes as OK (the lock
+        // failure is infrastructure, not lane-level).
+        assert_eq!(
+            receipt.lanes_failed, 0,
+            "lane-level failures should be 0 when only infrastructure failed"
+        );
+    }
+
+    /// Regression (Finding 1): `build_reconcile_receipt` must count
+    /// infrastructure failures from actions with non-lane IDs.
+    #[test]
+    fn build_receipt_counts_infrastructure_failures() {
+        let lane_ids = vec!["lane-00".to_string()];
+        let actions = vec![
+            // Infrastructure failure: lane_id is NOT a configured lane.
+            LaneReconcileAction {
+                lane_id: "locks/lanes".to_string(),
+                action: "create_lock_dir".to_string(),
+                outcome: LaneReconcileOutcome::Failed,
+                detail: Some("test failure".to_string()),
+            },
+            // Normal lane action.
+            LaneReconcileAction {
+                lane_id: "lane-00".to_string(),
+                action: "inspect".to_string(),
+                outcome: LaneReconcileOutcome::Ok,
+                detail: None,
+            },
+        ];
+
+        let receipt = LaneManager::build_reconcile_receipt(&lane_ids, actions);
+
+        assert_eq!(receipt.infrastructure_failures, 1);
+        assert_eq!(receipt.lanes_ok, 1);
+        assert_eq!(receipt.lanes_failed, 0);
+    }
+
+    /// Regression (Finding 2): reconcile must detect a regular file at a
+    /// lane workspace path and mark the lane as failed/corrupt.
+    #[test]
+    fn reconcile_detects_file_at_workspace_path() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        // Init first.
+        manager.init_lanes().expect("init_lanes");
+
+        let lane_id = &LaneManager::default_lane_ids()[0];
+        let lane_dir = manager.lane_dir(lane_id);
+
+        // Replace the workspace directory with a regular file.
+        let workspace = lane_dir.join("workspace");
+        fs::remove_dir_all(&workspace).expect("remove workspace dir");
+        fs::write(&workspace, b"not a directory").expect("write file at workspace");
+
+        let receipt = manager.reconcile_lanes().expect("reconcile_lanes");
+
+        // The lane must be counted as failed or marked corrupt.
+        assert!(
+            receipt.lanes_failed > 0 || receipt.lanes_marked_corrupt > 0,
+            "lane with file-at-workspace must be reported as failed or corrupt, \
+             got lanes_failed={}, lanes_marked_corrupt={}",
+            receipt.lanes_failed,
+            receipt.lanes_marked_corrupt,
+        );
+
+        // There must be a failed action mentioning the workspace.
+        let failed_action = receipt.actions.iter().find(|a| {
+            a.lane_id == *lane_id
+                && a.outcome == LaneReconcileOutcome::Failed
+                && a.action.contains("workspace")
+        });
+        assert!(
+            failed_action.is_some(),
+            "must have a failed action for workspace, actions: {:?}",
+            receipt.actions
+        );
+        let detail = failed_action.unwrap().detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("regular file"),
+            "detail must mention 'regular file', got: {detail}"
+        );
+    }
+
+    /// Regression (Finding 2): reconcile must detect a symlink at a lane
+    /// workspace path and mark the lane as failed/corrupt.
+    #[test]
+    fn reconcile_detects_symlink_at_workspace_path() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        // Init first.
+        manager.init_lanes().expect("init_lanes");
+
+        let lane_id = &LaneManager::default_lane_ids()[0];
+        let lane_dir = manager.lane_dir(lane_id);
+
+        // Replace the workspace directory with a symlink.
+        let workspace = lane_dir.join("workspace");
+        fs::remove_dir_all(&workspace).expect("remove workspace dir");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/tmp", &workspace).expect("create symlink at workspace");
+        }
+
+        // On non-Unix this test is effectively a no-op — the symlink_metadata
+        // validation still applies.
+        #[cfg(not(unix))]
+        {
+            // Create a file instead of symlink on non-Unix for test coverage.
+            fs::write(&workspace, b"not a directory").expect("write file");
+        }
+
+        let receipt = manager.reconcile_lanes().expect("reconcile_lanes");
+
+        // The lane must be counted as failed or marked corrupt.
+        assert!(
+            receipt.lanes_failed > 0 || receipt.lanes_marked_corrupt > 0,
+            "lane with symlink-at-workspace must be reported as failed or corrupt, \
+             got lanes_failed={}, lanes_marked_corrupt={}",
+            receipt.lanes_failed,
+            receipt.lanes_marked_corrupt,
+        );
+
+        // There must be a failed action for the workspace.
+        let failed_action = receipt.actions.iter().find(|a| {
+            a.lane_id == *lane_id
+                && a.outcome == LaneReconcileOutcome::Failed
+                && a.action.contains("workspace")
+        });
+        assert!(
+            failed_action.is_some(),
+            "must have a failed action for workspace, actions: {:?}",
+            receipt.actions
+        );
+
+        #[cfg(unix)]
+        {
+            let detail = failed_action.unwrap().detail.as_deref().unwrap_or("");
+            assert!(
+                detail.contains("symlink"),
+                "detail must mention 'symlink', got: {detail}"
+            );
+        }
+    }
+
+    /// Regression (Finding 3): `infrastructure_failures` field round-trips
+    /// through JSON serialization/deserialization.
+    #[test]
+    fn reconcile_receipt_infrastructure_failures_roundtrip() {
+        let receipt = LaneReconcileReceiptV1 {
+            schema: LANE_RECONCILE_RECEIPT_SCHEMA.to_string(),
+            lanes_inspected: 3,
+            lanes_ok: 3,
+            lanes_repaired: 0,
+            lanes_marked_corrupt: 0,
+            lanes_failed: 0,
+            infrastructure_failures: 2,
+            actions: vec![LaneReconcileAction {
+                lane_id: "locks/lanes".to_string(),
+                action: "create_lock_dir".to_string(),
+                outcome: LaneReconcileOutcome::Failed,
+                detail: Some("test failure".to_string()),
+            }],
+        };
+
+        let json = serde_json::to_string(&receipt).expect("serialize");
+        let deserialized: LaneReconcileReceiptV1 =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(receipt, deserialized);
+        assert_eq!(deserialized.infrastructure_failures, 2);
+    }
+
+    /// Regression (Finding 3): backward-compatible deserialization — receipts
+    /// without the `infrastructure_failures` field default to 0.
+    #[test]
+    fn reconcile_receipt_missing_infrastructure_failures_defaults_to_zero() {
+        let json = r#"{
+            "schema": "apm2.fac.lane_reconcile_receipt.v1",
+            "lanes_inspected": 3,
+            "lanes_ok": 3,
+            "lanes_repaired": 0,
+            "lanes_marked_corrupt": 0,
+            "lanes_failed": 0,
+            "actions": []
+        }"#;
+        let receipt: LaneReconcileReceiptV1 = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(receipt.infrastructure_failures, 0);
     }
 }

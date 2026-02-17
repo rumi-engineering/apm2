@@ -4765,7 +4765,10 @@ fn run_lane_reconcile(_args: &LaneReconcileArgs, json_output: bool) -> u8 {
         print_lane_reconcile_receipt(&receipt);
     }
 
-    if receipt.lanes_marked_corrupt > 0 || receipt.lanes_failed > 0 {
+    if receipt.lanes_marked_corrupt > 0
+        || receipt.lanes_failed > 0
+        || receipt.infrastructure_failures > 0
+    {
         exit_codes::GENERIC_ERROR
     } else {
         exit_codes::SUCCESS
@@ -4776,11 +4779,18 @@ fn run_lane_reconcile(_args: &LaneReconcileArgs, json_output: bool) -> u8 {
 fn print_lane_reconcile_receipt(receipt: &LaneReconcileReceiptV1) {
     println!("Lane reconciliation complete");
     println!();
-    println!("  Lanes inspected:      {}", receipt.lanes_inspected);
-    println!("  Lanes OK:             {}", receipt.lanes_ok);
-    println!("  Lanes repaired:       {}", receipt.lanes_repaired);
-    println!("  Lanes marked corrupt: {}", receipt.lanes_marked_corrupt);
-    println!("  Lanes failed:         {}", receipt.lanes_failed);
+    println!("  Lanes inspected:          {}", receipt.lanes_inspected);
+    println!("  Lanes OK:                 {}", receipt.lanes_ok);
+    println!("  Lanes repaired:           {}", receipt.lanes_repaired);
+    println!(
+        "  Lanes marked corrupt:     {}",
+        receipt.lanes_marked_corrupt
+    );
+    println!("  Lanes failed:             {}", receipt.lanes_failed);
+    println!(
+        "  Infrastructure failures:  {}",
+        receipt.infrastructure_failures
+    );
 
     if !receipt.actions.is_empty() {
         println!();

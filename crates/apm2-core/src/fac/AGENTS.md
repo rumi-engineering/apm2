@@ -578,11 +578,18 @@ bootstrap and recovery commands exposed via `apm2 fac lane init` and
   quarantine contract: operators must clear the marker via `apm2 fac lane reset`
   before the lane is eligible for repair.
 - Lanes that cannot be repaired are marked CORRUPT via `LaneCorruptMarkerV1`.
+- `reconcile_dir` validates existing paths using `symlink_metadata` to ensure
+  they are real directories. Files, symlinks, and other non-directory entries
+  are treated as failures that mark the lane corrupt (fail-closed).
 - Receipt counters (`lanes_ok`, `lanes_repaired`, `lanes_marked_corrupt`,
   `lanes_failed`) are aggregated **per lane** using worst-outcome priority
   (`Failed` > `MarkedCorrupt` > `Repaired` > `Ok` > `Skipped`), so counters
   never exceed `lanes_inspected`. Per-action detail is preserved in the
   `actions` list.
+- Infrastructure-level failures (e.g., lock-dir creation) that are not
+  attributable to any specific lane are tracked separately in the
+  `infrastructure_failures` counter. Any non-zero value means the reconcile
+  run should be treated as failed.
 - Emits a `LaneReconcileReceiptV1` persisted under
   `$APM2_HOME/private/fac/evidence/`.
 - Receipt types: `LaneReconcileReceiptV1`, `LaneReconcileAction`,
@@ -610,6 +617,14 @@ bootstrap and recovery commands exposed via `apm2 fac lane init` and
 - [INV-LANE-RECON-005] Receipt lane counters are aggregated per lane (not per
   action). A single lane with multiple repairs counts as exactly one repaired
   lane. Counters never exceed `lanes_inspected`.
+- [INV-LANE-RECON-006] Infrastructure failures (actions whose `lane_id` is not
+  a configured lane, e.g., lock-dir creation) are tracked in the
+  `infrastructure_failures` counter. The CLI exit code treats any non-zero
+  infrastructure failures as a reconcile failure (fail-closed).
+- [INV-LANE-RECON-007] `reconcile_dir` uses `symlink_metadata` (not `.exists()`)
+  to validate existing lane subdirectories. Files, symlinks, and other
+  non-directory entries are treated as failures that mark the lane corrupt
+  (fail-closed, common-review-findings.md section 9).
 
 ### `repo_mirror` — Node-Local Bare Mirror + Lane Checkout
 
