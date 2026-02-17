@@ -37,6 +37,11 @@ pub struct GateResourcePolicy {
     pub gate_profile: Option<String>,
     pub test_parallelism: Option<u32>,
     pub bounded_runner: bool,
+    /// BLAKE3 hash of the `SandboxHardeningProfile` used for gate execution
+    /// (TCK-00573 MAJOR-3). Ensures the attestation digest changes when the
+    /// hardening profile is modified, preventing stale gate result reuse
+    /// from insecure environments.
+    pub sandbox_hardening: Option<String>,
 }
 
 impl GateResourcePolicy {
@@ -51,6 +56,7 @@ impl GateResourcePolicy {
         bounded_runner: bool,
         gate_profile: Option<&str>,
         test_parallelism: Option<u32>,
+        sandbox_hardening: Option<&str>,
     ) -> Self {
         Self {
             quick_mode,
@@ -61,6 +67,7 @@ impl GateResourcePolicy {
             gate_profile: gate_profile.map(str::to_string),
             test_parallelism,
             bounded_runner,
+            sandbox_hardening: sandbox_hardening.map(str::to_string),
         }
     }
 }
@@ -507,7 +514,7 @@ mod tests {
         let command =
             gate_command_for_attestation(&workspace_root, "rustfmt", None).expect("command");
         let policy =
-            GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true, None, None);
+            GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true, None, None, None);
 
         let one = compute_gate_attestation(
             &workspace_root,
@@ -660,6 +667,7 @@ mod tests {
             true,
             Some("throughput"),
             Some(8),
+            None,
         );
         let conservative = GateResourcePolicy::from_cli(
             false,
@@ -670,6 +678,7 @@ mod tests {
             true,
             Some("conservative"),
             Some(2),
+            None,
         );
         assert_ne!(
             super::resource_digest(&throughput),
@@ -707,7 +716,7 @@ mod tests {
         let command =
             gate_command_for_attestation(&workspace_root, "rustfmt", None).expect("command");
         let policy =
-            GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true, None, None);
+            GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true, None, None, None);
 
         let attestation = compute_gate_attestation(
             &workspace_root,
@@ -792,6 +801,146 @@ mod tests {
         assert!(
             file_sha256(&symlink_path).is_err(),
             "symlink inputs must be rejected for attestation hashing"
+        );
+    }
+
+    // --- TCK-00573 MAJOR-1: sandbox hardening hash binds attestation ---
+
+    #[test]
+    fn resource_digest_changes_when_sandbox_hardening_hash_changes() {
+        // Regression: attestation must bind to the effective policy-driven
+        // sandbox hardening profile, not a default. Mutating the hardening
+        // hash MUST change the resource digest (and therefore the attestation
+        // digest), preventing cache reuse across hardening-profile drift.
+        use apm2_core::fac::SandboxHardeningProfile;
+
+        let default_hash = SandboxHardeningProfile::default().content_hash_hex();
+        let custom_profile = SandboxHardeningProfile {
+            private_tmp: false,
+            ..SandboxHardeningProfile::default()
+        };
+        let custom_hash = custom_profile.content_hash_hex();
+
+        // Precondition: the two hashes must differ.
+        assert_ne!(
+            default_hash, custom_hash,
+            "mutated sandbox profile must produce a different content hash"
+        );
+
+        let policy_default = GateResourcePolicy::from_cli(
+            false,
+            600,
+            "48G",
+            1536,
+            "200%",
+            true,
+            Some("throughput"),
+            Some(4),
+            Some(&default_hash),
+        );
+        let policy_custom = GateResourcePolicy::from_cli(
+            false,
+            600,
+            "48G",
+            1536,
+            "200%",
+            true,
+            Some("throughput"),
+            Some(4),
+            Some(&custom_hash),
+        );
+
+        assert_ne!(
+            super::resource_digest(&policy_default),
+            super::resource_digest(&policy_custom),
+            "resource digest must change when sandbox hardening profile changes \
+             (cache reuse denied across profile drift)"
+        );
+    }
+
+    #[test]
+    fn attestation_digest_changes_when_sandbox_hardening_hash_changes() {
+        // End-to-end regression: a full attestation with different sandbox
+        // hardening hashes must produce different attestation digests.
+        use apm2_core::fac::SandboxHardeningProfile;
+
+        let workspace_root = std::env::current_dir().expect("cwd");
+        let command =
+            gate_command_for_attestation(&workspace_root, "rustfmt", None).expect("command");
+        let sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let default_hash = SandboxHardeningProfile::default().content_hash_hex();
+        let custom_profile = SandboxHardeningProfile {
+            private_tmp: false,
+            ..SandboxHardeningProfile::default()
+        };
+        let custom_hash = custom_profile.content_hash_hex();
+
+        let policy_default = GateResourcePolicy::from_cli(
+            false,
+            600,
+            "48G",
+            1536,
+            "200%",
+            true,
+            None,
+            None,
+            Some(&default_hash),
+        );
+        let policy_custom = GateResourcePolicy::from_cli(
+            false,
+            600,
+            "48G",
+            1536,
+            "200%",
+            true,
+            None,
+            None,
+            Some(&custom_hash),
+        );
+
+        let att_default =
+            compute_gate_attestation(&workspace_root, sha, "rustfmt", &command, &policy_default)
+                .expect("attestation default");
+        let att_custom =
+            compute_gate_attestation(&workspace_root, sha, "rustfmt", &command, &policy_custom)
+                .expect("attestation custom");
+
+        assert_ne!(
+            att_default.attestation_digest, att_custom.attestation_digest,
+            "attestation digest must differ when sandbox hardening profile changes"
+        );
+        assert_ne!(
+            att_default.resource_digest, att_custom.resource_digest,
+            "resource digest component must differ when sandbox hardening profile changes"
+        );
+    }
+
+    #[test]
+    fn sandbox_hardening_none_vs_some_produces_different_digest() {
+        // Gate attestation with sandbox_hardening=None (legacy) must differ
+        // from one with sandbox_hardening=Some (post-TCK-00573).
+        use apm2_core::fac::SandboxHardeningProfile;
+
+        let default_hash = SandboxHardeningProfile::default().content_hash_hex();
+        let policy_none =
+            GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true, None, None, None);
+        let policy_some = GateResourcePolicy::from_cli(
+            false,
+            600,
+            "48G",
+            1536,
+            "200%",
+            true,
+            None,
+            None,
+            Some(&default_hash),
+        );
+
+        assert_ne!(
+            super::resource_digest(&policy_none),
+            super::resource_digest(&policy_some),
+            "resource digest must differ between None and Some sandbox hardening"
         );
     }
 }
