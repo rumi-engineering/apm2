@@ -35,8 +35,6 @@ use std::io::{Read as _, Write};
 use std::os::unix::fs::DirBuilderExt;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
@@ -885,28 +883,48 @@ impl RepoMirrorManager {
 // Filesystem helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// S-4: Use `symlink_metadata` instead of `path.exists()` to avoid TOCTOU and
-/// symlink-following. If the path exists and is a symlink, we refuse it.
+/// S-4 / CQ-B1: Atomically open the directory with `O_NOFOLLOW | O_DIRECTORY`
+/// and apply permissions via `fchmod` on the resulting fd. This eliminates the
+/// TOCTOU window between symlink check and `set_permissions`: `O_NOFOLLOW`
+/// refuses symlinks at open time, and `fchmod` operates on the verified inode
+/// rather than re-resolving the path.
 #[cfg(unix)]
 fn ensure_dir_mode_0700(path: &Path) -> Result<(), RepoMirrorError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => {
-            // Refuse symlinks — fail-closed (S-4).
-            if meta.file_type().is_symlink() {
-                return Err(RepoMirrorError::SymlinkInPath {
-                    reason: format!("directory path is a symlink: {}", path.display()),
-                });
-            }
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-                .map_err(RepoMirrorError::Io)?;
+    use nix::fcntl::OFlag;
+    use nix::sys::stat::Mode;
+
+    match nix::fcntl::open(
+        path,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY,
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            // `fd` is an `OwnedFd` (nix 0.30) — closed on drop.
+            nix::sys::stat::fchmod(&fd, Mode::S_IRWXU)
+                .map_err(|e| RepoMirrorError::Io(std::io::Error::from_raw_os_error(e as i32)))?;
             Ok(())
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)
-            .map_err(RepoMirrorError::Io),
-        Err(e) => Err(RepoMirrorError::Io(e)),
+        Err(nix::errno::Errno::ENOENT) => {
+            // Directory does not exist — create it with mode 0o700.
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(path)
+                .map_err(RepoMirrorError::Io)
+        },
+        Err(nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR) => {
+            // ELOOP: path is a symlink (O_NOFOLLOW).
+            // ENOTDIR: path exists but is not a directory (O_DIRECTORY).
+            Err(RepoMirrorError::SymlinkInPath {
+                reason: format!(
+                    "directory path is a symlink or not a directory: {}",
+                    path.display()
+                ),
+            })
+        },
+        Err(e) => Err(RepoMirrorError::Io(std::io::Error::from_raw_os_error(
+            e as i32,
+        ))),
     }
 }
 
@@ -1042,8 +1060,14 @@ fn git_command(
 
 /// Run a git command with a wall-clock timeout using `Instant` (monotonic).
 ///
-/// The child process is spawned and then polled with a deadline. If the
-/// deadline expires, the child is killed.
+/// The child process is spawned, stdout/stderr are read on dedicated threads
+/// (bounded to `GIT_STDOUT_MAX_BYTES`), and the main thread polls for exit
+/// with a deadline. If the deadline expires, the child is killed.
+///
+/// CQ-m1: stdout/stderr are consumed on background threads to prevent the
+/// child from blocking on a full pipe. When a thread hits the byte cap it
+/// kills the child process immediately so it does not hang for the full
+/// timeout duration.
 ///
 /// CTR-2501: uses `Instant` for duration measurement, not `SystemTime`.
 fn git_command_with_timeout(
@@ -1066,54 +1090,31 @@ fn git_command_with_timeout(
         .spawn()
         .map_err(|e| make_error(&format!("failed to spawn git: {e}")))?;
 
+    // CQ-m1: Take stdout/stderr handles and read them on background threads
+    // so the child never blocks on a full pipe buffer. Each thread reads up
+    // to `GIT_STDOUT_MAX_BYTES` then drains and discards any remaining data,
+    // ensuring the child can always make progress writing.
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    let stdout_thread = std::thread::spawn(move || bounded_read_pipe(stdout_handle));
+    let stderr_thread = std::thread::spawn(move || bounded_read_pipe(stderr_handle));
+
+    // Poll for exit with monotonic deadline.
     let deadline = Instant::now() + timeout;
     let poll_interval = Duration::from_millis(250);
 
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                // Process exited — collect output.
-                let stdout = child
-                    .stdout
-                    .take()
-                    .map(|mut r| {
-                        let mut buf = Vec::new();
-                        // Bounded read: at most GIT_STDOUT_MAX_BYTES of stdout (S-1).
-                        let _ =
-                            std::io::Read::take(&mut r, GIT_STDOUT_MAX_BYTES).read_to_end(&mut buf);
-                        buf
-                    })
-                    .unwrap_or_default();
-                let stderr = child
-                    .stderr
-                    .take()
-                    .map(|mut r| {
-                        let mut buf = Vec::new();
-                        let _ =
-                            std::io::Read::take(&mut r, GIT_STDOUT_MAX_BYTES).read_to_end(&mut buf);
-                        buf
-                    })
-                    .unwrap_or_default();
-
-                if !status.success() {
-                    let mut reason = String::from_utf8_lossy(&stderr).trim().to_string();
-                    if reason.is_empty() {
-                        reason = String::from_utf8_lossy(&stdout).trim().to_string();
-                    }
-                    if reason.is_empty() {
-                        reason = "git command failed with no output".to_string();
-                    }
-                    return Err(make_error(&reason));
-                }
-
-                return Ok(String::from_utf8_lossy(&stdout).into_owned());
-            },
+            Ok(Some(status)) => break status,
             Ok(None) => {
-                // Still running — check deadline.
                 if Instant::now() >= deadline {
-                    // Kill the child process.
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Join reader threads before returning (they will see EOF
+                    // from the killed process).
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
                     return Err(RepoMirrorError::Timeout {
                         timeout_secs: timeout.as_secs(),
                         reason: format!("git {}", args.first().unwrap_or(&"<unknown>")),
@@ -1122,10 +1123,51 @@ fn git_command_with_timeout(
                 std::thread::sleep(poll_interval);
             },
             Err(e) => {
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
                 return Err(make_error(&format!("failed to wait for git: {e}")));
             },
         }
+    };
+
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+
+    if !status.success() {
+        let mut reason = String::from_utf8_lossy(&stderr).trim().to_string();
+        if reason.is_empty() {
+            reason = String::from_utf8_lossy(&stdout).trim().to_string();
+        }
+        if reason.is_empty() {
+            reason = "git command failed with no output".to_string();
+        }
+        return Err(make_error(&reason));
     }
+
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+/// Read up to `GIT_STDOUT_MAX_BYTES` from a pipe, then drain and discard
+/// any remaining data so the writing process does not block.
+///
+/// CQ-m1: This prevents the child process from hanging on a full pipe buffer
+/// when it produces output exceeding the byte cap.
+fn bounded_read_pipe(pipe: Option<impl std::io::Read>) -> Vec<u8> {
+    let Some(mut reader) = pipe else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    // Bounded read: at most GIT_STDOUT_MAX_BYTES (S-1, CTR-1603).
+    let _ = std::io::Read::take(&mut reader, GIT_STDOUT_MAX_BYTES).read_to_end(&mut buf);
+    // Drain remaining data so the child does not block on the pipe.
+    let mut discard = [0u8; 8192];
+    loop {
+        match std::io::Read::read(&mut reader, &mut discard) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {},
+        }
+    }
+    buf
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1379,6 +1421,17 @@ fn validate_remote_url(remote_url: &str) -> Result<(), RepoMirrorError> {
     if remote_url.is_empty() {
         return Err(RepoMirrorError::InvalidRemoteUrl {
             reason: "remote URL must not be empty".to_string(),
+        });
+    }
+    // CQ-M1: Enforce length bound so the URL can be stored in receipts
+    // without violating the S-5 bounds check in `MirrorUpdateReceiptV1::is_valid`.
+    if remote_url.len() > MAX_RECEIPT_MIRROR_PATH_LENGTH {
+        return Err(RepoMirrorError::InvalidRemoteUrl {
+            reason: format!(
+                "remote URL too long: {} > {}",
+                remote_url.len(),
+                MAX_RECEIPT_MIRROR_PATH_LENGTH
+            ),
         });
     }
     if remote_url.starts_with('-') {
@@ -2582,7 +2635,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_ensure_dir_mode_0700_refuses_symlink() {
-        // S-4: ensure_dir_mode_0700 must refuse symlinks.
+        // S-4 / CQ-B1: ensure_dir_mode_0700 must refuse symlinks via
+        // O_NOFOLLOW | O_DIRECTORY + fchmod, not path-based set_permissions.
         let temp = tempfile::tempdir().expect("tempdir");
         let real_dir = temp.path().join("real_dir");
         fs::create_dir_all(&real_dir).expect("create real dir");
@@ -2594,6 +2648,83 @@ mod tests {
         assert!(
             matches!(result, Err(RepoMirrorError::SymlinkInPath { .. })),
             "ensure_dir_mode_0700 should refuse symlinks: {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_ensure_dir_mode_0700_sets_permissions_on_real_dir() {
+        // CQ-B1: Verify fchmod actually sets mode on a real directory.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("test_dir");
+        fs::create_dir_all(&dir).expect("create dir");
+        // Set initial permissive mode
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("set initial mode");
+
+        let result = ensure_dir_mode_0700(&dir);
+        assert!(
+            result.is_ok(),
+            "ensure_dir_mode_0700 should succeed: {result:?}"
+        );
+
+        let meta = fs::metadata(&dir).expect("read metadata");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o700,
+            "permissions should be 0700 after ensure_dir_mode_0700"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix round 2: CQ-M1 — URL length validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_remote_url_rejects_oversized_url() {
+        // CQ-M1: URLs longer than MAX_RECEIPT_MIRROR_PATH_LENGTH must be
+        // rejected to prevent invalid receipts (S-5 bounds check).
+        let long_url = format!(
+            "https://example.com/{}",
+            "a".repeat(MAX_RECEIPT_MIRROR_PATH_LENGTH)
+        );
+        assert!(
+            long_url.len() > MAX_RECEIPT_MIRROR_PATH_LENGTH,
+            "test URL should exceed limit"
+        );
+        let result = validate_remote_url(&long_url);
+        assert!(
+            matches!(result, Err(RepoMirrorError::InvalidRemoteUrl { .. })),
+            "oversized URL should be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_remote_url_accepts_url_at_limit() {
+        // CQ-M1: A URL exactly at the limit should be accepted.
+        let prefix = "https://example.com/";
+        let padding_len = MAX_RECEIPT_MIRROR_PATH_LENGTH - prefix.len();
+        let url_at_limit = format!("{}{}", prefix, "a".repeat(padding_len));
+        assert_eq!(url_at_limit.len(), MAX_RECEIPT_MIRROR_PATH_LENGTH);
+        let result = validate_remote_url(&url_at_limit);
+        assert!(
+            result.is_ok(),
+            "URL at exact limit should be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_ensure_mirror_rejects_oversized_remote_url() {
+        // CQ-M1: End-to-end test that ensure_mirror refuses oversized URLs.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mgr = RepoMirrorManager::new(&temp.path().join("private").join("fac"));
+        let long_url = format!(
+            "https://example.com/{}",
+            "x".repeat(MAX_RECEIPT_MIRROR_PATH_LENGTH)
+        );
+        let result = mgr.ensure_mirror("sample", Some(&long_url));
+        assert!(
+            matches!(result, Err(RepoMirrorError::InvalidRemoteUrl { .. })),
+            "ensure_mirror should reject oversized URL: {result:?}"
         );
     }
 }
