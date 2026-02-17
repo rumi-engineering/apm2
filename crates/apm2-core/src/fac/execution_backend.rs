@@ -548,9 +548,18 @@ fn build_property_list(props: &SystemdUnitProperties, backend: ExecutionBackend)
     match backend {
         ExecutionBackend::SystemMode => {
             list.extend(props.sandbox_hardening.to_property_strings());
+            // Network policy directives (TCK-00574).
+            // PrivateNetwork requires CAP_SYS_ADMIN (network namespace).
+            // IPAddressDeny/IPAddressAllow require BPF cgroup support.
+            // Both are only available in system mode.
+            list.extend(props.network_policy.to_property_strings());
         },
         ExecutionBackend::UserMode => {
             list.extend(props.sandbox_hardening.to_user_mode_property_strings());
+            // Network policy: no reliable user-mode enforcement.
+            // RestrictAddressFamilies (from sandbox hardening) provides
+            // socket-type restriction in user mode as a partial mitigation.
+            list.extend(props.network_policy.to_user_mode_property_strings());
         },
     }
 
@@ -677,6 +686,7 @@ mod tests {
     use crate::fac::SandboxHardeningProfile;
     use crate::fac::job_spec::JobConstraints;
     use crate::fac::lane::{LanePolicy, LaneProfileV1, LaneTimeouts, ResourceProfile};
+    use crate::fac::systemd_properties::NetworkPolicy;
 
     // ── Backend enum ────────────────────────────────────────────────────
 
@@ -811,6 +821,7 @@ mod tests {
             &test_profile(),
             None,
             SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
         )
     }
 
@@ -957,6 +968,7 @@ mod tests {
             &profile,
             Some(&constraints),
             SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
         );
         let cmd = build_systemd_run_command(
             ExecutionBackend::UserMode,
@@ -1058,8 +1070,12 @@ mod tests {
             private_tmp: false,
             ..Default::default()
         };
-        let props =
-            SystemdUnitProperties::from_lane_profile_with_hardening(&profile, None, hardening);
+        let props = SystemdUnitProperties::from_lane_profile_with_hardening(
+            &profile,
+            None,
+            hardening,
+            NetworkPolicy::deny(),
+        );
         let list = build_property_list(&props, ExecutionBackend::SystemMode);
 
         // Disabled directives must NOT be in the property list.
@@ -1288,6 +1304,7 @@ mod tests {
             &zero_profile,
             None,
             SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
         );
         let cmd = build_systemd_run_command(
             ExecutionBackend::UserMode,

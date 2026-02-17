@@ -296,6 +296,11 @@ tables are printed by default via `print_lane_init_receipt()` and
   chains (exec and warm paths) call `.sandbox_hardening_hash(&sbx_hash)` so the
   cryptographically signed `GateReceipt` binds the hardening profile used during
   execution. This complements the `FacJobReceiptV1` binding done via `emit_job_receipt`.
+- **Network policy resolution** (`fac_worker.rs`, TCK-00574): `process_job()` resolves
+  network policy via `resolve_network_policy(&spec.kind, None)` based on the job kind.
+  Gates jobs get deny-all; warm jobs get allow. The resolved `NetworkPolicy` is passed to
+  `SystemdUnitProperties::from_lane_profile_with_hardening()` alongside the existing
+  sandbox hardening profile.
 - **Policy-aware warm spec validation** (`fac_warm.rs`, TCK-00579): The warm enqueue path
   derives a `JobSpecValidationPolicy` from the loaded FAC policy and validates the warm
   spec via `validate_job_spec_with_policy()` before enqueue, failing closed on validation

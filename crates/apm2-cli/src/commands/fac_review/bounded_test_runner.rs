@@ -29,7 +29,7 @@ use std::process::Command;
 use apm2_core::fac::execution_backend::{
     ExecutionBackend, SystemModeConfig, build_systemd_run_command, probe_user_bus, select_backend,
 };
-use apm2_core::fac::{SandboxHardeningProfile, SystemdUnitProperties};
+use apm2_core::fac::{NetworkPolicy, SandboxHardeningProfile, SystemdUnitProperties};
 use apm2_daemon::telemetry::is_cgroup_v2_available;
 
 use super::timeout_policy::parse_memory_limit;
@@ -82,10 +82,12 @@ fn parse_cpu_quota_percent(cpu_quota: &str) -> Result<u32, String> {
 ///
 /// Parses string-format limits (e.g., "48G", "200%") into numeric types
 /// used by the core command builder. Uses the provided sandbox hardening
-/// profile (from policy) instead of hard-coding the default (TCK-00573).
+/// profile and network policy (from policy) instead of hard-coding
+/// defaults (TCK-00573, TCK-00574).
 fn limits_to_properties(
     limits: BoundedTestLimits<'_>,
     sandbox_hardening: SandboxHardeningProfile,
+    network_policy: NetworkPolicy,
 ) -> Result<SystemdUnitProperties, String> {
     let memory_max_bytes = parse_memory_limit(limits.memory_max)?;
     let cpu_quota_percent = parse_cpu_quota_percent(limits.cpu_quota)?;
@@ -99,6 +101,7 @@ fn limits_to_properties(
         tasks_max,
         limits.timeout_seconds,
         sandbox_hardening,
+        network_policy,
     ))
 }
 
@@ -128,6 +131,7 @@ pub fn build_bounded_test_command(
     nextest_command: &[String],
     policy_env: &[(String, String)],
     sandbox_hardening: SandboxHardeningProfile,
+    network_policy: NetworkPolicy,
 ) -> Result<BoundedTestCommandSpec, String> {
     if nextest_command.is_empty() {
         return Err("nextest command cannot be empty".to_string());
@@ -141,8 +145,9 @@ pub fn build_bounded_test_command(
 
     // Convert CLI limits to core properties for unified command
     // construction. Uses the policy-driven sandbox hardening profile
-    // (TCK-00573) instead of hard-coding defaults.
-    let properties = limits_to_properties(limits, sandbox_hardening)?;
+    // and network policy (TCK-00573, TCK-00574) instead of hard-coding
+    // defaults.
+    let properties = limits_to_properties(limits, sandbox_hardening, network_policy)?;
 
     // Select execution backend: user-mode (requires D-Bus session) or
     // system-mode (headless VPS). Controlled by APM2_FAC_EXECUTION_BACKEND.
@@ -317,7 +322,7 @@ fn command_available(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use apm2_core::fac::SandboxHardeningProfile;
+    use apm2_core::fac::{NetworkPolicy, SandboxHardeningProfile};
 
     use super::{
         BoundedTestLimits, MAX_SETENV_PAIRS, append_systemd_setenv_args,
@@ -351,6 +356,7 @@ mod tests {
             &[],
             &[],
             SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
         )
         .expect_err("empty command must fail");
         assert!(err.contains("nextest command cannot be empty"));
@@ -455,8 +461,12 @@ mod tests {
             pids_max: 512,
             cpu_quota: "200%",
         };
-        let props =
-            limits_to_properties(limits, SandboxHardeningProfile::default()).expect("valid limits");
+        let props = limits_to_properties(
+            limits,
+            SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
+        )
+        .expect("valid limits");
         assert_eq!(props.cpu_quota_percent, 200);
         assert_eq!(props.memory_max_bytes, 1024 * 1024 * 1024);
         assert_eq!(props.tasks_max, 512);
@@ -464,6 +474,7 @@ mod tests {
         assert_eq!(props.runtime_max_sec, 600);
         assert_eq!(props.kill_mode, "control-group");
         assert_eq!(props.sandbox_hardening, SandboxHardeningProfile::default());
+        assert_eq!(props.network_policy, NetworkPolicy::deny());
     }
 
     #[test]
@@ -479,7 +490,8 @@ mod tests {
             private_tmp: false,
             ..Default::default()
         };
-        let props = limits_to_properties(limits, hardening.clone()).expect("valid limits");
+        let props = limits_to_properties(limits, hardening.clone(), NetworkPolicy::deny())
+            .expect("valid limits");
         assert_eq!(props.sandbox_hardening, hardening);
         assert!(!props.sandbox_hardening.private_tmp);
     }

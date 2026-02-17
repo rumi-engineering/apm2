@@ -2819,10 +2819,13 @@ fn process_job(
         },
     };
 
+    // Resolve network policy for this job kind (TCK-00574).
+    let job_network_policy = apm2_core::fac::resolve_network_policy(&spec.kind, None);
     let lane_systemd_properties = SystemdUnitProperties::from_lane_profile_with_hardening(
         &lane_profile,
         Some(&spec.constraints),
         policy.sandbox_hardening.clone(),
+        job_network_policy,
     );
     if print_unit {
         eprintln!(

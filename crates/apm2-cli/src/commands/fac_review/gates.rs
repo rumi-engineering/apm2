@@ -937,6 +937,8 @@ fn run_gates_inner(
     let test_command = if quick {
         None
     } else {
+        // TCK-00574: Gates always deny network access (default posture).
+        let gate_network_policy = apm2_core::fac::resolve_network_policy("gates", None);
         let spec = build_systemd_bounded_test_command(
             workspace_root,
             BoundedTestLimits {
@@ -949,6 +951,7 @@ fn run_gates_inner(
             &default_nextest_command,
             &test_command_environment,
             policy.sandbox_hardening,
+            gate_network_policy,
         )
         .map_err(|err| format!("bounded test runner unavailable for FAC gates: {err}"))?;
         bounded = true;

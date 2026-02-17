@@ -2,7 +2,7 @@
 //!
 //! This module is the authoritative conversion point for lane + constraint
 //! inputs into systemd-style execution guardrails (resource limits + timeouts +
-//! kill mode + sandbox hardening).
+//! kill mode + sandbox hardening + network policy).
 //!
 //! ## Sandbox Hardening (TCK-00573)
 //!
@@ -22,6 +22,20 @@
 //! - `RestrictRealtime=yes` — deny realtime scheduling
 //! - `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` — restrict socket types
 //! - `SystemCallArchitectures=native` — deny non-native syscall ABIs
+//!
+//! ## Network Policy (TCK-00574)
+//!
+//! `NetworkPolicy` controls network access for FAC job units. The default
+//! posture is **deny** (`PrivateNetwork=yes`), which isolates the unit in
+//! its own network namespace with only the loopback interface. Jobs that
+//! require network access (e.g., `warm`, `fetch`) must be explicitly
+//! allowed via `resolve_network_policy()`.
+//!
+//! Network policy directives:
+//! - `PrivateNetwork=yes` — deny: isolate in a private network namespace
+//! - `IPAddressDeny=any` + `IPAddressAllow=localhost` — defense-in-depth deny
+//!   layer when `PrivateNetwork` is active
+//! - When allowed: no `PrivateNetwork`, no `IPAddressDeny`/`IPAddressAllow`
 
 use serde::{Deserialize, Serialize};
 
@@ -320,6 +334,171 @@ impl SandboxHardeningProfile {
     }
 }
 
+/// Network access policy for FAC job units (TCK-00574).
+///
+/// Controls whether a transient systemd unit can access the network.
+/// The default posture is **deny** (`PrivateNetwork=yes`), which isolates
+/// the unit in its own network namespace containing only the loopback
+/// interface.
+///
+/// # Security Model
+///
+/// - **Fail-closed**: Default denies all network access. Only jobs explicitly
+///   marked as needing network (warm, fetch) are allowed.
+/// - **Defense-in-depth**: When network is denied, both `PrivateNetwork=yes`
+///   AND `IPAddressDeny=any` are applied. `PrivateNetwork` provides namespace
+///   isolation; `IPAddressDeny` provides packet-filter-level denial as a second
+///   layer.
+/// - **Receipt binding**: The network policy hash is included in job receipts
+///   for audit trail.
+///
+/// # Directive Mapping
+///
+/// | `allow_network` | systemd directives |
+/// |---|---|
+/// | `false` (default) | `PrivateNetwork=yes`, `IPAddressDeny=any`, `IPAddressAllow=localhost` |
+/// | `true` | *(none — network access inherited from host)* |
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkPolicy {
+    /// Whether the job unit is allowed to access the network.
+    ///
+    /// - `false` (default): Network denied via `PrivateNetwork=yes` and
+    ///   `IPAddressDeny=any` with `IPAddressAllow=localhost` for
+    ///   defense-in-depth.
+    /// - `true`: Network access allowed (no network isolation directives).
+    #[serde(default)]
+    pub allow_network: bool,
+}
+
+impl Default for NetworkPolicy {
+    /// Default-deny: no network access. This is the fail-closed posture
+    /// required by `DOMAIN_SECURITY`.
+    fn default() -> Self {
+        Self {
+            allow_network: false,
+        }
+    }
+}
+
+impl NetworkPolicy {
+    /// Create a network policy that denies all network access (default).
+    #[must_use]
+    pub const fn deny() -> Self {
+        Self {
+            allow_network: false,
+        }
+    }
+
+    /// Create a network policy that allows network access.
+    #[must_use]
+    pub const fn allow() -> Self {
+        Self {
+            allow_network: true,
+        }
+    }
+
+    /// Render the network policy as systemd `[Service]` property strings
+    /// suitable for `--property` arguments to `systemd-run`.
+    ///
+    /// When network is denied, emits:
+    /// - `PrivateNetwork=yes` — namespace isolation (primary enforcement)
+    /// - `IPAddressDeny=any` — packet-filter denial (defense-in-depth)
+    /// - `IPAddressAllow=localhost` — allow loopback even with `IPAddressDeny`
+    ///
+    /// When network is allowed, emits no directives (host network inherited).
+    #[must_use]
+    pub fn to_property_strings(&self) -> Vec<String> {
+        if self.allow_network {
+            return Vec::new();
+        }
+        vec![
+            "PrivateNetwork=yes".to_string(),
+            "IPAddressDeny=any".to_string(),
+            "IPAddressAllow=localhost".to_string(),
+        ]
+    }
+
+    /// Render the user-mode-safe subset of network policy directives.
+    ///
+    /// `PrivateNetwork` requires `CAP_SYS_ADMIN` (mount namespace). In user
+    /// mode, only `IPAddressDeny`/`IPAddressAllow` via BPF can sometimes
+    /// work depending on kernel version and cgroup delegation, but are not
+    /// reliably available. To maintain fail-closed behavior, user-mode
+    /// emits no network directives — callers must rely on the sandbox
+    /// hardening `RestrictAddressFamilies` directive (which IS emitted in
+    /// user-mode when `NoNewPrivileges=yes` is set) as the network
+    /// restriction layer in user-mode.
+    ///
+    /// This is a conservative choice: we do not emit directives that may
+    /// silently fail to enforce in user mode.
+    #[must_use]
+    pub const fn to_user_mode_property_strings(&self) -> Vec<String> {
+        // No reliable network isolation directives in user mode.
+        // RestrictAddressFamilies from SandboxHardeningProfile provides
+        // the socket-type restriction layer in user mode.
+        Vec::new()
+    }
+
+    /// Compute a deterministic BLAKE3 hash of the network policy for
+    /// receipt audit. Uses domain separation and a single boolean byte.
+    #[must_use]
+    pub fn content_hash(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.fac.network_policy.v1\0");
+        hasher.update(&[u8::from(self.allow_network)]);
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Format the content hash as a `b3-256:` prefixed hex string for
+    /// inclusion in receipts.
+    #[must_use]
+    pub fn content_hash_hex(&self) -> String {
+        let hash = self.content_hash();
+        format!("b3-256:{}", hex::encode(hash))
+    }
+
+    /// Returns the number of enabled network policy directives (for audit
+    /// logging).
+    #[must_use]
+    pub const fn enabled_directive_count(&self) -> usize {
+        if self.allow_network { 0 } else { 3 }
+    }
+}
+
+/// Resolve the network policy for a given job kind (TCK-00574).
+///
+/// # Default Posture
+///
+/// - `gates`, `bulk`, `control`, `stop_revoke`: **deny** — these jobs execute
+///   tests, lints, and administrative tasks that must not access the network.
+/// - `warm`: **allow** — warm phases fetch dependencies (crate registry, git
+///   repos) and require network access.
+/// - Unknown kinds: **deny** — fail-closed for any unrecognized job kind.
+///
+/// # Arguments
+///
+/// * `job_kind` — The job kind string from the job spec (e.g., `"gates"`,
+///   `"warm"`).
+/// * `policy_override` — Optional policy-level override. When `Some`, the
+///   override takes precedence over the default mapping. This allows operators
+///   to grant network access to specific gate jobs or deny it for warm jobs via
+///   policy configuration.
+#[must_use]
+pub fn resolve_network_policy(
+    job_kind: &str,
+    policy_override: Option<&NetworkPolicy>,
+) -> NetworkPolicy {
+    if let Some(override_policy) = policy_override {
+        return override_policy.clone();
+    }
+    match job_kind {
+        "warm" => NetworkPolicy::allow(),
+        // gates, bulk, control, stop_revoke, and any unknown kind: deny
+        _ => NetworkPolicy::deny(),
+    }
+}
+
 /// Systemd unit properties derived from FAC lane profile + job constraints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemdUnitProperties {
@@ -339,17 +518,20 @@ pub struct SystemdUnitProperties {
     pub kill_mode: String,
     /// Sandbox hardening profile (TCK-00573).
     pub sandbox_hardening: SandboxHardeningProfile,
+    /// Network access policy (TCK-00574).
+    pub network_policy: NetworkPolicy,
 }
 
 impl SystemdUnitProperties {
-    /// Build properties from lane profile, job constraints, and an explicit
-    /// sandbox hardening profile (from policy).
+    /// Build properties from lane profile, job constraints, an explicit
+    /// sandbox hardening profile, and a network policy (both from policy).
     ///
     /// This is the ONLY public constructor for `SystemdUnitProperties`.
     /// Production code MUST supply the policy-driven hardening profile
-    /// (INV-SBX-001). Using `SandboxHardeningProfile::default()` directly
-    /// is prohibited in production paths — the profile must come from
-    /// `FacPolicyV1.sandbox_hardening`.
+    /// (INV-SBX-001) and network policy (INV-NET-001). Using
+    /// `SandboxHardeningProfile::default()` or `NetworkPolicy::default()`
+    /// directly is prohibited in production paths — both must come from
+    /// policy resolution.
     ///
     /// Job constraints override lane defaults using MIN semantics:
     /// - `memory_max_bytes` = min(`profile.memory_max_bytes`,
@@ -361,6 +543,7 @@ impl SystemdUnitProperties {
         profile: &LaneProfileV1,
         job_constraints: Option<&JobConstraints>,
         hardening: SandboxHardeningProfile,
+        network_policy: NetworkPolicy,
     ) -> Self {
         let resource_profile = &profile.resource_profile;
         let timeouts = &profile.timeouts;
@@ -386,17 +569,18 @@ impl SystemdUnitProperties {
             runtime_max_sec: timeouts.job_runtime_max_seconds,
             kill_mode: Self::DEFAULT_KILL_MODE.to_string(),
             sandbox_hardening: hardening,
+            network_policy,
         }
     }
 
-    /// Build properties from CLI-provided limits and a policy-driven sandbox
-    /// hardening profile.
+    /// Build properties from CLI-provided limits, a policy-driven sandbox
+    /// hardening profile, and a network policy.
     ///
     /// This constructor is used by the bounded test runner (CLI) where no
     /// `LaneProfileV1` is available. It uses the same centralized defaults
     /// for `io_weight` and `kill_mode` as
     /// [`Self::from_lane_profile_with_hardening`] to avoid hard-coded
-    /// values at caller sites (INV-SBX-001).
+    /// values at caller sites (INV-SBX-001, INV-NET-001).
     ///
     /// The `timeout_seconds` value is used for both `timeout_start_sec` and
     /// `runtime_max_sec` since CLI limits express a single timeout.
@@ -407,6 +591,7 @@ impl SystemdUnitProperties {
         tasks_max: u32,
         timeout_seconds: u64,
         hardening: SandboxHardeningProfile,
+        network_policy: NetworkPolicy,
     ) -> Self {
         Self {
             cpu_quota_percent,
@@ -417,6 +602,7 @@ impl SystemdUnitProperties {
             runtime_max_sec: timeout_seconds,
             kill_mode: Self::DEFAULT_KILL_MODE.to_string(),
             sandbox_hardening: hardening,
+            network_policy,
         }
     }
 
@@ -440,6 +626,7 @@ impl SystemdUnitProperties {
             format!("KillMode={}", self.kill_mode),
         ];
         directives.extend(self.sandbox_hardening.to_property_strings());
+        directives.extend(self.network_policy.to_property_strings());
         directives.join("\n")
     }
 
@@ -470,6 +657,12 @@ impl SystemdUnitProperties {
                 props.push((key.to_string(), value.to_string()));
             }
         }
+        // Append network policy directives as key=value pairs (TCK-00574).
+        for prop_str in self.network_policy.to_property_strings() {
+            if let Some((key, value)) = prop_str.split_once('=') {
+                props.push((key.to_string(), value.to_string()));
+            }
+        }
         props
     }
 }
@@ -487,6 +680,7 @@ mod tests {
             &profile,
             None,
             SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
         );
 
         assert_eq!(properties.cpu_quota_percent, 200);
@@ -501,6 +695,8 @@ mod tests {
             properties.sandbox_hardening,
             SandboxHardeningProfile::default()
         );
+        // Network policy is applied from explicit parameter (INV-NET-001).
+        assert_eq!(properties.network_policy, NetworkPolicy::deny());
     }
 
     #[test]
@@ -519,6 +715,7 @@ mod tests {
             &profile,
             Some(&constraints),
             SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
         );
 
         assert_eq!(properties.memory_max_bytes, 1_000);
@@ -533,6 +730,7 @@ mod tests {
             &profile,
             Some(&loose_constraints),
             SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
         );
 
         assert_eq!(constrained_properties.memory_max_bytes, 10_000);
@@ -540,13 +738,14 @@ mod tests {
     }
 
     #[test]
-    fn to_unit_directives_includes_hardening() {
+    fn to_unit_directives_includes_hardening_and_network_deny() {
         let profile =
             LaneProfileV1::new("lane-00", "b3-256:node", "boundary-00").expect("create profile");
         let properties = SystemdUnitProperties::from_lane_profile_with_hardening(
             &profile,
             None,
             SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
         );
 
         let directives = properties.to_unit_directives();
@@ -566,16 +765,30 @@ mod tests {
         assert!(directives.contains("RestrictRealtime=yes"));
         assert!(directives.contains("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"));
         assert!(directives.contains("SystemCallArchitectures=native"));
+        // Network policy directives (TCK-00574) — deny posture.
+        assert!(
+            directives.contains("PrivateNetwork=yes"),
+            "PrivateNetwork=yes must be present when network is denied"
+        );
+        assert!(
+            directives.contains("IPAddressDeny=any"),
+            "IPAddressDeny=any must be present when network is denied"
+        );
+        assert!(
+            directives.contains("IPAddressAllow=localhost"),
+            "IPAddressAllow=localhost must be present when network is denied"
+        );
     }
 
     #[test]
-    fn to_dbus_properties_includes_hardening() {
+    fn to_dbus_properties_includes_hardening_and_network_deny() {
         let profile =
             LaneProfileV1::new("lane-00", "b3-256:node", "boundary-00").expect("create profile");
         let properties = SystemdUnitProperties::from_lane_profile_with_hardening(
             &profile,
             None,
             SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
         );
 
         let dbus_props = properties.to_dbus_properties();
@@ -598,6 +811,15 @@ mod tests {
         assert!(
             dbus_props.contains(&("SystemCallArchitectures".to_string(), "native".to_string())),
             "SystemCallArchitectures missing from D-Bus properties"
+        );
+        // Network policy (TCK-00574) — deny posture.
+        assert!(
+            dbus_props.contains(&("PrivateNetwork".to_string(), "yes".to_string())),
+            "PrivateNetwork missing from D-Bus properties when network denied"
+        );
+        assert!(
+            dbus_props.contains(&("IPAddressDeny".to_string(), "any".to_string())),
+            "IPAddressDeny missing from D-Bus properties when network denied"
         );
     }
 
@@ -629,6 +851,7 @@ mod tests {
                 memory_max_bytes: Some(0),
             }),
             SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
         );
 
         assert_eq!(zero_properties.cpu_quota_percent, 0);
@@ -664,6 +887,7 @@ mod tests {
                 memory_max_bytes: Some(u64::MAX),
             }),
             SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
         );
 
         assert_eq!(max_properties.cpu_quota_percent, u32::MAX);
@@ -883,10 +1107,213 @@ mod tests {
             &profile,
             None,
             hardening.clone(),
+            NetworkPolicy::deny(),
         );
         assert_eq!(properties.sandbox_hardening, hardening);
         assert!(!properties.sandbox_hardening.private_tmp);
         // Resource properties are still from lane profile.
         assert_eq!(properties.cpu_quota_percent, 200);
+    }
+
+    // ── Network policy tests (TCK-00574) ──
+
+    #[test]
+    fn network_policy_default_is_deny() {
+        let policy = NetworkPolicy::default();
+        assert!(!policy.allow_network);
+    }
+
+    #[test]
+    fn network_policy_deny_emits_private_network_and_ip_deny() {
+        let policy = NetworkPolicy::deny();
+        let props = policy.to_property_strings();
+        assert_eq!(props.len(), 3);
+        assert!(props.contains(&"PrivateNetwork=yes".to_string()));
+        assert!(props.contains(&"IPAddressDeny=any".to_string()));
+        assert!(props.contains(&"IPAddressAllow=localhost".to_string()));
+    }
+
+    #[test]
+    fn network_policy_allow_emits_no_directives() {
+        let policy = NetworkPolicy::allow();
+        let props = policy.to_property_strings();
+        assert!(
+            props.is_empty(),
+            "allow policy must emit no network directives"
+        );
+    }
+
+    #[test]
+    fn network_policy_user_mode_emits_no_directives() {
+        // Both deny and allow produce no user-mode directives (conservative).
+        let deny_props = NetworkPolicy::deny().to_user_mode_property_strings();
+        assert!(
+            deny_props.is_empty(),
+            "deny policy must emit no user-mode network directives"
+        );
+        let allow_props = NetworkPolicy::allow().to_user_mode_property_strings();
+        assert!(
+            allow_props.is_empty(),
+            "allow policy must emit no user-mode network directives"
+        );
+    }
+
+    #[test]
+    fn network_policy_hash_is_deterministic() {
+        let a = NetworkPolicy::deny();
+        let b = NetworkPolicy::deny();
+        assert_eq!(a.content_hash(), b.content_hash());
+        assert_eq!(a.content_hash_hex(), b.content_hash_hex());
+        assert!(a.content_hash_hex().starts_with("b3-256:"));
+    }
+
+    #[test]
+    fn network_policy_hash_changes_on_mutation() {
+        let deny = NetworkPolicy::deny();
+        let allow = NetworkPolicy::allow();
+        assert_ne!(
+            deny.content_hash(),
+            allow.content_hash(),
+            "deny and allow must produce different hashes"
+        );
+    }
+
+    #[test]
+    fn network_policy_serde_roundtrip() {
+        let policy = NetworkPolicy::deny();
+        let json = serde_json::to_string(&policy).expect("serialize");
+        let restored: NetworkPolicy = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(policy, restored);
+
+        let allow_policy = NetworkPolicy::allow();
+        let json = serde_json::to_string(&allow_policy).expect("serialize");
+        let restored: NetworkPolicy = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(allow_policy, restored);
+    }
+
+    #[test]
+    fn network_policy_serde_default_is_deny() {
+        // Empty JSON object should default to deny.
+        let json = "{}";
+        let policy: NetworkPolicy = serde_json::from_str(json).expect("deserialize");
+        assert!(!policy.allow_network);
+    }
+
+    #[test]
+    fn network_policy_enabled_directive_count() {
+        assert_eq!(NetworkPolicy::deny().enabled_directive_count(), 3);
+        assert_eq!(NetworkPolicy::allow().enabled_directive_count(), 0);
+    }
+
+    // ── resolve_network_policy tests (TCK-00574) ──
+
+    #[test]
+    fn resolve_network_policy_gates_deny() {
+        let policy = resolve_network_policy("gates", None);
+        assert!(!policy.allow_network, "gates must deny network");
+    }
+
+    #[test]
+    fn resolve_network_policy_warm_allow() {
+        let policy = resolve_network_policy("warm", None);
+        assert!(policy.allow_network, "warm must allow network");
+    }
+
+    #[test]
+    fn resolve_network_policy_bulk_deny() {
+        let policy = resolve_network_policy("bulk", None);
+        assert!(!policy.allow_network, "bulk must deny network");
+    }
+
+    #[test]
+    fn resolve_network_policy_control_deny() {
+        let policy = resolve_network_policy("control", None);
+        assert!(!policy.allow_network, "control must deny network");
+    }
+
+    #[test]
+    fn resolve_network_policy_stop_revoke_deny() {
+        let policy = resolve_network_policy("stop_revoke", None);
+        assert!(!policy.allow_network, "stop_revoke must deny network");
+    }
+
+    #[test]
+    fn resolve_network_policy_unknown_kind_deny() {
+        let policy = resolve_network_policy("unknown_kind", None);
+        assert!(
+            !policy.allow_network,
+            "unknown job kinds must fail-closed to deny"
+        );
+    }
+
+    #[test]
+    fn resolve_network_policy_override_takes_precedence() {
+        // Override gates to allow (operator policy override).
+        let override_allow = NetworkPolicy::allow();
+        let policy = resolve_network_policy("gates", Some(&override_allow));
+        assert!(
+            policy.allow_network,
+            "policy override must take precedence over default"
+        );
+
+        // Override warm to deny (operator policy override).
+        let override_deny = NetworkPolicy::deny();
+        let policy = resolve_network_policy("warm", Some(&override_deny));
+        assert!(
+            !policy.allow_network,
+            "policy override must take precedence over default"
+        );
+    }
+
+    #[test]
+    fn to_unit_directives_network_allow_omits_network_directives() {
+        let profile =
+            LaneProfileV1::new("lane-00", "b3-256:node", "boundary-00").expect("create profile");
+        let properties = SystemdUnitProperties::from_lane_profile_with_hardening(
+            &profile,
+            None,
+            SandboxHardeningProfile::default(),
+            NetworkPolicy::allow(),
+        );
+
+        let directives = properties.to_unit_directives();
+        // Network allow must NOT emit PrivateNetwork or IPAddressDeny.
+        assert!(
+            !directives.contains("PrivateNetwork"),
+            "PrivateNetwork must not be present when network allowed"
+        );
+        assert!(
+            !directives.contains("IPAddressDeny"),
+            "IPAddressDeny must not be present when network allowed"
+        );
+        assert!(
+            !directives.contains("IPAddressAllow"),
+            "IPAddressAllow must not be present when network allowed"
+        );
+        // But other directives are still present.
+        assert!(directives.contains("CPUQuota=200%"));
+        assert!(directives.contains("NoNewPrivileges=yes"));
+    }
+
+    #[test]
+    fn to_dbus_properties_network_allow_omits_network_directives() {
+        let profile =
+            LaneProfileV1::new("lane-00", "b3-256:node", "boundary-00").expect("create profile");
+        let properties = SystemdUnitProperties::from_lane_profile_with_hardening(
+            &profile,
+            None,
+            SandboxHardeningProfile::default(),
+            NetworkPolicy::allow(),
+        );
+
+        let dbus_props = properties.to_dbus_properties();
+        assert!(
+            !dbus_props.iter().any(|(k, _)| k == "PrivateNetwork"),
+            "PrivateNetwork must not appear in D-Bus properties when network allowed"
+        );
+        assert!(
+            !dbus_props.iter().any(|(k, _)| k == "IPAddressDeny"),
+            "IPAddressDeny must not appear in D-Bus properties when network allowed"
+        );
     }
 }

@@ -706,12 +706,14 @@ user-mode and system-mode execution backends.
   - `runtime_max_sec` → `RuntimeMaxSec`
   - `kill_mode` → `KillMode` (default `control-group`)
   - `sandbox_hardening` → `SandboxHardeningProfile` (TCK-00573)
+  - `network_policy` → `NetworkPolicy` (TCK-00574)
 - Input binding:
-  - `from_lane_profile_with_hardening(&LaneProfileV1, Option<&JobConstraints>, SandboxHardeningProfile)` — primary constructor for lane-driven paths; requires explicit policy-driven hardening profile (INV-SBX-001)
-  - `from_cli_limits_with_hardening(cpu_quota_percent, memory_max_bytes, tasks_max, timeout_seconds, SandboxHardeningProfile)` — CLI-driven constructor for bounded test runner where no `LaneProfileV1` is available; uses centralized `DEFAULT_IO_WEIGHT` and `DEFAULT_KILL_MODE` constants shared with the lane constructor (INV-SBX-001)
+  - `from_lane_profile_with_hardening(&LaneProfileV1, Option<&JobConstraints>, SandboxHardeningProfile, NetworkPolicy)` — primary constructor for lane-driven paths; requires explicit policy-driven hardening and network policy profiles (INV-SBX-001, INV-NET-001)
+  - `from_cli_limits_with_hardening(cpu_quota_percent, memory_max_bytes, tasks_max, timeout_seconds, SandboxHardeningProfile, NetworkPolicy)` — CLI-driven constructor for bounded test runner where no `LaneProfileV1` is available; uses centralized `DEFAULT_IO_WEIGHT` and `DEFAULT_KILL_MODE` constants shared with the lane constructor (INV-SBX-001, INV-NET-001)
 - Override semantics:
   - `memory_max_bytes` and `test_timeout_seconds` use MIN(job, lane).
   - `sandbox_hardening` is policy-driven via `FacPolicyV1.sandbox_hardening` (TCK-00573).
+  - `network_policy` is resolved via `resolve_network_policy(job_kind, policy_override)` (TCK-00574).
 
 **Core type**: `SandboxHardeningProfile` (TCK-00573)
 
@@ -731,6 +733,29 @@ Systemd security directives for transient units. Policy-driven via
   Rejects duplicate entries in `restrict_address_families` via `HashSet`-based
   detection (TCK-00573 NIT-3).
 
+**Core type**: `NetworkPolicy` (TCK-00574)
+
+Network access control for systemd transient units. Default posture is
+fail-closed (deny all network). Policy-driven via
+`resolve_network_policy(job_kind, policy_override)`.
+
+- Directives (when `allow_network=false`): `PrivateNetwork=yes`,
+  `IPAddressDeny=any`, `IPAddressAllow=localhost`.
+- When `allow_network=true`: no network directives emitted (full access).
+- `content_hash()` / `content_hash_hex()`: Deterministic BLAKE3 hash with
+  domain separation `apm2.fac.network_policy.v1\0` for receipt audit binding.
+- `to_property_strings()`: Full network isolation for system-mode.
+- `to_user_mode_property_strings()`: Returns empty (no reliable user-mode
+  network enforcement available).
+- `enabled_directive_count()`: Returns 3 for deny, 0 for allow.
+
+**Resolver**: `resolve_network_policy(job_kind, policy_override) -> NetworkPolicy`
+
+Maps job kind to network policy with explicit override support:
+- `"warm"` → `NetworkPolicy::allow()` (needs network for fetching dependencies)
+- All other job kinds (gates, bulk, control, etc.) → `NetworkPolicy::deny()`
+- If `policy_override` is `Some`, it takes precedence over job-kind mapping.
+
 ### Security Invariants (TCK-00573)
 
 - [INV-SBX-001] All `SystemdUnitProperties` construction sites in production
@@ -745,6 +770,21 @@ Systemd security directives for transient units. Policy-driven via
 - [INV-SBX-003] Address families bounded by `MAX_ADDRESS_FAMILIES=16`.
 - [INV-SBX-004] Address families must be unique; `validate()` rejects
   duplicates with a diagnostic error identifying the offending index.
+
+### Security Invariants (TCK-00574)
+
+- [INV-NET-001] All `SystemdUnitProperties` construction sites pass an explicit
+  `NetworkPolicy` resolved via `resolve_network_policy(job_kind, ...)`. No
+  caller site may hard-code network access decisions.
+- [INV-NET-002] Default network posture is fail-closed: `NetworkPolicy::default()`
+  denies all network access (`allow_network=false`).
+- [INV-NET-003] Only `"warm"` job kind resolves to `NetworkPolicy::allow()`;
+  all other job kinds (gates, bulk, control, stop_revoke) default to deny.
+- [INV-NET-004] Network policy directives (`PrivateNetwork`, `IPAddressDeny`,
+  `IPAddressAllow`) are emitted in system-mode only; user-mode returns empty
+  (no reliable enforcement path).
+- [INV-NET-005] `FacPolicyV1.network_policy` field uses `#[serde(default)]`
+  for backward compatibility; missing field deserializes to deny-all.
 
 ## Rendering API
 

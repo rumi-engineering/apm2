@@ -1004,6 +1004,8 @@ fn build_pipeline_test_command(
     // so attestation binds to the actual policy-driven profile.
     let sandbox_hardening_hash = policy.sandbox_hardening.content_hash_hex();
 
+    // TCK-00574: Pipeline test (evidence gates) always deny network access.
+    let evidence_network_policy = apm2_core::fac::resolve_network_policy("gates", None);
     let bounded_spec = build_systemd_bounded_test_command(
         workspace_root,
         BoundedTestLimits {
@@ -1016,6 +1018,7 @@ fn build_pipeline_test_command(
         &build_nextest_command(),
         &test_env,
         policy.sandbox_hardening,
+        evidence_network_policy,
     )
     .map_err(|err| format!("bounded test runner unavailable for FAC pipeline: {err}"))?;
     test_env.extend(bounded_spec.environment);

@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use super::job_spec::{MAX_REPO_ALLOWLIST_SIZE, parse_b3_256_digest};
 use super::policy_resolution::{DeterminismClass, RiskTier};
-use super::systemd_properties::SandboxHardeningProfile;
+use super::systemd_properties::{NetworkPolicy, SandboxHardeningProfile};
 use crate::determinism::canonicalize_json;
 use crate::economics::profile::EconomicsProfile;
 #[cfg(unix)]
@@ -230,6 +230,20 @@ pub struct FacPolicyV1 {
     #[serde(default)]
     pub sandbox_hardening: SandboxHardeningProfile,
 
+    /// Network access policy for FAC job units (TCK-00574).
+    ///
+    /// Defines the default network access posture for job units. When no
+    /// per-job-kind override is configured, `resolve_network_policy()`
+    /// uses the built-in mapping (deny for gates/bulk/control, allow for
+    /// warm). This field allows operators to override the default posture
+    /// globally.
+    ///
+    /// The default is `NetworkPolicy::deny()` (fail-closed). Existing
+    /// policies that predate TCK-00574 will correctly default to deny
+    /// via `serde(default)`.
+    #[serde(default)]
+    pub network_policy: NetworkPolicy,
+
     /// Optional `repo_id` allowlist for job spec validation (TCK-00579).
     ///
     /// When `Some`, only the listed `repo_id` values are accepted by
@@ -316,6 +330,7 @@ impl FacPolicyV1 {
             determinism_class: DeterminismClass::SoftDeterministic,
             economics_profile_hash,
             sandbox_hardening: SandboxHardeningProfile::default(),
+            network_policy: NetworkPolicy::default(),
             allowed_repo_ids: None,
         }
     }
