@@ -675,7 +675,18 @@ fn emit_cancellation_receipt(
         .map_err(|e| format!("cannot build cancellation receipt: {e}"))?;
 
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
-    persist_content_addressed_receipt(&receipts_dir, &receipt)
+    let result = persist_content_addressed_receipt(&receipts_dir, &receipt)?;
+
+    // TCK-00576: Best-effort signed envelope alongside cancellation receipt.
+    if let Ok(signer) =
+        crate::commands::fac_key_material::load_or_generate_persistent_signer(fac_root)
+    {
+        let content_hash = apm2_core::fac::compute_job_receipt_content_hash(&receipt);
+        let envelope = apm2_core::fac::sign_receipt(&content_hash, &signer, "fac-cli");
+        let _ = apm2_core::fac::persist_signed_envelope(&receipts_dir, &envelope);
+    }
+
+    Ok(result)
 }
 
 /// Emits a non-terminal `CancellationRequested` receipt for a claimed job.
@@ -707,7 +718,19 @@ fn emit_cancellation_requested_receipt(
         .map_err(|e| format!("cannot build cancellation-requested receipt: {e}"))?;
 
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
-    persist_content_addressed_receipt(&receipts_dir, &receipt)
+    let result = persist_content_addressed_receipt(&receipts_dir, &receipt)?;
+
+    // TCK-00576: Best-effort signed envelope alongside cancellation-requested
+    // receipt.
+    if let Ok(signer) =
+        crate::commands::fac_key_material::load_or_generate_persistent_signer(fac_root)
+    {
+        let content_hash = apm2_core::fac::compute_job_receipt_content_hash(&receipt);
+        let envelope = apm2_core::fac::sign_receipt(&content_hash, &signer, "fac-cli");
+        let _ = apm2_core::fac::persist_signed_envelope(&receipts_dir, &envelope);
+    }
+
+    Ok(result)
 }
 
 // =============================================================================

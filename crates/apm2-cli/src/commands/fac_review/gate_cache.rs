@@ -3,6 +3,14 @@
 //! V2 stores one file per gate under:
 //! `~/.apm2/private/fac/gate_cache_v2/{sha}/{gate}.yaml`.
 //! Legacy v1 (`gate_cache/{sha}.yaml`) is read as best-effort fallback.
+//!
+//! # Signed Receipts (TCK-00576)
+//!
+//! Each `CachedGateResult` carries an optional Ed25519 signature over the
+//! canonical bytes of the receipt entry (domain-separated with
+//! `GATE_CACHE_RECEIPT:`).  In default mode, `check_reuse` requires a
+//! valid signature — unsigned or forged entries are rejected for cache
+//! reuse (fail-closed).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -12,6 +20,8 @@ use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use apm2_core::crypto::{Signer, VerifyingKey};
+use apm2_core::fac::{GATE_CACHE_RECEIPT_PREFIX, sign_with_domain, verify_with_domain};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +31,11 @@ use crate::commands::fac_permissions;
 
 const CACHE_SCHEMA_V2: &str = "apm2.fac.gate_result_receipt.v2";
 const MAX_CACHE_READ_BYTES: usize = 1_048_576;
+
+/// Maximum length of `signature_hex` and `signer_id` fields (TCK-00576).
+/// Ed25519 signature = 64 bytes = 128 hex chars; public key = 32 bytes = 64
+/// hex chars.  256 is generous but bounded.
+const MAX_SIG_FIELD_LENGTH: usize = 256;
 
 /// Result of a single cached gate execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +62,165 @@ pub struct CachedGateResult {
     /// the requested SHA rather than the latest file by mtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_path: Option<String>,
+    /// Hex-encoded Ed25519 signature over the canonical bytes of this entry
+    /// (TCK-00576).  Domain-separated with `GATE_CACHE_RECEIPT:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_hex: Option<String>,
+    /// Hex-encoded Ed25519 public key of the signer (TCK-00576).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_id: Option<String>,
+}
+
+impl CachedGateResult {
+    /// Returns deterministic canonical bytes for signing.
+    ///
+    /// Includes all fields that are semantically meaningful for cache reuse
+    /// decisions.  `signature_hex` and `signer_id` are excluded (they are
+    /// the authentication envelope, not the authenticated content).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    fn canonical_bytes(&self, sha: &str, gate_name: &str) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(512);
+
+        // SHA binding
+        buf.extend_from_slice(&(sha.len() as u32).to_be_bytes());
+        buf.extend_from_slice(sha.as_bytes());
+
+        // Gate name binding
+        buf.extend_from_slice(&(gate_name.len() as u32).to_be_bytes());
+        buf.extend_from_slice(gate_name.as_bytes());
+
+        // Status
+        buf.extend_from_slice(&(self.status.len() as u32).to_be_bytes());
+        buf.extend_from_slice(self.status.as_bytes());
+
+        // Duration
+        buf.extend_from_slice(&self.duration_secs.to_be_bytes());
+
+        // Completed at
+        buf.extend_from_slice(&(self.completed_at.len() as u32).to_be_bytes());
+        buf.extend_from_slice(self.completed_at.as_bytes());
+
+        // Attestation digest
+        Self::append_optional_string(&mut buf, self.attestation_digest.as_deref());
+
+        // Evidence log digest
+        Self::append_optional_string(&mut buf, self.evidence_log_digest.as_deref());
+
+        // Quick mode
+        match self.quick_mode {
+            Some(true) => buf.push(2u8),
+            Some(false) => buf.push(1u8),
+            None => buf.push(0u8),
+        }
+
+        // Log bundle hash
+        Self::append_optional_string(&mut buf, self.log_bundle_hash.as_deref());
+
+        // bytes_written
+        Self::append_optional_u64(&mut buf, self.bytes_written);
+
+        // bytes_total
+        Self::append_optional_u64(&mut buf, self.bytes_total);
+
+        // was_truncated
+        match self.was_truncated {
+            Some(true) => buf.push(2u8),
+            Some(false) => buf.push(1u8),
+            None => buf.push(0u8),
+        }
+
+        // log_path
+        Self::append_optional_string(&mut buf, self.log_path.as_deref());
+
+        buf
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn append_optional_string(buf: &mut Vec<u8>, value: Option<&str>) {
+        if let Some(s) = value {
+            buf.push(1u8);
+            buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        } else {
+            buf.push(0u8);
+        }
+    }
+
+    fn append_optional_u64(buf: &mut Vec<u8>, value: Option<u64>) {
+        if let Some(v) = value {
+            buf.push(1u8);
+            buf.extend_from_slice(&v.to_be_bytes());
+        } else {
+            buf.push(0u8);
+        }
+    }
+
+    /// Sign this entry using the given signer and context.
+    ///
+    /// Populates `signature_hex` and `signer_id` fields in-place.
+    pub fn sign(&mut self, signer: &Signer, sha: &str, gate_name: &str) {
+        let canonical = self.canonical_bytes(sha, gate_name);
+        let sig = sign_with_domain(signer, GATE_CACHE_RECEIPT_PREFIX, &canonical);
+        self.signature_hex = Some(hex::encode(sig.to_bytes()));
+        self.signer_id = Some(hex::encode(signer.verifying_key().to_bytes()));
+    }
+
+    /// Verify the signature on this entry against the expected verifying key.
+    ///
+    /// Returns `Ok(())` if the signature is valid and matches the expected
+    /// key.  Returns `Err` with a human-readable reason on any failure.
+    pub fn verify(
+        &self,
+        expected_key: &VerifyingKey,
+        sha: &str,
+        gate_name: &str,
+    ) -> Result<(), String> {
+        let sig_hex = self
+            .signature_hex
+            .as_deref()
+            .ok_or("missing signature_hex")?;
+        let signer_hex = self.signer_id.as_deref().ok_or("missing signer_id")?;
+
+        // Bound field lengths to prevent memory exhaustion on crafted input.
+        if sig_hex.len() > MAX_SIG_FIELD_LENGTH {
+            return Err("signature_hex exceeds maximum length".to_string());
+        }
+        if signer_hex.len() > MAX_SIG_FIELD_LENGTH {
+            return Err("signer_id exceeds maximum length".to_string());
+        }
+
+        // Verify signer_id matches expected key (constant-time comparison
+        // on the raw bytes after decode).
+        let signer_bytes =
+            hex::decode(signer_hex).map_err(|e| format!("invalid signer_id hex: {e}"))?;
+        let expected_bytes = expected_key.to_bytes();
+        if signer_bytes.len() != expected_bytes.len() {
+            return Err("signer_id length mismatch".to_string());
+        }
+        // Constant-time comparison to prevent timing side channels.
+        let eq: bool =
+            subtle::ConstantTimeEq::ct_eq(signer_bytes.as_slice(), expected_bytes.as_slice())
+                .into();
+        if !eq {
+            return Err("signer_id does not match expected verifying key".to_string());
+        }
+
+        // Decode and verify signature.
+        let sig_bytes =
+            hex::decode(sig_hex).map_err(|e| format!("invalid signature_hex hex: {e}"))?;
+        let signature = apm2_core::crypto::parse_signature(&sig_bytes)
+            .map_err(|e| format!("malformed signature: {e}"))?;
+
+        let canonical = self.canonical_bytes(sha, gate_name);
+        verify_with_domain(
+            expected_key,
+            GATE_CACHE_RECEIPT_PREFIX,
+            &canonical,
+            &signature,
+        )
+        .map_err(|_| "signature verification failed".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +507,14 @@ impl GateCache {
         Ok(())
     }
 
+    /// Sign all gate entries in this cache with the given signer (TCK-00576).
+    pub fn sign_all(&mut self, signer: &Signer) {
+        let sha = self.sha.clone();
+        for (gate_name, result) in &mut self.gates {
+            result.sign(signer, &sha, gate_name);
+        }
+    }
+
     /// Look up a single gate result.
     pub fn get(&self, gate: &str) -> Option<&CachedGateResult> {
         self.gates.get(gate)
@@ -364,6 +546,8 @@ impl GateCache {
                 bytes_total: None,
                 was_truncated: None,
                 log_path,
+                signature_hex: None,
+                signer_id: None,
             },
         );
     }
@@ -404,12 +588,19 @@ impl GateCache {
 
     /// Evaluate whether a cached gate result is safe to reuse.
     ///
+    /// In default mode, signature verification is mandatory: unsigned or
+    /// forged receipts are rejected (fail-closed, TCK-00576).
+    ///
+    /// `verifying_key` is the expected signer's public key.  Pass `None`
+    /// to skip signature verification (developer/test mode only).
+    ///
     /// `require_full_mode` should be true for normal push pipeline runs.
     pub fn check_reuse(
         &self,
         gate: &str,
         expected_attestation_digest: Option<&str>,
         require_full_mode: bool,
+        verifying_key: Option<&VerifyingKey>,
     ) -> ReuseDecision {
         if gate == MERGE_CONFLICT_GATE_NAME {
             return ReuseDecision::miss("policy_merge_conflict_recompute");
@@ -437,13 +628,56 @@ impl GateCache {
         {
             return ReuseDecision::miss("evidence_digest_missing");
         }
+
+        // TCK-00576: Signature verification gate (fail-closed in default mode).
+        if let Some(key) = verifying_key {
+            if let Err(_reason) = cached.verify(key, &self.sha, gate) {
+                return ReuseDecision::miss("signature_invalid");
+            }
+        } else {
+            // No verifying key provided: unsigned receipts cannot be reused
+            // in any mode.  Fail closed.
+            if cached.signature_hex.is_none() {
+                return ReuseDecision::miss("signature_missing");
+            }
+        }
+
         ReuseDecision::hit()
+    }
+
+    /// Verify a specific gate receipt against the expected verifying key.
+    ///
+    /// Returns `Ok(())` on success or `Err(reason)` on failure.
+    /// Used by the `apm2 fac receipts verify` CLI command.
+    #[allow(dead_code)]
+    pub fn verify_gate(&self, gate: &str, verifying_key: &VerifyingKey) -> Result<(), String> {
+        let cached = self
+            .get(gate)
+            .ok_or_else(|| format!("no cached result for gate '{gate}'"))?;
+        cached.verify(verifying_key, &self.sha, gate)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use apm2_core::crypto::Signer;
+
     use super::{GateCache, ReuseDecision};
+
+    fn make_signed_cache(signer: &Signer) -> GateCache {
+        let mut cache = GateCache::new("abc123");
+        cache.set_with_attestation(
+            "rustfmt",
+            true,
+            1,
+            Some("digest-1".to_string()),
+            false,
+            Some("log-digest".to_string()),
+            None,
+        );
+        cache.sign_all(signer);
+        cache
+    }
 
     #[test]
     fn test_gate_cache_new_is_empty() {
@@ -563,6 +797,44 @@ mod tests {
 
     #[test]
     fn test_reuse_decision_requires_attestation_and_log_digest() {
+        let signer = Signer::generate();
+        let cache = make_signed_cache(&signer);
+        let vk = signer.verifying_key();
+        assert_eq!(
+            cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk)),
+            ReuseDecision::hit()
+        );
+        assert_eq!(
+            cache
+                .check_reuse("rustfmt", Some("digest-2"), true, Some(&vk))
+                .reason,
+            "attestation_mismatch"
+        );
+        assert_eq!(
+            cache
+                .check_reuse("merge_conflict_main", Some("digest-1"), true, Some(&vk))
+                .reason,
+            "policy_merge_conflict_recompute"
+        );
+    }
+
+    // --- TCK-00576: Signed receipt verification tests ---
+
+    /// Signed receipt passes verification with the correct key.
+    #[test]
+    fn signed_receipt_valid_reuse() {
+        let signer = Signer::generate();
+        let cache = make_signed_cache(&signer);
+        let vk = signer.verifying_key();
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk));
+        assert!(reuse.reusable, "validly signed receipt must be reusable");
+        assert_eq!(reuse.reason, "attestation_match");
+    }
+
+    /// Unsigned receipt is rejected for cache reuse (fail-closed).
+    #[test]
+    fn unsigned_receipt_rejected_for_reuse() {
+        let signer = Signer::generate();
         let mut cache = GateCache::new("abc123");
         cache.set_with_attestation(
             "rustfmt",
@@ -573,19 +845,98 @@ mod tests {
             Some("log-digest".to_string()),
             None,
         );
-        assert_eq!(
-            cache.check_reuse("rustfmt", Some("digest-1"), true),
-            ReuseDecision::hit()
+        // Do NOT sign the cache.
+        let vk = signer.verifying_key();
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk));
+        assert!(!reuse.reusable, "unsigned receipt must NOT be reusable");
+        assert_eq!(reuse.reason, "signature_invalid");
+    }
+
+    /// Receipt signed with wrong key is rejected (forged receipt).
+    #[test]
+    fn forged_receipt_wrong_key_rejected() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let cache = make_signed_cache(&signer_a);
+        let vk_b = signer_b.verifying_key();
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk_b));
+        assert!(
+            !reuse.reusable,
+            "receipt signed with wrong key must NOT be reusable"
         );
-        assert_eq!(
-            cache.check_reuse("rustfmt", Some("digest-2"), true).reason,
-            "attestation_mismatch"
+        assert_eq!(reuse.reason, "signature_invalid");
+    }
+
+    /// Receipt with tampered payload is rejected.
+    #[test]
+    fn tampered_receipt_rejected() {
+        let signer = Signer::generate();
+        let mut cache = make_signed_cache(&signer);
+
+        // Tamper with the attestation digest after signing.
+        if let Some(entry) = cache.gates.get_mut("rustfmt") {
+            entry.attestation_digest = Some("tampered-digest".to_string());
+        }
+
+        let vk = signer.verifying_key();
+        // The attestation_digest now mismatches what check_reuse expects,
+        // so it will fail on attestation_mismatch first.
+        let reuse = cache.check_reuse("rustfmt", Some("tampered-digest"), true, Some(&vk));
+        assert!(!reuse.reusable, "tampered receipt must NOT be reusable");
+        // The signature was computed over original data; tampered data
+        // produces a different canonical_bytes, so signature fails.
+        assert_eq!(reuse.reason, "signature_invalid");
+    }
+
+    /// When no verifying key is provided, unsigned entries fail closed.
+    #[test]
+    fn no_verifying_key_unsigned_entry_fails_closed() {
+        let mut cache = GateCache::new("abc123");
+        cache.set_with_attestation(
+            "rustfmt",
+            true,
+            1,
+            Some("digest-1".to_string()),
+            false,
+            Some("log-digest".to_string()),
+            None,
         );
-        assert_eq!(
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, None);
+        assert!(
+            !reuse.reusable,
+            "unsigned receipt without verifying key must fail closed"
+        );
+        assert_eq!(reuse.reason, "signature_missing");
+    }
+
+    /// Verify roundtrip: sign, serialize to YAML, deserialize, verify.
+    #[test]
+    fn sign_serialize_deserialize_verify_roundtrip() {
+        let signer = Signer::generate();
+        let cache = make_signed_cache(&signer);
+
+        let yaml = serde_yaml::to_string(&cache).expect("serialize");
+        let restored: GateCache = serde_yaml::from_str(&yaml).expect("deserialize");
+
+        let vk = signer.verifying_key();
+        let reuse = restored.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk));
+        assert!(reuse.reusable, "signature must survive YAML roundtrip");
+    }
+
+    /// Direct `verify_gate` API works correctly.
+    #[test]
+    fn verify_gate_api() {
+        let signer = Signer::generate();
+        let cache = make_signed_cache(&signer);
+        let vk = signer.verifying_key();
+
+        assert!(cache.verify_gate("rustfmt", &vk).is_ok());
+
+        let other = Signer::generate();
+        assert!(
             cache
-                .check_reuse("merge_conflict_main", Some("digest-1"), true)
-                .reason,
-            "policy_merge_conflict_recompute"
+                .verify_gate("rustfmt", &other.verifying_key())
+                .is_err()
         );
     }
 
@@ -604,9 +955,6 @@ mod tests {
         let sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
         let mut cache = GateCache::new(sha);
 
-        // Simulate a cache entry created under old v1 semantics: the
-        // attestation digest was derived from HEAD:path (git blob) which
-        // could differ from actual file content in a dirty workspace.
         let dirty_v1_digest = "v1_dirty_git_blob_based_attestation_digest_abc123";
         cache.set_with_attestation(
             "rustfmt",
@@ -618,11 +966,8 @@ mod tests {
             None,
         );
 
-        // The pipeline now computes a v2 attestation digest using
-        // file_sha256 (actual file content) with v2 schema/domain in the
-        // root material. This will always differ from v1 digests.
         let clean_v2_digest = "v2_clean_file_sha256_based_attestation_digest_xyz789";
-        let reuse = cache.check_reuse("rustfmt", Some(clean_v2_digest), true);
+        let reuse = cache.check_reuse("rustfmt", Some(clean_v2_digest), true, None);
 
         assert!(
             !reuse.reusable,
@@ -649,7 +994,7 @@ mod tests {
             None,
         );
 
-        let reuse = cache.check_reuse("rustfmt", Some("any-digest"), true);
+        let reuse = cache.check_reuse("rustfmt", Some("any-digest"), true, None);
         assert!(
             !reuse.reusable,
             "cache entry without attestation digest must not be reusable"
@@ -676,7 +1021,7 @@ mod tests {
             None,
         );
 
-        let reuse = cache.check_reuse("rustfmt", Some("matching-digest"), true);
+        let reuse = cache.check_reuse("rustfmt", Some("matching-digest"), true, None);
         assert!(
             !reuse.reusable,
             "cache entry without evidence log digest must not be reusable"

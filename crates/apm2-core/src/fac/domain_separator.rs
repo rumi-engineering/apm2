@@ -165,6 +165,22 @@ pub const PROJECTION_REPLAY_RECEIPT_PREFIX: &[u8] = b"PROJECTION_REPLAY_RECEIPT:
 /// be accepted as proof of temporal binding.
 pub const PROJECTION_ADMISSION_RECEIPT_PREFIX: &[u8] = b"PROJECTION_ADMISSION_RECEIPT:";
 
+/// Domain prefix for signed receipt envelope signatures (TCK-00576).
+///
+/// Used when signing/verifying receipt payload digests in the
+/// `SignedReceiptEnvelopeV1` container. Distinct from `GATE_RECEIPT:`
+/// to prevent cross-type signature confusion: a gate receipt signature
+/// MUST NOT be accepted as proof of receipt envelope binding.
+pub const SIGNED_RECEIPT_ENVELOPE_PREFIX: &[u8] = b"SIGNED_RECEIPT_ENVELOPE:";
+
+/// Domain prefix for gate cache receipt entries (TCK-00576).
+///
+/// Used when signing/verifying per-SHA gate cache receipts.  These are
+/// the on-disk YAML files under `gate_cache_v2/{sha}/{gate}.yaml` that
+/// record gate execution outcomes.  Signing prevents forged or tampered
+/// receipts from being accepted for cache reuse in default mode.
+pub const GATE_CACHE_RECEIPT_PREFIX: &[u8] = b"GATE_CACHE_RECEIPT:";
+
 // =============================================================================
 // Domain-Separated Signing
 // =============================================================================
@@ -396,6 +412,8 @@ pub mod tests {
             REVIEW_RECEIPT_RECORDED_PREFIX,
             PROJECTION_RECEIPT_RECORDED_PREFIX,
             PROJECTION_ADMISSION_RECEIPT_PREFIX,
+            SIGNED_RECEIPT_ENVELOPE_PREFIX,
+            GATE_CACHE_RECEIPT_PREFIX,
         ];
 
         // All prefixes should be non-empty and end with ':'

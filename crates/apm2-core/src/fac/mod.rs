@@ -163,6 +163,7 @@ pub mod scheduler_state;
 pub mod sd_notify;
 pub mod selection_policy;
 pub mod serde_helpers;
+pub mod signed_receipt;
 mod systemd_properties;
 pub mod taint;
 mod terminal_verifier;
@@ -288,13 +289,14 @@ pub use determinism::{
 // Re-export domain separator constants and functions
 pub use domain_separator::{
     AAT_RESULT_REUSED_PREFIX, CHANGESET_PUBLISHED_PREFIX, CI_IMPORT_ATTESTATION_PREFIX,
-    GATE_LEASE_ISSUED_PREFIX, GATE_RECEIPT_PREFIX, GATE_RUN_COMPLETED_PREFIX,
-    INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX, LEASE_REVOKED_PREFIX,
-    LEDGER_EVENT_PREFIX, MERGE_RECEIPT_PREFIX, POLICY_RESOLVED_PREFIX,
+    GATE_CACHE_RECEIPT_PREFIX, GATE_LEASE_ISSUED_PREFIX, GATE_RECEIPT_PREFIX,
+    GATE_RUN_COMPLETED_PREFIX, INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX,
+    LEASE_REVOKED_PREFIX, LEDGER_EVENT_PREFIX, MERGE_RECEIPT_PREFIX, POLICY_RESOLVED_PREFIX,
     PROJECTION_ADMISSION_RECEIPT_PREFIX, PROJECTION_COMPROMISE_SIGNAL_PREFIX,
     PROJECTION_RECEIPT_PREFIX, PROJECTION_RECEIPT_RECORDED_PREFIX,
     PROJECTION_REPLAY_RECEIPT_PREFIX, QUARANTINE_EVENT_PREFIX, REVIEW_BLOCKED_RECORDED_PREFIX,
-    REVIEW_RECEIPT_RECORDED_PREFIX, sign_with_domain, verify_with_domain,
+    REVIEW_RECEIPT_RECORDED_PREFIX, SIGNED_RECEIPT_ENVELOPE_PREFIX, sign_with_domain,
+    verify_with_domain,
 };
 // Re-export echo-trap detection types
 pub use echo_trap::{
@@ -460,6 +462,13 @@ pub use selection_policy::{
     AatRequirement, DEFAULT_LOW_TIER_SAMPLE_RATE, MAX_DOMAIN_LENGTH, MAX_POLICY_ID_LENGTH,
     MAX_POLICY_SIZE, MAX_WORK_ID_LENGTH, SENSITIVE_DOMAINS, SelectionContext, SelectionPolicy,
     SelectionPolicyBuilder, SelectionPolicyError, TierConfig,
+};
+// Re-export signed receipt types (TCK-00576)
+pub use signed_receipt::{
+    MAX_SIGNED_ENVELOPE_SIZE, SIGNED_RECEIPT_ENVELOPE_SCHEMA, SIGNED_RECEIPT_PREFIX,
+    SignedReceiptEnvelopeV1, SignedReceiptError, deserialize_signed_envelope,
+    load_and_verify_receipt_signature, load_signed_envelope, persist_signed_envelope, sign_receipt,
+    signed_envelope_path, verify_receipt_signature,
 };
 pub use taint::{
     FlowRule, MAX_FLOW_RULES, MAX_POLICY_RULE_ID_LEN, MAX_SOURCE_DESCRIPTION_LEN, MAX_TAINT_TAGS,

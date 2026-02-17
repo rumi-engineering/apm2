@@ -648,6 +648,12 @@ pub enum ReceiptSubcommand {
     /// non-authoritative index used for fast job/receipt lookup.
     /// The index is a cache — this command is safe to run at any time.
     Reindex(ReceiptReindexArgs),
+    /// Verify a receipt's signed envelope (TCK-00576).
+    ///
+    /// Loads the signed receipt envelope for the given content hash and
+    /// verifies the Ed25519 signature against the persistent broker key.
+    /// Exits with 0 on success, non-zero on verification failure.
+    Verify(ReceiptVerifyArgs),
 }
 
 /// Arguments for `apm2 fac receipts show`.
@@ -696,6 +702,18 @@ pub struct ReceiptStatusArgs {
 /// Arguments for `apm2 fac receipts reindex`.
 #[derive(Debug, Args)]
 pub struct ReceiptReindexArgs {
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac receipts verify` (TCK-00576).
+#[derive(Debug, Args)]
+pub struct ReceiptVerifyArgs {
+    /// Receipt content hash (BLAKE3 hex, with or without `b3-256:` prefix)
+    /// or path to a `.sig.json` signed envelope file.
+    pub digest_or_path: String,
+
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -2287,6 +2305,9 @@ pub fn run_fac(
             ReceiptSubcommand::Reindex(reindex_args) => {
                 run_receipt_reindex(resolve_json(reindex_args.json))
             },
+            ReceiptSubcommand::Verify(verify_args) => {
+                run_receipt_verify(verify_args, resolve_json(verify_args.json))
+            },
         },
         FacSubcommand::Context(args) => match &args.subcommand {
             ContextSubcommand::Rebuild(rebuild_args) => run_context_rebuild(
@@ -3734,6 +3755,124 @@ fn run_receipt_reindex(json_output: bool) -> u8 {
             "index_rebuild_failed",
             &format!("failed to rebuild receipt index: {err}"),
             exit_codes::GENERIC_ERROR,
+        ),
+    }
+}
+
+// =============================================================================
+// Receipt Verify Command (TCK-00576)
+// =============================================================================
+
+/// Verify a receipt's signed envelope.
+///
+/// Loads the signed receipt envelope for the given content hash (or from the
+/// provided `.sig.json` file path) and verifies the Ed25519 signature against
+/// the persistent broker key. Returns exit code 0 on success, non-zero on
+/// verification failure.
+fn run_receipt_verify(args: &ReceiptVerifyArgs, json_output: bool) -> u8 {
+    let Some(apm2_home) = apm2_core::github::resolve_apm2_home() else {
+        return output_error(
+            json_output,
+            "apm2_home_not_found",
+            "Cannot resolve APM2_HOME for receipt store",
+            exit_codes::GENERIC_ERROR,
+        );
+    };
+
+    let fac_root = apm2_home.join("private").join("fac");
+    let receipts_dir = fac_root.join("receipts");
+
+    // Load signing key for verification.
+    let signer = match crate::commands::fac_key_material::load_persistent_signer(&fac_root) {
+        Ok(s) => s,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "signing_key_not_found",
+                &format!("Cannot load signing key for verification: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+    let verifying_key = signer.verifying_key();
+
+    // Determine whether the argument is a file path or a content hash.
+    let input = &args.digest_or_path;
+    let (envelope, content_hash) = if std::path::Path::new(input).is_file() {
+        // Path mode: read the file directly.
+        let data = match std::fs::read(input) {
+            Ok(d) => d,
+            Err(e) => {
+                return output_error(
+                    json_output,
+                    "io_error",
+                    &format!("Cannot read file {input}: {e}"),
+                    exit_codes::GENERIC_ERROR,
+                );
+            },
+        };
+        match apm2_core::fac::deserialize_signed_envelope(&data) {
+            Ok(env) => {
+                let digest = env.payload_digest.clone();
+                (env, digest)
+            },
+            Err(e) => {
+                return output_error(
+                    json_output,
+                    "envelope_parse_error",
+                    &format!("Cannot parse signed envelope: {e}"),
+                    exit_codes::VALIDATION_ERROR,
+                );
+            },
+        }
+    } else {
+        // Digest mode: normalize and load from receipts directory.
+        let normalized = if input.starts_with("b3-256:") {
+            input.clone()
+        } else {
+            format!("b3-256:{input}")
+        };
+        match apm2_core::fac::load_signed_envelope(&receipts_dir, &normalized) {
+            Ok(env) => (env, normalized),
+            Err(e) => {
+                return output_error(
+                    json_output,
+                    "envelope_not_found",
+                    &format!("Cannot load signed envelope for {input}: {e}"),
+                    exit_codes::NOT_FOUND,
+                );
+            },
+        }
+    };
+
+    // Verify the signature.
+    match apm2_core::fac::verify_receipt_signature(&envelope, &content_hash, &verifying_key) {
+        Ok(()) => {
+            if json_output {
+                let result = serde_json::json!({
+                    "status": "ok",
+                    "verified": true,
+                    "payload_digest": envelope.payload_digest,
+                    "signer_id": envelope.signer_id,
+                    "signer_public_key_hex": envelope.signer_public_key_hex,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_default()
+                );
+            } else {
+                println!(
+                    "receipt signature verified: digest={} signer={}",
+                    envelope.payload_digest, envelope.signer_id
+                );
+            }
+            exit_codes::SUCCESS
+        },
+        Err(e) => output_error(
+            json_output,
+            "verification_failed",
+            &format!("Signature verification failed: {e}"),
+            exit_codes::VALIDATION_ERROR,
         ),
     }
 }
@@ -6684,6 +6823,31 @@ mod tests {
             FacSubcommand::Receipts(args) => match args.subcommand {
                 ReceiptSubcommand::Reindex(reindex_args) => assert!(reindex_args.json),
                 other => panic!("expected receipts reindex subcommand, got {other:?}"),
+            },
+            other => panic!("expected receipts command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_receipts_verify_json_flag_parses() {
+        let verify = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "receipts",
+            "verify",
+            "b3-256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "--json",
+        ])
+        .expect("receipts verify --json should parse");
+        match verify.subcommand {
+            FacSubcommand::Receipts(args) => match args.subcommand {
+                ReceiptSubcommand::Verify(verify_args) => {
+                    assert!(verify_args.json);
+                    assert_eq!(
+                        verify_args.digest_or_path,
+                        "b3-256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                    );
+                },
+                other => panic!("expected receipts verify subcommand, got {other:?}"),
             },
             other => panic!("expected receipts command, got {other:?}"),
         }

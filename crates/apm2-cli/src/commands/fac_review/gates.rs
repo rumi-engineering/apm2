@@ -1088,6 +1088,16 @@ fn run_gates_inner(
                 result.log_path.as_ref().and_then(|p| p.to_str()),
             );
         }
+
+        // TCK-00576: Sign all gate cache entries before persisting.
+        // The persistent signer is loaded (or generated on first use) from
+        // the FAC root.  Signing ensures unsigned or forged cache entries
+        // are rejected on reuse (fail-closed).
+        let signer =
+            crate::commands::fac_key_material::load_or_generate_persistent_signer(&fac_root)
+                .map_err(|e| format!("cannot load signing key for gate cache: {e}"))?;
+        cache.sign_all(&signer);
+
         cache.save()?;
     }
 

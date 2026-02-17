@@ -305,10 +305,11 @@ fn reuse_decision_for_gate(
     cache: Option<&GateCache>,
     gate_name: &str,
     attestation_digest: Option<&str>,
+    verifying_key: Option<&apm2_core::crypto::VerifyingKey>,
 ) -> ReuseDecision {
     cache.map_or_else(
         || ReuseDecision::miss("no_record"),
-        |cached| cached.check_reuse(gate_name, attestation_digest, true),
+        |cached| cached.check_reuse(gate_name, attestation_digest, true, verifying_key),
     )
 }
 
@@ -1276,6 +1277,7 @@ fn finalize_status_gate_run(
     gate_cache: &mut GateCache,
     updater: &PrBodyStatusUpdater,
     status: &CiStatus,
+    signer: &apm2_core::crypto::Signer,
 ) -> Result<(), String> {
     attach_log_bundle_hash(gate_results, logs_dir)?;
 
@@ -1295,6 +1297,9 @@ fn finalize_status_gate_run(
 
     // Force a final update to ensure all gate results are posted.
     updater.force_update(status);
+
+    // TCK-00576: Sign all gate cache entries before persisting.
+    gate_cache.sign_all(signer);
 
     // Persist gate cache so future pipeline runs can reuse results.
     gate_cache
@@ -1796,6 +1801,17 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     let mut status = CiStatus::new(sha, pr_number);
     let updater = PrBodyStatusUpdater::new(owner_repo, pr_number);
 
+    // TCK-00576: Load the persistent signer for gate cache signature
+    // verification (reuse decisions) and signing (new cache entries).
+    let fac_signer = {
+        let apm2_home = apm2_core::github::resolve_apm2_home()
+            .ok_or_else(|| "cannot resolve APM2_HOME for gate cache signing".to_string())?;
+        let fac_root = apm2_home.join("private/fac");
+        crate::commands::fac_key_material::load_or_generate_persistent_signer(&fac_root)
+            .map_err(|e| format!("cannot load signing key for gate cache: {e}"))?
+    };
+    let fac_verifying_key = fac_signer.verifying_key();
+
     // Load attested gate cache for this SHA (typically populated by `fac gates`).
     let cache = GateCache::load(sha);
     let mut gate_cache = GateCache::new(sha);
@@ -1895,6 +1911,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 &mut gate_cache,
                 &updater,
                 &status,
+                &fac_signer,
             )?;
             return Ok((false, gate_results));
         }
@@ -1905,8 +1922,12 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
         let log_path = logs_dir.join(format!("{gate_name}.log"));
-        let reuse =
-            reuse_decision_for_gate(cache.as_ref(), gate_name, attestation_digest.as_deref());
+        let reuse = reuse_decision_for_gate(
+            cache.as_ref(),
+            gate_name,
+            attestation_digest.as_deref(),
+            Some(&fac_verifying_key),
+        );
         if reuse.reusable {
             if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
                 emit_gate_started_cb(on_gate_progress, gate_name);
@@ -1991,6 +2012,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 &mut gate_cache,
                 &updater,
                 &status,
+                &fac_signer,
             )?;
             return Ok((false, gate_results));
         }
@@ -2064,6 +2086,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 &mut gate_cache,
                 &updater,
                 &status,
+                &fac_signer,
             )?;
             return Ok((false, gate_results));
         }
@@ -2074,8 +2097,12 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         let log_path = logs_dir.join(format!("{gate_name}.log"));
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
-        let reuse =
-            reuse_decision_for_gate(cache.as_ref(), gate_name, attestation_digest.as_deref());
+        let reuse = reuse_decision_for_gate(
+            cache.as_ref(),
+            gate_name,
+            attestation_digest.as_deref(),
+            Some(&fac_verifying_key),
+        );
         if reuse.reusable {
             if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
                 emit_gate_started_cb(on_gate_progress, gate_name);
@@ -2160,6 +2187,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 &mut gate_cache,
                 &updater,
                 &status,
+                &fac_signer,
             )?;
             return Ok((false, gate_results));
         }
@@ -2223,6 +2251,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 &mut gate_cache,
                 &updater,
                 &status,
+                &fac_signer,
             )?;
             return Ok((false, gate_results));
         }
@@ -2240,8 +2269,12 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             Some(pipeline_test_command.command.as_slice()),
             &policy,
         );
-        let reuse =
-            reuse_decision_for_gate(cache.as_ref(), gate_name, attestation_digest.as_deref());
+        let reuse = reuse_decision_for_gate(
+            cache.as_ref(),
+            gate_name,
+            attestation_digest.as_deref(),
+            Some(&fac_verifying_key),
+        );
         let log_path = logs_dir.join("test.log");
         emit_gate_started_cb(on_gate_progress, gate_name);
         status.set_running(gate_name);
@@ -2323,6 +2356,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     &mut gate_cache,
                     &updater,
                     &status,
+                    &fac_signer,
                 )?;
                 return Ok((false, gate_results));
             }
@@ -2401,6 +2435,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     &mut gate_cache,
                     &updater,
                     &status,
+                    &fac_signer,
                 )?;
                 return Ok((false, gate_results));
             }
@@ -2411,8 +2446,12 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         let gate_name = "workspace_integrity";
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
-        let reuse =
-            reuse_decision_for_gate(cache.as_ref(), gate_name, attestation_digest.as_deref());
+        let reuse = reuse_decision_for_gate(
+            cache.as_ref(),
+            gate_name,
+            attestation_digest.as_deref(),
+            Some(&fac_verifying_key),
+        );
         let log_path = logs_dir.join("workspace_integrity.log");
         emit_gate_started_cb(on_gate_progress, gate_name);
         status.set_running(gate_name);
@@ -2494,6 +2533,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     &mut gate_cache,
                     &updater,
                     &status,
+                    &fac_signer,
                 )?;
                 return Ok((false, gate_results));
             }
@@ -2535,6 +2575,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     &mut gate_cache,
                     &updater,
                     &status,
+                    &fac_signer,
                 )?;
                 return Ok((false, gate_results));
             }
@@ -2546,8 +2587,12 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         let log_path = logs_dir.join(format!("{gate_name}.log"));
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
-        let reuse =
-            reuse_decision_for_gate(cache.as_ref(), gate_name, attestation_digest.as_deref());
+        let reuse = reuse_decision_for_gate(
+            cache.as_ref(),
+            gate_name,
+            attestation_digest.as_deref(),
+            Some(&fac_verifying_key),
+        );
         if reuse.reusable {
             if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
                 emit_gate_started_cb(on_gate_progress, gate_name);
@@ -2632,6 +2677,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 &mut gate_cache,
                 &updater,
                 &status,
+                &fac_signer,
             )?;
             return Ok((false, gate_results));
         }
@@ -2694,6 +2740,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 &mut gate_cache,
                 &updater,
                 &status,
+                &fac_signer,
             )?;
             return Ok((false, gate_results));
         }
@@ -2706,6 +2753,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         &mut gate_cache,
         &updater,
         &status,
+        &fac_signer,
     )?;
     Ok((true, gate_results))
 }

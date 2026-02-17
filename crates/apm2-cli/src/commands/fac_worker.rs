@@ -4090,9 +4090,8 @@ fn handle_stop_revoke(
             },
         };
 
-        if let Err(e) =
-            persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
-        {
+        let receipts_dir_sr = fac_root.join(FAC_RECEIPTS_DIR);
+        if let Err(e) = persist_content_addressed_receipt(&receipts_dir_sr, &receipt) {
             // Fail-closed: cannot persist receipt -> deny stop_revoke.
             let deny_reason = format!(
                 "stop_revoke failed: cannot persist cancellation receipt for target {target_job_id}: {e}"
@@ -4129,6 +4128,17 @@ fn handle_stop_revoke(
             return JobOutcome::Denied {
                 reason: deny_reason,
             };
+        }
+        // TCK-00576: Best-effort signed envelope alongside cancellation receipt.
+        if let Ok(signer) = fac_key_material::load_or_generate_persistent_signer(fac_root) {
+            let content_hash = apm2_core::fac::compute_job_receipt_content_hash(&receipt);
+            let envelope = apm2_core::fac::sign_receipt(&content_hash, &signer, "fac-worker");
+            if let Err(e) = apm2_core::fac::persist_signed_envelope(&receipts_dir_sr, &envelope) {
+                tracing::warn!(
+                    error = %e,
+                    "signed cancellation receipt envelope failed (non-fatal)"
+                );
+            }
         }
     }
 
@@ -5117,7 +5127,19 @@ fn emit_scan_receipt(
         .try_build()
         .map_err(|e| format!("cannot build scan receipt: {e}"))?;
 
-    persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
+    let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
+    let result = persist_content_addressed_receipt(&receipts_dir, &receipt)?;
+
+    // TCK-00576: Best-effort signed envelope alongside scan receipt.
+    if let Ok(signer) = fac_key_material::load_or_generate_persistent_signer(fac_root) {
+        let content_hash = apm2_core::fac::compute_job_receipt_content_hash(&receipt);
+        let envelope = apm2_core::fac::sign_receipt(&content_hash, &signer, "fac-worker");
+        if let Err(e) = apm2_core::fac::persist_signed_envelope(&receipts_dir, &envelope) {
+            tracing::warn!(error = %e, "signed scan receipt envelope failed (non-fatal)");
+        }
+    }
+
+    Ok(result)
 }
 
 fn emit_lane_cleanup_receipt(
@@ -5360,7 +5382,19 @@ fn emit_job_receipt_internal(
         observed_cost,
         sandbox_hardening_hash,
     )?;
-    persist_content_addressed_receipt(&fac_root.join(FAC_RECEIPTS_DIR), &receipt)
+    let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
+    let result = persist_content_addressed_receipt(&receipts_dir, &receipt)?;
+
+    // TCK-00576: Best-effort signed envelope alongside receipt.
+    if let Ok(signer) = fac_key_material::load_or_generate_persistent_signer(fac_root) {
+        let content_hash = apm2_core::fac::compute_job_receipt_content_hash(&receipt);
+        let envelope = apm2_core::fac::sign_receipt(&content_hash, &signer, "fac-worker");
+        if let Err(e) = apm2_core::fac::persist_signed_envelope(&receipts_dir, &envelope) {
+            tracing::warn!(error = %e, "signed envelope persistence failed (non-fatal)");
+        }
+    }
+
+    Ok(result)
 }
 
 /// Commit a claimed job through the `ReceiptWritePipeline`: persist receipt,
@@ -5417,7 +5451,28 @@ fn commit_claimed_job_via_pipeline(
     let pipeline =
         ReceiptWritePipeline::new(fac_root.join(FAC_RECEIPTS_DIR), queue_root.to_path_buf());
 
-    let result = pipeline.commit(&receipt, claimed_path, claimed_file_name, terminal_state)?;
+    // TCK-00576: Attempt signed commit using the persistent broker key.
+    // If the signing key is available, persist a signed receipt envelope
+    // alongside the receipt. If key loading fails, fall back to unsigned
+    // commit (the receipt is still valid but will be treated as unsigned
+    // for cache-reuse decisions, which is fail-closed).
+    let result = match fac_key_material::load_or_generate_persistent_signer(fac_root) {
+        Ok(signer) => pipeline.commit_signed(
+            &receipt,
+            claimed_path,
+            claimed_file_name,
+            terminal_state,
+            &signer,
+            "fac-worker",
+        )?,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "cannot load signing key for receipt signing (falling back to unsigned)"
+            );
+            pipeline.commit(&receipt, claimed_path, claimed_file_name, terminal_state)?
+        },
+    };
 
     Ok(result.job_terminal_path)
 }

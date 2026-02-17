@@ -61,6 +61,7 @@ use super::receipt::{
     FacJobReceiptV1, compute_job_receipt_content_hash, persist_content_addressed_receipt,
 };
 use super::receipt_index::ReceiptIndexV1;
+use super::signed_receipt::{persist_signed_envelope, sign_receipt};
 
 // =============================================================================
 // Constants
@@ -493,6 +494,78 @@ impl ReceiptWritePipeline {
         // Step 2: Update receipt index (best-effort, non-authoritative).
         // Index failure does not block the commit. On failure, delete the
         // stale index to force rebuild on next read.
+        if let Err(e) = ReceiptIndexV1::incremental_update(&self.receipts_dir, receipt) {
+            tracing::warn!(error = %e, "receipt pipeline index update failed");
+            let index_path = ReceiptIndexV1::index_path(&self.receipts_dir);
+            let _ = std::fs::remove_file(&index_path);
+        }
+
+        // Step 3: Move job file to terminal directory (commit point).
+        let dest_dir = self.queue_root.join(terminal_state.dir_name());
+        let job_terminal_path =
+            move_job_to_terminal(claimed_path, &dest_dir, file_name).map_err(|reason| {
+                ReceiptPipelineError::TornState {
+                    job_id: receipt.job_id.clone(),
+                    receipt_path: receipt_path.clone(),
+                    reason,
+                }
+            })?;
+
+        Ok(CommitResult {
+            receipt_path,
+            content_hash,
+            job_terminal_path,
+        })
+    }
+
+    /// Execute the atomic commit protocol with receipt signing (TCK-00576).
+    ///
+    /// Identical to [`commit`](Self::commit) but additionally persists a
+    /// `SignedReceiptEnvelopeV1` alongside the receipt. The signed envelope
+    /// binds the receipt's content hash to the broker's Ed25519 key, so
+    /// forged or unsigned receipts are rejected on cache reuse.
+    ///
+    /// Signing occurs between step 1 (receipt persistence) and step 3
+    /// (job move). If envelope persistence fails, the commit continues
+    /// (the receipt is still valid) but a warning is logged -- downstream
+    /// verification will treat the missing envelope as fail-closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReceiptPipelineError`] for the same reasons as `commit`.
+    /// Signed envelope persistence failures are non-fatal warnings.
+    pub fn commit_signed(
+        &self,
+        receipt: &FacJobReceiptV1,
+        claimed_path: &Path,
+        file_name: &str,
+        terminal_state: TerminalState,
+        signer: &crate::crypto::Signer,
+        signer_id: &str,
+    ) -> Result<CommitResult, ReceiptPipelineError> {
+        // Validate file_name confinement before any mutation (CTR-1504).
+        validate_file_name(file_name)?;
+
+        // Step 1: Persist the receipt (content-addressed, idempotent).
+        let receipt_path = persist_content_addressed_receipt(&self.receipts_dir, receipt)
+            .map_err(ReceiptPipelineError::ReceiptPersistFailed)?;
+
+        let content_hash = compute_job_receipt_content_hash(receipt);
+
+        // Step 1b (TCK-00576): Persist signed envelope alongside receipt.
+        // Non-fatal: if signing fails, the receipt is still valid but
+        // downstream verification will treat the missing envelope as
+        // fail-closed (no cache reuse for unsigned receipts).
+        let envelope = sign_receipt(&content_hash, signer, signer_id);
+        if let Err(e) = persist_signed_envelope(&self.receipts_dir, &envelope) {
+            tracing::warn!(
+                error = %e,
+                content_hash = %content_hash,
+                "signed receipt envelope persistence failed (non-fatal)"
+            );
+        }
+
+        // Step 2: Update receipt index (best-effort, non-authoritative).
         if let Err(e) = ReceiptIndexV1::incremental_update(&self.receipts_dir, receipt) {
             tracing::warn!(error = %e, "receipt pipeline index update failed");
             let index_path = ReceiptIndexV1::index_path(&self.receipts_dir);
@@ -2237,5 +2310,92 @@ mod tests {
         assert_eq!(truncate_to_byte_budget(emoji, 7), "\u{1F600}");
         assert_eq!(truncate_to_byte_budget(emoji, 4), "\u{1F600}");
         assert_eq!(truncate_to_byte_budget(emoji, 3), "");
+    }
+
+    // =========================================================================
+    // TCK-00576: commit_signed tests
+    // =========================================================================
+
+    #[test]
+    fn test_commit_signed_persists_signed_envelope() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        let queue_root = tmp.path().join("queue");
+        let claimed_path = setup_claimed_job(&queue_root, "job-signed");
+
+        let signer = crate::crypto::Signer::generate();
+        let pipeline = ReceiptWritePipeline::new(receipts_dir.clone(), queue_root);
+        let receipt = make_receipt("job-signed", FacJobOutcome::Completed);
+
+        let result = pipeline
+            .commit_signed(
+                &receipt,
+                &claimed_path,
+                "job-signed.json",
+                TerminalState::Completed,
+                &signer,
+                "test-broker",
+            )
+            .expect("commit_signed should succeed");
+
+        // Receipt file must exist.
+        assert!(result.receipt_path.exists(), "receipt file must exist");
+
+        // Job must be in completed/.
+        assert!(
+            result.job_terminal_path.exists(),
+            "job must be in completed/"
+        );
+
+        // Signed envelope must exist alongside the receipt.
+        let sig_path =
+            crate::fac::signed_receipt::signed_envelope_path(&receipts_dir, &result.content_hash);
+        assert!(
+            sig_path.exists(),
+            "signed envelope must exist at {sig_path:?}"
+        );
+
+        // Signed envelope must verify against the signer's key.
+        let verified = crate::fac::signed_receipt::load_and_verify_receipt_signature(
+            &receipts_dir,
+            &result.content_hash,
+            &signer.verifying_key(),
+        );
+        assert!(
+            verified.is_ok(),
+            "signed envelope must verify: {verified:?}"
+        );
+    }
+
+    #[test]
+    fn test_commit_signed_wrong_key_fails_verification() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        let queue_root = tmp.path().join("queue");
+        let claimed_path = setup_claimed_job(&queue_root, "job-sig-wrong");
+
+        let signer = crate::crypto::Signer::generate();
+        let other_signer = crate::crypto::Signer::generate();
+        let pipeline = ReceiptWritePipeline::new(receipts_dir.clone(), queue_root);
+        let receipt = make_receipt("job-sig-wrong", FacJobOutcome::Completed);
+
+        let result = pipeline
+            .commit_signed(
+                &receipt,
+                &claimed_path,
+                "job-sig-wrong.json",
+                TerminalState::Completed,
+                &signer,
+                "test-broker",
+            )
+            .expect("commit_signed should succeed");
+
+        // Verification with the wrong key must fail.
+        let verify_result = crate::fac::signed_receipt::load_and_verify_receipt_signature(
+            &receipts_dir,
+            &result.content_hash,
+            &other_signer.verifying_key(),
+        );
+        assert!(verify_result.is_err(), "wrong key must fail verification");
     }
 }

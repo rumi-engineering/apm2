@@ -301,6 +301,17 @@ pub enum EvidenceBundleError {
         /// `import`).
         operation: String,
     },
+
+    /// Receipt signature verification failed during import (TCK-00576).
+    ///
+    /// Fail-closed: evidence bundle import requires a valid signed receipt
+    /// envelope. This prevents forged or unsigned receipts from being
+    /// accepted as legitimate evidence.
+    #[error("receipt signature verification failed: {detail}")]
+    SignatureVerificationFailed {
+        /// Human-readable detail of the verification failure.
+        detail: String,
+    },
 }
 
 // =============================================================================
@@ -574,6 +585,61 @@ pub fn import_evidence_bundle(
 
     // INV-EB-002: RFC-0029 economics receipt validation.
     validate_economics_traces(&envelope)?;
+
+    Ok(envelope)
+}
+
+/// Import and validate an evidence bundle envelope with receipt signature
+/// verification (TCK-00576).
+///
+/// This function performs all validations from [`import_evidence_bundle`] and
+/// additionally verifies the receipt's signed envelope against the provided
+/// verifying key. This is the fail-closed import path: unsigned or forged
+/// receipts are rejected.
+///
+/// # Errors
+///
+/// Returns `EvidenceBundleError` for any validation failure, including
+/// `SignatureVerificationFailed` if the receipt signature is missing,
+/// malformed, or does not verify against the provided key.
+pub fn import_evidence_bundle_verified(
+    data: &[u8],
+    verifying_key: &crate::crypto::VerifyingKey,
+    receipts_dir: Option<&std::path::Path>,
+) -> Result<EvidenceBundleEnvelopeV1, EvidenceBundleError> {
+    // Perform standard import validation first.
+    let envelope = import_evidence_bundle(data)?;
+
+    // TCK-00576: Verify receipt signature.
+    // The receipt's content_hash in the envelope is the binding point.
+    let receipt_content_hash = &envelope.receipt.content_hash;
+
+    // Try to load the signed envelope from the receipts directory if provided.
+    // Otherwise, construct the expected content hash and verify against it.
+    if let Some(receipts_dir) = receipts_dir {
+        match super::signed_receipt::load_and_verify_receipt_signature(
+            receipts_dir,
+            receipt_content_hash,
+            verifying_key,
+        ) {
+            Ok(_) => {},
+            Err(e) => {
+                return Err(EvidenceBundleError::SignatureVerificationFailed {
+                    detail: format!(
+                        "receipt {receipt_content_hash} signature verification failed: {e}"
+                    ),
+                });
+            },
+        }
+    } else {
+        // No receipts directory provided: fail-closed. We cannot verify
+        // without the signed envelope.
+        return Err(EvidenceBundleError::SignatureVerificationFailed {
+            detail: format!(
+                "no receipts directory provided for signature verification of {receipt_content_hash}"
+            ),
+        });
+    }
 
     Ok(envelope)
 }
@@ -3120,6 +3186,118 @@ pub mod tests {
         assert_ne!(
             m1.content_hash, m2.content_hash,
             "different envelopes should produce different manifest hashes"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00576: import_evidence_bundle_verified tests
+    // =========================================================================
+
+    #[test]
+    fn test_import_verified_rejects_missing_receipts_dir() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("build envelope");
+        let data = serde_json::to_vec(&envelope).expect("serialize");
+
+        let signer = crate::crypto::Signer::generate();
+        let vk = signer.verifying_key();
+
+        // No receipts_dir provided: fail-closed.
+        let result = import_evidence_bundle_verified(&data, &vk, None);
+        assert!(
+            matches!(
+                result,
+                Err(EvidenceBundleError::SignatureVerificationFailed { .. })
+            ),
+            "missing receipts_dir must fail: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_import_verified_rejects_unsigned_receipt() {
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("build envelope");
+        let data = serde_json::to_vec(&envelope).expect("serialize");
+
+        let signer = crate::crypto::Signer::generate();
+        let vk = signer.verifying_key();
+
+        // Create receipts dir but do NOT persist a signed envelope.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let result = import_evidence_bundle_verified(&data, &vk, Some(tmp.path()));
+        assert!(
+            matches!(
+                result,
+                Err(EvidenceBundleError::SignatureVerificationFailed { .. })
+            ),
+            "unsigned receipt must fail: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_import_verified_accepts_signed_receipt() {
+        let mut receipt = make_valid_receipt();
+        // Compute the content hash so the signed envelope digest matches.
+        receipt.content_hash = crate::fac::receipt::compute_job_receipt_content_hash(&receipt);
+
+        let config = make_valid_export_config();
+        let envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("build envelope");
+        let data = serde_json::to_vec(&envelope).expect("serialize");
+
+        let signer = crate::crypto::Signer::generate();
+        let vk = signer.verifying_key();
+
+        // Persist a signed envelope.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let signed_env = super::super::signed_receipt::sign_receipt(
+            &receipt.content_hash,
+            &signer,
+            "test-broker",
+        );
+        super::super::signed_receipt::persist_signed_envelope(tmp.path(), &signed_env)
+            .expect("persist signed envelope");
+
+        let result = import_evidence_bundle_verified(&data, &vk, Some(tmp.path()));
+        assert!(result.is_ok(), "signed receipt must pass: {result:?}");
+    }
+
+    #[test]
+    fn test_import_verified_rejects_wrong_key() {
+        let mut receipt = make_valid_receipt();
+        receipt.content_hash = crate::fac::receipt::compute_job_receipt_content_hash(&receipt);
+
+        let config = make_valid_export_config();
+        let envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("build envelope");
+        let data = serde_json::to_vec(&envelope).expect("serialize");
+
+        let signer = crate::crypto::Signer::generate();
+        let other_signer = crate::crypto::Signer::generate();
+        let vk = other_signer.verifying_key(); // Wrong key!
+
+        // Persist signed envelope with signer (not other_signer).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let signed_env = super::super::signed_receipt::sign_receipt(
+            &receipt.content_hash,
+            &signer,
+            "test-broker",
+        );
+        super::super::signed_receipt::persist_signed_envelope(tmp.path(), &signed_env)
+            .expect("persist signed envelope");
+
+        // Verify with wrong key: must fail.
+        let result = import_evidence_bundle_verified(&data, &vk, Some(tmp.path()));
+        assert!(
+            matches!(
+                result,
+                Err(EvidenceBundleError::SignatureVerificationFailed { .. })
+            ),
+            "wrong key must fail: {result:?}"
         );
     }
 }
