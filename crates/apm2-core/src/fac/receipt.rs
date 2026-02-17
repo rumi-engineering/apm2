@@ -598,6 +598,10 @@ pub enum DenialReasonCode {
     /// Job spec policy violation: disallowed `repo_id`, `bytes_backend`, or
     /// filesystem path detected (TCK-00579).
     PolicyViolation,
+    /// The actuation token's policy binding does not match the admitted
+    /// policy digest (INV-PADOPT-004, TCK-00561). Workers fail-closed
+    /// when the policy hash is not admitted.
+    PolicyAdmissionDenied,
 }
 
 /// Trace of the RFC-0028 channel boundary check.
@@ -3070,6 +3074,10 @@ pub mod tests {
                 "\"invalid_canonicalizer_digest\"",
             ),
             (DenialReasonCode::PolicyViolation, "\"policy_violation\""),
+            (
+                DenialReasonCode::PolicyAdmissionDenied,
+                "\"policy_admission_denied\"",
+            ),
         ];
 
         for (variant, expected) in map {

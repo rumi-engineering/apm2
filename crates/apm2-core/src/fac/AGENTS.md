@@ -1141,28 +1141,44 @@ previous digest retained in `admitted_policy_root.prev.v1.json` for rollback.
 
 Adoption and rollback CLI commands resolve the operator identity from the
 process environment (`$USER` / `$LOGNAME`, falling back to numeric UID on
-Unix). The identity is formatted as `operator:<username>` and persisted in
-both the admitted policy root and adoption receipts. This replaces the
-hard-coded `"operator:local"` actor ID that was previously used.
+Unix via `nix::unistd::getuid()` safe wrapper). The identity is formatted as
+`operator:<username>` and persisted in both the admitted policy root and
+adoption receipts. The username is sanitized to the safe character set
+`[a-zA-Z0-9._@-]` to prevent control character injection into the audit
+trail. Usernames containing only unsafe characters fall back to hex encoding.
 
 ### Security Invariants (TCK-00561)
 
 - [INV-PADOPT-001] Adoption requires schema + hash validation before acceptance
   (no arbitrary file acceptance).
-- [INV-PADOPT-002] Atomic persistence via temp + rename with fsync (CTR-2607).
-  The prev-file backup also uses temp + rename (not `fs::copy`).
+- [INV-PADOPT-002] Atomic persistence via `NamedTempFile` + fsync + `persist()`
+  (CTR-2607, RSK-1502). `NamedTempFile` uses `O_EXCL` + random names to
+  eliminate symlink TOCTOU on temp file creation. The prev-file backup also
+  uses temp + rename (not `fs::copy`).
 - [INV-PADOPT-003] Rollback to `prev` is atomic and emits a receipt.
 - [INV-PADOPT-004] Workers refuse actuation tokens whose policy binding
-  mismatches the admitted digest (fail-closed).
+  mismatches the admitted digest (fail-closed). The worker calls
+  `is_policy_hash_admitted` before processing non-control-lane jobs and denies
+  with `DenialReasonCode::PolicyAdmissionDenied` when the policy hash is not
+  admitted.
 - [INV-PADOPT-005] Receipt content hash uses domain-separated BLAKE3 with
   injective length-prefix framing (CTR-2612).
 - [INV-PADOPT-006] All string fields are bounded for DoS prevention (CTR-1303).
-- [INV-PADOPT-007] File reads are bounded before deserialization (CTR-1603).
+- [INV-PADOPT-007] File reads use the open-once pattern: `O_NOFOLLOW | O_CLOEXEC`
+  at `open(2)` atomically refuses symlinks at the kernel level, `fstat` on the
+  opened fd verifies regular file type, and `take(max_size+1)` bounds reads
+  (CTR-1603). This eliminates the TOCTOU gap between symlink check and read.
 - [INV-PADOPT-008] All persistence paths (admitted root, prev root, receipt
-  files, broker dir, receipts dir) reject symlinks via `symlink_metadata`
-  before writes. Symlink detection uses lstat semantics (not following).
+  files, broker dir, receipts dir) reject symlinks via `reject_symlink()`
+  before writes. Read paths use `O_NOFOLLOW` at the kernel level.
 - [INV-PADOPT-009] Actor identity in receipts is resolved from the calling
-  process environment, not hard-coded.
+  process environment, not hard-coded. Username is sanitized to safe chars.
+- [INV-PADOPT-010] Receipts directory is synced after atomic rename for
+  durability (CTR-2607, CTR-1502).
+- [INV-PADOPT-011] FAC root resolution uses the shared `fac_utils::resolve_fac_root()`
+  helper, avoiding predictable `/tmp` fallback paths (RSK-1502).
+- [INV-PADOPT-012] Rotation logic reads the current root via bounded
+  `load_bounded_json` (not unbounded `fs::read`) to prevent memory exhaustion.
 
 ## Receipt Versioning (TCK-00518)
 

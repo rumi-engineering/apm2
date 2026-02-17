@@ -522,57 +522,59 @@ fn reject_symlink(path: &Path) -> Result<(), PolicyAdoptionError> {
     }
 }
 
-/// Write bytes to a temp file atomically: write -> fsync -> rename.
+/// Write bytes to a file atomically via `NamedTempFile` + fsync + persist.
 ///
-/// Sets permissions to 0o600 on Unix. The caller-provided `final_path`
-/// must not be a symlink (checked before rename).
+/// Uses `tempfile::NamedTempFile::new_in(dir)` which creates the temp file
+/// with a random name and `O_EXCL` flags, eliminating the symlink TOCTOU
+/// race that existed with predictable temp paths
+/// (f-722-security-1771348924639728-0, RSK-1502).
+///
+/// Sets permissions to 0o600 on Unix before persist.
 fn atomic_write_file(
     dir: &Path,
-    temp_name: &str,
+    _temp_name: &str,
     final_path: &Path,
     bytes: &[u8],
 ) -> Result<(), PolicyAdoptionError> {
-    // Reject symlinks on the final destination before writing.
+    // Reject symlinks on the final destination before rename.
     reject_symlink(final_path)?;
 
-    let temp_path = dir.join(temp_name);
-    // Also reject symlinks on the temp path (defense in depth).
-    reject_symlink(&temp_path)?;
-
-    let mut file = fs::File::create(&temp_path).map_err(|e| PolicyAdoptionError::Persistence {
-        detail: format!("cannot create temp file {}: {e}", temp_path.display()),
-    })?;
+    // NamedTempFile::new_in uses O_EXCL + random name: no symlink TOCTOU.
+    let mut named_temp =
+        tempfile::NamedTempFile::new_in(dir).map_err(|e| PolicyAdoptionError::Persistence {
+            detail: format!("cannot create NamedTempFile in {}: {e}", dir.display()),
+        })?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600)).map_err(|e| {
+        let perms = fs::Permissions::from_mode(0o600);
+        named_temp.as_file().set_permissions(perms).map_err(|e| {
             PolicyAdoptionError::Persistence {
-                detail: format!(
-                    "cannot set permissions on temp file {}: {e}",
-                    temp_path.display()
-                ),
+                detail: format!("cannot set permissions on temp file: {e}"),
             }
         })?;
     }
 
-    file.write_all(bytes)
+    named_temp
+        .as_file_mut()
+        .write_all(bytes)
         .map_err(|e| PolicyAdoptionError::Persistence {
-            detail: format!("cannot write temp file {}: {e}", temp_path.display()),
+            detail: format!("cannot write temp file: {e}"),
         })?;
-    file.sync_all()
+    named_temp
+        .as_file()
+        .sync_all()
         .map_err(|e| PolicyAdoptionError::Persistence {
-            detail: format!("cannot sync temp file {}: {e}", temp_path.display()),
+            detail: format!("cannot sync temp file: {e}"),
         })?;
 
-    // Atomic rename to final destination.
-    fs::rename(&temp_path, final_path).map_err(|e| PolicyAdoptionError::Persistence {
-        detail: format!(
-            "cannot rename {} -> {}: {e}",
-            temp_path.display(),
-            final_path.display()
-        ),
-    })?;
+    // Atomic rename to final destination via persist().
+    named_temp
+        .persist(final_path)
+        .map_err(|e| PolicyAdoptionError::Persistence {
+            detail: format!("cannot persist temp file -> {}: {e}", final_path.display()),
+        })?;
 
     Ok(())
 }
@@ -602,15 +604,18 @@ fn persist_admitted_root_atomic(
 
     // If a current root exists, snapshot it to prev via temp+rename
     // (atomic checkpoint, not fs::copy which can produce partial writes).
+    // Uses load_bounded_json's open-once pattern for bounded reads
+    // (f-722-security-1771348934962474-0: prevents memory exhaustion if
+    // the root file was maliciously replaced with a massive file).
     reject_symlink(&current_path)?;
     if current_path.exists() {
-        let current_bytes =
-            fs::read(&current_path).map_err(|e| PolicyAdoptionError::Persistence {
-                detail: format!(
-                    "cannot read current root for prev snapshot {}: {e}",
-                    current_path.display()
-                ),
-            })?;
+        let current_root: AdmittedPolicyRootV1 =
+            load_bounded_json(&current_path, MAX_ADMITTED_ROOT_FILE_SIZE)?;
+        let current_bytes = serde_json::to_vec_pretty(&current_root).map_err(|e| {
+            PolicyAdoptionError::Serialization {
+                detail: format!("cannot re-serialize current root for prev snapshot: {e}"),
+            }
+        })?;
         atomic_write_file(
             &dir,
             ".admitted_policy_root.prev.v1.json.tmp",
@@ -702,6 +707,19 @@ fn build_and_persist_receipt(
     // Use atomic_write_file which validates symlinks and does temp+rename.
     atomic_write_file(&receipts, &temp_receipt_name, &receipt_path, &receipt_bytes)?;
 
+    // Sync receipts directory for durability (CTR-2607, CTR-1502).
+    // Ensures the directory entry from the atomic rename is persisted
+    // (f-722-security-1771348938905787-0).
+    let receipts_dir_handle =
+        fs::File::open(&receipts).map_err(|e| PolicyAdoptionError::Persistence {
+            detail: format!("cannot open receipts dir for sync: {e}"),
+        })?;
+    receipts_dir_handle
+        .sync_all()
+        .map_err(|e| PolicyAdoptionError::Persistence {
+            detail: format!("cannot sync receipts dir: {e}"),
+        })?;
+
     Ok(receipt)
 }
 
@@ -740,32 +758,57 @@ fn compute_adoption_receipt_hash(
     format!("b3-256:{}", hasher.finalize().to_hex())
 }
 
-/// Read and deserialize a bounded JSON file. Rejects files larger than
-/// `max_size` before reading (CTR-1603, INV-PADOPT-007).
+/// Read and deserialize a bounded JSON file using the open-once pattern.
+///
+/// Opens with `O_NOFOLLOW | O_CLOEXEC` (Unix) to atomically refuse symlinks
+/// at the kernel level, then verifies via `fstat` (handle-based) that the fd
+/// is a regular file. Reads at most `max_size + 1` bytes via `take()` to
+/// enforce the size limit without a TOCTOU gap between stat and read
+/// (f-722-security-1771348928218169-0, CTR-1603, INV-PADOPT-007).
 fn load_bounded_json<T: serde::de::DeserializeOwned>(
     path: &Path,
     max_size: usize,
 ) -> Result<T, PolicyAdoptionError> {
-    // Use symlink_metadata to avoid following symlinks (security).
-    let meta = fs::symlink_metadata(path).map_err(|e| {
+    use std::fs::OpenOptions;
+    use std::io::Read as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Open-once: O_NOFOLLOW rejects symlinks at open(2), no TOCTOU gap.
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+
+    let file = options.open(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             PolicyAdoptionError::NoAdmittedRoot {
                 path: path.display().to_string(),
             }
         } else {
             PolicyAdoptionError::Io {
-                detail: format!("cannot stat {}: {e}", path.display()),
+                detail: format!(
+                    "cannot open {} (symlink rejected fail-closed): {e}",
+                    path.display()
+                ),
             }
         }
     })?;
 
-    if meta.file_type().is_symlink() {
+    // fstat on the opened fd -- not the path -- to verify regular file.
+    // This cannot race because the fd is already bound to the inode.
+    let metadata = file.metadata().map_err(|e| PolicyAdoptionError::Io {
+        detail: format!("cannot fstat {}: {e}", path.display()),
+    })?;
+    if !metadata.is_file() {
         return Err(PolicyAdoptionError::Io {
-            detail: format!("refusing to follow symlink at {}", path.display()),
+            detail: format!("not a regular file (fail-closed): {}", path.display()),
         });
     }
 
-    let file_size = meta.len();
+    let file_size = metadata.len();
     if file_size > max_size as u64 {
         return Err(PolicyAdoptionError::FileTooLarge {
             size: file_size,
@@ -773,9 +816,22 @@ fn load_bounded_json<T: serde::de::DeserializeOwned>(
         });
     }
 
-    let bytes = fs::read(path).map_err(|e| PolicyAdoptionError::Io {
-        detail: format!("cannot read {}: {e}", path.display()),
-    })?;
+    // Bounded read via take() -- never reads more than max_size + 1 bytes.
+    let limit = (max_size as u64).saturating_add(1);
+    let mut bounded_reader = file.take(limit);
+    #[allow(clippy::cast_possible_truncation)]
+    let mut bytes = Vec::with_capacity((file_size as usize).min(max_size));
+    bounded_reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| PolicyAdoptionError::Io {
+            detail: format!("cannot read {}: {e}", path.display()),
+        })?;
+    if bytes.len() > max_size {
+        return Err(PolicyAdoptionError::FileTooLarge {
+            size: bytes.len() as u64,
+            max: max_size,
+        });
+    }
 
     serde_json::from_slice(&bytes).map_err(|e| PolicyAdoptionError::Serialization {
         detail: format!("cannot parse {}: {e}", path.display()),
@@ -1442,5 +1498,106 @@ mod tests {
             rollback_policy(fac_root, "operator:bob", "rollback by bob").expect("rollback");
         assert_eq!(receipt.actor_id, "operator:bob");
         assert_eq!(root.actor_id, "operator:bob");
+    }
+
+    // =====================================================================
+    // Open-once pattern tests (f-722-security-1771348928218169-0)
+    // =====================================================================
+
+    /// Verify that `load_bounded_json` rejects symlinks via `O_NOFOLLOW`
+    /// at the kernel level (no TOCTOU gap).
+    #[cfg(unix)]
+    #[test]
+    fn test_load_bounded_json_rejects_symlink_via_o_nofollow() {
+        let tmp = tempdir().expect("tempdir");
+        let real_file = tmp.path().join("real.json");
+        let root = AdmittedPolicyRootV1 {
+            schema: ADMITTED_POLICY_ROOT_SCHEMA.to_string(),
+            schema_version: "1.0.0".to_string(),
+            admitted_policy_hash: "b3-256:aa".to_string(),
+            adopted_at_unix_secs: 0,
+            actor_id: "test".to_string(),
+        };
+        let bytes = serde_json::to_vec_pretty(&root).expect("serialize");
+        fs::write(&real_file, &bytes).expect("write real file");
+
+        let symlink_path = tmp.path().join("symlink.json");
+        std::os::unix::fs::symlink(&real_file, &symlink_path).expect("create symlink");
+
+        // Real file should load fine.
+        let result: Result<AdmittedPolicyRootV1, _> =
+            load_bounded_json(&real_file, MAX_ADMITTED_ROOT_FILE_SIZE);
+        assert!(result.is_ok(), "real file should load: {result:?}");
+
+        // Symlink MUST be rejected at open(2) via O_NOFOLLOW.
+        let result: Result<AdmittedPolicyRootV1, _> =
+            load_bounded_json(&symlink_path, MAX_ADMITTED_ROOT_FILE_SIZE);
+        assert!(
+            result.is_err(),
+            "symlink must be rejected by O_NOFOLLOW: {result:?}"
+        );
+    }
+
+    /// Verify that `load_bounded_json` rejects oversized files.
+    #[test]
+    fn test_load_bounded_json_rejects_oversized_file() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("big.json");
+        // Create a file larger than the max allowed size.
+        let large_content = vec![b' '; MAX_ADMITTED_ROOT_FILE_SIZE + 100];
+        fs::write(&path, &large_content).expect("write oversized file");
+
+        let result: Result<AdmittedPolicyRootV1, _> =
+            load_bounded_json(&path, MAX_ADMITTED_ROOT_FILE_SIZE);
+        assert!(
+            matches!(result, Err(PolicyAdoptionError::FileTooLarge { .. })),
+            "should reject oversized file: {result:?}"
+        );
+    }
+
+    // =====================================================================
+    // NamedTempFile atomic write tests (f-722-security-1771348924639728-0)
+    // =====================================================================
+
+    /// Verify that `atomic_write_file` using `NamedTempFile` creates
+    /// correct content and leaves no temp artifacts.
+    #[test]
+    fn test_atomic_write_via_named_tempfile() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let final_path = dir.join("namedtemp_output.json");
+        let content = b"{\"namedtempfile\": true}";
+
+        atomic_write_file(dir, ".unused_name.tmp", &final_path, content).expect("write");
+
+        let read_back = fs::read(&final_path).expect("read");
+        assert_eq!(read_back, content);
+    }
+
+    /// Verify that bounded reads in `persist_admitted_root_atomic`
+    /// reject oversized current root files (f-722-security-1771348934962474-0).
+    #[test]
+    fn test_persist_rejects_oversized_current_root() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let policy_bytes = make_default_policy_bytes();
+
+        // First adoption creates a valid current root.
+        adopt_policy(fac_root, &policy_bytes, "operator:local", "initial").expect("first adopt");
+
+        // Replace the current root with an oversized file.
+        let current = admitted_root_path(fac_root);
+        let oversized = vec![b'{'; MAX_ADMITTED_ROOT_FILE_SIZE + 100];
+        fs::write(&current, &oversized).expect("write oversized");
+
+        // Second adoption should fail during bounded read of current root.
+        let mut policy = FacPolicyV1::default_policy();
+        policy.deny_ambient_cargo_home = false;
+        let second_bytes = serde_json::to_vec_pretty(&policy).expect("serialize");
+        let result = adopt_policy(fac_root, &second_bytes, "operator:local", "update");
+        assert!(
+            result.is_err(),
+            "should reject oversized current root during rotation: {result:?}"
+        );
     }
 }

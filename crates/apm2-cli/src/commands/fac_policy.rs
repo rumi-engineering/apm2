@@ -13,8 +13,10 @@
 //! - Actor identity is resolved from the calling process environment, not
 //!   hard-coded (f-722-security-1771347580085305-0).
 
-use std::fs;
+use std::fs::OpenOptions;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use apm2_core::fac::policy::MAX_POLICY_SIZE;
@@ -336,11 +338,18 @@ fn run_rollback(args: &PolicyRollbackArgs, json_global: bool) -> u8 {
 // =============================================================================
 
 /// Resolve the FAC root directory (`$APM2_HOME/private/fac`).
+///
+/// Uses the shared `fac_utils::resolve_fac_root()` helper for consistent
+/// path resolution across all FAC commands (f-722-security-1771348946744505-0).
+/// Eliminates the predictable `/tmp/.apm2` fallback that diverged from
+/// the canonical implementation.
 fn resolve_fac_root() -> PathBuf {
-    apm2_core::github::resolve_apm2_home()
-        .unwrap_or_else(|| PathBuf::from("/tmp/.apm2"))
-        .join("private")
-        .join("fac")
+    super::fac_utils::resolve_fac_root().unwrap_or_else(|_| {
+        // Fail-closed: if APM2 home cannot be resolved, use a path that
+        // will not exist and will produce clear errors downstream rather
+        // than falling back to a predictable /tmp path (RSK-1502).
+        PathBuf::from("/nonexistent/.apm2/private/fac")
+    })
 }
 
 /// Resolve the operator identity from the environment.
@@ -350,30 +359,52 @@ fn resolve_fac_root() -> PathBuf {
 /// to distinguish CLI operator actors from other actor types in
 /// receipts.
 ///
-/// This replaces the hard-coded `"operator:local"` that was previously
-/// used, per finding f-722-security-1771347580085305-0.
+/// The username is sanitized to the safe character set
+/// `[a-zA-Z0-9._@-]` to prevent control character injection into
+/// the audit trail (f-722-code_quality-1771348873224017-0).
+///
+/// Uses `nix::unistd::getuid()` instead of `unsafe { libc::getuid() }`
+/// (f-722-code_quality-1771348873076573-0).
 fn resolve_operator_identity() -> String {
-    let username = std::env::var("USER")
+    let raw_username = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| {
             // Fall back to numeric UID for environments where USER is
-            // unset (e.g., cron, containers).
+            // unset (e.g., cron, containers). Uses safe nix wrapper
+            // instead of unsafe libc call.
             #[cfg(unix)]
             {
-                // SAFETY: libc::getuid() is always safe to call — it
-                // requires no preconditions, has no UB conditions, and
-                // cannot fail. It simply returns the real user ID of
-                // the calling process.
-                #[allow(unsafe_code)]
-                let uid = unsafe { libc::getuid() };
-                format!("uid:{uid}")
+                let uid = nix::unistd::getuid();
+                format!("uid:{}", uid.as_raw())
             }
             #[cfg(not(unix))]
             {
                 "unknown".to_string()
             }
         });
-    format!("operator:{username}")
+
+    // Sanitize to safe character set: alphanumeric + .-_@
+    // Reject usernames that contain only unsafe characters.
+    let sanitized: String = raw_username
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@'))
+        .collect();
+
+    if sanitized.is_empty() {
+        // If sanitization removed everything, fall back to hex encoding
+        // of the raw bytes to preserve auditability without control chars.
+        use std::fmt::Write as _;
+        let hex = raw_username
+            .as_bytes()
+            .iter()
+            .fold(String::new(), |mut acc, b| {
+                let _ = write!(acc, "{b:02x}");
+                acc
+            });
+        format!("operator:hex:{hex}")
+    } else {
+        format!("operator:{sanitized}")
+    }
 }
 
 /// Read policy input from a file path or stdin.
@@ -390,23 +421,61 @@ fn read_policy_input(path: Option<&Path>) -> Result<Vec<u8>, String> {
 
 /// Read a file with a size cap before reading into memory (CTR-1603).
 ///
-/// Uses `symlink_metadata` to avoid following symlinks.
+/// Uses the open-once pattern: `O_NOFOLLOW | O_CLOEXEC` at open(2)
+/// atomically refuses symlinks at the kernel level, then `fstat` on
+/// the opened fd verifies regular file type. This eliminates the
+/// TOCTOU gap between `symlink_metadata` and `fs::read`
+/// (f-722-security-1771348928218169-0).
 fn read_bounded_file(path: &Path, max_size: usize) -> Result<Vec<u8>, String> {
-    let meta =
-        fs::symlink_metadata(path).map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
-
-    if meta.file_type().is_symlink() {
-        return Err(format!("refusing to follow symlink at {}", path.display()));
+    // Open-once: O_NOFOLLOW rejects symlinks at open(2), no TOCTOU gap.
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
 
-    let file_size = meta.len();
+    let file = options.open(path).map_err(|e| {
+        format!(
+            "cannot open {} (symlink rejected fail-closed): {e}",
+            path.display()
+        )
+    })?;
+
+    // fstat on the opened fd -- not the path -- to verify regular file.
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("cannot fstat {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "not a regular file (fail-closed): {}",
+            path.display()
+        ));
+    }
+
+    let file_size = metadata.len();
     if file_size > max_size as u64 {
         return Err(format!(
             "file size {file_size} exceeds maximum {max_size} bytes"
         ));
     }
 
-    fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
+    // Bounded read via take() -- never reads more than max_size + 1 bytes.
+    let limit = (max_size as u64).saturating_add(1);
+    let mut bounded_reader = file.take(limit);
+    #[allow(clippy::cast_possible_truncation)]
+    let mut bytes = Vec::with_capacity((file_size as usize).min(max_size));
+    bounded_reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if bytes.len() > max_size {
+        return Err(format!(
+            "file size {} exceeds maximum {max_size} bytes",
+            bytes.len()
+        ));
+    }
+
+    Ok(bytes)
 }
 
 /// Read from stdin with bounded semantics (CTR-1603).
@@ -452,13 +521,50 @@ mod tests {
         );
     }
 
+    /// Verify that sanitization strips control characters and unsafe chars.
+    #[test]
+    fn test_resolve_operator_identity_sanitizes_control_chars() {
+        // Test the sanitization logic directly by simulating what would
+        // happen with a username containing control characters.
+        let raw = "user\x00\x1b[31m\nhack";
+        let sanitized: String = raw
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@'))
+            .collect();
+        assert_eq!(sanitized, "user31mhack");
+    }
+
+    /// Verify that a username with only unsafe characters falls back to
+    /// hex encoding.
+    #[test]
+    #[allow(clippy::items_after_statements)]
+    fn test_resolve_operator_identity_hex_fallback() {
+        let raw = "\x01\x02\x03";
+        let sanitized: String = raw
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@'))
+            .collect();
+        assert!(sanitized.is_empty());
+        // Would produce hex fallback.
+        use std::fmt::Write as _;
+        let hex = raw
+            .as_bytes()
+            .iter()
+            .fold(String::new(), |mut acc, b| {
+                let _ = write!(acc, "{b:02x}");
+                acc
+            });
+        let result = format!("operator:hex:{hex}");
+        assert_eq!(result, "operator:hex:010203");
+    }
+
     #[test]
     fn test_read_bounded_file_rejects_symlink() {
         use tempfile::tempdir;
 
         let tmp = tempdir().expect("tempdir");
         let real_file = tmp.path().join("real.json");
-        fs::write(&real_file, b"{}").expect("write");
+        std::fs::write(&real_file, b"{}").expect("write");
 
         #[cfg(unix)]
         {
@@ -466,9 +572,12 @@ mod tests {
             std::os::unix::fs::symlink(&real_file, &symlink).expect("symlink");
             let result = read_bounded_file(&symlink, 1024);
             assert!(result.is_err());
+            let err = result.unwrap_err();
+            // O_NOFOLLOW produces ELOOP on Linux, which maps to
+            // "symlink rejected fail-closed" in our error message.
             assert!(
-                result.unwrap_err().contains("refusing to follow symlink"),
-                "should reject symlink"
+                err.contains("symlink rejected") || err.contains("loop"),
+                "should reject symlink via O_NOFOLLOW, got: {err}"
             );
         }
     }
@@ -479,7 +588,7 @@ mod tests {
 
         let tmp = tempdir().expect("tempdir");
         let path = tmp.path().join("big.json");
-        fs::write(&path, vec![b' '; 100]).expect("write");
+        std::fs::write(&path, vec![b' '; 100]).expect("write");
 
         let result = read_bounded_file(&path, 50);
         assert!(result.is_err());

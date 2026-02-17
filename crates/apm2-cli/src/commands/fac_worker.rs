@@ -2138,6 +2138,47 @@ fn process_job(
         );
     }
 
+    // Step 2.5: Enforce admitted policy binding (INV-PADOPT-004, TCK-00561).
+    // Workers MUST fail-closed when the actuation token's policy binding
+    // does not match the admitted digest. This prevents policy drift where
+    // tokens issued under an old policy continue to authorize actuation
+    // after a new policy has been adopted.
+    if !apm2_core::fac::is_policy_hash_admitted(fac_root, policy_hash) {
+        let reason = format!(
+            "policy hash not admitted (INV-PADOPT-004): worker policy_hash={policy_hash} is not \
+             the currently admitted digest"
+        );
+        if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            fac_root,
+            queue_root,
+            spec,
+            path,
+            &file_name,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::PolicyAdmissionDenied),
+            &reason,
+            None,
+            None,
+            None,
+            None,
+            Some(canonicalizer_tuple_digest),
+            policy_hash,
+            None,
+            None,
+            Some(&sbx_hash),
+        ) {
+            eprintln!(
+                "worker: WARNING: pipeline commit failed for policy-admission-denied job: {commit_err}"
+            );
+            return JobOutcome::Skipped {
+                reason: format!(
+                    "pipeline commit failed for policy-admission-denied job: {commit_err}"
+                ),
+            };
+        }
+        return JobOutcome::Denied { reason };
+    }
+
     // Step 3: Validate RFC-0028 token (non-control-lane jobs only).
     let token = match &spec.actuation.channel_context_token {
         Some(t) if !t.is_empty() => t.as_str(),
