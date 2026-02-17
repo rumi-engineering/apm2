@@ -135,6 +135,9 @@ pub mod lane;
 mod lease;
 pub mod merge_receipt;
 mod node_identity;
+/// Patch injection hardening: path traversal rejection, safe apply mode,
+/// and patch provenance receipts (TCK-00581).
+pub mod patch_hardening;
 pub mod policy;
 /// Policy adoption protocol: broker-admitted `FacPolicyHash` rotation with
 /// receipts and rollback (TCK-00561).
@@ -359,6 +362,13 @@ pub use lease::{
 pub use merge_receipt::{
     MAX_GATE_RECEIPTS as MAX_MERGE_GATE_RECEIPTS, MergeReceipt, MergeReceiptError,
     MergeReceiptProto,
+};
+// Re-export patch hardening types (TCK-00581)
+pub use patch_hardening::{
+    MAX_PATCH_CONTENT_SIZE, MAX_PATCH_FILE_ENTRIES, MAX_REFUSALS, PATCH_APPLY_RECEIPT_SCHEMA_ID,
+    PATCH_APPLY_RECEIPT_SCHEMA_VERSION, PATCH_FORMAT_GIT_DIFF_V1, PatchApplyReceiptV1,
+    PatchRefusal, PatchValidationError, PatchValidationResult, validate_for_apply,
+    validate_patch_content,
 };
 #[cfg(unix)]
 pub use policy::verify_dir_permissions;

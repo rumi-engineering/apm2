@@ -1920,6 +1920,67 @@ inconsistencies deterministically on worker startup.
   use wall-clock time for receipt timestamps and file deduplication suffixes.
   Documented inline with security justification.
 
+## patch_hardening Submodule (TCK-00581)
+
+The `patch_hardening` submodule implements pre-apply validation of unified
+diff content to prevent path traversal attacks, restricts patch format to
+`git_diff_v1` rules, provides a safe-apply wrapper on `RepoMirrorManager`,
+and emits `PatchApplyReceiptV1` receipts for audit provenance.
+
+### Key Types
+
+- `PatchApplyReceiptV1`: Provenance receipt emitted after a patch apply
+  attempt. Contains `patch_digest`, `applied_files_count`, `refusals`
+  list, `applied` flag, and a BLAKE3 `content_hash` binding all normative
+  fields.
+- `PatchRefusal`: A single refusal reason attached to a receipt, carrying
+  the offending path and a human-readable reason.
+- `PatchValidationResult`: Successful validation result containing
+  `file_count` and `validated_paths`.
+- `PatchValidationError`: Structured error enum covering size, NUL bytes,
+  path traversal, absolute paths, Windows paths, invalid prefixes, empty
+  patches, too many files, and unsupported format.
+
+### Core Capabilities
+
+- `validate_patch_content(bytes, format)`: Validates raw patch bytes
+  against `git_diff_v1` rules. Parses `diff --git` headers and `---`/`+++`
+  lines. Rejects paths containing `..`, absolute paths, Windows drive
+  letters, UNC prefixes, backslash separators, and NUL bytes.
+- `validate_for_apply(bytes, format)`: Convenience wrapper that returns a
+  denial `PatchApplyReceiptV1` on validation failure.
+- `RepoMirrorManager::apply_patch_hardened(workspace, bytes, format)`:
+  Safe-apply entry point that validates, applies via `git apply`, verifies
+  the digest binding, and returns a success receipt.
+
+### Security Invariants (TCK-00581)
+
+- [INV-PH-001] Paths containing `..` components are rejected.
+- [INV-PH-002] Absolute paths (leading `/`) are rejected.
+- [INV-PH-003] Windows drive letters, UNC prefixes, and backslash
+  separators are rejected.
+- [INV-PH-004] Paths must start with `a/` or `b/` prefix (standard git
+  diff prefix); the prefix is stripped before traversal checks.
+- [INV-PH-005] NUL bytes in patch content are rejected.
+- [INV-PH-006] Patch size is bounded by `MAX_PATCH_CONTENT_SIZE` (10 MiB).
+- [INV-PH-007] Only `git_diff_v1` format patches are accepted.
+- [INV-PH-008] Receipt content hash covers all normative fields with
+  injective length-prefix framing.
+- [INV-PH-009] Empty patches (no diff headers) are rejected.
+- [INV-PH-010] `/dev/null` is allowed as a source/destination in file
+  creation/deletion diffs.
+- All collections are bounded: `MAX_PATCH_FILE_ENTRIES=10000`,
+  `MAX_REFUSALS=1000`.
+- Refusal reasons are truncated at `MAX_REFUSAL_REASON_LENGTH=512`.
+- `RepoMirrorError::PatchHardeningDenied` carries a boxed denial receipt.
+- `DenialReasonCode::PatchHardeningDenied` maps the hardening denial to the
+  receipt system for structured denial tracking.
+- The worker `patch_injection` path calls `apply_patch_hardened` (not
+  `apply_patch`), ensuring INV-PH-001 through INV-PH-010 are enforced on
+  all untrusted patch bytes. Denial receipts are persisted under
+  `fac_root/patch_receipts/` and the receipt content hash is included in
+  the job denial reason for audit traceability.
+
 ## Control-Lane Exception (TCK-00533)
 
 `stop_revoke` jobs bypass the standard RFC-0028 channel context token and

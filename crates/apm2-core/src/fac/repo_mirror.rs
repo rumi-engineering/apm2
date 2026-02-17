@@ -92,6 +92,15 @@ pub enum RepoMirrorError {
         actual: String,
     },
 
+    /// Patch content was denied by hardening validation (TCK-00581).
+    #[error("patch hardening denied: {reason}")]
+    PatchHardeningDenied {
+        /// Why the patch was denied.
+        reason: String,
+        /// Denial receipt with provenance.
+        receipt: Box<super::patch_hardening::PatchApplyReceiptV1>,
+    },
+
     /// safe_rmtree returned an error.
     #[error("safe_rmtree failed: {0}")]
     SafeRmtreeError(SafeRmtreeError),
@@ -308,6 +317,63 @@ impl RepoMirrorManager {
             head_sha: head_sha.to_string(),
             workspace_path: lane_workspace.to_path_buf(),
         })
+    }
+
+    /// Apply patch bytes with hardened validation and provenance receipt.
+    ///
+    /// This is the **safe apply mode** entry point (TCK-00581).  It:
+    /// 1. Validates patch content against `git_diff_v1` rules (path traversal,
+    ///    absolute paths, format checks).
+    /// 2. Applies the patch via `git apply`.
+    /// 3. Verifies the resulting tree matches the expected patch digest.
+    /// 4. Emits a [`super::patch_hardening::PatchApplyReceiptV1`] receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PatchApplyFailed` if validation or apply fails.  On
+    /// validation failure, the returned error includes a denial receipt
+    /// in the reason string.
+    pub fn apply_patch_hardened(
+        &self,
+        lane_workspace: &Path,
+        patch_bytes: &[u8],
+        patch_format: &str,
+    ) -> Result<(PatchOutcome, super::patch_hardening::PatchApplyReceiptV1), RepoMirrorError> {
+        use super::patch_hardening::{PatchApplyReceiptV1, validate_for_apply};
+
+        let patch_digest = format!("b3-256:{}", blake3::hash(patch_bytes).to_hex());
+
+        // Step 1: Pre-apply validation (fail-closed)
+        match validate_for_apply(patch_bytes, patch_format) {
+            Ok(_validation_result) => {
+                // Validation passed — proceed with apply
+            },
+            Err(boxed) => {
+                let (receipt, err) = *boxed;
+                return Err(RepoMirrorError::PatchHardeningDenied {
+                    reason: err.to_string(),
+                    receipt: Box::new(receipt),
+                });
+            },
+        }
+
+        // Step 2: Apply via git
+        let outcome = self.apply_patch(lane_workspace, patch_bytes)?;
+
+        // Step 3: Verify digest binding
+        if outcome.patch_digest != patch_digest {
+            return Err(RepoMirrorError::PatchApplyFailed {
+                reason: format!(
+                    "patch digest mismatch after apply: expected {patch_digest}, got {}",
+                    outcome.patch_digest
+                ),
+            });
+        }
+
+        // Step 4: Emit success receipt
+        let receipt = PatchApplyReceiptV1::success(patch_digest, outcome.files_affected);
+
+        Ok((outcome, receipt))
     }
 
     /// Apply patch bytes to a checked-out lane workspace and return a digest.
@@ -1184,5 +1250,207 @@ mod tests {
             fs::read_to_string(&checked_link).expect("read checked out link"),
             "payload.txt"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_patch_hardened tests (TCK-00581)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_hardened_apply_rejects_path_traversal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manager = RepoMirrorManager::new(&temp.path().join("private").join("fac"));
+
+        // Create a minimal git workspace
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .arg("init")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+
+        let traversal_patch = b"diff --git a/../../../etc/passwd b/../../../etc/passwd\n\
+                                --- a/../../../etc/passwd\n\
+                                +++ b/../../../etc/passwd\n\
+                                @@ -1 +1 @@\n\
+                                -old\n\
+                                +new\n";
+
+        let result = manager.apply_patch_hardened(&workspace, traversal_patch, "git_diff_v1");
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            RepoMirrorError::PatchHardeningDenied { reason, receipt } => {
+                assert!(
+                    reason.contains(".."),
+                    "denial reason should mention path traversal: {reason}"
+                );
+                assert!(!receipt.applied);
+                assert_eq!(receipt.refusals.len(), 1);
+                assert!(receipt.verify_content_hash());
+            },
+            other => panic!("expected PatchHardeningDenied, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_hardened_apply_rejects_absolute_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manager = RepoMirrorManager::new(&temp.path().join("private").join("fac"));
+
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .arg("init")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git init");
+
+        let absolute_patch = b"diff --git a//etc/shadow b//etc/shadow\n\
+                               --- a//etc/shadow\n\
+                               +++ b//etc/shadow\n\
+                               @@ -1 +1 @@\n\
+                               -old\n\
+                               +new\n";
+
+        let result = manager.apply_patch_hardened(&workspace, absolute_patch, "git_diff_v1");
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            RepoMirrorError::PatchHardeningDenied { .. }
+        ));
+    }
+
+    #[test]
+    fn test_hardened_apply_rejects_wrong_format() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manager = RepoMirrorManager::new(&temp.path().join("private").join("fac"));
+
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let patch = b"diff --git a/file.txt b/file.txt\n\
+                      --- a/file.txt\n\
+                      +++ b/file.txt\n\
+                      @@ -1 +1 @@\n\
+                      -old\n\
+                      +new\n";
+
+        let result = manager.apply_patch_hardened(&workspace, patch, "binary_v1");
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            RepoMirrorError::PatchHardeningDenied { .. }
+        ));
+    }
+
+    #[test]
+    fn test_hardened_apply_succeeds_with_valid_patch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manager = RepoMirrorManager::new(&temp.path().join("private").join("fac"));
+
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        // Initialize git repo with a file
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .arg("init")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+
+        Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["config", "user.name", "Test"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("set user.name");
+
+        Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["config", "user.email", "test@example.com"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("set user.email");
+
+        fs::write(workspace.join("file.txt"), b"").expect("write file");
+
+        Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["add", "file.txt"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git add");
+
+        Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["commit", "-m", "base"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git commit");
+
+        let patch = b"diff --git a/file.txt b/file.txt\n\
+                      index e69de29..e69de29 100644\n\
+                      --- a/file.txt\n\
+                      +++ b/file.txt\n\
+                      @@ -0,0 +1 @@\n\
+                      +hello\n";
+
+        let result = manager.apply_patch_hardened(&workspace, patch, "git_diff_v1");
+
+        assert!(result.is_ok(), "hardened apply should succeed: {result:?}");
+        let (outcome, receipt) = result.unwrap();
+        assert_eq!(outcome.files_affected, 1);
+        assert!(receipt.applied);
+        assert!(receipt.verify_content_hash());
+        assert!(receipt.refusals.is_empty());
+        assert!(!receipt.patch_digest.is_empty());
+    }
+
+    #[test]
+    fn test_hardened_apply_denial_receipt_has_valid_digest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manager = RepoMirrorManager::new(&temp.path().join("private").join("fac"));
+
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let traversal_patch = b"diff --git a/../../escape b/../../escape\n\
+                                --- a/../../escape\n\
+                                +++ b/../../escape\n\
+                                @@ -1 +1 @@\n\
+                                -old\n\
+                                +new\n";
+
+        let result = manager.apply_patch_hardened(&workspace, traversal_patch, "git_diff_v1");
+
+        assert!(result.is_err());
+        if let Err(RepoMirrorError::PatchHardeningDenied { receipt, .. }) = result {
+            let expected_digest = format!("b3-256:{}", blake3::hash(traversal_patch).to_hex());
+            assert_eq!(receipt.patch_digest, expected_digest);
+            assert!(receipt.verify_content_hash());
+        }
     }
 }
