@@ -144,7 +144,7 @@ pub enum GitHardeningError {
         max: u64,
     },
 
-    /// `git config --local --list` command failed (non-zero exit).
+    /// `git config --local --list --null` command failed (non-zero exit).
     /// Fail-closed: we cannot verify the config is safe.
     #[error("git config scan command failed (exit {exit_code}): stdout={stdout}, stderr={stderr}")]
     ConfigScanCommandFailed {
@@ -494,6 +494,10 @@ fn set_git_config_local_with_safe_dir(
 
 /// Scan the workspace's local git config for unsafe entries.
 ///
+/// Uses `git config --local --list --null` for NUL-delimited output so
+/// that values containing embedded newlines are parsed unambiguously
+/// (each entry is `key\nvalue\0`).
+///
 /// Uses `-c safe.directory=<val>` to allow the scan to succeed even on
 /// mismatched-owner workspaces without writing to any persistent config.
 ///
@@ -518,7 +522,12 @@ fn scan_unsafe_configs(
         });
     }
 
-    // Use `git config --local --list` to get all local config entries.
+    // Use `git config --local --list --null` to get all local config entries
+    // with NUL-delimited output.  With `--null`, each entry is emitted as
+    // `key\nvalue\0` (key and value separated by a newline, entries separated
+    // by a NUL byte).  This is robust against values that contain embedded
+    // newlines — newline-delimited `--list` output would misparse such values
+    // as additional key=value lines, risking false-positive unsafe-key matches.
     // Pass `-c safe.directory=<val>` so the command succeeds on
     // mismatched-owner workspaces.
     let output = Command::new("git")
@@ -529,6 +538,7 @@ fn scan_unsafe_configs(
         .arg("config")
         .arg("--local")
         .arg("--list")
+        .arg("--null")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
@@ -558,16 +568,28 @@ fn scan_unsafe_configs(
         });
     }
 
-    let config_text = String::from_utf8_lossy(&output.stdout);
+    // Parse NUL-delimited entries.  Each entry is `key\nvalue\0` where the
+    // first line within the entry is the key and the remainder (after the
+    // first newline) is the value.  An entry with no value may appear as
+    // just `key\0`.
+    let raw = &output.stdout;
     let mut unsafe_keys = Vec::new();
 
-    for line in config_text.lines() {
-        // Each line is key=value
-        let key = match line.split_once('=') {
-            Some((k, _)) => k,
-            None => line,
-        };
+    for entry in raw.split(|&b| b == 0) {
+        // Skip empty trailing segments (the output ends with \0, so split
+        // produces a trailing empty slice).
+        if entry.is_empty() {
+            continue;
+        }
 
+        // The key is everything up to the first newline (or the whole
+        // entry if there is no newline).
+        let key_bytes = entry
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(entry, |pos| &entry[..pos]);
+
+        let key = String::from_utf8_lossy(key_bytes);
         let key_lower = key.to_ascii_lowercase();
 
         if is_unsafe_config_key(&key_lower) {
