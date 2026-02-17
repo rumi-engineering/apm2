@@ -4,7 +4,11 @@ ticket_meta:
   ticket:
     id: "TCK-00580"
     title: "Git safety hardening in lane workspaces: disable hooks, enforce safe.directory, refuse unsafe configs"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 728
+        merge_commit: "0e843dd126613a2c94c5678877960f285b10f36c"
+        merged_at: "2026-02-17T21:31:52Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

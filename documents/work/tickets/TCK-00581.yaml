@@ -4,7 +4,11 @@ ticket_meta:
   ticket:
     id: "TCK-00581"
     title: "Patch injection hardening: path traversal rejection, safe apply mode, and patch provenance receipts"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 731
+        merge_commit: "fc43e1feda7dcf5dedbe288f311840bf6cd38f7f"
+        merged_at: "2026-02-17T21:00:43Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

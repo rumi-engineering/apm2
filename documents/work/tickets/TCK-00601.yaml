@@ -4,7 +4,11 @@ ticket_meta:
   ticket:
     id: "TCK-00601"
     title: "E2E tests: deterministic failures (no hangs) + secrets posture (gates unaffected)"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 729
+        merge_commit: "9cb9cede6a4d28fd9c8f91b71f0e0cea1a75cf81"
+        merged_at: "2026-02-17T21:51:55Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

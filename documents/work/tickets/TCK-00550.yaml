@@ -4,7 +4,11 @@ ticket_meta:
   ticket:
     id: "TCK-00550"
     title: "CI guardrails: ban NoOpVerifier in default builds; enforce RFC-0028/0029 fields present in execution receipts"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 730
+        merge_commit: "793c38716ebb7c2e3695b5979ee632e4d8288810"
+        merged_at: "2026-02-17T20:29:35Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"
