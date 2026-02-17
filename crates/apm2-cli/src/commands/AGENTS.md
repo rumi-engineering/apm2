@@ -286,6 +286,9 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
   duplicate receipt check in `process_job` uses `find_receipt_for_job` instead of
   `has_receipt_for_job` and routes to the correct terminal directory via
   `outcome_to_terminal_state`. Denied receipts route to `denied/`, not `completed/`.
+  Move failures during duplicate terminalization are logged via `eprintln!` and
+  surfaced in the `JobOutcome::Skipped` reason (MAJOR-1 fix round 5), ensuring
+  the duplicate stays visible for reconciliation instead of being silently orphaned.
 
 ## Introspection CLI Invariants (Updated for TCK-00535)
 

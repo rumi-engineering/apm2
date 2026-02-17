@@ -1780,7 +1780,21 @@ fn process_job(
                 || queue_root.join(COMPLETED_DIR),
                 |ts| queue_root.join(ts.dir_name()),
             );
-        let _ = move_to_dir_safe(path, &terminal_dir, &file_name);
+        // MAJOR-1 fix (f-715-code_quality): Handle move failure — do NOT discard
+        // the Result. On failure, log and return Skipped with the error so the
+        // duplicate stays visible for reconciliation.
+        if let Err(move_err) = move_to_dir_safe(path, &terminal_dir, &file_name) {
+            eprintln!(
+                "worker: duplicate job {} detected but move to terminal failed: {move_err}",
+                spec.job_id,
+            );
+            return JobOutcome::Skipped {
+                reason: format!(
+                    "receipt already exists for job {} but move to terminal failed: {move_err}",
+                    spec.job_id,
+                ),
+            };
+        }
         return JobOutcome::Skipped {
             reason: format!(
                 "receipt already exists for job {} (index lookup, outcome={:?})",

@@ -361,6 +361,19 @@ impl RecoveryReceiptV1 {
         validate_receipt_id_for_filename(&self.receipt_id)?;
 
         let final_name = format!("recovery-{}.json", self.receipt_id);
+
+        // MINOR-1 fix (f-715-security): Validate the constructed filename
+        // against MAX_FILE_NAME_LENGTH. The receipt_id is bounded by
+        // MAX_ID_LENGTH but the framing prefix ("recovery-") and suffix
+        // (".json") can push the total beyond the 255-byte filesystem limit.
+        if final_name.len() > MAX_FILE_NAME_LENGTH {
+            return Err(ReceiptPipelineError::RecoveryValidation(format!(
+                "recovery receipt filename too long: {} > {MAX_FILE_NAME_LENGTH} \
+                 (receipt_id framing exceeds filesystem limit)",
+                final_name.len(),
+            )));
+        }
+
         let final_path = receipts_dir.join(&final_name);
 
         // Atomic write: NamedTempFile + fsync + rename (CTR-2607).
@@ -529,11 +542,15 @@ impl ReceiptWritePipeline {
         // unreceipted state change occurs.
         let dest_path_preview = dest_dir.join(file_name);
 
-        // MINOR security (f-715-security-1771314598909139-0): Compute receipt_id with
-        // length awareness. The prefix "recovery-" (9 chars) and suffix "-{timestamp}"
-        // (~20 chars) leave up to MAX_ID_LENGTH - 30 chars for the job_id
-        // portion.
-        let max_job_id_chars = MAX_ID_LENGTH.saturating_sub(30);
+        // MINOR-1 fix (f-715-security): Compute receipt_id with full filename
+        // budget awareness. The persist() filename format is:
+        //   "recovery-{receipt_id}.json"  (9 prefix + 5 suffix = 14 framing)
+        // The receipt_id format here is:
+        //   "recovery-{truncated_job_id}-{timestamp_secs}"
+        //   (9 + 1 + up to 20 digits for timestamp = ~30 framing)
+        // Combined total framing from persist filename: 14 + 30 = 44 chars.
+        // Budget for job_id portion: MAX_FILE_NAME_LENGTH - 44.
+        let max_job_id_chars = MAX_FILE_NAME_LENGTH.saturating_sub(44);
         let truncated_job_id: String = receipt.job_id.chars().take(max_job_id_chars).collect();
         let recovery_receipt = RecoveryReceiptV1 {
             schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
@@ -1905,10 +1922,129 @@ mod tests {
             result.err()
         );
         let recovery = result.unwrap();
+        // The full filename is "recovery-{receipt_id}.json" (14 chars of framing).
+        // Verify the constructed filename fits within the filesystem limit.
+        let final_name = format!("recovery-{}.json", recovery.receipt_id);
         assert!(
-            recovery.receipt_id.len() <= MAX_ID_LENGTH,
-            "receipt_id must not exceed MAX_ID_LENGTH, got: {}",
-            recovery.receipt_id.len()
+            final_name.len() <= MAX_FILE_NAME_LENGTH,
+            "recovery receipt filename must not exceed MAX_FILE_NAME_LENGTH ({}), got: {} for '{}'",
+            MAX_FILE_NAME_LENGTH,
+            final_name.len(),
+            final_name,
+        );
+    }
+
+    // =========================================================================
+    // MINOR-1 fix: persist() rejects filenames exceeding filesystem limit
+    // =========================================================================
+
+    #[test]
+    fn test_persist_rejects_overlength_filename() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+
+        // Construct a receipt_id that passes MAX_ID_LENGTH but whose framed
+        // filename ("recovery-{receipt_id}.json") exceeds MAX_FILE_NAME_LENGTH.
+        // "recovery-" = 9 chars, ".json" = 5 chars => 14 chars of framing.
+        // MAX_FILE_NAME_LENGTH = 255, so receipt_id of 242+ chars will overflow.
+        let overlength_receipt_id = "x".repeat(MAX_FILE_NAME_LENGTH - 14 + 1); // 242 chars
+        assert!(
+            overlength_receipt_id.len() <= MAX_ID_LENGTH,
+            "test precondition: receipt_id must pass MAX_ID_LENGTH check"
+        );
+
+        let recovery = RecoveryReceiptV1 {
+            schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
+            receipt_id: overlength_receipt_id,
+            job_id: "test-job".to_string(),
+            original_receipt_hash: "b3-256:abcd1234".to_string(),
+            detected_state: "test state".to_string(),
+            repair_action: "test action".to_string(),
+            source_path: "/tmp/test".to_string(),
+            destination_path: "/tmp/test-dest".to_string(),
+            timestamp_secs: 1000,
+        };
+
+        let result = recovery.persist(&receipts_dir);
+        assert!(result.is_err(), "persist must reject overlength filename");
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("filename too long"),
+            "error must mention filename length, got: {err_str}"
+        );
+    }
+
+    #[test]
+    fn test_persist_accepts_max_length_filename() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+
+        // Construct a receipt_id that brings the filename exactly to
+        // MAX_FILE_NAME_LENGTH (255 bytes).
+        // "recovery-" = 9 chars, ".json" = 5 chars => 14 chars of framing.
+        let exact_max_receipt_id = "x".repeat(MAX_FILE_NAME_LENGTH - 14); // 241 chars
+        assert!(
+            exact_max_receipt_id.len() <= MAX_ID_LENGTH,
+            "test precondition: receipt_id must pass MAX_ID_LENGTH check"
+        );
+
+        let recovery = RecoveryReceiptV1 {
+            schema: RECOVERY_RECEIPT_SCHEMA.to_string(),
+            receipt_id: exact_max_receipt_id,
+            job_id: "test-job".to_string(),
+            original_receipt_hash: "b3-256:abcd1234".to_string(),
+            detected_state: "test state".to_string(),
+            repair_action: "test action".to_string(),
+            source_path: "/tmp/test".to_string(),
+            destination_path: "/tmp/test-dest".to_string(),
+            timestamp_secs: 1000,
+        };
+
+        let result = recovery.persist(&receipts_dir);
+        assert!(
+            result.is_ok(),
+            "persist must accept filename at exactly MAX_FILE_NAME_LENGTH, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_recover_torn_state_filename_within_filesystem_limit_with_large_timestamp() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        let queue_root = tmp.path().join("queue");
+        let claimed_path = setup_claimed_job(&queue_root, "ts-test");
+
+        let mut receipt = make_receipt("ts-test", FacJobOutcome::Completed);
+        // Use a near-max job_id (256 chars) to stress the truncation logic.
+        receipt.job_id = "j".repeat(MAX_ID_LENGTH);
+        receipt.content_hash = compute_job_receipt_content_hash(&receipt);
+        let _receipt_path =
+            persist_content_addressed_receipt(&receipts_dir, &receipt).expect("persist");
+
+        let pipeline = ReceiptWritePipeline::new(receipts_dir, queue_root);
+        // Use a 10-digit epoch timestamp to test worst-case framing.
+        let result = pipeline.recover_torn_state(
+            &claimed_path,
+            "ts-test.json",
+            &receipt,
+            TerminalState::Completed,
+            9_999_999_999,
+        );
+        assert!(
+            result.is_ok(),
+            "recovery must succeed with 10-digit timestamp and near-max job_id, got: {:?}",
+            result.err()
+        );
+        let recovery = result.unwrap();
+        let final_name = format!("recovery-{}.json", recovery.receipt_id);
+        assert!(
+            final_name.len() <= MAX_FILE_NAME_LENGTH,
+            "recovery receipt filename must fit in {} bytes, got: {} for '{}'",
+            MAX_FILE_NAME_LENGTH,
+            final_name.len(),
+            final_name,
         );
     }
 }

@@ -1408,8 +1408,14 @@ for receipt IDs constructed from job IDs (MAJOR-3/MINOR security fixes).
   prefix and hex suffix (MINOR-1 fix).
 - [INV-PIPE-011] `receipt_id` in `RecoveryReceiptV1::persist` is validated
   against path traversal via `validate_receipt_id_for_filename` (BLOCKER security).
-- [INV-PIPE-012] `receipt_id` length is bounded by truncating `job_id` to prevent
-  overflow (MINOR security fix).
+- [INV-PIPE-012] `receipt_id` length is bounded by truncating `job_id` to
+  `MAX_FILE_NAME_LENGTH - 44` chars, accounting for full filename framing
+  overhead ("recovery-{receipt_id}.json" prefix/suffix) to keep the final
+  filename within the 255-byte filesystem limit (MINOR-1 security fix).
+- [INV-PIPE-013] `RecoveryReceiptV1::persist` validates the final constructed
+  filename (`"recovery-{receipt_id}.json"`) against `MAX_FILE_NAME_LENGTH`
+  before writing, preventing `ENAMETOOLONG` errors that could bypass recovery
+  receipt persistence (MINOR-1 security fix).
 
 ## reconcile Submodule (TCK-00534)
 
