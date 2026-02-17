@@ -723,6 +723,13 @@ pub struct FacJobReceiptV1 {
     /// expected hardening profile was applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox_hardening_hash: Option<String>,
+    /// Network policy hash for audit (TCK-00574).
+    ///
+    /// BLAKE3 hash of the `NetworkPolicy` used for the job unit,
+    /// formatted as `b3-256:<64hex>`. Enables audit verification that the
+    /// expected network isolation posture was applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_policy_hash: Option<String>,
     /// Epoch timestamp.
     pub timestamp_secs: u64,
     /// BLAKE3 body hash for content-addressed storage.
@@ -868,6 +875,14 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(hash.as_bytes());
         }
 
+        // TCK-00574: Network policy hash. Added as an append-only trailing
+        // optional for V1; uses type-specific marker `5u8` for injective encoding.
+        if let Some(hash) = &self.network_policy_hash {
+            bytes.push(5u8);
+            bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(hash.as_bytes());
+        }
+
         bytes
     }
 
@@ -918,7 +933,7 @@ impl FacJobReceiptV1 {
     /// not been deployed to any production receipt store. This schema break
     /// is therefore safe and requires no migration.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     pub fn canonical_bytes_v2(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(512);
 
@@ -1047,6 +1062,14 @@ impl FacJobReceiptV1 {
         // `3u8` to ensure injective encoding (MAJOR-1 fix).
         if let Some(hash) = &self.sandbox_hardening_hash {
             bytes.push(3u8);
+            bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(hash.as_bytes());
+        }
+
+        // TCK-00574: Network policy hash. Uses type-specific marker
+        // `5u8` to ensure injective encoding.
+        if let Some(hash) = &self.network_policy_hash {
+            bytes.push(5u8);
             bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
             bytes.extend_from_slice(hash.as_bytes());
         }
@@ -1267,6 +1290,16 @@ impl FacJobReceiptV1 {
             }
         }
 
+        // TCK-00574: Validate network policy hash format if present.
+        if let Some(hash) = &self.network_policy_hash {
+            if !is_strict_b3_256_digest(hash) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "network_policy_hash must be exactly 71 chars in b3-256:<64hex> format"
+                        .to_string(),
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -1291,6 +1324,7 @@ pub struct FacJobReceiptV1Builder {
     containment: Option<super::containment::ContainmentTrace>,
     observed_cost: Option<crate::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<String>,
+    network_policy_hash: Option<String>,
     timestamp_secs: Option<u64>,
 }
 
@@ -1408,6 +1442,13 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn sandbox_hardening_hash(mut self, hash: impl Into<String>) -> Self {
         self.sandbox_hardening_hash = Some(hash.into());
+        self
+    }
+
+    /// Sets the network policy hash for audit (TCK-00574).
+    #[must_use]
+    pub fn network_policy_hash(mut self, hash: impl Into<String>) -> Self {
+        self.network_policy_hash = Some(hash.into());
         self
     }
 
@@ -1611,6 +1652,16 @@ impl FacJobReceiptV1Builder {
             }
         }
 
+        // TCK-00574: Validate network policy hash format.
+        if let Some(hash) = &self.network_policy_hash {
+            if !is_strict_b3_256_digest(hash) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "network_policy_hash must be exactly 71 chars in b3-256:<64hex> format"
+                        .to_string(),
+                ));
+            }
+        }
+
         let candidate = FacJobReceiptV1 {
             schema: FAC_JOB_RECEIPT_SCHEMA.to_string(),
             receipt_id,
@@ -1629,6 +1680,7 @@ impl FacJobReceiptV1Builder {
             containment: self.containment,
             observed_cost: self.observed_cost,
             sandbox_hardening_hash: self.sandbox_hardening_hash,
+            network_policy_hash: self.network_policy_hash,
             moved_job_path,
             timestamp_secs,
             content_hash: String::new(),
@@ -1902,6 +1954,14 @@ pub struct GateReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_hardening_hash: Option<String>,
 
+    /// Network policy hash for audit (TCK-00574).
+    ///
+    /// BLAKE3 hash of the `NetworkPolicy` used for the gate execution
+    /// environment, formatted as `b3-256:<64hex>`. Enables audit verification
+    /// that the expected network isolation posture was applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_policy_hash: Option<String>,
+
     /// Ed25519 signature over canonical bytes with domain separation.
     #[serde(with = "serde_bytes")]
     pub receipt_signature: [u8; 64],
@@ -1990,6 +2050,15 @@ impl GateReceipt {
         // across all optional trailing fields in GateReceipt.
         if let Some(hash) = self.sandbox_hardening_hash.as_ref() {
             bytes.push(4u8);
+            bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(hash.as_bytes());
+        }
+
+        // 14. network_policy_hash (optional, TCK-00574)
+        // Uses type-specific marker `6u8` to ensure injective encoding
+        // across all optional trailing fields in GateReceipt.
+        if let Some(hash) = self.network_policy_hash.as_ref() {
+            bytes.push(6u8);
             bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
             bytes.extend_from_slice(hash.as_bytes());
         }
@@ -2135,6 +2204,7 @@ pub struct GateReceiptBuilder {
     job_spec_digest: Option<String>,
     passed: Option<bool>,
     sandbox_hardening_hash: Option<String>,
+    network_policy_hash: Option<String>,
 }
 
 impl GateReceiptBuilder {
@@ -2224,6 +2294,13 @@ impl GateReceiptBuilder {
     #[must_use]
     pub fn sandbox_hardening_hash(mut self, hash: impl Into<String>) -> Self {
         self.sandbox_hardening_hash = Some(hash.into());
+        self
+    }
+
+    /// Sets the network policy hash for audit (TCK-00574).
+    #[must_use]
+    pub fn network_policy_hash(mut self, hash: impl Into<String>) -> Self {
+        self.network_policy_hash = Some(hash.into());
         self
     }
 
@@ -2330,6 +2407,16 @@ impl GateReceiptBuilder {
             }
         }
 
+        // TCK-00574: Validate network_policy_hash format if set.
+        if let Some(ref hash) = self.network_policy_hash {
+            if !is_strict_b3_256_digest(hash) {
+                return Err(ReceiptError::InvalidData(format!(
+                    "network_policy_hash must be 'b3-256:<64 hex chars>', got length {}",
+                    hash.len()
+                )));
+            }
+        }
+
         // Create receipt with placeholder signature
         let mut receipt = GateReceipt {
             receipt_id: self.receipt_id,
@@ -2345,6 +2432,7 @@ impl GateReceiptBuilder {
             job_spec_digest,
             passed,
             sandbox_hardening_hash: self.sandbox_hardening_hash,
+            network_policy_hash: self.network_policy_hash,
             receipt_signature: [0u8; 64],
         };
 
@@ -2415,6 +2503,20 @@ impl TryFrom<GateReceiptProto> for GateReceipt {
                 ));
             }
         }
+        if let Some(hash) = proto.network_policy_hash.as_ref() {
+            if hash.len() > MAX_STRING_LENGTH {
+                return Err(ReceiptError::StringTooLong {
+                    field: "network_policy_hash",
+                    actual: hash.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if !is_strict_b3_256_digest(hash) {
+                return Err(ReceiptError::InvalidData(
+                    "network_policy_hash must be b3-256:<64 hex chars>".to_string(),
+                ));
+            }
+        }
 
         let changeset_digest: [u8; 32] = proto.changeset_digest.try_into().map_err(|_| {
             ReceiptError::InvalidData("changeset_digest must be 32 bytes".to_string())
@@ -2432,6 +2534,7 @@ impl TryFrom<GateReceiptProto> for GateReceipt {
         let job_spec_digest = proto.job_spec_digest;
 
         let sandbox_hardening_hash = proto.sandbox_hardening_hash;
+        let network_policy_hash = proto.network_policy_hash;
 
         let receipt_signature: [u8; 64] = proto.receipt_signature.try_into().map_err(|_| {
             ReceiptError::InvalidData("receipt_signature must be 64 bytes".to_string())
@@ -2451,6 +2554,7 @@ impl TryFrom<GateReceiptProto> for GateReceipt {
             job_spec_digest,
             passed: proto.passed,
             sandbox_hardening_hash,
+            network_policy_hash,
             receipt_signature,
         })
     }
@@ -2471,6 +2575,7 @@ impl From<GateReceipt> for GateReceiptProto {
             evidence_bundle_hash: receipt.evidence_bundle_hash.to_vec(),
             job_spec_digest: receipt.job_spec_digest,
             sandbox_hardening_hash: receipt.sandbox_hardening_hash,
+            network_policy_hash: receipt.network_policy_hash,
             receipt_signature: receipt.receipt_signature.to_vec(),
             // HTF time envelope reference (RFC-0016): not yet populated by this conversion.
             // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
@@ -3546,6 +3651,7 @@ pub mod tests {
             evidence_bundle_hash: vec![0xCD; 32],
             job_spec_digest: None,
             sandbox_hardening_hash: None,
+            network_policy_hash: None,
             receipt_signature: vec![0u8; 64],
             // HTF time envelope reference (RFC-0016): not yet populated.
             time_envelope_ref: None,
@@ -3571,6 +3677,7 @@ pub mod tests {
             evidence_bundle_hash: vec![0xCD; 32],
             job_spec_digest: None,
             sandbox_hardening_hash: None,
+            network_policy_hash: None,
             receipt_signature: vec![0u8; 32], // Wrong length - should be 64
             // HTF time envelope reference (RFC-0016): not yet populated.
             time_envelope_ref: None,
@@ -3622,6 +3729,7 @@ pub mod tests {
             evidence_bundle_hash: vec![0xCD; 32],
             job_spec_digest: None,
             sandbox_hardening_hash: None,
+            network_policy_hash: None,
             receipt_signature: vec![0u8; 64],
             // HTF time envelope reference (RFC-0016): not yet populated.
             time_envelope_ref: None,

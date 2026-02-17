@@ -1511,6 +1511,7 @@ fn execute_queued_gates_job(
     canonicalizer_tuple_digest: &str,
     policy_hash: &str,
     sbx_hash: &str,
+    net_hash: &str,
 ) -> JobOutcome {
     let job_wall_start = Instant::now();
     let options = match parse_gates_job_options(spec) {
@@ -1535,6 +1536,7 @@ fn execute_queued_gates_job(
                 None,
                 None,
                 Some(sbx_hash),
+                Some(net_hash),
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -1574,6 +1576,7 @@ fn execute_queued_gates_job(
                 None,
                 None,
                 Some(sbx_hash),
+                Some(net_hash),
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -1610,6 +1613,7 @@ fn execute_queued_gates_job(
             None,
             None,
             Some(sbx_hash),
+            Some(net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -1645,6 +1649,7 @@ fn execute_queued_gates_job(
                 None,
                 None,
                 Some(sbx_hash),
+                Some(net_hash),
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -1679,6 +1684,7 @@ fn execute_queued_gates_job(
             None,
             Some(observed_cost),
             Some(sbx_hash),
+            Some(net_hash),
         ) {
             eprintln!("worker: pipeline commit failed for gates job: {commit_err}");
             if let Err(move_err) = move_to_dir_safe(
@@ -1721,6 +1727,7 @@ fn execute_queued_gates_job(
         None,
         None,
         Some(sbx_hash),
+        Some(net_hash),
     ) {
         return handle_pipeline_commit_failure(
             &commit_err,
@@ -1840,6 +1847,12 @@ fn process_job(
     // instead of re-computing it in every denial path.
     let sbx_hash = policy.sandbox_hardening.content_hash_hex();
 
+    // TCK-00574: Compute the network policy hash for the resolved network
+    // policy. This is deferred until the actual job kind is known (after spec
+    // parsing), but we declare the variable here. For denial paths before
+    // spec parsing, we use the default-deny hash since spec.kind is unknown.
+    let default_net_hash = apm2_core::fac::NetworkPolicy::deny().content_hash_hex();
+
     // Step 1+2: Use the bounded bytes already loaded by scan_pending.
     //
     // The file was already validated by `scan_pending`; this avoids duplicate I/O.
@@ -1883,6 +1896,7 @@ fn process_job(
                 None,
                 None,
                 Some(&sbx_hash),
+                Some(&default_net_hash),
             ) {
                 eprintln!(
                     "worker: WARNING: pipeline commit failed for quarantined job: {commit_err}"
@@ -1928,6 +1942,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
+            Some(&default_net_hash),
         ) {
             eprintln!("worker: WARNING: pipeline commit failed for denied job: {commit_err}");
             // Job stays in pending/ for reconciliation.
@@ -2027,6 +2042,7 @@ fn process_job(
                     policy_hash,
                     None,
                     Some(&sbx_hash),
+                    Some(&default_net_hash),
                 ) {
                     eprintln!(
                         "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -2064,6 +2080,7 @@ fn process_job(
                 policy_hash,
                 None,
                 Some(&sbx_hash),
+                Some(&default_net_hash),
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -2108,6 +2125,7 @@ fn process_job(
                 None,
                 None,
                 Some(&sbx_hash),
+                Some(&default_net_hash),
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -2134,6 +2152,7 @@ fn process_job(
             canonicalizer_tuple_digest,
             policy_hash,
             &sbx_hash,
+            &default_net_hash,
             job_wall_start,
         );
     }
@@ -2167,6 +2186,7 @@ fn process_job(
                 policy_hash,
                 None,
                 Some(&sbx_hash),
+                Some(&default_net_hash),
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -2209,6 +2229,7 @@ fn process_job(
             policy_hash,
             None,
             Some(&sbx_hash),
+            Some(&default_net_hash),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2256,6 +2277,7 @@ fn process_job(
                 policy_hash,
                 None,
                 Some(&sbx_hash),
+                Some(&default_net_hash),
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -2296,6 +2318,7 @@ fn process_job(
                 policy_hash,
                 None,
                 Some(&sbx_hash),
+                Some(&default_net_hash),
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -2330,6 +2353,7 @@ fn process_job(
             policy_hash,
             None,
             Some(&sbx_hash),
+            Some(&default_net_hash),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2364,6 +2388,7 @@ fn process_job(
             policy_hash,
             None,
             Some(&sbx_hash),
+            Some(&default_net_hash),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2409,6 +2434,7 @@ fn process_job(
             policy_hash,
             None,
             Some(&sbx_hash),
+            Some(&default_net_hash),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2449,6 +2475,7 @@ fn process_job(
             policy_hash,
             None,
             Some(&sbx_hash),
+            Some(&default_net_hash),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2533,6 +2560,7 @@ fn process_job(
             policy_hash,
             None,
             Some(&sbx_hash),
+            Some(&default_net_hash),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2587,6 +2615,7 @@ fn process_job(
                 policy_hash,
                 None,
                 Some(&sbx_hash),
+                Some(&default_net_hash),
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for budget-denied job: {receipt_err}"
@@ -2626,6 +2655,7 @@ fn process_job(
             policy_hash,
             None,
             Some(&sbx_hash),
+            Some(&default_net_hash),
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2671,6 +2701,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
+            Some(&default_net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -2688,6 +2719,9 @@ fn process_job(
     // Avoid acquiring a second worker lane here: `fac gates` already uses its
     // own lane lock/containment strategy for heavy phases.
     if spec.kind == "gates" {
+        let gates_net_hash =
+            apm2_core::fac::resolve_network_policy(&spec.kind, policy.network_policy.as_ref())
+                .content_hash_hex();
         return execute_queued_gates_job(
             spec,
             &claimed_path,
@@ -2700,6 +2734,7 @@ fn process_job(
             canonicalizer_tuple_digest,
             policy_hash,
             &sbx_hash,
+            &gates_net_hash,
         );
     }
 
@@ -2767,6 +2802,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
+            Some(&default_net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -2806,6 +2842,7 @@ fn process_job(
                 None,
                 None,
                 Some(&sbx_hash),
+                Some(&default_net_hash),
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -2820,7 +2857,11 @@ fn process_job(
     };
 
     // Resolve network policy for this job kind (TCK-00574).
-    let job_network_policy = apm2_core::fac::resolve_network_policy(&spec.kind, None);
+    // Pass the operator's policy override (if explicitly set) to allow
+    // global network posture configuration via FacPolicyV1.network_policy.
+    let job_network_policy =
+        apm2_core::fac::resolve_network_policy(&spec.kind, policy.network_policy.as_ref());
+    let net_hash = job_network_policy.content_hash_hex();
     let lane_systemd_properties = SystemdUnitProperties::from_lane_profile_with_hardening(
         &lane_profile,
         Some(&spec.constraints),
@@ -2880,6 +2921,7 @@ fn process_job(
                 None,
                 None,
                 Some(&sbx_hash),
+                Some(&net_hash),
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -2913,6 +2955,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
+            Some(&net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -2960,6 +3003,7 @@ fn process_job(
             canonicalizer_tuple_digest,
             policy_hash,
             &sbx_hash,
+            &net_hash,
             job_wall_start,
         );
     }
@@ -2992,6 +3036,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
+            Some(&net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3044,6 +3089,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
+            Some(&net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3101,6 +3147,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
+            Some(&net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3196,6 +3243,7 @@ fn process_job(
             None,
             None,
             Some(&sbx_hash),
+            Some(&net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3278,6 +3326,7 @@ fn process_job(
             policy,
             &lane_systemd_properties,
             &sbx_hash,
+            &net_hash,
             heartbeat_cycle_count,
             heartbeat_jobs_completed,
             heartbeat_jobs_denied,
@@ -3306,6 +3355,7 @@ fn process_job(
             .evidence_bundle_hash(evidence_hash)
             .job_spec_digest(&spec.job_spec_digest)
             .sandbox_hardening_hash(&sbx_hash)
+            .network_policy_hash(&net_hash)
             .passed(false)
             .build_and_sign(signer);
 
@@ -3335,6 +3385,7 @@ fn process_job(
         containment_trace.as_ref(),
         Some(observed_cost),
         Some(&sbx_hash),
+        Some(&net_hash),
     ) {
         eprintln!("worker: pipeline commit failed, cannot complete job: {commit_err}");
         let _ = LaneLeaseV1::remove(&lane_dir);
@@ -3819,6 +3870,7 @@ fn handle_stop_revoke(
     canonicalizer_tuple_digest: &str,
     policy_hash: &str,
     sbx_hash: &str,
+    net_hash: &str,
     job_wall_start: Instant,
 ) -> JobOutcome {
     let target_job_id = match &spec.cancel_target_job_id {
@@ -3848,6 +3900,7 @@ fn handle_stop_revoke(
                 None,
                 None,
                 Some(sbx_hash),
+                Some(net_hash),
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -3903,6 +3956,7 @@ fn handle_stop_revoke(
                 None,
                 Some(observed),
                 Some(sbx_hash),
+                Some(net_hash),
             ) {
                 eprintln!(
                     "worker: pipeline commit failed for stop_revoke (target already terminal): {commit_err}"
@@ -3941,6 +3995,7 @@ fn handle_stop_revoke(
             None,
             None,
             Some(sbx_hash),
+            Some(net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3995,6 +4050,7 @@ fn handle_stop_revoke(
             None,
             None,
             Some(sbx_hash),
+            Some(net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -4078,6 +4134,7 @@ fn handle_stop_revoke(
                     None,
                     None,
                     Some(sbx_hash),
+                    Some(net_hash),
                 ) {
                     return handle_pipeline_commit_failure(
                         &commit_err,
@@ -4119,6 +4176,7 @@ fn handle_stop_revoke(
                 None,
                 None,
                 Some(sbx_hash),
+                Some(net_hash),
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -4173,6 +4231,7 @@ fn handle_stop_revoke(
             None,
             None,
             Some(sbx_hash),
+            Some(net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -4208,6 +4267,7 @@ fn handle_stop_revoke(
         None,
         Some(observed),
         Some(sbx_hash),
+        Some(net_hash),
     ) {
         // Fail-closed: pipeline commit failed — stop_revoke job stays in claimed/.
         let reason = format!(
@@ -4259,6 +4319,7 @@ fn execute_warm_job(
     policy: &FacPolicyV1,
     lane_systemd_properties: &SystemdUnitProperties,
     sbx_hash: &str,
+    net_hash: &str,
     heartbeat_cycle_count: u64,
     heartbeat_jobs_completed: u64,
     heartbeat_jobs_denied: u64,
@@ -4302,6 +4363,7 @@ fn execute_warm_job(
                             containment_trace,
                             None,
                             Some(sbx_hash),
+                            Some(net_hash),
                         ) {
                             return handle_pipeline_commit_failure(
                                 &commit_err,
@@ -4346,6 +4408,7 @@ fn execute_warm_job(
             containment_trace,
             None,
             Some(sbx_hash),
+            Some(net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -4380,6 +4443,7 @@ fn execute_warm_job(
             containment_trace,
             None,
             Some(sbx_hash),
+            Some(net_hash),
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -4446,6 +4510,7 @@ fn execute_warm_job(
                 containment_trace,
                 None,
                 Some(sbx_hash),
+                Some(net_hash),
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -4508,6 +4573,7 @@ fn execute_warm_job(
                             containment_trace,
                             None,
                             Some(sbx_hash),
+                            Some(net_hash),
                         ) {
                             return handle_pipeline_commit_failure(
                                 &commit_err,
@@ -4568,6 +4634,7 @@ fn execute_warm_job(
                     containment_trace,
                     None,
                     Some(sbx_hash),
+                    Some(net_hash),
                 ) {
                     return handle_pipeline_commit_failure(
                         &commit_err,
@@ -4668,6 +4735,7 @@ fn execute_warm_job(
                 containment_trace,
                 None,
                 Some(sbx_hash),
+                Some(net_hash),
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -4721,6 +4789,7 @@ fn execute_warm_job(
             .evidence_bundle_hash(warm_receipt_hash)
             .job_spec_digest(&spec.job_spec_digest)
             .sandbox_hardening_hash(sbx_hash)
+            .network_policy_hash(net_hash)
             .passed(persist_ok)
             .build_and_sign(signer);
 
@@ -4750,6 +4819,7 @@ fn execute_warm_job(
         containment_trace,
         Some(observed_cost),
         Some(sbx_hash),
+        Some(net_hash),
     ) {
         eprintln!("worker: pipeline commit failed for warm job: {commit_err}");
         let _ = LaneLeaseV1::remove(lane_dir);
@@ -5219,6 +5289,7 @@ fn emit_job_receipt(
     policy_hash: &str,
     containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
     sandbox_hardening_hash: Option<&str>,
+    network_policy_hash: Option<&str>,
 ) -> Result<PathBuf, String> {
     emit_job_receipt_internal(
         fac_root,
@@ -5236,6 +5307,7 @@ fn emit_job_receipt(
         containment,
         None,
         sandbox_hardening_hash,
+        network_policy_hash,
     )
 }
 
@@ -5262,6 +5334,7 @@ fn emit_job_receipt_with_observed_cost(
     containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
     observed_cost: apm2_core::economics::cost_model::ObservedJobCost,
     sandbox_hardening_hash: Option<&str>,
+    network_policy_hash: Option<&str>,
 ) -> Result<PathBuf, String> {
     emit_job_receipt_internal(
         fac_root,
@@ -5279,6 +5352,7 @@ fn emit_job_receipt_with_observed_cost(
         containment,
         Some(observed_cost),
         sandbox_hardening_hash,
+        network_policy_hash,
     )
 }
 
@@ -5302,6 +5376,7 @@ fn build_job_receipt(
     containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
     observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<&str>,
+    network_policy_hash: Option<&str>,
 ) -> Result<FacJobReceiptV1, String> {
     let mut builder = FacJobReceiptV1Builder::new(
         format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs()),
@@ -5345,6 +5420,10 @@ fn build_job_receipt(
     if let Some(hash) = sandbox_hardening_hash {
         builder = builder.sandbox_hardening_hash(hash);
     }
+    // TCK-00574: Bind network policy hash to receipt for audit.
+    if let Some(hash) = network_policy_hash {
+        builder = builder.network_policy_hash(hash);
+    }
 
     builder
         .try_build()
@@ -5368,6 +5447,7 @@ fn emit_job_receipt_internal(
     containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
     observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<&str>,
+    network_policy_hash: Option<&str>,
 ) -> Result<PathBuf, String> {
     let receipt = build_job_receipt(
         spec,
@@ -5384,6 +5464,7 @@ fn emit_job_receipt_internal(
         containment,
         observed_cost,
         sandbox_hardening_hash,
+        network_policy_hash,
     )?;
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
     let result = persist_content_addressed_receipt(&receipts_dir, &receipt)?;
@@ -5426,6 +5507,7 @@ fn commit_claimed_job_via_pipeline(
     containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
     observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<&str>,
+    network_policy_hash: Option<&str>,
 ) -> Result<PathBuf, ReceiptPipelineError> {
     let terminal_state = outcome_to_terminal_state(outcome).ok_or_else(|| {
         ReceiptPipelineError::ReceiptPersistFailed(format!(
@@ -5448,6 +5530,7 @@ fn commit_claimed_job_via_pipeline(
         containment,
         observed_cost,
         sandbox_hardening_hash,
+        network_policy_hash,
     )
     .map_err(ReceiptPipelineError::ReceiptPersistFailed)?;
 
@@ -6290,6 +6373,7 @@ mod tests {
             &spec.job_spec_digest,
             None,
             None,
+            None,
         )
         .expect("emit receipt");
 
@@ -6329,6 +6413,7 @@ mod tests {
             Some(&canonicalizer_tuple_digest),
             None,
             &spec.job_spec_digest,
+            None,
             None,
             None,
         )
@@ -6530,6 +6615,7 @@ mod tests {
             &spec.job_spec_digest,
             Some(&containment_trace),
             None,
+            None,
         )
         .expect("emit receipt with containment");
 
@@ -6601,6 +6687,7 @@ mod tests {
             &spec.job_spec_digest,
             None,
             None,
+            None,
         )
         .expect("emit receipt without containment");
 
@@ -6657,6 +6744,7 @@ mod tests {
             &spec.job_spec_digest,
             None,
             Some(&hardening_hash),
+            None,
         )
         .expect("emit receipt with sandbox_hardening_hash");
 
@@ -6723,6 +6811,7 @@ mod tests {
             &spec.job_spec_digest,
             None,
             None,
+            None,
         )
         .expect("emit receipt without sandbox_hardening_hash");
 
@@ -6781,6 +6870,7 @@ mod tests {
             &tuple_digest,
             &spec.job_spec_digest,
             &hardening_hash,
+            &apm2_core::fac::NetworkPolicy::deny().content_hash_hex(),
         );
         assert!(
             matches!(outcome, JobOutcome::Denied { .. }),
@@ -7350,6 +7440,7 @@ mod tests {
             Some(&tuple_digest),
             None,
             &spec.job_spec_digest,
+            None,
             None,
             None,
         )

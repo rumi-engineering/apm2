@@ -230,19 +230,21 @@ pub struct FacPolicyV1 {
     #[serde(default)]
     pub sandbox_hardening: SandboxHardeningProfile,
 
-    /// Network access policy for FAC job units (TCK-00574).
+    /// Network access policy override for FAC job units (TCK-00574).
     ///
-    /// Defines the default network access posture for job units. When no
-    /// per-job-kind override is configured, `resolve_network_policy()`
-    /// uses the built-in mapping (deny for gates/bulk/control, allow for
-    /// warm). This field allows operators to override the default posture
-    /// globally.
+    /// When `Some`, this policy takes precedence over the built-in
+    /// per-job-kind mapping in `resolve_network_policy()`. When `None`
+    /// (the default), the built-in mapping is used: deny for
+    /// gates/bulk/control, allow for warm.
     ///
-    /// The default is `NetworkPolicy::deny()` (fail-closed). Existing
-    /// policies that predate TCK-00574 will correctly default to deny
-    /// via `serde(default)`.
-    #[serde(default)]
-    pub network_policy: NetworkPolicy,
+    /// This allows operators to explicitly override the default posture
+    /// globally (e.g., deny network even for warm, or allow for gates).
+    ///
+    /// The default is `None` (use built-in mapping). Existing policies
+    /// that predate TCK-00574 will correctly default to `None` via
+    /// `serde(default)`, preserving the built-in warm→allow mapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_policy: Option<NetworkPolicy>,
 
     /// Optional `repo_id` allowlist for job spec validation (TCK-00579).
     ///
@@ -330,7 +332,7 @@ impl FacPolicyV1 {
             determinism_class: DeterminismClass::SoftDeterministic,
             economics_profile_hash,
             sandbox_hardening: SandboxHardeningProfile::default(),
-            network_policy: NetworkPolicy::default(),
+            network_policy: None,
             allowed_repo_ids: None,
         }
     }

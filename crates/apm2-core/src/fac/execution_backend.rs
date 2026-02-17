@@ -1133,11 +1133,13 @@ mod tests {
             !list.iter().any(|p| p.starts_with("RestrictRealtime")),
             "RestrictRealtime requires root"
         );
+        // TCK-00574: RestrictAddressFamilies=AF_UNIX is now emitted in
+        // user-mode by the network-policy deny path (partial mitigation for
+        // PrivateNetwork which requires root). The sandbox_hardening form
+        // (which lists AF_INET, AF_INET6, AF_UNIX) is still root-only.
         assert!(
-            !list
-                .iter()
-                .any(|p| p.starts_with("RestrictAddressFamilies")),
-            "RestrictAddressFamilies requires root"
+            list.contains(&"RestrictAddressFamilies=AF_UNIX".to_string()),
+            "RestrictAddressFamilies=AF_UNIX should be present from network deny policy"
         );
         assert!(
             !list
