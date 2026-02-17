@@ -1493,6 +1493,7 @@ fn execute_queued_gates_job(
     budget_trace: Option<&FacBudgetAdmissionTrace>,
     canonicalizer_tuple_digest: &str,
     policy_hash: &str,
+    sbx_hash: &str,
 ) -> JobOutcome {
     let job_wall_start = Instant::now();
     let options = match parse_gates_job_options(spec) {
@@ -1524,7 +1525,7 @@ fn execute_queued_gates_job(
                 moved_path.as_deref(),
                 policy_hash,
                 None,
-                None,
+                Some(sbx_hash),
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for denied gates job: {receipt_err}"
@@ -1567,7 +1568,7 @@ fn execute_queued_gates_job(
                 moved_path.as_deref(),
                 policy_hash,
                 None,
-                None,
+                Some(sbx_hash),
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for denied gates job: {receipt_err}"
@@ -1607,7 +1608,7 @@ fn execute_queued_gates_job(
             moved_path.as_deref(),
             policy_hash,
             None,
-            None,
+            Some(sbx_hash),
         ) {
             eprintln!(
                 "worker: WARNING: receipt emission failed for denied gates job: {receipt_err}"
@@ -1646,7 +1647,7 @@ fn execute_queued_gates_job(
                 moved_path.as_deref(),
                 policy_hash,
                 None,
-                None,
+                Some(sbx_hash),
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for denied gates job: {receipt_err}"
@@ -1673,7 +1674,7 @@ fn execute_queued_gates_job(
             policy_hash,
             None,
             observed_cost,
-            None,
+            Some(sbx_hash),
         ) {
             eprintln!("worker: receipt emission failed for gates job: {receipt_err}");
             if let Err(move_err) = move_to_dir_safe(
@@ -1731,7 +1732,7 @@ fn execute_queued_gates_job(
         moved_path.as_deref(),
         policy_hash,
         None,
-        None,
+        Some(sbx_hash),
     ) {
         eprintln!("worker: WARNING: receipt emission failed for denied gates job: {receipt_err}");
     }
@@ -2661,6 +2662,7 @@ fn process_job(
             budget_trace.as_ref(),
             canonicalizer_tuple_digest,
             policy_hash,
+            &sbx_hash,
         );
     }
 
@@ -6554,6 +6556,74 @@ mod tests {
         assert!(
             receipt_json.get("sandbox_hardening_hash").is_none(),
             "sandbox_hardening_hash must be absent when None"
+        );
+    }
+
+    #[test]
+    fn test_execute_queued_gates_job_binds_sandbox_hardening_hash_in_denial_receipt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let queue_root = dir.path().join("queue");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        ensure_queue_dirs(&queue_root).expect("create queue dirs");
+
+        let claimed_path = queue_root.join(CLAIMED_DIR).join("gates-test.json");
+        fs::write(&claimed_path, b"{}").expect("seed claimed file");
+        let claimed_file_name = "gates-test.json";
+
+        let spec = make_receipt_test_spec();
+        let boundary_trace = ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
+        };
+        let queue_trace = JobQueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "consume".to_string(),
+            defect_reason: None,
+            cost_estimate_ticks: None,
+        };
+        let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
+        let hardening_hash = apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
+
+        let outcome = execute_queued_gates_job(
+            &spec,
+            &claimed_path,
+            claimed_file_name,
+            &queue_root,
+            &fac_root,
+            &boundary_trace,
+            &queue_trace,
+            None,
+            &tuple_digest,
+            &spec.job_spec_digest,
+            &hardening_hash,
+        );
+        assert!(
+            matches!(outcome, JobOutcome::Denied { .. }),
+            "missing gates payload should fail closed in denial path"
+        );
+
+        let receipt_file = fs::read_dir(fac_root.join(FAC_RECEIPTS_DIR))
+            .expect("receipts dir")
+            .flatten()
+            .find(|entry| entry.file_type().is_ok_and(|ty| ty.is_file()))
+            .expect("at least one receipt emitted");
+        let receipt_json = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(receipt_file.path()).expect("read receipt"),
+        )
+        .expect("parse receipt JSON");
+        assert_eq!(
+            receipt_json
+                .get("sandbox_hardening_hash")
+                .and_then(serde_json::Value::as_str),
+            Some(hardening_hash.as_str()),
+            "queued gates receipt must bind sandbox hardening hash"
         );
     }
 

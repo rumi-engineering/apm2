@@ -118,7 +118,9 @@ plan:
         - `cargo test --workspace`
 
 definition_of_done:
-  evidence_ids: []
+  evidence_ids:
+    - "EXEC-2026-02-17-CI-MERGE-POLICY"
+    - "EXEC-2026-02-17-WORKSPACE-VALIDATION"
   criteria:
     - "`fac push` uses reusable queued gates abstraction and blocks on queue completion."
     - "Push fails closed on empty job id, SHA mismatch, and incomplete/inconsistent gate rows."
@@ -129,12 +131,35 @@ definition_of_done:
 notes:
   context: |
     This ticket update is scoped only to work completed in this branch iteration:
-    reusable queued gates abstraction, fac push queue integration, fail-fast gate
-    execution, and corresponding regressions.
+    queued-gates fail-closed validation hardening in `fac push`, sandbox-hash
+    binding for queued gates worker receipts, and CI projection-policy regression
+    test hardening with machine-verifiable execution receipts.
 
     Modified files tied to this ticket:
-    - `crates/apm2-cli/src/commands/fac_review/gates.rs`
     - `crates/apm2-cli/src/commands/fac_review/push.rs`
-    - `crates/apm2-cli/src/commands/fac_review/evidence.rs`
-    - `crates/apm2-core/tests/test_ct_eq.rs` (deleted)
+    - `crates/apm2-cli/src/commands/fac_worker.rs`
+    - `crates/apm2-cli/tests/ci_merge_policy_invariants.rs`
+    - `documents/work/reports/tck-00614.validation.2026-02-17.json`
   security: "default-deny, fail-closed gate queueing and projection guards"
+  verification_evidence:
+    artifact: "documents/work/reports/tck-00614.validation.2026-02-17.json"
+    receipts:
+      - id: "EXEC-2026-02-17-CI-MERGE-POLICY"
+        command_receipt_id: "cmd_ci_merge_policy"
+        command: "cargo test -p apm2-cli --test ci_merge_policy_invariants"
+        exit_code: 0
+        stdout_stderr_sha256: "7791cee5a9470b3a7cde9c9ecf68b37af4f42921941d9cb9ae878ec3dc331286"
+      - id: "EXEC-2026-02-17-WORKSPACE-VALIDATION"
+        command_receipt_ids:
+          - "cmd_fmt_all"
+          - "cmd_test_apm2_cli"
+          - "cmd_clippy_workspace"
+          - "cmd_doc_workspace"
+          - "cmd_test_workspace"
+        commands:
+          - "cargo fmt --all"
+          - "cargo test -p apm2-cli"
+          - "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+          - "cargo doc --workspace --no-deps"
+          - "cargo test --workspace"
+        exit_code: 0
