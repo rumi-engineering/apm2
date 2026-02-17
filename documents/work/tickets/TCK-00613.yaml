@@ -215,6 +215,48 @@ scope:
           - All unit, integration, and e2e tests pass.
           - All hard compliance gates pass.
 
+    - id: S8_POST_CUTOVER_STABILIZATION
+      title: "Post-cutover reliability fixes (broker admission, queue identity, gate correctness, doctor diagnostics)"
+      detail: |
+        Stabilization fixes applied after single-cutover merge prep:
+
+        1. Broker admission/token binding hardening:
+           - Bind channel-context token policy to admitted policy digest
+             (not job digest), preserving admission integrity semantics.
+           - Update broker callsites in gates/warm paths to use the
+             admitted digest contract.
+
+        2. `fac warm --wait` correctness:
+           - Do not treat receipt existence as success.
+           - Require terminal receipt outcome and fail on denied/
+             quarantined/cancelled states.
+
+        3. Queue collision hardening:
+           - Replace low-entropy suffixing with
+             `secs+nanos+pid+atomic_counter` composition to avoid
+             same-second collisions under concurrency.
+
+        4. Gate correctness hardening:
+           - Fix top-level `src/*.rs` target detection in
+             `test_safety_guard` Rust path logic.
+           - Scope shell-literal checks to avoid false positives from
+             Rust-only contexts while preserving fail-closed behavior.
+
+        5. Evidence runtime stabilization:
+           - Remove ambient-env dependency for policy-root resolution.
+           - Derive `apm2_home/fac_root` from locked lane paths to
+             eliminate flake from parallel test environments.
+
+        6. Documentation/lint stabilization:
+           - Resolve rustdoc warning in economics cost-model docs.
+
+        7. FAC doctor and dispatch diagnostics:
+           - Confirmed local failure mode for PR orchestration:
+             `agent registry integrity check failed`.
+           - `fac doctor --pr <N> --fix` currently resets lifecycle to
+             `pushed` but may not quarantine/rebuild corrupt registry in
+             this failure class; follow-up hardening remains required.
+
   out_of_scope:
     - "Compatibility wrappers for old script paths (clean cutover, no shims)."
     - "Removing bounded execution or containment controls (security posture unchanged)."
@@ -280,6 +322,21 @@ plan:
         5. Run failure-injection suite.
         6. Verify all hard compliance gates pass.
 
+    - id: STEP_08
+      title: "Post-cutover stabilization and doctor-path hardening"
+      detail: |
+        1. Patch broker token policy binding to admitted-digest
+           semantics and update callsites.
+        2. Tighten warm wait terminal-state validation.
+        3. Harden queue job suffix uniqueness under concurrency.
+        4. Fix subtle test_safety_guard target/path regressions and
+           add regression tests.
+        5. Remove ambient env coupling from evidence policy-root lookup.
+        6. Repair doc/lint warnings introduced by refactor.
+        7. Validate with full gates run and FAC push orchestration.
+        8. Follow up on doctor recovery path so `--fix` can quarantine/
+           rebuild invalid agent registry state for dispatch recovery.
+
 definition_of_done:
   evidence_ids: []
   criteria:
@@ -301,6 +358,12 @@ definition_of_done:
     - "All unit, integration, e2e, and hard compliance gates pass."
     - "`cargo test --workspace` passes."
     - "Single-PR cutover: no transitional wrappers or compatibility shims."
+    - "Broker channel-context token policy is bound to admitted digest semantics (no job-digest mismatch)."
+    - "`fac warm --wait` fails closed on non-success terminal outcomes."
+    - "Queue submission suffixes are collision-resistant under high concurrency."
+    - "`test_safety_guard` correctly evaluates top-level `src/*.rs` paths and avoids false-positive shell-literal detection drift."
+    - "Evidence policy-root derivation is lane-path based and deterministic in parallel test environments."
+    - "`fac doctor --pr <N> --fix` follow-up documented for agent-registry integrity recovery gap when dispatch fails with integrity mismatch."
 
 notes:
   context: |
@@ -331,4 +394,28 @@ notes:
     throughput regression (TCK-00612) which revealed the dual
     shell/Rust execution model as a source of inconsistency and
     maintenance burden.
+
+    Implementation update (2026-02-17):
+    - Local verification used repository build `./target/debug/apm2`
+      (distinct binary hash from globally installed `~/.local/bin/apm2`).
+    - FAC push completed with gates passed (`duration_secs=229`) and
+      PR update to `https://github.com/guardian-intelligence/apm2/pull/708`.
+    - Post-cutover stabilization fixes were applied:
+      broker admitted-digest binding, warm wait terminal checks,
+      queue suffix hardening, test_safety_guard path fixes,
+      evidence lane-derived policy-root, and rustdoc cleanup.
+    - Outstanding operational blocker captured:
+      PR-level doctor diagnostics still report registry integrity
+      mismatch (`agent registry integrity check failed`) and missing
+      review run-state files for PR #708. `doctor --fix` resets
+      lifecycle but may require additional registry quarantine/rebuild
+      behavior for full self-healing dispatch recovery.
+  amendments:
+    - amendment_id: "AMD-2026-02-17-POST-CUTOVER-STABILIZATION"
+      summary: "Closure fixes and diagnostics from the unified Rust gate cutover."
+      supersedes:
+        - "Assumption that doctor --fix already self-heals all registry-integrity dispatch failures."
+      replacement:
+        - "Doctor --fix is authoritative for lifecycle reset and run-state repair but needs explicit registry-integrity quarantine/rebuild handling for the `agent registry integrity check failed` class."
+        - "Post-cutover reliability includes broker admission digest binding, warm wait fail-closed terminal checks, queue suffix entropy hardening, and gate/evidence correctness fixes."
   security: "default-deny, least privilege, fail-closed"
