@@ -10,8 +10,11 @@
 //! - Adoption validates schema + hash before acceptance.
 //! - All reads are bounded (CTR-1603).
 //! - Rollback is atomic with receipt emission.
+//! - Actor identity is resolved from the calling process environment, not
+//!   hard-coded (f-722-security-1771347580085305-0).
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use apm2_core::fac::policy::MAX_POLICY_SIZE;
@@ -59,8 +62,8 @@ pub struct PolicyShowArgs {
 /// Arguments for `apm2 fac policy validate`.
 #[derive(Debug, Args)]
 pub struct PolicyValidateArgs {
-    /// Path to the policy file to validate.
-    pub path: PathBuf,
+    /// Path to the policy file to validate, or "-" for stdin.
+    pub path: Option<PathBuf>,
 
     /// Emit JSON output.
     #[arg(long, default_value_t = false)]
@@ -70,8 +73,8 @@ pub struct PolicyValidateArgs {
 /// Arguments for `apm2 fac policy adopt`.
 #[derive(Debug, Args)]
 pub struct PolicyAdoptArgs {
-    /// Path to the policy file to adopt.
-    pub path: PathBuf,
+    /// Path to the policy file to adopt, or "-" for stdin.
+    pub path: Option<PathBuf>,
 
     /// Reason for the adoption (for the receipt).
     #[arg(long, default_value = "operator adoption")]
@@ -159,8 +162,8 @@ fn run_show(args: &PolicyShowArgs, json_global: bool) -> u8 {
 fn run_validate(args: &PolicyValidateArgs, json_global: bool) -> u8 {
     let json = args.json || json_global;
 
-    // Bounded read (CTR-1603).
-    let bytes = match read_bounded_file(&args.path, MAX_POLICY_SIZE) {
+    // Read from path or stdin (CTR-1603 bounded).
+    let bytes = match read_policy_input(args.path.as_deref()) {
         Ok(b) => b,
         Err(msg) => {
             if json {
@@ -230,9 +233,10 @@ fn run_validate(args: &PolicyValidateArgs, json_global: bool) -> u8 {
 fn run_adopt(args: &PolicyAdoptArgs, json_global: bool) -> u8 {
     let json = args.json || json_global;
     let fac_root = resolve_fac_root();
+    let actor_id = resolve_operator_identity();
 
-    // Bounded read (CTR-1603).
-    let bytes = match read_bounded_file(&args.path, MAX_POLICY_SIZE) {
+    // Read from path or stdin (CTR-1603 bounded).
+    let bytes = match read_policy_input(args.path.as_deref()) {
         Ok(b) => b,
         Err(msg) => {
             if json {
@@ -244,7 +248,7 @@ fn run_adopt(args: &PolicyAdoptArgs, json_global: bool) -> u8 {
         },
     };
 
-    match adopt_policy(&fac_root, &bytes, "operator:local", &args.reason) {
+    match adopt_policy(&fac_root, &bytes, &actor_id, &args.reason) {
         Ok((root, receipt)) => {
             if json {
                 println!(
@@ -288,8 +292,9 @@ fn run_adopt(args: &PolicyAdoptArgs, json_global: bool) -> u8 {
 fn run_rollback(args: &PolicyRollbackArgs, json_global: bool) -> u8 {
     let json = args.json || json_global;
     let fac_root = resolve_fac_root();
+    let actor_id = resolve_operator_identity();
 
-    match rollback_policy(&fac_root, "operator:local", &args.reason) {
+    match rollback_policy(&fac_root, &actor_id, &args.reason) {
         Ok((root, receipt)) => {
             if json {
                 println!(
@@ -338,6 +343,51 @@ fn resolve_fac_root() -> PathBuf {
         .join("fac")
 }
 
+/// Resolve the operator identity from the environment.
+///
+/// Uses `$USER` or `$LOGNAME` (standard POSIX), falling back to the
+/// numeric UID if neither is set. The format is `operator:<username>`
+/// to distinguish CLI operator actors from other actor types in
+/// receipts.
+///
+/// This replaces the hard-coded `"operator:local"` that was previously
+/// used, per finding f-722-security-1771347580085305-0.
+fn resolve_operator_identity() -> String {
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| {
+            // Fall back to numeric UID for environments where USER is
+            // unset (e.g., cron, containers).
+            #[cfg(unix)]
+            {
+                // SAFETY: libc::getuid() is always safe to call — it
+                // requires no preconditions, has no UB conditions, and
+                // cannot fail. It simply returns the real user ID of
+                // the calling process.
+                #[allow(unsafe_code)]
+                let uid = unsafe { libc::getuid() };
+                format!("uid:{uid}")
+            }
+            #[cfg(not(unix))]
+            {
+                "unknown".to_string()
+            }
+        });
+    format!("operator:{username}")
+}
+
+/// Read policy input from a file path or stdin.
+///
+/// When `path` is `None` or `Some("-")`, reads from stdin with bounded
+/// semantics (CTR-1603). Otherwise reads from the given file path.
+fn read_policy_input(path: Option<&Path>) -> Result<Vec<u8>, String> {
+    match path {
+        None => read_bounded_stdin(MAX_POLICY_SIZE),
+        Some(p) if p.as_os_str() == "-" => read_bounded_stdin(MAX_POLICY_SIZE),
+        Some(p) => read_bounded_file(p, MAX_POLICY_SIZE),
+    }
+}
+
 /// Read a file with a size cap before reading into memory (CTR-1603).
 ///
 /// Uses `symlink_metadata` to avoid following symlinks.
@@ -357,4 +407,82 @@ fn read_bounded_file(path: &Path, max_size: usize) -> Result<Vec<u8>, String> {
     }
 
     fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
+}
+
+/// Read from stdin with bounded semantics (CTR-1603).
+///
+/// Reads at most `max_size + 1` bytes. Returns an error if the input
+/// exceeds `max_size`. This prevents memory exhaustion from unbounded
+/// piped input.
+fn read_bounded_stdin(max_size: usize) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    let mut handle = std::io::stdin().take(max_size.saturating_add(1) as u64);
+    handle
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("failed to read from stdin: {e}"))?;
+    if bytes.len() > max_size {
+        return Err(format!(
+            "stdin input exceeds maximum size limit of {max_size} bytes"
+        ));
+    }
+    if bytes.is_empty() {
+        return Err("stdin is empty; provide a policy file via path or pipe".to_string());
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_operator_identity_not_hardcoded() {
+        let identity = resolve_operator_identity();
+        assert!(
+            identity.starts_with("operator:"),
+            "identity should start with 'operator:' prefix, got: {identity}"
+        );
+        // The identity should NOT be the old hard-coded value in all cases
+        // (unless the system user actually is named "local").
+        // Verify it resolves to something meaningful.
+        let user_part = identity.strip_prefix("operator:").unwrap();
+        assert!(
+            !user_part.is_empty(),
+            "operator identity should have a non-empty user part"
+        );
+    }
+
+    #[test]
+    fn test_read_bounded_file_rejects_symlink() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let real_file = tmp.path().join("real.json");
+        fs::write(&real_file, b"{}").expect("write");
+
+        #[cfg(unix)]
+        {
+            let symlink = tmp.path().join("link.json");
+            std::os::unix::fs::symlink(&real_file, &symlink).expect("symlink");
+            let result = read_bounded_file(&symlink, 1024);
+            assert!(result.is_err());
+            assert!(
+                result.unwrap_err().contains("refusing to follow symlink"),
+                "should reject symlink"
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_bounded_file_rejects_oversized() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("big.json");
+        fs::write(&path, vec![b' '; 100]).expect("write");
+
+        let result = read_bounded_file(&path, 50);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("exceeds maximum"));
+    }
 }

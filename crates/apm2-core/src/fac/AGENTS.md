@@ -1128,18 +1128,29 @@ previous digest retained in `admitted_policy_root.prev.v1.json` for rollback.
 ### CLI Commands (fac_policy.rs)
 
 - `apm2 fac policy show [--json]`: Display the currently admitted policy root.
-- `apm2 fac policy validate <path> [--json]`: Validate a policy file (schema +
-  hash computation) and check admission status.
-- `apm2 fac policy adopt <path> [--reason <reason>] [--json]`: Adopt a new
-  policy (atomic, with receipt).
+- `apm2 fac policy validate [<path|->] [--json]`: Validate a policy file (schema +
+  hash computation) and check admission status. Accepts a file path or `-` for
+  stdin. When no argument is given, reads from stdin (bounded, CTR-1603).
+- `apm2 fac policy adopt [<path|->] [--reason <reason>] [--json]`: Adopt a new
+  policy (atomic, with receipt). Accepts a file path or `-` for stdin. When no
+  argument is given, reads from stdin (bounded, CTR-1603).
 - `apm2 fac policy rollback [--reason <reason>] [--json]`: Rollback to the
   previous admitted policy (with receipt).
+
+### Actor Identity Resolution (TCK-00561, fix round 1)
+
+Adoption and rollback CLI commands resolve the operator identity from the
+process environment (`$USER` / `$LOGNAME`, falling back to numeric UID on
+Unix). The identity is formatted as `operator:<username>` and persisted in
+both the admitted policy root and adoption receipts. This replaces the
+hard-coded `"operator:local"` actor ID that was previously used.
 
 ### Security Invariants (TCK-00561)
 
 - [INV-PADOPT-001] Adoption requires schema + hash validation before acceptance
   (no arbitrary file acceptance).
 - [INV-PADOPT-002] Atomic persistence via temp + rename with fsync (CTR-2607).
+  The prev-file backup also uses temp + rename (not `fs::copy`).
 - [INV-PADOPT-003] Rollback to `prev` is atomic and emits a receipt.
 - [INV-PADOPT-004] Workers refuse actuation tokens whose policy binding
   mismatches the admitted digest (fail-closed).
@@ -1147,6 +1158,11 @@ previous digest retained in `admitted_policy_root.prev.v1.json` for rollback.
   injective length-prefix framing (CTR-2612).
 - [INV-PADOPT-006] All string fields are bounded for DoS prevention (CTR-1303).
 - [INV-PADOPT-007] File reads are bounded before deserialization (CTR-1603).
+- [INV-PADOPT-008] All persistence paths (admitted root, prev root, receipt
+  files, broker dir, receipts dir) reject symlinks via `symlink_metadata`
+  before writes. Symlink detection uses lstat semantics (not following).
+- [INV-PADOPT-009] Actor identity in receipts is resolved from the calling
+  process environment, not hard-coded.
 
 ## Receipt Versioning (TCK-00518)
 

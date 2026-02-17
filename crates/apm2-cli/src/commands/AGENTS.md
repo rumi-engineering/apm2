@@ -377,3 +377,15 @@ tables are printed by default via `print_lane_init_receipt()` and
   the receipt index to entries at or after the given UNIX epoch. Deterministic ordering is
   enforced: primary sort by `timestamp_secs` descending, secondary sort by `content_hash`
   ascending for stable tie-breaking. Boundary inclusion is verified by regression test.
+
+## Policy CLI Invariants (Updated for TCK-00561 fix round 1)
+
+- **Stdin support** (`fac_policy.rs`): `apm2 fac policy validate` and `apm2 fac policy adopt`
+  accept `<path|->` as an optional positional argument. When the argument is omitted or is `-`,
+  input is read from stdin with bounded semantics (`MAX_POLICY_SIZE` cap via `take()` on the
+  stdin handle, CTR-1603). Empty stdin returns an explicit error.
+- **Operator identity resolution** (`fac_policy.rs`): `run_adopt` and `run_rollback` resolve
+  the operator identity from `$USER` / `$LOGNAME` (POSIX), falling back to numeric UID on Unix
+  when neither is set. The identity is formatted as `operator:<username>` and passed to the
+  core `adopt_policy`/`rollback_policy` APIs. This replaces the hard-coded `"operator:local"`
+  actor ID (f-722-security-1771347580085305-0).

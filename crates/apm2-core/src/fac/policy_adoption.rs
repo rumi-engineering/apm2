@@ -495,36 +495,49 @@ pub fn rollback_policy(
 // Internal Helpers
 // =============================================================================
 
-/// Persist the admitted policy root atomically. Moves the current file
-/// to `.prev` before writing the new file.
-fn persist_admitted_root_atomic(
-    fac_root: &Path,
-    root: &AdmittedPolicyRootV1,
-) -> Result<(), PolicyAdoptionError> {
-    let dir = broker_dir(fac_root);
-    fs::create_dir_all(&dir).map_err(|e| PolicyAdoptionError::Persistence {
-        detail: format!("cannot create broker dir {}: {e}", dir.display()),
-    })?;
-
-    let current_path = admitted_root_path(fac_root);
-    let prev_path_val = prev_root_path(fac_root);
-    let temp_path = dir.join(".admitted_policy_root.v1.json.tmp");
-
-    // If a current root exists, copy it to prev (atomic).
-    if current_path.exists() {
-        fs::copy(&current_path, &prev_path_val).map_err(|e| PolicyAdoptionError::Persistence {
-            detail: format!(
-                "cannot copy current root to prev at {}: {e}",
-                prev_path_val.display()
-            ),
-        })?;
+/// Reject symlinks on a path. Uses `symlink_metadata` to detect symlinks
+/// without following them (closing the TOCTOU gap for symlink-following
+/// writes, per f-722-security-1771347582402872-0).
+///
+/// Returns `Ok(())` if the path does not exist (caller may be about to
+/// create it) or if it is a regular file/directory. Returns
+/// `Err(PolicyAdoptionError::Persistence)` if the path is a symlink.
+fn reject_symlink(path: &Path) -> Result<(), PolicyAdoptionError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(PolicyAdoptionError::Persistence {
+                    detail: format!(
+                        "refusing to operate on symlink at {} (security: symlink-following rejected)",
+                        path.display()
+                    ),
+                });
+            }
+            Ok(())
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(PolicyAdoptionError::Persistence {
+            detail: format!("cannot stat {}: {e}", path.display()),
+        }),
     }
+}
 
-    // Write new root to temp file.
-    let bytes =
-        serde_json::to_vec_pretty(root).map_err(|e| PolicyAdoptionError::Serialization {
-            detail: format!("cannot serialize admitted root: {e}"),
-        })?;
+/// Write bytes to a temp file atomically: write -> fsync -> rename.
+///
+/// Sets permissions to 0o600 on Unix. The caller-provided `final_path`
+/// must not be a symlink (checked before rename).
+fn atomic_write_file(
+    dir: &Path,
+    temp_name: &str,
+    final_path: &Path,
+    bytes: &[u8],
+) -> Result<(), PolicyAdoptionError> {
+    // Reject symlinks on the final destination before writing.
+    reject_symlink(final_path)?;
+
+    let temp_path = dir.join(temp_name);
+    // Also reject symlinks on the temp path (defense in depth).
+    reject_symlink(&temp_path)?;
 
     let mut file = fs::File::create(&temp_path).map_err(|e| PolicyAdoptionError::Persistence {
         detail: format!("cannot create temp file {}: {e}", temp_path.display()),
@@ -543,7 +556,7 @@ fn persist_admitted_root_atomic(
         })?;
     }
 
-    file.write_all(&bytes)
+    file.write_all(bytes)
         .map_err(|e| PolicyAdoptionError::Persistence {
             detail: format!("cannot write temp file {}: {e}", temp_path.display()),
         })?;
@@ -552,14 +565,72 @@ fn persist_admitted_root_atomic(
             detail: format!("cannot sync temp file {}: {e}", temp_path.display()),
         })?;
 
-    // Atomic rename.
-    fs::rename(&temp_path, &current_path).map_err(|e| PolicyAdoptionError::Persistence {
+    // Atomic rename to final destination.
+    fs::rename(&temp_path, final_path).map_err(|e| PolicyAdoptionError::Persistence {
         detail: format!(
             "cannot rename {} -> {}: {e}",
             temp_path.display(),
-            current_path.display()
+            final_path.display()
         ),
     })?;
+
+    Ok(())
+}
+
+/// Persist the admitted policy root atomically. Snapshots the current
+/// file to `.prev` via temp+rename before writing the new file.
+///
+/// All paths are validated against symlinks before writes to close the
+/// TOCTOU gap identified in f-722-security-1771347582402872-0.
+///
+/// The prev-file backup uses temp+rename (not `fs::copy`) to maintain
+/// atomic checkpoint semantics, per f-722-code_quality-1771347577305561-0.
+fn persist_admitted_root_atomic(
+    fac_root: &Path,
+    root: &AdmittedPolicyRootV1,
+) -> Result<(), PolicyAdoptionError> {
+    let dir = broker_dir(fac_root);
+    fs::create_dir_all(&dir).map_err(|e| PolicyAdoptionError::Persistence {
+        detail: format!("cannot create broker dir {}: {e}", dir.display()),
+    })?;
+
+    // Validate the broker directory itself is not a symlink.
+    reject_symlink(&dir)?;
+
+    let current_path = admitted_root_path(fac_root);
+    let prev_path_val = prev_root_path(fac_root);
+
+    // If a current root exists, snapshot it to prev via temp+rename
+    // (atomic checkpoint, not fs::copy which can produce partial writes).
+    reject_symlink(&current_path)?;
+    if current_path.exists() {
+        let current_bytes =
+            fs::read(&current_path).map_err(|e| PolicyAdoptionError::Persistence {
+                detail: format!(
+                    "cannot read current root for prev snapshot {}: {e}",
+                    current_path.display()
+                ),
+            })?;
+        atomic_write_file(
+            &dir,
+            ".admitted_policy_root.prev.v1.json.tmp",
+            &prev_path_val,
+            &current_bytes,
+        )?;
+    }
+
+    // Write new root to temp file, then atomic rename.
+    let bytes =
+        serde_json::to_vec_pretty(root).map_err(|e| PolicyAdoptionError::Serialization {
+            detail: format!("cannot serialize admitted root: {e}"),
+        })?;
+
+    atomic_write_file(
+        &dir,
+        ".admitted_policy_root.v1.json.tmp",
+        &current_path,
+        &bytes,
+    )?;
 
     // Sync directory for durability.
     let dir_handle = fs::File::open(&dir).map_err(|e| PolicyAdoptionError::Persistence {
@@ -612,64 +683,24 @@ fn build_and_persist_receipt(
         detail: format!("cannot create receipts dir {}: {e}", receipts.display()),
     })?;
 
+    // Validate receipts directory is not a symlink.
+    reject_symlink(&receipts)?;
+
     // Use content hash (without prefix) as filename.
     let hash_suffix = content_hash
         .strip_prefix("b3-256:")
         .unwrap_or(&content_hash);
     let receipt_filename = format!("policy_{action}_{hash_suffix}.json");
     let receipt_path = receipts.join(&receipt_filename);
-    let temp_receipt_path = receipts.join(format!(".{receipt_filename}.tmp"));
+    let temp_receipt_name = format!(".{receipt_filename}.tmp");
 
     let receipt_bytes =
         serde_json::to_vec_pretty(&receipt).map_err(|e| PolicyAdoptionError::Serialization {
             detail: format!("cannot serialize adoption receipt: {e}"),
         })?;
 
-    let mut file =
-        fs::File::create(&temp_receipt_path).map_err(|e| PolicyAdoptionError::Persistence {
-            detail: format!(
-                "cannot create temp receipt file {}: {e}",
-                temp_receipt_path.display()
-            ),
-        })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp_receipt_path, fs::Permissions::from_mode(0o600)).map_err(
-            |e| PolicyAdoptionError::Persistence {
-                detail: format!(
-                    "cannot set permissions on temp receipt {}: {e}",
-                    temp_receipt_path.display()
-                ),
-            },
-        )?;
-    }
-
-    file.write_all(&receipt_bytes)
-        .map_err(|e| PolicyAdoptionError::Persistence {
-            detail: format!(
-                "cannot write temp receipt {}: {e}",
-                temp_receipt_path.display()
-            ),
-        })?;
-    file.sync_all()
-        .map_err(|e| PolicyAdoptionError::Persistence {
-            detail: format!(
-                "cannot sync temp receipt {}: {e}",
-                temp_receipt_path.display()
-            ),
-        })?;
-
-    fs::rename(&temp_receipt_path, &receipt_path).map_err(|e| {
-        PolicyAdoptionError::Persistence {
-            detail: format!(
-                "cannot rename receipt {} -> {}: {e}",
-                temp_receipt_path.display(),
-                receipt_path.display()
-            ),
-        }
-    })?;
+    // Use atomic_write_file which validates symlinks and does temp+rename.
+    atomic_write_file(&receipts, &temp_receipt_name, &receipt_path, &receipt_bytes)?;
 
     Ok(receipt)
 }
@@ -1165,5 +1196,251 @@ mod tests {
             !is_policy_hash_admitted(fac_root, wrong_hash),
             "worker must refuse mismatched policy (fail-closed, INV-PADOPT-004)"
         );
+    }
+
+    // =====================================================================
+    // Symlink rejection tests (f-722-security-1771347582402872-0)
+    // =====================================================================
+
+    /// Verify that `reject_symlink` correctly identifies symlinks.
+    #[cfg(unix)]
+    #[test]
+    fn test_reject_symlink_on_regular_file() {
+        let tmp = tempdir().expect("tempdir");
+        let real = tmp.path().join("real.txt");
+        fs::write(&real, b"data").expect("write");
+        assert!(reject_symlink(&real).is_ok(), "regular file should pass");
+
+        let link = tmp.path().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let err = reject_symlink(&link);
+        assert!(err.is_err(), "symlink should be rejected");
+    }
+
+    /// Verify that adoption rejects symlinked current admitted root.
+    #[cfg(unix)]
+    #[test]
+    fn test_adopt_rejects_symlink_on_current_root() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let policy_bytes = make_default_policy_bytes();
+
+        // First adoption to create a real current root.
+        adopt_policy(fac_root, &policy_bytes, "operator:local", "initial").expect("first adopt");
+
+        // Replace current root with a symlink.
+        let current = admitted_root_path(fac_root);
+        let target = tmp.path().join("evil_target.json");
+        fs::copy(&current, &target).expect("copy to target");
+        fs::remove_file(&current).expect("remove current");
+        std::os::unix::fs::symlink(&target, &current).expect("create symlink");
+
+        // Second adoption should fail because current root is a symlink.
+        let mut policy = FacPolicyV1::default_policy();
+        policy.deny_ambient_cargo_home = false;
+        let second_bytes = serde_json::to_vec_pretty(&policy).expect("serialize");
+        let result = adopt_policy(fac_root, &second_bytes, "operator:local", "update");
+        // The symlink is rejected either at load time or at persist time.
+        assert!(result.is_err(), "should reject symlinked current root");
+    }
+
+    /// Verify that adoption rejects symlinked prev root path.
+    #[cfg(unix)]
+    #[test]
+    fn test_adopt_rejects_symlink_on_prev_root() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let policy_bytes = make_default_policy_bytes();
+
+        // First adoption.
+        adopt_policy(fac_root, &policy_bytes, "operator:local", "initial").expect("first adopt");
+
+        // Place a symlink at the prev path before second adoption.
+        let prev = prev_root_path(fac_root);
+        let target = tmp.path().join("evil_prev.json");
+        fs::write(&target, b"{}").expect("write target");
+        // Remove the real prev if it exists.
+        let _ = fs::remove_file(&prev);
+        std::os::unix::fs::symlink(&target, &prev).expect("create symlink at prev");
+
+        // Second adoption should fail because prev path is a symlink.
+        let mut policy = FacPolicyV1::default_policy();
+        policy.deny_ambient_cargo_home = false;
+        let second_bytes = serde_json::to_vec_pretty(&policy).expect("serialize");
+        let result = adopt_policy(fac_root, &second_bytes, "operator:local", "update");
+        assert!(
+            result.is_err(),
+            "should reject symlinked prev root path, got: {result:?}"
+        );
+    }
+
+    /// Verify that receipt persistence rejects symlinked receipts directory.
+    #[cfg(unix)]
+    #[test]
+    fn test_adopt_rejects_symlink_on_receipts_dir() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+
+        // Create the receipts directory as a symlink.
+        let receipts = receipts_dir(fac_root);
+        let evil_dir = tmp.path().join("evil_receipts");
+        fs::create_dir_all(&evil_dir).expect("create evil dir");
+        // Ensure the parent exists so the symlink can be created.
+        if let Some(parent) = receipts.parent() {
+            fs::create_dir_all(parent).expect("create parent");
+        }
+        std::os::unix::fs::symlink(&evil_dir, &receipts).expect("create symlink");
+
+        let policy_bytes = make_default_policy_bytes();
+        let result = adopt_policy(fac_root, &policy_bytes, "operator:local", "initial");
+        assert!(
+            result.is_err(),
+            "should reject symlinked receipts dir, got: {result:?}"
+        );
+    }
+
+    /// Verify that `reject_symlink` allows non-existent paths (about to be
+    /// created).
+    #[test]
+    fn test_reject_symlink_nonexistent_path() {
+        let tmp = tempdir().expect("tempdir");
+        let nonexistent = tmp.path().join("does_not_exist.json");
+        assert!(
+            reject_symlink(&nonexistent).is_ok(),
+            "non-existent path should be allowed"
+        );
+    }
+
+    // =====================================================================
+    // Atomic backup tests (f-722-code_quality-1771347577305561-0)
+    // =====================================================================
+
+    /// Verify that the prev file is atomically written (not partially
+    /// written) by checking it is always valid JSON after adoption.
+    #[test]
+    fn test_prev_file_is_valid_json_after_rotation() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let policy_bytes = make_default_policy_bytes();
+
+        // First adopt.
+        let (first_root, _) = adopt_policy(fac_root, &policy_bytes, "operator:local", "initial")
+            .expect("first adopt");
+
+        // Second adopt with different policy.
+        let mut policy = FacPolicyV1::default_policy();
+        policy.deny_ambient_cargo_home = false;
+        let second_bytes = serde_json::to_vec_pretty(&policy).expect("serialize");
+        adopt_policy(fac_root, &second_bytes, "operator:local", "update").expect("second adopt");
+
+        // Verify prev is valid JSON and matches first root.
+        let prev_bytes = fs::read(prev_root_path(fac_root)).expect("read prev");
+        let prev: AdmittedPolicyRootV1 =
+            serde_json::from_slice(&prev_bytes).expect("prev should be valid JSON");
+        assert_eq!(prev.admitted_policy_hash, first_root.admitted_policy_hash);
+    }
+
+    /// Verify `atomic_write_file` creates a well-formed file.
+    #[test]
+    fn test_atomic_write_file_creates_correct_content() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let final_path = dir.join("output.json");
+        let content = b"{\"test\": true}";
+
+        atomic_write_file(dir, ".output.json.tmp", &final_path, content).expect("write");
+
+        let read_back = fs::read(&final_path).expect("read");
+        assert_eq!(read_back, content);
+
+        // Temp file should not exist after successful rename.
+        assert!(!dir.join(".output.json.tmp").exists());
+    }
+
+    /// Verify that rollback still works correctly after the atomic backup
+    /// changes.
+    #[test]
+    fn test_rollback_correctness_after_atomic_backup() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let policy_bytes = make_default_policy_bytes();
+
+        // First adopt.
+        let (first_root, _) = adopt_policy(fac_root, &policy_bytes, "operator:local", "initial")
+            .expect("first adopt");
+
+        // Second adopt.
+        let mut policy = FacPolicyV1::default_policy();
+        policy.deny_ambient_cargo_home = false;
+        let second_bytes = serde_json::to_vec_pretty(&policy).expect("serialize");
+        let (second_root, _) = adopt_policy(fac_root, &second_bytes, "operator:local", "update")
+            .expect("second adopt");
+
+        // Verify current is second, prev is first.
+        let current = load_admitted_policy_root(fac_root).expect("load current");
+        assert_eq!(
+            current.admitted_policy_hash,
+            second_root.admitted_policy_hash
+        );
+
+        // Rollback.
+        let (rolled_back, receipt) =
+            rollback_policy(fac_root, "operator:local", "revert").expect("rollback");
+        assert_eq!(
+            rolled_back.admitted_policy_hash,
+            first_root.admitted_policy_hash
+        );
+        assert_eq!(receipt.old_digest, second_root.admitted_policy_hash);
+        assert_eq!(receipt.new_digest, first_root.admitted_policy_hash);
+
+        // Verify current is now first.
+        let after_rollback = load_admitted_policy_root(fac_root).expect("load after rollback");
+        assert_eq!(
+            after_rollback.admitted_policy_hash,
+            first_root.admitted_policy_hash
+        );
+    }
+
+    // =====================================================================
+    // Actor identity tests (f-722-security-1771347580085305-0)
+    // =====================================================================
+
+    /// Verify that adoption receipts preserve the actor identity passed
+    /// in (not hard-coded).
+    #[test]
+    fn test_adoption_receipt_records_custom_actor() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let policy_bytes = make_default_policy_bytes();
+
+        let (root, receipt) = adopt_policy(
+            fac_root,
+            &policy_bytes,
+            "operator:alice",
+            "custom actor test",
+        )
+        .expect("adopt");
+        assert_eq!(receipt.actor_id, "operator:alice");
+        assert_eq!(root.actor_id, "operator:alice");
+    }
+
+    /// Verify that rollback receipts preserve the actor identity.
+    #[test]
+    fn test_rollback_receipt_records_custom_actor() {
+        let tmp = tempdir().expect("tempdir");
+        let fac_root = tmp.path();
+        let policy_bytes = make_default_policy_bytes();
+
+        adopt_policy(fac_root, &policy_bytes, "operator:alice", "initial").expect("first adopt");
+
+        let mut policy = FacPolicyV1::default_policy();
+        policy.deny_ambient_cargo_home = false;
+        let second_bytes = serde_json::to_vec_pretty(&policy).expect("serialize");
+        adopt_policy(fac_root, &second_bytes, "operator:alice", "update").expect("second adopt");
+
+        let (root, receipt) =
+            rollback_policy(fac_root, "operator:bob", "rollback by bob").expect("rollback");
+        assert_eq!(receipt.actor_id, "operator:bob");
+        assert_eq!(root.actor_id, "operator:bob");
     }
 }
