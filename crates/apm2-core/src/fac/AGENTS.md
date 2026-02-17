@@ -603,7 +603,7 @@ bootstrap and recovery commands exposed via `apm2 fac lane init` and
 - `LANE_RECONCILE_RECEIPT_SCHEMA = "apm2.fac.lane_reconcile_receipt.v1"`
 
 **Security invariants (TCK-00539)**:
-- [INV-LANE-INIT-001] All directories use restricted permissions (0o700).
+- [INV-LANE-INIT-001] All directories use restricted permissions (0o700, or 0o770 in SystemMode to allow service group access).
 - [INV-LANE-INIT-002] Profile writes use atomic write (temp + rename, CTR-2607).
 - [INV-LANE-INIT-003] Init is idempotent: existing profiles are not overwritten.
 - [INV-LANE-RECON-001] Reconcile is fail-closed: unrecoverable lanes are marked

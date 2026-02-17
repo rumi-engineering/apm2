@@ -2643,21 +2643,45 @@ pub(crate) fn create_dir_restricted(path: &Path) -> Result<(), LaneError> {
         // the restricted mode. Using `recursive(false)` so the mode is
         // applied to the single directory being created.
         for component in components_to_create.into_iter().rev() {
-            fs::DirBuilder::new()
+            match fs::DirBuilder::new()
                 .recursive(false)
                 .mode(mode)
                 .create(component)
-                .or_else(|e| {
-                    // Tolerate AlreadyExists (concurrent creation race)
-                    if e.kind() == io::ErrorKind::AlreadyExists {
-                        Ok(())
-                    } else {
-                        Err(e)
+            {
+                Ok(()) => {},
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    // CTR-2611 TOCTOU mitigation: An attacker may plant a
+                    // symlink between the initial `symlink_metadata` check
+                    // (which returned NotFound) and this `DirBuilder::create`
+                    // call.  Re-stat the path and fail-closed if it is not a
+                    // real directory.
+                    let meta = fs::symlink_metadata(component).map_err(|e2| {
+                        LaneError::io(
+                            format!("re-stat after AlreadyExists for {}", component.display()),
+                            e2,
+                        )
+                    })?;
+                    if !meta.is_dir() {
+                        return Err(LaneError::io(
+                            format!(
+                                "path {} exists but is not a directory (possible symlink attack)",
+                                component.display()
+                            ),
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "existing path is not a directory",
+                            ),
+                        ));
                     }
-                })
-                .map_err(|e| {
-                    LaneError::io(format!("creating directory {}", component.display()), e)
-                })?;
+                    // It is a genuine directory — tolerate the race.
+                },
+                Err(e) => {
+                    return Err(LaneError::io(
+                        format!("creating directory {}", component.display()),
+                        e,
+                    ));
+                },
+            }
         }
 
         Ok(())
@@ -3506,6 +3530,45 @@ mod tests {
         symlink(&target, &symlink_path).expect("create symlink dir");
 
         assert!(create_dir_restricted(&symlink_path.join("child")).is_err());
+    }
+
+    /// Regression test for TOCTOU symlink planting in `create_dir_restricted`.
+    ///
+    /// Simulates the race: a symlink exists at a path where
+    /// `DirBuilder::create` returns `AlreadyExists`. The function must
+    /// re-stat and reject the symlink (fail-closed) rather than silently
+    /// accepting it.
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_restricted_rejects_symlink_on_already_exists() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let base = dir.path().join("base");
+        fs::create_dir_all(&base).expect("create base");
+
+        // Create a real target directory that the symlink will point to.
+        let real_target = dir.path().join("real_target");
+        fs::create_dir_all(&real_target).expect("create real target");
+
+        // Plant a symlink at the path where create_dir_restricted will try to
+        // create a directory.  DirBuilder::create will return AlreadyExists
+        // because the symlink path already exists on the filesystem.
+        let symlink_component = base.join("planted");
+        symlink(&real_target, &symlink_component).expect("create symlink");
+
+        // create_dir_restricted must fail-closed: the existing entry is a
+        // symlink, not a real directory.
+        let result = create_dir_restricted(&symlink_component);
+        assert!(
+            result.is_err(),
+            "create_dir_restricted must reject a symlink that triggers AlreadyExists"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("not a directory") || err_msg.contains("symlink"),
+            "error should mention symlink or not-a-directory: {err_msg}"
+        );
     }
 
     #[cfg(unix)]
