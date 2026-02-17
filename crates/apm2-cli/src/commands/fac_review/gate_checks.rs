@@ -957,31 +957,9 @@ pub fn run_review_artifact_lint(workspace_root: &Path) -> Result<CheckExecution,
     }
 }
 
-fn hash_sha256(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
-}
-
-fn hash_file(path: &Path) -> Result<String, String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        let target = fs::read_link(path)
-            .map_err(|err| format!("failed to read symlink {}: {err}", path.display()))?;
-        #[cfg(unix)]
-        {
-            return Ok(hash_sha256(target.as_os_str().as_bytes()));
-        }
-        #[cfg(not(unix))]
-        {
-            return Ok(hash_sha256(target.to_string_lossy().as_bytes()));
-        }
-    }
-
+fn hash_file_contents_into(path: &Path, hasher: &mut Sha256) -> Result<(), String> {
     let mut file = fs::File::open(path)
         .map_err(|err| format!("failed to open {} for hashing: {err}", path.display()))?;
-    let mut hasher = Sha256::new();
     let mut buf = [0_u8; 8192];
     loop {
         let read = file
@@ -992,6 +970,34 @@ fn hash_file(path: &Path) -> Result<String, String> {
         }
         hasher.update(&buf[..read]);
     }
+    Ok(())
+}
+
+fn hash_file(path: &Path) -> Result<String, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(path)
+            .map_err(|err| format!("failed to read symlink {}: {err}", path.display()))?;
+        let target_path = if target.is_absolute() {
+            target.clone()
+        } else {
+            path.parent().unwrap_or_else(|| Path::new("")).join(&target)
+        };
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"apm2_workspace_symlink_v1\0");
+        #[cfg(unix)]
+        hasher.update(target.as_os_str().as_bytes());
+        #[cfg(not(unix))]
+        hasher.update(target.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        hash_file_contents_into(&target_path, &mut hasher)?;
+        return Ok(format!("{:x}", hasher.finalize()));
+    }
+
+    let mut hasher = Sha256::new();
+    hash_file_contents_into(path, &mut hasher)?;
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -1232,6 +1238,8 @@ pub fn verify_workspace_integrity(
 mod tests {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     use super::*;
 
@@ -1608,5 +1616,34 @@ mod tests {
         let check = verify_workspace_integrity(repo, &snapshot, Some(&allow))
             .expect("verify with allowlist");
         assert!(check.passed, "allowlisted mutation should pass");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_integrity_detects_tracked_symlink_target_content_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo(repo);
+
+        fs::write(repo.join("target_payload.txt"), b"v1\n").expect("write untracked target");
+        symlink("target_payload.txt", repo.join("tracked_link.txt")).expect("create symlink");
+        run_git(repo, &["add", "tracked_link.txt"]);
+
+        let snapshot = repo.join("target/ci/workspace_integrity.snapshot.tsv");
+        snapshot_workspace_integrity(repo, &snapshot).expect("snapshot");
+
+        fs::write(repo.join("target_payload.txt"), b"v2\n").expect("mutate target");
+        let check =
+            verify_workspace_integrity(repo, &snapshot, None).expect("verify without allowlist");
+        assert!(
+            !check.passed,
+            "tracked symlink target-content mutation must fail:\n{}",
+            check.output
+        );
+        assert!(
+            check.output.contains("tracked_link.txt"),
+            "expected symlink path in output:\n{}",
+            check.output
+        );
     }
 }

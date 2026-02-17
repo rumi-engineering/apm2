@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use apm2_core::fac::job_spec::{
@@ -253,14 +253,24 @@ fn run_gates_via_worker(
             );
         },
     };
-    if !wait && !has_live_worker_heartbeat(&fac_root) {
-        return output_worker_enqueue_error(
-            json_output,
-            "cannot run fac gates with --no-wait when no active FAC worker is detected \
-             (stale/missing heartbeat). Start `apm2 fac worker` or run with wait mode.",
-            exit_codes::VALIDATION_ERROR,
-        );
-    }
+    let worker_bootstrapped = if wait {
+        false
+    } else {
+        match ensure_non_wait_worker_bootstrap(
+            &fac_root,
+            has_live_worker_heartbeat,
+            spawn_detached_worker_for_queue,
+        ) {
+            Ok(spawned) => spawned,
+            Err(err) => {
+                return output_worker_enqueue_error(
+                    json_output,
+                    &format!("cannot bootstrap FAC worker for --no-wait mode: {err}"),
+                    exit_codes::GENERIC_ERROR,
+                );
+            },
+        }
+    };
     let boundary_id = apm2_core::fac::load_or_default_boundary_id(&fac_root)
         .unwrap_or_else(|_| "local".to_string());
     let mut broker = match init_broker(&fac_root, &boundary_id) {
@@ -351,6 +361,7 @@ fn run_gates_via_worker(
             "queue_lane": spec.queue_lane,
             "policy_hash": policy_hash,
             "head_sha": repo_source.head_sha,
+            "worker_bootstrapped": worker_bootstrapped,
             "options": options,
         });
         println!(
@@ -360,8 +371,14 @@ fn run_gates_via_worker(
         );
     } else {
         eprintln!(
-            "fac gates: enqueued worker job {job_id} lane={} head_sha={}",
-            spec.queue_lane, repo_source.head_sha
+            "fac gates: enqueued worker job {job_id} lane={} head_sha={}{}",
+            spec.queue_lane,
+            repo_source.head_sha,
+            if worker_bootstrapped {
+                " (bootstrapped detached worker)"
+            } else {
+                ""
+            }
         );
     }
 
@@ -547,6 +564,36 @@ fn has_live_worker_heartbeat(fac_root: &Path) -> bool {
         return false;
     }
     is_pid_running(heartbeat.pid)
+}
+
+fn ensure_non_wait_worker_bootstrap<F>(
+    fac_root: &Path,
+    has_live_heartbeat: fn(&Path) -> bool,
+    mut spawn_worker: F,
+) -> Result<bool, String>
+where
+    F: FnMut() -> Result<(), String>,
+{
+    if has_live_heartbeat(fac_root) {
+        return Ok(false);
+    }
+    spawn_worker()?;
+    Ok(true)
+}
+
+fn spawn_detached_worker_for_queue() -> Result<(), String> {
+    let current_exe =
+        std::env::current_exe().map_err(|err| format!("resolve current executable: {err}"))?;
+    let mut command = Command::new(current_exe);
+    command
+        .args(["fac", "worker", "--poll-interval-secs", "1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _child = command
+        .spawn()
+        .map_err(|err| format!("spawn detached FAC worker: {err}"))?;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1174,6 +1221,40 @@ mod tests {
         assert!(balanced.test_parallelism >= 1);
         assert!(balanced.test_parallelism <= host);
         assert!(balanced.test_parallelism <= BALANCED_MAX_PARALLELISM.min(host));
+    }
+
+    #[test]
+    fn non_wait_worker_bootstrap_requests_spawn_without_heartbeat() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut spawned = false;
+        let result = ensure_non_wait_worker_bootstrap(
+            temp.path(),
+            |_| false,
+            || {
+                spawned = true;
+                Ok(())
+            },
+        )
+        .expect("bootstrap should succeed");
+        assert!(result);
+        assert!(spawned);
+    }
+
+    #[test]
+    fn non_wait_worker_bootstrap_skips_when_heartbeat_is_live() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut spawned = false;
+        let result = ensure_non_wait_worker_bootstrap(
+            temp.path(),
+            |_| true,
+            || {
+                spawned = true;
+                Ok(())
+            },
+        )
+        .expect("live heartbeat should bypass bootstrap");
+        assert!(!result);
+        assert!(!spawned);
     }
 
     #[test]
