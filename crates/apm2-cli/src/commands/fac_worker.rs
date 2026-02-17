@@ -3167,7 +3167,10 @@ fn process_job(
     // execution path. The entire job execution remains sequential behind the
     // lane lease and remains fail-closed on error.
     let mirror_manager = RepoMirrorManager::new(fac_root);
-    if let Err(e) = mirror_manager.ensure_mirror(&spec.source.repo_id, None) {
+    if let Err(e) = mirror_manager
+        .ensure_mirror(&spec.source.repo_id, None)
+        .map(|(_path, _receipt)| ())
+    {
         let reason = format!("mirror ensure failed: {e}");
         let _ = LaneLeaseV1::remove(&lane_dir);
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.

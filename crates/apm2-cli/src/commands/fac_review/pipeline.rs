@@ -385,7 +385,7 @@ fn setup_mirror_lane_workspace(
         });
     }
 
-    mirror_manager
+    let (_mirror_path, mirror_receipt) = mirror_manager
         .ensure_mirror(repo, Some(&remote_url))
         .map_err(|err| format!("failed to ensure bare mirror for {repo}: {err}"))?;
 
@@ -396,6 +396,13 @@ fn setup_mirror_lane_workspace(
             extra: serde_json::json!({
                 "repo": repo,
                 "sha": sha,
+                "mirror_receipt": {
+                    "operation": mirror_receipt.operation,
+                    "duration_ms": mirror_receipt.duration_ms,
+                    "success": mirror_receipt.success,
+                    "refs_before_count": mirror_receipt.refs_before.len(),
+                    "refs_after_count": mirror_receipt.refs_after.len(),
+                },
             }),
         });
     }

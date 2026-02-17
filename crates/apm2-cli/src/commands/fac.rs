@@ -312,6 +312,12 @@ pub enum FacSubcommand {
     ///
     /// Idempotent: safe to re-run without destroying existing state.
     Bootstrap(crate::commands::fac_bootstrap::BootstrapArgs),
+    /// Show resolved FAC configuration (operator correctness tool).
+    ///
+    /// Aggregates policy, boundary identity, execution backend, lane
+    /// configuration, admitted digests, and queue bounds from broker
+    /// and filesystem state.
+    Config(crate::commands::fac_config::ConfigArgs),
 }
 
 /// Arguments for `apm2 fac warm`.
@@ -2202,6 +2208,7 @@ pub fn run_fac(
             | FacSubcommand::Policy(_)
             | FacSubcommand::Economics(_)
             | FacSubcommand::Bootstrap(_)
+            | FacSubcommand::Config(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -2729,6 +2736,9 @@ pub fn run_fac(
         FacSubcommand::Bootstrap(args) => {
             crate::commands::fac_bootstrap::run_bootstrap(args, operator_socket, config_path)
         },
+        FacSubcommand::Config(args) => {
+            crate::commands::fac_config::run_config_command(args, json_output)
+        },
     }
 }
 
@@ -2861,7 +2871,8 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Queue(_)
         | FacSubcommand::Policy(_)
         | FacSubcommand::Economics(_)
-        | FacSubcommand::Bootstrap(_) => true,
+        | FacSubcommand::Bootstrap(_)
+        | FacSubcommand::Config(_) => true,
     }
 }
 

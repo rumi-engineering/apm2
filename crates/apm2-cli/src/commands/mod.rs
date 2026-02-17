@@ -50,6 +50,7 @@ pub mod fac;
 pub mod fac_bench;
 pub mod fac_bootstrap;
 pub mod fac_broker;
+pub mod fac_config;
 pub mod fac_economics;
 mod fac_gates_job;
 pub mod fac_gc;
