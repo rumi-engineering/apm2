@@ -16,6 +16,7 @@ ticket_meta:
       - "EXEC-2026-02-17-RULESET-SYNC-HARDENING"
       - "EXEC-2026-02-17-PROJECTION-CONTEXT-ALIGNMENT"
       - "EXEC-2026-02-17-PUSH-ATTEMPT-RULESET-STAGE"
+      - "EXEC-2026-02-17-REVIEWER-STARTUP-HARDENING"
       - "EXEC-2026-02-17-E2E-REHEARSAL"
       - "EXEC-2026-02-17-WORKSPACE-VALIDATION"
   custody:
@@ -187,6 +188,11 @@ notes:
       `cargo test -p apm2-cli push_attempt_record_reports_ruleset_sync_failure_stage -- --nocapture`.
       Result: `fac_push_ruleset_sync_failed` now records deterministic failed_stage
       `ruleset_sync` for doctor/remediation routing.
+    - EXEC-2026-02-17-REVIEWER-STARTUP-HARDENING:
+      `cargo test -p apm2-cli lease_contention_ -- --nocapture`.
+      Result: lease-contention dedupe now requires verified PID + proc_start_time
+      identity match for state-only contention, preventing stale/PID-reuse false
+      dedupe that can suppress reviewer startup.
     - EXEC-2026-02-17-E2E-REHEARSAL:
       `cargo test -p apm2-cli run_pre_push_sequence_with_stops_before_remote_side_effects_on_gate_failure -- --nocapture`
       and

@@ -916,6 +916,17 @@ fn skipped_stage() -> PushAttemptStage {
     }
 }
 
+fn mark_ruleset_sync_stage_if_succeeded(
+    attempt: &mut PushAttemptRecord,
+    ruleset_sync_executed: bool,
+    ruleset_sync_passed: bool,
+    ruleset_sync_duration_secs: u64,
+) {
+    if ruleset_sync_executed && ruleset_sync_passed {
+        attempt.set_stage_pass("ruleset_sync", ruleset_sync_duration_secs);
+    }
+}
+
 fn push_attempts_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
     Ok(apm2_home_dir()?
         .join("fac_projection")
@@ -1740,9 +1751,12 @@ pub fn run_push(
         },
     ) {
         Ok(results) => {
-            if ruleset_sync_executed && ruleset_sync_passed {
-                attempt.set_stage_pass("ruleset_sync", ruleset_sync_duration_secs);
-            }
+            mark_ruleset_sync_stage_if_succeeded(
+                &mut attempt,
+                ruleset_sync_executed,
+                ruleset_sync_passed,
+                ruleset_sync_duration_secs,
+            );
             if git_push_executed {
                 attempt.set_stage_pass("git_push", git_push_duration_secs);
             }
@@ -1765,6 +1779,12 @@ pub fn run_push(
             fail_with_attempt!("fac_push_ruleset_sync_failed", err);
         },
         Err(PrePushExecutionError::GitPush(err)) => {
+            mark_ruleset_sync_stage_if_succeeded(
+                &mut attempt,
+                ruleset_sync_executed,
+                ruleset_sync_passed,
+                ruleset_sync_duration_secs,
+            );
             if git_push_executed {
                 attempt.set_stage_fail(
                     "git_push",
@@ -2036,6 +2056,29 @@ mod tests {
             failed.error_hint.as_deref(),
             Some("ruleset drift not synchronized")
         );
+    }
+
+    #[test]
+    fn mark_ruleset_sync_stage_if_succeeded_sets_pass_only_on_success() {
+        let mut success = PushAttemptRecord::new("0123456789abcdef0123456789abcdef01234567");
+        mark_ruleset_sync_stage_if_succeeded(&mut success, true, true, 7);
+        assert_eq!(success.ruleset_sync.status, PUSH_STAGE_PASS);
+        assert_eq!(success.ruleset_sync.duration_s, 7);
+
+        let mut skipped = PushAttemptRecord::new("0123456789abcdef0123456789abcdef01234567");
+        mark_ruleset_sync_stage_if_succeeded(&mut skipped, true, false, 7);
+        assert_eq!(skipped.ruleset_sync.status, PUSH_STAGE_SKIPPED);
+    }
+
+    #[test]
+    fn push_attempt_record_preserves_ruleset_sync_pass_when_git_push_fails() {
+        let mut record = PushAttemptRecord::new("0123456789abcdef0123456789abcdef01234567");
+        mark_ruleset_sync_stage_if_succeeded(&mut record, true, true, 2);
+        record.set_stage_fail("git_push", 1, Some(1), Some("remote rejected".to_string()));
+
+        assert_eq!(record.ruleset_sync.status, PUSH_STAGE_PASS);
+        let failed = record.first_failed_stage().expect("failed stage");
+        assert_eq!(failed.stage, "git_push");
     }
 
     #[test]

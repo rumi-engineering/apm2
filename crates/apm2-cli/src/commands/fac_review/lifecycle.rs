@@ -54,6 +54,7 @@ const FAC_STATUS_DESCRIPTION_PENDING: &str = "Forge Admission Cycle pending revi
 const FAC_STATUS_DESCRIPTION_SUCCESS: &str = "Forge Admission Cycle approved";
 const FAC_STATUS_DESCRIPTION_DENIED: &str = "Forge Admission Cycle denied";
 const FAC_STATUS_DESCRIPTION_FAIL_CLOSED: &str = "Forge Admission Cycle integrity failure";
+const FAC_STATUS_PROJECTION_MAX_ATTEMPTS: usize = 3;
 type HmacSha256 = Hmac<Sha256>;
 
 pub(super) const fn default_retry_budget() -> u32 {
@@ -2360,6 +2361,17 @@ fn load_fac_required_status_contexts() -> Result<Vec<String>, String> {
     Ok(contexts)
 }
 
+fn load_fac_required_status_snapshot(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<verdict_projection::VerdictProjectionSnapshot, String> {
+    verdict_projection::load_verdict_projection_snapshot(owner_repo, pr_number, head_sha)?
+        .ok_or_else(|| {
+            format!("missing verdict projection snapshot for PR #{pr_number} SHA {head_sha}")
+        })
+}
+
 fn project_fac_required_status_to_contexts_with<F>(
     contexts: &[String],
     mut project_context: F,
@@ -2376,29 +2388,69 @@ where
     Ok(())
 }
 
+fn project_fac_required_status_with<FSnapshot, FProjectContext>(
+    _owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    required_status_contexts: &[String],
+    mut load_snapshot: FSnapshot,
+    mut project_context: FProjectContext,
+) -> Result<(), String>
+where
+    FSnapshot: FnMut() -> Result<verdict_projection::VerdictProjectionSnapshot, String>,
+    FProjectContext: FnMut(&str, FacRequiredStatusProjection) -> Result<(), String>,
+{
+    let mut last_mismatch: Option<(FacRequiredStatusProjection, FacRequiredStatusProjection)> =
+        None;
+    for _ in 0..FAC_STATUS_PROJECTION_MAX_ATTEMPTS {
+        let projection = derive_fac_required_status_projection(&load_snapshot()?);
+        project_fac_required_status_to_contexts_with(required_status_contexts, |context| {
+            project_context(context, projection)
+        })?;
+        let observed_projection = derive_fac_required_status_projection(&load_snapshot()?);
+        if observed_projection == projection {
+            return Ok(());
+        }
+        last_mismatch = Some((projection, observed_projection));
+    }
+    let mismatch_detail = last_mismatch.map_or_else(
+        || "projection mismatch unavailable".to_string(),
+        |(written, observed)| {
+            format!(
+                "last_written={} last_observed={}",
+                written.state, observed.state
+            )
+        },
+    );
+    Err(format!(
+        "concurrent verdict updates prevented stable FAC required-status projection for PR #{pr_number} SHA {head_sha} after {FAC_STATUS_PROJECTION_MAX_ATTEMPTS} attempts ({mismatch_detail})"
+    ))
+}
+
 fn project_fac_required_status(
     owner_repo: &str,
     pr_number: u32,
     head_sha: &str,
 ) -> Result<(), String> {
-    let snapshot =
-        verdict_projection::load_verdict_projection_snapshot(owner_repo, pr_number, head_sha)?
-            .ok_or_else(|| {
-                format!("missing verdict projection snapshot for PR #{pr_number} SHA {head_sha}")
-            })?;
-    let projection = derive_fac_required_status_projection(&snapshot);
     let required_status_contexts = load_fac_required_status_contexts()?;
     let target_url = format!("https://github.com/{owner_repo}/pull/{pr_number}");
-    project_fac_required_status_to_contexts_with(&required_status_contexts, |context| {
-        github_projection::upsert_commit_status(
-            owner_repo,
-            head_sha,
-            context,
-            projection.state,
-            projection.description,
-            Some(&target_url),
-        )
-    })
+    project_fac_required_status_with(
+        owner_repo,
+        pr_number,
+        head_sha,
+        &required_status_contexts,
+        || load_fac_required_status_snapshot(owner_repo, pr_number, head_sha),
+        |context, projection| {
+            github_projection::upsert_commit_status(
+                owner_repo,
+                head_sha,
+                context,
+                projection.state,
+                projection.description,
+                Some(&target_url),
+            )
+        },
+    )
 }
 
 fn finalize_projected_verdict(
@@ -3533,14 +3585,15 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{
-        AgentType, AutoVerdictCandidate, AutoVerdictFinalizeResult, LifecycleEventKind,
-        PrLifecycleState, TrackedAgentState, acquire_registry_lock, active_agents_for_pr,
-        apply_event, bind_reviewer_runtime, derive_auto_verdict_decision_from_findings,
+        AgentType, AutoVerdictCandidate, AutoVerdictFinalizeResult,
+        FAC_STATUS_PROJECTION_MAX_ATTEMPTS, LifecycleEventKind, PrLifecycleState,
+        TrackedAgentState, acquire_registry_lock, active_agents_for_pr, apply_event,
+        bind_reviewer_runtime, derive_auto_verdict_decision_from_findings,
         derive_fac_required_status_projection, enforce_pr_capacity,
         finalize_auto_verdict_candidate, load_fac_required_status_contexts, load_registry,
-        project_fac_required_status_to_contexts_with, register_agent_spawn,
-        register_reviewer_dispatch, save_registry, sync_local_main_with_origin, token_hash,
-        try_fast_forward_main,
+        project_fac_required_status_to_contexts_with, project_fac_required_status_with,
+        register_agent_spawn, register_reviewer_dispatch, save_registry,
+        sync_local_main_with_origin, token_hash, try_fast_forward_main,
     };
     use crate::commands::fac_review::lifecycle::tracked_agent_id;
     use crate::commands::fac_review::state::{
@@ -3660,6 +3713,76 @@ mod tests {
         let err = project_fac_required_status_to_contexts_with(&[], |_| Ok(()))
             .expect_err("empty context set must fail");
         assert!(err.contains("at least one context"));
+    }
+
+    #[test]
+    fn required_status_projection_retries_until_snapshot_stabilizes() {
+        let contexts = vec!["apm2 / Forge Admission Cycle".to_string()];
+        let snapshot_calls = std::cell::Cell::new(0usize);
+        let projected_states = std::cell::RefCell::new(Vec::<String>::new());
+        let result = project_fac_required_status_with(
+            "guardian-intelligence/apm2",
+            718,
+            "0123456789abcdef0123456789abcdef01234567",
+            &contexts,
+            || {
+                let call = snapshot_calls.get();
+                snapshot_calls.set(call + 1);
+                let snapshot = match call {
+                    0 => verdict_snapshot("pending", false),
+                    _ => verdict_snapshot("approve", false),
+                };
+                Ok(snapshot)
+            },
+            |_, projection| {
+                projected_states
+                    .borrow_mut()
+                    .push(projection.state.to_string());
+                Ok(())
+            },
+        );
+
+        result.expect("projection should converge to latest verdict state");
+        assert_eq!(
+            &*projected_states.borrow(),
+            &vec!["pending".to_string(), "success".to_string()]
+        );
+    }
+
+    #[test]
+    fn required_status_projection_fails_when_snapshot_never_stabilizes() {
+        let contexts = vec!["apm2 / Forge Admission Cycle".to_string()];
+        let snapshot_calls = std::cell::Cell::new(0usize);
+        let projected_states = std::cell::RefCell::new(Vec::<String>::new());
+        let err = project_fac_required_status_with(
+            "guardian-intelligence/apm2",
+            718,
+            "0123456789abcdef0123456789abcdef01234567",
+            &contexts,
+            || {
+                let call = snapshot_calls.get();
+                snapshot_calls.set(call + 1);
+                let snapshot = if call % 2 == 0 {
+                    verdict_snapshot("pending", false)
+                } else {
+                    verdict_snapshot("approve", false)
+                };
+                Ok(snapshot)
+            },
+            |_, projection| {
+                projected_states
+                    .borrow_mut()
+                    .push(projection.state.to_string());
+                Ok(())
+            },
+        )
+        .expect_err("projection must fail closed when verdict state keeps drifting");
+
+        assert!(err.contains("concurrent verdict updates"));
+        assert_eq!(
+            projected_states.borrow().len(),
+            FAC_STATUS_PROJECTION_MAX_ATTEMPTS
+        );
     }
 
     fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
