@@ -1682,11 +1682,16 @@ corruption), and parse failures.
 - Set-union merge on receipt digests (idempotent).
 - Deterministic presentation ordering: `timestamp_secs` descending, then
   `content_hash` ascending for tiebreaking.
-- Atomic writes using temp+rename protocol.
+- Atomic writes using `tempfile::NamedTempFile::new_in()` + `persist()` for
+  secure temp file creation (`O_EXCL`) and atomic rename.
 - Bounded directory scans (`MAX_MERGE_SCAN_FILES = 65,536`).
 - Content-hash integrity verification (recomputes BLAKE3, never trusts
-  self-reported `content_hash`).
+  self-reported `content_hash`). Normalizes filename stems to canonical
+  `b3-256:<hex>` form before comparison, accepting both bare hex and
+  prefixed filenames.
 - Symlink-safe reads via `O_NOFOLLOW`.
+- Directory entry type checks via `entry.file_type()` (`lstat`) instead of
+  `path.is_dir()` (`stat`) to avoid following symlinks during scans.
 
 ### Security Invariants (TCK-00543)
 
@@ -1695,12 +1700,20 @@ corruption), and parse failures.
 - [INV-MERGE-002] Digest filenames are validated before use as filesystem
   path components (path traversal prevention).
 - [INV-MERGE-003] Content-hash integrity is verified by recomputing the
-  BLAKE3 hash (v1 and v2) before accepting any receipt.
+  BLAKE3 hash (v1 and v2) before accepting any receipt. Filename stems
+  are normalized to canonical `b3-256:<hex>` form before comparison so
+  both bare-hex and prefixed filenames verify correctly.
 - [INV-MERGE-004] Directory scans are bounded by `MAX_MERGE_SCAN_FILES`
   to prevent unbounded traversal.
-- [INV-MERGE-005] Writes use atomic temp+rename to prevent partial files.
+- [INV-MERGE-005] Writes use `tempfile::NamedTempFile::new_in()` with
+  `O_EXCL` for secure randomized temp file creation, then `persist()` for
+  atomic rename. This prevents symlink attacks on deterministic temp file
+  names (CWE-367 / CWE-59).
 - [INV-MERGE-006] Parse failures and job_id mismatches are bounded in the
   audit report (`MAX_PARSE_FAILURES`, `MAX_JOB_ID_MISMATCHES`).
+- [INV-MERGE-007] Directory entry type checks use `entry.file_type()`
+  (`lstat`) instead of `path.is_dir()` (`stat`) to avoid following
+  symlinks and the associated TOCTOU / hang risk.
 
 ## receipt_pipeline Submodule (TCK-00564)
 
