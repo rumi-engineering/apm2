@@ -189,6 +189,9 @@ Both subcommands accept a `--json` flag for structured output. Human-readable
 tables are printed by default via `print_lane_init_receipt()` and
 `print_lane_reconcile_receipt()`.
 
+**Exit code policy for `run_lane_reconcile`**: non-zero when any of
+`lanes_marked_corrupt`, `lanes_failed`, or `infrastructure_failures` is > 0.
+
 **LaneSubcommand** enum variants added:
 - `Init(LaneInitArgs)` -- `--json` flag
 - `Reconcile(LaneReconcileArgs)` -- `--json` flag
