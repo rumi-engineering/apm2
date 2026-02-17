@@ -2179,6 +2179,67 @@ fn process_job(
         return JobOutcome::Denied { reason };
     }
 
+    // Step 2.6: Enforce admitted economics profile binding (INV-EADOPT-004,
+    // TCK-00584). Workers MUST fail-closed when the policy's economics
+    // profile hash does not match the broker-admitted economics profile
+    // digest. This prevents economics drift where profiles from an old
+    // policy continue to authorize budget decisions after a new economics
+    // profile has been adopted.
+    //
+    // Skip check when no admitted economics profile exists (fail-open for
+    // backwards compatibility: existing installations that have not
+    // adopted an economics profile should not break).
+    {
+        let profile_hash_str = format!("b3-256:{}", hex::encode(policy.economics_profile_hash));
+        let fac_root_for_econ = fac_root;
+        if apm2_core::fac::economics_adoption::load_admitted_economics_profile_root(
+            fac_root_for_econ,
+        )
+        .is_ok()
+            && !apm2_core::fac::economics_adoption::is_economics_profile_hash_admitted(
+                fac_root_for_econ,
+                &profile_hash_str,
+            )
+        {
+            let reason = format!(
+                "economics profile hash not admitted (INV-EADOPT-004): \
+                 policy economics_profile_hash={profile_hash_str} is not \
+                 the currently admitted digest"
+            );
+            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+                fac_root,
+                queue_root,
+                spec,
+                path,
+                &file_name,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::EconomicsAdmissionDenied),
+                &reason,
+                None,
+                None,
+                None,
+                None,
+                Some(canonicalizer_tuple_digest),
+                policy_hash,
+                None,
+                None,
+                Some(&sbx_hash),
+            ) {
+                eprintln!(
+                    "worker: WARNING: pipeline commit failed for \
+                     economics-admission-denied job: {commit_err}"
+                );
+                return JobOutcome::Skipped {
+                    reason: format!(
+                        "pipeline commit failed for \
+                         economics-admission-denied job: {commit_err}"
+                    ),
+                };
+            }
+            return JobOutcome::Denied { reason };
+        }
+    }
+
     // Step 3: Validate RFC-0028 token (non-control-lane jobs only).
     let token = match &spec.actuation.channel_context_token {
         Some(t) if !t.is_empty() => t.as_str(),
