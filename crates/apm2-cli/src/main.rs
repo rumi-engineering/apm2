@@ -2,7 +2,9 @@
 //!
 //! CLI client for managing AI CLI processes like Claude Code, Gemini CLI, etc.
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use apm2_core::bootstrap::verify_bootstrap_hash;
@@ -303,6 +305,10 @@ fn main() -> Result<()> {
         );
     }
 
+    // Resolve daemon config path from the git common-dir checkout root so all
+    // worktrees target the same daemon by default.
+    let daemon_config_path = resolve_daemon_config_path(&cli.config);
+
     // Determine socket paths (TCK-00288: dual-socket privilege separation)
     // - operator_socket: For privileged operations (ClaimWork, SpawnEpisode,
     //   Shutdown)
@@ -310,8 +316,8 @@ fn main() -> Result<()> {
     let (operator_socket, session_socket) = if let Some(ref socket) = cli.socket {
         // Legacy --socket flag maps to operator_socket only
         (socket.clone(), socket.clone())
-    } else if cli.config.exists() {
-        if let Ok(config) = apm2_core::config::EcosystemConfig::from_file(&cli.config) {
+    } else if daemon_config_path.exists() {
+        if let Ok(config) = apm2_core::config::EcosystemConfig::from_file(&daemon_config_path) {
             (config.daemon.operator_socket, config.daemon.session_socket)
         } else {
             (default_operator_socket(), default_session_socket())
@@ -336,9 +342,9 @@ fn main() -> Result<()> {
                 commands::daemon::install(enable_linger)
             },
             Some(DaemonSubcommand::Doctor { json }) => {
-                commands::daemon::doctor(&socket_path, &cli.config, json)
+                commands::daemon::doctor(&socket_path, &daemon_config_path, json)
             },
-            None => commands::daemon::run(&cli.config, no_daemon),
+            None => commands::daemon::run(&daemon_config_path, no_daemon),
         },
         Commands::Kill => commands::daemon::kill(&socket_path),
         Commands::Start { name } => commands::process::start(&socket_path, &name),
@@ -463,8 +469,12 @@ fn main() -> Result<()> {
             // Exit codes per RFC-0018.
             // TCK-00595 MAJOR-2 FIX: Thread config path so ensure_daemon_running
             // can forward --config when spawning the daemon.
-            let exit_code =
-                commands::fac::run_fac(&fac_cmd, &operator_socket, &session_socket, &cli.config);
+            let exit_code = commands::fac::run_fac(
+                &fac_cmd,
+                &operator_socket,
+                &session_socket,
+                &daemon_config_path,
+            );
             std::process::exit(i32::from(exit_code));
         },
         Commands::Factory(cmd) => match cmd {
@@ -515,4 +525,101 @@ fn default_session_socket() -> PathBuf {
         |_| PathBuf::from("/tmp/apm2/session.sock"),
         |runtime_dir| PathBuf::from(runtime_dir).join("apm2").join("session.sock"),
     )
+}
+
+const DEFAULT_CONFIG_FILE: &str = "ecosystem.toml";
+
+fn resolve_daemon_config_path(config_path: &Path) -> PathBuf {
+    resolve_daemon_config_path_with(config_path, resolve_git_common_dir)
+}
+
+fn resolve_daemon_config_path_with<F>(config_path: &Path, resolve_common_dir: F) -> PathBuf
+where
+    F: FnOnce() -> Option<PathBuf>,
+{
+    if config_path != Path::new(DEFAULT_CONFIG_FILE) {
+        return config_path.to_path_buf();
+    }
+
+    let Some(common_dir) = resolve_common_dir() else {
+        return config_path.to_path_buf();
+    };
+
+    if common_dir.file_name() != Some(OsStr::new(".git")) {
+        return config_path.to_path_buf();
+    }
+    let Some(repo_root) = common_dir.parent() else {
+        return config_path.to_path_buf();
+    };
+
+    let shared_config = repo_root.join(DEFAULT_CONFIG_FILE);
+    if shared_config.exists() {
+        shared_config
+    } else {
+        config_path.to_path_buf()
+    }
+}
+
+fn resolve_git_common_dir() -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let raw = stdout.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        std::env::current_dir().ok().map(|cwd| cwd.join(path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_daemon_config_path_prefers_shared_checkout_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_root = temp.path().join("repo");
+        let common_git_dir = repo_root.join(".git");
+        std::fs::create_dir_all(&common_git_dir).expect("create .git dir");
+        let shared_config = repo_root.join(DEFAULT_CONFIG_FILE);
+        std::fs::write(&shared_config, b"[daemon]\n").expect("write shared config");
+
+        let resolved = resolve_daemon_config_path_with(Path::new(DEFAULT_CONFIG_FILE), || {
+            Some(common_git_dir)
+        });
+        assert_eq!(resolved, shared_config);
+    }
+
+    #[test]
+    fn resolve_daemon_config_path_falls_back_when_shared_config_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_root = temp.path().join("repo");
+        let common_git_dir = repo_root.join(".git");
+        std::fs::create_dir_all(&common_git_dir).expect("create .git dir");
+
+        let resolved = resolve_daemon_config_path_with(Path::new(DEFAULT_CONFIG_FILE), || {
+            Some(common_git_dir)
+        });
+        assert_eq!(resolved, PathBuf::from(DEFAULT_CONFIG_FILE));
+    }
+
+    #[test]
+    fn resolve_daemon_config_path_keeps_non_default_config() {
+        let resolved = resolve_daemon_config_path_with(Path::new("custom.toml"), || {
+            Some(PathBuf::from("/tmp/repo/.git"))
+        });
+        assert_eq!(resolved, PathBuf::from("custom.toml"));
+    }
 }
