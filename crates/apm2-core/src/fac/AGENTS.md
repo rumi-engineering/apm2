@@ -1973,6 +1973,13 @@ and emits `PatchApplyReceiptV1` receipts for audit provenance.
   `MAX_REFUSALS=1000`.
 - Refusal reasons are truncated at `MAX_REFUSAL_REASON_LENGTH=512`.
 - `RepoMirrorError::PatchHardeningDenied` carries a boxed denial receipt.
+- `DenialReasonCode::PatchHardeningDenied` maps the hardening denial to the
+  receipt system for structured denial tracking.
+- The worker `patch_injection` path calls `apply_patch_hardened` (not
+  `apply_patch`), ensuring INV-PH-001 through INV-PH-010 are enforced on
+  all untrusted patch bytes. Denial receipts are persisted under
+  `fac_root/patch_receipts/` and the receipt content hash is included in
+  the job denial reason for audit traceability.
 
 ## Control-Lane Exception (TCK-00533)
 
