@@ -310,6 +310,10 @@ fn collect_reason_stats(
 
             if reasons.len() < MAX_REASON_CODES || reasons.contains_key(&reason_key) {
                 *reasons.entry(reason_key).or_insert(0) += 1;
+            } else {
+                // Finding 3 fix: aggregate overflow codes into "other"
+                // so total counts remain accurate.
+                *reasons.entry("other".to_string()).or_insert(0) += 1;
             }
         }
     }
@@ -598,5 +602,46 @@ mod tests {
             },
             cancel_target_job_id: None,
         }
+    }
+
+    /// Finding 3 regression: when `MAX_REASON_CODES` distinct reason keys
+    /// are reached, subsequent new keys must aggregate into an `"other"`
+    /// bucket so total counts remain accurate.
+    #[test]
+    fn test_collect_reason_stats_overflow_aggregates_to_other() {
+        // Pre-fill the map with MAX_REASON_CODES distinct keys.
+        let mut reasons = HashMap::new();
+        for i in 0..MAX_REASON_CODES {
+            reasons.insert(format!("reason_{i}"), 1usize);
+        }
+        assert_eq!(reasons.len(), MAX_REASON_CODES);
+
+        // Simulate an overflow scenario: create a dir with a job spec
+        // that has no receipt (will produce an "unknown" key). Since
+        // "unknown" is not yet in the map, it should go to "other".
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("denied");
+        let receipts_dir = tmp.path().join("receipts");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&receipts_dir).unwrap();
+
+        let spec = make_test_spec("overflow-job", "2026-02-15T10:00:00Z");
+        let json = serde_json::to_string_pretty(&spec).unwrap();
+        fs::write(dir.join("overflow-job.json"), &json).unwrap();
+
+        collect_reason_stats(&dir, &receipts_dir, &mut reasons);
+
+        // The new reason ("unknown") was not in the map and the map was
+        // at capacity, so it should have been aggregated into "other".
+        assert!(
+            reasons.contains_key("other"),
+            "overflow codes must aggregate into 'other': {reasons:?}"
+        );
+        assert_eq!(reasons["other"], 1);
+        // "unknown" should NOT have been inserted since map was at capacity.
+        assert!(
+            !reasons.contains_key("unknown"),
+            "'unknown' should not be inserted when map is at capacity: {reasons:?}"
+        );
     }
 }

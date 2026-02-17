@@ -997,9 +997,9 @@ fn discover_log_pointers(job_id: &str) -> (Vec<String>, bool) {
                 let mut scan_count = 0usize;
                 for entry in entries {
                     if scan_count >= MAX_SCAN_ENTRIES || at_cap(&pointers) {
-                        if at_cap(&pointers) {
-                            truncated = true;
-                        }
+                        // Finding 4 fix: report truncation for both
+                        // scan-entry cap and log-pointer cap.
+                        truncated = true;
                         break;
                     }
                     scan_count = scan_count.saturating_add(1);
@@ -1041,9 +1041,9 @@ fn discover_log_pointers(job_id: &str) -> (Vec<String>, bool) {
                     let mut scan_count = 0usize;
                     for entry in entries {
                         if scan_count >= MAX_SCAN_ENTRIES || at_cap(&pointers) {
-                            if at_cap(&pointers) {
-                                truncated = true;
-                            }
+                            // Finding 4 fix: report truncation for both
+                            // scan-entry cap and log-pointer cap.
+                            truncated = true;
                             break;
                         }
                         scan_count = scan_count.saturating_add(1);
@@ -1062,9 +1062,9 @@ fn discover_log_pointers(job_id: &str) -> (Vec<String>, bool) {
                             let mut log_scan = 0usize;
                             for log_entry in log_entries {
                                 if log_scan >= MAX_SCAN_ENTRIES || at_cap(&pointers) {
-                                    if at_cap(&pointers) {
-                                        truncated = true;
-                                    }
+                                    // Finding 4 fix: report truncation for
+                                    // both scan-entry cap and log-pointer cap.
+                                    truncated = true;
                                     break;
                                 }
                                 log_scan = log_scan.saturating_add(1);

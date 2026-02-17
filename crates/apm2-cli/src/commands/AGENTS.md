@@ -297,16 +297,25 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
   logs). The function resolves lanes from `resolve_fac_root().join("lanes")` (the canonical
   FAC root) rather than inferring from queue root parentage. Truncation is reported in both
   text and JSON output via `log_pointers_truncated`.
-- **Symlink guards** (`fac_utils.rs`, `fac_job.rs`): `read_job_spec_bounded` uses
-  `symlink_metadata` (lstat semantics) to reject symlinks and non-regular files before
-  opening, preventing symlink-based redirects outside FAC roots. `discover_log_pointers`
+- **Symlink guards** (`fac_utils.rs`, `fac_job.rs`): `read_job_spec_bounded` uses an
+  open-once pattern with `O_NOFOLLOW | O_CLOEXEC` (via `OpenOptionsExt::custom_flags` on
+  Unix) to atomically refuse symlinks at the kernel level, then calls `fstat` on the opened
+  fd (via `File::metadata()`) to verify the target is a regular file. This eliminates the
+  TOCTOU race between `symlink_metadata()` and `File::open()` that existed previously,
+  matching the established pattern in `fac_secure_io::read_bounded`. `discover_log_pointers`
   validates all scanned directories with `validate_real_directory` and skips symlinked
   entries via `is_symlink_entry`, both using lstat semantics.
+- **Reason code overflow** (`fac_queue.rs`): When `MAX_REASON_CODES` distinct reason keys
+  are reached in `collect_reason_stats`, new reason codes are aggregated into an `"other"`
+  bucket rather than silently dropped, ensuring total counts remain accurate.
+- **Scan truncation reporting** (`fac_job.rs`): `discover_log_pointers` sets `truncated =
+  true` when `MAX_SCAN_ENTRIES` is hit in any directory scan (evidence, lanes, or logs),
+  consistent with the `MAX_LOG_POINTERS` cap reporting.
 - **Shared utilities** (`fac_utils.rs`): Queue root resolution (`resolve_queue_root`), FAC
   root resolution (`resolve_fac_root`), bounded job spec reading (`read_job_spec_bounded`),
-  and symlink validation (`validate_regular_file`, `validate_real_directory`) are
-  consolidated in `fac_utils` to eliminate cross-module duplication between `fac_queue.rs`
-  and `fac_job.rs`. Constants `QUEUE_DIR`, `MAX_SCAN_ENTRIES` are shared.
+  and directory validation (`validate_real_directory`) are consolidated in `fac_utils` to
+  eliminate cross-module duplication between `fac_queue.rs` and `fac_job.rs`. Constants
+  `QUEUE_DIR`, `MAX_SCAN_ENTRIES` are shared.
 - **Receipts list --since** (`fac.rs`): `apm2 fac receipts list --since <epoch_secs>` filters
   the receipt index to entries at or after the given UNIX epoch. Deterministic ordering is
   enforced: primary sort by `timestamp_secs` descending, secondary sort by `content_hash`
