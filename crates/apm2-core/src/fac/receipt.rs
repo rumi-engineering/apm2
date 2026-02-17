@@ -743,6 +743,20 @@ pub struct FacJobReceiptV1 {
     /// expected network isolation posture was applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_policy_hash: Option<String>,
+    /// HTF time envelope stamp in nanoseconds (RFC-0016, TCK-00543).
+    ///
+    /// When present, this is the primary sort key for deterministic
+    /// receipt ordering per RFC-0019 section 8.4. Populated by the
+    /// daemon clock service when HTF is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub htf_time_envelope_ns: Option<u64>,
+    /// Node fingerprint for deterministic ordering fallback (TCK-00543).
+    ///
+    /// Same semantics as `LaneProfileV1.node_fingerprint`. Used as the
+    /// second component of the fallback ordering tuple per RFC-0019
+    /// section 8.4: `(monotonic_time_ns, node_fingerprint, receipt_digest)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_fingerprint: Option<String>,
     /// Epoch timestamp.
     pub timestamp_secs: u64,
     /// BLAKE3 body hash for content-addressed storage.
@@ -1087,6 +1101,22 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(hash.as_bytes());
         }
 
+        // TCK-00543: HTF time envelope stamp. Uses type-specific marker
+        // `6u8` to ensure injective encoding. Absence is omitted for
+        // backwards compatibility with existing V2 receipts.
+        if let Some(ns) = self.htf_time_envelope_ns {
+            bytes.push(6u8);
+            bytes.extend_from_slice(&ns.to_be_bytes());
+        }
+
+        // TCK-00543: Node fingerprint. Uses type-specific marker `7u8`
+        // to ensure injective encoding.
+        if let Some(fp) = &self.node_fingerprint {
+            bytes.push(7u8);
+            bytes.extend_from_slice(&(fp.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(fp.as_bytes());
+        }
+
         bytes
     }
 
@@ -1198,6 +1228,16 @@ impl FacJobReceiptV1 {
             return Err(FacJobReceiptError::InvalidData(
                 "content_hash must be 'b3-256:<64 hex>'".to_string(),
             ));
+        }
+        // TCK-00543: Validate node_fingerprint length bound.
+        if let Some(fp) = &self.node_fingerprint {
+            if fp.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "node_fingerprint",
+                    actual: fp.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
         }
 
         match self.outcome {
@@ -1338,6 +1378,8 @@ pub struct FacJobReceiptV1Builder {
     observed_cost: Option<crate::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<String>,
     network_policy_hash: Option<String>,
+    htf_time_envelope_ns: Option<u64>,
+    node_fingerprint: Option<String>,
     timestamp_secs: Option<u64>,
 }
 
@@ -1462,6 +1504,20 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn network_policy_hash(mut self, hash: impl Into<String>) -> Self {
         self.network_policy_hash = Some(hash.into());
+        self
+    }
+
+    /// Sets the HTF time envelope stamp in nanoseconds (TCK-00543).
+    #[must_use]
+    pub const fn htf_time_envelope_ns(mut self, ns: u64) -> Self {
+        self.htf_time_envelope_ns = Some(ns);
+        self
+    }
+
+    /// Sets the node fingerprint for deterministic ordering (TCK-00543).
+    #[must_use]
+    pub fn node_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.node_fingerprint = Some(fingerprint.into());
         self
     }
 
@@ -1675,6 +1731,17 @@ impl FacJobReceiptV1Builder {
             }
         }
 
+        // TCK-00543: Validate node_fingerprint length bound.
+        if let Some(fp) = &self.node_fingerprint {
+            if fp.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "node_fingerprint",
+                    actual: fp.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+        }
+
         let candidate = FacJobReceiptV1 {
             schema: FAC_JOB_RECEIPT_SCHEMA.to_string(),
             receipt_id,
@@ -1694,6 +1761,8 @@ impl FacJobReceiptV1Builder {
             observed_cost: self.observed_cost,
             sandbox_hardening_hash: self.sandbox_hardening_hash,
             network_policy_hash: self.network_policy_hash,
+            htf_time_envelope_ns: self.htf_time_envelope_ns,
+            node_fingerprint: self.node_fingerprint,
             moved_job_path,
             timestamp_secs,
             content_hash: String::new(),

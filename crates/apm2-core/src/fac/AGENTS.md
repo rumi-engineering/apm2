@@ -1728,8 +1728,15 @@ corruption), and parse failures.
   by canonical `b3-256:<hex>` form so that bare-hex and prefixed filenames
   for the same logical receipt map to the same key, preventing duplicate-
   detection bypass via mixed filename forms.
-- Deterministic presentation ordering: `timestamp_secs` descending, then
-  `content_hash` ascending for tiebreaking.
+- Deterministic presentation ordering per RFC-0019 section 8.4:
+  1. Primary: `htf_time_envelope_ns` descending (when present; HTF-bearing
+     receipts sort before non-HTF receipts).
+  2. Fallback: `timestamp_secs` descending > `node_fingerprint` ascending >
+     `content_hash` ascending.
+  Both `htf_time_envelope_ns` and `node_fingerprint` are optional fields on
+  `FacJobReceiptV1` and `MergedReceiptHeader`; the comparator handles their
+  absence correctly (None sorts after Some for fingerprints; None-None uses
+  next tiebreaker).
 - Atomic writes using `tempfile::NamedTempFile::new_in()` + `persist()` for
   secure temp file creation (`O_EXCL`) and atomic rename.
 - Bounded directory scans (`MAX_MERGE_SCAN_FILES = 65,536`).

@@ -1036,6 +1036,8 @@ mod tests {
             observed_cost: None,
             sandbox_hardening_hash: None,
             network_policy_hash: None,
+            htf_time_envelope_ns: None,
+            node_fingerprint: None,
             timestamp_secs: 1000,
             content_hash: String::new(),
         };
