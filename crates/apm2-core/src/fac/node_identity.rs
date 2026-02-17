@@ -145,6 +145,34 @@ pub fn load_or_derive_node_fingerprint(apm2_home: &Path) -> Result<String, NodeI
     Ok(fingerprint)
 }
 
+/// Read the boundary id from disk without creating directories or files.
+///
+/// Returns `Ok(Some(id))` if the boundary id file exists and is valid,
+/// `Ok(None)` if the file or parent directory does not exist, or `Err` if
+/// the file exists but cannot be read or contains invalid data.
+///
+/// This is the non-mutating counterpart to [`load_or_default_boundary_id`]
+/// and is suitable for read-only introspection paths that must not perform
+/// state mutation.
+///
+/// # Errors
+///
+/// Returns `Err` if the boundary id file exists but cannot be read (I/O
+/// failure, symlink rejection, oversized file) or contains invalid data
+/// (empty, non-ASCII, exceeds `MAX_BOUNDARY_ID_LENGTH`).
+pub fn read_boundary_id(apm2_home: &Path) -> Result<Option<String>, NodeIdentityError> {
+    let path = identity_path(apm2_home, BOUNDARY_ID_FILE);
+
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let stored = read_bounded_file(&path, MAX_FILE_SIZE)?;
+    let value = trim_identity_value(&stored)?;
+    validate_boundary_id(value)?;
+    Ok(Some(value.to_string()))
+}
+
 /// Load boundary id from disk or persist `DEFAULT_BOUNDARY_ID` if missing.
 ///
 /// # Errors
@@ -621,6 +649,68 @@ mod tests {
             .expect("node fingerprint");
         assert!(fp.starts_with("b3-256:"));
         assert_eq!(fp.len(), 71);
+    }
+
+    /// `read_boundary_id` must return `None` when no `boundary_id` file or
+    /// parent directory exists, and must NOT create any files or
+    /// directories.
+    #[test]
+    fn read_boundary_id_returns_none_on_empty_home_without_mutation() {
+        let home = tempdir().expect("tempdir");
+        let fac_dir = home.path().join("private/fac");
+
+        // Pre-condition: no FAC identity directory exists.
+        assert!(
+            !fac_dir.exists(),
+            "precondition: private/fac must not exist"
+        );
+
+        let result = read_boundary_id(home.path()).expect("read_boundary_id must not error");
+        assert_eq!(result, None, "must return None when boundary_id is absent");
+
+        // Post-condition: no directory or file was created.
+        assert!(
+            !fac_dir.exists(),
+            "read_boundary_id must NOT create private/fac directory"
+        );
+        assert!(
+            !home.path().join("private").exists(),
+            "read_boundary_id must NOT create private/ directory"
+        );
+    }
+
+    /// `read_boundary_id` must return the stored value when it exists.
+    #[test]
+    fn read_boundary_id_returns_stored_value() {
+        let home = tempdir().expect("tempdir");
+        // Seed a boundary_id using the mutating helper.
+        let _ = load_or_default_boundary_id(home.path()).expect("seed");
+
+        let result = read_boundary_id(home.path()).expect("read");
+        assert_eq!(
+            result,
+            Some(DEFAULT_BOUNDARY_ID.to_string()),
+            "must return the persisted default boundary_id"
+        );
+    }
+
+    /// `read_boundary_id` must return an error for invalid stored data.
+    #[test]
+    fn read_boundary_id_rejects_invalid_stored_data() {
+        let home = tempdir().expect("tempdir");
+        let _ = load_or_default_boundary_id(home.path()).expect("seed");
+
+        // Overwrite with empty content (invalid).
+        let boundary_path = home.path().join("private/fac/boundary_id");
+        std::fs::write(&boundary_path, "").expect("write invalid");
+
+        assert!(
+            matches!(
+                read_boundary_id(home.path()),
+                Err(NodeIdentityError::InvalidData { .. })
+            ),
+            "read_boundary_id must reject empty boundary_id"
+        );
     }
 
     #[test]
