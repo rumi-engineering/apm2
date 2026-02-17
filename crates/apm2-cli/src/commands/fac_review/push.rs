@@ -1,4 +1,5 @@
-//! Lean `run_push` pipeline: git push → blocking gates → PR/update → dispatch.
+//! Lean `run_push` pipeline: blocking gates → ruleset sync → git push →
+//! PR/update → dispatch.
 //!
 //! Bridge module: combines FAC core gate orchestration with projection-layer
 //! PR management through `github_projection`.
@@ -29,6 +30,7 @@ use super::types::{
     sanitize_for_path,
 };
 use super::{github_projection, lifecycle, projection_store, state};
+use crate::commands::fac_pr::sync_required_status_ruleset;
 use crate::exit_codes::codes as exit_codes;
 
 const REQUIRED_TCK_FORMAT_MESSAGE: &str = "Required format: include `TCK-12345` in the branch name (recommended: `ticket/RFC-0018/TCK-12345`) or in the worktree directory name (example: `apm2-TCK-12345`).";
@@ -374,6 +376,29 @@ fn run_blocking_evidence_gates(sha: &str) -> Result<Vec<EvidenceGateResult>, Str
     };
     let outcome = run_queued_gates_and_collect(&request)?;
     validate_queued_gates_outcome_for_push(sha, outcome)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrePushExecutionError {
+    Gates(String),
+    RulesetSync(String),
+    GitPush(String),
+}
+
+fn run_pre_push_sequence_with<FGates, FSync, FPush>(
+    mut run_gates_fn: FGates,
+    mut sync_ruleset_fn: FSync,
+    mut git_push_fn: FPush,
+) -> Result<Vec<EvidenceGateResult>, PrePushExecutionError>
+where
+    FGates: FnMut() -> Result<Vec<EvidenceGateResult>, String>,
+    FSync: FnMut() -> Result<(), String>,
+    FPush: FnMut() -> Result<(), String>,
+{
+    let gate_results = run_gates_fn().map_err(PrePushExecutionError::Gates)?;
+    sync_ruleset_fn().map_err(PrePushExecutionError::RulesetSync)?;
+    git_push_fn().map_err(PrePushExecutionError::GitPush)?;
+    Ok(gate_results)
 }
 
 #[cfg(test)]
@@ -1364,70 +1389,7 @@ pub fn run_push(
         metadata.ticket_path.display()
     );
 
-    // Step 1: git push (always force; local branch truth is authoritative).
-    let git_push_started = Instant::now();
-    let push_output = Command::new("git")
-        .args(["push", "--force", remote, &branch])
-        .output();
-    match push_output {
-        Ok(o) if o.status.success() => {
-            let duration_secs = git_push_started.elapsed().as_secs();
-            attempt.set_stage_pass("git_push", duration_secs);
-            emit_stage(
-                "git_push_completed",
-                serde_json::json!({
-                    "status": "pass",
-                    "duration_secs": duration_secs,
-                }),
-            );
-            human_log!("fac push: git push --force succeeded");
-        },
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            let duration_secs = git_push_started.elapsed().as_secs();
-            attempt.set_stage_fail(
-                "git_push",
-                duration_secs,
-                o.status.code(),
-                normalize_error_hint(&stderr),
-            );
-            emit_stage(
-                "git_push_completed",
-                serde_json::json!({
-                    "status": "fail",
-                    "duration_secs": duration_secs,
-                    "error": stderr.trim(),
-                }),
-            );
-            fail_with_attempt!(
-                "fac_push_git_push_failed",
-                format!("git push --force failed: {stderr}")
-            );
-        },
-        Err(e) => {
-            let duration_secs = git_push_started.elapsed().as_secs();
-            attempt.set_stage_fail(
-                "git_push",
-                duration_secs,
-                None,
-                normalize_error_hint(&e.to_string()),
-            );
-            emit_stage(
-                "git_push_completed",
-                serde_json::json!({
-                    "status": "error",
-                    "duration_secs": duration_secs,
-                    "error": e.to_string(),
-                }),
-            );
-            fail_with_attempt!(
-                "fac_push_git_push_exec_failed",
-                format!("failed to execute git push --force: {e}")
-            );
-        },
-    }
-
-    // Step 2: run evidence gates synchronously with cache-aware status path.
+    // Step 1: fail closed on HEAD drift before running queued gates.
     let current_head = match Command::new("git").args(["rev-parse", "HEAD"]).output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => {
@@ -1448,192 +1410,345 @@ pub fn run_push(
 
     let existing_pr_number = find_existing_pr(repo, &branch);
     attempt_pr_number = existing_pr_number;
-    human_log!("fac push: enqueuing evidence gates job (external worker, blocking)");
-    emit_stage("gates_started", serde_json::json!({}));
-    let gates_started = Instant::now();
-    let gate_results = match run_blocking_evidence_gates(&sha) {
-        Ok(results) => {
-            for gate in &results {
-                let stage = stage_from_gate_name(&gate.gate_name);
-                let log_path = gate
-                    .log_path
-                    .as_ref()
-                    .and_then(|path| path.to_str())
-                    .map(str::to_string);
-                let error_hint = if gate.passed {
-                    None
-                } else {
-                    gate_error_hint_from_result(gate).or_else(|| {
-                        normalize_error_hint(&format!("gate {} failed", gate.gate_name))
-                    })
-                };
-                if gate.passed {
-                    attempt.set_stage_pass(stage, gate.duration_secs);
-                } else {
-                    attempt.set_stage_fail(stage, gate.duration_secs, None, error_hint.clone());
-                }
-                if json_output {
-                    let status = if gate.passed { "pass" } else { "fail" }.to_string();
-                    let _ = emit_jsonl(&GateCompletedEvent {
-                        event: "gate_completed",
-                        gate: gate.gate_name.clone(),
-                        status,
-                        duration_secs: gate.duration_secs,
-                        log_path: log_path.clone(),
-                        bytes_written: gate.bytes_written,
-                        bytes_total: gate.bytes_total,
-                        was_truncated: gate.was_truncated,
-                        log_bundle_hash: gate.log_bundle_hash.clone(),
-                        error_hint: error_hint.clone(),
-                        ts: ts_now(),
-                    });
-                    if !gate.passed {
-                        let _ = emit_jsonl(&GateErrorEvent {
-                            event: "gate_error",
-                            gate: gate.gate_name.clone(),
-                            error: error_hint
-                                .clone()
-                                .unwrap_or_else(|| "gate failed".to_string()),
-                            log_path,
-                            duration_secs: Some(gate.duration_secs),
-                            bytes_written: gate.bytes_written,
-                            bytes_total: gate.bytes_total,
-                            was_truncated: gate.was_truncated,
-                            log_bundle_hash: gate.log_bundle_hash.clone(),
-                            ts: ts_now(),
-                        });
-                    }
-                }
-            }
-            results
-        },
-        Err(err) => {
-            emit_stage(
-                "gates_completed",
-                serde_json::json!({
-                    "passed": false,
-                    "duration_secs": gates_started.elapsed().as_secs(),
-                    "error": err.as_str(),
-                }),
-            );
-            let mut mapped_any = false;
-            if let Some(cache) = GateCache::load(&sha) {
-                for (gate_name, gate_result) in cache.gates {
-                    let stage = stage_from_gate_name(&gate_name);
-                    mapped_any = true;
-                    if gate_result.status.eq_ignore_ascii_case("PASS") {
-                        attempt.set_stage_pass(stage, gate_result.duration_secs);
-                    } else {
-                        let hint = latest_gate_error_hint(&gate_name)
-                            .or_else(|| normalize_error_hint(&format!("gate {gate_name} failed")));
-                        attempt.set_stage_fail(stage, gate_result.duration_secs, None, hint);
-                    }
-                    if json_output {
-                        let normalized_status = gate_result.status.to_ascii_lowercase();
-                        let log_path = gate_result.log_path.clone();
-                        let error_hint = if gate_result.status.eq_ignore_ascii_case("PASS") {
+    let mut git_push_duration_secs = 0_u64;
+    let mut git_push_exit_code: Option<i32> = None;
+    let mut git_push_error_hint: Option<String> = None;
+    let mut git_push_executed = false;
+    let gate_results = match run_pre_push_sequence_with(
+        || {
+            human_log!("fac push: enqueuing evidence gates job (external worker, blocking)");
+            emit_stage("gates_started", serde_json::json!({}));
+            let gates_started = Instant::now();
+            let gate_results = match run_blocking_evidence_gates(&sha) {
+                Ok(results) => {
+                    for gate in &results {
+                        let stage = stage_from_gate_name(&gate.gate_name);
+                        let log_path = gate
+                            .log_path
+                            .as_ref()
+                            .and_then(|path| path.to_str())
+                            .map(str::to_string);
+                        let error_hint = if gate.passed {
                             None
                         } else {
-                            gate_result.log_path.as_deref().and_then(|path| {
-                                read_log_error_hint(std::path::Path::new(path))
-                                    .or_else(|| latest_gate_error_hint(&gate_name))
+                            gate_error_hint_from_result(gate).or_else(|| {
+                                normalize_error_hint(&format!("gate {} failed", gate.gate_name))
                             })
                         };
-                        let _ = emit_jsonl(&GateCompletedEvent {
-                            event: "gate_completed",
-                            gate: gate_name.clone(),
-                            status: normalized_status,
-                            duration_secs: gate_result.duration_secs,
-                            log_path: log_path.clone(),
-                            bytes_written: gate_result.bytes_written,
-                            bytes_total: gate_result.bytes_total,
-                            was_truncated: gate_result.was_truncated,
-                            log_bundle_hash: gate_result.log_bundle_hash.clone(),
-                            error_hint: error_hint.clone(),
-                            ts: ts_now(),
-                        });
-                        if gate_result.status.eq_ignore_ascii_case("FAIL") {
+                        if gate.passed {
+                            attempt.set_stage_pass(stage, gate.duration_secs);
+                        } else {
+                            attempt.set_stage_fail(
+                                stage,
+                                gate.duration_secs,
+                                None,
+                                error_hint.clone(),
+                            );
+                        }
+                        if json_output {
+                            let status = if gate.passed { "pass" } else { "fail" }.to_string();
+                            let _ = emit_jsonl(&GateCompletedEvent {
+                                event: "gate_completed",
+                                gate: gate.gate_name.clone(),
+                                status,
+                                duration_secs: gate.duration_secs,
+                                log_path: log_path.clone(),
+                                bytes_written: gate.bytes_written,
+                                bytes_total: gate.bytes_total,
+                                was_truncated: gate.was_truncated,
+                                log_bundle_hash: gate.log_bundle_hash.clone(),
+                                error_hint: error_hint.clone(),
+                                ts: ts_now(),
+                            });
+                            if !gate.passed {
+                                let _ = emit_jsonl(&GateErrorEvent {
+                                    event: "gate_error",
+                                    gate: gate.gate_name.clone(),
+                                    error: error_hint
+                                        .clone()
+                                        .unwrap_or_else(|| "gate failed".to_string()),
+                                    log_path,
+                                    duration_secs: Some(gate.duration_secs),
+                                    bytes_written: gate.bytes_written,
+                                    bytes_total: gate.bytes_total,
+                                    was_truncated: gate.was_truncated,
+                                    log_bundle_hash: gate.log_bundle_hash.clone(),
+                                    ts: ts_now(),
+                                });
+                            }
+                        }
+                    }
+                    results
+                },
+                Err(err) => {
+                    emit_stage(
+                        "gates_completed",
+                        serde_json::json!({
+                            "passed": false,
+                            "duration_secs": gates_started.elapsed().as_secs(),
+                            "error": err.as_str(),
+                        }),
+                    );
+                    let mut mapped_any = false;
+                    if let Some(cache) = GateCache::load(&sha) {
+                        for (gate_name, gate_result) in cache.gates {
+                            let stage = stage_from_gate_name(&gate_name);
+                            mapped_any = true;
+                            if gate_result.status.eq_ignore_ascii_case("PASS") {
+                                attempt.set_stage_pass(stage, gate_result.duration_secs);
+                            } else {
+                                let hint = latest_gate_error_hint(&gate_name).or_else(|| {
+                                    normalize_error_hint(&format!("gate {gate_name} failed"))
+                                });
+                                attempt.set_stage_fail(
+                                    stage,
+                                    gate_result.duration_secs,
+                                    None,
+                                    hint,
+                                );
+                            }
+                            if json_output {
+                                let normalized_status = gate_result.status.to_ascii_lowercase();
+                                let log_path = gate_result.log_path.clone();
+                                let error_hint = if gate_result.status.eq_ignore_ascii_case("PASS")
+                                {
+                                    None
+                                } else {
+                                    gate_result.log_path.as_deref().and_then(|path| {
+                                        read_log_error_hint(std::path::Path::new(path))
+                                            .or_else(|| latest_gate_error_hint(&gate_name))
+                                    })
+                                };
+                                let _ = emit_jsonl(&GateCompletedEvent {
+                                    event: "gate_completed",
+                                    gate: gate_name.clone(),
+                                    status: normalized_status,
+                                    duration_secs: gate_result.duration_secs,
+                                    log_path: log_path.clone(),
+                                    bytes_written: gate_result.bytes_written,
+                                    bytes_total: gate_result.bytes_total,
+                                    was_truncated: gate_result.was_truncated,
+                                    log_bundle_hash: gate_result.log_bundle_hash.clone(),
+                                    error_hint: error_hint.clone(),
+                                    ts: ts_now(),
+                                });
+                                if gate_result.status.eq_ignore_ascii_case("FAIL") {
+                                    let _ = emit_jsonl(&GateErrorEvent {
+                                        event: "gate_error",
+                                        gate: gate_name.clone(),
+                                        error: error_hint
+                                            .unwrap_or_else(|| "gate failed".to_string()),
+                                        log_path,
+                                        duration_secs: Some(gate_result.duration_secs),
+                                        bytes_written: gate_result.bytes_written,
+                                        bytes_total: gate_result.bytes_total,
+                                        was_truncated: gate_result.was_truncated,
+                                        log_bundle_hash: gate_result.log_bundle_hash.clone(),
+                                        ts: ts_now(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if !mapped_any {
+                        let duration = gates_started.elapsed().as_secs();
+                        for stage in ["gate_fmt", "gate_clippy", "gate_test", "gate_doc"] {
+                            attempt.set_stage_fail(
+                                stage,
+                                duration,
+                                None,
+                                normalize_error_hint(&err),
+                            );
+                        }
+                        if json_output {
                             let _ = emit_jsonl(&GateErrorEvent {
                                 event: "gate_error",
-                                gate: gate_name.clone(),
-                                error: error_hint.unwrap_or_else(|| "gate failed".to_string()),
-                                log_path,
-                                duration_secs: Some(gate_result.duration_secs),
-                                bytes_written: gate_result.bytes_written,
-                                bytes_total: gate_result.bytes_total,
-                                was_truncated: gate_result.was_truncated,
-                                log_bundle_hash: gate_result.log_bundle_hash.clone(),
+                                gate: "unknown".to_string(),
+                                error: normalize_error_hint(&err).unwrap_or_else(|| err.clone()),
+                                log_path: None,
+                                duration_secs: Some(duration),
+                                bytes_written: None,
+                                bytes_total: None,
+                                was_truncated: None,
+                                log_bundle_hash: None,
                                 ts: ts_now(),
                             });
                         }
                     }
-                }
-            }
-            if !mapped_any {
-                let duration = gates_started.elapsed().as_secs();
-                for stage in ["gate_fmt", "gate_clippy", "gate_test", "gate_doc"] {
-                    attempt.set_stage_fail(stage, duration, None, normalize_error_hint(&err));
-                }
-                if json_output {
-                    let _ = emit_jsonl(&GateErrorEvent {
-                        event: "gate_error",
-                        gate: "unknown".to_string(),
-                        error: normalize_error_hint(&err).unwrap_or_else(|| err.clone()),
-                        log_path: None,
-                        duration_secs: Some(duration),
-                        bytes_written: None,
-                        bytes_total: None,
-                        was_truncated: None,
-                        log_bundle_hash: None,
-                        ts: ts_now(),
-                    });
-                }
-            }
-            if existing_pr_number > 0 {
-                if let Err(state_err) = lifecycle::apply_event(
-                    repo,
-                    existing_pr_number,
-                    &sha,
-                    &lifecycle::LifecycleEventKind::PushObserved,
-                ) {
-                    human_log!(
-                        "WARNING: failed to record push_observed lifecycle event for PR #{existing_pr_number}: {state_err}",
+                    if existing_pr_number > 0 {
+                        if let Err(state_err) = lifecycle::apply_event(
+                            repo,
+                            existing_pr_number,
+                            &sha,
+                            &lifecycle::LifecycleEventKind::PushObserved,
+                        ) {
+                            human_log!(
+                                "WARNING: failed to record push_observed lifecycle event for PR #{existing_pr_number}: {state_err}",
+                            );
+                        }
+                        if let Err(state_err) = lifecycle::apply_event(
+                            repo,
+                            existing_pr_number,
+                            &sha,
+                            &lifecycle::LifecycleEventKind::GatesStarted,
+                        ) {
+                            human_log!(
+                                "WARNING: failed to record gates_started lifecycle event for PR #{existing_pr_number}: {state_err}",
+                            );
+                        }
+                        if let Err(state_err) = lifecycle::apply_event(
+                            repo,
+                            existing_pr_number,
+                            &sha,
+                            &lifecycle::LifecycleEventKind::GatesFailed,
+                        ) {
+                            human_log!(
+                                "WARNING: failed to record gates_failed lifecycle event for PR #{existing_pr_number}: {state_err}",
+                            );
+                        }
+                    }
+                    return Err(err);
+                },
+            };
+            emit_stage(
+                "gates_completed",
+                serde_json::json!({
+                    "passed": true,
+                    "duration_secs": gates_started.elapsed().as_secs(),
+                }),
+            );
+            human_log!("fac push: evidence gates PASSED");
+            Ok(gate_results)
+        },
+        || {
+            emit_stage("ruleset_sync_started", serde_json::json!({}));
+            let sync_started = Instant::now();
+            match sync_required_status_ruleset(repo, None, None, false) {
+                Ok(sync_outcome) => {
+                    let required_status_contexts = sync_outcome.contexts.clone();
+                    emit_stage(
+                        "ruleset_sync_completed",
+                        serde_json::json!({
+                            "status": "pass",
+                            "duration_secs": sync_started.elapsed().as_secs(),
+                            "ruleset_id": sync_outcome.ruleset_id,
+                            "drift_detected": sync_outcome.drift_detected,
+                            "changed": sync_outcome.changed,
+                            "required_status_contexts": required_status_contexts,
+                        }),
                     );
-                }
-                if let Err(state_err) = lifecycle::apply_event(
-                    repo,
-                    existing_pr_number,
-                    &sha,
-                    &lifecycle::LifecycleEventKind::GatesStarted,
-                ) {
-                    human_log!(
-                        "WARNING: failed to record gates_started lifecycle event for PR #{existing_pr_number}: {state_err}",
+                    if sync_outcome.changed {
+                        human_log!(
+                            "fac push: synchronized GitHub ruleset #{} required-status contexts from local source of truth",
+                            sync_outcome.ruleset_id
+                        );
+                    } else {
+                        human_log!(
+                            "fac push: GitHub ruleset #{} already aligned with local required-status policy",
+                            sync_outcome.ruleset_id
+                        );
+                    }
+                    Ok(())
+                },
+                Err(err) => {
+                    emit_stage(
+                        "ruleset_sync_completed",
+                        serde_json::json!({
+                            "status": "fail",
+                            "duration_secs": sync_started.elapsed().as_secs(),
+                            "error": err.as_str(),
+                        }),
                     );
-                }
-                if let Err(state_err) = lifecycle::apply_event(
-                    repo,
-                    existing_pr_number,
-                    &sha,
-                    &lifecycle::LifecycleEventKind::GatesFailed,
-                ) {
-                    human_log!(
-                        "WARNING: failed to record gates_failed lifecycle event for PR #{existing_pr_number}: {state_err}",
-                    );
-                }
+                    Err(err)
+                },
             }
+        },
+        || {
+            let git_push_started = Instant::now();
+            let push_output = Command::new("git")
+                .args(["push", "--force", remote, &branch])
+                .output();
+            match push_output {
+                Ok(o) if o.status.success() => {
+                    let duration_secs = git_push_started.elapsed().as_secs();
+                    git_push_executed = true;
+                    git_push_duration_secs = duration_secs;
+                    git_push_exit_code = None;
+                    git_push_error_hint = None;
+                    emit_stage(
+                        "git_push_completed",
+                        serde_json::json!({
+                            "status": "pass",
+                            "duration_secs": duration_secs,
+                        }),
+                    );
+                    human_log!("fac push: git push --force succeeded");
+                    Ok(())
+                },
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    let duration_secs = git_push_started.elapsed().as_secs();
+                    git_push_executed = true;
+                    git_push_duration_secs = duration_secs;
+                    git_push_exit_code = o.status.code();
+                    git_push_error_hint = normalize_error_hint(&stderr);
+                    emit_stage(
+                        "git_push_completed",
+                        serde_json::json!({
+                            "status": "fail",
+                            "duration_secs": duration_secs,
+                            "error": stderr.trim(),
+                        }),
+                    );
+                    Err(format!("git push --force failed: {stderr}"))
+                },
+                Err(err) => {
+                    let duration_secs = git_push_started.elapsed().as_secs();
+                    git_push_executed = true;
+                    git_push_duration_secs = duration_secs;
+                    git_push_exit_code = None;
+                    git_push_error_hint = normalize_error_hint(&err.to_string());
+                    emit_stage(
+                        "git_push_completed",
+                        serde_json::json!({
+                            "status": "error",
+                            "duration_secs": duration_secs,
+                            "error": err.to_string(),
+                        }),
+                    );
+                    Err(format!("failed to execute git push --force: {err}"))
+                },
+            }
+        },
+    ) {
+        Ok(results) => {
+            if git_push_executed {
+                attempt.set_stage_pass("git_push", git_push_duration_secs);
+            }
+            results
+        },
+        Err(PrePushExecutionError::Gates(err)) => {
             fail_with_attempt!("fac_push_gates_failed", err);
         },
+        Err(PrePushExecutionError::RulesetSync(err)) => {
+            fail_with_attempt!("fac_push_ruleset_sync_failed", err);
+        },
+        Err(PrePushExecutionError::GitPush(err)) => {
+            if git_push_executed {
+                attempt.set_stage_fail(
+                    "git_push",
+                    git_push_duration_secs,
+                    git_push_exit_code,
+                    git_push_error_hint,
+                );
+            } else {
+                attempt.set_stage_fail("git_push", 0, None, normalize_error_hint(&err));
+            }
+            fail_with_attempt!("fac_push_git_push_failed", err);
+        },
     };
-    emit_stage(
-        "gates_completed",
-        serde_json::json!({
-            "passed": true,
-            "duration_secs": gates_started.elapsed().as_secs(),
-        }),
-    );
-    human_log!("fac push: evidence gates PASSED");
 
-    // Step 3: create or update PR.
+    // Step 2: create or update PR.
     let pr_update_started = Instant::now();
     let pr_number = find_existing_pr(repo, &branch);
     let pr_number = if pr_number == 0 {
@@ -1718,7 +1833,7 @@ pub fn run_push(
         );
     }
 
-    // Step 4: sync gate status section to PR body (best-effort).
+    // Step 3: sync gate status section to PR body (best-effort).
     let gate_status_rows = gate_results
         .iter()
         .map(|result| GateResult {
@@ -1739,14 +1854,14 @@ pub fn run_push(
         human_log!("fac push: synced gate status section in PR body for PR #{pr_number}");
     }
 
-    // Step 5: enable auto-merge.
+    // Step 4: enable auto-merge.
     if let Err(e) = enable_auto_merge(repo, pr_number) {
         human_log!("WARNING: auto-merge enable failed: {e}");
     } else {
         human_log!("fac push: auto-merge enabled on PR #{pr_number}");
     }
 
-    // Step 6: dispatch reviews.
+    // Step 5: dispatch reviews.
     //
     // Intentional: dispatch failures are non-fatal for `fac push`. Push owns
     // publication and gate validation; reviewer liveness and retry are handled
@@ -1802,7 +1917,7 @@ pub fn run_push(
         }),
     );
 
-    // Step 7: persist projection identity only after gates + dispatch attempt.
+    // Step 6: persist projection identity only after gates + dispatch attempt.
     let mut identity_persisted = false;
     if let Err(err) = projection_store::save_identity_with_context(repo, pr_number, &sha, "push") {
         human_log!("WARNING: failed to persist local projection identity: {err}");
@@ -1897,6 +2012,82 @@ mod tests {
                 ..Default::default()
             })
             .collect()
+    }
+
+    #[test]
+    fn run_pre_push_sequence_with_enforces_gates_then_ruleset_sync_then_git_push() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let expected_results = seed_required_pass_results();
+        let outcome = run_pre_push_sequence_with(
+            || {
+                calls.borrow_mut().push("gates");
+                Ok(expected_results.clone())
+            },
+            || {
+                calls.borrow_mut().push("ruleset_sync");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("git_push");
+                Ok(())
+            },
+        )
+        .expect("pre-push sequence should succeed");
+
+        assert_eq!(*calls.borrow(), vec!["gates", "ruleset_sync", "git_push"]);
+        assert_eq!(outcome.len(), expected_results.len());
+    }
+
+    #[test]
+    fn run_pre_push_sequence_with_stops_before_remote_side_effects_on_gate_failure() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let error = run_pre_push_sequence_with(
+            || {
+                calls.borrow_mut().push("gates");
+                Err("gate failed".to_string())
+            },
+            || {
+                calls.borrow_mut().push("ruleset_sync");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("git_push");
+                Ok(())
+            },
+        )
+        .expect_err("gate failure should fail closed");
+
+        assert_eq!(*calls.borrow(), vec!["gates"]);
+        assert_eq!(
+            error,
+            PrePushExecutionError::Gates("gate failed".to_string())
+        );
+    }
+
+    #[test]
+    fn run_pre_push_sequence_with_stops_before_git_push_when_ruleset_sync_fails() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let error = run_pre_push_sequence_with(
+            || {
+                calls.borrow_mut().push("gates");
+                Ok(seed_required_pass_results())
+            },
+            || {
+                calls.borrow_mut().push("ruleset_sync");
+                Err("ruleset drift not synchronized".to_string())
+            },
+            || {
+                calls.borrow_mut().push("git_push");
+                Ok(())
+            },
+        )
+        .expect_err("ruleset sync failure should block git push");
+
+        assert_eq!(*calls.borrow(), vec!["gates", "ruleset_sync"]);
+        assert_eq!(
+            error,
+            PrePushExecutionError::RulesetSync("ruleset drift not synchronized".to_string())
+        );
     }
 
     #[test]
