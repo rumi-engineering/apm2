@@ -556,6 +556,47 @@ by another worker).
   Cleanup failure on denial paths results in CORRUPT lane marking, same as the
   success path.
 
+### Lane Init and Reconcile (TCK-00539)
+
+Lane init (`init_lanes`) and reconcile (`reconcile_lanes`) are operator-facing
+bootstrap and recovery commands exposed via `apm2 fac lane init` and
+`apm2 fac lane reconcile`.
+
+**Init** (`LaneManager::init_lanes`):
+- Creates all lane directories (`workspace/`, `target/`, `logs/`, per-lane env
+  dirs from `LANE_ENV_DIRS`) with 0o700 permissions (CTR-2611).
+- Writes default `LaneProfileV1` for each lane (idempotent: existing profiles
+  are left untouched).
+- Derives `node_fingerprint` and `boundary_id` from `$APM2_HOME` identity.
+- Emits a `LaneInitReceiptV1` persisted under `$APM2_HOME/private/fac/evidence/`.
+- Receipt types: `LaneInitReceiptV1`, `LaneInitProfileEntry`.
+
+**Reconcile** (`LaneManager::reconcile_lanes`):
+- Inspects each configured lane and repairs missing directories/profiles.
+- Lanes with existing corrupt markers are reported as `Skipped`.
+- Lanes that cannot be repaired are marked CORRUPT via `LaneCorruptMarkerV1`.
+- Emits a `LaneReconcileReceiptV1` persisted under
+  `$APM2_HOME/private/fac/evidence/`.
+- Receipt types: `LaneReconcileReceiptV1`, `LaneReconcileAction`,
+  `LaneReconcileOutcome`.
+- Decomposed into helper methods (`reconcile_single_lane`, `reconcile_dir`,
+  `reconcile_profile`, `mark_lane_corrupt`, `build_reconcile_receipt`) to stay
+  under the 100-line clippy limit.
+
+**Schema constants**:
+- `LANE_INIT_RECEIPT_SCHEMA = "apm2.fac.lane_init_receipt.v1"`
+- `LANE_RECONCILE_RECEIPT_SCHEMA = "apm2.fac.lane_reconcile_receipt.v1"`
+
+**Security invariants (TCK-00539)**:
+- [INV-LANE-INIT-001] All directories use restricted permissions (0o700).
+- [INV-LANE-INIT-002] Profile writes use atomic write (temp + rename, CTR-2607).
+- [INV-LANE-INIT-003] Init is idempotent: existing profiles are not overwritten.
+- [INV-LANE-RECON-001] Reconcile is fail-closed: unrecoverable lanes are marked
+  CORRUPT rather than silently skipped.
+- [INV-LANE-RECON-002] Corrupt marker `detected_at` uses `SystemTime::now()`
+  with `#[allow(clippy::disallowed_methods)]` and inline CTR-2501 justification.
+- [INV-LANE-RECON-003] Receipt persistence uses atomic write (CTR-2607).
+
 ### `repo_mirror` — Node-Local Bare Mirror + Lane Checkout
 
 **Core type**: `RepoMirrorManager`
