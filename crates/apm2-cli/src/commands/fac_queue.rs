@@ -293,9 +293,20 @@ fn collect_reason_stats(
         // Best-effort: try to read the spec to get the job_id.
         if let Ok(spec) = read_job_spec_bounded(&path) {
             // Primary: resolve canonical denial_reason from receipt.
+            // Finding 4 fix: use serde-serialized snake_case codes
+            // (e.g., "malformed_spec") instead of Debug strings
+            // (e.g., "MalformedSpec") for stable machine-readable output.
             let reason_key = apm2_core::fac::lookup_job_receipt(receipts_dir, &spec.job_id)
                 .and_then(|receipt| receipt.denial_reason)
-                .map_or_else(|| "unknown".to_string(), |dr| format!("{dr:?}"));
+                .map_or_else(
+                    || "unknown".to_string(),
+                    |dr| {
+                        serde_json::to_value(dr)
+                            .ok()
+                            .and_then(|v| v.as_str().map(String::from))
+                            .unwrap_or_else(|| "unknown".to_string())
+                    },
+                );
 
             if reasons.len() < MAX_REASON_CODES || reasons.contains_key(&reason_key) {
                 *reasons.entry(reason_key).or_insert(0) += 1;
@@ -535,12 +546,13 @@ mod tests {
         let mut reasons = HashMap::new();
         collect_reason_stats(&denied_dir, &receipts_dir, &mut reasons);
 
-        // The job with a receipt should be keyed by "DigestMismatch" (Debug format).
+        // Finding 4 fix: the job with a receipt should be keyed by
+        // "digest_mismatch" (serde snake_case), NOT "DigestMismatch" (Debug).
         assert!(
-            reasons.contains_key("DigestMismatch"),
-            "expected DigestMismatch reason key, got: {reasons:?}"
+            reasons.contains_key("digest_mismatch"),
+            "expected digest_mismatch reason key (serde snake_case), got: {reasons:?}"
         );
-        assert_eq!(reasons["DigestMismatch"], 1);
+        assert_eq!(reasons["digest_mismatch"], 1);
 
         // The job without a receipt should be keyed by "unknown", NOT "gates".
         assert!(

@@ -59,6 +59,7 @@ use serde::Serialize;
 use crate::commands::fac::CancelArgs;
 use crate::commands::fac_utils::{
     MAX_SCAN_ENTRIES, read_job_spec_bounded, resolve_fac_root, resolve_queue_root,
+    validate_real_directory,
 };
 use crate::exit_codes::codes as exit_codes;
 
@@ -121,6 +122,26 @@ enum JobState {
     NotFound,
     /// Job was found in multiple directories (ambiguous, fail-closed).
     Ambiguous(Vec<String>),
+}
+
+impl JobState {
+    /// Returns the canonical directory-token label for this job state.
+    ///
+    /// Labels match queue directory names exactly (pending, claimed,
+    /// completed, cancelled, denied, quarantine) to prevent drift
+    /// between introspection output and directory identifiers
+    /// (Finding 5 fix).
+    const fn state_label(&self) -> Option<&'static str> {
+        match self {
+            Self::Pending(_) => Some("pending"),
+            Self::Claimed(_) => Some("claimed"),
+            Self::Completed(_) => Some("completed"),
+            Self::Cancelled(_) => Some("cancelled"),
+            Self::Denied(_) => Some("denied"),
+            Self::Quarantined(_) => Some("quarantine"),
+            Self::NotFound | Self::Ambiguous(_) => None,
+        }
+    }
 }
 
 // =============================================================================
@@ -867,13 +888,17 @@ pub fn run_job_show(job_id: &str, json_output: bool) -> u8 {
     // Locate the job across all directories.
     let state = locate_job(&queue_root, job_id);
 
-    let (state_name, spec_path) = match &state {
-        JobState::Pending(p) => ("pending", Some(p.clone())),
-        JobState::Claimed(p) => ("claimed", Some(p.clone())),
-        JobState::Completed(p) => ("completed", Some(p.clone())),
-        JobState::Cancelled(p) => ("cancelled", Some(p.clone())),
-        JobState::Denied(p) => ("denied", Some(p.clone())),
-        JobState::Quarantined(p) => ("quarantined", Some(p.clone())),
+    // Extract state label and spec path.
+    // state_label() returns the canonical directory-token string, matching
+    // queue directory names exactly (Finding 5 fix: "quarantine" not
+    // "quarantined").
+    let spec_path = match &state {
+        JobState::Pending(p)
+        | JobState::Claimed(p)
+        | JobState::Completed(p)
+        | JobState::Cancelled(p)
+        | JobState::Denied(p)
+        | JobState::Quarantined(p) => Some(p.clone()),
         JobState::NotFound => {
             output_error(
                 json_output,
@@ -892,6 +917,9 @@ pub fn run_job_show(job_id: &str, json_output: bool) -> u8 {
             return exit_codes::GENERIC_ERROR;
         },
     };
+
+    // state_label() is guaranteed Some for non-NotFound/Ambiguous states.
+    let state_name = state.state_label().unwrap_or("unknown");
 
     // Read the job spec.
     let spec = spec_path
@@ -947,6 +975,12 @@ fn resolve_latest_receipt(job_id: &str) -> Option<serde_json::Value> {
 /// which resolves to `$APM2_HOME/private/fac/lanes/`. Previous code
 /// incorrectly resolved from `queue_root.parent()` which produced the
 /// wrong base directory.
+///
+/// # Symlink guards (Finding 2/3 fix)
+///
+/// All scanned directories are validated with `symlink_metadata` (lstat
+/// semantics) before traversal. Symlinked directories and entries are
+/// skipped to prevent redirect-based attacks outside FAC roots.
 fn discover_log_pointers(job_id: &str) -> (Vec<String>, bool) {
     let mut pointers = Vec::new();
     let mut truncated = false;
@@ -957,7 +991,8 @@ fn discover_log_pointers(job_id: &str) -> (Vec<String>, bool) {
     // Check evidence directory for job-related logs.
     if let Some(apm2_home) = apm2_core::github::resolve_apm2_home() {
         let evidence_dir = apm2_home.join("private").join("fac").join("evidence");
-        if evidence_dir.is_dir() && !at_cap(&pointers) {
+        // Symlink guard: validate evidence_dir is a real directory.
+        if validate_real_directory(&evidence_dir).is_ok() && !at_cap(&pointers) {
             if let Ok(entries) = fs::read_dir(&evidence_dir) {
                 let mut scan_count = 0usize;
                 for entry in entries {
@@ -969,6 +1004,10 @@ fn discover_log_pointers(job_id: &str) -> (Vec<String>, bool) {
                     }
                     scan_count = scan_count.saturating_add(1);
                     let Ok(entry) = entry else { continue };
+                    // Symlink guard: skip symlinked entries.
+                    if is_symlink_entry(&entry) {
+                        continue;
+                    }
                     let name = entry.file_name();
                     let Some(name_str) = name.to_str() else {
                         continue;
@@ -983,7 +1022,8 @@ fn discover_log_pointers(job_id: &str) -> (Vec<String>, bool) {
         // Check receipts directory for related receipt files.
         if !at_cap(&pointers) {
             let receipts_dir = apm2_home.join("private").join("fac").join("receipts");
-            if receipts_dir.is_dir() {
+            // Symlink guard: validate receipts_dir is a real directory.
+            if validate_real_directory(&receipts_dir).is_ok() {
                 pointers.push(format!("{} (receipt store)", receipts_dir.display()));
             }
         }
@@ -995,7 +1035,8 @@ fn discover_log_pointers(job_id: &str) -> (Vec<String>, bool) {
     if !at_cap(&pointers) {
         let lanes_dir = resolve_fac_root().ok().map(|p| p.join("lanes"));
         if let Some(lanes_dir) = lanes_dir {
-            if lanes_dir.is_dir() {
+            // Symlink guard: validate lanes_dir is a real directory.
+            if validate_real_directory(&lanes_dir).is_ok() {
                 if let Ok(entries) = fs::read_dir(&lanes_dir) {
                     let mut scan_count = 0usize;
                     for entry in entries {
@@ -1007,27 +1048,37 @@ fn discover_log_pointers(job_id: &str) -> (Vec<String>, bool) {
                         }
                         scan_count = scan_count.saturating_add(1);
                         let Ok(entry) = entry else { continue };
+                        // Symlink guard: skip symlinked lane entries.
+                        if is_symlink_entry(&entry) {
+                            continue;
+                        }
                         let lane_path = entry.path();
                         let logs_dir = lane_path.join("logs");
-                        if logs_dir.is_dir() {
-                            if let Ok(log_entries) = fs::read_dir(&logs_dir) {
-                                let mut log_scan = 0usize;
-                                for log_entry in log_entries {
-                                    if log_scan >= MAX_SCAN_ENTRIES || at_cap(&pointers) {
-                                        if at_cap(&pointers) {
-                                            truncated = true;
-                                        }
-                                        break;
+                        // Symlink guard: validate logs_dir is a real directory.
+                        if validate_real_directory(&logs_dir).is_err() {
+                            continue;
+                        }
+                        if let Ok(log_entries) = fs::read_dir(&logs_dir) {
+                            let mut log_scan = 0usize;
+                            for log_entry in log_entries {
+                                if log_scan >= MAX_SCAN_ENTRIES || at_cap(&pointers) {
+                                    if at_cap(&pointers) {
+                                        truncated = true;
                                     }
-                                    log_scan = log_scan.saturating_add(1);
-                                    let Ok(log_entry) = log_entry else { continue };
-                                    let log_name = log_entry.file_name();
-                                    let Some(log_name_str) = log_name.to_str() else {
-                                        continue;
-                                    };
-                                    if log_name_str.contains(job_id) {
-                                        pointers.push(log_entry.path().display().to_string());
-                                    }
+                                    break;
+                                }
+                                log_scan = log_scan.saturating_add(1);
+                                let Ok(log_entry) = log_entry else { continue };
+                                // Symlink guard: skip symlinked log entries.
+                                if is_symlink_entry(&log_entry) {
+                                    continue;
+                                }
+                                let log_name = log_entry.file_name();
+                                let Some(log_name_str) = log_name.to_str() else {
+                                    continue;
+                                };
+                                if log_name_str.contains(job_id) {
+                                    pointers.push(log_entry.path().display().to_string());
                                 }
                             }
                         }
@@ -1038,6 +1089,19 @@ fn discover_log_pointers(job_id: &str) -> (Vec<String>, bool) {
     }
 
     (pointers, truncated)
+}
+
+/// Checks whether a directory entry is a symlink using lstat semantics.
+///
+/// Returns `true` if the entry is a symlink (should be skipped for
+/// security), `false` if it is a regular file or directory.
+fn is_symlink_entry(entry: &fs::DirEntry) -> bool {
+    // Use symlink_metadata (lstat) to detect symlinks without following.
+    // If metadata cannot be read, treat as unsafe (fail-closed).
+    entry
+        .path()
+        .symlink_metadata()
+        .map_or(true, |meta| meta.file_type().is_symlink())
 }
 
 /// Prints job show output in text format.
@@ -1445,5 +1509,103 @@ mod tests {
         // With no matching evidence, truncated should be false.
         // (May still find a receipt store pointer if $APM2_HOME exists.)
         let _ = truncated;
+    }
+
+    /// Finding 5 regression: `JobState::Quarantined` must map to "quarantine"
+    /// (canonical directory token), NOT "quarantined".
+    #[test]
+    fn test_job_state_quarantine_label_matches_directory_token() {
+        let state = JobState::Quarantined(PathBuf::from("/tmp/test"));
+        assert_eq!(
+            state.state_label(),
+            Some("quarantine"),
+            "Quarantined state must use 'quarantine' to match directory name"
+        );
+
+        // Verify all other states also match their directory tokens.
+        assert_eq!(
+            JobState::Pending(PathBuf::from("/tmp")).state_label(),
+            Some("pending")
+        );
+        assert_eq!(
+            JobState::Claimed(PathBuf::from("/tmp")).state_label(),
+            Some("claimed")
+        );
+        assert_eq!(
+            JobState::Completed(PathBuf::from("/tmp")).state_label(),
+            Some("completed")
+        );
+        assert_eq!(
+            JobState::Cancelled(PathBuf::from("/tmp")).state_label(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            JobState::Denied(PathBuf::from("/tmp")).state_label(),
+            Some("denied")
+        );
+        assert_eq!(JobState::NotFound.state_label(), None);
+    }
+
+    /// Finding 2/3 regression: `is_symlink_entry` must detect symlinks and
+    /// `discover_log_pointers` must skip them. Test the helper directly.
+    #[test]
+    #[cfg(unix)]
+    fn test_is_symlink_entry_detects_symlinks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_file = tmp.path().join("real.txt");
+        fs::write(&real_file, b"content").unwrap();
+
+        let symlink_file = tmp.path().join("sym.txt");
+        std::os::unix::fs::symlink(&real_file, &symlink_file).unwrap();
+
+        // Read the directory and check each entry.
+        let entries: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+
+        for entry in &entries {
+            let name = entry.file_name();
+            let name_str = name.to_str().unwrap();
+            if name_str == "sym.txt" {
+                assert!(is_symlink_entry(entry), "symlink entry must be detected");
+            } else if name_str == "real.txt" {
+                assert!(
+                    !is_symlink_entry(entry),
+                    "real file must not be flagged as symlink"
+                );
+            }
+        }
+    }
+
+    /// Finding 2/3 regression: symlinked queue directory entries must be
+    /// skipped by `find_job_in_dir` (which calls `read_job_spec_bounded`
+    /// with symlink rejection).
+    #[test]
+    #[cfg(unix)]
+    fn test_find_job_in_dir_rejects_symlinked_specs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("pending");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Create a real spec file outside the directory.
+        let real_spec_dir = tmp.path().join("outside");
+        fs::create_dir_all(&real_spec_dir).unwrap();
+        let real_spec = real_spec_dir.join("symlink-target.json");
+        let spec = build_stop_revoke_spec("sym-job-test", "test").expect("spec builds");
+        let spec_json = serde_json::to_vec_pretty(&spec).unwrap();
+        fs::write(&real_spec, &spec_json).unwrap();
+
+        // Create a symlink to it inside the queue directory.
+        let symlink_path = dir.join("symlink-target.json");
+        std::os::unix::fs::symlink(&real_spec, &symlink_path).unwrap();
+
+        // find_job_in_dir should NOT find the job via symlink because
+        // read_job_spec_bounded rejects symlinks.
+        let result = find_job_in_dir(&dir, &spec.job_id);
+        assert!(
+            result.is_none(),
+            "symlinked spec must be rejected by find_job_in_dir"
+        );
     }
 }
