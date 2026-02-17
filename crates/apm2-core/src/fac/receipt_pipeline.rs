@@ -1035,6 +1035,7 @@ mod tests {
             containment: None,
             observed_cost: None,
             sandbox_hardening_hash: None,
+            network_policy_hash: None,
             timestamp_secs: 1000,
             content_hash: String::new(),
         };

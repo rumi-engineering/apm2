@@ -937,8 +937,9 @@ fn run_gates_inner(
     let test_command = if quick {
         None
     } else {
-        // TCK-00574: Gates always deny network access (default posture).
-        let gate_network_policy = apm2_core::fac::resolve_network_policy("gates", None);
+        // TCK-00574: Resolve network policy for gates with operator override.
+        let gate_network_policy =
+            apm2_core::fac::resolve_network_policy("gates", policy.network_policy.as_ref());
         let spec = build_systemd_bounded_test_command(
             workspace_root,
             BoundedTestLimits {

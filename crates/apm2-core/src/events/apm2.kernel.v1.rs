@@ -1252,6 +1252,10 @@ pub struct GateReceipt {
     /// Present when gate execution is bound to a materialized hardening profile.
     #[prost(string, optional, tag = "15")]
     pub sandbox_hardening_hash: ::core::option::Option<::prost::alloc::string::String>,
+    /// BLAKE3 digest of the network policy used for gate execution (TCK-00574).
+    /// Present when gate execution is bound to a materialized network policy.
+    #[prost(string, optional, tag = "16")]
+    pub network_policy_hash: ::core::option::Option<::prost::alloc::string::String>,
     /// Ed25519 signature over canonical bytes with GATE_RECEIPT: domain (64 bytes)
     #[prost(bytes = "vec", tag = "11")]
     pub receipt_signature: ::prost::alloc::vec::Vec<u8>,

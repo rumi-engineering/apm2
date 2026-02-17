@@ -421,23 +421,31 @@ impl NetworkPolicy {
 
     /// Render the user-mode-safe subset of network policy directives.
     ///
-    /// `PrivateNetwork` requires `CAP_SYS_ADMIN` (mount namespace). In user
-    /// mode, only `IPAddressDeny`/`IPAddressAllow` via BPF can sometimes
-    /// work depending on kernel version and cgroup delegation, but are not
-    /// reliably available. To maintain fail-closed behavior, user-mode
-    /// emits no network directives — callers must rely on the sandbox
-    /// hardening `RestrictAddressFamilies` directive (which IS emitted in
-    /// user-mode when `NoNewPrivileges=yes` is set) as the network
-    /// restriction layer in user-mode.
+    /// `PrivateNetwork` requires `CAP_SYS_ADMIN` (mount namespace) and
+    /// cannot be used in user mode. `IPAddressDeny`/`IPAddressAllow` via
+    /// BPF are not reliably available in user mode.
     ///
-    /// This is a conservative choice: we do not emit directives that may
-    /// silently fail to enforce in user mode.
+    /// When network is denied, we emit `RestrictAddressFamilies=AF_UNIX`
+    /// as a partial mitigation. This directive works in user mode when
+    /// `NoNewPrivileges=yes` is set (which IS emitted by the sandbox
+    /// hardening profile in user mode). It restricts the unit to only
+    /// Unix domain sockets, preventing TCP/UDP network access.
+    ///
+    /// **Important**: This is a degraded posture compared to system-mode
+    /// where full namespace isolation via `PrivateNetwork=yes` is
+    /// available. User-mode enforcement is best-effort and callers
+    /// should be aware of this limitation.
+    ///
+    /// When network is allowed, no directives are emitted.
     #[must_use]
-    pub const fn to_user_mode_property_strings(&self) -> Vec<String> {
-        // No reliable network isolation directives in user mode.
-        // RestrictAddressFamilies from SandboxHardeningProfile provides
-        // the socket-type restriction layer in user mode.
-        Vec::new()
+    pub fn to_user_mode_property_strings(&self) -> Vec<String> {
+        if self.allow_network {
+            return Vec::new();
+        }
+        // Partial mitigation: restrict to AF_UNIX only (no inet sockets).
+        // This requires NoNewPrivileges=yes which is emitted by the
+        // SandboxHardeningProfile in user mode.
+        vec!["RestrictAddressFamilies=AF_UNIX".to_string()]
     }
 
     /// Compute a deterministic BLAKE3 hash of the network policy for
@@ -1144,12 +1152,16 @@ mod tests {
     }
 
     #[test]
-    fn network_policy_user_mode_emits_no_directives() {
-        // Both deny and allow produce no user-mode directives (conservative).
+    fn network_policy_user_mode_deny_emits_restrict_address_families() {
+        // TCK-00574: deny policy emits RestrictAddressFamilies=AF_UNIX as
+        // partial mitigation when running without root (user-mode). This
+        // blocks AF_INET/AF_INET6 socket creation even without
+        // PrivateNetwork, providing defence-in-depth.
         let deny_props = NetworkPolicy::deny().to_user_mode_property_strings();
-        assert!(
-            deny_props.is_empty(),
-            "deny policy must emit no user-mode network directives"
+        assert_eq!(
+            deny_props,
+            vec!["RestrictAddressFamilies=AF_UNIX".to_string()],
+            "deny policy must emit RestrictAddressFamilies=AF_UNIX in user-mode"
         );
         let allow_props = NetworkPolicy::allow().to_user_mode_property_strings();
         assert!(

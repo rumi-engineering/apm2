@@ -1004,8 +1004,9 @@ fn build_pipeline_test_command(
     // so attestation binds to the actual policy-driven profile.
     let sandbox_hardening_hash = policy.sandbox_hardening.content_hash_hex();
 
-    // TCK-00574: Pipeline test (evidence gates) always deny network access.
-    let evidence_network_policy = apm2_core::fac::resolve_network_policy("gates", None);
+    // TCK-00574: Resolve network policy for evidence gates with operator override.
+    let evidence_network_policy =
+        apm2_core::fac::resolve_network_policy("gates", policy.network_policy.as_ref());
     let bounded_spec = build_systemd_bounded_test_command(
         workspace_root,
         BoundedTestLimits {
