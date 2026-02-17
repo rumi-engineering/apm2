@@ -25,6 +25,9 @@ All command functions return a `u8` exit code or `anyhow::Result<()>`, using val
 | `fac.rs` | `apm2 fac *` | FAC (Factory Automation Cycle) top-level dispatcher |
 | `fac_pr/` | `apm2 fac pr *` | GitHub App credential management for PR operations |
 | `fac_review/` | `apm2 fac review *` | Review orchestration (security + quality reviews) |
+| `fac_queue.rs` | `apm2 fac queue *` | Queue introspection (status with counts, reason stats) |
+| `fac_job.rs` | `apm2 fac job *` | Job introspection (show, cancel) with bounded I/O |
+| `fac_utils.rs` | _(shared)_ | Shared utilities: queue/fac root resolution, bounded job spec I/O |
 | `factory/` | `apm2 factory *` | Factory pipeline (CCP, Impact Map, RFC, Tickets) |
 | `cac.rs` | `apm2 cac *` | CAC (Compliance Artifact Chain) operations |
 | `coordinate.rs` | `apm2 coordinate *` | Multi-agent coordination commands |
@@ -283,3 +286,54 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
   duplicate receipt check in `process_job` uses `find_receipt_for_job` instead of
   `has_receipt_for_job` and routes to the correct terminal directory via
   `outcome_to_terminal_state`. Denied receipts route to `denied/`, not `completed/`.
+
+## Introspection CLI Invariants (Updated for TCK-00535)
+
+- **Queue status** (`fac_queue.rs`): `apm2 fac queue status` scans the six queue directories
+  (`pending`, `claimed`, `completed`, `denied`, `quarantine`, `cancelled`) with bounded
+  `read_dir` (MAX_SCAN_ENTRIES=4096) and reports per-directory valid job counts, malformed
+  entry counts, oldest job ID and enqueue time, and denial/quarantine reason stats. Job
+  counts only increment after successful `read_job_spec_bounded` parse; malformed `.json`
+  files are tracked separately to avoid inflating job counts. Reason codes are capped at
+  MAX_REASON_CODES=64 to prevent unbounded memory growth from adversarial data.
+- **Receipt-based reason stats** (`fac_queue.rs`): `collect_reason_stats` resolves denial
+  reasons from the canonical receipt index via `lookup_job_receipt()`, not from `spec.kind`.
+  Reason keys use serde-serialized snake_case codes (e.g., `"digest_mismatch"`) for stable
+  machine-readable output, not Debug formatting.
+- **Job show** (`fac_job.rs`): `apm2 fac job show <job_id>` locates a job across all queue
+  directories, reads the spec with bounded I/O (reuses `read_job_spec_bounded` from
+  `fac_utils`), resolves the latest receipt from the receipt index, and discovers log
+  pointers from the evidence directory and lane logs. Returns NOT_FOUND (exit 12) if the
+  job is absent. State labels use canonical directory tokens via `JobState::state_label()`
+  (e.g., "quarantine" not "quarantined").
+- **Bounded log pointers** (`fac_job.rs`): `discover_log_pointers` caps total discovered
+  log paths at MAX_LOG_POINTERS=256 across all scan locations (evidence directory + lane
+  logs). The function resolves lanes from `resolve_fac_root().join("lanes")` (the canonical
+  FAC root) rather than inferring from queue root parentage. Truncation is reported in both
+  text and JSON output via `log_pointers_truncated`.
+- **Symlink and FIFO guards** (`fac_utils.rs`, `fac_job.rs`): `read_job_spec_bounded` uses
+  an open-once pattern with `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK` (via
+  `OpenOptionsExt::custom_flags` on Unix) to atomically refuse symlinks at the kernel level
+  and prevent blocking on FIFOs (named pipes), then calls `fstat` on the opened fd (via
+  `File::metadata()`) to verify the target is a regular file. `O_NONBLOCK` prevents a local
+  DoS where a FIFO queue entry would block the open(2) call indefinitely waiting for a
+  writer; for regular files, `O_NONBLOCK` has no effect. This eliminates the TOCTOU race
+  between `symlink_metadata()` and `File::open()` that existed previously, matching the
+  established pattern in `fac_secure_io::read_bounded`. `discover_log_pointers` validates
+  all scanned directories with `validate_real_directory` and skips symlinked entries via
+  `is_symlink_entry`, both using lstat semantics.
+- **Reason code overflow** (`fac_queue.rs`): When `MAX_REASON_CODES` distinct reason keys
+  are reached in `collect_reason_stats`, new reason codes are aggregated into an `"other"`
+  bucket rather than silently dropped, ensuring total counts remain accurate.
+- **Scan truncation reporting** (`fac_job.rs`): `discover_log_pointers` sets `truncated =
+  true` when `MAX_SCAN_ENTRIES` is hit in any directory scan (evidence, lanes, or logs),
+  consistent with the `MAX_LOG_POINTERS` cap reporting.
+- **Shared utilities** (`fac_utils.rs`): Queue root resolution (`resolve_queue_root`), FAC
+  root resolution (`resolve_fac_root`), bounded job spec reading (`read_job_spec_bounded`),
+  and directory validation (`validate_real_directory`) are consolidated in `fac_utils` to
+  eliminate cross-module duplication between `fac_queue.rs` and `fac_job.rs`. Constants
+  `QUEUE_DIR`, `MAX_SCAN_ENTRIES` are shared.
+- **Receipts list --since** (`fac.rs`): `apm2 fac receipts list --since <epoch_secs>` filters
+  the receipt index to entries at or after the given UNIX epoch. Deterministic ordering is
+  enforced: primary sort by `timestamp_secs` descending, secondary sort by `content_hash`
+  ascending for stable tie-breaking. Boundary inclusion is verified by regression test.
