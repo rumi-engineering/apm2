@@ -651,14 +651,13 @@ bootstrap and recovery commands exposed via `apm2 fac lane init` and
 
 ### `git_hardening` — Git Safety Hardening for Lane Workspaces (TCK-00580)
 
-**Core function**: `harden_lane_workspace(workspace, hooks_parent, refuse_unsafe_configs, global_config_file)`
+**Core function**: `harden_lane_workspace(workspace, hooks_parent, refuse_unsafe_configs)`
 
 Applies security hardening to lane workspace git config after checkout:
-1. Enforces `safe.directory` in the **global** user git config (`--global` or `--file`).
-   Git ignores `safe.directory` in local scope (CVE-2022-24765). This is done **first**
-   because local config writes fail on mismatched-owner workspaces until `safe.directory`
-   is set. The `global_config_file` parameter allows test isolation (`Some(temp_file)`)
-   vs. production use (`None` for real `~/.gitconfig`).
+1. Resolves workspace absolute path and passes `safe.directory` as a `-c` flag on all
+   git commands. Git ignores `safe.directory` in local scope (CVE-2022-24765), and
+   writing to global config causes lock contention in concurrent lane environments, so
+   the `-c` flag approach passes it transiently on each command invocation.
 2. Sets `core.hooksPath` to an empty FAC-controlled directory (disables hooks)
 3. Scans `.git/config` for unsafe filter/smudge/command entries
 
@@ -686,9 +685,10 @@ Applies security hardening to lane workspace git config after checkout:
   diagnostics instead of silently passing the config scan.
 - [INV-GH-007] When unsafe config is detected and rejected, a `GitHardeningReceipt`
   with `outcome: Rejected` is included in the error for audit trail persistence.
-- [INV-GH-008] `safe.directory` is set in global git config scope, never local.
-  Git ignores `safe.directory` in local scope per CVE-2022-24765 security property.
-  This prevents denial-of-service on mismatched-owner workspaces.
+- [INV-GH-008] `safe.directory` is passed via `-c` flag on every git command, never
+  written to any persistent config (local or global). Git ignores `safe.directory` in
+  local scope per CVE-2022-24765, and writing to global config causes lock contention
+  in concurrent lane environments. The `-c` flag approach avoids both issues.
 
 **Integration**: Called automatically by `checkout_to_lane()` after checkout completes.
 Receipt is included in `CheckoutOutcome::git_hardening`.
