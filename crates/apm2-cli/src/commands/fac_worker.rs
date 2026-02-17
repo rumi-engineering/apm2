@@ -2187,8 +2187,13 @@ fn process_job(
     // profile has been adopted.
     //
     // Error handling is fail-closed by error variant:
-    // - NoAdmittedRoot: skip check (backwards compatibility for installations that
-    //   have not adopted an economics profile).
+    // - NoAdmittedRoot + policy has non-zero economics_profile_hash: DENY the job.
+    //   The policy requires economics enforcement but there is no admitted root to
+    //   verify against. An attacker could delete the root file to bypass admission
+    //   — this arm prevents that (INV-EADOPT-004).
+    // - NoAdmittedRoot + policy has zero economics_profile_hash: skip check
+    //   (backwards compatibility for installations that have not adopted an
+    //   economics profile and whose policies don't require one).
     // - Any other error (Io, Serialization, FileTooLarge, SchemaMismatch,
     //   UnsupportedSchemaVersion, etc.): DENY the job. Treating I/O/corruption
     //   errors as "no root" would let an attacker bypass admission by tampering
@@ -2218,8 +2223,24 @@ fn process_job(
                 }
             },
             Err(apm2_core::fac::EconomicsAdoptionError::NoAdmittedRoot { .. }) => {
-                // No admitted root exists yet: backwards-compatible skip.
-                None
+                // No admitted root exists. Fail-closed decision based on
+                // whether the policy requires economics enforcement:
+                // - If the policy's economics_profile_hash is all zeros, no economics binding
+                //   is required, so the check is skipped (backwards compatibility for
+                //   installations that have not adopted an economics profile).
+                // - If the policy's economics_profile_hash is non-zero, it specifies a concrete
+                //   economics binding. Without an admitted root, we cannot verify that binding,
+                //   so the job MUST be denied. This prevents bypass via root file deletion
+                //   (INV-EADOPT-004).
+                if policy.economics_profile_hash == [0u8; 32] {
+                    None
+                } else {
+                    Some(format!(
+                        "economics admission denied (INV-EADOPT-004, fail-closed): \
+                         policy requires economics binding (economics_profile_hash={profile_hash_str}) \
+                         but no admitted economics root exists on this broker"
+                    ))
+                }
             },
             Err(load_err) => {
                 // Any other error (I/O, corruption, schema mismatch,

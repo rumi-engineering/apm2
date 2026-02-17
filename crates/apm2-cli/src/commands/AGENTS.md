@@ -439,10 +439,13 @@ Security invariants:
 - **Bounded file reads** (`fac_economics.rs`): `read_bounded_file` uses the open-once pattern
   (`O_NOFOLLOW | O_CLOEXEC` at `open(2)` + `fstat` + `take()`) to eliminate the TOCTOU gap
   between symlink validation and file read.
-- **Worker economics admission fail-closed** (`fac_worker.rs`, fix round 1): Step 2.6
+- **Worker economics admission fail-closed** (`fac_worker.rs`, fix rounds 1-2): Step 2.6
   economics admission now branches on the specific error variant from
-  `load_admitted_economics_profile_root`: `NoAdmittedRoot` skips the check (backwards
-  compatibility); successful load triggers constant-time hash comparison; any other error
-  (I/O, corruption, schema mismatch, oversized file) denies the job with
+  `load_admitted_economics_profile_root`: `NoAdmittedRoot` denies the job if the policy's
+  `economics_profile_hash` is non-zero (policy requires economics but no root exists to
+  verify against — prevents bypass via root file deletion), skips only if the hash is zero
+  (backwards compatibility for policies without economics requirements); successful load
+  triggers constant-time hash comparison; any other error (I/O, corruption, schema
+  mismatch, oversized file) denies the job with
   `DenialReasonCode::EconomicsAdmissionDenied`. Previously, all load errors were treated
   as "no root" which allowed admission bypass via root file tampering (INV-EADOPT-004).

@@ -1238,8 +1238,12 @@ after the existing policy admission check (Step 2.5). The worker formats
 `policy.economics_profile_hash` as `b3-256:<hex>`, loads the admitted root, and
 denies with `DenialReasonCode::EconomicsAdmissionDenied` on mismatch.
 Error handling is fail-closed by error variant:
-- `NoAdmittedRoot`: skip check (backwards compatibility for installations that
-  have not adopted an economics profile).
+- `NoAdmittedRoot` + non-zero `economics_profile_hash`: DENY the job. The
+  policy requires economics enforcement but there is no admitted root to
+  verify against. Prevents admission bypass via root file deletion.
+- `NoAdmittedRoot` + zero `economics_profile_hash`: skip check (backwards
+  compatibility for installations that have not adopted an economics profile
+  and whose policies don't require one).
 - Any other load error (I/O, corruption, schema mismatch, oversized file):
   deny the job. Treating non-`NoAdmittedRoot` errors as "no root" would allow
   an attacker to bypass admission by tampering with the admitted-economics root
@@ -1257,10 +1261,12 @@ Error handling is fail-closed by error variant:
 - [INV-EADOPT-004] Workers refuse actuation tokens whose economics profile hash
   mismatches the admitted digest (fail-closed). The worker loads the admitted
   root via `load_admitted_economics_profile_root` and branches on the error
-  variant: `NoAdmittedRoot` skips the check (backwards compatibility);
-  successful load triggers constant-time hash comparison; any other error
-  (I/O, corruption, schema mismatch, oversized) denies the job. This prevents
-  admission bypass via root file tampering.
+  variant: `NoAdmittedRoot` denies the job if the policy's
+  `economics_profile_hash` is non-zero (policy requires economics but no root
+  exists — prevents bypass via root file deletion), skips only if the hash is
+  zero (no economics binding required); successful load triggers constant-time
+  hash comparison; any other error (I/O, corruption, schema mismatch, oversized)
+  denies the job. This prevents admission bypass via root file tampering.
 - [INV-EADOPT-005] Receipt content hash uses domain-separated BLAKE3 with
   injective length-prefix framing (CTR-2612).
 - [INV-EADOPT-006] All string fields are bounded for DoS prevention (CTR-1303).

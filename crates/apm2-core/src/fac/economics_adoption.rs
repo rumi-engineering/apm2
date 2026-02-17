@@ -507,6 +507,16 @@ pub fn adopt_economics_profile(
     // Transactional ordering: if receipt persistence fails, the root is
     // never committed, so the durable receipt invariant is maintained.
     // If receipt succeeds but root fails, the receipt is an orphan (safe).
+    //
+    // RESIDUAL RISK (f-726-security-1771355420177259-0): These two writes
+    // (receipt then root) are NOT atomic as a unit. If the process crashes
+    // after the receipt is synced but before the root file is renamed, an
+    // orphan receipt will exist without the adoption taking effect. This is
+    // an acceptable fail-safe: the previous policy remains active (deny-by-
+    // default), the orphan receipt is auditable, and retry will succeed
+    // idempotently (the no-op check will be retried against the old root).
+    // A future improvement could use a WAL or lock-file protocol to
+    // provide strict receipt-root atomicity.
     let receipt = build_and_persist_receipt(
         fac_root,
         EconomicsAdoptionAction::Adopt,
@@ -582,6 +592,9 @@ pub fn rollback_economics_profile(
     // receipt invariant is never violated. An orphan receipt (receipt
     // written but root fails) is safe; a committed root without a receipt
     // is not.
+    //
+    // RESIDUAL RISK: same non-atomic receipt+root window as in
+    // `adopt_economics_profile` — see comment there for analysis.
     let receipt = build_and_persist_receipt(
         fac_root,
         EconomicsAdoptionAction::Rollback,
