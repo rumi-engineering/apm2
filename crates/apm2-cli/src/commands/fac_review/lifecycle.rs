@@ -28,7 +28,9 @@ use super::types::{
     normalize_decision_dimension as normalize_verdict_dimension, now_iso8601, sanitize_for_path,
     validate_expected_head_sha,
 };
-use super::{dispatch, findings_store, projection_store, state, verdict_projection};
+use super::{
+    dispatch, findings_store, github_projection, projection_store, state, verdict_projection,
+};
 use crate::exit_codes::codes as exit_codes;
 
 const MACHINE_SCHEMA: &str = "apm2.fac.lifecycle_machine.v1";
@@ -48,6 +50,11 @@ const RUN_SECRET_MAX_FILE_BYTES: u64 = 128;
 const RUN_SECRET_LEN_BYTES: usize = 32;
 const RUN_SECRET_MAX_ENCODED_CHARS: usize = 128;
 const LIFECYCLE_HMAC_ERROR: &str = "lifecycle state integrity check failed";
+const FAC_REQUIRED_STATUS_CONTEXT: &str = "apm2 / Forge Admission Cycle";
+const FAC_STATUS_DESCRIPTION_PENDING: &str = "Forge Admission Cycle pending reviewer verdicts";
+const FAC_STATUS_DESCRIPTION_SUCCESS: &str = "Forge Admission Cycle approved";
+const FAC_STATUS_DESCRIPTION_DENIED: &str = "Forge Admission Cycle denied";
+const FAC_STATUS_DESCRIPTION_FAIL_CLOSED: &str = "Forge Admission Cycle integrity failure";
 type HmacSha256 = Hmac<Sha256>;
 
 pub(super) const fn default_retry_budget() -> u32 {
@@ -2314,6 +2321,60 @@ fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FacRequiredStatusProjection {
+    state: &'static str,
+    description: &'static str,
+}
+
+fn derive_fac_required_status_projection(
+    snapshot: &verdict_projection::VerdictProjectionSnapshot,
+) -> FacRequiredStatusProjection {
+    if snapshot.fail_closed {
+        return FacRequiredStatusProjection {
+            state: "failure",
+            description: FAC_STATUS_DESCRIPTION_FAIL_CLOSED,
+        };
+    }
+
+    match snapshot.overall_decision.as_str() {
+        "deny" => FacRequiredStatusProjection {
+            state: "failure",
+            description: FAC_STATUS_DESCRIPTION_DENIED,
+        },
+        "approve" => FacRequiredStatusProjection {
+            state: "success",
+            description: FAC_STATUS_DESCRIPTION_SUCCESS,
+        },
+        _ => FacRequiredStatusProjection {
+            state: "pending",
+            description: FAC_STATUS_DESCRIPTION_PENDING,
+        },
+    }
+}
+
+fn project_fac_required_status(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<(), String> {
+    let snapshot =
+        verdict_projection::load_verdict_projection_snapshot(owner_repo, pr_number, head_sha)?
+            .ok_or_else(|| {
+                format!("missing verdict projection snapshot for PR #{pr_number} SHA {head_sha}")
+            })?;
+    let projection = derive_fac_required_status_projection(&snapshot);
+    let target_url = format!("https://github.com/{owner_repo}/pull/{pr_number}");
+    github_projection::upsert_commit_status(
+        owner_repo,
+        head_sha,
+        FAC_REQUIRED_STATUS_CONTEXT,
+        projection.state,
+        projection.description,
+        Some(&target_url),
+    )
+}
+
 fn finalize_projected_verdict(
     projected: &verdict_projection::PersistedVerdictProjection,
     fallback_dimension: &str,
@@ -2343,6 +2404,18 @@ fn finalize_projected_verdict(
             },
         )?;
     }
+
+    if let Err(err) = project_fac_required_status(
+        &projected.owner_repo,
+        projected.pr_number,
+        &projected.head_sha,
+    ) {
+        eprintln!(
+            "WARNING: failed to project required FAC status check for PR #{} sha {}: {err}",
+            projected.pr_number, projected.head_sha
+        );
+    }
+
     maybe_auto_merge_if_ready(&reduced, auto_source.unwrap_or("explicit_verdict_set"));
 
     let authority = TerminationAuthority::new(
@@ -3437,7 +3510,8 @@ mod tests {
         AgentType, AutoVerdictCandidate, AutoVerdictFinalizeResult, LifecycleEventKind,
         PrLifecycleState, TrackedAgentState, acquire_registry_lock, active_agents_for_pr,
         apply_event, bind_reviewer_runtime, derive_auto_verdict_decision_from_findings,
-        enforce_pr_capacity, finalize_auto_verdict_candidate, load_registry, register_agent_spawn,
+        derive_fac_required_status_projection, enforce_pr_capacity,
+        finalize_auto_verdict_candidate, load_registry, register_agent_spawn,
         register_reviewer_dispatch, save_registry, sync_local_main_with_origin, token_hash,
         try_fast_forward_main,
     };
@@ -3468,6 +3542,24 @@ mod tests {
         format!("example/{tag}-{pr}")
     }
 
+    fn verdict_snapshot(
+        overall_decision: &str,
+        fail_closed: bool,
+    ) -> super::verdict_projection::VerdictProjectionSnapshot {
+        super::verdict_projection::VerdictProjectionSnapshot {
+            schema: "apm2.review.verdict.v1".to_string(),
+            pr_number: 77,
+            head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            overall_decision: overall_decision.to_string(),
+            fail_closed,
+            dimensions: Vec::new(),
+            errors: Vec::new(),
+            source_comment_id: None,
+            source_comment_url: None,
+            updated_at: "2026-02-17T00:00:00Z".to_string(),
+        }
+    }
+
     fn git_checked(dir: &std::path::Path, args: &[&str]) {
         let output = Command::new("git")
             .args(args)
@@ -3480,6 +3572,34 @@ mod tests {
             args,
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn required_status_projection_reports_failure_for_denied_verdict() {
+        let snapshot = verdict_snapshot("deny", false);
+        let projection = derive_fac_required_status_projection(&snapshot);
+        assert_eq!(projection.state, "failure");
+    }
+
+    #[test]
+    fn required_status_projection_reports_success_for_approved_verdict() {
+        let snapshot = verdict_snapshot("approve", false);
+        let projection = derive_fac_required_status_projection(&snapshot);
+        assert_eq!(projection.state, "success");
+    }
+
+    #[test]
+    fn required_status_projection_reports_pending_for_partial_verdict() {
+        let snapshot = verdict_snapshot("pending", false);
+        let projection = derive_fac_required_status_projection(&snapshot);
+        assert_eq!(projection.state, "pending");
+    }
+
+    #[test]
+    fn required_status_projection_fails_closed_when_snapshot_integrity_fails() {
+        let snapshot = verdict_snapshot("approve", true);
+        let projection = derive_fac_required_status_projection(&snapshot);
+        assert_eq!(projection.state, "failure");
     }
 
     fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
