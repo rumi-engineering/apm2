@@ -1,7 +1,7 @@
 //! Shared FAC queue submission helpers for CLI producers.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,6 +17,8 @@ use apm2_core::fac::{
 };
 use apm2_core::github::{parse_github_remote_url, resolve_apm2_home};
 
+use crate::commands::{fac_key_material, fac_secure_io};
+
 /// Queue subdirectory under `$APM2_HOME`.
 pub(super) const QUEUE_DIR: &str = "queue";
 /// Queue pending subdirectory.
@@ -24,8 +26,6 @@ pub(super) const PENDING_DIR: &str = "pending";
 /// Default authority clock for local-mode evaluation windows.
 pub(super) const DEFAULT_AUTHORITY_CLOCK: &str = "local";
 
-/// Maximum size for the signing key file.
-const MAX_SIGNING_KEY_SIZE: usize = 64;
 /// Maximum size for broker state file (1 MiB, matching broker constant).
 const MAX_BROKER_STATE_FILE_SIZE: usize = 1_048_576;
 /// Fallback SHA when git metadata is unavailable.
@@ -74,7 +74,7 @@ pub(super) fn resolve_repo_source_info() -> RepoSourceInfo {
 /// Initialize broker state and open the RFC-0029 admission health gate.
 pub(super) fn init_broker(fac_root: &Path, boundary_id: &str) -> Result<FacBroker, String> {
     // Load or generate a persistent signing key (same path as worker).
-    let signer = load_or_generate_persistent_signer(fac_root)?;
+    let signer = fac_key_material::load_or_generate_persistent_signer(fac_root)?;
     let signer_key_bytes = signer.secret_key_bytes().to_vec();
 
     // Load or create broker state (matching worker pattern).
@@ -131,7 +131,7 @@ pub(super) fn load_or_init_policy(
     let policy_path = policy_dir.join("fac_policy.v1.json");
 
     let policy = if policy_path.exists() {
-        let bytes = read_bounded(&policy_path, MAX_POLICY_SIZE)?;
+        let bytes = fac_secure_io::read_bounded(&policy_path, MAX_POLICY_SIZE)?;
         deserialize_policy(&bytes).map_err(|err| format!("cannot load fac policy: {err}"))?
     } else {
         let default_policy = FacPolicyV1::default();
@@ -303,38 +303,12 @@ fn sanitize_repo_segment(raw: &str) -> String {
     }
 }
 
-fn load_or_generate_persistent_signer(fac_root: &Path) -> Result<Signer, String> {
-    let key_path = fac_root.join("signing_key");
-
-    if key_path.exists() {
-        let bytes = read_bounded(&key_path, MAX_SIGNING_KEY_SIZE)?;
-        Signer::from_bytes(&bytes).map_err(|err| format!("invalid signing key: {err}"))
-    } else {
-        let signer = Signer::generate();
-        let key_bytes = signer.secret_key_bytes();
-        if let Some(parent) = key_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("cannot create key directory: {err}"))?;
-        }
-        fs::write(&key_path, key_bytes.as_ref())
-            .map_err(|err| format!("cannot write signing key: {err}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&key_path, perms)
-                .map_err(|err| format!("cannot set key permissions: {err}"))?;
-        }
-        Ok(signer)
-    }
-}
-
 fn load_broker_state(fac_root: &Path) -> Option<apm2_core::fac::broker::BrokerState> {
     let state_path = fac_root.join("broker_state.json");
     if !state_path.exists() {
         return None;
     }
-    let bytes = read_bounded(&state_path, MAX_BROKER_STATE_FILE_SIZE).ok()?;
+    let bytes = fac_secure_io::read_bounded(&state_path, MAX_BROKER_STATE_FILE_SIZE).ok()?;
     FacBroker::deserialize_state(&bytes).ok()
 }
 
@@ -345,41 +319,6 @@ fn make_default_eval_window(boundary_id: &str) -> HtfEvaluationWindow {
         tick_start: 0,
         tick_end: 1,
     }
-}
-
-fn read_bounded(path: &Path, max_size: usize) -> Result<Vec<u8>, String> {
-    let file = fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|err| format!("stat {}: {err}", path.display()))?;
-    let file_size = metadata.len();
-    if file_size > max_size as u64 {
-        return Err(format!(
-            "file {} too large: {} > {}",
-            path.display(),
-            file_size,
-            max_size
-        ));
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    let alloc_size = file_size as usize;
-    let mut buf = Vec::with_capacity(alloc_size);
-    let mut limited_reader = file.take(max_size.saturating_add(1) as u64);
-    limited_reader
-        .read_to_end(&mut buf)
-        .map_err(|err| format!("read {}: {err}", path.display()))?;
-
-    if buf.len() > max_size {
-        return Err(format!(
-            "file {} grew to {} (exceeds max {})",
-            path.display(),
-            buf.len(),
-            max_size
-        ));
-    }
-
-    Ok(buf)
 }
 
 #[cfg(test)]

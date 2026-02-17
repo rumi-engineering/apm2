@@ -3,10 +3,9 @@
 //! This module exposes broker introspection for status checks used by
 //! local operators when debugging FAC admission state and authority freshness.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use apm2_core::crypto::Signer;
 use apm2_core::fac::FacBroker;
 use apm2_core::github::resolve_apm2_home;
@@ -14,6 +13,7 @@ use blake3::hash as blake3_hash;
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
+use crate::commands::{fac_key_material, fac_secure_io};
 use crate::exit_codes::codes as exit_codes;
 
 /// Relative path for broker state persisted on disk.
@@ -131,15 +131,7 @@ fn load_broker_for_status() -> Result<FacBroker> {
 
 fn load_persistent_signer() -> Result<Signer> {
     let fac_root = resolve_fac_root()?;
-    let key_path = fac_root.join("signing_key");
-    if !key_path.exists() {
-        bail!("no persistent signing key found");
-    }
-
-    let bytes = fs::read(&key_path)
-        .map_err(|error| anyhow!("cannot read signing key {}: {error}", key_path.display()))?;
-
-    Signer::from_bytes(&bytes).map_err(|error| anyhow!("invalid signing key: {error}"))
+    fac_key_material::load_persistent_signer(&fac_root).map_err(|error| anyhow!("{error}"))
 }
 
 fn resolve_state_path() -> Result<PathBuf> {
@@ -157,21 +149,7 @@ fn load_state(path: &Path) -> Result<Option<apm2_core::fac::BrokerState>> {
     if !path.exists() {
         return Ok(None);
     }
-
-    let metadata = fs::metadata(path).map_err(|error| {
-        anyhow!(
-            "cannot read broker state metadata {}: {error}",
-            path.display()
-        )
-    })?;
-    if metadata.len() > MAX_BROKER_STATE_FILE_SIZE as u64 {
-        bail!(
-            "broker state file {} exceeds max size {MAX_BROKER_STATE_FILE_SIZE}",
-            path.display()
-        );
-    }
-
-    let bytes = fs::read(path)
+    let bytes = fac_secure_io::read_bounded(path, MAX_BROKER_STATE_FILE_SIZE)
         .map_err(|error| anyhow!("cannot read broker state {}: {error}", path.display()))?;
 
     let state = FacBroker::deserialize_state(&bytes)

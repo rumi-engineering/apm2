@@ -16,11 +16,28 @@ use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::commands::fac_secure_io;
+
 pub const TEST_SAFETY_ALLOWLIST_REL_PATH: &str = ".github/review-gate/test-safety-allowlist.txt";
 pub const REVIEW_ARTIFACTS_REL_PATH: &str = "documents/reviews";
 pub const TRUSTED_REVIEWERS_REL_PATH: &str = ".github/review-gate/trusted-reviewers.json";
 pub const WORKSPACE_INTEGRITY_SNAPSHOT_REL_PATH: &str =
     "target/ci/workspace_integrity.snapshot.tsv";
+
+const MAX_TEST_SAFETY_SOURCE_FILE_SIZE: usize = 10 * 1024 * 1024;
+const MAX_TEST_SAFETY_ALLOWLIST_FILE_SIZE: usize = 512 * 1024;
+const MAX_REVIEW_ARTIFACT_FILE_SIZE: usize = 10 * 1024 * 1024;
+const MAX_PROMPT_FILE_SIZE: usize = 4 * 1024 * 1024;
+const MAX_TRUSTED_REVIEWERS_FILE_SIZE: usize = 1024 * 1024;
+const MAX_WORKSPACE_SNAPSHOT_FILE_SIZE: usize = 10 * 1024 * 1024;
+const TEST_SAFETY_FALLBACK_EXCLUDED_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    ".nextest",
+    ".cargo",
+    "node_modules",
+    ".cache",
+];
 
 #[derive(Debug, Clone)]
 pub struct CheckExecution {
@@ -164,7 +181,10 @@ fn walk_regular_files(root: &Path) -> Result<Vec<PathBuf>, String> {
                 continue;
             }
             if file_type.is_dir() {
-                if entry.file_name() == OsStr::new(".git") {
+                if TEST_SAFETY_FALLBACK_EXCLUDED_DIRS
+                    .iter()
+                    .any(|name| entry.file_name() == OsStr::new(name))
+                {
                     continue;
                 }
                 stack.push(path);
@@ -200,39 +220,74 @@ fn path_contains_test_segment(rel: &str) -> bool {
     })
 }
 
-fn should_scan_default_target(rel: &str, abs: &Path) -> bool {
+fn file_contains_cfg_test(path: &Path) -> Result<bool, String> {
+    let bytes = fac_secure_io::read_bounded(path, MAX_TEST_SAFETY_SOURCE_FILE_SIZE)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(text.contains("#[cfg(test)]"))
+}
+
+fn should_scan_default_target(rel: &str, abs: &Path) -> Result<bool, String> {
     if !is_scannable_source_ext(abs) {
-        return false;
+        return Ok(false);
     }
 
     if path_contains_test_segment(rel) || basename_matches_test_pattern(abs) {
-        return true;
+        return Ok(true);
     }
 
     if abs
         .extension()
         .and_then(OsStr::to_str)
         .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
-        && rel.contains("/src/")
+        && (rel.starts_with("src/") || rel.contains("/src/"))
+        && file_contains_cfg_test(abs)?
     {
-        if let Ok(bytes) = fs::read(abs) {
-            let text = String::from_utf8_lossy(&bytes);
-            if text.contains("#[cfg(test)]") {
-                return true;
-            }
-        }
+        return Ok(true);
     }
 
-    false
+    Ok(false)
+}
+
+fn collect_test_safety_targets(workspace_root: &Path) -> Result<BTreeSet<String>, String> {
+    let mut targets = BTreeSet::new();
+
+    match tracked_files(workspace_root) {
+        Ok(files) => {
+            for rel in files {
+                let abs = workspace_root.join(&rel);
+                if !abs.is_file() {
+                    continue;
+                }
+                if should_scan_default_target(&rel, &abs)? {
+                    targets.insert(rel);
+                }
+            }
+        },
+        Err(_) => {
+            for abs in walk_regular_files(workspace_root)? {
+                let rel = match abs.strip_prefix(workspace_root) {
+                    Ok(value) => normalize_rel(value),
+                    Err(_) => continue,
+                };
+                if should_scan_default_target(&rel, &abs)? {
+                    targets.insert(rel);
+                }
+            }
+        },
+    }
+
+    Ok(targets)
 }
 
 fn parse_allowlist(path: &Path) -> Result<Vec<AllowlistEntry>, String> {
-    let bytes = fs::read(path).map_err(|err| {
-        format!(
-            "allowlist file not found (fail-closed): {} ({err})",
-            path.display()
-        )
-    })?;
+    let bytes =
+        fac_secure_io::read_bounded(path, MAX_TEST_SAFETY_ALLOWLIST_FILE_SIZE).map_err(|err| {
+            format!(
+                "allowlist file not found (fail-closed): {} ({err})",
+                path.display()
+            )
+        })?;
     let text = String::from_utf8_lossy(&bytes);
 
     let mut entries = Vec::new();
@@ -366,17 +421,7 @@ fn is_rust_commentish_line(line: &str) -> bool {
 pub fn run_test_safety_guard(workspace_root: &Path) -> Result<CheckExecution, String> {
     let allowlist_path = workspace_root.join(TEST_SAFETY_ALLOWLIST_REL_PATH);
     let allowlist = parse_allowlist(&allowlist_path)?;
-
-    let mut targets = BTreeSet::new();
-    for abs in walk_regular_files(workspace_root)? {
-        let rel = match abs.strip_prefix(workspace_root) {
-            Ok(value) => normalize_rel(value),
-            Err(_) => continue,
-        };
-        if should_scan_default_target(&rel, &abs) {
-            targets.insert(rel);
-        }
-    }
+    let targets = collect_test_safety_targets(workspace_root)?;
 
     let mut output = String::new();
     writeln!(output, "INFO: === Test Safety Guard (TCK-00410) ===").ok();
@@ -398,6 +443,13 @@ pub fn run_test_safety_guard(workspace_root: &Path) -> Result<CheckExecution, St
     }
 
     let mut violations = Vec::new();
+    let mut target_contents = BTreeMap::new();
+    for rel in &targets {
+        let abs = workspace_root.join(rel);
+        let bytes = fac_secure_io::read_bounded(&abs, MAX_TEST_SAFETY_SOURCE_FILE_SIZE)
+            .map_err(|err| format!("failed to read test safety target {}: {err}", abs.display()))?;
+        target_contents.insert(rel.clone(), String::from_utf8_lossy(&bytes).into_owned());
+    }
 
     for rule in TEST_SAFETY_RULES {
         let regex = Regex::new(rule.pattern)
@@ -407,24 +459,16 @@ pub fn run_test_safety_guard(workspace_root: &Path) -> Result<CheckExecution, St
             if !rule_applies_to_target(rule, rel) {
                 continue;
             }
-            let abs = workspace_root.join(rel);
-            let bytes = match fs::read(&abs) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    return Err(format!(
-                        "failed to read test safety target {}: {err}",
-                        abs.display()
-                    ));
-                },
-            };
-            let content = String::from_utf8_lossy(&bytes).into_owned();
-            let (scan_content, line_base) = scan_view_for_rust_target(rel, &content);
+            let content = target_contents
+                .get(rel)
+                .ok_or_else(|| format!("missing cached test-safety target {rel}"))?;
+            let (scan_content, line_base) = scan_view_for_rust_target(rel, content);
             let is_rust = has_rs_extension(rel);
 
             if rule.multiline {
                 for m in regex.find_iter(scan_content) {
                     let line_number = line_number_for_offset(scan_content, m.start()) + line_base;
-                    let line_text = line_text_at(&content, line_number);
+                    let line_text = line_text_at(content, line_number);
                     if is_allowlisted(&allowlist, rule.id, rel, line_number, &line_text) {
                         continue;
                     }
@@ -447,7 +491,7 @@ pub fn run_test_safety_guard(workspace_root: &Path) -> Result<CheckExecution, St
                     continue;
                 }
                 let line_number = idx + 1 + line_base;
-                let full_line = line_text_at(&content, line_number);
+                let full_line = line_text_at(content, line_number);
                 if is_allowlisted(&allowlist, rule.id, rel, line_number, &full_line) {
                     continue;
                 }
@@ -621,7 +665,7 @@ fn join_continuations(content: &str) -> Vec<(usize, String)> {
 }
 
 fn validate_prompt_identity_constraints(prompt_path: &Path) -> Result<Vec<String>, String> {
-    let bytes = fs::read(prompt_path)
+    let bytes = fac_secure_io::read_bounded(prompt_path, MAX_PROMPT_FILE_SIZE)
         .map_err(|err| format!("failed to read {}: {err}", prompt_path.display()))?;
     let value: Value =
         serde_json::from_slice(&bytes).map_err(|err| format!("invalid JSON: {err}"))?;
@@ -783,10 +827,8 @@ pub fn run_review_artifact_lint(workspace_root: &Path) -> Result<CheckExecution,
             .and_then(OsStr::to_str)
             .unwrap_or_default()
             .to_string();
-        let content = String::from_utf8_lossy(
-            &fs::read(file).map_err(|err| format!("failed to read {}: {err}", file.display()))?,
-        )
-        .into_owned();
+        let content = fac_secure_io::read_bounded_text(file, MAX_REVIEW_ARTIFACT_FILE_SIZE)
+            .map_err(|err| format!("failed to read {}: {err}", file.display()))?;
         let stripped = strip_comment_lines(&content);
         let stream = flatten_stream(&stripped);
 
@@ -882,8 +924,9 @@ pub fn run_review_artifact_lint(workspace_root: &Path) -> Result<CheckExecution,
     writeln!(output, "INFO: Checking trusted-reviewers.json integrity...").ok();
     let trusted_reviewers = workspace_root.join(TRUSTED_REVIEWERS_REL_PATH);
     if trusted_reviewers.is_file() {
-        let bytes = fs::read(&trusted_reviewers)
-            .map_err(|err| format!("failed to read {}: {err}", trusted_reviewers.display()))?;
+        let bytes =
+            fac_secure_io::read_bounded(&trusted_reviewers, MAX_TRUSTED_REVIEWERS_FILE_SIZE)
+                .map_err(|err| format!("failed to read {}: {err}", trusted_reviewers.display()))?;
         if let Err(err) = serde_json::from_slice::<Value>(&bytes) {
             violations.push(format!(
                 "Invalid JSON in {}: {err}",
@@ -1045,8 +1088,8 @@ fn write_manifest(
 }
 
 fn read_manifest(path: &Path) -> Result<BTreeMap<String, (String, String)>, String> {
-    let bytes =
-        fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let bytes = fac_secure_io::read_bounded(path, MAX_WORKSPACE_SNAPSHOT_FILE_SIZE)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     let content = String::from_utf8_lossy(&bytes);
     let mut manifest = BTreeMap::new();
 
@@ -1083,7 +1126,7 @@ fn read_manifest(path: &Path) -> Result<BTreeMap<String, (String, String)>, Stri
 }
 
 fn parse_allowlisted_paths(path: &Path) -> Result<BTreeSet<String>, String> {
-    let bytes = fs::read(path)
+    let bytes = fac_secure_io::read_bounded(path, MAX_TEST_SAFETY_ALLOWLIST_FILE_SIZE)
         .map_err(|err| format!("allowlist file not found: {} ({err})", path.display()))?;
     let content = String::from_utf8_lossy(&bytes);
     let mut allowed = BTreeSet::new();
@@ -1379,6 +1422,88 @@ mod tests {
 
         let check = run_test_safety_guard(repo).expect("run guard");
         assert!(check.passed, "unexpected output:\n{}", check.output);
+    }
+
+    #[test]
+    fn test_safety_guard_detects_top_level_src_lib_cfg_test_violation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        fs::create_dir_all(repo.join("src")).expect("create src");
+        fs::create_dir_all(repo.join(".github/review-gate")).expect("create review-gate");
+        fs::write(
+            repo.join(".github/review-gate/test-safety-allowlist.txt"),
+            b"# empty\n",
+        )
+        .expect("write allowlist");
+        fs::write(
+            repo.join("src/lib.rs"),
+            br"
+pub fn safe_prod_path() {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn detects_exec_rule() {
+        unsafe { libc::execvp(std::ptr::null(), std::ptr::null()); }
+    }
+}
+",
+        )
+        .expect("write rust file");
+
+        let check = run_test_safety_guard(repo).expect("run guard");
+        assert!(!check.passed, "expected violation:\n{}", check.output);
+        assert!(check.output.contains("[TSG011]"));
+    }
+
+    #[test]
+    fn test_safety_guard_detects_top_level_src_main_cfg_test_violation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        fs::create_dir_all(repo.join("src")).expect("create src");
+        fs::create_dir_all(repo.join(".github/review-gate")).expect("create review-gate");
+        fs::write(
+            repo.join(".github/review-gate/test-safety-allowlist.txt"),
+            b"# empty\n",
+        )
+        .expect("write allowlist");
+        fs::write(
+            repo.join("src/main.rs"),
+            br"
+fn main() {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn detects_exec_rule() {
+        unsafe { libc::execvp(std::ptr::null(), std::ptr::null()); }
+    }
+}
+",
+        )
+        .expect("write rust file");
+
+        let check = run_test_safety_guard(repo).expect("run guard");
+        assert!(!check.passed, "expected violation:\n{}", check.output);
+        assert!(check.output.contains("[TSG011]"));
+    }
+
+    #[test]
+    fn test_safety_guard_fails_closed_on_oversized_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        fs::create_dir_all(repo.join("tests")).expect("create tests");
+        fs::create_dir_all(repo.join(".github/review-gate")).expect("create review-gate");
+        fs::write(
+            repo.join(".github/review-gate/test-safety-allowlist.txt"),
+            b"# empty\n",
+        )
+        .expect("write allowlist");
+        let oversized = vec![b'x'; MAX_TEST_SAFETY_SOURCE_FILE_SIZE + 1];
+        fs::write(repo.join("tests/huge_test.sh"), oversized).expect("write oversized file");
+
+        let err = run_test_safety_guard(repo).expect_err("oversized source must fail closed");
+        assert!(err.contains("too large"));
     }
 
     #[test]

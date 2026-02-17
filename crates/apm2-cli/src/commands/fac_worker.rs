@@ -61,7 +61,7 @@
 //!   cannot acquire a lane are moved back to pending.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -100,7 +100,7 @@ use apm2_core::fac::{
     load_or_default_boundary_id, parse_policy_hash, persist_content_addressed_receipt,
     persist_policy, run_preflight, select_and_validate_backend,
 };
-use apm2_core::github::resolve_apm2_home;
+use apm2_core::github::{parse_github_remote_url, resolve_apm2_home};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use chrono::{SecondsFormat, Utc};
@@ -108,6 +108,7 @@ use serde::Serialize;
 use subtle::ConstantTimeEq;
 
 use super::fac_gates_job::{GATES_JOB_OPTIONS_SCHEMA, GatesJobOptionsV1};
+use super::{fac_key_material, fac_secure_io};
 #[cfg(not(test))]
 use crate::commands::fac_review as fac_review_api;
 #[cfg(test)]
@@ -129,6 +130,7 @@ mod fac_review_api {
         _pids_max: u64,
         _cpu_quota: &str,
         _gate_profile: GateThroughputProfile,
+        _workspace_root: &std::path::Path,
     ) -> Result<u8, String> {
         Ok(crate::exit_codes::codes::GENERIC_ERROR)
     }
@@ -205,6 +207,15 @@ const DEFAULT_GATES_MEMORY_MAX: &str = "48G";
 const DEFAULT_GATES_PIDS_MAX: u64 = 1536;
 #[cfg(test)]
 const DEFAULT_GATES_CPU_QUOTA: &str = "auto";
+const UNKNOWN_REPO_SEGMENT: &str = "unknown";
+
+#[cfg(test)]
+pub fn env_var_test_lock() -> &'static std::sync::Mutex<()> {
+    use std::sync::{Mutex, OnceLock};
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 // =============================================================================
 // Worker result types
@@ -1223,11 +1234,11 @@ fn parse_gates_job_options(spec: &FacJobSpecV1) -> Result<GatesJobOptions, Strin
         pids_max: payload.pids_max,
         cpu_quota: payload.cpu_quota,
         gate_profile: parse_gate_profile(&payload.gate_profile)?,
-        workspace_root: resolve_workspace_root(&payload.workspace_root)?,
+        workspace_root: resolve_workspace_root(&payload.workspace_root, &spec.source.repo_id)?,
     })
 }
 
-fn resolve_workspace_root(raw: &str) -> Result<PathBuf, String> {
+fn resolve_workspace_root(raw: &str, expected_repo_id: &str) -> Result<PathBuf, String> {
     let candidate = PathBuf::from(raw);
     if !candidate.is_dir() {
         return Err(format!(
@@ -1235,9 +1246,122 @@ fn resolve_workspace_root(raw: &str) -> Result<PathBuf, String> {
             candidate.display()
         ));
     }
-    candidate
+
+    let canonical = candidate
         .canonicalize()
-        .map_err(|err| format!("failed to canonicalize workspace_root {raw}: {err}"))
+        .map_err(|err| format!("failed to canonicalize workspace_root {raw}: {err}"))?;
+
+    // Explicitly block FAC-internal roots.
+    let apm2_home = resolve_apm2_home().ok_or_else(|| "cannot resolve APM2_HOME".to_string())?;
+    let blocked_roots = [
+        apm2_home.join("private").join("fac"),
+        apm2_home.join("queue"),
+    ];
+    if blocked_roots
+        .iter()
+        .any(|blocked| canonical == *blocked || canonical.starts_with(blocked))
+    {
+        return Err(format!(
+            "workspace_root {} is within FAC-internal storage (denied)",
+            canonical.display()
+        ));
+    }
+
+    // Must be a git toplevel root, not a nested path.
+    let toplevel_output = Command::new("git")
+        .arg("-C")
+        .arg(&canonical)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|err| format!("failed to run git rev-parse --show-toplevel: {err}"))?;
+    if !toplevel_output.status.success() {
+        return Err(format!(
+            "workspace_root {} is not a git worktree root",
+            canonical.display()
+        ));
+    }
+    let git_toplevel_raw = String::from_utf8_lossy(&toplevel_output.stdout)
+        .trim()
+        .to_string();
+    let git_toplevel = PathBuf::from(git_toplevel_raw)
+        .canonicalize()
+        .map_err(|err| format!("failed to canonicalize git toplevel for {raw}: {err}"))?;
+    if git_toplevel != canonical {
+        return Err(format!(
+            "workspace_root {} must equal git toplevel {} (denied)",
+            canonical.display(),
+            git_toplevel.display()
+        ));
+    }
+
+    // Hard-bind job payload to expected repository identity.
+    let resolved_repo_id = resolve_repo_id(&canonical);
+    if !resolved_repo_id.eq_ignore_ascii_case(expected_repo_id) {
+        return Err(format!(
+            "workspace_root repo mismatch: expected {expected_repo_id}, resolved {resolved_repo_id}"
+        ));
+    }
+
+    Ok(canonical)
+}
+
+fn resolve_repo_id(workspace_root: &Path) -> String {
+    if let Some(remote_url) = resolve_origin_remote_url(workspace_root) {
+        if let Some((owner, repo)) = parse_github_remote_url(&remote_url) {
+            return format!("{owner}/{repo}");
+        }
+    }
+
+    let segment = workspace_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_repo_segment)
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or_else(|| UNKNOWN_REPO_SEGMENT.to_string());
+    format!("local/{segment}")
+}
+
+fn resolve_origin_remote_url(workspace_root: &Path) -> Option<String> {
+    Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                String::from_utf8(out.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            }
+        })
+}
+
+fn sanitize_repo_segment(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+
+    while out.starts_with('-') || out.starts_with('.') || out.starts_with('_') {
+        out.remove(0);
+    }
+    while out.ends_with('-') || out.ends_with('.') || out.ends_with('_') {
+        out.pop();
+    }
+
+    if out.is_empty() {
+        UNKNOWN_REPO_SEGMENT.to_string()
+    } else {
+        out
+    }
 }
 
 fn resolve_workspace_head(workspace_root: &Path) -> Result<String, String> {
@@ -1257,34 +1381,7 @@ fn resolve_workspace_head(workspace_root: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-struct CurrentDirGuard {
-    original: PathBuf,
-}
-
-impl CurrentDirGuard {
-    fn enter(target: &Path) -> Result<Self, String> {
-        let original = std::env::current_dir()
-            .map_err(|err| format!("failed to resolve current directory: {err}"))?;
-        std::env::set_current_dir(target).map_err(|err| {
-            format!(
-                "failed to change current directory to {}: {err}",
-                target.display()
-            )
-        })?;
-        Ok(Self { original })
-    }
-}
-
-impl Drop for CurrentDirGuard {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.original);
-    }
-}
-
 fn run_gates_in_workspace(options: &GatesJobOptions) -> Result<u8, String> {
-    // The worker is single-threaded; changing process CWD here is scoped by
-    // `CurrentDirGuard` and restored on all return paths.
-    let _dir_guard = CurrentDirGuard::enter(&options.workspace_root)?;
     fac_review_api::run_gates_local_worker(
         options.force,
         options.quick,
@@ -1293,6 +1390,7 @@ fn run_gates_in_workspace(options: &GatesJobOptions) -> Result<u8, String> {
         options.pids_max,
         &options.cpu_quota,
         options.gate_profile,
+        &options.workspace_root,
     )
 }
 
@@ -4748,36 +4846,8 @@ fn consume_authority(queue_root: &Path, job_id: &str, spec_digest: &str) -> Resu
 ///
 /// Returns an error if the file is larger than `max_size` or cannot be read.
 fn read_bounded(path: &Path, max_size: usize) -> Result<Vec<u8>, String> {
-    let file = fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
-    let file_size = metadata.len();
-    if file_size > max_size as u64 {
-        return Err(format!("file size {file_size} exceeds max {max_size}"));
-    }
-
-    // Read with explicit size bound. We allocate based on verified metadata.
-    #[allow(clippy::cast_possible_truncation)]
-    let alloc_size = file_size as usize;
-    let mut buf = Vec::with_capacity(alloc_size);
-
-    // Read up to max_size + 1 to detect if the file grew between stat and read.
-    let read_limit = max_size.saturating_add(1);
-    let mut limited_reader = file.take(read_limit as u64);
-    limited_reader
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("read error on {}: {e}", path.display()))?;
-
-    if buf.len() > max_size {
-        return Err(format!(
-            "file grew to {} (exceeds max {})",
-            buf.len(),
-            max_size
-        ));
-    }
-
-    Ok(buf)
+    fac_secure_io::read_bounded(path, max_size)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))
 }
 
 /// Loads or generates a persistent signing key from
@@ -4788,28 +4858,7 @@ fn read_bounded(path: &Path, max_size: usize) -> Result<Vec<u8>, String> {
 /// receipts consistent across worker restarts.
 fn load_or_generate_persistent_signer() -> Result<Signer, String> {
     let fac_root = resolve_fac_root()?;
-    let key_path = fac_root.join("signing_key");
-
-    if key_path.exists() {
-        let bytes = read_bounded(&key_path, 64)?;
-        Signer::from_bytes(&bytes).map_err(|e| format!("invalid signing key: {e}"))
-    } else {
-        let signer = Signer::generate();
-        let key_bytes = signer.secret_key_bytes();
-        if let Some(parent) = key_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("cannot create key directory: {e}"))?;
-        }
-        fs::write(&key_path, key_bytes.as_ref())
-            .map_err(|e| format!("cannot write signing key: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&key_path, perms)
-                .map_err(|e| format!("cannot set key permissions: {e}"))?;
-        }
-        Ok(signer)
-    }
+    fac_key_material::load_or_generate_persistent_signer(&fac_root)
 }
 
 /// Loads persisted broker state from
@@ -5327,7 +5376,7 @@ mod tests {
 
         let result = read_bounded(&file_path, MAX_JOB_SPEC_SIZE);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("exceeds max"),);
+        assert!(result.unwrap_err().contains("too large"));
     }
 
     #[test]
@@ -5471,6 +5520,7 @@ mod tests {
 
     #[test]
     fn test_parse_gates_job_options_from_patch_payload() {
+        let workspace_root = repo_toplevel_for_tests();
         let mut spec = make_receipt_test_spec();
         spec.source.patch = Some(serde_json::json!({
             "schema": GATES_JOB_OPTIONS_SCHEMA,
@@ -5481,7 +5531,7 @@ mod tests {
             "pids_max": 99,
             "cpu_quota": "150%",
             "gate_profile": "balanced",
-            "workspace_root": "."
+            "workspace_root": workspace_root
         }));
         let options = parse_gates_job_options(&spec).expect("parse payload");
         assert!(options.force);
@@ -5499,6 +5549,7 @@ mod tests {
 
     #[test]
     fn test_parse_gates_job_options_rejects_missing_decoded_source() {
+        let workspace_root = repo_toplevel_for_tests();
         let mut spec = make_receipt_test_spec();
         spec.actuation.decoded_source = None;
         spec.source.patch = Some(serde_json::json!({
@@ -5510,7 +5561,7 @@ mod tests {
             "pids_max": DEFAULT_GATES_PIDS_MAX,
             "cpu_quota": DEFAULT_GATES_CPU_QUOTA,
             "gate_profile": "throughput",
-            "workspace_root": "."
+            "workspace_root": workspace_root
         }));
         let err = parse_gates_job_options(&spec).expect_err("missing decoded_source must fail");
         assert!(err.contains("missing gates decoded_source hint"));
@@ -5518,6 +5569,7 @@ mod tests {
 
     #[test]
     fn test_parse_gates_job_options_rejects_schema_mismatch() {
+        let workspace_root = repo_toplevel_for_tests();
         let mut spec = make_receipt_test_spec();
         spec.source.patch = Some(serde_json::json!({
             "schema": "apm2.fac.gates_job_options.v0",
@@ -5528,7 +5580,7 @@ mod tests {
             "pids_max": 1536,
             "cpu_quota": "auto",
             "gate_profile": "throughput",
-            "workspace_root": "."
+            "workspace_root": workspace_root
         }));
         let err = parse_gates_job_options(&spec).expect_err("schema mismatch must fail closed");
         assert!(err.contains("unsupported gates options schema"));
@@ -5536,6 +5588,7 @@ mod tests {
 
     #[test]
     fn test_parse_gates_job_options_rejects_invalid_profile() {
+        let workspace_root = repo_toplevel_for_tests();
         let mut spec = make_receipt_test_spec();
         spec.source.patch = Some(serde_json::json!({
             "schema": GATES_JOB_OPTIONS_SCHEMA,
@@ -5546,7 +5599,7 @@ mod tests {
             "pids_max": 1536,
             "cpu_quota": "auto",
             "gate_profile": "extreme",
-            "workspace_root": "."
+            "workspace_root": workspace_root
         }));
         let err = parse_gates_job_options(&spec).expect_err("invalid profile must fail closed");
         assert!(err.contains("invalid gates gate_profile"));
@@ -5571,7 +5624,79 @@ mod tests {
         assert!(err.contains("workspace_root"));
     }
 
+    #[test]
+    fn test_parse_gates_job_options_rejects_repo_mismatch() {
+        let workspace_root = repo_toplevel_for_tests();
+        let mut spec = make_receipt_test_spec();
+        spec.source.repo_id = "local/not-this-workspace".to_string();
+        spec.source.patch = Some(serde_json::json!({
+            "schema": GATES_JOB_OPTIONS_SCHEMA,
+            "force": false,
+            "quick": false,
+            "timeout_seconds": 600,
+            "memory_max": "48G",
+            "pids_max": 1536,
+            "cpu_quota": "auto",
+            "gate_profile": "throughput",
+            "workspace_root": workspace_root
+        }));
+        let err = parse_gates_job_options(&spec).expect_err("repo mismatch must fail closed");
+        assert!(err.contains("repo mismatch"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_parse_gates_job_options_rejects_fac_internal_workspace_root() {
+        let _guard = env_var_test_lock().lock().expect("serialize env test");
+        let original_apm2_home = std::env::var_os("APM2_HOME");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let apm2_home = dir.path().join(".apm2");
+        let fac_internal = apm2_home.join("private").join("fac").join("workspace");
+        fs::create_dir_all(&fac_internal).expect("create fac internal path");
+
+        set_env_var_for_test("APM2_HOME", &apm2_home);
+
+        let mut spec = make_receipt_test_spec();
+        spec.source.patch = Some(serde_json::json!({
+            "schema": GATES_JOB_OPTIONS_SCHEMA,
+            "force": false,
+            "quick": false,
+            "timeout_seconds": 600,
+            "memory_max": "48G",
+            "pids_max": 1536,
+            "cpu_quota": "auto",
+            "gate_profile": "throughput",
+            "workspace_root": fac_internal.to_string_lossy()
+        }));
+        let err = parse_gates_job_options(&spec).expect_err("fac internal path must be denied");
+        assert!(
+            err.contains("FAC-internal storage"),
+            "unexpected error: {err}"
+        );
+
+        if let Some(value) = original_apm2_home {
+            set_env_var_for_test("APM2_HOME", value);
+        } else {
+            remove_env_var_for_test("APM2_HOME");
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn set_env_var_for_test<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(
+        key: K,
+        value: V,
+    ) {
+        unsafe { std::env::set_var(key, value) };
+    }
+
+    #[allow(unsafe_code)]
+    fn remove_env_var_for_test<K: AsRef<std::ffi::OsStr>>(key: K) {
+        unsafe { std::env::remove_var(key) };
+    }
+
     fn make_receipt_test_spec() -> FacJobSpecV1 {
+        let repo_root = PathBuf::from(repo_toplevel_for_tests());
+        let repo_id = resolve_repo_id(&repo_root);
         FacJobSpecV1 {
             schema: "apm2.fac.job_spec.v1".to_string(),
             job_id: "job-001".to_string(),
@@ -5588,7 +5713,7 @@ mod tests {
             },
             source: apm2_core::fac::job_spec::JobSource {
                 kind: "mirror_commit".to_string(),
-                repo_id: "repo-001".to_string(),
+                repo_id,
                 head_sha: "abcd1234abcd1234abcd1234abcd1234abcd1234".to_string(),
                 patch: None,
             },
@@ -5602,6 +5727,18 @@ mod tests {
             },
             cancel_target_job_id: None,
         }
+    }
+
+    fn repo_toplevel_for_tests() -> String {
+        let output = Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .expect("git rev-parse should execute");
+        assert!(
+            output.status.success(),
+            "git rev-parse --show-toplevel failed"
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     #[test]

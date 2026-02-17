@@ -3,7 +3,7 @@ ticket_meta:
   template_version: "2026-01-29"
   ticket:
     id: "TCK-00613"
-    title: "Unified Rust gate engine: migrate all CI from shell scripts to apm2 fac gates profiles"
+    title: "FAC gates architecture alignment + security hardening (throughput-profile model)"
     status: "OPEN"
   binds:
     prd_id: "PRD-PLACEHOLDER"
@@ -16,406 +16,129 @@ ticket_meta:
   dependencies:
     tickets:
       - ticket_id: "TCK-00612"
-        reason: "TCK-00612 introduced gate throughput profiles (throughput/balanced/conservative) and host-aware parallelism. This ticket builds on that profile model to define gate-set profiles (local-full/quick/workflow-preflight/drift-audit)."
-      - ticket_id: "TCK-00436"
-        reason: "Original fac gates unification; this ticket completes the migration by replacing all remaining shell-script gates with Rust-native gate engine."
+        reason: "Defines the throughput-profile model (`throughput`/`balanced`/`conservative`) and host-aware parallelism contract used by fac gates."
       - ticket_id: "TCK-00605"
-        reason: "Rust-native bounded test path; gate engine reuses this execution model."
+        reason: "Defines bounded test execution constraints and containment policy used by FAC gates."
+      - ticket_id: "TCK-00563"
+        reason: "Canonicalizer tuple pinning and receipt integrity remain required invariants in worker/broker admission flows."
   root_cause_analysis:
     summary: |
-      CI behavior is split across two execution models:
+      The prior revision of this ticket mixed two incompatible directions:
+      - A new trait/registry gate engine with gate-set `--profile`.
+      - The already-adopted command-centric FAC gates runtime with throughput
+        profiles and typed gate checks.
 
-      1. Shell scripts under scripts/ that implement lint, doc, evidence,
-         and compliance checks via bash orchestration.
-      2. Rust-native gates under `apm2 fac gates` that implement bounded
-         test execution with containment controls.
+      In parallel, PR review surfaced concrete security and correctness gaps:
+      - Signing key TOCTOU and duplicated key-handling paths.
+      - Unbounded file reads in gates/preflight paths.
+      - Worker workspace-root trust boundary ambiguity.
+      - Process-global CWD mutation in worker execution path.
+      - workflow_dispatch authorization trust override via env var.
+      - test_safety_guard misses on top-level `src/*.rs` and unbounded traversal.
 
-      This split causes:
-      - Inconsistent failure semantics (shell exit codes vs typed results)
-      - Duplicate orchestration logic (workflow YAML + fac review evidence.rs
-        both call scripts independently)
-      - No unified gate registry (can't query "what gates exist" or
-        "what does profile X run")
-      - Script-coupled attestation (gate_attestation.rs fingerprints
-        script paths, not gate inputs)
-      - Shell scripts bypass bounded execution containment controls
-
-      The fix is to build one Rust gate engine with a registry, runner,
-      and profile system, then migrate all CI behavior into it. Shell
-      scripts are deleted entirely.
-
-scope:
-  in_scope:
-    - id: S1_GATE_ENGINE
-      title: "Build Gate trait, GateRegistry, and parallel-phase runner"
-      detail: |
-        Add `gates_engine/` module under
-        `crates/apm2-cli/src/commands/fac_review/`:
-
-        1. `Gate` trait:
-           - `id() -> &str` (unique gate identifier)
-           - `phase() -> Phase` (compile, lint, test, doc, evidence, audit)
-           - `parallel_group() -> Option<&str>` (gates in same group run concurrently)
-           - `run(&self, ctx: &GateContext) -> GateResult`
-
-        2. `GateRegistry`:
-           - Stores all registered gates
-           - `gates_for_profile(profile: &str) -> Vec<&dyn Gate>`
-           - `all_gate_ids() -> Vec<&str>`
-           - Profiles: local-full, quick, workflow-preflight, drift-audit
-
-        3. `GateRunner`:
-           - Executes gates in deterministic phase order
-           - Parallel execution within declared groups
-           - Fail-fast policy per phase (configurable)
-           - Typed `GateResult` with bounded logs + receipt hooks
-           - Respects bounded containment controls (timeout, memory, pids)
-
-        Gate IDs cover all former CI/lint script checks.
-
-        Acceptance:
-          - `GateRegistry` can enumerate all gates and resolve profiles.
-          - `GateRunner` executes gates in phase order with parallel groups.
-          - Fail-fast halts remaining gates in a phase on first failure.
-          - Gate results are typed (not exit codes).
-
-    - id: S2_PROFILE_CLI
-      title: "Add --profile to apm2 fac gates as canonical CI entrypoint"
-      detail: |
-        Extend existing `apm2 fac gates` args:
-
-            #[arg(long, default_value = "local-full")]
-            pub profile: String,
-
-        Profiles map to explicit gate lists:
-          - `local-full`: all gates (lint, compile, test, doc, evidence, audit)
-          - `quick`: fast-feedback subset (fmt, clippy, targeted tests)
-          - `workflow-preflight`: GitHub Actions pre-merge checks
-          - `drift-audit`: documentation/schema drift detection
-
-        `apm2 fac gates --profile quick` replaces ad-hoc script
-        combinations. `apm2 fac gates` (no args) defaults to
-        `local-full`.
-
-        Acceptance:
-          - `apm2 fac gates --help` shows `--profile` with all options.
-          - Each profile resolves to a deterministic gate list.
-          - `apm2 fac gates --profile quick` runs only fast-feedback gates.
-
-    - id: S3_FAC_REVIEW_INTEGRATION
-      title: "Replace bash callsites in FAC review with gate-engine invocation"
-      detail: |
-        Three callsite migrations:
-
-        1. `evidence.rs`: Replace shell script invocations with direct
-           gate-engine calls. The gate engine returns typed results that
-           feed directly into evidence attestation.
-
-        2. `gate_attestation.rs`: Fingerprint Rust gate inputs (gate ID
-           + version + config hash), not script paths. Attestation
-           records become script-independent.
-
-        3. `push.rs`: Update expected gate-set logic to use registry
-           IDs (not file existence checks). Gate completeness is
-           verified against the registry, not the filesystem.
-
-        Acceptance:
-          - Zero shell script execution from fac_review code paths.
-          - Gate attestation fingerprints are deterministic and
-            script-path-free.
-          - push.rs gate-set validation uses registry gate IDs.
-
-    - id: S4_WORKFLOW_MIGRATION
-      title: "Rewrite GitHub Actions workflow to use apm2 fac gates --profile"
-      detail: |
-        Rewrite `.github/workflows/forge-admission-cycle.yml`:
-
-        Replace all direct script execution with:
-
-            apm2 fac gates --profile workflow-preflight
-
-        The workflow becomes a thin shell around the gate engine.
-        All gate logic lives in Rust, not in workflow YAML.
-
-        Acceptance:
-          - Workflow calls `apm2 fac gates --profile workflow-preflight`.
-          - No direct script execution in workflow YAML.
-          - CI pass/fail behavior is identical to pre-migration.
-
-    - id: S5_NON_CI_SCRIPT_MIGRATION
-      title: "Port non-CI scripts to dedicated command families"
-      detail: |
-        Three script families to migrate:
-
-        1. Evidence scripts → `apm2 evidence verify` subcommands
-           (JSON schema parity with original scripts).
-
-        2. Skills sync → `apm2 dev skills-runtime-sync`
-           (port skills/runtime synchronization logic).
-
-        3. RFC loop → `apm2 factory rfc-codex-loop`
-           (port RFC codex loop orchestration).
-
-        Delete original scripts after parity tests pass.
-
-        Acceptance:
-          - `apm2 evidence verify` produces identical output to
-            original evidence scripts.
-          - `apm2 dev skills-runtime-sync` replaces skills sync script.
-          - `apm2 factory rfc-codex-loop` replaces RFC loop script.
-          - Original scripts deleted.
-
-    - id: S6_REFERENCE_REWRITE
-      title: "Rewrite all repository references from script paths to new commands"
-      detail: |
-        Sweep all docs, tickets, SKILL.md files, AGENTS.md files,
-        workflow files, and code comments. Replace references to
-        `scripts/*.sh` paths with the corresponding `apm2` command.
-
-        Remove dead script-coupled code paths from Rust source.
-
-        Acceptance:
-          - `find . -type f -name '*.sh'` returns empty.
-          - `rg -n 'scripts/.+\.sh|run_rfc_codex_loop\.sh'` returns empty.
-          - `rg -n 'Command::new\("bash"|Command::new\("sh"'
-            crates/apm2-cli/src/commands/fac_review` returns empty
-            (non-test code).
-
-    - id: S7_TESTING
-      title: "Comprehensive test suite for gate engine, profiles, and migration"
-      detail: |
-        Unit tests:
-          - One test module per migrated gate (fixtures as data files)
-          - Parser/lint equivalence tests for rule-heavy checks
-          - Profile composition tests (exact gate membership)
-
-        Integration tests:
-          - `apm2 fac gates --profile ...` pass/fail matrix
-          - FAC review evidence integration (zero script execution)
-          - Workflow-preflight gate tests with fixture event payloads
-          - Evidence verify command tests (JSON schema parity)
-
-        End-to-end:
-          - Full `local-full` run on clean repo
-          - Failure-injection suite for each guardrail gate
-          - Command-output stability checks for machine consumers
-
-        Hard compliance gates (must all pass):
+      This ticket update formalizes the architecture actually in use and binds
+      DoD to hardened, fail-closed behavior across FAC gates and preflight.
+  scope:
+    in_scope:
+      - "Architecture contract: command-centric gates execution remains authoritative (`fac_review/gates.rs` orchestration + typed checks in `fac_review/gate_checks.rs`)."
+      - "Gate selection semantics: keep `--quick` as gate-set selector (fast subset) and full mode as default behavior."
+      - "Throughput semantics: keep `--gate-profile` (`throughput`/`balanced`/`conservative`) for resource/concurrency policy, independent of gate-set selection."
+      - "Introduce shared hardened signer-key utility (`fac_key_material`) and remove duplicated key creation/loading logic across queue submit, worker, and broker paths."
+      - "Introduce shared fail-closed bounded-read utility (`fac_secure_io`) and replace raw unbounded reads in FAC review gate checks, FAC preflight, FAC broker, queue submit, and worker-adjacent read sites."
+      - "Enforce fail-closed handling for oversized/unreadable inputs in security-sensitive paths (no skip-on-error behavior for authorization/gate enforcement inputs)."
+      - "Remove process-global CWD mutation from worker execution path; pass explicit workspace root through the gates call chain."
+      - "Define and enforce workspace-root admission policy in worker gates execution: canonical dir, git toplevel equality, repo identity binding, and explicit deny for FAC-internal roots."
+      - "Strengthen preflight trust binding: no env override for actor permission, validated repository/actor normalization, bounded event/policy/PR JSON parsing, and explicit deny on permission lookup failure."
+      - "Harden test_safety_guard determinism and coverage: tracked-file-first targeting, top-level `src/lib.rs` and `src/main.rs` coverage under `#[cfg(test)]`, and bounded fail-closed file reads."
+      - "Add regression tests for key creation race, workflow_dispatch permission checks, oversized payload denial, workspace-root policy denial, and top-level Rust test-safety detection."
+    out_of_scope:
+      - "Mandating a `gates_engine/` trait/registry abstraction (`Gate`, `GateRegistry`, `GateRunner`) in this ticket."
+      - "Replacing current gate-set semantics with a new `--profile <gate-set>` CLI contract in this ticket."
+      - "Repository-wide deletion of all shell scripts outside the FAC gates/preflight hardening scope."
+      - "Backward-compatibility shims for superseded ticket language."
+      - "Global scheduler redesign or distributed queue architecture changes."
+  plan:
+    steps:
+      - id: "STEP_01"
+        title: "Codify architecture and CLI contract"
+        detail: |
+          Lock the canonical model for this ticket:
+          - `fac_review/gates.rs` orchestrates execution.
+          - `--quick` controls gate-set shape.
+          - `--gate-profile` controls throughput/resource policy only.
+      - id: "STEP_02"
+        title: "Centralize hardened key material handling"
+        detail: |
+          Add shared signer utility for secure create/load semantics:
+          - create with owner-only mode at open time
+          - nofollow safeguards
+          - fsync of file and parent dir
+          - race-safe concurrent creator convergence
+          Replace all duplicate key handling in queue submit/worker/broker.
+      - id: "STEP_03"
+        title: "Centralize bounded fail-closed file reads"
+        detail: |
+          Add shared bounded I/O helper and migrate targeted paths off raw
+          `fs::read` / `fs::read_to_string` for security-sensitive inputs.
+      - id: "STEP_04"
+        title: "Harden worker execution boundary"
+        detail: |
+          Remove ambient CWD dependency and enforce explicit workspace-root
+          admission checks (canonicalize + git root + repo bind + FAC-internal
+          deny rules).
+      - id: "STEP_05"
+        title: "Harden preflight trust binding"
+        detail: |
+          Remove env-based actor-permission override from authorization path,
+          enforce repository/actor normalization, and deny on oversized/invalid
+          preflight payloads or permission lookup failures.
+      - id: "STEP_06"
+        title: "Fix gate correctness regressions"
+        detail: |
+          Ensure test_safety_guard covers top-level `src/*.rs` test regions and
+          uses bounded deterministic file targeting/read behavior.
+      - id: "STEP_07"
+        title: "Regression suite and verification"
+        detail: |
+          Run targeted security/correctness regressions and strict quality gates:
           - `cargo fmt --all`
-          - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-          - `cargo doc --workspace --no-deps`
-          - `cargo test --workspace`
-          - `find . -type f -name '*.sh'` must be empty
-          - `rg -n 'scripts/.+\.sh'` must be empty
-          - `rg -n 'Command::new("bash")|Command::new("sh")'
-            crates/apm2-cli/src/commands/fac_review` must be empty
-            (non-test code)
+          - `cargo clippy -p apm2-cli --all-targets --all-features -- -D warnings`
+          - `cargo test -p apm2-cli`
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "Ticket language is internally consistent with implemented architecture: command-centric gates orchestration + throughput profiles."
+      - "Signer key lifecycle is centralized; queue submit, worker, and broker use shared hardened key material helpers."
+      - "No production path creates signing keys via write-then-chmod TOCTOU sequence."
+      - "Bounded read helper is shared and used across targeted FAC gates/preflight/broker/queue paths; oversized inputs are denied fail-closed."
+      - "Worker gates execution path does not mutate process-global CWD."
+      - "Worker workspace_root admission denies FAC-internal roots and repo-identity mismatches; git toplevel binding is enforced."
+      - "workflow_dispatch authorization does not trust env permission overrides and denies on lookup failure or insufficient permission."
+      - "Preflight event/policy payload reads are bounded and oversized payloads fail closed."
+      - "test_safety_guard evaluates top-level `src/lib.rs` and `src/main.rs` test regions and fails closed on oversized targets."
+      - "Regression tests exist for signer concurrency, workflow_dispatch permission checks, oversized payload denial, and workspace-root policy denial."
+      - "`cargo fmt --all` passes."
+      - "`cargo clippy -p apm2-cli --all-targets --all-features -- -D warnings` passes."
+      - "`cargo test -p apm2-cli` passes."
+  notes:
+    context: |
+      This amendment aligns TCK-00613 with the architecture currently used by
+      FAC gates in this repository branch:
+      - command-centric orchestration in `fac_review/gates.rs`
+      - typed gate checks and evidence checks under `fac_review/*`
+      - throughput profile model from TCK-00612
 
-        Acceptance:
-          - All unit, integration, and e2e tests pass.
-          - All hard compliance gates pass.
-
-    - id: S8_POST_CUTOVER_STABILIZATION
-      title: "Post-cutover reliability fixes (broker admission, queue identity, gate correctness, doctor diagnostics)"
-      detail: |
-        Stabilization fixes applied after single-cutover merge prep:
-
-        1. Broker admission/token binding hardening:
-           - Bind channel-context token policy to admitted policy digest
-             (not job digest), preserving admission integrity semantics.
-           - Update broker callsites in gates/warm paths to use the
-             admitted digest contract.
-
-        2. `fac warm --wait` correctness:
-           - Do not treat receipt existence as success.
-           - Require terminal receipt outcome and fail on denied/
-             quarantined/cancelled states.
-
-        3. Queue collision hardening:
-           - Replace low-entropy suffixing with
-             `secs+nanos+pid+atomic_counter` composition to avoid
-             same-second collisions under concurrency.
-
-        4. Gate correctness hardening:
-           - Fix top-level `src/*.rs` target detection in
-             `test_safety_guard` Rust path logic.
-           - Scope shell-literal checks to avoid false positives from
-             Rust-only contexts while preserving fail-closed behavior.
-
-        5. Evidence runtime stabilization:
-           - Remove ambient-env dependency for policy-root resolution.
-           - Derive `apm2_home/fac_root` from locked lane paths to
-             eliminate flake from parallel test environments.
-
-        6. Documentation/lint stabilization:
-           - Resolve rustdoc warning in economics cost-model docs.
-
-        7. FAC doctor and dispatch diagnostics:
-           - Confirmed local failure mode for PR orchestration:
-             `agent registry integrity check failed`.
-           - `fac doctor --pr <N> --fix` currently resets lifecycle to
-             `pushed` but may not quarantine/rebuild corrupt registry in
-             this failure class; follow-up hardening remains required.
-
-  out_of_scope:
-    - "Compatibility wrappers for old script paths (clean cutover, no shims)."
-    - "Removing bounded execution or containment controls (security posture unchanged)."
-    - "Reintroducing wrapper/sccache pass-through in bounded mode without new containment guarantees."
-    - "Global distributed scheduler redesign."
-
-plan:
-  steps:
-    - id: STEP_01
-      title: "Implement gate engine (Gate trait + GateRegistry + GateRunner)"
-      detail: |
-        1. Create gates_engine/ module with Gate trait, GateRegistry,
-           and GateRunner.
-        2. Implement phase ordering, parallel groups, fail-fast policy.
-        3. Register all existing gate checks (lint, compile, test, doc,
-           evidence, audit) as Gate implementations.
-
-    - id: STEP_02
-      title: "Wire --profile into apm2 fac gates CLI"
-      detail: |
-        1. Add --profile arg with local-full/quick/workflow-preflight/
-           drift-audit options.
-        2. Wire profile resolution to GateRegistry.
-        3. Default to local-full when no profile specified.
-
-    - id: STEP_03
-      title: "Migrate FAC review callsites to gate engine"
-      detail: |
-        1. Replace evidence.rs shell invocations with gate-engine calls.
-        2. Update gate_attestation.rs to fingerprint gate IDs.
-        3. Update push.rs gate-set validation to use registry.
-
-    - id: STEP_04
-      title: "Migrate GitHub Actions workflow"
-      detail: |
-        1. Rewrite forge-admission-cycle.yml to call apm2 fac gates
-           --profile workflow-preflight.
-        2. Remove all direct script execution from workflow.
-
-    - id: STEP_05
-      title: "Port non-CI scripts to command families"
-      detail: |
-        1. Port evidence scripts to apm2 evidence verify.
-        2. Port skills sync to apm2 dev skills-runtime-sync.
-        3. Port RFC loop to apm2 factory rfc-codex-loop.
-        4. Delete original scripts after parity tests pass.
-
-    - id: STEP_06
-      title: "Reference rewrite and dead code removal"
-      detail: |
-        1. Sweep all docs, tickets, skills, agents for script references.
-        2. Replace with corresponding apm2 commands.
-        3. Remove dead script-coupled code paths from Rust source.
-        4. Delete all .sh files.
-
-    - id: STEP_07
-      title: "Testing and validation"
-      detail: |
-        1. Run unit tests per migrated gate.
-        2. Run profile composition tests.
-        3. Run integration pass/fail matrix.
-        4. Run e2e local-full on clean repo.
-        5. Run failure-injection suite.
-        6. Verify all hard compliance gates pass.
-
-    - id: STEP_08
-      title: "Post-cutover stabilization and doctor-path hardening"
-      detail: |
-        1. Patch broker token policy binding to admitted-digest
-           semantics and update callsites.
-        2. Tighten warm wait terminal-state validation.
-        3. Harden queue job suffix uniqueness under concurrency.
-        4. Fix subtle test_safety_guard target/path regressions and
-           add regression tests.
-        5. Remove ambient env coupling from evidence policy-root lookup.
-        6. Repair doc/lint warnings introduced by refactor.
-        7. Validate with full gates run and FAC push orchestration.
-        8. Follow up on doctor recovery path so `--fix` can quarantine/
-           rebuild invalid agent registry state for dispatch recovery.
-
-definition_of_done:
-  evidence_ids: []
-  criteria:
-    - "`apm2 fac gates --help` exposes `--profile` with local-full/quick/workflow-preflight/drift-audit options."
-    - "`apm2 fac gates` defaults to `local-full` profile with host-aware parallelism."
-    - "Gate engine executes gates in deterministic phase order with parallel groups and fail-fast."
-    - "Gate results are typed (GateResult), not shell exit codes."
-    - "FAC review evidence.rs uses gate-engine invocation, not shell scripts."
-    - "gate_attestation.rs fingerprints gate IDs + config hash, not script paths."
-    - "push.rs validates gate completeness against registry, not filesystem."
-    - "GitHub Actions workflow calls `apm2 fac gates --profile workflow-preflight` exclusively."
-    - "`apm2 evidence verify` replaces evidence shell scripts with JSON schema parity."
-    - "`apm2 dev skills-runtime-sync` replaces skills sync script."
-    - "`apm2 factory rfc-codex-loop` replaces RFC loop script."
-    - "`find . -type f -name '*.sh'` returns empty (all shell scripts deleted)."
-    - "`rg -n 'scripts/.+\\.sh'` returns empty (no script path references remain)."
-    - "`rg -n 'Command::new(\"bash\")|Command::new(\"sh\")'` returns empty in fac_review non-test code."
-    - "Bounded containment semantics remain fail-closed and unchanged in security posture."
-    - "All unit, integration, e2e, and hard compliance gates pass."
-    - "`cargo test --workspace` passes."
-    - "Single-PR cutover: no transitional wrappers or compatibility shims."
-    - "Broker channel-context token policy is bound to admitted digest semantics (no job-digest mismatch)."
-    - "`fac warm --wait` fails closed on non-success terminal outcomes."
-    - "Queue submission suffixes are collision-resistant under high concurrency."
-    - "`test_safety_guard` correctly evaluates top-level `src/*.rs` paths and avoids false-positive shell-literal detection drift."
-    - "Evidence policy-root derivation is lane-path based and deterministic in parallel test environments."
-    - "`fac doctor --pr <N> --fix` follow-up documented for agent-registry integrity recovery gap when dispatch fails with integrity mismatch."
-
-notes:
-  context: |
-    DESIGN: "CI = Gates" — single cutover to unified Rust gate engine.
-
-    The core insight is that CI behavior should be defined exclusively
-    by gate profiles under `apm2 fac gates`. Shell scripts are a
-    historical artifact from before the Rust gate system existed. Now
-    that the gate engine can handle all check types (lint, compile,
-    test, doc, evidence, audit), there's no reason to maintain two
-    orchestration models.
-
-    The migration is a single PR with no transitional wrappers:
-    1. Implement gate engine + profiles
-    2. Switch fac gates and FAC review to engine
-    3. Migrate workflow
-    4. Port non-CI scripts to existing command families
-    5. Rewrite all references
-    6. Delete all .sh files + dead code
-    7. Run full validation suite and merge
-
-    Assumptions:
-    - No compatibility wrappers for old script paths
-    - CI is defined exclusively by gate profiles under apm2 fac gates
-    - Historical docs are rewritten to eliminate script pointers
-
-    This ticket was informed by a Codex investigation into gate
-    throughput regression (TCK-00612) which revealed the dual
-    shell/Rust execution model as a source of inconsistency and
-    maintenance burden.
-
-    Implementation update (2026-02-17):
-    - Local verification used repository build `./target/debug/apm2`
-      (distinct binary hash from globally installed `~/.local/bin/apm2`).
-    - FAC push completed with gates passed (`duration_secs=229`) and
-      PR update to `https://github.com/guardian-intelligence/apm2/pull/708`.
-    - Post-cutover stabilization fixes were applied:
-      broker admitted-digest binding, warm wait terminal checks,
-      queue suffix hardening, test_safety_guard path fixes,
-      evidence lane-derived policy-root, and rustdoc cleanup.
-    - Outstanding operational blocker captured:
-      PR-level doctor diagnostics still report registry integrity
-      mismatch (`agent registry integrity check failed`) and missing
-      review run-state files for PR #708. `doctor --fix` resets
-      lifecycle but may require additional registry quarantine/rebuild
-      behavior for full self-healing dispatch recovery.
-  amendments:
-    - amendment_id: "AMD-2026-02-17-POST-CUTOVER-STABILIZATION"
-      summary: "Closure fixes and diagnostics from the unified Rust gate cutover."
-      supersedes:
-        - "Assumption that doctor --fix already self-heals all registry-integrity dispatch failures."
-      replacement:
-        - "Doctor --fix is authoritative for lifecycle reset and run-state repair but needs explicit registry-integrity quarantine/rebuild handling for the `agent registry integrity check failed` class."
-        - "Post-cutover reliability includes broker admission digest binding, warm wait fail-closed terminal checks, queue suffix entropy hardening, and gate/evidence correctness fixes."
-  security: "default-deny, least privilege, fail-closed"
+      It intentionally removes conflicting requirements that assumed this ticket
+      was also the migration vehicle for a trait/registry gate engine and
+      gate-set profile CLI redesign.
+    amendments:
+      - amendment_id: "AMD-2026-02-17-ARCH-REALIGNMENT"
+        summary: "Replace conflicting gate-engine/profile requirements with branch-aligned architecture and hardening scope."
+        supersedes:
+          - "Requirement that TCK-00613 must introduce `gates_engine/` with `Gate` trait, `GateRegistry`, and `GateRunner`."
+          - "Requirement that TCK-00613 must replace `--quick` with gate-set `--profile` semantics."
+          - "Requirement that TCK-00613 must be the single vehicle for repository-wide script eradication."
+        replacement:
+          - "TCK-00613 defines and hardens the existing command-centric FAC gates model with explicit fail-closed security guarantees."
+          - "Gate-set profile CLI redesign and trait/registry abstraction, if still desired, are follow-on architecture work and not blockers for this ticket."
+    security: "default-deny, least privilege, fail-closed"

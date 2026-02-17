@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -8,12 +7,18 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::commands::fac_secure_io;
 use crate::exit_codes::codes as exit_codes;
 
 const FAC_PRECHECK_PREFIX: &str = "fac-credential";
 const FAC_AUTH_PREFIX: &str = "fac-preflight";
 const DEFAULT_POLICY_PATH: &str = ".github/review-gate/workflow-trust-policy.json";
 const DEFAULT_LINT_PATHS: &[&str] = &[".github/workflows/forge-admission-cycle.yml"];
+const MAX_CMDLINE_CONTEXT_SIZE: usize = 128 * 1024;
+const MAX_LINT_SCAN_FILE_SIZE: usize = 10 * 1024 * 1024;
+const MAX_EVENT_JSON_SIZE: usize = 10 * 1024 * 1024;
+const MAX_POLICY_JSON_SIZE: usize = 2 * 1024 * 1024;
+const MAX_PR_JSON_OVERRIDE_SIZE: usize = 10 * 1024 * 1024;
 const PAT_ENV_VARS: &[&str] = &[
     "GH_PAT",
     "GITHUB_PAT",
@@ -102,13 +107,33 @@ fn allow(prefix: &str, check: &str, details: &str, json_output: bool) {
 }
 
 fn render_cmdline(path: &Path) -> Result<String, String> {
-    let bytes = fs::read(path)
+    let bytes = fac_secure_io::read_bounded(path, MAX_CMDLINE_CONTEXT_SIZE)
         .map_err(|err| format!("cannot read cmdline context {}: {err}", path.display()))?;
     let rendered = String::from_utf8_lossy(&bytes).replace(['\0', '\n'], " ");
     if rendered.trim().is_empty() {
         return Err("cmdline context is empty".to_string());
     }
     Ok(rendered)
+}
+
+fn validate_repository_owner_repo(repository: &str) -> Result<(), String> {
+    let re = Regex::new(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$").expect("static repository regex");
+    if re.is_match(repository) {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid repository format `{repository}` (expected owner/repo)"
+        ))
+    }
+}
+
+fn validate_actor_name(actor: &str) -> Result<(), String> {
+    let re = Regex::new(r"^[A-Za-z0-9_.\-\[\]]+$").expect("static actor regex");
+    if !actor.is_empty() && re.is_match(actor) {
+        Ok(())
+    } else {
+        Err(format!("invalid actor `{actor}`"))
+    }
 }
 
 pub fn run_credential(mode: CredentialMode, paths: &[PathBuf], json_output: bool) -> u8 {
@@ -419,7 +444,7 @@ pub fn run_credential_lint(paths: &[PathBuf], json_output: bool) -> u8 {
 fn scan_regex_matches(paths: &[PathBuf], regex: &Regex) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for path in paths {
-        let text = fs::read_to_string(path)
+        let text = fac_secure_io::read_bounded_text(path, MAX_LINT_SCAN_FILE_SIZE)
             .map_err(|err| format!("path={} error={err}", path.display()))?;
         for (idx, line) in text.lines().enumerate() {
             if regex.is_match(line) {
@@ -489,9 +514,6 @@ pub fn run_workflow_authorization(json_output: bool) -> u8 {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from);
-    let actor_permission_override = std::env::var("APM2_PREFLIGHT_ACTOR_PERMISSION")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
     let github_token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
     let gh_token = std::env::var("GH_TOKEN").unwrap_or_default();
     let pat_env_values = collect_pat_env_values();
@@ -523,6 +545,24 @@ pub fn run_workflow_authorization(json_output: bool) -> u8 {
             json_output,
         );
     };
+    if let Err(reason) = validate_repository_owner_repo(&repository) {
+        return deny(
+            FAC_AUTH_PREFIX,
+            "context",
+            "invalid_repository",
+            &reason,
+            json_output,
+        );
+    }
+    if let Err(reason) = validate_actor_name(&actor) {
+        return deny(
+            FAC_AUTH_PREFIX,
+            "context",
+            "invalid_actor",
+            &reason,
+            json_output,
+        );
+    }
     let context = WorkflowAuthorizationContext {
         event_name,
         event_path,
@@ -536,10 +576,12 @@ pub fn run_workflow_authorization(json_output: bool) -> u8 {
         gh_token,
         pat_env_values,
         pr_json_override_path,
-        actor_permission_override,
+        permission_lookup: fetch_actor_permission_via_gh,
     };
     run_workflow_authorization_with_context(&context, json_output)
 }
+
+type PermissionLookup = fn(&str, &str) -> Result<String, String>;
 
 #[derive(Debug, Clone)]
 struct WorkflowAuthorizationContext {
@@ -555,7 +597,7 @@ struct WorkflowAuthorizationContext {
     gh_token: String,
     pat_env_values: BTreeMap<String, String>,
     pr_json_override_path: Option<PathBuf>,
-    actor_permission_override: Option<String>,
+    permission_lookup: PermissionLookup,
 }
 
 fn run_workflow_authorization_with_context(
@@ -633,7 +675,7 @@ fn run_workflow_authorization_with_context(
         json_output,
     );
 
-    let event_json = match read_json_file(&context.event_path) {
+    let event_json = match read_json_file_with_limit(&context.event_path, MAX_EVENT_JSON_SIZE) {
         Ok(value) => value,
         Err(reason) => {
             return deny(
@@ -685,7 +727,7 @@ fn run_workflow_authorization_with_context(
                 );
             }
             let pr_json = match context.pr_json_override_path.as_deref() {
-                Some(path) => match read_json_file(path) {
+                Some(path) => match read_json_file_with_limit(path, MAX_PR_JSON_OVERRIDE_SIZE) {
                     Ok(value) => value,
                     Err(_) => {
                         return deny(
@@ -839,11 +881,18 @@ fn run_workflow_authorization_with_context(
             json_output,
         );
 
-        let permission = context
-            .actor_permission_override
-            .clone()
-            .or_else(|| fetch_actor_permission_via_gh(&context.repository, &context.actor).ok())
-            .unwrap_or_default();
+        let permission = match (context.permission_lookup)(&context.repository, &context.actor) {
+            Ok(permission) => permission,
+            Err(err) => {
+                return deny(
+                    FAC_AUTH_PREFIX,
+                    "dispatch_actor",
+                    "actor_permission_lookup_failed",
+                    &format!("actor={} detail={err}", context.actor),
+                    json_output,
+                );
+            },
+        };
         if !matches!(permission.as_str(), "admin" | "maintain" | "write") {
             return deny(
                 FAC_AUTH_PREFIX,
@@ -996,8 +1045,8 @@ fn run_workflow_authorization_with_context(
 }
 
 fn load_policy(path: &Path) -> Result<WorkflowTrustPolicyV1, String> {
-    let bytes =
-        fs::read(path).map_err(|err| format!("cannot read policy {}: {err}", path.display()))?;
+    let bytes = fac_secure_io::read_bounded(path, MAX_POLICY_JSON_SIZE)
+        .map_err(|err| format!("cannot read policy {}: {err}", path.display()))?;
     let policy: WorkflowTrustPolicyV1 =
         serde_json::from_slice(&bytes).map_err(|err| format!("invalid JSON: {err}"))?;
     if policy.schema != "apm2.fac_workflow_trust_policy.v1" {
@@ -1015,12 +1064,14 @@ fn load_policy(path: &Path) -> Result<WorkflowTrustPolicyV1, String> {
     Ok(policy)
 }
 
-fn read_json_file(path: &Path) -> Result<Value, String> {
-    let bytes = fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+fn read_json_file_with_limit(path: &Path, max_size: usize) -> Result<Value, String> {
+    let bytes = fac_secure_io::read_bounded(path, max_size)
+        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
     serde_json::from_slice(&bytes).map_err(|err| format!("invalid JSON {}: {err}", path.display()))
 }
 
 fn fetch_pr_json_via_gh(repository: &str, pr_number: &str) -> Result<Value, String> {
+    validate_repository_owner_repo(repository)?;
     let output = Command::new("gh")
         .args(["api", &format!("repos/{repository}/pulls/{pr_number}")])
         .output()
@@ -1033,6 +1084,8 @@ fn fetch_pr_json_via_gh(repository: &str, pr_number: &str) -> Result<Value, Stri
 }
 
 fn fetch_actor_permission_via_gh(repository: &str, actor: &str) -> Result<String, String> {
+    validate_repository_owner_repo(repository)?;
+    validate_actor_name(actor)?;
     let output = Command::new("gh")
         .args([
             "api",
@@ -1088,8 +1141,18 @@ mod tests {
             gh_token: String::new(),
             pat_env_values: BTreeMap::new(),
             pr_json_override_path: None,
-            actor_permission_override: None,
+            permission_lookup: fetch_actor_permission_via_gh,
         }
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn permission_lookup_write(_repository: &str, _actor: &str) -> Result<String, String> {
+        Ok("write".to_string())
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn permission_lookup_read(_repository: &str, _actor: &str) -> Result<String, String> {
+        Ok("read".to_string())
     }
 
     #[test]
@@ -1358,6 +1421,104 @@ mod tests {
             "authorization/trust_policy_missing_credential_posture.json",
             "ci-test",
         );
+        let code = run_workflow_authorization_with_context(&context, false);
+        assert_eq!(code, exit_codes::GENERIC_ERROR);
+    }
+
+    #[test]
+    fn workflow_dispatch_uses_permission_lookup_and_allows_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let event_path = dir.path().join("event.json");
+        let pr_json_path = dir.path().join("pr.json");
+        std::fs::write(&event_path, r#"{"inputs":{"pr_number":"42"}}"#).expect("write event");
+        std::fs::write(
+            &pr_json_path,
+            r#"{
+  "state":"open",
+  "author_association":"OWNER",
+  "base":{"ref":"main","repo":{"full_name":"guardian-intelligence/apm2"}},
+  "head":{"repo":{"full_name":"guardian-intelligence/apm2","fork":false}},
+  "labels":[]
+}"#,
+        )
+        .expect("write pr json");
+
+        let mut context = workflow_context(
+            "authorization/event_owner_allowed.json",
+            "authorization/trust_policy_main_only.json",
+            "ci-test",
+        );
+        context.event_name = "workflow_dispatch".to_string();
+        context.event_path = event_path;
+        context.pr_json_override_path = Some(pr_json_path);
+        context.permission_lookup = permission_lookup_write;
+
+        let code = run_workflow_authorization_with_context(&context, false);
+        assert_eq!(code, exit_codes::SUCCESS);
+    }
+
+    #[test]
+    fn workflow_dispatch_denies_when_permission_lookup_not_writable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let event_path = dir.path().join("event.json");
+        let pr_json_path = dir.path().join("pr.json");
+        std::fs::write(&event_path, r#"{"inputs":{"pr_number":"42"}}"#).expect("write event");
+        std::fs::write(
+            &pr_json_path,
+            r#"{
+  "state":"open",
+  "author_association":"OWNER",
+  "base":{"ref":"main","repo":{"full_name":"guardian-intelligence/apm2"}},
+  "head":{"repo":{"full_name":"guardian-intelligence/apm2","fork":false}},
+  "labels":[]
+}"#,
+        )
+        .expect("write pr json");
+
+        let mut context = workflow_context(
+            "authorization/event_owner_allowed.json",
+            "authorization/trust_policy_main_only.json",
+            "ci-test",
+        );
+        context.event_name = "workflow_dispatch".to_string();
+        context.event_path = event_path;
+        context.pr_json_override_path = Some(pr_json_path);
+        context.permission_lookup = permission_lookup_read;
+
+        let code = run_workflow_authorization_with_context(&context, false);
+        assert_eq!(code, exit_codes::GENERIC_ERROR);
+    }
+
+    #[test]
+    fn workflow_authorization_denies_oversized_event_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let event_path = dir.path().join("event_oversized.json");
+        let payload = "x".repeat(MAX_EVENT_JSON_SIZE + 1);
+        std::fs::write(&event_path, payload).expect("write oversized event");
+
+        let mut context = workflow_context(
+            "authorization/event_owner_allowed.json",
+            "authorization/trust_policy_main_only.json",
+            "ci-test",
+        );
+        context.event_path = event_path;
+        let code = run_workflow_authorization_with_context(&context, false);
+        assert_eq!(code, exit_codes::GENERIC_ERROR);
+    }
+
+    #[test]
+    fn workflow_authorization_denies_oversized_policy_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let policy_path = dir.path().join("policy_oversized.json");
+        let payload = "x".repeat(MAX_POLICY_JSON_SIZE + 1);
+        std::fs::write(&policy_path, payload).expect("write oversized policy");
+
+        let mut context = workflow_context(
+            "authorization/event_owner_allowed.json",
+            "authorization/trust_policy_main_only.json",
+            "ci-test",
+        );
+        context.policy_path = policy_path;
         let code = run_workflow_authorization_with_context(&context, false);
         assert_eq!(code, exit_codes::GENERIC_ERROR);
     }

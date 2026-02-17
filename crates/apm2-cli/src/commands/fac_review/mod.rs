@@ -4191,6 +4191,7 @@ pub(super) fn run_gates_local_worker(
     pids_max: u64,
     cpu_quota: &str,
     gate_profile: GateThroughputProfile,
+    workspace_root: &Path,
 ) -> Result<u8, String> {
     gates::run_gates_local_worker(
         force,
@@ -4200,6 +4201,7 @@ pub(super) fn run_gates_local_worker(
         pids_max,
         cpu_quota,
         gate_profile,
+        workspace_root,
     )
 }
 

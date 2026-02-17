@@ -175,10 +175,12 @@ pub(super) fn run_gates_local_worker(
     pids_max: u64,
     cpu_quota: &str,
     gate_profile: GateThroughputProfile,
+    workspace_root: &Path,
 ) -> Result<u8, String> {
     let (resolved_profile, effective_cpu_quota) =
         resolve_effective_execution_profile(cpu_quota, gate_profile)?;
     let summary = run_gates_inner(
+        workspace_root,
         force,
         quick,
         timeout_seconds,
@@ -543,6 +545,7 @@ struct GateResult {
 
 #[allow(clippy::too_many_arguments)]
 fn run_gates_inner(
+    workspace_root: &Path,
     force: bool,
     quick: bool,
     timeout_seconds: u64,
@@ -563,9 +566,7 @@ fn run_gates_inner(
         ));
     }
 
-    let workspace_root =
-        std::env::current_dir().map_err(|e| format!("failed to resolve cwd: {e}"))?;
-    let timeout_decision = resolve_bounded_test_timeout(&workspace_root, timeout_seconds);
+    let timeout_decision = resolve_bounded_test_timeout(workspace_root, timeout_seconds);
 
     // TCK-00526: Load FAC policy for environment enforcement.
     let apm2_home = apm2_core::github::resolve_apm2_home()
@@ -597,12 +598,12 @@ fn run_gates_inner(
 
     // 1. Require clean working tree for full gates only. `--force` allows
     // rerunning gates for the same SHA while local edits are in progress.
-    ensure_clean_working_tree(&workspace_root, quick || force)?;
+    ensure_clean_working_tree(workspace_root, quick || force)?;
 
     // 2. Resolve HEAD SHA.
     let sha_output = Command::new("git")
         .args(["rev-parse", "HEAD"])
-        .current_dir(&workspace_root)
+        .current_dir(workspace_root)
         .output()
         .map_err(|e| format!("failed to run git rev-parse HEAD: {e}"))?;
     if !sha_output.status.success() {
@@ -622,7 +623,7 @@ fn run_gates_inner(
             gate_name: "merge_conflict_main".to_string(),
         });
     }
-    let merge_gate = evaluate_merge_conflict_gate(&workspace_root, &sha, emit_human_logs)?;
+    let merge_gate = evaluate_merge_conflict_gate(workspace_root, &sha, emit_human_logs)?;
     // Emit gate_completed immediately after the merge gate finishes.
     if let Some(ref cb) = on_gate_progress {
         cb(super::evidence::GateProgressEvent::Completed {
@@ -666,7 +667,7 @@ fn run_gates_inner(
         None
     } else {
         let spec = build_systemd_bounded_test_command(
-            &workspace_root,
+            workspace_root,
             BoundedTestLimits {
                 timeout_seconds: timeout_decision.effective_seconds,
                 kill_after_seconds: DEFAULT_TEST_KILL_AFTER_SECONDS,
@@ -719,7 +720,7 @@ fn run_gates_inner(
     // 5. Run evidence gates.
     let started = Instant::now();
     let (passed, gate_results) = run_evidence_gates_with_lane_context(
-        &workspace_root,
+        workspace_root,
         &sha,
         None,
         Some(&opts),
@@ -742,12 +743,12 @@ fn run_gates_inner(
         let mut cache = GateCache::new(&sha);
         for result in &gate_results {
             let command = gate_command_for_attestation(
-                &workspace_root,
+                workspace_root,
                 &result.gate_name,
                 opts.test_command.as_deref(),
             );
             let attestation_digest = command.and_then(|cmd| {
-                compute_gate_attestation(&workspace_root, &sha, &result.gate_name, &cmd, &policy)
+                compute_gate_attestation(workspace_root, &sha, &result.gate_name, &cmd, &policy)
                     .ok()
                     .map(|attestation| attestation.attestation_digest)
             });
@@ -1480,6 +1481,7 @@ mod tests {
         env::set_current_dir(&repo).expect("set test repository as cwd");
 
         let summary = run_gates_inner(
+            &repo,
             false,
             true,
             30,
