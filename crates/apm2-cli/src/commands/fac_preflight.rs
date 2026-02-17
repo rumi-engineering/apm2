@@ -118,13 +118,29 @@ fn render_cmdline(path: &Path) -> Result<String, String> {
 
 fn validate_repository_owner_repo(repository: &str) -> Result<(), String> {
     let re = Regex::new(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$").expect("static repository regex");
-    if re.is_match(repository) {
-        Ok(())
-    } else {
-        Err(format!(
+    if !re.is_match(repository) {
+        return Err(format!(
             "invalid repository format `{repository}` (expected owner/repo)"
-        ))
+        ));
     }
+
+    let mut parts = repository.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repo = parts.next().unwrap_or_default();
+    if owner == "." || owner == ".." || repo == "." || repo == ".." {
+        return Err(format!(
+            "invalid repository format `{repository}` (reserved path segment)"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pr_number(pr_number: &str) -> Result<(), String> {
+    if pr_number.is_empty() || !pr_number.chars().all(|ch| ch.is_ascii_digit()) || pr_number == "0"
+    {
+        return Err(format!("invalid pr_number `{pr_number}`"));
+    }
+    Ok(())
 }
 
 fn validate_actor_name(actor: &str) -> Result<(), String> {
@@ -456,64 +472,29 @@ fn scan_regex_matches(paths: &[PathBuf], regex: &Regex) -> Result<Vec<String>, S
 }
 
 pub fn run_workflow_authorization(json_output: bool) -> u8 {
-    let event_name = std::env::var("APM2_PREFLIGHT_EVENT_NAME")
+    let event_name = std::env::var("GITHUB_EVENT_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let event_path = std::env::var("GITHUB_EVENT_PATH")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("GITHUB_EVENT_NAME")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        });
-    let event_path = std::env::var("APM2_PREFLIGHT_EVENT_PATH")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("GITHUB_EVENT_PATH")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
         .map(PathBuf::from);
-    let repository = std::env::var("APM2_PREFLIGHT_REPOSITORY")
+    let repository = std::env::var("GITHUB_REPOSITORY")
         .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("GITHUB_REPOSITORY")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        });
-    let actor = std::env::var("APM2_PREFLIGHT_ACTOR")
+        .filter(|value| !value.trim().is_empty());
+    let actor = std::env::var("GITHUB_ACTOR")
         .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("GITHUB_ACTOR")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-    let dispatch_ref = std::env::var("APM2_PREFLIGHT_REF_NAME")
+        .filter(|value| !value.trim().is_empty());
+    let dispatch_ref = std::env::var("GITHUB_REF_NAME")
         .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("GITHUB_REF_NAME")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        });
-    let policy_path = std::env::var("APM2_PREFLIGHT_TRUST_POLICY_PATH")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map_or_else(|| PathBuf::from(DEFAULT_POLICY_PATH), PathBuf::from);
+        .filter(|value| !value.trim().is_empty());
+    let policy_path = PathBuf::from(DEFAULT_POLICY_PATH);
     let runtime_stage = std::env::var("APM2_CREDENTIAL_HARDENING_STAGE")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "preflight".to_string());
-    let cmdline_path = std::env::var("APM2_CREDENTIAL_HARDENING_CMDLINE_PATH")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map_or_else(|| PathBuf::from("/proc/self/cmdline"), PathBuf::from);
-    let pr_json_override_path = std::env::var("APM2_PREFLIGHT_PR_JSON_PATH")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from);
+    let cmdline_path = PathBuf::from("/proc/self/cmdline");
+    let pr_json_override_path = None;
     let github_token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
     let gh_token = std::env::var("GH_TOKEN").unwrap_or_default();
     let pat_env_values = collect_pat_env_values();
@@ -545,6 +526,9 @@ pub fn run_workflow_authorization(json_output: bool) -> u8 {
             json_output,
         );
     };
+    let Some(actor) = actor else {
+        return deny(FAC_AUTH_PREFIX, "context", "missing_actor", "", json_output);
+    };
     if let Err(reason) = validate_repository_owner_repo(&repository) {
         return deny(
             FAC_AUTH_PREFIX,
@@ -566,7 +550,7 @@ pub fn run_workflow_authorization(json_output: bool) -> u8 {
     let context = WorkflowAuthorizationContext {
         event_name,
         event_path,
-        repository,
+        repository: repository.to_ascii_lowercase(),
         actor,
         dispatch_ref,
         policy_path,
@@ -726,6 +710,15 @@ fn run_workflow_authorization_with_context(
                     json_output,
                 );
             }
+            if let Err(reason) = validate_pr_number(&pr_number) {
+                return deny(
+                    FAC_AUTH_PREFIX,
+                    "context",
+                    "invalid_pr_number",
+                    &reason,
+                    json_output,
+                );
+            }
             let pr_json = match context.pr_json_override_path.as_deref() {
                 Some(path) => match read_json_file_with_limit(path, MAX_PR_JSON_OVERRIDE_SIZE) {
                     Ok(value) => value,
@@ -765,12 +758,12 @@ fn run_workflow_authorization_with_context(
         },
     };
 
-    if !pr_number.chars().all(|ch| ch.is_ascii_digit()) || pr_number == "0" {
+    if let Err(reason) = validate_pr_number(&pr_number) {
         return deny(
             FAC_AUTH_PREFIX,
             "context",
             "invalid_pr_number",
-            &format!("pr={pr_number}"),
+            &reason,
             json_output,
         );
     }
@@ -815,7 +808,7 @@ fn run_workflow_authorization_with_context(
     let actor_is_trusted_app = policy
         .trusted_app_actors
         .iter()
-        .any(|value| value == &context.actor);
+        .any(|value| value.eq_ignore_ascii_case(&context.actor));
 
     let base_ref = pr_json
         .pointer("/base/ref")
@@ -1296,6 +1289,12 @@ mod tests {
     }
 
     #[test]
+    fn repository_validation_rejects_reserved_segments() {
+        assert!(validate_repository_owner_repo("../apm2").is_err());
+        assert!(validate_repository_owner_repo("guardian-intelligence/..").is_err());
+    }
+
+    #[test]
     fn credential_lint_accepts_safe_fixture() {
         let code =
             run_credential_lint(&[fixture_path("credential_hardening/lint_safe.txt")], false);
@@ -1484,6 +1483,26 @@ mod tests {
         context.event_path = event_path;
         context.pr_json_override_path = Some(pr_json_path);
         context.permission_lookup = permission_lookup_read;
+
+        let code = run_workflow_authorization_with_context(&context, false);
+        assert_eq!(code, exit_codes::GENERIC_ERROR);
+    }
+
+    #[test]
+    fn workflow_dispatch_denies_invalid_pr_number_before_lookup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let event_path = dir.path().join("event_invalid_pr.json");
+        std::fs::write(&event_path, r#"{"inputs":{"pr_number":"42/commits"}}"#)
+            .expect("write event");
+
+        let mut context = workflow_context(
+            "authorization/event_owner_allowed.json",
+            "authorization/trust_policy_main_only.json",
+            "ci-test",
+        );
+        context.event_name = "workflow_dispatch".to_string();
+        context.event_path = event_path;
+        context.permission_lookup = permission_lookup_write;
 
         let code = run_workflow_authorization_with_context(&context, false);
         assert_eq!(code, exit_codes::GENERIC_ERROR);

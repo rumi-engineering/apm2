@@ -208,6 +208,7 @@ const DEFAULT_GATES_PIDS_MAX: u64 = 1536;
 #[cfg(test)]
 const DEFAULT_GATES_CPU_QUOTA: &str = "auto";
 const UNKNOWN_REPO_SEGMENT: &str = "unknown";
+const ALLOWED_WORKSPACE_ROOTS_ENV: &str = "APM2_FAC_ALLOWED_WORKSPACE_ROOTS";
 
 #[cfg(test)]
 pub fn env_var_test_lock() -> &'static std::sync::Mutex<()> {
@@ -1253,6 +1254,7 @@ fn resolve_workspace_root(raw: &str, expected_repo_id: &str) -> Result<PathBuf, 
 
     // Explicitly block FAC-internal roots.
     let apm2_home = resolve_apm2_home().ok_or_else(|| "cannot resolve APM2_HOME".to_string())?;
+    let apm2_home = apm2_home.canonicalize().unwrap_or(apm2_home);
     let blocked_roots = [
         apm2_home.join("private").join("fac"),
         apm2_home.join("queue"),
@@ -1264,6 +1266,16 @@ fn resolve_workspace_root(raw: &str, expected_repo_id: &str) -> Result<PathBuf, 
         return Err(format!(
             "workspace_root {} is within FAC-internal storage (denied)",
             canonical.display()
+        ));
+    }
+
+    let allowed_roots = resolve_allowed_workspace_roots()?;
+    if !is_within_allowed_workspace_roots(&canonical, &allowed_roots) {
+        return Err(format!(
+            "workspace_root {} is outside allowed workspace roots [{}]; configure {}",
+            canonical.display(),
+            format_allowed_workspace_roots(&allowed_roots),
+            ALLOWED_WORKSPACE_ROOTS_ENV
         ));
     }
 
@@ -1303,6 +1315,85 @@ fn resolve_workspace_root(raw: &str, expected_repo_id: &str) -> Result<PathBuf, 
     }
 
     Ok(canonical)
+}
+
+fn resolve_allowed_workspace_roots() -> Result<Vec<PathBuf>, String> {
+    let mut allowed = Vec::new();
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        if home.is_dir() {
+            if let Ok(canonical_home) = home.canonicalize() {
+                allowed.push(canonical_home);
+            }
+        }
+    }
+
+    if let Some(repo_root) = resolve_current_git_toplevel() {
+        allowed.push(repo_root);
+    }
+
+    if let Some(raw) = std::env::var_os(ALLOWED_WORKSPACE_ROOTS_ENV) {
+        for root in std::env::split_paths(&raw) {
+            if root.as_os_str().is_empty() {
+                continue;
+            }
+            if !root.is_dir() {
+                return Err(format!(
+                    "{} entry is not a directory: {}",
+                    ALLOWED_WORKSPACE_ROOTS_ENV,
+                    root.display()
+                ));
+            }
+            let canonical_root = root.canonicalize().map_err(|err| {
+                format!(
+                    "failed to canonicalize {} entry {}: {err}",
+                    ALLOWED_WORKSPACE_ROOTS_ENV,
+                    root.display()
+                )
+            })?;
+            allowed.push(canonical_root);
+        }
+    }
+
+    allowed.sort();
+    allowed.dedup();
+    if allowed.is_empty() {
+        return Err(format!(
+            "no allowed workspace roots resolved; set {ALLOWED_WORKSPACE_ROOTS_ENV}"
+        ));
+    }
+    Ok(allowed)
+}
+
+fn resolve_current_git_toplevel() -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    let path = PathBuf::from(raw.trim());
+    if !path.is_dir() {
+        return None;
+    }
+    path.canonicalize().ok()
+}
+
+fn is_within_allowed_workspace_roots(candidate: &Path, allowed_roots: &[PathBuf]) -> bool {
+    allowed_roots
+        .iter()
+        .any(|root| candidate == root || candidate.starts_with(root))
+}
+
+fn format_allowed_workspace_roots(allowed_roots: &[PathBuf]) -> String {
+    allowed_roots
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn resolve_repo_id(workspace_root: &Path) -> String {
@@ -5678,6 +5769,78 @@ mod tests {
             set_env_var_for_test("APM2_HOME", value);
         } else {
             remove_env_var_for_test("APM2_HOME");
+        }
+    }
+
+    #[test]
+    fn test_parse_gates_job_options_rejects_workspace_outside_allowlist_roots() {
+        let _guard = env_var_test_lock().lock().expect("serialize env test");
+        let original_allowlist = std::env::var_os(ALLOWED_WORKSPACE_ROOTS_ENV);
+        remove_env_var_for_test(ALLOWED_WORKSPACE_ROOTS_ENV);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().join("foreign-workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        init_test_workspace_git_repo(&workspace);
+
+        let mut spec = make_receipt_test_spec();
+        spec.source.repo_id = resolve_repo_id(&workspace);
+        spec.source.patch = Some(serde_json::json!({
+            "schema": GATES_JOB_OPTIONS_SCHEMA,
+            "force": false,
+            "quick": false,
+            "timeout_seconds": 600,
+            "memory_max": "48G",
+            "pids_max": 1536,
+            "cpu_quota": "auto",
+            "gate_profile": "throughput",
+            "workspace_root": workspace.to_string_lossy()
+        }));
+        let err =
+            parse_gates_job_options(&spec).expect_err("workspace outside allowlist must deny");
+        assert!(
+            err.contains("outside allowed workspace roots"),
+            "unexpected error: {err}"
+        );
+
+        if let Some(value) = original_allowlist {
+            set_env_var_for_test(ALLOWED_WORKSPACE_ROOTS_ENV, value);
+        } else {
+            remove_env_var_for_test(ALLOWED_WORKSPACE_ROOTS_ENV);
+        }
+    }
+
+    #[test]
+    fn test_parse_gates_job_options_accepts_workspace_in_explicit_allowlist() {
+        let _guard = env_var_test_lock().lock().expect("serialize env test");
+        let original_allowlist = std::env::var_os(ALLOWED_WORKSPACE_ROOTS_ENV);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().join("allowed-workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        init_test_workspace_git_repo(&workspace);
+        set_env_var_for_test(ALLOWED_WORKSPACE_ROOTS_ENV, &workspace);
+
+        let mut spec = make_receipt_test_spec();
+        spec.source.repo_id = resolve_repo_id(&workspace);
+        spec.source.patch = Some(serde_json::json!({
+            "schema": GATES_JOB_OPTIONS_SCHEMA,
+            "force": false,
+            "quick": false,
+            "timeout_seconds": 600,
+            "memory_max": "48G",
+            "pids_max": 1536,
+            "cpu_quota": "auto",
+            "gate_profile": "throughput",
+            "workspace_root": workspace.to_string_lossy()
+        }));
+        let options = parse_gates_job_options(&spec).expect("allowlisted workspace should pass");
+        assert_eq!(options.workspace_root, workspace);
+
+        if let Some(value) = original_allowlist {
+            set_env_var_for_test(ALLOWED_WORKSPACE_ROOTS_ENV, value);
+        } else {
+            remove_env_var_for_test(ALLOWED_WORKSPACE_ROOTS_ENV);
         }
     }
 

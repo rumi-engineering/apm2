@@ -25,19 +25,13 @@ pub const WORKSPACE_INTEGRITY_SNAPSHOT_REL_PATH: &str =
     "target/ci/workspace_integrity.snapshot.tsv";
 
 const MAX_TEST_SAFETY_SOURCE_FILE_SIZE: usize = 10 * 1024 * 1024;
+const MAX_TEST_SAFETY_TARGET_FILES: usize = 20_000;
+const MAX_TEST_SAFETY_TOTAL_SOURCE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_TEST_SAFETY_ALLOWLIST_FILE_SIZE: usize = 512 * 1024;
 const MAX_REVIEW_ARTIFACT_FILE_SIZE: usize = 10 * 1024 * 1024;
 const MAX_PROMPT_FILE_SIZE: usize = 4 * 1024 * 1024;
 const MAX_TRUSTED_REVIEWERS_FILE_SIZE: usize = 1024 * 1024;
 const MAX_WORKSPACE_SNAPSHOT_FILE_SIZE: usize = 10 * 1024 * 1024;
-const TEST_SAFETY_FALLBACK_EXCLUDED_DIRS: &[&str] = &[
-    ".git",
-    "target",
-    ".nextest",
-    ".cargo",
-    "node_modules",
-    ".cache",
-];
 
 #[derive(Debug, Clone)]
 pub struct CheckExecution {
@@ -155,10 +149,6 @@ const TEST_SAFETY_RULES: &[RuleSpec] = &[
     },
 ];
 
-fn normalize_rel(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
 fn walk_regular_files(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut stack = vec![root.to_path_buf()];
     let mut files = Vec::new();
@@ -181,12 +171,6 @@ fn walk_regular_files(root: &Path) -> Result<Vec<PathBuf>, String> {
                 continue;
             }
             if file_type.is_dir() {
-                if TEST_SAFETY_FALLBACK_EXCLUDED_DIRS
-                    .iter()
-                    .any(|name| entry.file_name() == OsStr::new(name))
-                {
-                    continue;
-                }
                 stack.push(path);
                 continue;
             }
@@ -252,29 +236,23 @@ fn should_scan_default_target(rel: &str, abs: &Path) -> Result<bool, String> {
 fn collect_test_safety_targets(workspace_root: &Path) -> Result<BTreeSet<String>, String> {
     let mut targets = BTreeSet::new();
 
-    match tracked_files(workspace_root) {
-        Ok(files) => {
-            for rel in files {
-                let abs = workspace_root.join(&rel);
-                if !abs.is_file() {
-                    continue;
-                }
-                if should_scan_default_target(&rel, &abs)? {
-                    targets.insert(rel);
-                }
+    let files = tracked_files(workspace_root)
+        .map_err(|err| format!("test safety target discovery failed (fail-closed): {err}"))?;
+    for rel in files {
+        let abs = workspace_root.join(&rel);
+        if !abs.is_file() {
+            continue;
+        }
+        if should_scan_default_target(&rel, &abs)? {
+            targets.insert(rel);
+            if targets.len() > MAX_TEST_SAFETY_TARGET_FILES {
+                return Err(format!(
+                    "test safety target count exceeded cap: {} > {}",
+                    targets.len(),
+                    MAX_TEST_SAFETY_TARGET_FILES
+                ));
             }
-        },
-        Err(_) => {
-            for abs in walk_regular_files(workspace_root)? {
-                let rel = match abs.strip_prefix(workspace_root) {
-                    Ok(value) => normalize_rel(value),
-                    Err(_) => continue,
-                };
-                if should_scan_default_target(&rel, &abs)? {
-                    targets.insert(rel);
-                }
-            }
-        },
+        }
     }
 
     Ok(targets)
@@ -444,10 +422,19 @@ pub fn run_test_safety_guard(workspace_root: &Path) -> Result<CheckExecution, St
 
     let mut violations = Vec::new();
     let mut target_contents = BTreeMap::new();
+    let mut total_source_bytes = 0usize;
     for rel in &targets {
         let abs = workspace_root.join(rel);
         let bytes = fac_secure_io::read_bounded(&abs, MAX_TEST_SAFETY_SOURCE_FILE_SIZE)
             .map_err(|err| format!("failed to read test safety target {}: {err}", abs.display()))?;
+        total_source_bytes = total_source_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| "test safety source byte accounting overflow".to_string())?;
+        if total_source_bytes > MAX_TEST_SAFETY_TOTAL_SOURCE_BYTES {
+            return Err(format!(
+                "test safety source bytes exceeded cap: {total_source_bytes} > {MAX_TEST_SAFETY_TOTAL_SOURCE_BYTES}",
+            ));
+        }
         target_contents.insert(rel.clone(), String::from_utf8_lossy(&bytes).into_owned());
     }
 
@@ -893,12 +880,7 @@ pub fn run_review_artifact_lint(workspace_root: &Path) -> Result<CheckExecution,
         review_dir.join("SECURITY_REVIEW_PROMPT.cac.json"),
     ] {
         if !prompt.exists() {
-            writeln!(
-                output,
-                "WARN: Review prompt not found: {}",
-                prompt.display()
-            )
-            .ok();
+            violations.push(format!("Review prompt not found: {}", prompt.display()));
             continue;
         }
         match validate_prompt_identity_constraints(&prompt) {
@@ -1330,9 +1312,29 @@ mod tests {
         let repo = dir.path();
         fs::create_dir_all(repo.join("tests")).expect("create tests");
         fs::write(repo.join("tests/unsafe_test.sh"), b"rm -rf /\n").expect("write unsafe test");
+        init_git_repo(repo);
+        run_git(repo, &["add", "."]);
 
         let err = run_test_safety_guard(repo).expect_err("missing allowlist should fail closed");
         assert!(err.contains("allowlist file not found"));
+    }
+
+    #[test]
+    fn test_safety_guard_fails_closed_when_git_tracking_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        fs::create_dir_all(repo.join("tests")).expect("create tests");
+        fs::create_dir_all(repo.join(".github/review-gate")).expect("create review-gate");
+        fs::write(repo.join("tests/unsafe_test.sh"), b"rm -rf /\n").expect("write unsafe test");
+        fs::write(
+            repo.join(".github/review-gate/test-safety-allowlist.txt"),
+            b"# empty\n",
+        )
+        .expect("write allowlist");
+
+        let err =
+            run_test_safety_guard(repo).expect_err("non-git workspace must fail target discovery");
+        assert!(err.contains("target discovery failed"));
     }
 
     #[test]
@@ -1347,6 +1349,8 @@ mod tests {
             b"TSG001|tests/unsafe_test.sh:1\n",
         )
         .expect("write allowlist");
+        init_git_repo(repo);
+        run_git(repo, &["add", "."]);
 
         let check = run_test_safety_guard(repo).expect("run guard");
         assert!(check.passed, "unexpected output:\n{}", check.output);
@@ -1386,6 +1390,8 @@ mod tests {
 "#,
         )
         .expect("write rust file");
+        init_git_repo(repo);
+        run_git(repo, &["add", "."]);
 
         let check = run_test_safety_guard(repo).expect("run guard");
         assert!(check.passed, "unexpected output:\n{}", check.output);
@@ -1419,6 +1425,8 @@ mod tests {
         ]
         .join("");
         fs::write(repo.join("src/lib.rs"), fixture).expect("write rust file");
+        init_git_repo(repo);
+        run_git(repo, &["add", "."]);
 
         let check = run_test_safety_guard(repo).expect("run guard");
         assert!(check.passed, "unexpected output:\n{}", check.output);
@@ -1450,6 +1458,8 @@ mod tests {
 ",
         )
         .expect("write rust file");
+        init_git_repo(repo);
+        run_git(repo, &["add", "."]);
 
         let check = run_test_safety_guard(repo).expect("run guard");
         assert!(!check.passed, "expected violation:\n{}", check.output);
@@ -1482,6 +1492,8 @@ mod tests {
 ",
         )
         .expect("write rust file");
+        init_git_repo(repo);
+        run_git(repo, &["add", "."]);
 
         let check = run_test_safety_guard(repo).expect("run guard");
         assert!(!check.passed, "expected violation:\n{}", check.output);
@@ -1501,6 +1513,8 @@ mod tests {
         .expect("write allowlist");
         let oversized = vec![b'x'; MAX_TEST_SAFETY_SOURCE_FILE_SIZE + 1];
         fs::write(repo.join("tests/huge_test.sh"), oversized).expect("write oversized file");
+        init_git_repo(repo);
+        run_git(repo, &["add", "."]);
 
         let err = run_test_safety_guard(repo).expect_err("oversized source must fail closed");
         assert!(err.contains("too large"));
