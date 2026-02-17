@@ -1,0 +1,201 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00617"
+    title: "Forge admission merge decoupling: local-authoritative merge with clean worktree, PR projection, and signed receipts"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY", "DOMAIN_CI"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00616"
+        reason: "Gates-before-push ordering and projection demotion must land first."
+      - ticket_id: "TCK-00614"
+        reason: "Queued-gates fail-closed hardening is prerequisite for merge-after-gates."
+  root_cause_analysis:
+    summary: |
+      Three compounding bugs in the post-admission merge path:
+
+      BUG 1: Main branch gets dirty after merge.
+        Location: lifecycle.rs:2058-2085 (sync_main_worktree_if_present)
+        Cause: After try_fast_forward_main() updates refs/heads/main via
+        git update-ref, the worktree sync only runs `git reset --hard HEAD`
+        which handles tracked files but leaves untracked files from the
+        feature branch work. git_worktree_has_tracked_changes() uses
+        --untracked-files=no so untracked artifacts accumulate. Additionally,
+        no cleanup of the feature branch ref or its worktree happens post-merge.
+
+      BUG 2: PR/Admission Request status not updated post-merge.
+        Location: lifecycle.rs:2289-2321 (maybe_auto_merge_if_ready_inner success path)
+        Cause: After successful local fast-forward + push to origin, the code
+        only records a local Merged lifecycle event. No GitHub API call closes
+        the PR, deletes the remote branch, or updates the PR body. The system
+        relies on GitHub detecting the fast-forward push to auto-close the PR,
+        which is GitHub-dependent and not guaranteed.
+
+      BUG 3: GitHub still used as source of truth for merge state.
+        Location: lifecycle.rs:2087-2132 (sync_local_main_with_origin),
+                  push.rs:1909 (enable_auto_merge),
+                  CLAUDE.md ("GitHub is temporarily authoritative for merges")
+        Cause: Two competing merge paths exist:
+        (a) Local fast-forward merge triggered by maybe_auto_merge_if_ready()
+            when both security + code-quality verdicts are approve.
+        (b) GitHub auto-merge enabled during fac push via enable_auto_merge()
+            which lets GitHub merge independently when status checks pass.
+        Either can fire first, creating race conditions. The CLI merge path
+        produces no signed MergeReceipt (the daemon MergeExecutor does, but
+        is not wired into the CLI path). sync_local_main_with_origin() treats
+        origin/main as authoritative, not local state.
+
+scope:
+  in_scope:
+    - id: "S1_CLEAN_WORKTREE_POST_MERGE"
+      title: "Clean worktree after merge (tracked + untracked)"
+      detail: |
+        After successful fast-forward merge of a feature branch:
+        - Run `git clean -fd` (or equivalent) on the main worktree to remove
+          untracked files left by the feature branch work.
+        - Delete the local feature branch ref.
+        - Remove or detach the feature branch worktree if it exists.
+        - Clean up any stale worktree target/ directories.
+        Ensures main is always clean after admission without manual intervention.
+
+    - id: "S2_PROJECT_MERGE_TO_GITHUB"
+      title: "Project merge state to GitHub post-merge"
+      detail: |
+        After successful local merge + push to origin:
+        - Close the PR via GitHub API if not auto-closed by fast-forward detection.
+        - Delete the remote feature branch.
+        - Update PR body with merge evidence (merge commit SHA, timestamp, receipt).
+        - Post a final commit status update reflecting merged state.
+        All of these are projections (best-effort, non-authoritative). Local
+        lifecycle Merged event remains the source of truth.
+
+    - id: "S3_REMOVE_GITHUB_AUTO_MERGE"
+      title: "Stop enabling GitHub auto-merge during fac push"
+      detail: |
+        Remove the call to enable_auto_merge() in the push flow. The local
+        maybe_auto_merge_if_ready() path is the authoritative merge trigger.
+        GitHub auto-merge creates a competing merge path and race condition.
+        With strict_required_status_checks_policy=true (TCK-00616), the PR
+        cannot merge via GitHub until FAC status is posted anyway, so GitHub
+        auto-merge adds no value and adds risk.
+
+    - id: "S4_SIGNED_MERGE_RECEIPT"
+      title: "Emit signed MergeReceipt on CLI merge path"
+      detail: |
+        The daemon MergeExecutor already produces signed MergeReceipts.
+        The CLI maybe_auto_merge_if_ready_inner() path does not.
+        Add MergeReceipt emission to the CLI path:
+        - Bind receipt to gate evidence hashes, verdict hashes, and merge commit SHA.
+        - Sign with broker/operator key.
+        - Persist to receipts store.
+        This makes the merge cryptographically attested, not just a raw git operation.
+
+    - id: "S5_LOCAL_AUTHORITATIVE_MERGE_STATE"
+      title: "Make local lifecycle state authoritative for merge (remove origin dependency)"
+      detail: |
+        sync_local_main_with_origin() currently treats origin/main as
+        authoritative. Invert this:
+        - Local lifecycle Merged event + signed receipt = authoritative merge.
+        - Origin is a projection target, not a source of truth.
+        - If origin/main has diverged unexpectedly, fail-closed and surface
+          the conflict rather than silently accepting origin state.
+        - Remove "GitHub is temporarily authoritative for merges" from CLAUDE.md
+          once this lands.
+
+    - id: "S6_REGRESSION_TESTS"
+      title: "Regression tests for merge flow"
+      detail: |
+        - Test: worktree is clean (no untracked files) after merge.
+        - Test: feature branch ref deleted after merge.
+        - Test: GitHub auto-merge is NOT enabled during push.
+        - Test: MergeReceipt is emitted and verifiable after CLI merge.
+        - Test: origin divergence triggers fail-closed, not silent acceptance.
+        - Test: PR is closed/updated via projection after merge.
+
+  out_of_scope:
+    - "Redesigning the daemon MergeExecutor or wiring it into the CLI path (future unification)."
+    - "Multi-repo or distributed merge coordination."
+    - "Changing the verdict state machine (security + code-quality approve = MergeReady)."
+
+plan:
+  steps:
+    - id: "STEP_01"
+      title: "Fix worktree cleanup post-merge"
+      detail: |
+        In sync_main_worktree_if_present(): add git clean -fd after
+        git reset --hard HEAD. Add feature branch ref deletion and
+        worktree removal/detach logic.
+    - id: "STEP_02"
+      title: "Add post-merge GitHub projection"
+      detail: |
+        After Merged lifecycle event: close PR, delete remote branch,
+        update PR body, post final status. All best-effort projection.
+    - id: "STEP_03"
+      title: "Remove enable_auto_merge() from fac push"
+      detail: |
+        Delete the call in push.rs:1909. Local merge path is authoritative.
+    - id: "STEP_04"
+      title: "Add signed MergeReceipt to CLI merge path"
+      detail: |
+        Emit MergeReceipt binding gate evidence, verdicts, and merge commit.
+        Sign with broker/operator key. Persist to receipts store.
+    - id: "STEP_05"
+      title: "Invert origin/main authority"
+      detail: |
+        Make sync_local_main_with_origin() fail-closed on unexpected divergence
+        instead of accepting origin state. Local Merged event is authoritative.
+    - id: "STEP_06"
+      title: "Add regression tests"
+      detail: |
+        Clean worktree, branch cleanup, no auto-merge, receipt emission,
+        origin divergence fail-closed, PR projection.
+    - id: "STEP_07"
+      title: "Run full workspace validation"
+      detail: |
+        - cargo fmt --all
+        - cargo clippy --workspace --all-targets --all-features -- -D warnings
+        - cargo doc --workspace --no-deps
+        - cargo test --workspace
+
+definition_of_done:
+  evidence_ids:
+    - "EXEC-TCK00617-CLEAN-WORKTREE"
+    - "EXEC-TCK00617-MERGE-RECEIPT"
+    - "EXEC-TCK00617-PR-PROJECTION"
+    - "EXEC-TCK00617-WORKSPACE-VALIDATION"
+  criteria:
+    - "After forge admission merge, main worktree has zero untracked files from the feature branch."
+    - "Feature branch ref and worktree are cleaned up after merge."
+    - "GitHub auto-merge is not enabled during fac push."
+    - "Signed MergeReceipt is emitted on CLI merge path, binding gate evidence + verdicts + merge SHA."
+    - "PR is closed, remote branch deleted, and PR body updated via projection after merge."
+    - "Origin/main divergence triggers fail-closed error, not silent acceptance."
+    - "CLAUDE.md no longer says GitHub is temporarily authoritative for merges."
+    - "Regression tests pass for all merge flow invariants."
+    - "Workspace validation commands complete successfully."
+
+notes:
+  context: |
+    The merge path in the CLI (lifecycle.rs maybe_auto_merge_if_ready_inner)
+    currently does a local git fast-forward + push to origin, but:
+    - Leaves untracked files in the main worktree
+    - Does not close or update the PR on GitHub
+    - Does not delete the remote feature branch
+    - Does not emit a signed MergeReceipt
+    - Races with GitHub auto-merge (enabled during fac push)
+    - Treats origin/main as authoritative via sync_local_main_with_origin()
+
+    The daemon-side MergeExecutor (gate/merge_executor.rs) has the right
+    design (signed receipts, event emission, policy validation) but is not
+    wired into the CLI lifecycle path. This ticket fixes the CLI path
+    directly; unifying with the daemon executor is future work.
+  security: "default-deny, fail-closed on origin divergence, signed merge receipts"

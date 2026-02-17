@@ -4,7 +4,11 @@ ticket_meta:
   ticket:
     id: "TCK-00579"
     title: "Strict job spec validation policy: allowed kinds/repos; size caps; patch backend allowlist; deny unknown"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 716
+        merge_commit: "620483d4c6909ccb921df74fb2ec3e26e9ddbc5d"
+        merged_at: "2026-02-17T14:35:03Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

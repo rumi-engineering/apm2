@@ -4,7 +4,15 @@ ticket_meta:
   ticket:
     id: "TCK-00584"
     title: "EconomicsProfile adoption protocol: broker-admitted economics_profile_hash with rollback + receipts"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 726
+        merge_commit: "b7558a609ffd375837995fc82c4418659d65c515"
+        merged_at: "2026-02-17T19:28:03Z"
+        note: "Merged despite pending FAC denial (INC-2026-02-17-PR726-MERGE-PAST-DENIAL). Strict policy applied post-merge."
+      - pr: 727
+        merge_commit: "e743c215839e8dcf046b06a64d1ebac09321a1fe"
+        merged_at: "2026-02-17T19:54:51Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

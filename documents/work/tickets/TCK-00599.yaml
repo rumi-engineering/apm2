@@ -4,7 +4,11 @@ ticket_meta:
   ticket:
     id: "TCK-00599"
     title: "`apm2 fac bootstrap`: compute-host provisioning (dirs, perms, policy stub, services)"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 723
+        merge_commit: "e59df5c09ddd8979f7ebd39e69f205233593479d"
+        merged_at: "2026-02-17T17:28:19Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

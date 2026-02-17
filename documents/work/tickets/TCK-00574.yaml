@@ -4,7 +4,11 @@ ticket_meta:
   ticket:
     id: "TCK-00574"
     title: "Network policy for job units: default deny network for gates, allow only for explicit fetch/warm phases (policy-driven)"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 724
+        merge_commit: "cef719dd0e3965f213c04d279c6e4862b0c6bbc9"
+        merged_at: "2026-02-17T19:20:25Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

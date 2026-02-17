@@ -4,7 +4,11 @@ ticket_meta:
   ticket:
     id: "TCK-00535"
     title: "Introspection CLI: queue status + job show + receipts list (forensics-first UX)"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 717
+        merge_commit: "a932451a483c20719c28f7ae8763f3e14d47e5ca"
+        merged_at: "2026-02-17T09:27:28Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"
