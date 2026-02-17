@@ -900,6 +900,9 @@ message GateReceipt {
   // BLAKE3 digest of the sandbox hardening profile used for gate execution.
   // Present when gate execution is bound to a materialized hardening profile.
   optional string sandbox_hardening_hash = 15;
+  // BLAKE3 digest of the network policy used for gate execution (TCK-00574).
+  // Present when gate execution is bound to a materialized network policy.
+  optional string network_policy_hash = 16;
   // Ed25519 signature over canonical bytes with GATE_RECEIPT: domain (64 bytes)
   bytes receipt_signature = 11;
   // HTF time envelope reference for temporal authority (RFC-0016).

@@ -42,6 +42,11 @@ pub struct GateResourcePolicy {
     /// hardening profile is modified, preventing stale gate result reuse
     /// from insecure environments.
     pub sandbox_hardening: Option<String>,
+    /// BLAKE3 hash of the `NetworkPolicy` used for gate execution
+    /// (TCK-00574 MAJOR-1). Ensures the attestation digest changes when the
+    /// network policy toggles between allow and deny, preventing cache
+    /// reuse across policy drift.
+    pub network_policy_hash: Option<String>,
 }
 
 impl GateResourcePolicy {
@@ -57,6 +62,7 @@ impl GateResourcePolicy {
         gate_profile: Option<&str>,
         test_parallelism: Option<u32>,
         sandbox_hardening: Option<&str>,
+        network_policy_hash: Option<&str>,
     ) -> Self {
         Self {
             quick_mode,
@@ -68,6 +74,7 @@ impl GateResourcePolicy {
             test_parallelism,
             bounded_runner,
             sandbox_hardening: sandbox_hardening.map(str::to_string),
+            network_policy_hash: network_policy_hash.map(str::to_string),
         }
     }
 }
@@ -513,8 +520,9 @@ mod tests {
         let workspace_root = std::env::current_dir().expect("cwd");
         let command =
             gate_command_for_attestation(&workspace_root, "rustfmt", None).expect("command");
-        let policy =
-            GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true, None, None, None);
+        let policy = GateResourcePolicy::from_cli(
+            false, 600, "48G", 1536, "200%", true, None, None, None, None,
+        );
 
         let one = compute_gate_attestation(
             &workspace_root,
@@ -668,6 +676,7 @@ mod tests {
             Some("throughput"),
             Some(8),
             None,
+            None,
         );
         let conservative = GateResourcePolicy::from_cli(
             false,
@@ -678,6 +687,7 @@ mod tests {
             true,
             Some("conservative"),
             Some(2),
+            None,
             None,
         );
         assert_ne!(
@@ -715,8 +725,9 @@ mod tests {
         let workspace_root = std::env::current_dir().expect("cwd");
         let command =
             gate_command_for_attestation(&workspace_root, "rustfmt", None).expect("command");
-        let policy =
-            GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true, None, None, None);
+        let policy = GateResourcePolicy::from_cli(
+            false, 600, "48G", 1536, "200%", true, None, None, None, None,
+        );
 
         let attestation = compute_gate_attestation(
             &workspace_root,
@@ -837,6 +848,7 @@ mod tests {
             Some("throughput"),
             Some(4),
             Some(&default_hash),
+            None,
         );
         let policy_custom = GateResourcePolicy::from_cli(
             false,
@@ -848,6 +860,7 @@ mod tests {
             Some("throughput"),
             Some(4),
             Some(&custom_hash),
+            None,
         );
 
         assert_ne!(
@@ -886,6 +899,7 @@ mod tests {
             None,
             None,
             Some(&default_hash),
+            None,
         );
         let policy_custom = GateResourcePolicy::from_cli(
             false,
@@ -897,6 +911,7 @@ mod tests {
             None,
             None,
             Some(&custom_hash),
+            None,
         );
 
         let att_default =
@@ -923,8 +938,9 @@ mod tests {
         use apm2_core::fac::SandboxHardeningProfile;
 
         let default_hash = SandboxHardeningProfile::default().content_hash_hex();
-        let policy_none =
-            GateResourcePolicy::from_cli(false, 600, "48G", 1536, "200%", true, None, None, None);
+        let policy_none = GateResourcePolicy::from_cli(
+            false, 600, "48G", 1536, "200%", true, None, None, None, None,
+        );
         let policy_some = GateResourcePolicy::from_cli(
             false,
             600,
@@ -935,12 +951,151 @@ mod tests {
             None,
             None,
             Some(&default_hash),
+            None,
         );
 
         assert_ne!(
             super::resource_digest(&policy_none),
             super::resource_digest(&policy_some),
             "resource digest must differ between None and Some sandbox hardening"
+        );
+    }
+
+    // --- TCK-00574 MAJOR-1: network policy hash binds attestation ---
+
+    #[test]
+    fn resource_digest_changes_when_network_policy_hash_changes() {
+        // Regression: attestation must bind to the effective network policy.
+        // Toggling between deny and allow MUST change the resource digest
+        // (and therefore the attestation digest), preventing cache reuse
+        // across network policy drift.
+        use apm2_core::fac::NetworkPolicy;
+
+        let deny_hash = NetworkPolicy::deny().content_hash_hex();
+        let allow_hash = NetworkPolicy::allow().content_hash_hex();
+
+        // Precondition: the two hashes must differ.
+        assert_ne!(
+            deny_hash, allow_hash,
+            "deny and allow network policy must produce different content hashes"
+        );
+
+        let policy_deny = GateResourcePolicy::from_cli(
+            false,
+            600,
+            "48G",
+            1536,
+            "200%",
+            true,
+            Some("throughput"),
+            Some(4),
+            None,
+            Some(&deny_hash),
+        );
+        let policy_allow = GateResourcePolicy::from_cli(
+            false,
+            600,
+            "48G",
+            1536,
+            "200%",
+            true,
+            Some("throughput"),
+            Some(4),
+            None,
+            Some(&allow_hash),
+        );
+
+        assert_ne!(
+            super::resource_digest(&policy_deny),
+            super::resource_digest(&policy_allow),
+            "resource digest must change when network policy toggles between deny and allow \
+             (cache reuse denied across policy drift)"
+        );
+    }
+
+    #[test]
+    fn attestation_digest_changes_when_network_policy_hash_changes() {
+        // End-to-end regression: a full attestation with deny vs allow
+        // network policy hashes must produce different attestation digests.
+        use apm2_core::fac::NetworkPolicy;
+
+        let workspace_root = std::env::current_dir().expect("cwd");
+        let command =
+            gate_command_for_attestation(&workspace_root, "rustfmt", None).expect("command");
+        let sha = "cccccccccccccccccccccccccccccccccccccccc";
+
+        let deny_hash = NetworkPolicy::deny().content_hash_hex();
+        let allow_hash = NetworkPolicy::allow().content_hash_hex();
+
+        let policy_deny = GateResourcePolicy::from_cli(
+            false,
+            600,
+            "48G",
+            1536,
+            "200%",
+            true,
+            None,
+            None,
+            None,
+            Some(&deny_hash),
+        );
+        let policy_allow = GateResourcePolicy::from_cli(
+            false,
+            600,
+            "48G",
+            1536,
+            "200%",
+            true,
+            None,
+            None,
+            None,
+            Some(&allow_hash),
+        );
+
+        let att_deny =
+            compute_gate_attestation(&workspace_root, sha, "rustfmt", &command, &policy_deny)
+                .expect("attestation deny");
+        let att_allow =
+            compute_gate_attestation(&workspace_root, sha, "rustfmt", &command, &policy_allow)
+                .expect("attestation allow");
+
+        assert_ne!(
+            att_deny.attestation_digest, att_allow.attestation_digest,
+            "attestation digest must differ when network policy toggles between deny and allow"
+        );
+        assert_ne!(
+            att_deny.resource_digest, att_allow.resource_digest,
+            "resource digest component must differ when network policy changes"
+        );
+    }
+
+    #[test]
+    fn network_policy_none_vs_some_produces_different_digest() {
+        // Gate attestation with network_policy_hash=None (legacy) must differ
+        // from one with network_policy_hash=Some (post-TCK-00574).
+        use apm2_core::fac::NetworkPolicy;
+
+        let deny_hash = NetworkPolicy::deny().content_hash_hex();
+        let policy_none = GateResourcePolicy::from_cli(
+            false, 600, "48G", 1536, "200%", true, None, None, None, None,
+        );
+        let policy_some = GateResourcePolicy::from_cli(
+            false,
+            600,
+            "48G",
+            1536,
+            "200%",
+            true,
+            None,
+            None,
+            None,
+            Some(&deny_hash),
+        );
+
+        assert_ne!(
+            super::resource_digest(&policy_none),
+            super::resource_digest(&policy_some),
+            "resource digest must differ between None and Some network policy hash"
         );
     }
 }

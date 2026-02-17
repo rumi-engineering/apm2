@@ -93,9 +93,12 @@ pub use projection_continuity::{
     SinkIdentityEntry, evaluate_projection_continuity, validate_deferred_replay_boundedness,
     validate_projection_continuity_tp005,
 };
+// NoOpVerifier is only available in test or with feature = "unsafe_no_verify" (TCK-00550).
+#[cfg(any(test, feature = "unsafe_no_verify"))]
+pub use queue_admission::NoOpVerifier;
 pub use queue_admission::{
     AntiEntropyAdmissionRequest, AntiEntropyBudget, AntiEntropyDirection, ConvergenceHorizonRef,
-    ConvergenceReceipt, EnvelopeSignature, FreshnessHorizonRef, HtfEvaluationWindow, NoOpVerifier,
+    ConvergenceReceipt, EnvelopeSignature, FreshnessHorizonRef, HtfEvaluationWindow,
     QueueAdmissionDecision, QueueAdmissionRequest, QueueAdmissionTrace, QueueAdmissionVerdict,
     QueueDenyDefect, QueueLane, QueueSchedulerState, RevocationFrontierSnapshot, SignatureVerifier,
     TimeAuthorityEnvelopeV1, evaluate_anti_entropy_admission, evaluate_queue_admission,

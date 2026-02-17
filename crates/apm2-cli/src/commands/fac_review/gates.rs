@@ -969,6 +969,13 @@ fn run_gates_inner(
     // so attestation binds to the actual policy-driven profile.
     let sandbox_hardening_hash = policy.sandbox_hardening.content_hash_hex();
 
+    // TCK-00574: Resolve network policy for gates with operator override.
+    // Computed before the conditional branch so the hash is available for
+    // gate attestation (MAJOR-1: attestation digest must bind network policy).
+    let gate_network_policy =
+        apm2_core::fac::resolve_network_policy("gates", policy.network_policy.as_ref());
+    let network_policy_hash = gate_network_policy.content_hash_hex();
+
     let mut env_remove_keys = Vec::new();
     let test_command = if quick {
         None
@@ -985,6 +992,7 @@ fn run_gates_inner(
             &default_nextest_command,
             &test_command_environment,
             policy.sandbox_hardening,
+            gate_network_policy,
         )
         .map_err(|err| format!("bounded test runner unavailable for FAC gates: {err}"))?;
         bounded = true;
@@ -1039,7 +1047,9 @@ fn run_gates_inner(
     // 6. Write attested results to gate cache for full runs only.
     if !quick {
         // TCK-00573 MAJOR-3: Include sandbox hardening hash in gate attestation.
-        // Uses the effective policy-driven hash computed above (before the
+        // TCK-00574 MAJOR-1: Include network policy hash in gate attestation
+        // to prevent cache reuse across network policy drift.
+        // Uses the effective policy-driven hashes computed above (before the
         // profile was moved into the bounded test command builder).
         let policy = GateResourcePolicy::from_cli(
             quick,
@@ -1051,6 +1061,7 @@ fn run_gates_inner(
             Some(gate_profile.as_str()),
             Some(test_parallelism),
             Some(&sandbox_hardening_hash),
+            Some(&network_policy_hash),
         );
         let mut cache = GateCache::new(&sha);
         let merge_command = gate_command_for_attestation(

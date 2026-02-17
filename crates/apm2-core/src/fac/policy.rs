@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use super::job_spec::{MAX_REPO_ALLOWLIST_SIZE, parse_b3_256_digest};
 use super::policy_resolution::{DeterminismClass, RiskTier};
-use super::systemd_properties::SandboxHardeningProfile;
+use super::systemd_properties::{NetworkPolicy, SandboxHardeningProfile};
 use crate::determinism::canonicalize_json;
 use crate::economics::profile::EconomicsProfile;
 #[cfg(unix)]
@@ -230,6 +230,22 @@ pub struct FacPolicyV1 {
     #[serde(default)]
     pub sandbox_hardening: SandboxHardeningProfile,
 
+    /// Network access policy override for FAC job units (TCK-00574).
+    ///
+    /// When `Some`, this policy takes precedence over the built-in
+    /// per-job-kind mapping in `resolve_network_policy()`. When `None`
+    /// (the default), the built-in mapping is used: deny for
+    /// gates/bulk/control, allow for warm.
+    ///
+    /// This allows operators to explicitly override the default posture
+    /// globally (e.g., deny network even for warm, or allow for gates).
+    ///
+    /// The default is `None` (use built-in mapping). Existing policies
+    /// that predate TCK-00574 will correctly default to `None` via
+    /// `serde(default)`, preserving the built-in warm→allow mapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_policy: Option<NetworkPolicy>,
+
     /// Optional `repo_id` allowlist for job spec validation (TCK-00579).
     ///
     /// When `Some`, only the listed `repo_id` values are accepted by
@@ -316,6 +332,7 @@ impl FacPolicyV1 {
             determinism_class: DeterminismClass::SoftDeterministic,
             economics_profile_hash,
             sandbox_hardening: SandboxHardeningProfile::default(),
+            network_policy: None,
             allowed_repo_ids: None,
         }
     }

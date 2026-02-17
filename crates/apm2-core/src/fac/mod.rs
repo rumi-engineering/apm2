@@ -110,6 +110,9 @@ pub mod credential_gate;
 pub mod determinism;
 mod domain_separator;
 pub mod echo_trap;
+/// Economics profile adoption protocol: broker-admitted economics_profile_hash
+/// rotation with rollback and durable receipts (TCK-00584).
+pub mod economics_adoption;
 /// Evidence bundle export/import with RFC-0028 boundary validation and RFC-0029
 /// receipt validation (TCK-00527).
 pub mod evidence_bundle;
@@ -125,6 +128,8 @@ pub mod gc;
 pub mod gc_receipt;
 /// Non-interactive, lane-scoped GitHub CLI command builder (TCK-00597).
 pub mod gh_cli;
+/// Git safety hardening for lane workspaces (TCK-00580).
+pub mod git_hardening;
 pub mod harness_sandbox;
 pub mod job_spec;
 mod key_policy;
@@ -132,7 +137,13 @@ pub mod lane;
 mod lease;
 pub mod merge_receipt;
 mod node_identity;
+/// Patch injection hardening: path traversal rejection, safe apply mode,
+/// and patch provenance receipts (TCK-00581).
+pub mod patch_hardening;
 pub mod policy;
+/// Policy adoption protocol: broker-admitted `FacPolicyHash` rotation with
+/// receipts and rollback (TCK-00561).
+pub mod policy_adoption;
 pub mod policy_inheritance;
 mod policy_resolution;
 /// Disk preflight and auto-GC escalation policy.
@@ -304,6 +315,14 @@ pub use echo_trap::{
     MAX_SIGNATURE_LENGTH, MAX_SIGNATURES as MAX_ECHO_TRAP_SIGNATURES, SessionTermination,
     TerminationRationale,
 };
+// Re-export economics adoption types (TCK-00584)
+pub use economics_adoption::{
+    ADMITTED_ECONOMICS_PROFILE_SCHEMA, AdmittedEconomicsProfileRootV1,
+    ECONOMICS_ADOPTION_RECEIPT_SCHEMA, EconomicsAdoptionAction, EconomicsAdoptionError,
+    EconomicsAdoptionReceiptV1, adopt_economics_profile, adopt_economics_profile_by_hash,
+    is_economics_profile_hash_admitted, load_admitted_economics_profile_root, looks_like_digest,
+    rollback_economics_profile, validate_digest_string, validate_economics_profile_bytes,
+};
 // Re-export flake classification routing types
 pub use flake_class::FlakeRouting;
 pub use gc::{GcPlan, GcPlanError, GcTarget, execute_gc, plan_gc, plan_quarantine_prune};
@@ -313,6 +332,9 @@ pub use gc_receipt::{
 };
 // Re-export gh_cli (TCK-00597)
 pub use gh_cli::{GhCommand, gh_command};
+pub use git_hardening::{
+    GIT_HARDENING_RECEIPT_SCHEMA, GitHardeningError, GitHardeningOutcome, GitHardeningReceipt,
+};
 // Re-export harness sandbox types
 pub use harness_sandbox::{
     EgressRule, HarnessSandboxError, MAX_EGRESS_RULES, MAX_HOST_LENGTH,
@@ -346,6 +368,13 @@ pub use merge_receipt::{
     MAX_GATE_RECEIPTS as MAX_MERGE_GATE_RECEIPTS, MergeReceipt, MergeReceiptError,
     MergeReceiptProto,
 };
+// Re-export patch hardening types (TCK-00581)
+pub use patch_hardening::{
+    MAX_PATCH_CONTENT_SIZE, MAX_PATCH_FILE_ENTRIES, MAX_REFUSALS, PATCH_APPLY_RECEIPT_SCHEMA_ID,
+    PATCH_APPLY_RECEIPT_SCHEMA_VERSION, PATCH_FORMAT_GIT_DIFF_V1, PatchApplyReceiptV1,
+    PatchRefusal, PatchValidationError, PatchValidationResult, validate_for_apply,
+    validate_patch_content,
+};
 #[cfg(unix)]
 pub use policy::verify_dir_permissions;
 pub use policy::{
@@ -353,6 +382,13 @@ pub use policy::{
     LANE_ENV_DIR_XDG_CACHE, LANE_ENV_DIR_XDG_CONFIG, LANE_ENV_DIRS, POLICY_SCHEMA_ID,
     apply_lane_env_overrides, build_job_environment, compute_policy_hash, deserialize_policy,
     ensure_lane_env_dirs, parse_policy_hash, persist_policy,
+};
+// Re-export policy adoption types (TCK-00561)
+pub use policy_adoption::{
+    ADMITTED_POLICY_ROOT_SCHEMA, AdmittedPolicyRootV1, POLICY_ADOPTION_RECEIPT_SCHEMA,
+    PolicyAdoptionAction, PolicyAdoptionError, PolicyAdoptionReceiptV1, adopt_policy,
+    deserialize_adoption_receipt, is_policy_hash_admitted, load_admitted_policy_root,
+    rollback_policy, validate_policy_bytes,
 };
 // Re-export policy inheritance types (TCK-00340)
 pub use policy_inheritance::{
@@ -665,7 +701,7 @@ pub use lane::{
     LaneState, LaneStatusV1, LaneTimeouts, MAX_LANE_COUNT, MAX_LANE_ID_LENGTH, MAX_LEASE_FILE_SIZE,
     MAX_MEMORY_MAX_BYTES, MAX_PROFILE_FILE_SIZE, MAX_STRING_LENGTH as MAX_LANE_STRING_LENGTH,
     MAX_TEST_TIMEOUT_SECONDS, ResourceProfile, compute_test_env_for_parallelism,
-    resolve_host_test_parallelism,
+    create_dir_restricted, resolve_host_test_parallelism,
 };
 // Re-export node identity types (TCK-00556).
 pub use node_identity::{
@@ -679,7 +715,9 @@ pub use safe_rmtree::{
     MAX_DIR_ENTRIES, MAX_TRAVERSAL_DEPTH, RefusedDeleteReceipt, SafeRmtreeError, SafeRmtreeOutcome,
     safe_rmtree_v1,
 };
-pub use systemd_properties::{SandboxHardeningProfile, SystemdUnitProperties};
+pub use systemd_properties::{
+    NetworkPolicy, SandboxHardeningProfile, SystemdUnitProperties, resolve_network_policy,
+};
 pub use warm::{
     DEFAULT_WARM_PHASES, MAX_WARM_PHASES, MAX_WARM_RECEIPT_SIZE, MAX_WARM_STRING_LENGTH,
     WARM_RECEIPT_SCHEMA, WarmContainment, WarmError, WarmPhase, WarmPhaseResult, WarmReceiptV1,

@@ -22,7 +22,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::bounded_test_runner::{
-    BoundedTestLimits, build_bounded_test_command as build_systemd_bounded_test_command,
+    BoundedTestLimits, build_bounded_gate_command as build_systemd_bounded_gate_command,
+    build_bounded_test_command as build_systemd_bounded_test_command,
 };
 use super::ci_status::{CiStatus, PrBodyStatusUpdater};
 use super::gate_attestation::{
@@ -939,6 +940,11 @@ struct PipelineTestCommand {
     /// bounded test execution. Carried through so attestation binds to the
     /// actual policy-driven profile, not a default (TCK-00573 MAJOR-1 fix).
     sandbox_hardening_hash: String,
+    /// BLAKE3 hex hash of the effective `NetworkPolicy` used for gate
+    /// execution. Carried through so attestation binds to the actual
+    /// policy-driven network posture, preventing cache reuse across
+    /// policy drift (TCK-00574 MAJOR-1 fix).
+    network_policy_hash: String,
 }
 
 /// Build the pipeline test command with policy-filtered environment.
@@ -1004,6 +1010,13 @@ fn build_pipeline_test_command(
     // so attestation binds to the actual policy-driven profile.
     let sandbox_hardening_hash = policy.sandbox_hardening.content_hash_hex();
 
+    // TCK-00574: Resolve network policy for evidence gates with operator override.
+    // Compute the hash BEFORE the policy is moved into the bounded test command
+    // builder, so attestation binds to the actual policy-driven network posture
+    // (MAJOR-1 fix: attestation digest must change when network policy changes).
+    let evidence_network_policy =
+        apm2_core::fac::resolve_network_policy("gates", policy.network_policy.as_ref());
+    let network_policy_hash = evidence_network_policy.content_hash_hex();
     let bounded_spec = build_systemd_bounded_test_command(
         workspace_root,
         BoundedTestLimits {
@@ -1016,6 +1029,7 @@ fn build_pipeline_test_command(
         &build_nextest_command(),
         &test_env,
         policy.sandbox_hardening,
+        evidence_network_policy,
     )
     .map_err(|err| format!("bounded test runner unavailable for FAC pipeline: {err}"))?;
     test_env.extend(bounded_spec.environment);
@@ -1031,6 +1045,7 @@ fn build_pipeline_test_command(
         test_env,
         env_remove_keys: bounded_spec.env_remove_keys,
         sandbox_hardening_hash,
+        network_policy_hash,
     })
 }
 
@@ -1507,22 +1522,97 @@ pub(super) fn run_evidence_gates_with_lane_context(
 
     // Phase 1: cargo fmt/clippy/doc — all receive the policy-filtered env
     // and wrapper-stripping keys (TCK-00526: defense-in-depth for all gates).
-    for &(gate_name, cmd_args) in gates {
+    //
+    // TCK-00574 BLOCKER fix: In full (non-quick) mode, wrap non-test gates
+    // in systemd-run with network policy isolation directives to enforce
+    // default-deny network posture for ALL evidence gate phases (not just test).
+    // Quick mode skips network isolation (development shortcut, same as test skip).
+    let skip_test_gate = opts.is_some_and(|o| o.skip_test_gate);
+    #[allow(clippy::type_complexity)]
+    let bounded_gate_specs: Option<Vec<(&str, Vec<String>, Vec<(String, String)>)>> =
+        if skip_test_gate {
+            None
+        } else {
+            // Load the policy to resolve network policy and sandbox hardening
+            // for non-test gate phases (TCK-00574 BLOCKER fix).
+            let apm2_home = apm2_core::github::resolve_apm2_home().ok_or_else(|| {
+                "cannot resolve APM2_HOME for gate network policy enforcement".to_string()
+            })?;
+            let fac_root = apm2_home.join("private/fac");
+            let policy = load_or_create_pipeline_policy(&fac_root)?;
+            let gate_network_policy =
+                apm2_core::fac::resolve_network_policy("gates", policy.network_policy.as_ref());
+            let mut specs = Vec::new();
+            for &(gate_name, cmd_args) in gates {
+                let gate_cmd: Vec<String> = cmd_args.iter().map(|s| (*s).to_string()).collect();
+                let bounded = build_systemd_bounded_gate_command(
+                    workspace_root,
+                    BoundedTestLimits {
+                        timeout_seconds: DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS,
+                        kill_after_seconds: DEFAULT_TEST_KILL_AFTER_SECONDS,
+                        memory_max: DEFAULT_TEST_MEMORY_MAX,
+                        pids_max: DEFAULT_TEST_PIDS_MAX,
+                        cpu_quota: "200%",
+                    },
+                    &gate_cmd,
+                    &gate_env,
+                    policy.sandbox_hardening.clone(),
+                    gate_network_policy.clone(),
+                )
+                .map_err(|err| {
+                    format!(
+                        "bounded gate runner unavailable for {gate_name} \
+                         (network deny enforcement requires systemd-run): {err}"
+                    )
+                })?;
+                specs.push((gate_name, bounded.command, bounded.environment));
+            }
+            Some(specs)
+        };
+
+    for (idx, &(gate_name, cmd_args)) in gates.iter().enumerate() {
         let log_path = logs_dir.join(format!("{gate_name}.log"));
         emit_gate_started(opts, gate_name);
         let started = Instant::now();
-        let (passed, stream_stats) = run_single_evidence_gate_with_env_and_progress(
-            workspace_root,
-            sha,
-            gate_name,
-            cmd_args[0],
-            &cmd_args[1..],
-            &log_path,
-            Some(&gate_env),
-            gate_wrapper_strip_ref,
-            emit_human_logs,
-            on_gate_progress,
-        );
+
+        // TCK-00574: Use bounded gate command (with network isolation) in
+        // full mode; fall back to bare command in quick mode.
+        let (passed, stream_stats) = if let Some(ref specs) = bounded_gate_specs {
+            let (_, ref bounded_cmd, ref bounded_env) = specs[idx];
+            let (bcmd, bargs) = bounded_cmd
+                .split_first()
+                .ok_or_else(|| format!("bounded gate command is empty for {gate_name}"))?;
+            // The outer env includes D-Bus runtime variables needed by
+            // systemd-run; the inner unit gets env via --setenv.
+            let mut outer_env = gate_env.clone();
+            outer_env.extend(bounded_env.iter().cloned());
+            run_single_evidence_gate_with_env_and_progress(
+                workspace_root,
+                sha,
+                gate_name,
+                bcmd,
+                &bargs.iter().map(String::as_str).collect::<Vec<_>>(),
+                &log_path,
+                Some(&outer_env),
+                gate_wrapper_strip_ref,
+                emit_human_logs,
+                on_gate_progress,
+            )
+        } else {
+            run_single_evidence_gate_with_env_and_progress(
+                workspace_root,
+                sha,
+                gate_name,
+                cmd_args[0],
+                &cmd_args[1..],
+                &log_path,
+                Some(&gate_env),
+                gate_wrapper_strip_ref,
+                emit_human_logs,
+                on_gate_progress,
+            )
+        };
+
         let duration = started.elapsed().as_secs();
         let result = build_evidence_gate_result(
             gate_name,
@@ -1822,6 +1912,9 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     // Uses the effective policy-driven profile carried through
     // PipelineTestCommand (MAJOR-1 fix: was previously default()).
     let sandbox_hardening_hash = &pipeline_test_command.sandbox_hardening_hash;
+    // TCK-00574 MAJOR-1: Include network policy hash in gate attestation
+    // to prevent cache reuse across network policy drift.
+    let network_policy_hash = &pipeline_test_command.network_policy_hash;
     let policy = GateResourcePolicy::from_cli(
         false,
         pipeline_test_command.effective_timeout_seconds,
@@ -1832,6 +1925,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         Some(pipeline_test_command.gate_profile.as_str()),
         Some(pipeline_test_command.effective_test_parallelism),
         Some(sandbox_hardening_hash.as_str()),
+        Some(network_policy_hash.as_str()),
     );
     if emit_human_logs {
         eprintln!(
@@ -1917,8 +2011,47 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         }
     }
 
+    // TCK-00574 BLOCKER fix: Build bounded gate commands for non-test gates
+    // to enforce network-deny in the pipeline path (always full mode).
+    #[allow(clippy::type_complexity)]
+    let pipeline_bounded_gate_specs: Vec<(&str, Vec<String>, Vec<(String, String)>)> = {
+        let apm2_home = apm2_core::github::resolve_apm2_home().ok_or_else(|| {
+            "cannot resolve APM2_HOME for pipeline gate network policy enforcement".to_string()
+        })?;
+        let fac_root = apm2_home.join("private/fac");
+        let fac_policy = load_or_create_pipeline_policy(&fac_root)?;
+        let gate_network_policy =
+            apm2_core::fac::resolve_network_policy("gates", fac_policy.network_policy.as_ref());
+        let mut specs = Vec::new();
+        for &(gate_name, cmd_args) in gates {
+            let gate_cmd: Vec<String> = cmd_args.iter().map(|s| (*s).to_string()).collect();
+            let bounded = build_systemd_bounded_gate_command(
+                workspace_root,
+                BoundedTestLimits {
+                    timeout_seconds: DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS,
+                    kill_after_seconds: DEFAULT_TEST_KILL_AFTER_SECONDS,
+                    memory_max: DEFAULT_TEST_MEMORY_MAX,
+                    pids_max: DEFAULT_TEST_PIDS_MAX,
+                    cpu_quota: "200%",
+                },
+                &gate_cmd,
+                &gate_env,
+                fac_policy.sandbox_hardening.clone(),
+                gate_network_policy.clone(),
+            )
+            .map_err(|err| {
+                format!(
+                    "bounded gate runner unavailable for {gate_name} \
+                     (network deny enforcement requires systemd-run): {err}"
+                )
+            })?;
+            specs.push((gate_name, bounded.command, bounded.environment));
+        }
+        specs
+    };
+
     // Phase 1: cargo fmt/clippy/doc.
-    for &(gate_name, cmd_args) in gates {
+    for (idx, &(gate_name, _cmd_args)) in gates.iter().enumerate() {
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
         let log_path = logs_dir.join(format!("{gate_name}.log"));
@@ -2033,14 +2166,21 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         status.set_running(gate_name);
         updater.update(&status);
         let started = Instant::now();
+        // TCK-00574: Use bounded gate command with network isolation.
+        let (_bounded_name, bounded_cmd, bounded_env) = &pipeline_bounded_gate_specs[idx];
+        let (bcmd, bargs) = bounded_cmd
+            .split_first()
+            .ok_or_else(|| format!("bounded gate command is empty for {gate_name}"))?;
+        let mut outer_env = gate_env.clone();
+        outer_env.extend(bounded_env.iter().cloned());
         let (passed, stream_stats) = run_single_evidence_gate_with_env_and_progress(
             workspace_root,
             sha,
             gate_name,
-            cmd_args[0],
-            &cmd_args[1..],
+            bcmd,
+            &bargs.iter().map(String::as_str).collect::<Vec<_>>(),
             &log_path,
-            Some(&gate_env),
+            Some(&outer_env),
             gate_wrapper_strip_ref,
             emit_human_logs,
             on_gate_progress,

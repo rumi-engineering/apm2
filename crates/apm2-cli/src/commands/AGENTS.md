@@ -23,6 +23,8 @@ All command functions return a `u8` exit code or `anyhow::Result<()>`, using val
 | `capability.rs` | `apm2 capability request` | Capability token issuance |
 | `consensus.rs` | `apm2 consensus *` | Consensus query operations |
 | `fac.rs` | `apm2 fac *` | FAC (Factory Automation Cycle) top-level dispatcher |
+| `fac_bootstrap.rs` | `apm2 fac bootstrap` | One-shot compute-host provisioning for FESv1 |
+| `fac_economics.rs` | `apm2 fac economics *` | Economics profile adoption, rollback, and inspection (TCK-00584) |
 | `fac_pr/` | `apm2 fac pr *` | GitHub App credential management for PR operations |
 | `fac_review/` | `apm2 fac review *` | Review orchestration (security + quality reviews) |
 | `fac_queue.rs` | `apm2 fac queue *` | Queue introspection (status with counts, reason stats) |
@@ -81,6 +83,8 @@ pub enum FacSubcommand {
     Logs(LogsArgs),
     Pipeline(PipelineArgs),
     Lane(LaneArgs),
+    Bootstrap(BootstrapArgs),
+    Economics(EconomicsArgs),
 }
 ```
 
@@ -144,6 +148,7 @@ pub enum EventSubcommand {
 3. **Toolchain**: cargo, cargo-nextest, systemd-run availability
 4. **Security Posture**: FAC root permissions (0700/ownership), socket permissions (0600), lane symlink detection
 5. **Credentials Posture** (WARN-only): GITHUB_TOKEN/GH_TOKEN, GitHub App config, systemd credential file
+6. **Secret Verification** (--full only, TCK-00598): When `full` is set, `creds_github_app_secret` attempts to resolve the GitHub App private key via `GitHubAppTokenProvider::resolve_private_key` and reports ERROR if the key is inaccessible. Remediation messages include `--for-systemd` guidance for headless hosts.
 
 Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK), and `message` (including actionable remediation). Credentials checks are WARN-only to avoid blocking local-only workflows.
 
@@ -195,6 +200,29 @@ tables are printed by default via `print_lane_init_receipt()` and
 **LaneSubcommand** enum variants added:
 - `Init(LaneInitArgs)` -- `--json` flag
 - `Reconcile(LaneReconcileArgs)` -- `--json` flag
+
+### Bootstrap (fac_bootstrap.rs, TCK-00599)
+
+| Subcommand | Function | Description |
+|------------|----------|-------------|
+| `apm2 fac bootstrap` | `run_bootstrap()` | One-shot compute-host provisioning for FESv1 |
+
+Five-phase provisioning sequence:
+1. **Directories**: creates `$APM2_HOME/private/fac/**` tree via `create_dir_restricted` (0o700 user-mode, 0o770 system-mode) (CTR-2611)
+2. **Policy**: writes default `FacPolicyV1` (safe no-secrets posture) via `persist_policy()`
+3. **Lanes**: initializes lane pool via `LaneManager::init_lanes()`
+4. **Services** (optional): installs systemd templates from `contrib/systemd/` (`--user` or `--system`)
+5. **Doctor**: runs `collect_doctor_checks()` and gates exit code on result
+
+Flags: `--dry-run` (show planned actions), `--user`/`--system` (systemd install mode), `--json`.
+
+Security invariants:
+- [INV-BOOT-001] Directories created via `create_dir_restricted` with restricted permissions at create-time (no TOCTOU chmod window). Uses 0o700 in user-mode, 0o770 in system-mode. Recursive: intermediate directories also get restricted permissions. Symlink paths rejected.
+- [INV-BOOT-002] Policy files written with 0o600 permissions
+- [INV-BOOT-003] Existing state never destroyed (additive-only)
+- [INV-BOOT-004] Doctor checks gate the exit code (fail-closed)
+- [INV-BOOT-005] Phase 4 (service installation) degrades gracefully when not in a git repository (e.g. binary releases). Missing templates are skipped with a warning, not fatal.
+- [INV-BOOT-006] Installs `apm2-worker@.service` template unit alongside non-templated units for parallel lane-specific workers.
 
 ### Work (work.rs)
 
@@ -296,6 +324,11 @@ tables are printed by default via `print_lane_init_receipt()` and
   chains (exec and warm paths) call `.sandbox_hardening_hash(&sbx_hash)` so the
   cryptographically signed `GateReceipt` binds the hardening profile used during
   execution. This complements the `FacJobReceiptV1` binding done via `emit_job_receipt`.
+- **Network policy resolution** (`fac_worker.rs`, TCK-00574): `process_job()` resolves
+  network policy via `resolve_network_policy(&spec.kind, None)` based on the job kind.
+  Gates jobs get deny-all; warm jobs get allow. The resolved `NetworkPolicy` is passed to
+  `SystemdUnitProperties::from_lane_profile_with_hardening()` alongside the existing
+  sandbox hardening profile.
 - **Policy-aware warm spec validation** (`fac_warm.rs`, TCK-00579): The warm enqueue path
   derives a `JobSpecValidationPolicy` from the loaded FAC policy and validates the warm
   spec via `validate_job_spec_with_policy()` before enqueue, failing closed on validation
@@ -377,3 +410,59 @@ tables are printed by default via `print_lane_init_receipt()` and
   the receipt index to entries at or after the given UNIX epoch. Deterministic ordering is
   enforced: primary sort by `timestamp_secs` descending, secondary sort by `content_hash`
   ascending for stable tie-breaking. Boundary inclusion is verified by regression test.
+
+## Policy CLI Invariants (Updated for TCK-00561 fix round 2)
+
+- **Stdin support** (`fac_policy.rs`): `apm2 fac policy validate` and `apm2 fac policy adopt`
+  accept `<path|->` as an optional positional argument. When the argument is omitted or is `-`,
+  input is read from stdin with bounded semantics (`MAX_POLICY_SIZE` cap via `take()` on the
+  stdin handle, CTR-1603). Empty stdin returns an explicit error.
+- **Operator identity resolution** (`fac_policy.rs`): `run_adopt` and `run_rollback` resolve
+  the operator identity from `$USER` / `$LOGNAME` (POSIX), falling back to numeric UID on Unix
+  via `nix::unistd::getuid()` (safe wrapper, no `unsafe` block). The identity is formatted as
+  `operator:<username>` and passed to the core `adopt_policy`/`rollback_policy` APIs. The
+  username is sanitized to `[a-zA-Z0-9._@-]` to prevent control character injection.
+- **FAC root resolution** (`fac_policy.rs`): Uses shared `fac_utils::resolve_fac_root()` helper
+  instead of a custom implementation with predictable `/tmp` fallback (RSK-1502).
+- **Bounded file reads** (`fac_policy.rs`): `read_bounded_file` uses the open-once pattern
+  (`O_NOFOLLOW | O_CLOEXEC` at `open(2)` + `fstat` + `take()`) to eliminate the TOCTOU gap
+  between symlink validation and file read.
+
+## Economics CLI Invariants (TCK-00584)
+
+- **Hash-or-path input** (`fac_economics.rs`): `apm2 fac economics adopt` accepts
+  `<hash|path|->` as an optional positional argument. When the argument starts with `b3-256:`,
+  it is treated as a digest for hash-only adoption (validates `b3-256:<64-lowercase-hex>`
+  format, records the hash directly without loading a profile file). When it is a path or `-`,
+  input is read from file or stdin with bounded semantics (`MAX_ECONOMICS_PROFILE_SIZE` cap
+  via `take()` on the stdin handle, CTR-1603). Auto-detects framed vs raw JSON input and adds
+  domain framing if needed.
+- **Operator identity resolution** (`fac_economics.rs`): `run_adopt` and `run_rollback`
+  resolve the operator identity from `$USER` / `$LOGNAME` (POSIX), falling back to numeric
+  UID on Unix via `nix::unistd::getuid()` (safe wrapper, no `unsafe` block). The identity
+  is formatted as `operator:<username>` and passed to the core
+  `adopt_economics_profile`/`rollback_economics_profile` APIs. The username is sanitized to
+  `[a-zA-Z0-9._@-]` to prevent control character injection.
+- **FAC root resolution** (`fac_economics.rs`): Uses shared `fac_utils::resolve_fac_root()`
+  helper instead of a custom implementation with predictable `/tmp` fallback (RSK-1502).
+- **Bounded file reads** (`fac_economics.rs`): `read_bounded_file` uses the open-once pattern
+  (`O_NOFOLLOW | O_CLOEXEC` at `open(2)` + `fstat` + `take()`) to eliminate the TOCTOU gap
+  between symlink validation and file read.
+- **Patch hardening on worker path** (`fac_worker.rs`, TCK-00581 fix round 1):
+  The `patch_injection` execution path now calls `apply_patch_hardened` instead of
+  `apply_patch`, enforcing INV-PH-001 through INV-PH-010 (path traversal rejection,
+  absolute path rejection, NUL byte rejection, size bounds, format validation).
+  `PatchHardeningDenied` errors map to `DenialReasonCode::PatchHardeningDenied`
+  with the denial receipt content hash included in the reason string. The denial
+  receipt is also persisted as a standalone file under `fac_root/patch_receipts/`
+  for provenance evidence. Lane cleanup runs before the job is moved to `denied/`.
+- **Worker economics admission fail-closed** (`fac_worker.rs`, fix rounds 1-2): Step 2.6
+  economics admission now branches on the specific error variant from
+  `load_admitted_economics_profile_root`: `NoAdmittedRoot` denies the job if the policy's
+  `economics_profile_hash` is non-zero (policy requires economics but no root exists to
+  verify against — prevents bypass via root file deletion), skips only if the hash is zero
+  (backwards compatibility for policies without economics requirements); successful load
+  triggers constant-time hash comparison; any other error (I/O, corruption, schema
+  mismatch, oversized file) denies the job with
+  `DenialReasonCode::EconomicsAdmissionDenied`. Previously, all load errors were treated
+  as "no root" which allowed admission bypass via root file tampering (INV-EADOPT-004).

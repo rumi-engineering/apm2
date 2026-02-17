@@ -304,7 +304,7 @@ All admission decisions require valid temporal authority:
 - `QueueSchedulerState` -- Per-lane backlog and max-wait tracking (not internally synchronized)
 - `AntiEntropyBudget` -- Budget tracker for anti-entropy admission (not internally synchronized)
 - `SignatureVerifier` -- Trait for cryptographic signature verification; injected into TP-EIO29-001 evaluation
-- `NoOpVerifier` -- Default fail-closed verifier; always denies (`DENY_SIGNATURE_VERIFICATION_NOT_CONFIGURED`)
+- `NoOpVerifier` -- Default fail-closed verifier; always denies (`DENY_SIGNATURE_VERIFICATION_NOT_CONFIGURED`). Gated behind `#[cfg(any(test, feature = "unsafe_no_verify"))]` (TCK-00550): not available in default builds.
 
 ### Invariants
 
@@ -317,6 +317,7 @@ All admission decisions require valid temporal authority:
 - [INV-QA07] Emergency stop/revoke carve-out: tp001 failure alone does not block stop_revoke lane (authority-reducing operations), but tp002/tp003 failures still deny.
 - [INV-QA08] All protocol-boundary `String` and `Vec` fields use bounded serde deserializers to prevent OOM during deserialization from untrusted input.
 - [INV-QA09] `tp001_passed` is never `true` without real cryptographic signature verification via an injected `SignatureVerifier`. The default `NoOpVerifier` denies fail-closed.
+- [INV-QA10] `NoOpVerifier` is gated behind `#[cfg(any(test, feature = "unsafe_no_verify"))]` (TCK-00550). Default builds cannot reference it, enforcing that production code injects a real verifier. `validate_envelope_tp001()` with `verifier=None` returns `DENY_SIGNATURE_VERIFICATION_NOT_CONFIGURED` directly without requiring `NoOpVerifier`.
 
 ### Contracts
 
@@ -738,6 +739,7 @@ Ensures reconstruction of mandatory artifact tiers (source snapshots, policy roo
 - [`apm2_core::budget`](../budget/AGENTS.md) -- Budget tracking and enforcement at the session level
 - [`apm2_core::pcac::temporal_arbitration`](../pcac/AGENTS.md) -- `TemporalPredicateId` enum (TpEio29001/002/003/004/005/007/008/009) used for predicate tracking in admission traces
 - [`apm2_core::fac::domain_separator`](../fac/AGENTS.md) -- `sign_with_domain` / `verify_with_domain` for domain-separated receipt signatures
+- [`apm2_core::fac::economics_adoption`](../fac/AGENTS.md) -- Broker-admitted economics profile hash rotation with receipts (TCK-00584). Workers deny budget admissions when the profile hash mismatches the admitted digest.
 
 ## References
 

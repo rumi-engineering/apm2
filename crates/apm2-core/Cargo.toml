@@ -108,6 +108,7 @@ seccompiler.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 criterion.workspace = true
+serial_test.workspace = true
 # Certificate generation (test-only)
 rcgen.workspace = true
 x509-cert.workspace = true
@@ -129,6 +130,9 @@ clap-introspection = ["dep:clap"]
 # Enable YubiHSM hardware support for T1 validator keys
 # When disabled, YubiHsmProvider operates in mock mode for testing
 yubihsm = []
+# UNSAFE: Allow NoOpVerifier in non-test builds. For dev/testing only.
+# Default builds ban NoOpVerifier at compile time (TCK-00550).
+unsafe_no_verify = []
 
 [lints]
 workspace = true

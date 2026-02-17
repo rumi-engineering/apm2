@@ -29,7 +29,7 @@ use std::process::Command;
 use apm2_core::fac::execution_backend::{
     ExecutionBackend, SystemModeConfig, build_systemd_run_command, probe_user_bus, select_backend,
 };
-use apm2_core::fac::{SandboxHardeningProfile, SystemdUnitProperties};
+use apm2_core::fac::{NetworkPolicy, SandboxHardeningProfile, SystemdUnitProperties};
 use apm2_daemon::telemetry::is_cgroup_v2_available;
 
 use super::timeout_policy::parse_memory_limit;
@@ -82,10 +82,12 @@ fn parse_cpu_quota_percent(cpu_quota: &str) -> Result<u32, String> {
 ///
 /// Parses string-format limits (e.g., "48G", "200%") into numeric types
 /// used by the core command builder. Uses the provided sandbox hardening
-/// profile (from policy) instead of hard-coding the default (TCK-00573).
+/// profile and network policy (from policy) instead of hard-coding
+/// defaults (TCK-00573, TCK-00574).
 fn limits_to_properties(
     limits: BoundedTestLimits<'_>,
     sandbox_hardening: SandboxHardeningProfile,
+    network_policy: NetworkPolicy,
 ) -> Result<SystemdUnitProperties, String> {
     let memory_max_bytes = parse_memory_limit(limits.memory_max)?;
     let cpu_quota_percent = parse_cpu_quota_percent(limits.cpu_quota)?;
@@ -99,6 +101,7 @@ fn limits_to_properties(
         tasks_max,
         limits.timeout_seconds,
         sandbox_hardening,
+        network_policy,
     ))
 }
 
@@ -128,6 +131,7 @@ pub fn build_bounded_test_command(
     nextest_command: &[String],
     policy_env: &[(String, String)],
     sandbox_hardening: SandboxHardeningProfile,
+    network_policy: NetworkPolicy,
 ) -> Result<BoundedTestCommandSpec, String> {
     if nextest_command.is_empty() {
         return Err("nextest command cannot be empty".to_string());
@@ -141,8 +145,9 @@ pub fn build_bounded_test_command(
 
     // Convert CLI limits to core properties for unified command
     // construction. Uses the policy-driven sandbox hardening profile
-    // (TCK-00573) instead of hard-coding defaults.
-    let properties = limits_to_properties(limits, sandbox_hardening)?;
+    // and network policy (TCK-00573, TCK-00574) instead of hard-coding
+    // defaults.
+    let properties = limits_to_properties(limits, sandbox_hardening, network_policy)?;
 
     // Select execution backend: user-mode (requires D-Bus session) or
     // system-mode (headless VPS). Controlled by APM2_FAC_EXECUTION_BACKEND.
@@ -215,6 +220,112 @@ pub fn build_bounded_test_command(
         .map(|k| (*k).to_string())
         .collect();
     // Also strip any SCCACHE_* vars from parent env.
+    for (key, _) in std::env::vars() {
+        if key.starts_with("SCCACHE_") && !env_remove_keys.contains(&key) {
+            env_remove_keys.push(key);
+        }
+    }
+
+    Ok(BoundedTestCommandSpec {
+        command,
+        environment,
+        setenv_pairs,
+        env_remove_keys,
+        backend,
+    })
+}
+
+/// Build a bounded gate command for non-test evidence gates (rustfmt, clippy,
+/// doc) that applies network policy isolation via `systemd-run` (TCK-00574).
+///
+/// This ensures ALL evidence gate phases — not only the bounded test phase —
+/// run under network-deny when the default policy is active. Uses the same
+/// execution backend infrastructure as `build_bounded_test_command` so that
+/// system-mode and user-mode backends are handled consistently.
+///
+/// # Arguments
+///
+/// * `workspace_root` — Working directory for the transient unit.
+/// * `limits` — Resource caps enforced by systemd unit properties (same caps as
+///   the test gate to maintain consistent containment).
+/// * `gate_command` — The gate command to execute inside the unit (e.g.,
+///   `["cargo", "fmt", "--all", "--check"]`).
+/// * `policy_env` — Pre-computed environment from `FacPolicyV1` via
+///   `build_job_environment()`. Forwarded via `--setenv` to the transient unit.
+/// * `sandbox_hardening` — Policy-driven sandbox hardening profile.
+/// * `network_policy` — Policy-driven network access posture. When deny, the
+///   transient unit receives `PrivateNetwork=yes` + `IPAddressDeny=any` (system
+///   mode) or `RestrictAddressFamilies=AF_UNIX` (user mode).
+///
+/// # Errors
+///
+/// Returns `Err` if cgroup v2 is unavailable, `systemd-run` is not on PATH,
+/// or backend selection/command construction fails.
+pub fn build_bounded_gate_command(
+    workspace_root: &Path,
+    limits: BoundedTestLimits<'_>,
+    gate_command: &[String],
+    policy_env: &[(String, String)],
+    sandbox_hardening: SandboxHardeningProfile,
+    network_policy: NetworkPolicy,
+) -> Result<BoundedTestCommandSpec, String> {
+    if gate_command.is_empty() {
+        return Err("gate command cannot be empty".to_string());
+    }
+    if !is_cgroup_v2_available() {
+        return Err("cgroup v2 controllers not found (bounded runner unavailable)".to_string());
+    }
+    if !command_available("systemd-run") {
+        return Err("systemd-run not found on PATH".to_string());
+    }
+
+    let properties = limits_to_properties(limits, sandbox_hardening, network_policy)?;
+    let backend =
+        select_backend().map_err(|e| format!("execution backend selection failed: {e}"))?;
+    let setenv_pairs = build_policy_setenv_pairs(policy_env)?;
+
+    let environment = match backend {
+        ExecutionBackend::UserMode => {
+            if !probe_user_bus() {
+                return Err("user D-Bus session bus not found for bounded runner. \
+                     Set APM2_FAC_EXECUTION_BACKEND=system for headless environments"
+                    .to_string());
+            }
+            normalized_runtime_environment()
+        },
+        ExecutionBackend::SystemMode => Vec::new(),
+    };
+
+    let system_config = if backend == ExecutionBackend::SystemMode {
+        Some(SystemModeConfig::from_env().map_err(|e| format!("system-mode config error: {e}"))?)
+    } else {
+        None
+    };
+
+    let core_cmd = build_systemd_run_command(
+        backend,
+        &properties,
+        workspace_root,
+        None,
+        system_config.as_ref(),
+        gate_command,
+    )
+    .map_err(|e| format!("systemd-run command construction failed: {e}"))?;
+
+    let mut command = Vec::with_capacity(core_cmd.args.len() + setenv_pairs.len() * 2);
+    let property_start = core_cmd
+        .args
+        .iter()
+        .position(|a| a == "--property")
+        .unwrap_or(core_cmd.args.len());
+    command.extend(core_cmd.args[..property_start].iter().cloned());
+    append_systemd_setenv_args(&mut command, &setenv_pairs);
+    command.extend(core_cmd.args[property_start..].iter().cloned());
+
+    let mut env_remove_keys: Vec<String> = SCCACHE_ENV_STRIP_KEYS
+        .iter()
+        .map(|k| (*k).to_string())
+        .collect();
     for (key, _) in std::env::vars() {
         if key.starts_with("SCCACHE_") && !env_remove_keys.contains(&key) {
             env_remove_keys.push(key);
@@ -317,12 +428,12 @@ fn command_available(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use apm2_core::fac::SandboxHardeningProfile;
+    use apm2_core::fac::{NetworkPolicy, SandboxHardeningProfile};
 
     use super::{
         BoundedTestLimits, MAX_SETENV_PAIRS, append_systemd_setenv_args,
-        build_bounded_test_command, build_policy_setenv_pairs, default_runtime_dir,
-        limits_to_properties, parse_cpu_quota_percent,
+        build_bounded_gate_command, build_bounded_test_command, build_policy_setenv_pairs,
+        default_runtime_dir, limits_to_properties, parse_cpu_quota_percent,
     };
 
     #[test]
@@ -351,6 +462,7 @@ mod tests {
             &[],
             &[],
             SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
         )
         .expect_err("empty command must fail");
         assert!(err.contains("nextest command cannot be empty"));
@@ -455,8 +567,12 @@ mod tests {
             pids_max: 512,
             cpu_quota: "200%",
         };
-        let props =
-            limits_to_properties(limits, SandboxHardeningProfile::default()).expect("valid limits");
+        let props = limits_to_properties(
+            limits,
+            SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
+        )
+        .expect("valid limits");
         assert_eq!(props.cpu_quota_percent, 200);
         assert_eq!(props.memory_max_bytes, 1024 * 1024 * 1024);
         assert_eq!(props.tasks_max, 512);
@@ -464,6 +580,7 @@ mod tests {
         assert_eq!(props.runtime_max_sec, 600);
         assert_eq!(props.kill_mode, "control-group");
         assert_eq!(props.sandbox_hardening, SandboxHardeningProfile::default());
+        assert_eq!(props.network_policy, NetworkPolicy::deny());
     }
 
     #[test]
@@ -479,7 +596,8 @@ mod tests {
             private_tmp: false,
             ..Default::default()
         };
-        let props = limits_to_properties(limits, hardening.clone()).expect("valid limits");
+        let props = limits_to_properties(limits, hardening.clone(), NetworkPolicy::deny())
+            .expect("valid limits");
         assert_eq!(props.sandbox_hardening, hardening);
         assert!(!props.sandbox_hardening.private_tmp);
     }
@@ -491,6 +609,32 @@ mod tests {
         assert_eq!(
             command,
             vec!["--setenv".to_string(), "TOKEN=abcd".to_string()]
+        );
+    }
+
+    // --- TCK-00574 BLOCKER: bounded gate command for non-test gates ---
+
+    #[test]
+    fn bounded_gate_command_rejects_empty_gate_command() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let err = build_bounded_gate_command(
+            temp_dir.path(),
+            BoundedTestLimits {
+                timeout_seconds: 600,
+                kill_after_seconds: 20,
+                memory_max: "48G",
+                pids_max: 1536,
+                cpu_quota: "200%",
+            },
+            &[],
+            &[],
+            SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
+        )
+        .expect_err("empty gate command must fail");
+        assert!(
+            err.contains("gate command cannot be empty"),
+            "expected empty command error, got: {err}"
         );
     }
 }

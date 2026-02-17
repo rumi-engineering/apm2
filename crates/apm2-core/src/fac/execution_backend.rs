@@ -548,9 +548,19 @@ fn build_property_list(props: &SystemdUnitProperties, backend: ExecutionBackend)
     match backend {
         ExecutionBackend::SystemMode => {
             list.extend(props.sandbox_hardening.to_property_strings());
+            // Network policy directives (TCK-00574).
+            // PrivateNetwork requires CAP_SYS_ADMIN (network namespace).
+            // IPAddressDeny/IPAddressAllow require BPF cgroup support.
+            // Both are only available in system mode.
+            list.extend(props.network_policy.to_property_strings());
         },
         ExecutionBackend::UserMode => {
             list.extend(props.sandbox_hardening.to_user_mode_property_strings());
+            // Network policy: partial user-mode mitigation.
+            // NetworkPolicy::to_user_mode_property_strings() emits
+            // RestrictAddressFamilies=AF_UNIX to block IP sockets when
+            // deny is active, relying on NoNewPrivileges=yes (above).
+            list.extend(props.network_policy.to_user_mode_property_strings());
         },
     }
 
@@ -677,6 +687,7 @@ mod tests {
     use crate::fac::SandboxHardeningProfile;
     use crate::fac::job_spec::JobConstraints;
     use crate::fac::lane::{LanePolicy, LaneProfileV1, LaneTimeouts, ResourceProfile};
+    use crate::fac::systemd_properties::{NetworkPolicy, resolve_network_policy};
 
     // ── Backend enum ────────────────────────────────────────────────────
 
@@ -811,6 +822,7 @@ mod tests {
             &test_profile(),
             None,
             SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
         )
     }
 
@@ -957,6 +969,7 @@ mod tests {
             &profile,
             Some(&constraints),
             SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
         );
         let cmd = build_systemd_run_command(
             ExecutionBackend::UserMode,
@@ -1058,8 +1071,12 @@ mod tests {
             private_tmp: false,
             ..Default::default()
         };
-        let props =
-            SystemdUnitProperties::from_lane_profile_with_hardening(&profile, None, hardening);
+        let props = SystemdUnitProperties::from_lane_profile_with_hardening(
+            &profile,
+            None,
+            hardening,
+            NetworkPolicy::deny(),
+        );
         let list = build_property_list(&props, ExecutionBackend::SystemMode);
 
         // Disabled directives must NOT be in the property list.
@@ -1117,11 +1134,13 @@ mod tests {
             !list.iter().any(|p| p.starts_with("RestrictRealtime")),
             "RestrictRealtime requires root"
         );
+        // TCK-00574: RestrictAddressFamilies=AF_UNIX is now emitted in
+        // user-mode by the network-policy deny path (partial mitigation for
+        // PrivateNetwork which requires root). The sandbox_hardening form
+        // (which lists AF_INET, AF_INET6, AF_UNIX) is still root-only.
         assert!(
-            !list
-                .iter()
-                .any(|p| p.starts_with("RestrictAddressFamilies")),
-            "RestrictAddressFamilies requires root"
+            list.contains(&"RestrictAddressFamilies=AF_UNIX".to_string()),
+            "RestrictAddressFamilies=AF_UNIX should be present from network deny policy"
         );
         assert!(
             !list
@@ -1288,6 +1307,7 @@ mod tests {
             &zero_profile,
             None,
             SandboxHardeningProfile::default(),
+            NetworkPolicy::deny(),
         );
         let cmd = build_systemd_run_command(
             ExecutionBackend::UserMode,
@@ -1425,5 +1445,107 @@ mod tests {
             .is_platform_unavailable()
         );
         assert!(!ExecutionBackendError::EnvValueNotUtf8 { var: "X" }.is_platform_unavailable());
+    }
+
+    // ── Network denial enforcement (TCK-00574) ─────────────────────────
+
+    #[test]
+    fn property_list_system_mode_network_deny_emits_isolation_directives() {
+        // Verify that a gate job (default deny) emits all three network
+        // isolation directives in system-mode: PrivateNetwork, IPAddressDeny,
+        // IPAddressAllow. Regression test for INV-NET-002/003/004.
+        let policy = resolve_network_policy("gates", None);
+        assert!(!policy.allow_network, "gates must resolve to deny");
+
+        let profile = test_profile();
+        let props = SystemdUnitProperties::from_lane_profile_with_hardening(
+            &profile,
+            None,
+            SandboxHardeningProfile::default(),
+            policy,
+        );
+        let list = build_property_list(&props, ExecutionBackend::SystemMode);
+
+        assert!(
+            list.contains(&"PrivateNetwork=yes".to_string()),
+            "system-mode deny must emit PrivateNetwork=yes"
+        );
+        assert!(
+            list.contains(&"IPAddressDeny=any".to_string()),
+            "system-mode deny must emit IPAddressDeny=any"
+        );
+        assert!(
+            list.contains(&"IPAddressAllow=localhost".to_string()),
+            "system-mode deny must emit IPAddressAllow=localhost"
+        );
+    }
+
+    #[test]
+    fn property_list_user_mode_network_deny_emits_restrict_af() {
+        // Verify that a gate job (default deny) emits the partial
+        // mitigation RestrictAddressFamilies=AF_UNIX in user-mode.
+        // This blocks AF_INET/AF_INET6 socket creation even without root.
+        // Regression test for INV-NET-004 user-mode mitigation.
+        let policy = resolve_network_policy("gates", None);
+        assert!(!policy.allow_network, "gates must resolve to deny");
+
+        let profile = test_profile();
+        let props = SystemdUnitProperties::from_lane_profile_with_hardening(
+            &profile,
+            None,
+            SandboxHardeningProfile::default(),
+            policy,
+        );
+        let list = build_property_list(&props, ExecutionBackend::UserMode);
+
+        assert!(
+            list.contains(&"RestrictAddressFamilies=AF_UNIX".to_string()),
+            "user-mode deny must emit RestrictAddressFamilies=AF_UNIX"
+        );
+        // Full namespace directives must NOT be present in user-mode.
+        assert!(
+            !list.iter().any(|p| p.starts_with("PrivateNetwork")),
+            "PrivateNetwork requires root, must not appear in user-mode"
+        );
+        assert!(
+            !list.iter().any(|p| p.starts_with("IPAddressDeny")),
+            "IPAddressDeny requires BPF cgroup, must not appear in user-mode"
+        );
+    }
+
+    #[test]
+    fn property_list_network_allow_omits_all_network_directives() {
+        // Verify that an allowed network policy (e.g. warm job kind)
+        // emits no network restriction directives in either mode.
+        let policy = resolve_network_policy("warm", None);
+        assert!(policy.allow_network, "warm must resolve to allow");
+
+        let profile = test_profile();
+        let props = SystemdUnitProperties::from_lane_profile_with_hardening(
+            &profile,
+            None,
+            SandboxHardeningProfile::default(),
+            policy,
+        );
+
+        // System-mode: no network directives.
+        let sys_list = build_property_list(&props, ExecutionBackend::SystemMode);
+        assert!(
+            !sys_list.iter().any(|p| p.starts_with("PrivateNetwork")),
+            "allow policy must not emit PrivateNetwork"
+        );
+        assert!(
+            !sys_list.iter().any(|p| p.starts_with("IPAddressDeny")),
+            "allow policy must not emit IPAddressDeny"
+        );
+
+        // User-mode: no network directives.
+        let user_list = build_property_list(&props, ExecutionBackend::UserMode);
+        assert!(
+            !user_list
+                .iter()
+                .any(|p| p.starts_with("RestrictAddressFamilies")),
+            "allow policy must not emit RestrictAddressFamilies in user-mode"
+        );
     }
 }

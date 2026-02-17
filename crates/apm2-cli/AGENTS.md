@@ -343,6 +343,29 @@ Commands surface daemon errors and exit non-zero on failure.
 - [`apm2_core::config`](../apm2-core/src/config/AGENTS.md) - `EcosystemConfig` for socket path resolution
 - [`apm2_daemon`](../apm2-daemon/AGENTS.md) - Server-side implementation
 
+## E2E Test Coverage (TCK-00601)
+
+- `tests/tck_00601_e2e_deterministic_failures.rs`: 16 tests covering FAC gates
+  deterministic failure modes and secrets posture.
+  - **Subprocess E2E tests** (5 tests): Invoke the `apm2` binary as a subprocess
+    via `std::process::Command` with hermetic `APM2_HOME`:
+    - `subprocess_broker_absent_fails_fast_no_hang`: `apm2 fac gates --quick` in
+      bare APM2_HOME (no broker/queue) exits non-zero within timeout.
+    - `subprocess_no_fac_root_fails_fast_no_hang`: `apm2 fac gates --quick` in
+      completely empty APM2_HOME exits non-zero within timeout.
+    - `subprocess_worker_absent_exits_bounded_no_hang`: `apm2 fac gates --quick`
+      with broker infrastructure but no worker exits within bounded timeout.
+    - `subprocess_gates_no_credential_error_without_github_creds`: `apm2 fac gates`
+      with no GITHUB_TOKEN/GH_TOKEN does NOT produce credential errors.
+    - `subprocess_push_fails_fast_with_credential_remediation`: `apm2 fac push`
+      with no GitHub credentials exits non-zero with credential remediation.
+  - **Library tests** (11 tests): Heartbeat reads, credential posture Debug
+    output, error message remediation content, receipt builder secret leakage,
+    subprocess error output secret scanning.
+  - All subprocess tests use `env_clear()` + explicit env vars for isolation.
+  - All temp dirs use 0o700 permissions (CTR-2611) for FAC preflight compliance.
+  - Hang guard: `SUBPROCESS_TIMEOUT_SECS = 30` enforced via child process kill.
+
 ## References
 
 - [Clap Derive Tutorial](https://docs.rs/clap/latest/clap/_derive/_tutorial/index.html)

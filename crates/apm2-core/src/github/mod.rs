@@ -59,7 +59,8 @@ pub use lease::{GitHubLease, GitHubLeaseState, RevocationReason};
 pub use scope::{GitHubApp, GitHubScope, RiskTier};
 pub use token_provider::{
     GitHubAppConfig, GitHubAppTokenProvider, MockTokenProvider, RateLimitedTokenProvider,
-    TokenProvider, TokenRequest, TokenResponse, load_github_app_config, resolve_apm2_home,
+    SYSTEMD_GITHUB_APP_KEY_NAME, TokenProvider, TokenRequest, TokenResponse,
+    load_github_app_config, resolve_apm2_home,
 };
 
 /// Maximum length for GitHub App IDs.

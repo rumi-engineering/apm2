@@ -71,7 +71,10 @@ use subtle::ConstantTimeEq;
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
 pub use crate::commands::fac_broker::BrokerArgs;
 use crate::commands::role_launch::{self, RoleLaunchArgs};
-use crate::commands::{fac_broker, fac_gc, fac_pr, fac_preflight, fac_quarantine, fac_review};
+use crate::commands::{
+    fac_broker, fac_economics, fac_gc, fac_policy, fac_pr, fac_preflight, fac_quarantine,
+    fac_review,
+};
 use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
 // =============================================================================
@@ -288,6 +291,27 @@ pub enum FacSubcommand {
     /// Shows job counts by directory, oldest pending job, and
     /// denial/quarantine reason code distributions.
     Queue(QueueArgs),
+    /// Manage admitted FAC policy: show, validate, adopt, rollback.
+    ///
+    /// The broker maintains an admitted policy digest. Adoption is atomic
+    /// with rollback support. Every operation emits a durable receipt.
+    Policy(fac_policy::PolicyArgs),
+    /// Manage admitted economics profile: show, adopt, rollback.
+    ///
+    /// The broker maintains an admitted economics profile digest. Adoption
+    /// is atomic with rollback support. Every operation emits a durable
+    /// receipt. Workers deny budget admissions when profile hash mismatches.
+    Economics(fac_economics::EconomicsArgs),
+    /// One-shot compute-host provisioning for `FESv1`.
+    ///
+    /// Creates the required `$APM2_HOME/private/fac/**` directory tree with
+    /// correct permissions and ownership, writes a minimal default
+    /// `FacPolicyV1` (safe no-secrets posture), initializes lanes, and
+    /// optionally installs systemd services. Runs doctor checks and fails
+    /// with actionable output if the host cannot support `FESv1`.
+    ///
+    /// Idempotent: safe to re-run without destroying existing state.
+    Bootstrap(crate::commands::fac_bootstrap::BootstrapArgs),
 }
 
 /// Arguments for `apm2 fac warm`.
@@ -2152,6 +2176,9 @@ pub fn run_fac(
             | FacSubcommand::Bundle(_)
             | FacSubcommand::Reconcile(_)
             | FacSubcommand::Queue(_)
+            | FacSubcommand::Policy(_)
+            | FacSubcommand::Economics(_)
+            | FacSubcommand::Bootstrap(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -2671,6 +2698,11 @@ pub fn run_fac(
             },
         },
         FacSubcommand::Reconcile(args) => run_reconcile(args, resolve_json(args.json)),
+        FacSubcommand::Policy(args) => fac_policy::run_policy_command(args, json_output),
+        FacSubcommand::Economics(args) => fac_economics::run_economics_command(args, json_output),
+        FacSubcommand::Bootstrap(args) => {
+            crate::commands::fac_bootstrap::run_bootstrap(args, operator_socket, config_path)
+        },
     }
 }
 
@@ -2800,7 +2832,10 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Bench(_)
         | FacSubcommand::Bundle(_)
         | FacSubcommand::Reconcile(_)
-        | FacSubcommand::Queue(_) => true,
+        | FacSubcommand::Queue(_)
+        | FacSubcommand::Policy(_)
+        | FacSubcommand::Economics(_)
+        | FacSubcommand::Bootstrap(_) => true,
     }
 }
 

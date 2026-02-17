@@ -904,6 +904,7 @@ mod tests {
             containment: None,
             observed_cost: None,
             sandbox_hardening_hash: None,
+            network_policy_hash: None,
             timestamp_secs: timestamp,
             content_hash: content_hash.to_string(),
         }

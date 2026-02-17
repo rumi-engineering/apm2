@@ -33,7 +33,9 @@ default mode.
   limits, persistence, and deserialization failures.
 - `BrokerSignatureVerifier`: Implements `SignatureVerifier` trait from
   `economics::queue_admission` using the broker's Ed25519 public key. Workers use
-  this instead of `NoOpVerifier` in default mode.
+  this instead of `NoOpVerifier` in default mode. Note: `NoOpVerifier` is gated
+  behind `cfg(test)/feature="unsafe_no_verify"` and not available in default
+  builds (TCK-00550).
 
 ### Core Capabilities
 
@@ -645,6 +647,51 @@ bootstrap and recovery commands exposed via `apm2 fac lane init` and
 - `core.symlinks=false` prevents symlink creation in workspaces
 - `--no-hardlinks` prevents object sharing between mirror and workspace
 - Path traversal prevention delegated to `git apply` (standard git safety)
+- Post-checkout git hardening disables hooks and refuses unsafe configs (TCK-00580)
+
+### `git_hardening` — Git Safety Hardening for Lane Workspaces (TCK-00580)
+
+**Core function**: `harden_lane_workspace(workspace, hooks_parent, refuse_unsafe_configs)`
+
+Applies security hardening to lane workspace git config after checkout:
+1. Resolves workspace absolute path and passes `safe.directory` as a `-c` flag on all
+   git commands. Git ignores `safe.directory` in local scope (CVE-2022-24765), and
+   writing to global config causes lock contention in concurrent lane environments, so
+   the `-c` flag approach passes it transiently on each command invocation.
+2. Sets `core.hooksPath` to an empty FAC-controlled directory (disables hooks)
+3. Scans `.git/config` for unsafe filter/smudge/command entries
+
+**Key types**:
+- `GitHardeningReceipt`: Audit receipt recording hooks, safe.directory, and config scan status
+- `GitHardeningOutcome`: Enum (`Hardened`, `Failed`, `Rejected`)
+- `GitHardeningError`: Error taxonomy for hardening failures. Includes:
+  - `HooksDirCreationFailed`: hooks directory could not be created
+  - `HooksDirValidationFailed`: pre-existing hooks directory failed validation
+    (symlink, wrong owner, wrong permissions, non-empty)
+  - `ConfigScanCommandFailed`: `git config --local --list` exited non-zero
+    (fail-closed; includes stdout/stderr for diagnostics)
+  - `UnsafeConfigDetected`: unsafe config keys found; carries a `GitHardeningReceipt`
+    with `Rejected` outcome for audit trail
+
+**Security invariants**:
+- [INV-GH-001] After hardening, no repository-shipped hook can execute
+- [INV-GH-002] Hooks directory is empty, FAC-controlled, mode 0o700, outside workspace tree
+- [INV-GH-003] Unsafe filter/smudge/fsmonitor/sshcommand/editor/pager/askpass/gitproxy/alias configs are detected and rejected
+- [INV-GH-004] All hardening results recorded in `GitHardeningReceipt` for evidence
+- [INV-GH-005] Pre-existing hooks directories are validated before reuse: must not be
+  a symlink, must be owned by current uid, must have mode 0o700, must be empty. Failure
+  on any check returns `Err` (fail-closed; do not reuse attacker-controlled directories).
+- [INV-GH-006] `git config --local --list` failure is fail-closed: returns `Err` with
+  diagnostics instead of silently passing the config scan.
+- [INV-GH-007] When unsafe config is detected and rejected, a `GitHardeningReceipt`
+  with `outcome: Rejected` is included in the error for audit trail persistence.
+- [INV-GH-008] `safe.directory` is passed via `-c` flag on every git command, never
+  written to any persistent config (local or global). Git ignores `safe.directory` in
+  local scope per CVE-2022-24765, and writing to global config causes lock contention
+  in concurrent lane environments. The `-c` flag approach avoids both issues.
+
+**Integration**: Called automatically by `checkout_to_lane()` after checkout completes.
+Receipt is included in `CheckoutOutcome::git_hardening`.
 
 ### `execution_backend` — System-mode and user-mode execution backend selection (TCK-00529)
 
@@ -706,12 +753,14 @@ user-mode and system-mode execution backends.
   - `runtime_max_sec` → `RuntimeMaxSec`
   - `kill_mode` → `KillMode` (default `control-group`)
   - `sandbox_hardening` → `SandboxHardeningProfile` (TCK-00573)
+  - `network_policy` → `NetworkPolicy` (TCK-00574)
 - Input binding:
-  - `from_lane_profile_with_hardening(&LaneProfileV1, Option<&JobConstraints>, SandboxHardeningProfile)` — primary constructor for lane-driven paths; requires explicit policy-driven hardening profile (INV-SBX-001)
-  - `from_cli_limits_with_hardening(cpu_quota_percent, memory_max_bytes, tasks_max, timeout_seconds, SandboxHardeningProfile)` — CLI-driven constructor for bounded test runner where no `LaneProfileV1` is available; uses centralized `DEFAULT_IO_WEIGHT` and `DEFAULT_KILL_MODE` constants shared with the lane constructor (INV-SBX-001)
+  - `from_lane_profile_with_hardening(&LaneProfileV1, Option<&JobConstraints>, SandboxHardeningProfile, NetworkPolicy)` — primary constructor for lane-driven paths; requires explicit policy-driven hardening and network policy profiles (INV-SBX-001, INV-NET-001)
+  - `from_cli_limits_with_hardening(cpu_quota_percent, memory_max_bytes, tasks_max, timeout_seconds, SandboxHardeningProfile, NetworkPolicy)` — CLI-driven constructor for bounded test runner where no `LaneProfileV1` is available; uses centralized `DEFAULT_IO_WEIGHT` and `DEFAULT_KILL_MODE` constants shared with the lane constructor (INV-SBX-001, INV-NET-001)
 - Override semantics:
   - `memory_max_bytes` and `test_timeout_seconds` use MIN(job, lane).
   - `sandbox_hardening` is policy-driven via `FacPolicyV1.sandbox_hardening` (TCK-00573).
+  - `network_policy` is resolved via `resolve_network_policy(job_kind, policy_override)` (TCK-00574).
 
 **Core type**: `SandboxHardeningProfile` (TCK-00573)
 
@@ -731,6 +780,30 @@ Systemd security directives for transient units. Policy-driven via
   Rejects duplicate entries in `restrict_address_families` via `HashSet`-based
   detection (TCK-00573 NIT-3).
 
+**Core type**: `NetworkPolicy` (TCK-00574)
+
+Network access control for systemd transient units. Default posture is
+fail-closed (deny all network). Policy-driven via
+`resolve_network_policy(job_kind, policy_override)`.
+
+- Directives (when `allow_network=false`): `PrivateNetwork=yes`,
+  `IPAddressDeny=any`, `IPAddressAllow=localhost`.
+- When `allow_network=true`: no network directives emitted (full access).
+- `content_hash()` / `content_hash_hex()`: Deterministic BLAKE3 hash with
+  domain separation `apm2.fac.network_policy.v1\0` for receipt audit binding.
+- `to_property_strings()`: Full network isolation for system-mode.
+- `to_user_mode_property_strings()`: Emits `RestrictAddressFamilies=AF_UNIX`
+  as partial mitigation when `allow_network=false` (requires
+  `NoNewPrivileges=yes` from sandbox hardening). Returns empty when allowed.
+- `enabled_directive_count()`: Returns 3 for deny, 0 for allow.
+
+**Resolver**: `resolve_network_policy(job_kind, policy_override) -> NetworkPolicy`
+
+Maps job kind to network policy with explicit override support:
+- `"warm"` → `NetworkPolicy::allow()` (needs network for fetching dependencies)
+- All other job kinds (gates, bulk, control, etc.) → `NetworkPolicy::deny()`
+- If `policy_override` is `Some`, it takes precedence over job-kind mapping.
+
 ### Security Invariants (TCK-00573)
 
 - [INV-SBX-001] All `SystemdUnitProperties` construction sites in production
@@ -745,6 +818,22 @@ Systemd security directives for transient units. Policy-driven via
 - [INV-SBX-003] Address families bounded by `MAX_ADDRESS_FAMILIES=16`.
 - [INV-SBX-004] Address families must be unique; `validate()` rejects
   duplicates with a diagnostic error identifying the offending index.
+
+### Security Invariants (TCK-00574)
+
+- [INV-NET-001] All `SystemdUnitProperties` construction sites pass an explicit
+  `NetworkPolicy` resolved via `resolve_network_policy(job_kind, ...)`. No
+  caller site may hard-code network access decisions.
+- [INV-NET-002] Default network posture is fail-closed: `NetworkPolicy::default()`
+  denies all network access (`allow_network=false`).
+- [INV-NET-003] Only `"warm"` job kind resolves to `NetworkPolicy::allow()`;
+  all other job kinds (gates, bulk, control, stop_revoke) default to deny.
+- [INV-NET-004] Network policy directives (`PrivateNetwork`, `IPAddressDeny`,
+  `IPAddressAllow`) are emitted in system-mode only. In user-mode,
+  `RestrictAddressFamilies=AF_UNIX` is emitted as a partial mitigation to
+  block IP sockets, provided `NoNewPrivileges=yes` is active.
+- [INV-NET-005] `FacPolicyV1.network_policy` field uses `#[serde(default)]`
+  for backward compatibility; missing field deserializes to deny-all.
 
 ## Rendering API
 
@@ -1087,6 +1176,210 @@ directories (`~/.cache`, `~/.cargo`, `~/.config`, etc.).
   lane (returned by `allocate_lane_job_logs_dir`) to maintain lock/env coupling.
   Every FAC gate phase runs with deterministic lane-local `HOME`/`TMPDIR`/`XDG_*`
   values.
+
+## policy_adoption Submodule (TCK-00561)
+
+The `policy_adoption` module implements broker-admitted `FacPolicyHash` rotation
+with receipts and rollback. The broker maintains an admitted policy digest under
+`$APM2_HOME/private/fac/broker/admitted_policy_root.v1.json` (digest only;
+non-secret). Adoption is atomic (temp + rename + fsync per CTR-2607), with the
+previous digest retained in `admitted_policy_root.prev.v1.json` for rollback.
+
+### Types
+
+- `AdmittedPolicyRootV1`: Persisted admitted policy root (schema, hash,
+  timestamp, actor). Uses `#[serde(deny_unknown_fields)]`.
+- `PolicyAdoptionAction`: Enum (`Adopt`, `Rollback`).
+- `PolicyAdoptionReceiptV1`: Durable receipt for adoption/rollback events.
+  Contains `old_digest`, `new_digest`, actor, reason, timestamp, and
+  domain-separated BLAKE3 content hash.
+- `PolicyAdoptionError`: Error enum (via `thiserror`) covering validation,
+  persistence, I/O, serialization, size-limit, string-bound, and duplicate
+  adoption failures.
+
+### Key Functions
+
+- `load_admitted_policy_root(fac_root) -> Result<AdmittedPolicyRootV1>`: Reads
+  the current admitted root with bounded I/O (CTR-1603) and symlink rejection.
+- `is_policy_hash_admitted(fac_root, hash) -> bool`: Constant-time comparison
+  (via `subtle::ConstantTimeEq`) of a policy hash against the admitted root.
+  Returns `false` when no root exists (fail-closed, INV-PADOPT-004).
+- `validate_policy_bytes(bytes) -> Result<(FacPolicyV1, String)>`: Deserializes,
+  validates schema+fields, and computes BLAKE3 policy hash.
+- `adopt_policy(fac_root, bytes, actor, reason) -> Result<(Root, Receipt)>`:
+  Full adoption lifecycle: validate, check for duplicate, persist atomically
+  (current -> prev, new -> current), emit receipt.
+- `rollback_policy(fac_root, actor, reason) -> Result<(Root, Receipt)>`:
+  Restores the previous admitted root atomically and emits a rollback receipt.
+- `deserialize_adoption_receipt(bytes) -> Result<PolicyAdoptionReceiptV1>`:
+  Bounded deserialization of adoption receipts.
+
+### CLI Commands (fac_policy.rs)
+
+- `apm2 fac policy show [--json]`: Display the currently admitted policy root.
+- `apm2 fac policy validate [<path|->] [--json]`: Validate a policy file (schema +
+  hash computation) and check admission status. Accepts a file path or `-` for
+  stdin. When no argument is given, reads from stdin (bounded, CTR-1603).
+- `apm2 fac policy adopt [<path|->] [--reason <reason>] [--json]`: Adopt a new
+  policy (atomic, with receipt). Accepts a file path or `-` for stdin. When no
+  argument is given, reads from stdin (bounded, CTR-1603).
+- `apm2 fac policy rollback [--reason <reason>] [--json]`: Rollback to the
+  previous admitted policy (with receipt).
+
+### Actor Identity Resolution (TCK-00561, fix round 1)
+
+Adoption and rollback CLI commands resolve the operator identity from the
+process environment (`$USER` / `$LOGNAME`, falling back to numeric UID on
+Unix via `nix::unistd::getuid()` safe wrapper). The identity is formatted as
+`operator:<username>` and persisted in both the admitted policy root and
+adoption receipts. The username is sanitized to the safe character set
+`[a-zA-Z0-9._@-]` to prevent control character injection into the audit
+trail. Usernames containing only unsafe characters fall back to hex encoding.
+
+### Security Invariants (TCK-00561)
+
+- [INV-PADOPT-001] Adoption requires schema + hash validation before acceptance
+  (no arbitrary file acceptance).
+- [INV-PADOPT-002] Atomic persistence via `NamedTempFile` + fsync + `persist()`
+  (CTR-2607, RSK-1502). `NamedTempFile` uses `O_EXCL` + random names to
+  eliminate symlink TOCTOU on temp file creation. The prev-file backup also
+  uses temp + rename (not `fs::copy`).
+- [INV-PADOPT-003] Rollback to `prev` is atomic and emits a receipt.
+- [INV-PADOPT-004] Workers refuse actuation tokens whose policy binding
+  mismatches the admitted digest (fail-closed). The worker calls
+  `is_policy_hash_admitted` before processing non-control-lane jobs and denies
+  with `DenialReasonCode::PolicyAdmissionDenied` when the policy hash is not
+  admitted.
+- [INV-PADOPT-005] Receipt content hash uses domain-separated BLAKE3 with
+  injective length-prefix framing (CTR-2612).
+- [INV-PADOPT-006] All string fields are bounded for DoS prevention (CTR-1303).
+- [INV-PADOPT-007] File reads use the open-once pattern: `O_NOFOLLOW | O_CLOEXEC`
+  at `open(2)` atomically refuses symlinks at the kernel level, `fstat` on the
+  opened fd verifies regular file type, and `take(max_size+1)` bounds reads
+  (CTR-1603). This eliminates the TOCTOU gap between symlink check and read.
+- [INV-PADOPT-008] All persistence paths (admitted root, prev root, receipt
+  files, broker dir, receipts dir) reject symlinks via `reject_symlink()`
+  before writes. Read paths use `O_NOFOLLOW` at the kernel level.
+- [INV-PADOPT-009] Actor identity in receipts is resolved from the calling
+  process environment, not hard-coded. Username is sanitized to safe chars.
+- [INV-PADOPT-010] Receipts directory is synced after atomic rename for
+  durability (CTR-2607, CTR-1502).
+- [INV-PADOPT-011] FAC root resolution uses the shared `fac_utils::resolve_fac_root()`
+  helper, avoiding predictable `/tmp` fallback paths (RSK-1502).
+- [INV-PADOPT-012] Rotation logic reads the current root via bounded
+  `load_bounded_json` (not unbounded `fs::read`) to prevent memory exhaustion.
+
+## economics_adoption Submodule (TCK-00584)
+
+The `economics_adoption` module implements broker-admitted `EconomicsProfile`
+hash rotation with receipts and rollback. The broker maintains an admitted
+economics profile digest under
+`$APM2_HOME/private/fac/broker/admitted_economics_profile.v1.json` (digest only;
+non-secret). Adoption is atomic (temp + rename + fsync per CTR-2607), with the
+previous digest retained in `admitted_economics_profile.prev.v1.json` for
+rollback.
+
+### Types
+
+- `AdmittedEconomicsProfileRootV1`: Persisted admitted economics profile root
+  (schema, hash, timestamp, actor). Uses `#[serde(deny_unknown_fields)]`.
+- `EconomicsAdoptionAction`: Enum (`Adopt`, `Rollback`).
+- `EconomicsAdoptionReceiptV1`: Durable receipt for adoption/rollback events.
+  Contains `old_digest`, `new_digest`, actor, reason, timestamp, and
+  domain-separated BLAKE3 content hash.
+- `EconomicsAdoptionError`: Error enum (via `thiserror`) covering validation,
+  persistence, I/O, serialization, size-limit, string-bound, duplicate
+  adoption, and invalid digest format failures.
+
+### Key Functions
+
+- `load_admitted_economics_profile_root(fac_root) -> Result<AdmittedEconomicsProfileRootV1>`:
+  Reads the current admitted root with bounded I/O (CTR-1603) and symlink rejection.
+- `is_economics_profile_hash_admitted(fac_root, hash) -> bool`: Constant-time
+  comparison (via `subtle::ConstantTimeEq`) of a profile hash against the
+  admitted root. Returns `false` when no root exists (fail-closed, INV-EADOPT-004).
+- `validate_economics_profile_bytes(bytes) -> Result<(EconomicsProfile, String)>`:
+  Validates framed profile bytes (domain-prefix check) and computes BLAKE3 hash.
+- `validate_economics_profile_json_bytes(bytes) -> Result<(EconomicsProfile, String)>`:
+  Validates raw JSON profile bytes, adds domain framing, and computes BLAKE3 hash.
+- `adopt_economics_profile(fac_root, bytes, actor, reason) -> Result<(Root, Receipt)>`:
+  Full adoption lifecycle: validate, check for duplicate, persist atomically
+  (current -> prev, new -> current), emit receipt.
+- `adopt_economics_profile_by_hash(fac_root, digest, actor, reason) -> Result<(Root, Receipt)>`:
+  Hash-only adoption: validates the digest format (`b3-256:<64-lowercase-hex>`),
+  checks for duplicate, persists the hash as the admitted root atomically, and
+  emits a receipt. Does not require the full profile file.
+- `validate_digest_string(digest) -> Result<()>`: Validates that a digest string
+  conforms to `b3-256:<64-lowercase-hex>` format.
+- `looks_like_digest(s) -> bool`: Quick syntactic check (prefix match) to
+  distinguish digest arguments from file paths in CLI argument routing.
+- `rollback_economics_profile(fac_root, actor, reason) -> Result<(Root, Receipt)>`:
+  Restores the previous admitted root atomically and emits a rollback receipt.
+- `deserialize_adoption_receipt(bytes) -> Result<EconomicsAdoptionReceiptV1>`:
+  Bounded deserialization of adoption receipts.
+
+### CLI Commands (fac_economics.rs)
+
+- `apm2 fac economics show [--json]`: Display the currently admitted economics
+  profile root.
+- `apm2 fac economics adopt [<hash|path|->] [--reason <reason>] [--json]`: Adopt
+  a new economics profile (atomic, with receipt). Accepts a `b3-256:<hex>` digest
+  for hash-only adoption, a file path, or `-` for stdin. When given a digest,
+  validates the format and records it directly without loading a profile file.
+  Auto-detects framed vs raw JSON for file/stdin input.
+- `apm2 fac economics rollback [--reason <reason>] [--json]`: Rollback to the
+  previous admitted economics profile (with receipt).
+
+### Worker Integration (fac_worker.rs)
+
+The worker admission path includes a Step 2.6 economics profile hash check
+after the existing policy admission check (Step 2.5). The worker formats
+`policy.economics_profile_hash` as `b3-256:<hex>`, loads the admitted root, and
+denies with `DenialReasonCode::EconomicsAdmissionDenied` on mismatch.
+Error handling is fail-closed by error variant:
+- `NoAdmittedRoot` + non-zero `economics_profile_hash`: DENY the job. The
+  policy requires economics enforcement but there is no admitted root to
+  verify against. Prevents admission bypass via root file deletion.
+- `NoAdmittedRoot` + zero `economics_profile_hash`: skip check (backwards
+  compatibility for installations that have not adopted an economics profile
+  and whose policies don't require one).
+- Any other load error (I/O, corruption, schema mismatch, oversized file):
+  deny the job. Treating non-`NoAdmittedRoot` errors as "no root" would allow
+  an attacker to bypass admission by tampering with the admitted-economics root
+  file (INV-EADOPT-004).
+
+### Security Invariants (TCK-00584)
+
+- [INV-EADOPT-001] Adoption requires schema + hash validation before acceptance
+  (no arbitrary file acceptance).
+- [INV-EADOPT-002] Atomic persistence via `NamedTempFile` + fsync + `persist()`
+  (CTR-2607, RSK-1502). `NamedTempFile` uses `O_EXCL` + random names to
+  eliminate symlink TOCTOU on temp file creation. The prev-file backup also
+  uses temp + rename (not `fs::copy`).
+- [INV-EADOPT-003] Rollback to `prev` is atomic and emits a receipt.
+- [INV-EADOPT-004] Workers refuse actuation tokens whose economics profile hash
+  mismatches the admitted digest (fail-closed). The worker loads the admitted
+  root via `load_admitted_economics_profile_root` and branches on the error
+  variant: `NoAdmittedRoot` denies the job if the policy's
+  `economics_profile_hash` is non-zero (policy requires economics but no root
+  exists — prevents bypass via root file deletion), skips only if the hash is
+  zero (no economics binding required); successful load triggers constant-time
+  hash comparison; any other error (I/O, corruption, schema mismatch, oversized)
+  denies the job. This prevents admission bypass via root file tampering.
+- [INV-EADOPT-005] Receipt content hash uses domain-separated BLAKE3 with
+  injective length-prefix framing (CTR-2612).
+- [INV-EADOPT-006] All string fields are bounded for DoS prevention (CTR-1303).
+- [INV-EADOPT-007] File reads use the open-once pattern: `O_NOFOLLOW | O_CLOEXEC`
+  at `open(2)` atomically refuses symlinks at the kernel level, `fstat` on the
+  opened fd verifies regular file type, and `take(max_size+1)` bounds reads
+  (CTR-1603). This eliminates the TOCTOU gap between symlink check and read.
+- [INV-EADOPT-008] All persistence paths (admitted root, prev root, receipt
+  files, broker dir, receipts dir) reject symlinks via `reject_symlink()`
+  before writes. Read paths use `O_NOFOLLOW` at the kernel level.
+- [INV-EADOPT-009] Actor identity in receipts is resolved from the calling
+  process environment, not hard-coded. Username is sanitized to safe chars.
+- [INV-EADOPT-010] Receipts directory is synced after atomic rename for
+  durability (CTR-2607, CTR-1502).
 
 ## Receipt Versioning (TCK-00518)
 
@@ -1671,6 +1964,67 @@ inconsistencies deterministically on worker startup.
 - CTR-2501 deviation: `current_timestamp_rfc3339()` and `wall_clock_nanos()`
   use wall-clock time for receipt timestamps and file deduplication suffixes.
   Documented inline with security justification.
+
+## patch_hardening Submodule (TCK-00581)
+
+The `patch_hardening` submodule implements pre-apply validation of unified
+diff content to prevent path traversal attacks, restricts patch format to
+`git_diff_v1` rules, provides a safe-apply wrapper on `RepoMirrorManager`,
+and emits `PatchApplyReceiptV1` receipts for audit provenance.
+
+### Key Types
+
+- `PatchApplyReceiptV1`: Provenance receipt emitted after a patch apply
+  attempt. Contains `patch_digest`, `applied_files_count`, `refusals`
+  list, `applied` flag, and a BLAKE3 `content_hash` binding all normative
+  fields.
+- `PatchRefusal`: A single refusal reason attached to a receipt, carrying
+  the offending path and a human-readable reason.
+- `PatchValidationResult`: Successful validation result containing
+  `file_count` and `validated_paths`.
+- `PatchValidationError`: Structured error enum covering size, NUL bytes,
+  path traversal, absolute paths, Windows paths, invalid prefixes, empty
+  patches, too many files, and unsupported format.
+
+### Core Capabilities
+
+- `validate_patch_content(bytes, format)`: Validates raw patch bytes
+  against `git_diff_v1` rules. Parses `diff --git` headers and `---`/`+++`
+  lines. Rejects paths containing `..`, absolute paths, Windows drive
+  letters, UNC prefixes, backslash separators, and NUL bytes.
+- `validate_for_apply(bytes, format)`: Convenience wrapper that returns a
+  denial `PatchApplyReceiptV1` on validation failure.
+- `RepoMirrorManager::apply_patch_hardened(workspace, bytes, format)`:
+  Safe-apply entry point that validates, applies via `git apply`, verifies
+  the digest binding, and returns a success receipt.
+
+### Security Invariants (TCK-00581)
+
+- [INV-PH-001] Paths containing `..` components are rejected.
+- [INV-PH-002] Absolute paths (leading `/`) are rejected.
+- [INV-PH-003] Windows drive letters, UNC prefixes, and backslash
+  separators are rejected.
+- [INV-PH-004] Paths must start with `a/` or `b/` prefix (standard git
+  diff prefix); the prefix is stripped before traversal checks.
+- [INV-PH-005] NUL bytes in patch content are rejected.
+- [INV-PH-006] Patch size is bounded by `MAX_PATCH_CONTENT_SIZE` (10 MiB).
+- [INV-PH-007] Only `git_diff_v1` format patches are accepted.
+- [INV-PH-008] Receipt content hash covers all normative fields with
+  injective length-prefix framing.
+- [INV-PH-009] Empty patches (no diff headers) are rejected.
+- [INV-PH-010] `/dev/null` is allowed as a source/destination in file
+  creation/deletion diffs.
+- All collections are bounded: `MAX_PATCH_FILE_ENTRIES=10000`,
+  `MAX_REFUSALS=1000`.
+- Refusal reasons are truncated at `MAX_REFUSAL_REASON_LENGTH=512`.
+- `RepoMirrorError::PatchHardeningDenied` carries a boxed denial receipt.
+- `DenialReasonCode::PatchHardeningDenied` maps the hardening denial to the
+  receipt system for structured denial tracking.
+- The worker `patch_injection` path calls `apply_patch_hardened` (not
+  `apply_patch`), ensuring INV-PH-001 through INV-PH-010 are enforced on
+  all untrusted patch bytes. Denial receipts are persisted under
+  `fac_root/patch_receipts/` and the receipt content hash is included in
+  the job denial reason for audit traceability.
 
 ## Control-Lane Exception (TCK-00533)
 

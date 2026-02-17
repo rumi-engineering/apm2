@@ -1805,6 +1805,7 @@ mod tests {
                 kill_mode: "control-group".to_string(),
                 sandbox_hardening:
                     super::super::systemd_properties::SandboxHardeningProfile::default(),
+                network_policy: super::super::systemd_properties::NetworkPolicy::allow(),
             },
             system_config: None,
         };
@@ -1849,6 +1850,7 @@ mod tests {
                 kill_mode: "control-group".to_string(),
                 sandbox_hardening:
                     super::super::systemd_properties::SandboxHardeningProfile::default(),
+                network_policy: super::super::systemd_properties::NetworkPolicy::allow(),
             },
             system_config: None,
         };
@@ -1974,6 +1976,7 @@ mod tests {
                 kill_mode: "control-group".to_string(),
                 sandbox_hardening:
                     super::super::systemd_properties::SandboxHardeningProfile::default(),
+                network_policy: super::super::systemd_properties::NetworkPolicy::allow(),
             },
             system_config: None,
         };
