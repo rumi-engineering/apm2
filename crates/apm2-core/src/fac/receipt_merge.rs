@@ -226,17 +226,34 @@ fn load_receipt_bounded(path: &Path) -> Result<FacJobReceiptV1, String> {
     serde_json::from_slice::<FacJobReceiptV1>(&buf).map_err(|e| format!("JSON parse failed: {e}"))
 }
 
+/// Normalize a digest filename stem to canonical `b3-256:<hex>` form.
+///
+/// Accepts both bare 64-char hex and `b3-256:`-prefixed forms.
+/// Returns the canonical prefixed form in both cases.
+fn normalize_digest(stem: &str) -> String {
+    if stem.starts_with("b3-256:") {
+        stem.to_string()
+    } else {
+        format!("b3-256:{stem}")
+    }
+}
+
 /// Verify content-addressed integrity of a loaded receipt against the
 /// expected digest derived from its filename.
+///
+/// Normalizes the filename stem to canonical `b3-256:<hex>` form before
+/// comparison, so both bare `<hex>.json` and `b3-256:<hex>.json` filenames
+/// verify correctly.
 fn verify_receipt_integrity(receipt: &FacJobReceiptV1, expected_digest: &str) -> bool {
+    let canonical = normalize_digest(expected_digest);
     // Try v1 hash first.
     let v1_hash = compute_job_receipt_content_hash(receipt);
-    if v1_hash.as_bytes().ct_eq(expected_digest.as_bytes()).into() {
+    if v1_hash.as_bytes().ct_eq(canonical.as_bytes()).into() {
         return true;
     }
     // Try v2 hash (includes unsafe_direct).
     let v2_hash = compute_job_receipt_content_hash_v2(receipt);
-    if v2_hash.as_bytes().ct_eq(expected_digest.as_bytes()).into() {
+    if v2_hash.as_bytes().ct_eq(canonical.as_bytes()).into() {
         return true;
     }
     false
@@ -269,8 +286,10 @@ fn scan_receipt_dir(
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
         }
-        // Skip directories.
-        if path.is_dir() {
+        // Skip directories. Use entry.file_type() (lstat) instead of
+        // path.is_dir() (stat) to avoid following symlinks and the
+        // extra syscall / TOCTOU window.
+        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
             continue;
         }
         // Skip index subdirectory files.
@@ -342,11 +361,17 @@ fn scan_receipt_dir(
 }
 
 /// Atomically write receipt bytes to the target directory.
+///
+/// Uses `tempfile::NamedTempFile::new_in` for secure temp file creation
+/// with `O_EXCL` protection, preventing symlink attacks on deterministic
+/// temp file names (CVE-class: CWE-367 / CWE-59).
 fn atomic_write_receipt(
     target_dir: &Path,
     digest: &str,
     receipt: &FacJobReceiptV1,
 ) -> Result<PathBuf, ReceiptMergeError> {
+    use std::io::Write as _;
+
     let body = serde_json::to_vec_pretty(receipt).map_err(|e| {
         ReceiptMergeError::io(
             format!("serializing receipt {digest}"),
@@ -355,21 +380,27 @@ fn atomic_write_receipt(
     })?;
 
     let final_path = target_dir.join(format!("{digest}.json"));
-    let temp_path = target_dir.join(format!("{digest}.merge.tmp"));
 
-    fs::write(&temp_path, body).map_err(|e| {
-        ReceiptMergeError::io(format!("writing temp file {}", temp_path.display()), e)
-    })?;
-    fs::rename(&temp_path, &final_path).map_err(|e| {
-        // Clean up temp file on rename failure.
-        let _ = fs::remove_file(&temp_path);
+    // Create a securely randomized temp file with O_EXCL (no symlink follow).
+    let mut temp_file = tempfile::NamedTempFile::new_in(target_dir).map_err(|e| {
         ReceiptMergeError::io(
-            format!(
-                "renaming {} to {}",
-                temp_path.display(),
-                final_path.display()
-            ),
+            format!("creating secure temp file in {}", target_dir.display()),
             e,
+        )
+    })?;
+    temp_file.write_all(&body).map_err(|e| {
+        ReceiptMergeError::io(
+            format!("writing temp file {}", temp_file.path().display()),
+            e,
+        )
+    })?;
+    // persist() performs an atomic rename from the randomized temp path to
+    // the final destination — preserving atomicity and preventing symlink
+    // attacks since the temp name is unpredictable.
+    temp_file.persist(&final_path).map_err(|e| {
+        ReceiptMergeError::io(
+            format!("persisting temp file to {}", final_path.display()),
+            e.error,
         )
     })?;
 
@@ -779,5 +810,98 @@ mod tests {
         assert_eq!(report.total_target_receipts, 1);
         assert_eq!(report.merged_headers.len(), 1);
         assert_eq!(report.merged_headers[0].origin, "target");
+    }
+
+    /// Regression test: bare-hex filename receipts (without `b3-256:` prefix)
+    /// must merge successfully. Previously, integrity verification compared
+    /// the recomputed `b3-256:<hex>` hash directly against the bare `<hex>`
+    /// filename stem, causing a constant mismatch and treating all bare-hex
+    /// files as parse failures.
+    #[test]
+    fn test_bare_hex_filename_receipts_merge_successfully() {
+        let source = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+
+        let receipt = make_test_receipt("job-bare-hex", 5000);
+        // The receipt's content_hash is `b3-256:<hex>`. Extract the bare hex
+        // portion and persist using that as the filename stem instead.
+        let bare_hex = receipt
+            .content_hash
+            .strip_prefix("b3-256:")
+            .expect("hash should have b3-256: prefix");
+        let bare_path = source.path().join(format!("{bare_hex}.json"));
+        let body = serde_json::to_vec_pretty(&receipt).expect("serialize");
+        fs::write(&bare_path, body).expect("write bare-hex receipt");
+
+        let report =
+            merge_receipt_dirs(source.path(), target.path()).expect("merge should succeed");
+
+        // The bare-hex receipt must be copied, not treated as a parse failure.
+        assert_eq!(
+            report.receipts_copied, 1,
+            "bare-hex receipt should be copied, not rejected"
+        );
+        assert!(
+            report.parse_failures.is_empty(),
+            "bare-hex receipt must not produce a parse failure: {:?}",
+            report.parse_failures
+        );
+        assert_eq!(report.merged_headers.len(), 1);
+        assert_eq!(report.merged_headers[0].job_id, "job-bare-hex");
+    }
+
+    /// Regression test: symlink in target directory must not cause the merge
+    /// to overwrite an arbitrary file. The atomic write uses
+    /// `tempfile::NamedTempFile::new_in()` with `O_EXCL`, which creates a
+    /// randomized temp name that cannot be predicted for a symlink attack.
+    /// Additionally, `persist()` atomically renames to the final path.
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_in_target_not_overwritten() {
+        use std::os::unix::fs as unix_fs;
+
+        let source = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+        let victim_dir = tempfile::tempdir().expect("tempdir for victim");
+
+        // Create a receipt in source.
+        let receipt = make_test_receipt("job-symlink-test", 7000);
+        let digest = persist_receipt(source.path(), &receipt);
+
+        // Create a "victim" file that the attacker wants us to overwrite.
+        let victim_path = victim_dir.path().join("precious_data.txt");
+        let victim_content = b"ORIGINAL VICTIM CONTENT - MUST NOT BE OVERWRITTEN";
+        fs::write(&victim_path, victim_content).expect("write victim");
+
+        // Pre-create a symlink at the final destination path in target,
+        // pointing to the victim file. With the old deterministic temp name,
+        // this could not happen on the final path (since rename replaces),
+        // but we verify the final file does not follow a pre-existing symlink
+        // to overwrite the victim.
+        let final_name = format!("{digest}.json");
+        let symlink_path = target.path().join(&final_name);
+        unix_fs::symlink(&victim_path, &symlink_path).expect("create symlink");
+
+        // The merge should succeed — the receipt is written atomically and
+        // the persist() call replaces the symlink with a regular file via
+        // rename(). The victim file must remain untouched.
+        let report =
+            merge_receipt_dirs(source.path(), target.path()).expect("merge should succeed");
+
+        assert_eq!(report.receipts_copied, 1);
+
+        // Verify the victim file was NOT overwritten.
+        let victim_after = fs::read(&victim_path).expect("read victim after merge");
+        assert_eq!(
+            victim_after, victim_content,
+            "victim file must not be overwritten by merge"
+        );
+
+        // Verify the target file is now a regular file (not a symlink).
+        let target_meta = fs::symlink_metadata(&symlink_path).expect("metadata for target path");
+        assert!(
+            !target_meta.file_type().is_symlink(),
+            "target path should be a regular file, not a symlink"
+        );
     }
 }
