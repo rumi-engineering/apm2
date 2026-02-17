@@ -3,8 +3,9 @@
 //! Runs all evidence gates locally, caches results per-SHA so the background
 //! pipeline can skip already-validated gates.
 
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -23,7 +24,10 @@ use sha2::{Digest, Sha256};
 use super::bounded_test_runner::{
     BoundedTestLimits, build_bounded_test_command as build_systemd_bounded_test_command,
 };
-use super::evidence::{EvidenceGateOptions, run_evidence_gates_with_lane_context};
+use super::evidence::{
+    EvidenceGateOptions, EvidenceGateResult, LANE_EVIDENCE_GATES,
+    run_evidence_gates_with_lane_context,
+};
 use super::gate_attestation::{
     GateResourcePolicy, build_nextest_command, compute_gate_attestation,
     gate_command_for_attestation,
@@ -55,6 +59,45 @@ const GATES_QUEUE_LANE: &str = "consume";
 enum QueueProcessingMode {
     ExternalWorker,
     InlineSingleJob,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerExecutionMode {
+    AllowInlineFallback,
+    RequireExternalWorker,
+}
+
+/// Request payload for queued FAC gates execution.
+#[derive(Debug, Clone)]
+pub(super) struct QueuedGatesRequest {
+    pub(super) force: bool,
+    pub(super) quick: bool,
+    pub(super) timeout_seconds: u64,
+    pub(super) memory_max: String,
+    pub(super) pids_max: u64,
+    pub(super) cpu_quota: String,
+    pub(super) gate_profile: GateThroughputProfile,
+    pub(super) wait_timeout_secs: u64,
+    pub(super) require_external_worker: bool,
+}
+
+/// Queue-backed FAC gates outcome with materialized per-gate rows.
+#[derive(Debug, Clone)]
+pub(super) struct QueuedGatesOutcome {
+    pub(super) job_id: String,
+    pub(super) head_sha: String,
+    pub(super) gate_results: Vec<EvidenceGateResult>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedQueuedGatesJob {
+    fac_root: PathBuf,
+    head_sha: String,
+    job_id: String,
+    spec: FacJobSpecV1,
+    worker_bootstrapped: bool,
+    policy_hash: String,
+    options: GatesJobOptionsV1,
 }
 
 /// Throughput profile for bounded FAC gate execution.
@@ -172,6 +215,191 @@ pub fn run_gates(
     )
 }
 
+/// Submit queued gates to worker execution and collect per-gate results from
+/// the authoritative per-SHA gate cache.
+pub(super) fn run_queued_gates_and_collect(
+    request: &QueuedGatesRequest,
+) -> Result<QueuedGatesOutcome, String> {
+    if request.quick {
+        return Err(
+            "queued gate-result collection requires full mode (quick=false) because quick mode does not persist attested gate cache entries".to_string(),
+        );
+    }
+
+    let prepared = prepare_queued_gates_job(request, true)?;
+    let timeout_secs = normalize_wait_timeout(request.wait_timeout_secs);
+    wait_for_gates_job_receipt_with_mode(
+        &prepared.fac_root,
+        &prepared.job_id,
+        Duration::from_secs(timeout_secs),
+        WorkerExecutionMode::RequireExternalWorker,
+    )?;
+
+    let gate_results = load_gate_results_from_cache_for_sha(&prepared.head_sha)?;
+    Ok(QueuedGatesOutcome {
+        job_id: prepared.job_id,
+        head_sha: prepared.head_sha,
+        gate_results,
+    })
+}
+
+const fn normalize_wait_timeout(wait_timeout_secs: u64) -> u64 {
+    if wait_timeout_secs == 0 {
+        DEFAULT_GATES_WAIT_TIMEOUT_SECS
+    } else {
+        wait_timeout_secs
+    }
+}
+
+fn prepare_queued_gates_job(
+    request: &QueuedGatesRequest,
+    wait: bool,
+) -> Result<PreparedQueuedGatesJob, String> {
+    validate_timeout_seconds(request.timeout_seconds)?;
+    let memory_max_bytes = parse_memory_limit(&request.memory_max)?;
+    if memory_max_bytes > max_memory_bytes() {
+        return Err(format!(
+            "--memory-max {} exceeds FAC test memory cap of {}",
+            request.memory_max,
+            max_memory_bytes(),
+        ));
+    }
+    resolve_effective_execution_profile(&request.cpu_quota, request.gate_profile)?;
+
+    let fac_root = resolve_fac_root().map_err(|err| format!("cannot resolve FAC root: {err}"))?;
+    if request.require_external_worker && !has_live_worker_heartbeat(&fac_root) {
+        return Err(
+            "no live FAC worker heartbeat found; fac push requires external worker queue processing".to_string(),
+        );
+    }
+
+    let worker_bootstrapped = if wait {
+        false
+    } else {
+        ensure_non_wait_worker_bootstrap(
+            &fac_root,
+            has_live_worker_heartbeat,
+            spawn_detached_worker_for_queue,
+        )
+        .map_err(|err| format!("cannot bootstrap FAC worker for --no-wait mode: {err}"))?
+    };
+    let boundary_id = apm2_core::fac::load_or_default_boundary_id(&fac_root)
+        .unwrap_or_else(|_| "local".to_string());
+    let mut broker = init_broker(&fac_root, &boundary_id)
+        .map_err(|err| format!("cannot initialize broker: {err}"))?;
+    let (policy_hash, policy_digest, _) =
+        load_or_init_policy(&fac_root).map_err(|err| format!("cannot load FAC policy: {err}"))?;
+    broker
+        .admit_policy_digest(policy_digest)
+        .map_err(|err| format!("cannot admit FAC policy digest: {err}"))?;
+
+    let job_id = format!("gates-{}", generate_job_suffix());
+    let lease_id = format!("gates-lease-{}", generate_job_suffix());
+    let repo_source = resolve_repo_source_info();
+    let options = GatesJobOptionsV1::new(
+        request.force,
+        request.quick,
+        request.timeout_seconds,
+        &request.memory_max,
+        request.pids_max,
+        &request.cpu_quota,
+        request.gate_profile.as_str(),
+        &repo_source.workspace_root,
+    );
+    let spec = build_gates_job_spec(
+        &job_id,
+        &lease_id,
+        &repo_source.repo_id,
+        &repo_source.head_sha,
+        &policy_digest,
+        memory_max_bytes,
+        &options,
+        &boundary_id,
+        &mut broker,
+    )
+    .map_err(|err| format!("cannot build gates job spec: {err}"))?;
+
+    let queue_root =
+        resolve_queue_root().map_err(|err| format!("cannot resolve queue root: {err}"))?;
+    enqueue_job(&queue_root, &spec).map_err(|err| format!("failed to enqueue gates job: {err}"))?;
+
+    Ok(PreparedQueuedGatesJob {
+        fac_root,
+        head_sha: repo_source.head_sha,
+        job_id,
+        spec,
+        worker_bootstrapped,
+        policy_hash,
+        options,
+    })
+}
+
+fn load_gate_results_from_cache_for_sha(sha: &str) -> Result<Vec<EvidenceGateResult>, String> {
+    let cache = GateCache::load(sha).ok_or_else(|| {
+        format!(
+            "queued gates job completed for sha={sha} but no attested gate cache entry was found"
+        )
+    })?;
+
+    let expected = LANE_EVIDENCE_GATES
+        .iter()
+        .map(|gate| (*gate).to_string())
+        .collect::<BTreeSet<_>>();
+    let actual = cache.gates.keys().cloned().collect::<BTreeSet<_>>();
+
+    let missing = expected
+        .difference(&actual)
+        .cloned()
+        .collect::<Vec<String>>();
+    let extra = actual
+        .difference(&expected)
+        .cloned()
+        .collect::<Vec<String>>();
+    if !missing.is_empty() || !extra.is_empty() {
+        let missing_summary = if missing.is_empty() {
+            "-".to_string()
+        } else {
+            missing.join(",")
+        };
+        let extra_summary = if extra.is_empty() {
+            "-".to_string()
+        } else {
+            extra.join(",")
+        };
+        return Err(format!(
+            "queued gates cache for sha={sha} does not match required gate set (missing={missing_summary}, extra={extra_summary})"
+        ));
+    }
+
+    let mut results = Vec::with_capacity(LANE_EVIDENCE_GATES.len());
+    for gate_name in LANE_EVIDENCE_GATES {
+        let cached = cache.get(gate_name).ok_or_else(|| {
+            format!("queued gates cache for sha={sha} missing required gate `{gate_name}`")
+        })?;
+        let passed = if cached.status.eq_ignore_ascii_case("PASS") {
+            true
+        } else if cached.status.eq_ignore_ascii_case("FAIL") {
+            false
+        } else {
+            return Err(format!(
+                "queued gates cache for sha={sha} has unsupported gate status for `{gate_name}`: {}",
+                cached.status
+            ));
+        };
+        results.push(EvidenceGateResult {
+            gate_name: (*gate_name).to_string(),
+            passed,
+            duration_secs: cached.duration_secs,
+            log_path: cached.log_path.as_deref().map(PathBuf::from),
+            bytes_written: cached.bytes_written,
+            bytes_total: cached.bytes_total,
+            was_truncated: cached.was_truncated,
+            log_bundle_hash: cached.log_bundle_hash.clone(),
+        });
+    }
+    Ok(results)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(test, allow(dead_code))]
 pub(super) fn run_gates_local_worker(
@@ -220,149 +448,48 @@ fn run_gates_via_worker(
     wait_timeout_secs: u64,
     json_output: bool,
 ) -> u8 {
-    if let Err(err) = validate_timeout_seconds(timeout_seconds) {
-        return output_worker_enqueue_error(json_output, &err, exit_codes::VALIDATION_ERROR);
-    }
-    let memory_max_bytes = match parse_memory_limit(memory_max) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            return output_worker_enqueue_error(json_output, &err, exit_codes::VALIDATION_ERROR);
-        },
-    };
-    if memory_max_bytes > max_memory_bytes() {
-        return output_worker_enqueue_error(
-            json_output,
-            &format!(
-                "--memory-max {memory_max} exceeds FAC test memory cap of {max_bytes}",
-                max_bytes = max_memory_bytes()
-            ),
-            exit_codes::VALIDATION_ERROR,
-        );
-    }
-    if let Err(err) = resolve_effective_execution_profile(cpu_quota, gate_profile) {
-        return output_worker_enqueue_error(json_output, &err, exit_codes::VALIDATION_ERROR);
-    }
-
-    let fac_root = match resolve_fac_root() {
-        Ok(path) => path,
-        Err(err) => {
-            return output_worker_enqueue_error(
-                json_output,
-                &format!("cannot resolve FAC root: {err}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-    let worker_bootstrapped = if wait {
-        false
-    } else {
-        match ensure_non_wait_worker_bootstrap(
-            &fac_root,
-            has_live_worker_heartbeat,
-            spawn_detached_worker_for_queue,
-        ) {
-            Ok(spawned) => spawned,
-            Err(err) => {
-                return output_worker_enqueue_error(
-                    json_output,
-                    &format!("cannot bootstrap FAC worker for --no-wait mode: {err}"),
-                    exit_codes::GENERIC_ERROR,
-                );
-            },
-        }
-    };
-    let boundary_id = apm2_core::fac::load_or_default_boundary_id(&fac_root)
-        .unwrap_or_else(|_| "local".to_string());
-    let mut broker = match init_broker(&fac_root, &boundary_id) {
-        Ok(broker) => broker,
-        Err(err) => {
-            return output_worker_enqueue_error(
-                json_output,
-                &format!("cannot initialize broker: {err}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-    let (policy_hash, policy_digest, _) = match load_or_init_policy(&fac_root) {
-        Ok(result) => result,
-        Err(err) => {
-            return output_worker_enqueue_error(
-                json_output,
-                &format!("cannot load FAC policy: {err}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-    if let Err(err) = broker.admit_policy_digest(policy_digest) {
-        return output_worker_enqueue_error(
-            json_output,
-            &format!("cannot admit FAC policy digest: {err}"),
-            exit_codes::GENERIC_ERROR,
-        );
-    }
-
-    let job_id = format!("gates-{}", generate_job_suffix());
-    let lease_id = format!("gates-lease-{}", generate_job_suffix());
-    let repo_source = resolve_repo_source_info();
-    let options = GatesJobOptionsV1::new(
+    let request = QueuedGatesRequest {
         force,
         quick,
         timeout_seconds,
-        memory_max,
+        memory_max: memory_max.to_string(),
         pids_max,
-        cpu_quota,
-        gate_profile.as_str(),
-        &repo_source.workspace_root,
-    );
-    let spec = match build_gates_job_spec(
-        &job_id,
-        &lease_id,
-        &repo_source.repo_id,
-        &repo_source.head_sha,
-        &policy_digest,
-        memory_max_bytes,
-        &options,
-        &boundary_id,
-        &mut broker,
-    ) {
-        Ok(spec) => spec,
+        cpu_quota: cpu_quota.to_string(),
+        gate_profile,
+        wait_timeout_secs,
+        require_external_worker: false,
+    };
+    let prepared = match prepare_queued_gates_job(&request, wait) {
+        Ok(prepared) => prepared,
         Err(err) => {
-            return output_worker_enqueue_error(
-                json_output,
-                &format!("cannot build gates job spec: {err}"),
-                exit_codes::GENERIC_ERROR,
-            );
+            let code = if err.starts_with("--timeout-seconds")
+                || err.starts_with("--memory-max")
+                || err.starts_with("invalid cpu_quota")
+                || err.starts_with("cpu_quota")
+            {
+                exit_codes::VALIDATION_ERROR
+            } else {
+                exit_codes::GENERIC_ERROR
+            };
+            return output_worker_enqueue_error(json_output, &err, code);
         },
     };
 
-    let queue_root = match resolve_queue_root() {
-        Ok(path) => path,
-        Err(err) => {
-            return output_worker_enqueue_error(
-                json_output,
-                &format!("cannot resolve queue root: {err}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-    if let Err(err) = enqueue_job(&queue_root, &spec) {
-        return output_worker_enqueue_error(
-            json_output,
-            &format!("failed to enqueue gates job: {err}"),
-            exit_codes::GENERIC_ERROR,
-        );
-    }
+    let queued_job_id = prepared.job_id.clone();
+    let queued_head_sha = prepared.head_sha.clone();
+    let queued_lane = prepared.spec.queue_lane.clone();
+    let queued_bootstrapped = prepared.worker_bootstrapped;
 
     if json_output {
         let payload = serde_json::json!({
             "status": "enqueued",
             "job_kind": "gates",
-            "job_id": job_id,
-            "queue_lane": spec.queue_lane,
-            "policy_hash": policy_hash,
-            "head_sha": repo_source.head_sha,
-            "worker_bootstrapped": worker_bootstrapped,
-            "options": options,
+            "job_id": queued_job_id,
+            "queue_lane": queued_lane,
+            "policy_hash": &prepared.policy_hash,
+            "head_sha": queued_head_sha,
+            "worker_bootstrapped": queued_bootstrapped,
+            "options": &prepared.options,
         });
         println!(
             "{}",
@@ -372,30 +499,27 @@ fn run_gates_via_worker(
     } else {
         eprintln!(
             "fac gates: enqueued worker job {job_id} lane={} head_sha={}{}",
-            spec.queue_lane,
-            repo_source.head_sha,
-            if worker_bootstrapped {
+            queued_lane,
+            queued_head_sha,
+            if queued_bootstrapped {
                 " (bootstrapped detached worker)"
             } else {
                 ""
-            }
+            },
+            job_id = queued_job_id,
         );
     }
 
     if wait {
-        let timeout_secs = if wait_timeout_secs == 0 {
-            DEFAULT_GATES_WAIT_TIMEOUT_SECS
-        } else {
-            wait_timeout_secs
-        };
+        let timeout_secs = normalize_wait_timeout(wait_timeout_secs);
         let timeout = Duration::from_secs(timeout_secs);
-        match wait_for_gates_job_receipt(&fac_root, &job_id, timeout) {
+        match wait_for_gates_job_receipt(&prepared.fac_root, &prepared.job_id, timeout) {
             Ok(()) => {
                 if json_output {
                     let payload = serde_json::json!({
                         "status": "completed",
                         "job_kind": "gates",
-                        "job_id": job_id,
+                        "job_id": prepared.job_id,
                     });
                     println!(
                         "{}",
@@ -404,7 +528,7 @@ fn run_gates_via_worker(
                         })
                     );
                 } else {
-                    eprintln!("fac gates: worker job {job_id} completed");
+                    eprintln!("fac gates: worker job {} completed", prepared.job_id);
                 }
             },
             Err(err) => {
@@ -504,6 +628,20 @@ fn wait_for_gates_job_receipt(
     job_id: &str,
     timeout: Duration,
 ) -> Result<(), String> {
+    wait_for_gates_job_receipt_with_mode(
+        fac_root,
+        job_id,
+        timeout,
+        WorkerExecutionMode::AllowInlineFallback,
+    )
+}
+
+fn wait_for_gates_job_receipt_with_mode(
+    fac_root: &Path,
+    job_id: &str,
+    timeout: Duration,
+    mode: WorkerExecutionMode,
+) -> Result<(), String> {
     let receipts_dir = fac_root.join("receipts");
     let start = Instant::now();
     loop {
@@ -540,8 +678,11 @@ fn wait_for_gates_job_receipt(
             QueueProcessingMode::ExternalWorker => {
                 std::thread::sleep(Duration::from_secs(GATES_WAIT_POLL_INTERVAL_SECS));
             },
-            QueueProcessingMode::InlineSingleJob => {
-                run_inline_worker_cycle()?;
+            QueueProcessingMode::InlineSingleJob => match mode {
+                WorkerExecutionMode::AllowInlineFallback => run_inline_worker_cycle()?,
+                WorkerExecutionMode::RequireExternalWorker => {
+                    std::thread::sleep(Duration::from_secs(GATES_WAIT_POLL_INTERVAL_SECS));
+                },
             },
         }
     }
@@ -1177,12 +1318,58 @@ fn check_lane_not_corrupt(lane_manager: &LaneManager) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::Command;
 
     use super::*;
+
+    #[allow(unsafe_code)]
+    fn with_test_apm2_home<T>(f: impl FnOnce(&Path) -> T) -> T {
+        struct EnvGuard {
+            original_apm2_home: Option<OsString>,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                if let Some(value) = self.original_apm2_home.take() {
+                    // SAFETY: serialized through env_var_test_lock in test scope.
+                    unsafe { std::env::set_var("APM2_HOME", value) };
+                } else {
+                    // SAFETY: serialized through env_var_test_lock in test scope.
+                    unsafe { std::env::remove_var("APM2_HOME") };
+                }
+            }
+        }
+
+        let _env_lock = crate::commands::env_var_test_lock()
+            .lock()
+            .expect("serialize APM2_HOME tests");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let apm2_home = temp.path().join("apm2-home");
+        fs::create_dir_all(apm2_home.join("private/fac")).expect("create fac root");
+        let original_apm2_home = std::env::var_os("APM2_HOME");
+        // SAFETY: serialized through env_var_test_lock in test scope.
+        unsafe { std::env::set_var("APM2_HOME", &apm2_home) };
+        let _guard = EnvGuard { original_apm2_home };
+        f(&apm2_home)
+    }
+
+    fn default_queued_request(require_external_worker: bool, quick: bool) -> QueuedGatesRequest {
+        QueuedGatesRequest {
+            force: false,
+            quick,
+            timeout_seconds: 30,
+            memory_max: "128M".to_string(),
+            pids_max: 128,
+            cpu_quota: "100%".to_string(),
+            gate_profile: GateThroughputProfile::Conservative,
+            wait_timeout_secs: 60,
+            require_external_worker,
+        }
+    }
 
     #[test]
     fn gate_execution_profile_resolves_auto_quota_from_profile() {
@@ -1231,6 +1418,83 @@ mod tests {
         assert!(balanced.test_parallelism >= 1);
         assert!(balanced.test_parallelism <= host);
         assert!(balanced.test_parallelism <= BALANCED_MAX_PARALLELISM.min(host));
+    }
+
+    #[test]
+    fn run_queued_gates_and_collect_rejects_quick_mode() {
+        let request = default_queued_request(false, true);
+        let err = run_queued_gates_and_collect(&request)
+            .expect_err("quick mode must be rejected for queue collection");
+        assert!(err.contains("quick=false"));
+    }
+
+    #[test]
+    fn prepare_queued_gates_job_rejects_missing_worker_heartbeat_when_required() {
+        with_test_apm2_home(|_| {
+            let request = default_queued_request(true, false);
+            let err = prepare_queued_gates_job(&request, true)
+                .expect_err("missing worker heartbeat must fail closed");
+            assert!(err.contains("no live FAC worker heartbeat found"));
+            assert!(err.contains("external worker"));
+        });
+    }
+
+    #[test]
+    fn load_gate_results_from_cache_for_sha_rejects_incomplete_gate_set() {
+        with_test_apm2_home(|_| {
+            let sha = "a".repeat(40);
+            let mut cache = GateCache::new(&sha);
+            for gate_name in LANE_EVIDENCE_GATES
+                .iter()
+                .take(LANE_EVIDENCE_GATES.len().saturating_sub(1))
+            {
+                cache.set_with_attestation(
+                    gate_name,
+                    true,
+                    1,
+                    Some(format!("b3-256:{}", "a".repeat(64))),
+                    false,
+                    Some(format!("b3-256:{}", "b".repeat(64))),
+                    Some(format!("/tmp/{gate_name}.log")),
+                );
+            }
+            cache.save().expect("persist cache");
+
+            let err = load_gate_results_from_cache_for_sha(&sha)
+                .expect_err("incomplete gate set must fail closed");
+            assert!(err.contains("required gate set"));
+            assert!(err.contains("missing="));
+        });
+    }
+
+    #[test]
+    fn load_gate_results_from_cache_for_sha_returns_rows_in_lane_order() {
+        with_test_apm2_home(|_| {
+            let sha = "b".repeat(40);
+            let mut cache = GateCache::new(&sha);
+            for (idx, gate_name) in LANE_EVIDENCE_GATES.iter().enumerate() {
+                let passed = idx != 2;
+                cache.set_with_attestation(
+                    gate_name,
+                    passed,
+                    (idx + 1) as u64,
+                    Some(format!("b3-256:{}", "c".repeat(64))),
+                    false,
+                    Some(format!("b3-256:{}", "d".repeat(64))),
+                    Some(format!("/tmp/{gate_name}.log")),
+                );
+            }
+            cache.save().expect("persist cache");
+
+            let rows =
+                load_gate_results_from_cache_for_sha(&sha).expect("full cache should materialize");
+            assert_eq!(rows.len(), LANE_EVIDENCE_GATES.len());
+            for (idx, row) in rows.iter().enumerate() {
+                assert_eq!(row.gate_name, LANE_EVIDENCE_GATES[idx]);
+                assert_eq!(row.duration_secs, (idx + 1) as u64);
+            }
+            assert!(!rows[2].passed, "third gate should preserve FAIL status");
+        });
     }
 
     #[test]

@@ -36,72 +36,81 @@ ticket_meta:
 
 scope:
   in_scope:
-    - id: "S1_REVERT_BRANCH_STATE"
-      title: "Revert PR #711 merge commit on this branch"
+    - id: "S1_REUSABLE_GATES_QUEUE_ABSTRACTION"
+      title: "Extract reusable queue-backed gates path"
       detail: |
-        Reverted commit `7f17f7da2906cb173f64286a28b640f679c62117` using
-        `git revert -m 1`, producing commit `f2370301...`, to remove the immediate
-        merge-behavior change from this branch baseline before hardening.
+        Added queue-backed reusable abstractions in
+        `crates/apm2-cli/src/commands/fac_review/gates.rs`:
+        - `QueuedGatesRequest`
+        - `QueuedGatesOutcome`
+        - `run_queued_gates_and_collect(...)`
+        - fail-closed cache loading and required gate-set verification
 
-    - id: "S2_SIMPLIFY_FAC_WORKFLOW"
-      title: "Make Forge Admission Cycle GitHub workflow projection-only"
+        This path waits for queue execution and materializes authoritative
+        per-gate rows from attested gate cache for the target SHA.
+
+    - id: "S2_FAC_PUSH_USES_QUEUE_ABSTRACTION"
+      title: "Make fac push consume queued gates result (not ad-hoc gate logic)"
       detail: |
-        `.github/workflows/forge-admission-cycle.yml` was simplified:
-        - removed `pull_request_target` trigger path
-        - removed Rust FAC execution path (`cargo run ... apm2-cli ...`)
-        - kept a manual `workflow_dispatch` projection diagnostic job
+        `crates/apm2-cli/src/commands/fac_review/push.rs` now uses
+        `run_queued_gates_and_collect(...)` with `require_external_worker=true`
+        and blocking wait semantics.
 
-        GitHub no longer computes FAC verdicts in this workflow.
+        Push now fails closed when:
+        - queue returns empty job id
+        - returned head SHA differs from expected push SHA
+        - required gate artifacts are missing/inconsistent
 
-    - id: "S3_REQUIRE_SINGLE_AUTHORITATIVE_STATUS"
-      title: "Require only `apm2 / Forge Admission Cycle` on main ruleset"
+    - id: "S3_FAIL_FAST_GATE_EXECUTION"
+      title: "Stop gate pipelines on first failure"
       detail: |
-        `.github/rulesets/protect-main.json` now requires exactly one status check:
-        - `apm2 / Forge Admission Cycle`
+        `crates/apm2-cli/src/commands/fac_review/evidence.rs` gate execution was
+        hardened to fail on first failing gate in both:
+        - `run_evidence_gates_with_lane_context(...)`
+        - `run_evidence_gates_with_status_with_lane_context(...)`
 
-        `strict_required_status_checks_policy` remains enabled.
+        Finalization/projection/cache persistence still runs before returning.
 
-    - id: "S4_REGRESSION_TESTS_FOR_CI_POLICY"
-      title: "Add CI merge-policy invariants test suite"
+    - id: "S4_REGRESSION_TESTS"
+      title: "Add regression tests for queue abstraction and push integration"
       detail: |
-        Added `crates/apm2-cli/tests/ci_merge_policy_invariants.rs` to assert:
-        - protect-main ruleset requires only `apm2 / Forge Admission Cycle`
-        - strict required checks policy is true
-        - forge-admission-cycle workflow is projection-only (no PR trigger,
-          no CLI-driven FAC execution in workflow)
+        Added/updated tests to lock behavior:
+        - queue quick-mode rejection for collection path
+        - external-worker-required heartbeat fail-closed
+        - cache gate-set completeness enforcement
+        - cache-to-result materialization order/status mapping
+        - fac push queued outcome SHA mismatch fail-closed
 
-    - id: "S5_COMPILE_FIX_UNBLOCKING_VALIDATION"
-      title: "Fix receipt call type mismatch to unblock workspace validation"
+    - id: "S5_CLEANUP_SYNTHETIC_TEST"
+      title: "Remove synthetic clippy test artifact"
       detail: |
-        In `crates/apm2-cli/src/commands/fac_worker.rs`, updated a receipt emission
-        call to use `emit_job_receipt_with_observed_cost(...)` so the observed cost
-        type matches the function contract.
+        Deleted `crates/apm2-core/tests/test_ct_eq.rs` (intentional temporary test
+        artifact) and focused branch scope on production FAC queue/gate logic.
 
   out_of_scope:
-    - "Changing CLI auto-merge behavior in fac push."
-    - "Reintroducing GitHub-side FAC verdict computation via Rust binary execution."
-    - "Adding additional required checks beyond `apm2 / Forge Admission Cycle` in this ticket."
+    - "Changing GitHub rulesets/workflow policy in this ticket update."
+    - "Changing GitHub auto-merge policy semantics directly."
+    - "Reintroducing ad-hoc inline gate logic inside fac push."
 
 plan:
   steps:
     - id: "STEP_01"
-      title: "Reset branch to intended baseline"
-      detail: "Revert PR #711 merge commit from this branch."
+      title: "Implement reusable queue abstraction"
+      detail: "Add reusable queue request/outcome and cache materialization path."
     - id: "STEP_02"
-      title: "Simplify projection workflow"
-      detail: "Replace FAC workflow logic with projection-only manual diagnostics."
+      title: "Route fac push through reusable queue path"
+      detail: "Require external worker, wait for queue receipt, validate SHA and gates."
     - id: "STEP_03"
-      title: "Harden required-check policy"
-      detail: "Set main ruleset to one authoritative required status context."
+      title: "Harden gate execution fail-fast behavior"
+      detail: "Return immediately on first failed gate after deterministic finalization."
     - id: "STEP_04"
-      title: "Lock behavior with regression tests"
-      detail: "Add tests that fail on workflow/ruleset drift away from projection model."
+      title: "Add regression tests"
+      detail: "Cover queue fail-closed invariants and push queue integration guards."
     - id: "STEP_05"
-      title: "Run full validation gates"
+      title: "Run full workspace validation"
       detail: |
         Validate with:
         - `cargo fmt --all`
-        - `cargo test -p apm2-cli`
         - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
         - `cargo doc --workspace --no-deps`
         - `cargo test --workspace`
@@ -109,21 +118,21 @@ plan:
 definition_of_done:
   evidence_ids: []
   criteria:
-    - "Branch contains revert commit for PR #711 merge commit."
-    - "Forge Admission Cycle workflow is projection-only and not triggered by PR events."
-    - "Main ruleset requires only `apm2 / Forge Admission Cycle` with strict required checks enabled."
-    - "Regression tests assert workflow/ruleset invariants and pass."
+    - "`fac push` uses reusable queued gates abstraction and blocks on queue completion."
+    - "Push fails closed on empty job id, SHA mismatch, and incomplete/inconsistent gate rows."
+    - "Gate execution fails on first error while preserving finalization/projection/cache update behavior."
+    - "Regression tests assert queue/path invariants and pass."
     - "Workspace validation commands complete successfully."
 
 notes:
   context: |
-    This ticket update intentionally narrows scope to what is implemented in this
-    branch. It records the decision to treat GitHub as projection-only and to bind
-    merge blocking to one authoritative FAC status context emitted by apm2 logic.
+    This ticket update is scoped only to work completed in this branch iteration:
+    reusable queued gates abstraction, fac push queue integration, fail-fast gate
+    execution, and corresponding regressions.
 
     Modified files tied to this ticket:
-    - `.github/workflows/forge-admission-cycle.yml`
-    - `.github/rulesets/protect-main.json`
-    - `crates/apm2-cli/tests/ci_merge_policy_invariants.rs`
-    - `crates/apm2-cli/src/commands/fac_worker.rs`
-  security: "default-deny, fail-closed required status enforcement"
+    - `crates/apm2-cli/src/commands/fac_review/gates.rs`
+    - `crates/apm2-cli/src/commands/fac_review/push.rs`
+    - `crates/apm2-cli/src/commands/fac_review/evidence.rs`
+    - `crates/apm2-core/tests/test_ct_eq.rs` (deleted)
+  security: "default-deny, fail-closed gate queueing and projection guards"
