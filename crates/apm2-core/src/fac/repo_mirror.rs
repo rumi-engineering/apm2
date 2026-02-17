@@ -22,23 +22,40 @@
 //! - workspaces are fully cleaned with `safe_rmtree_v1` before checkout
 //! - post-checkout git hardening disables hooks and refuses unsafe configs
 //!   (TCK-00580)
+//! - mirror updates are serialized via per-mirror file lock (TCK-00582)
+//! - remote URLs are validated against a policy-driven allowlist (TCK-00582)
+//! - git fetch/clone operations are bounded by wall-clock timeout (TCK-00582)
+//! - mirror paths are validated to contain no symlink components (TCK-00582)
+//! - mirror updates emit receipts with before/after refs (TCK-00582)
 
-use std::io::Write;
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Read as _, Write};
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::flock_util;
 use super::git_hardening::{self, GitHardeningError, GitHardeningReceipt};
 use super::safe_rmtree::{SafeRmtreeError, safe_rmtree_v1};
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Schema identifier for repository mirror metadata.
 pub const REPO_MIRROR_SCHEMA: &str = "apm2.fac.repo_mirror.v1";
+/// Schema identifier for mirror update receipts (TCK-00582).
+pub const MIRROR_UPDATE_RECEIPT_SCHEMA: &str = "apm2.fac.mirror_update_receipt.v1";
 /// Maximum allowed repository identifier length.
 pub const MAX_REPO_ID_LENGTH: usize = 256;
 /// Maximum allowed mirror directory name length.
@@ -47,10 +64,149 @@ pub const MAX_MIRROR_DIR_NAME: usize = 280;
 pub const MAX_MIRROR_COUNT: usize = 64;
 /// Maximum patch size in bytes.
 pub const MAX_PATCH_SIZE: usize = 10_485_760;
+/// Maximum number of refs tracked in a single receipt (DoS bound).
+pub const MAX_RECEIPT_REFS: usize = 4096;
+/// Maximum number of allowed URL patterns in a mirror policy (DoS bound).
+pub const MAX_ALLOWED_URL_PATTERNS: usize = 256;
+
+/// Default wall-clock timeout for git fetch operations (seconds).
+///
+/// CTR-2501 deviation: uses `Instant` (monotonic) for elapsed measurement.
+pub const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 300;
+
+/// Default wall-clock timeout for git clone operations (seconds).
+pub const DEFAULT_CLONE_TIMEOUT_SECS: u64 = 600;
+
+/// Maximum duration to wait for the mirror file lock (seconds).
+pub const MIRROR_LOCK_TIMEOUT_SECS: u64 = 120;
+
+/// Poll interval when waiting for the mirror file lock.
+const MIRROR_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mirror Policy (TCK-00582)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Policy-driven remote URL allowlist for mirror updates.
+///
+/// When `allowed_url_patterns` is non-empty, only remote URLs matching at
+/// least one pattern are permitted. An empty list means "use built-in
+/// protocol validation only" (the pre-TCK-00582 behavior).
+///
+/// Patterns are matched as prefixes: a URL must start with one of the
+/// allowed patterns. This supports both exact-match and domain-scoped
+/// policies (e.g., `https://github.com/myorg/`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MirrorPolicy {
+    /// Allowed remote URL prefixes. Empty = built-in protocol validation only.
+    pub allowed_url_patterns: Vec<String>,
+    /// Wall-clock timeout for git fetch operations (seconds).
+    /// Zero means use `DEFAULT_FETCH_TIMEOUT_SECS`.
+    #[serde(default)]
+    pub fetch_timeout_secs: u64,
+    /// Wall-clock timeout for git clone operations (seconds).
+    /// Zero means use `DEFAULT_CLONE_TIMEOUT_SECS`.
+    #[serde(default)]
+    pub clone_timeout_secs: u64,
+}
+
+impl Default for MirrorPolicy {
+    fn default() -> Self {
+        Self {
+            allowed_url_patterns: Vec::new(),
+            fetch_timeout_secs: DEFAULT_FETCH_TIMEOUT_SECS,
+            clone_timeout_secs: DEFAULT_CLONE_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl MirrorPolicy {
+    /// Returns the effective fetch timeout.
+    const fn effective_fetch_timeout(&self) -> Duration {
+        let secs = if self.fetch_timeout_secs == 0 {
+            DEFAULT_FETCH_TIMEOUT_SECS
+        } else {
+            self.fetch_timeout_secs
+        };
+        Duration::from_secs(secs)
+    }
+
+    /// Returns the effective clone timeout.
+    const fn effective_clone_timeout(&self) -> Duration {
+        let secs = if self.clone_timeout_secs == 0 {
+            DEFAULT_CLONE_TIMEOUT_SECS
+        } else {
+            self.clone_timeout_secs
+        };
+        Duration::from_secs(secs)
+    }
+
+    /// Check whether a remote URL is allowed by this policy.
+    ///
+    /// If `allowed_url_patterns` is empty, all URLs pass (subject to the
+    /// built-in protocol validation in `validate_remote_url`).
+    fn is_url_allowed(&self, url: &str) -> bool {
+        if self.allowed_url_patterns.is_empty() {
+            return true;
+        }
+        self.allowed_url_patterns
+            .iter()
+            .any(|pattern| url.starts_with(pattern.as_str()))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mirror Update Receipt (TCK-00582)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Receipt emitted after a mirror update operation, capturing before/after
+/// ref state for auditability.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MirrorUpdateReceiptV1 {
+    /// Schema identifier.
+    pub schema: String,
+    /// Repository identifier.
+    pub repo_id: String,
+    /// Remote URL used for the update (if any).
+    pub remote_url: Option<String>,
+    /// Mirror path on disk.
+    pub mirror_path: String,
+    /// Ref state before the update. Keys are ref names, values are SHAs.
+    pub refs_before: HashMap<String, String>,
+    /// Ref state after the update. Keys are ref names, values are SHAs.
+    pub refs_after: HashMap<String, String>,
+    /// Whether the update operation succeeded.
+    pub success: bool,
+    /// Operation type: "fetch", "clone", or "noop".
+    pub operation: String,
+    /// Wall-clock duration of the operation in milliseconds.
+    pub duration_ms: u64,
+    /// Human-readable reason if the operation failed.
+    pub failure_reason: Option<String>,
+}
+
+impl MirrorUpdateReceiptV1 {
+    /// Verify that the receipt is structurally valid.
+    pub fn is_valid(&self) -> bool {
+        self.schema == MIRROR_UPDATE_RECEIPT_SCHEMA
+            && !self.repo_id.is_empty()
+            && !self.mirror_path.is_empty()
+            && !self.operation.is_empty()
+            && self.refs_before.len() <= MAX_RECEIPT_REFS
+            && self.refs_after.len() <= MAX_RECEIPT_REFS
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Core Types
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Mirrors and lane workspaces for FAC execution.
+#[derive(Debug)]
 pub struct RepoMirrorManager {
     mirror_root: PathBuf,
+    lock_root: PathBuf,
+    policy: MirrorPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,19 +292,125 @@ pub enum RepoMirrorError {
     /// Git hardening failed after checkout (TCK-00580).
     #[error("git hardening failed: {0}")]
     GitHardeningFailed(#[from] GitHardeningError),
+
+    /// Remote URL rejected by mirror policy allowlist (TCK-00582).
+    #[error("remote URL denied by policy: {reason}")]
+    PolicyDenied {
+        /// Why the URL was denied.
+        reason: String,
+    },
+
+    /// Mirror update lock could not be acquired (TCK-00582).
+    #[error("mirror lock acquisition failed: {reason}")]
+    LockFailed {
+        /// Why the lock could not be acquired.
+        reason: String,
+    },
+
+    /// Git operation timed out (TCK-00582).
+    #[error("git operation timed out after {timeout_secs}s: {reason}")]
+    Timeout {
+        /// Timeout that was exceeded.
+        timeout_secs: u64,
+        /// Context for the timeout.
+        reason: String,
+    },
+
+    /// Mirror path contains a symlink component (TCK-00582).
+    #[error("symlink component in mirror path: {reason}")]
+    SymlinkInPath {
+        /// Which component was a symlink.
+        reason: String,
+    },
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// RepoMirrorManager implementation
+// ─────────────────────────────────────────────────────────────────────────────
+
 impl RepoMirrorManager {
-    /// Creates a mirror manager rooted at the FAC mirror directory.
+    /// Creates a mirror manager rooted at the FAC mirror directory with the
+    /// default (permissive) policy.
     pub fn new(fac_root: &Path) -> Self {
         Self {
             mirror_root: fac_root.join("repo_mirror"),
+            lock_root: fac_root.join("locks").join("mirrors"),
+            policy: MirrorPolicy::default(),
         }
+    }
+
+    /// Creates a mirror manager with an explicit policy.
+    pub fn with_policy(fac_root: &Path, policy: MirrorPolicy) -> Result<Self, RepoMirrorError> {
+        if policy.allowed_url_patterns.len() > MAX_ALLOWED_URL_PATTERNS {
+            return Err(RepoMirrorError::PolicyDenied {
+                reason: format!(
+                    "too many allowed URL patterns: {} > {}",
+                    policy.allowed_url_patterns.len(),
+                    MAX_ALLOWED_URL_PATTERNS
+                ),
+            });
+        }
+        Ok(Self {
+            mirror_root: fac_root.join("repo_mirror"),
+            lock_root: fac_root.join("locks").join("mirrors"),
+            policy,
+        })
     }
 
     /// Returns the path to the bare mirror for `repo_id`.
     pub fn mirror_path(&self, repo_id: &str) -> PathBuf {
         self.mirror_root.join(format!("{repo_id}.git"))
+    }
+
+    /// Returns the path to the lock file for `repo_id`.
+    fn lock_path(&self, repo_id: &str) -> PathBuf {
+        // Flatten repo_id for lock file name (replace `/` with `__`).
+        let safe_name = repo_id.replace('/', "__");
+        self.lock_root.join(format!("{safe_name}.lock"))
+    }
+
+    /// Acquire an exclusive file lock for a mirror update.
+    ///
+    /// Uses `flock(LOCK_EX | LOCK_NB)` with polling and monotonic timeout
+    /// (INV-2501). Returns the open lock file handle; the lock is released
+    /// when the file handle is dropped.
+    ///
+    /// Synchronization protocol:
+    /// - Protected data: the bare mirror directory for `repo_id`
+    /// - Who can mutate: only the holder of the exclusive flock
+    /// - Lock ordering: one lock per repo_id, no nesting
+    /// - Happens-before: flock(LOCK_EX) → mirror mutation → drop(File)
+    /// - Async suspension: not applicable (synchronous code)
+    fn acquire_mirror_lock(&self, repo_id: &str) -> Result<File, RepoMirrorError> {
+        ensure_dir_mode_0700(&self.lock_root)?;
+
+        let lock_path = self.lock_path(repo_id);
+        let lock_file = open_lock_file(&lock_path)?;
+
+        let deadline = Instant::now() + Duration::from_secs(MIRROR_LOCK_TIMEOUT_SECS);
+        loop {
+            match flock_util::try_acquire_exclusive_nonblocking(&lock_file) {
+                Ok(true) => return Ok(lock_file),
+                Ok(false) => {
+                    // Lock held by another process — poll with timeout.
+                    if Instant::now() >= deadline {
+                        return Err(RepoMirrorError::LockFailed {
+                            reason: format!(
+                                "timed out after {}s waiting for mirror lock: {}",
+                                MIRROR_LOCK_TIMEOUT_SECS,
+                                lock_path.display()
+                            ),
+                        });
+                    }
+                    std::thread::sleep(MIRROR_LOCK_POLL_INTERVAL);
+                },
+                Err(e) => {
+                    return Err(RepoMirrorError::LockFailed {
+                        reason: format!("flock failed: {e}"),
+                    });
+                },
+            }
+        }
     }
 
     /// Ensure a bare mirror exists for `repo_id` and, if possible, updated.
@@ -157,16 +419,94 @@ impl RepoMirrorManager {
     /// least one configured remote.
     /// If `remote_url` is present, it is configured as `origin` and then used
     /// to fetch updates.
+    ///
+    /// **TCK-00582 hardening:**
+    /// - Acquires an exclusive file lock for the duration of the update.
+    /// - Validates remote URL against the policy allowlist.
+    /// - Bounds fetch/clone with a wall-clock timeout.
+    /// - Refuses symlink components in mirror path.
+    /// - Emits a `MirrorUpdateReceiptV1` with before/after refs.
     pub fn ensure_mirror(
         &self,
         repo_id: &str,
         remote_url: Option<&str>,
-    ) -> Result<PathBuf, RepoMirrorError> {
+    ) -> Result<(PathBuf, MirrorUpdateReceiptV1), RepoMirrorError> {
         validate_repo_id(repo_id)?;
+
+        // Validate remote URL against policy allowlist before any I/O.
+        if let Some(url) = remote_url {
+            validate_remote_url(url)?;
+            if !self.policy.is_url_allowed(url) {
+                return Err(RepoMirrorError::PolicyDenied {
+                    reason: format!(
+                        "remote URL '{url}' does not match any allowed pattern in mirror policy"
+                    ),
+                });
+            }
+        }
+
         let mirror_path = self.mirror_path(repo_id);
         ensure_dir_mode_0700(&self.mirror_root)?;
 
+        // Acquire exclusive lock before any mirror mutation.
+        let _lock_guard = self.acquire_mirror_lock(repo_id)?;
+
+        let start = Instant::now();
+
+        // Capture before-refs (if mirror exists).
+        let refs_before = if mirror_path.is_dir() {
+            snapshot_refs(&mirror_path).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
+        let result = self.ensure_mirror_inner(repo_id, remote_url, &mirror_path);
+
+        let elapsed = start.elapsed();
+        let duration_ms =
+            u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
+
+        // Capture after-refs.
+        let refs_after = if mirror_path.is_dir() {
+            snapshot_refs(&mirror_path).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
+        let (success, failure_reason, operation) = match &result {
+            Ok(op) => (true, None, op.clone()),
+            Err(e) => (false, Some(format!("{e}")), "error".to_string()),
+        };
+
+        let receipt = MirrorUpdateReceiptV1 {
+            schema: MIRROR_UPDATE_RECEIPT_SCHEMA.to_string(),
+            repo_id: repo_id.to_string(),
+            remote_url: remote_url.map(String::from),
+            mirror_path: mirror_path.display().to_string(),
+            refs_before,
+            refs_after,
+            success,
+            operation,
+            duration_ms,
+            failure_reason,
+        };
+
+        // _lock_guard dropped here, releasing the flock.
+        result.map(|_| (mirror_path, receipt))
+    }
+
+    /// Inner implementation that performs the actual mirror ensure logic.
+    /// Returns the operation type string on success.
+    fn ensure_mirror_inner(
+        &self,
+        repo_id: &str,
+        remote_url: Option<&str>,
+        mirror_path: &Path,
+    ) -> Result<String, RepoMirrorError> {
         if mirror_path.exists() {
+            // Refuse symlink components in the mirror path (TCK-00582).
+            validate_no_symlinks_in_path(mirror_path)?;
+
             if !mirror_path.is_dir() {
                 return Err(RepoMirrorError::MirrorInitFailed {
                     reason: format!(
@@ -176,48 +516,41 @@ impl RepoMirrorManager {
                 });
             }
 
-            validate_bare_repo(&mirror_path)?;
+            validate_bare_repo(mirror_path)?;
 
             match remote_url {
                 Some(url) => {
-                    validate_remote_url(url)?;
-                    set_or_replace_remote(&mirror_path, url)?;
-                    git_fetch(&mirror_path)?;
+                    set_or_replace_remote(mirror_path, url)?;
+                    git_fetch_bounded(mirror_path, self.policy.effective_fetch_timeout())?;
+                    Ok("fetch".to_string())
                 },
                 None => {
-                    if mirror_has_remote(&mirror_path)? {
-                        git_fetch(&mirror_path)?;
+                    if mirror_has_remote(mirror_path)? {
+                        git_fetch_bounded(mirror_path, self.policy.effective_fetch_timeout())?;
+                        Ok("fetch".to_string())
+                    } else {
+                        Ok("noop".to_string())
                     }
                 },
             }
+        } else {
+            let remote_url = remote_url.ok_or_else(|| RepoMirrorError::MirrorNotFound {
+                repo_id: repo_id.to_string(),
+                reason: "mirror does not exist and no remote_url provided for bootstrap"
+                    .to_string(),
+            })?;
 
-            return Ok(mirror_path);
-        }
+            self.evict_if_needed()?;
 
-        let remote_url = remote_url.ok_or_else(|| RepoMirrorError::MirrorNotFound {
-            repo_id: repo_id.to_string(),
-            reason: "mirror does not exist and no remote_url provided for bootstrap".to_string(),
-        })?;
-        validate_remote_url(remote_url)?;
-
-        self.evict_if_needed()?;
-
-        // Create a new bare mirror.
-        git_command(
-            &[
-                "clone",
-                "--bare",
-                "--",
+            // Create a new bare mirror with bounded timeout.
+            git_clone_bare_bounded(
                 remote_url,
-                mirror_path.to_string_lossy().as_ref(),
-            ],
-            None,
-            |reason| RepoMirrorError::MirrorInitFailed {
-                reason: reason.to_string(),
-            },
-        )?;
+                mirror_path,
+                self.policy.effective_clone_timeout(),
+            )?;
 
-        Ok(mirror_path)
+            Ok("clone".to_string())
+        }
     }
 
     fn evict_if_needed(&self) -> Result<(), RepoMirrorError> {
@@ -490,6 +823,10 @@ impl RepoMirrorManager {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Filesystem helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[cfg(unix)]
 fn ensure_dir_mode_0700(path: &Path) -> Result<(), RepoMirrorError> {
     if path.exists() {
@@ -511,6 +848,102 @@ fn ensure_dir_mode_0700(path: &Path) -> Result<(), RepoMirrorError> {
     }
     std::fs::create_dir_all(path).map_err(RepoMirrorError::Io)
 }
+
+/// Open (or create) a lock file with restrictive permissions.
+fn open_lock_file(path: &Path) -> Result<File, RepoMirrorError> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    opts.open(path).map_err(|e| RepoMirrorError::LockFailed {
+        reason: format!("cannot open lock file {}: {e}", path.display()),
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Symlink path validation (TCK-00582)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Validate that no component of `path` is a symlink.
+///
+/// Uses `symlink_metadata` (not `metadata`) so dangling symlinks are also
+/// detected (common-review-findings.md section 9).
+fn validate_no_symlinks_in_path(path: &Path) -> Result<(), RepoMirrorError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        // Only check components that exist on disk.
+        if current.exists() {
+            match std::fs::symlink_metadata(&current) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(RepoMirrorError::SymlinkInPath {
+                            reason: format!("path component is a symlink: {}", current.display()),
+                        });
+                    }
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Component disappeared between exists() and
+                    // symlink_metadata(). This is benign — the rest of the
+                    // path cannot be symlinks if this component is missing.
+                    break;
+                },
+                Err(e) => {
+                    return Err(RepoMirrorError::SymlinkInPath {
+                        reason: format!("cannot stat path component {}: {e}", current.display()),
+                    });
+                },
+            }
+        }
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ref snapshot helper (TCK-00582)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Snapshot all refs in a bare mirror via `git show-ref`.
+///
+/// Returns a map of ref-name -> SHA. The output is bounded by
+/// `MAX_RECEIPT_REFS` to prevent DoS from repositories with an extremely
+/// large number of refs.
+fn snapshot_refs(mirror_path: &Path) -> Result<HashMap<String, String>, RepoMirrorError> {
+    let output = git_command(
+        &["-C", mirror_path.to_string_lossy().as_ref(), "show-ref"],
+        None,
+        |_reason| {
+            // show-ref returns non-zero when there are no refs — treat as empty.
+            RepoMirrorError::MirrorInitFailed {
+                reason: "show-ref failed".to_string(),
+            }
+        },
+    );
+
+    let stdout = match output {
+        Ok(s) => s,
+        // Empty repo with no refs returns non-zero — that is fine.
+        Err(RepoMirrorError::MirrorInitFailed { .. }) => return Ok(HashMap::new()),
+        Err(e) => return Err(e),
+    };
+
+    let mut refs = HashMap::new();
+    for line in stdout.lines().take(MAX_RECEIPT_REFS) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Format: "<sha> <refname>"
+        if let Some((sha, refname)) = line.split_once(' ') {
+            refs.insert(refname.to_string(), sha.to_string());
+        }
+    }
+    Ok(refs)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Git command helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn git_command(
     args: &[&str],
@@ -542,6 +975,96 @@ fn git_command(
 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
+
+/// Run a git command with a wall-clock timeout using `Instant` (monotonic).
+///
+/// The child process is spawned and then polled with a deadline. If the
+/// deadline expires, the child is killed.
+///
+/// CTR-2501: uses `Instant` for duration measurement, not `SystemTime`.
+fn git_command_with_timeout(
+    args: &[&str],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    make_error: impl Fn(&str) -> RepoMirrorError,
+) -> Result<String, RepoMirrorError> {
+    let mut cmd = Command::new("git");
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.args(args);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| make_error(&format!("failed to spawn git: {e}")))?;
+
+    let deadline = Instant::now() + timeout;
+    let poll_interval = Duration::from_millis(250);
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Process exited — collect output.
+                let stdout = child
+                    .stdout
+                    .take()
+                    .map(|mut r| {
+                        let mut buf = Vec::new();
+                        // Bounded read: at most 4 MiB of stdout.
+                        let _ = std::io::Read::take(&mut r, 4 * 1024 * 1024).read_to_end(&mut buf);
+                        buf
+                    })
+                    .unwrap_or_default();
+                let stderr = child
+                    .stderr
+                    .take()
+                    .map(|mut r| {
+                        let mut buf = Vec::new();
+                        let _ = std::io::Read::take(&mut r, 4 * 1024 * 1024).read_to_end(&mut buf);
+                        buf
+                    })
+                    .unwrap_or_default();
+
+                if !status.success() {
+                    let mut reason = String::from_utf8_lossy(&stderr).trim().to_string();
+                    if reason.is_empty() {
+                        reason = String::from_utf8_lossy(&stdout).trim().to_string();
+                    }
+                    if reason.is_empty() {
+                        reason = "git command failed with no output".to_string();
+                    }
+                    return Err(make_error(&reason));
+                }
+
+                return Ok(String::from_utf8_lossy(&stdout).into_owned());
+            },
+            Ok(None) => {
+                // Still running — check deadline.
+                if Instant::now() >= deadline {
+                    // Kill the child process.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(RepoMirrorError::Timeout {
+                        timeout_secs: timeout.as_secs(),
+                        reason: format!("git {}", args.first().unwrap_or(&"<unknown>")),
+                    });
+                }
+                std::thread::sleep(poll_interval);
+            },
+            Err(e) => {
+                return Err(make_error(&format!("failed to wait for git: {e}")));
+            },
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Git operations (internal)
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn validate_repo_id(repo_id: &str) -> Result<(), RepoMirrorError> {
     if repo_id.is_empty() {
@@ -702,8 +1225,9 @@ fn set_or_replace_remote(mirror_path: &Path, remote_url: &str) -> Result<(), Rep
     Ok(())
 }
 
-fn git_fetch(mirror_path: &Path) -> Result<(), RepoMirrorError> {
-    git_command(
+/// Fetch with wall-clock timeout (TCK-00582).
+fn git_fetch_bounded(mirror_path: &Path, timeout: Duration) -> Result<(), RepoMirrorError> {
+    git_command_with_timeout(
         &[
             "-C",
             mirror_path.to_string_lossy().as_ref(),
@@ -712,6 +1236,30 @@ fn git_fetch(mirror_path: &Path) -> Result<(), RepoMirrorError> {
             "--prune",
         ],
         None,
+        timeout,
+        |reason| RepoMirrorError::MirrorInitFailed {
+            reason: reason.to_string(),
+        },
+    )
+    .map(|_| ())
+}
+
+/// Clone --bare with wall-clock timeout (TCK-00582).
+fn git_clone_bare_bounded(
+    remote_url: &str,
+    mirror_path: &Path,
+    timeout: Duration,
+) -> Result<(), RepoMirrorError> {
+    git_command_with_timeout(
+        &[
+            "clone",
+            "--bare",
+            "--",
+            remote_url,
+            mirror_path.to_string_lossy().as_ref(),
+        ],
+        None,
+        timeout,
         |reason| RepoMirrorError::MirrorInitFailed {
             reason: reason.to_string(),
         },
@@ -946,13 +1494,16 @@ mod tests {
         }
 
         let source_repo = temp.path().join("source_repo");
-        let head_sha = create_git_repo_with_commit(&source_repo, "README.md", "hello");
+        let _head_sha = create_git_repo_with_commit(&source_repo, "README.md", "hello");
 
-        let _ = manager
+        let (mirror_path, receipt) = manager
             .ensure_mirror("new", Some(source_repo.to_string_lossy().as_ref()))
             .expect("ensure mirror after eviction");
-        assert!(manager.mirror_path("new").exists());
+        assert!(mirror_path.exists());
         assert!(!manager.mirror_path("repo-0").exists());
+        assert!(receipt.success);
+        assert_eq!(receipt.operation, "clone");
+        assert!(receipt.is_valid());
 
         let mirror_root = manager.mirror_root;
         let count = std::fs::read_dir(mirror_root)
@@ -962,7 +1513,6 @@ mod tests {
             .count();
 
         assert_eq!(count, MAX_MIRROR_COUNT);
-        assert_eq!(head_sha.len(), 40);
     }
 
     #[test]
@@ -982,10 +1532,13 @@ mod tests {
         fs::create_dir_all(lane_workspace.parent().expect("lane parent"))
             .expect("create lane parent");
 
-        let mirror_path = manager
+        let (mirror_path, receipt) = manager
             .ensure_mirror("sample", Some(source_repo.to_string_lossy().as_ref()))
             .expect("ensure mirror");
         assert!(mirror_path.ends_with("sample.git"));
+        assert!(receipt.success);
+        assert_eq!(receipt.operation, "clone");
+        assert!(receipt.is_valid());
 
         let outcome = manager
             .checkout_to_lane("sample", &head_sha, &lane_workspace, &lanes_root)
@@ -1004,7 +1557,7 @@ mod tests {
         let head_sha = create_git_repo_with_commit(&source_repo, "README.md", "hello");
 
         let manager = RepoMirrorManager::new(&temp.path().join("private").join("fac"));
-        let mirror_path = manager
+        let (mirror_path, _receipt) = manager
             .ensure_mirror("sample", Some(source_repo.to_string_lossy().as_ref()))
             .expect("ensure mirror");
 
@@ -1243,7 +1796,7 @@ mod tests {
         let head_sha = String::from_utf8_lossy(&head_sha.stdout).trim().to_string();
 
         let manager = RepoMirrorManager::new(&temp.path().join("private").join("fac"));
-        let mirror_path = manager
+        let (mirror_path, _receipt) = manager
             .ensure_mirror("sample", Some(source_repo.to_string_lossy().as_ref()))
             .expect("ensure mirror");
         assert!(mirror_path.ends_with("sample.git"));
@@ -1472,5 +2025,271 @@ mod tests {
             assert_eq!(receipt.patch_digest, expected_digest);
             assert!(receipt.verify_content_hash());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // TCK-00582: New hardening tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_policy_denies_unallowed_url() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let policy = MirrorPolicy {
+            allowed_url_patterns: vec!["https://github.com/myorg/".to_string()],
+            fetch_timeout_secs: 300,
+            clone_timeout_secs: 600,
+        };
+        let mgr = RepoMirrorManager::with_policy(&temp.path().join("private").join("fac"), policy)
+            .expect("create with policy");
+
+        let result = mgr.ensure_mirror("evil", Some("https://evil.com/repo.git"));
+        assert!(
+            matches!(result, Err(RepoMirrorError::PolicyDenied { .. })),
+            "expected PolicyDenied, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_policy_allows_matching_url() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_repo = temp.path().join("source_repo");
+        let _head_sha = create_git_repo_with_commit(&source_repo, "README.md", "hello");
+
+        // Use the local path as allowed pattern.
+        let local_url = source_repo.to_string_lossy().to_string();
+        let policy = MirrorPolicy {
+            allowed_url_patterns: vec![local_url.clone()],
+            fetch_timeout_secs: 300,
+            clone_timeout_secs: 600,
+        };
+        let mgr = RepoMirrorManager::with_policy(&temp.path().join("private").join("fac"), policy)
+            .expect("create with policy");
+
+        let result = mgr.ensure_mirror("sample", Some(&local_url));
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        let (_path, receipt) = result.unwrap();
+        assert!(receipt.success);
+        assert_eq!(receipt.operation, "clone");
+    }
+
+    #[test]
+    fn test_empty_policy_allows_any_valid_url() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_repo = temp.path().join("source_repo");
+        let _head_sha = create_git_repo_with_commit(&source_repo, "README.md", "hi");
+
+        let mgr = RepoMirrorManager::new(&temp.path().join("private").join("fac"));
+
+        let result = mgr.ensure_mirror("sample", Some(source_repo.to_string_lossy().as_ref()));
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn test_policy_rejects_too_many_patterns() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let policy = MirrorPolicy {
+            allowed_url_patterns: (0..=MAX_ALLOWED_URL_PATTERNS)
+                .map(|i| format!("https://example.com/{i}/"))
+                .collect(),
+            fetch_timeout_secs: 0,
+            clone_timeout_secs: 0,
+        };
+        let result =
+            RepoMirrorManager::with_policy(&temp.path().join("private").join("fac"), policy);
+        assert!(
+            matches!(result, Err(RepoMirrorError::PolicyDenied { .. })),
+            "expected PolicyDenied for too many patterns, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_receipt_captures_before_after_refs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_repo = temp.path().join("source_repo");
+        let _head_sha = create_git_repo_with_commit(&source_repo, "README.md", "hello");
+
+        let mgr = RepoMirrorManager::new(&temp.path().join("private").join("fac"));
+
+        // First clone: refs_before should be empty, refs_after should have refs.
+        let (_path, receipt) = mgr
+            .ensure_mirror("sample", Some(source_repo.to_string_lossy().as_ref()))
+            .expect("ensure mirror");
+
+        assert!(receipt.success);
+        assert_eq!(receipt.operation, "clone");
+        assert!(receipt.refs_before.is_empty());
+        assert!(
+            !receipt.refs_after.is_empty(),
+            "refs_after should have at least one ref"
+        );
+        assert!(receipt.is_valid());
+        // duration_ms is always set (may be 0 for very fast operations).
+        assert_eq!(receipt.schema, MIRROR_UPDATE_RECEIPT_SCHEMA);
+
+        // Second call should be a fetch (mirror already exists).
+        let (_path, receipt2) = mgr
+            .ensure_mirror("sample", Some(source_repo.to_string_lossy().as_ref()))
+            .expect("re-ensure mirror");
+
+        assert!(receipt2.success);
+        assert_eq!(receipt2.operation, "fetch");
+        assert!(!receipt2.refs_before.is_empty());
+        assert!(!receipt2.refs_after.is_empty());
+        assert!(receipt2.is_valid());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_symlink_in_mirror_path_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fac_root = temp.path().join("private").join("fac");
+        let mirror_root = fac_root.join("repo_mirror");
+        std::fs::create_dir_all(&mirror_root).expect("create mirror root");
+
+        // Create a real directory
+        let real_dir = temp.path().join("real_mirror");
+        std::fs::create_dir_all(&real_dir).expect("create real dir");
+
+        // Create a symlink in the mirror root that points to the real directory
+        let symlink_path = mirror_root.join("evil.git");
+        symlink(&real_dir, &symlink_path).expect("create symlink");
+
+        // Initialize a bare repo at the real location (so validate_bare_repo passes)
+        Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(&real_dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("init bare");
+
+        let mgr = RepoMirrorManager::new(&fac_root);
+
+        // The mirror path "evil" resolves to mirror_root/evil.git which is a symlink.
+        // ensure_mirror should detect and reject this.
+        let result = mgr.ensure_mirror("evil", None);
+
+        assert!(
+            matches!(result, Err(RepoMirrorError::SymlinkInPath { .. })),
+            "expected SymlinkInPath, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_mirror_update_receipt_is_valid() {
+        let receipt = MirrorUpdateReceiptV1 {
+            schema: MIRROR_UPDATE_RECEIPT_SCHEMA.to_string(),
+            repo_id: "test-repo".to_string(),
+            remote_url: Some("https://github.com/example/repo.git".to_string()),
+            mirror_path: "/tmp/mirror/test-repo.git".to_string(),
+            refs_before: HashMap::new(),
+            refs_after: {
+                let mut m = HashMap::new();
+                m.insert("refs/heads/main".to_string(), "abc123".to_string());
+                m
+            },
+            success: true,
+            operation: "clone".to_string(),
+            duration_ms: 1234,
+            failure_reason: None,
+        };
+
+        assert!(receipt.is_valid());
+    }
+
+    #[test]
+    fn test_mirror_update_receipt_invalid_schema() {
+        let receipt = MirrorUpdateReceiptV1 {
+            schema: "wrong".to_string(),
+            repo_id: "test-repo".to_string(),
+            remote_url: None,
+            mirror_path: "/tmp/mirror/test-repo.git".to_string(),
+            refs_before: HashMap::new(),
+            refs_after: HashMap::new(),
+            success: false,
+            operation: "error".to_string(),
+            duration_ms: 0,
+            failure_reason: Some("test".to_string()),
+        };
+
+        assert!(!receipt.is_valid());
+    }
+
+    #[test]
+    fn test_lock_file_created_on_ensure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_repo = temp.path().join("source_repo");
+        let _head_sha = create_git_repo_with_commit(&source_repo, "README.md", "hello");
+
+        let fac_root = temp.path().join("private").join("fac");
+        let mgr = RepoMirrorManager::new(&fac_root);
+
+        let (_path, _receipt) = mgr
+            .ensure_mirror("sample", Some(source_repo.to_string_lossy().as_ref()))
+            .expect("ensure mirror");
+
+        // Verify lock directory was created.
+        let lock_dir = fac_root.join("locks").join("mirrors");
+        assert!(lock_dir.is_dir(), "lock directory should exist");
+
+        // Verify lock file was created.
+        let lock_file = lock_dir.join("sample.lock");
+        assert!(
+            lock_file.exists(),
+            "lock file should exist after ensure_mirror"
+        );
+    }
+
+    #[test]
+    fn test_default_mirror_policy() {
+        let policy = MirrorPolicy::default();
+        assert!(policy.allowed_url_patterns.is_empty());
+        assert_eq!(policy.fetch_timeout_secs, DEFAULT_FETCH_TIMEOUT_SECS);
+        assert_eq!(policy.clone_timeout_secs, DEFAULT_CLONE_TIMEOUT_SECS);
+        assert!(policy.is_url_allowed("https://example.com/repo.git"));
+        assert!(policy.is_url_allowed("ssh://git@github.com/repo.git"));
+    }
+
+    #[test]
+    fn test_mirror_policy_url_matching() {
+        let policy = MirrorPolicy {
+            allowed_url_patterns: vec![
+                "https://github.com/myorg/".to_string(),
+                "https://github.com/myother/".to_string(),
+            ],
+            fetch_timeout_secs: 0,
+            clone_timeout_secs: 0,
+        };
+
+        assert!(policy.is_url_allowed("https://github.com/myorg/repo.git"));
+        assert!(policy.is_url_allowed("https://github.com/myother/repo2.git"));
+        assert!(!policy.is_url_allowed("https://github.com/evil/repo.git"));
+        assert!(!policy.is_url_allowed("https://evil.com/repo.git"));
+    }
+
+    #[test]
+    fn test_mirror_policy_effective_timeouts() {
+        let policy = MirrorPolicy {
+            allowed_url_patterns: vec![],
+            fetch_timeout_secs: 0,
+            clone_timeout_secs: 0,
+        };
+        assert_eq!(
+            policy.effective_fetch_timeout(),
+            Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            policy.effective_clone_timeout(),
+            Duration::from_secs(DEFAULT_CLONE_TIMEOUT_SECS)
+        );
+
+        let custom = MirrorPolicy {
+            allowed_url_patterns: vec![],
+            fetch_timeout_secs: 60,
+            clone_timeout_secs: 120,
+        };
+        assert_eq!(custom.effective_fetch_timeout(), Duration::from_secs(60));
+        assert_eq!(custom.effective_clone_timeout(), Duration::from_secs(120));
     }
 }
