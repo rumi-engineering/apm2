@@ -448,6 +448,14 @@ Security invariants:
 - **Bounded file reads** (`fac_economics.rs`): `read_bounded_file` uses the open-once pattern
   (`O_NOFOLLOW | O_CLOEXEC` at `open(2)` + `fstat` + `take()`) to eliminate the TOCTOU gap
   between symlink validation and file read.
+- **Patch hardening on worker path** (`fac_worker.rs`, TCK-00581 fix round 1):
+  The `patch_injection` execution path now calls `apply_patch_hardened` instead of
+  `apply_patch`, enforcing INV-PH-001 through INV-PH-010 (path traversal rejection,
+  absolute path rejection, NUL byte rejection, size bounds, format validation).
+  `PatchHardeningDenied` errors map to `DenialReasonCode::PatchHardeningDenied`
+  with the denial receipt content hash included in the reason string. The denial
+  receipt is also persisted as a standalone file under `fac_root/patch_receipts/`
+  for provenance evidence. Lane cleanup runs before the job is moved to `denied/`.
 - **Worker economics admission fail-closed** (`fac_worker.rs`, fix rounds 1-2): Step 2.6
   economics admission now branches on the specific error variant from
   `load_admitted_economics_profile_root`: `NoAdmittedRoot` denies the job if the policy's

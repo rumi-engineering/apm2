@@ -94,7 +94,7 @@ use apm2_core::fac::{
     ChannelBoundaryTrace, DenialReasonCode, ExecutionBackend, FAC_LANE_CLEANUP_RECEIPT_SCHEMA,
     FacJobOutcome, FacJobReceiptV1, FacJobReceiptV1Builder, FacPolicyV1, GateReceipt,
     GateReceiptBuilder, LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1,
-    LaneCorruptMarkerV1, LaneProfileV1, MAX_POLICY_SIZE,
+    LaneCorruptMarkerV1, LaneProfileV1, MAX_POLICY_SIZE, PATCH_FORMAT_GIT_DIFF_V1,
     QueueAdmissionTrace as JobQueueAdmissionTrace, ReceiptPipelineError, ReceiptWritePipeline,
     RepoMirrorManager, SystemModeConfig, SystemdUnitProperties, apply_credential_mount_to_env,
     build_github_credential_mount, build_job_environment, compute_policy_hash, deserialize_policy,
@@ -3356,8 +3356,85 @@ fn process_job(
             ));
         }
 
-        let patch_outcome = match mirror_manager.apply_patch(&lane_workspace, &patch_bytes) {
-            Ok(patch_outcome) => patch_outcome,
+        let patch_outcome = match mirror_manager.apply_patch_hardened(
+            &lane_workspace,
+            &patch_bytes,
+            PATCH_FORMAT_GIT_DIFF_V1,
+        ) {
+            Ok((outcome, _receipt)) => outcome,
+            Err(apm2_core::fac::RepoMirrorError::PatchHardeningDenied { reason, receipt }) => {
+                // TCK-00581: Map PatchHardeningDenied to explicit denial
+                // with receipt metadata in the reason string for audit.
+                let receipt_hash = receipt.content_hash_hex();
+                let denial_reason =
+                    format!("patch hardening denied: {reason} [receipt_hash={receipt_hash}]");
+
+                // Persist the denial receipt as a standalone file for
+                // provenance evidence alongside the job receipt.
+                let patch_receipt_json = serde_json::json!({
+                    "schema_id": receipt.schema_id,
+                    "schema_version": receipt.schema_version,
+                    "patch_digest": receipt.patch_digest,
+                    "applied_files_count": receipt.applied_files_count,
+                    "applied": receipt.applied,
+                    "refusals": receipt.refusals.iter().map(|r| {
+                        serde_json::json!({
+                            "path": r.path,
+                            "reason": r.reason,
+                        })
+                    }).collect::<Vec<_>>(),
+                    "content_hash": receipt_hash,
+                });
+                let patch_receipts_dir = fac_root.join("patch_receipts");
+                if let Err(e) = std::fs::create_dir_all(&patch_receipts_dir) {
+                    eprintln!("worker: WARNING: failed to create patch_receipts dir: {e}");
+                } else if let Ok(body) = serde_json::to_vec_pretty(&patch_receipt_json) {
+                    let receipt_file = patch_receipts_dir.join(format!("{receipt_hash}.json"));
+                    if let Err(e) = std::fs::write(&receipt_file, &body) {
+                        eprintln!("worker: WARNING: failed to persist patch denial receipt: {e}");
+                    }
+                }
+
+                // Run lane cleanup and commit denial via pipeline.
+                if let Err(cleanup_err) =
+                    execute_lane_cleanup(fac_root, &lane_mgr, &acquired_lane_id, &lane_workspace)
+                {
+                    eprintln!(
+                        "worker: WARNING: lane cleanup during patch hardening denial failed for {acquired_lane_id}: {cleanup_err}"
+                    );
+                }
+                if let Err(commit_err) = commit_claimed_job_via_pipeline(
+                    fac_root,
+                    queue_root,
+                    spec,
+                    &claimed_path,
+                    &claimed_file_name,
+                    FacJobOutcome::Denied,
+                    Some(DenialReasonCode::PatchHardeningDenied),
+                    &denial_reason,
+                    Some(&boundary_trace),
+                    Some(&queue_trace),
+                    budget_trace.as_ref(),
+                    None,
+                    Some(canonicalizer_tuple_digest),
+                    policy_hash,
+                    None,
+                    None,
+                    Some(&sbx_hash),
+                    Some(&resolved_net_hash),
+                ) {
+                    return handle_pipeline_commit_failure(
+                        &commit_err,
+                        "denied warm job (patch hardening denied)",
+                        &claimed_path,
+                        queue_root,
+                        &claimed_file_name,
+                    );
+                }
+                return JobOutcome::Denied {
+                    reason: denial_reason,
+                };
+            },
             Err(err) => {
                 return deny_with_reason_and_lease_cleanup(&format!("patch apply failed: {err}"));
             },
