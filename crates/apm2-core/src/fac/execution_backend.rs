@@ -412,9 +412,8 @@ pub fn build_systemd_run_command(
         args.push(name.to_string());
     }
 
-    // Build properties list (backend-aware: user-mode skips directives
-    // that require mount namespaces / root capabilities).
-    let mut property_list = build_property_list(properties, backend);
+    // Build properties list
+    let mut property_list = build_property_list(properties);
 
     // System-mode: add User= property and additional hardening
     let service_user = if backend == ExecutionBackend::SystemMode {
@@ -515,11 +514,8 @@ fn parse_dbus_unix_path(address: &str) -> Option<&str> {
 ///
 /// This produces the same set of properties for both backends. The
 /// system-mode `User=` property is added separately by the caller.
-///
-/// Includes sandbox hardening directives from `SandboxHardeningProfile`
-/// (TCK-00573) after the resource and kill-signal properties.
-fn build_property_list(props: &SystemdUnitProperties, backend: ExecutionBackend) -> Vec<String> {
-    let mut list = vec![
+fn build_property_list(props: &SystemdUnitProperties) -> Vec<String> {
+    vec![
         "MemoryAccounting=yes".to_string(),
         "CPUAccounting=yes".to_string(),
         "TasksAccounting=yes".to_string(),
@@ -536,25 +532,7 @@ fn build_property_list(props: &SystemdUnitProperties, backend: ExecutionBackend)
         "TimeoutStopSec=20s".to_string(),
         "FinalKillSignal=SIGKILL".to_string(),
         "SendSIGKILL=yes".to_string(),
-    ];
-
-    // Sandbox hardening directives (TCK-00573).
-    // User-mode systemd cannot apply mount-namespace directives (PrivateTmp,
-    // ProtectControlGroups, ProtectKernelTunables, ProtectKernelLogs) or
-    // capability-manipulation directives (RestrictSUIDSGID, LockPersonality,
-    // RestrictAddressFamilies, SystemCallArchitectures, RestrictRealtime) —
-    // these require root/CAP_SYS_ADMIN.  Only NoNewPrivileges (prctl-based)
-    // is safe in user mode.  System-mode applies the full profile.
-    match backend {
-        ExecutionBackend::SystemMode => {
-            list.extend(props.sandbox_hardening.to_property_strings());
-        },
-        ExecutionBackend::UserMode => {
-            list.extend(props.sandbox_hardening.to_user_mode_property_strings());
-        },
-    }
-
-    list
+    ]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -674,7 +652,6 @@ fn read_bounded_env(var: &'static str) -> Result<Option<String>, ExecutionBacken
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fac::SandboxHardeningProfile;
     use crate::fac::job_spec::JobConstraints;
     use crate::fac::lane::{LanePolicy, LaneProfileV1, LaneTimeouts, ResourceProfile};
 
@@ -807,11 +784,7 @@ mod tests {
     }
 
     fn test_properties() -> SystemdUnitProperties {
-        SystemdUnitProperties::from_lane_profile_with_hardening(
-            &test_profile(),
-            None,
-            SandboxHardeningProfile::default(),
-        )
+        SystemdUnitProperties::from_lane_profile(&test_profile(), None)
     }
 
     #[test]
@@ -953,11 +926,7 @@ mod tests {
             memory_max_bytes: Some(500_000_000), // Less than profile
             test_timeout_seconds: Some(60),      // Less than profile
         };
-        let props = SystemdUnitProperties::from_lane_profile_with_hardening(
-            &profile,
-            Some(&constraints),
-            SandboxHardeningProfile::default(),
-        );
+        let props = SystemdUnitProperties::from_lane_profile(&profile, Some(&constraints));
         let cmd = build_systemd_run_command(
             ExecutionBackend::UserMode,
             &props,
@@ -981,15 +950,15 @@ mod tests {
     #[test]
     fn property_list_is_deterministic() {
         let props = test_properties();
-        let list1 = build_property_list(&props, ExecutionBackend::SystemMode);
-        let list2 = build_property_list(&props, ExecutionBackend::SystemMode);
+        let list1 = build_property_list(&props);
+        let list2 = build_property_list(&props);
         assert_eq!(list1, list2, "property list must be deterministic");
     }
 
     #[test]
     fn property_list_includes_accounting_and_kill_directives() {
         let props = test_properties();
-        let list = build_property_list(&props, ExecutionBackend::SystemMode);
+        let list = build_property_list(&props);
 
         assert!(list.contains(&"MemoryAccounting=yes".to_string()));
         assert!(list.contains(&"CPUAccounting=yes".to_string()));
@@ -998,140 +967,6 @@ mod tests {
         assert!(list.contains(&"FinalKillSignal=SIGKILL".to_string()));
         assert!(list.contains(&"SendSIGKILL=yes".to_string()));
         assert!(list.contains(&"KillMode=control-group".to_string()));
-    }
-
-    #[test]
-    fn property_list_includes_sandbox_hardening_directives() {
-        let props = test_properties();
-        let list = build_property_list(&props, ExecutionBackend::SystemMode);
-
-        // All default sandbox hardening directives must be present (TCK-00573).
-        assert!(
-            list.contains(&"NoNewPrivileges=yes".to_string()),
-            "missing NoNewPrivileges in property list"
-        );
-        assert!(
-            list.contains(&"PrivateTmp=yes".to_string()),
-            "missing PrivateTmp in property list"
-        );
-        assert!(
-            list.contains(&"ProtectControlGroups=yes".to_string()),
-            "missing ProtectControlGroups in property list"
-        );
-        assert!(
-            list.contains(&"ProtectKernelTunables=yes".to_string()),
-            "missing ProtectKernelTunables in property list"
-        );
-        assert!(
-            list.contains(&"ProtectKernelLogs=yes".to_string()),
-            "missing ProtectKernelLogs in property list"
-        );
-        assert!(
-            list.contains(&"RestrictSUIDSGID=yes".to_string()),
-            "missing RestrictSUIDSGID in property list"
-        );
-        assert!(
-            list.contains(&"LockPersonality=yes".to_string()),
-            "missing LockPersonality in property list"
-        );
-        assert!(
-            list.contains(&"RestrictRealtime=yes".to_string()),
-            "missing RestrictRealtime in property list"
-        );
-        assert!(
-            list.contains(&"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6".to_string()),
-            "missing RestrictAddressFamilies in property list"
-        );
-        assert!(
-            list.contains(&"SystemCallArchitectures=native".to_string()),
-            "missing SystemCallArchitectures in property list"
-        );
-    }
-
-    #[test]
-    fn property_list_respects_disabled_hardening_directives() {
-        use super::super::systemd_properties::SandboxHardeningProfile;
-
-        let profile = test_profile();
-        let hardening = SandboxHardeningProfile {
-            no_new_privileges: false,
-            private_tmp: false,
-            ..Default::default()
-        };
-        let props =
-            SystemdUnitProperties::from_lane_profile_with_hardening(&profile, None, hardening);
-        let list = build_property_list(&props, ExecutionBackend::SystemMode);
-
-        // Disabled directives must NOT be in the property list.
-        assert!(
-            !list.iter().any(|p| p.starts_with("NoNewPrivileges")),
-            "NoNewPrivileges=false should not emit property"
-        );
-        assert!(
-            !list.iter().any(|p| p.starts_with("PrivateTmp")),
-            "PrivateTmp=false should not emit property"
-        );
-        // Other directives should still be present.
-        assert!(
-            list.contains(&"ProtectControlGroups=yes".to_string()),
-            "ProtectControlGroups should still be present"
-        );
-    }
-
-    #[test]
-    fn property_list_user_mode_only_includes_no_new_privileges() {
-        let props = test_properties();
-        let list = build_property_list(&props, ExecutionBackend::UserMode);
-
-        // NoNewPrivileges is safe in user-mode (prctl-based).
-        assert!(
-            list.contains(&"NoNewPrivileges=yes".to_string()),
-            "NoNewPrivileges should be present in user-mode"
-        );
-        // Mount-namespace and capability directives must NOT be present.
-        assert!(
-            !list.iter().any(|p| p.starts_with("PrivateTmp")),
-            "PrivateTmp requires root, should not be in user-mode"
-        );
-        assert!(
-            !list.iter().any(|p| p.starts_with("ProtectControlGroups")),
-            "ProtectControlGroups requires root"
-        );
-        assert!(
-            !list.iter().any(|p| p.starts_with("ProtectKernelTunables")),
-            "ProtectKernelTunables requires root"
-        );
-        assert!(
-            !list.iter().any(|p| p.starts_with("ProtectKernelLogs")),
-            "ProtectKernelLogs requires root"
-        );
-        assert!(
-            !list.iter().any(|p| p.starts_with("RestrictSUIDSGID")),
-            "RestrictSUIDSGID requires root"
-        );
-        assert!(
-            !list.iter().any(|p| p.starts_with("LockPersonality")),
-            "LockPersonality requires root"
-        );
-        assert!(
-            !list.iter().any(|p| p.starts_with("RestrictRealtime")),
-            "RestrictRealtime requires root"
-        );
-        assert!(
-            !list
-                .iter()
-                .any(|p| p.starts_with("RestrictAddressFamilies")),
-            "RestrictAddressFamilies requires root"
-        );
-        assert!(
-            !list
-                .iter()
-                .any(|p| p.starts_with("SystemCallArchitectures")),
-            "SystemCallArchitectures requires root"
-        );
-        // Resource accounting/limits must still be present.
-        assert!(list.contains(&"MemoryAccounting=yes".to_string()));
-        assert!(list.contains(&"KillSignal=SIGKILL".to_string()));
     }
 
     // ── D-Bus path parsing ──────────────────────────────────────────────
@@ -1284,11 +1119,7 @@ mod tests {
             },
             policy: LanePolicy::default(),
         };
-        let props = SystemdUnitProperties::from_lane_profile_with_hardening(
-            &zero_profile,
-            None,
-            SandboxHardeningProfile::default(),
-        );
+        let props = SystemdUnitProperties::from_lane_profile(&zero_profile, None);
         let cmd = build_systemd_run_command(
             ExecutionBackend::UserMode,
             &props,
