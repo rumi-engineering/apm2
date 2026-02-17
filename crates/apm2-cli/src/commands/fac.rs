@@ -490,6 +490,15 @@ pub struct DoctorArgs {
     #[arg(long)]
     pub pr: Option<u32>,
 
+    /// Restrict global doctor output to one repository (`owner/repo`).
+    #[arg(
+        long,
+        value_name = "OWNER/REPO",
+        conflicts_with = "pr",
+        value_parser = parse_owner_repo_filter
+    )]
+    pub repo: Option<String>,
+
     /// Execute doctor-prescribed recovery actions for the PR.
     #[arg(long, default_value_t = false)]
     pub fix: bool,
@@ -559,6 +568,41 @@ fn parse_wait_timeout(raw: &str) -> Result<u64, String> {
         );
     }
     Ok(value)
+}
+
+fn parse_owner_repo_filter(raw: &str) -> Result<String, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err("repository filter cannot be empty".to_string());
+    }
+
+    let (owner, repo) = value
+        .split_once('/')
+        .ok_or_else(|| format!("invalid repository format `{value}` (expected owner/repo)"))?;
+
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return Err(format!(
+            "invalid repository format `{value}` (expected owner/repo)"
+        ));
+    }
+    if owner == "." || owner == ".." || repo == "." || repo == ".." {
+        return Err(format!(
+            "invalid repository format `{value}` (reserved path segment)"
+        ));
+    }
+    if !owner
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        || !repo
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(format!(
+            "invalid repository format `{value}` (expected owner/repo)"
+        ));
+    }
+
+    Ok(format!("{owner}/{repo}"))
 }
 
 /// Arguments for `apm2 fac services`.
@@ -2287,21 +2331,22 @@ pub fn run_fac(
                             );
                         },
                     };
-                let repo_hint = fac_review::derive_repo().ok();
-                let tracked_prs =
-                    match fac_review::collect_tracked_pr_summaries(repo_hint.as_deref()) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            let message =
-                                format!("failed to build tracked PR doctor summary: {err}");
-                            checks.push(crate::commands::daemon::DaemonDoctorCheck {
-                                name: "tracked_pr_summary".to_string(),
-                                status: "WARN",
-                                message,
-                            });
-                            Vec::new()
-                        },
-                    };
+                let repo_hint = args.repo.clone();
+                let tracked_prs = match fac_review::collect_tracked_pr_summaries(
+                    repo_hint.as_deref(),
+                    args.repo.as_deref(),
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        let message = format!("failed to build tracked PR doctor summary: {err}");
+                        checks.push(crate::commands::daemon::DaemonDoctorCheck {
+                            name: "tracked_pr_summary".to_string(),
+                            status: "WARN",
+                            message,
+                        });
+                        Vec::new()
+                    },
+                };
                 let payload = serde_json::json!({
                     "schema": "apm2.fac.doctor.system.v1",
                     "checks": checks,
@@ -6753,6 +6798,7 @@ mod tests {
         match parsed.subcommand {
             FacSubcommand::Doctor(args) => {
                 assert_eq!(args.pr, Some(615));
+                assert_eq!(args.repo, None);
                 assert!(args.fix);
                 assert!(!args.full);
             },
@@ -6768,6 +6814,7 @@ mod tests {
             FacSubcommand::Doctor(args) => {
                 assert!(args.full);
                 assert!(args.pr.is_none());
+                assert!(args.repo.is_none());
             },
             other => panic!("expected doctor subcommand, got {other:?}"),
         }
@@ -6802,6 +6849,49 @@ mod tests {
             },
             other => panic!("expected doctor subcommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_doctor_repo_filter_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "doctor",
+            "--repo",
+            "guardian-intelligence/apm2",
+        ])
+        .expect("doctor --repo should parse");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert!(args.pr.is_none());
+                assert_eq!(args.repo.as_deref(), Some("guardian-intelligence/apm2"));
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_doctor_repo_filter_rejects_invalid_value() {
+        let err = FacLogsCliHarness::try_parse_from(["fac", "doctor", "--repo", "invalid_repo"])
+            .expect_err("invalid --repo should fail parsing");
+        let rendered = err.to_string();
+        assert!(rendered.contains("invalid repository format"));
+        assert!(rendered.contains("owner/repo"));
+    }
+
+    #[test]
+    fn test_doctor_repo_filter_conflicts_with_pr() {
+        let err = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "doctor",
+            "--pr",
+            "615",
+            "--repo",
+            "guardian-intelligence/apm2",
+        ])
+        .expect_err("--repo and --pr should conflict");
+        let rendered = err.to_string();
+        assert!(rendered.contains("cannot be used with"));
+        assert!(rendered.contains("--pr"));
     }
 
     #[test]

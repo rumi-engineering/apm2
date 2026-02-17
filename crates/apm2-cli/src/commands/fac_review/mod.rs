@@ -664,6 +664,7 @@ pub fn run_doctor(
         }
 
         if started.elapsed() >= wait_timeout {
+            emit_doctor_wait_timeout_event(json_output, tick, &summary, elapsed_seconds);
             emit_doctor_wait_result(&summary, json_output, tick, true, elapsed_seconds);
             return DOCTOR_WAIT_TIMEOUT_EXIT_CODE;
         }
@@ -763,6 +764,26 @@ fn emit_doctor_wait_result(
     }
 }
 
+fn emit_doctor_wait_timeout_event(
+    json_output: bool,
+    tick: u64,
+    summary: &DoctorPrSummary,
+    elapsed_seconds: u64,
+) {
+    if !json_output {
+        return;
+    }
+    if let Err(err) = jsonl::emit_jsonl(&jsonl::DoctorWaitTimeoutEvent {
+        event: "wait_timeout",
+        tick,
+        action: summary.recommended_action.action.clone(),
+        elapsed_seconds,
+        ts: jsonl::ts_now(),
+    }) {
+        eprintln!("WARNING: failed to emit doctor wait timeout event: {err}");
+    }
+}
+
 fn emit_doctor_wait_error(json_output: bool, error: &str, message: &str, exit_code: u8) -> u8 {
     if json_output {
         let _ = jsonl::emit_jsonl(&jsonl::StageEvent {
@@ -815,17 +836,25 @@ const MAX_TRACKED_PR_SUMMARIES: usize = 100;
 
 pub fn collect_tracked_pr_summaries(
     fallback_owner_repo: Option<&str>,
+    repo_filter: Option<&str>,
 ) -> Result<Vec<DoctorTrackedPrSummary>, String> {
     let mut pr_numbers = list_review_pr_numbers()?;
     // Sort descending so we keep the most recent PRs when truncating.
     pr_numbers.sort_unstable_by(|a, b| b.cmp(a));
     pr_numbers.truncate(MAX_TRACKED_PR_SUMMARIES);
+    let repo_filter = repo_filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
 
     let mut summaries = Vec::with_capacity(pr_numbers.len());
     for pr_number in pr_numbers {
         let Some(owner_repo) = resolve_owner_repo_for_pr(pr_number, fallback_owner_repo) else {
             continue;
         };
+        if !tracked_pr_matches_repo_filter(&owner_repo, repo_filter.as_deref()) {
+            continue;
+        }
         let summary = run_doctor_inner(&owner_repo, pr_number, Vec::new(), true);
         let lifecycle_state = summary
             .lifecycle
@@ -873,6 +902,18 @@ fn resolve_owner_repo_for_pr(pr_number: u32, fallback_owner_repo: Option<&str>) 
             Some(normalized)
         }
     })
+}
+
+fn tracked_pr_matches_repo_filter(owner_repo: &str, repo_filter: Option<&str>) -> bool {
+    let normalized_owner_repo = owner_repo.trim().to_ascii_lowercase();
+    if normalized_owner_repo.is_empty() {
+        return false;
+    }
+    let normalized_filter = repo_filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    normalized_filter.is_none_or(|filter| normalized_owner_repo == filter)
 }
 
 fn run_doctor_inner(
@@ -7340,5 +7381,38 @@ mod tests {
             result.is_err(),
             "expected MultipleHandlers error since global handler was already installed"
         );
+    }
+
+    #[test]
+    fn tracked_pr_repo_filter_matches_case_insensitive_exact_repo() {
+        assert!(super::tracked_pr_matches_repo_filter(
+            "Guardian-Intelligence/APM2",
+            Some("guardian-intelligence/apm2"),
+        ));
+        assert!(super::tracked_pr_matches_repo_filter(
+            "guardian-intelligence/apm2",
+            Some("  GUARDIAN-INTELLIGENCE/APM2  "),
+        ));
+    }
+
+    #[test]
+    fn tracked_pr_repo_filter_rejects_partial_or_mismatched_repo() {
+        assert!(!super::tracked_pr_matches_repo_filter(
+            "guardian-intelligence/apm2",
+            Some("guardian-intelligence"),
+        ));
+        assert!(!super::tracked_pr_matches_repo_filter(
+            "guardian-intelligence/apm2",
+            Some("guardian-intelligence/apm2-docs"),
+        ));
+    }
+
+    #[test]
+    fn tracked_pr_repo_filter_defaults_to_allow_without_filter() {
+        assert!(super::tracked_pr_matches_repo_filter(
+            "guardian-intelligence/apm2",
+            None
+        ));
+        assert!(!super::tracked_pr_matches_repo_filter("   ", None));
     }
 }

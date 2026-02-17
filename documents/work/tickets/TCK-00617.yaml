@@ -111,8 +111,29 @@ scope:
         - Remove "GitHub is temporarily authoritative for merges" from CLAUDE.md
           once this lands.
 
-    - id: "S6_REGRESSION_TESTS"
-      title: "Regression tests for merge flow"
+    - id: "S6_DOCTOR_WAIT_TIMEOUT_EVENT"
+      title: "Emit terminal event on `fac doctor --wait-for-recommended-action` timeout"
+      detail: |
+        When --wait-for-recommended-action reaches its timeout, the command
+        exits silently — no final JSON line, no error, just EOF. This makes
+        it impossible for orchestrators to distinguish "timed out" from
+        "process died".
+        Fix: emit a terminal event line before exit, e.g.
+        {"event":"wait_timeout","elapsed_seconds":1200}
+        so the caller can unambiguously branch on timeout vs crash vs success.
+
+    - id: "S7_DOCTOR_REPO_FILTER"
+      title: "Add --repo filter to `fac doctor --json`"
+      detail: |
+        The global `apm2 fac doctor --json` (no --pr) mixes test/capacity PRs
+        with real ones. With 100+ entries from example/capacity-* repos, it is
+        hard to spot actual guardian-intelligence/apm2 PRs.
+        Add a --repo flag (e.g. --repo guardian-intelligence/apm2) so
+        orchestrators can scope output to a specific repo without
+        post-processing jq filters.
+
+    - id: "S8_REGRESSION_TESTS"
+      title: "Regression tests for merge flow and doctor UX"
       detail: |
         - Test: worktree is clean (no untracked files) after merge.
         - Test: feature branch ref deleted after merge.
@@ -120,6 +141,8 @@ scope:
         - Test: MergeReceipt is emitted and verifiable after CLI merge.
         - Test: origin divergence triggers fail-closed, not silent acceptance.
         - Test: PR is closed/updated via projection after merge.
+        - Test: doctor --wait-for-recommended-action emits terminal event on timeout.
+        - Test: doctor --json --repo filters output to specified repo only.
 
   out_of_scope:
     - "Redesigning the daemon MergeExecutor or wiring it into the CLI path (future unification)."
@@ -154,11 +177,22 @@ plan:
         Make sync_local_main_with_origin() fail-closed on unexpected divergence
         instead of accepting origin state. Local Merged event is authoritative.
     - id: "STEP_06"
+      title: "Doctor: emit terminal event on wait timeout"
+      detail: |
+        In fac doctor --wait-for-recommended-action, emit a JSON terminal
+        event line (wait_timeout + elapsed_seconds) before exiting on timeout.
+    - id: "STEP_07"
+      title: "Doctor: add --repo filter flag"
+      detail: |
+        Add --repo flag to fac doctor --json to scope PR list output
+        to a specific repo. Filter applied before serialization.
+    - id: "STEP_08"
       title: "Add regression tests"
       detail: |
         Clean worktree, branch cleanup, no auto-merge, receipt emission,
-        origin divergence fail-closed, PR projection.
-    - id: "STEP_07"
+        origin divergence fail-closed, PR projection, doctor timeout event,
+        doctor repo filter.
+    - id: "STEP_09"
       title: "Run full workspace validation"
       detail: |
         - cargo fmt --all
@@ -180,7 +214,9 @@ definition_of_done:
     - "PR is closed, remote branch deleted, and PR body updated via projection after merge."
     - "Origin/main divergence triggers fail-closed error, not silent acceptance."
     - "CLAUDE.md no longer says GitHub is temporarily authoritative for merges."
-    - "Regression tests pass for all merge flow invariants."
+    - "`fac doctor --wait-for-recommended-action` emits terminal JSON event on timeout (not silent exit)."
+    - "`fac doctor --json --repo <owner/repo>` filters output to the specified repo."
+    - "Regression tests pass for all merge flow and doctor UX invariants."
     - "Workspace validation commands complete successfully."
 
 notes:
