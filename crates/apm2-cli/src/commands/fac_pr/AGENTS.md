@@ -94,9 +94,12 @@ pub struct PrAuthSetupCliArgs {
 **Invariants:**
 - [INV-SETUP-001] Private key is stored in OS keyring before any config file is written (keyring mode).
 - [INV-SETUP-002] Config file and fallback PEM are written with mode 0600 (owner read/write only).
-- [INV-SETUP-003] Symlink targets are rejected for private key paths to prevent symlink attacks.
-- [INV-SETUP-004] Source PEM file is deleted after keyring import unless `--keep-private-key-file` is specified.
+- [INV-SETUP-003] Symlink targets are rejected for private key paths via `O_NOFOLLOW` at open time (CWE-61, no TOCTOU gap). All private key reads use the open-once bounded strategy: open with `O_NOFOLLOW`, validate metadata on the handle, read bounded content from the same descriptor (INV-0910/CTR-0901 pattern).
+- [INV-SETUP-004] Source PEM file is deleted after keyring import unless `--keep-private-key-file` is specified. When source and destination paths alias the same file, deletion is skipped to avoid removing the just-written PEM.
 - [INV-SETUP-005] In `--for-systemd` mode, keyring is skipped entirely and PEM is written to `$APM2_HOME/app-{app_id}.pem`.
+- [INV-SETUP-006] `app_id` and `installation_id` are validated as strict numeric-only GitHub identifiers before use in filesystem paths or TOML config content (CTR-2609). Path separators, dot-segments, quotes, control characters, and whitespace are rejected.
+- [INV-SETUP-007] `github_app.toml` is generated via typed TOML serialization (`GitHubAppTomlConfig` struct), not manual string interpolation, to prevent config injection.
+- [INV-SETUP-008] Private key reads are bounded to 16 KiB (`MAX_PRIVATE_KEY_FILE_SIZE`) to prevent resource exhaustion (CTR-1603, RSK-1601).
 
 ### `AuthInfo` (types.rs)
 

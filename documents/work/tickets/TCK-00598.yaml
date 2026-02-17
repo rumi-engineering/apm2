@@ -34,6 +34,6 @@ ticket_meta:
   definition_of_done:
     evidence_ids: []
     criteria:
-      - "A headless compute host can run `apm2 fac pr auth-setup --app-id ... --installation-id ... --private-key-file ...` successfully."
-      - "No requirement for a desktop keyring; systemd credentials path works."
+      - "A headless compute host can run `apm2 fac pr auth-setup --app-id ... --installation-id ... --private-key-file ... --for-systemd` successfully."
+      - "No requirement for a desktop keyring; systemd credentials path works. The `--for-systemd` flag skips keyring entirely."
       - "Missing GitHub app config does not affect `apm2 fac gates`."
