@@ -607,6 +607,10 @@ pub enum DenialReasonCode {
     /// TCK-00584). Workers fail-closed when the economics profile hash is
     /// not admitted.
     EconomicsAdmissionDenied,
+    /// Patch content was denied by hardening validation (INV-PH-001
+    /// through INV-PH-010, TCK-00581). Path traversal, absolute paths,
+    /// unsupported format, or other patch content violation detected.
+    PatchHardeningDenied,
 }
 
 /// Trace of the RFC-0028 channel boundary check.
@@ -4179,5 +4183,44 @@ pub mod tests {
             restored_without.cost_estimate_ticks, None,
             "missing cost_estimate_ticks must default to None"
         );
+    }
+
+    // ── TCK-00581: PatchHardeningDenied denial reason code ──
+
+    #[test]
+    fn patch_hardening_denied_reason_builds_valid_receipt() {
+        let receipt = FacJobReceiptV1Builder::new(
+            "receipt-patch-deny-001",
+            "job-patch-001",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .outcome(FacJobOutcome::Denied)
+        .denial_reason(DenialReasonCode::PatchHardeningDenied)
+        .reason("patch hardening denied: path traversal in diff header [receipt_hash=b3-256:bbbb]")
+        .policy_hash("b3-256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+        .timestamp_secs(1_700_000_000)
+        .try_build();
+
+        assert!(
+            receipt.is_ok(),
+            "PatchHardeningDenied receipt should build successfully: {receipt:?}"
+        );
+        let receipt = receipt.unwrap();
+        assert_eq!(receipt.outcome, FacJobOutcome::Denied);
+        assert_eq!(
+            receipt.denial_reason,
+            Some(DenialReasonCode::PatchHardeningDenied)
+        );
+        assert!(!receipt.content_hash.is_empty());
+    }
+
+    #[test]
+    fn patch_hardening_denied_reason_serializes_correctly() {
+        let code = DenialReasonCode::PatchHardeningDenied;
+        let json = serde_json::to_string(&code).expect("serialize");
+        assert_eq!(json, "\"patch_hardening_denied\"");
+
+        let restored: DenialReasonCode = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored, DenialReasonCode::PatchHardeningDenied);
     }
 }
