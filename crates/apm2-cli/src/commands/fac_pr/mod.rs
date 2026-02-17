@@ -11,8 +11,10 @@ pub mod types;
 
 mod auth_check;
 mod auth_setup;
+mod ruleset_sync;
 
 // Re-export for potential external callers.
+pub use ruleset_sync::sync_required_status_ruleset;
 #[allow(unused_imports)]
 pub use types::AuthInfo;
 
@@ -52,6 +54,8 @@ pub enum PrSubcommand {
     AuthCheck(PrAuthCheckCliArgs),
     /// Store GitHub App private key material in OS keyring and write config.
     AuthSetup(PrAuthSetupCliArgs),
+    /// Sync live GitHub required-status rule to local source of truth.
+    RulesetSync(PrRulesetSyncCliArgs),
 }
 
 #[derive(Debug, Args)]
@@ -97,6 +101,30 @@ pub struct PrAuthSetupCliArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct PrRulesetSyncCliArgs {
+    /// Repository in owner/repo format.
+    #[arg(long, default_value = "guardian-intelligence/apm2")]
+    pub repo: String,
+
+    /// Optional explicit ruleset id.
+    #[arg(long)]
+    pub ruleset_id: Option<u64>,
+
+    /// Optional local ruleset file path (defaults to
+    /// .github/rulesets/protect-main.json).
+    #[arg(long)]
+    pub ruleset_file: Option<std::path::PathBuf>,
+
+    /// Check for drift only; do not apply updates.
+    #[arg(long, default_value_t = false)]
+    pub check: bool,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
 // ── Dispatcher ─────────────────────────────────────────────────────────────
 
 /// Dispatch `apm2 fac pr` subcommands.
@@ -105,5 +133,6 @@ pub fn run_pr(args: &PrArgs, parent_json_output: bool) -> u8 {
     match &args.subcommand {
         PrSubcommand::AuthCheck(a) => auth_check::run_pr_auth_check(&a.repo, resolve_json(a.json)),
         PrSubcommand::AuthSetup(a) => auth_setup::run_pr_auth_setup(a, resolve_json(a.json)),
+        PrSubcommand::RulesetSync(a) => ruleset_sync::run_pr_ruleset_sync(a, resolve_json(a.json)),
     }
 }
