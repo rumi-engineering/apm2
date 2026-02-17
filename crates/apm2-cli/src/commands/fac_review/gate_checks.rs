@@ -982,9 +982,7 @@ fn hash_file(path: &Path) -> Result<String, String> {
         let target_path = if target.is_absolute() {
             target.clone()
         } else {
-            path.parent()
-                .unwrap_or_else(|| Path::new(""))
-                .join(&target)
+            path.parent().unwrap_or_else(|| Path::new("")).join(&target)
         };
 
         let mut hasher = Sha256::new();
