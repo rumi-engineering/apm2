@@ -209,7 +209,20 @@ impl GitHubAppTokenProvider {
             }
         }
 
-        // 2. Keyring lookup.
+        // 2. Systemd credential directory (`$CREDENTIALS_DIRECTORY/github-app-key`).
+        //
+        // On headless compute hosts managed by systemd, the private key can be
+        // provisioned via `LoadCredential=github-app-key:/path/to/key.pem` in
+        // the unit file.  The runtime places it at
+        // `$CREDENTIALS_DIRECTORY/github-app-key` with restrictive permissions
+        // (0400, owned by the service user).
+        let systemd_resolution_error = match resolve_systemd_credential(SYSTEMD_GITHUB_APP_KEY_NAME)
+        {
+            Ok(secret) => return Ok(secret),
+            Err(err) => Some(err),
+        };
+
+        // 3. Keyring lookup.
         let service = keyring_service
             .or_else(|| config.and_then(|cfg| cfg.keyring_service.as_deref()))
             .unwrap_or("apm2.github.app");
@@ -236,7 +249,7 @@ impl GitHubAppTokenProvider {
             Err(err) => Some(format!("keyring init failed: {err}")),
         };
 
-        // 3. Optional config-file private key fallback (explicit opt-in only).
+        // 4. Optional config-file private key fallback (explicit opt-in only).
         let mut file_resolution_error = None;
         if let Some(cfg) = config {
             if let Some(pem_path) = cfg.private_key_file.as_ref() {
@@ -260,6 +273,9 @@ impl GitHubAppTokenProvider {
         }
 
         let mut details = Vec::new();
+        if let Some(err) = systemd_resolution_error {
+            details.push(err);
+        }
         if let Some(err) = keyring_resolution_error {
             details.push(err);
         }
@@ -272,8 +288,18 @@ impl GitHubAppTokenProvider {
             format!(" ({})", details.join("; "))
         };
         Err(format!(
-            "no private key found: set ${env_var_name}, run `apm2 fac pr auth-setup`, \
-             or store key in keyring ({service}/{account}){detail_suffix}"
+            "no private key found for GitHub App (app_id={app_id}). \
+             Checked sources in order:\n\
+             \x20 1. env ${env_var_name}\n\
+             \x20 2. systemd credential $CREDENTIALS_DIRECTORY/{SYSTEMD_GITHUB_APP_KEY_NAME}\n\
+             \x20 3. OS keyring ({service}/{account})\n\
+             \x20 4. config file private_key_file (allow_private_key_file_fallback={allow_private_key_file_fallback})\n\
+             Remediation:\n\
+             \x20 - Interactive host: run `apm2 fac pr auth-setup --app-id <ID> --installation-id <ID> --private-key-file <PEM>`\n\
+             \x20 - Headless/systemd: run `apm2 fac pr auth-setup --for-systemd --app-id <ID> --installation-id <ID> --private-key-file <PEM>`\n\
+             \x20 - systemd unit: add `LoadCredential={SYSTEMD_GITHUB_APP_KEY_NAME}:/path/to/key.pem` to [Service]\n\
+             \x20 - env var: export {env_var_name}=\"$(cat /path/to/key.pem)\"\
+             {detail_suffix}"
         ))
     }
 
@@ -300,6 +326,70 @@ impl GitHubAppTokenProvider {
             false,
         )
     }
+}
+
+/// The systemd credential name for the GitHub App private key.
+///
+/// On headless compute hosts provisioned via systemd, the private key is
+/// injected through `LoadCredential=github-app-key:/path/to/key.pem` in
+/// the unit file. The runtime makes it available at
+/// `$CREDENTIALS_DIRECTORY/github-app-key`.
+pub const SYSTEMD_GITHUB_APP_KEY_NAME: &str = "github-app-key";
+
+/// Maximum file size for a PEM private key read from systemd credentials
+/// or config-file fallback. RSA-4096 PEM is ~3.2 KiB; 16 KiB provides
+/// ample headroom while preventing unbounded allocation (CTR-1603).
+const MAX_PRIVATE_KEY_FILE_SIZE: u64 = 16 * 1024;
+
+/// Attempt to read the GitHub App private key from the systemd credential
+/// directory (`$CREDENTIALS_DIRECTORY/<name>`).
+///
+/// Returns `Ok(SecretString)` if the credential file exists and contains
+/// non-empty content. Returns `Err(String)` with a diagnostic message
+/// otherwise.
+fn resolve_systemd_credential(credential_name: &str) -> Result<SecretString, String> {
+    let cred_dir = std::env::var("CREDENTIALS_DIRECTORY").map_err(|_| {
+        "CREDENTIALS_DIRECTORY not set (not running under systemd with LoadCredential)".to_string()
+    })?;
+    let cred_path = Path::new(&cred_dir).join(credential_name);
+    read_private_key_file_bounded(&cred_path)
+}
+
+/// Read a PEM private key file with bounded I/O and symlink rejection.
+///
+/// The file must be a regular file (no symlinks), and its size must not
+/// exceed [`MAX_PRIVATE_KEY_FILE_SIZE`] (CTR-1603, RSK-1601).
+fn read_private_key_file_bounded(path: &Path) -> Result<SecretString, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing symlink path for private key file: {}",
+            path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "refusing non-regular path for private key file: {}",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_PRIVATE_KEY_FILE_SIZE {
+        return Err(format!(
+            "private key file too large: {} bytes > {} max ({})",
+            metadata.len(),
+            MAX_PRIVATE_KEY_FILE_SIZE,
+            path.display()
+        ));
+    }
+
+    let content = std::fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err(format!("private key file is empty: {}", path.display()));
+    }
+    Ok(SecretString::new(trimmed.to_string().into_boxed_str()))
 }
 
 fn read_private_key_file_secure(path: &Path) -> Result<SecretString, String> {
@@ -1056,6 +1146,143 @@ mod unit_tests {
             err.contains("no private key found")
                 || err.contains("keyring lookup failed")
                 || err.contains("keyring init failed")
+        );
+    }
+
+    #[test]
+    fn test_resolve_private_key_error_includes_systemd_guidance() {
+        let err = GitHubAppTokenProvider::resolve_private_key(
+            "99999",
+            "APM2_TEST_NONEXISTENT_PRIVATE_KEY_ENV_VAR_FOR_GUIDANCE",
+            None,
+            Some("apm2.tests.nonexistent.service"),
+            Some("apm2.tests.nonexistent.account"),
+            false,
+        )
+        .expect_err("should fail when no credential source is available");
+
+        // Error message must include systemd credential guidance.
+        assert!(
+            err.contains("CREDENTIALS_DIRECTORY"),
+            "error should mention CREDENTIALS_DIRECTORY: {err}"
+        );
+        assert!(
+            err.contains("github-app-key"),
+            "error should mention github-app-key credential name: {err}"
+        );
+        assert!(
+            err.contains("LoadCredential"),
+            "error should mention systemd LoadCredential: {err}"
+        );
+        assert!(
+            err.contains("--for-systemd"),
+            "error should mention --for-systemd flag: {err}"
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // Env var mutation is required for test setup and teardown.
+    fn test_resolve_systemd_credential_reads_valid_file() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let cred_file = temp.path().join("github-app-key");
+        std::fs::write(
+            &cred_file,
+            "-----BEGIN RSA PRIVATE KEY-----\ntest-data\n-----END RSA PRIVATE KEY-----\n",
+        )
+        .expect("write cred file");
+
+        // Set CREDENTIALS_DIRECTORY to our temp dir for this test.
+        // SAFETY: This modifies process-global state; acceptable in serial test.
+        let prev = std::env::var("CREDENTIALS_DIRECTORY").ok();
+        unsafe { std::env::set_var("CREDENTIALS_DIRECTORY", temp.path()) };
+
+        let result = super::resolve_systemd_credential("github-app-key");
+        assert!(result.is_ok(), "should resolve credential: {result:?}");
+        let secret = result.unwrap();
+        assert!(
+            secret.expose_secret().contains("BEGIN RSA PRIVATE KEY"),
+            "should contain PEM content"
+        );
+
+        // Restore previous env state.
+        match prev {
+            Some(val) => unsafe { std::env::set_var("CREDENTIALS_DIRECTORY", val) },
+            None => unsafe { std::env::remove_var("CREDENTIALS_DIRECTORY") },
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // Env var mutation is required for test setup and teardown.
+    fn test_resolve_systemd_credential_rejects_empty_file() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let cred_file = temp.path().join("github-app-key");
+        std::fs::write(&cred_file, "  \n  ").expect("write empty cred file");
+
+        let prev = std::env::var("CREDENTIALS_DIRECTORY").ok();
+        // SAFETY: This modifies process-global state; acceptable in serial test.
+        unsafe { std::env::set_var("CREDENTIALS_DIRECTORY", temp.path()) };
+
+        let result = super::resolve_systemd_credential("github-app-key");
+        assert!(result.is_err(), "should reject empty credential file");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("empty"),
+            "error should mention empty file: {err}"
+        );
+
+        match prev {
+            Some(val) => unsafe { std::env::set_var("CREDENTIALS_DIRECTORY", val) },
+            None => unsafe { std::env::remove_var("CREDENTIALS_DIRECTORY") },
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(unsafe_code)] // Env var mutation is required for test setup and teardown.
+    fn test_resolve_systemd_credential_rejects_symlink() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let real_file = temp.path().join("real-key");
+        std::fs::write(
+            &real_file,
+            "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n",
+        )
+        .expect("write real file");
+        let link = temp.path().join("github-app-key");
+        std::os::unix::fs::symlink(&real_file, &link).expect("create symlink");
+
+        let prev = std::env::var("CREDENTIALS_DIRECTORY").ok();
+        // SAFETY: This modifies process-global state; acceptable in serial test.
+        unsafe { std::env::set_var("CREDENTIALS_DIRECTORY", temp.path()) };
+
+        let result = super::resolve_systemd_credential("github-app-key");
+        assert!(result.is_err(), "should reject symlink credential");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("symlink"),
+            "error should mention symlink: {err}"
+        );
+
+        match prev {
+            Some(val) => unsafe { std::env::set_var("CREDENTIALS_DIRECTORY", val) },
+            None => unsafe { std::env::remove_var("CREDENTIALS_DIRECTORY") },
+        }
+    }
+
+    #[test]
+    fn test_read_private_key_file_bounded_rejects_oversize() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let oversize_file = temp.path().join("huge.pem");
+        let oversize_len =
+            usize::try_from(super::MAX_PRIVATE_KEY_FILE_SIZE + 1).expect("size fits usize");
+        let oversize = "x".repeat(oversize_len);
+        std::fs::write(&oversize_file, oversize).expect("write oversize file");
+
+        let result = super::read_private_key_file_bounded(&oversize_file);
+        assert!(result.is_err(), "should reject oversized key file");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("too large"),
+            "error should mention too large: {err}"
         );
     }
 
