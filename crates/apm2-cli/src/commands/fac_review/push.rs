@@ -12,6 +12,7 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use apm2_core::fac::{parse_b3_256_digest, parse_policy_hash};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
@@ -357,12 +358,7 @@ fn update_pr(repo: &str, pr_number: u32, title: &str, body: &str) -> Result<(), 
     github_projection::update_pr(repo, pr_number, title, body)
 }
 
-/// Enable auto-merge (merge commit) on a PR.
-fn enable_auto_merge(repo: &str, pr_number: u32) -> Result<(), String> {
-    github_projection::enable_auto_merge(repo, pr_number)
-}
-
-fn run_blocking_evidence_gates(sha: &str) -> Result<Vec<EvidenceGateResult>, String> {
+fn run_blocking_evidence_gates(sha: &str) -> Result<QueuedGatesOutcome, String> {
     let request = QueuedGatesRequest {
         force: false,
         quick: false,
@@ -389,23 +385,23 @@ fn run_pre_push_sequence_with<FGates, FSync, FPush>(
     mut run_gates_fn: FGates,
     mut sync_ruleset_fn: FSync,
     mut git_push_fn: FPush,
-) -> Result<Vec<EvidenceGateResult>, PrePushExecutionError>
+) -> Result<QueuedGatesOutcome, PrePushExecutionError>
 where
-    FGates: FnMut() -> Result<Vec<EvidenceGateResult>, String>,
+    FGates: FnMut() -> Result<QueuedGatesOutcome, String>,
     FSync: FnMut() -> Result<(), String>,
     FPush: FnMut() -> Result<(), String>,
 {
-    let gate_results = run_gates_fn().map_err(PrePushExecutionError::Gates)?;
+    let gate_outcome = run_gates_fn().map_err(PrePushExecutionError::Gates)?;
     sync_ruleset_fn().map_err(PrePushExecutionError::RulesetSync)?;
     git_push_fn().map_err(PrePushExecutionError::GitPush)?;
-    Ok(gate_results)
+    Ok(gate_outcome)
 }
 
 #[cfg(test)]
 fn run_blocking_evidence_gates_with<F>(
     sha: &str,
     mut run_queued_gates_fn: F,
-) -> Result<Vec<EvidenceGateResult>, String>
+) -> Result<QueuedGatesOutcome, String>
 where
     F: FnMut() -> Result<QueuedGatesOutcome, String>,
 {
@@ -416,9 +412,21 @@ where
 fn validate_queued_gates_outcome_for_push(
     sha: &str,
     outcome: QueuedGatesOutcome,
-) -> Result<Vec<EvidenceGateResult>, String> {
+) -> Result<QueuedGatesOutcome, String> {
     if outcome.job_id.trim().is_empty() {
         return Err("queued gates returned empty job_id".to_string());
+    }
+    if outcome.job_receipt_id.trim().is_empty() {
+        return Err("queued gates returned empty job_receipt_id".to_string());
+    }
+    if outcome.policy_hash.trim().is_empty() {
+        return Err("queued gates returned empty policy_hash".to_string());
+    }
+    if parse_policy_hash(outcome.policy_hash.trim()).is_none() {
+        return Err(format!(
+            "queued gates returned invalid policy_hash `{}`",
+            outcome.policy_hash
+        ));
     }
     if !outcome.head_sha.eq_ignore_ascii_case(sha) {
         return Err(format!(
@@ -427,7 +435,7 @@ fn validate_queued_gates_outcome_for_push(
         ));
     }
     validate_gate_results_for_pass(sha, &outcome.gate_results)?;
-    Ok(outcome.gate_results)
+    Ok(outcome)
 }
 
 fn expected_gate_names() -> BTreeSet<String> {
@@ -485,6 +493,34 @@ fn validate_gate_results_for_pass(
         };
         return Err(format!(
             "evidence gate results for sha={sha} do not match required gate set (missing={missing_summary}, extra={extra_summary}); refusing gate projection"
+        ));
+    }
+
+    let mut missing_bundle_hash = Vec::new();
+    let mut invalid_bundle_hash = Vec::new();
+    for gate in gate_results {
+        match gate.log_bundle_hash.as_deref().map(str::trim) {
+            Some(value) if !value.is_empty() => {
+                if parse_b3_256_digest(value).is_none() {
+                    invalid_bundle_hash.push(format!("{}={value}", gate.gate_name));
+                }
+            },
+            _ => missing_bundle_hash.push(gate.gate_name.clone()),
+        }
+    }
+    if !missing_bundle_hash.is_empty() || !invalid_bundle_hash.is_empty() {
+        let missing_summary = if missing_bundle_hash.is_empty() {
+            "-".to_string()
+        } else {
+            missing_bundle_hash.join(",")
+        };
+        let invalid_summary = if invalid_bundle_hash.is_empty() {
+            "-".to_string()
+        } else {
+            invalid_bundle_hash.join(",")
+        };
+        return Err(format!(
+            "queued gates completed for sha={sha} without fully attested log bundle hashes (missing={missing_summary}, invalid={invalid_summary}); refusing authoritative admission binding"
         ));
     }
     Ok(())
@@ -1433,14 +1469,14 @@ pub fn run_push(
     let mut ruleset_sync_error_hint: Option<String> = None;
     let mut ruleset_sync_executed = false;
     let mut ruleset_sync_passed = false;
-    let gate_results = match run_pre_push_sequence_with(
+    let gate_outcome = match run_pre_push_sequence_with(
         || {
             human_log!("fac push: enqueuing evidence gates job (external worker, blocking)");
             emit_stage("gates_started", serde_json::json!({}));
             let gates_started = Instant::now();
-            let gate_results = match run_blocking_evidence_gates(&sha) {
-                Ok(results) => {
-                    for gate in &results {
+            let gate_outcome = match run_blocking_evidence_gates(&sha) {
+                Ok(outcome) => {
+                    for gate in &outcome.gate_results {
                         let stage = stage_from_gate_name(&gate.gate_name);
                         let log_path = gate
                             .log_path
@@ -1497,7 +1533,7 @@ pub fn run_push(
                             }
                         }
                     }
-                    results
+                    outcome
                 },
                 Err(err) => {
                     emit_stage(
@@ -1637,7 +1673,7 @@ pub fn run_push(
                 }),
             );
             human_log!("fac push: evidence gates PASSED");
-            Ok(gate_results)
+            Ok(gate_outcome)
         },
         || {
             emit_stage("ruleset_sync_started", serde_json::json!({}));
@@ -1884,8 +1920,32 @@ pub fn run_push(
         );
     }
 
+    let gate_evidence_hashes = gate_outcome
+        .gate_results
+        .iter()
+        .filter_map(|gate| gate.log_bundle_hash.clone())
+        .collect::<Vec<_>>();
+    if let Err(err) = projection_store::save_gates_admission(
+        repo,
+        pr_number,
+        &sha,
+        &projection_store::GatesAdmissionSaveRequest {
+            gate_job_id: &gate_outcome.job_id,
+            gate_receipt_id: &gate_outcome.job_receipt_id,
+            policy_hash: &gate_outcome.policy_hash,
+            gate_evidence_hashes: &gate_evidence_hashes,
+            source: "push",
+        },
+    ) {
+        fail_with_attempt!(
+            "fac_push_gates_admission_persist_failed",
+            format!("failed to persist authoritative gates admission binding: {err}")
+        );
+    }
+
     // Step 3: sync gate status section to PR body (best-effort).
-    let gate_status_rows = gate_results
+    let gate_status_rows = gate_outcome
+        .gate_results
         .iter()
         .map(|result| GateResult {
             name: result.gate_name.clone(),
@@ -1905,14 +1965,7 @@ pub fn run_push(
         human_log!("fac push: synced gate status section in PR body for PR #{pr_number}");
     }
 
-    // Step 4: enable auto-merge.
-    if let Err(e) = enable_auto_merge(repo, pr_number) {
-        human_log!("WARNING: auto-merge enable failed: {e}");
-    } else {
-        human_log!("fac push: auto-merge enabled on PR #{pr_number}");
-    }
-
-    // Step 5: dispatch reviews.
+    // Step 4: dispatch reviews.
     //
     // Intentional: dispatch failures are non-fatal for `fac push`. Push owns
     // publication and gate validation; reviewer liveness and retry are handled
@@ -1968,7 +2021,7 @@ pub fn run_push(
         }),
     );
 
-    // Step 6: persist projection identity only after gates + dispatch attempt.
+    // Step 5: persist projection identity only after gates + dispatch attempt.
     let mut identity_persisted = false;
     if let Err(err) = projection_store::save_identity_with_context(repo, pr_number, &sha, "push") {
         human_log!("WARNING: failed to persist local projection identity: {err}");
@@ -2106,19 +2159,39 @@ mod tests {
                 gate_name,
                 passed: true,
                 duration_secs: 1,
+                log_bundle_hash: Some(format!("b3-256:{}", "ab".repeat(32))),
                 ..Default::default()
             })
             .collect()
+    }
+
+    fn queued_outcome_with(
+        job_id: &str,
+        sha: &str,
+        gate_results: Vec<EvidenceGateResult>,
+    ) -> QueuedGatesOutcome {
+        QueuedGatesOutcome {
+            job_id: job_id.to_string(),
+            job_receipt_id: format!("{job_id}-receipt"),
+            policy_hash: format!("b3-256:{}", "ab".repeat(32)),
+            head_sha: sha.to_string(),
+            gate_results,
+        }
     }
 
     #[test]
     fn run_pre_push_sequence_with_enforces_gates_then_ruleset_sync_then_git_push() {
         let calls = std::cell::RefCell::new(Vec::new());
         let expected_results = seed_required_pass_results();
+        let sha = "f".repeat(40);
         let outcome = run_pre_push_sequence_with(
             || {
                 calls.borrow_mut().push("gates");
-                Ok(expected_results.clone())
+                Ok(queued_outcome_with(
+                    "gates-pre-push-order",
+                    &sha,
+                    expected_results.clone(),
+                ))
             },
             || {
                 calls.borrow_mut().push("ruleset_sync");
@@ -2132,7 +2205,7 @@ mod tests {
         .expect("pre-push sequence should succeed");
 
         assert_eq!(*calls.borrow(), vec!["gates", "ruleset_sync", "git_push"]);
-        assert_eq!(outcome.len(), expected_results.len());
+        assert_eq!(outcome.gate_results.len(), expected_results.len());
     }
 
     #[test]
@@ -2167,7 +2240,11 @@ mod tests {
         let error = run_pre_push_sequence_with(
             || {
                 calls.borrow_mut().push("gates");
-                Ok(seed_required_pass_results())
+                Ok(queued_outcome_with(
+                    "gates-pre-push-ruleset-fail",
+                    &"a".repeat(40),
+                    seed_required_pass_results(),
+                ))
             },
             || {
                 calls.borrow_mut().push("ruleset_sync");
@@ -2426,27 +2503,23 @@ mod tests {
         let results = seed_required_pass_results();
 
         let result = run_blocking_evidence_gates_with(&sha, || {
-            Ok(QueuedGatesOutcome {
-                job_id: "gates-test-pass".to_string(),
-                head_sha: sha.clone(),
-                gate_results: results.clone(),
-            })
+            Ok(queued_outcome_with(
+                "gates-test-pass",
+                &sha,
+                results.clone(),
+            ))
         })
         .expect("pass should return reported rows");
 
-        assert_eq!(result.len(), expected_gate_names().len());
-        assert!(result.iter().all(|gate| gate.passed));
+        assert_eq!(result.gate_results.len(), expected_gate_names().len());
+        assert!(result.gate_results.iter().all(|gate| gate.passed));
     }
 
     #[test]
     fn run_blocking_evidence_gates_with_fails_closed_when_pass_without_gate_artifacts() {
         let sha = "d".repeat(40);
         let err = run_blocking_evidence_gates_with(&sha, || {
-            Ok(QueuedGatesOutcome {
-                job_id: "gates-test-empty".to_string(),
-                head_sha: sha.clone(),
-                gate_results: Vec::new(),
-            })
+            Ok(queued_outcome_with("gates-test-empty", &sha, Vec::new()))
         })
         .expect_err("missing gate artifacts on PASS must fail closed");
         assert!(err.contains("no gate result artifacts"));
@@ -2457,10 +2530,10 @@ mod tests {
     fn run_blocking_evidence_gates_with_reports_failed_gate_names() {
         let sha = "e".repeat(40);
         let err = run_blocking_evidence_gates_with(&sha, || {
-            Ok(QueuedGatesOutcome {
-                job_id: "gates-test-failed".to_string(),
-                head_sha: sha.clone(),
-                gate_results: vec![
+            Ok(queued_outcome_with(
+                "gates-test-failed",
+                &sha,
+                vec![
                     EvidenceGateResult {
                         gate_name: "rustfmt".to_string(),
                         passed: false,
@@ -2474,7 +2547,7 @@ mod tests {
                         ..Default::default()
                     },
                 ],
-            })
+            ))
         })
         .expect_err("failed gate should surface reported failing names");
         assert!(err.contains("rustfmt"));
@@ -2492,11 +2565,11 @@ mod tests {
         rustfmt.passed = false;
 
         let err = run_blocking_evidence_gates_with(&sha, || {
-            Ok(QueuedGatesOutcome {
-                job_id: "gates-test-pass-with-fail-row".to_string(),
-                head_sha: sha.clone(),
-                gate_results: results.clone(),
-            })
+            Ok(queued_outcome_with(
+                "gates-test-pass-with-fail-row",
+                &sha,
+                results.clone(),
+            ))
         })
         .expect_err("pass path must fail when reported gate row is FAIL");
         assert!(err.contains("reported gate rows include FAIL"));
@@ -2522,11 +2595,11 @@ mod tests {
         ];
 
         let err = run_blocking_evidence_gates_with(&sha, || {
-            Ok(QueuedGatesOutcome {
-                job_id: "gates-test-incomplete".to_string(),
-                head_sha: sha.clone(),
-                gate_results: incomplete_results.clone(),
-            })
+            Ok(queued_outcome_with(
+                "gates-test-incomplete",
+                &sha,
+                incomplete_results.clone(),
+            ))
         })
         .expect_err("pass path must fail on incomplete reported gate set");
         assert!(err.contains("required gate set"));
@@ -2540,11 +2613,11 @@ mod tests {
         let results = seed_required_pass_results();
 
         let err = run_blocking_evidence_gates_with(&sha, || {
-            Ok(QueuedGatesOutcome {
-                job_id: "gates-test-sha-mismatch".to_string(),
-                head_sha: mismatch_sha.clone(),
-                gate_results: results.clone(),
-            })
+            Ok(queued_outcome_with(
+                "gates-test-sha-mismatch",
+                &mismatch_sha,
+                results.clone(),
+            ))
         })
         .expect_err("sha mismatch must fail closed");
         assert!(err.contains("unexpected sha"));
@@ -2559,12 +2632,75 @@ mod tests {
         let err = run_blocking_evidence_gates_with(&sha, || {
             Ok(QueuedGatesOutcome {
                 job_id: String::new(),
+                job_receipt_id: "gates-test-empty-job-id-receipt".to_string(),
+                policy_hash: format!("b3-256:{}", "ab".repeat(32)),
                 head_sha: sha.clone(),
                 gate_results: results.clone(),
             })
         })
         .expect_err("empty job_id must fail closed");
         assert!(err.contains("empty job_id"));
+    }
+
+    #[test]
+    fn run_blocking_evidence_gates_with_rejects_invalid_policy_hash() {
+        let sha = "5".repeat(40);
+        let results = seed_required_pass_results();
+        let err = run_blocking_evidence_gates_with(&sha, || {
+            Ok(QueuedGatesOutcome {
+                job_id: "gates-test-invalid-policy-hash".to_string(),
+                job_receipt_id: "gates-test-invalid-policy-hash-receipt".to_string(),
+                policy_hash: "not-a-hash".to_string(),
+                head_sha: sha.clone(),
+                gate_results: results.clone(),
+            })
+        })
+        .expect_err("invalid policy hash must fail closed");
+        assert!(err.contains("invalid policy_hash"));
+    }
+
+    #[test]
+    fn run_blocking_evidence_gates_with_rejects_missing_log_bundle_hash() {
+        let sha = "6".repeat(40);
+        let mut results = seed_required_pass_results();
+        let rustfmt = results
+            .iter_mut()
+            .find(|result| result.gate_name == "rustfmt")
+            .expect("rustfmt row");
+        rustfmt.log_bundle_hash = None;
+
+        let err = run_blocking_evidence_gates_with(&sha, || {
+            Ok(queued_outcome_with(
+                "gates-test-missing-log-bundle-hash",
+                &sha,
+                results.clone(),
+            ))
+        })
+        .expect_err("missing log bundle hash must fail closed");
+        assert!(err.contains("log bundle hashes"));
+        assert!(err.contains("rustfmt"));
+    }
+
+    #[test]
+    fn run_blocking_evidence_gates_with_rejects_invalid_log_bundle_hash() {
+        let sha = "7".repeat(40);
+        let mut results = seed_required_pass_results();
+        let rustfmt = results
+            .iter_mut()
+            .find(|result| result.gate_name == "rustfmt")
+            .expect("rustfmt row");
+        rustfmt.log_bundle_hash = Some("b3-256:nothex".to_string());
+
+        let err = run_blocking_evidence_gates_with(&sha, || {
+            Ok(queued_outcome_with(
+                "gates-test-invalid-log-bundle-hash",
+                &sha,
+                results.clone(),
+            ))
+        })
+        .expect_err("invalid log bundle hash must fail closed");
+        assert!(err.contains("log bundle hashes"));
+        assert!(err.contains("rustfmt"));
     }
 
     #[test]

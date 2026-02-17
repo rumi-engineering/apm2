@@ -13,10 +13,14 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, id as current_process_id};
 
+use apm2_core::fac::{
+    MergeReceipt, parse_b3_256_digest, parse_policy_hash, persist_signed_envelope, sign_receipt,
+};
 use chrono::{DateTime, Duration, Utc};
 use clap::ValueEnum;
 use fs2::FileExt;
 use hmac::{Hmac, Mac};
+use prost::Message;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_jcs;
@@ -55,6 +59,15 @@ const FAC_STATUS_DESCRIPTION_SUCCESS: &str = "Forge Admission Cycle approved";
 const FAC_STATUS_DESCRIPTION_DENIED: &str = "Forge Admission Cycle denied";
 const FAC_STATUS_DESCRIPTION_FAIL_CLOSED: &str = "Forge Admission Cycle integrity failure";
 const FAC_STATUS_PROJECTION_MAX_ATTEMPTS: usize = 3;
+const FAC_RECEIPTS_DIR: &str = "receipts";
+const MERGE_EVIDENCE_SCHEMA: &str = "apm2.fac.merge_evidence_projection.v1";
+const MERGE_EVIDENCE_START: &str = "<!-- apm2-merge-evidence:start -->";
+const MERGE_EVIDENCE_END: &str = "<!-- apm2-merge-evidence:end -->";
+const MERGE_RECEIPT_PROTO_SUFFIX: &str = ".merge_receipt.pb";
+const MERGE_RECEIPT_BINDING_SUFFIX: &str = ".merge_binding.json";
+const MERGE_RECEIPT_CONTENT_HASH_PREFIX: &[u8] = b"apm2.fac.merge_receipt.content_hash.v1\0";
+const SHA256_HEX_LEN: usize = 64;
+const MERGE_PROJECTION_REPLAY_SCAN_LIMIT: usize = 64;
 type HmacSha256 = Hmac<Sha256>;
 
 pub(super) const fn default_retry_budget() -> u32 {
@@ -2081,6 +2094,13 @@ fn sync_main_worktree_if_present(reference_dir: &Path) {
             "WARNING: failed to sync main worktree {} after ref update: {err}",
             main_worktree.display()
         );
+        return;
+    }
+    if let Err(err) = git_run_checked(&main_worktree, &["clean", "-fd"]) {
+        eprintln!(
+            "WARNING: failed to clean untracked files in main worktree {} after ref update: {err}",
+            main_worktree.display()
+        );
     }
 }
 
@@ -2115,17 +2135,15 @@ fn sync_local_main_with_origin(current_dir: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    if git_merge_base_is_ancestor(current_dir, "refs/heads/main", "refs/remotes/origin/main")? {
-        git_run_checked(
-            current_dir,
-            &["update-ref", "refs/heads/main", &remote_main, &local_main],
-        )?;
-        sync_main_worktree_if_present(current_dir);
+    if git_merge_base_is_ancestor(current_dir, "refs/remotes/origin/main", "refs/heads/main")? {
         return Ok(());
     }
 
-    if git_merge_base_is_ancestor(current_dir, "refs/remotes/origin/main", "refs/heads/main")? {
-        return Ok(());
+    if git_merge_base_is_ancestor(current_dir, "refs/heads/main", "refs/remotes/origin/main")? {
+        return Err(
+            "origin/main is ahead of local main; refusing remote-authoritative main sync"
+                .to_string(),
+        );
     }
 
     Err("local main diverged from origin/main; manual rebase/repair required".to_string())
@@ -2220,6 +2238,719 @@ fn maybe_cleanup_worktree_target(worktree: Option<&str>) {
     let _ = std::fs::remove_dir_all(&target);
 }
 
+fn cleanup_merged_branch_local_state_inner(
+    reference_dir: &Path,
+    branch: &str,
+    worktree: Option<&str>,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    maybe_cleanup_worktree_target(worktree);
+    let mut skipped_worktree_removal_for_current_dir = false;
+    if let Some(worktree_path) = worktree {
+        let current_dir = std::env::current_dir().ok();
+        let remove_ok = current_dir
+            .as_ref()
+            .is_none_or(|cwd| cwd != Path::new(worktree_path));
+        if !remove_ok {
+            skipped_worktree_removal_for_current_dir = true;
+            errors.push(format!(
+                "skipped worktree removal for `{worktree_path}` because it is the current working directory"
+            ));
+        } else if let Err(err) = git_run_checked(
+            reference_dir,
+            &["worktree", "remove", "--force", worktree_path],
+        ) {
+            errors.push(format!(
+                "failed to remove worktree `{worktree_path}`: {err}"
+            ));
+        }
+    }
+    if !branch.eq_ignore_ascii_case("main") {
+        if skipped_worktree_removal_for_current_dir {
+            errors.push(format!(
+                "skipped deleting local branch `{branch}` because its worktree is still active in the current directory"
+            ));
+        } else if let Err(err) = git_run_checked(reference_dir, &["branch", "-D", branch]) {
+            errors.push(format!("failed to delete local branch `{branch}`: {err}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn cleanup_merged_branch_local_state(reference_dir: &Path, branch: &str, worktree: Option<&str>) {
+    if let Err(err) = cleanup_merged_branch_local_state_inner(reference_dir, branch, worktree) {
+        eprintln!("WARNING: post-merge local cleanup incomplete: {err}");
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MergeEvidenceBinding {
+    gate_job_id: String,
+    gate_receipt_id: String,
+    policy_hash: String,
+    gate_evidence_hashes: Vec<String>,
+    verdict_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PersistedMergeReceipt {
+    content_hash: String,
+    merged_at_iso: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MergeReceiptBindingPreimage<'a> {
+    schema: &'static str,
+    owner_repo: &'a str,
+    pr_number: u32,
+    head_sha: &'a str,
+    gate_job_id: &'a str,
+    gate_receipt_id: &'a str,
+    gate_evidence_hashes: &'a [String],
+    verdict_hashes: &'a [String],
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MergeReceiptBindingRecord {
+    schema: String,
+    owner_repo: String,
+    pr_number: u32,
+    head_sha: String,
+    merge_sha: String,
+    merge_receipt_content_hash: String,
+    gate_job_id: String,
+    gate_receipt_id: String,
+    policy_hash: String,
+    gate_evidence_hashes: Vec<String>,
+    verdict_hashes: Vec<String>,
+    changeset_digest_hex: String,
+    merged_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct MergeProjectionContext {
+    owner_repo: String,
+    pr_number: u32,
+    merge_sha: String,
+    source_branch: String,
+    merge_receipt_hash: String,
+    merged_at_iso: String,
+    gate_job_id: String,
+    gate_receipt_id: String,
+    policy_hash: String,
+    gate_evidence_hashes: Vec<String>,
+    verdict_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MergeProjectionSink {
+    Github,
+}
+
+impl MergeProjectionSink {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Github => "github",
+        }
+    }
+}
+
+fn configured_merge_projection_sinks() -> Vec<MergeProjectionSink> {
+    vec![MergeProjectionSink::Github]
+}
+
+fn fac_root_dir() -> Result<PathBuf, String> {
+    Ok(apm2_home_dir()?.join("private").join("fac"))
+}
+
+fn fac_receipts_dir() -> Result<PathBuf, String> {
+    Ok(fac_root_dir()?.join(FAC_RECEIPTS_DIR))
+}
+
+fn normalize_hash_list(values: &[String]) -> Vec<String> {
+    let mut normalized = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+fn normalize_sha256_hex_digest(value: &str, field: &str) -> Result<String, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err(format!("merge receipt binding requires non-empty {field}"));
+    }
+    if normalized.len() != SHA256_HEX_LEN
+        || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(format!(
+            "merge receipt binding requires {field} as 64-char hex digest, found `{value}`"
+        ));
+    }
+    Ok(normalized)
+}
+
+fn load_approved_verdict_hashes(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<Vec<String>, String> {
+    let home = apm2_home_dir()?;
+    let mut hashes = Vec::with_capacity(2);
+    for review_type in ["security", "quality"] {
+        let signal = verdict_projection::resolve_completion_signal_from_projection_for_home(
+            &home,
+            owner_repo,
+            pr_number,
+            review_type,
+            head_sha,
+        )?
+        .ok_or_else(|| {
+            format!("missing `{review_type}` completion signal for PR #{pr_number} SHA {head_sha}")
+        })?;
+        if signal.decision != "approve" {
+            return Err(format!(
+                "merge receipt binding requires approved `{review_type}` verdict, found `{}`",
+                signal.decision
+            ));
+        }
+        hashes.push(normalize_sha256_hex_digest(
+            &signal.decision_summary,
+            &format!("`{review_type}` decision hash"),
+        )?);
+    }
+    let hashes = normalize_hash_list(&hashes);
+    if hashes.is_empty() {
+        return Err(format!(
+            "merge receipt binding produced no verdict hashes for PR #{pr_number} SHA {head_sha}"
+        ));
+    }
+    Ok(hashes)
+}
+
+fn load_merge_evidence_binding(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<MergeEvidenceBinding, String> {
+    let admission = projection_store::load_gates_admission(owner_repo, pr_number, head_sha)?
+        .ok_or_else(|| {
+            format!(
+                "missing authoritative gates admission snapshot for PR #{pr_number} SHA {head_sha}"
+            )
+        })?;
+    let gate_job_id = admission.gate_job_id.trim().to_string();
+    if gate_job_id.is_empty() {
+        return Err(format!(
+            "authoritative gates admission snapshot has empty gate_job_id for PR #{pr_number} SHA {head_sha}"
+        ));
+    }
+    let gate_receipt_id = admission.gate_receipt_id.trim().to_string();
+    if gate_receipt_id.is_empty() {
+        return Err(format!(
+            "authoritative gates admission snapshot has empty gate_receipt_id for PR #{pr_number} SHA {head_sha}"
+        ));
+    }
+    let policy_hash = admission.policy_hash.trim().to_string();
+    if policy_hash.is_empty() {
+        return Err(format!(
+            "authoritative gates admission snapshot has empty policy_hash for PR #{pr_number} SHA {head_sha}"
+        ));
+    }
+    if parse_policy_hash(&policy_hash).is_none() {
+        return Err(format!(
+            "authoritative gates admission snapshot has invalid policy_hash `{policy_hash}` for PR #{pr_number} SHA {head_sha}"
+        ));
+    }
+    let gate_evidence_hashes = normalize_hash_list(&admission.gate_evidence_hashes);
+    if gate_evidence_hashes.is_empty() {
+        return Err(format!(
+            "authoritative gates admission snapshot has no gate evidence hashes for PR #{pr_number} SHA {head_sha}"
+        ));
+    }
+    if let Some(invalid_hash) = gate_evidence_hashes
+        .iter()
+        .find(|value| parse_b3_256_digest(value).is_none())
+    {
+        return Err(format!(
+            "authoritative gates admission snapshot has invalid gate evidence hash `{invalid_hash}` for PR #{pr_number} SHA {head_sha}"
+        ));
+    }
+    let verdict_hashes = load_approved_verdict_hashes(owner_repo, pr_number, head_sha)?;
+    Ok(MergeEvidenceBinding {
+        gate_job_id,
+        gate_receipt_id,
+        policy_hash,
+        gate_evidence_hashes,
+        verdict_hashes,
+    })
+}
+
+fn compute_merge_receipt_changeset_digest(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    binding: &MergeEvidenceBinding,
+) -> Result<[u8; 32], String> {
+    let preimage = MergeReceiptBindingPreimage {
+        schema: MERGE_EVIDENCE_SCHEMA,
+        owner_repo,
+        pr_number,
+        head_sha,
+        gate_job_id: &binding.gate_job_id,
+        gate_receipt_id: &binding.gate_receipt_id,
+        gate_evidence_hashes: &binding.gate_evidence_hashes,
+        verdict_hashes: &binding.verdict_hashes,
+    };
+    let canonical = serde_jcs::to_vec(&preimage)
+        .map_err(|err| format!("failed to canonicalize merge receipt binding preimage: {err}"))?;
+    let digest = blake3::hash(&canonical);
+    Ok(*digest.as_bytes())
+}
+
+fn compute_merge_receipt_content_hash(proto_bytes: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(MERGE_RECEIPT_CONTENT_HASH_PREFIX);
+    hasher.update(proto_bytes);
+    format!("b3-256:{}", hasher.finalize().to_hex())
+}
+
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    ensure_parent_dir(path)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid output file name for {}", path.display()))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_path =
+        path.with_file_name(format!("{file_name}.tmp-{}-{nonce}", current_process_id()));
+    fs::write(&temp_path, bytes)
+        .map_err(|err| format!("failed to write temp file {}: {err}", temp_path.display()))?;
+    fs::rename(&temp_path, path).map_err(|err| {
+        format!(
+            "failed to atomically move {} -> {}: {err}",
+            temp_path.display(),
+            path.display()
+        )
+    })
+}
+
+fn persist_merge_receipt_binding_record(
+    receipts_dir: &Path,
+    merge_receipt_hash: &str,
+    record: &MergeReceiptBindingRecord,
+) -> Result<(), String> {
+    let path = receipts_dir.join(format!(
+        "{merge_receipt_hash}{MERGE_RECEIPT_BINDING_SUFFIX}"
+    ));
+    let bytes = serde_json::to_vec_pretty(record)
+        .map_err(|err| format!("failed to serialize merge receipt binding record: {err}"))?;
+    write_bytes_atomic(&path, &bytes)
+}
+
+fn persist_signed_merge_receipt(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    merge_sha: &str,
+    binding: &MergeEvidenceBinding,
+) -> Result<PersistedMergeReceipt, String> {
+    validate_expected_head_sha(head_sha)?;
+    validate_expected_head_sha(merge_sha)?;
+    let policy_hash = parse_policy_hash(&binding.policy_hash).ok_or_else(|| {
+        format!(
+            "invalid policy hash `{}` in authoritative gates admission snapshot",
+            binding.policy_hash
+        )
+    })?;
+    let changeset_digest =
+        compute_merge_receipt_changeset_digest(owner_repo, pr_number, head_sha, binding)?;
+    let merged_at_ns_u128 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0)
+        .min(u128::from(u64::MAX));
+    let merged_at_ns = u64::try_from(merged_at_ns_u128).unwrap_or(u64::MAX);
+    let merged_at_iso = now_iso8601();
+    let fac_root = fac_root_dir()?;
+    let signer = crate::commands::fac_key_material::load_or_generate_persistent_signer(&fac_root)?;
+    let receipt = MergeReceipt::create_after_observation(
+        "main".to_string(),
+        changeset_digest,
+        vec![binding.gate_receipt_id.clone()],
+        policy_hash,
+        merge_sha.to_string(),
+        merged_at_ns,
+        "fac-review-cli".to_string(),
+        &signer,
+    )
+    .map_err(|err| format!("failed to create signed merge receipt: {err}"))?;
+    let receipt_proto: apm2_core::fac::MergeReceiptProto = receipt.into();
+    let proto_bytes = receipt_proto.encode_to_vec();
+    let content_hash = compute_merge_receipt_content_hash(&proto_bytes);
+
+    let receipts_dir = fac_receipts_dir()?;
+    let proto_path = receipts_dir.join(format!("{content_hash}{MERGE_RECEIPT_PROTO_SUFFIX}"));
+    write_bytes_atomic(&proto_path, &proto_bytes)?;
+
+    let binding_record = MergeReceiptBindingRecord {
+        schema: MERGE_EVIDENCE_SCHEMA.to_string(),
+        owner_repo: owner_repo.to_string(),
+        pr_number,
+        head_sha: head_sha.to_string(),
+        merge_sha: merge_sha.to_string(),
+        merge_receipt_content_hash: content_hash.clone(),
+        gate_job_id: binding.gate_job_id.clone(),
+        gate_receipt_id: binding.gate_receipt_id.clone(),
+        policy_hash: binding.policy_hash.clone(),
+        gate_evidence_hashes: binding.gate_evidence_hashes.clone(),
+        verdict_hashes: binding.verdict_hashes.clone(),
+        changeset_digest_hex: hex::encode(changeset_digest),
+        merged_at: merged_at_iso.clone(),
+    };
+    persist_merge_receipt_binding_record(&receipts_dir, &content_hash, &binding_record)?;
+
+    let envelope = sign_receipt(&content_hash, &signer, "fac-review-cli");
+    persist_signed_envelope(&receipts_dir, &envelope)
+        .map_err(|err| format!("failed to persist merge receipt signed envelope: {err}"))?;
+
+    Ok(PersistedMergeReceipt {
+        content_hash,
+        merged_at_iso,
+    })
+}
+
+fn rollback_local_main_after_receipt_failure(
+    current_dir: &Path,
+    previous_main_sha: &str,
+    merged_sha: &str,
+) -> Result<(), String> {
+    validate_expected_head_sha(previous_main_sha)?;
+    validate_expected_head_sha(merged_sha)?;
+    git_run_checked(
+        current_dir,
+        &[
+            "update-ref",
+            "refs/heads/main",
+            previous_main_sha,
+            merged_sha,
+        ],
+    )?;
+    sync_main_worktree_if_present(current_dir);
+    Ok(())
+}
+
+fn delete_remote_branch_projection(current_dir: &Path, branch: &str) -> Result<(), String> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err("cannot delete remote branch projection for empty branch name".to_string());
+    }
+    if branch.eq_ignore_ascii_case("main") {
+        return Ok(());
+    }
+    let remote_ref = format!("refs/heads/{branch}");
+    let remote_output = git_stdout_checked(
+        current_dir,
+        &["ls-remote", "--heads", "origin", &remote_ref],
+    )?;
+    if remote_output.trim().is_empty() {
+        return Ok(());
+    }
+    git_run_checked(current_dir, &["push", "origin", "--delete", branch])
+}
+
+fn fetch_pr_body_for_merge_projection(owner_repo: &str, pr_number: u32) -> Result<String, String> {
+    match github_projection::fetch_pr_body(owner_repo, pr_number) {
+        Ok(body) if !body.trim().is_empty() => Ok(body),
+        first_result => {
+            let snapshot = projection_store::load_pr_body_snapshot(owner_repo, pr_number)?;
+            if let Some(body) = snapshot.as_ref()
+                && !body.trim().is_empty()
+            {
+                return Ok(body.clone());
+            }
+            match first_result {
+                Ok(body) => Ok(body),
+                Err(err) => Err(err),
+            }
+        },
+    }
+}
+
+fn upsert_marker_section(
+    body: &str,
+    start_marker: &str,
+    end_marker: &str,
+    section: &str,
+) -> String {
+    let section = section.trim_end();
+    let mut output = String::new();
+
+    if let Some(start_idx) = body.find(start_marker) {
+        let search_start = start_idx + start_marker.len();
+        if let Some(rel_end_idx) = body[search_start..].find(end_marker) {
+            let end_idx = search_start + rel_end_idx + end_marker.len();
+            let before = body[..start_idx].trim_end();
+            let after = body[end_idx..].trim_start();
+            if !before.is_empty() {
+                output.push_str(before);
+                output.push_str("\n\n");
+            }
+            output.push_str(section);
+            if after.is_empty() {
+                output.push('\n');
+            } else {
+                output.push_str("\n\n");
+                output.push_str(after);
+            }
+            return output;
+        }
+    }
+
+    let trimmed = body.trim_end();
+    if !trimmed.is_empty() {
+        output.push_str(trimmed);
+        output.push_str("\n\n");
+    }
+    output.push_str(section);
+    output.push('\n');
+    output
+}
+
+fn render_merge_evidence_section(context: &MergeProjectionContext) -> String {
+    let gate_evidence = if context.gate_evidence_hashes.is_empty() {
+        "(none)".to_string()
+    } else {
+        context.gate_evidence_hashes.join(", ")
+    };
+    let verdict_hashes = if context.verdict_hashes.is_empty() {
+        "(none)".to_string()
+    } else {
+        context.verdict_hashes.join(", ")
+    };
+    format!(
+        "{MERGE_EVIDENCE_START}\n\
+### FAC Merge Evidence\n\
+- schema: `{MERGE_EVIDENCE_SCHEMA}`\n\
+- merged_sha: `{merge_sha}`\n\
+- merged_at: `{merged_at}`\n\
+- merge_receipt: `{merge_receipt}`\n\
+- gate_job_id: `{gate_job_id}`\n\
+- gate_receipt_id: `{gate_receipt_id}`\n\
+- policy_hash: `{policy_hash}`\n\
+- gate_evidence_hashes: `{gate_evidence}`\n\
+- verdict_hashes: `{verdict_hashes}`\n\
+{MERGE_EVIDENCE_END}",
+        merge_sha = context.merge_sha,
+        merged_at = context.merged_at_iso,
+        merge_receipt = context.merge_receipt_hash,
+        gate_job_id = context.gate_job_id,
+        gate_receipt_id = context.gate_receipt_id,
+        policy_hash = context.policy_hash,
+        gate_evidence = gate_evidence,
+        verdict_hashes = verdict_hashes,
+    )
+}
+
+fn project_merge_evidence_to_pr_body(context: &MergeProjectionContext) -> Result<(), String> {
+    let current_body = fetch_pr_body_for_merge_projection(&context.owner_repo, context.pr_number)?;
+    let section = render_merge_evidence_section(context);
+    let updated_body = upsert_marker_section(
+        &current_body,
+        MERGE_EVIDENCE_START,
+        MERGE_EVIDENCE_END,
+        &section,
+    );
+    github_projection::edit_pr_body(&context.owner_repo, context.pr_number, &updated_body)?;
+    projection_store::save_pr_body_snapshot(
+        &context.owner_repo,
+        context.pr_number,
+        &updated_body,
+        "merge_projection",
+    )?;
+    Ok(())
+}
+
+fn project_merge_to_github(
+    merge_dir: &Path,
+    context: &MergeProjectionContext,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    if let Err(err) = github_projection::close_pr_if_open(&context.owner_repo, context.pr_number) {
+        errors.push(format!("close_pr: {err}"));
+    }
+    if let Err(err) = delete_remote_branch_projection(merge_dir, &context.source_branch) {
+        errors.push(format!(
+            "delete_remote_branch `{}`: {err}",
+            context.source_branch
+        ));
+    }
+    if let Err(err) = project_fac_required_status_for_decision(
+        &context.owner_repo,
+        context.pr_number,
+        &context.merge_sha,
+        "approve",
+    ) {
+        errors.push(format!("commit_status: {err}"));
+    }
+    if let Err(err) = project_merge_evidence_to_pr_body(context) {
+        errors.push(format!("pr_body: {err}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn project_merge_to_all_sinks(
+    merge_dir: &Path,
+    context: &MergeProjectionContext,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for sink in configured_merge_projection_sinks() {
+        let sink_result = match sink {
+            MergeProjectionSink::Github => project_merge_to_github(merge_dir, context),
+        };
+        if let Err(err) = sink_result {
+            errors.push(format!("{}: {err}", sink.as_str()));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn save_merge_projection_pending(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    context: &MergeProjectionContext,
+    reason: &str,
+    attempt_count: u32,
+) -> Result<(), String> {
+    projection_store::save_merge_projection_pending(
+        owner_repo,
+        pr_number,
+        head_sha,
+        &projection_store::MergeProjectionPendingSaveRequest {
+            merge_sha: &context.merge_sha,
+            source_branch: &context.source_branch,
+            merge_receipt_hash: &context.merge_receipt_hash,
+            merged_at_iso: &context.merged_at_iso,
+            gate_job_id: &context.gate_job_id,
+            gate_receipt_id: &context.gate_receipt_id,
+            policy_hash: &context.policy_hash,
+            gate_evidence_hashes: &context.gate_evidence_hashes,
+            verdict_hashes: &context.verdict_hashes,
+            last_error: reason,
+            attempt_count,
+            source: "auto_merge",
+        },
+    )
+}
+
+fn project_merge_to_all_sinks_with_retry(
+    merge_dir: &Path,
+    context: &MergeProjectionContext,
+    max_attempts: u32,
+) -> Result<(), String> {
+    let attempts = max_attempts.max(1);
+    let mut last_error = String::new();
+    for attempt in 1..=attempts {
+        match project_merge_to_all_sinks(merge_dir, context) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_error = err;
+                if attempt < attempts {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            },
+        }
+    }
+    Err(last_error)
+}
+
+fn replay_pending_merge_projection_for_repo(owner_repo: &str) {
+    let pending = match projection_store::list_merge_projection_pending_for_repo(
+        owner_repo,
+        MERGE_PROJECTION_REPLAY_SCAN_LIMIT,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!(
+                "WARNING: failed to list pending merge projection records for {owner_repo}: {err}"
+            );
+            return;
+        },
+    };
+    let Some(snapshot) = pending.into_iter().min_by(|lhs, rhs| {
+        lhs.attempt_count
+            .cmp(&rhs.attempt_count)
+            .then_with(|| lhs.updated_at.cmp(&rhs.updated_at))
+    }) else {
+        return;
+    };
+
+    let merge_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let context = MergeProjectionContext {
+        owner_repo: snapshot.owner_repo.clone(),
+        pr_number: snapshot.pr_number,
+        merge_sha: snapshot.merge_sha.clone(),
+        source_branch: snapshot.source_branch.clone(),
+        merge_receipt_hash: snapshot.merge_receipt_hash.clone(),
+        merged_at_iso: snapshot.merged_at_iso.clone(),
+        gate_job_id: snapshot.gate_job_id.clone(),
+        gate_receipt_id: snapshot.gate_receipt_id.clone(),
+        policy_hash: snapshot.policy_hash.clone(),
+        gate_evidence_hashes: snapshot.gate_evidence_hashes.clone(),
+        verdict_hashes: snapshot.verdict_hashes.clone(),
+    };
+    match project_merge_to_all_sinks_with_retry(&merge_dir, &context, 3) {
+        Ok(()) => {
+            if let Err(err) = projection_store::clear_merge_projection_pending(
+                &snapshot.owner_repo,
+                snapshot.pr_number,
+                &snapshot.head_sha,
+            ) {
+                eprintln!(
+                    "WARNING: replayed pending merge projection for PR #{} but failed to clear pending record: {err}",
+                    snapshot.pr_number
+                );
+            }
+        },
+        Err(err) => {
+            let next_attempt = snapshot.attempt_count.saturating_add(1);
+            if let Err(persist_err) = save_merge_projection_pending(
+                &snapshot.owner_repo,
+                snapshot.pr_number,
+                &snapshot.head_sha,
+                &context,
+                &err,
+                next_attempt,
+            ) {
+                eprintln!(
+                    "WARNING: failed to update pending merge projection record for PR #{} after replay failure: {persist_err}",
+                    snapshot.pr_number
+                );
+            }
+        },
+    }
+}
+
 /// Run auto-merge synchronously when the PR reaches `MergeReady`. Earlier
 /// versions spawned a background thread, but short-lived CLI processes
 /// (reviewer agents) exit immediately after verdict set, killing the thread
@@ -2283,11 +3014,75 @@ fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) {
         .filter(|path| path.exists())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    let merge_result = sync_local_main_with_origin(&merge_dir)
-        .and_then(|()| try_fast_forward_main(&merge_dir, branch, &record.current_sha))
-        .and_then(|()| push_local_main_to_origin(&merge_dir, &record.current_sha));
+    let merge_evidence = match load_merge_evidence_binding(
+        &record.owner_repo,
+        record.pr_number,
+        &record.current_sha,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            let _ = apply_event(
+                &record.owner_repo,
+                record.pr_number,
+                &record.current_sha,
+                &LifecycleEventKind::MergeFailed { reason: err },
+            );
+            return;
+        },
+    };
+
+    let merge_result = (|| -> Result<MergeProjectionContext, String> {
+        sync_local_main_with_origin(&merge_dir)?;
+        let pre_merge_main = git_stdout_checked(
+            &merge_dir,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/main^{commit}",
+            ],
+        )?;
+        try_fast_forward_main(&merge_dir, branch, &record.current_sha)?;
+        let persisted_receipt = match persist_signed_merge_receipt(
+            &record.owner_repo,
+            record.pr_number,
+            &record.current_sha,
+            &record.current_sha,
+            &merge_evidence,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                if let Err(rollback_err) = rollback_local_main_after_receipt_failure(
+                    &merge_dir,
+                    &pre_merge_main,
+                    &record.current_sha,
+                ) {
+                    return Err(format!(
+                        "failed to emit signed merge receipt: {err}; additionally failed to roll back local main: {rollback_err}"
+                    ));
+                }
+                return Err(format!(
+                    "failed to emit signed merge receipt: {err}; local main rolled back to pre-merge commit"
+                ));
+            },
+        };
+        push_local_main_to_origin(&merge_dir, &record.current_sha)?;
+        Ok(MergeProjectionContext {
+            owner_repo: record.owner_repo.clone(),
+            pr_number: record.pr_number,
+            merge_sha: record.current_sha.clone(),
+            source_branch: branch.to_string(),
+            merge_receipt_hash: persisted_receipt.content_hash,
+            merged_at_iso: persisted_receipt.merged_at_iso,
+            gate_job_id: merge_evidence.gate_job_id.clone(),
+            gate_receipt_id: merge_evidence.gate_receipt_id.clone(),
+            policy_hash: merge_evidence.policy_hash.clone(),
+            gate_evidence_hashes: merge_evidence.gate_evidence_hashes.clone(),
+            verdict_hashes: merge_evidence.verdict_hashes.clone(),
+        })
+    })();
     match merge_result {
-        Ok(()) => {
+        Ok(projection_context) => {
             if let Err(err) = apply_event(
                 &record.owner_repo,
                 record.pr_number,
@@ -2301,7 +3096,50 @@ fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) {
                     record.pr_number
                 );
             }
-            maybe_cleanup_worktree_target(identity.worktree.as_deref());
+            if let Err(err) =
+                project_merge_to_all_sinks_with_retry(&merge_dir, &projection_context, 3)
+            {
+                eprintln!(
+                    "WARNING: local merge completed but projection sinks reported errors for PR #{}: {err}",
+                    record.pr_number
+                );
+                if let Err(event_err) = apply_event(
+                    &record.owner_repo,
+                    record.pr_number,
+                    &record.current_sha,
+                    &LifecycleEventKind::ProjectionFailed {
+                        reason: err.clone(),
+                    },
+                ) {
+                    eprintln!(
+                        "WARNING: failed to persist projection_failed lifecycle event for PR #{}: {event_err}",
+                        record.pr_number
+                    );
+                }
+                if let Err(persist_err) = save_merge_projection_pending(
+                    &record.owner_repo,
+                    record.pr_number,
+                    &record.current_sha,
+                    &projection_context,
+                    &err,
+                    1,
+                ) {
+                    eprintln!(
+                        "WARNING: failed to persist pending merge projection record for PR #{}: {persist_err}",
+                        record.pr_number
+                    );
+                }
+            } else if let Err(err) = projection_store::clear_merge_projection_pending(
+                &record.owner_repo,
+                record.pr_number,
+                &record.current_sha,
+            ) {
+                eprintln!(
+                    "WARNING: merge projection succeeded for PR #{} but failed to clear pending projection record: {err}",
+                    record.pr_number
+                );
+            }
+            cleanup_merged_branch_local_state(&merge_dir, branch, identity.worktree.as_deref());
         },
         Err(err) => {
             if let Err(event_err) = apply_event(
@@ -2349,6 +3187,23 @@ fn derive_fac_required_status_projection(
         _ => FacRequiredStatusProjection {
             state: "pending",
             description: FAC_STATUS_DESCRIPTION_PENDING,
+        },
+    }
+}
+
+fn fac_required_status_projection_for_decision(decision: &str) -> FacRequiredStatusProjection {
+    match decision {
+        "deny" => FacRequiredStatusProjection {
+            state: "failure",
+            description: FAC_STATUS_DESCRIPTION_DENIED,
+        },
+        "approve" => FacRequiredStatusProjection {
+            state: "success",
+            description: FAC_STATUS_DESCRIPTION_SUCCESS,
+        },
+        _ => FacRequiredStatusProjection {
+            state: "failure",
+            description: FAC_STATUS_DESCRIPTION_FAIL_CLOSED,
         },
     }
 }
@@ -2453,12 +3308,60 @@ fn project_fac_required_status(
     )
 }
 
+fn project_fac_required_status_with_projection(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    projection: FacRequiredStatusProjection,
+) -> Result<(), String> {
+    let required_status_contexts = load_fac_required_status_contexts()?;
+    let target_url = format!("https://github.com/{owner_repo}/pull/{pr_number}");
+    project_fac_required_status_to_contexts_with(&required_status_contexts, |context| {
+        github_projection::upsert_commit_status(
+            owner_repo,
+            head_sha,
+            context,
+            projection.state,
+            projection.description,
+            Some(&target_url),
+        )
+    })
+}
+
+fn project_fac_required_status_for_decision(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    decision: &str,
+) -> Result<(), String> {
+    let projection = fac_required_status_projection_for_decision(decision);
+    project_fac_required_status_with_projection(owner_repo, pr_number, head_sha, projection)
+}
+
+fn project_fac_required_status_fail_closed(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<(), String> {
+    project_fac_required_status_with_projection(
+        owner_repo,
+        pr_number,
+        head_sha,
+        FacRequiredStatusProjection {
+            state: "failure",
+            description: FAC_STATUS_DESCRIPTION_FAIL_CLOSED,
+        },
+    )
+}
+
 fn finalize_projected_verdict(
     projected: &verdict_projection::PersistedVerdictProjection,
     fallback_dimension: &str,
     run_id: &str,
     auto_source: Option<&str>,
 ) -> Result<(), String> {
+    replay_pending_merge_projection_for_repo(&projected.owner_repo);
+
     let lifecycle_dimension =
         resolve_lifecycle_dimension(&projected.review_state_type, fallback_dimension)?;
     let reduced = apply_event(
@@ -2492,6 +3395,35 @@ fn finalize_projected_verdict(
             "WARNING: failed to project required FAC status check for PR #{} sha {}: {err}",
             projected.pr_number, projected.head_sha
         );
+        let fallback_result = match load_fac_required_status_snapshot(
+            &projected.owner_repo,
+            projected.pr_number,
+            &projected.head_sha,
+        ) {
+            Ok(snapshot) => project_fac_required_status_with_projection(
+                &projected.owner_repo,
+                projected.pr_number,
+                &projected.head_sha,
+                derive_fac_required_status_projection(&snapshot),
+            ),
+            Err(snapshot_err) => {
+                eprintln!(
+                    "WARNING: failed to load overall verdict snapshot for fallback status projection on PR #{} sha {}: {snapshot_err}; projecting fail-closed status",
+                    projected.pr_number, projected.head_sha
+                );
+                project_fac_required_status_fail_closed(
+                    &projected.owner_repo,
+                    projected.pr_number,
+                    &projected.head_sha,
+                )
+            },
+        };
+        if let Err(fallback_err) = fallback_result {
+            eprintln!(
+                "WARNING: failed fallback FAC required-status projection for PR #{} sha {}: {fallback_err}",
+                projected.pr_number, projected.head_sha
+            );
+        }
     }
 
     maybe_auto_merge_if_ready(&reduced, auto_source.unwrap_or("explicit_verdict_set"));
@@ -3586,14 +4518,17 @@ mod tests {
 
     use super::{
         AgentType, AutoVerdictCandidate, AutoVerdictFinalizeResult,
-        FAC_STATUS_PROJECTION_MAX_ATTEMPTS, LifecycleEventKind, PrLifecycleState,
-        TrackedAgentState, acquire_registry_lock, active_agents_for_pr, apply_event,
-        bind_reviewer_runtime, derive_auto_verdict_decision_from_findings,
-        derive_fac_required_status_projection, enforce_pr_capacity,
+        FAC_STATUS_PROJECTION_MAX_ATTEMPTS, LifecycleEventKind, MERGE_EVIDENCE_END,
+        MERGE_EVIDENCE_START, MergeEvidenceBinding, PrLifecycleState, TrackedAgentState,
+        acquire_registry_lock, active_agents_for_pr, apply_event, bind_reviewer_runtime,
+        compute_merge_receipt_changeset_digest, delete_remote_branch_projection,
+        derive_auto_verdict_decision_from_findings, derive_fac_required_status_projection,
+        enforce_pr_capacity, fac_required_status_projection_for_decision,
         finalize_auto_verdict_candidate, load_fac_required_status_contexts, load_registry,
+        normalize_hash_list, normalize_sha256_hex_digest,
         project_fac_required_status_to_contexts_with, project_fac_required_status_with,
         register_agent_spawn, register_reviewer_dispatch, save_registry,
-        sync_local_main_with_origin, token_hash, try_fast_forward_main,
+        sync_local_main_with_origin, token_hash, try_fast_forward_main, upsert_marker_section,
     };
     use crate::commands::fac_review::lifecycle::tracked_agent_id;
     use crate::commands::fac_review::state::{
@@ -3679,6 +4614,12 @@ mod tests {
     fn required_status_projection_fails_closed_when_snapshot_integrity_fails() {
         let snapshot = verdict_snapshot("approve", true);
         let projection = derive_fac_required_status_projection(&snapshot);
+        assert_eq!(projection.state, "failure");
+    }
+
+    #[test]
+    fn required_status_projection_fallback_reports_failure_for_deny() {
+        let projection = fac_required_status_projection_for_decision("deny");
         assert_eq!(projection.state, "failure");
     }
 
@@ -4131,6 +5072,107 @@ mod tests {
         let recreated_main = git_stdout(dir, &["rev-parse", "refs/heads/main"]);
         let remote_main = git_stdout(dir, &["rev-parse", "refs/remotes/origin/main"]);
         assert_eq!(recreated_main, remote_main);
+    }
+
+    #[test]
+    fn sync_local_main_with_origin_fails_closed_when_origin_main_is_ahead() {
+        let temp = init_git_repo_for_merge_tests();
+        let dir = temp.path();
+        let origin_path = dir.join("origin.git");
+        let origin_str = origin_path.to_string_lossy().to_string();
+
+        git_checked(dir, &["clone", "--bare", ".", &origin_str]);
+        git_checked(dir, &["remote", "add", "origin", &origin_str]);
+        git_checked(
+            dir,
+            &[
+                "fetch",
+                "origin",
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
+        );
+
+        let upstream_clone = tempfile::tempdir().expect("tempdir for upstream clone");
+        let upstream_clone_str = upstream_clone.path().to_string_lossy().to_string();
+        git_checked(dir, &["clone", &origin_str, &upstream_clone_str]);
+        git_checked(
+            upstream_clone.path(),
+            &["config", "user.email", "test@example.com"],
+        );
+        git_checked(upstream_clone.path(), &["config", "user.name", "apm2-test"]);
+        fs::write(upstream_clone.path().join("README.md"), "origin ahead\n")
+            .expect("write origin ahead update");
+        git_checked(upstream_clone.path(), &["add", "README.md"]);
+        git_checked(upstream_clone.path(), &["commit", "-m", "origin ahead"]);
+        git_checked(upstream_clone.path(), &["push", "origin", "main"]);
+
+        let err =
+            sync_local_main_with_origin(dir).expect_err("origin-ahead state must fail closed");
+        assert!(err.contains("origin/main is ahead"));
+    }
+
+    #[test]
+    fn delete_remote_branch_projection_is_idempotent_when_branch_missing() {
+        let temp = init_git_repo_for_merge_tests();
+        let dir = temp.path();
+        let origin_path = dir.join("origin.git");
+        let origin_str = origin_path.to_string_lossy().to_string();
+
+        git_checked(dir, &["clone", "--bare", ".", &origin_str]);
+        git_checked(dir, &["remote", "add", "origin", &origin_str]);
+
+        delete_remote_branch_projection(dir, "ticket/missing")
+            .expect("missing remote branch should not fail projection");
+    }
+
+    #[test]
+    fn normalize_sha256_hex_digest_rejects_invalid_payload() {
+        let err = normalize_sha256_hex_digest("b3-256:abc", "decision hash")
+            .expect_err("non-hex signature digest must be rejected");
+        assert!(err.contains("64-char hex digest"));
+    }
+
+    #[test]
+    fn merge_receipt_changeset_digest_binds_gate_and_verdict_hashes() {
+        let binding = MergeEvidenceBinding {
+            gate_job_id: "job-1".to_string(),
+            gate_receipt_id: "receipt-1".to_string(),
+            policy_hash: format!("b3-256:{}", "ab".repeat(32)),
+            gate_evidence_hashes: normalize_hash_list(&[
+                format!("b3-256:{}", "01".repeat(32)),
+                format!("b3-256:{}", "02".repeat(32)),
+            ]),
+            verdict_hashes: normalize_hash_list(&[
+                format!("b3-256:{}", "03".repeat(32)),
+                format!("b3-256:{}", "04".repeat(32)),
+            ]),
+        };
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let digest_a = compute_merge_receipt_changeset_digest("example/repo", 42, sha, &binding)
+            .expect("compute digest A");
+
+        let mut binding_b = binding;
+        binding_b.verdict_hashes = normalize_hash_list(&[format!("b3-256:{}", "ff".repeat(32))]);
+        let digest_b = compute_merge_receipt_changeset_digest("example/repo", 42, sha, &binding_b)
+            .expect("compute digest B");
+
+        assert_ne!(
+            digest_a, digest_b,
+            "changeset digest must change when verdict hashes change"
+        );
+    }
+
+    #[test]
+    fn merge_evidence_section_replaces_existing_marker_block() {
+        let old =
+            format!("intro\n\n{MERGE_EVIDENCE_START}\nold content\n{MERGE_EVIDENCE_END}\n\nfooter");
+        let replacement = format!("{MERGE_EVIDENCE_START}\nnew content\n{MERGE_EVIDENCE_END}");
+        let updated =
+            upsert_marker_section(&old, MERGE_EVIDENCE_START, MERGE_EVIDENCE_END, &replacement);
+        assert!(updated.contains("intro"));
+        assert!(updated.contains("footer"));
+        assert!(updated.contains("new content"));
+        assert!(!updated.contains("old content"));
     }
 
     #[test]

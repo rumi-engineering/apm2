@@ -2738,6 +2738,7 @@ fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommended
         && !has_actionable_findings
         && active_agents == 0
         && input.merge_readiness.sha_freshness_source == DoctorShaFreshnessSource::RemoteMatch
+        && input.merge_readiness.merge_conflict_status != DoctorMergeConflictStatus::HasConflicts
     {
         return DoctorRecommendedAction {
             action: "approve".to_string(),
@@ -2749,10 +2750,13 @@ fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommended
 
     if input.merge_readiness.merge_conflict_status == DoctorMergeConflictStatus::HasConflicts {
         return DoctorRecommendedAction {
-            action: "escalate".to_string(),
-            reason: "non-fast-forward merge conflict requires human intervention".to_string(),
+            action: "dispatch_implementor".to_string(),
+            reason: "merge conflicts require implementor remediation and a fresh push".to_string(),
             priority: "high".to_string(),
-            command: Some(escalate_command),
+            command: Some(format!(
+                "apm2 fac review findings --pr {} --json",
+                input.pr_number
+            )),
         };
     }
 
@@ -6355,7 +6359,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_recommended_action_escalates_on_explicit_merge_conflicts() {
+    fn test_build_recommended_action_dispatches_implementor_on_explicit_merge_conflicts() {
         let reviews = doctor_reviews_with_terminal_reason(None);
         let findings = pending_findings_summary();
         let action = build_recommended_action_for_tests(
@@ -6371,9 +6375,57 @@ mod tests {
             &findings,
             &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::HasConflicts),
         );
-        assert_eq!(action.action, "escalate");
-        let command = action.command.expect("escalate command");
-        assert!(command.contains("apm2 fac doctor --pr 42 --json"));
+        assert_eq!(action.action, "dispatch_implementor");
+        let command = action.command.expect("dispatch command");
+        assert!(command.contains("apm2 fac review findings --pr 42 --json"));
+    }
+
+    #[test]
+    fn test_build_recommended_action_conflicts_override_approve_waiting_state() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = vec![
+            findings_summary_entry("security", "approve", 0, 0, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
+        let action = build_recommended_action_for_tests(
+            42,
+            None,
+            Some(&super::DoctorAgentSection {
+                max_active_agents_per_pr: 2,
+                active_agents: 0,
+                total_agents: 0,
+                entries: Vec::new(),
+            }),
+            &reviews,
+            &findings,
+            &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::HasConflicts),
+        );
+        assert_eq!(action.action, "dispatch_implementor");
+    }
+
+    #[test]
+    fn test_build_recommended_action_conflicts_preserve_failed_review_remediation() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = vec![
+            findings_summary_entry("security", "deny", 1, 0, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
+        let action = build_recommended_action_for_tests(
+            42,
+            None,
+            Some(&super::DoctorAgentSection {
+                max_active_agents_per_pr: 2,
+                active_agents: 0,
+                total_agents: 0,
+                entries: Vec::new(),
+            }),
+            &reviews,
+            &findings,
+            &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::HasConflicts),
+        );
+        assert_eq!(action.action, "dispatch_implementor");
+        let command = action.command.expect("dispatch command");
+        assert!(command.contains("apm2 fac review findings --pr 42 --json"));
     }
 
     #[test]
