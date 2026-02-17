@@ -1327,6 +1327,70 @@ pre-populating build caches in the lane target namespace.
   `execute_warm`/`execute_warm_phase` and runs synchronously on the same
   thread (no cross-thread sharing).
 
+## receipt_pipeline Submodule (TCK-00564)
+
+The `receipt_pipeline` submodule implements an atomic commit protocol for job
+completion that ensures crash safety. The protocol guarantees that no job is ever
+marked done (moved to a terminal directory) without its receipt being present in
+the content-addressed receipt store.
+
+### Key Types
+
+- `ReceiptWritePipeline`: The main pipeline struct. Created with a receipts
+  directory and queue root path. Provides `commit()` for normal job completion
+  and `recover_torn_state()` for reconciliation of incomplete commits.
+- `TerminalState`: Enum of terminal directories a job can transition to:
+  `Completed`, `Denied`, `Cancelled`, `Quarantined`.
+- `RecoveryReceiptV1`: Schema-versioned receipt emitted when reconciliation
+  detects and repairs a torn state. Persisted to the receipts directory with
+  atomic write protocol (temp + fsync + rename, CTR-2607).
+- `CommitResult`: Result of a successful pipeline commit, containing receipt
+  path, content hash, and terminal job path.
+- `ReceiptPipelineError`: Error taxonomy covering receipt persistence failures,
+  job move failures, and torn state detection.
+
+### Commit Protocol (Crash-Safe Ordering)
+
+1. **Write receipt** (content-addressed file) -- after this point, the receipt
+   is durable in the receipt store. Uses `persist_content_addressed_receipt`.
+2. **Update receipt index** (best-effort) -- non-authoritative cache update. On
+   failure, the stale index is deleted to force rebuild on next read.
+3. **Move job file** (`claimed/` -> terminal/) -- this is the commit point.
+   Uses `rename_noreplace` (`renameat2(RENAME_NOREPLACE)` on Linux) for
+   collision-safe atomic moves. On collision, generates a timestamped fallback
+   name.
+
+### Recovery Protocol
+
+When reconciliation (via `reconcile` submodule) detects a claimed job that
+already has a receipt in the store, it calls `recover_torn_state()` which:
+1. Moves the job to its terminal directory.
+2. Emits a `RecoveryReceiptV1` documenting the detected inconsistency and the
+   repair action taken.
+
+### Helper Functions
+
+- `receipt_exists_for_job(receipts_dir, job_id)`: O(1) index lookup with
+  fallback to directory scan. Used by reconciliation to detect torn states.
+- `outcome_to_terminal_state(outcome)`: Maps `FacJobOutcome` to `TerminalState`.
+
+### Security Invariants (TCK-00564)
+
+- [INV-PIPE-001] No job is moved to a terminal directory without its receipt
+  being present in the content-addressed receipt store. Guaranteed by ordering:
+  receipt write (step 1) always precedes job move (step 3).
+- [INV-PIPE-002] Recovery receipts document all torn-state repairs with schema,
+  job ID, original receipt hash, detected state, and repair action.
+- [INV-PIPE-003] All string fields in `RecoveryReceiptV1` are bounded
+  (`MAX_RECOVERY_REASON_LENGTH = 1024`). Serialized size is bounded
+  (`MAX_RECOVERY_RECEIPT_SIZE = 65536`).
+- [INV-PIPE-004] Directory creation uses mode 0o700 (CTR-2611).
+- [INV-PIPE-005] File moves use `rename_noreplace` (`renameat2(RENAME_NOREPLACE)`
+  on Linux) to prevent silent overwrites. On collision, a timestamped fallback
+  name is generated.
+- [INV-PIPE-006] Wall-clock time for collision avoidance is narrowly bypassed
+  with documented CTR-2501 security justification.
+
 ## reconcile Submodule (TCK-00534)
 
 The `reconcile` submodule implements crash recovery reconciliation for FAC queue
