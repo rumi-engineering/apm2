@@ -20,11 +20,13 @@
 //! is aggregated into an `"other"` bucket to keep totals accurate.
 
 use std::collections::BTreeMap;
+use std::io::Read as _;
 
 use serde::{Deserialize, Serialize};
 
 use super::gc_receipt::GcReceiptV1;
 use super::receipt::{DenialReasonCode, FacJobOutcome, FacJobReceiptV1};
+use super::receipt_index::open_no_follow;
 
 // =============================================================================
 // Constants
@@ -238,11 +240,27 @@ fn percentile(sorted: &[u64], p: u32) -> u64 {
 // I/O helpers (loading receipts from disk)
 // =============================================================================
 
-/// Maximum number of receipt files to scan when loading GC receipts.
-pub const MAX_GC_RECEIPT_SCAN_FILES: usize = 16_384;
+/// Maximum number of directory entries to visit when loading GC receipts.
+///
+/// GC receipts share the receipt directory with job receipts. In large
+/// directories, GC receipt files may appear after many job receipt entries in
+/// the directory enumeration. A limit of 65,536 total directory entries
+/// (matching [`super::receipt_index::MAX_REBUILD_SCAN_FILES`]) ensures GC
+/// receipts are found in all but the most extreme cases. This is a
+/// defense-in-depth bound, not a correctness guarantee — operators with
+/// extremely large receipt directories should periodically reindex or
+/// increase this constant.
+pub const MAX_GC_RECEIPT_SCAN_FILES: usize = 65_536;
 
 /// Maximum GC receipt file size to read (256 KiB).
 const MAX_GC_RECEIPT_READ_SIZE: u64 = 256 * 1024;
+
+/// Maximum number of GC receipts to load into memory.
+///
+/// Prevents unbounded memory growth from a large number of GC receipts.
+/// At ~256 KiB per receipt and 4,096 receipts, the worst-case memory is
+/// ~1 GiB.
+pub const MAX_GC_RECEIPTS_LOADED: usize = 4_096;
 
 /// Load GC receipts from the receipts directory, filtering by
 /// `since_epoch_secs`.
@@ -250,9 +268,17 @@ const MAX_GC_RECEIPT_READ_SIZE: u64 = 256 * 1024;
 /// Scans `.json` files in `receipts_dir`, attempts to parse each as a
 /// `GcReceiptV1`, and returns those with `timestamp_secs >= since_epoch_secs`.
 ///
-/// Bounded by [`MAX_GC_RECEIPT_SCAN_FILES`] and `MAX_GC_RECEIPT_READ_SIZE`.
-/// Parse failures are silently skipped (GC receipts share the directory with
-/// job receipts; we only care about files matching the GC schema).
+/// Bounded by [`MAX_GC_RECEIPT_SCAN_FILES`] directory entries,
+/// [`MAX_GC_RECEIPTS_LOADED`] loaded receipts, and
+/// `MAX_GC_RECEIPT_READ_SIZE` per file. Parse failures are silently skipped
+/// (GC receipts share the directory with job receipts; we only care about
+/// files matching the GC schema).
+///
+/// # Security
+///
+/// File reads use `open_no_follow` (`O_NOFOLLOW` on Unix) to prevent
+/// symlink-following attacks (MAJOR-1). An attacker placing a symlink in
+/// the receipt directory cannot trigger arbitrary file reads.
 #[must_use]
 pub fn load_gc_receipts(receipts_dir: &std::path::Path, since_epoch_secs: u64) -> Vec<GcReceiptV1> {
     let mut results = Vec::new();
@@ -260,8 +286,15 @@ pub fn load_gc_receipts(receipts_dir: &std::path::Path, since_epoch_secs: u64) -
         return results;
     };
 
-    for (scanned, entry) in entries.enumerate() {
-        if scanned >= MAX_GC_RECEIPT_SCAN_FILES {
+    let mut scanned: usize = 0;
+    for entry in entries {
+        scanned = scanned.saturating_add(1);
+        if scanned > MAX_GC_RECEIPT_SCAN_FILES {
+            break;
+        }
+
+        // Cap loaded results to prevent unbounded memory growth.
+        if results.len() >= MAX_GC_RECEIPTS_LOADED {
             break;
         }
 
@@ -279,20 +312,30 @@ pub fn load_gc_receipts(receipts_dir: &std::path::Path, since_epoch_secs: u64) -
             continue;
         }
 
-        // Bounded read: check size before reading.
-        let Ok(meta) = std::fs::metadata(&path) else {
+        // Open with O_NOFOLLOW to prevent symlink-following attacks
+        // (MAJOR-1 fix). This matches the pattern used in
+        // `load_receipt_bounded` from receipt_index.rs.
+        let Ok(file) = open_no_follow(&path) else {
             continue;
         };
-        if meta.len() > MAX_GC_RECEIPT_READ_SIZE {
+        let Ok(file_meta) = file.metadata() else {
+            continue;
+        };
+        if file_meta.len() > MAX_GC_RECEIPT_READ_SIZE {
             continue;
         }
 
-        let Ok(data) = std::fs::read(&path) else {
+        let mut buf = Vec::new();
+        let cap = MAX_GC_RECEIPT_READ_SIZE;
+        if file.take(cap + 1).read_to_end(&mut buf).is_err() {
             continue;
-        };
+        }
+        if buf.len() as u64 > cap {
+            continue;
+        }
 
         // Try parsing as GC receipt. Skip files that don't match.
-        let Ok(receipt) = serde_json::from_slice::<GcReceiptV1>(&data) else {
+        let Ok(receipt) = serde_json::from_slice::<GcReceiptV1>(&buf) else {
             continue;
         };
 
@@ -613,4 +656,61 @@ mod tests {
         assert_eq!(summary.denied_jobs, 1);
         assert_eq!(summary.denial_counts_by_reason.get("unknown"), Some(&1));
     }
+
+    // =========================================================================
+    // MAJOR-1 regression: load_gc_receipts symlink hardening
+    // =========================================================================
+
+    #[test]
+    #[cfg(unix)]
+    fn load_gc_receipts_rejects_symlinks() {
+        // Regression test for MAJOR-1: load_gc_receipts must not follow
+        // symlinks. A symlink in the receipts directory must not cause
+        // arbitrary file reads.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create a target file that looks like a GC receipt.
+        let target_dir = tmp.path().join("targets");
+        std::fs::create_dir_all(&target_dir).expect("mkdir");
+        let gc = make_gc_receipt(2000, 100);
+        let gc_bytes = serde_json::to_vec_pretty(&gc).expect("ser");
+        let target_path = target_dir.join("real_gc.json");
+        std::fs::write(&target_path, &gc_bytes).expect("write");
+
+        // Create a symlink in receipts_dir pointing to the target.
+        let symlink_path = receipts_dir.join("symlinked_gc.json");
+        std::os::unix::fs::symlink(&target_path, &symlink_path).expect("symlink");
+
+        // load_gc_receipts must NOT follow the symlink and thus return
+        // an empty result (since the only .json file is a symlink).
+        let results = load_gc_receipts(receipts_dir, 0);
+        assert!(
+            results.is_empty(),
+            "load_gc_receipts must not follow symlinks (got {} results)",
+            results.len()
+        );
+    }
+
+    #[test]
+    fn load_gc_receipts_loads_regular_files() {
+        // Positive test: load_gc_receipts correctly loads regular GC receipt
+        // files from the directory.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let gc = make_gc_receipt(2000, 500_000);
+        let gc_bytes = serde_json::to_vec_pretty(&gc).expect("ser");
+        std::fs::write(receipts_dir.join("gc-receipt-1.json"), &gc_bytes).expect("write");
+
+        let results = load_gc_receipts(receipts_dir, 1000);
+        assert_eq!(results.len(), 1, "should load one GC receipt");
+        assert_eq!(results[0].timestamp_secs, 2000);
+    }
+
+    // Compile-time assertion: load cap must not exceed scan cap.
+    const _: () = {
+        assert!(MAX_GC_RECEIPTS_LOADED > 0);
+        assert!(MAX_GC_RECEIPTS_LOADED <= MAX_GC_RECEIPT_SCAN_FILES);
+    };
 }

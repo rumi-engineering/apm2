@@ -599,7 +599,7 @@ impl ReceiptIndexV1 {
 /// Open a file for reading without following symlinks (`O_NOFOLLOW` on Unix).
 ///
 /// On non-Unix platforms, falls back to a plain open (no symlink protection).
-fn open_no_follow(path: &Path) -> Result<std::fs::File, std::io::Error> {
+pub(crate) fn open_no_follow(path: &Path) -> Result<std::fs::File, std::io::Error> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -677,11 +677,24 @@ pub fn list_receipt_headers(receipts_dir: &Path) -> Vec<ReceiptHeaderV1> {
 /// I/O and `O_NOFOLLOW`. Returns `None` if the file is missing, oversized,
 /// or fails to parse.
 ///
+/// # Security
+///
+/// The `content_hash` is validated with `is_valid_digest` before path
+/// construction to prevent path traversal attacks. The index is
+/// non-authoritative and attacker-writable — a poisoned entry with
+/// `content_hash` set to `../../../../etc/passwd` must never result in
+/// arbitrary file reads (BLOCKER-1/BLOCKER-2 fix).
+///
 /// This is used by the metrics module to load full receipts when the header
 /// index does not contain all required fields (e.g., `denial_reason`,
 /// `observed_cost`).
 #[must_use]
 pub fn lookup_receipt_by_hash(receipts_dir: &Path, content_hash: &str) -> Option<FacJobReceiptV1> {
+    // Validate content_hash is a well-formed digest before using it in path
+    // construction (path traversal prevention — BLOCKER-1/BLOCKER-2).
+    if !is_valid_digest(content_hash) {
+        return None;
+    }
     let path = receipts_dir.join(format!("{content_hash}.json"));
     load_receipt_bounded(&path)
 }
@@ -1912,5 +1925,61 @@ mod tests {
             found.is_none(),
             "must reject tampered receipt after index miss"
         );
+    }
+
+    // =========================================================================
+    // BLOCKER-1/BLOCKER-2 regression: lookup_receipt_by_hash path traversal
+    // =========================================================================
+
+    #[test]
+    fn test_lookup_receipt_by_hash_rejects_path_traversal() {
+        // Regression test for BLOCKER-1/BLOCKER-2: lookup_receipt_by_hash must
+        // reject content_hash values that contain path traversal sequences.
+        // A poisoned index entry with content_hash = "../../../../etc/passwd"
+        // must NOT cause arbitrary file reads.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Attempt traversal patterns — all must return None.
+        assert!(
+            lookup_receipt_by_hash(receipts_dir, "../../../../etc/passwd").is_none(),
+            "must reject path traversal in content_hash"
+        );
+        assert!(
+            lookup_receipt_by_hash(receipts_dir, "../../../etc/shadow").is_none(),
+            "must reject relative path traversal"
+        );
+        assert!(
+            lookup_receipt_by_hash(receipts_dir, "/etc/passwd").is_none(),
+            "must reject absolute path"
+        );
+        assert!(
+            lookup_receipt_by_hash(receipts_dir, "not-hex-at-all!!!").is_none(),
+            "must reject non-hex content_hash"
+        );
+        assert!(
+            lookup_receipt_by_hash(receipts_dir, "").is_none(),
+            "must reject empty content_hash"
+        );
+    }
+
+    #[test]
+    fn test_lookup_receipt_by_hash_accepts_valid_digest() {
+        // Positive test: lookup_receipt_by_hash accepts a valid hex digest
+        // and a valid b3-256:-prefixed digest.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create a receipt with correctly computed content hash.
+        let (_receipt, integrity_hash) =
+            make_and_persist_receipt(receipts_dir, "job-hash-lookup", 5000);
+
+        // lookup_receipt_by_hash with the valid digest should succeed.
+        let found = lookup_receipt_by_hash(receipts_dir, &integrity_hash);
+        assert!(
+            found.is_some(),
+            "must accept well-formed digest in lookup_receipt_by_hash"
+        );
+        assert_eq!(found.unwrap().job_id, "job-hash-lookup");
     }
 }

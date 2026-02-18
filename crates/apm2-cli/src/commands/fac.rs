@@ -6392,6 +6392,14 @@ fn run_bundle_import(args: &BundleImportArgs, json_output: bool) -> u8 {
 /// Default observation window: 24 hours (in seconds).
 const DEFAULT_METRICS_WINDOW_SECS: u64 = 86_400;
 
+/// Maximum number of job receipts to load for metrics computation.
+///
+/// At 64 KiB per receipt (`MAX_JOB_RECEIPT_SIZE`), 16,384 receipts consumes
+/// at most ~1 GiB. This hard cap prevents unbounded memory growth when
+/// the receipt store contains a very large number of receipts within the
+/// observation window (MINOR-2 fix).
+const MAX_METRICS_RECEIPTS: usize = 16_384;
+
 /// Execute `apm2 fac metrics`.
 fn run_metrics(args: &MetricsArgs, json_output: bool) -> u8 {
     let Some(apm2_home) = apm2_core::github::resolve_apm2_home() else {
@@ -6419,8 +6427,15 @@ fn run_metrics(args: &MetricsArgs, json_output: bool) -> u8 {
     let all_headers = apm2_core::fac::list_receipt_headers(&receipts_dir);
 
     // Filter by window and load full receipts for those in range.
+    // Bounded by MAX_METRICS_RECEIPTS to prevent unbounded memory growth
+    // (MINOR-2 fix).
     let mut job_receipts: Vec<apm2_core::fac::FacJobReceiptV1> = Vec::new();
+    let mut truncated = false;
     for header in &all_headers {
+        if job_receipts.len() >= MAX_METRICS_RECEIPTS {
+            truncated = true;
+            break;
+        }
         if header.timestamp_secs >= since_secs && header.timestamp_secs <= until_secs {
             if let Some(receipt) =
                 apm2_core::fac::lookup_receipt_by_hash(&receipts_dir, &header.content_hash)
@@ -6428,6 +6443,13 @@ fn run_metrics(args: &MetricsArgs, json_output: bool) -> u8 {
                 job_receipts.push(receipt);
             }
         }
+    }
+
+    if truncated {
+        eprintln!(
+            "warning: receipt count exceeds MAX_METRICS_RECEIPTS ({MAX_METRICS_RECEIPTS}); \
+             metrics are computed from the first {MAX_METRICS_RECEIPTS} receipts only"
+        );
     }
 
     // Load GC receipts.
