@@ -4625,7 +4625,7 @@ fn handle_cleanup_corruption(
         Err(err) => {
             let emit_failure_reason =
                 format!("failed to emit lane cleanup failure receipt for {lane_id}: {err}");
-            eprintln!("worker: WARNING: {emit_failure_reason}");
+            tracing::warn!(lane_id = lane_id, reason = %emit_failure_reason, "lane cleanup failure receipt emission failed");
             if let Err(marker_err) =
                 persist_corrupt_marker_with_retries(fac_root, lane_id, &emit_failure_reason, None)
             {
@@ -4673,8 +4673,12 @@ fn persist_corrupt_marker_with_retries(
             Ok(()) => return Ok(()),
             Err(marker_err) => {
                 last_error = Some(marker_err.clone());
-                eprintln!(
-                    "worker: WARNING: failed to persist corrupt lane marker for {lane_id} (attempt {attempt}/{CORRUPT_MARKER_PERSIST_RETRIES}): {marker_err}"
+                tracing::warn!(
+                    lane_id = lane_id,
+                    attempt = attempt,
+                    max_attempts = CORRUPT_MARKER_PERSIST_RETRIES,
+                    error = %marker_err,
+                    "failed to persist corrupt lane marker"
                 );
                 let delay_ms =
                     CORRUPT_MARKER_PERSIST_RETRY_DELAY_MS.saturating_mul(1u64 << (attempt - 1));
