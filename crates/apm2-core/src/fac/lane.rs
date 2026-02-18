@@ -979,6 +979,15 @@ impl LaneCorruptMarkerV1 {
     /// `LaneError::InvalidRecord` if the marker schema is invalid.
     pub fn persist(&self, fac_root: &Path) -> Result<(), LaneError> {
         // Defense-in-depth: validate fields before writing to disk.
+        if self.schema != LANE_CORRUPT_MARKER_SCHEMA {
+            return Err(LaneError::InvalidRecord {
+                lane_id: self.lane_id.clone(),
+                reason: format!(
+                    "schema mismatch: expected '{LANE_CORRUPT_MARKER_SCHEMA}', got '{}'",
+                    self.schema
+                ),
+            });
+        }
         validate_lane_id(&self.lane_id)?;
         validate_string_field("reason", &self.reason, MAX_STRING_LENGTH)?;
         validate_string_field("detected_at", &self.detected_at, MAX_STRING_LENGTH)?;
@@ -3836,6 +3845,45 @@ mod tests {
             LaneCorruptMarkerV1::load(&fac_root, lane_id)
                 .expect("load after remove")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn corrupt_marker_persist_rejects_invalid_schema() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(fac_root.join("lanes").join("lane-00")).expect("create lane dir");
+
+        let marker = LaneCorruptMarkerV1 {
+            schema: "bogus.schema.v99".to_string(),
+            lane_id: "lane-00".to_string(),
+            reason: "cleanup failed".to_string(),
+            cleanup_receipt_digest: None,
+            detected_at: "2026-02-15T00:00:00Z".to_string(),
+        };
+
+        let err = marker
+            .persist(&fac_root)
+            .expect_err("persist with wrong schema must fail");
+        match &err {
+            LaneError::InvalidRecord { lane_id, reason } => {
+                assert_eq!(lane_id, "lane-00");
+                assert!(
+                    reason.contains("schema mismatch"),
+                    "expected schema mismatch message, got: {reason}"
+                );
+            },
+            other => panic!("expected InvalidRecord, got: {other:?}"),
+        }
+
+        // Verify no file was written to disk.
+        let marker_path = fac_root
+            .join("lanes")
+            .join("lane-00")
+            .join("corrupt.v1.json");
+        assert!(
+            !marker_path.exists(),
+            "marker file must NOT exist after rejected persist"
         );
     }
 
