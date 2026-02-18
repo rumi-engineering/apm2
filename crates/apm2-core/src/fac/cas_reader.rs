@@ -262,7 +262,7 @@ fn exists_cas_object(cas_root: &Path, prefix: &str, suffix: &str) -> bool {
 fn map_nix_open_error(e: nix::errno::Errno, context: &str) -> CasReaderError {
     let io_err = std::io::Error::from(e);
     match io_err.raw_os_error() {
-        Some(libc::ELOOP | libc::ENOTDIR) => CasReaderError::SymlinkDetected,
+        Some(e) if e == libc::ELOOP || e == libc::ENOTDIR => CasReaderError::SymlinkDetected,
         Some(libc::ENOENT) => CasReaderError::NotFound,
         _ => CasReaderError::Io(std::io::Error::new(
             io_err.kind(),
