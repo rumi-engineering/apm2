@@ -35,7 +35,8 @@ use subtle::ConstantTimeEq;
 
 use crate::channel::{
     ChannelBoundaryCheck, ChannelContextTokenError, ChannelSource, DeclassificationIntentScope,
-    TokenBindingV1, derive_channel_source_witness, issue_channel_context_token_with_token_binding,
+    TokenBindingV1, derive_channel_source_witness,
+    issue_channel_context_token_with_token_binding_and_expiry,
 };
 use crate::crypto::{Signer, VerifyingKey};
 use crate::determinism::write_atomic;
@@ -84,6 +85,12 @@ pub const MAX_ENVELOPE_TTL_TICKS: u64 = 10_000;
 
 /// Default TTL for time authority envelopes (in ticks).
 pub const DEFAULT_ENVELOPE_TTL_TICKS: u64 = 1_000;
+
+/// Wall-clock TTL for broker-issued RFC-0028 channel context tokens.
+///
+/// This window must be long enough to cover bounded queue delay on shared
+/// single-flight hosts plus normal job startup time.
+const BROKER_CHANNEL_CONTEXT_TOKEN_EXPIRES_AFTER_SECS: u64 = 1_800;
 
 /// Domain separator for broker envelope content hashing.
 const BROKER_ENVELOPE_HASH_DOMAIN: &[u8] = b"apm2.fac_broker.envelope.v1";
@@ -930,7 +937,7 @@ impl FacBroker {
             declared_leakage_budget_bits: None,
             timing_budget_policy_max_ticks: Some(10),
             declared_timing_budget_ticks: None,
-            token_binding: None, // Set by issue_channel_context_token_with_token_binding below.
+            token_binding: None, // Set during token issuance below.
         };
 
         // TCK-00566: Generate a single-use nonce for replay protection.
@@ -970,11 +977,12 @@ impl FacBroker {
             nonce: Some(nonce),
         };
 
-        let token = issue_channel_context_token_with_token_binding(
+        let token = issue_channel_context_token_with_token_binding_and_expiry(
             &check,
             lease_id,
             request_id,
             current_time_secs(),
+            BROKER_CHANNEL_CONTEXT_TOKEN_EXPIRES_AFTER_SECS,
             &self.signer,
             token_binding,
         )?;
@@ -3200,6 +3208,26 @@ mod tests {
             .expect("token issuance should succeed");
 
         (broker, token)
+    }
+
+    #[test]
+    fn broker_issued_channel_token_uses_extended_wall_clock_expiry_window() {
+        use base64::Engine as _;
+
+        let (_broker, token) = broker_with_issued_token();
+        let token_bytes = base64::engine::general_purpose::STANDARD
+            .decode(token)
+            .expect("decode token");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&token_bytes).expect("parse token json");
+        let expiry_secs = parsed
+            .pointer("/payload/expires_after_secs")
+            .and_then(serde_json::Value::as_u64)
+            .expect("expires_after_secs must be present");
+        assert_eq!(
+            expiry_secs, BROKER_CHANNEL_CONTEXT_TOKEN_EXPIRES_AFTER_SECS,
+            "broker token TTL must cover queued FAC gate startup delays"
+        );
     }
 
     #[test]

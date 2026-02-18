@@ -1286,7 +1286,7 @@ Maps job kind to network policy with explicit override support:
 - [INV-SYS-003] `LaneProfileV1` loading failures fail the job path as a denial
   with machine-readable receipt output, not silent continuation.
 
-## evidence_bundle Submodule (TCK-00527, TCK-00542)
+## evidence_bundle Submodule (TCK-00527, TCK-00542, TCK-00555)
 
 The `evidence_bundle` submodule implements evidence bundle export/import commands
 exercising RFC-0028 boundary validation and RFC-0029 receipt validation (local-only).
@@ -1305,7 +1305,25 @@ and content-addressed integrity verification (TCK-00542).
 - `BundleEconomicsTraceV1`: RFC-0029 economics traces (queue admission + budget
   admission).
 - `BundleExportConfig`: Configuration for export carrying optional boundary-check
-  substructures (leakage budget, timing channel, disclosure policy, policy binding).
+  substructures (leakage budget, timing channel, disclosure policy, policy binding)
+  and TCK-00555 leakage budget policy/declassification receipt fields.
+- `LeakageBudgetPolicy` (TCK-00555): Per-risk-tier ceilings on exported evidence
+  volume (bytes) and distinct artifact classes. Provides `tier0_default()` (64 MiB,
+  64 classes, 512 bits), `tier2_default()` (4 MiB, 16 classes, 64 bits), and
+  `deny_all()` constructors. Default is `tier2_default()` (most restrictive
+  non-zero policy). Integer-only per RFC-0028 section 6 determinism contract.
+- `DeclassificationExportReceipt` (TCK-00555): Authorizes exports that exceed the
+  leakage budget policy ceiling. Contains `receipt_id`, `authorized_bytes`,
+  `authorized_classes`, `authorized_leakage_bits`, `authority_id`, `reason`, and a
+  BLAKE3 `content_hash` binding. Validates structural well-formedness via
+  `validate()` and computes content hash via `compute_content_hash()` using
+  domain-separated length-prefixed BLAKE3.
+- `LeakageBudgetDecision` (TCK-00555): Export-time enforcement result bound into the
+  envelope. Contains the applied policy, actual usage (bytes, classes, leakage bits),
+  exceeded flag, declassification authorization flag, optional receipt ID, and the full
+  embedded `DeclassificationExportReceipt` when declassification was authorized. The
+  embedded receipt allows import-side validation to independently verify that the receipt
+  actually authorizes the declared export values and that its content hash is valid.
 - `EvidenceBundleManifestV1` (TCK-00542): Lightweight outer manifest document for
   bundle discovery and indexing. References the envelope by its content hash, carries
   summary metadata (job_id, outcome, timestamp), a `channel_boundary_checked` flag,
@@ -1320,19 +1338,30 @@ and content-addressed integrity verification (TCK-00542).
 - `build_evidence_bundle_envelope()`: Builds an envelope from a job receipt and
   export config. Requires RFC-0028 boundary trace, RFC-0029 queue admission trace,
   and RFC-0029 budget admission trace in the receipt (fail-closed on missing traces).
+  When `leakage_budget_policy` is set in config, enforces INV-EB-006: serialized
+  envelope byte size and artifact class count must not exceed the policy ceiling
+  without a valid `DeclassificationExportReceipt`. Also checks leakage bits from
+  the leakage budget receipt against `max_leakage_bits`. Binds a
+  `LeakageBudgetDecision` into the envelope for import-side verification.
   Computes BLAKE3 content hash with domain-separated, length-prefixed encoding over
-  ALL envelope fields using `canonical_bytes_v2()` for the receipt (which includes
-  `unsafe_direct`, `policy_hash`, and `canonicalizer_tuple_digest`), plus boundary
-  check, economics trace, policy binding, and blob refs.
+  ALL envelope fields (including `leakage_budget_decision`) using
+  `canonical_bytes_v2()` for the receipt (which includes `unsafe_direct`,
+  `policy_hash`, and `canonicalizer_tuple_digest`), plus boundary check, economics
+  trace, policy binding, blob refs, and leakage budget decision.
 - `serialize_envelope()`: Serializes the envelope to JSON bytes.
 - `import_evidence_bundle()`: Imports and validates an envelope from JSON bytes.
   Enforces: bounded read (MAX_ENVELOPE_SIZE=256 KiB), schema verification,
   per-field length bounds (MAX_JOB_ID_LENGTH, MAX_BLOB_REF_LENGTH), content
   hash integrity, RFC-0028 boundary validation (core defects required zero;
   honestly-absent optional sub-evidence tolerated), RFC-0029 economics receipt
-  validation (Allow verdicts required), and policy binding digest matching
+  validation (Allow verdicts required), policy binding digest matching
   (including cross-field consistency with receipt's policy_hash and
-  canonicalizer_tuple_digest).
+  canonicalizer_tuple_digest), and INV-EB-007/018/019/020 leakage budget decision
+  consistency (TCK-00555): if `exceeded_policy` then `declassification_authorized`
+  must be true with a valid receipt ID; when `exceeded_policy=false`, independently
+  verifies that actual values are within policy ceilings; cross-checks
+  `actual_export_classes` against `blob_refs.len() + 2`; cross-checks
+  `actual_leakage_bits` against the boundary check's leakage budget receipt.
 - `verify_blob_refs()`: Verifies all blob_refs in an imported envelope exist in the
   bundle directory and their BLAKE3 hashes match declared values. Bounded reads,
   path traversal prevention, constant-time hash comparison.
@@ -1361,7 +1390,9 @@ and content-addressed integrity verification (TCK-00542).
   (0600 mode, `O_NOFOLLOW`, symlink check). Constructs `BundleExportConfig`
   from authoritative receipt artifacts (policy binding only); leakage budget receipt,
   timing channel budget, and disclosure policy binding are honestly marked absent
-  (None) because they do not exist in `FacJobReceiptV1`. Fail-closed on malformed
+  (None) because they do not exist in `FacJobReceiptV1`. Sets `leakage_budget_policy`
+  to `LeakageBudgetPolicy::tier2_default()` for fail-closed secure default (TCK-00555);
+  `declassification_receipt` defaults to None (fail-closed on policy exceedance). Fail-closed on malformed
   policy digests: if `policy_hash` or `canonicalizer_tuple_digest` is absent or
   cannot be decoded to a verified 32-byte digest, export returns
   `MalformedPolicyDigest` error instead of fabricating a placeholder. Discovers
@@ -1439,9 +1470,79 @@ and content-addressed integrity verification (TCK-00542).
   `EvidenceBundleManifestEntryV1` use `#[serde(deny_unknown_fields)]` to reject
   any fields not defined in the struct during deserialization (fail-closed on
   unknown/malformed input).
-- [INV-EB-014] (TCK-00542) Envelope import accepts both the legacy schema
+- [INV-EB-026] (TCK-00542) Envelope import accepts both the legacy schema
   (`apm2.fac.evidence_bundle.v1`) and the canonical schema
   (`apm2.fac.evidence_bundle_envelope.v1`) for backwards compatibility.
+- [INV-EB-015] (TCK-00555) Export uses two-phase leakage budget enforcement with
+  convergence: phase 1 checks class count and leakage bits before hash computation;
+  phase 2 enforces `max_export_bytes` against the exact `serde_json::to_vec_pretty`
+  bytes. The convergence loop re-measures the serialized size after updating
+  `actual_export_bytes` and re-hashing, iterating until the recorded size matches
+  the actual serialized size (converges in at most `MAX_BYTE_CONVERGENCE_ROUNDS`
+  rounds). This ensures the "exact byte enforcement" invariant: the
+  `actual_export_bytes` in the decision equals the actual byte count of the
+  envelope as written to disk. Declassification receipt validation includes
+  structural well-formedness, BLAKE3 content hash verification (constant-time
+  comparison), and authorization coverage checks. The full
+  `DeclassificationExportReceipt` is embedded in the `LeakageBudgetDecision` for
+  import-side audit.
+- [INV-EB-016] (TCK-00555) Import verifies embedded `DeclassificationExportReceipt`
+  when `exceeded_policy=true` and `declassification_authorized=true`: validates receipt
+  structural well-formedness, verifies BLAKE3 content hash, and confirms
+  `receipt.authorized_bytes >= decision.actual_bytes`,
+  `receipt.authorized_classes >= decision.actual_classes`, and
+  `receipt.authorized_leakage_bits >= decision.actual_leakage_bits`. Rejects forged
+  envelopes that set the `authorized` flag without a receipt that covers the values.
+  Cross-checks leakage bits from the boundary check's leakage budget receipt against
+  the policy ceiling when `exceeded_policy=false`. The leakage budget decision is
+  included in the BLAKE3 content hash computation, preventing tampering.
+- [INV-EB-018] (TCK-00555) Import independently verifies that when
+  `exceeded_policy=false`, actual values (`actual_export_bytes`,
+  `actual_export_classes`, `actual_leakage_bits`) are within the policy ceilings.
+  Prevents forged `exceeded_policy=false` from bypassing declassification
+  requirements.
+- [INV-EB-019] (TCK-00555) Import cross-checks `actual_export_classes` against
+  `blob_refs.len() + 2` (fixed overhead: envelope + receipt). Prevents forged
+  class counts from understating the actual export volume.
+- [INV-EB-020] (TCK-00555) Import cross-checks `actual_leakage_bits` against the
+  `leakage_budget_receipt.leakage_bits` in the boundary check (or requires 0 when
+  no receipt is present). Prevents forged leakage bit counts.
+- [INV-EB-021] (TCK-00555) Import independently recomputes the canonical envelope
+  byte size from the serialized data being imported (`data.len()`) and requires
+  `decision.actual_export_bytes` to equal this recomputed size before any policy
+  comparisons. This prevents an attacker from forging a lower `actual_export_bytes`
+  to bypass byte-dimension declassification enforcement.
+- [INV-EB-022] (TCK-00555) Export-time declassification receipt validation
+  (`validate_declassification_receipt`) always checks
+  `authorized_leakage_bits >= actual_leakage_bits` whenever a declassification
+  receipt is present — not only when the leakage-bit dimension itself exceeded
+  policy. This aligns export semantics with import semantics (INV-EB-016) and
+  prevents bundles that pass export but are rejected on import.
+- [INV-EB-017] (TCK-00555) Legacy hash compatibility: when `leakage_budget_decision`
+  is absent AND the envelope schema is the legacy schema ID
+  (`apm2.fac.evidence_bundle.v1`), the content hash is computed WITHOUT the leakage
+  budget presence/absence byte. This preserves backward compatibility with
+  pre-TCK-00555 envelopes (INV-EB-026). New-schema envelopes always include the
+  presence/absence tag.
+- [INV-EB-014] (TCK-00555) Import rejects new-schema envelopes
+  (`EVIDENCE_BUNDLE_ENVELOPE_SCHEMA` / `apm2.fac.evidence_bundle_envelope.v1`) that
+  are missing `leakage_budget_decision`. Legacy envelopes
+  (`EVIDENCE_BUNDLE_SCHEMA` / `apm2.fac.evidence_bundle.v1`) are exempt for backward
+  compatibility. This prevents downgrade-by-omission attacks where an attacker strips
+  the decision field and recomputes a self-consistent content hash to bypass leakage
+  budget enforcement.
+- [INV-EB-023] (TCK-00555) Even legacy-schema envelopes are rejected when missing
+  `leakage_budget_decision` if the boundary check carries budget-aware fields
+  (`leakage_budget_receipt`, `timing_channel_budget`, or `disclosure_policy_binding`).
+  This closes a schema-downgrade bypass where an attacker swaps the schema string to
+  legacy after stripping the decision.
+- [INV-EB-024] (TCK-00555) Export-time finalization always validates
+  `authorized_bytes >= actual_export_bytes` whenever the policy is exceeded and a
+  declassification receipt is present, regardless of which dimension triggered
+  exceedance. This aligns export with import semantics.
+- [INV-EB-025] (TCK-00555) Export fails closed when `leakage_budget_policy` is
+  `None` for new-schema output. Callers must supply a policy (even if permissive)
+  to produce importable envelopes.
 
 ## Policy Environment Enforcement (TCK-00526, TCK-00575)
 

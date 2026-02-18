@@ -4248,6 +4248,7 @@ pub fn run_gates(
     json_output: bool,
     wait: bool,
     wait_timeout_secs: u64,
+    allow_legacy_cache: bool,
 ) -> u8 {
     gates::run_gates(
         force,
@@ -4260,6 +4261,7 @@ pub fn run_gates(
         json_output,
         wait,
         wait_timeout_secs,
+        allow_legacy_cache,
     )
 }
 
@@ -4274,6 +4276,7 @@ pub(super) fn run_gates_local_worker(
     cpu_quota: &str,
     gate_profile: GateThroughputProfile,
     workspace_root: &Path,
+    allow_legacy_cache: bool,
 ) -> Result<u8, String> {
     gates::run_gates_local_worker(
         force,
@@ -4284,7 +4287,32 @@ pub(super) fn run_gates_local_worker(
         cpu_quota,
         gate_profile,
         workspace_root,
+        allow_legacy_cache,
     )
+}
+
+/// Post-receipt gate cache rebinding (TCK-00540 BLOCKER fix).
+///
+/// Called by the worker after persisting a job receipt to promote
+/// `rfc0028_receipt_bound` and `rfc0029_receipt_bound` flags in the
+/// gate cache based on verified receipt evidence.
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn rebind_gate_cache_after_receipt(
+    sha: &str,
+    receipts_dir: &std::path::Path,
+    job_id: &str,
+    signer: &apm2_core::crypto::Signer,
+) {
+    gate_cache::rebind_gate_cache_after_receipt(sha, receipts_dir, job_id, signer);
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn apply_gate_result_lifecycle_for_repo_sha(
+    owner_repo: &str,
+    head_sha: &str,
+    passed: bool,
+) -> Result<usize, String> {
+    lifecycle::apply_gate_result_events_for_repo_sha(owner_repo, head_sha, passed)
 }
 
 // ── Internal dispatch helper (shared with pipeline/restart) ─────────────────

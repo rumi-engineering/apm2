@@ -138,6 +138,11 @@ pub enum FacSubcommand {
     /// Validates fmt, clippy, doc, test safety, tests (bounded), workspace
     /// integrity, and review artifact lint. Results are cached per-SHA so
     /// `apm2 fac pipeline` can skip gates that already passed.
+    ///
+    /// Throughput model: FAC executes full gates in single-flight mode so one
+    /// caller gets maximal host compute (CPU/memory/IO) until completion.
+    /// Concurrent callers coalesce/queue rather than splitting compute across
+    /// multiple heavyweight test runs.
     Gates(GatesArgs),
 
     /// Internal: CI preflight checks for credential posture and workflow trust.
@@ -425,6 +430,9 @@ pub struct GatesArgs {
     pub json: bool,
 
     /// Wait for queued gates job completion (default).
+    ///
+    /// While waiting, `apm2 fac gates` reports queue state so operators can
+    /// see whether the job is pending or already claimed by a worker.
     #[arg(long, default_value_t = true)]
     pub wait: bool,
 
@@ -435,6 +443,16 @@ pub struct GatesArgs {
     /// Maximum wait time in seconds when wait mode is enabled.
     #[arg(long, default_value_t = 1200)]
     pub wait_timeout_secs: u64,
+
+    /// **UNSAFE**: Allow reuse of legacy gate cache entries that lack
+    /// RFC-0028/0029 receipt bindings (TCK-00540).
+    ///
+    /// By default, gate cache entries without auditable receipt bindings are
+    /// treated as untrusted and rejected (fail-closed). This flag permits
+    /// reuse of those unbound entries for migration purposes. Reused entries
+    /// are marked `legacy_cache_override` in the receipt for audit trail.
+    #[arg(long, default_value_t = false)]
+    pub allow_legacy_cache: bool,
 }
 
 /// Arguments for `apm2 fac preflight`.
@@ -2308,6 +2326,7 @@ pub fn run_fac(
             resolve_json(args.json),
             args.wait && !args.no_wait,
             args.wait_timeout_secs,
+            args.allow_legacy_cache,
         ),
         FacSubcommand::Preflight(args) => match &args.subcommand {
             PreflightSubcommand::Credential(credential_args) => fac_preflight::run_credential(
@@ -5763,6 +5782,15 @@ fn build_export_config_from_receipt(
         leakage_budget_receipt,
         timing_channel_budget,
         disclosure_policy_binding,
+        // TCK-00555: Leakage budget policy defaults to Tier2 (fail-closed).
+        // Tier0 requires explicit opt-in configuration. The secure default
+        // bounds evidence export to 4 MiB / 16 classes / 64 leakage bits.
+        leakage_budget_policy: Some(
+            apm2_core::fac::evidence_bundle::LeakageBudgetPolicy::tier2_default(),
+        ),
+        // No declassification receipt by default — exports that exceed the
+        // policy ceiling will fail closed.
+        declassification_receipt: None,
     })
 }
 
