@@ -364,6 +364,106 @@ with hard caps.
 - [INV-CPRL-005] Budget denial always produces a structured
   `ControlPlaneDenialReceipt` with machine-readable evidence.
 
+## queue_bounds Submodule (TCK-00578)
+
+The `queue_bounds` submodule enforces instantaneous queue size limits at enqueue
+time. Unlike `broker_rate_limits` (which tracks cumulative window counters),
+`queue_bounds` scans the actual `queue/pending/` directory to determine the
+current number of pending jobs and their total byte size, and denies new
+enqueue attempts that would exceed configured caps.
+
+### Key Types
+
+- `QueueBoundsPolicy`: Configuration struct with `max_pending_jobs`,
+  `max_pending_bytes`, and optional `per_lane_max_pending_jobs`. Hard cap
+  validation via `validate()`. Defaults: 10K jobs, 1 GiB bytes.
+- `PendingQueueSnapshot`: Point-in-time snapshot of the pending queue
+  (`job_count`, `total_bytes`, `truncated`).
+- `QueueBoundsDenialReceipt`: Structured denial evidence carrying dimension,
+  current usage, limit, requested increment, and stable reason code.
+- `QueueBoundsDimension`: Enum (`PendingJobs`, `PendingBytes`, `ScanTruncated`).
+- `QueueBoundsError`: Error taxonomy with `QueueBoundsExceeded`, `InvalidPolicy`,
+  and `ScanFailed` variants.
+
+### Hard Caps
+
+- `HARD_CAP_MAX_PENDING_JOBS`: 1,000,000
+- `HARD_CAP_MAX_PENDING_BYTES`: 64 GiB
+
+### Core Capabilities
+
+- `check_queue_bounds()`: Scans `queue/pending/`, computes snapshot, evaluates
+  proposed enqueue against policy, returns `Ok(snapshot)` or
+  `Err(QueueBoundsExceeded)`.
+- Filesystem scan is bounded by `MAX_SCAN_ENTRIES` (100K) to prevent DoS
+  (INV-QB-002). Truncated scans are treated as fail-closed denials with
+  `ScanTruncated` dimension.
+- `pending_dir` is verified via `symlink_metadata()` before scanning
+  (INV-QB-006). A broken symlink (target does not exist) returns `ScanFailed`,
+  not an empty snapshot. Only a true `NotFound` from `symlink_metadata()` is
+  treated as a legitimately absent queue.
+- Symlinks within the directory are skipped via `symlink_metadata()` to prevent
+  inflation attacks (INV-QB-005).
+- Filenames exceeding `MAX_FILENAME_BYTES` (4096) are skipped to bound per-entry
+  memory allocation.
+- Hidden files (starting with `.`) are skipped (temp files from atomic writes).
+- Fail-closed: zero limits deny immediately; unreadable directory denies
+  (INV-QB-001).
+- All arithmetic uses `checked_add`/`saturating_add` (INV-QB-004).
+
+### CLI Integration
+
+- `enqueue_job()` in `apm2-cli/src/commands/fac_queue_submit.rs` accepts a
+  `&QueueBoundsPolicy` loaded from the persisted FAC configuration
+  (`FacPolicyV1::queue_bounds_policy`), validates it, acquires a process-level
+  lockfile (`queue/.enqueue.lock`) for the full check-write critical section,
+  and passes it to `check_queue_bounds()`. The lockfile prevents concurrent
+  `apm2 fac` processes from bypassing queue caps via TOCTOU. Denial produces
+  a descriptive error with the `queue/quota_exceeded` reason code and persists
+  a `QueueBoundsDenialReceipt` artifact in the `denied/` directory. A
+  structured denial event is also emitted to a trusted audit log under the
+  FAC private directory (`$APM2_HOME/private/fac/audit/denial_events.jsonl`)
+  outside the writable queue directories, ensuring audit evidence resilience
+  even if the `queue/denied/` directory is tampered with.
+- `FacPolicyV1` includes a `queue_bounds_policy` field (`serde(default)` for
+  backward compatibility with pre-TCK-00578 policies).
+- Control-lane `stop_revoke` jobs bypass queue bounds (consistent with the
+  control-lane exception documented in `fac/mod.rs`).
+
+### Receipt Integration
+
+- `DenialReasonCode::QueueQuotaExceeded` variant added for receipt chain
+  integration.
+- Denial reason code: `queue/quota_exceeded`.
+- Denial receipts are persisted as JSON artifacts in `queue/denied/` when
+  `check_queue_bounds()` returns a quota error.
+
+### Security Invariants (TCK-00578)
+
+- [INV-QB-001] Fail-closed: unreadable pending directory denies all enqueue
+  attempts.
+- [INV-QB-002] Directory scan is bounded by `MAX_SCAN_ENTRIES` to prevent DoS.
+  Truncated scans are treated as fail-closed denials.
+- [INV-QB-003] Denial receipts include dimension, current usage, limit, and
+  stable reason code for audit. Receipts are persisted to `queue/denied/`.
+- [INV-QB-004] Arithmetic uses `checked_add`; overflow returns Err.
+- [INV-QB-005] Symlinks in pending directory are skipped (not counted) to
+  prevent inflation attacks.
+- [INV-QB-006] `pending_dir` is verified via `symlink_metadata()` before
+  scanning. A broken symlink (target does not exist) returns `ScanFailed`,
+  not an empty snapshot. Only a true `NotFound` from `symlink_metadata()` is
+  treated as a legitimately absent queue. This prevents bypass of the symlink
+  hardening by using `Path::exists()` which follows symlinks.
+- [INV-QB-007] Process-level lockfile (`queue/.enqueue.lock`) acquired via
+  `fs2::FileExt::lock_exclusive()` for the full check-write critical section
+  in `enqueue_job()`. Prevents concurrent `apm2 fac` processes from bypassing
+  queue caps via TOCTOU. The lock is held until after the job spec file is
+  written (dropped at scope exit).
+- [INV-QB-008] Structured denial events are emitted to a trusted audit log
+  (`$APM2_HOME/private/fac/audit/denial_events.jsonl`) outside the writable
+  queue directories, ensuring audit evidence resilience even if `queue/denied/`
+  is tampered with.
+
 ## projection_compromise Submodule
 
 The `projection_compromise` submodule implements compromise handling for public
