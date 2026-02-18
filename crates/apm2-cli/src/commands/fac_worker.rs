@@ -133,6 +133,7 @@ mod fac_review_api {
         _cpu_quota: &str,
         _gate_profile: GateThroughputProfile,
         _workspace_root: &std::path::Path,
+        _allow_legacy_cache: bool,
     ) -> Result<u8, String> {
         Ok(crate::exit_codes::codes::GENERIC_ERROR)
     }
@@ -302,6 +303,9 @@ struct GatesJobOptions {
     cpu_quota: String,
     gate_profile: fac_review_api::GateThroughputProfile,
     workspace_root: PathBuf,
+    /// TCK-00540: Allow reuse of legacy gate cache entries without
+    /// RFC-0028/0029 receipt bindings.
+    allow_legacy_cache: bool,
 }
 
 // =============================================================================
@@ -1249,6 +1253,7 @@ fn parse_gates_job_options(spec: &FacJobSpecV1) -> Result<GatesJobOptions, Strin
         cpu_quota: payload.cpu_quota,
         gate_profile: parse_gate_profile(&payload.gate_profile)?,
         workspace_root: resolve_workspace_root(&payload.workspace_root, &spec.source.repo_id)?,
+        allow_legacy_cache: payload.allow_legacy_cache,
     })
 }
 
@@ -1495,6 +1500,7 @@ fn run_gates_in_workspace(options: &GatesJobOptions) -> Result<u8, String> {
         &options.cpu_quota,
         options.gate_profile,
         &options.workspace_root,
+        options.allow_legacy_cache,
     )
 }
 

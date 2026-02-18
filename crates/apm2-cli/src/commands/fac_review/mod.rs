@@ -4248,6 +4248,7 @@ pub fn run_gates(
     json_output: bool,
     wait: bool,
     wait_timeout_secs: u64,
+    allow_legacy_cache: bool,
 ) -> u8 {
     gates::run_gates(
         force,
@@ -4260,6 +4261,7 @@ pub fn run_gates(
         json_output,
         wait,
         wait_timeout_secs,
+        allow_legacy_cache,
     )
 }
 
@@ -4274,6 +4276,7 @@ pub(super) fn run_gates_local_worker(
     cpu_quota: &str,
     gate_profile: GateThroughputProfile,
     workspace_root: &Path,
+    allow_legacy_cache: bool,
 ) -> Result<u8, String> {
     gates::run_gates_local_worker(
         force,
@@ -4284,6 +4287,7 @@ pub(super) fn run_gates_local_worker(
         cpu_quota,
         gate_profile,
         workspace_root,
+        allow_legacy_cache,
     )
 }
 

@@ -118,6 +118,8 @@ pub enum GateProgressEvent {
 }
 
 /// Options for customizing evidence gate execution.
+#[allow(dead_code)] // TCK-00540: allow_legacy_cache is wired for future cache-reuse in CLI path.
+#[allow(clippy::struct_excessive_bools)]
 pub struct EvidenceGateOptions {
     /// Override command for the test phase. When `Some`, the test gate uses
     /// this command instead of `cargo nextest run ...`.
@@ -144,6 +146,10 @@ pub struct EvidenceGateOptions {
     /// progress instead of buffering all events until `run_evidence_gates`
     /// returns.
     pub on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
+    /// TCK-00540: When `true`, permit reuse of legacy gate cache entries that
+    /// lack RFC-0028/0029 receipt bindings. This is an **unsafe** escape hatch
+    /// for migration; default-deny is the fail-closed posture.
+    pub allow_legacy_cache: bool,
 }
 
 /// Result of a single evidence gate execution.
@@ -307,10 +313,19 @@ fn reuse_decision_for_gate(
     gate_name: &str,
     attestation_digest: Option<&str>,
     verifying_key: Option<&apm2_core::crypto::VerifyingKey>,
+    allow_legacy_cache: bool,
 ) -> ReuseDecision {
     cache.map_or_else(
         || ReuseDecision::miss("no_record"),
-        |cached| cached.check_reuse(gate_name, attestation_digest, true, verifying_key),
+        |cached| {
+            cached.check_reuse(
+                gate_name,
+                attestation_digest,
+                true,
+                verifying_key,
+                allow_legacy_cache,
+            )
+        },
     )
 }
 
@@ -1872,6 +1887,10 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     lane_context: EvidenceLaneContext,
 ) -> Result<(bool, Vec<EvidenceGateResult>), String> {
     let logs_dir = lane_context.logs_dir;
+    // TCK-00540: Pipeline path always enforces fail-closed legacy cache deny.
+    // The `--allow-legacy-cache` unsafe override is only available via the
+    // `apm2 fac gates` CLI path (not the PR pipeline).
+    let allow_legacy_cache = false;
 
     // TCK-00526: Build policy-filtered environment for ALL gates.
     // TCK-00575 round 2: Use the lane_dir from the actually-locked lane
@@ -2060,6 +2079,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
+            allow_legacy_cache,
         );
         if reuse.reusable {
             if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
@@ -2242,6 +2262,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
+            allow_legacy_cache,
         );
         if reuse.reusable {
             if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
@@ -2414,6 +2435,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
+            allow_legacy_cache,
         );
         let log_path = logs_dir.join("test.log");
         emit_gate_started_cb(on_gate_progress, gate_name);
@@ -2591,6 +2613,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
+            allow_legacy_cache,
         );
         let log_path = logs_dir.join("workspace_integrity.log");
         emit_gate_started_cb(on_gate_progress, gate_name);
@@ -2732,6 +2755,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
+            allow_legacy_cache,
         );
         if reuse.reusable {
             if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {

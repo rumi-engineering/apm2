@@ -73,6 +73,7 @@ enum WorkerExecutionMode {
 
 /// Request payload for queued FAC gates execution.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub(super) struct QueuedGatesRequest {
     pub(super) force: bool,
     pub(super) quick: bool,
@@ -83,6 +84,9 @@ pub(super) struct QueuedGatesRequest {
     pub(super) gate_profile: GateThroughputProfile,
     pub(super) wait_timeout_secs: u64,
     pub(super) require_external_worker: bool,
+    /// TCK-00540: Allow reuse of legacy gate cache entries without
+    /// RFC-0028/0029 receipt bindings (unsafe migration override).
+    pub(super) allow_legacy_cache: bool,
 }
 
 /// Queue-backed FAC gates outcome with materialized per-gate rows.
@@ -207,6 +211,7 @@ pub fn run_gates(
     json_output: bool,
     wait: bool,
     wait_timeout_secs: u64,
+    allow_legacy_cache: bool,
 ) -> u8 {
     run_gates_via_worker(
         force,
@@ -219,6 +224,7 @@ pub fn run_gates(
         wait,
         wait_timeout_secs,
         json_output,
+        allow_legacy_cache,
     )
 }
 
@@ -355,6 +361,7 @@ fn prepare_queued_gates_job(
         &request.cpu_quota,
         request.gate_profile.as_str(),
         &repo_source.workspace_root,
+        request.allow_legacy_cache,
     );
     let spec = build_gates_job_spec(
         &job_id,
@@ -462,6 +469,7 @@ pub(super) fn run_gates_local_worker(
     cpu_quota: &str,
     gate_profile: GateThroughputProfile,
     workspace_root: &Path,
+    allow_legacy_cache: bool,
 ) -> Result<u8, String> {
     let (resolved_profile, effective_cpu_quota) =
         resolve_effective_execution_profile(cpu_quota, gate_profile)?;
@@ -477,6 +485,7 @@ pub(super) fn run_gates_local_worker(
         resolved_profile.test_parallelism,
         false,
         None,
+        allow_legacy_cache,
     )?;
     Ok(if summary.passed {
         exit_codes::SUCCESS
@@ -498,6 +507,7 @@ fn run_gates_via_worker(
     wait: bool,
     wait_timeout_secs: u64,
     json_output: bool,
+    allow_legacy_cache: bool,
 ) -> u8 {
     let request = QueuedGatesRequest {
         force,
@@ -509,6 +519,7 @@ fn run_gates_via_worker(
         gate_profile,
         wait_timeout_secs,
         require_external_worker: false,
+        allow_legacy_cache,
     };
     let prepared = match prepare_queued_gates_job(&request, wait) {
         Ok(prepared) => prepared,
@@ -963,6 +974,7 @@ fn bind_merge_gate_log_bundle_hash(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::fn_params_excessive_bools)]
 fn run_gates_inner(
     workspace_root: &Path,
     force: bool,
@@ -975,6 +987,7 @@ fn run_gates_inner(
     test_parallelism: u32,
     emit_human_logs: bool,
     on_gate_progress: Option<Box<dyn Fn(super::evidence::GateProgressEvent) + Send>>,
+    allow_legacy_cache: bool,
 ) -> Result<GatesSummary, String> {
     validate_timeout_seconds(timeout_seconds)?;
     let memory_max_bytes = parse_memory_limit(memory_max)?;
@@ -1148,6 +1161,7 @@ fn run_gates_inner(
         skip_merge_conflict_gate: true,
         emit_human_logs,
         on_gate_progress,
+        allow_legacy_cache,
     };
 
     // 5. Run evidence gates.
@@ -1611,6 +1625,7 @@ mod tests {
             gate_profile: GateThroughputProfile::Conservative,
             wait_timeout_secs: 60,
             require_external_worker,
+            allow_legacy_cache: false,
         }
     }
 
@@ -2165,6 +2180,7 @@ mod tests {
             skip_merge_conflict_gate: true,
             emit_human_logs: false,
             on_gate_progress: Some(callback),
+            allow_legacy_cache: false,
         };
 
         // Simulate the callback being invoked for a gate lifecycle.
@@ -2401,6 +2417,7 @@ mod tests {
             2,
             false,
             None,
+            false,
         )
         .expect("gates should run in single-lane mode");
         assert!(summary.passed);

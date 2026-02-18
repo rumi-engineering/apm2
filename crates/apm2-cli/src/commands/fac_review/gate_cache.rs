@@ -11,6 +11,21 @@
 //! `GATE_CACHE_RECEIPT:`).  In default mode, `check_reuse` requires a
 //! valid signature — unsigned or forged entries are rejected for cache
 //! reuse (fail-closed).
+//!
+//! # Legacy Cache Reuse Policy (TCK-00540)
+//!
+//! Gate cache entries are treated as **untrusted** unless they carry
+//! RFC-0028 authorization and RFC-0029 admission receipt bindings
+//! (`rfc0028_receipt_bound` and `rfc0029_receipt_bound` fields).
+//!
+//! In default mode, `check_reuse` rejects entries missing these bindings
+//! (fail-closed). The `--allow-legacy-cache` CLI flag sets
+//! `allow_legacy_cache = true` to permit fallback reuse of unbound entries,
+//! and marks the reuse decision accordingly.
+//!
+//! Migration path: as gates are re-run, new entries will carry bound
+//! receipts. Over time, all cache entries become bound and the override
+//! becomes unnecessary.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -69,6 +84,21 @@ pub struct CachedGateResult {
     /// Hex-encoded Ed25519 public key of the signer (TCK-00576).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer_id: Option<String>,
+    /// Whether this cache entry is bound to an RFC-0028 authorization receipt
+    /// (TCK-00540). Legacy entries without this field default to `false`
+    /// (untrusted).
+    #[serde(default)]
+    pub rfc0028_receipt_bound: bool,
+    /// Whether this cache entry is bound to an RFC-0029 admission receipt
+    /// (TCK-00540). Legacy entries without this field default to `false`
+    /// (untrusted).
+    #[serde(default)]
+    pub rfc0029_receipt_bound: bool,
+    /// When `true`, this cache entry was reused via the `--allow-legacy-cache`
+    /// unsafe override despite missing RFC-0028/0029 receipt bindings
+    /// (TCK-00540). Receipts are marked accordingly for audit.
+    #[serde(default)]
+    pub legacy_cache_override: bool,
 }
 
 impl CachedGateResult {
@@ -132,6 +162,11 @@ impl CachedGateResult {
 
         // log_path
         Self::append_optional_string(&mut buf, self.log_path.as_deref());
+
+        // TCK-00540: RFC-0028/0029 receipt binding fields
+        buf.push(u8::from(self.rfc0028_receipt_bound));
+        buf.push(u8::from(self.rfc0029_receipt_bound));
+        buf.push(u8::from(self.legacy_cache_override));
 
         buf
     }
@@ -521,6 +556,11 @@ impl GateCache {
     }
 
     /// Record a gate result with attestation metadata.
+    ///
+    /// New entries created by the current pipeline carry RFC-0028/0029
+    /// receipt bindings (`rfc0028_receipt_bound = true`,
+    /// `rfc0029_receipt_bound = true`). Legacy entries loaded from disk
+    /// may have these fields as `false`.
     #[allow(clippy::too_many_arguments)]
     pub fn set_with_attestation(
         &mut self,
@@ -548,6 +588,10 @@ impl GateCache {
                 log_path,
                 signature_hex: None,
                 signer_id: None,
+                // TCK-00540: new entries carry receipt bindings by default.
+                rfc0028_receipt_bound: true,
+                rfc0029_receipt_bound: true,
+                legacy_cache_override: false,
             },
         );
     }
@@ -595,12 +639,19 @@ impl GateCache {
     /// to skip signature verification (developer/test mode only).
     ///
     /// `require_full_mode` should be true for normal push pipeline runs.
+    ///
+    /// `allow_legacy_cache` when `true` permits reuse of cache entries
+    /// that lack RFC-0028/0029 receipt bindings (unsafe override,
+    /// TCK-00540). In default mode (`false`), entries without both
+    /// `rfc0028_receipt_bound` and `rfc0029_receipt_bound` are rejected
+    /// (fail-closed).
     pub fn check_reuse(
         &self,
         gate: &str,
         expected_attestation_digest: Option<&str>,
         require_full_mode: bool,
         verifying_key: Option<&VerifyingKey>,
+        allow_legacy_cache: bool,
     ) -> ReuseDecision {
         if gate == MERGE_CONFLICT_GATE_NAME {
             return ReuseDecision::miss("policy_merge_conflict_recompute");
@@ -640,6 +691,20 @@ impl GateCache {
             if cached.signature_hex.is_none() {
                 return ReuseDecision::miss("signature_missing");
             }
+        }
+
+        // TCK-00540: RFC-0028/0029 receipt binding gate (fail-closed by
+        // default). Cache entries without both receipt bindings are treated
+        // as untrusted legacy entries. The `--allow-legacy-cache` flag
+        // permits unsafe override for migration.
+        if !cached.rfc0028_receipt_bound || !cached.rfc0029_receipt_bound {
+            if allow_legacy_cache {
+                return ReuseDecision {
+                    reusable: true,
+                    reason: "legacy_cache_override_unsafe",
+                };
+            }
+            return ReuseDecision::miss("receipt_binding_missing");
         }
 
         ReuseDecision::hit()
@@ -801,18 +866,24 @@ mod tests {
         let cache = make_signed_cache(&signer);
         let vk = signer.verifying_key();
         assert_eq!(
-            cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk)),
+            cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), false),
             ReuseDecision::hit()
         );
         assert_eq!(
             cache
-                .check_reuse("rustfmt", Some("digest-2"), true, Some(&vk))
+                .check_reuse("rustfmt", Some("digest-2"), true, Some(&vk), false)
                 .reason,
             "attestation_mismatch"
         );
         assert_eq!(
             cache
-                .check_reuse("merge_conflict_main", Some("digest-1"), true, Some(&vk))
+                .check_reuse(
+                    "merge_conflict_main",
+                    Some("digest-1"),
+                    true,
+                    Some(&vk),
+                    false
+                )
                 .reason,
             "policy_merge_conflict_recompute"
         );
@@ -826,7 +897,7 @@ mod tests {
         let signer = Signer::generate();
         let cache = make_signed_cache(&signer);
         let vk = signer.verifying_key();
-        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk));
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), false);
         assert!(reuse.reusable, "validly signed receipt must be reusable");
         assert_eq!(reuse.reason, "attestation_match");
     }
@@ -847,7 +918,7 @@ mod tests {
         );
         // Do NOT sign the cache.
         let vk = signer.verifying_key();
-        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk));
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), false);
         assert!(!reuse.reusable, "unsigned receipt must NOT be reusable");
         assert_eq!(reuse.reason, "signature_invalid");
     }
@@ -859,7 +930,7 @@ mod tests {
         let signer_b = Signer::generate();
         let cache = make_signed_cache(&signer_a);
         let vk_b = signer_b.verifying_key();
-        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk_b));
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk_b), false);
         assert!(
             !reuse.reusable,
             "receipt signed with wrong key must NOT be reusable"
@@ -881,7 +952,7 @@ mod tests {
         let vk = signer.verifying_key();
         // The attestation_digest now mismatches what check_reuse expects,
         // so it will fail on attestation_mismatch first.
-        let reuse = cache.check_reuse("rustfmt", Some("tampered-digest"), true, Some(&vk));
+        let reuse = cache.check_reuse("rustfmt", Some("tampered-digest"), true, Some(&vk), false);
         assert!(!reuse.reusable, "tampered receipt must NOT be reusable");
         // The signature was computed over original data; tampered data
         // produces a different canonical_bytes, so signature fails.
@@ -901,7 +972,7 @@ mod tests {
             Some("log-digest".to_string()),
             None,
         );
-        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, None);
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, None, false);
         assert!(
             !reuse.reusable,
             "unsigned receipt without verifying key must fail closed"
@@ -919,7 +990,7 @@ mod tests {
         let restored: GateCache = serde_yaml::from_str(&yaml).expect("deserialize");
 
         let vk = signer.verifying_key();
-        let reuse = restored.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk));
+        let reuse = restored.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), false);
         assert!(reuse.reusable, "signature must survive YAML roundtrip");
     }
 
@@ -967,7 +1038,7 @@ mod tests {
         );
 
         let clean_v2_digest = "v2_clean_file_sha256_based_attestation_digest_xyz789";
-        let reuse = cache.check_reuse("rustfmt", Some(clean_v2_digest), true, None);
+        let reuse = cache.check_reuse("rustfmt", Some(clean_v2_digest), true, None, false);
 
         assert!(
             !reuse.reusable,
@@ -994,7 +1065,7 @@ mod tests {
             None,
         );
 
-        let reuse = cache.check_reuse("rustfmt", Some("any-digest"), true, None);
+        let reuse = cache.check_reuse("rustfmt", Some("any-digest"), true, None, false);
         assert!(
             !reuse.reusable,
             "cache entry without attestation digest must not be reusable"
@@ -1021,7 +1092,7 @@ mod tests {
             None,
         );
 
-        let reuse = cache.check_reuse("rustfmt", Some("matching-digest"), true, None);
+        let reuse = cache.check_reuse("rustfmt", Some("matching-digest"), true, None, false);
         assert!(
             !reuse.reusable,
             "cache entry without evidence log digest must not be reusable"
@@ -1029,6 +1100,156 @@ mod tests {
         assert_eq!(
             reuse.reason, "evidence_digest_missing",
             "reason must be evidence_digest_missing"
+        );
+    }
+
+    // --- TCK-00540: Legacy cache reuse policy tests ---
+
+    /// Helper: create a signed cache whose entries have the receipt binding
+    /// fields explicitly overridden. This allows testing the receipt binding
+    /// gate in isolation (after the signature gate passes).
+    fn make_signed_cache_with_bindings(signer: &Signer, rfc0028: bool, rfc0029: bool) -> GateCache {
+        let mut cache = GateCache::new("abc123");
+        cache.set_with_attestation(
+            "rustfmt",
+            true,
+            1,
+            Some("digest-1".to_string()),
+            false,
+            Some("log-digest".to_string()),
+            None,
+        );
+        // Override the default-true bindings set by set_with_attestation.
+        if let Some(entry) = cache.gates.get_mut("rustfmt") {
+            entry.rfc0028_receipt_bound = rfc0028;
+            entry.rfc0029_receipt_bound = rfc0029;
+        }
+        // Re-sign after mutation so the signature covers the updated fields.
+        cache.sign_all(signer);
+        cache
+    }
+
+    /// Signed cache entry (missing RFC-0028/0029 bindings) is denied by
+    /// default (fail-closed). The entry is validly signed but lacks receipt
+    /// bindings, simulating a pre-TCK-00540 cache entry that was resigned.
+    #[test]
+    fn legacy_entry_without_receipt_bindings_denied_by_default() {
+        let signer = Signer::generate();
+        let cache = make_signed_cache_with_bindings(&signer, false, false);
+        let vk = signer.verifying_key();
+
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), false);
+        assert!(
+            !reuse.reusable,
+            "entry without receipt bindings must be denied by default"
+        );
+        assert_eq!(reuse.reason, "receipt_binding_missing");
+    }
+
+    /// Signed cache entry with `--allow-legacy-cache` override is accepted
+    /// (unsafe migration path).
+    #[test]
+    fn legacy_entry_accepted_with_allow_legacy_cache_override() {
+        let signer = Signer::generate();
+        let cache = make_signed_cache_with_bindings(&signer, false, false);
+        let vk = signer.verifying_key();
+
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), true);
+        assert!(
+            reuse.reusable,
+            "entry must be accepted with allow_legacy_cache override"
+        );
+        assert_eq!(reuse.reason, "legacy_cache_override_unsafe");
+    }
+
+    /// Entry with both RFC-0028 and RFC-0029 bindings passes the receipt
+    /// binding gate regardless of the `allow_legacy_cache` flag.
+    #[test]
+    fn bound_entry_passes_receipt_binding_gate() {
+        let signer = Signer::generate();
+        let cache = make_signed_cache(&signer);
+        let vk = signer.verifying_key();
+
+        // With allow_legacy_cache = false (default deny).
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), false);
+        assert!(reuse.reusable, "entry with both receipt bindings must pass");
+        assert_eq!(reuse.reason, "attestation_match");
+
+        // With allow_legacy_cache = true (override enabled).
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), true);
+        assert!(
+            reuse.reusable,
+            "entry with both receipt bindings must pass even with override"
+        );
+        assert_eq!(reuse.reason, "attestation_match");
+    }
+
+    /// Entry with only RFC-0028 binding (missing RFC-0029) is denied.
+    #[test]
+    fn partial_binding_rfc0028_only_denied() {
+        let signer = Signer::generate();
+        let cache = make_signed_cache_with_bindings(&signer, true, false);
+        let vk = signer.verifying_key();
+
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), false);
+        assert!(
+            !reuse.reusable,
+            "entry with only RFC-0028 binding must be denied"
+        );
+        assert_eq!(reuse.reason, "receipt_binding_missing");
+    }
+
+    /// YAML roundtrip preserves the TCK-00540 receipt binding fields.
+    #[test]
+    fn yaml_roundtrip_preserves_receipt_binding_fields() {
+        let signer = Signer::generate();
+        let cache = make_signed_cache(&signer);
+
+        let yaml = serde_yaml::to_string(&cache).expect("serialize");
+        let restored: GateCache = serde_yaml::from_str(&yaml).expect("deserialize");
+
+        let entry = restored.gates.get("rustfmt").expect("entry exists");
+        assert!(
+            entry.rfc0028_receipt_bound,
+            "rfc0028 binding must survive roundtrip"
+        );
+        assert!(
+            entry.rfc0029_receipt_bound,
+            "rfc0029 binding must survive roundtrip"
+        );
+        assert!(
+            !entry.legacy_cache_override,
+            "legacy_cache_override must survive roundtrip"
+        );
+    }
+
+    /// Deserializing a legacy YAML entry without TCK-00540 fields defaults to
+    /// `false` (fail-closed).
+    #[test]
+    fn deserialize_legacy_yaml_defaults_to_unbound() {
+        let yaml = r#"
+sha: abc123
+gates:
+  rustfmt:
+    status: PASS
+    duration_secs: 1
+    completed_at: "2024-01-01T00:00:00Z"
+    attestation_digest: "digest-1"
+    evidence_log_digest: "log-digest"
+"#;
+        let cache: GateCache = serde_yaml::from_str(yaml).expect("deserialize legacy YAML");
+        let entry = cache.gates.get("rustfmt").expect("entry exists");
+        assert!(
+            !entry.rfc0028_receipt_bound,
+            "legacy YAML without rfc0028_receipt_bound must default to false"
+        );
+        assert!(
+            !entry.rfc0029_receipt_bound,
+            "legacy YAML without rfc0029_receipt_bound must default to false"
+        );
+        assert!(
+            !entry.legacy_cache_override,
+            "legacy YAML without legacy_cache_override must default to false"
         );
     }
 }
