@@ -1925,6 +1925,7 @@ fn execute_queued_gates_job(
                 None,
                 Some(sbx_hash),
                 Some(net_hash),
+                None, // stop_revoke_admission
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,

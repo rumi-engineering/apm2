@@ -15,6 +15,7 @@ pub use enforcement::{
     RedundancyDeclassificationReceipt, TimingChannelBudget, TokenBindingV1,
     decode_channel_context_token, decode_channel_context_token_with_binding,
     derive_channel_source_witness, issue_channel_context_token,
-    issue_channel_context_token_with_token_binding, validate_channel_boundary,
+    issue_channel_context_token_with_token_binding,
+    issue_channel_context_token_with_token_binding_and_expiry, validate_channel_boundary,
     verify_channel_source_witness,
 };
