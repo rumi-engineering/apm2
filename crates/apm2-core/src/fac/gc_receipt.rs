@@ -104,6 +104,8 @@ pub enum GcActionKind {
     LaneTarget,
     LaneLog,
     GateCache,
+    /// Gate cache v3 (receipt-indexed, TCK-00541).
+    GateCacheV3,
     BlobPrune,
     QuarantinePrune,
     DeniedPrune,

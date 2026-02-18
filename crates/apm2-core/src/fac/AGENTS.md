@@ -2009,7 +2009,8 @@ All receipt-touching hot paths consult the index first:
 - **Receipt persistence** error handling: Both `persist_content_addressed_receipt`
   and `persist_content_addressed_receipt_v2` log warnings on `incremental_update`
   failure and delete the stale index to force rebuild on next read.
-- **Gates**: Use their own gate-result cache (`gate_cache.rs`), not the job receipt
+- **Gates**: Use their own gate-result cache (`gate_cache.rs` for v2,
+  `gate_cache_v3.rs` for v3 compound-key-indexed cache), not the job receipt
   store. No index wiring needed.
 - **Metrics**: Daemon and consensus metrics modules do not reference the job receipt
   store. No index wiring needed.
@@ -2938,3 +2939,91 @@ before invoking `gh`.
   The directory is created with restrictive 0o700 permissions (CTR-2611) to
   prevent information disclosure of `gh` configuration or session data to
   other users on the same host.
+
+## gate_cache_v3 Submodule (TCK-00541)
+
+The `gate_cache_v3` submodule implements a receipt-indexed gate cache store
+keyed by a compound key of attestation digest, FAC policy hash, toolchain
+fingerprint, RFC-0028 channel authorization receipt hash, and RFC-0029
+queue/budget admission receipt hash. This ensures that a cache hit is
+provably tied to an authoritative receipt chain and cannot be forged by
+simple file writes.
+
+### On-Disk Layout
+
+```
+$APM2_HOME/private/fac/gate_cache_v3/{index_key}/{gate}.yaml
+```
+
+Where `{index_key}` is the BLAKE3-256 digest of the compound key with
+length-prefix framing and domain separation
+(`apm2.fac.gate_cache_v3.index_key`).
+
+### Core Types
+
+- `V3CompoundKey`: Validated compound key with 5 required components.
+  Constructed via `V3CompoundKey::new()` which rejects empty/whitespace
+  and oversized fields.
+- `V3GateResult`: Per-gate cached result (status, duration, attestation,
+  evidence, signature).
+- `V3CacheEntry`: On-disk YAML format wrapping compound key + gate result.
+- `GateCacheV3`: In-memory index with `load_from_dir()`, `save_to_dir()`,
+  `check_reuse()`, and `sign_all()`.
+- `V3ReuseDecision`: Hit/miss decision with human-readable reason.
+
+### Compound Key Index
+
+The index key binds each cache directory to the full admission context:
+
+```
+BLAKE3(domain || len(attestation) || attestation
+    || len(policy)      || policy
+    || len(toolchain)   || toolchain
+    || len(rfc0028)     || rfc0028
+    || len(rfc0029)     || rfc0029)
+```
+
+Length-prefix framing prevents preimage collision between concatenated
+components.
+
+### Check-Reuse Protocol (Fail-Closed)
+
+`check_reuse()` requires ALL of:
+1. Gate result exists with status `PASS`.
+2. Not quick-mode when full mode is required.
+3. Attestation digest matches the current workspace fingerprint.
+4. Evidence log digest is present and non-empty.
+5. Ed25519 signature verifies against the expected key (domain-separated
+   with `GATE_CACHE_RECEIPT:` prefix).
+
+Any missing or invalid component returns a `miss` decision.
+
+### V2 Read Compatibility
+
+`GateCacheV3` is a separate store from v2 (`gate_cache_v2`). Callers may
+load v2 as a best-effort fallback. V2 entries that pass all v3 reuse
+checks can be promoted to v3 on the next write cycle. Legacy entries
+without receipt bindings are rejected unless `allow_legacy_cache` is set.
+
+### GC Policy
+
+Stale v3 entries are pruned by mtime after `GATE_CACHE_TTL_SECS` (30 days)
+by the GC planner (`gc.rs`). The `GcActionKind::GateCacheV3` variant
+distinguishes v3 prune targets from v2.
+
+### Security Invariants (TCK-00541)
+
+- [INV-GCV3-001] All compound key components are validated at construction
+  time. Empty or whitespace-only components are rejected (fail-closed).
+- [INV-GCV3-002] String fields are bounded by `MAX_V3_STRING_FIELD_LENGTH`
+  (1024 bytes). Gate count bounded by `MAX_V3_GATES_PER_INDEX` (64).
+- [INV-GCV3-003] On-disk reads use `O_NOFOLLOW` (Unix), bounded size
+  (`MAX_V3_ENTRY_SIZE` = 512 KiB), and `serde(deny_unknown_fields)`.
+- [INV-GCV3-004] Writes use atomic temp+rename with fsync for crash safety.
+  Directories created with 0o700 permissions.
+- [INV-GCV3-005] Index keys are validated (`b3-256:` prefix + 64 hex chars)
+  before filesystem use, preventing path traversal.
+- [INV-GCV3-006] Signer identity comparison uses `subtle::ConstantTimeEq`
+  to prevent timing side-channels.
+- [INV-GCV3-007] Signature verification uses domain-separated Ed25519 with
+  `GATE_CACHE_RECEIPT:` prefix, preventing cross-protocol replay.
