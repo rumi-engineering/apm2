@@ -378,10 +378,10 @@ enqueue attempts that would exceed configured caps.
   `max_pending_bytes`, and optional `per_lane_max_pending_jobs`. Hard cap
   validation via `validate()`. Defaults: 10K jobs, 1 GiB bytes.
 - `PendingQueueSnapshot`: Point-in-time snapshot of the pending queue
-  (`job_count`, `total_bytes`).
+  (`job_count`, `total_bytes`, `truncated`).
 - `QueueBoundsDenialReceipt`: Structured denial evidence carrying dimension,
   current usage, limit, requested increment, and stable reason code.
-- `QueueBoundsDimension`: Enum (`PendingJobs`, `PendingBytes`).
+- `QueueBoundsDimension`: Enum (`PendingJobs`, `PendingBytes`, `ScanTruncated`).
 - `QueueBoundsError`: Error taxonomy with `QueueBoundsExceeded`, `InvalidPolicy`,
   and `ScanFailed` variants.
 
@@ -396,9 +396,13 @@ enqueue attempts that would exceed configured caps.
   proposed enqueue against policy, returns `Ok(snapshot)` or
   `Err(QueueBoundsExceeded)`.
 - Filesystem scan is bounded by `MAX_SCAN_ENTRIES` (100K) to prevent DoS
-  (INV-QB-002).
-- Symlinks are skipped via `symlink_metadata()` to prevent inflation attacks
-  (INV-QB-005).
+  (INV-QB-002). Truncated scans are treated as fail-closed denials with
+  `ScanTruncated` dimension.
+- `pending_dir` is verified not to be a symlink before scanning (INV-QB-006).
+- Symlinks within the directory are skipped via `symlink_metadata()` to prevent
+  inflation attacks (INV-QB-005).
+- Filenames exceeding `MAX_FILENAME_BYTES` (4096) are skipped to bound per-entry
+  memory allocation.
 - Hidden files (starting with `.`) are skipped (temp files from atomic writes).
 - Fail-closed: zero limits deny immediately; unreadable directory denies
   (INV-QB-001).
@@ -406,9 +410,14 @@ enqueue attempts that would exceed configured caps.
 
 ### CLI Integration
 
-- `enqueue_job()` in `apm2-cli/src/commands/fac_queue_submit.rs` calls
-  `check_queue_bounds()` before writing any job spec file. Denial produces a
-  descriptive error with the `queue/quota_exceeded` reason code.
+- `enqueue_job()` in `apm2-cli/src/commands/fac_queue_submit.rs` accepts a
+  `&QueueBoundsPolicy` loaded from the persisted FAC configuration
+  (`FacPolicyV1::queue_bounds_policy`), validates it, and passes it to
+  `check_queue_bounds()`. Denial produces a descriptive error with the
+  `queue/quota_exceeded` reason code and persists a `QueueBoundsDenialReceipt`
+  artifact in the `denied/` directory.
+- `FacPolicyV1` includes a `queue_bounds_policy` field (`serde(default)` for
+  backward compatibility with pre-TCK-00578 policies).
 - Control-lane `stop_revoke` jobs bypass queue bounds (consistent with the
   control-lane exception documented in `fac/mod.rs`).
 
@@ -417,17 +426,24 @@ enqueue attempts that would exceed configured caps.
 - `DenialReasonCode::QueueQuotaExceeded` variant added for receipt chain
   integration.
 - Denial reason code: `queue/quota_exceeded`.
+- Denial receipts are persisted as JSON artifacts in `queue/denied/` when
+  `check_queue_bounds()` returns a quota error.
 
 ### Security Invariants (TCK-00578)
 
 - [INV-QB-001] Fail-closed: unreadable pending directory denies all enqueue
   attempts.
 - [INV-QB-002] Directory scan is bounded by `MAX_SCAN_ENTRIES` to prevent DoS.
+  Truncated scans are treated as fail-closed denials.
 - [INV-QB-003] Denial receipts include dimension, current usage, limit, and
-  stable reason code for audit.
+  stable reason code for audit. Receipts are persisted to `queue/denied/`.
 - [INV-QB-004] Arithmetic uses `checked_add`; overflow returns Err.
 - [INV-QB-005] Symlinks in pending directory are skipped (not counted) to
   prevent inflation attacks.
+- [INV-QB-006] `pending_dir` itself must be a real directory (not a symlink);
+  symlink-swapped queue directories are rejected before scanning.
+- ACKNOWLEDGED TOCTOU (RSK-1501): check-then-write is not atomic; mitigated by
+  single-process broker context. File lock is out of scope per TCK-00578.
 
 ## projection_compromise Submodule
 

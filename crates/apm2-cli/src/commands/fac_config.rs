@@ -19,6 +19,7 @@ use apm2_core::fac::broker_rate_limits::{
 };
 use apm2_core::fac::economics_adoption::EconomicsAdoptionError;
 use apm2_core::fac::execution_backend::{ExecutionBackend, select_backend};
+#[cfg(test)]
 use apm2_core::fac::queue_bounds::QueueBoundsPolicy;
 use apm2_core::fac::{
     CanonicalizerTupleV1, DEFAULT_LANE_COUNT, LaneManager, MAX_LANE_COUNT,
@@ -285,11 +286,37 @@ fn build_config_show_response() -> ConfigShowResponse {
     };
 
     // -- Pending queue bounds (instantaneous caps, TCK-00578) --
-    let default_qb_policy = QueueBoundsPolicy::default();
+    // Load from persisted FAC policy when available; fall back to defaults.
+    let qb_policy = fac_root
+        .as_ref()
+        .and_then(|root| {
+            let policy_path = root.join(POLICY_FILE_RELATIVE_PATH);
+            if policy_path.exists() {
+                match crate::commands::fac_secure_io::read_bounded(
+                    &policy_path,
+                    apm2_core::fac::MAX_POLICY_SIZE,
+                ) {
+                    Ok(bytes) => match apm2_core::fac::deserialize_policy(&bytes) {
+                        Ok(policy) => Some(policy.queue_bounds_policy),
+                        Err(e) => {
+                            warnings.push(format!("queue_bounds_policy: cannot parse policy: {e}"));
+                            None
+                        },
+                    },
+                    Err(e) => {
+                        warnings.push(format!("queue_bounds_policy: cannot read policy: {e}"));
+                        None
+                    },
+                }
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
     let pending_queue_bounds = PendingQueueBoundsInfo {
-        max_pending_jobs: default_qb_policy.max_pending_jobs,
-        max_pending_bytes: default_qb_policy.max_pending_bytes,
-        per_lane_max_pending_jobs: default_qb_policy.per_lane_max_pending_jobs,
+        max_pending_jobs: qb_policy.max_pending_jobs,
+        max_pending_bytes: qb_policy.max_pending_bytes,
+        per_lane_max_pending_jobs: qb_policy.per_lane_max_pending_jobs,
     };
 
     ConfigShowResponse {
