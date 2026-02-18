@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00617"
     title: "Forge admission merge decoupling: local-authoritative merge with clean worktree, PR projection, and signed receipts"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

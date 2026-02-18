@@ -370,8 +370,6 @@ fn run_blocking_evidence_gates(sha: &str) -> Result<QueuedGatesOutcome, String> 
         gate_profile: GateThroughputProfile::Throughput,
         wait_timeout_secs: PUSH_QUEUE_GATES_WAIT_TIMEOUT_SECS,
         require_external_worker: true,
-        // TCK-00540: Push path always enforces fail-closed legacy cache deny.
-        allow_legacy_cache: false,
     };
     let outcome = run_queued_gates_and_collect(&request)?;
     validate_queued_gates_outcome_for_push(sha, outcome)

@@ -5,6 +5,7 @@
 //! bookkeeping.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -2423,12 +2424,6 @@ fn cleanup_merged_branch_local_state_inner(
         git_run_checked_with_git_dir(git_common_dir, args)
     };
 
-    let is_missing_worktree_error = |err: &str| -> bool {
-        let lower = err.to_ascii_lowercase();
-        lower.contains("is not a working tree")
-            || lower.contains("no such file or directory")
-            || lower.contains("does not exist")
-    };
     let is_missing_branch_error = |err: &str| -> bool {
         let lower = err.to_ascii_lowercase();
         lower.contains("branch")
@@ -2436,21 +2431,34 @@ fn cleanup_merged_branch_local_state_inner(
                 || lower.contains("not a valid branch")
                 || lower.contains("unknown revision"))
     };
+    let is_branch_checked_out_error = |err: &str| -> bool {
+        let lower = err.to_ascii_lowercase();
+        lower.contains("branch is currently checked out")
+            || lower.contains("checked out at")
+            || lower.contains("used by worktree at")
+    };
+    if !branch.eq_ignore_ascii_case("main") {
+        let mut branch_delete_error = run_cleanup_git(&["branch", "-D", branch]).err();
 
-    if let Some(worktree_path) = worktree {
-        if let Err(err) = run_cleanup_git(&["worktree", "remove", "--force", worktree_path]) {
-            if is_missing_worktree_error(&err) {
-                // Idempotent cleanup: missing worktree is treated as
-                // already-clean.
-            } else {
-                errors.push(format!(
-                    "failed to remove worktree `{worktree_path}`: {err}"
-                ));
+        // Keep the worktree in place, but detach HEAD if needed so the
+        // feature branch ref can be deleted.
+        if let Some(err) = branch_delete_error.as_ref()
+            && is_branch_checked_out_error(err)
+            && let Some(worktree_path) = worktree
+        {
+            match git_run_checked(Path::new(worktree_path), &["checkout", "--detach"]) {
+                Ok(()) => {
+                    branch_delete_error = run_cleanup_git(&["branch", "-D", branch]).err();
+                },
+                Err(detach_err) => {
+                    errors.push(format!(
+                        "failed to detach worktree `{worktree_path}` before deleting local branch `{branch}`: {detach_err}"
+                    ));
+                },
             }
         }
-    }
-    if !branch.eq_ignore_ascii_case("main") {
-        if let Err(err) = run_cleanup_git(&["branch", "-D", branch]) {
+
+        if let Some(err) = branch_delete_error {
             if is_missing_branch_error(&err) {
                 // Idempotent cleanup: missing branch is treated as
                 // already-clean.
@@ -3015,7 +3023,7 @@ fn project_merge_to_github(
     project_merge_to_github_with(
         merge_dir,
         context,
-        github_projection::close_pr_if_open,
+        github_projection::merge_pr_on_github,
         delete_remote_branch_projection,
         |owner_repo, pr_number, head_sha, decision| {
             project_fac_required_status_for_decision(owner_repo, pr_number, head_sha, decision)
@@ -3024,23 +3032,23 @@ fn project_merge_to_github(
     )
 }
 
-fn project_merge_to_github_with<FClose, FDelete, FStatus, FBody>(
+fn project_merge_to_github_with<FMerge, FDelete, FStatus, FBody>(
     merge_dir: &Path,
     context: &MergeProjectionContext,
-    mut close_pr_fn: FClose,
+    mut merge_pr_fn: FMerge,
     mut delete_remote_branch_fn: FDelete,
     mut project_status_fn: FStatus,
     mut project_pr_body_fn: FBody,
 ) -> Result<(), String>
 where
-    FClose: FnMut(&str, u32) -> Result<(), String>,
+    FMerge: FnMut(&str, u32, &str) -> Result<(), String>,
     FDelete: FnMut(&Path, &str) -> Result<(), String>,
     FStatus: FnMut(&str, u32, &str, &str) -> Result<(), String>,
     FBody: FnMut(&MergeProjectionContext) -> Result<(), String>,
 {
     let mut errors = Vec::new();
-    if let Err(err) = close_pr_fn(&context.owner_repo, context.pr_number) {
-        errors.push(format!("close_pr: {err}"));
+    if let Err(err) = merge_pr_fn(&context.owner_repo, context.pr_number, &context.merge_sha) {
+        errors.push(format!("merge_pr: {err}"));
     }
     if let Err(err) = delete_remote_branch_fn(merge_dir, &context.source_branch) {
         errors.push(format!(
@@ -3209,54 +3217,47 @@ fn replay_pending_merge_projection_for_repo(owner_repo: &str) {
 /// before the merge completes. Running synchronously is safe — the caller
 /// is `finalize_projected_verdict` at the tail of verdict set, so a few
 /// seconds of git fast-forward latency does not block any upstream work.
-fn maybe_auto_merge_if_ready(record: &PrLifecycleRecord, source: &str) {
+fn maybe_auto_merge_if_ready(record: &PrLifecycleRecord, source: &str) -> Result<(), String> {
     if record.pr_state != PrLifecycleState::MergeReady {
-        return;
+        return Ok(());
     }
 
-    maybe_auto_merge_if_ready_inner(record, source);
+    maybe_auto_merge_if_ready_inner(record, source)
 }
 
-fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) {
-    let identity = match projection_store::load_pr_identity(&record.owner_repo, record.pr_number) {
-        Ok(value) => value,
-        Err(err) => {
-            let _ = apply_event(
-                &record.owner_repo,
-                record.pr_number,
-                &record.current_sha,
-                &LifecycleEventKind::MergeFailed {
-                    reason: format!("failed to load identity for auto-merge: {err}"),
-                },
-            );
-            return;
-        },
-    };
-    let Some(identity) = identity else {
-        let _ = apply_event(
+fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) -> Result<(), String> {
+    let persist_merge_failed = |reason: String| -> Result<(), String> {
+        if let Err(event_err) = apply_event(
             &record.owner_repo,
             record.pr_number,
             &record.current_sha,
             &LifecycleEventKind::MergeFailed {
-                reason: "missing identity for auto-merge".to_string(),
+                reason: reason.clone(),
             },
-        );
-        return;
+        ) {
+            return Err(format!(
+                "failed to persist merge_failed lifecycle event for PR #{}: {} (merge error: {reason})",
+                record.pr_number, event_err
+            ));
+        }
+        Err(reason)
+    };
+
+    let identity = match projection_store::load_pr_identity(&record.owner_repo, record.pr_number) {
+        Ok(value) => value,
+        Err(err) => {
+            return persist_merge_failed(format!("failed to load identity for auto-merge: {err}"));
+        },
+    };
+    let Some(identity) = identity else {
+        return persist_merge_failed("missing identity for auto-merge".to_string());
     };
     let Some(branch) = identity
         .branch
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     else {
-        let _ = apply_event(
-            &record.owner_repo,
-            record.pr_number,
-            &record.current_sha,
-            &LifecycleEventKind::MergeFailed {
-                reason: "missing branch in identity for auto-merge".to_string(),
-            },
-        );
-        return;
+        return persist_merge_failed("missing branch in identity for auto-merge".to_string());
     };
 
     let merge_dir = identity
@@ -3273,13 +3274,7 @@ fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) {
     ) {
         Ok(value) => value,
         Err(err) => {
-            let _ = apply_event(
-                &record.owner_repo,
-                record.pr_number,
-                &record.current_sha,
-                &LifecycleEventKind::MergeFailed { reason: err },
-            );
-            return;
+            return persist_merge_failed(err);
         },
     };
 
@@ -3355,6 +3350,10 @@ fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) {
                     "WARNING: local merge completed but projection sinks reported errors for PR #{}: {err}",
                     record.pr_number
                 );
+                let mut surfaced_error = format!(
+                    "local merge completed but projection sinks reported errors for PR #{}: {err}",
+                    record.pr_number
+                );
                 if let Err(event_err) = apply_event(
                     &record.owner_repo,
                     record.pr_number,
@@ -3366,6 +3365,10 @@ fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) {
                     eprintln!(
                         "WARNING: failed to persist projection_failed lifecycle event for PR #{}: {event_err}",
                         record.pr_number
+                    );
+                    let _ = write!(
+                        surfaced_error,
+                        "; additionally failed to persist projection_failed lifecycle event: {event_err}"
                     );
                 }
                 if let Err(persist_err) = save_merge_projection_pending(
@@ -3380,7 +3383,13 @@ fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) {
                         "WARNING: failed to persist pending merge projection record for PR #{}: {persist_err}",
                         record.pr_number
                     );
+                    let _ = write!(
+                        surfaced_error,
+                        "; additionally failed to persist pending merge projection record: {persist_err}"
+                    );
                 }
+                cleanup_merged_branch_local_state(&merge_dir, branch, identity.worktree.as_deref());
+                return Err(surfaced_error);
             } else if let Err(err) = projection_store::clear_merge_projection_pending(
                 &record.owner_repo,
                 record.pr_number,
@@ -3392,22 +3401,9 @@ fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) {
                 );
             }
             cleanup_merged_branch_local_state(&merge_dir, branch, identity.worktree.as_deref());
+            Ok(())
         },
-        Err(err) => {
-            if let Err(event_err) = apply_event(
-                &record.owner_repo,
-                record.pr_number,
-                &record.current_sha,
-                &LifecycleEventKind::MergeFailed {
-                    reason: err.clone(),
-                },
-            ) {
-                eprintln!(
-                    "WARNING: failed to persist merge_failed lifecycle event for PR #{}: {} (merge error: {err})",
-                    record.pr_number, event_err
-                );
-            }
-        },
+        Err(err) => persist_merge_failed(err),
     }
 }
 
@@ -3678,7 +3674,8 @@ fn finalize_projected_verdict(
         }
     }
 
-    maybe_auto_merge_if_ready(&reduced, auto_source.unwrap_or("explicit_verdict_set"));
+    let auto_merge_result =
+        maybe_auto_merge_if_ready(&reduced, auto_source.unwrap_or("explicit_verdict_set"));
 
     let authority = TerminationAuthority::new(
         &projected.owner_repo,
@@ -3693,7 +3690,7 @@ fn finalize_projected_verdict(
     );
     let home = apm2_home_dir()?;
     dispatch::write_completion_receipt_for_verdict(&home, &authority, &projected.decision)?;
-    Ok(())
+    auto_merge_result
 }
 
 fn finalize_auto_verdict_candidate(
@@ -5740,7 +5737,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_merged_branch_local_state_removes_worktree_and_branch() {
+    fn cleanup_merged_branch_local_state_preserves_worktree_and_deletes_branch() {
         let temp = init_git_repo_for_merge_tests();
         let dir = temp.path();
         let ticket_worktree = dir.join("ticket-cleanup-wt");
@@ -5761,17 +5758,28 @@ mod tests {
             .expect("write cleanup worktree change");
         git_checked(&ticket_worktree, &["add", "README.md"]);
         git_checked(&ticket_worktree, &["commit", "-m", "cleanup worktree"]);
+        fs::create_dir_all(ticket_worktree.join("target"))
+            .expect("create target directory for cleanup");
+        fs::write(
+            ticket_worktree.join("target").join("artifact.bin"),
+            "artifact",
+        )
+        .expect("write target artifact");
 
         cleanup_merged_branch_local_state_inner(
             &ticket_worktree,
             "ticket/cleanup-local-state",
             Some(&ticket_worktree_str),
         )
-        .expect("cleanup should remove feature worktree and branch");
+        .expect("cleanup should preserve worktree and delete branch");
 
         assert!(
-            !ticket_worktree.exists(),
-            "feature worktree directory should be removed after cleanup"
+            ticket_worktree.exists(),
+            "feature worktree directory should remain after cleanup"
+        );
+        assert!(
+            !ticket_worktree.join("target").exists(),
+            "feature worktree target directory should be removed after cleanup"
         );
         let branch_exists = Command::new("git")
             .args([
@@ -5811,10 +5819,10 @@ mod tests {
         project_merge_to_github_with(
             merge_dir,
             &context,
-            |owner_repo, pr_number| {
+            |owner_repo, pr_number, sha| {
                 calls
                     .borrow_mut()
-                    .push(format!("close_pr:{owner_repo}:{pr_number}"));
+                    .push(format!("merge_pr:{owner_repo}:{pr_number}:{sha}"));
                 Ok(())
             },
             |dir, branch| {
@@ -5841,7 +5849,8 @@ mod tests {
         assert_eq!(
             calls.into_inner(),
             vec![
-                "close_pr:guardian-intelligence/apm2:735".to_string(),
+                "merge_pr:guardian-intelligence/apm2:735:0123456789abcdef0123456789abcdef01234567"
+                    .to_string(),
                 "delete_remote_branch:/tmp/apm2-merge-projection:ticket/RFC-0019/TCK-00617"
                     .to_string(),
                 "commit_status:guardian-intelligence/apm2:735:0123456789abcdef0123456789abcdef01234567:approve"
@@ -5872,9 +5881,9 @@ mod tests {
         let err = project_merge_to_github_with(
             merge_dir,
             &context,
-            |_, _| {
-                calls.borrow_mut().push("close");
-                Err("close failed".to_string())
+            |_, _, _| {
+                calls.borrow_mut().push("merge");
+                Err("merge failed".to_string())
             },
             |_, _| {
                 calls.borrow_mut().push("delete");
@@ -5893,9 +5902,9 @@ mod tests {
 
         assert_eq!(
             calls.into_inner(),
-            vec!["close", "delete", "status", "body"]
+            vec!["merge", "delete", "status", "body"]
         );
-        assert!(err.contains("close_pr: close failed"));
+        assert!(err.contains("merge_pr: merge failed"));
         assert!(err.contains("delete_remote_branch `ticket/RFC-0019/TCK-00617`: delete failed"));
         assert!(err.contains("pr_body: body failed"));
     }
