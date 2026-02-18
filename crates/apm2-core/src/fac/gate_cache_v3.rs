@@ -19,10 +19,11 @@
 //! - RFC-0028/0029 receipt bindings are mandatory for reuse in default mode.
 //! - Unknown/corrupt entries are rejected (never treated as hits).
 //!
-//! # V2 Read Compatibility (Informational Only — No Reuse)
+//! # V2 Read Compatibility (Diagnostic / Migration Only — Never in Evidence Pipeline)
 //!
-//! The v3 cache can read from v2 directories for informational display, but
-//! v2-sourced entries are **never reusable** for gate verdict decisions.
+//! `load_from_v2_dir` can read from v2 directories for diagnostic or
+//! migration tooling, but v2-sourced entries are **never reusable** for
+//! gate verdict decisions and are **never loaded by the evidence pipeline**.
 //!
 //! [INV-GCV3-001] V2 entries lack cryptographic proof of RFC-0028/0029
 //! binding continuity: they were signed under the v2 schema which does not
@@ -31,7 +32,8 @@
 //! Allowing v2 entries to satisfy v3 reuse would let stale PASS decisions
 //! propagate across authority-context drift.
 //!
-//! `check_reuse` enforces this by returning
+//! The evidence pipeline (`evidence.rs`) uses only `load_from_dir` (native
+//! v3). As defense-in-depth, `check_reuse` also returns
 //! `miss("v2_sourced_no_binding_proof")` for any cache loaded via
 //! `load_from_v2_dir`.
 //!
@@ -779,7 +781,7 @@ impl GateCacheV3 {
         }
     }
 
-    /// Best-effort fallback: load gate results from a v2 cache directory.
+    /// Diagnostic/migration-only: load gate results from a v2 cache directory.
     ///
     /// V2 entries live at `v2_root / {sha} / {gate}.yaml`. They lack
     /// compound-key binding (no policy hash, no toolchain fingerprint, no
@@ -794,8 +796,13 @@ impl GateCacheV3 {
     /// v2-sourced caches to prevent stale PASS decisions from propagating
     /// across authority-context drift.
     ///
-    /// This method is called when `load_from_dir` returns `None` (v3 miss).
-    /// V2 entries are never written by v3 code -- read-only fallback only.
+    /// # Usage restriction
+    ///
+    /// This method is for diagnostic or migration tooling **only**. The
+    /// evidence pipeline (`evidence.rs`) must NOT call this method; it
+    /// uses `load_from_dir` (native v3) exclusively. Loading v2 entries
+    /// into a v3 compound-key context without cryptographic binding creates
+    /// a structural gap even if `check_reuse` denies reuse.
     ///
     /// Returns `None` if the v2 SHA directory does not exist or contains no
     /// valid entries.
@@ -877,13 +884,25 @@ impl GateCacheV3 {
         serde_yaml::from_str(&content).ok()
     }
 
-    /// Write the v3 gate cache to disk atomically.
+    /// Write the v3 gate cache to disk atomically under an exclusive lock.
     ///
     /// Creates one YAML file per gate under `root / {index_key} / {gate}.yaml`.
     /// Uses atomic directory write: all files are written to a temporary
     /// staging directory, then the staging directory is renamed over the
     /// final path. This ensures a crash mid-write never leaves a
     /// partially-updated index.
+    ///
+    /// # Concurrency: per-index lock file
+    ///
+    /// An exclusive `flock` is held on `root/.{index_key}.lock` for the
+    /// duration of the write. This serializes concurrent FAC runs targeting
+    /// the same compound key, preventing last-writer-wins clobber.
+    ///
+    /// - **What is protected**: the index directory at `root/{index_key}/`.
+    /// - **Who can mutate**: only the holder of the exclusive flock.
+    /// - **Lock ordering**: single lock per index key; no nested locks.
+    /// - **Happens-before**: `flock(LOCK_EX)` acquisition happens-after the
+    ///   previous holder's `close(fd)`.
     ///
     /// Cross-device rename is handled gracefully by falling back to per-file
     /// temp+rename when same-filesystem rename fails.
@@ -907,6 +926,29 @@ impl GateCacheV3 {
             context: format!("create v3 cache root {}", root.display()),
             source: err.to_string(),
         })?;
+
+        // Acquire exclusive lock for this index key. The lock file lives at
+        // `root/.{index_key}.lock` and is held for the entire write operation.
+        // Drop of `_lock_guard` releases the flock.
+        let lock_path = root.join(format!(".{index_key}.lock"));
+        let _lock_guard = {
+            let lock_file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|err| GateCacheV3Error::Io {
+                    context: format!("open v3 cache lock file {}", lock_path.display()),
+                    source: err.to_string(),
+                })?;
+            super::flock_util::acquire_exclusive_blocking(&lock_file).map_err(|err| {
+                GateCacheV3Error::Io {
+                    context: format!("acquire lock on {}", lock_path.display()),
+                    source: err.to_string(),
+                }
+            })?;
+            lock_file
+        };
 
         // Clean up any leftover staging dir from a prior crash.
         if staging_dir.exists() {
@@ -954,53 +996,7 @@ impl GateCacheV3 {
             }
         }
 
-        // Atomic swap: remove old directory (if any) then rename staging -> final.
-        // On same-filesystem this is atomic at the directory level.
-        if final_dir.exists() {
-            // Move old dir out of the way first (best-effort).
-            let old_name = format!(".{index_key}.old.{}", std::process::id());
-            let old_dir = root.join(&old_name);
-            if std::fs::rename(&final_dir, &old_dir).is_ok() {
-                // Rename staging to final.
-                if let Err(err) = std::fs::rename(&staging_dir, &final_dir) {
-                    // Restore old dir on failure.
-                    let _ = std::fs::rename(&old_dir, &final_dir);
-                    let _ = std::fs::remove_dir_all(&staging_dir);
-                    return Err(GateCacheV3Error::Io {
-                        context: format!(
-                            "rename staging dir {} -> {}",
-                            staging_dir.display(),
-                            final_dir.display()
-                        ),
-                        source: err.to_string(),
-                    });
-                }
-                // Clean up old dir.
-                let _ = std::fs::remove_dir_all(&old_dir);
-            } else {
-                // Cross-device: fall back to removing final dir then renaming.
-                let _ = std::fs::remove_dir_all(&final_dir);
-                std::fs::rename(&staging_dir, &final_dir).map_err(|err| GateCacheV3Error::Io {
-                    context: format!(
-                        "rename staging dir {} -> {}",
-                        staging_dir.display(),
-                        final_dir.display()
-                    ),
-                    source: err.to_string(),
-                })?;
-            }
-        } else {
-            std::fs::rename(&staging_dir, &final_dir).map_err(|err| GateCacheV3Error::Io {
-                context: format!(
-                    "rename staging dir {} -> {}",
-                    staging_dir.display(),
-                    final_dir.display()
-                ),
-                source: err.to_string(),
-            })?;
-        }
-
-        Ok(())
+        atomic_swap_dirs(root, &staging_dir, &final_dir, &index_key)
     }
 
     /// Read a single v3 cache entry from disk with bounded I/O.
@@ -1030,6 +1026,67 @@ impl GateCacheV3 {
         }
         serde_yaml::from_str(&content).ok()
     }
+}
+
+// =============================================================================
+// Atomic Directory Swap
+// =============================================================================
+
+/// Atomically swap a staging directory into the final target path.
+///
+/// If the target directory already exists, it is renamed aside before the
+/// staging directory takes its place. On cross-device rename failure, falls
+/// back to remove-then-rename.
+fn atomic_swap_dirs(
+    root: &std::path::Path,
+    staging_dir: &std::path::Path,
+    final_dir: &std::path::Path,
+    index_key: &str,
+) -> Result<(), GateCacheV3Error> {
+    if final_dir.exists() {
+        // Move old dir out of the way first (best-effort).
+        let old_name = format!(".{index_key}.old.{}", std::process::id());
+        let old_dir = root.join(&old_name);
+        if std::fs::rename(final_dir, &old_dir).is_ok() {
+            // Rename staging to final.
+            if let Err(err) = std::fs::rename(staging_dir, final_dir) {
+                // Restore old dir on failure.
+                let _ = std::fs::rename(&old_dir, final_dir);
+                let _ = std::fs::remove_dir_all(staging_dir);
+                return Err(GateCacheV3Error::Io {
+                    context: format!(
+                        "rename staging dir {} -> {}",
+                        staging_dir.display(),
+                        final_dir.display()
+                    ),
+                    source: err.to_string(),
+                });
+            }
+            // Clean up old dir.
+            let _ = std::fs::remove_dir_all(&old_dir);
+        } else {
+            // Cross-device: fall back to removing final dir then renaming.
+            let _ = std::fs::remove_dir_all(final_dir);
+            std::fs::rename(staging_dir, final_dir).map_err(|err| GateCacheV3Error::Io {
+                context: format!(
+                    "rename staging dir {} -> {}",
+                    staging_dir.display(),
+                    final_dir.display()
+                ),
+                source: err.to_string(),
+            })?;
+        }
+    } else {
+        std::fs::rename(staging_dir, final_dir).map_err(|err| GateCacheV3Error::Io {
+            context: format!(
+                "rename staging dir {} -> {}",
+                staging_dir.display(),
+                final_dir.display()
+            ),
+            source: err.to_string(),
+        })?;
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -1866,6 +1923,84 @@ mod tests {
         assert!(
             !cache.is_v2_sourced(),
             "newly constructed cache must not be v2-sourced"
+        );
+    }
+
+    // =========================================================================
+    // Lock File Tests (CODE-QUALITY MINOR fix)
+    // =========================================================================
+
+    /// Verify that `save_to_dir` creates a lock file for the index key.
+    #[test]
+    fn save_creates_lock_file() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let root = dir.path().join("gate_cache_v3");
+
+        let signer = Signer::generate();
+        let cache = make_signed_v3(&signer);
+        cache.save_to_dir(&root).expect("save");
+
+        let index_key = cache.compound_key.compute_index_key();
+        let lock_path = root.join(format!(".{index_key}.lock"));
+        assert!(lock_path.exists(), "lock file must be created during save");
+    }
+
+    /// Verify that concurrent saves to the same index key are serialized by
+    /// the lock file protocol (no clobber).
+    ///
+    /// This test uses two threads writing different gate sets to the same
+    /// compound key. After both complete, the loaded cache must contain
+    /// exactly the gates from one of the two writers (no interleaving).
+    #[test]
+    fn concurrent_saves_serialized_by_lock() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let root = dir.path().join("gate_cache_v3");
+        std::fs::create_dir_all(&root).expect("mkdir");
+
+        let key = sample_compound_key();
+
+        // Writer A: gates "alpha"
+        let root_a = root.clone();
+        let key_a = key.clone();
+        let handle_a = std::thread::spawn(move || {
+            let signer = Signer::generate();
+            let mut cache = GateCacheV3::new("sha-concurrent", key_a).expect("new");
+            cache.set("alpha", sample_gate_result()).expect("set");
+            cache.sign_all(&signer);
+            cache.save_to_dir(&root_a).expect("save A");
+        });
+
+        // Writer B: gates "beta"
+        let root_b = root.clone();
+        let key_b = key.clone();
+        let handle_b = std::thread::spawn(move || {
+            let signer = Signer::generate();
+            let mut cache = GateCacheV3::new("sha-concurrent", key_b).expect("new");
+            cache.set("beta", sample_gate_result()).expect("set");
+            cache.sign_all(&signer);
+            cache.save_to_dir(&root_b).expect("save B");
+        });
+
+        handle_a.join().expect("thread A");
+        handle_b.join().expect("thread B");
+
+        // The loaded cache must be a consistent snapshot from one writer.
+        let loaded = GateCacheV3::load_from_dir(&root, "sha-concurrent", &key)
+            .expect("must load after concurrent saves");
+        assert_eq!(
+            loaded.gates.len(),
+            1,
+            "one writer must win; no interleaving of gate sets"
+        );
+        let has_alpha = loaded.get("alpha").is_some();
+        let has_beta = loaded.get("beta").is_some();
+        assert!(
+            has_alpha || has_beta,
+            "loaded cache must have gates from exactly one writer"
+        );
+        assert!(
+            !(has_alpha && has_beta),
+            "loaded cache must NOT have gates from both writers"
         );
     }
 }

@@ -367,26 +367,26 @@ fn cache_v3_root() -> Option<std::path::PathBuf> {
     Some(apm2_home.join("private/fac/gate_cache_v3"))
 }
 
-fn cache_v2_root() -> Option<std::path::PathBuf> {
-    let apm2_home = apm2_core::github::resolve_apm2_home()?;
-    Some(apm2_home.join("private/fac/gate_cache_v2"))
-}
+// cache_v2_root removed: v2 fallback loading disabled in evidence pipeline
+// ([INV-GCV3-001] TCK-00541 MAJOR security fix round 4). V2 entries lack
+// RFC-0028/0029 binding proof and cannot satisfy v3 compound-key continuity.
 
-/// Try to reuse from v3 cache first; v2 fallback is disabled for security.
+/// Try to reuse from v3 cache; v2 is structurally excluded.
 ///
 /// Returns a unified `ReuseDecision` that can be used by the evidence flow.
 /// When v3 hits, the v3 decision reason is used.
 ///
-/// # Security: V2 fallback disabled for reuse (TCK-00541 MAJOR fix)
+/// # Security: V2 structurally excluded (TCK-00541 MAJOR fix round 4)
 ///
 /// [INV-GCV3-001] V2 entries lack RFC-0028/0029 binding proof and cannot
-/// satisfy v3 compound-key continuity requirements. When a v3 compound key
-/// is available (meaning v3 binding enforcement is active), v2 fallback
-/// is unconditionally disabled for reuse decisions to prevent stale PASS
-/// decisions from propagating across authority-context drift.
+/// satisfy v3 compound-key continuity requirements. As of round 4, v2
+/// entries are no longer loaded into `v3_cache_loaded` at all: the
+/// evidence pipeline uses `GateCacheV3::load_from_dir` only (native v3).
+/// The `_v2_cache` parameter is retained for the v2 fallback miss path
+/// but v2 entries never reach `check_reuse`.
 ///
-/// V2 entries may still be loaded for informational/display purposes but
-/// will never produce a reusable `ReuseDecision`.
+/// Defense-in-depth: even if a v2-sourced `GateCacheV3` were passed here,
+/// `check_reuse` would deny via `v2_sourced_no_binding_proof`.
 fn reuse_decision_with_v3_fallback(
     v3_cache: Option<&GateCacheV3>,
     _v2_cache: Option<&GateCache>,
@@ -1783,7 +1783,12 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 .expect("guarded by cache_reuse_active");
             let attestation_digest =
                 gate_attestation_digest(workspace_root, sha, gate_name, None, reuse_grp);
-            let reuse = reuse_decision_for_gate(
+            // [INV-GCV3-001] V2-only reuse disabled. Pass None for v3
+            // cache since this path does not load v3 infrastructure.
+            // This ensures fail-closed: gates always re-execute in the
+            // non-status path until v3 cache is wired in.
+            let reuse = reuse_decision_with_v3_fallback(
+                None,
                 cached_gate_cache.as_ref(),
                 gate_name,
                 attestation_digest.as_deref(),
@@ -1904,7 +1909,12 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 .expect("guarded by cache_reuse_active");
             let attestation_digest =
                 gate_attestation_digest(workspace_root, sha, gate_name, None, reuse_grp);
-            let reuse = reuse_decision_for_gate(
+            // [INV-GCV3-001] V2-only reuse disabled. Pass None for v3
+            // cache since this path does not load v3 infrastructure.
+            // This ensures fail-closed: gates always re-execute in the
+            // non-status path until v3 cache is wired in.
+            let reuse = reuse_decision_with_v3_fallback(
+                None,
                 cached_gate_cache.as_ref(),
                 gate_name,
                 attestation_digest.as_deref(),
@@ -2024,7 +2034,10 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 Some(&test_command_override),
                 reuse_grp,
             );
-            let reuse = reuse_decision_for_gate(
+            // [INV-GCV3-001] V2-only reuse disabled. Pass None for v3
+            // cache since this path does not load v3 infrastructure.
+            let reuse = reuse_decision_with_v3_fallback(
+                None,
                 cached_gate_cache.as_ref(),
                 "test",
                 attestation_digest.as_deref(),
@@ -2158,7 +2171,12 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 .expect("guarded by cache_reuse_active");
             let attestation_digest =
                 gate_attestation_digest(workspace_root, sha, gate_name, None, reuse_grp);
-            let reuse = reuse_decision_for_gate(
+            // [INV-GCV3-001] V2-only reuse disabled. Pass None for v3
+            // cache since this path does not load v3 infrastructure.
+            // This ensures fail-closed: gates always re-execute in the
+            // non-status path until v3 cache is wired in.
+            let reuse = reuse_decision_with_v3_fallback(
+                None,
                 cached_gate_cache.as_ref(),
                 gate_name,
                 attestation_digest.as_deref(),
@@ -2330,14 +2348,15 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         &pipeline_test_command.network_policy_hash,
     );
     let v3_root = cache_v3_root();
-    let v2_root = cache_v2_root();
+    // [INV-GCV3-001] V2 fallback loading removed from evidence pipeline.
+    // V2 entries lack RFC-0028/0029 binding proof and cannot satisfy v3
+    // compound-key continuity. Loading v2 entries into a GateCacheV3
+    // assigned the current compound key without cryptographic binding,
+    // creating a structural gap even though check_reuse denied reuse.
+    // The evidence pipeline now only loads native v3 entries.
     let v3_cache_loaded = v3_compound_key.as_ref().and_then(|ck| {
         let root = v3_root.as_deref()?;
-        GateCacheV3::load_from_dir(root, sha, ck).or_else(|| {
-            // V2 fallback: try loading from v2 directory.
-            let v2r = v2_root.as_deref()?;
-            GateCacheV3::load_from_v2_dir(v2r, sha, ck)
-        })
+        GateCacheV3::load_from_dir(root, sha, ck)
     });
     // Create a mutable v3 cache for new gate results (writes only to v3).
     let mut v3_gate_cache = v3_compound_key
@@ -3828,6 +3847,8 @@ mod tests {
                 log_path: Some("/tmp/v2-path.log".to_string()),
                 signature_hex: None,
                 signer_id: None,
+                rfc0028_receipt_bound: false,
+                rfc0029_receipt_bound: false,
             },
         );
 
@@ -3905,6 +3926,8 @@ mod tests {
             log_path: Some("/tmp/v2-fallback.log".to_string()),
             signature_hex: None,
             signer_id: None,
+            rfc0028_receipt_bound: false,
+            rfc0029_receipt_bound: false,
         };
         v2_result.sign(&signer, "test-sha-789", "doc");
         v2_cache.gates.insert("doc".to_string(), v2_result);

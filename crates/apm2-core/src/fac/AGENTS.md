@@ -3014,13 +3014,18 @@ v2 entries from `gate_cache_v2/{sha}/{gate}.yaml` (schema
 constraints as v3 reads (`MAX_V3_ENTRY_SIZE`, `O_NOFOLLOW` on Unix).
 
 Callers (e.g., `evidence.rs`) use `reuse_decision_with_v3_fallback()`
-which tries v3 first, then falls back to v2 entries. V2 results promoted
-to v3 are signed and persisted in `finalize_status_gate_run()`.
+which tries v3 only. As of round 4, v2 fallback loading is removed from
+the evidence pipeline: `v3_cache_loaded` uses `load_from_dir` only
+(native v3). `load_from_v2_dir()` exists for diagnostic/migration
+tooling only and must NOT be called from the evidence pipeline.
 
-### Atomic Multi-File Write
+### Atomic Multi-File Write with Lock
 
 `save_to_dir()` returns `Result<(), GateCacheV3Error>` and uses an atomic
-staging pattern:
+staging pattern under an exclusive `flock`:
+
+0. Acquires exclusive `flock(LOCK_EX)` on `root/.{index_key}.lock`
+   (blocking — serializes concurrent writers targeting the same key).
 1. Creates a staging directory (`{target}_staging_{random}`) with 0o700
    permissions.
 2. Writes all gate YAML files into the staging directory with fsync.
@@ -3031,9 +3036,11 @@ staging pattern:
 5. Cleans up the old directory on success.
 6. On cross-device rename failure, falls back to recursive copy +
    cleanup.
+7. Lock released on drop of the lock file handle.
 
 This ensures that a crash at any point leaves either the old complete
-cache or the new complete cache, never a partial write.
+cache or the new complete cache, never a partial write. The per-index
+lock prevents concurrent FAC runs from clobbering each other's writes.
 
 ### Error Types
 
@@ -3052,17 +3059,22 @@ distinguishes v3 prune targets from v2.
 
 ### Security Invariants (TCK-00541)
 
-- [INV-GCV3-001] **V2-sourced entries are never reusable for gate verdict
-  decisions.** V2 entries lack cryptographic proof of RFC-0028/0029 binding
-  continuity: they were signed under the v2 schema which does not include
-  policy hash, toolchain fingerprint, or receipt hashes. The compound key
-  is assigned by the loader, not cryptographically bound at production time.
-  `check_reuse()` unconditionally returns
+- [INV-GCV3-001] **V2-sourced entries are structurally excluded from the
+  evidence pipeline and never reusable.** V2 entries lack cryptographic
+  proof of RFC-0028/0029 binding continuity: they were signed under the
+  v2 schema which does not include policy hash, toolchain fingerprint,
+  or receipt hashes. The compound key is assigned by the loader, not
+  cryptographically bound at production time.
+  **Primary defense (structural)**: the evidence pipeline (`evidence.rs`)
+  uses only `GateCacheV3::load_from_dir()` (native v3). V2 entries are
+  never loaded into `v3_cache_loaded`. `load_from_v2_dir()` exists for
+  diagnostic/migration tooling only and must NOT be called from the
+  evidence pipeline.
+  **Defense-in-depth**: `check_reuse()` unconditionally returns
   `miss("v2_sourced_no_binding_proof")` for any cache loaded via
-  `load_from_v2_dir()`. The `reuse_decision_with_v3_fallback()` function
-  in the evidence pipeline also disables direct v2 fallback for reuse
-  decisions (`miss("v3_miss_v2_fallback_disabled")`). This prevents stale
-  PASS decisions from propagating across authority-context drift.
+  `load_from_v2_dir()`. `reuse_decision_with_v3_fallback()` returns
+  `miss("v3_miss_v2_fallback_disabled")` when v3 misses. This prevents
+  stale PASS decisions from propagating across authority-context drift.
 - [INV-GCV3-002] All compound key components are validated at construction
   time. Empty or whitespace-only components are rejected (fail-closed).
 - [INV-GCV3-003] String fields are bounded by `MAX_V3_STRING_FIELD_LENGTH`
@@ -3071,7 +3083,9 @@ distinguishes v3 prune targets from v2.
   (`MAX_V3_ENTRY_SIZE` = 512 KiB), and `serde(deny_unknown_fields)`.
 - [INV-GCV3-005] Writes use atomic staging-directory+rename pattern for
   crash safety (no partial writes). Directories created with 0o700
-  permissions.
+  permissions. Concurrent writers are serialized by an exclusive
+  `flock(LOCK_EX)` on `root/.{index_key}.lock`, preventing
+  last-writer-wins clobber across parallel FAC runs.
 - [INV-GCV3-006] Index keys are validated (`b3-256:` prefix + 64 hex chars)
   before filesystem use, preventing path traversal.
 - [INV-GCV3-007] Signer identity comparison uses `subtle::ConstantTimeEq`
