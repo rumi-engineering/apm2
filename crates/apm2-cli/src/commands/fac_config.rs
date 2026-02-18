@@ -19,6 +19,8 @@ use apm2_core::fac::broker_rate_limits::{
 };
 use apm2_core::fac::economics_adoption::EconomicsAdoptionError;
 use apm2_core::fac::execution_backend::{ExecutionBackend, select_backend};
+#[cfg(test)]
+use apm2_core::fac::queue_bounds::QueueBoundsPolicy;
 use apm2_core::fac::{
     CanonicalizerTupleV1, DEFAULT_LANE_COUNT, LaneManager, MAX_LANE_COUNT,
     load_admitted_economics_profile_root, load_admitted_policy_root, read_boundary_id,
@@ -102,6 +104,9 @@ struct ConfigShowResponse {
     /// Queue bounds from broker rate-limit constants.
     pub queue_bounds: QueueBoundsInfo,
 
+    /// Pending queue bounds (TCK-00578): instantaneous job/byte caps.
+    pub pending_queue_bounds: PendingQueueBoundsInfo,
+
     /// Errors encountered during introspection (non-fatal; included for
     /// operator diagnostics).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -128,6 +133,19 @@ struct QueueBoundsInfo {
     pub queue_enqueue_ops_limit: u64,
     /// Maximum queue bytes per budget window.
     pub queue_bytes_limit: u64,
+}
+
+/// Pending queue bounds from queue bounds policy (TCK-00578).
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingQueueBoundsInfo {
+    /// Maximum number of jobs in `queue/pending/`.
+    pub max_pending_jobs: u64,
+    /// Maximum total bytes of job spec files in `queue/pending/`.
+    pub max_pending_bytes: u64,
+    /// Optional per-lane maximum pending jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_lane_max_pending_jobs: Option<u64>,
 }
 
 // =============================================================================
@@ -260,11 +278,45 @@ fn build_config_show_response() -> ConfigShowResponse {
     let lane_count = LaneManager::lane_count();
     let lane_ids = LaneManager::default_lane_ids();
 
-    // -- Queue bounds --
+    // -- Queue bounds (rate-limit window) --
     let queue_bounds = QueueBoundsInfo {
         token_issuance_limit: MAX_TOKEN_ISSUANCE_LIMIT,
         queue_enqueue_ops_limit: MAX_QUEUE_ENQUEUE_LIMIT,
         queue_bytes_limit: MAX_QUEUE_BYTES_LIMIT,
+    };
+
+    // -- Pending queue bounds (instantaneous caps, TCK-00578) --
+    // Load from persisted FAC policy when available; fall back to defaults.
+    let qb_policy = fac_root
+        .as_ref()
+        .and_then(|root| {
+            let policy_path = root.join(POLICY_FILE_RELATIVE_PATH);
+            if policy_path.exists() {
+                match crate::commands::fac_secure_io::read_bounded(
+                    &policy_path,
+                    apm2_core::fac::MAX_POLICY_SIZE,
+                ) {
+                    Ok(bytes) => match apm2_core::fac::deserialize_policy(&bytes) {
+                        Ok(policy) => Some(policy.queue_bounds_policy),
+                        Err(e) => {
+                            warnings.push(format!("queue_bounds_policy: cannot parse policy: {e}"));
+                            None
+                        },
+                    },
+                    Err(e) => {
+                        warnings.push(format!("queue_bounds_policy: cannot read policy: {e}"));
+                        None
+                    },
+                }
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+    let pending_queue_bounds = PendingQueueBoundsInfo {
+        max_pending_jobs: qb_policy.max_pending_jobs,
+        max_pending_bytes: qb_policy.max_pending_bytes,
+        per_lane_max_pending_jobs: qb_policy.per_lane_max_pending_jobs,
     };
 
     ConfigShowResponse {
@@ -278,6 +330,7 @@ fn build_config_show_response() -> ConfigShowResponse {
         lane_count,
         lane_ids,
         queue_bounds,
+        pending_queue_bounds,
         warnings,
     }
 }
@@ -361,6 +414,23 @@ fn print_human_readable(response: &ConfigShowResponse) {
         response.queue_bounds.queue_bytes_limit as f64 / (1024.0 * 1024.0 * 1024.0)
     );
 
+    // Pending queue bounds (TCK-00578)
+    println!();
+    println!("  Pending Queue Bounds:");
+    println!(
+        "    max_pending_jobs:         {}",
+        response.pending_queue_bounds.max_pending_jobs
+    );
+    println!(
+        "    max_pending_bytes:        {} ({:.1} GiB)",
+        response.pending_queue_bounds.max_pending_bytes,
+        response.pending_queue_bounds.max_pending_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+    match response.pending_queue_bounds.per_lane_max_pending_jobs {
+        Some(limit) => println!("    per_lane_max_pending_jobs: {limit}"),
+        None => println!("    per_lane_max_pending_jobs: <not configured>"),
+    }
+
     // Warnings
     if !response.warnings.is_empty() {
         println!();
@@ -424,6 +494,10 @@ mod tests {
         assert!(obj.contains_key("lane_count"), "missing lane_count");
         assert!(obj.contains_key("lane_ids"), "missing lane_ids");
         assert!(obj.contains_key("queue_bounds"), "missing queue_bounds");
+        assert!(
+            obj.contains_key("pending_queue_bounds"),
+            "missing pending_queue_bounds"
+        );
     }
 
     /// Canonicalizer tuple digest must follow the `b3-256:<hex>` format.
@@ -481,6 +555,25 @@ mod tests {
         assert_eq!(
             response.queue_bounds.queue_bytes_limit,
             MAX_QUEUE_BYTES_LIMIT
+        );
+    }
+
+    /// Pending queue bounds must reflect the default `QueueBoundsPolicy`.
+    #[test]
+    fn pending_queue_bounds_match_default_policy() {
+        let response = build_config_show_response();
+        let default_policy = QueueBoundsPolicy::default();
+        assert_eq!(
+            response.pending_queue_bounds.max_pending_jobs,
+            default_policy.max_pending_jobs
+        );
+        assert_eq!(
+            response.pending_queue_bounds.max_pending_bytes,
+            default_policy.max_pending_bytes
+        );
+        assert_eq!(
+            response.pending_queue_bounds.per_lane_max_pending_jobs,
+            default_policy.per_lane_max_pending_jobs
         );
     }
 

@@ -367,12 +367,19 @@ fn prepare_queued_gates_job(
         &boundary_id,
         &mut broker,
         &job_spec_policy,
+        fac_policy.allowed_intents.as_deref(),
     )
     .map_err(|err| format!("cannot build gates job spec: {err}"))?;
 
     let queue_root =
         resolve_queue_root().map_err(|err| format!("cannot resolve queue root: {err}"))?;
-    enqueue_job(&queue_root, &spec).map_err(|err| format!("failed to enqueue gates job: {err}"))?;
+    enqueue_job(
+        &queue_root,
+        &fac_root,
+        &spec,
+        &fac_policy.queue_bounds_policy,
+    )
+    .map_err(|err| format!("failed to enqueue gates job: {err}"))?;
 
     Ok(PreparedQueuedGatesJob {
         fac_root,
@@ -621,6 +628,7 @@ fn build_gates_job_spec(
     boundary_id: &str,
     broker: &mut apm2_core::fac::broker::FacBroker,
     job_spec_policy: &JobSpecValidationPolicy,
+    allowed_intents: Option<&[apm2_core::fac::job_spec::FacIntent]>,
 ) -> Result<FacJobSpecV1, String> {
     if GATES_QUEUE_LANE.is_empty() || GATES_QUEUE_LANE.len() > MAX_QUEUE_LANE_LENGTH {
         return Err("invalid gates queue lane configuration".to_string());
@@ -667,9 +675,24 @@ fn build_gates_job_spec(
     // Bind policy fields to the admitted FAC policy digest and bind the
     // specific job through request_id (= spec digest), preserving fail-closed
     // token verification while avoiding digest-domain mismatch.
-    let token = broker
-        .issue_channel_context_token(policy_digest, lease_id, &digest, boundary_id)
+    // TCK-00567: Derive intent from job kind for intent-bound token issuance.
+    // Thread FacPolicyV1.allowed_intents so the broker enforces the allowlist
+    // at issuance (fail-closed).
+    let intent = apm2_core::fac::job_spec::job_kind_to_intent(&spec.kind);
+    let (token, wal_bytes) = broker
+        .issue_channel_context_token(
+            policy_digest,
+            lease_id,
+            &digest,
+            boundary_id,
+            intent.as_ref(),
+            allowed_intents,
+        )
         .map_err(|err| format!("issue channel context token: {err}"))?;
+    // BLOCKER fix: persist the WAL entry before releasing the token
+    // (crash durability for issuance registration).
+    super::super::fac_worker::append_token_ledger_wal_pub(&wal_bytes)
+        .map_err(|err| format!("token ledger WAL persist on issuance: {err}"))?;
     spec.actuation.channel_context_token = Some(token);
     validate_job_spec_with_policy(&spec, job_spec_policy)
         .map_err(|err| format!("validate job spec: {err}"))?;

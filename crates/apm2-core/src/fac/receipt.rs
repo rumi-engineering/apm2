@@ -611,6 +611,20 @@ pub enum DenialReasonCode {
     /// through INV-PH-010, TCK-00581). Path traversal, absolute paths,
     /// unsupported format, or other patch content violation detected.
     PatchHardeningDenied,
+    /// Job kind does not map to any known RFC-0028 intent (TCK-00567).
+    /// Fail-closed: workers deny execution when the intent cannot be
+    /// derived, preventing unknown job kinds from bypassing intent-binding
+    /// verification.
+    UnknownJobKindIntent,
+    /// Token replay detected: the nonce in the token has already been
+    /// consumed by a prior job execution (TCK-00566).
+    TokenReplayDetected,
+    /// Token has been explicitly revoked before expiry (TCK-00566).
+    TokenRevoked,
+    /// Queue bounds exceeded: pending job count or pending bytes would
+    /// exceed the configured `QueueBoundsPolicy` limits (TCK-00578).
+    /// Denial reason code: `queue/quota_exceeded`.
+    QueueQuotaExceeded,
 }
 
 /// Trace of the RFC-0028 channel boundary check.

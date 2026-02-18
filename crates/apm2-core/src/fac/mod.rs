@@ -153,6 +153,9 @@ pub mod projection;
 pub mod projection_compromise;
 pub mod projection_receipt_recorded;
 pub mod quarantine;
+/// Queue bounds enforcement: max pending jobs/bytes with denial receipts
+/// (TCK-00578).
+pub mod queue_bounds;
 mod receipt;
 /// Non-authoritative, rebuildable receipt index for fast job/receipt lookup.
 pub mod receipt_index;
@@ -181,6 +184,7 @@ pub mod signed_receipt;
 mod systemd_properties;
 pub mod taint;
 mod terminal_verifier;
+pub mod token_ledger;
 pub mod transcript_binding;
 pub mod warm;
 pub mod worker_heartbeat;
