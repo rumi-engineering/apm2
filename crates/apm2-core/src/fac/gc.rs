@@ -211,8 +211,16 @@ pub fn plan_gc(
                             let Some(hash) = parse_cas_ref_filename(name_str) else {
                                 continue;
                             };
-                            // Skip if referenced by a recent receipt.
-                            if receipt_refs.cas_hashes.contains(&hash) {
+                            // MAJOR-1 fix: Use receipt-derived hashes as
+                            // the authoritative keep-alive set.  Check BOTH
+                            // `cas_hashes` (receipts with bytes_backend=apm2_cas)
+                            // AND `blob_hashes` (legacy/unspecified receipts that
+                            // may reference the same digest without backend tag).
+                            // Fail-closed: if ANY receipt set references this
+                            // hash, it MUST NOT be pruned.
+                            if receipt_refs.cas_hashes.contains(&hash)
+                                || receipt_refs.blob_hashes.contains(&hash)
+                            {
                                 continue;
                             }
                             // Skip if the ref file itself is recent.
@@ -231,7 +239,8 @@ pub fn plan_gc(
                                     estimated_bytes: estimate_dir_size(&reader.hash_to_path(&hash)),
                                 });
                             }
-                            // Clean up the stale ref file itself.
+                            // Clean up the stale ref file itself only when
+                            // the hash is not referenced by any receipt set.
                             let _ = std::fs::remove_file(&ref_path);
                         }
                     }
@@ -1069,8 +1078,9 @@ pub fn record_cas_ref(fac_root: &Path, hash: &[u8; 32]) -> Result<(), std::io::E
     }
     let hex = hex::encode(hash);
     let ref_path = cas_refs_dir.join(format!("{hex}.ref"));
-    // Touch the file (create or update mtime).
-    std::fs::OpenOptions::new()
+    // Touch the file (create or update mtime) using a single file handle
+    // to avoid reopening the path (NIT-1: eliminates redundant open).
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
@@ -1081,7 +1091,7 @@ pub fn record_cas_ref(fac_root: &Path, hash: &[u8; 32]) -> Result<(), std::io::E
     // signal; mtime is best-effort recency.
     #[allow(clippy::disallowed_methods)]
     let now = std::time::SystemTime::now();
-    let _ = std::fs::File::open(&ref_path).and_then(|f| f.set_modified(now));
+    let _ = file.set_modified(now);
     Ok(())
 }
 
@@ -1754,5 +1764,239 @@ mod tests {
         assert!(!super::is_v3_lock_file(&PathBuf::from(
             "/tmp/gate_cache_v3/.lock"
         )));
+    }
+
+    // =========================================================================
+    // TCK-00546 MAJOR-1: CAS pruning uses receipt-derived hashes as
+    // authoritative keep-alive (fail-closed against legacy receipts)
+    // =========================================================================
+
+    /// Helper: write a CAS object in the daemon layout under `cas_root`.
+    fn write_cas_object(cas_root: &Path, data: &[u8]) -> [u8; 32] {
+        let hash = *blake3::hash(data).as_bytes();
+        let hex = hex::encode(hash);
+        let (prefix, suffix) = hex.split_at(4);
+        let dir = cas_root.join("objects").join(prefix);
+        std::fs::create_dir_all(&dir).expect("mkdir CAS prefix");
+        let path = dir.join(suffix);
+        std::fs::write(&path, data).expect("write CAS object");
+        hash
+    }
+
+    #[test]
+    fn cas_ref_kept_alive_by_legacy_receipt_without_bytes_backend() {
+        // MAJOR-1 regression: a CAS ref marker whose hash appears in a
+        // legacy receipt (no bytes_backend field -> hash goes into
+        // blob_hashes) must NOT be pruned.  Before the fix, only
+        // cas_hashes was checked, so legacy receipts did not protect CAS
+        // objects.
+        let dir = tempdir().expect("tmp");
+        // Layout: $dir/private/fac (fac_root), $dir/private/cas (cas_root)
+        let private_dir = dir.path().join("private");
+        let fac_root = private_dir.join("fac");
+        let cas_root = private_dir.join("cas");
+        std::fs::create_dir_all(&fac_root).expect("fac_root");
+        std::fs::create_dir_all(&cas_root).expect("cas_root");
+
+        let lane_manager = LaneManager::new(fac_root.clone()).expect("manager");
+        lane_manager.ensure_directories().expect("directories");
+
+        // Create a CAS object.
+        let cas_data = b"cas-backed patch data for legacy receipt";
+        let cas_hash = write_cas_object(&cas_root, cas_data);
+        let cas_hex = hex::encode(cas_hash);
+
+        // Create a cas_refs marker file and make it stale.
+        let cas_refs_dir = fac_root.join("cas_refs");
+        std::fs::create_dir_all(&cas_refs_dir).expect("cas_refs dir");
+        let ref_file = cas_refs_dir.join(format!("{cas_hex}.ref"));
+        std::fs::write(&ref_file, b"").expect("write ref file");
+        let stale_secs = BLOB_RETENTION_SECS.saturating_mul(3) + 120;
+        let stale_time = filetime_from_secs(current_wall_clock_secs().saturating_sub(stale_secs));
+        set_file_mtime(&ref_file, stale_time).expect("set ref mtime");
+
+        // Create a receipt that references the SAME hash but WITHOUT
+        // bytes_backend — simulating a legacy receipt.  The hash should
+        // route to blob_hashes in ReceiptBlobRefs.
+        let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
+        std::fs::create_dir_all(&receipts_dir).expect("receipts dir");
+        let digest_str = format!("b3-256:{cas_hex}");
+        let receipt_json = format!("{{\"patch_digest\":\"{digest_str}\"}}");
+        let receipt_path = receipts_dir.join("legacy-receipt.json");
+        std::fs::write(&receipt_path, receipt_json).expect("write receipt");
+
+        let plan = plan_gc(
+            &fac_root,
+            &lane_manager,
+            QUARANTINE_RETENTION_SECS,
+            DENIED_RETENTION_SECS,
+        )
+        .expect("plan");
+
+        // The CAS object MUST NOT be pruned — the legacy receipt keeps it alive.
+        assert!(
+            !plan
+                .targets
+                .iter()
+                .any(|t| matches!(t.kind, crate::fac::gc_receipt::GcActionKind::CasBlobPrune)),
+            "CAS object referenced by legacy receipt (no bytes_backend) must not be pruned"
+        );
+    }
+
+    #[test]
+    fn cas_ref_pruned_when_no_receipt_references_it() {
+        // Complement to the above: a stale CAS ref with NO receipt reference
+        // anywhere IS eligible for pruning.
+        let dir = tempdir().expect("tmp");
+        let private_dir = dir.path().join("private");
+        let fac_root = private_dir.join("fac");
+        let cas_root = private_dir.join("cas");
+        std::fs::create_dir_all(&fac_root).expect("fac_root");
+        std::fs::create_dir_all(&cas_root).expect("cas_root");
+
+        let lane_manager = LaneManager::new(fac_root.clone()).expect("manager");
+        lane_manager.ensure_directories().expect("directories");
+
+        let cas_data = b"orphan cas object";
+        let cas_hash = write_cas_object(&cas_root, cas_data);
+        let cas_hex = hex::encode(cas_hash);
+
+        // Create a stale cas_refs marker.
+        let cas_refs_dir = fac_root.join("cas_refs");
+        std::fs::create_dir_all(&cas_refs_dir).expect("cas_refs dir");
+        let ref_file = cas_refs_dir.join(format!("{cas_hex}.ref"));
+        std::fs::write(&ref_file, b"").expect("write ref file");
+        let stale_secs = BLOB_RETENTION_SECS.saturating_mul(3) + 120;
+        let stale_time = filetime_from_secs(current_wall_clock_secs().saturating_sub(stale_secs));
+        set_file_mtime(&ref_file, stale_time).expect("set ref mtime");
+
+        // NO receipt references this hash.
+        let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
+        std::fs::create_dir_all(&receipts_dir).expect("receipts dir");
+
+        let plan = plan_gc(
+            &fac_root,
+            &lane_manager,
+            QUARANTINE_RETENTION_SECS,
+            DENIED_RETENTION_SECS,
+        )
+        .expect("plan");
+
+        assert!(
+            plan.targets
+                .iter()
+                .any(|t| matches!(t.kind, crate::fac::gc_receipt::GcActionKind::CasBlobPrune)),
+            "orphan stale CAS ref must be pruned when no receipt references it"
+        );
+    }
+
+    #[test]
+    fn cas_ref_kept_alive_by_apm2_cas_receipt() {
+        // A CAS ref whose hash appears in a receipt WITH bytes_backend=apm2_cas
+        // (routed to cas_hashes) must also be kept alive.
+        let dir = tempdir().expect("tmp");
+        let private_dir = dir.path().join("private");
+        let fac_root = private_dir.join("fac");
+        let cas_root = private_dir.join("cas");
+        std::fs::create_dir_all(&fac_root).expect("fac_root");
+        std::fs::create_dir_all(&cas_root).expect("cas_root");
+
+        let lane_manager = LaneManager::new(fac_root.clone()).expect("manager");
+        lane_manager.ensure_directories().expect("directories");
+
+        let cas_data = b"cas-backed patch data with apm2_cas tag";
+        let cas_hash = write_cas_object(&cas_root, cas_data);
+        let cas_hex = hex::encode(cas_hash);
+
+        let cas_refs_dir = fac_root.join("cas_refs");
+        std::fs::create_dir_all(&cas_refs_dir).expect("cas_refs dir");
+        let ref_file = cas_refs_dir.join(format!("{cas_hex}.ref"));
+        std::fs::write(&ref_file, b"").expect("write ref file");
+        let stale_secs = BLOB_RETENTION_SECS.saturating_mul(3) + 120;
+        let stale_time = filetime_from_secs(current_wall_clock_secs().saturating_sub(stale_secs));
+        set_file_mtime(&ref_file, stale_time).expect("set ref mtime");
+
+        // Receipt WITH bytes_backend=apm2_cas -> hash routes to cas_hashes.
+        let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
+        std::fs::create_dir_all(&receipts_dir).expect("receipts dir");
+        let digest_str = format!("b3-256:{cas_hex}");
+        let receipt_json =
+            format!("{{\"patch_digest\":\"{digest_str}\",\"bytes_backend\":\"apm2_cas\"}}");
+        let receipt_path = receipts_dir.join("cas-receipt.json");
+        std::fs::write(&receipt_path, receipt_json).expect("write receipt");
+
+        let plan = plan_gc(
+            &fac_root,
+            &lane_manager,
+            QUARANTINE_RETENTION_SECS,
+            DENIED_RETENTION_SECS,
+        )
+        .expect("plan");
+
+        assert!(
+            !plan
+                .targets
+                .iter()
+                .any(|t| matches!(t.kind, crate::fac::gc_receipt::GcActionKind::CasBlobPrune)),
+            "CAS object referenced by apm2_cas receipt must not be pruned"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00546 NIT-1: record_cas_ref single-handle mtime update
+    // =========================================================================
+
+    #[test]
+    fn record_cas_ref_creates_marker_and_sets_mtime() {
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac_root");
+
+        let hash = *blake3::hash(b"test data").as_bytes();
+        let before_secs = current_wall_clock_secs();
+
+        super::record_cas_ref(&fac_root, &hash).expect("record_cas_ref");
+
+        let hex = hex::encode(hash);
+        let ref_path = fac_root.join("cas_refs").join(format!("{hex}.ref"));
+        assert!(ref_path.exists(), "marker file must exist");
+
+        // Verify mtime is recent (within a few seconds of now).
+        let mtime_secs = file_modified_secs(&ref_path);
+        assert!(
+            mtime_secs >= before_secs.saturating_sub(2),
+            "marker mtime ({mtime_secs}) must be recent (after {before_secs})"
+        );
+    }
+
+    #[test]
+    fn record_cas_ref_idempotent_updates_mtime() {
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac_root");
+
+        let hash = *blake3::hash(b"idempotent data").as_bytes();
+        super::record_cas_ref(&fac_root, &hash).expect("first record");
+
+        let hex = hex::encode(hash);
+        let ref_path = fac_root.join("cas_refs").join(format!("{hex}.ref"));
+
+        // Backdate the marker to simulate staleness.
+        let backdated = filetime_from_secs(current_wall_clock_secs().saturating_sub(86400));
+        set_file_mtime(&ref_path, backdated).expect("backdate mtime");
+
+        let mtime_before = file_modified_secs(&ref_path);
+
+        // Sleep briefly to ensure time advances.
+        sleep(Duration::from_millis(50));
+
+        // Re-record: should update mtime.
+        super::record_cas_ref(&fac_root, &hash).expect("second record");
+
+        let mtime_after = file_modified_secs(&ref_path);
+        assert!(
+            mtime_after > mtime_before,
+            "mtime must advance after re-recording (before={mtime_before}, after={mtime_after})"
+        );
     }
 }
