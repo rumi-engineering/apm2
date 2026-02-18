@@ -40,7 +40,10 @@ default mode.
 ### Core Capabilities
 
 - RFC-0028 `ChannelContextToken` issuance bound to `job_spec_digest` + `lease_id`
-  via `issue_channel_context_token()`.
+  via `issue_channel_context_token()`.  TCK-00567 adds optional `intent` and
+  `allowed_intents` parameters for RFC-0028 intent taxonomy enforcement.
+  When `allowed_intents` is configured, intent MUST be in the allowed set
+  (fail-closed).
 - RFC-0029 `TimeAuthorityEnvelopeV1` issuance for `boundary_id` + evaluation
   window via `issue_time_authority_envelope()`.
 - TP-EIO29-002 freshness horizon refs (`freshness_horizon()`) and revocation
@@ -2141,6 +2144,40 @@ still enforced; only the token requirement is waived.
   except the token requirement.
 - All deny paths in the control-lane flow emit explicit refusal receipts before
   moving jobs to `denied/`.
+
+## Intent Taxonomy (TCK-00567)
+
+The `job_spec` module defines `FacIntent`, a typed intent taxonomy mapping FAC
+job kinds to RFC-0028 intent classes.  The mapping is authoritative and
+fail-closed:
+
+| Job Kind | Intent |
+|---|---|
+| `gates` | `intent.fac.execute_gates` |
+| `warm` | `intent.fac.warm` |
+| `gc` | `intent.fac.gc` |
+| `lane_reset` | `intent.fac.lane_reset` |
+| `stop_revoke` | `intent.fac.cancel` |
+| `bundle_export` / `bundle_import` | `intent.fac.bundle` |
+| `bulk` | `intent.fac.bulk` |
+| `control` | `intent.fac.control` |
+
+### Key Types
+
+- `FacIntent`: Enum with one variant per intent class.  `as_str()` returns the
+  stable dotted string.  Serde-serializes to/from the dotted string.
+- `job_kind_to_intent(kind) -> Option<FacIntent>`: Maps a job kind string to
+  its intent.  Returns `None` for unknown kinds.
+- `FacPolicyV1::allowed_intents`: Optional policy knob.  When `Some`, only
+  listed intents may be issued (fail-closed).  Bounded by
+  `MAX_ALLOWED_INTENTS_SIZE` (32).
+
+### Enforcement Points
+
+1. **Broker** (`issue_channel_context_token`): Embeds intent in
+   `TokenBindingV1`.  Validates intent against `allowed_intents` if configured.
+2. **Worker** (`fac_worker.rs`): Derives `expected_intent` from job kind,
+   passes to `ExpectedTokenBinding`.  Decode fails on mismatch (fail-closed).
 
 ## Strict Job Spec Validation Policy (TCK-00579)
 

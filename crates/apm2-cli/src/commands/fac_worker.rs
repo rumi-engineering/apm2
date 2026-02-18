@@ -2390,11 +2390,17 @@ fn process_job(
         }
         return JobOutcome::Denied { reason };
     };
+    // TCK-00567: Derive expected intent from job kind for intent-binding
+    // verification.  The worker denies if the token intent does not match
+    // the job kind (fail-closed).
+    let expected_intent = apm2_core::fac::job_spec::job_kind_to_intent(&spec.kind);
+    let expected_intent_str = expected_intent.as_ref().map(|i| i.as_str());
     let expected_binding = ExpectedTokenBinding {
         fac_policy_hash: policy_digest,
         canonicalizer_tuple_digest: &ct_digest_bytes,
         boundary_id,
         current_tick: broker.current_tick(),
+        expected_intent: expected_intent_str,
     };
 
     let boundary_check = match decode_channel_context_token_with_binding(

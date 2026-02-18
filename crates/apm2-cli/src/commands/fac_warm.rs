@@ -430,16 +430,21 @@ fn build_warm_job_spec(
     spec.actuation.request_id = digest;
 
     // Issue channel context token from broker.
-    // Signature: issue_channel_context_token(&Hash, &str, &str, &str)
-    // where Hash = [u8; 32].
+    // Signature: issue_channel_context_token(&Hash, &str, &str, &str,
+    // Option<&FacIntent>, Option<&[FacIntent]>) where Hash = [u8; 32].
     // Bind token policy fields to the admitted FAC policy digest while
     // keeping request_id bound to this concrete job spec digest.
+    // TCK-00567: Derive intent from job kind and pass to broker for
+    // intent-bound token issuance.
+    let intent = apm2_core::fac::job_spec::job_kind_to_intent(&spec.kind);
     let token = broker
         .issue_channel_context_token(
             policy_digest,
             lease_id,
             &spec.actuation.request_id,
             boundary_id,
+            intent.as_ref(),
+            None,
         )
         .map_err(|e| format!("broker token issuance: {e}"))?;
     spec.actuation.channel_context_token = Some(token);
