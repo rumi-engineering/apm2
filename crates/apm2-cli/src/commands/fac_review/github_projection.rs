@@ -219,11 +219,25 @@ pub(super) fn fetch_pr_body(owner_repo: &str, pr_number: u32) -> Result<String, 
 }
 
 pub(super) fn edit_pr_body(owner_repo: &str, pr_number: u32, body: &str) -> Result<(), String> {
+    let mut payload_file = tempfile::NamedTempFile::new()
+        .map_err(|err| format!("failed to create temp payload for pr body sync: {err}"))?;
+    payload_file
+        .write_all(body.as_bytes())
+        .map_err(|err| format!("failed to write pr body sync payload: {err}"))?;
+    payload_file
+        .flush()
+        .map_err(|err| format!("failed to flush pr body sync payload: {err}"))?;
+
     let output = gh_command()
         .arg("pr")
         .arg("edit")
         .arg(pr_number.to_string())
-        .args(["--repo", owner_repo, "--body", body])
+        .args([
+            "--repo",
+            owner_repo,
+            "--body-file",
+            &payload_file.path().display().to_string(),
+        ])
         .output()
         .map_err(|err| format!("failed to execute gh pr edit for body sync: {err}"))?;
     if !output.status.success() {

@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, id as current_process_id};
 
 use apm2_core::fac::{
-    MergeReceipt, parse_b3_256_digest, parse_policy_hash, persist_signed_envelope, sign_receipt,
+    BlobStore, MergeReceipt, parse_b3_256_digest, parse_policy_hash, persist_signed_envelope,
+    sign_receipt,
 };
 use chrono::{DateTime, Duration, Utc};
 use clap::ValueEnum;
@@ -2314,7 +2315,7 @@ struct MergeReceiptBindingPreimage<'a> {
     verdict_hashes: &'a [String],
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MergeReceiptBindingRecord {
     schema: String,
     owner_repo: String,
@@ -2329,6 +2330,8 @@ struct MergeReceiptBindingRecord {
     verdict_hashes: Vec<String>,
     changeset_digest_hex: String,
     merged_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binding_blob_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2547,10 +2550,20 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn persist_merge_receipt_binding_record(
+    fac_root: &Path,
     receipts_dir: &Path,
     merge_receipt_hash: &str,
-    record: &MergeReceiptBindingRecord,
+    record: &mut MergeReceiptBindingRecord,
 ) -> Result<(), String> {
+    let canonical_payload = serde_jcs::to_vec(record).map_err(|err| {
+        format!("failed to canonicalize merge receipt binding record payload: {err}")
+    })?;
+    let blob_store = BlobStore::new(fac_root);
+    let payload_hash = blob_store.store(&canonical_payload).map_err(|err| {
+        format!("failed to persist merge receipt binding payload in fac blob store: {err}")
+    })?;
+    record.binding_blob_hash = Some(format!("b3-256:{}", hex::encode(payload_hash)));
+
     let path = receipts_dir.join(format!(
         "{merge_receipt_hash}{MERGE_RECEIPT_BINDING_SUFFIX}"
     ));
@@ -2604,7 +2617,7 @@ fn persist_signed_merge_receipt(
     let proto_path = receipts_dir.join(format!("{content_hash}{MERGE_RECEIPT_PROTO_SUFFIX}"));
     write_bytes_atomic(&proto_path, &proto_bytes)?;
 
-    let binding_record = MergeReceiptBindingRecord {
+    let mut binding_record = MergeReceiptBindingRecord {
         schema: MERGE_EVIDENCE_SCHEMA.to_string(),
         owner_repo: owner_repo.to_string(),
         pr_number,
@@ -2618,8 +2631,14 @@ fn persist_signed_merge_receipt(
         verdict_hashes: binding.verdict_hashes.clone(),
         changeset_digest_hex: hex::encode(changeset_digest),
         merged_at: merged_at_iso.clone(),
+        binding_blob_hash: None,
     };
-    persist_merge_receipt_binding_record(&receipts_dir, &content_hash, &binding_record)?;
+    persist_merge_receipt_binding_record(
+        &fac_root,
+        &receipts_dir,
+        &content_hash,
+        &mut binding_record,
+    )?;
 
     let envelope = sign_receipt(&content_hash, &signer, "fac-review-cli");
     persist_signed_envelope(&receipts_dir, &envelope)
@@ -2694,12 +2713,23 @@ fn upsert_marker_section(
     end_marker: &str,
     section: &str,
 ) -> String {
-    let section = section.trim_end();
-    let mut output = String::new();
+    fn append_section(base_body: &str, section: &str) -> String {
+        let mut output = String::new();
+        let trimmed = base_body.trim_end();
+        if !trimmed.is_empty() {
+            output.push_str(trimmed);
+            output.push_str("\n\n");
+        }
+        output.push_str(section);
+        output.push('\n');
+        output
+    }
 
+    let section = section.trim_end();
     if let Some(start_idx) = body.find(start_marker) {
         let search_start = start_idx + start_marker.len();
         if let Some(rel_end_idx) = body[search_start..].find(end_marker) {
+            let mut output = String::new();
             let end_idx = search_start + rel_end_idx + end_marker.len();
             let before = body[..start_idx].trim_end();
             let after = body[end_idx..].trim_start();
@@ -2716,16 +2746,28 @@ fn upsert_marker_section(
             }
             return output;
         }
+        let before = body[..start_idx].trim_end();
+        return append_section(before, section);
     }
 
-    let trimmed = body.trim_end();
-    if !trimmed.is_empty() {
-        output.push_str(trimmed);
-        output.push_str("\n\n");
+    if let Some(end_idx) = body.find(end_marker) {
+        let after_idx = end_idx + end_marker.len();
+        let before = body[..end_idx].trim_end();
+        let after = body[after_idx..].trim_start();
+        let mut sanitized = String::new();
+        if !before.is_empty() {
+            sanitized.push_str(before);
+        }
+        if !after.is_empty() {
+            if !sanitized.is_empty() {
+                sanitized.push_str("\n\n");
+            }
+            sanitized.push_str(after);
+        }
+        return append_section(&sanitized, section);
     }
-    output.push_str(section);
-    output.push('\n');
-    output
+
+    append_section(body, section)
 }
 
 fn render_merge_evidence_section(context: &MergeProjectionContext) -> String {
@@ -4517,15 +4559,16 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{
-        AgentType, AutoVerdictCandidate, AutoVerdictFinalizeResult,
+        AgentType, AutoVerdictCandidate, AutoVerdictFinalizeResult, FAC_RECEIPTS_DIR,
         FAC_STATUS_PROJECTION_MAX_ATTEMPTS, LifecycleEventKind, MERGE_EVIDENCE_END,
-        MERGE_EVIDENCE_START, MergeEvidenceBinding, PrLifecycleState, TrackedAgentState,
-        acquire_registry_lock, active_agents_for_pr, apply_event, bind_reviewer_runtime,
+        MERGE_EVIDENCE_START, MERGE_RECEIPT_BINDING_SUFFIX, MergeEvidenceBinding,
+        MergeReceiptBindingRecord, PrLifecycleState, TrackedAgentState, acquire_registry_lock,
+        active_agents_for_pr, apply_event, bind_reviewer_runtime,
         compute_merge_receipt_changeset_digest, delete_remote_branch_projection,
         derive_auto_verdict_decision_from_findings, derive_fac_required_status_projection,
         enforce_pr_capacity, fac_required_status_projection_for_decision,
         finalize_auto_verdict_candidate, load_fac_required_status_contexts, load_registry,
-        normalize_hash_list, normalize_sha256_hex_digest,
+        normalize_hash_list, normalize_sha256_hex_digest, persist_merge_receipt_binding_record,
         project_fac_required_status_to_contexts_with, project_fac_required_status_with,
         register_agent_spawn, register_reviewer_dispatch, save_registry,
         sync_local_main_with_origin, token_hash, try_fast_forward_main, upsert_marker_section,
@@ -5163,6 +5206,66 @@ mod tests {
     }
 
     #[test]
+    fn merge_receipt_binding_record_is_anchored_in_blob_store() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fac_root = temp.path().join("private").join("fac");
+        let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
+        let merge_receipt_hash = format!("b3-256:{}", "aa".repeat(32));
+
+        let mut record = MergeReceiptBindingRecord {
+            schema: "apm2.fac.merge_evidence_projection.v1".to_string(),
+            owner_repo: "example/repo".to_string(),
+            pr_number: 42,
+            head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            merge_sha: "fedcba9876543210fedcba9876543210fedcba98".to_string(),
+            merge_receipt_content_hash: merge_receipt_hash.clone(),
+            gate_job_id: "job-42".to_string(),
+            gate_receipt_id: "receipt-42".to_string(),
+            policy_hash: format!("b3-256:{}", "11".repeat(32)),
+            gate_evidence_hashes: vec![format!("b3-256:{}", "22".repeat(32))],
+            verdict_hashes: vec![format!("b3-256:{}", "33".repeat(32))],
+            changeset_digest_hex: "44".repeat(32),
+            merged_at: "2026-02-18T00:00:00Z".to_string(),
+            binding_blob_hash: None,
+        };
+
+        persist_merge_receipt_binding_record(
+            &fac_root,
+            &receipts_dir,
+            &merge_receipt_hash,
+            &mut record,
+        )
+        .expect("persist binding record");
+
+        let binding_blob_hash = record
+            .binding_blob_hash
+            .clone()
+            .expect("binding blob hash must be populated");
+        let binding_path = receipts_dir.join(format!(
+            "{merge_receipt_hash}{MERGE_RECEIPT_BINDING_SUFFIX}"
+        ));
+        let persisted_bytes = fs::read(&binding_path).expect("read persisted binding record");
+        let persisted: MergeReceiptBindingRecord =
+            serde_json::from_slice(&persisted_bytes).expect("parse persisted binding record");
+        assert_eq!(
+            persisted.binding_blob_hash.as_deref(),
+            Some(binding_blob_hash.as_str())
+        );
+
+        let binding_digest = apm2_core::fac::parse_b3_256_digest(&binding_blob_hash)
+            .expect("binding blob hash must be valid b3 digest");
+        let blob_store = apm2_core::fac::BlobStore::new(&fac_root);
+        let blob_bytes = blob_store
+            .retrieve(&binding_digest)
+            .expect("binding payload must exist in fac blob store");
+        let mut canonical_payload = persisted;
+        canonical_payload.binding_blob_hash = None;
+        let expected_blob_bytes =
+            serde_jcs::to_vec(&canonical_payload).expect("canonicalize binding payload");
+        assert_eq!(blob_bytes, expected_blob_bytes);
+    }
+
+    #[test]
     fn merge_evidence_section_replaces_existing_marker_block() {
         let old =
             format!("intro\n\n{MERGE_EVIDENCE_START}\nold content\n{MERGE_EVIDENCE_END}\n\nfooter");
@@ -5173,6 +5276,32 @@ mod tests {
         assert!(updated.contains("footer"));
         assert!(updated.contains("new content"));
         assert!(!updated.contains("old content"));
+    }
+
+    #[test]
+    fn merge_evidence_section_replaces_orphan_start_marker_block() {
+        let old = format!("intro\n\n{MERGE_EVIDENCE_START}\nold dangling content");
+        let replacement = format!("{MERGE_EVIDENCE_START}\nnew content\n{MERGE_EVIDENCE_END}");
+        let updated =
+            upsert_marker_section(&old, MERGE_EVIDENCE_START, MERGE_EVIDENCE_END, &replacement);
+        assert!(updated.contains("intro"));
+        assert!(updated.contains("new content"));
+        assert!(!updated.contains("old dangling content"));
+        assert_eq!(updated.matches(MERGE_EVIDENCE_START).count(), 1);
+        assert_eq!(updated.matches(MERGE_EVIDENCE_END).count(), 1);
+    }
+
+    #[test]
+    fn merge_evidence_section_cleans_orphan_end_marker() {
+        let old = format!("intro\n\nstale text\n{MERGE_EVIDENCE_END}\n\nfooter");
+        let replacement = format!("{MERGE_EVIDENCE_START}\nnew content\n{MERGE_EVIDENCE_END}");
+        let updated =
+            upsert_marker_section(&old, MERGE_EVIDENCE_START, MERGE_EVIDENCE_END, &replacement);
+        assert!(updated.contains("intro"));
+        assert!(updated.contains("footer"));
+        assert!(updated.contains("new content"));
+        assert_eq!(updated.matches(MERGE_EVIDENCE_START).count(), 1);
+        assert_eq!(updated.matches(MERGE_EVIDENCE_END).count(), 1);
     }
 
     #[test]
