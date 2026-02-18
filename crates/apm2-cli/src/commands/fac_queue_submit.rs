@@ -19,6 +19,7 @@ use apm2_core::fac::{
     persist_policy,
 };
 use apm2_core::github::{parse_github_remote_url, resolve_apm2_home};
+use fs2::FileExt;
 
 use crate::commands::{fac_key_material, fac_secure_io};
 
@@ -28,6 +29,23 @@ pub(super) const QUEUE_DIR: &str = "queue";
 pub(super) const PENDING_DIR: &str = "pending";
 /// Default authority clock for local-mode evaluation windows.
 pub(super) const DEFAULT_AUTHORITY_CLOCK: &str = "local";
+
+/// Lockfile name for the enqueue critical section.
+///
+/// Acquired via `fs2::FileExt::lock_exclusive()` for the full
+/// check-queue-bounds + write-job-spec critical section to prevent
+/// concurrent `apm2 fac` processes from bypassing queue caps.
+///
+/// Synchronization protocol:
+/// - Protected data: the set of files in `queue/pending/` and the
+///   snapshot-derived bounds decision.
+/// - Who can mutate: only the holder of the exclusive flock.
+/// - Lock ordering: single lock, no nesting required.
+/// - Happens-before: `lock_exclusive()` on `ENQUEUE_LOCKFILE` → scan pending
+///   dir + write job spec → drop lockfile (implicit `flock(LOCK_UN)` on
+///   `File::drop`).
+/// - Async suspension: not applicable (synchronous path).
+const ENQUEUE_LOCKFILE: &str = ".enqueue.lock";
 
 /// Maximum size for broker state file (1 MiB, matching broker constant).
 const MAX_BROKER_STATE_FILE_SIZE: usize = 1_048_576;
@@ -157,16 +175,24 @@ pub(super) fn load_or_init_policy(
 /// must not exceed `max_pending_jobs` or `max_pending_bytes` as
 /// configured by the provided [`QueueBoundsPolicy`]. Excess enqueue
 /// attempts are denied with structured denial receipts persisted to
-/// the `denied/` directory.
+/// the `denied/` directory and a structured denial event emitted to
+/// the trusted audit log under the FAC private directory.
+///
+/// A process-level lockfile (`queue/.enqueue.lock`) is held for the
+/// full check-write critical section to prevent concurrent `apm2 fac`
+/// processes from bypassing queue bounds via TOCTOU.
 ///
 /// # Arguments
 ///
 /// * `queue_root` - Path to the queue root directory.
+/// * `fac_root` - Path to the FAC private root (`$APM2_HOME/private/fac`), used
+///   for trusted denial event logging.
 /// * `spec` - The job spec to enqueue.
 /// * `queue_bounds_policy` - The queue bounds policy loaded from FAC
 ///   configuration. Must be pre-validated via `QueueBoundsPolicy::validate()`.
 pub(super) fn enqueue_job(
     queue_root: &Path,
+    fac_root: &Path,
     spec: &FacJobSpecV1,
     queue_bounds_policy: &QueueBoundsPolicy,
 ) -> Result<PathBuf, String> {
@@ -193,6 +219,13 @@ pub(super) fn enqueue_job(
         .validate()
         .map_err(|err| format!("queue bounds policy validation failed: {err}"))?;
 
+    // Acquire process-level lockfile for the full check-write critical section.
+    // This prevents concurrent `apm2 fac` processes from each passing the
+    // bounds check against a stale snapshot and then all writing,
+    // oversubscribing the cap. The lock is held until after the job spec
+    // file is written (dropped at scope exit).
+    let lock_file = acquire_enqueue_lock(queue_root)?;
+
     let proposed_bytes = json.len() as u64;
     if let Err(err) = check_queue_bounds(&pending_dir, proposed_bytes, queue_bounds_policy) {
         // Persist denial receipt for downstream tooling (TCK-00578).
@@ -202,7 +235,10 @@ pub(super) fn enqueue_job(
         } = err
         {
             persist_denial_receipt(queue_root, &spec.job_id, receipt, reason);
+            emit_trusted_denial_event(fac_root, &spec.job_id, receipt, reason);
         }
+        // Lock is released on drop (implicit flock(LOCK_UN)).
+        drop(lock_file);
         return Err(format!(
             "queue bounds check failed (queue/quota_exceeded): {err}"
         ));
@@ -226,6 +262,10 @@ pub(super) fn enqueue_job(
     }
     temp.persist(&target)
         .map_err(|err| format!("persist: {}", err.error))?;
+
+    // Lock is released on drop (implicit flock(LOCK_UN)) after the job
+    // spec file has been persisted.
+    drop(lock_file);
 
     Ok(target)
 }
@@ -279,6 +319,117 @@ fn persist_denial_receipt(
     }
     let _ = file.sync_all();
     let _ = temp.persist(&target);
+}
+
+/// Acquire the process-level enqueue lockfile under `queue_root`.
+///
+/// Returns the open `File` handle whose lifetime controls the lock.
+/// The lock is released when the file handle is dropped (implicit
+/// `flock(LOCK_UN)` on `File::drop`).
+///
+/// # Errors
+///
+/// Returns `Err` if the lockfile cannot be created or locked.
+fn acquire_enqueue_lock(queue_root: &Path) -> Result<fs::File, String> {
+    let lock_path = queue_root.join(ENQUEUE_LOCKFILE);
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| {
+            format!(
+                "cannot open enqueue lockfile {}: {err}",
+                lock_path.display()
+            )
+        })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = lock_file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
+
+    lock_file
+        .lock_exclusive()
+        .map_err(|err| format!("cannot acquire enqueue lock {}: {err}", lock_path.display()))?;
+
+    Ok(lock_file)
+}
+
+/// Emit a structured denial event to the trusted audit log under the
+/// FAC private directory.
+///
+/// The trusted log is stored outside the writable queue directories so
+/// that an attacker with filesystem control over `queue/denied/` cannot
+/// suppress denial evidence. The denial is still enforced regardless of
+/// whether this log write succeeds.
+///
+/// This is a best-effort audit event: if the log write fails, it is
+/// not fatal. The primary denial is enforced by the return value of
+/// `enqueue_job`.
+fn emit_trusted_denial_event(
+    fac_root: &Path,
+    job_id: &str,
+    receipt: &QueueBoundsDenialReceipt,
+    reason: &str,
+) {
+    let audit_dir = fac_root.join("audit");
+    if fs::create_dir_all(&audit_dir).is_err() {
+        eprintln!(
+            "warning: cannot create FAC audit directory {}: denial event for job {job_id} not logged",
+            audit_dir.display()
+        );
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&audit_dir, fs::Permissions::from_mode(0o700));
+    }
+
+    let event = serde_json::json!({
+        "schema": "apm2.fac.queue_bounds_denial_event.v1",
+        "job_id": job_id,
+        "reason": reason,
+        "receipt": receipt,
+        "denied_at_unix_secs": current_epoch_secs(),
+        "pid": std::process::id(),
+    });
+
+    let Ok(event_line) = serde_json::to_string(&event) else {
+        eprintln!("warning: cannot serialize denial event for job {job_id}");
+        return;
+    };
+
+    let log_path = audit_dir.join("denial_events.jsonl");
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        eprintln!(
+            "warning: cannot open denial event log {}",
+            log_path.display()
+        );
+        return;
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
+
+    // Write the event as a single JSONL line.
+    if let Err(err) = writeln!(file, "{event_line}") {
+        eprintln!(
+            "warning: cannot write denial event to {}: {err}",
+            log_path.display()
+        );
+    }
 }
 
 /// Build a deterministic suffix for job and lease identifiers.

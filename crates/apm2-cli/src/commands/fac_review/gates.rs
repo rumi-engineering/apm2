@@ -372,8 +372,13 @@ fn prepare_queued_gates_job(
 
     let queue_root =
         resolve_queue_root().map_err(|err| format!("cannot resolve queue root: {err}"))?;
-    enqueue_job(&queue_root, &spec, &fac_policy.queue_bounds_policy)
-        .map_err(|err| format!("failed to enqueue gates job: {err}"))?;
+    enqueue_job(
+        &queue_root,
+        &fac_root,
+        &spec,
+        &fac_policy.queue_bounds_policy,
+    )
+    .map_err(|err| format!("failed to enqueue gates job: {err}"))?;
 
     Ok(PreparedQueuedGatesJob {
         fac_root,

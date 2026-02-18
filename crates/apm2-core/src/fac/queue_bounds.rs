@@ -33,13 +33,15 @@
 //!
 //! # Thread Safety
 //!
-//! ACKNOWLEDGED TOCTOU (RSK-1501): The check is a point-in-time filesystem
-//! scan. The check and subsequent write are not atomic. In the current
-//! single-process broker architecture, only one `enqueue_job` call is active
-//! at a time, so the race window is limited to external filesystem mutations.
-//! Concurrent enqueue from separate processes could briefly exceed the cap
-//! by a small margin. A file lock is out of scope per TCK-00578; the
-//! single-process mitigation is sufficient for the local broker context.
+//! # Thread Safety
+//!
+//! The caller (`enqueue_job`) is responsible for holding a process-level
+//! lockfile (`queue/.enqueue.lock`) for the full check-write critical
+//! section. This prevents concurrent `apm2 fac` processes from each
+//! passing the bounds check against a stale snapshot and then all
+//! writing, oversubscribing the cap. The lockfile is acquired via
+//! `fs2::FileExt::lock_exclusive()` and held until after the job spec
+//! file is written.
 //!
 //! # Security Invariants
 //!
@@ -53,8 +55,10 @@
 //! - [INV-QB-004] Arithmetic uses `checked_add`; overflow returns Err.
 //! - [INV-QB-005] Symlinks in pending directory are skipped (not counted) to
 //!   prevent inflation attacks.
-//! - [INV-QB-006] `pending_dir` is verified not to be a symlink before
-//!   scanning, preventing DoS via symlink-swapped queue directories.
+//! - [INV-QB-006] `pending_dir` is verified via `symlink_metadata()` before
+//!   scanning. A broken symlink (target does not exist) returns `ScanFailed`,
+//!   not an empty snapshot. Only a true `NotFound` from `symlink_metadata()` is
+//!   treated as a legitimately absent queue.
 
 use std::path::Path;
 
@@ -268,30 +272,46 @@ pub fn check_queue_bounds(
     proposed_bytes: u64,
     policy: &QueueBoundsPolicy,
 ) -> Result<PendingQueueSnapshot, QueueBoundsError> {
-    // ACKNOWLEDGED TOCTOU (RSK-1501): The filesystem scan and the subsequent
-    // file write (by the caller) are not atomic. In the current single-process
-    // broker architecture, only one `enqueue_job` call is active at a time,
-    // so the race window is limited to external filesystem mutations.
-    // Concurrent enqueue from separate processes could briefly exceed the cap
-    // by a small margin. A file lock is out of scope per TCK-00578; the
-    // single-process mitigation is sufficient for the local broker context.
-
     // Fail-closed: zero limits deny everything (INV-QB-001).
     check_zero_limits(policy, proposed_bytes)?;
 
-    // If the directory does not exist, the queue is empty.
-    if !pending_dir.exists() {
-        return Ok(PendingQueueSnapshot {
-            job_count: 0,
-            total_bytes: 0,
-            truncated: false,
-        });
+    // [INV-QB-006] Check symlink_metadata() BEFORE using Path::exists()
+    // to prevent a broken symlink from bypassing the symlink hardening.
+    // Path::exists() follows symlinks, so a broken symlink returns false
+    // and would skip reject_symlink_pending_dir entirely.
+    //
+    // Order: symlink_metadata() → if NotFound, return empty snapshot;
+    //        if symlink, return ScanFailed; otherwise proceed.
+    match pending_dir.symlink_metadata() {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(QueueBoundsError::ScanFailed {
+                    detail: format!(
+                        "pending directory {} is a symlink; refusing to scan (INV-QB-006)",
+                        pending_dir.display()
+                    ),
+                });
+            }
+            // Path exists and is not a symlink — proceed to scan.
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Directory truly does not exist — queue is empty.
+            return Ok(PendingQueueSnapshot {
+                job_count: 0,
+                total_bytes: 0,
+                truncated: false,
+            });
+        },
+        Err(e) => {
+            // Cannot stat pending directory — fail-closed (INV-QB-001).
+            return Err(QueueBoundsError::ScanFailed {
+                detail: format!(
+                    "cannot stat pending directory {}: {e}",
+                    pending_dir.display()
+                ),
+            });
+        },
     }
-
-    // [INV-QB-006] Reject symlinked pending_dir to prevent `DoS` via a
-    // symlink-swapped queue directory pointing at a large filesystem tree.
-    // Uses `symlink_metadata()` to detect symlinks without following them.
-    reject_symlink_pending_dir(pending_dir)?;
 
     let snapshot = scan_pending_dir(pending_dir)?;
 
@@ -336,27 +356,6 @@ fn check_zero_limits(
             proposed_bytes,
             DENY_REASON_QUEUE_QUOTA_EXCEEDED,
         ));
-    }
-    Ok(())
-}
-
-/// Rejects a pending directory that is a symlink (INV-QB-006).
-fn reject_symlink_pending_dir(pending_dir: &Path) -> Result<(), QueueBoundsError> {
-    let dir_meta = pending_dir
-        .symlink_metadata()
-        .map_err(|e| QueueBoundsError::ScanFailed {
-            detail: format!(
-                "cannot stat pending directory {}: {e}",
-                pending_dir.display()
-            ),
-        })?;
-    if dir_meta.file_type().is_symlink() {
-        return Err(QueueBoundsError::ScanFailed {
-            detail: format!(
-                "pending directory {} is a symlink; refusing to scan (INV-QB-006)",
-                pending_dir.display()
-            ),
-        });
     }
     Ok(())
 }
@@ -957,5 +956,51 @@ mod tests {
         assert!(truncated.len() <= MAX_DENIAL_REASON_LENGTH);
         // Verify valid UTF-8.
         let _ = truncated.as_str();
+    }
+
+    // -----------------------------------------------------------------------
+    // Broken symlink regression (INV-QB-006)
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_symlink_pending_dir_returns_scan_failed() {
+        let policy = QueueBoundsPolicy {
+            max_pending_jobs: 100,
+            max_pending_bytes: 100_000,
+            per_lane_max_pending_jobs: None,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a symlink to a target that does not exist (broken symlink).
+        let broken_symlink = tmp.path().join("broken_pending");
+        std::os::unix::fs::symlink("/nonexistent/target", &broken_symlink).unwrap();
+
+        // Path::exists() returns false for broken symlinks, but
+        // symlink_metadata() returns Ok with is_symlink() == true.
+        assert!(
+            !broken_symlink.exists(),
+            "broken symlink must return false from exists()"
+        );
+        assert!(
+            broken_symlink.symlink_metadata().is_ok(),
+            "broken symlink must return Ok from symlink_metadata()"
+        );
+
+        // check_queue_bounds must return ScanFailed, not an empty snapshot.
+        let err = check_queue_bounds(&broken_symlink, 10, &policy).unwrap_err();
+        match err {
+            QueueBoundsError::ScanFailed { detail } => {
+                assert!(
+                    detail.contains("symlink"),
+                    "error must mention symlink, got: {detail}"
+                );
+                assert!(
+                    detail.contains("INV-QB-006"),
+                    "error must reference INV-QB-006, got: {detail}"
+                );
+            },
+            other => panic!("expected ScanFailed for broken symlink, got {other:?}"),
+        }
     }
 }
