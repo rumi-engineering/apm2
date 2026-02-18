@@ -62,6 +62,20 @@
 //!   exempt for backward compatibility. This prevents downgrade-by-omission
 //!   attacks where an attacker strips the decision field and recomputes a
 //!   self-consistent content hash (TCK-00555).
+//! - [INV-EB-023] Even legacy-schema envelopes are rejected when missing
+//!   `leakage_budget_decision` if the boundary check carries budget-aware
+//!   fields (`leakage_budget_receipt`, `timing_channel_budget`, or
+//!   `disclosure_policy_binding`). This closes a schema-downgrade bypass where
+//!   an attacker swaps the schema string to legacy after stripping the decision
+//!   (TCK-00555).
+//! - [INV-EB-024] Export-time finalization always validates `authorized_bytes
+//!   >= actual_export_bytes` whenever the policy is exceeded and a
+//!   declassification receipt is present, regardless of which dimension
+//!   triggered exceedance. This aligns export with import semantics
+//!   (TCK-00555).
+//! - [INV-EB-025] Export fails closed when `leakage_budget_policy` is `None`
+//!   for new-schema output. Callers must supply a policy (even if permissive)
+//!   to produce importable envelopes (TCK-00555).
 
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -692,10 +706,11 @@ pub struct BundleExportConfig {
     pub disclosure_policy_binding: Option<DisclosurePolicyBinding>,
     /// Leakage budget policy ceiling for export-time enforcement (TCK-00555).
     ///
-    /// When `Some`, the export path enforces that the serialized envelope
-    /// size and artifact class count do not exceed the policy ceiling.
-    /// When `None`, no leakage budget enforcement is applied (backwards
-    /// compatible default for callers that have not adopted TCK-00555).
+    /// **Required for new-schema output** (INV-EB-025): export fails closed
+    /// when this is `None`. Callers must supply a policy, even if permissive
+    /// (e.g., `LeakageBudgetPolicy::tier0_default()`). This ensures all
+    /// new-schema envelopes carry a `leakage_budget_decision` that import
+    /// can validate (INV-EB-014).
     pub leakage_budget_policy: Option<LeakageBudgetPolicy>,
     /// Declassification receipt authorizing exports that exceed the leakage
     /// budget policy ceiling (TCK-00555).
@@ -773,6 +788,21 @@ pub fn build_evidence_bundle_envelope(
         queue_admission: queue_trace.clone(),
         budget_admission: budget_trace.clone(),
     };
+
+    // INV-EB-025: Fail-closed when leakage_budget_policy is absent for
+    // new-schema output. New-schema envelopes (EVIDENCE_BUNDLE_ENVELOPE_SCHEMA)
+    // require a leakage_budget_decision for import acceptance (INV-EB-014).
+    // Exporting without a policy would produce an envelope that passes export
+    // but fails import — a self-incompatible API surface. Callers must supply
+    // a policy, even if it is a permissive tier (e.g., tier0_default()).
+    if config.leakage_budget_policy.is_none() {
+        return Err(EvidenceBundleError::LeakageBudgetDenied {
+            reason: "export requires leakage_budget_policy for new-schema envelopes \
+                     (EVIDENCE_BUNDLE_ENVELOPE_SCHEMA); callers must supply a policy, \
+                     even if permissive (e.g., LeakageBudgetPolicy::tier0_default())"
+                .to_string(),
+        });
+    }
 
     // Build envelope without content hash first.
     let mut envelope = EvidenceBundleEnvelopeV1 {
@@ -880,6 +910,21 @@ pub fn build_evidence_bundle_envelope(
                             return Err(EvidenceBundleError::LeakageBudgetDenied {
                                 reason: format!(
                                     "declassification receipt authorizes {} bytes but converged export is {} bytes",
+                                    declass.authorized_bytes, new_size,
+                                ),
+                            });
+                        }
+                    }
+                }
+
+                // INV-EB-024: byte coverage for all exceeded-policy exports.
+                if d.exceeded_policy || byte_exceeded {
+                    if let Some(declass) = &config.declassification_receipt {
+                        if declass.authorized_bytes < new_size {
+                            return Err(EvidenceBundleError::LeakageBudgetDenied {
+                                reason: format!(
+                                    "declassification receipt authorizes {} bytes but converged export is {} bytes \
+                                     (byte coverage required for all exceeded-policy exports)",
                                     declass.authorized_bytes, new_size,
                                 ),
                             });
@@ -1026,6 +1071,28 @@ fn enforce_leakage_budget_final(
                 return Err(EvidenceBundleError::LeakageBudgetDenied {
                     reason: format!(
                         "declassification receipt authorizes {} bytes but final export is {} bytes",
+                        declass.authorized_bytes, actual_export_bytes,
+                    ),
+                });
+            }
+        }
+    }
+
+    // INV-EB-024: When any dimension exceeded policy and a declassification
+    // receipt is present, always validate that authorized_bytes covers the
+    // actual export bytes — regardless of which dimension triggered
+    // exceedance. This aligns export semantics with import semantics
+    // (import always checks authorized_bytes >= actual_export_bytes when
+    // declassification_authorized is true). Without this check, a
+    // class-triggered exceedance with an under-authorized byte receipt
+    // could pass export but fail import.
+    if any_exceeded {
+        if let Some(declass) = &config.declassification_receipt {
+            if declass.authorized_bytes < actual_export_bytes {
+                return Err(EvidenceBundleError::LeakageBudgetDenied {
+                    reason: format!(
+                        "declassification receipt authorizes {} bytes but actual export is {} bytes \
+                         (byte coverage required for all exceeded-policy exports)",
                         declass.authorized_bytes, actual_export_bytes,
                     ),
                 });
@@ -1575,7 +1642,7 @@ fn compute_envelope_content_hash(envelope: &EvidenceBundleEnvelopeV1) -> [u8; 32
     // Schema-gated legacy hash path: when `leakage_budget_decision` is absent
     // AND the envelope schema is a legacy schema ID, omit the leakage budget
     // field entirely to preserve backward compatibility with pre-TCK-00555
-    // envelopes (INV-EB-014). New-schema envelopes always include the
+    // envelopes (INV-EB-026). New-schema envelopes always include the
     // presence/absence tag.
     let is_legacy_schema = envelope.schema == EVIDENCE_BUNDLE_SCHEMA;
     if is_legacy_schema && envelope.leakage_budget_decision.is_none() {
@@ -1856,9 +1923,36 @@ fn validate_leakage_budget_decision(
         //
         // Legacy envelopes (EVIDENCE_BUNDLE_SCHEMA) are exempt for backward
         // compatibility — they predate TCK-00555 and never carried a decision.
+        //
+        // INV-EB-023: Schema-downgrade detection. Even if the schema string
+        // is legacy, if the boundary check carries leakage-budget-aware
+        // fields (leakage_budget_receipt, timing_channel_budget, or
+        // disclosure_policy_binding), the envelope was produced with
+        // budget-awareness (post-TCK-00555) and cannot be legitimately
+        // legacy. An attacker who takes a new-schema envelope, strips the
+        // decision, and swaps the schema to legacy must also fabricate a
+        // boundary check without these fields — but the content hash binds
+        // all boundary check fields, so any tampering invalidates the hash.
+        // This check closes the gap for envelopes where the attacker can
+        // recompute the hash (e.g., unsigned bundles): if budget-aware
+        // fields are present, the legacy exemption does not apply.
         let is_legacy = envelope.schema == EVIDENCE_BUNDLE_SCHEMA;
         if is_legacy {
-            return Ok(()); // Pre-TCK-00555 envelope: no decision expected
+            let has_budget_aware_fields = envelope.boundary_check.leakage_budget_receipt.is_some()
+                || envelope.boundary_check.timing_channel_budget.is_some()
+                || envelope.boundary_check.disclosure_policy_binding.is_some();
+            if has_budget_aware_fields {
+                return Err(EvidenceBundleError::LeakageBudgetDenied {
+                    reason: "import rejected: legacy-schema envelope carries \
+                             budget-aware boundary check fields \
+                             (leakage_budget_receipt, timing_channel_budget, or \
+                             disclosure_policy_binding) but is missing \
+                             leakage_budget_decision — possible schema-downgrade \
+                             attack (INV-EB-023)"
+                        .to_string(),
+                });
+            }
+            return Ok(()); // Truly pre-TCK-00555 envelope: no decision expected
         }
         return Err(EvidenceBundleError::LeakageBudgetDenied {
             reason: "import rejected: new-schema envelope requires leakage_budget_decision \
@@ -4435,16 +4529,17 @@ pub mod tests {
     }
 
     #[test]
-    fn export_with_no_policy_succeeds_without_decision() {
+    fn export_with_no_policy_fails_closed() {
+        // INV-EB-025: Export fails closed when leakage_budget_policy is
+        // None for new-schema output. Callers must supply a policy.
         let receipt = make_valid_receipt();
         let mut config = make_valid_export_config();
         config.leakage_budget_policy = None;
 
-        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[])
-            .expect("export without policy should succeed");
+        let result = build_evidence_bundle_envelope(&receipt, &config, &[]);
         assert!(
-            envelope.leakage_budget_decision.is_none(),
-            "no policy means no leakage budget decision"
+            matches!(result, Err(EvidenceBundleError::LeakageBudgetDenied { .. })),
+            "export without leakage_budget_policy must fail closed (INV-EB-025): {result:?}"
         );
     }
 
@@ -4635,17 +4730,24 @@ pub mod tests {
     #[test]
     fn import_rejects_new_schema_envelope_without_decision() {
         // INV-EB-014: New-schema envelopes MUST carry a leakage budget
-        // decision. An envelope exported without a policy (decision=None)
-        // but bearing the new schema ID must be rejected on import to
-        // prevent downgrade-by-omission attacks.
+        // decision. A new-schema envelope without a decision must be
+        // rejected on import to prevent downgrade-by-omission attacks.
+        //
+        // Since INV-EB-025 now prevents export without a policy, we
+        // construct the tampered envelope directly to test import behavior.
         let receipt = make_valid_receipt();
-        let mut config = make_valid_export_config();
-        config.leakage_budget_policy = None;
+        let config = make_valid_export_config();
 
-        let envelope =
+        // Build a valid envelope with a decision, then strip it.
+        let mut envelope =
             build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
-        assert!(envelope.leakage_budget_decision.is_none());
+        assert!(envelope.leakage_budget_decision.is_some());
         assert_eq!(envelope.schema, EVIDENCE_BUNDLE_ENVELOPE_SCHEMA);
+
+        // Strip the decision (simulating a downgrade-by-omission attack).
+        envelope.leakage_budget_decision = None;
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
 
         let data = serialize_envelope(&envelope).expect("serialize");
         let result = import_evidence_bundle(&data);
@@ -4660,15 +4762,25 @@ pub mod tests {
         // INV-EB-014: Legacy envelopes (EVIDENCE_BUNDLE_SCHEMA) are exempt
         // from the mandatory decision requirement for backward compatibility
         // with pre-TCK-00555 exports.
+        //
+        // Construct a truly legacy envelope by building a valid envelope
+        // with a decision, then stripping the decision, clearing
+        // budget-aware fields, and setting the legacy schema. This
+        // simulates a pre-TCK-00555 export that never had budget awareness.
         let receipt = make_valid_receipt();
-        let mut config = make_valid_export_config();
-        config.leakage_budget_policy = None;
+        let config = make_valid_export_config();
 
         let mut envelope =
             build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
-        assert!(envelope.leakage_budget_decision.is_none());
 
-        // Switch to legacy schema (simulating a pre-TCK-00555 envelope).
+        // Strip decision and budget-aware boundary check fields to simulate
+        // a truly pre-TCK-00555 legacy envelope.
+        envelope.leakage_budget_decision = None;
+        envelope.boundary_check.leakage_budget_receipt = None;
+        envelope.boundary_check.timing_channel_budget = None;
+        envelope.boundary_check.disclosure_policy_binding = None;
+
+        // Switch to legacy schema.
         envelope.schema = EVIDENCE_BUNDLE_SCHEMA.to_string();
         // Recompute content hash for the legacy schema path.
         let hash = compute_envelope_content_hash(&envelope);
@@ -4678,7 +4790,7 @@ pub mod tests {
         let result = import_evidence_bundle(&data);
         assert!(
             result.is_ok(),
-            "legacy-schema envelope without decision should be accepted: {result:?}"
+            "truly legacy-schema envelope without decision should be accepted: {result:?}"
         );
     }
 
@@ -4937,33 +5049,39 @@ pub mod tests {
         // schema and has no leakage_budget_decision. The hash must be
         // computed WITHOUT the leakage budget presence/absence byte to
         // preserve backward compatibility (INV-EB-014).
+        //
+        // Since INV-EB-025 requires a policy for export, we construct
+        // the legacy envelope by building a valid one and then stripping
+        // the decision and budget-aware fields.
         let receipt = make_valid_receipt();
-        let mut config = make_valid_export_config();
-        // Disable leakage budget policy to simulate a pre-TCK-00555 export.
-        config.leakage_budget_policy = None;
+        let config = make_valid_export_config();
 
         let mut envelope =
             build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
-        assert!(
-            envelope.leakage_budget_decision.is_none(),
-            "no policy means no decision"
-        );
 
-        // Record the hash from the canonical (new-schema) envelope.
-        let canonical_hash = envelope.content_hash.clone();
+        // Record the hash from the new-schema envelope WITH decision.
+        let new_schema_with_decision_hash = envelope.content_hash.clone();
+
+        // Strip decision and budget-aware fields for legacy simulation.
+        envelope.leakage_budget_decision = None;
+        envelope.boundary_check.leakage_budget_receipt = None;
+        envelope.boundary_check.timing_channel_budget = None;
+        envelope.boundary_check.disclosure_policy_binding = None;
+
+        // Compute new-schema hash without decision (includes [0u8] byte).
+        let canonical_hash_no_decision = compute_envelope_content_hash(&envelope);
+        let canonical_hash_no_decision_str =
+            format!("b3-256:{}", hex::encode(canonical_hash_no_decision));
 
         // Switch to legacy schema and recompute hash via the legacy path.
         envelope.schema = EVIDENCE_BUNDLE_SCHEMA.to_string();
         let legacy_hash = compute_envelope_content_hash(&envelope);
         envelope.content_hash = format!("b3-256:{}", hex::encode(legacy_hash));
 
-        // Compute what the hash would be for legacy schema — this is the
-        // "fixture" hash that must remain stable across code changes.
-        // The legacy path omits the leakage budget field entirely.
         let legacy_hash_str = envelope.content_hash.clone();
 
         // Verify the legacy-schema envelope passes import (with recomputed
-        // content hash matching).
+        // content hash matching and no budget-aware fields).
         let data = serialize_envelope(&envelope).expect("serialize");
         let result = import_evidence_bundle(&data);
         assert!(
@@ -4972,11 +5090,17 @@ pub mod tests {
         );
 
         // Verify the legacy hash is different from the canonical hash
-        // (the canonical path includes a [0u8] absence byte; the legacy
-        // path omits the field entirely).
+        // without decision (the canonical path includes a [0u8] absence
+        // byte; the legacy path omits the field entirely).
         assert_ne!(
-            canonical_hash, legacy_hash_str,
+            canonical_hash_no_decision_str, legacy_hash_str,
             "legacy and canonical hashes should differ when schema differs"
+        );
+
+        // Also verify new-schema-with-decision hash differs from legacy.
+        assert_ne!(
+            new_schema_with_decision_hash, legacy_hash_str,
+            "new-schema-with-decision hash must differ from legacy hash"
         );
     }
 
@@ -4986,20 +5110,35 @@ pub mod tests {
         // decision still includes the [0u8] absence byte in the hash (not
         // the legacy path). After INV-EB-014, import now rejects such
         // envelopes, but we verify the hash computation itself is correct.
+        //
+        // Since INV-EB-025 requires a policy for export, construct the
+        // envelope by building a valid one and stripping the decision.
         let receipt = make_valid_receipt();
-        let mut config = make_valid_export_config();
-        config.leakage_budget_policy = None;
+        let config = make_valid_export_config();
 
-        let envelope =
+        let mut envelope =
             build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
-        assert!(envelope.leakage_budget_decision.is_none());
+
+        // Strip decision to test hash computation without it.
+        envelope.leakage_budget_decision = None;
 
         // Verify the hash is self-consistent (hash validation passes).
         let computed = compute_envelope_content_hash(&envelope);
         let expected_hex = format!("b3-256:{}", hex::encode(computed));
-        assert_eq!(
-            envelope.content_hash, expected_hex,
-            "content hash should be self-consistent"
+        envelope.content_hash = expected_hex.clone();
+
+        // Verify the new-schema hash includes the [0u8] absence byte by
+        // comparing with a legacy-schema hash (which omits the field).
+        let mut legacy_envelope = envelope.clone();
+        legacy_envelope.schema = EVIDENCE_BUNDLE_SCHEMA.to_string();
+        legacy_envelope.boundary_check.leakage_budget_receipt = None;
+        legacy_envelope.boundary_check.timing_channel_budget = None;
+        legacy_envelope.boundary_check.disclosure_policy_binding = None;
+        let legacy_hash = compute_envelope_content_hash(&legacy_envelope);
+        let legacy_hex = format!("b3-256:{}", hex::encode(legacy_hash));
+        assert_ne!(
+            expected_hex, legacy_hex,
+            "new-schema and legacy-schema hashes should differ (absence byte vs omission)"
         );
 
         // INV-EB-014: import must now REJECT new-schema envelopes missing
@@ -5604,6 +5743,57 @@ pub mod tests {
     }
 
     // =========================================================================
+    // Regression: class-triggered exceedance with under-authorized bytes
+    // must fail export (INV-EB-024)
+    // =========================================================================
+
+    #[test]
+    fn export_fails_when_class_exceeded_but_bytes_under_authorized() {
+        // Regression test for INV-EB-024: When classes exceed the policy
+        // ceiling but bytes do not, a declassification receipt is required.
+        // Even though byte exceedance did not trigger, the receipt's
+        // authorized_bytes must still cover the actual export bytes
+        // (because import always validates byte coverage when
+        // declassification_authorized=true). This test verifies
+        // fail-closed: a receipt that authorizes fewer bytes than the
+        // actual export must be rejected at export time.
+        let receipt = make_valid_receipt();
+        let mut config = make_valid_export_config();
+
+        // Policy: generous byte ceiling (no byte exceedance), but very
+        // tight class ceiling (class exceedance triggers declassification).
+        config.leakage_budget_policy = Some(LeakageBudgetPolicy {
+            max_export_bytes: 100 * 1024 * 1024, // generous — no byte exceedance
+            max_export_classes: 1,               // tight — class exceedance
+            max_leakage_bits: 1024,              // generous
+        });
+
+        // Declassification receipt: authorizes classes generously but
+        // under-authorizes bytes (1 byte < actual export bytes).
+        let mut declass = make_valid_declassification_receipt();
+        declass.authorized_bytes = 1; // far below actual export bytes
+        declass.authorized_classes = 128; // generous
+        declass.authorized_leakage_bits = 1024; // generous
+        declass.content_hash = declass.compute_content_hash();
+        config.declassification_receipt = Some(declass);
+
+        let result = build_evidence_bundle_envelope(&receipt, &config, &[]);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::LeakageBudgetDenied { .. })),
+            "class-triggered exceedance with under-authorized bytes must fail \
+             export (INV-EB-024): {result:?}"
+        );
+
+        // Verify error mentions byte coverage.
+        if let Err(EvidenceBundleError::LeakageBudgetDenied { reason }) = &result {
+            assert!(
+                reason.contains("byte") || reason.contains("bytes"),
+                "error should mention byte under-authorization: {reason}"
+            );
+        }
+    }
+
+    // =========================================================================
     // Regression: decision-stripping bypass attempt (INV-EB-014)
     // =========================================================================
 
@@ -5707,5 +5897,68 @@ pub mod tests {
             "schema swap must produce a different hash, proving the original \
              committed hash cannot survive a schema downgrade"
         );
+    }
+
+    #[test]
+    fn import_rejects_schema_downgraded_envelope_with_budget_aware_fields() {
+        // Regression test for INV-EB-023: An attacker takes a valid
+        // new-schema envelope with a leakage_budget_decision, strips the
+        // decision field, swaps the schema to legacy, and recomputes the
+        // content hash via the legacy hash path. The resulting envelope
+        // would previously pass import because the legacy exemption
+        // accepted it. With INV-EB-023, the boundary check's budget-aware
+        // fields (leakage_budget_receipt, timing_channel_budget,
+        // disclosure_policy_binding) reveal that this is NOT a truly
+        // legacy envelope, and import MUST reject it.
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+
+        // Step 1: Build a legitimate new-schema envelope with decision.
+        let mut envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+        assert!(
+            envelope.leakage_budget_decision.is_some(),
+            "legitimate envelope must have a leakage budget decision"
+        );
+        // Verify boundary check has budget-aware fields.
+        assert!(
+            envelope.boundary_check.leakage_budget_receipt.is_some()
+                || envelope.boundary_check.timing_channel_budget.is_some()
+                || envelope.boundary_check.disclosure_policy_binding.is_some(),
+            "test setup: boundary check must carry budget-aware fields"
+        );
+
+        // Step 2: Attacker strips the decision and swaps schema to legacy.
+        envelope.leakage_budget_decision = None;
+        envelope.schema = EVIDENCE_BUNDLE_SCHEMA.to_string();
+
+        // Step 3: Attacker recomputes the hash via the legacy path.
+        let tampered_hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(tampered_hash));
+
+        // Step 4: Verify the tampered hash is self-consistent (hash
+        // check alone would pass — the INV-EB-023 check must catch this).
+        let recomputed = compute_envelope_content_hash(&envelope);
+        assert_eq!(
+            tampered_hash, recomputed,
+            "tampered hash must be self-consistent for this attack to be meaningful"
+        );
+
+        // Step 5: Import must reject the tampered envelope.
+        let data = serialize_envelope(&envelope).expect("serialize tampered envelope");
+        let result = import_evidence_bundle(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::LeakageBudgetDenied { .. })),
+            "schema-downgraded envelope with budget-aware fields must be \
+             rejected (INV-EB-023): {result:?}"
+        );
+
+        // Verify the error message mentions schema-downgrade.
+        if let Err(EvidenceBundleError::LeakageBudgetDenied { reason }) = &result {
+            assert!(
+                reason.contains("budget-aware") || reason.contains("INV-EB-023"),
+                "error should indicate schema-downgrade detection: {reason}"
+            );
+        }
     }
 }
