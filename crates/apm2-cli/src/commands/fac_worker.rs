@@ -4217,9 +4217,10 @@ fn acquire_worker_lane(
 
         match LaneCorruptMarkerV1::load(lane_mgr.fac_root(), lane_id) {
             Ok(Some(marker)) => {
-                eprintln!(
-                    "worker: WARNING: skipping corrupt lane {lane_id}: {reason}",
-                    reason = marker.reason
+                tracing::warn!(
+                    lane_id = lane_id.as_str(),
+                    reason = marker.reason.as_str(),
+                    "skipping corrupt lane"
                 );
                 // TCK-00570: Emit structured reset recommendation for corrupt lane.
                 emit_lane_reset_recommendation(lane_id, &marker.reason);
@@ -4229,9 +4230,10 @@ fn acquire_worker_lane(
                 match LaneLeaseV1::load(&lane_dir) {
                     Ok(Some(lease)) => match lease.state {
                         LaneState::Corrupt => {
-                            eprintln!(
-                                "worker: WARNING: skipping corrupt lease lane {lane_id}: {state}",
-                                state = lease.state
+                            tracing::warn!(
+                                lane_id = lane_id.as_str(),
+                                state = %lease.state,
+                                "skipping corrupt lease lane"
                             );
                             // TCK-00570: Emit structured reset recommendation for
                             // corrupt lease state.
@@ -4263,8 +4265,10 @@ fn acquire_worker_lane(
                                         "lane has RUNNING lease for pid {} which is still alive (unexpected with flock held)",
                                         lease.pid
                                     );
-                                    eprintln!(
-                                        "worker: WARNING: marking lane as corrupt: {lane_id} ({reason})"
+                                    tracing::warn!(
+                                        lane_id = lane_id.as_str(),
+                                        reason = reason.as_str(),
+                                        "marking lane as corrupt"
                                     );
                                     if let Err(err) = persist_corrupt_marker_with_retries(
                                         lane_mgr.fac_root(),
@@ -4272,8 +4276,10 @@ fn acquire_worker_lane(
                                         &reason,
                                         None,
                                     ) {
-                                        eprintln!(
-                                            "worker: ERROR: failed to persist corrupt marker for lane {lane_id}: {err}"
+                                        tracing::error!(
+                                            lane_id = lane_id.as_str(),
+                                            error = %err,
+                                            "failed to persist corrupt marker for lane"
                                         );
                                     }
                                     // TCK-00570: Emit structured reset recommendation
@@ -4289,15 +4295,21 @@ fn acquire_worker_lane(
                                         "lane has RUNNING lease for pid {} which exists but is not signalable (EPERM), marking corrupt",
                                         lease.pid
                                     );
-                                    eprintln!("worker: WARNING: {lane_id}: {reason}");
+                                    tracing::warn!(
+                                        lane_id = lane_id.as_str(),
+                                        reason = reason.as_str(),
+                                        "lane has running lease with permission-denied liveness check"
+                                    );
                                     if let Err(err) = persist_corrupt_marker_with_retries(
                                         lane_mgr.fac_root(),
                                         lane_id,
                                         &reason,
                                         None,
                                     ) {
-                                        eprintln!(
-                                            "worker: ERROR: failed to persist corrupt marker for lane {lane_id}: {err}"
+                                        tracing::error!(
+                                            lane_id = lane_id.as_str(),
+                                            error = %err,
+                                            "failed to persist corrupt marker for lane"
                                         );
                                     }
                                     // TCK-00570: Emit structured reset recommendation
