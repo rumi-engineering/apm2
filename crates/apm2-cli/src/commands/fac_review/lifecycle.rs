@@ -1307,28 +1307,62 @@ pub fn apply_gate_result_events_for_repo_sha(
         if !snapshot.current_sha.eq_ignore_ascii_case(head_sha) {
             continue;
         }
+        if !is_gate_result_replay_candidate_state(&snapshot.pr_state) {
+            continue;
+        }
 
-        apply_event(
+        if let Err(err) = apply_event(
             owner_repo,
             pr_number,
             head_sha,
             &LifecycleEventKind::PushObserved,
-        )?;
-        apply_event(
+        ) {
+            if err.contains("illegal transition") {
+                eprintln!(
+                    "WARNING: skipping gate-result replay for PR #{pr_number} ({owner_repo}@{head_sha}) due to push_observed transition mismatch: {err}"
+                );
+                continue;
+            }
+            return Err(err);
+        }
+        if let Err(err) = apply_event(
             owner_repo,
             pr_number,
             head_sha,
             &LifecycleEventKind::GatesStarted,
-        )?;
+        ) {
+            if err.contains("illegal transition") {
+                eprintln!(
+                    "WARNING: skipping gate-result replay for PR #{pr_number} ({owner_repo}@{head_sha}) due to gates_started transition mismatch: {err}"
+                );
+                continue;
+            }
+            return Err(err);
+        }
         let terminal_event = if passed {
             LifecycleEventKind::GatesPassed
         } else {
             LifecycleEventKind::GatesFailed
         };
-        apply_event(owner_repo, pr_number, head_sha, &terminal_event)?;
+        if let Err(err) = apply_event(owner_repo, pr_number, head_sha, &terminal_event) {
+            if err.contains("illegal transition") {
+                eprintln!(
+                    "WARNING: skipping gate-result replay for PR #{pr_number} ({owner_repo}@{head_sha}) due to terminal transition mismatch: {err}"
+                );
+                continue;
+            }
+            return Err(err);
+        }
         applied = applied.saturating_add(1);
     }
     Ok(applied)
+}
+
+fn is_gate_result_replay_candidate_state(state: &str) -> bool {
+    matches!(
+        state,
+        "pushed" | "gates_running" | "gates_failed" | "recovering"
+    )
 }
 
 fn load_pr_state_bypass_hmac(
@@ -5199,6 +5233,79 @@ mod tests {
         )
         .expect("noop for unknown sha");
         assert_eq!(applied, 0);
+    }
+
+    #[test]
+    fn apply_gate_result_events_for_repo_sha_skips_terminal_sibling_states() {
+        let repo = next_repo("gate-retry-terminal-skip", next_pr());
+        let sha = "7777777777777777777777777777777777777777";
+        let merged_pr = next_pr();
+        let active_pr = next_pr();
+
+        let _ =
+            apply_event(&repo, merged_pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+        let _ =
+            apply_event(&repo, merged_pr, sha, &LifecycleEventKind::GatesStarted).expect("start");
+        let _ =
+            apply_event(&repo, merged_pr, sha, &LifecycleEventKind::GatesPassed).expect("passed");
+        let _ = apply_event(
+            &repo,
+            merged_pr,
+            sha,
+            &LifecycleEventKind::ReviewsDispatched,
+        )
+        .expect("dispatch");
+        let _ = apply_event(
+            &repo,
+            merged_pr,
+            sha,
+            &LifecycleEventKind::VerdictSet {
+                dimension: "security".to_string(),
+                decision: "approve".to_string(),
+            },
+        )
+        .expect("security approve");
+        let _ = apply_event(
+            &repo,
+            merged_pr,
+            sha,
+            &LifecycleEventKind::VerdictSet {
+                dimension: "code-quality".to_string(),
+                decision: "approve".to_string(),
+            },
+        )
+        .expect("quality approve");
+        let merged = apply_event(
+            &repo,
+            merged_pr,
+            sha,
+            &LifecycleEventKind::Merged {
+                source: "unit_test".to_string(),
+            },
+        )
+        .expect("merged");
+        assert_eq!(merged.pr_state, PrLifecycleState::Merged);
+
+        let _ =
+            apply_event(&repo, active_pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+        let _ =
+            apply_event(&repo, active_pr, sha, &LifecycleEventKind::GatesStarted).expect("start");
+        let _ =
+            apply_event(&repo, active_pr, sha, &LifecycleEventKind::GatesFailed).expect("failed");
+
+        let applied =
+            apply_gate_result_events_for_repo_sha(&repo, sha, true).expect("apply retry events");
+        assert_eq!(applied, 1);
+
+        let merged_snapshot = super::load_pr_lifecycle_snapshot(&repo, merged_pr)
+            .expect("merged snapshot")
+            .expect("merged lifecycle");
+        assert_eq!(merged_snapshot.pr_state, "merged");
+
+        let active_snapshot = super::load_pr_lifecycle_snapshot(&repo, active_pr)
+            .expect("active snapshot")
+            .expect("active lifecycle");
+        assert_eq!(active_snapshot.pr_state, "gates_passed");
     }
 
     #[test]

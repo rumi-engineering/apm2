@@ -861,12 +861,12 @@ where
             {
                 let tombstone =
                     render_tombstoned_decision_comment_body(response.id, &response.html_url);
-                update_comment(owner_repo, orphaned_comment_id, &tombstone).map_err(|err| {
-                    format!(
-                        "created replacement verdict comment {} for PR #{pr_number} but failed to tombstone superseded comment {orphaned_comment_id}: {err}",
+                if let Err(err) = update_comment(owner_repo, orphaned_comment_id, &tombstone) {
+                    eprintln!(
+                        "WARNING: created replacement verdict comment {} for PR #{pr_number} but failed to tombstone superseded comment {orphaned_comment_id}: {err}",
                         response.id
-                    )
-                })?;
+                    );
+                }
             }
             Ok((response.id, response.html_url))
         },
@@ -2293,6 +2293,81 @@ mod tests {
         );
         assert_eq!(update_calls, 2);
         assert!(tombstone_seen);
+    }
+
+    #[test]
+    fn project_decision_comment_tombstone_failure_is_best_effort() {
+        let owner_repo = "example/repo";
+        let pr_number = 665;
+        let head_sha = "aabbccddeeff0011223344556677889900112233";
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: "ok".to_string(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-18T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
+            },
+        );
+        let payload = DecisionComment {
+            schema: DECISION_SCHEMA.to_string(),
+            pr: pr_number,
+            sha: head_sha.to_string(),
+            updated_at: "2026-02-18T00:00:00Z".to_string(),
+            dimensions: dimensions.clone(),
+        };
+        let record = DecisionProjectionRecord {
+            schema: super::PROJECTION_VERDICT_SCHEMA.to_string(),
+            owner_repo: owner_repo.to_string(),
+            pr_number,
+            head_sha: head_sha.to_string(),
+            updated_at: payload.updated_at.clone(),
+            decision_comment_id: 77,
+            decision_comment_url: "https://github.com/example/repo/issues/665#issuecomment-77"
+                .to_string(),
+            decision_signature: String::new(),
+            integrity_hmac: None,
+            dimensions,
+        };
+
+        let mut update_calls = 0usize;
+        let (comment_id, comment_url) = super::project_decision_comment_with(
+            owner_repo,
+            pr_number,
+            &record,
+            &payload,
+            |_, id| {
+                assert_eq!(id, 77);
+                Ok(None)
+            },
+            |_, id, _| {
+                update_calls = update_calls.saturating_add(1);
+                assert_eq!(id, 77);
+                if update_calls == 1 {
+                    Err("comment no longer patchable".to_string())
+                } else {
+                    Err("tombstone update denied".to_string())
+                }
+            },
+            |_, _, _| {
+                Ok(super::github_projection::IssueCommentResponse {
+                    id: 89,
+                    html_url: "https://github.com/example/repo/issues/665#issuecomment-89"
+                        .to_string(),
+                })
+            },
+        )
+        .expect("replacement comment should be accepted even when tombstone fails");
+
+        assert_eq!(comment_id, 89);
+        assert_eq!(
+            comment_url,
+            "https://github.com/example/repo/issues/665#issuecomment-89"
+        );
+        assert_eq!(update_calls, 2);
     }
 
     #[test]
