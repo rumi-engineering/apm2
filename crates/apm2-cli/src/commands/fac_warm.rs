@@ -207,6 +207,7 @@ pub fn run_fac_warm(
         &boundary_id,
         &mut broker,
         &job_spec_policy,
+        fac_policy.allowed_intents.as_deref(),
     ) {
         Ok(s) => s,
         Err(msg) => {
@@ -386,6 +387,7 @@ fn build_warm_job_spec(
     boundary_id: &str,
     broker: &mut FacBroker,
     job_spec_policy: &JobSpecValidationPolicy,
+    allowed_intents: Option<&[apm2_core::fac::job_spec::FacIntent]>,
 ) -> Result<FacJobSpecV1, String> {
     let enqueue_time = format_iso8601(current_epoch_secs());
     let phases_csv = phases
@@ -435,16 +437,22 @@ fn build_warm_job_spec(
     spec.actuation.request_id = digest;
 
     // Issue channel context token from broker.
-    // Signature: issue_channel_context_token(&Hash, &str, &str, &str)
-    // where Hash = [u8; 32].
+    // Signature: issue_channel_context_token(&Hash, &str, &str, &str,
+    // Option<&FacIntent>, Option<&[FacIntent]>) where Hash = [u8; 32].
     // Bind token policy fields to the admitted FAC policy digest while
     // keeping request_id bound to this concrete job spec digest.
+    // TCK-00567: Derive intent from job kind and pass to broker for
+    // intent-bound token issuance.  Thread FacPolicyV1.allowed_intents
+    // so the broker enforces the allowlist at issuance (fail-closed).
+    let intent = apm2_core::fac::job_spec::job_kind_to_intent(&spec.kind);
     let (token, wal_bytes) = broker
         .issue_channel_context_token(
             policy_digest,
             lease_id,
             &spec.actuation.request_id,
             boundary_id,
+            intent.as_ref(),
+            allowed_intents,
         )
         .map_err(|e| format!("broker token issuance: {e}"))?;
     // BLOCKER fix: persist the WAL entry before releasing the token
