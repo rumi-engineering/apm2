@@ -326,4 +326,6 @@ notes:
       semantics to avoid false restart recommendations during long reviews.
     - Regression tests added for unknown-activity running reviewers and
       liveness idle-age timestamp derivation.
+    - Repo-scoped doctor filtering now applies before global tracked-PR
+      truncation, with regression coverage for mixed-repo (>100 PR) state.
   security: "default-deny, fail-closed on origin divergence, signed merge receipts"

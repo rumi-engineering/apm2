@@ -841,20 +841,17 @@ pub fn collect_tracked_pr_summaries(
     let mut pr_numbers = list_review_pr_numbers()?;
     // Sort descending so we keep the most recent PRs when truncating.
     pr_numbers.sort_unstable_by(|a, b| b.cmp(a));
-    pr_numbers.truncate(MAX_TRACKED_PR_SUMMARIES);
-    let repo_filter = repo_filter
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_ascii_lowercase);
-
-    let mut summaries = Vec::with_capacity(pr_numbers.len());
+    let mut candidates = Vec::with_capacity(pr_numbers.len());
     for pr_number in pr_numbers {
         let Some(owner_repo) = resolve_owner_repo_for_pr(pr_number, fallback_owner_repo) else {
             continue;
         };
-        if !tracked_pr_matches_repo_filter(&owner_repo, repo_filter.as_deref()) {
-            continue;
-        }
+        candidates.push((pr_number, owner_repo));
+    }
+    let selected = filter_tracked_pr_candidates(candidates, repo_filter, MAX_TRACKED_PR_SUMMARIES);
+
+    let mut summaries = Vec::with_capacity(selected.len());
+    for (pr_number, owner_repo) in selected {
         let summary = run_doctor_inner(&owner_repo, pr_number, Vec::new(), true);
         let lifecycle_state = summary
             .lifecycle
@@ -883,6 +880,18 @@ pub fn collect_tracked_pr_summaries(
     }
     summaries.sort_by_key(|entry| entry.pr_number);
     Ok(summaries)
+}
+
+fn filter_tracked_pr_candidates(
+    candidates: Vec<(u32, String)>,
+    repo_filter: Option<&str>,
+    limit: usize,
+) -> Vec<(u32, String)> {
+    candidates
+        .into_iter()
+        .filter(|(_, owner_repo)| tracked_pr_matches_repo_filter(owner_repo, repo_filter))
+        .take(limit)
+        .collect()
 }
 
 fn resolve_owner_repo_for_pr(pr_number: u32, fallback_owner_repo: Option<&str>) -> Option<String> {
@@ -7489,5 +7498,26 @@ mod tests {
             None
         ));
         assert!(!super::tracked_pr_matches_repo_filter("   ", None));
+    }
+
+    #[test]
+    fn tracked_pr_repo_filter_applies_before_global_limit() {
+        let mut candidates = Vec::new();
+        for pr in (1000..=1105).rev() {
+            candidates.push((pr, "example/capacity-load".to_string()));
+        }
+        // This target PR would be dropped by old logic that truncated to 100
+        // before applying repo filtering.
+        candidates.push((42, "guardian-intelligence/apm2".to_string()));
+
+        let selected = super::filter_tracked_pr_candidates(
+            candidates,
+            Some("guardian-intelligence/apm2"),
+            super::MAX_TRACKED_PR_SUMMARIES,
+        );
+        assert_eq!(
+            selected,
+            vec![(42, "guardian-intelligence/apm2".to_string())]
+        );
     }
 }
