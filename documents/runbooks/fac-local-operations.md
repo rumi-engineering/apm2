@@ -271,25 +271,6 @@ apm2 fac gc --json
 
 GC emits a `GcReceiptV1` persisted under `$APM2_HOME/private/fac/receipts/`.
 
-#### gate_cache_v2 unbound-entry wipe (TCK-00619 migration)
-
-When deploying the TCK-00619 binary (which removes `--allow-legacy-cache`),
-any existing gate cache entries that lack RFC-0028/0029 receipt bindings will
-be treated as cache misses and cause gates to re-run. To avoid unnecessary
-re-execution:
-
-```bash
-# Option A: wipe the entire gate cache (simplest, safest)
-rm -rf "${APM2_HOME:-$HOME/.apm2}/private/fac/gate_cache_v2/"
-
-# Option B: let GC expire them naturally (30-day TTL)
-apm2 fac gc --dry-run   # preview what would be removed
-apm2 fac gc             # run GC (unbound entries become misses; they expire within 30 days)
-```
-
-Option A is recommended for the migration moment; Option B is acceptable if
-re-running some gates is not a concern.
-
 ### 3.4 Enqueueing jobs manually (PLANNED)
 
 > **PLANNED -- not yet implemented.** The `apm2 fac enqueue` subcommand does
