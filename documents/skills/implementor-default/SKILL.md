@@ -68,10 +68,11 @@ decision_tree:
           action: "References do not interpolate variables. Replace placeholders like <TICKET_ID>, <PR_NUMBER>, and <WORKTREE_PATH> before running commands."
         - id: DISCOVER_RELEVANT_FAC_HELP
           action: |
-            Discover the 3 CLI commands you will use. Run these help commands:
+            Discover the 4 CLI commands you will use. Run these help commands:
             (1) `apm2 fac review findings --help`
             (2) `apm2 fac gates --help`
-            (3) `apm2 fac push --help`
+            (3) `apm2 fac gates explain --help`
+            (4) `apm2 fac push --help`
             Help output is authoritative for names/flags.
         - id: RESOLVE_SCOPE
           action: |
