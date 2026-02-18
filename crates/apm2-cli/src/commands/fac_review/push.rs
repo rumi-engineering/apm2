@@ -410,6 +410,8 @@ fn apply_gate_lifecycle_events_with<F>(
 where
     F: FnMut(lifecycle::LifecycleEventKind) -> Result<(), String>,
 {
+    // TCK-00618: gate lifecycle projection must fail closed. Any illegal
+    // transition aborts the sequence and bubbles the error to caller.
     for (event_name, event) in events {
         apply_event_fn(event.clone()).map_err(|err| {
             format!(
