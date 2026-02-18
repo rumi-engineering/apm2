@@ -1,18 +1,17 @@
 // AGENT-AUTHORED
-//! Toolchain fingerprint derivation, caching, and verification (TCK-00538).
+//! Toolchain fingerprint derivation and verification (TCK-00538).
 //!
 //! Computes a stable `b3-256:` BLAKE3 fingerprint of the build toolchain
 //! installed on this node: `rustc -Vv`, `cargo -V`, `cargo nextest --version`,
 //! and `systemd-run --version`. The fingerprint changes when any underlying
 //! tool changes (different binary, different version, different host triple).
 //!
-//! # Caching
+//! # Design
 //!
-//! Fingerprints are cached at
-//! `$APM2_HOME/private/fac/toolchain/fingerprint.v1.json` with 0o700 directory
-//! / 0o600 file permissions. The cache is keyed by the raw version output of
-//! all tools; if any tool output changes, the fingerprint is recomputed and the
-//! cache is replaced atomically (temp → rename).
+//! The fingerprint is computed once at worker startup by spawning 4 version-
+//! probe subprocesses and hashing their output. Since this runs exactly once
+//! per worker lifecycle, no caching is needed -- the cost of 4 process spawns
+//! is negligible at startup.
 //!
 //! # Security Model
 //!
@@ -20,28 +19,20 @@
 //! - Length-prefixed encoding of each tool's output prevents concatenation
 //!   ambiguity.
 //! - Bounded I/O on tool output prevents OOM from malicious tool wrappers.
-//! - Atomic write for cache persistence prevents partial reads.
-//! - Safe permissions at create-time (no chmod TOCTOU).
 //!
 //! # Invariants
 //!
 //! - [INV-TC-001] Fingerprint changes when any toolchain component changes.
 //! - [INV-TC-002] Fingerprint is consistent across processes on the same node
 //!   (deterministic hash over deterministic inputs).
-//! - [INV-TC-003] Cache directory uses 0o700 and cache file uses 0o600
-//!   permissions (CTR-2611).
-//! - [INV-TC-004] Cache reads are bounded by `MAX_CACHE_FILE_SIZE` before
-//!   parsing (RSK-1601, CTR-1603).
 //! - [INV-TC-005] Tool version probes are bounded by `MAX_VERSION_OUTPUT_BYTES`
 //!   and `VERSION_PROBE_TIMEOUT` to prevent OOM and hang.
 
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -51,24 +42,12 @@ use thiserror::Error;
 /// Domain separator for the toolchain fingerprint hash.
 const HASH_DOMAIN: &str = "apm2.fac.toolchain_fingerprint.v1";
 
-/// Schema identifier for the persisted cache file.
-const SCHEMA_ID: &str = "apm2.fac.toolchain_fingerprint.v1";
-
-/// Relative directory under `$APM2_HOME` for cache storage.
-const TOOLCHAIN_CACHE_DIR: &str = "private/fac/toolchain";
-
-/// Cache file name.
-const CACHE_FILE_NAME: &str = "fingerprint.v1.json";
-
 /// Maximum size of a tool's version output (bytes). Prevents OOM from
 /// malicious tool wrappers (INV-TC-005).
 const MAX_VERSION_OUTPUT_BYTES: u64 = 8192;
 
 /// Timeout for each version probe command (INV-TC-005).
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Maximum cache file size for bounded reads (INV-TC-004).
-const MAX_CACHE_FILE_SIZE: u64 = 65_536;
 
 /// Maximum length of the fingerprint string (`b3-256:` + 64 hex = 71).
 pub const FINGERPRINT_STRING_LENGTH: usize = 71;
@@ -80,7 +59,7 @@ pub const FINGERPRINT_STRING_LENGTH: usize = 71;
 /// Errors from toolchain fingerprint operations.
 #[derive(Debug, Error)]
 pub enum ToolchainFingerprintError {
-    /// I/O failure.
+    /// I/O failure during version probe.
     #[error("toolchain fingerprint I/O failure while {context}: {source}")]
     Io {
         /// Operation context.
@@ -88,59 +67,26 @@ pub enum ToolchainFingerprintError {
         /// Source error.
         source: std::io::Error,
     },
-
-    /// Cache file exceeded maximum size.
-    #[error("toolchain fingerprint cache file exceeds max size {max} bytes")]
-    FileTooLarge {
-        /// Limit.
-        max: u64,
-    },
-
-    /// JSON parse/serialize failure.
-    #[error("toolchain fingerprint JSON error: {0}")]
-    Json(String),
-
-    /// Invalid data in cache file.
-    #[error("toolchain fingerprint invalid data: {0}")]
-    InvalidData(String),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Persisted cache type
+// Types
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Persisted toolchain fingerprint cache entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedToolchainFingerprint {
-    /// Schema tag.
-    schema: String,
-    /// The computed fingerprint (`b3-256:<hex>`).
-    fingerprint: String,
-    /// Raw version outputs used to derive the fingerprint, for cache
-    /// invalidation: if any raw output differs, the cache is stale.
-    raw_versions: ToolchainVersions,
-}
 
 /// Raw tool version outputs collected from the local toolchain.
 ///
 /// Each field holds the stdout output of the corresponding version command,
-/// or `None` if the tool is not available. The struct is serialized
-/// deterministically (fields in declaration order) for cache comparison.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// or `None` if the tool is not available. Fields are hashed in declaration
+/// order for deterministic fingerprint derivation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolchainVersions {
     /// `rustc -Vv` output.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rustc: Option<String>,
     /// `cargo -V` output.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cargo: Option<String>,
     /// `cargo nextest --version` output.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nextest: Option<String>,
     /// `systemd-run --version` output.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub systemd_run: Option<String>,
 }
 
@@ -148,65 +94,32 @@ pub struct ToolchainVersions {
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Resolve the toolchain fingerprint, checking the on-disk cache first and
-/// only spawning version-probe processes when the cache is missing or stale.
+/// Resolve the toolchain fingerprint by collecting version probes and
+/// deriving the hash.
+///
+/// Spawns 4 subprocesses to probe tool versions, then computes a
+/// domain-separated BLAKE3 hash. Called once at worker startup.
 ///
 /// Returns a `b3-256:<hex>` string that changes when any toolchain component
 /// changes.
 ///
-/// # Cache integrity
-///
-/// On cache hit, the fingerprint is recomputed from `raw_versions` and
-/// compared to the stored value. If they differ (cache tampering), the cache
-/// is overwritten atomically and the recomputed value is returned.
-///
 /// # Errors
 ///
-/// Returns `ToolchainFingerprintError` if cache persistence fails. Tool
-/// version probe failures are non-fatal (the tool is recorded as `None`).
+/// This function is infallible with respect to individual tool probes
+/// (missing tools produce `None` in the version struct). It always returns
+/// `Ok(fingerprint)`.
 pub fn resolve_fingerprint(
-    apm2_home: &Path,
     hardened_env: &BTreeMap<String, String>,
 ) -> Result<String, ToolchainFingerprintError> {
-    let cache_dir = apm2_home.join(TOOLCHAIN_CACHE_DIR);
-    let cache_path = cache_dir.join(CACHE_FILE_NAME);
-
-    // Check filesystem cache FIRST — avoids spawning 4 processes on cache hit
-    // when toolchain has not changed.
-    let cached = load_cache(&cache_path)?;
-
-    // Collect current tool versions (spawns processes).
-    let current_versions = collect_toolchain_versions(hardened_env);
-
-    if let Some(cached) = cached {
-        if cached.raw_versions == current_versions {
-            // Cache hit: verify integrity by recomputing the hash from raw
-            // versions. This defends against cache tampering that preserves
-            // raw_versions but injects a forged fingerprint.
-            let expected = derive_fingerprint(&current_versions);
-            if cached.fingerprint == expected {
-                return Ok(expected);
-            }
-            // Integrity mismatch: overwrite cache atomically and return the
-            // recomputed value.
-            persist_cache(&cache_dir, &cache_path, &expected, &current_versions)?;
-            return Ok(expected);
-        }
-    }
-
-    // Cache miss or stale: compute fresh fingerprint.
-    let fingerprint = derive_fingerprint(&current_versions);
-
-    // Persist to cache (atomic write).
-    persist_cache(&cache_dir, &cache_path, &fingerprint, &current_versions)?;
-
+    let versions = collect_toolchain_versions(hardened_env);
+    let fingerprint = derive_fingerprint(&versions);
     Ok(fingerprint)
 }
 
 /// Compute the toolchain fingerprint without caching (pure derivation).
 ///
-/// Useful for testing and environments where cache persistence is not
-/// desired.
+/// Useful for testing and environments where version probes have already
+/// been collected.
 #[must_use]
 pub fn derive_from_versions(versions: &ToolchainVersions) -> String {
     derive_fingerprint(versions)
@@ -236,6 +149,24 @@ pub fn is_valid_fingerprint(fingerprint: &str) -> bool {
     }
     let hex_part = &fingerprint["b3-256:".len()..];
     hex_part.len() == 64 && hex_part.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Extract the short hex prefix from a fingerprint string.
+///
+/// Returns the first 16 hex characters of the fingerprint hash, suitable for
+/// use as a directory name suffix. Returns `None` if the fingerprint is
+/// invalid.
+#[must_use]
+pub fn fingerprint_short_hex(fingerprint: &str) -> Option<&str> {
+    if !fingerprint.starts_with("b3-256:") {
+        return None;
+    }
+    let hex_part = &fingerprint["b3-256:".len()..];
+    if hex_part.len() >= 16 && hex_part[..16].chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(&hex_part[..16])
+    } else {
+        None
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -279,189 +210,6 @@ fn push_optional_versioned(hasher: &mut blake3::Hasher, value: Option<&str>) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Internal: cache persistence
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn load_cache(
-    cache_path: &Path,
-) -> Result<Option<PersistedToolchainFingerprint>, ToolchainFingerprintError> {
-    if !cache_path.exists() {
-        return Ok(None);
-    }
-
-    // Bounded read (INV-TC-004).
-    let bytes = read_bounded_file(cache_path, MAX_CACHE_FILE_SIZE)?;
-
-    let cached: PersistedToolchainFingerprint = serde_json::from_slice(&bytes).map_err(|e| {
-        ToolchainFingerprintError::Json(format!(
-            "failed to parse toolchain fingerprint cache at {}: {e}",
-            cache_path.display()
-        ))
-    })?;
-
-    if cached.schema != SCHEMA_ID {
-        return Err(ToolchainFingerprintError::InvalidData(format!(
-            "schema mismatch: expected '{SCHEMA_ID}', got '{}'",
-            cached.schema
-        )));
-    }
-
-    if !is_valid_fingerprint(&cached.fingerprint) {
-        return Err(ToolchainFingerprintError::InvalidData(
-            "cached fingerprint has invalid format".to_string(),
-        ));
-    }
-
-    Ok(Some(cached))
-}
-
-fn persist_cache(
-    cache_dir: &Path,
-    cache_path: &Path,
-    fingerprint: &str,
-    versions: &ToolchainVersions,
-) -> Result<(), ToolchainFingerprintError> {
-    // Ensure directory with safe permissions (INV-TC-003).
-    create_restricted_dir(cache_dir)?;
-
-    let entry = PersistedToolchainFingerprint {
-        schema: SCHEMA_ID.to_string(),
-        fingerprint: fingerprint.to_string(),
-        raw_versions: versions.clone(),
-    };
-
-    let data = serde_json::to_vec_pretty(&entry).map_err(|e| {
-        ToolchainFingerprintError::Json(format!("failed to serialize fingerprint cache: {e}"))
-    })?;
-
-    // Atomic write: temp → fsync → rename (CTR-2607).
-    let mut temp =
-        tempfile::NamedTempFile::new_in(cache_dir).map_err(|e| ToolchainFingerprintError::Io {
-            context: "create temporary cache file",
-            source: e,
-        })?;
-
-    // Set file permissions at create-time (CTR-2611).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(temp.path(), perms).map_err(|e| {
-            ToolchainFingerprintError::Io {
-                context: "set cache file permissions",
-                source: e,
-            }
-        })?;
-    }
-
-    std::io::Write::write_all(&mut temp, &data).map_err(|e| ToolchainFingerprintError::Io {
-        context: "write cache file",
-        source: e,
-    })?;
-
-    temp.as_file()
-        .sync_all()
-        .map_err(|e| ToolchainFingerprintError::Io {
-            context: "fsync cache file",
-            source: e,
-        })?;
-
-    temp.persist(cache_path)
-        .map_err(|e| ToolchainFingerprintError::Io {
-            context: "rename cache file",
-            source: e.error,
-        })?;
-
-    Ok(())
-}
-
-fn read_bounded_file(path: &Path, max_size: u64) -> Result<Vec<u8>, ToolchainFingerprintError> {
-    let file = std::fs::File::open(path).map_err(|e| ToolchainFingerprintError::Io {
-        context: "open cache file",
-        source: e,
-    })?;
-
-    let metadata = file.metadata().map_err(|e| ToolchainFingerprintError::Io {
-        context: "read cache file metadata",
-        source: e,
-    })?;
-
-    if metadata.len() > max_size {
-        return Err(ToolchainFingerprintError::FileTooLarge { max: max_size });
-    }
-
-    let mut buffer = Vec::new();
-    file.take(max_size.saturating_add(1))
-        .read_to_end(&mut buffer)
-        .map_err(|e| ToolchainFingerprintError::Io {
-            context: "read cache file",
-            source: e,
-        })?;
-
-    if buffer.len() as u64 > max_size {
-        return Err(ToolchainFingerprintError::FileTooLarge { max: max_size });
-    }
-
-    Ok(buffer)
-}
-
-fn create_restricted_dir(path: &Path) -> Result<(), ToolchainFingerprintError> {
-    // If it already exists and is a directory, we are fine.
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                return Err(ToolchainFingerprintError::Io {
-                    context: "create toolchain cache directory",
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "path is a symlink",
-                    ),
-                });
-            }
-            if metadata.is_dir() {
-                return Ok(());
-            }
-            return Err(ToolchainFingerprintError::Io {
-                context: "create toolchain cache directory",
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "path exists but is not a directory",
-                ),
-            });
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
-        Err(e) => {
-            return Err(ToolchainFingerprintError::Io {
-                context: "check toolchain cache directory",
-                source: e,
-            });
-        },
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)
-            .map_err(|e| ToolchainFingerprintError::Io {
-                context: "create toolchain cache directory",
-                source: e,
-            })?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(path).map_err(|e| ToolchainFingerprintError::Io {
-            context: "create toolchain cache directory",
-            source: e,
-        })?;
-    }
-
-    Ok(())
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Internal: version probe
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -473,7 +221,7 @@ fn create_restricted_dir(path: &Path) -> Result<(), ToolchainFingerprintError> {
 ///
 /// # Deadlock-free design
 ///
-/// Same pattern as `warm.rs::version_output()` — the calling thread retains
+/// Same pattern as `warm.rs::version_output()` -- the calling thread retains
 /// direct ownership of the `Child` process handle (no mutex). The helper thread
 /// receives only the `ChildStdout` pipe and performs the bounded `read_to_end`.
 ///
@@ -650,130 +398,27 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_round_trip() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let apm2_home = tmp.path();
+    fn test_resolve_fingerprint_returns_valid() {
         let env = test_hardened_env();
+        let fp = resolve_fingerprint(&env).expect("resolve_fingerprint");
+        assert!(
+            is_valid_fingerprint(&fp),
+            "resolved fingerprint must be valid"
+        );
+    }
 
-        // First call computes and caches.
-        let fp1 = resolve_fingerprint(apm2_home, &env).expect("first resolve_fingerprint");
-        assert!(is_valid_fingerprint(&fp1));
-
-        // Second call should hit cache and return same value.
-        let fp2 = resolve_fingerprint(apm2_home, &env).expect("second resolve_fingerprint");
-        assert_eq!(fp1, fp2, "cached fingerprint must be consistent");
+    #[test]
+    fn test_resolve_fingerprint_deterministic() {
+        let env = test_hardened_env();
+        let fp1 = resolve_fingerprint(&env).expect("first resolve");
+        let fp2 = resolve_fingerprint(&env).expect("second resolve");
+        assert_eq!(fp1, fp2, "successive resolves must be identical");
     }
 
     #[test]
     fn test_collect_toolchain_versions_does_not_panic() {
         let env = test_hardened_env();
         let _ = collect_toolchain_versions(&env);
-    }
-
-    #[test]
-    fn test_cache_invalidation_on_version_change() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let cache_dir = tmp.path().join(TOOLCHAIN_CACHE_DIR);
-        let cache_path = cache_dir.join(CACHE_FILE_NAME);
-
-        let v1 = ToolchainVersions {
-            rustc: Some("rustc 1.85.0".to_string()),
-            cargo: Some("cargo 1.85.0".to_string()),
-            nextest: None,
-            systemd_run: None,
-        };
-
-        let fp1 = derive_fingerprint(&v1);
-        persist_cache(&cache_dir, &cache_path, &fp1, &v1).expect("persist v1 cache");
-
-        // Load with same versions: should match.
-        let cached = load_cache(&cache_path)
-            .expect("load cache")
-            .expect("cache present");
-        assert_eq!(cached.fingerprint, fp1);
-        assert_eq!(cached.raw_versions, v1);
-
-        // Change versions: cache should be considered stale.
-        let v2 = ToolchainVersions {
-            rustc: Some("rustc 1.86.0".to_string()),
-            ..v1
-        };
-        let cached2 = load_cache(&cache_path)
-            .expect("load cache")
-            .expect("cache present");
-        assert_ne!(
-            cached2.raw_versions, v2,
-            "cache raw_versions should not match new versions"
-        );
-    }
-
-    #[test]
-    fn test_load_cache_rejects_oversized_file() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let cache_dir = tmp.path().join(TOOLCHAIN_CACHE_DIR);
-        std::fs::create_dir_all(&cache_dir).expect("create dir");
-        let cache_path = cache_dir.join(CACHE_FILE_NAME);
-
-        // Write a file larger than MAX_CACHE_FILE_SIZE.
-        #[allow(clippy::cast_possible_truncation)]
-        let oversized = vec![b'x'; (MAX_CACHE_FILE_SIZE as usize) + 1];
-        std::fs::write(&cache_path, &oversized).expect("write oversized file");
-
-        let result = load_cache(&cache_path);
-        assert!(result.is_err(), "should reject oversized cache file");
-    }
-
-    #[test]
-    fn test_load_cache_rejects_invalid_schema() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let cache_dir = tmp.path().join(TOOLCHAIN_CACHE_DIR);
-        std::fs::create_dir_all(&cache_dir).expect("create dir");
-        let cache_path = cache_dir.join(CACHE_FILE_NAME);
-
-        let invalid = PersistedToolchainFingerprint {
-            schema: "wrong.schema".to_string(),
-            fingerprint: "b3-256:".to_string() + &"ab".repeat(32),
-            raw_versions: ToolchainVersions::default(),
-        };
-        let data = serde_json::to_vec_pretty(&invalid).expect("serialize");
-        std::fs::write(&cache_path, &data).expect("write");
-
-        let result = load_cache(&cache_path);
-        assert!(result.is_err(), "should reject invalid schema");
-    }
-
-    #[test]
-    fn test_load_cache_rejects_invalid_fingerprint_format() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let cache_dir = tmp.path().join(TOOLCHAIN_CACHE_DIR);
-        std::fs::create_dir_all(&cache_dir).expect("create dir");
-        let cache_path = cache_dir.join(CACHE_FILE_NAME);
-
-        let invalid = PersistedToolchainFingerprint {
-            schema: SCHEMA_ID.to_string(),
-            fingerprint: "bad-fingerprint".to_string(),
-            raw_versions: ToolchainVersions::default(),
-        };
-        let data = serde_json::to_vec_pretty(&invalid).expect("serialize");
-        std::fs::write(&cache_path, &data).expect("write");
-
-        let result = load_cache(&cache_path);
-        assert!(result.is_err(), "should reject invalid fingerprint format");
-    }
-
-    #[test]
-    fn test_symlink_directory_rejected() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let real_dir = tmp.path().join("real");
-        std::fs::create_dir_all(&real_dir).expect("create real dir");
-        let symlink_dir = tmp.path().join("symlink");
-
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&real_dir, &symlink_dir).expect("create symlink");
-            let result = create_restricted_dir(&symlink_dir);
-            assert!(result.is_err(), "should reject symlink directory");
-        }
     }
 
     #[test]
@@ -801,38 +446,27 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_integrity_verification_detects_tampered_fingerprint() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let cache_dir = tmp.path().join(TOOLCHAIN_CACHE_DIR);
-        let cache_path = cache_dir.join(CACHE_FILE_NAME);
+    fn test_fingerprint_short_hex_valid() {
+        let fp = "b3-256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        assert_eq!(fingerprint_short_hex(fp), Some("abcdef0123456789"));
+    }
 
-        let versions = ToolchainVersions {
-            rustc: Some("rustc 1.85.0".to_string()),
-            cargo: Some("cargo 1.85.0".to_string()),
-            nextest: None,
-            systemd_run: None,
-        };
+    #[test]
+    fn test_fingerprint_short_hex_invalid() {
+        assert_eq!(fingerprint_short_hex("sha256:abc"), None);
+        assert_eq!(fingerprint_short_hex("b3-256:short"), None);
+        assert_eq!(fingerprint_short_hex(""), None);
+    }
 
-        let correct_fp = derive_fingerprint(&versions);
-
-        // Write a tampered cache: correct raw_versions but wrong fingerprint.
-        let tampered_fp = "b3-256:0000000000000000000000000000000000000000000000000000000000000000";
-        assert_ne!(correct_fp, tampered_fp);
-        persist_cache(&cache_dir, &cache_path, tampered_fp, &versions)
-            .expect("persist tampered cache");
-
-        // Verify the tampered cache was written.
-        let cached = load_cache(&cache_path)
-            .expect("load cache")
-            .expect("cache present");
-        assert_eq!(cached.fingerprint, tampered_fp);
-
-        // resolve_fingerprint should detect the integrity mismatch and return
-        // the correct fingerprint (not the tampered one). We can't call
-        // resolve_fingerprint directly here because it spawns processes, but we
-        // can verify the integrity check logic by simulating it:
-        let expected = derive_fingerprint(&versions);
-        assert_ne!(cached.fingerprint, expected, "tampered cache must differ");
-        assert_eq!(expected, correct_fp, "recomputed must match correct");
+    #[test]
+    fn test_fingerprint_short_hex_from_resolved() {
+        let env = test_hardened_env();
+        let fp = resolve_fingerprint(&env).expect("resolve");
+        let short = fingerprint_short_hex(&fp);
+        assert!(
+            short.is_some(),
+            "resolved fingerprint must have valid short hex"
+        );
+        assert_eq!(short.unwrap().len(), 16);
     }
 }

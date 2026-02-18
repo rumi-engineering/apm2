@@ -556,7 +556,8 @@ pub use terminal_verifier::{
 pub use toolchain_fingerprint::{
     FINGERPRINT_STRING_LENGTH, ToolchainFingerprintError, ToolchainVersions,
     collect_toolchain_versions, derive_from_versions as derive_toolchain_fingerprint,
-    is_valid_fingerprint, resolve_fingerprint as resolve_toolchain_fingerprint,
+    fingerprint_short_hex, is_valid_fingerprint,
+    resolve_fingerprint as resolve_toolchain_fingerprint,
 };
 // Re-export transcript binding types
 pub use transcript_binding::{

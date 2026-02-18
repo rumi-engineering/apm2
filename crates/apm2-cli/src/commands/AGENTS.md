@@ -331,6 +331,16 @@ Security invariants:
   commit failures are handled via `handle_pipeline_commit_failure` which leaves the job
   in `claimed/` for reconcile to repair. No denial returns without an atomic terminal
   queue state transition.
+- **Fingerprint-namespaced lane target dir** (`fac_worker.rs`, TCK-00538 fix round 2):
+  CARGO_TARGET_DIR within lanes is namespaced by toolchain fingerprint as
+  `target-<hex16>` (first 16 hex characters of the fingerprint). This ensures that
+  toolchain changes produce a fresh build directory, preventing stale incremental
+  compilation artifacts from a different compiler version.
+- **Fail-closed toolchain fingerprint** (`fac_worker.rs`, TCK-00538 fix round 2):
+  Worker startup is fail-closed on toolchain fingerprint resolution failure. If the
+  fingerprint cannot be computed, the worker refuses to start and returns an error
+  exit code. The fingerprint is required for receipt integrity and lane target
+  namespacing.
 - **Systemd-run containment** (`fac_worker.rs`, `warm.rs`): Warm phase subprocesses
   (which compile untrusted repository code including `build.rs` and proc-macros) are
   wrapped in `systemd-run` transient units with MemoryMax/CPUQuota/TasksMax/RuntimeMaxSec

@@ -99,9 +99,10 @@ use apm2_core::fac::{
     QueueAdmissionTrace as JobQueueAdmissionTrace, ReceiptPipelineError, ReceiptWritePipeline,
     RepoMirrorManager, SystemModeConfig, SystemdUnitProperties, apply_credential_mount_to_env,
     build_github_credential_mount, build_job_environment, compute_policy_hash, deserialize_policy,
-    load_or_default_boundary_id, move_job_to_terminal, outcome_to_terminal_state,
-    parse_policy_hash, persist_content_addressed_receipt, persist_policy, rename_noreplace,
-    resolve_toolchain_fingerprint, run_preflight, select_and_validate_backend,
+    fingerprint_short_hex, load_or_default_boundary_id, move_job_to_terminal,
+    outcome_to_terminal_state, parse_policy_hash, persist_content_addressed_receipt,
+    persist_policy, rename_noreplace, resolve_toolchain_fingerprint, run_preflight,
+    select_and_validate_backend,
 };
 use apm2_core::github::{parse_github_remote_url, resolve_apm2_home};
 use base64::Engine;
@@ -767,15 +768,10 @@ pub fn run_fac_worker(
         }
     }
 
-    // TCK-00538: Compute toolchain fingerprint ONCE at startup. Avoids
-    // per-job process spawning (4 subprocesses per call). On failure, use
-    // None — fail-closed telemetry, not node_fingerprint fallback.
-    let toolchain_fingerprint: Option<String> = {
-        let apm2_home = resolve_apm2_home().unwrap_or_else(|| {
-            std::env::var("HOME")
-                .unwrap_or_else(|_| "/".to_string())
-                .into()
-        });
+    // TCK-00538: Compute toolchain fingerprint ONCE at startup. Fail-closed:
+    // if fingerprint resolution fails, the worker refuses to start. The
+    // fingerprint is required for receipt integrity and lane target namespacing.
+    let toolchain_fingerprint: String = {
         let mut probe_env = std::collections::BTreeMap::new();
         if let Ok(path) = std::env::var("PATH") {
             probe_env.insert("PATH".to_string(), path);
@@ -786,14 +782,17 @@ pub fn run_fac_worker(
         if let Ok(user) = std::env::var("USER") {
             probe_env.insert("USER".to_string(), user);
         }
-        match resolve_toolchain_fingerprint(&apm2_home, &probe_env) {
-            Ok(fp) => Some(fp),
+        match resolve_toolchain_fingerprint(&probe_env) {
+            Ok(fp) => fp,
             Err(e) => {
-                eprintln!(
-                    "worker: WARNING: toolchain fingerprint computation failed: {e}, \
-                     receipts will omit toolchain_fingerprint (fail-closed)"
+                output_worker_error(
+                    json_output,
+                    &format!(
+                        "toolchain fingerprint computation failed: {e} \
+                         (fail-closed: fingerprint required for receipts and lane target namespacing)"
+                    ),
                 );
-                None
+                return exit_codes::GENERIC_ERROR;
             },
         }
     };
@@ -1036,7 +1035,7 @@ pub fn run_fac_worker(
                     summary.jobs_denied as u64,
                     summary.jobs_quarantined as u64,
                     &cost_model,
-                    toolchain_fingerprint.as_deref(),
+                    Some(toolchain_fingerprint.as_str()),
                 );
                 cycle_scheduler.record_completion(lane);
                 outcome
@@ -3792,8 +3791,8 @@ fn process_job(
         .unwrap_or_else(|_| "b3-256:unknown".to_string());
 
     // TCK-00538: Use toolchain fingerprint from worker startup for lane lease.
-    // Falls back to "unknown" if fingerprint was not computed (fail-closed:
-    // None means probe failed at startup; lane lease still records this fact).
+    // Worker startup is fail-closed (refuses to start without fingerprint), so
+    // this should always be Some. The unwrap_or is defensive only.
     let toolchain_fp_for_lease = toolchain_fingerprint.unwrap_or("b3-256:unknown");
 
     let lane_lease = match LaneLeaseV1::new(
@@ -5636,8 +5635,16 @@ fn execute_warm_job(
     };
 
     // Set up CARGO_HOME and CARGO_TARGET_DIR within the lane.
+    // TCK-00538: Namespace CARGO_TARGET_DIR by toolchain fingerprint so that
+    // toolchain changes get a fresh build directory, preventing stale artifacts
+    // from a different compiler version from corrupting incremental builds.
     let cargo_home = lane_dir.join("cargo_home");
-    let cargo_target_dir = lane_dir.join("target");
+    // Defensive: if fingerprint is somehow invalid (should not happen since
+    // worker startup validates it), fall back to plain "target".
+    let target_dir_name = toolchain_fingerprint
+        .and_then(fingerprint_short_hex)
+        .map_or_else(|| "target".to_string(), |hex16| format!("target-{hex16}"));
+    let cargo_target_dir = lane_dir.join(&target_dir_name);
     if let Err(e) = std::fs::create_dir_all(&cargo_home) {
         let reason = format!("cannot create lane CARGO_HOME: {e}");
         let _ = LaneLeaseV1::remove(lane_dir);
