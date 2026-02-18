@@ -1041,6 +1041,10 @@ impl LaneCorruptMarkerV1 {
         }
         validate_string_field("reason", &marker.reason, MAX_STRING_LENGTH)?;
         validate_string_field("detected_at", &marker.detected_at, MAX_STRING_LENGTH)?;
+        if let Some(ref digest) = marker.cleanup_receipt_digest {
+            validate_string_field("cleanup_receipt_digest", digest, MAX_STRING_LENGTH)?;
+            validate_b3_256_digest("cleanup_receipt_digest", digest)?;
+        }
 
         Ok(Some(marker))
     }
@@ -3846,6 +3850,175 @@ mod tests {
                 .expect("load after remove")
                 .is_none()
         );
+    }
+
+    /// Helper: write a raw corrupt marker JSON to disk, bypassing `persist()`
+    /// validation, so we can test that `load()` independently rejects
+    /// malformed data.
+    fn write_raw_corrupt_marker(fac_root: &Path, lane_id: &str, json: &[u8]) {
+        let lane_dir = fac_root.join("lanes").join(lane_id);
+        fs::create_dir_all(&lane_dir).expect("create lane dir");
+        fs::write(lane_dir.join("corrupt.v1.json"), json).expect("write raw marker");
+    }
+
+    #[test]
+    fn corrupt_marker_load_rejects_wrong_prefix_digest() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        let lane_id = "lane-00";
+
+        // sha256: prefix instead of b3-256:
+        let raw = serde_json::json!({
+            "schema": LANE_CORRUPT_MARKER_SCHEMA,
+            "lane_id": lane_id,
+            "reason": "test",
+            "cleanup_receipt_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "detected_at": "2026-02-15T00:00:00Z"
+        });
+        write_raw_corrupt_marker(&fac_root, lane_id, raw.to_string().as_bytes());
+
+        let err = LaneCorruptMarkerV1::load(&fac_root, lane_id)
+            .expect_err("load must reject digest with wrong prefix");
+        assert!(
+            matches!(err, LaneError::InvalidDigestFormat { .. }),
+            "expected InvalidDigestFormat, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn corrupt_marker_load_rejects_too_short_digest() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        let lane_id = "lane-00";
+
+        let raw = serde_json::json!({
+            "schema": LANE_CORRUPT_MARKER_SCHEMA,
+            "lane_id": lane_id,
+            "reason": "test",
+            "cleanup_receipt_digest": "b3-256:deadbeef",
+            "detected_at": "2026-02-15T00:00:00Z"
+        });
+        write_raw_corrupt_marker(&fac_root, lane_id, raw.to_string().as_bytes());
+
+        let err = LaneCorruptMarkerV1::load(&fac_root, lane_id)
+            .expect_err("load must reject digest with too few hex chars");
+        assert!(
+            matches!(err, LaneError::InvalidDigestFormat { .. }),
+            "expected InvalidDigestFormat, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn corrupt_marker_load_rejects_uppercase_hex_digest() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        let lane_id = "lane-00";
+
+        let raw = serde_json::json!({
+            "schema": LANE_CORRUPT_MARKER_SCHEMA,
+            "lane_id": lane_id,
+            "reason": "test",
+            "cleanup_receipt_digest": "b3-256:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef",
+            "detected_at": "2026-02-15T00:00:00Z"
+        });
+        write_raw_corrupt_marker(&fac_root, lane_id, raw.to_string().as_bytes());
+
+        let err = LaneCorruptMarkerV1::load(&fac_root, lane_id)
+            .expect_err("load must reject digest with uppercase hex");
+        assert!(
+            matches!(err, LaneError::InvalidDigestFormat { .. }),
+            "expected InvalidDigestFormat, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn corrupt_marker_load_rejects_non_hex_digest() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        let lane_id = "lane-00";
+
+        let raw = serde_json::json!({
+            "schema": LANE_CORRUPT_MARKER_SCHEMA,
+            "lane_id": lane_id,
+            "reason": "test",
+            "cleanup_receipt_digest": "b3-256:not-a-digest-string-at-all-nope-not-valid-hex-chars-at-all!",
+            "detected_at": "2026-02-15T00:00:00Z"
+        });
+        write_raw_corrupt_marker(&fac_root, lane_id, raw.to_string().as_bytes());
+
+        let err = LaneCorruptMarkerV1::load(&fac_root, lane_id)
+            .expect_err("load must reject digest with non-hex characters");
+        assert!(
+            matches!(err, LaneError::InvalidDigestFormat { .. }),
+            "expected InvalidDigestFormat, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn corrupt_marker_load_rejects_missing_prefix_digest() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        let lane_id = "lane-00";
+
+        // Bare hex without any prefix
+        let raw = serde_json::json!({
+            "schema": LANE_CORRUPT_MARKER_SCHEMA,
+            "lane_id": lane_id,
+            "reason": "test",
+            "cleanup_receipt_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "detected_at": "2026-02-15T00:00:00Z"
+        });
+        write_raw_corrupt_marker(&fac_root, lane_id, raw.to_string().as_bytes());
+
+        let err = LaneCorruptMarkerV1::load(&fac_root, lane_id)
+            .expect_err("load must reject digest without b3-256: prefix");
+        assert!(
+            matches!(err, LaneError::InvalidDigestFormat { .. }),
+            "expected InvalidDigestFormat, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn corrupt_marker_load_accepts_valid_digest() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        let lane_id = "lane-00";
+
+        let valid_digest =
+            "b3-256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let raw = serde_json::json!({
+            "schema": LANE_CORRUPT_MARKER_SCHEMA,
+            "lane_id": lane_id,
+            "reason": "test",
+            "cleanup_receipt_digest": valid_digest,
+            "detected_at": "2026-02-15T00:00:00Z"
+        });
+        write_raw_corrupt_marker(&fac_root, lane_id, raw.to_string().as_bytes());
+
+        let marker = LaneCorruptMarkerV1::load(&fac_root, lane_id)
+            .expect("load must succeed")
+            .expect("marker must be present");
+        assert_eq!(marker.cleanup_receipt_digest.as_deref(), Some(valid_digest));
+    }
+
+    #[test]
+    fn corrupt_marker_load_accepts_none_digest() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        let lane_id = "lane-00";
+
+        let raw = serde_json::json!({
+            "schema": LANE_CORRUPT_MARKER_SCHEMA,
+            "lane_id": lane_id,
+            "reason": "test",
+            "detected_at": "2026-02-15T00:00:00Z"
+        });
+        write_raw_corrupt_marker(&fac_root, lane_id, raw.to_string().as_bytes());
+
+        let marker = LaneCorruptMarkerV1::load(&fac_root, lane_id)
+            .expect("load must succeed")
+            .expect("marker must be present");
+        assert_eq!(marker.cleanup_receipt_digest, None);
     }
 
     #[test]
