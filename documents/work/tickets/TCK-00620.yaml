@@ -1,0 +1,205 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00620"
+    title: "Implement daemon-owned readiness controller for zero-touch gates auto-bootstrap"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: ["REQ-0031"]
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_CI", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets: []
+
+root_cause_analysis:
+  summary: |
+    `apm2 fac gates` currently fails silently or with raw system errors on a
+    fresh worktree because the FAC substrate (directory tree, lane pool, policy
+    root, economics profile, worker readiness) is not initialized automatically.
+    Operators must manually run `apm2 fac bootstrap` and related adopt commands
+    before gates are usable. This requirement for a specific manual setup
+    sequence is undocumented from the implementor agent perspective, causes
+    first-run failures that appear as gate bugs rather than infrastructure gaps,
+    and prevents autonomous agent operation on freshly provisioned worktrees.
+
+    Compounding bug: `apm2 daemon doctor` falsely reports broker_socket ERROR
+    even when the daemon is healthy and running under systemd. Root cause is a
+    socket path mismatch between ecosystem.toml and the systemd socket unit:
+
+      - The systemd .socket unit uses ListenStream=%t/apm2/operator.sock
+        (i.e., $XDG_RUNTIME_DIR/apm2/operator.sock, e.g. /run/user/1000/apm2/operator.sock).
+      - ecosystem.toml hardcodes operator_socket = "/tmp/apm2/operator.sock".
+      - main.rs has a correct XDG-aware default_operator_socket() fallback but
+        it is never reached when ecosystem.toml is present and parses successfully.
+      - The generated apm2-daemon.service also sets PrivateTmp=yes, making all
+        /tmp/ paths written by the daemon invisible to the CLI (private tmpfs).
+        Any pid file, log dir, or state file under /tmp/ in ecosystem.toml is
+        equally unreachable.
+
+    As a result, the ReadinessController's broker/worker health check would
+    probe /tmp/apm2/operator.sock, find nothing, and falsely emit PREP_NOT_READY
+    — even on a healthy system. The socket path must be derived from
+    XDG_RUNTIME_DIR at runtime, not read from ecosystem.toml.
+
+scope:
+  in_scope:
+    - id: "S1_READINESS_CONTROLLER"
+      title: "Implement ReadinessController with check/autofix/recheck loop"
+      detail: |
+        Define a ReadinessController struct with a run() method that:
+          1. Checks each substrate component in dependency order.
+          2. For any component that is missing or invalid, invokes the
+             corresponding autofix routine (idempotent, same as bootstrap).
+          3. Rechecks the fixed component; on failure emits PREP_NOT_READY.
+        Components (in check order):
+          - FAC root directory tree + permissions
+          - Lane pool (at least one lane initialized)
+          - Admitted canonicalizer tuple (policy root hash, toolchain, resolver)
+          - Admitted economics profile
+          - Worker and broker process readiness (ping/health check)
+          - Managed cargo_home directory and local dependency substrate
+    - id: "S2_GATES_INTEGRATION"
+      title: "Wire ReadinessController as the first step of apm2 fac gates"
+      detail: |
+        Before any gate is enqueued or executed, call ReadinessController::run().
+        Gate execution proceeds only after run() returns Ok(()).
+        On Err, emit structured PREP_NOT_READY failure (per REQ-0035 taxonomy)
+        and exit. Do not start any gate processes on readiness failure.
+    - id: "S3_IDEMPOTENCY"
+      title: "Ensure controller is a no-op on a ready substrate"
+      detail: |
+        On a substrate that is already fully ready, ReadinessController::run()
+        MUST complete in under 100 ms and make no observable mutations.
+        Write a benchmark/test that measures controller overhead on a ready system.
+    - id: "S4_REGRESSION_TESTS"
+      title: "Regression tests covering fresh-substrate and partial-substrate scenarios"
+      detail: |
+        - Test: empty APM2_HOME → controller auto-heals → gates succeed.
+        - Test: missing lane pool → controller creates lanes → gates succeed.
+        - Test: autofix failure → PREP_NOT_READY emitted → no gates run.
+        - Test: fully ready substrate → controller is a no-op.
+        - Test: daemon running on XDG socket + ecosystem.toml with /tmp path →
+          broker/worker check succeeds (uses XDG path, not ecosystem.toml path).
+        - Test: PrivateTmp=yes service environment → no /tmp paths are probed.
+
+    - id: "S5_FIX_DAEMON_SOCKET_PATH"
+      title: "Fix socket path resolution: derive from XDG_RUNTIME_DIR, not ecosystem.toml"
+      detail: |
+        Root cause: ecosystem.toml hardcodes /tmp/apm2/operator.sock but the
+        systemd socket unit uses $XDG_RUNTIME_DIR/apm2/operator.sock, and
+        PrivateTmp=yes makes /tmp invisible to the CLI process.
+
+        Fix (option 3 from bug report — correct long-term):
+          - Remove operator_socket (and any other /tmp-based paths: pid_file,
+            log_dir, state_file) from the [daemon] section of ecosystem.toml.
+            Make these fields optional in EcosystemConfig; they should not be
+            present in the generated or checked-in ecosystem.toml.
+          - In all code that resolves the operator socket path, always use
+            default_operator_socket() (the XDG-aware function that already
+            exists in main.rs) regardless of whether ecosystem.toml is present.
+          - If ecosystem.toml still needs to override the socket path for
+            non-systemd setups, accept $XDG_RUNTIME_DIR as a literal variable
+            in the path string and expand it at read time — never a bare /tmp
+            path.
+          - Update ecosystem.toml (checked-in example/default) to remove the
+            [daemon] socket/tmp path fields entirely.
+
+        Secondary fix: audit all ecosystem.toml-sourced paths for /tmp prefixes.
+        Any path used by the daemon process that has PrivateTmp=yes must not
+        live under /tmp/. Redirect pid_file, log_dir, and state_file to
+        $XDG_RUNTIME_DIR/apm2/ or $HOME/.local/share/apm2/ as appropriate.
+  out_of_scope:
+    - "Changes to gate execution logic or gate ordering."
+    - "Network-independence enforcement (REQ-0033, TCK-00622)."
+    - "Structured stdout JSONL schema (REQ-0036, TCK-00625)."
+    - "Any manual operator bootstrap sequence exposed to implementors."
+
+plan:
+  steps:
+    - id: "STEP_01"
+      title: "Define ReadinessController struct and component check interface"
+      detail: |
+        In fac_review/ or a new fac_readiness module, define:
+          - SubstrateComponent enum (FacRoot, LanePool, Canonicalizer,
+            EconomicsProfile, WorkerBroker, CargoDeps)
+          - ComponentStatus: Ready | Missing | Invalid | FixFailed(String)
+          - ReadinessController::check_all() -> Vec<(SubstrateComponent, ComponentStatus)>
+          - ReadinessController::autofix(component) -> Result<(), String>
+          - ReadinessController::run() -> Result<(), ReadinessError>
+    - id: "STEP_02"
+      title: "Implement autofix routines for each component"
+      detail: |
+        Reuse bootstrap logic from fac_bootstrap.rs for directory creation,
+        policy initialization, and lane pool creation. Wire worker/broker
+        ping from existing health-check paths. Make each routine idempotent.
+    - id: "STEP_03"
+      title: "Integrate ReadinessController into apm2 fac gates entry point"
+      detail: |
+        In fac.rs gates subcommand handler: call ReadinessController::run()
+        before dispatching to the gate evaluation pipeline. On error, emit
+        structured failure and return non-zero exit code.
+    - id: "STEP_04"
+      title: "Fix daemon socket path resolution (XDG-aware, /tmp-free)"
+      detail: |
+        Remove operator_socket, pid_file, log_dir, and state_file /tmp paths
+        from ecosystem.toml [daemon] section. Make EcosystemConfig fields
+        optional. Update all call sites that resolve operator socket path to
+        use default_operator_socket() unconditionally (ignoring ecosystem.toml
+        for this field). Redirect daemon-written paths from /tmp/ to
+        $XDG_RUNTIME_DIR/apm2/ or $HOME/.local/share/apm2/. Update the
+        generated ecosystem.toml example to omit [daemon] path fields.
+    - id: "STEP_05"
+      title: "Add regression tests"
+      detail: |
+        Cover: empty APM2_HOME auto-heal, partial substrate, autofix failure,
+        no-op on ready substrate. Daemon-on-XDG-socket + /tmp-in-ecosystem
+        → broker check succeeds. PrivateTmp fixture → no /tmp probe.
+        Use temp dir fixtures for isolation.
+    - id: "STEP_06"
+      title: "Run full workspace validation"
+      detail: |
+        cargo fmt --all
+        cargo clippy --workspace --all-targets --all-features -- -D warnings
+        cargo doc --workspace --no-deps
+        cargo test --workspace
+
+definition_of_done:
+  evidence_ids:
+    - "EXEC-TCK00620-READINESS-CONTROLLER"
+    - "EXEC-TCK00620-FRESH-WORKTREE-SUCCESS"
+    - "EXEC-TCK00620-SOCKET-PATH-FIX"
+    - "EXEC-TCK00620-WORKSPACE-VALIDATION"
+  criteria:
+    - "ReadinessController is implemented with check/autofix/recheck for all six substrate components."
+    - "apm2 fac gates invokes ReadinessController before any gate runs."
+    - "Fresh APM2_HOME with valid config: apm2 fac gates succeeds on first invocation."
+    - "Autofix failure produces structured PREP_NOT_READY output with no raw system errors."
+    - "Controller is a no-op (< 100 ms) on a fully ready substrate."
+    - "operator_socket and /tmp-based path fields are removed from ecosystem.toml [daemon] section."
+    - "All broker/worker socket path resolution uses default_operator_socket() (XDG-aware) unconditionally."
+    - "apm2 daemon doctor reports broker_socket OK when daemon is running on the XDG socket path."
+    - "No daemon-written paths (pid file, log dir, state file) remain under /tmp/ in ecosystem.toml."
+    - "Regression tests pass for XDG socket resolution and PrivateTmp isolation invariants."
+    - "Regression tests pass for all fresh/partial/failure scenarios."
+    - "Workspace validation (fmt, clippy, doc, test) completes successfully."
+
+notes:
+  context: |
+    This is the foundation ticket for the gates usability redesign. All
+    subsequent tickets in the REQ-0031..REQ-0039 cluster depend on the
+    ReadinessController being in place. The autofix routines should reuse
+    the existing fac_bootstrap.rs logic rather than duplicating it.
+
+    The daemon socket path bug (S5) is included here because the ReadinessController's
+    broker/worker health check is the first consumer of the socket path in the gates
+    flow. If the path is wrong, the controller emits a false PREP_NOT_READY — making
+    the fix a prerequisite for correct broker readiness checking. The fix removes
+    socket/tmp path fields from ecosystem.toml entirely and makes all path resolution
+    XDG-aware unconditionally, matching the invariant enforced by the systemd socket
+    unit (ListenStream=%t/apm2/operator.sock) and the PrivateTmp=yes service sandbox.
+  security: "default-deny; readiness failure is fail-closed (no gates run); XDG socket path removes /tmp TOCTOU surface from PrivateTmp=yes sandbox"

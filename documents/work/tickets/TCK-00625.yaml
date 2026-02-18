@@ -1,0 +1,121 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00625"
+    title: "Implement structured stdout JSONL event schema (apm2.fac.gates_event.v1)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: ["REQ-0036"]
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_CI"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00621"
+        reason: "Two-phase structure provides the prep/execute phase boundary events."
+      - ticket_id: "TCK-00623"
+        reason: "closure_hash field in gate_finished requires closure artifact to be defined."
+
+root_cause_analysis:
+  summary: |
+    `apm2 fac gates` currently emits unstructured human-readable output that
+    orchestrators and CI systems cannot reliably parse. Progress, timing,
+    cache decisions, and failure attribution are not available in a stable
+    machine-readable format. Consumers resort to scraping text output, which
+    breaks on every binary change and cannot support structured failure
+    routing or performance tracking.
+
+scope:
+  in_scope:
+    - id: "S1_EVENT_SCHEMA"
+      title: "Define GatesEventV1 enum and all 10 required event types"
+      detail: |
+        Define in a shared fac_gates_events module:
+          - GatesEventV1 enum with variants for all 10 required event types
+          - Each variant carries the required fields (see REQ-0036)
+          - Implement Serialize for JSON emission
+          - schema field set to "apm2.fac.gates_event.v1" on all events
+          - Emit via a shared EventEmitter that writes to stdout when --json
+            is active, or suppresses when not in JSON mode
+    - id: "S2_WIRE_EVENTS"
+      title: "Wire all 10 event emissions into the gates execution path"
+      detail: |
+        Wire in order:
+          run_started    — at entry to gates handler
+          prep_started   — at start of PREP phase (TCK-00621)
+          prep_step      — for each ReadinessController step (TCK-00620)
+          prep_autofix   — when ReadinessController applies autofix (TCK-00620)
+          execute_started — at start of EXECUTE phase
+          gate_started   — before each gate process launch
+          gate_finished  — after each gate process exits (includes cache_decision)
+          cache_decision — inlined in gate_finished
+          run_summary    — on successful completion
+          run_failed     — on any failure (uses StructuredFailure from TCK-00624)
+    - id: "S3_JSON_MODE"
+      title: "Gate all event emission on --json flag"
+      detail: |
+        Without --json: emit a concise human-friendly progress/summary.
+        With --json: emit full JSONL event stream; suppress human-friendly text.
+        EventEmitter selects mode at startup based on the flag; all downstream
+        code calls EventEmitter::emit(event) without flag awareness.
+    - id: "S4_REGRESSION_TESTS"
+      title: "Regression tests for event schema and emission completeness"
+      detail: |
+        - Test: successful run emits all 10 event types in correct order.
+        - Test: failed run (each of 4 failure codes) emits run_failed with correct fields.
+        - Test: each event deserializes as valid GatesEventV1.
+        - Test: schema field is present on all events.
+        - Test: run_summary includes all required timing and cache count fields.
+  out_of_scope:
+    - "Human-friendly output formatting (separate concern)."
+    - "Event streaming to external sinks (stdout only for this ticket)."
+    - "Cache reuse explainability detail (TCK-00626 owns cache_decision content)."
+
+plan:
+  steps:
+    - id: "STEP_01"
+      title: "Define GatesEventV1 enum and EventEmitter"
+      detail: |
+        New module fac_gates_events.rs. All 10 variants with required fields.
+        EventEmitter wraps stdout with JSON/human mode selection.
+    - id: "STEP_02"
+      title: "Wire all 10 event emissions into gates execution path"
+      detail: |
+        Thread EventEmitter through the gates handler, phase runner (TCK-00621),
+        ReadinessController (TCK-00620), and gate dispatch loop.
+    - id: "STEP_03"
+      title: "Add regression tests"
+      detail: |
+        Parse output as JSONL and assert event presence, order, field completeness
+        for both success and each failure code.
+    - id: "STEP_04"
+      title: "Run full workspace validation"
+      detail: |
+        cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings
+        cargo doc --workspace --no-deps && cargo test --workspace
+
+definition_of_done:
+  evidence_ids:
+    - "EXEC-TCK00625-JSONL-SCHEMA"
+    - "EXEC-TCK00625-ALL-EVENTS-EMITTED"
+    - "EXEC-TCK00625-WORKSPACE-VALIDATION"
+  criteria:
+    - "GatesEventV1 enum is defined with all 10 required event types."
+    - "All 10 events are emitted in correct order during a successful --json run."
+    - "run_failed is emitted on failure with all StructuredFailure fields."
+    - "schema: apm2.fac.gates_event.v1 is present on every event."
+    - "EventEmitter suppresses JSONL in non-json mode."
+    - "Regression tests parse JSONL and verify event completeness for success and all failure codes."
+    - "Workspace validation completes successfully."
+
+notes:
+  context: |
+    This ticket is the observability foundation. TCK-00626 (cache explainability)
+    and TCK-00628 (conformance suite) both depend on the JSONL event stream
+    being available and parseable. The cache_decision content within gate_finished
+    is stubbed here and filled by TCK-00626.
+  security: "event stream contains no secrets; closure_hash and policy_hash are non-sensitive digests"

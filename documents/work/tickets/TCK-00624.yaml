@@ -1,0 +1,129 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00624"
+    title: "Implement bounded failure taxonomy with machine-readable remediation for apm2 fac gates"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: ["REQ-0035"]
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_CI"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00621"
+        reason: "Two-phase structure provides the stage field required by the failure taxonomy."
+
+root_cause_analysis:
+  summary: |
+    Gates failures currently surface as heterogeneous error messages drawn from
+    raw system errors, cargo output, git errors, and internal panics. No stable
+    taxonomy exists, so orchestrators and agents cannot make deterministic
+    branching decisions on failure type. Remediation is either absent or buried
+    in log files that agents are not expected to read. The closed failure
+    taxonomy and machine-readable remediation contract fix both problems.
+
+scope:
+  in_scope:
+    - id: "S1_FAILURE_TYPES"
+      title: "Define StructuredFailure type and the four failure codes"
+      detail: |
+        Define in a shared module:
+          struct StructuredFailure {
+            failure_code: FailureCode,   // enum
+            failure_class: FailureClass, // enum: prep | authority | execution
+            stage: GatesRunPhase,        // prep | execute
+            root_cause: String,          // human-readable one-liner
+            remediation: String,         // actionable instruction
+            diagnostics: Vec<String>,    // raw internal errors (never top-level)
+          }
+          enum FailureCode {
+            PrepNotReady,
+            PrepSupplyUnavailable,
+            AuthorityDenied,
+            GateExecutionFailed,
+          }
+    - id: "S2_EMIT_ON_STDOUT"
+      title: "Emit StructuredFailure as JSON on stdout for all failure paths"
+      detail: |
+        All four failure codes must be reachable from existing code paths.
+        Wire StructuredFailure emission at:
+          - ReadinessController failure → PrepNotReady
+          - Closure hydration failure with no network → PrepSupplyUnavailable
+          - Policy/token/admission rejection → AuthorityDenied
+          - Gate process exit != 0 → GateExecutionFailed
+        Emit as a JSON line on stdout (not stderr) with --json flag.
+        Without --json, emit a human-friendly formatted version of the
+        same structured data.
+    - id: "S3_SUPPRESS_RAW_ERRORS"
+      title: "Demote all raw internal errors to diagnostics[]"
+      detail: |
+        Audit all existing error propagation paths in fac gates. Any raw
+        system error, cargo output line, or internal string error that
+        currently reaches top-level stdout must be moved into diagnostics[]
+        within the enclosing StructuredFailure.
+    - id: "S4_REGRESSION_TESTS"
+      title: "Regression tests enumerating all four failure codes"
+      detail: |
+        - Test: each of the four FailureCode variants is reachable and produces
+          correct failure_code, failure_class, stage, root_cause, remediation.
+        - Test: diagnostics[] is populated with raw errors; top-level output
+          contains only structured fields.
+        - Test: remediation field alone is sufficient for recovery without logs
+          (assert non-empty and action-oriented for PREP_NOT_READY and
+          PREP_SUPPLY_UNAVAILABLE).
+  out_of_scope:
+    - "Adding new top-level failure codes beyond the four defined."
+    - "JSONL full event schema (TCK-00625 owns the broader stdout contract)."
+    - "Failure taxonomy for commands other than apm2 fac gates."
+
+plan:
+  steps:
+    - id: "STEP_01"
+      title: "Define StructuredFailure, FailureCode, FailureClass types"
+      detail: |
+        In fac_review/ or a shared fac_error module. Derive Serialize for
+        JSON emission. Implement Display for human-friendly format.
+    - id: "STEP_02"
+      title: "Wire StructuredFailure into all failure paths"
+      detail: |
+        Replace ad-hoc error strings in gates entry point with StructuredFailure
+        construction. Capture raw errors in diagnostics[]. Emit on stdout.
+    - id: "STEP_03"
+      title: "Audit and demote raw error propagation"
+      detail: |
+        Search all error! / eprintln! / return Err(...) paths in the gates
+        pipeline. Move raw content into diagnostics[]. Verify no raw errors
+        reach top-level stdout.
+    - id: "STEP_04"
+      title: "Add regression tests and workspace validation"
+      detail: |
+        cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings
+        cargo doc --workspace --no-deps && cargo test --workspace
+
+definition_of_done:
+  evidence_ids:
+    - "EXEC-TCK00624-FAILURE-TAXONOMY"
+    - "EXEC-TCK00624-ALL-FOUR-CODES"
+    - "EXEC-TCK00624-WORKSPACE-VALIDATION"
+  criteria:
+    - "StructuredFailure type is defined with all required fields."
+    - "All four FailureCode values are reachable from gates execution paths."
+    - "Every failure emits failure_code, failure_class, stage, root_cause, and remediation."
+    - "No raw system errors appear at the top level of stdout output."
+    - "remediation field for PREP_NOT_READY and PREP_SUPPLY_UNAVAILABLE is actionable without log access."
+    - "Regression tests enumerate all four codes and verify output shape."
+    - "Workspace validation completes successfully."
+
+notes:
+  context: |
+    This ticket defines the shared StructuredFailure type that all other
+    gates tickets reference. TCK-00622 uses PREP_SUPPLY_UNAVAILABLE;
+    TCK-00620 uses PREP_NOT_READY; TCK-00623 uses AUTHORITY_DENIED for
+    closure signature rejection. The taxonomy is explicitly closed: no
+    new top-level codes may be added without a new requirement.
+  security: "fail-closed; raw errors are demoted to diagnostics, never top-level"

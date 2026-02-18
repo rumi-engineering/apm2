@@ -1,0 +1,140 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00623"
+    title: "Define and implement signed content-addressed dependency closure artifact"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: ["REQ-0034"]
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00621"
+        reason: "PREP phase hook for closure hydration must exist before closure artifact can be wired."
+      - ticket_id: "TCK-00622"
+        reason: "Network policy for hydration is defined in TCK-00622; closure artifact must be consistent with it."
+
+root_cause_analysis:
+  summary: |
+    Gate execution has no formal definition of its dependency supply. Cargo
+    registry fetches, git dependency clones, and toolchain resolution happen
+    implicitly at build time with no content-addressed record. This means:
+    cache reuse cannot reason about supply changes (toolchain upgrade silently
+    invalidates results without a cache miss), network access cannot be
+    eliminated during EXECUTE (nothing is pre-fetched), and supply chain
+    tampering has no detection surface. A signed closure artifact closes all
+    three gaps.
+
+scope:
+  in_scope:
+    - id: "S1_CLOSURE_SCHEMA"
+      title: "Define GateSupplyClosureV1 schema"
+      detail: |
+        GateSupplyClosureV1:
+          schema: "apm2.fac.gate_supply_closure.v1"
+          closure_hash: String  (blake3 of canonical serialization of all entries)
+          entries:
+            - kind: registry | git | toolchain
+              name: String
+              version: String
+              content_hash: String  (sha256 of content)
+              source_url: Option<String>  (for hydration; not used in EXECUTE)
+          signed_at: Timestamp
+          signer_key_id: String
+          signature: String  (ed25519 over closure_hash + signed_at)
+        Store at: $APM2_HOME/private/fac/closure/{closure_hash}.yaml
+    - id: "S2_CLOSURE_HASH_IN_ATTESTATION"
+      title: "Bind closure_hash into gate attestation receipts"
+      detail: |
+        Add closure_hash field to GateCacheEntryV2 and gate attestation
+        receipt. Cache lookup MUST reject entries where closure_hash does
+        not match the current closure_hash. This deterministically invalidates
+        cache entries when the closure changes.
+    - id: "S3_PREP_HYDRATION"
+      title: "Implement closure hydration in PREP phase"
+      detail: |
+        Wire PREP closure hydration hook (from TCK-00621/TCK-00622):
+          1. Load existing closure if present.
+          2. Compute expected closure_hash for current workspace state.
+          3. If hash matches and all entries are present: no-op.
+          4. If entries are missing and network available: fetch missing entries,
+             update closure, re-sign.
+          5. If entries are missing and network unavailable: emit
+             PREP_SUPPLY_UNAVAILABLE (per TCK-00622).
+    - id: "S4_DAEMON_SIGNING"
+      title: "Daemon signs closure before EXECUTE"
+      detail: |
+        Before EXECUTE begins, daemon signs the closure artifact with its
+        operator key (reusing existing broker signing infrastructure). Gate
+        processes receive the signed closure path and verify the signature
+        before accessing any supply entry.
+    - id: "S5_REGRESSION_TESTS"
+      title: "Regression tests for closure schema, cache invalidation, and signing"
+      detail: |
+        - Test: closure_hash change → cache miss for all affected gate entries.
+        - Test: closure with all entries present + network denied → EXECUTE succeeds.
+        - Test: unsigned closure → EXECUTE rejects it.
+        - Test: PREP hydrates missing entries when network available.
+  out_of_scope:
+    - "Full supply chain provenance verification (future work)."
+    - "Multi-registry or private registry support."
+    - "Toolchain download automation (assume toolchain is pre-installed)."
+
+plan:
+  steps:
+    - id: "STEP_01"
+      title: "Define GateSupplyClosureV1 struct and serialization"
+      detail: |
+        In a new fac_closure module: define schema, closure_hash computation
+        (blake3 over canonical entry list), and YAML serialization.
+    - id: "STEP_02"
+      title: "Add closure_hash to GateCacheEntryV2 and implement invalidation"
+      detail: |
+        Add closure_hash field to gate cache entry. In check_reuse(), if
+        cached closure_hash != current closure_hash, return cache miss with
+        reason="closure_drift".
+    - id: "STEP_03"
+      title: "Implement PREP hydration and daemon signing"
+      detail: |
+        Wire PREP hook: check closure, fetch missing entries, re-sign.
+        Daemon signing uses existing Signer infrastructure from gate_cache.rs.
+    - id: "STEP_04"
+      title: "Wire closure verification into gate process startup"
+      detail: |
+        Before each gate process starts in EXECUTE, verify closure signature.
+        On verification failure: emit AUTHORITY_DENIED failure, abort run.
+    - id: "STEP_05"
+      title: "Add regression tests and workspace validation"
+      detail: |
+        cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings
+        cargo doc --workspace --no-deps && cargo test --workspace
+
+definition_of_done:
+  evidence_ids:
+    - "EXEC-TCK00623-CLOSURE-SCHEMA"
+    - "EXEC-TCK00623-CACHE-INVALIDATION"
+    - "EXEC-TCK00623-SIGNING"
+    - "EXEC-TCK00623-WORKSPACE-VALIDATION"
+  criteria:
+    - "GateSupplyClosureV1 schema is defined with all four entry kinds."
+    - "closure_hash is bound in gate attestation receipts and gate cache entries."
+    - "Cache miss is triggered deterministically when closure_hash changes."
+    - "PREP auto-hydrates missing closure entries when network is available."
+    - "Closure is signed by daemon; gate processes reject unsigned or mismatched supply."
+    - "Gate execution with pre-seeded closure and network denied: succeeds."
+    - "Regression tests pass for all closure invariants."
+    - "Workspace validation completes successfully."
+
+notes:
+  context: |
+    The closure artifact is the supply-side anchor for the entire gates
+    usability redesign. Cache reuse explainability (TCK-00626), warm-path
+    SLO (TCK-00627), and the conformance suite (TCK-00628) all depend on
+    the closure_hash being a stable, deterministic cache key dimension.
+  security: "daemon-signed closure; gate processes reject unsigned supply; closure drift is fail-closed cache miss"

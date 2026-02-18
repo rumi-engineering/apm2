@@ -1,0 +1,119 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00622"
+    title: "Enforce network denial during EXECUTE phase; normalize supply failure to PREP_SUPPLY_UNAVAILABLE"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: ["REQ-0033"]
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00621"
+        reason: "Two-phase structure must exist before network denial can be phase-scoped."
+
+root_cause_analysis:
+  summary: |
+    Gate processes currently have unrestricted network access during execution.
+    This allows non-deterministic external I/O (registry fetches, git clones)
+    to occur mid-gate, making results non-reproducible and violating the
+    hermetic execution model. Additionally, when network is unavailable,
+    the failure surface is raw cargo/registry errors that implementors cannot
+    act on without reading internal logs. Both problems are addressed together:
+    deny network in EXECUTE and collapse the supply-failure surface to one
+    normalized code in PREP.
+
+scope:
+  in_scope:
+    - id: "S1_NETWORK_DENIAL_EXECUTE"
+      title: "Deny network access for all gate processes in EXECUTE phase"
+      detail: |
+        Using Linux network namespaces (unshare(CLONE_NEWNET)) or
+        equivalent cgroup-based network isolation, ensure gate worker
+        processes have no outbound network access during EXECUTE.
+        Record the network policy hash in the gate attestation receipt.
+        Emit the enforcement method in the execute_started event.
+    - id: "S2_SUPPLY_FAILURE_NORMALIZATION"
+      title: "Normalize supply failures to PREP_SUPPLY_UNAVAILABLE in PREP"
+      detail: |
+        In PREP phase closure hydration hook:
+          - If closure is incomplete AND network is available: fetch missing entries.
+          - If closure is incomplete AND network is unavailable: emit structured
+            failure with failure_code=PREP_SUPPLY_UNAVAILABLE, failure_class=supply,
+            stage=prep, root_cause (human-readable summary of missing entries),
+            remediation ("connect to network and retry to hydrate dependency closure").
+          - Raw cargo/registry errors are captured as diagnostics[] only.
+    - id: "S3_PREP_NETWORK_SCOPE"
+      title: "Confine PREP network access to closure hydration only"
+      detail: |
+        PREP phase network access is allowed only for dependency closure
+        hydration (S2 above). Other PREP steps (readiness controller,
+        policy checks) MUST NOT initiate outbound network connections.
+        Enforce via audit log or network namespace scoping per step.
+    - id: "S4_REGRESSION_TESTS"
+      title: "Regression tests for network isolation and supply failure"
+      detail: |
+        - Test: EXECUTE with network namespace: no outbound connections observed.
+        - Test: offline run with pre-seeded closure: EXECUTE succeeds.
+        - Test: offline run without closure: PREP emits PREP_SUPPLY_UNAVAILABLE
+          (not a raw cargo error), zero gates run.
+        - Test: online run with missing closure entries: PREP fetches and succeeds.
+  out_of_scope:
+    - "Dependency closure artifact schema (TCK-00623)."
+    - "Full failure taxonomy definition (TCK-00624)."
+    - "JSONL event schema (TCK-00625)."
+    - "Windows or macOS network isolation (Linux only for now)."
+
+plan:
+  steps:
+    - id: "STEP_01"
+      title: "Implement network namespace isolation for gate worker processes"
+      detail: |
+        In the gate process launcher, call unshare(CLONE_NEWNET) before exec
+        (or equivalent systemd-run --property=IPAddressDeny=any). Record
+        enforcement method and verify no connections are possible from within
+        the gate process boundary.
+    - id: "STEP_02"
+      title: "Implement supply failure normalization in PREP closure hydration hook"
+      detail: |
+        Wire the PREP closure hydration stub (from TCK-00621) with real logic:
+        detect incomplete closure, attempt fetch if network available, else
+        emit PREP_SUPPLY_UNAVAILABLE with structured fields.
+    - id: "STEP_03"
+      title: "Verify PREP network scope confinement"
+      detail: |
+        Add audit assertions that non-hydration PREP steps do not initiate
+        network connections. Use strace or similar in test mode to verify.
+    - id: "STEP_04"
+      title: "Add regression tests and workspace validation"
+      detail: |
+        cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings
+        cargo doc --workspace --no-deps && cargo test --workspace
+
+definition_of_done:
+  evidence_ids:
+    - "EXEC-TCK00622-NETWORK-DENIAL"
+    - "EXEC-TCK00622-SUPPLY-UNAVAILABLE"
+    - "EXEC-TCK00622-WORKSPACE-VALIDATION"
+  criteria:
+    - "EXECUTE phase: all gate processes run with network denied; verified by test."
+    - "Offline run with pre-seeded closure: succeeds without network access."
+    - "Offline run without closure: emits exactly PREP_SUPPLY_UNAVAILABLE with all required fields."
+    - "PREP_SUPPLY_UNAVAILABLE output contains no raw cargo/registry errors at top level."
+    - "PREP network access is limited to closure hydration only."
+    - "Regression tests pass for all isolation and failure normalization invariants."
+    - "Workspace validation completes successfully."
+
+notes:
+  context: |
+    Network denial in EXECUTE is a security boundary, not just a performance
+    optimization. The normalization of supply failures to PREP_SUPPLY_UNAVAILABLE
+    is essential for the usability contract: implementor agents must be able to
+    act on a failure without reading internal logs.
+  security: "fail-closed: network denied in EXECUTE; supply failure is a PREP abort"

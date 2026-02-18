@@ -1,0 +1,124 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00621"
+    title: "Implement two-phase gates contract: PREP (healing) then EXECUTE (isolated, deterministic)"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: ["REQ-0032"]
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_CI"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00620"
+        reason: "ReadinessController (the PREP healing step) must land first."
+
+root_cause_analysis:
+  summary: |
+    Gate execution currently interleaves preparation (readiness checks,
+    dependency resolution) with execution (running individual gates). This
+    means a gate can fail mid-run due to an infrastructure problem that could
+    have been detected and fixed before any gate started, producing ambiguous
+    partial results and making failure attribution hard. The PREP/EXECUTE split
+    makes the two concerns orthogonal and separately observable.
+
+scope:
+  in_scope:
+    - id: "S1_PREP_PHASE"
+      title: "Define and implement the PREP phase"
+      detail: |
+        PREP phase steps (in order):
+          1. ReadinessController::run() (TCK-00620)
+          2. Dependency closure hydration check (TCK-00623, stub/no-op if not yet landed)
+          3. Emit prep_started event on stdout (per REQ-0036 schema)
+          4. For each prep step, emit prep_step event (step name, status, duration_ms)
+          5. On any failure: emit structured failure (stage: "prep") and exit.
+        PREP phase MUST complete before EXECUTE begins.
+    - id: "S2_EXECUTE_PHASE"
+      title: "Define and implement the EXECUTE phase"
+      detail: |
+        EXECUTE phase:
+          - Runs gates in deterministic order (existing gate ordering preserved).
+          - MUST NOT perform ambient filesystem mutations outside gate workspaces.
+          - Emits execute_started event on stdout before first gate runs.
+          - Each gate emits gate_started and gate_finished events.
+          - Network denial enforced (TCK-00622 wires the enforcement;
+            this ticket reserves the hook point).
+    - id: "S3_SEPARATE_REPORTING"
+      title: "Emit separately timed PREP and EXECUTE outcome events"
+      detail: |
+        run_summary event MUST include:
+          - prep_duration_ms
+          - execute_duration_ms
+          - phase_failed: "prep" | "execute" | null
+        run_failed event MUST include stage field.
+    - id: "S4_REGRESSION_TESTS"
+      title: "Regression tests for phase separation"
+      detail: |
+        - Test: PREP failure → zero gates run → run_failed has stage=prep.
+        - Test: PREP success → EXECUTE runs → run_summary has both durations.
+        - Test: EXECUTE failure → run_failed has stage=execute.
+        - Test: EXECUTE makes no ambient mutations outside gate workspaces.
+  out_of_scope:
+    - "Network denial enforcement (TCK-00622)."
+    - "Full JSONL event schema definition (TCK-00625)."
+    - "Dependency closure artifact definition (TCK-00623)."
+    - "Any user-visible change to gate ordering or gate logic."
+
+plan:
+  steps:
+    - id: "STEP_01"
+      title: "Define GatesRunPhase enum and phase runner"
+      detail: |
+        enum GatesRunPhase { Prep, Execute }
+        struct PhaseOutcome { phase, duration_ms, error: Option<StructuredFailure> }
+        fn run_gates_phased(ctx) -> (PhaseOutcome, Option<PhaseOutcome>)
+    - id: "STEP_02"
+      title: "Implement PREP phase runner"
+      detail: |
+        Call ReadinessController::run(), emit prep events, fail fast on error.
+        Stub closure hydration hook (no-op until TCK-00623 lands).
+    - id: "STEP_03"
+      title: "Implement EXECUTE phase runner"
+      detail: |
+        Wrap existing gate dispatch loop. Emit execute_started before first
+        gate. Enforce no-ambient-mutation invariant by asserting workspace
+        paths before and after (test hook only in EXECUTE phase).
+    - id: "STEP_04"
+      title: "Wire phase runner into fac gates entry point"
+      detail: |
+        Replace the current flat gate dispatch with run_gates_phased().
+        Emit run_summary at end with both phase durations.
+    - id: "STEP_05"
+      title: "Add regression tests and workspace validation"
+      detail: |
+        cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings
+        cargo doc --workspace --no-deps && cargo test --workspace
+
+definition_of_done:
+  evidence_ids:
+    - "EXEC-TCK00621-PHASE-SEPARATION"
+    - "EXEC-TCK00621-PREP-FAIL-NO-GATES"
+    - "EXEC-TCK00621-WORKSPACE-VALIDATION"
+  criteria:
+    - "PREP and EXECUTE are distinct, separately timed phases."
+    - "If PREP fails, no gate processes are started."
+    - "run_summary includes prep_duration_ms, execute_duration_ms, and phase_failed."
+    - "run_failed includes stage field identifying which phase failed."
+    - "EXECUTE phase makes no ambient filesystem mutations outside gate workspaces."
+    - "Regression tests pass for all phase separation invariants."
+    - "Workspace validation completes successfully."
+
+notes:
+  context: |
+    This ticket restructures the gates runner into two explicit phases. It
+    depends on TCK-00620 (ReadinessController) but does not require TCK-00622
+    or TCK-00623 to be complete — those integrate via stub hook points that
+    this ticket reserves. The JSONL event schema is stubbed here and fully
+    defined in TCK-00625.
+  security: "fail-closed: PREP failure prevents any gate execution"
