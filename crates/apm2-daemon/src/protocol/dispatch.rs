@@ -8198,6 +8198,12 @@ impl PrivilegedDispatcher {
             boundary_id: self.token_binding_boundary_id.clone(),
             issued_at_tick: current_tick,
             expiry_tick: current_tick.saturating_add(DEFAULT_ENVELOPE_TTL_TICKS),
+            // TCK-00566: Nonce is None here because the daemon-side token
+            // issuance path (session dispatch) does not go through the
+            // FacBroker token-use ledger. Broker-side replay protection
+            // applies only to broker-issued tokens via
+            // `FacBroker::issue_channel_context_token()`.
+            nonce: None,
         };
 
         issue_channel_context_token_with_token_binding(
