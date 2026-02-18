@@ -517,7 +517,7 @@ pub struct DoctorArgs {
     pub full: bool,
 
     /// Wait until doctor recommends an action other than `wait`.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, visible_alias = "wait", default_value_t = false)]
     pub wait_for_recommended_action: bool,
 
     /// Poll cadence while waiting for recommended action.
@@ -525,7 +525,12 @@ pub struct DoctorArgs {
     pub poll_interval_seconds: u64,
 
     /// Maximum wait time while waiting for recommended action.
-    #[arg(long, default_value_t = 1200, value_parser = parse_wait_timeout)]
+    #[arg(
+        long,
+        visible_alias = "wait-timeout-secs",
+        default_value_t = 1200,
+        value_parser = parse_wait_timeout
+    )]
     pub wait_timeout_seconds: u64,
 
     /// Exit only when doctor returns one of these actions (comma-separated).
@@ -6854,6 +6859,39 @@ mod tests {
                     args.exit_on,
                     vec![DoctorExitActionArg::Fix, DoctorExitActionArg::Merge]
                 );
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_doctor_wait_alias_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "doctor", "--pr", "615", "--wait"])
+            .expect("doctor --wait alias should parse");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert_eq!(args.pr, Some(615));
+                assert!(args.wait_for_recommended_action);
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_doctor_wait_timeout_secs_alias_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "doctor",
+            "--pr",
+            "615",
+            "--wait-for-recommended-action",
+            "--wait-timeout-secs",
+            "30",
+        ])
+        .expect("doctor --wait-timeout-secs alias should parse");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert_eq!(args.wait_timeout_seconds, 30);
             },
             other => panic!("expected doctor subcommand, got {other:?}"),
         }
