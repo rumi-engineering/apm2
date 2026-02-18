@@ -1,10 +1,12 @@
-//! Gate Cache V3: Receipt-indexed cache store keyed by attestation+policy+toolchain.
+//! Gate Cache V3: Receipt-indexed cache store keyed by
+//! attestation+policy+toolchain.
 //!
 //! V3 stores one file per gate under:
 //! `$APM2_HOME/private/fac/gate_cache_v3/{index_key}/{gate}.yaml`.
 //!
 //! The `index_key` is a BLAKE3-256 digest of the compound key:
-//!   attestation_digest + FacPolicyHash + ToolchainFingerprint + rfc0028_receipt_hash + rfc0029_receipt_hash
+//!   attestation_digest + FacPolicyHash + ToolchainFingerprint +
+//! rfc0028_receipt_hash + rfc0029_receipt_hash
 //!
 //! This ensures that a cache hit is provably tied to an authoritative receipt
 //! chain and cannot be forged by simple file writes. The compound key binds
@@ -104,11 +106,7 @@ impl fmt::Display for GateCacheV3Error {
             Self::MissingKeyComponent { component } => {
                 write!(f, "missing required key component: {component}")
             },
-            Self::FieldTooLong {
-                field,
-                actual,
-                max,
-            } => {
+            Self::FieldTooLong { field, actual, max } => {
                 write!(f, "field {field} too long: {actual} > {max}")
             },
             Self::InvalidIndexKey => write!(f, "invalid index key format"),
@@ -130,9 +128,9 @@ impl std::error::Error for GateCacheV3Error {}
 
 /// The compound key components that uniquely identify a gate cache v3 index.
 ///
-/// All components are required and validated at construction time (fail-closed).
-/// The compound key is hashed with BLAKE3-256 to produce the on-disk directory
-/// name (the `index_key`).
+/// All components are required and validated at construction time
+/// (fail-closed). The compound key is hashed with BLAKE3-256 to produce the
+/// on-disk directory name (the `index_key`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct V3CompoundKey {
@@ -390,14 +388,8 @@ impl GateCacheV3 {
     ///
     /// Returns [`GateCacheV3Error::TooManyGates`] if inserting would exceed
     /// [`MAX_V3_GATES_PER_INDEX`].
-    pub fn set(
-        &mut self,
-        gate_name: &str,
-        result: V3GateResult,
-    ) -> Result<(), GateCacheV3Error> {
-        if !self.gates.contains_key(gate_name)
-            && self.gates.len() >= MAX_V3_GATES_PER_INDEX
-        {
+    pub fn set(&mut self, gate_name: &str, result: V3GateResult) -> Result<(), GateCacheV3Error> {
+        if !self.gates.contains_key(gate_name) && self.gates.len() >= MAX_V3_GATES_PER_INDEX {
             return Err(GateCacheV3Error::TooManyGates {
                 current: self.gates.len(),
                 max: MAX_V3_GATES_PER_INDEX,
@@ -509,10 +501,8 @@ impl GateCacheV3 {
         let index_key = self.compound_key.compute_index_key();
         let sha = self.sha.clone();
         for (gate_name, result) in &mut self.gates {
-            let canonical =
-                Self::build_canonical_bytes_static(&sha, gate_name, &index_key, result);
-            let sig =
-                super::sign_with_domain(signer, super::GATE_CACHE_RECEIPT_PREFIX, &canonical);
+            let canonical = Self::build_canonical_bytes_static(&sha, gate_name, &index_key, result);
+            let sig = super::sign_with_domain(signer, super::GATE_CACHE_RECEIPT_PREFIX, &canonical);
             result.signature_hex = Some(hex::encode(sig.to_bytes()));
             result.signer_id = Some(hex::encode(signer.verifying_key().to_bytes()));
         }
@@ -723,10 +713,7 @@ impl GateCacheV3 {
                 }
             }
             std::fs::rename(&tmp_path, &path).map_err(|err| {
-                format!(
-                    "failed to rename v3 cache entry {}: {err}",
-                    path.display()
-                )
+                format!("failed to rename v3 cache entry {}: {err}", path.display())
             })?;
         }
 
@@ -984,8 +971,7 @@ mod tests {
         let signer = Signer::generate();
         let cache = make_signed_v3(&signer);
         let vk = signer.verifying_key();
-        let digest =
-            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
         assert!(decision.reusable);
         assert_eq!(decision.reason, "v3_compound_key_match");
@@ -1038,8 +1024,7 @@ mod tests {
         cache.sign_all(&signer);
 
         let vk = signer.verifying_key();
-        let digest =
-            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
         assert!(!decision.reusable);
         assert_eq!(decision.reason, "quick_receipt_not_reusable");
@@ -1053,8 +1038,7 @@ mod tests {
         // Not signed.
         let signer = Signer::generate();
         let vk = signer.verifying_key();
-        let digest =
-            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
         assert!(!decision.reusable);
         assert_eq!(decision.reason, "signature_missing");
@@ -1066,8 +1050,7 @@ mod tests {
         let signer_b = Signer::generate();
         let cache = make_signed_v3(&signer_a);
         let vk_b = signer_b.verifying_key();
-        let digest =
-            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk_b));
         assert!(!decision.reusable);
         assert_eq!(decision.reason, "signer_id_mismatch");
@@ -1084,8 +1067,7 @@ mod tests {
         cache.sign_all(&signer);
 
         let vk = signer.verifying_key();
-        let digest =
-            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
         assert!(!decision.reusable);
         assert_eq!(decision.reason, "evidence_digest_missing");
@@ -1096,8 +1078,7 @@ mod tests {
         let key = sample_compound_key();
         let mut cache = GateCacheV3::new("abc123", key).expect("new");
         cache.set("rustfmt", sample_gate_result()).expect("set");
-        let digest =
-            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, None);
         assert!(!decision.reusable);
         assert_eq!(decision.reason, "signature_missing");
@@ -1112,8 +1093,7 @@ mod tests {
         let signer = Signer::generate();
         let cache = make_signed_v3(&signer);
         let vk = signer.verifying_key();
-        let digest =
-            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
         assert!(decision.reusable);
     }
@@ -1127,8 +1107,7 @@ mod tests {
             entry.duration_secs = 999;
         }
         let vk = signer.verifying_key();
-        let digest =
-            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
         assert!(!decision.reusable);
         assert_eq!(decision.reason, "signature_invalid");
@@ -1154,7 +1133,10 @@ mod tests {
         assert_eq!(restored.sha, "abc123");
         assert_eq!(restored.gate_name, "rustfmt");
         assert_eq!(restored.result.status, "PASS");
-        assert_eq!(restored.compound_key.attestation_digest, entry.compound_key.attestation_digest);
+        assert_eq!(
+            restored.compound_key.attestation_digest,
+            entry.compound_key.attestation_digest
+        );
     }
 
     #[test]
@@ -1261,8 +1243,7 @@ mod tests {
         cache2.save_to_dir(&root).expect("save");
 
         // Reload should only have gate_a.
-        let loaded = GateCacheV3::load_from_dir(&root, "abc123", &key)
-            .expect("load");
+        let loaded = GateCacheV3::load_from_dir(&root, "abc123", &key).expect("load");
         assert_eq!(loaded.gates.len(), 1);
         assert!(loaded.get("gate_a").is_some());
         assert!(loaded.get("gate_b").is_none());
@@ -1292,12 +1273,14 @@ mod tests {
         let cache = make_signed_v3(&signer);
         cache.save_to_dir(&root).expect("save");
 
-        let loaded = GateCacheV3::load_from_dir(&root, "abc123", &cache.compound_key)
-            .expect("load");
+        let loaded =
+            GateCacheV3::load_from_dir(&root, "abc123", &cache.compound_key).expect("load");
         let vk = signer.verifying_key();
-        let digest =
-            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = loaded.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(decision.reusable, "signature must survive save/load roundtrip");
+        assert!(
+            decision.reusable,
+            "signature must survive save/load roundtrip"
+        );
     }
 }
