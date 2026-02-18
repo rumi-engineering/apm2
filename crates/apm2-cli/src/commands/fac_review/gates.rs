@@ -453,6 +453,7 @@ fn load_gate_results_from_cache_for_sha(sha: &str) -> Result<Vec<EvidenceGateRes
             bytes_total: cached.bytes_total,
             was_truncated: cached.was_truncated,
             log_bundle_hash: cached.log_bundle_hash.clone(),
+            legacy_cache_override: false,
         });
     }
     Ok(results)
@@ -1153,6 +1154,23 @@ fn run_gates_inner(
     let lane_context =
         super::evidence::allocate_evidence_lane_context(&lane_manager, "lane-00", lane_guard)?;
 
+    // TCK-00540 fix round 3: Build the gate resource policy BEFORE the
+    // evidence call so it can be passed through EvidenceGateOptions for
+    // attestation digest computation during cache-reuse decisions.
+    // The same policy is reused below for the cache-write phase.
+    let policy = GateResourcePolicy::from_cli(
+        quick,
+        timeout_decision.effective_seconds,
+        memory_max,
+        pids_max,
+        cpu_quota,
+        bounded,
+        Some(gate_profile.as_str()),
+        Some(test_parallelism),
+        Some(&sandbox_hardening_hash),
+        Some(&network_policy_hash),
+    );
+
     let opts = EvidenceGateOptions {
         test_command,
         test_command_environment,
@@ -1162,6 +1180,7 @@ fn run_gates_inner(
         emit_human_logs,
         on_gate_progress,
         allow_legacy_cache,
+        gate_resource_policy: Some(policy.clone()),
     };
 
     // 5. Run evidence gates.
@@ -1183,18 +1202,8 @@ fn run_gates_inner(
         // to prevent cache reuse across network policy drift.
         // Uses the effective policy-driven hashes computed above (before the
         // profile was moved into the bounded test command builder).
-        let policy = GateResourcePolicy::from_cli(
-            quick,
-            timeout_decision.effective_seconds,
-            memory_max,
-            pids_max,
-            cpu_quota,
-            bounded,
-            Some(gate_profile.as_str()),
-            Some(test_parallelism),
-            Some(&sandbox_hardening_hash),
-            Some(&network_policy_hash),
-        );
+        // TCK-00540: `policy` is now computed before the evidence call so it
+        // can also be used for cache-reuse attestation digest matching.
         let mut cache = GateCache::new(&sha);
         let merge_command = gate_command_for_attestation(
             workspace_root,
@@ -1248,6 +1257,13 @@ fn run_gates_inner(
                     .and_then(|p| p.to_str())
                     .map(str::to_string),
             );
+            // TCK-00540 fix round 3: Preserve the legacy override audit trail.
+            // When a gate result was reused via `--allow-legacy-cache`, downgrade
+            // the cache entry so future default-mode runs still detect and deny
+            // the unbound entry.
+            if result.legacy_cache_override {
+                cache.mark_legacy_override(&result.gate_name);
+            }
         }
         cache.backfill_evidence_metadata(
             &merge_gate.name,
@@ -2026,6 +2042,7 @@ mod tests {
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: Some(shared.clone()),
+                legacy_cache_override: false,
             },
             EvidenceGateResult {
                 gate_name: "clippy".to_string(),
@@ -2036,6 +2053,7 @@ mod tests {
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: Some(shared.clone()),
+                legacy_cache_override: false,
             },
         ];
 
@@ -2067,6 +2085,7 @@ mod tests {
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: None,
+                legacy_cache_override: false,
             },
             EvidenceGateResult {
                 gate_name: "clippy".to_string(),
@@ -2077,6 +2096,7 @@ mod tests {
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: Some("b3-256:nothex".to_string()),
+                legacy_cache_override: false,
             },
         ];
 
@@ -2109,6 +2129,7 @@ mod tests {
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: Some(format!("b3-256:{}", "b".repeat(64))),
+                legacy_cache_override: false,
             },
             EvidenceGateResult {
                 gate_name: "clippy".to_string(),
@@ -2119,6 +2140,7 @@ mod tests {
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: Some(format!("b3-256:{}", "c".repeat(64))),
+                legacy_cache_override: false,
             },
         ];
 
@@ -2181,6 +2203,7 @@ mod tests {
             emit_human_logs: false,
             on_gate_progress: Some(callback),
             allow_legacy_cache: false,
+            gate_resource_policy: None,
         };
 
         // Simulate the callback being invoked for a gate lifecycle.

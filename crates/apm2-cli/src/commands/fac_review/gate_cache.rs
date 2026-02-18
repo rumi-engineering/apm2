@@ -1401,4 +1401,88 @@ gates:
             "legacy_cache_override must be true after roundtrip of override-marked entry"
         );
     }
+
+    // --- TCK-00540 fix round 3: End-to-end runtime behaviour regression test ---
+
+    /// Regression test proving the `--allow-legacy-cache` flag changes runtime
+    /// behavior for the `fac gates` path. This is the key test from the BLOCKER
+    /// finding: an unbound legacy entry must (a) be denied in default mode,
+    /// (b) be accepted and stored with `legacy_cache_override=true` when the
+    /// flag is set, and (c) subsequent default-mode runs must still deny the
+    /// override-marked entry.
+    #[test]
+    fn allow_legacy_cache_flag_changes_runtime_behaviour() {
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+
+        // Simulate a pre-existing signed cache entry WITHOUT receipt bindings
+        // (as would exist from a pre-TCK-00540 gate run).
+        let cache = make_signed_cache_with_bindings(&signer, false, false);
+
+        // (a) Default mode (allow_legacy_cache=false): MUST deny.
+        let reuse_default = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), false);
+        assert!(
+            !reuse_default.reusable,
+            "unbound legacy entry must be DENIED in default mode"
+        );
+        assert_eq!(
+            reuse_default.reason, "receipt_binding_missing",
+            "denial reason must be receipt_binding_missing"
+        );
+
+        // (b) Override mode (allow_legacy_cache=true): MUST accept.
+        let reuse_override = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), true);
+        assert!(
+            reuse_override.reusable,
+            "unbound legacy entry must be ACCEPTED with --allow-legacy-cache"
+        );
+        assert_eq!(
+            reuse_override.reason, "legacy_cache_override_unsafe",
+            "acceptance reason must be legacy_cache_override_unsafe"
+        );
+
+        // Simulate what run_gates_inner does after an override hit:
+        // write the gate result then call mark_legacy_override.
+        let mut new_cache = GateCache::new("abc123");
+        new_cache.set_with_attestation(
+            "rustfmt",
+            true,
+            1,
+            Some("digest-1".to_string()),
+            false,
+            Some("log-digest".to_string()),
+            None,
+        );
+        new_cache.mark_legacy_override("rustfmt");
+        new_cache.sign_all(&signer);
+
+        // Verify the persisted entry has correct override markings.
+        let entry = new_cache.gates.get("rustfmt").expect("entry must exist");
+        assert!(
+            !entry.rfc0028_receipt_bound,
+            "override-marked entry must have rfc0028_receipt_bound=false"
+        );
+        assert!(
+            !entry.rfc0029_receipt_bound,
+            "override-marked entry must have rfc0029_receipt_bound=false"
+        );
+        assert!(
+            entry.legacy_cache_override,
+            "override-marked entry must have legacy_cache_override=true"
+        );
+
+        // (c) Subsequent default-mode run: MUST still deny the
+        // override-marked entry (the override audit trail prevents silent
+        // promotion to trusted).
+        let reuse_subsequent =
+            new_cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), false);
+        assert!(
+            !reuse_subsequent.reusable,
+            "override-marked entry must be DENIED in subsequent default-mode run"
+        );
+        assert_eq!(
+            reuse_subsequent.reason, "receipt_binding_missing",
+            "subsequent denial must be receipt_binding_missing"
+        );
+    }
 }
