@@ -719,6 +719,15 @@ pub struct FacJobReceiptV1 {
     /// It is intentionally optional and currently not populated by the worker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eio29_budget_admission: Option<BudgetAdmissionTrace>,
+    /// Stop/revoke admission trace (TCK-00587).
+    ///
+    /// Records the explicit `stop_revoke` admission decision including which
+    /// policy provisions were exercised (lane reservation, tp001 emergency
+    /// carve-out, tick-floor status, worker first-pass priority).
+    /// Only populated for `stop_revoke` jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_revoke_admission:
+        Option<crate::economics::queue_admission::StopRevokeAdmissionTrace>,
     /// Containment verification trace (TCK-00548).
     ///
     /// Records whether child processes (rustc, nextest, etc.) were verified
@@ -779,7 +788,7 @@ impl FacJobReceiptV1 {
     /// These variants are statically constrained to serializable values, so
     /// this path is not expected under normal operation.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(512);
 
@@ -912,6 +921,16 @@ impl FacJobReceiptV1 {
             bytes.push(5u8);
             bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
             bytes.extend_from_slice(hash.as_bytes());
+        }
+
+        // TCK-00587: Stop/revoke admission trace. Added as an append-only
+        // trailing optional for V1; uses type-specific marker `7u8` for
+        // injective encoding.
+        if let Some(trace) = &self.stop_revoke_admission {
+            bytes.push(7u8);
+            let trace_json = serde_json::to_string(trace).unwrap_or_default();
+            bytes.extend_from_slice(&(trace_json.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(trace_json.as_bytes());
         }
 
         bytes
@@ -1119,6 +1138,16 @@ impl FacJobReceiptV1 {
             bytes.push(7u8);
             bytes.extend_from_slice(&(fp.len() as u32).to_be_bytes());
             bytes.extend_from_slice(fp.as_bytes());
+        }
+
+        // TCK-00587: Stop/revoke admission trace. Uses type-specific
+        // marker `8u8` for injective encoding (V2 only -- `7u8` is
+        // already allocated to node_fingerprint in V2).
+        if let Some(trace) = &self.stop_revoke_admission {
+            bytes.push(8u8);
+            let trace_json = serde_json::to_string(trace).unwrap_or_default();
+            bytes.extend_from_slice(&(trace_json.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(trace_json.as_bytes());
         }
 
         bytes
@@ -1378,6 +1407,8 @@ pub struct FacJobReceiptV1Builder {
     rfc0028_channel_boundary: Option<ChannelBoundaryTrace>,
     eio29_queue_admission: Option<QueueAdmissionTrace>,
     eio29_budget_admission: Option<BudgetAdmissionTrace>,
+    stop_revoke_admission:
+        Option<crate::economics::queue_admission::StopRevokeAdmissionTrace>,
     containment: Option<super::containment::ContainmentTrace>,
     observed_cost: Option<crate::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<String>,
@@ -1477,6 +1508,16 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn eio29_budget_admission(mut self, trace: BudgetAdmissionTrace) -> Self {
         self.eio29_budget_admission = Some(trace);
+        self
+    }
+
+    /// Sets the stop/revoke admission trace (TCK-00587).
+    #[must_use]
+    pub fn stop_revoke_admission(
+        mut self,
+        trace: crate::economics::queue_admission::StopRevokeAdmissionTrace,
+    ) -> Self {
+        self.stop_revoke_admission = Some(trace);
         self
     }
 
@@ -1761,6 +1802,7 @@ impl FacJobReceiptV1Builder {
             rfc0028_channel_boundary: self.rfc0028_channel_boundary,
             eio29_queue_admission: self.eio29_queue_admission,
             eio29_budget_admission: self.eio29_budget_admission,
+            stop_revoke_admission: self.stop_revoke_admission,
             containment: self.containment,
             observed_cost: self.observed_cost,
             sandbox_hardening_hash: self.sandbox_hardening_hash,

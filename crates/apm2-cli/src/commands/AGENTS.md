@@ -270,6 +270,16 @@ Security invariants:
   containing characters outside `[A-Za-z0-9_-]` to prevent command injection via unit names.
 - **Control-lane refusal receipts** (`fac_worker.rs`): All deny paths in the control-lane
   `stop_revoke` flow emit explicit refusal receipts before moving jobs to `denied/`.
+- **Stop/revoke explicit admission trace** (`fac_worker.rs`, TCK-00587): Control-lane
+  stop_revoke jobs construct a `StopRevokeAdmissionTrace` before dispatching to
+  `handle_stop_revoke()`. The trace captures the explicit admission policy snapshot
+  (lane reservation permille, max wait ticks, TP predicate requirements), queue backlog
+  state at admission, and the worker first-pass anti-starvation flag. The trace is bound
+  to the receipt via the `stop_revoke_admission` field on `FacJobReceiptV1` and included
+  in both v1 and v2 canonical bytes for replay verification. Anti-starvation is
+  guaranteed by the sort order: candidates are sorted `(priority ASC, enqueue_time ASC,
+  job_id ASC)` where `StopRevoke` priority=0 is highest, ensuring all stop_revoke jobs
+  in a cycle are processed before any lower-priority lane.
 - **RUNNING lease lifecycle** (`fac_worker.rs`): A RUNNING `LaneLeaseV1` is persisted after lane
   acquisition and lane profile loading, before any execution. Every early-return path removes the
   lease. This satisfies the `run_lane_cleanup` RUNNING-state precondition (INV-LANE-CLEANUP-005).

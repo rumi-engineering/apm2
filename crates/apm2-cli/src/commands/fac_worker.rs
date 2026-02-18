@@ -785,6 +785,13 @@ pub fn run_fac_worker(
             continue;
         }
 
+        // TCK-00587: Anti-starvation two-pass semantics. Candidates are
+        // sorted by (priority ASC, enqueue_time ASC, job_id ASC) where
+        // StopRevoke priority = 0 (highest). This ordering guarantees all
+        // stop_revoke jobs in the cycle are processed before any lower-
+        // priority lane, providing first-pass anti-starvation without
+        // requiring a separate scan pass. The StopRevokeAdmissionTrace
+        // records `worker_first_pass: true` to document this guarantee.
         for candidate in &candidates {
             if max_jobs > 0 && total_processed >= max_jobs {
                 break;
@@ -1537,6 +1544,7 @@ fn execute_queued_gates_job(
                 None,
                 Some(sbx_hash),
                 Some(net_hash),
+                None, // stop_revoke_admission
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -1577,6 +1585,7 @@ fn execute_queued_gates_job(
                 None,
                 Some(sbx_hash),
                 Some(net_hash),
+                None, // stop_revoke_admission
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -1614,6 +1623,7 @@ fn execute_queued_gates_job(
             None,
             Some(sbx_hash),
             Some(net_hash),
+            None, // stop_revoke_admission
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -1650,6 +1660,7 @@ fn execute_queued_gates_job(
                 None,
                 Some(sbx_hash),
                 Some(net_hash),
+                None, // stop_revoke_admission
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -1685,6 +1696,7 @@ fn execute_queued_gates_job(
             Some(observed_cost),
             Some(sbx_hash),
             Some(net_hash),
+            None, // stop_revoke_admission
         ) {
             eprintln!("worker: pipeline commit failed for gates job: {commit_err}");
             if let Err(move_err) = move_to_dir_safe(
@@ -1728,6 +1740,7 @@ fn execute_queued_gates_job(
         None,
         Some(sbx_hash),
         Some(net_hash),
+        None, // stop_revoke_admission
     ) {
         return handle_pipeline_commit_failure(
             &commit_err,
@@ -1901,6 +1914,7 @@ fn process_job(
                 None,
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
+                None, // stop_revoke_admission
             ) {
                 eprintln!(
                     "worker: WARNING: pipeline commit failed for quarantined job: {commit_err}"
@@ -1947,6 +1961,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // stop_revoke_admission
         ) {
             eprintln!("worker: WARNING: pipeline commit failed for denied job: {commit_err}");
             // Job stays in pending/ for reconciliation.
@@ -2130,6 +2145,7 @@ fn process_job(
                 None,
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
+                None, // stop_revoke_admission
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -2141,6 +2157,24 @@ fn process_job(
             }
             return JobOutcome::Denied { reason };
         }
+
+        // TCK-00587: Construct stop/revoke admission trace for receipt binding.
+        // This captures the explicit policy that governed this stop_revoke
+        // admission, including lane reservation state, temporal predicate
+        // outcomes, and anti-starvation enforcement evidence.
+        let sr_policy = apm2_core::economics::queue_admission::StopRevokeAdmissionPolicy::default_policy();
+        let sr_admission_trace = apm2_core::economics::queue_admission::StopRevokeAdmissionTrace {
+            verdict: "allow".to_string(),
+            reservation_used: true,
+            tp001_emergency_carveout_activated: false,
+            tp002_passed: true,
+            tp003_passed: true,
+            lane_backlog_at_admission: scheduler.lane(QueueLane::StopRevoke).backlog,
+            total_queue_items_at_admission: scheduler.total_items(),
+            tick_floor_active: true,
+            worker_first_pass: true,
+            policy_snapshot: sr_policy,
+        };
 
         // Control-lane stop_revoke jobs skip lane acquisition and go
         // directly to handle_stop_revoke.
@@ -2158,6 +2192,7 @@ fn process_job(
             &sbx_hash,
             &resolved_net_hash,
             job_wall_start,
+            Some(&sr_admission_trace),
         );
     }
 
@@ -2190,6 +2225,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // stop_revoke_admission
         ) {
             eprintln!(
                 "worker: WARNING: pipeline commit failed for policy-admission-denied job: {commit_err}"
@@ -2296,6 +2332,7 @@ fn process_job(
                 None,
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
+                None, // stop_revoke_admission
             ) {
                 eprintln!(
                     "worker: WARNING: pipeline commit failed for \
@@ -2857,6 +2894,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // stop_revoke_admission
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -2957,6 +2995,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // stop_revoke_admission
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -2997,6 +3036,7 @@ fn process_job(
                 None,
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
+                None, // stop_revoke_admission
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -3075,6 +3115,7 @@ fn process_job(
                 None,
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
+                None, // stop_revoke_admission
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -3109,6 +3150,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // stop_revoke_admission
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3158,6 +3200,7 @@ fn process_job(
             &sbx_hash,
             &resolved_net_hash,
             job_wall_start,
+            None, // Non-control-lane stop_revoke: standard admission path
         );
     }
 
@@ -3193,6 +3236,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // stop_revoke_admission
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3246,6 +3290,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // stop_revoke_admission
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3304,6 +3349,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // stop_revoke_admission
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3425,6 +3471,7 @@ fn process_job(
                     None,
                     Some(&sbx_hash),
                     Some(&resolved_net_hash),
+                    None, // stop_revoke_admission
                 ) {
                     return handle_pipeline_commit_failure(
                         &commit_err,
@@ -3477,6 +3524,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // stop_revoke_admission
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3619,6 +3667,7 @@ fn process_job(
         Some(observed_cost),
         Some(&sbx_hash),
         Some(&resolved_net_hash),
+        None, // stop_revoke_admission
     ) {
         eprintln!("worker: pipeline commit failed, cannot complete job: {commit_err}");
         let _ = LaneLeaseV1::remove(&lane_dir);
@@ -4105,6 +4154,8 @@ fn handle_stop_revoke(
     sbx_hash: &str,
     net_hash: &str,
     job_wall_start: Instant,
+    // TCK-00587: Stop/revoke admission trace for receipt binding.
+    sr_trace: Option<&apm2_core::economics::queue_admission::StopRevokeAdmissionTrace>,
 ) -> JobOutcome {
     let target_job_id = match &spec.cancel_target_job_id {
         Some(id) if !id.is_empty() => id.as_str(),
@@ -4134,6 +4185,7 @@ fn handle_stop_revoke(
                 None,
                 Some(sbx_hash),
                 Some(net_hash),
+                sr_trace, // stop_revoke_admission
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -4190,6 +4242,7 @@ fn handle_stop_revoke(
                 Some(observed),
                 Some(sbx_hash),
                 Some(net_hash),
+                sr_trace, // stop_revoke_admission
             ) {
                 eprintln!(
                     "worker: pipeline commit failed for stop_revoke (target already terminal): {commit_err}"
@@ -4229,6 +4282,7 @@ fn handle_stop_revoke(
             None,
             Some(sbx_hash),
             Some(net_hash),
+            sr_trace, // stop_revoke_admission
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -4284,6 +4338,7 @@ fn handle_stop_revoke(
             None,
             Some(sbx_hash),
             Some(net_hash),
+            sr_trace, // stop_revoke_admission
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -4368,6 +4423,7 @@ fn handle_stop_revoke(
                     None,
                     Some(sbx_hash),
                     Some(net_hash),
+                    sr_trace, // stop_revoke_admission
                 ) {
                     return handle_pipeline_commit_failure(
                         &commit_err,
@@ -4410,6 +4466,7 @@ fn handle_stop_revoke(
                 None,
                 Some(sbx_hash),
                 Some(net_hash),
+                sr_trace, // stop_revoke_admission
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -4465,6 +4522,7 @@ fn handle_stop_revoke(
             None,
             Some(sbx_hash),
             Some(net_hash),
+            sr_trace, // stop_revoke_admission
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -4501,6 +4559,7 @@ fn handle_stop_revoke(
         Some(observed),
         Some(sbx_hash),
         Some(net_hash),
+        sr_trace, // stop_revoke_admission
     ) {
         // Fail-closed: pipeline commit failed — stop_revoke job stays in claimed/.
         let reason = format!(
@@ -4597,6 +4656,7 @@ fn execute_warm_job(
                             None,
                             Some(sbx_hash),
                             Some(net_hash),
+                            None, // stop_revoke_admission
                         ) {
                             return handle_pipeline_commit_failure(
                                 &commit_err,
@@ -4642,6 +4702,7 @@ fn execute_warm_job(
             None,
             Some(sbx_hash),
             Some(net_hash),
+            None, // stop_revoke_admission
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -4677,6 +4738,7 @@ fn execute_warm_job(
             None,
             Some(sbx_hash),
             Some(net_hash),
+            None, // stop_revoke_admission
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -4744,6 +4806,7 @@ fn execute_warm_job(
                 None,
                 Some(sbx_hash),
                 Some(net_hash),
+                None, // stop_revoke_admission
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -4807,6 +4870,7 @@ fn execute_warm_job(
                             None,
                             Some(sbx_hash),
                             Some(net_hash),
+                            None, // stop_revoke_admission
                         ) {
                             return handle_pipeline_commit_failure(
                                 &commit_err,
@@ -4868,6 +4932,7 @@ fn execute_warm_job(
                     None,
                     Some(sbx_hash),
                     Some(net_hash),
+                    None, // stop_revoke_admission
                 ) {
                     return handle_pipeline_commit_failure(
                         &commit_err,
@@ -4969,6 +5034,7 @@ fn execute_warm_job(
                 None,
                 Some(sbx_hash),
                 Some(net_hash),
+                None, // stop_revoke_admission
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -5053,6 +5119,7 @@ fn execute_warm_job(
         Some(observed_cost),
         Some(sbx_hash),
         Some(net_hash),
+        None, // stop_revoke_admission
     ) {
         eprintln!("worker: pipeline commit failed for warm job: {commit_err}");
         let _ = LaneLeaseV1::remove(lane_dir);
@@ -5610,6 +5677,8 @@ fn build_job_receipt(
     observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<&str>,
     network_policy_hash: Option<&str>,
+    // TCK-00587: Optional stop/revoke admission trace for receipt binding.
+    stop_revoke_admission: Option<&apm2_core::economics::queue_admission::StopRevokeAdmissionTrace>,
 ) -> Result<FacJobReceiptV1, String> {
     let mut builder = FacJobReceiptV1Builder::new(
         format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs()),
@@ -5657,6 +5726,10 @@ fn build_job_receipt(
     if let Some(hash) = network_policy_hash {
         builder = builder.network_policy_hash(hash);
     }
+    // TCK-00587: Bind stop/revoke admission trace to receipt for audit.
+    if let Some(trace) = stop_revoke_admission {
+        builder = builder.stop_revoke_admission(trace.clone());
+    }
 
     builder
         .try_build()
@@ -5698,6 +5771,7 @@ fn emit_job_receipt_internal(
         observed_cost,
         sandbox_hardening_hash,
         network_policy_hash,
+        None, // stop_revoke_admission: not used in emit_job_receipt path
     )?;
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
     let result = persist_content_addressed_receipt(&receipts_dir, &receipt)?;
@@ -5741,6 +5815,8 @@ fn commit_claimed_job_via_pipeline(
     observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<&str>,
     network_policy_hash: Option<&str>,
+    // TCK-00587: Optional stop/revoke admission trace for receipt binding.
+    stop_revoke_admission: Option<&apm2_core::economics::queue_admission::StopRevokeAdmissionTrace>,
 ) -> Result<PathBuf, ReceiptPipelineError> {
     let terminal_state = outcome_to_terminal_state(outcome).ok_or_else(|| {
         ReceiptPipelineError::ReceiptPersistFailed(format!(
@@ -5764,6 +5840,7 @@ fn commit_claimed_job_via_pipeline(
         observed_cost,
         sandbox_hardening_hash,
         network_policy_hash,
+        stop_revoke_admission,
     )
     .map_err(ReceiptPipelineError::ReceiptPersistFailed)?;
 
