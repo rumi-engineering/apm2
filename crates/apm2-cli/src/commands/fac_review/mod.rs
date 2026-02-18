@@ -1010,9 +1010,7 @@ fn run_doctor_inner(
                 "stale" => health.push(DoctorHealthItem {
                     severity: "medium",
                     message: "lifecycle reducer indicates STALE state".to_string(),
-                    remediation:
-                        "run `apm2 fac push --pr <PR_NUMBER> --force` to refresh lifecycle state"
-                            .to_string(),
+                    remediation: "run `apm2 fac push` to refresh lifecycle state".to_string(),
                 }),
                 "recovering" => health.push(DoctorHealthItem {
                     severity: "medium",
@@ -1078,8 +1076,8 @@ fn run_doctor_inner(
                         "lifecycle current SHA {} != local identity SHA {}",
                         snapshot.current_sha, local_sha
                     ),
-                    remediation:
-                        "run `apm2 fac push --pr <PR_NUMBER>` to align lifecycle with current local SHA".to_string(),
+                    remediation: "run `apm2 fac push` to align lifecycle with current local SHA"
+                        .to_string(),
                 });
             }
 
@@ -1112,7 +1110,7 @@ fn run_doctor_inner(
                     health.push(DoctorHealthItem {
                         severity: "medium",
                         message: "no cached gate results for current SHA".to_string(),
-                        remediation: "run `apm2 fac push --pr <PR_NUMBER>`".to_string(),
+                        remediation: "run `apm2 fac push`".to_string(),
                     });
                 }
                 for (name, result) in cache.gates {
@@ -1122,9 +1120,8 @@ fn run_doctor_inner(
                         health.push(DoctorHealthItem {
                             severity: "high",
                             message: format!("gate {name} failed"),
-                            remediation: format!(
-                                "rerun gate evidence stage with `apm2 fac push --pr {pr_number}`"
-                            ),
+                            remediation: "rerun gate evidence stage with `apm2 fac push`"
+                                .to_string(),
                         });
                     } else if status == "NOT_RUN" {
                         health.push(DoctorHealthItem {
@@ -1163,17 +1160,14 @@ fn run_doctor_inner(
                 health.push(DoctorHealthItem {
                     severity: "low",
                     message: "no gate cache found for local SHA".to_string(),
-                    remediation: format!(
-                        "run `apm2 fac push --pr {pr_number}` to populate evidence cache"
-                    ),
+                    remediation: "run `apm2 fac push` to populate evidence cache".to_string(),
                 });
             },
         },
         None => health.push(DoctorHealthItem {
             severity: "high",
             message: "no local SHA resolved for gate review".to_string(),
-            remediation: "establish local identity via `apm2 fac push --pr <PR_NUMBER>`"
-                .to_string(),
+            remediation: "establish local identity via `apm2 fac push`".to_string(),
         }),
     }
 
@@ -1459,8 +1453,7 @@ fn run_doctor_inner(
                 health.push(DoctorHealthItem {
                     severity: "medium",
                     message: format!("failed to read push attempt log: {err}"),
-                    remediation: "rerun `apm2 fac push --pr <PR_NUMBER>` to refresh push telemetry"
-                        .to_string(),
+                    remediation: "rerun `apm2 fac push` to refresh push telemetry".to_string(),
                 });
                 None
             },
@@ -2422,8 +2415,7 @@ fn build_doctor_worktree_status(
         health.push(DoctorHealthItem {
             severity: "medium",
             message: format!("worktree path missing: {}", worktree_path.display()),
-            remediation: "run `apm2 fac push --pr <PR_NUMBER>` to refresh identity/worktree"
-                .to_string(),
+            remediation: "run `apm2 fac push` to refresh identity/worktree".to_string(),
         });
         return (status, merge_conflict_status);
     }

@@ -1445,7 +1445,11 @@ fn available_space_bytes(path: &std::path::Path) -> Result<u64> {
 }
 
 fn socket_permission_check(path: &Path) -> Result<bool> {
-    let metadata = std::fs::symlink_metadata(path).context("socket path is missing")?;
+    // Follow symlinks: the socket may be reached via a symlink (e.g.
+    // /tmp/apm2/operator.sock -> /run/user/1000/apm2/operator.sock). We want
+    // the target's permissions, not the symlink's (symlinks always report 0777
+    // on Linux).
+    let metadata = std::fs::metadata(path).context("socket path is missing")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -1478,6 +1482,47 @@ mod tests {
         // must not panic.
         let result = ensure_daemon_running(socket, config);
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_permission_check_follows_symlink_to_socket_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let socket_path = temp.path().join("operator.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+            .expect("set socket permissions");
+
+        let symlink_path = temp.path().join("operator-link.sock");
+        symlink(&socket_path, &symlink_path).expect("create symlink");
+
+        let secure = socket_permission_check(&symlink_path).expect("socket permission check");
+        assert!(
+            secure,
+            "symlink path should resolve to secure target socket"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_permission_check_rejects_non_0600_socket_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let socket_path = temp.path().join("operator.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666))
+            .expect("set socket permissions");
+
+        let secure = socket_permission_check(&socket_path).expect("socket permission check");
+        assert!(
+            !secure,
+            "socket permissions broader than 0600 must fail doctor check"
+        );
     }
 
     /// TCK-00595 MAJOR-3: projection worker health check returns OK when

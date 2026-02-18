@@ -53,7 +53,11 @@ const CONSERVATIVE_PARALLELISM: u32 = 2;
 const DEFAULT_GATES_WAIT_TIMEOUT_SECS: u64 = 1200;
 const GATES_WAIT_POLL_INTERVAL_SECS: u64 = 5;
 const INLINE_WORKER_POLL_INTERVAL_SECS: u64 = 1;
+const EXTERNAL_WORKER_BOOTSTRAP_POLL_INTERVAL_MS: u64 = 250;
+// 40 * 250ms ~= 10s bootstrap window for detached worker heartbeat.
+const EXTERNAL_WORKER_BOOTSTRAP_MAX_POLLS: u32 = 40;
 const GATES_QUEUE_LANE: &str = "consume";
+const DIRTY_TREE_STATUS_MAX_LINES: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueueProcessingMode {
@@ -88,6 +92,7 @@ pub(super) struct QueuedGatesOutcome {
     pub(super) job_receipt_id: String,
     pub(super) policy_hash: String,
     pub(super) head_sha: String,
+    pub(super) worker_bootstrapped: bool,
     pub(super) gate_results: Vec<EvidenceGateResult>,
 }
 
@@ -275,6 +280,7 @@ pub(super) fn run_queued_gates_and_collect(
         job_receipt_id,
         policy_hash,
         head_sha: prepared.head_sha,
+        worker_bootstrapped: prepared.worker_bootstrapped,
         gate_results,
     })
 }
@@ -303,13 +309,14 @@ fn prepare_queued_gates_job(
     resolve_effective_execution_profile(&request.cpu_quota, request.gate_profile)?;
 
     let fac_root = resolve_fac_root().map_err(|err| format!("cannot resolve FAC root: {err}"))?;
-    if request.require_external_worker && !has_live_worker_heartbeat(&fac_root) {
-        return Err(
-            "no live FAC worker heartbeat found; fac push requires external worker queue processing".to_string(),
-        );
-    }
-
-    let worker_bootstrapped = if wait {
+    let worker_bootstrapped = if request.require_external_worker {
+        ensure_external_worker_bootstrap(
+            &fac_root,
+            has_live_worker_heartbeat,
+            spawn_detached_worker_for_queue,
+        )
+        .map_err(|err| format!("cannot bootstrap external FAC worker: {err}"))?
+    } else if wait {
         false
     } else {
         ensure_non_wait_worker_bootstrap(
@@ -766,6 +773,47 @@ where
     }
     spawn_worker()?;
     Ok(true)
+}
+
+fn ensure_external_worker_bootstrap(
+    fac_root: &Path,
+    has_live_heartbeat: fn(&Path) -> bool,
+    spawn_worker: fn() -> Result<(), String>,
+) -> Result<bool, String> {
+    ensure_external_worker_bootstrap_with(fac_root, has_live_heartbeat, spawn_worker, || {
+        std::thread::sleep(Duration::from_millis(
+            EXTERNAL_WORKER_BOOTSTRAP_POLL_INTERVAL_MS,
+        ));
+    })
+}
+
+fn ensure_external_worker_bootstrap_with<FHeartbeat, FSpawn, FWait>(
+    fac_root: &Path,
+    mut has_live_heartbeat: FHeartbeat,
+    mut spawn_worker: FSpawn,
+    mut wait_for_heartbeat: FWait,
+) -> Result<bool, String>
+where
+    FHeartbeat: FnMut(&Path) -> bool,
+    FSpawn: FnMut() -> Result<(), String>,
+    FWait: FnMut(),
+{
+    if has_live_heartbeat(fac_root) {
+        return Ok(false);
+    }
+    spawn_worker()?;
+    for _ in 0..EXTERNAL_WORKER_BOOTSTRAP_MAX_POLLS {
+        if has_live_heartbeat(fac_root) {
+            return Ok(true);
+        }
+        wait_for_heartbeat();
+    }
+    if has_live_heartbeat(fac_root) {
+        return Ok(true);
+    }
+    Err(
+        "no live FAC worker heartbeat found after auto-start attempts; run `apm2 fac worker --poll-interval-secs 1`".to_string(),
+    )
 }
 
 fn spawn_detached_worker_for_queue() -> Result<(), String> {
@@ -1394,12 +1442,12 @@ fn ensure_clean_working_tree(workspace_root: &Path, quick: bool) -> Result<(), S
         .output()
         .map_err(|e| format!("failed to run git diff: {e}"))?;
     if !diff_status.status.success() {
-        return Err(
+        let status_hint = render_dirty_tree_status_hint(workspace_root);
+        return Err(format!(
             "DIRTY TREE: working tree has unstaged changes. ALL changes must be committed before \
              running full gates — build artifacts are SHA-attested and reused as a source of truth. \
-             Run `git add -A && git commit` first, or use `apm2 fac gates --quick` for inner-loop development."
-                .to_string(),
-        );
+             Run `git add -A && git commit` first, or use `apm2 fac gates --quick` for inner-loop development.{status_hint}"
+        ));
     }
 
     let cached_status = Command::new("git")
@@ -1408,13 +1456,13 @@ fn ensure_clean_working_tree(workspace_root: &Path, quick: bool) -> Result<(), S
         .output()
         .map_err(|e| format!("failed to run git diff --cached: {e}"))?;
     if !cached_status.status.success() {
-        return Err(
+        let status_hint = render_dirty_tree_status_hint(workspace_root);
+        return Err(format!(
             "DIRTY TREE: working tree has staged but uncommitted changes. ALL changes must be \
              committed before running full gates — build artifacts are SHA-attested and reused \
              as a source of truth. Run `git commit` first, or use `apm2 fac gates --quick` for \
-             inner-loop development."
-                .to_string(),
-        );
+             inner-loop development.{status_hint}"
+        ));
     }
 
     let untracked = Command::new("git")
@@ -1426,16 +1474,42 @@ fn ensure_clean_working_tree(workspace_root: &Path, quick: bool) -> Result<(), S
         return Err("failed to evaluate untracked files for clean-tree check".to_string());
     }
     if !String::from_utf8_lossy(&untracked.stdout).trim().is_empty() {
-        return Err(
+        let status_hint = render_dirty_tree_status_hint(workspace_root);
+        return Err(format!(
             "DIRTY TREE: working tree has untracked files. ALL files must be committed (or \
              .gitignored) before running full gates — build artifacts are SHA-attested and \
              reused as a source of truth. Run `git add -A && git commit` first, or use \
-             `apm2 fac gates --quick` for inner-loop development."
-                .to_string(),
-        );
+             `apm2 fac gates --quick` for inner-loop development.{status_hint}"
+        ));
     }
 
     Ok(())
+}
+
+fn render_dirty_tree_status_hint(workspace_root: &Path) -> String {
+    let output = match Command::new("git")
+        .args(["status", "--short", "--untracked-files=all"])
+        .current_dir(workspace_root)
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return String::new(),
+    };
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let mut status_lines = rendered
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .take(DIRTY_TREE_STATUS_MAX_LINES)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if status_lines.is_empty() {
+        return String::new();
+    }
+    if rendered.lines().count() > status_lines.len() {
+        status_lines.push("...".to_string());
+    }
+    format!("\nCurrent git status:\n{}", status_lines.join("\n"))
 }
 
 /// Load or create the FAC policy. Delegates to the shared `policy_loader`
@@ -1598,14 +1672,57 @@ mod tests {
     }
 
     #[test]
-    fn prepare_queued_gates_job_rejects_missing_worker_heartbeat_when_required() {
-        with_test_apm2_home(|_| {
-            let request = default_queued_request(true, false);
-            let err = prepare_queued_gates_job(&request, true)
-                .expect_err("missing worker heartbeat must fail closed");
-            assert!(err.contains("no live FAC worker heartbeat found"));
-            assert!(err.contains("external worker"));
-        });
+    fn external_worker_bootstrap_fails_closed_when_heartbeat_never_appears() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let err = ensure_external_worker_bootstrap_with(temp.path(), |_| false, || Ok(()), || {})
+            .expect_err("missing worker heartbeat must fail closed after auto-start");
+        assert!(err.contains("after auto-start attempts"));
+        assert!(err.contains("apm2 fac worker"));
+    }
+
+    #[test]
+    fn external_worker_bootstrap_skips_spawn_when_heartbeat_is_live() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut spawn_attempted = false;
+        let result = ensure_external_worker_bootstrap_with(
+            temp.path(),
+            |_| true,
+            || {
+                spawn_attempted = true;
+                Ok(())
+            },
+            || {},
+        )
+        .expect("live heartbeat should skip bootstrap");
+        assert!(!result);
+        assert!(!spawn_attempted);
+    }
+
+    #[test]
+    fn external_worker_bootstrap_spawns_and_waits_until_heartbeat_is_live() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut checks = 0_u32;
+        let mut waits = 0_u32;
+        let mut spawned = false;
+        let result = ensure_external_worker_bootstrap_with(
+            temp.path(),
+            |_| {
+                checks += 1;
+                checks >= 3
+            },
+            || {
+                spawned = true;
+                Ok(())
+            },
+            || {
+                waits += 1;
+            },
+        )
+        .expect("bootstrap should succeed once heartbeat appears");
+        assert!(result);
+        assert!(spawned);
+        assert_eq!(waits, 1);
+        assert_eq!(checks, 3);
     }
 
     #[test]

@@ -48,6 +48,7 @@ const PUSH_QUEUE_GATES_MEMORY_MAX: &str = "48G";
 const PUSH_QUEUE_GATES_PIDS_MAX: u64 = 1536;
 const PUSH_QUEUE_GATES_CPU_QUOTA: &str = "auto";
 const PUSH_QUEUE_GATES_WAIT_TIMEOUT_SECS: u64 = 1200;
+const PUSH_ATTEMPT_MALFORMED_WARN_LIMIT: usize = 3;
 
 /// Extract `TCK-xxxxx` from arbitrary text.
 fn extract_tck_from_text(input: &str) -> Option<String> {
@@ -839,16 +840,25 @@ pub(super) struct PushAttemptStage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct PushAttemptRecord {
+    #[serde(default = "default_push_attempt_schema")]
     pub schema: String,
     pub ts: String,
     pub sha: String,
+    #[serde(default)]
     pub ruleset_sync: PushAttemptStage,
+    #[serde(default)]
     pub git_push: PushAttemptStage,
+    #[serde(default)]
     pub gate_fmt: PushAttemptStage,
+    #[serde(default)]
     pub gate_clippy: PushAttemptStage,
+    #[serde(default)]
     pub gate_test: PushAttemptStage,
+    #[serde(default)]
     pub gate_doc: PushAttemptStage,
+    #[serde(default)]
     pub pr_update: PushAttemptStage,
+    #[serde(default)]
     pub dispatch: PushAttemptStage,
 }
 
@@ -941,6 +951,16 @@ impl PushAttemptRecord {
         }
         None
     }
+}
+
+impl Default for PushAttemptStage {
+    fn default() -> Self {
+        skipped_stage()
+    }
+}
+
+fn default_push_attempt_schema() -> String {
+    PUSH_ATTEMPT_SCHEMA.to_string()
 }
 
 fn skipped_stage() -> PushAttemptStage {
@@ -1067,6 +1087,8 @@ pub(super) fn load_latest_push_attempt_for_sha(
         .map_err(|err| format!("failed to open push attempt log {}: {err}", path.display()))?;
     let reader = BufReader::new(file);
     let mut latest = None;
+    let mut malformed_lines = 0_usize;
+    let mut warned_examples = 0_usize;
     for (line_number, line) in reader.lines().enumerate() {
         let line = line.map_err(|err| {
             format!(
@@ -1077,17 +1099,33 @@ pub(super) fn load_latest_push_attempt_for_sha(
         if line.trim().is_empty() {
             continue;
         }
-        let record = serde_json::from_str::<PushAttemptRecord>(&line).map_err(|err| {
-            format!(
-                "failed to parse line {} in push attempt log {}: {err}",
-                line_number + 1,
-                path.display()
-            )
-        })?;
+        let record = match serde_json::from_str::<PushAttemptRecord>(&line) {
+            Ok(record) => record,
+            Err(err) => {
+                malformed_lines += 1;
+                if warned_examples < PUSH_ATTEMPT_MALFORMED_WARN_LIMIT {
+                    warned_examples += 1;
+                    eprintln!(
+                        "WARN: skipping malformed push attempt line {} in {}: {}",
+                        line_number + 1,
+                        path.display(),
+                        err
+                    );
+                }
+                continue;
+            },
+        };
         if !record.sha.eq_ignore_ascii_case(sha) {
             continue;
         }
         latest = Some(record);
+    }
+    if malformed_lines > warned_examples {
+        eprintln!(
+            "WARN: skipped {} additional malformed push attempt line(s) in {}",
+            malformed_lines - warned_examples,
+            path.display()
+        );
     }
     Ok(latest)
 }
@@ -1670,8 +1708,14 @@ pub fn run_push(
                 serde_json::json!({
                     "passed": true,
                     "duration_secs": gates_started.elapsed().as_secs(),
+                    "worker_bootstrapped": gate_outcome.worker_bootstrapped,
                 }),
             );
+            if gate_outcome.worker_bootstrapped {
+                human_log!(
+                    "fac push: no live worker heartbeat detected; auto-started detached FAC worker"
+                );
+            }
             human_log!("fac push: evidence gates PASSED");
             Ok(gate_outcome)
         },
@@ -2057,9 +2101,43 @@ pub fn run_push(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
+    use std::io::Write;
+    use std::path::Path;
 
     use super::*;
+
+    #[allow(unsafe_code)]
+    fn with_test_apm2_home<T>(f: impl FnOnce(&Path) -> T) -> T {
+        struct EnvGuard {
+            original_apm2_home: Option<OsString>,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                if let Some(value) = self.original_apm2_home.take() {
+                    // SAFETY: serialized through env_var_test_lock in test scope.
+                    unsafe { std::env::set_var("APM2_HOME", value) };
+                } else {
+                    // SAFETY: serialized through env_var_test_lock in test scope.
+                    unsafe { std::env::remove_var("APM2_HOME") };
+                }
+            }
+        }
+
+        let _env_lock = crate::commands::env_var_test_lock()
+            .lock()
+            .expect("serialize APM2_HOME tests");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let apm2_home = temp.path().join("apm2-home");
+        fs::create_dir_all(&apm2_home).expect("create apm2 home");
+        let original_apm2_home = std::env::var_os("APM2_HOME");
+        // SAFETY: serialized through env_var_test_lock in test scope.
+        unsafe { std::env::set_var("APM2_HOME", &apm2_home) };
+        let _guard = EnvGuard { original_apm2_home };
+        f(&apm2_home)
+    }
 
     fn sample_commit_history() -> Vec<CommitSummary> {
         vec![
@@ -2135,6 +2213,58 @@ mod tests {
     }
 
     #[test]
+    fn push_attempt_record_deserializes_legacy_rows_without_ruleset_sync_field() {
+        let stage = serde_json::json!({
+            "status": PUSH_STAGE_PASS,
+            "duration_s": 1_u64
+        });
+        let legacy = serde_json::json!({
+            "ts": "2026-02-18T01:00:00Z",
+            "sha": "0123456789abcdef0123456789abcdef01234567",
+            "git_push": stage,
+            "gate_fmt": stage,
+            "gate_clippy": stage,
+            "gate_test": stage,
+            "gate_doc": stage,
+            "pr_update": stage,
+            "dispatch": stage
+        });
+
+        let record: PushAttemptRecord =
+            serde_json::from_value(legacy).expect("legacy row should deserialize");
+        assert_eq!(record.schema, PUSH_ATTEMPT_SCHEMA);
+        assert_eq!(record.ruleset_sync.status, PUSH_STAGE_SKIPPED);
+        assert_eq!(record.ruleset_sync.duration_s, 0);
+    }
+
+    #[test]
+    fn load_latest_push_attempt_for_sha_skips_malformed_lines_and_keeps_valid_rows() {
+        with_test_apm2_home(|_| {
+            let owner_repo = "guardian-intelligence/apm2";
+            let pr_number = 42_u32;
+            let sha = "0123456789abcdef0123456789abcdef01234567";
+
+            let mut record = PushAttemptRecord::new(sha);
+            record.set_stage_pass("gate_fmt", 1);
+            append_push_attempt_record(owner_repo, pr_number, &record)
+                .expect("append valid record");
+
+            let path = push_attempts_path(owner_repo, pr_number).expect("push attempts path");
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open push attempts file");
+            writeln!(file, "{{malformed-json").expect("write malformed line");
+
+            let loaded = load_latest_push_attempt_for_sha(owner_repo, pr_number, sha)
+                .expect("load attempt")
+                .expect("matching attempt");
+            assert_eq!(loaded.sha, sha);
+            assert_eq!(loaded.gate_fmt.status, PUSH_STAGE_PASS);
+        });
+    }
+
+    #[test]
     fn normalize_error_hint_uses_last_non_empty_line_and_caps_length() {
         let hint = normalize_error_hint("line1\n\nline2 final detail").expect("hint");
         assert_eq!(hint, "line2 final detail");
@@ -2175,6 +2305,7 @@ mod tests {
             job_receipt_id: format!("{job_id}-receipt"),
             policy_hash: format!("b3-256:{}", "ab".repeat(32)),
             head_sha: sha.to_string(),
+            worker_bootstrapped: false,
             gate_results,
         }
     }
@@ -2635,6 +2766,7 @@ mod tests {
                 job_receipt_id: "gates-test-empty-job-id-receipt".to_string(),
                 policy_hash: format!("b3-256:{}", "ab".repeat(32)),
                 head_sha: sha.clone(),
+                worker_bootstrapped: false,
                 gate_results: results.clone(),
             })
         })
@@ -2652,6 +2784,7 @@ mod tests {
                 job_receipt_id: "gates-test-invalid-policy-hash-receipt".to_string(),
                 policy_hash: "not-a-hash".to_string(),
                 head_sha: sha.clone(),
+                worker_bootstrapped: false,
                 gate_results: results.clone(),
             })
         })
