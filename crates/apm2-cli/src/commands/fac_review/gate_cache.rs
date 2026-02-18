@@ -596,6 +596,31 @@ impl GateCache {
         );
     }
 
+    /// Downgrade a cache entry to reflect that it was reused via the
+    /// `--allow-legacy-cache` unsafe override (TCK-00540 fix round 2).
+    ///
+    /// When a cache hit occurs through `legacy_cache_override_unsafe`,
+    /// `set_with_attestation` initially writes the entry with default
+    /// bindings (`rfc0028_receipt_bound=true`, `rfc0029_receipt_bound=true`,
+    /// `legacy_cache_override=false`).  This method corrects the entry to
+    /// preserve the override audit trail:
+    ///
+    /// - `rfc0028_receipt_bound = false`
+    /// - `rfc0029_receipt_bound = false`
+    /// - `legacy_cache_override = true`
+    ///
+    /// This ensures that future default-mode runs (without
+    /// `--allow-legacy-cache`) will still detect and deny the entry until
+    /// it has been legitimately re-attested with actual RFC-0028/0029
+    /// receipts.
+    pub fn mark_legacy_override(&mut self, gate: &str) {
+        if let Some(entry) = self.gates.get_mut(gate) {
+            entry.rfc0028_receipt_bound = false;
+            entry.rfc0029_receipt_bound = false;
+            entry.legacy_cache_override = true;
+        }
+    }
+
     /// Backfill truncation and log-bundle metadata from evidence gate results.
     ///
     /// Called after all gates have run and `attach_log_bundle_hash` has
@@ -1250,6 +1275,130 @@ gates:
         assert!(
             !entry.legacy_cache_override,
             "legacy YAML without legacy_cache_override must default to false"
+        );
+    }
+
+    // --- TCK-00540 fix round 2: mark_legacy_override tests ---
+
+    /// `mark_legacy_override` sets the correct binding flags on a cache entry
+    /// that was initially written with default trusted bindings.
+    #[test]
+    fn mark_legacy_override_preserves_audit_trail() {
+        let mut cache = GateCache::new("abc123");
+        cache.set_with_attestation(
+            "rustfmt",
+            true,
+            1,
+            Some("digest-1".to_string()),
+            false,
+            Some("log-digest".to_string()),
+            None,
+        );
+
+        // Before mark: default trusted bindings.
+        let entry = cache.gates.get("rustfmt").expect("entry exists");
+        assert!(entry.rfc0028_receipt_bound, "default should be true");
+        assert!(entry.rfc0029_receipt_bound, "default should be true");
+        assert!(!entry.legacy_cache_override, "default should be false");
+
+        // After mark: override audit trail preserved.
+        cache.mark_legacy_override("rustfmt");
+        let entry = cache.gates.get("rustfmt").expect("entry exists");
+        assert!(
+            !entry.rfc0028_receipt_bound,
+            "rfc0028 must be false after mark_legacy_override"
+        );
+        assert!(
+            !entry.rfc0029_receipt_bound,
+            "rfc0029 must be false after mark_legacy_override"
+        );
+        assert!(
+            entry.legacy_cache_override,
+            "legacy_cache_override must be true after mark_legacy_override"
+        );
+    }
+
+    /// After `mark_legacy_override`, the entry must be denied by a default-mode
+    /// `check_reuse` (the whole point of the fix: one unsafe run must not erase
+    /// that the result lacked RFC-0028/0029 bindings).
+    #[test]
+    fn override_marked_entry_denied_by_default_mode() {
+        let signer = Signer::generate();
+        let mut cache = GateCache::new("abc123");
+        cache.set_with_attestation(
+            "rustfmt",
+            true,
+            1,
+            Some("digest-1".to_string()),
+            false,
+            Some("log-digest".to_string()),
+            None,
+        );
+        cache.mark_legacy_override("rustfmt");
+        // Re-sign after mutation so signature covers the updated fields.
+        cache.sign_all(&signer);
+
+        let vk = signer.verifying_key();
+
+        // Default mode (allow_legacy_cache=false): must deny.
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), false);
+        assert!(
+            !reuse.reusable,
+            "override-marked entry must be denied in default mode"
+        );
+        assert_eq!(
+            reuse.reason, "receipt_binding_missing",
+            "reason must be receipt_binding_missing"
+        );
+
+        // Override mode (allow_legacy_cache=true): must accept.
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), true);
+        assert!(
+            reuse.reusable,
+            "override-marked entry must be accepted with override"
+        );
+        assert_eq!(reuse.reason, "legacy_cache_override_unsafe");
+    }
+
+    /// `mark_legacy_override` on a nonexistent gate is a no-op (no panic).
+    #[test]
+    fn mark_legacy_override_nonexistent_gate_is_noop() {
+        let mut cache = GateCache::new("abc123");
+        // Should not panic.
+        cache.mark_legacy_override("nonexistent");
+        assert!(cache.gates.is_empty());
+    }
+
+    /// YAML roundtrip preserves override-marked entry fields.
+    #[test]
+    fn yaml_roundtrip_preserves_override_marked_entry() {
+        let mut cache = GateCache::new("abc123");
+        cache.set_with_attestation(
+            "rustfmt",
+            true,
+            1,
+            Some("digest-1".to_string()),
+            false,
+            Some("log-digest".to_string()),
+            None,
+        );
+        cache.mark_legacy_override("rustfmt");
+
+        let yaml = serde_yaml::to_string(&cache).expect("serialize");
+        let restored: GateCache = serde_yaml::from_str(&yaml).expect("deserialize");
+
+        let entry = restored.gates.get("rustfmt").expect("entry exists");
+        assert!(
+            !entry.rfc0028_receipt_bound,
+            "rfc0028 must be false after roundtrip of override-marked entry"
+        );
+        assert!(
+            !entry.rfc0029_receipt_bound,
+            "rfc0029 must be false after roundtrip of override-marked entry"
+        );
+        assert!(
+            entry.legacy_cache_override,
+            "legacy_cache_override must be true after roundtrip of override-marked entry"
         );
     }
 }
