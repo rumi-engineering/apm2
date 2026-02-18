@@ -939,6 +939,13 @@ impl FacJobReceiptV1 {
         // independent of field order (CTR-1605).
         if let Some(trace) = &self.stop_revoke_admission {
             bytes.push(7u8);
+            // NIT fix: StopRevokeAdmissionTrace fields are all fixed-size
+            // types (String, bool, Option<bool>, usize) bounded at
+            // deserialization. Serialization is infallible by construction.
+            // unwrap_or_default is defensive (no panic on untrusted paths
+            // per RSK-0701) — an empty canonical produces an identifiably
+            // zero-length frame in the hash chain rather than a silent
+            // integrity gap.
             let canonical = trace.canonical_bytes().unwrap_or_default();
             bytes.extend_from_slice(&(canonical.len() as u32).to_be_bytes());
             bytes.extend_from_slice(&canonical);
@@ -1158,6 +1165,8 @@ impl FacJobReceiptV1 {
         // hashing independent of field order (CTR-1605).
         if let Some(trace) = &self.stop_revoke_admission {
             bytes.push(8u8);
+            // NIT fix: See V1 canonical_bytes() comment — infallible by
+            // construction, unwrap_or_default is defensive RSK-0701 safe.
             let canonical = trace.canonical_bytes().unwrap_or_default();
             bytes.extend_from_slice(&(canonical.len() as u32).to_be_bytes());
             bytes.extend_from_slice(&canonical);
@@ -1375,6 +1384,19 @@ impl FacJobReceiptV1 {
                     field: "containment.cgroup_path",
                     actual: trace.cgroup_path.len(),
                     max: super::containment::MAX_CGROUP_PATH_LENGTH,
+                });
+            }
+        }
+
+        // TCK-00587: Validate stop_revoke_admission trace bounds.
+        // The verdict field is bounded at deserialization by deser_deny_reason,
+        // but validate here for defensive consistency with other trace fields.
+        if let Some(trace) = &self.stop_revoke_admission {
+            if trace.verdict.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "stop_revoke_admission.verdict",
+                    actual: trace.verdict.len(),
+                    max: MAX_STRING_LENGTH,
                 });
             }
         }
