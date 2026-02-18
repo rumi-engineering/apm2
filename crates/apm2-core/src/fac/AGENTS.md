@@ -398,7 +398,10 @@ enqueue attempts that would exceed configured caps.
 - Filesystem scan is bounded by `MAX_SCAN_ENTRIES` (100K) to prevent DoS
   (INV-QB-002). Truncated scans are treated as fail-closed denials with
   `ScanTruncated` dimension.
-- `pending_dir` is verified not to be a symlink before scanning (INV-QB-006).
+- `pending_dir` is verified via `symlink_metadata()` before scanning
+  (INV-QB-006). A broken symlink (target does not exist) returns `ScanFailed`,
+  not an empty snapshot. Only a true `NotFound` from `symlink_metadata()` is
+  treated as a legitimately absent queue.
 - Symlinks within the directory are skipped via `symlink_metadata()` to prevent
   inflation attacks (INV-QB-005).
 - Filenames exceeding `MAX_FILENAME_BYTES` (4096) are skipped to bound per-entry
@@ -412,10 +415,16 @@ enqueue attempts that would exceed configured caps.
 
 - `enqueue_job()` in `apm2-cli/src/commands/fac_queue_submit.rs` accepts a
   `&QueueBoundsPolicy` loaded from the persisted FAC configuration
-  (`FacPolicyV1::queue_bounds_policy`), validates it, and passes it to
-  `check_queue_bounds()`. Denial produces a descriptive error with the
-  `queue/quota_exceeded` reason code and persists a `QueueBoundsDenialReceipt`
-  artifact in the `denied/` directory.
+  (`FacPolicyV1::queue_bounds_policy`), validates it, acquires a process-level
+  lockfile (`queue/.enqueue.lock`) for the full check-write critical section,
+  and passes it to `check_queue_bounds()`. The lockfile prevents concurrent
+  `apm2 fac` processes from bypassing queue caps via TOCTOU. Denial produces
+  a descriptive error with the `queue/quota_exceeded` reason code and persists
+  a `QueueBoundsDenialReceipt` artifact in the `denied/` directory. A
+  structured denial event is also emitted to a trusted audit log under the
+  FAC private directory (`$APM2_HOME/private/fac/audit/denial_events.jsonl`)
+  outside the writable queue directories, ensuring audit evidence resilience
+  even if the `queue/denied/` directory is tampered with.
 - `FacPolicyV1` includes a `queue_bounds_policy` field (`serde(default)` for
   backward compatibility with pre-TCK-00578 policies).
 - Control-lane `stop_revoke` jobs bypass queue bounds (consistent with the
@@ -440,10 +449,20 @@ enqueue attempts that would exceed configured caps.
 - [INV-QB-004] Arithmetic uses `checked_add`; overflow returns Err.
 - [INV-QB-005] Symlinks in pending directory are skipped (not counted) to
   prevent inflation attacks.
-- [INV-QB-006] `pending_dir` itself must be a real directory (not a symlink);
-  symlink-swapped queue directories are rejected before scanning.
-- ACKNOWLEDGED TOCTOU (RSK-1501): check-then-write is not atomic; mitigated by
-  single-process broker context. File lock is out of scope per TCK-00578.
+- [INV-QB-006] `pending_dir` is verified via `symlink_metadata()` before
+  scanning. A broken symlink (target does not exist) returns `ScanFailed`,
+  not an empty snapshot. Only a true `NotFound` from `symlink_metadata()` is
+  treated as a legitimately absent queue. This prevents bypass of the symlink
+  hardening by using `Path::exists()` which follows symlinks.
+- [INV-QB-007] Process-level lockfile (`queue/.enqueue.lock`) acquired via
+  `fs2::FileExt::lock_exclusive()` for the full check-write critical section
+  in `enqueue_job()`. Prevents concurrent `apm2 fac` processes from bypassing
+  queue caps via TOCTOU. The lock is held until after the job spec file is
+  written (dropped at scope exit).
+- [INV-QB-008] Structured denial events are emitted to a trusted audit log
+  (`$APM2_HOME/private/fac/audit/denial_events.jsonl`) outside the writable
+  queue directories, ensuring audit evidence resilience even if `queue/denied/`
+  is tampered with.
 
 ## projection_compromise Submodule
 
