@@ -671,6 +671,21 @@ pub fn list_receipt_headers(receipts_dir: &Path) -> Vec<ReceiptHeaderV1> {
     headers
 }
 
+/// Load a `FacJobReceiptV1` from the receipt store by content hash (TCK-00551).
+///
+/// Reads the receipt file at `receipts_dir/{content_hash}.json` with bounded
+/// I/O and `O_NOFOLLOW`. Returns `None` if the file is missing, oversized,
+/// or fails to parse.
+///
+/// This is used by the metrics module to load full receipts when the header
+/// index does not contain all required fields (e.g., `denial_reason`,
+/// `observed_cost`).
+#[must_use]
+pub fn lookup_receipt_by_hash(receipts_dir: &Path, content_hash: &str) -> Option<FacJobReceiptV1> {
+    let path = receipts_dir.join(format!("{content_hash}.json"));
+    load_receipt_bounded(&path)
+}
+
 /// Check whether a receipt exists for the given job ID using the index.
 ///
 /// Loads the receipt from the content-addressed store and verifies both

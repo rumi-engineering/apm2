@@ -142,6 +142,8 @@ mod key_policy;
 pub mod lane;
 mod lease;
 pub mod merge_receipt;
+/// Receipt-derived metrics for FAC observability (TCK-00551).
+pub mod metrics;
 mod node_identity;
 /// Patch injection hardening: path traversal rejection, safe apply mode,
 /// and patch provenance receipts (TCK-00581).
@@ -394,6 +396,11 @@ pub use merge_receipt::{
     MAX_GATE_RECEIPTS as MAX_MERGE_GATE_RECEIPTS, MergeReceipt, MergeReceiptError,
     MergeReceiptProto,
 };
+// Re-export metrics types (TCK-00551)
+pub use metrics::{
+    MAX_DENIAL_REASON_ENTRIES, MAX_GC_RECEIPT_SCAN_FILES, METRICS_SUMMARY_SCHEMA, MetricsInput,
+    MetricsSummary, compute_metrics, load_gc_receipts,
+};
 // Re-export patch hardening types (TCK-00581)
 pub use patch_hardening::{
     MAX_PATCH_CONTENT_SIZE, MAX_PATCH_FILE_ENTRIES, MAX_REFUSALS, PATCH_APPLY_RECEIPT_SCHEMA_ID,
@@ -476,7 +483,7 @@ pub use receipt_index::{
     INDEX_FILE_NAME, INDEX_SUBDIR, MAX_INDEX_ENTRIES, MAX_INDEX_FILE_SIZE, MAX_JOB_INDEX_ENTRIES,
     MAX_REBUILD_SCAN_FILES, RECEIPT_INDEX_SCHEMA, ReceiptHeaderV1, ReceiptIndexError,
     ReceiptIndexV1, find_receipt_for_job, has_receipt_for_job, list_receipt_headers,
-    lookup_job_receipt,
+    lookup_job_receipt, lookup_receipt_by_hash,
 };
 // Re-export receipt merge types (TCK-00543)
 pub use receipt_merge::{

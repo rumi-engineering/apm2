@@ -3206,3 +3206,49 @@ Regression tests: `gc_plan_excludes_v3_lock_files`, `is_v3_lock_file_matches_loc
   `receipt_binding_missing`. The `fac_worker` calls
   `rebind_v3_gate_cache_after_receipt()` (in `evidence.rs`) after the v2
   rebind to load, promote, re-sign, and persist the v3 cache.
+
+## metrics Submodule (TCK-00551)
+
+The `metrics` submodule extracts operator-facing observability metrics from FAC
+receipts (`FacJobReceiptV1` and `GcReceiptV1`). All computation is pure (no I/O,
+no side effects); callers provide loaded receipt data and receive a
+`MetricsSummary`.
+
+### Core Types
+
+- `MetricsSummary`: Aggregate metrics summary with schema identifier, observation
+  window bounds, throughput (completed/denied/quarantined/cancelled counts,
+  jobs-per-hour), queue latency percentiles (median and p95 wall-clock duration
+  from `observed_cost`), per-`DenialReasonCode` denial breakdown, disk preflight
+  failure count, and GC bytes freed. Serialized to JSON via serde with
+  `deny_unknown_fields`.
+- `MetricsInput`: Input parameters struct holding slices of job and GC receipts
+  plus the observation window bounds.
+
+### Key Functions
+
+- `compute_metrics(input: &MetricsInput) -> MetricsSummary`: Pure function that
+  aggregates job outcomes, computes throughput (completed jobs / window hours),
+  extracts duration percentiles (nearest-rank method), counts denial reasons with
+  bounded map (`MAX_DENIAL_REASON_ENTRIES = 64`, overflow to `"other"` bucket),
+  and sums GC freed bytes. Zero-window yields zero throughput (no division by
+  zero).
+- `load_gc_receipts(receipts_dir, since_epoch_secs) -> Vec<GcReceiptV1>`: I/O
+  helper that scans `.json` files in the receipts directory, attempts to parse
+  each as `GcReceiptV1`, and returns those matching the GC schema with timestamp
+  >= since. Bounded by `MAX_GC_RECEIPT_SCAN_FILES` (16384) and
+  `MAX_GC_RECEIPT_READ_SIZE` (256 KiB). Parse failures silently skipped.
+
+### Bounded Collections
+
+The denial-reason map uses `BTreeMap<String, u64>` for deterministic JSON key
+ordering. It is capped at `MAX_DENIAL_REASON_ENTRIES` (64); overflow is
+aggregated into an `"other"` bucket to keep totals accurate.
+
+### CLI Integration
+
+The `apm2 fac metrics` command (in `fac.rs`) loads receipt headers via the
+receipt index, filters by `--since`/`--until` time window (default: 24 hours),
+loads full receipts and GC receipts, calls `compute_metrics()`, and emits JSON
+(`--json`) or human-readable table output. The command is local-only (no daemon
+IPC) and excluded from daemon auto-start.
