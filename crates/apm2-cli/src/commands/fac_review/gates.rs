@@ -460,7 +460,7 @@ fn load_gate_results_from_cache_for_sha(sha: &str) -> Result<Vec<EvidenceGateRes
             bytes_total: cached.bytes_total,
             was_truncated: cached.was_truncated,
             log_bundle_hash: cached.log_bundle_hash.clone(),
-            legacy_cache_override: false,
+            legacy_cache_override: cached.legacy_cache_override,
         });
     }
     Ok(results)
