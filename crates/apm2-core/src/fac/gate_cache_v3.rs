@@ -6,7 +6,14 @@
 //!
 //! The `index_key` is a BLAKE3-256 digest of the compound key:
 //!   attestation_digest + FacPolicyHash + ToolchainFingerprint +
-//! rfc0028_receipt_hash + rfc0029_receipt_hash
+//!   sandbox_policy_hash + network_policy_hash
+//!
+//! Cache hit validity also requires RFC-0028/0029 receipt bindings
+//! (`rfc0028_receipt_bound` + `rfc0029_receipt_bound` flags on each
+//! `V3GateResult`). These flags are fail-closed: they default to `false`
+//! and are only promoted to `true` after a durable receipt lookup confirms
+//! RFC-0028 channel authorization and RFC-0029 queue admission. The
+//! `check_reuse` method enforces receipt binding before returning a hit.
 //!
 //! This ensures that a cache hit is provably tied to an authoritative receipt
 //! chain and cannot be forged by simple file writes. The compound key binds
@@ -144,6 +151,12 @@ impl std::error::Error for GateCacheV3Error {}
 /// All components are required and validated at construction time
 /// (fail-closed). The compound key is hashed with BLAKE3-256 to produce the
 /// on-disk directory name (the `index_key`).
+///
+/// Note: RFC-0028/0029 receipt bindings are NOT part of the compound key
+/// because receipts are produced AFTER gate execution. Instead, receipt
+/// binding is enforced per-gate via `rfc0028_receipt_bound` /
+/// `rfc0029_receipt_bound` flags in [`V3GateResult`], validated by
+/// `check_reuse()`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct V3CompoundKey {
@@ -153,10 +166,10 @@ pub struct V3CompoundKey {
     pub fac_policy_hash: String,
     /// `ToolchainFingerprint`: hex-encoded digest of the build toolchain.
     pub toolchain_fingerprint: String,
-    /// Hex-encoded hash binding from RFC-0028 (channel authorization).
-    pub rfc0028_receipt_hash: String,
-    /// Hex-encoded hash binding from RFC-0029 (queue/budget admission).
-    pub rfc0029_receipt_hash: String,
+    /// Hex-encoded BLAKE3 hash of the sandbox hardening profile.
+    pub sandbox_policy_hash: String,
+    /// Hex-encoded BLAKE3 hash of the network isolation policy.
+    pub network_policy_hash: String,
 }
 
 impl V3CompoundKey {
@@ -172,21 +185,21 @@ impl V3CompoundKey {
         attestation_digest: &str,
         fac_policy_hash: &str,
         toolchain_fingerprint: &str,
-        rfc0028_receipt_hash: &str,
-        rfc0029_receipt_hash: &str,
+        sandbox_policy_hash: &str,
+        network_policy_hash: &str,
     ) -> Result<Self, GateCacheV3Error> {
         Self::validate_component("attestation_digest", attestation_digest)?;
         Self::validate_component("fac_policy_hash", fac_policy_hash)?;
         Self::validate_component("toolchain_fingerprint", toolchain_fingerprint)?;
-        Self::validate_component("rfc0028_receipt_hash", rfc0028_receipt_hash)?;
-        Self::validate_component("rfc0029_receipt_hash", rfc0029_receipt_hash)?;
+        Self::validate_component("sandbox_policy_hash", sandbox_policy_hash)?;
+        Self::validate_component("network_policy_hash", network_policy_hash)?;
 
         Ok(Self {
             attestation_digest: attestation_digest.to_string(),
             fac_policy_hash: fac_policy_hash.to_string(),
             toolchain_fingerprint: toolchain_fingerprint.to_string(),
-            rfc0028_receipt_hash: rfc0028_receipt_hash.to_string(),
-            rfc0029_receipt_hash: rfc0029_receipt_hash.to_string(),
+            sandbox_policy_hash: sandbox_policy_hash.to_string(),
+            network_policy_hash: network_policy_hash.to_string(),
         })
     }
 
@@ -212,8 +225,8 @@ impl V3CompoundKey {
     /// BLAKE3(domain || len(attestation_digest) || attestation_digest
     ///     || len(fac_policy_hash) || fac_policy_hash
     ///     || len(toolchain_fingerprint) || toolchain_fingerprint
-    ///     || len(rfc0028_receipt_hash) || rfc0028_receipt_hash
-    ///     || len(rfc0029_receipt_hash) || rfc0029_receipt_hash)
+    ///     || len(sandbox_policy_hash) || sandbox_policy_hash
+    ///     || len(network_policy_hash) || network_policy_hash)
     /// ```
     ///
     /// Length-prefix framing prevents ambiguity between concatenated components
@@ -230,8 +243,8 @@ impl V3CompoundKey {
         Self::hash_component(&mut hasher, &self.attestation_digest);
         Self::hash_component(&mut hasher, &self.fac_policy_hash);
         Self::hash_component(&mut hasher, &self.toolchain_fingerprint);
-        Self::hash_component(&mut hasher, &self.rfc0028_receipt_hash);
-        Self::hash_component(&mut hasher, &self.rfc0029_receipt_hash);
+        Self::hash_component(&mut hasher, &self.sandbox_policy_hash);
+        Self::hash_component(&mut hasher, &self.network_policy_hash);
 
         format!("b3-256:{}", hasher.finalize().to_hex())
     }
@@ -252,6 +265,12 @@ impl V3CompoundKey {
 ///
 /// Carries the same fields as v2 `CachedGateResult` but within a compound-key
 /// context that provably binds it to a specific receipt chain.
+///
+/// RFC-0028/0029 receipt bindings are tracked via `rfc0028_receipt_bound` and
+/// `rfc0029_receipt_bound` flags. These default to `false` (fail-closed) and
+/// are only promoted to `true` after a durable receipt lookup confirms that
+/// the corresponding RFC receipts exist and passed. `check_reuse()` denies
+/// cache hits when either flag is `false`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct V3GateResult {
@@ -282,6 +301,20 @@ pub struct V3GateResult {
     /// Hex-encoded Ed25519 public key of the signer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer_id: Option<String>,
+    /// Whether this entry is bound to an RFC-0028 authorization receipt.
+    ///
+    /// Fail-closed: defaults to `false`. Only promoted to `true` after a
+    /// durable receipt lookup confirms RFC-0028 channel authorization passed.
+    /// `check_reuse()` denies cache hits when this is `false`.
+    #[serde(default)]
+    pub rfc0028_receipt_bound: bool,
+    /// Whether this entry is bound to an RFC-0029 admission receipt.
+    ///
+    /// Fail-closed: defaults to `false`. Only promoted to `true` after a
+    /// durable receipt lookup confirms RFC-0029 queue admission allowed.
+    /// `check_reuse()` denies cache hits when this is `false`.
+    #[serde(default)]
+    pub rfc0029_receipt_bound: bool,
 }
 
 // =============================================================================
@@ -305,6 +338,65 @@ pub struct V3CacheEntry {
     pub compound_key: V3CompoundKey,
     /// Gate result.
     pub result: V3GateResult,
+}
+
+impl V3CacheEntry {
+    /// Post-deserialization validation to enforce string field length bounds.
+    ///
+    /// `serde_yaml` bypasses `V3CompoundKey::new()` during deserialization,
+    /// so `MAX_V3_STRING_FIELD_LENGTH` is not enforced. This method must be
+    /// called after every deserialization from untrusted input to prevent
+    /// memory pressure from crafted payloads.
+    ///
+    /// Returns `true` if all fields pass validation, `false` otherwise.
+    #[must_use]
+    fn validate_field_lengths(&self) -> bool {
+        let max = MAX_V3_STRING_FIELD_LENGTH;
+
+        // Compound key fields
+        if self.compound_key.attestation_digest.len() > max
+            || self.compound_key.fac_policy_hash.len() > max
+            || self.compound_key.toolchain_fingerprint.len() > max
+            || self.compound_key.sandbox_policy_hash.len() > max
+            || self.compound_key.network_policy_hash.len() > max
+        {
+            return false;
+        }
+
+        // Entry-level string fields
+        if self.schema.len() > max || self.sha.len() > max || self.gate_name.len() > max {
+            return false;
+        }
+
+        // Gate result string fields
+        let r = &self.result;
+        if r.status.len() > max || r.completed_at.len() > max {
+            return false;
+        }
+        if r.attestation_digest.as_ref().is_some_and(|s| s.len() > max) {
+            return false;
+        }
+        if r.evidence_log_digest
+            .as_ref()
+            .is_some_and(|s| s.len() > max)
+        {
+            return false;
+        }
+        if r.log_bundle_hash.as_ref().is_some_and(|s| s.len() > max) {
+            return false;
+        }
+        if r.log_path.as_ref().is_some_and(|s| s.len() > max) {
+            return false;
+        }
+        if r.signature_hex.as_ref().is_some_and(|s| s.len() > max) {
+            return false;
+        }
+        if r.signer_id.as_ref().is_some_and(|s| s.len() > max) {
+            return false;
+        }
+
+        true
+    }
 }
 
 // =============================================================================
@@ -452,6 +544,7 @@ impl GateCacheV3 {
     /// 3. Attestation digest matches the expected value.
     /// 4. Evidence log digest is present and non-empty.
     /// 5. Signature is valid against the expected verifying key.
+    /// 6. RFC-0028/0029 receipt bindings are present (fail-closed).
     ///
     /// The compound key match is implicit: the caller looked up this cache
     /// by compound key, so if the entry exists, the compound key matched.
@@ -557,7 +650,69 @@ impl GateCacheV3 {
             return V3ReuseDecision::miss("signature_missing");
         }
 
+        // TCK-00541: RFC-0028/0029 receipt binding gate (fail-closed).
+        // Cache hits are only valid when the gate result carries evidence of
+        // both RFC-0028 channel authorization and RFC-0029 queue admission.
+        // These flags are promoted after a durable receipt lookup; entries
+        // that were never rebound remain false and are denied here.
+        if !cached.rfc0028_receipt_bound || !cached.rfc0029_receipt_bound {
+            return V3ReuseDecision::miss("receipt_binding_missing");
+        }
+
         V3ReuseDecision::hit()
+    }
+
+    /// Explicitly bind RFC-0028/0029 receipt evidence to a cache entry.
+    ///
+    /// Sets `rfc0028_receipt_bound` and `rfc0029_receipt_bound` to the
+    /// provided values. This must be called **after** `set()` and **before**
+    /// `sign_all()` so the signed canonical bytes reflect the final flag
+    /// values.
+    ///
+    /// Callers are responsible for verifying that receipt evidence actually
+    /// exists before passing `true`. Passing `true` without verified
+    /// evidence defeats the fail-closed posture.
+    pub fn bind_receipt_evidence(&mut self, gate: &str, rfc0028: bool, rfc0029: bool) {
+        if let Some(entry) = self.gates.get_mut(gate) {
+            entry.rfc0028_receipt_bound = rfc0028;
+            entry.rfc0029_receipt_bound = rfc0029;
+        }
+    }
+
+    /// Best-effort receipt lookup: scan the durable receipt store for a job
+    /// receipt matching `job_id` and promote receipt binding flags on all
+    /// gate entries in this cache.
+    ///
+    /// If a receipt is found with both `rfc0028_channel_boundary` (with
+    /// `passed == true`) and `eio29_queue_admission` (with `verdict ==
+    /// "allow"`), all entries are promoted to `rfc0028=true, rfc0029=true`.
+    ///
+    /// If the receipt is missing, or evidence fields are absent/failed, the
+    /// flags remain `false` (fail-closed).
+    ///
+    /// **CRITICAL:** This method **must** be called **before** `sign_all()`
+    /// so that the signed canonical bytes cover the final flag values.
+    pub fn try_bind_receipt_from_store(&mut self, receipts_dir: &std::path::Path, job_id: &str) {
+        let Some(receipt) = super::lookup_job_receipt(receipts_dir, job_id) else {
+            return; // No receipt found — flags stay false (fail-closed).
+        };
+
+        let rfc0028_ok = receipt
+            .rfc0028_channel_boundary
+            .as_ref()
+            .is_some_and(|trace| trace.passed);
+        let rfc0029_ok = receipt
+            .eio29_queue_admission
+            .as_ref()
+            .is_some_and(|trace| trace.verdict == "allow");
+
+        if rfc0028_ok && rfc0029_ok {
+            let gate_names: Vec<String> = self.gates.keys().cloned().collect();
+            for gate_name in &gate_names {
+                self.bind_receipt_evidence(gate_name, true, true);
+            }
+        }
+        // If either check fails, flags remain false — fail-closed.
     }
 
     /// Sign all gate entries in this cache with the given signer.
@@ -637,6 +792,11 @@ impl GateCacheV3 {
         // Log path
         Self::append_optional_string(&mut buf, result.log_path.as_deref());
 
+        // RFC-0028/0029 receipt binding flags (signed content — prevents
+        // tampering of binding status after signing).
+        buf.push(u8::from(result.rfc0028_receipt_bound));
+        buf.push(u8::from(result.rfc0029_receipt_bound));
+
         buf
     }
 
@@ -694,6 +854,10 @@ struct V2GateResult {
 
 impl V2GateResult {
     /// Convert a v2 result to a v3 result (unbound: no compound key binding).
+    ///
+    /// Receipt binding flags default to `false` because v2 entries do not
+    /// carry RFC-0028/0029 binding proof. Combined with the `v2_sourced`
+    /// flag on the cache, these entries are never reusable.
     fn to_v3(&self) -> V3GateResult {
         V3GateResult {
             status: self.status.clone(),
@@ -706,6 +870,9 @@ impl V2GateResult {
             log_path: self.log_path.clone(),
             signature_hex: self.signature_hex.clone(),
             signer_id: self.signer_id.clone(),
+            // V2 entries lack receipt bindings — fail-closed.
+            rfc0028_receipt_bound: false,
+            rfc0029_receipt_bound: false,
         }
     }
 }
@@ -1000,6 +1167,10 @@ impl GateCacheV3 {
     }
 
     /// Read a single v3 cache entry from disk with bounded I/O.
+    ///
+    /// Post-deserialization validation enforces `MAX_V3_STRING_FIELD_LENGTH`
+    /// on all string fields, since `serde_yaml` bypasses `V3CompoundKey::new()`
+    /// validation during deserialization.
     fn read_entry_bounded(path: &std::path::Path) -> Option<V3CacheEntry> {
         use std::io::Read;
 
@@ -1024,7 +1195,14 @@ impl GateCacheV3 {
         if content.len() as u64 > MAX_V3_ENTRY_SIZE {
             return None;
         }
-        serde_yaml::from_str(&content).ok()
+        let entry: V3CacheEntry = serde_yaml::from_str(&content).ok()?;
+        // Post-deserialization field-length validation: serde_yaml bypasses
+        // V3CompoundKey::new() so MAX_V3_STRING_FIELD_LENGTH must be
+        // enforced here to prevent memory pressure from crafted payloads.
+        if !entry.validate_field_lengths() {
+            return None;
+        }
+        Some(entry)
     }
 }
 
@@ -1155,6 +1333,8 @@ mod tests {
             log_path: None,
             signature_hex: None,
             signer_id: None,
+            rfc0028_receipt_bound: true,
+            rfc0029_receipt_bound: true,
         }
     }
 
@@ -1415,6 +1595,103 @@ mod tests {
         let decision = cache.check_reuse("rustfmt", Some(digest), true, None);
         assert!(!decision.reusable);
         assert_eq!(decision.reason, "signature_unverifiable_no_key");
+    }
+
+    // =========================================================================
+    // Receipt Binding Tests (TCK-00541 round 2)
+    // =========================================================================
+
+    /// `check_reuse` denies entries missing RFC-0028 receipt binding.
+    #[test]
+    fn check_reuse_miss_receipt_binding_missing_rfc0028() {
+        let signer = Signer::generate();
+        let key = sample_compound_key();
+        let mut cache = GateCacheV3::new("abc123", key).expect("new");
+        let mut result = sample_gate_result();
+        result.rfc0028_receipt_bound = false;
+        result.rfc0029_receipt_bound = true;
+        cache.set("rustfmt", result).expect("set");
+        cache.sign_all(&signer);
+
+        let vk = signer.verifying_key();
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
+        assert!(!decision.reusable);
+        assert_eq!(decision.reason, "receipt_binding_missing");
+    }
+
+    /// `check_reuse` denies entries missing RFC-0029 receipt binding.
+    #[test]
+    fn check_reuse_miss_receipt_binding_missing_rfc0029() {
+        let signer = Signer::generate();
+        let key = sample_compound_key();
+        let mut cache = GateCacheV3::new("abc123", key).expect("new");
+        let mut result = sample_gate_result();
+        result.rfc0028_receipt_bound = true;
+        result.rfc0029_receipt_bound = false;
+        cache.set("rustfmt", result).expect("set");
+        cache.sign_all(&signer);
+
+        let vk = signer.verifying_key();
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
+        assert!(!decision.reusable);
+        assert_eq!(decision.reason, "receipt_binding_missing");
+    }
+
+    /// `check_reuse` denies entries where both receipt bindings are false.
+    #[test]
+    fn check_reuse_miss_receipt_binding_both_missing() {
+        let signer = Signer::generate();
+        let key = sample_compound_key();
+        let mut cache = GateCacheV3::new("abc123", key).expect("new");
+        let mut result = sample_gate_result();
+        result.rfc0028_receipt_bound = false;
+        result.rfc0029_receipt_bound = false;
+        cache.set("rustfmt", result).expect("set");
+        cache.sign_all(&signer);
+
+        let vk = signer.verifying_key();
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
+        assert!(!decision.reusable);
+        assert_eq!(decision.reason, "receipt_binding_missing");
+    }
+
+    /// `bind_receipt_evidence` promotes flags; signed entries then pass reuse.
+    #[test]
+    fn bind_receipt_evidence_promotes_flags() {
+        let signer = Signer::generate();
+        let key = sample_compound_key();
+        let mut cache = GateCacheV3::new("abc123", key).expect("new");
+        let mut result = sample_gate_result();
+        result.rfc0028_receipt_bound = false;
+        result.rfc0029_receipt_bound = false;
+        cache.set("rustfmt", result).expect("set");
+        cache.bind_receipt_evidence("rustfmt", true, true);
+        cache.sign_all(&signer);
+
+        let vk = signer.verifying_key();
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
+        assert!(decision.reusable, "receipt-bound entry should be reusable");
+    }
+
+    /// Post-deserialization validation rejects oversized fields.
+    #[test]
+    fn validate_field_lengths_rejects_oversized() {
+        let key = sample_compound_key();
+        let entry = V3CacheEntry {
+            schema: GATE_CACHE_V3_SCHEMA.to_string(),
+            sha: "abc123".to_string(),
+            gate_name: "a".repeat(MAX_V3_STRING_FIELD_LENGTH + 1),
+            compound_key: key,
+            result: sample_gate_result(),
+        };
+        assert!(
+            !entry.validate_field_lengths(),
+            "oversized gate_name must be rejected"
+        );
     }
 
     // =========================================================================
@@ -1822,11 +2099,11 @@ mod tests {
     }
 
     /// [INV-GCV3-001] Profile drift regression: same SHA, different authority
-    /// context (different RFC-0028/0029 receipt hashes) must not produce a
+    /// context (different sandbox/network policy hashes) must not produce a
     /// v3 reuse hit via v2 fallback.
     ///
     /// Scenario: Attacker has a valid v2 entry for SHA "abc123". The v3
-    /// compound key uses different receipt hashes (authority context drift).
+    /// compound key uses different policy hashes (authority context drift).
     /// The v2 fallback loader assigns the current compound key to the v2
     /// data. `check_reuse` must deny because `v2_sourced` is true.
     #[test]
@@ -1843,7 +2120,7 @@ mod tests {
             "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "b3-256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            // Different receipt hashes (authority context drift).
+            // Different policy hashes (authority context drift).
             "b3-256:1111111111111111111111111111111111111111111111111111111111111111",
             "b3-256:2222222222222222222222222222222222222222222222222222222222222222",
         )

@@ -2965,10 +2965,13 @@ length-prefix framing and domain separation
   Constructed via `V3CompoundKey::new()` which rejects empty/whitespace
   and oversized fields.
 - `V3GateResult`: Per-gate cached result (status, duration, attestation,
-  evidence, signature).
+  evidence, signature, `rfc0028_receipt_bound`, `rfc0029_receipt_bound`).
 - `V3CacheEntry`: On-disk YAML format wrapping compound key + gate result.
+  Post-deserialization `validate_field_lengths()` enforces
+  `MAX_V3_STRING_FIELD_LENGTH` on all string fields.
 - `GateCacheV3`: In-memory index with `load_from_dir()`, `save_to_dir()`,
-  `check_reuse()`, and `sign_all()`.
+  `check_reuse()`, `sign_all()`, `bind_receipt_evidence()`, and
+  `try_bind_receipt_from_store()`.
 - `V3ReuseDecision`: Hit/miss decision with human-readable reason.
 
 ### Compound Key Index
@@ -2979,8 +2982,8 @@ The index key binds each cache directory to the full admission context:
 BLAKE3(domain || len(attestation) || attestation
     || len(policy)      || policy
     || len(toolchain)   || toolchain
-    || len(rfc0028)     || rfc0028
-    || len(rfc0029)     || rfc0029)
+    || len(sandbox)     || sandbox
+    || len(network)     || network)
 ```
 
 Length-prefix framing prevents preimage collision between concatenated
@@ -3000,6 +3003,9 @@ components.
    verifying key, `miss("signature_unverifiable_no_key")` is returned
    (prevents forged-signature bypass). Unsigned entries return
    `miss("signature_missing")`.
+7. RFC-0028/0029 receipt bindings are present
+   (`rfc0028_receipt_bound && rfc0029_receipt_bound`). Entries without
+   receipt binding return `miss("receipt_binding_missing")`.
 
 Any missing or invalid component returns a `miss` decision.
 

@@ -324,7 +324,7 @@ fn gate_attestation_digest(
 ///
 /// Returns a BLAKE3 hex digest. Falls back to a hash of "unknown" if rustc
 /// is not available (fail-closed: different key from any real toolchain).
-fn compute_toolchain_fingerprint() -> String {
+pub(super) fn compute_toolchain_fingerprint() -> String {
     let output = std::process::Command::new("rustc")
         .args(["--version", "--verbose"])
         .output();
@@ -342,8 +342,14 @@ fn compute_toolchain_fingerprint() -> String {
 ///
 /// Uses the commit SHA as the workspace attestation digest (content
 /// fingerprint), the FAC policy hash, a toolchain fingerprint, and
-/// sandbox/network policy hashes as RFC-0028/0029 receipt binding proxies.
-fn compute_v3_compound_key(
+/// sandbox/network policy hashes for environment-binding cache isolation.
+///
+/// Note: RFC-0028/0029 receipt bindings are NOT part of the compound key
+/// because receipts are produced AFTER gate execution. Instead, receipt
+/// binding is enforced per-gate via `rfc0028_receipt_bound` /
+/// `rfc0029_receipt_bound` flags on each `V3GateResult`, validated by
+/// `check_reuse()`.
+pub(super) fn compute_v3_compound_key(
     sha: &str,
     fac_policy: &FacPolicyV1,
     sandbox_hardening_hash: &str,
@@ -362,7 +368,7 @@ fn compute_v3_compound_key(
 }
 
 /// Cache directory paths for v3 and v2 under the FAC root.
-fn cache_v3_root() -> Option<std::path::PathBuf> {
+pub(super) fn cache_v3_root() -> Option<std::path::PathBuf> {
     let apm2_home = apm2_core::github::resolve_apm2_home()?;
     Some(apm2_home.join("private/fac/gate_cache_v3"))
 }
@@ -1474,6 +1480,11 @@ fn finalize_status_gate_run(
                 log_path: result.log_path.clone(),
                 signature_hex: None, // Will be signed below.
                 signer_id: None,
+                // TCK-00541: Inherit receipt binding flags from v2 cache.
+                // These are fail-closed (false) unless promoted by a durable
+                // receipt lookup. The v3 check_reuse enforces both must be true.
+                rfc0028_receipt_bound: result.rfc0028_receipt_bound,
+                rfc0029_receipt_bound: result.rfc0029_receipt_bound,
             };
             // Best-effort: skip if we hit the gate limit.
             let _ = v3.set(gate_name, v3_result);
@@ -1488,13 +1499,12 @@ fn finalize_status_gate_run(
         }
     }
 
-    // Persist gate cache (v2) as backward-compatible fallback.
-    // V2 writes are optional — v3 is the primary store. V2 persistence
-    // failures are logged but do not fail the pipeline.
-    gate_cache.sign_all(signer);
-    if let Err(err) = gate_cache.save() {
-        eprintln!("warning: failed to persist v2 gate cache (backward-compat): {err}");
-    }
+    // TCK-00541: V2 writes removed from default evidence pipeline path.
+    // The ticket requires "write only v3 in default mode". V2 read
+    // compatibility is preserved (load_from_v2_dir exists for diagnostic/
+    // migration tooling), but new gate results are only persisted to v3.
+    // This eliminates the deprecated v2 cache surface from the default
+    // admission flow.
 
     if let Some(file) = projection_log {
         for line in evidence_lines {
@@ -3745,6 +3755,8 @@ mod tests {
             log_path: Some("/tmp/v3-only-test.log".to_string()),
             signature_hex: None,
             signer_id: None,
+            rfc0028_receipt_bound: true,
+            rfc0029_receipt_bound: true,
         };
         v3_cache.set("rustfmt", v3_result).expect("set");
         v3_cache.sign_all(&signer);
@@ -3819,6 +3831,8 @@ mod tests {
             log_path: Some("/tmp/v3-path.log".to_string()),
             signature_hex: None,
             signer_id: None,
+            rfc0028_receipt_bound: true,
+            rfc0029_receipt_bound: true,
         };
         v3_cache.set("clippy", v3_result).expect("set");
         v3_cache.sign_all(&signer);

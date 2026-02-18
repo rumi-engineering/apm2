@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use apm2_core::fac::gate_cache_v3::GateCacheV3;
 use apm2_core::fac::job_spec::{
     Actuation, FacJobSpecV1, JobConstraints, JobSource, JobSpecValidationPolicy, LaneRequirements,
     MAX_QUEUE_LANE_LENGTH, validate_job_spec_with_policy,
@@ -28,8 +29,8 @@ use super::bounded_test_runner::{
     BoundedTestLimits, build_bounded_test_command as build_systemd_bounded_test_command,
 };
 use super::evidence::{
-    EvidenceGateOptions, EvidenceGateResult, LANE_EVIDENCE_GATES,
-    run_evidence_gates_with_lane_context,
+    EvidenceGateOptions, EvidenceGateResult, LANE_EVIDENCE_GATES, cache_v3_root,
+    compute_v3_compound_key, run_evidence_gates_with_lane_context,
 };
 use super::gate_attestation::{
     GateResourcePolicy, build_nextest_command, compute_gate_attestation,
@@ -1583,6 +1584,44 @@ fn run_gates_inner(
         cache.sign_all(&signer);
 
         cache.save()?;
+
+        // TCK-00541: Persist v3 gate cache alongside v2 for the manual
+        // `fac gates` path. This ensures consistent cache behavior across
+        // all execution entry points (pipeline and manual).
+        let v3_compound_key = compute_v3_compound_key(
+            &sha,
+            &load_or_create_gate_policy(&fac_root)?,
+            &sandbox_hardening_hash,
+            &network_policy_hash,
+        );
+        if let Some(ref ck) = v3_compound_key {
+            if let Ok(mut v3_cache) = GateCacheV3::new(&sha, ck.clone()) {
+                for (gate_name, result) in &cache.gates {
+                    let v3_result = apm2_core::fac::gate_cache_v3::V3GateResult {
+                        status: result.status.clone(),
+                        duration_secs: result.duration_secs,
+                        completed_at: result.completed_at.clone(),
+                        attestation_digest: result.attestation_digest.clone(),
+                        evidence_log_digest: result.evidence_log_digest.clone(),
+                        quick_mode: result.quick_mode,
+                        log_bundle_hash: result.log_bundle_hash.clone(),
+                        log_path: result.log_path.clone(),
+                        signature_hex: None, // Will be signed below.
+                        signer_id: None,
+                        // TCK-00541: Inherit receipt binding flags from v2.
+                        rfc0028_receipt_bound: result.rfc0028_receipt_bound,
+                        rfc0029_receipt_bound: result.rfc0029_receipt_bound,
+                    };
+                    let _ = v3_cache.set(gate_name, v3_result);
+                }
+                v3_cache.sign_all(&signer);
+                if let Some(root) = cache_v3_root() {
+                    if let Err(err) = v3_cache.save_to_dir(&root) {
+                        eprintln!("warning: failed to persist v3 gate cache: {err}");
+                    }
+                }
+            }
+        }
     }
 
     let mut gates = vec![merge_gate];
