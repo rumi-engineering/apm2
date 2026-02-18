@@ -616,6 +616,10 @@ pub enum DenialReasonCode {
     TokenReplayDetected,
     /// Token has been explicitly revoked before expiry (TCK-00566).
     TokenRevoked,
+    /// Queue bounds exceeded: pending job count or pending bytes would
+    /// exceed the configured `QueueBoundsPolicy` limits (TCK-00578).
+    /// Denial reason code: `queue/quota_exceeded`.
+    QueueQuotaExceeded,
 }
 
 /// Trace of the RFC-0028 channel boundary check.
