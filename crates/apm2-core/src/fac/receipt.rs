@@ -729,6 +729,14 @@ pub struct FacJobReceiptV1 {
     /// It is intentionally optional and currently not populated by the worker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eio29_budget_admission: Option<BudgetAdmissionTrace>,
+    /// Stop/revoke admission trace (TCK-00587).
+    ///
+    /// Records the explicit `stop_revoke` admission decision including which
+    /// policy provisions were exercised (lane reservation, tp001 emergency
+    /// carve-out, tick-floor status, worker first-pass priority).
+    /// Only populated for `stop_revoke` jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_revoke_admission: Option<crate::economics::queue_admission::StopRevokeAdmissionTrace>,
     /// Containment verification trace (TCK-00548).
     ///
     /// Records whether child processes (rustc, nextest, etc.) were verified
@@ -789,7 +797,7 @@ impl FacJobReceiptV1 {
     /// These variants are statically constrained to serializable values, so
     /// this path is not expected under normal operation.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(512);
 
@@ -922,6 +930,25 @@ impl FacJobReceiptV1 {
             bytes.push(5u8);
             bytes.extend_from_slice(&(hash.len() as u32).to_be_bytes());
             bytes.extend_from_slice(hash.as_bytes());
+        }
+
+        // TCK-00587: Stop/revoke admission trace. Added as an append-only
+        // trailing optional for V1; uses type-specific marker `7u8` for
+        // injective encoding. Uses canonical JSON (JCS) via
+        // `trace.canonical_bytes()` to ensure deterministic hashing
+        // independent of field order (CTR-1605).
+        if let Some(trace) = &self.stop_revoke_admission {
+            bytes.push(7u8);
+            // NIT fix: StopRevokeAdmissionTrace fields are all fixed-size
+            // types (String, bool, Option<bool>, usize) bounded at
+            // deserialization. Serialization is infallible by construction.
+            // unwrap_or_default is defensive (no panic on untrusted paths
+            // per RSK-0701) — an empty canonical produces an identifiably
+            // zero-length frame in the hash chain rather than a silent
+            // integrity gap.
+            let canonical = trace.canonical_bytes().unwrap_or_default();
+            bytes.extend_from_slice(&(canonical.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(&canonical);
         }
 
         bytes
@@ -1129,6 +1156,20 @@ impl FacJobReceiptV1 {
             bytes.push(7u8);
             bytes.extend_from_slice(&(fp.len() as u32).to_be_bytes());
             bytes.extend_from_slice(fp.as_bytes());
+        }
+
+        // TCK-00587: Stop/revoke admission trace. Uses type-specific
+        // marker `8u8` for injective encoding (V2 only -- `7u8` is
+        // already allocated to node_fingerprint in V2). Uses canonical
+        // JSON (JCS) via `trace.canonical_bytes()` to ensure deterministic
+        // hashing independent of field order (CTR-1605).
+        if let Some(trace) = &self.stop_revoke_admission {
+            bytes.push(8u8);
+            // NIT fix: See V1 canonical_bytes() comment — infallible by
+            // construction, unwrap_or_default is defensive RSK-0701 safe.
+            let canonical = trace.canonical_bytes().unwrap_or_default();
+            bytes.extend_from_slice(&(canonical.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(&canonical);
         }
 
         bytes
@@ -1347,6 +1388,19 @@ impl FacJobReceiptV1 {
             }
         }
 
+        // TCK-00587: Validate stop_revoke_admission trace bounds.
+        // The verdict field is bounded at deserialization by deser_deny_reason,
+        // but validate here for defensive consistency with other trace fields.
+        if let Some(trace) = &self.stop_revoke_admission {
+            if trace.verdict.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "stop_revoke_admission.verdict",
+                    actual: trace.verdict.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+        }
+
         // TCK-00573: Validate sandbox hardening hash format if present.
         if let Some(hash) = &self.sandbox_hardening_hash {
             if !is_strict_b3_256_digest(hash) {
@@ -1388,6 +1442,7 @@ pub struct FacJobReceiptV1Builder {
     rfc0028_channel_boundary: Option<ChannelBoundaryTrace>,
     eio29_queue_admission: Option<QueueAdmissionTrace>,
     eio29_budget_admission: Option<BudgetAdmissionTrace>,
+    stop_revoke_admission: Option<crate::economics::queue_admission::StopRevokeAdmissionTrace>,
     containment: Option<super::containment::ContainmentTrace>,
     observed_cost: Option<crate::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<String>,
@@ -1487,6 +1542,16 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn eio29_budget_admission(mut self, trace: BudgetAdmissionTrace) -> Self {
         self.eio29_budget_admission = Some(trace);
+        self
+    }
+
+    /// Sets the stop/revoke admission trace (TCK-00587).
+    #[must_use]
+    pub fn stop_revoke_admission(
+        mut self,
+        trace: crate::economics::queue_admission::StopRevokeAdmissionTrace,
+    ) -> Self {
+        self.stop_revoke_admission = Some(trace);
         self
     }
 
@@ -1771,6 +1836,7 @@ impl FacJobReceiptV1Builder {
             rfc0028_channel_boundary: self.rfc0028_channel_boundary,
             eio29_queue_admission: self.eio29_queue_admission,
             eio29_budget_admission: self.eio29_budget_admission,
+            stop_revoke_admission: self.stop_revoke_admission,
             containment: self.containment,
             observed_cost: self.observed_cost,
             sandbox_hardening_hash: self.sandbox_hardening_hash,

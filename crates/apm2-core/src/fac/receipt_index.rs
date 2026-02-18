@@ -901,6 +901,7 @@ mod tests {
                 cost_estimate_ticks: None,
             }),
             eio29_budget_admission: None,
+            stop_revoke_admission: None,
             containment: None,
             observed_cost: None,
             sandbox_hardening_hash: None,
