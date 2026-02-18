@@ -102,6 +102,127 @@ pub const CONTROL_LANE_REPO_ID: &str = "internal/control";
 /// documentation.
 pub const CONTROL_LANE_EXCEPTION_AUDITED: bool = true;
 
+/// Maximum number of entries in the `allowed_intents` policy list.
+///
+/// Protects against memory exhaustion from a policy that specifies an
+/// unbounded number of allowed intents (CTR-1303).
+pub const MAX_ALLOWED_INTENTS_SIZE: usize = 32;
+
+// ---------------------------------------------------------------------------
+// RFC-0028 Intent Taxonomy (TCK-00567)
+// ---------------------------------------------------------------------------
+
+/// RFC-0028 typed tool-intent class for FAC job authorization.
+///
+/// Each FAC job kind maps to exactly one intent.  The broker embeds the
+/// intent in issued tokens, and the worker denies execution when the
+/// token intent does not match the job kind (fail-closed).
+///
+/// The intent string representation uses a stable dotted namespace:
+/// `intent.fac.<action>`.
+///
+/// # Security invariants
+///
+/// - [INV-INT-001] Every valid job kind maps to exactly one intent via
+///   [`job_kind_to_intent`].  Unknown kinds produce `None` (fail-closed).
+/// - [INV-INT-002] Intent comparison is exact string equality (no prefix
+///   matching, no wildcards).
+/// - [INV-INT-003] User-defined arbitrary intents are out of scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FacIntent {
+    /// Gate execution (`gates` kind).
+    #[serde(rename = "intent.fac.execute_gates")]
+    ExecuteGates,
+    /// Warm/dependency pre-fetch (`warm` kind).
+    #[serde(rename = "intent.fac.warm")]
+    Warm,
+    /// Garbage collection (`gc` kind — planned).
+    #[serde(rename = "intent.fac.gc")]
+    Gc,
+    /// Lane reset (`lane_reset` kind — planned).
+    #[serde(rename = "intent.fac.lane_reset")]
+    LaneReset,
+    /// Cancellation / stop+revoke (`stop_revoke` kind).
+    #[serde(rename = "intent.fac.cancel")]
+    Cancel,
+    /// Bundle export/import (`bundle_export`/`bundle_import` kind — planned).
+    #[serde(rename = "intent.fac.bundle")]
+    Bundle,
+    /// Bulk execution (`bulk` kind).
+    #[serde(rename = "intent.fac.bulk")]
+    Bulk,
+    /// Control-lane operations (`control` kind).
+    #[serde(rename = "intent.fac.control")]
+    Control,
+}
+
+impl FacIntent {
+    /// Returns the stable dotted string representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExecuteGates => "intent.fac.execute_gates",
+            Self::Warm => "intent.fac.warm",
+            Self::Gc => "intent.fac.gc",
+            Self::LaneReset => "intent.fac.lane_reset",
+            Self::Cancel => "intent.fac.cancel",
+            Self::Bundle => "intent.fac.bundle",
+            Self::Bulk => "intent.fac.bulk",
+            Self::Control => "intent.fac.control",
+        }
+    }
+
+    /// All defined intent variants for enumeration.
+    pub const ALL: &'static [Self] = &[
+        Self::ExecuteGates,
+        Self::Warm,
+        Self::Gc,
+        Self::LaneReset,
+        Self::Cancel,
+        Self::Bundle,
+        Self::Bulk,
+        Self::Control,
+    ];
+}
+
+impl std::fmt::Display for FacIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Maps a FAC job kind string to its RFC-0028 typed intent.
+///
+/// Returns `None` for unknown kinds (fail-closed: callers must deny).
+///
+/// # Intent mapping
+///
+/// | Job kind        | Intent                         |
+/// |-----------------|--------------------------------|
+/// | `gates`         | `intent.fac.execute_gates`     |
+/// | `warm`          | `intent.fac.warm`              |
+/// | `gc`            | `intent.fac.gc`                |
+/// | `lane_reset`    | `intent.fac.lane_reset`        |
+/// | `stop_revoke`   | `intent.fac.cancel`            |
+/// | `bundle_export` | `intent.fac.bundle`            |
+/// | `bundle_import` | `intent.fac.bundle`            |
+/// | `bulk`          | `intent.fac.bulk`              |
+/// | `control`       | `intent.fac.control`           |
+#[must_use]
+pub fn job_kind_to_intent(kind: &str) -> Option<FacIntent> {
+    match kind {
+        "gates" => Some(FacIntent::ExecuteGates),
+        "warm" => Some(FacIntent::Warm),
+        "gc" => Some(FacIntent::Gc),
+        "lane_reset" => Some(FacIntent::LaneReset),
+        "stop_revoke" => Some(FacIntent::Cancel),
+        "bundle_export" | "bundle_import" => Some(FacIntent::Bundle),
+        "bulk" => Some(FacIntent::Bulk),
+        "control" => Some(FacIntent::Control),
+        _ => None,
+    }
+}
+
 /// Maps job kind to RFC-0029 budget admission keys.
 #[must_use]
 pub fn job_kind_to_budget_key(kind: &str) -> (RiskTier, BoundaryIntentClass) {
@@ -268,6 +389,37 @@ pub enum JobSpecError {
         expected: String,
         /// Actual `repo_id` value.
         actual: String,
+    },
+
+    /// Token intent does not match the job kind (TCK-00567).
+    ///
+    /// The broker-issued token was bound to a different intent than the one
+    /// required by the job kind.  This is a fail-closed denial: a token
+    /// for GC cannot be used to execute gates.
+    #[error(
+        "intent mismatch: token carries {token_intent}, job kind \"{job_kind}\" requires {expected_intent}"
+    )]
+    IntentMismatch {
+        /// Intent embedded in the token.
+        token_intent: String,
+        /// Job kind that was being validated.
+        job_kind: String,
+        /// Intent required by the job kind.
+        expected_intent: String,
+    },
+
+    /// The intent is not in the policy-allowed set (TCK-00567).
+    #[error("intent not allowed by policy: {intent}")]
+    IntentNotAllowed {
+        /// The rejected intent.
+        intent: String,
+    },
+
+    /// The job kind does not map to any known intent (TCK-00567).
+    #[error("unknown intent for job kind: {kind}")]
+    UnknownIntentForKind {
+        /// The job kind that has no intent mapping.
+        kind: String,
     },
 }
 
@@ -2580,5 +2732,55 @@ mod tests {
             matches!(result, Err(JobSpecError::InvalidControlLaneRepoId { .. })),
             "case-mismatched control-lane repo_id must be rejected: {result:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // TCK-00567: Intent taxonomy — mapping and serde correctness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tck_00567_job_kind_to_intent_mapping_exhaustive() {
+        // Verify every valid job kind maps to the correct intent.
+        assert_eq!(job_kind_to_intent("gates"), Some(FacIntent::ExecuteGates));
+        assert_eq!(job_kind_to_intent("warm"), Some(FacIntent::Warm));
+        assert_eq!(job_kind_to_intent("gc"), Some(FacIntent::Gc));
+        assert_eq!(job_kind_to_intent("lane_reset"), Some(FacIntent::LaneReset));
+        assert_eq!(job_kind_to_intent("stop_revoke"), Some(FacIntent::Cancel));
+        assert_eq!(job_kind_to_intent("bundle_export"), Some(FacIntent::Bundle));
+        assert_eq!(job_kind_to_intent("bundle_import"), Some(FacIntent::Bundle));
+        assert_eq!(job_kind_to_intent("bulk"), Some(FacIntent::Bulk));
+        assert_eq!(job_kind_to_intent("control"), Some(FacIntent::Control));
+    }
+
+    #[test]
+    fn tck_00567_unknown_kind_returns_none() {
+        assert_eq!(job_kind_to_intent("unknown"), None);
+        assert_eq!(job_kind_to_intent(""), None);
+        assert_eq!(job_kind_to_intent("GATES"), None);
+    }
+
+    #[test]
+    fn tck_00567_intent_as_str_roundtrips() {
+        for intent in FacIntent::ALL {
+            let s = intent.as_str();
+            assert!(
+                s.starts_with("intent.fac."),
+                "intent string must start with intent.fac. prefix, got: {s}"
+            );
+            // Verify serde roundtrip: serialize -> deserialize -> same variant.
+            let json = serde_json::to_string(intent).expect("intent should serialize");
+            let deserialized: FacIntent =
+                serde_json::from_str(&json).expect("intent should deserialize");
+            assert_eq!(*intent, deserialized);
+        }
+    }
+
+    #[test]
+    fn tck_00567_intent_display() {
+        assert_eq!(
+            FacIntent::ExecuteGates.to_string(),
+            "intent.fac.execute_gates"
+        );
+        assert_eq!(FacIntent::Gc.to_string(), "intent.fac.gc");
     }
 }

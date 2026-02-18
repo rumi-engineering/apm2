@@ -667,8 +667,17 @@ fn build_gates_job_spec(
     // Bind policy fields to the admitted FAC policy digest and bind the
     // specific job through request_id (= spec digest), preserving fail-closed
     // token verification while avoiding digest-domain mismatch.
+    // TCK-00567: Derive intent from job kind for intent-bound token issuance.
+    let intent = apm2_core::fac::job_spec::job_kind_to_intent(&spec.kind);
     let token = broker
-        .issue_channel_context_token(policy_digest, lease_id, &digest, boundary_id)
+        .issue_channel_context_token(
+            policy_digest,
+            lease_id,
+            &digest,
+            boundary_id,
+            intent.as_ref(),
+            None,
+        )
         .map_err(|err| format!("issue channel context token: {err}"))?;
     spec.actuation.channel_context_token = Some(token);
     validate_job_spec_with_policy(&spec, job_spec_policy)

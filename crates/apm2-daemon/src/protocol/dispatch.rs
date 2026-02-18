@@ -8198,6 +8198,7 @@ impl PrivilegedDispatcher {
             boundary_id: self.token_binding_boundary_id.clone(),
             issued_at_tick: current_tick,
             expiry_tick: current_tick.saturating_add(DEFAULT_ENVELOPE_TTL_TICKS),
+            intent: None,
         };
 
         issue_channel_context_token_with_token_binding(
