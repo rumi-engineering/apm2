@@ -1231,6 +1231,24 @@ fn normalize_error_hint(value: &str) -> Option<String> {
     super::jsonl::normalize_error_hint(value)
 }
 
+fn parse_failed_gates_from_error(error: &str) -> Vec<String> {
+    let marker = "failed_gates=";
+    let Some(start) = error.find(marker) else {
+        return Vec::new();
+    };
+    let rest = &error[start + marker.len()..];
+    let raw_segment = rest.split(';').next().unwrap_or(rest).trim();
+    if raw_segment.is_empty() {
+        return Vec::new();
+    }
+    raw_segment
+        .split(',')
+        .map(str::trim)
+        .filter(|gate| !gate.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn lane_evidence_log_dirs(home: &Path) -> Vec<PathBuf> {
     let lanes_dir = home.join("private/fac/lanes");
     let mut logs = Vec::new();
@@ -1731,27 +1749,58 @@ pub fn run_push(
                     }
                     if !mapped_any {
                         let duration = gates_started.elapsed().as_secs();
-                        for stage in ["gate_fmt", "gate_clippy", "gate_test", "gate_doc"] {
-                            attempt.set_stage_fail(
-                                stage,
-                                duration,
-                                None,
-                                normalize_error_hint(&err),
-                            );
+                        let failed_gates = parse_failed_gates_from_error(&err);
+                        if failed_gates.is_empty() {
+                            for stage in ["gate_fmt", "gate_clippy", "gate_test", "gate_doc"] {
+                                attempt.set_stage_fail(
+                                    stage,
+                                    duration,
+                                    None,
+                                    normalize_error_hint(&err),
+                                );
+                            }
+                        } else {
+                            for gate_name in &failed_gates {
+                                attempt.set_stage_fail(
+                                    stage_from_gate_name(gate_name),
+                                    duration,
+                                    None,
+                                    normalize_error_hint(&err),
+                                );
+                            }
                         }
                         if json_output {
-                            let _ = emit_jsonl(&GateErrorEvent {
-                                event: "gate_error",
-                                gate: "unknown".to_string(),
-                                error: normalize_error_hint(&err).unwrap_or_else(|| err.clone()),
-                                log_path: None,
-                                duration_secs: Some(duration),
-                                bytes_written: None,
-                                bytes_total: None,
-                                was_truncated: None,
-                                log_bundle_hash: None,
-                                ts: ts_now(),
-                            });
+                            if failed_gates.is_empty() {
+                                let _ = emit_jsonl(&GateErrorEvent {
+                                    event: "gate_error",
+                                    gate: "unknown".to_string(),
+                                    error: normalize_error_hint(&err)
+                                        .unwrap_or_else(|| err.clone()),
+                                    log_path: None,
+                                    duration_secs: Some(duration),
+                                    bytes_written: None,
+                                    bytes_total: None,
+                                    was_truncated: None,
+                                    log_bundle_hash: None,
+                                    ts: ts_now(),
+                                });
+                            } else {
+                                for gate_name in failed_gates {
+                                    let _ = emit_jsonl(&GateErrorEvent {
+                                        event: "gate_error",
+                                        gate: gate_name,
+                                        error: normalize_error_hint(&err)
+                                            .unwrap_or_else(|| err.clone()),
+                                        log_path: None,
+                                        duration_secs: Some(duration),
+                                        bytes_written: None,
+                                        bytes_total: None,
+                                        was_truncated: None,
+                                        log_bundle_hash: None,
+                                        ts: ts_now(),
+                                    });
+                                }
+                            }
                         }
                     }
                     if existing_pr_number > 0 {
@@ -2801,6 +2850,20 @@ mod tests {
         .expect_err("failed gate should surface reported failing names");
         assert!(err.contains("rustfmt"));
         assert!(!err.contains("clippy"));
+    }
+
+    #[test]
+    fn parse_failed_gates_from_error_extracts_comma_separated_names() {
+        let parsed = parse_failed_gates_from_error(
+            "gates failed with exit code 1; failed_gates=rustfmt,clippy,test; first_failure=test: timed out",
+        );
+        assert_eq!(parsed, vec!["rustfmt", "clippy", "test"]);
+    }
+
+    #[test]
+    fn parse_failed_gates_from_error_returns_empty_without_marker() {
+        let parsed = parse_failed_gates_from_error("gates failed with exit code 1");
+        assert!(parsed.is_empty());
     }
 
     #[test]
