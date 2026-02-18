@@ -5554,6 +5554,15 @@ fn build_export_config_from_receipt(
         leakage_budget_receipt,
         timing_channel_budget,
         disclosure_policy_binding,
+        // TCK-00555: Leakage budget policy defaults to Tier0 for CLI exports.
+        // This is the least-restrictive policy for local development use.
+        // Callers requiring stricter enforcement should set a Tier2+ policy.
+        leakage_budget_policy: Some(
+            apm2_core::fac::evidence_bundle::LeakageBudgetPolicy::tier0_default(),
+        ),
+        // No declassification receipt by default — exports that exceed the
+        // policy ceiling will fail closed.
+        declassification_receipt: None,
     })
 }
 
