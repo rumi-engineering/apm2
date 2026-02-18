@@ -324,6 +324,9 @@ notes:
       when activity is unknown.
     - Idle age derivation now uses log-write activity and liveness idle-age
       semantics to avoid false restart recommendations during long reviews.
+    - Reviewer idle-age heartbeat now advances only when tool-call count or
+      token count increases, so 301s idle windows only trigger restart when
+      both counters are flat.
     - Regression tests added for unknown-activity running reviewers and
       liveness idle-age timestamp derivation.
     - Repo-scoped doctor filtering now applies before global tracked-PR

@@ -1137,8 +1137,11 @@ fn run_single_review(
         let mut last_pulse_check = Instant::now();
         let mut last_liveness_report = Instant::now();
         let mut last_progress_at = Instant::now();
+        let mut last_tool_or_token_progress_at = Instant::now();
         let mut cursor = fs::metadata(&log_path).map(|meta| meta.len()).unwrap_or(0);
         let mut total_events_seen: u64 = 0;
+        let mut total_tool_calls_seen: u64 = 0;
+        let mut max_token_count_seen: u64 = 0;
         let mut last_event_type = String::new();
         let run_started = Instant::now();
 
@@ -1664,7 +1667,18 @@ fn run_single_review(
                 if liveness.made_progress {
                     last_progress_at = Instant::now();
                 }
-                let idle_secs = last_progress_at.elapsed().as_secs();
+                if liveness.tool_calls_since_last > 0 {
+                    total_tool_calls_seen =
+                        total_tool_calls_seen.saturating_add(liveness.tool_calls_since_last);
+                    last_tool_or_token_progress_at = Instant::now();
+                }
+                if let Some(token_count) = liveness.max_total_tokens_seen
+                    && token_count > max_token_count_seen
+                {
+                    max_token_count_seen = token_count;
+                    last_tool_or_token_progress_at = Instant::now();
+                }
+                let idle_secs = last_tool_or_token_progress_at.elapsed().as_secs();
 
                 emit_run_event(
                     "liveness_check",
@@ -1672,6 +1686,8 @@ fn run_single_review(
                     serde_json::json!({
                         "events_since_last": liveness.events_since_last,
                         "last_tool_call_age_secs": idle_secs,
+                        "tool_call_count": total_tool_calls_seen,
+                        "token_count": max_token_count_seen,
                         "log_bytes": liveness.log_bytes,
                     }),
                 )?;

@@ -546,6 +546,8 @@ pub struct LivenessSnapshot {
     pub last_event_type: String,
     pub log_bytes: u64,
     pub made_progress: bool,
+    pub tool_calls_since_last: u64,
+    pub max_total_tokens_seen: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
