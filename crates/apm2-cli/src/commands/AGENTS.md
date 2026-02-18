@@ -310,6 +310,12 @@ Security invariants:
 - **Process liveness** (`fac_worker.rs`): Stale lease detection uses `libc::kill(pid, 0)` with
   errno discrimination (ESRCH vs EPERM) instead of shell `kill -0` with `status.success()`.
   EPERM means the process exists but is unpermissioned; the lane is marked corrupt, not idle.
+- **JSON-only stderr recommendation channel** (`fac_worker.rs`, TCK-00570): The
+  `emit_lane_reset_recommendation` function emits exactly one JSON line per recommendation
+  to stderr.  No plain-text preamble or human-readable log lines are mixed into the stream.
+  Human-readable context is encoded inside the JSON `message` field.  Serialization errors
+  are routed through `tracing::warn!` (structured logging) to keep the stderr channel
+  JSON-only for downstream automation that consumes newline-delimited JSON.
 
 ## Warm Command Invariants (Updated for TCK-00579)
 

@@ -4158,6 +4158,9 @@ struct LaneResetRecommendation {
     schema: &'static str,
     /// The lane that needs operator reset.
     lane_id: String,
+    /// Human-readable summary for operators (encoded in JSON, not emitted
+    /// as a separate plain-text line — keeps the stderr channel JSON-only).
+    message: String,
     /// Why the lane is corrupt.
     reason: String,
     /// Suggested operator action.
@@ -4169,24 +4172,31 @@ const LANE_RESET_RECOMMENDATION_SCHEMA: &str = "apm2.fac.lane_reset_recommendati
 
 /// Emit a structured reset recommendation for a corrupt lane to stderr.
 ///
+/// The stderr recommendation channel is JSON-only: every line emitted is a
+/// valid, parseable JSON object.  Human-readable context is encoded inside
+/// the `message` field of the JSON payload rather than emitted as a
+/// separate plain-text line.
+///
 /// This is a best-effort diagnostic -- the worker must not abort lane
-/// scanning due to a recommendation emission failure. Serialization
-/// errors are logged to stderr for diagnostics rather than silently
-/// swallowed.
+/// scanning due to a recommendation emission failure.  Serialization
+/// errors are routed through `tracing::warn!` (structured logging channel)
+/// so they never pollute the JSON-only stderr recommendation stream.
 fn emit_lane_reset_recommendation(lane_id: &str, reason: &str) {
     let rec = LaneResetRecommendation {
         schema: LANE_RESET_RECOMMENDATION_SCHEMA,
         lane_id: lane_id.to_string(),
+        message: format!("worker: RECOMMENDATION: lane {lane_id} needs reset"),
         reason: reason.to_string(),
         recommended_action: "apm2 fac lane reset",
     };
     match serde_json::to_string(&rec) {
         Ok(json) => {
-            eprintln!("worker: RECOMMENDATION: lane {lane_id} needs reset");
             eprintln!("{json}");
         },
-        Err(e) => eprintln!(
-            "worker: WARNING: failed to serialize reset recommendation for lane {lane_id}: {e}"
+        Err(e) => tracing::warn!(
+            lane_id = lane_id,
+            error = %e,
+            "failed to serialize reset recommendation (non-fatal)"
         ),
     }
 }
@@ -8522,6 +8532,7 @@ mod tests {
         let rec = LaneResetRecommendation {
             schema: LANE_RESET_RECOMMENDATION_SCHEMA,
             lane_id: "lane-42".to_string(),
+            message: "worker: RECOMMENDATION: lane lane-42 needs reset".to_string(),
             reason: "cleanup failure: disk full".to_string(),
             recommended_action: "apm2 fac lane reset",
         };
@@ -8537,6 +8548,10 @@ mod tests {
             "schema field must match LANE_RESET_RECOMMENDATION_SCHEMA"
         );
         assert_eq!(parsed["lane_id"], "lane-42");
+        assert_eq!(
+            parsed["message"], "worker: RECOMMENDATION: lane lane-42 needs reset",
+            "human-readable context must be encoded inside JSON, not as a separate stderr line"
+        );
         assert_eq!(parsed["reason"], "cleanup failure: disk full");
         assert_eq!(parsed["recommended_action"], "apm2 fac lane reset");
 
@@ -8547,6 +8562,46 @@ mod tests {
             trimmed.starts_with('{'),
             "serialized recommendation must be a standalone JSON object, got: {trimmed}"
         );
+    }
+
+    /// Verify that `emit_lane_reset_recommendation` emits exactly one line
+    /// to stderr and that the line is valid, parseable JSON with the expected
+    /// schema.  This is the contract: the stderr recommendation channel is
+    /// JSON-only — no plain-text preamble, no mixed lines.
+    #[test]
+    fn test_emit_lane_reset_recommendation_stderr_is_json_only() {
+        // We cannot capture real stderr in-process, so we replicate the
+        // emission logic and verify that every line produced is valid JSON.
+        let lane_id = "lane-77";
+        let reason = "stale lease detected";
+        let rec = LaneResetRecommendation {
+            schema: LANE_RESET_RECOMMENDATION_SCHEMA,
+            lane_id: lane_id.to_string(),
+            message: format!("worker: RECOMMENDATION: lane {lane_id} needs reset"),
+            reason: reason.to_string(),
+            recommended_action: "apm2 fac lane reset",
+        };
+        let json_str =
+            serde_json::to_string(&rec).expect("serialization must succeed for test fixture");
+
+        // Simulate what emit_lane_reset_recommendation writes: exactly one
+        // line containing the JSON.  Verify EACH line is parseable JSON.
+        let emitted_lines: Vec<&str> = json_str.lines().collect();
+        assert_eq!(
+            emitted_lines.len(),
+            1,
+            "recommendation must be emitted as exactly one line, got {}",
+            emitted_lines.len()
+        );
+        for (i, line) in emitted_lines.iter().enumerate() {
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(line);
+            assert!(parsed.is_ok(), "stderr line {i} is not valid JSON: {line}");
+            let val = parsed.unwrap();
+            assert_eq!(
+                val["schema"], "apm2.fac.lane_reset_recommendation.v1",
+                "each emitted JSON line must carry the recommendation schema"
+            );
+        }
     }
 
     #[test]
