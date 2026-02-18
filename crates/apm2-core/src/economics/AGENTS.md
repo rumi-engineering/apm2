@@ -343,7 +343,7 @@ All admission decisions require valid temporal authority:
 #### Stop/Revoke Explicit Policy (TCK-00587)
 
 - `StopRevokeAdmissionPolicy` -- Structured policy for stop_revoke admission: lane reservation permille, max wait ticks, TP-001 emergency carve-out flag, TP-002/003 requirements, and worker first-pass priority flag. `default_policy()` returns the canonical defaults matching `STOP_REVOKE_RESERVATION_PERMILLE` (200) and `MAX_STOP_REVOKE_WAIT_TICKS` (100).
-- `StopRevokeAdmissionTrace` -- Structured admission trace bound to receipts: verdict, reservation/carve-out activation state, temporal predicate outcomes, queue backlog snapshot, and policy snapshot. All fields MUST be derived from actual runtime state (not hardcoded constants) to ensure accurate audit replay. `canonical_bytes()` returns deterministic canonical JSON bytes for replay verification.
+- `StopRevokeAdmissionTrace` -- Structured admission trace bound to receipts: verdict (bounded by `MAX_DENY_REASON_LENGTH`), reservation/carve-out activation state, temporal predicate outcomes (`Option<bool>` -- `None` = not evaluated, `Some(false)` = evaluated and failed), queue backlog snapshot, and policy snapshot. All fields MUST be derived from actual runtime state (not hardcoded constants) to ensure accurate audit replay. `canonical_bytes()` returns deterministic canonical JSON bytes for replay verification.
 
 **Invariants:**
 - [INV-QA11] `StopRevokeAdmissionPolicy::default_policy()` matches the canonical constants (`STOP_REVOKE_RESERVATION_PERMILLE`, `MAX_STOP_REVOKE_WAIT_TICKS`).

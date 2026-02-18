@@ -622,7 +622,7 @@ fn build_stop_revoke_spec(
         job_id: stop_revoke_job_id,
         job_spec_digest: String::new(),
         kind: "stop_revoke".to_string(),
-        queue_lane: "control".to_string(),
+        queue_lane: "stop_revoke".to_string(),
         priority: 0, // Highest priority.
         enqueue_time: format_iso8601(now),
         actuation: apm2_core::fac::job_spec::Actuation {

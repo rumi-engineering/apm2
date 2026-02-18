@@ -2243,9 +2243,9 @@ authorization gap identified in TCK-00587 review.
 
 ### Invariants
 
-- `validate_job_spec_control_lane()` enforces all structural/digest validation.
-  Token presence is not checked at the job_spec validation level (structural
-  validation only); the worker validates the token on the admission path.
+- `validate_job_spec_control_lane()` enforces all structural/digest validation
+  AND requires the RFC-0028 channel context token (consistent with the
+  worker's dual-layer enforcement policy).
 - The worker validates the RFC-0028 token using `decode_channel_context_token`
   before executing stop_revoke (fail-closed: missing/invalid token denies).
 - All deny paths in the control-lane flow emit explicit refusal receipts before
@@ -2274,7 +2274,7 @@ policy bypass from malformed or adversarial job specs.
   digest, token, repo_id allowlist, bytes_backend allowlist, and filesystem
   path rejection.
 - `validate_job_spec_control_lane_with_policy()`: Control-lane variant for
-  `stop_revoke` jobs (no token required, workload repo_id allowlist
+  `stop_revoke` jobs (RFC-0028 token required, workload repo_id allowlist
   bypassed).  The workload `repo_id` allowlist is intentionally skipped,
   but `validate_job_spec_control_lane` enforces that `repo_id` equals
   `CONTROL_LANE_REPO_ID` (`"internal/control"`) fail-closed (INV-JS-007).

@@ -718,28 +718,23 @@ pub fn validate_job_spec(spec: &FacJobSpecV1) -> Result<(), JobSpecError> {
 /// the fixed placeholder is enforced fail-closed to prevent arbitrary repo IDs
 /// from passing validation and corrupting audit trails.
 ///
-/// # `AUDITED_CONTROL_LANE_EXCEPTION`: RFC-0028/0029 bypass justification
+/// # `AUDITED_CONTROL_LANE_EXCEPTION`: RFC-0028/0029 enforcement
 ///
-/// Control-lane cancellation (`stop_revoke`) uses local operator authority
-/// proof instead of the standard RFC-0028 channel context token and RFC-0029
-/// queue admission flow.  This is an **explicit, audited policy exception**
-/// justified by the following trust model:
+/// Control-lane cancellation (`stop_revoke`) enforces dual-layer
+/// authorization:
 ///
-/// 1. **Same trust domain**: Cancellation originates from the local operator
-///    (the same user who owns the queue root directory).  The operator already
-///    has filesystem-level privilege over the queue, so a broker-issued token
-///    would add no additional authority — it would prove what filesystem access
-///    already proves.
+/// 1. **RFC-0028 token validation**: The spec MUST carry a valid
+///    `channel_context_token` (signing key proof).  This is enforced here at
+///    the core validation layer, consistent with the worker's enforcement
+///    policy.
 ///
-/// 2. **Capability-based proof**: The worker verifies authority by attempting a
-///    probe write to the queue root directory.  Only callers with write access
-///    to the directory succeed.  This is a stronger proof than a token for
-///    local operations because it demonstrates *current* filesystem capability,
-///    not a cached authorization.
+/// 2. **Queue directory ownership**: The worker additionally verifies
+///    local-origin authority via strict `owner+mode` checks on the queue
+///    directory tree.
 ///
 /// 3. **Digest integrity preserved**: All structural and digest validation
 ///    (schema, field bounds, BLAKE3 digest, `request_id` binding) is still
-///    enforced.  The only bypass is the token requirement.
+///    enforced.
 ///
 /// 4. **Fail-closed on all deny paths**: Every deny path in the control-lane
 ///    flow emits an explicit refusal receipt before moving the job to
@@ -806,9 +801,21 @@ pub fn validate_job_spec_control_lane(spec: &FacJobSpecV1) -> Result<(), JobSpec
         });
     }
 
-    // Token is deliberately NOT required for control-lane stop_revoke jobs.
-    // Local-origin authority is verified by the worker via queue directory
-    // ownership checks.
+    // RFC-0028 token IS required for stop_revoke jobs — the worker enforces
+    // dual-layer authorization (token + queue directory ownership).  Core
+    // validation must match the worker's enforcement policy to avoid
+    // inconsistency where specs passing core validation are later denied
+    // by the worker.
+    if spec
+        .actuation
+        .channel_context_token
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        return Err(JobSpecError::MissingToken {
+            field: "actuation.channel_context_token",
+        });
+    }
 
     Ok(())
 }
@@ -1785,12 +1792,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_control_lane_accepts_stop_revoke_without_token() {
-        // validate_job_spec_control_lane does NOT require a channel context token.
+    fn validate_control_lane_rejects_stop_revoke_without_token() {
+        // validate_job_spec_control_lane NOW requires a channel context token,
+        // consistent with the worker's dual-layer enforcement policy.
         let spec = FacJobSpecV1Builder::new(
             "sr-1",
             "stop_revoke",
-            "control",
+            "stop_revoke",
             "2026-02-12T00:00:00Z",
             "L1",
             control_lane_source(),
@@ -1799,19 +1807,42 @@ mod tests {
         .build()
         .expect("valid stop_revoke spec");
 
-        // Should succeed without token.
+        // Must reject without token.
         assert!(spec.actuation.channel_context_token.is_none());
         let result = validate_job_spec_control_lane(&spec);
         assert!(
-            result.is_ok(),
-            "control-lane validation should accept tokenless stop_revoke: {result:?}"
+            matches!(result, Err(JobSpecError::MissingToken { .. })),
+            "control-lane validation should reject tokenless stop_revoke: {result:?}"
         );
 
-        // Regular validate_job_spec should reject (missing token).
+        // Regular validate_job_spec should also reject (missing token).
         let result_full = validate_job_spec(&spec);
         assert!(
             matches!(result_full, Err(JobSpecError::MissingToken { .. })),
             "full validation should reject tokenless spec: {result_full:?}"
+        );
+    }
+
+    #[test]
+    fn validate_control_lane_accepts_stop_revoke_with_token() {
+        // With a valid token, control-lane validation should pass.
+        let spec = FacJobSpecV1Builder::new(
+            "sr-1",
+            "stop_revoke",
+            "stop_revoke",
+            "2026-02-12T00:00:00Z",
+            "L1",
+            control_lane_source(),
+        )
+        .cancel_target_job_id("target-123")
+        .channel_context_token("VALID_TOKEN")
+        .build()
+        .expect("valid stop_revoke spec");
+
+        let result = validate_job_spec_control_lane(&spec);
+        assert!(
+            result.is_ok(),
+            "control-lane validation should accept stop_revoke with token: {result:?}"
         );
     }
 
@@ -2154,12 +2185,13 @@ mod tests {
         let spec = FacJobSpecV1Builder::new(
             "sr-1",
             "stop_revoke",
-            "control",
+            "stop_revoke",
             "2026-02-12T00:00:00Z",
             "L1",
             control_lane_source(),
         )
         .cancel_target_job_id("target-123")
+        .channel_context_token("VALID_TOKEN")
         .build()
         .expect("valid stop_revoke spec");
 
@@ -2533,16 +2565,17 @@ mod tests {
 
     #[test]
     fn control_lane_accepts_correct_repo_id() {
-        // Confirm the happy path: CONTROL_LANE_REPO_ID passes validation.
+        // Confirm the happy path: CONTROL_LANE_REPO_ID + token passes validation.
         let spec = FacJobSpecV1Builder::new(
             "sr-ok",
             "stop_revoke",
-            "control",
+            "stop_revoke",
             "2026-02-12T00:00:00Z",
             "L1",
             control_lane_source(),
         )
         .cancel_target_job_id("target-ok")
+        .channel_context_token("VALID_TOKEN")
         .build()
         .expect("valid stop_revoke spec");
 
@@ -2550,7 +2583,7 @@ mod tests {
         let result = validate_job_spec_control_lane(&spec);
         assert!(
             result.is_ok(),
-            "correct control-lane repo_id must be accepted: {result:?}"
+            "correct control-lane repo_id with token must be accepted: {result:?}"
         );
     }
 

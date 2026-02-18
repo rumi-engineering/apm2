@@ -1875,11 +1875,11 @@ fn process_job(
     // The file was already validated by `scan_pending`; this avoids duplicate I/O.
     let _ = &candidate.raw_bytes;
     // Validate structure + digest + request_id binding.
-    // BLOCKER 2/3: stop_revoke jobs use control-lane validation (no token
-    // required); the worker verifies local-origin authority (queue directory
-    // ownership) instead of an RFC-0028 channel context token.
-    let is_control_lane = spec.kind == "stop_revoke";
-    let validation_result = if is_control_lane {
+    // stop_revoke jobs use control-lane validation which now enforces the
+    // RFC-0028 token at the core validation layer, consistent with the
+    // worker's dual-layer authorization (token + queue directory ownership).
+    let is_stop_revoke = spec.kind == "stop_revoke";
+    let validation_result = if is_stop_revoke {
         validate_job_spec_control_lane_with_policy(spec, job_spec_policy)
     } else {
         validate_job_spec_with_policy(spec, job_spec_policy)
@@ -1983,7 +1983,7 @@ fn process_job(
     // The cancel command issues a self-signed token using the persistent FAC
     // signing key. The worker validates this token here, ensuring only entities
     // with access to the signing key can issue valid cancellation tokens.
-    if is_control_lane {
+    if is_stop_revoke {
         // Step CL-1: Validate RFC-0028 token (fail-closed).
         // The token MUST be present and valid. Missing or invalid tokens
         // deny the job immediately — no queue-write-only authorization.
@@ -2098,7 +2098,7 @@ fn process_job(
         };
         let queue_trace = JobQueueAdmissionTrace {
             verdict: "allow".to_string(),
-            queue_lane: "control".to_string(),
+            queue_lane: "stop_revoke".to_string(),
             defect_reason: None,
             cost_estimate_ticks: None,
         };
@@ -2262,16 +2262,18 @@ fn process_job(
             apm2_core::economics::queue_admission::StopRevokeAdmissionPolicy::default_policy();
         let lane_state = scheduler.lane(QueueLane::StopRevoke);
         let total_items = scheduler.total_items();
-        // reservation_used: true only when total queue is at capacity and
-        // the lane reservation was needed to admit this job.
+        // reservation_used: true only when total queue was already at or over
+        // capacity before this job was admitted (i.e., the lane reservation was
+        // actually needed). Uses `>` because `total_items` includes the
+        // currently admitted job.
         let reservation_used =
-            total_items >= apm2_core::economics::queue_admission::MAX_TOTAL_QUEUE_ITEMS;
+            total_items > apm2_core::economics::queue_admission::MAX_TOTAL_QUEUE_ITEMS;
         // Control-lane jobs bypass RFC-0029 temporal predicates entirely.
-        // TP-001/002/003 are not evaluated — record false to indicate
-        // "not evaluated" (distinct from "evaluated and failed").
+        // TP-001/002/003 are not evaluated — record None to indicate
+        // "not evaluated" (distinct from Some(false) = "evaluated and failed").
         let tp001_emergency_carveout_activated = false;
-        let tp002_passed = false;
-        let tp003_passed = false;
+        let tp002_passed: Option<bool> = None;
+        let tp003_passed: Option<bool> = None;
         // tick_floor_active: true when stop_revoke items have been waiting
         // longer than the policy max_wait_ticks threshold.
         let tick_floor_active = lane_state.max_wait_ticks >= sr_policy.max_wait_ticks;
