@@ -1,6 +1,6 @@
-//! Gate Cache V3: Receipt-indexed cache store keyed by
-//! attestation+policy+toolchain.
+//! Gate Cache V3: receipt-indexed cache store (TCK-00541).
 //!
+//! Keyed by attestation+policy+toolchain compound key.
 //! V3 stores one file per gate under:
 //! `$APM2_HOME/private/fac/gate_cache_v3/{index_key}/{gate}.yaml`.
 //!
@@ -136,9 +136,9 @@ impl std::error::Error for GateCacheV3Error {}
 pub struct V3CompoundKey {
     /// Hex-encoded attestation digest (workspace content fingerprint).
     pub attestation_digest: String,
-    /// FacPolicyHash: hex-encoded BLAKE3-256 digest of the active FAC policy.
+    /// `FacPolicyHash`: hex-encoded BLAKE3-256 digest of the active FAC policy.
     pub fac_policy_hash: String,
-    /// ToolchainFingerprint: hex-encoded digest of the build toolchain.
+    /// `ToolchainFingerprint`: hex-encoded digest of the build toolchain.
     pub toolchain_fingerprint: String,
     /// Hex-encoded hash binding from RFC-0028 (channel authorization).
     pub rfc0028_receipt_hash: String,
@@ -410,6 +410,7 @@ impl GateCacheV3 {
     ///
     /// The compound key match is implicit: the caller looked up this cache
     /// by compound key, so if the entry exists, the compound key matched.
+    #[must_use]
     pub fn check_reuse(
         &self,
         gate: &str,
@@ -707,7 +708,6 @@ impl GateCacheV3 {
             #[cfg(unix)]
             {
                 // fsync the file before rename for crash safety.
-                use std::io::Write;
                 if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&tmp_path) {
                     let _ = file.sync_all();
                 }
@@ -776,9 +776,8 @@ impl GateCacheV3 {
 /// hex digest. Used before using it as a filesystem path component.
 #[must_use]
 pub fn is_valid_v3_index_key(s: &str) -> bool {
-    let hex_part = match s.strip_prefix("b3-256:") {
-        Some(h) => h,
-        None => return false,
+    let Some(hex_part) = s.strip_prefix("b3-256:") else {
+        return false;
     };
     hex_part.len() == 64 && hex_part.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -1201,7 +1200,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("mkdir");
 
         let signer = Signer::generate();
-        let mut cache = make_signed_v3(&signer);
+        let cache = make_signed_v3(&signer);
         cache.save_to_dir(&root).expect("save");
 
         let loaded = GateCacheV3::load_from_dir(&root, "abc123", &cache.compound_key)

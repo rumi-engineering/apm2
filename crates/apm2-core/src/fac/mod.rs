@@ -120,11 +120,12 @@ pub mod evidence_bundle;
 pub mod execution_backend;
 pub mod flake_class;
 mod flock_util;
+/// Gate cache v3 (TCK-00541).
+///
+/// Receipt-indexed cache store keyed by attestation+policy+toolchain.
+pub mod gate_cache_v3;
 /// Garbage-collection planner and execution primitives.
 #[allow(missing_docs)]
-/// Gate cache v3: receipt-indexed cache store keyed by
-/// attestation+policy+toolchain (TCK-00541).
-pub mod gate_cache_v3;
 pub mod gc;
 /// Garbage-collection receipt schema and persistence helpers.
 #[allow(missing_docs)]
