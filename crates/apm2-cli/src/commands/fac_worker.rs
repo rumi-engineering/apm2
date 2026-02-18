@@ -4169,9 +4169,10 @@ const LANE_RESET_RECOMMENDATION_SCHEMA: &str = "apm2.fac.lane_reset_recommendati
 
 /// Emit a structured reset recommendation for a corrupt lane to stderr.
 ///
-/// This is a best-effort diagnostic — serialization failures are silently
-/// ignored because the worker must not abort lane scanning due to a
-/// recommendation emission failure.
+/// This is a best-effort diagnostic -- the worker must not abort lane
+/// scanning due to a recommendation emission failure. Serialization
+/// errors are logged to stderr for diagnostics rather than silently
+/// swallowed.
 fn emit_lane_reset_recommendation(lane_id: &str, reason: &str) {
     let rec = LaneResetRecommendation {
         schema: LANE_RESET_RECOMMENDATION_SCHEMA,
@@ -4179,8 +4180,11 @@ fn emit_lane_reset_recommendation(lane_id: &str, reason: &str) {
         reason: reason.to_string(),
         recommended_action: "apm2 fac lane reset",
     };
-    if let Ok(json) = serde_json::to_string(&rec) {
-        eprintln!("worker: RECOMMENDATION: {json}");
+    match serde_json::to_string(&rec) {
+        Ok(json) => eprintln!("worker: RECOMMENDATION: {json}"),
+        Err(e) => eprintln!(
+            "worker: WARNING: failed to serialize reset recommendation for lane {lane_id}: {e}"
+        ),
     }
 }
 
@@ -4448,7 +4452,7 @@ fn persist_corrupt_marker_with_retries(
         lane_id: lane_id.to_string(),
         reason: reason.to_string(),
         cleanup_receipt_digest,
-        detected_at: current_timestamp_epoch_secs().to_string(),
+        detected_at: apm2_core::fac::current_time_iso8601(),
     };
 
     let mut last_error: Option<String> = None;

@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -955,7 +956,7 @@ pub struct LaneCorruptMarkerV1 {
     /// Optional digest of the cleanup receipt that marked this lane corrupt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup_receipt_digest: Option<String>,
-    /// ISO-8601 / epoch marker used to record when the lane became corrupt.
+    /// ISO-8601 UTC timestamp recording when the lane became corrupt.
     pub detected_at: String,
 }
 
@@ -966,11 +967,26 @@ impl LaneCorruptMarkerV1 {
 
     /// Persist this marker to the lane directory.
     ///
+    /// Performs defense-in-depth validation before writing to ensure no
+    /// invalid marker is ever persisted, even if constructed directly
+    /// (bypassing `LaneManager::mark_corrupt`).
+    ///
     /// # Errors
     ///
-    /// Returns `LaneError::Io` for serialization or write failures, or
+    /// Returns `LaneError::Io` for serialization or write failures,
+    /// `LaneError::StringTooLong` for oversized fields,
+    /// `LaneError::InvalidDigestFormat` for malformed digests, or
     /// `LaneError::InvalidRecord` if the marker schema is invalid.
     pub fn persist(&self, fac_root: &Path) -> Result<(), LaneError> {
+        // Defense-in-depth: validate fields before writing to disk.
+        validate_lane_id(&self.lane_id)?;
+        validate_string_field("reason", &self.reason, MAX_STRING_LENGTH)?;
+        validate_string_field("detected_at", &self.detected_at, MAX_STRING_LENGTH)?;
+        if let Some(ref digest) = self.cleanup_receipt_digest {
+            validate_string_field("cleanup_receipt_digest", digest, MAX_STRING_LENGTH)?;
+            validate_b3_256_digest("cleanup_receipt_digest", digest)?;
+        }
+
         let path = Self::marker_path(fac_root, &self.lane_id);
         let bytes =
             serde_json::to_vec_pretty(self).map_err(|e| LaneError::Serialization(e.to_string()))?;
@@ -1677,21 +1693,16 @@ impl LaneManager {
 
     /// Write a CORRUPT marker for a lane that could not be repaired.
     // SECURITY JUSTIFICATION (CTR-2501): Lane reconciliation corrupt-marker
-    // timestamps use wall-clock time because reconciliation is an operational
+    // Timestamps use wall-clock time because reconciliation is an operational
     // recovery task, not a coordinated consensus operation. The timestamp is
-    // used only for corrupt marker labelling.
-    #[allow(clippy::disallowed_methods)]
+    // used only for corrupt marker labelling (CTR-2501).
     fn mark_lane_corrupt(fac_root: &Path, lane_id: &str, actions: &mut Vec<LaneReconcileAction>) {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         let marker = LaneCorruptMarkerV1 {
             schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
             lane_id: lane_id.to_string(),
             reason: "lane reconcile failed to repair missing directories/profile".to_string(),
             cleanup_receipt_digest: None,
-            detected_at: now.to_string(),
+            detected_at: current_time_iso8601(),
         };
         if let Err(e) = marker.persist(fac_root) {
             actions.push(LaneReconcileAction {
@@ -1963,8 +1974,10 @@ impl LaneManager {
     ///   `MAX_STRING_LENGTH`).
     /// * `receipt_digest` - Optional `b3-256:<hex>` digest binding the marker
     ///   to an evidence artifact.
-    /// * `detected_at` - ISO-8601 timestamp string for when corruption was
-    ///   detected.
+    ///
+    /// The `detected_at` timestamp is generated internally as an ISO-8601
+    /// UTC string (CTR-2501) to ensure consistent format across all code
+    /// paths that create corrupt markers.
     ///
     /// # Errors
     ///
@@ -1977,11 +1990,9 @@ impl LaneManager {
         lane_id: &str,
         reason: &str,
         receipt_digest: Option<&str>,
-        detected_at: &str,
     ) -> Result<(), LaneError> {
         validate_lane_id(lane_id)?;
         validate_string_field("reason", reason, MAX_STRING_LENGTH)?;
-        validate_string_field("detected_at", detected_at, MAX_STRING_LENGTH)?;
         if let Some(digest) = receipt_digest {
             validate_string_field("cleanup_receipt_digest", digest, MAX_STRING_LENGTH)?;
             validate_b3_256_digest("cleanup_receipt_digest", digest)?;
@@ -1992,7 +2003,7 @@ impl LaneManager {
             lane_id: lane_id.to_string(),
             reason: reason.to_string(),
             cleanup_receipt_digest: receipt_digest.map(String::from),
-            detected_at: detected_at.to_string(),
+            detected_at: current_time_iso8601(),
         };
         marker.persist(&self.fac_root)
     }
@@ -3081,6 +3092,22 @@ pub fn validate_b3_256_digest(field: &'static str, digest: &str) -> Result<(), L
     Ok(())
 }
 
+/// Return the current wall-clock time as an ISO-8601 string (UTC, second
+/// precision).
+///
+/// # Clock Contract (CTR-2501)
+///
+/// This function reads wall-clock time (`chrono::Utc::now`) and is intended
+/// **only** for human-readable audit labels (e.g., `detected_at` in corrupt
+/// markers). It MUST NOT be used for monotonic ordering, timeout logic, or
+/// distributed coordination. Callers requiring elapsed-time measurement
+/// should use `std::time::Instant`.
+#[must_use]
+#[allow(clippy::disallowed_methods)]
+pub fn current_time_iso8601() -> String {
+    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 /// Return the worse (higher-priority) of two reconcile outcomes.
 ///
 /// Priority order: `Failed` > `MarkedCorrupt` > `Repaired` > `Ok` > `Skipped`.
@@ -3844,12 +3871,7 @@ mod tests {
         let valid_digest =
             "b3-256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         manager
-            .mark_corrupt(
-                "lane-00",
-                "operator maintenance",
-                Some(valid_digest),
-                "2026-02-18T00:00:00Z",
-            )
+            .mark_corrupt("lane-00", "operator maintenance", Some(valid_digest))
             .expect("mark_corrupt should succeed");
 
         let marker = LaneCorruptMarkerV1::load(&fac_root, "lane-00")
@@ -3858,7 +3880,8 @@ mod tests {
         assert_eq!(marker.lane_id, "lane-00");
         assert_eq!(marker.reason, "operator maintenance");
         assert_eq!(marker.cleanup_receipt_digest.as_deref(), Some(valid_digest));
-        assert_eq!(marker.detected_at, "2026-02-18T00:00:00Z");
+        // detected_at is now generated internally as ISO-8601; verify it is non-empty.
+        assert!(!marker.detected_at.is_empty(), "detected_at must be set");
     }
 
     #[test]
@@ -3869,7 +3892,7 @@ mod tests {
         let manager = LaneManager::new(fac_root).expect("create manager");
 
         let long_reason = "x".repeat(MAX_STRING_LENGTH + 1);
-        let result = manager.mark_corrupt("lane-00", &long_reason, None, "2026-02-18T00:00:00Z");
+        let result = manager.mark_corrupt("lane-00", &long_reason, None);
         assert!(result.is_err(), "oversized reason must be rejected");
     }
 
@@ -3884,7 +3907,6 @@ mod tests {
             "lane-00",
             "test",
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
-            "2026-02-18T00:00:00Z",
         );
         assert!(
             matches!(result, Err(LaneError::InvalidDigestFormat { .. })),
@@ -3903,7 +3925,6 @@ mod tests {
             "lane-00",
             "test",
             Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
-            "2026-02-18T00:00:00Z",
         );
         assert!(
             matches!(result, Err(LaneError::InvalidDigestFormat { .. })),
@@ -3918,12 +3939,7 @@ mod tests {
         fs::create_dir_all(fac_root.join("lanes").join("lane-00")).expect("create lane dir");
         let manager = LaneManager::new(fac_root).expect("create manager");
 
-        let result = manager.mark_corrupt(
-            "lane-00",
-            "test",
-            Some("b3-256:deadbeef"),
-            "2026-02-18T00:00:00Z",
-        );
+        let result = manager.mark_corrupt("lane-00", "test", Some("b3-256:deadbeef"));
         assert!(
             matches!(result, Err(LaneError::InvalidDigestFormat { .. })),
             "digest with too few hex chars must be rejected, got: {result:?}"
@@ -3942,7 +3958,6 @@ mod tests {
             "lane-00",
             "test",
             Some("b3-256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"),
-            "2026-02-18T00:00:00Z",
         );
         assert!(
             matches!(result, Err(LaneError::InvalidDigestFormat { .. })),
@@ -3961,7 +3976,6 @@ mod tests {
             "lane-00",
             "test",
             Some("b3-256:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"),
-            "2026-02-18T00:00:00Z",
         );
         assert!(
             matches!(result, Err(LaneError::InvalidDigestFormat { .. })),
@@ -3980,7 +3994,6 @@ mod tests {
             "lane-00",
             "test",
             Some("b3-256:not-a-digest-string-at-all-nope-not-valid-hex-chars-at-all!"),
-            "2026-02-18T00:00:00Z",
         );
         assert!(
             matches!(result, Err(LaneError::InvalidDigestFormat { .. })),
@@ -3996,7 +4009,7 @@ mod tests {
         let manager = LaneManager::new(fac_root).expect("create manager");
 
         manager
-            .mark_corrupt("lane-00", "test reason", None, "2026-02-18T00:00:00Z")
+            .mark_corrupt("lane-00", "test reason", None)
             .expect("None digest must be accepted");
     }
 
@@ -4028,7 +4041,7 @@ mod tests {
         let manager = LaneManager::new(fac_root.clone()).expect("create manager");
 
         manager
-            .mark_corrupt("lane-01", "test", None, "2026-02-18T00:00:00Z")
+            .mark_corrupt("lane-01", "test", None)
             .expect("mark_corrupt should succeed");
 
         // Marker should exist.

@@ -775,13 +775,20 @@ marker persistence.
 - `LaneCorruptMarkerV1`: Persistent marker at
   `lanes/<lane_id>/corrupt.v1.json` with schema, lane_id, reason,
   optional cleanup_receipt_digest (b3-256), and detected_at timestamp.
+  `persist()` performs defense-in-depth validation before writing to
+  ensure no invalid marker reaches disk even if constructed directly.
 - `LaneManager::mark_corrupt()`: Operator-facing API to create a corrupt
-  marker. Validates lane_id, reason length, and receipt_digest length
-  against `MAX_STRING_LENGTH`. Caller MUST hold the lane lock.
+  marker. Validates lane_id, reason length, and receipt_digest format
+  against `MAX_STRING_LENGTH`. Generates `detected_at` internally as
+  ISO-8601 UTC (CTR-2501). Caller MUST hold the lane lock.
 - `LaneManager::clear_corrupt_marker()`: Removes the marker file.
+- `current_time_iso8601()`: Public helper returning current wall-clock
+  time as ISO-8601 UTC string (second precision). Used for all corrupt
+  marker timestamps to ensure consistent format across reconcile,
+  worker, and CLI code paths.
 - Worker refusal: `acquire_worker_lane()` in the worker poll loop checks
   for corrupt markers before leasing. A corrupt-marked lane is skipped
-  with a warning.
+  with a warning and a structured reset recommendation is emitted.
 - CLI: `apm2 fac lane mark-corrupt <lane_id> --reason ...` creates the
   marker under exclusive lock. Refuses RUNNING lanes (use `lane reset
   --force`). Refuses already-CORRUPT lanes (use `lane reset` first).
@@ -794,8 +801,11 @@ marker persistence.
   checks the marker on each poll iteration.
 - [INV-LANE-CORRUPT-002] Marker persistence uses atomic write (temp +
   rename). Reads are bounded to `MAX_LEASE_FILE_SIZE` (1 MiB).
-- [INV-LANE-CORRUPT-003] `detected_at` uses wall-clock time for audit
-  labelling only; monotonic ordering is not relied upon.
+  `persist()` performs defense-in-depth field validation before write.
+- [INV-LANE-CORRUPT-003] `detected_at` uses wall-clock time in ISO-8601
+  UTC format for audit labelling only; monotonic ordering is not relied
+  upon. All code paths (reconcile, worker, CLI) use the same format via
+  `current_time_iso8601()`.
 - [INV-LANE-CORRUPT-004] Reason and receipt_digest string fields are
   validated against `MAX_STRING_LENGTH` (512) before persistence.
 
