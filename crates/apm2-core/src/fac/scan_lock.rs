@@ -432,33 +432,34 @@ fn write_lock_metadata(lock_path: &Path, metadata: &ScanLockMetadata) -> Result<
     let json = serde_json::to_string_pretty(metadata)
         .map_err(|e| ScanLockError::io("serializing scan lock metadata", io::Error::other(e)))?;
 
-    // Atomic write: write to temp file, then rename (INV-SL-004).
+    // Atomic write: write to unpredictable temp file, then rename (INV-SL-004).
+    // Uses tempfile::NamedTempFile for unpredictable name + O_EXCL creation +
+    // 0600 permissions, preventing symlink attacks on the temp file (CTR-2607).
     let parent = lock_path.parent().unwrap_or(lock_path);
-    let temp_path = parent.join(".scan.lock.tmp");
 
-    let mut file = File::create(&temp_path)
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
         .map_err(|e| ScanLockError::io("creating scan lock temp file", e))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = fs::Permissions::from_mode(0o600);
-        let _ = file.set_permissions(perms);
+        let _ = tmp.as_file().set_permissions(perms);
     }
 
-    file.write_all(json.as_bytes())
+    tmp.write_all(json.as_bytes())
         .map_err(|e| ScanLockError::io("writing scan lock metadata", e))?;
-    file.sync_all()
+    tmp.as_file()
+        .sync_all()
         .map_err(|e| ScanLockError::io("syncing scan lock metadata", e))?;
-    drop(file);
 
     // We write metadata to a separate sidecar file rather than the lock file
     // itself, because replacing the lock file via rename would break the flock
     // association (the flock is on the open fd, which references the original
     // inode).
     let meta_path = lock_path.with_extension("lock.meta");
-    fs::rename(&temp_path, &meta_path)
-        .map_err(|e| ScanLockError::io("renaming scan lock metadata", e))?;
+    tmp.persist(&meta_path)
+        .map_err(|e| ScanLockError::io("renaming scan lock metadata", e.error))?;
 
     Ok(())
 }
@@ -466,27 +467,45 @@ fn write_lock_metadata(lock_path: &Path, metadata: &ScanLockMetadata) -> Result<
 fn read_lock_metadata(lock_path: &Path) -> Result<ScanLockMetadata, ScanLockError> {
     let meta_path = lock_path.with_extension("lock.meta");
 
-    // Symlink check.
-    match fs::symlink_metadata(&meta_path) {
-        Ok(m) if m.file_type().is_symlink() => {
-            return Err(ScanLockError::SymlinkDetected {
-                path: meta_path.display().to_string(),
-            });
-        },
-        Err(e) => return Err(ScanLockError::io("stat scan lock metadata", e)),
-        Ok(m) => {
-            let size = usize::try_from(m.len()).unwrap_or(usize::MAX);
-            if size > MAX_SCAN_LOCK_FILE_SIZE {
-                return Err(ScanLockError::MetadataTooLarge {
-                    size,
-                    max: MAX_SCAN_LOCK_FILE_SIZE,
-                });
-            }
-        },
+    // Open with O_NOFOLLOW to atomically reject symlinks (INV-SL-001).
+    // This eliminates the TOCTOU race between a separate symlink check and
+    // the open call. On symlinks, open() returns ELOOP which we translate
+    // to SymlinkDetected.
+    let mut options = OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW);
     }
 
-    let mut file =
-        File::open(&meta_path).map_err(|e| ScanLockError::io("opening scan lock metadata", e))?;
+    let mut file = match options.open(&meta_path) {
+        Ok(f) => f,
+        Err(e) => {
+            // ELOOP (errno 40) indicates the path is a symlink when O_NOFOLLOW is set.
+            #[cfg(unix)]
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                return Err(ScanLockError::SymlinkDetected {
+                    path: meta_path.display().to_string(),
+                });
+            }
+            return Err(ScanLockError::io("opening scan lock metadata", e));
+        },
+    };
+
+    // Size check on the opened fd (no TOCTOU — we already hold the fd).
+    {
+        let file_meta = file
+            .metadata()
+            .map_err(|e| ScanLockError::io("stat scan lock metadata", e))?;
+        let size = usize::try_from(file_meta.len()).unwrap_or(usize::MAX);
+        if size > MAX_SCAN_LOCK_FILE_SIZE {
+            return Err(ScanLockError::MetadataTooLarge {
+                size,
+                max: MAX_SCAN_LOCK_FILE_SIZE,
+            });
+        }
+    }
 
     let mut buf = vec![0u8; MAX_SCAN_LOCK_FILE_SIZE];
     let mut total = 0usize;
@@ -791,5 +810,104 @@ mod tests {
         let json = r#"{"schema":"test","stuck_holder_pid":1,"acquired_epoch_secs":0,"detected_epoch_secs":0,"detector_pid":1,"held_duration_secs":0,"extra":"bad"}"#;
         let result = serde_json::from_str::<ScanLockStuckReceipt>(json);
         assert!(result.is_err(), "deny_unknown_fields should reject extra");
+    }
+
+    // ========================================================================
+    // Regression tests for security findings (TCK-00586 fix round)
+    // ========================================================================
+
+    /// Regression: read_lock_metadata must reject symlinks via O_NOFOLLOW
+    /// (BLOCKER: TOCTOU symlink attack fix).
+    #[cfg(unix)]
+    #[test]
+    fn test_read_lock_metadata_rejects_symlink_atomically() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = tmp.path().join("queue");
+        fs::create_dir_all(&queue_root).expect("create dir");
+
+        // Write a legitimate metadata file at a different location.
+        let real_meta = tmp.path().join("real.meta");
+        let metadata = ScanLockMetadata {
+            schema: SCAN_LOCK_METADATA_SCHEMA.to_string(),
+            holder_pid: 1,
+            acquired_epoch_secs: 1_700_000_000,
+        };
+        let json = serde_json::to_string_pretty(&metadata).expect("serialize");
+        fs::write(&real_meta, json.as_bytes()).expect("write real meta");
+
+        // Create a symlink at the metadata path pointing to the real file.
+        let meta_path = queue_root.join("scan.lock.meta");
+        std::os::unix::fs::symlink(&real_meta, &meta_path).expect("symlink");
+
+        let lock_path = queue_root.join(SCAN_LOCK_FILENAME);
+        let result = read_lock_metadata(&lock_path);
+        assert!(result.is_err(), "symlink metadata should be rejected");
+        assert!(
+            matches!(result.unwrap_err(), ScanLockError::SymlinkDetected { .. }),
+            "expected SymlinkDetected error for symlinked metadata"
+        );
+    }
+
+    /// Regression: write_lock_metadata uses unpredictable temp file name
+    /// (MAJOR: predictable temp file name fix).
+    #[test]
+    fn test_write_lock_metadata_no_predictable_temp() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = tmp.path().join("queue");
+        fs::create_dir_all(&queue_root).expect("create dir");
+
+        let lock_path = queue_root.join(SCAN_LOCK_FILENAME);
+        let metadata = ScanLockMetadata {
+            schema: SCAN_LOCK_METADATA_SCHEMA.to_string(),
+            holder_pid: std::process::id(),
+            acquired_epoch_secs: current_epoch_secs(),
+        };
+
+        write_lock_metadata(&lock_path, &metadata).expect("write metadata");
+
+        // Verify the predictable temp file `.scan.lock.tmp` does NOT exist
+        // (the old code would have left it or used it; the new code uses
+        // NamedTempFile which creates a random name and persist() renames it).
+        let old_temp_path = queue_root.join(".scan.lock.tmp");
+        assert!(
+            !old_temp_path.exists(),
+            "predictable temp file should not exist after write_lock_metadata"
+        );
+
+        // Verify the metadata sidecar was written correctly.
+        let meta_path = lock_path.with_extension("lock.meta");
+        assert!(meta_path.exists(), "metadata sidecar should exist");
+        let read_back = read_lock_metadata(&lock_path).expect("read back metadata");
+        assert_eq!(read_back.holder_pid, std::process::id());
+    }
+
+    /// Regression: write_lock_metadata sets 0600 permissions on metadata file.
+    #[cfg(unix)]
+    #[test]
+    fn test_write_lock_metadata_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = tmp.path().join("queue");
+        fs::create_dir_all(&queue_root).expect("create dir");
+
+        let lock_path = queue_root.join(SCAN_LOCK_FILENAME);
+        let metadata = ScanLockMetadata {
+            schema: SCAN_LOCK_METADATA_SCHEMA.to_string(),
+            holder_pid: std::process::id(),
+            acquired_epoch_secs: current_epoch_secs(),
+        };
+
+        write_lock_metadata(&lock_path, &metadata).expect("write metadata");
+
+        let meta_path = lock_path.with_extension("lock.meta");
+        let perms = fs::metadata(&meta_path).expect("stat").permissions();
+        // tempfile creates with 0600 by default on Unix; verify no group/other bits.
+        let mode = perms.mode() & 0o777;
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "metadata file should have no group/other permissions, got {mode:#o}"
+        );
     }
 }

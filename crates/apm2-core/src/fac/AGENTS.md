@@ -163,13 +163,16 @@ rely on the atomic claim (rename) for correctness.
 
 ### Security Invariants (TCK-00586)
 
-- [INV-SL-001] Lock file creation uses `O_NOFOLLOW` to prevent symlink attacks.
+- [INV-SL-001] Lock file creation and metadata reads use `O_NOFOLLOW` to
+  prevent symlink attacks atomically (no TOCTOU between check and open).
 - [INV-SL-002] Lock metadata reads are bounded to `MAX_SCAN_LOCK_FILE_SIZE`
-  (1 KiB).
+  (1 KiB). Size check performed on the opened fd (no TOCTOU).
 - [INV-SL-003] CTR-2501 deviation documented: `SystemTime::now()` used for
   persisted epoch timestamp (cross-process readable); elapsed comparisons
   use `saturating_sub` for safety.
-- [INV-SL-004] Lock metadata writes use atomic write (temp + rename).
+- [INV-SL-004] Lock metadata writes use atomic write via
+  `tempfile::NamedTempFile` (unpredictable name + O_EXCL) then `persist()`
+  (rename). No predictable temp file names in shared directories.
 - [INV-SL-005] All string fields in `ScanLockMetadata` are bounded during
   deserialization (`deny_unknown_fields` + length check).
 

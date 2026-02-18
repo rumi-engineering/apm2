@@ -6547,17 +6547,56 @@ fn compute_evidence_hash(data: &[u8]) -> [u8; 32] {
 ///
 /// Best-effort: errors are logged but not propagated (stuck detection is
 /// observability, not correctness).
+///
+/// Atomic write protocol (CTR-1502): writes to a temp file via
+/// `NamedTempFile::new_in()` then `persist()` to rename into place.
+/// Directory created with mode 0700 (CTR-2611).
 fn persist_scan_lock_stuck_receipt(fac_root: &Path, receipt_json: &str) -> Result<(), String> {
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
-    fs::create_dir_all(&receipts_dir).map_err(|e| format!("create receipts dir: {e}"))?;
+
+    // Create receipts directory with restricted permissions (CTR-2611).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&receipts_dir)
+            .map_err(|e| format!("create receipts dir: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(&receipts_dir).map_err(|e| format!("create receipts dir: {e}"))?;
+    }
 
     let filename = format!(
         "scan_lock_stuck_{}.json",
         chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
     );
-    let receipt_path = receipts_dir.join(&filename);
-    fs::write(&receipt_path, receipt_json.as_bytes())
+
+    // Atomic write: temp file + persist (rename) to prevent partial reads
+    // (CTR-1502). NamedTempFile provides unpredictable name + O_EXCL.
+    let mut tmp = tempfile::NamedTempFile::new_in(&receipts_dir)
+        .map_err(|e| format!("create stuck receipt temp file: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = tmp.as_file().set_permissions(perms);
+    }
+
+    use std::io::Write;
+    tmp.write_all(receipt_json.as_bytes())
         .map_err(|e| format!("write stuck receipt: {e}"))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("sync stuck receipt: {e}"))?;
+
+    let receipt_path = receipts_dir.join(&filename);
+    tmp.persist(&receipt_path)
+        .map_err(|e| format!("rename stuck receipt: {e}"))?;
+
     Ok(())
 }
 
