@@ -116,11 +116,32 @@ use super::{fac_key_material, fac_secure_io};
 use crate::commands::fac_review as fac_review_api;
 #[cfg(test)]
 mod fac_review_api {
+    use std::cell::RefCell;
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum GateThroughputProfile {
         Throughput,
         Balanced,
         Conservative,
+    }
+
+    thread_local! {
+        static RUN_GATES_LOCAL_WORKER_OVERRIDE: RefCell<Option<Result<u8, String>>> =
+            const { RefCell::new(None) };
+        static GATE_LIFECYCLE_OVERRIDE: RefCell<Option<Result<usize, String>>> =
+            const { RefCell::new(None) };
+    }
+
+    pub fn set_run_gates_local_worker_override(result: Option<Result<u8, String>>) {
+        RUN_GATES_LOCAL_WORKER_OVERRIDE.with(|slot| {
+            *slot.borrow_mut() = result;
+        });
+    }
+
+    pub fn set_gate_lifecycle_override(result: Option<Result<usize, String>>) {
+        GATE_LIFECYCLE_OVERRIDE.with(|slot| {
+            *slot.borrow_mut() = result;
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -136,6 +157,11 @@ mod fac_review_api {
         _workspace_root: &std::path::Path,
         _allow_legacy_cache: bool,
     ) -> Result<u8, String> {
+        if let Some(override_result) =
+            RUN_GATES_LOCAL_WORKER_OVERRIDE.with(|slot| slot.borrow().clone())
+        {
+            return override_result;
+        }
         Ok(crate::exit_codes::codes::GENERIC_ERROR)
     }
 
@@ -154,6 +180,9 @@ mod fac_review_api {
         head_sha: &str,
         _passed: bool,
     ) -> Result<usize, String> {
+        if let Some(override_result) = GATE_LIFECYCLE_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return override_result;
+        }
         // Test shim: enforce non-empty routing inputs and return a non-zero
         // applied count so worker unit tests do not silently mask no-op behavior.
         if owner_repo.trim().is_empty() {
@@ -7249,6 +7278,26 @@ mod tests {
         unsafe { std::env::remove_var(key) };
     }
 
+    struct FacReviewApiOverrideGuard;
+
+    impl FacReviewApiOverrideGuard {
+        fn install(
+            run_result: Result<u8, String>,
+            lifecycle_result: Result<usize, String>,
+        ) -> Self {
+            fac_review_api::set_run_gates_local_worker_override(Some(run_result));
+            fac_review_api::set_gate_lifecycle_override(Some(lifecycle_result));
+            Self
+        }
+    }
+
+    impl Drop for FacReviewApiOverrideGuard {
+        fn drop(&mut self) {
+            fac_review_api::set_run_gates_local_worker_override(None);
+            fac_review_api::set_gate_lifecycle_override(None);
+        }
+    }
+
     fn make_receipt_test_spec() -> FacJobSpecV1 {
         let repo_root = PathBuf::from(repo_toplevel_for_tests());
         let repo_id = resolve_repo_id(&repo_root);
@@ -7930,6 +7979,93 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(hardening_hash.as_str()),
             "queued gates receipt must bind sandbox hardening hash"
+        );
+    }
+
+    #[test]
+    fn test_execute_queued_gates_job_denies_when_lifecycle_replay_returns_illegal_transition() {
+        let _override_guard = FacReviewApiOverrideGuard::install(
+            Ok(exit_codes::SUCCESS),
+            Err("illegal transition: pushed + gates_started".to_string()),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let queue_root = dir.path().join("queue");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        ensure_queue_dirs(&queue_root).expect("create queue dirs");
+
+        let claimed_path = queue_root
+            .join(CLAIMED_DIR)
+            .join("gates-lifecycle-illegal.json");
+        fs::write(&claimed_path, b"{}").expect("seed claimed file");
+        let claimed_file_name = "gates-lifecycle-illegal.json";
+
+        let repo_root = PathBuf::from(repo_toplevel_for_tests());
+        let current_head = resolve_workspace_head(&repo_root).expect("resolve workspace head");
+        let mut spec = make_receipt_test_spec();
+        spec.source.head_sha = current_head;
+        spec.source.patch = Some(serde_json::json!({
+            "schema": GATES_JOB_OPTIONS_SCHEMA,
+            "force": false,
+            "quick": false,
+            "timeout_seconds": 600,
+            "memory_max": "48G",
+            "pids_max": 1536,
+            "cpu_quota": "auto",
+            "gate_profile": "throughput",
+            "workspace_root": repo_root.to_string_lossy(),
+        }));
+
+        let boundary_trace = ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
+        };
+        let queue_trace = JobQueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "consume".to_string(),
+            defect_reason: None,
+            cost_estimate_ticks: None,
+        };
+        let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
+        let hardening_hash = apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
+        let network_hash = apm2_core::fac::NetworkPolicy::deny().content_hash_hex();
+
+        let outcome = execute_queued_gates_job(
+            &spec,
+            &claimed_path,
+            claimed_file_name,
+            &queue_root,
+            &fac_root,
+            &boundary_trace,
+            &queue_trace,
+            None,
+            &tuple_digest,
+            &spec.job_spec_digest,
+            &hardening_hash,
+            &network_hash,
+            1,
+            0,
+            0,
+            0,
+        );
+        let reason = match outcome {
+            JobOutcome::Denied { reason } => reason,
+            other => panic!("expected denied outcome, got {other:?}"),
+        };
+        assert!(reason.contains("lifecycle update failed"));
+        assert!(reason.contains("illegal transition"));
+        assert!(
+            queue_root
+                .join(DENIED_DIR)
+                .join(claimed_file_name)
+                .is_file(),
+            "job should be moved to denied on lifecycle replay failure"
         );
     }
 

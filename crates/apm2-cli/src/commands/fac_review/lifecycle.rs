@@ -1293,6 +1293,56 @@ fn list_repo_pr_numbers(owner_repo: &str) -> Result<Vec<u32>, String> {
     Ok(pr_numbers)
 }
 
+fn apply_gate_result_replay_event(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    event: &LifecycleEventKind,
+    event_name: &str,
+) -> Result<(), String> {
+    apply_event(owner_repo, pr_number, head_sha, event)
+        .map(|_| ())
+        .map_err(|err| {
+            format!(
+                "failed gate-result replay event `{event_name}` for PR #{pr_number} ({owner_repo}@{head_sha}): {err}"
+            )
+        })
+}
+
+fn replay_gate_result_events_for_pr(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    passed: bool,
+) -> Result<(), String> {
+    apply_gate_result_replay_event(
+        owner_repo,
+        pr_number,
+        head_sha,
+        &LifecycleEventKind::PushObserved,
+        "push_observed",
+    )?;
+    apply_gate_result_replay_event(
+        owner_repo,
+        pr_number,
+        head_sha,
+        &LifecycleEventKind::GatesStarted,
+        "gates_started",
+    )?;
+    let (terminal_event, terminal_name) = if passed {
+        (LifecycleEventKind::GatesPassed, "gates_passed")
+    } else {
+        (LifecycleEventKind::GatesFailed, "gates_failed")
+    };
+    apply_gate_result_replay_event(
+        owner_repo,
+        pr_number,
+        head_sha,
+        &terminal_event,
+        terminal_name,
+    )
+}
+
 pub fn apply_gate_result_events_for_repo_sha(
     owner_repo: &str,
     head_sha: &str,
@@ -1310,49 +1360,7 @@ pub fn apply_gate_result_events_for_repo_sha(
         if !is_gate_result_replay_candidate_state(&snapshot.pr_state) {
             continue;
         }
-
-        if let Err(err) = apply_event(
-            owner_repo,
-            pr_number,
-            head_sha,
-            &LifecycleEventKind::PushObserved,
-        ) {
-            if err.contains("illegal transition") {
-                eprintln!(
-                    "WARNING: skipping gate-result replay for PR #{pr_number} ({owner_repo}@{head_sha}) due to push_observed transition mismatch: {err}"
-                );
-                continue;
-            }
-            return Err(err);
-        }
-        if let Err(err) = apply_event(
-            owner_repo,
-            pr_number,
-            head_sha,
-            &LifecycleEventKind::GatesStarted,
-        ) {
-            if err.contains("illegal transition") {
-                eprintln!(
-                    "WARNING: skipping gate-result replay for PR #{pr_number} ({owner_repo}@{head_sha}) due to gates_started transition mismatch: {err}"
-                );
-                continue;
-            }
-            return Err(err);
-        }
-        let terminal_event = if passed {
-            LifecycleEventKind::GatesPassed
-        } else {
-            LifecycleEventKind::GatesFailed
-        };
-        if let Err(err) = apply_event(owner_repo, pr_number, head_sha, &terminal_event) {
-            if err.contains("illegal transition") {
-                eprintln!(
-                    "WARNING: skipping gate-result replay for PR #{pr_number} ({owner_repo}@{head_sha}) due to terminal transition mismatch: {err}"
-                );
-                continue;
-            }
-            return Err(err);
-        }
+        replay_gate_result_events_for_pr(owner_repo, pr_number, head_sha, passed)?;
         applied = applied.saturating_add(1);
     }
     Ok(applied)
@@ -4917,13 +4925,13 @@ mod tests {
         MERGE_EVIDENCE_START, MERGE_RECEIPT_BINDING_SUFFIX, MergeEvidenceBinding,
         MergeProjectionContext, MergeReceiptBindingRecord, PrLifecycleState, TrackedAgentState,
         acquire_registry_lock, active_agents_for_pr, apply_event,
-        apply_gate_result_events_for_repo_sha, bind_reviewer_runtime,
-        cleanup_merged_branch_local_state_inner, compute_merge_receipt_changeset_digest,
-        delete_remote_branch_projection, derive_auto_verdict_decision_from_findings,
-        derive_fac_required_status_projection, enforce_pr_capacity,
-        fac_required_status_projection_for_decision, finalize_auto_verdict_candidate,
-        load_fac_required_status_contexts, load_registry, normalize_hash_list,
-        normalize_sha256_hex_digest, persist_merge_receipt_binding_record,
+        apply_gate_result_events_for_repo_sha, apply_gate_result_replay_event,
+        bind_reviewer_runtime, cleanup_merged_branch_local_state_inner,
+        compute_merge_receipt_changeset_digest, delete_remote_branch_projection,
+        derive_auto_verdict_decision_from_findings, derive_fac_required_status_projection,
+        enforce_pr_capacity, fac_required_status_projection_for_decision,
+        finalize_auto_verdict_candidate, load_fac_required_status_contexts, load_registry,
+        normalize_hash_list, normalize_sha256_hex_digest, persist_merge_receipt_binding_record,
         project_fac_required_status_to_contexts_with, project_fac_required_status_with,
         project_merge_to_github_with, register_agent_spawn, register_reviewer_dispatch,
         save_registry, sync_local_main_with_origin, token_hash, try_fast_forward_main,
@@ -5233,6 +5241,43 @@ mod tests {
         )
         .expect("noop for unknown sha");
         assert_eq!(applied, 0);
+    }
+
+    #[test]
+    fn apply_gate_result_replay_event_fails_closed_on_illegal_gates_started_transition() {
+        let pr = next_pr();
+        let repo = next_repo("gate-replay-illegal-gates-started", pr);
+        let sha = "1234123412341234123412341234123412341234";
+
+        let err = apply_gate_result_replay_event(
+            &repo,
+            pr,
+            sha,
+            &LifecycleEventKind::GatesStarted,
+            "gates_started",
+        )
+        .expect_err("gates_started from untracked state must fail closed");
+        assert!(err.contains("illegal transition"));
+        assert!(err.contains("gates_started"));
+    }
+
+    #[test]
+    fn apply_gate_result_replay_event_fails_closed_on_illegal_terminal_transition() {
+        let pr = next_pr();
+        let repo = next_repo("gate-replay-illegal-terminal", pr);
+        let sha = "5678567856785678567856785678567856785678";
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+
+        let err = apply_gate_result_replay_event(
+            &repo,
+            pr,
+            sha,
+            &LifecycleEventKind::GatesPassed,
+            "gates_passed",
+        )
+        .expect_err("terminal replay from pushed state must fail closed");
+        assert!(err.contains("illegal transition"));
+        assert!(err.contains("gates_passed"));
     }
 
     #[test]
