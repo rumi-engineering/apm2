@@ -1411,6 +1411,17 @@ and content-addressed integrity verification (TCK-00542).
 - [INV-EB-020] (TCK-00555) Import cross-checks `actual_leakage_bits` against the
   `leakage_budget_receipt.leakage_bits` in the boundary check (or requires 0 when
   no receipt is present). Prevents forged leakage bit counts.
+- [INV-EB-021] (TCK-00555) Import independently recomputes the canonical envelope
+  byte size from the serialized data being imported (`data.len()`) and requires
+  `decision.actual_export_bytes` to equal this recomputed size before any policy
+  comparisons. This prevents an attacker from forging a lower `actual_export_bytes`
+  to bypass byte-dimension declassification enforcement.
+- [INV-EB-022] (TCK-00555) Export-time declassification receipt validation
+  (`validate_declassification_receipt`) always checks
+  `authorized_leakage_bits >= actual_leakage_bits` whenever a declassification
+  receipt is present — not only when the leakage-bit dimension itself exceeded
+  policy. This aligns export semantics with import semantics (INV-EB-016) and
+  prevents bundles that pass export but are rejected on import.
 - [INV-EB-017] (TCK-00555) Legacy hash compatibility: when `leakage_budget_decision`
   is absent AND the envelope schema is the legacy schema ID
   (`apm2.fac.evidence_bundle.v1`), the content hash is computed WITHOUT the leakage
