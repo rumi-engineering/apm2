@@ -310,17 +310,11 @@ fn gate_attestation_digest(
         .map(|attestation| attestation.attestation_digest)
 }
 
-fn reuse_decision_for_gate(
-    cache: Option<&GateCache>,
-    gate_name: &str,
-    attestation_digest: Option<&str>,
-    verifying_key: Option<&apm2_core::crypto::VerifyingKey>,
-) -> ReuseDecision {
-    cache.map_or_else(
-        || ReuseDecision::miss("no_record"),
-        |cached| cached.check_reuse(gate_name, attestation_digest, true, verifying_key),
-    )
-}
+// NOTE: `reuse_decision_for_gate` (v2-only reuse path) was removed as part
+// of the TCK-00541 MAJOR security fix. V2 entries lack RFC-0028/0029
+// binding proof and cannot satisfy v3 compound-key continuity. All reuse
+// decisions now flow through `reuse_decision_with_v3_fallback` which
+// only allows v3-native entries to satisfy reuse.
 
 // =============================================================================
 // Gate Cache V3 helpers (TCK-00541)
@@ -378,14 +372,24 @@ fn cache_v2_root() -> Option<std::path::PathBuf> {
     Some(apm2_home.join("private/fac/gate_cache_v2"))
 }
 
-/// Try to reuse from v3 cache first, then fall back to v2.
+/// Try to reuse from v3 cache first; v2 fallback is disabled for security.
 ///
 /// Returns a unified `ReuseDecision` that can be used by the evidence flow.
-/// When v3 hits, the v3 decision reason is used. When v3 misses and v2 hits,
-/// the v2 decision is used.
+/// When v3 hits, the v3 decision reason is used.
+///
+/// # Security: V2 fallback disabled for reuse (TCK-00541 MAJOR fix)
+///
+/// [INV-GCV3-001] V2 entries lack RFC-0028/0029 binding proof and cannot
+/// satisfy v3 compound-key continuity requirements. When a v3 compound key
+/// is available (meaning v3 binding enforcement is active), v2 fallback
+/// is unconditionally disabled for reuse decisions to prevent stale PASS
+/// decisions from propagating across authority-context drift.
+///
+/// V2 entries may still be loaded for informational/display purposes but
+/// will never produce a reusable `ReuseDecision`.
 fn reuse_decision_with_v3_fallback(
     v3_cache: Option<&GateCacheV3>,
-    v2_cache: Option<&GateCache>,
+    _v2_cache: Option<&GateCache>,
     gate_name: &str,
     attestation_digest: Option<&str>,
     verifying_key: Option<&apm2_core::crypto::VerifyingKey>,
@@ -397,8 +401,11 @@ fn reuse_decision_with_v3_fallback(
             return ReuseDecision::hit_v3();
         }
     }
-    // Fall back to v2.
-    reuse_decision_for_gate(v2_cache, gate_name, attestation_digest, verifying_key)
+    // [INV-GCV3-001] V2 fallback disabled for reuse. V2 entries do not
+    // carry RFC-0028/0029 binding proof and cannot satisfy v3 compound-key
+    // continuity. Returning miss ensures fail-closed behavior: gates that
+    // only have v2 entries will be re-executed under v3 with full bindings.
+    ReuseDecision::miss("v3_miss_v2_fallback_disabled")
 }
 
 /// Unified cached payload fields extracted from either v2 or v3.
@@ -3850,9 +3857,14 @@ mod tests {
         assert_eq!(payload.log_path.as_deref(), Some("/tmp/v3-path.log"));
     }
 
-    /// Prove that when v3 misses but v2 hits, the payload comes from v2.
+    /// [INV-GCV3-001] Prove that when v3 misses and v2 has a signed entry,
+    /// v2 fallback is denied for reuse (security: no binding continuity proof).
+    ///
+    /// TCK-00541 MAJOR fix: v2 entries lack RFC-0028/0029 binding proof and
+    /// cannot satisfy v3 compound-key continuity requirements. The gate
+    /// must be re-executed under v3 with full bindings.
     #[test]
-    fn v2_fallback_when_v3_misses() {
+    fn v2_fallback_denied_when_v3_misses() {
         use apm2_core::crypto::Signer;
         use apm2_core::fac::gate_cache_v3::{GateCacheV3, V3CompoundKey};
 
@@ -3901,7 +3913,8 @@ mod tests {
         let attestation_digest =
             "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-        // v3 cache exists but has no "doc" entry, so v2 fallback is used.
+        // [INV-GCV3-001] v3 cache exists but has no "doc" entry. V2 fallback
+        // MUST be denied — v2 entries lack binding continuity proof.
         let reuse = reuse_decision_with_v3_fallback(
             Some(&v3_cache),
             Some(&v2_cache),
@@ -3909,16 +3922,13 @@ mod tests {
             Some(attestation_digest),
             Some(&vk),
         );
-        assert!(reuse.reusable);
-        assert_eq!(reuse.source, CacheSource::V2);
-
-        // Payload must come from v2.
-        let payload = resolve_cached_payload(&reuse, Some(&v3_cache), Some(&v2_cache), gate_name);
-        let payload = payload.expect("v2 fallback payload must resolve");
-        assert_eq!(payload.duration_secs, 77);
+        assert!(
+            !reuse.reusable,
+            "v2 fallback must be denied: v2 entries lack RFC-0028/0029 binding proof"
+        );
         assert_eq!(
-            payload.evidence_log_digest.as_deref(),
-            Some("v2-fallback-digest")
+            reuse.reason, "v3_miss_v2_fallback_disabled",
+            "reason must indicate v2 fallback was disabled"
         );
     }
 }

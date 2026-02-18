@@ -19,13 +19,21 @@
 //! - RFC-0028/0029 receipt bindings are mandatory for reuse in default mode.
 //! - Unknown/corrupt entries are rejected (never treated as hits).
 //!
-//! # V2 Read Compatibility
+//! # V2 Read Compatibility (Informational Only — No Reuse)
 //!
-//! The v3 cache reads from v2 as a best-effort fallback. V2 entries that pass
-//! all v3 reuse checks (attestation match, signature valid, receipt bindings
-//! present) can be promoted to v3 on the next write cycle. Legacy entries
-//! without receipt bindings are rejected unless the `allow_legacy_cache`
-//! override is set.
+//! The v3 cache can read from v2 directories for informational display, but
+//! v2-sourced entries are **never reusable** for gate verdict decisions.
+//!
+//! [INV-GCV3-001] V2 entries lack cryptographic proof of RFC-0028/0029
+//! binding continuity: they were signed under the v2 schema which does not
+//! include policy hash, toolchain fingerprint, or receipt hashes. The
+//! compound key is assigned by the loader, not bound at production time.
+//! Allowing v2 entries to satisfy v3 reuse would let stale PASS decisions
+//! propagate across authority-context drift.
+//!
+//! `check_reuse` enforces this by returning
+//! `miss("v2_sourced_no_binding_proof")` for any cache loaded via
+//! `load_from_v2_dir`.
 //!
 //! # GC Policy
 //!
@@ -339,6 +347,19 @@ impl V3ReuseDecision {
 /// Holds all gate results for a given compound key. The compound key is
 /// validated at construction time. Writing to disk stores one file per gate
 /// under the index key directory.
+///
+/// # Security Invariant (TCK-00541 MAJOR fix)
+///
+/// [INV-GCV3-001] Entries loaded from v2 fallback (`load_from_v2_dir`) are
+/// marked `v2_sourced = true` and are **never reusable** for gate verdict
+/// decisions. V2 entries lack cryptographic proof of RFC-0028/0029 binding
+/// continuity: they were signed under a v2 schema that does not include
+/// policy hash, toolchain fingerprint, or receipt hashes. Treating v2
+/// entries as reusable under a v3 compound key would allow stale PASS
+/// decisions to propagate across authority-context drift.
+///
+/// The `check_reuse` method enforces this invariant by returning
+/// `miss("v2_sourced_no_binding_proof")` for any v2-sourced cache.
 #[derive(Debug, Clone)]
 pub struct GateCacheV3 {
     /// The SHA this cache is for.
@@ -347,6 +368,14 @@ pub struct GateCacheV3 {
     pub compound_key: V3CompoundKey,
     /// Gate results keyed by gate name.
     pub gates: BTreeMap<String, V3GateResult>,
+    /// Whether the entries were loaded from a v2 fallback directory.
+    ///
+    /// When `true`, `check_reuse` unconditionally denies reuse because
+    /// v2 entries do not carry RFC-0028/0029 binding proof and cannot
+    /// satisfy v3 compound-key continuity requirements.
+    ///
+    /// [INV-GCV3-001] Fail-closed: v2-sourced entries never satisfy reuse.
+    v2_sourced: bool,
 }
 
 impl GateCacheV3 {
@@ -370,7 +399,17 @@ impl GateCacheV3 {
             sha: sha.to_string(),
             compound_key,
             gates: BTreeMap::new(),
+            v2_sourced: false,
         })
+    }
+
+    /// Returns `true` if this cache was loaded from v2 fallback data.
+    ///
+    /// V2-sourced caches lack RFC-0028/0029 binding proof and are never
+    /// reusable for gate verdict decisions ([INV-GCV3-001]).
+    #[must_use]
+    pub const fn is_v2_sourced(&self) -> bool {
+        self.v2_sourced
     }
 
     /// Get the index key for this cache (BLAKE3-256 of compound key).
@@ -405,6 +444,7 @@ impl GateCacheV3 {
     /// Evaluate whether a v3 cache entry is safe to reuse.
     ///
     /// A v3 cache hit requires:
+    /// 0. Cache is NOT v2-sourced ([INV-GCV3-001]).
     /// 1. Gate result exists and status is "PASS".
     /// 2. Not quick-mode if `require_full_mode` is set.
     /// 3. Attestation digest matches the expected value.
@@ -413,6 +453,14 @@ impl GateCacheV3 {
     ///
     /// The compound key match is implicit: the caller looked up this cache
     /// by compound key, so if the entry exists, the compound key matched.
+    ///
+    /// # Security: V2-Sourced Deny (TCK-00541 MAJOR fix)
+    ///
+    /// V2-sourced entries are unconditionally denied. V2 entries do not
+    /// carry RFC-0028/0029 binding proof and were signed under the v2
+    /// schema which lacks policy hash, toolchain fingerprint, and receipt
+    /// hashes. Allowing v2 entries to satisfy v3 reuse would let stale
+    /// PASS decisions propagate across authority-context drift.
     #[must_use]
     pub fn check_reuse(
         &self,
@@ -421,6 +469,13 @@ impl GateCacheV3 {
         require_full_mode: bool,
         verifying_key: Option<&crate::crypto::VerifyingKey>,
     ) -> V3ReuseDecision {
+        // [INV-GCV3-001] Fail-closed: v2-sourced entries never satisfy reuse.
+        // V2 entries lack RFC-0028/0029 binding proof; the compound key was
+        // assigned by the loader, not cryptographically bound at production time.
+        if self.v2_sourced {
+            return V3ReuseDecision::miss("v2_sourced_no_binding_proof");
+        }
+
         let Some(cached) = self.get(gate) else {
             return V3ReuseDecision::miss("no_record");
         };
@@ -686,6 +741,7 @@ impl GateCacheV3 {
             sha: sha.to_string(),
             compound_key: compound_key.clone(),
             gates: BTreeMap::new(),
+            v2_sourced: false, // Native v3 load: entries carry binding proof.
         };
         let mut count = 0usize;
         for entry in entries.flatten() {
@@ -727,11 +783,19 @@ impl GateCacheV3 {
     ///
     /// V2 entries live at `v2_root / {sha} / {gate}.yaml`. They lack
     /// compound-key binding (no policy hash, no toolchain fingerprint, no
-    /// receipt hashes). Results loaded from v2 are treated as unbound and
-    /// will only pass `check_reuse` if attestation digest and signature match.
+    /// receipt hashes). Results loaded from v2 are **informational only**
+    /// and are marked `v2_sourced = true`.
+    ///
+    /// # Security: V2 entries are never reusable ([INV-GCV3-001])
+    ///
+    /// V2 entries do not carry RFC-0028/0029 binding proof. The compound
+    /// key is assigned by the caller, not cryptographically bound at
+    /// production time. `check_reuse` unconditionally denies reuse for
+    /// v2-sourced caches to prevent stale PASS decisions from propagating
+    /// across authority-context drift.
     ///
     /// This method is called when `load_from_dir` returns `None` (v3 miss).
-    /// V2 entries are never written by v3 code — read-only fallback only.
+    /// V2 entries are never written by v3 code -- read-only fallback only.
     ///
     /// Returns `None` if the v2 SHA directory does not exist or contains no
     /// valid entries.
@@ -750,6 +814,9 @@ impl GateCacheV3 {
             sha: sha.to_string(),
             compound_key: compound_key.clone(),
             gates: BTreeMap::new(),
+            // [INV-GCV3-001] V2-sourced: lacks RFC-0028/0029 binding proof.
+            // check_reuse will unconditionally deny reuse.
+            v2_sourced: true,
         };
         let mut count = 0usize;
         for entry in entries.flatten() {
@@ -1540,7 +1607,7 @@ mod tests {
     }
 
     #[test]
-    fn load_from_v2_dir_returns_fallback_results() {
+    fn load_from_v2_dir_returns_fallback_results_but_marked_v2_sourced() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let sha = "abc123";
         let v2_sha_dir = dir.path().join("gate_cache_v2").join(sha);
@@ -1554,6 +1621,11 @@ mod tests {
         assert_eq!(loaded.gates.len(), 2);
         assert_eq!(loaded.get("rustfmt").unwrap().status, "PASS");
         assert_eq!(loaded.get("clippy").unwrap().status, "PASS");
+        // [INV-GCV3-001] Must be marked as v2-sourced.
+        assert!(
+            loaded.is_v2_sourced(),
+            "v2-loaded cache must be marked v2_sourced"
+        );
     }
 
     #[test]
@@ -1640,5 +1712,160 @@ mod tests {
         let cache = make_signed_v3(&signer);
         // Should succeed (valid key).
         cache.save_to_dir(&root).expect("save should succeed");
+    }
+
+    // =========================================================================
+    // TCK-00541 MAJOR Security Fix: V2 Binding Continuity Regression Tests
+    // =========================================================================
+
+    /// [INV-GCV3-001] V2-sourced cache entries MUST be denied by `check_reuse`.
+    ///
+    /// Regression test: v2 entries lack RFC-0028/0029 binding proof. Even if
+    /// the entry has a valid signature, attestation match, and PASS status,
+    /// reuse must be denied because the signature was produced under the v2
+    /// schema which does not cover the compound key dimensions.
+    #[test]
+    fn v2_sourced_entries_denied_by_check_reuse() {
+        let signer = Signer::generate();
+        let key = sample_compound_key();
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        // Build a v3 cache and sign it (simulates a well-formed entry).
+        let mut cache = GateCacheV3::new("abc123", key).expect("new");
+        cache.set("rustfmt", sample_gate_result()).expect("set");
+        cache.sign_all(&signer);
+
+        // Verify it WOULD pass reuse if v2_sourced were false.
+        let vk = signer.verifying_key();
+        let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
+        assert!(decision.reusable, "native v3 entry should be reusable");
+        assert!(!cache.is_v2_sourced());
+
+        // Now simulate v2 sourcing by loading from v2 directory.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let v2_sha_dir = dir.path().join("gate_cache_v2").join("abc123");
+        write_v2_entry(&v2_sha_dir, "abc123", "rustfmt", true);
+
+        let v2_key = sample_compound_key();
+        let v2_root = dir.path().join("gate_cache_v2");
+        let v2_loaded = GateCacheV3::load_from_v2_dir(&v2_root, "abc123", &v2_key)
+            .expect("should load v2 entries");
+
+        // V2-sourced entries MUST be denied regardless of other checks.
+        assert!(v2_loaded.is_v2_sourced());
+        let v2_decision = v2_loaded.check_reuse("rustfmt", Some(digest), false, None);
+        assert!(
+            !v2_decision.reusable,
+            "v2-sourced entries must never satisfy reuse"
+        );
+        assert_eq!(
+            v2_decision.reason, "v2_sourced_no_binding_proof",
+            "denial reason must cite missing binding proof"
+        );
+    }
+
+    /// [INV-GCV3-001] Profile drift regression: same SHA, different authority
+    /// context (different RFC-0028/0029 receipt hashes) must not produce a
+    /// v3 reuse hit via v2 fallback.
+    ///
+    /// Scenario: Attacker has a valid v2 entry for SHA "abc123". The v3
+    /// compound key uses different receipt hashes (authority context drift).
+    /// The v2 fallback loader assigns the current compound key to the v2
+    /// data. `check_reuse` must deny because `v2_sourced` is true.
+    #[test]
+    fn profile_drift_v2_fallback_denied() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let sha = "abc123";
+
+        // Write a valid v2 entry.
+        let v2_sha_dir = dir.path().join("gate_cache_v2").join(sha);
+        write_v2_entry(&v2_sha_dir, sha, "rustfmt", true);
+
+        // Load with a DIFFERENT compound key (simulates authority drift).
+        let drifted_key = V3CompoundKey::new(
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "b3-256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            // Different receipt hashes (authority context drift).
+            "b3-256:1111111111111111111111111111111111111111111111111111111111111111",
+            "b3-256:2222222222222222222222222222222222222222222222222222222222222222",
+        )
+        .expect("valid drifted compound key");
+
+        let v2_root = dir.path().join("gate_cache_v2");
+        let loaded = GateCacheV3::load_from_v2_dir(&v2_root, sha, &drifted_key)
+            .expect("v2 load succeeds (informational)");
+
+        // The compound key on the loaded cache matches the drifted key
+        // (assigned by loader, NOT proven by the v2 entry).
+        assert_eq!(loaded.compound_key, drifted_key);
+        assert!(loaded.is_v2_sourced());
+
+        // check_reuse MUST deny despite the compound key "matching".
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let decision = loaded.check_reuse("rustfmt", Some(digest), false, None);
+        assert!(
+            !decision.reusable,
+            "v2-sourced entry under drifted authority context must be denied"
+        );
+        assert_eq!(decision.reason, "v2_sourced_no_binding_proof");
+    }
+
+    /// [INV-GCV3-001] Native v3 entries (not v2-sourced) are still reusable.
+    ///
+    /// Ensures the `v2_sourced` flag does not break legitimate v3 reuse.
+    #[test]
+    fn native_v3_entries_remain_reusable() {
+        let signer = Signer::generate();
+        let cache = make_signed_v3(&signer);
+        assert!(!cache.is_v2_sourced());
+
+        let vk = signer.verifying_key();
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
+        assert!(
+            decision.reusable,
+            "native v3 signed entry must remain reusable"
+        );
+        assert_eq!(decision.reason, "v3_compound_key_match");
+    }
+
+    /// [INV-GCV3-001] V3 cache loaded from disk (save/load roundtrip) is
+    /// NOT v2-sourced and remains reusable.
+    #[test]
+    fn v3_disk_roundtrip_not_v2_sourced() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let root = dir.path().join("gate_cache_v3");
+        std::fs::create_dir_all(&root).expect("mkdir");
+
+        let signer = Signer::generate();
+        let cache = make_signed_v3(&signer);
+        cache.save_to_dir(&root).expect("save");
+
+        let loaded =
+            GateCacheV3::load_from_dir(&root, "abc123", &cache.compound_key).expect("load");
+        assert!(
+            !loaded.is_v2_sourced(),
+            "v3 disk roundtrip must not be v2-sourced"
+        );
+
+        let vk = signer.verifying_key();
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let decision = loaded.check_reuse("rustfmt", Some(digest), true, Some(&vk));
+        assert!(
+            decision.reusable,
+            "v3 disk roundtrip entry must be reusable"
+        );
+    }
+
+    /// [INV-GCV3-001] Newly constructed caches are NOT v2-sourced.
+    #[test]
+    fn new_cache_not_v2_sourced() {
+        let key = sample_compound_key();
+        let cache = GateCacheV3::new("sha123", key).expect("new");
+        assert!(
+            !cache.is_v2_sourced(),
+            "newly constructed cache must not be v2-sourced"
+        );
     }
 }

@@ -3052,22 +3052,33 @@ distinguishes v3 prune targets from v2.
 
 ### Security Invariants (TCK-00541)
 
-- [INV-GCV3-001] All compound key components are validated at construction
+- [INV-GCV3-001] **V2-sourced entries are never reusable for gate verdict
+  decisions.** V2 entries lack cryptographic proof of RFC-0028/0029 binding
+  continuity: they were signed under the v2 schema which does not include
+  policy hash, toolchain fingerprint, or receipt hashes. The compound key
+  is assigned by the loader, not cryptographically bound at production time.
+  `check_reuse()` unconditionally returns
+  `miss("v2_sourced_no_binding_proof")` for any cache loaded via
+  `load_from_v2_dir()`. The `reuse_decision_with_v3_fallback()` function
+  in the evidence pipeline also disables direct v2 fallback for reuse
+  decisions (`miss("v3_miss_v2_fallback_disabled")`). This prevents stale
+  PASS decisions from propagating across authority-context drift.
+- [INV-GCV3-002] All compound key components are validated at construction
   time. Empty or whitespace-only components are rejected (fail-closed).
-- [INV-GCV3-002] String fields are bounded by `MAX_V3_STRING_FIELD_LENGTH`
+- [INV-GCV3-003] String fields are bounded by `MAX_V3_STRING_FIELD_LENGTH`
   (1024 bytes). Gate count bounded by `MAX_V3_GATES_PER_INDEX` (64).
-- [INV-GCV3-003] On-disk reads use `O_NOFOLLOW` (Unix), bounded size
+- [INV-GCV3-004] On-disk reads use `O_NOFOLLOW` (Unix), bounded size
   (`MAX_V3_ENTRY_SIZE` = 512 KiB), and `serde(deny_unknown_fields)`.
-- [INV-GCV3-004] Writes use atomic staging-directory+rename pattern for
+- [INV-GCV3-005] Writes use atomic staging-directory+rename pattern for
   crash safety (no partial writes). Directories created with 0o700
   permissions.
-- [INV-GCV3-005] Index keys are validated (`b3-256:` prefix + 64 hex chars)
+- [INV-GCV3-006] Index keys are validated (`b3-256:` prefix + 64 hex chars)
   before filesystem use, preventing path traversal.
-- [INV-GCV3-006] Signer identity comparison uses `subtle::ConstantTimeEq`
+- [INV-GCV3-007] Signer identity comparison uses `subtle::ConstantTimeEq`
   to prevent timing side-channels.
-- [INV-GCV3-007] Signature verification uses domain-separated Ed25519 with
+- [INV-GCV3-008] Signature verification uses domain-separated Ed25519 with
   `GATE_CACHE_RECEIPT:` prefix, preventing cross-protocol replay.
-- [INV-GCV3-008] `check_reuse()` denies all entries when no verifying key
+- [INV-GCV3-009] `check_reuse()` denies all entries when no verifying key
   is provided, preventing forged-signature bypass (fail-closed).
-- [INV-GCV3-009] V2 read fallback validates SHA match before accepting
+- [INV-GCV3-010] V2 read fallback validates SHA match before accepting
   entries, preventing cross-SHA cache poisoning.

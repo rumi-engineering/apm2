@@ -266,6 +266,11 @@ pub enum CacheSource {
     /// Hit came from gate cache v3 (receipt-indexed, compound-key bound).
     V3,
     /// Hit came from gate cache v2 (SHA-indexed, attestation-only).
+    ///
+    /// [INV-GCV3-001] V2 reuse is disabled (TCK-00541 MAJOR fix). This
+    /// variant is retained for match exhaustiveness in `resolve_cached_payload`
+    /// but is no longer constructable from production reuse decisions.
+    #[allow(dead_code)]
     V2,
     /// No cache hit (miss).
     None,
@@ -280,7 +285,13 @@ pub struct ReuseDecision {
 }
 
 impl ReuseDecision {
+    /// V2 attestation-match hit.
+    ///
+    /// [INV-GCV3-001] V2 reuse is disabled (TCK-00541 MAJOR fix). This
+    /// constructor is retained for test compatibility but is no longer
+    /// called from production reuse decision paths.
     #[must_use]
+    #[allow(dead_code)]
     pub const fn hit() -> Self {
         Self {
             reusable: true,
@@ -680,7 +691,12 @@ impl GateCache {
         }
     }
 
-    /// Evaluate whether a cached gate result is safe to reuse.
+    /// Evaluate whether a cached gate result is safe to reuse (v2 path).
+    ///
+    /// [INV-GCV3-001] This v2 reuse check is no longer called from
+    /// production reuse decision paths (TCK-00541 MAJOR fix). All reuse
+    /// decisions flow through v3 `check_reuse` which requires compound-key
+    /// binding proof. Retained for test compatibility.
     ///
     /// In default mode, signature verification is mandatory: unsigned or
     /// forged receipts are rejected (fail-closed, TCK-00576).
@@ -689,6 +705,7 @@ impl GateCache {
     /// to skip signature verification (developer/test mode only).
     ///
     /// `require_full_mode` should be true for normal push pipeline runs.
+    #[allow(dead_code)]
     pub fn check_reuse(
         &self,
         gate: &str,
