@@ -81,36 +81,7 @@ pub fn plan_gc(
     let statuses = load_lane_statuses(lane_manager, &known_lane_ids)?;
     let mut targets = collect_idle_lane_targets(lane_manager, &statuses);
 
-    let gate_cache_root = fac_root.join("gate_cache_v2");
-    if let Ok(entries) = std::fs::read_dir(&gate_cache_root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if is_stale_by_mtime(&path, GATE_CACHE_TTL_SECS, now_secs) {
-                targets.push(GcTarget {
-                    path: path.clone(),
-                    allowed_parent: gate_cache_root.clone(),
-                    kind: crate::fac::gc_receipt::GcActionKind::GateCache,
-                    estimated_bytes: estimate_dir_size(&path),
-                });
-            }
-        }
-    }
-
-    // Gate cache v3 (TCK-00541): receipt-indexed cache store.
-    let gate_cache_v3_root = fac_root.join("gate_cache_v3");
-    if let Ok(entries) = std::fs::read_dir(&gate_cache_v3_root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if is_stale_by_mtime(&path, GATE_CACHE_TTL_SECS, now_secs) {
-                targets.push(GcTarget {
-                    path: path.clone(),
-                    allowed_parent: gate_cache_v3_root.clone(),
-                    kind: crate::fac::gc_receipt::GcActionKind::GateCacheV3,
-                    estimated_bytes: estimate_dir_size(&path),
-                });
-            }
-        }
-    }
+    collect_stale_gate_cache_targets(fac_root, now_secs, &mut targets);
 
     let queue_root = infer_queue_root(fac_root);
     let cargo_home_root = fac_root.join(FAC_CARGO_HOME_DIR);
@@ -251,6 +222,40 @@ fn collect_idle_lane_targets(
         }
     }
     targets
+}
+
+fn collect_stale_gate_cache_targets(fac_root: &Path, now_secs: u64, targets: &mut Vec<GcTarget>) {
+    // Gate cache v2.
+    let gate_cache_root = fac_root.join("gate_cache_v2");
+    if let Ok(entries) = std::fs::read_dir(&gate_cache_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_stale_by_mtime(&path, GATE_CACHE_TTL_SECS, now_secs) {
+                targets.push(GcTarget {
+                    path: path.clone(),
+                    allowed_parent: gate_cache_root.clone(),
+                    kind: crate::fac::gc_receipt::GcActionKind::GateCache,
+                    estimated_bytes: estimate_dir_size(&path),
+                });
+            }
+        }
+    }
+
+    // Gate cache v3 (TCK-00541): receipt-indexed cache store.
+    let gate_cache_v3_root = fac_root.join("gate_cache_v3");
+    if let Ok(entries) = std::fs::read_dir(&gate_cache_v3_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_stale_by_mtime(&path, GATE_CACHE_TTL_SECS, now_secs) {
+                targets.push(GcTarget {
+                    path: path.clone(),
+                    allowed_parent: gate_cache_v3_root.clone(),
+                    kind: crate::fac::gc_receipt::GcActionKind::GateCacheV3,
+                    estimated_bytes: estimate_dir_size(&path),
+                });
+            }
+        }
+    }
 }
 
 /// Create a focused quarantine/denied GC plan with TTL and quota policy.
