@@ -24,10 +24,12 @@
 //!   has local filesystem privilege over the queue.
 //! - Cancellation receipts include the cancellation reason and previous state.
 //! - No evidence or log artifacts are deleted.
-//! - `stop_revoke` jobs bypass the RFC-0028 channel context token requirement;
-//!   the worker validates local-origin authority (queue directory ownership)
-//!   instead.  This is the `CONTROL_LANE` concept: operator-initiated control
-//!   jobs use filesystem-level privilege proof rather than broker tokens.
+//! - `stop_revoke` jobs carry a self-signed RFC-0028 channel context token
+//!   issued by the cancel command using the persistent FAC signing key.  The
+//!   worker validates this token on the control-lane admission path AND
+//!   verifies local-origin authority (queue directory ownership).  This
+//!   dual-layer enforcement ensures that cancellation requires both signing key
+//!   access and filesystem privilege (TCK-00587).
 //! - Receipt emission failures are fatal: the cancel command fails with an
 //!   error exit code rather than silently continuing without evidence.
 //!
@@ -378,7 +380,7 @@ fn cancel_claimed_job(
     json_output: bool,
 ) -> u8 {
     // Enqueue a stop_revoke job targeting this job.
-    let stop_revoke_spec = match build_stop_revoke_spec(job_id, reason) {
+    let stop_revoke_spec = match build_stop_revoke_spec(job_id, reason, fac_root) {
         Ok(spec) => spec,
         Err(e) => {
             output_error(json_output, &format!("cannot build stop_revoke spec: {e}"));
@@ -587,13 +589,17 @@ fn find_job_in_dir(dir: &Path, job_id: &str) -> Option<PathBuf> {
 /// The spec has priority 0 (highest) to ensure it is processed before any
 /// other pending jobs (INV-CANCEL-005).
 ///
-/// BLOCKER 2+3: The `channel_context_token` is set to `None` because
-/// `stop_revoke` jobs are operator-initiated local commands.  The worker
-/// validates local-origin authority (queue directory ownership) instead of an
-/// RFC-0028 token.  This is the `CONTROL_LANE` bypass: `stop_revoke` jobs are
-/// validated via `validate_job_spec_control_lane()` which skips the token
-/// requirement.
-fn build_stop_revoke_spec(target_job_id: &str, reason: &str) -> Result<FacJobSpecV1, String> {
+/// TCK-00587: RFC-0028 token enforcement. The cancel command issues a
+/// self-signed channel context token using the persistent FAC signing key.
+/// The worker validates this token on the control-lane admission path,
+/// ensuring that only entities with access to the signing key (same trust
+/// domain as queue owner) can issue valid cancellation tokens. This
+/// closes the "queue-write-only" authorization gap identified in review.
+fn build_stop_revoke_spec(
+    target_job_id: &str,
+    reason: &str,
+    fac_root: &Path,
+) -> Result<FacJobSpecV1, String> {
     let now = current_timestamp_epoch_secs();
     let stop_revoke_job_id = format!("stop-revoke-{target_job_id}-{now}");
 
@@ -607,9 +613,10 @@ fn build_stop_revoke_spec(target_job_id: &str, reason: &str) -> Result<FacJobSpe
         patch: None,
     };
 
-    // Build spec with highest priority (0).
-    // CONTROL_LANE: token is intentionally None; the worker uses
-    // validate_job_spec_control_lane() and verifies queue dir ownership.
+    let lease_id = format!("cancel-{target_job_id}");
+
+    // Build spec with highest priority (0) and placeholder fields that
+    // will be filled after digest computation.
     let mut spec = FacJobSpecV1 {
         schema: apm2_core::fac::job_spec::JOB_SPEC_SCHEMA_ID.to_string(),
         job_id: stop_revoke_job_id,
@@ -619,9 +626,9 @@ fn build_stop_revoke_spec(target_job_id: &str, reason: &str) -> Result<FacJobSpe
         priority: 0, // Highest priority.
         enqueue_time: format_iso8601(now),
         actuation: apm2_core::fac::job_spec::Actuation {
-            lease_id: format!("cancel-{target_job_id}"),
+            lease_id: lease_id.clone(),
             request_id: String::new(),
-            channel_context_token: None,
+            channel_context_token: None, // Set after digest computation.
             decoded_source: Some(truncate_string(reason, 64)),
         },
         source,
@@ -636,14 +643,77 @@ fn build_stop_revoke_spec(target_job_id: &str, reason: &str) -> Result<FacJobSpe
         cancel_target_job_id: Some(target_job_id.to_string()),
     };
 
-    // Compute digest.
+    // Compute digest (token is excluded from digest per FacJobSpecV1 contract).
     let digest = spec
         .compute_digest()
         .map_err(|e| format!("digest computation failed: {e}"))?;
     spec.job_spec_digest.clone_from(&digest);
-    spec.actuation.request_id = digest;
+    spec.actuation.request_id.clone_from(&digest);
+
+    // TCK-00587: Issue RFC-0028 channel context token for the stop_revoke
+    // spec. This ensures the worker can validate token authenticity before
+    // executing the cancellation (no unauth cancel).
+    let token = issue_stop_revoke_token(fac_root, &lease_id, &digest, now)?;
+    spec.actuation.channel_context_token = Some(token);
 
     Ok(spec)
+}
+
+/// Issues a self-signed RFC-0028 channel context token for a `stop_revoke`
+/// job spec.
+///
+/// Uses the persistent FAC signing key stored at
+/// `$APM2_HOME/private/fac/signing_key`. The worker validates this token
+/// using the corresponding verifying key, proving the cancel command was
+/// invoked by an entity with access to the signing key material.
+///
+/// # Errors
+///
+/// Returns an error if the signing key cannot be loaded or token issuance
+/// fails.
+fn issue_stop_revoke_token(
+    fac_root: &Path,
+    lease_id: &str,
+    request_id: &str,
+    issued_at_secs: u64,
+) -> Result<String, String> {
+    use apm2_core::channel::enforcement::{
+        ChannelBoundaryCheck, ChannelSource, DeclassificationIntentScope,
+        derive_channel_source_witness, issue_channel_context_token,
+    };
+
+    let signer = crate::commands::fac_key_material::load_or_generate_persistent_signer(fac_root)?;
+
+    // Build a minimal boundary check for the control-lane token.
+    // The source is TypedToolIntent because the cancel command is a
+    // structured, intentional operator action (not free-form output).
+    let source = ChannelSource::TypedToolIntent;
+    let witness = derive_channel_source_witness(source);
+    let check = ChannelBoundaryCheck {
+        source,
+        channel_source_witness: Some(witness),
+        broker_verified: false,
+        capability_verified: false,
+        context_firewall_verified: false,
+        policy_ledger_verified: false,
+        taint_allow: true,
+        classification_allow: true,
+        declass_receipt_valid: false,
+        declassification_intent: DeclassificationIntentScope::None,
+        redundancy_declassification_receipt: None,
+        boundary_flow_policy_binding: None,
+        leakage_budget_receipt: None,
+        timing_channel_budget: None,
+        disclosure_policy_binding: None,
+        leakage_budget_policy_max_bits: None,
+        declared_leakage_budget_bits: None,
+        timing_budget_policy_max_ticks: None,
+        declared_timing_budget_ticks: None,
+        token_binding: None,
+    };
+
+    issue_channel_context_token(&check, lease_id, request_id, issued_at_secs, &signer)
+        .map_err(|e| format!("cannot issue stop_revoke token: {e}"))
 }
 
 // =============================================================================
@@ -1224,9 +1294,17 @@ mod tests {
         assert!(truncated.is_char_boundary(truncated.len()));
     }
 
+    /// Helper: create a temp `fac_root` suitable for `build_stop_revoke_spec`.
+    fn test_fac_root() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(tmp.path().join(FAC_RECEIPTS_DIR)).unwrap();
+        tmp
+    }
+
     #[test]
     fn test_build_stop_revoke_spec() {
-        let spec = build_stop_revoke_spec("target-job-123", "test cancellation")
+        let fac_tmp = test_fac_root();
+        let spec = build_stop_revoke_spec("target-job-123", "test cancellation", fac_tmp.path())
             .expect("should build stop_revoke spec");
 
         assert_eq!(spec.kind, "stop_revoke");
@@ -1235,8 +1313,20 @@ mod tests {
         assert!(spec.job_id.starts_with("stop-revoke-target-job-123-"));
         assert!(!spec.job_spec_digest.is_empty());
         assert_eq!(spec.actuation.request_id, spec.job_spec_digest);
-        // CONTROL_LANE: token is intentionally None.
-        assert!(spec.actuation.channel_context_token.is_none());
+        // TCK-00587: RFC-0028 token MUST be present.
+        assert!(
+            spec.actuation.channel_context_token.is_some(),
+            "stop_revoke spec must carry RFC-0028 token"
+        );
+        assert!(
+            !spec
+                .actuation
+                .channel_context_token
+                .as_ref()
+                .unwrap()
+                .is_empty(),
+            "stop_revoke token must not be empty"
+        );
     }
 
     #[test]
@@ -1264,7 +1354,9 @@ mod tests {
         fs::create_dir_all(queue_root.join(QUARANTINE_DIR)).unwrap();
 
         // Create the same job spec in two directories.
-        let spec = build_stop_revoke_spec("ambig-target", "test").expect("spec builds");
+        let fac_tmp = test_fac_root();
+        let spec =
+            build_stop_revoke_spec("ambig-target", "test", fac_tmp.path()).expect("spec builds");
         let spec_json = serde_json::to_vec_pretty(&spec).unwrap();
         let file_name = format!("{}.json", spec.job_id);
         fs::write(queue_root.join(PENDING_DIR).join(&file_name), &spec_json).unwrap();
@@ -1287,7 +1379,9 @@ mod tests {
         fs::create_dir_all(fac_root.join(FAC_RECEIPTS_DIR)).unwrap();
 
         // Create a minimal job spec file in pending/.
-        let spec = build_stop_revoke_spec("dummy-target", "test").expect("spec builds");
+        let fac_tmp = test_fac_root();
+        let spec =
+            build_stop_revoke_spec("dummy-target", "test", fac_tmp.path()).expect("spec builds");
         let spec_json = serde_json::to_vec_pretty(&spec).unwrap();
         let file_name = format!("{}.json", spec.job_id);
         let pending_path = queue_root.join(PENDING_DIR).join(&file_name);
@@ -1325,7 +1419,9 @@ mod tests {
         fs::create_dir_all(fac_root.join(FAC_RECEIPTS_DIR)).unwrap();
 
         // Create a job spec in claimed/.
-        let spec = build_stop_revoke_spec("some-target", "test").expect("spec builds");
+        let fac_tmp = test_fac_root();
+        let spec =
+            build_stop_revoke_spec("some-target", "test", fac_tmp.path()).expect("spec builds");
         let spec_json = serde_json::to_vec_pretty(&spec).unwrap();
         let file_name = format!("{}.json", spec.job_id);
         let claimed_path = queue_root.join(CLAIMED_DIR).join(&file_name);
@@ -1423,7 +1519,9 @@ mod tests {
     #[test]
     fn test_read_job_spec_bounded_accepts_valid_spec() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let spec = build_stop_revoke_spec("bounded-read-test", "test").expect("spec builds");
+        let fac_tmp = test_fac_root();
+        let spec = build_stop_revoke_spec("bounded-read-test", "test", fac_tmp.path())
+            .expect("spec builds");
         let spec_json = serde_json::to_vec_pretty(&spec).unwrap();
         let spec_path = tmp.path().join("valid.json");
         fs::write(&spec_path, &spec_json).unwrap();
@@ -1479,8 +1577,10 @@ mod tests {
             JobSpecValidationPolicy, validate_job_spec_control_lane_with_policy,
         };
 
-        let spec = build_stop_revoke_spec("target-job-789", "operator cancellation")
-            .expect("should build stop_revoke spec");
+        let fac_tmp = test_fac_root();
+        let spec =
+            build_stop_revoke_spec("target-job-789", "operator cancellation", fac_tmp.path())
+                .expect("should build stop_revoke spec");
 
         // Confirm the spec uses the CONTROL_LANE_REPO_ID constant.
         assert_eq!(
@@ -1535,7 +1635,9 @@ mod tests {
         fs::create_dir_all(fac_root.join(FAC_RECEIPTS_DIR)).unwrap();
 
         // Create a workload job spec in claimed/ (simulates claimed job).
-        let workload_spec = build_stop_revoke_spec("workload-job-42", "test").expect("spec builds");
+        let fac_tmp = test_fac_root();
+        let workload_spec =
+            build_stop_revoke_spec("workload-job-42", "test", fac_tmp.path()).expect("spec builds");
         let spec_json = serde_json::to_vec_pretty(&workload_spec).unwrap();
         let file_name = format!("{}.json", workload_spec.job_id);
         let claimed_path = queue_root.join(CLAIMED_DIR).join(&file_name);
@@ -1610,7 +1712,9 @@ mod tests {
         fs::create_dir_all(queue_root.join(DENIED_DIR)).unwrap();
         fs::create_dir_all(queue_root.join(QUARANTINE_DIR)).unwrap();
 
-        let spec = build_stop_revoke_spec("show-target", "test").expect("spec builds");
+        let fac_tmp = test_fac_root();
+        let spec =
+            build_stop_revoke_spec("show-target", "test", fac_tmp.path()).expect("spec builds");
         let spec_json = serde_json::to_vec_pretty(&spec).unwrap();
         let file_name = format!("{}.json", spec.job_id);
         fs::write(queue_root.join(PENDING_DIR).join(&file_name), &spec_json).unwrap();
@@ -1728,7 +1832,9 @@ mod tests {
         let real_spec_dir = tmp.path().join("outside");
         fs::create_dir_all(&real_spec_dir).unwrap();
         let real_spec = real_spec_dir.join("symlink-target.json");
-        let spec = build_stop_revoke_spec("sym-job-test", "test").expect("spec builds");
+        let fac_tmp = test_fac_root();
+        let spec =
+            build_stop_revoke_spec("sym-job-test", "test", fac_tmp.path()).expect("spec builds");
         let spec_json = serde_json::to_vec_pretty(&spec).unwrap();
         fs::write(&real_spec, &spec_json).unwrap();
 

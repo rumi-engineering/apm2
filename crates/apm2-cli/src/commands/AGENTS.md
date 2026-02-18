@@ -270,16 +270,23 @@ Security invariants:
   containing characters outside `[A-Za-z0-9_-]` to prevent command injection via unit names.
 - **Control-lane refusal receipts** (`fac_worker.rs`): All deny paths in the control-lane
   `stop_revoke` flow emit explicit refusal receipts before moving jobs to `denied/`.
+- **RFC-0028 token enforcement for stop_revoke** (`fac_job.rs`, `fac_worker.rs`, TCK-00587):
+  The cancel command issues a self-signed RFC-0028 channel context token using the persistent
+  FAC signing key. The worker validates this token on the control-lane admission path before
+  executing stop_revoke. Missing or invalid tokens deny the job fail-closed. This dual-layer
+  enforcement (token + queue directory ownership) ensures cancellation requires both signing
+  key access and filesystem privilege.
 - **Stop/revoke explicit admission trace** (`fac_worker.rs`, TCK-00587): Control-lane
   stop_revoke jobs construct a `StopRevokeAdmissionTrace` before dispatching to
-  `handle_stop_revoke()`. The trace captures the explicit admission policy snapshot
-  (lane reservation permille, max wait ticks, TP predicate requirements), queue backlog
-  state at admission, and the worker first-pass anti-starvation flag. The trace is bound
-  to the receipt via the `stop_revoke_admission` field on `FacJobReceiptV1` and included
-  in both v1 and v2 canonical bytes for replay verification. Anti-starvation is
-  guaranteed by the sort order: candidates are sorted `(priority ASC, enqueue_time ASC,
-  job_id ASC)` where `StopRevoke` priority=0 is highest, ensuring all stop_revoke jobs
-  in a cycle are processed before any lower-priority lane.
+  `handle_stop_revoke()`. All trace fields are derived from actual runtime state:
+  `reservation_used` checks total queue capacity, `tick_floor_active` checks lane
+  max_wait_ticks against policy threshold, TP fields reflect that TPs are not evaluated
+  for control-lane (false = not evaluated). The trace is bound to the receipt via the
+  `stop_revoke_admission` field on `FacJobReceiptV1` and included in both v1 and v2
+  canonical bytes for replay verification. Anti-starvation is guaranteed by the sort
+  order: candidates are sorted `(priority ASC, enqueue_time ASC, job_id ASC)` where
+  `StopRevoke` priority=0 is highest, ensuring all stop_revoke jobs in a cycle are
+  processed before any lower-priority lane.
 - **RUNNING lease lifecycle** (`fac_worker.rs`): A RUNNING `LaneLeaseV1` is persisted after lane
   acquisition and lane profile loading, before any execution. Every early-return path removes the
   lease. This satisfies the `run_lane_cleanup` RUNNING-state precondition (INV-LANE-CLEANUP-005).

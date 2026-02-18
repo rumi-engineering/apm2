@@ -1168,11 +1168,14 @@ impl AntiEntropyBudget {
 /// - **Worker priority**: Workers MUST process `stop_revoke` candidates before
 ///   any other lane in each processing cycle (two-pass scan).
 ///
-/// # RFC-0028 Token Policy
+/// # RFC-0028 Token Policy (TCK-00587)
 ///
-/// Control-lane `stop_revoke` jobs bypass RFC-0028 channel context tokens.
-/// Instead, the worker verifies local-origin authority via queue directory
-/// ownership checks (`AUDITED_CONTROL_LANE_EXCEPTION`).
+/// Control-lane `stop_revoke` jobs carry a self-signed RFC-0028 channel
+/// context token issued by the cancel command using the persistent FAC
+/// signing key. The worker validates this token AND verifies local-origin
+/// authority via queue directory ownership checks. This dual-layer
+/// enforcement ensures cancellation requires both signing key access and
+/// filesystem privilege.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StopRevokeAdmissionPolicy {
