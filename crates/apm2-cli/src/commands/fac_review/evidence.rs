@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use apm2_core::fac::gate_cache_v3::{GateCacheV3, V3CompoundKey};
 use apm2_core::fac::{
     FacPolicyV1, LaneLockGuard, LaneManager, apply_lane_env_overrides, build_job_environment,
     compute_test_env_for_parallelism, ensure_lane_env_dirs,
@@ -319,6 +320,85 @@ fn reuse_decision_for_gate(
         || ReuseDecision::miss("no_record"),
         |cached| cached.check_reuse(gate_name, attestation_digest, true, verifying_key),
     )
+}
+
+// =============================================================================
+// Gate Cache V3 helpers (TCK-00541)
+// =============================================================================
+
+/// Compute a toolchain fingerprint from `rustc --version --verbose` output.
+///
+/// Returns a BLAKE3 hex digest. Falls back to a hash of "unknown" if rustc
+/// is not available (fail-closed: different key from any real toolchain).
+fn compute_toolchain_fingerprint() -> String {
+    let output = std::process::Command::new("rustc")
+        .args(["--version", "--verbose"])
+        .output();
+    let version_bytes = match &output {
+        Ok(o) if o.status.success() => &o.stdout[..],
+        _ => b"unknown-toolchain",
+    };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"apm2.fac.toolchain_fingerprint:");
+    hasher.update(version_bytes);
+    format!("b3-256:{}", hasher.finalize().to_hex())
+}
+
+/// Compute a v3 compound key from the evidence pipeline context.
+///
+/// Uses the commit SHA as the workspace attestation digest (content
+/// fingerprint), the FAC policy hash, a toolchain fingerprint, and
+/// sandbox/network policy hashes as RFC-0028/0029 receipt binding proxies.
+fn compute_v3_compound_key(
+    sha: &str,
+    fac_policy: &FacPolicyV1,
+    sandbox_hardening_hash: &str,
+    network_policy_hash: &str,
+) -> Option<V3CompoundKey> {
+    let policy_hash = apm2_core::fac::compute_policy_hash(fac_policy).ok()?;
+    let toolchain = compute_toolchain_fingerprint();
+    V3CompoundKey::new(
+        sha,
+        &policy_hash,
+        &toolchain,
+        sandbox_hardening_hash,
+        network_policy_hash,
+    )
+    .ok()
+}
+
+/// Cache directory paths for v3 and v2 under the FAC root.
+fn cache_v3_root() -> Option<std::path::PathBuf> {
+    let apm2_home = apm2_core::github::resolve_apm2_home()?;
+    Some(apm2_home.join("private/fac/gate_cache_v3"))
+}
+
+fn cache_v2_root() -> Option<std::path::PathBuf> {
+    let apm2_home = apm2_core::github::resolve_apm2_home()?;
+    Some(apm2_home.join("private/fac/gate_cache_v2"))
+}
+
+/// Try to reuse from v3 cache first, then fall back to v2.
+///
+/// Returns a unified `ReuseDecision` that can be used by the evidence flow.
+/// When v3 hits, the v3 decision reason is used. When v3 misses and v2 hits,
+/// the v2 decision is used.
+fn reuse_decision_with_v3_fallback(
+    v3_cache: Option<&GateCacheV3>,
+    v2_cache: Option<&GateCache>,
+    gate_name: &str,
+    attestation_digest: Option<&str>,
+    verifying_key: Option<&apm2_core::crypto::VerifyingKey>,
+) -> ReuseDecision {
+    // Try v3 first.
+    if let Some(v3) = v3_cache {
+        let v3_decision = v3.check_reuse(gate_name, attestation_digest, true, verifying_key);
+        if v3_decision.reusable {
+            return ReuseDecision::hit();
+        }
+    }
+    // Fall back to v2.
+    reuse_decision_for_gate(v2_cache, gate_name, attestation_digest, verifying_key)
 }
 
 fn stream_pipe_to_file<R: Read>(
@@ -1300,6 +1380,7 @@ fn finalize_status_gate_run(
     updater: &PrBodyStatusUpdater,
     status: &CiStatus,
     signer: &apm2_core::crypto::Signer,
+    v3_gate_cache: Option<&mut GateCacheV3>,
 ) -> Result<(), String> {
     attach_log_bundle_hash(gate_results, logs_dir)?;
 
@@ -1323,10 +1404,41 @@ fn finalize_status_gate_run(
     // TCK-00576: Sign all gate cache entries before persisting.
     gate_cache.sign_all(signer);
 
-    // Persist gate cache so future pipeline runs can reuse results.
+    // Persist gate cache (v2) so future pipeline runs can reuse results.
     gate_cache
         .save()
         .map_err(|err| format!("failed to persist attested gate cache: {err}"))?;
+
+    // TCK-00541: Populate and persist v3 gate cache alongside v2.
+    // V3 writes are additive — v2 writes remain for backwards compatibility
+    // with push.rs and gates.rs callers.
+    if let Some(v3) = v3_gate_cache {
+        // Copy all gate results from v2 into v3 for persistence.
+        for (gate_name, result) in &gate_cache.gates {
+            let v3_result = apm2_core::fac::gate_cache_v3::V3GateResult {
+                status: result.status.clone(),
+                duration_secs: result.duration_secs,
+                completed_at: result.completed_at.clone(),
+                attestation_digest: result.attestation_digest.clone(),
+                evidence_log_digest: result.evidence_log_digest.clone(),
+                quick_mode: result.quick_mode,
+                log_bundle_hash: result.log_bundle_hash.clone(),
+                log_path: result.log_path.clone(),
+                signature_hex: None, // Will be signed below.
+                signer_id: None,
+            };
+            // Best-effort: skip if we hit the gate limit.
+            let _ = v3.set(gate_name, v3_result);
+        }
+        // Sign v3 entries.
+        v3.sign_all(signer);
+        // Persist v3 cache.
+        if let Some(root) = cache_v3_root() {
+            if let Err(err) = v3.save_to_dir(&root) {
+                eprintln!("warning: failed to persist v3 gate cache: {err}");
+            }
+        }
+    }
 
     if let Some(file) = projection_log {
         for line in evidence_lines {
@@ -2149,6 +2261,32 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     let mut gate_cache = GateCache::new(sha);
     let pipeline_test_command =
         build_pipeline_test_command(workspace_root, &lane_context.lane_dir)?;
+
+    // TCK-00541: Build v3 compound key and load v3 cache (with v2 fallback).
+    let v3_compound_key = compute_v3_compound_key(
+        sha,
+        &load_or_create_pipeline_policy(
+            &apm2_core::github::resolve_apm2_home()
+                .ok_or_else(|| "cannot resolve APM2_HOME for v3 cache".to_string())?
+                .join("private/fac"),
+        )?,
+        &pipeline_test_command.sandbox_hardening_hash,
+        &pipeline_test_command.network_policy_hash,
+    );
+    let v3_root = cache_v3_root();
+    let v2_root = cache_v2_root();
+    let v3_cache_loaded = v3_compound_key.as_ref().and_then(|ck| {
+        let root = v3_root.as_deref()?;
+        GateCacheV3::load_from_dir(root, sha, ck).or_else(|| {
+            // V2 fallback: try loading from v2 directory.
+            let v2r = v2_root.as_deref()?;
+            GateCacheV3::load_from_v2_dir(v2r, sha, ck)
+        })
+    });
+    // Create a mutable v3 cache for new gate results (writes only to v3).
+    let mut v3_gate_cache = v3_compound_key
+        .as_ref()
+        .and_then(|ck| GateCacheV3::new(sha, ck.clone()).ok());
     // TCK-00573 MAJOR-3: Include sandbox hardening hash in gate attestation
     // to prevent stale gate results from insecure environments being reused.
     // Uses the effective policy-driven profile carried through
@@ -2248,6 +2386,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 &updater,
                 &status,
                 &fac_signer,
+                v3_gate_cache.as_mut(),
             )?;
             return Ok((false, gate_results));
         }
@@ -2297,7 +2436,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
         let log_path = logs_dir.join(format!("{gate_name}.log"));
-        let reuse = reuse_decision_for_gate(
+        let reuse = reuse_decision_with_v3_fallback(
+            v3_cache_loaded.as_ref(),
             cache.as_ref(),
             gate_name,
             attestation_digest.as_deref(),
@@ -2388,6 +2528,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 &updater,
                 &status,
                 &fac_signer,
+                v3_gate_cache.as_mut(),
             )?;
             return Ok((false, gate_results));
         }
@@ -2469,6 +2610,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 &updater,
                 &status,
                 &fac_signer,
+                v3_gate_cache.as_mut(),
             )?;
             return Ok((false, gate_results));
         }
@@ -2479,7 +2621,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         let log_path = logs_dir.join(format!("{gate_name}.log"));
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
-        let reuse = reuse_decision_for_gate(
+        let reuse = reuse_decision_with_v3_fallback(
+            v3_cache_loaded.as_ref(),
             cache.as_ref(),
             gate_name,
             attestation_digest.as_deref(),
@@ -2570,6 +2713,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 &updater,
                 &status,
                 &fac_signer,
+                v3_gate_cache.as_mut(),
             )?;
             return Ok((false, gate_results));
         }
@@ -2634,6 +2778,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 &updater,
                 &status,
                 &fac_signer,
+                v3_gate_cache.as_mut(),
             )?;
             return Ok((false, gate_results));
         }
@@ -2651,7 +2796,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             Some(pipeline_test_command.command.as_slice()),
             &policy,
         );
-        let reuse = reuse_decision_for_gate(
+        let reuse = reuse_decision_with_v3_fallback(
+            v3_cache_loaded.as_ref(),
             cache.as_ref(),
             gate_name,
             attestation_digest.as_deref(),
@@ -2739,6 +2885,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     &updater,
                     &status,
                     &fac_signer,
+                    v3_gate_cache.as_mut(),
                 )?;
                 return Ok((false, gate_results));
             }
@@ -2818,6 +2965,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     &updater,
                     &status,
                     &fac_signer,
+                    v3_gate_cache.as_mut(),
                 )?;
                 return Ok((false, gate_results));
             }
@@ -2828,7 +2976,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         let gate_name = "workspace_integrity";
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
-        let reuse = reuse_decision_for_gate(
+        let reuse = reuse_decision_with_v3_fallback(
+            v3_cache_loaded.as_ref(),
             cache.as_ref(),
             gate_name,
             attestation_digest.as_deref(),
@@ -2916,6 +3065,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     &updater,
                     &status,
                     &fac_signer,
+                    v3_gate_cache.as_mut(),
                 )?;
                 return Ok((false, gate_results));
             }
@@ -2958,6 +3108,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     &updater,
                     &status,
                     &fac_signer,
+                    v3_gate_cache.as_mut(),
                 )?;
                 return Ok((false, gate_results));
             }
@@ -2969,7 +3120,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         let log_path = logs_dir.join(format!("{gate_name}.log"));
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
-        let reuse = reuse_decision_for_gate(
+        let reuse = reuse_decision_with_v3_fallback(
+            v3_cache_loaded.as_ref(),
             cache.as_ref(),
             gate_name,
             attestation_digest.as_deref(),
@@ -3060,6 +3212,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 &updater,
                 &status,
                 &fac_signer,
+                v3_gate_cache.as_mut(),
             )?;
             return Ok((false, gate_results));
         }
@@ -3123,6 +3276,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 &updater,
                 &status,
                 &fac_signer,
+                v3_gate_cache.as_mut(),
             )?;
             return Ok((false, gate_results));
         }
@@ -3136,6 +3290,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         &updater,
         &status,
         &fac_signer,
+        v3_gate_cache.as_mut(),
     )?;
     Ok((true, gate_results))
 }

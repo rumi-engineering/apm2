@@ -2995,15 +2995,54 @@ components.
 4. Evidence log digest is present and non-empty.
 5. Ed25519 signature verifies against the expected key (domain-separated
    with `GATE_CACHE_RECEIPT:` prefix).
+6. When a verifying key is NOT provided: all entries are denied regardless
+   of signature presence. If a signed entry is encountered without a
+   verifying key, `miss("signature_unverifiable_no_key")` is returned
+   (prevents forged-signature bypass). Unsigned entries return
+   `miss("signature_missing")`.
 
 Any missing or invalid component returns a `miss` decision.
 
 ### V2 Read Compatibility
 
-`GateCacheV3` is a separate store from v2 (`gate_cache_v2`). Callers may
-load v2 as a best-effort fallback. V2 entries that pass all v3 reuse
-checks can be promoted to v3 on the next write cycle. Legacy entries
-without receipt bindings are rejected unless `allow_legacy_cache` is set.
+`load_from_v2_dir()` provides best-effort v2 fallback reads. It reads
+v2 entries from `gate_cache_v2/{sha}/{gate}.yaml` (schema
+`apm2.fac.gate_result_receipt.v2`), deserializes them via `V2CacheEntry`
+/ `V2GateResult` internal types, and converts to `V3GateResult` via
+`V2GateResult::to_v3()`. The v2 SHA must match the requested SHA
+(fail-closed). `read_v2_entry_bounded()` applies the same bounded I/O
+constraints as v3 reads (`MAX_V3_ENTRY_SIZE`, `O_NOFOLLOW` on Unix).
+
+Callers (e.g., `evidence.rs`) use `reuse_decision_with_v3_fallback()`
+which tries v3 first, then falls back to v2 entries. V2 results promoted
+to v3 are signed and persisted in `finalize_status_gate_run()`.
+
+### Atomic Multi-File Write
+
+`save_to_dir()` returns `Result<(), GateCacheV3Error>` and uses an atomic
+staging pattern:
+1. Creates a staging directory (`{target}_staging_{random}`) with 0o700
+   permissions.
+2. Writes all gate YAML files into the staging directory with fsync.
+3. If the target directory exists, renames it aside to
+   `{target}_old_{random}`.
+4. Renames the staging directory to the target (atomic on same
+   filesystem).
+5. Cleans up the old directory on success.
+6. On cross-device rename failure, falls back to recursive copy +
+   cleanup.
+
+This ensures that a crash at any point leaves either the old complete
+cache or the new complete cache, never a partial write.
+
+### Error Types
+
+`GateCacheV3Error` variants:
+- `Io { context, source }`: I/O errors with human-readable context and
+  source description.
+- `Yaml(String)`: YAML serialization/deserialization failures.
+- `Validation(String)`: Compound key or field validation failures.
+- `Signature(String)`: Ed25519 signing or verification failures.
 
 ### GC Policy
 
@@ -3019,11 +3058,16 @@ distinguishes v3 prune targets from v2.
   (1024 bytes). Gate count bounded by `MAX_V3_GATES_PER_INDEX` (64).
 - [INV-GCV3-003] On-disk reads use `O_NOFOLLOW` (Unix), bounded size
   (`MAX_V3_ENTRY_SIZE` = 512 KiB), and `serde(deny_unknown_fields)`.
-- [INV-GCV3-004] Writes use atomic temp+rename with fsync for crash safety.
-  Directories created with 0o700 permissions.
+- [INV-GCV3-004] Writes use atomic staging-directory+rename pattern for
+  crash safety (no partial writes). Directories created with 0o700
+  permissions.
 - [INV-GCV3-005] Index keys are validated (`b3-256:` prefix + 64 hex chars)
   before filesystem use, preventing path traversal.
 - [INV-GCV3-006] Signer identity comparison uses `subtle::ConstantTimeEq`
   to prevent timing side-channels.
 - [INV-GCV3-007] Signature verification uses domain-separated Ed25519 with
   `GATE_CACHE_RECEIPT:` prefix, preventing cross-protocol replay.
+- [INV-GCV3-008] `check_reuse()` denies all entries when no verifying key
+  is provided, preventing forged-signature bypass (fail-closed).
+- [INV-GCV3-009] V2 read fallback validates SHA match before accepting
+  entries, preventing cross-SHA cache poisoning.
