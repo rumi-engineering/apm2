@@ -4561,8 +4561,8 @@ fn process_job(
         Some(observed_cost),
         Some(&sbx_hash),
         Some(&resolved_net_hash),
-        None,                                      // stop_revoke_admission
-        resolved_bytes_backend.as_deref(),          // TCK-00546: bytes_backend
+        None,                              // stop_revoke_admission
+        resolved_bytes_backend.as_deref(), // TCK-00546: bytes_backend
         toolchain_fingerprint,
     ) {
         eprintln!("worker: pipeline commit failed, cannot complete job: {commit_err}");
