@@ -11,6 +11,7 @@ use apm2_core::economics::queue_admission::HtfEvaluationWindow;
 use apm2_core::fac::broker::FacBroker;
 use apm2_core::fac::broker_health::WorkerHealthPolicy;
 use apm2_core::fac::job_spec::{FacJobSpecV1, MAX_JOB_SPEC_SIZE};
+use apm2_core::fac::queue_bounds::{QueueBoundsPolicy, check_queue_bounds, scan_pending_queue};
 use apm2_core::fac::{
     FacPolicyV1, MAX_POLICY_SIZE, compute_policy_hash, deserialize_policy, parse_policy_hash,
     persist_policy,
@@ -149,6 +150,10 @@ pub(super) fn load_or_init_policy(
 }
 
 /// Enqueue a validated job spec into `queue/pending`.
+///
+/// Enforces queue bounds (TCK-00578) before writing the job spec to disk.
+/// If the queue would exceed configured bounds, the enqueue is denied with
+/// a structured denial receipt and the job is NOT written.
 pub(super) fn enqueue_job(queue_root: &Path, spec: &FacJobSpecV1) -> Result<PathBuf, String> {
     let pending_dir = queue_root.join(PENDING_DIR);
     fs::create_dir_all(&pending_dir).map_err(|err| format!("create pending dir: {err}"))?;
@@ -166,6 +171,16 @@ pub(super) fn enqueue_job(queue_root: &Path, spec: &FacJobSpecV1) -> Result<Path
             MAX_JOB_SPEC_SIZE
         ));
     }
+
+    // TCK-00578: Queue bounds check BEFORE writing to disk (INV-QB-002).
+    let bounds_policy = QueueBoundsPolicy::default();
+    let track_lanes = bounds_policy.per_lane_max_pending_jobs.is_some();
+    let snapshot = scan_pending_queue(queue_root, track_lanes)
+        .map_err(|err| format!("queue bounds scan failed (enqueue denied fail-closed): {err}"))?;
+    let proposed_bytes = json.len() as u64;
+    let proposed_lane = Some(spec.queue_lane.as_str());
+    check_queue_bounds(&snapshot, &bounds_policy, proposed_bytes, proposed_lane)
+        .map_err(|err| format!("queue quota exceeded (enqueue denied): {err}"))?;
 
     let filename = format!("{}.json", spec.job_id);
     let target = pending_dir.join(filename);

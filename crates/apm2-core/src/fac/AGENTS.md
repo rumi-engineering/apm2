@@ -364,6 +364,75 @@ with hard caps.
 - [INV-CPRL-005] Budget denial always produces a structured
   `ControlPlaneDenialReceipt` with machine-readable evidence.
 
+## queue_bounds Submodule (TCK-00578)
+
+The `queue_bounds` submodule implements hard queue-level bounds on the number
+and total size of pending jobs. When a new enqueue would exceed any configured
+bound, the enqueue is denied fail-closed with a structured
+`QueueQuotaDenialReceipt`. This is defense-in-depth complementing the per-window
+rate limits in `broker_rate_limits` (TCK-00568).
+
+### Key Types
+
+- `QueueBoundsPolicy`: Configuration struct with three dimensions:
+  `max_pending_jobs` (default 10,000), `max_pending_bytes` (default 10 GiB),
+  and optional `per_lane_max_pending_jobs` (default `None`). Validated via
+  `validate()` against hard caps before use.
+- `QueueSnapshot`: Point-in-time filesystem scan result carrying `total_jobs`,
+  `total_bytes`, `truncated` flag, and optional `lane_counts` HashMap.
+- `QueueBoundsError`: Fail-closed error taxonomy with `QuotaExceeded` (carries
+  `QueueQuotaDenialReceipt`), `ScanFailed`, and `InvalidPolicy` variants.
+- `QueueQuotaDenialReceipt`: Structured denial evidence carrying `dimension`,
+  `current_usage`, `limit`, `proposed_increment`, `reason` (stable reason code),
+  and optional `lane` identifier. Serializable for audit persistence.
+- `QueueBoundsDimension`: Enum identifying the exceeded dimension
+  (`PendingJobs`, `PendingBytes`, `PerLanePendingJobs`, `ScanError`).
+
+### Hard Caps
+
+- `HARD_CAP_MAX_PENDING_JOBS`: 1,000,000
+- `HARD_CAP_MAX_PENDING_BYTES`: 1 TiB (1,099,511,627,776)
+- `HARD_CAP_PER_LANE_MAX_PENDING_JOBS`: 100,000
+- `MAX_SCAN_ENTRIES`: 100,000 (directory scan bound, INV-QB-005)
+- `MAX_TRACKED_LANES`: 256 (HashMap growth bound, CTR-1303)
+
+### Core Capabilities
+
+- `scan_pending_queue(queue_root, track_lanes)`: Bounded filesystem scan of
+  `queue/pending/` using `symlink_metadata` (no symlink following, CTR-1503).
+  Counts files and bytes up to `MAX_SCAN_ENTRIES`. When `track_lanes` is true,
+  reads job spec files (bounded to `MAX_JOB_SPEC_SIZE`) and parses `queue_lane`
+  fields into per-lane counts bounded by `MAX_TRACKED_LANES`.
+- `check_queue_bounds(snapshot, policy, proposed_bytes, proposed_lane)`:
+  Evaluates proposed enqueue against policy. Checks global job count, global
+  byte count, and (when configured) per-lane job count. Uses `checked_add`
+  arithmetic; overflow denies fail-closed.
+- Stable denial reason codes for audit:
+  - `queue/quota_exceeded:pending_jobs`
+  - `queue/quota_exceeded:pending_bytes`
+  - `queue/quota_exceeded:per_lane_pending_jobs`
+  - `queue/quota_exceeded:scan_error`
+  - `queue/quota_exceeded:counter_overflow`
+
+### CLI Integration
+
+The `enqueue_job()` function in `fac_queue_submit.rs` calls
+`scan_pending_queue()` and `check_queue_bounds()` BEFORE writing the job spec
+to disk (INV-QB-002). Scan failures deny fail-closed.
+
+### Security Invariants (TCK-00578)
+
+- [INV-QB-001] Fail-closed: scan failure or counter overflow denies the enqueue.
+- [INV-QB-002] Bounds check occurs BEFORE the job spec is written to disk.
+- [INV-QB-003] Denial receipts include the exceeded dimension, current usage,
+  limit, and stable reason code for audit.
+- [INV-QB-004] All string fields in receipts are bounded
+  (`MAX_DENIAL_REASON_LENGTH=256`).
+- [INV-QB-005] Directory scan is bounded by `MAX_SCAN_ENTRIES` (100,000) to
+  prevent DoS from a directory with millions of entries.
+- [INV-QB-006] File metadata reads use `symlink_metadata` (no symlink following)
+  per CTR-1503.
+
 ## projection_compromise Submodule
 
 The `projection_compromise` submodule implements compromise handling for public
