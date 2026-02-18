@@ -107,7 +107,7 @@ pub(super) struct QueuedGatesOutcome {
     pub(super) gate_results: Vec<EvidenceGateResult>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PreparedQueuedGatesJob {
     fac_root: PathBuf,
     head_sha: String,
@@ -117,6 +117,9 @@ struct PreparedQueuedGatesJob {
     worker_bootstrapped: bool,
     policy_hash: String,
     options: GatesJobOptionsV1,
+    // Keep the lock guard alive for the whole request lifecycle so --wait
+    // callers cannot concurrently trigger inline worker execution.
+    _single_flight_lock: std::fs::File,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -380,7 +383,7 @@ fn prepare_queued_gates_job(
     );
     let queue_root =
         resolve_queue_root().map_err(|err| format!("cannot resolve queue root: {err}"))?;
-    let _single_flight_lock =
+    let single_flight_lock =
         acquire_gates_single_flight_lock(&fac_root, &repo_source.repo_id, &repo_source.head_sha)?;
     let include_claimed = has_live_worker_heartbeat(&fac_root);
     if let Some(existing_spec) = find_coalescible_gates_job(
@@ -399,6 +402,7 @@ fn prepare_queued_gates_job(
             worker_bootstrapped,
             policy_hash,
             options,
+            _single_flight_lock: single_flight_lock,
         });
     }
 
@@ -435,6 +439,7 @@ fn prepare_queued_gates_job(
         worker_bootstrapped,
         policy_hash,
         options,
+        _single_flight_lock: single_flight_lock,
     })
 }
 
