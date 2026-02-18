@@ -259,6 +259,33 @@ pub struct FacPolicyV1 {
     /// are unconditional and do not depend on this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_repo_ids: Option<Vec<String>>,
+
+    /// Optional RFC-0028 intent allowlist for broker token issuance
+    /// (TCK-00567).
+    ///
+    /// When `Some`, only the listed intents are permitted by the broker
+    /// when issuing tokens.  When `None` (the default), any structurally
+    /// valid intent is accepted (open policy).
+    ///
+    /// Note: `serde(default)` is safe here because `None` is the MOST
+    /// permissive option for this field, and the default is correct for
+    /// existing persisted policies that predate TCK-00567.  The fail-closed
+    /// enforcement is at the broker and worker layers when the field is
+    /// `Some`.
+    ///
+    /// The list is bounded by [`super::job_spec::MAX_ALLOWED_INTENTS_SIZE`]
+    /// at validation time (CTR-1303).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_intents: Option<Vec<super::job_spec::FacIntent>>,
+
+    /// Queue bounds policy controlling maximum pending queue size (TCK-00578).
+    ///
+    /// Configures `max_pending_jobs`, `max_pending_bytes`, and optional
+    /// `per_lane_max_pending_jobs` for enqueue-time enforcement. When not
+    /// present in persisted policy (pre-TCK-00578 policies), defaults to
+    /// `QueueBoundsPolicy::default()` via `serde(default)`.
+    #[serde(default)]
+    pub queue_bounds_policy: super::queue_bounds::QueueBoundsPolicy,
 }
 
 impl Default for FacPolicyV1 {
@@ -334,6 +361,8 @@ impl FacPolicyV1 {
             sandbox_hardening: SandboxHardeningProfile::default(),
             network_policy: None,
             allowed_repo_ids: None,
+            allowed_intents: None,
+            queue_bounds_policy: super::queue_bounds::QueueBoundsPolicy::default(),
         }
     }
 
@@ -426,6 +455,25 @@ impl FacPolicyV1 {
                 });
             }
         }
+
+        // Validate allowed_intents length (TCK-00567, CTR-1303).
+        if let Some(ref intents) = self.allowed_intents {
+            if intents.len() > super::job_spec::MAX_ALLOWED_INTENTS_SIZE {
+                return Err(FacPolicyError::VectorTooLarge {
+                    field: "allowed_intents",
+                    actual: intents.len(),
+                    max: super::job_spec::MAX_ALLOWED_INTENTS_SIZE,
+                });
+            }
+        }
+
+        // Validate queue bounds policy (TCK-00578).
+        self.queue_bounds_policy
+            .validate()
+            .map_err(|e| FacPolicyError::InvalidFieldValue {
+                field: "queue_bounds_policy",
+                value: format!("{e}"),
+            })?;
 
         Ok(())
     }

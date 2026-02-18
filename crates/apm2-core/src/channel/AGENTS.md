@@ -249,6 +249,19 @@ Issues a base64-encoded, signed channel context token from a boundary check. Enc
 
 Decodes and verifies a signed channel context token. Validates schema, signature, lease binding, request binding, witness, and expiry.
 
+### `TokenBindingV1` — Intent Field (TCK-00567)
+
+`TokenBindingV1` carries an optional `intent: Option<String>` field (serde-default,
+skip-if-none for backwards compatibility).  When present, the intent string identifies
+the RFC-0028 typed intent class the token was issued for (e.g. `"intent.fac.execute_gates"`).
+
+`ExpectedTokenBinding` carries a corresponding `expected_intent: Option<&str>`.  When
+`expected_intent` is `Some`, `decode_channel_context_token_with_binding` enforces that
+the token intent matches exactly (fail-closed):
+- **Match** — decode succeeds.
+- **Mismatch** — `IntentMismatch` error.
+- **Missing intent in token** — `MissingIntent` error.
+
 ## Resource Limit Constants
 
 | Constant | Value | Purpose |
