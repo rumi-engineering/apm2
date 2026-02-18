@@ -417,6 +417,12 @@ pub fn run_fac_worker(
         },
     );
 
+    // TCK-00566: Load persisted token ledger if available. The ledger
+    // survives restarts so replay protection is not lost on daemon restart.
+    if let Some(ledger) = load_token_ledger(broker.current_tick()) {
+        broker.set_token_ledger(ledger);
+    }
+
     let (mut queue_state, mut cost_model) = match load_scheduler_state(&fac_root) {
         Ok(Some(saved)) => {
             let cm = saved
@@ -774,6 +780,7 @@ pub fn run_fac_worker(
                     return exit_codes::GENERIC_ERROR;
                 }
                 let _ = save_broker_state(&broker);
+                let _ = save_token_ledger(&broker);
                 if json_output {
                     emit_worker_summary(&summary);
                 } else {
@@ -954,6 +961,7 @@ pub fn run_fac_worker(
                     return exit_codes::GENERIC_ERROR;
                 }
                 let _ = save_broker_state(&broker);
+                let _ = save_token_ledger(&broker);
                 if json_output {
                     emit_worker_summary(&summary);
                 }
@@ -1000,6 +1008,7 @@ pub fn run_fac_worker(
         return exit_codes::GENERIC_ERROR;
     }
     let _ = save_broker_state(&broker);
+    let _ = save_token_ledger(&broker);
     exit_codes::SUCCESS
 }
 
@@ -2594,6 +2603,62 @@ fn process_job(
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
         return JobOutcome::Denied { reason };
+    }
+
+    // TCK-00566: Token replay protection — validate nonce and record use.
+    //
+    // After the token is decoded and boundary defects are checked, extract
+    // the nonce from the token binding and validate it against the broker's
+    // token-use ledger. If the nonce is already consumed or revoked, deny
+    // the job (fail-closed). If the nonce is fresh, record it so any
+    // subsequent replay is detected.
+    if let Some(binding) = boundary_check.token_binding.as_ref() {
+        if let Some(ref nonce) = binding.nonce {
+            if let Err(ledger_err) =
+                broker.validate_and_record_token_nonce(nonce, &spec.actuation.request_id)
+            {
+                let denial_code = match &ledger_err {
+                    apm2_core::fac::token_ledger::TokenLedgerError::TokenRevoked { .. } => {
+                        DenialReasonCode::TokenRevoked
+                    },
+                    _ => DenialReasonCode::TokenReplayDetected,
+                };
+                let reason = format!("token nonce replay/revocation check failed: {ledger_err}");
+                let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+                    .map(|p| {
+                        p.strip_prefix(queue_root)
+                            .unwrap_or(&p)
+                            .to_string_lossy()
+                            .to_string()
+                    })
+                    .ok();
+                if let Err(receipt_err) = emit_job_receipt(
+                    fac_root,
+                    spec,
+                    FacJobOutcome::Denied,
+                    Some(denial_code),
+                    &reason,
+                    Some(&boundary_trace),
+                    None,
+                    None,
+                    None,
+                    Some(canonicalizer_tuple_digest),
+                    moved_path.as_deref(),
+                    policy_hash,
+                    None,
+                    Some(&sbx_hash),
+                    Some(&resolved_net_hash),
+                ) {
+                    eprintln!(
+                        "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
+                    );
+                }
+                return JobOutcome::Denied { reason };
+            }
+        }
+        // If nonce is None (pre-TCK-00566 token), skip nonce validation.
+        // This is backwards-compatible: old tokens without nonces are
+        // admitted based on other checks alone.
     }
 
     // Step 4: Evaluate RFC-0029 queue admission.
@@ -5342,6 +5407,49 @@ fn save_broker_state(broker: &FacBroker) -> Result<(), String> {
         .serialize_state()
         .map_err(|e| format!("cannot serialize broker state: {e}"))?;
     fs::write(&state_path, bytes).map_err(|e| format!("cannot write broker state: {e}"))
+}
+
+/// TCK-00566: Loads persisted token ledger from
+/// `$APM2_HOME/private/fac/broker/token_ledger/state.json`.
+///
+/// Returns `None` if the file doesn't exist or deserialization fails.
+/// Expired entries are dropped on load.
+fn load_token_ledger(current_tick: u64) -> Option<apm2_core::fac::token_ledger::TokenUseLedger> {
+    let fac_root = resolve_fac_root().ok()?;
+    let ledger_dir = fac_root.join("broker").join("token_ledger");
+    let state_path = ledger_dir.join("state.json");
+    if !state_path.exists() {
+        return None;
+    }
+    let bytes = read_bounded(
+        &state_path,
+        apm2_core::fac::token_ledger::MAX_TOKEN_LEDGER_FILE_SIZE,
+    )
+    .ok()?;
+    apm2_core::fac::token_ledger::TokenUseLedger::deserialize_state(&bytes, current_tick).ok()
+}
+
+/// TCK-00566: Saves token ledger to
+/// `$APM2_HOME/private/fac/broker/token_ledger/state.json`.
+///
+/// Uses atomic write (temp+rename) for crash safety (CTR-2607).
+fn save_token_ledger(broker: &FacBroker) -> Result<(), String> {
+    let fac_root = resolve_fac_root()?;
+    let ledger_dir = fac_root.join("broker").join("token_ledger");
+    if !ledger_dir.exists() {
+        fac_permissions::ensure_dir_with_mode(&ledger_dir)
+            .map_err(|e| format!("cannot create token ledger dir: {e}"))?;
+    }
+    let state_path = ledger_dir.join("state.json");
+    let bytes = broker
+        .serialize_token_ledger()
+        .map_err(|e| format!("cannot serialize token ledger: {e}"))?;
+    // Atomic write: temp file + rename.
+    let tmp_path = ledger_dir.join("state.json.tmp");
+    fs::write(&tmp_path, &bytes)
+        .map_err(|e| format!("cannot write token ledger temp file: {e}"))?;
+    fs::rename(&tmp_path, &state_path)
+        .map_err(|e| format!("cannot rename token ledger temp file: {e}"))
 }
 
 /// Atomically moves a file to a destination directory with collision-safe
