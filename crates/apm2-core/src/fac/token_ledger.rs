@@ -1,19 +1,31 @@
 //! Token replay protection: broker-side one-time use ledger + revocation.
 //!
 //! Implements TCK-00566: a bounded, TTL-evicting ledger that tracks issued
-//! token nonces to detect and deny replay attempts. The broker records each
-//! nonce at issuance time; a second use of the same nonce is denied.
+//! and consumed token nonces to detect and deny replay attempts. The broker
+//! registers each nonce at issuance time in an `Issued` state; when the
+//! worker validates and consumes the token, the entry transitions to
+//! `Consumed`. A second presentation of the same nonce is denied.
 //!
 //! The ledger also supports explicit token revocation: the broker can revoke
-//! a nonce before its natural expiry, and workers consult the revocation set
-//! when validating tokens.
+//! a nonce before its first use (in the `Issued` state) or after use (in the
+//! `Consumed` state), and workers consult the revocation set when validating
+//! tokens.
+//!
+//! # Persistence Model
+//!
+//! The ledger uses a write-ahead log (WAL) for incremental persistence.
+//! Individual operations (record, revoke) are appended to the WAL as
+//! single-line JSON entries, which requires only a small fixed-size write
+//! per job. Periodically, a full snapshot is written and the WAL is
+//! truncated (compaction). On startup, the latest snapshot is loaded and
+//! the WAL is replayed to restore full ledger state.
 //!
 //! # Security Invariants
 //!
-//! - [INV-TL-001] Every token nonce is included in the issued token but
-//!   recorded in the ledger only when the worker validates and consumes the
-//!   token via `validate_and_record_token_nonce`. A second presentation of the
-//!   same nonce is denied (fail-closed).
+//! - [INV-TL-001] Every token nonce is registered in the ledger at issuance
+//!   time in an `Issued` state. When the worker validates the token via
+//!   `validate_and_record_token_nonce`, the entry transitions to `Consumed`. A
+//!   second presentation of the same nonce is denied (fail-closed).
 //! - [INV-TL-002] The ledger is bounded by `MAX_LEDGER_ENTRIES`. When the cap
 //!   is reached, the oldest entry is evicted (TTL-based FIFO).
 //! - [INV-TL-003] The revocation set is bounded by `MAX_REVOKED_TOKENS`.
@@ -28,6 +40,15 @@
 //!   is NOT constant-time over the full entry set; however, 32-byte random
 //!   nonces (INV-TL-006) make collision-based timing leakage infeasible in
 //!   practice (RSK-1909).
+//! - [INV-TL-008] Nonces are registered at issuance in `Issued` state.
+//!   `revoke_token` can revoke nonces in either `Issued` or `Consumed` state,
+//!   closing the window for leaked-but-unused token exploitation.
+//! - [INV-TL-009] Ledger persistence is fail-closed: load errors from an
+//!   existing ledger file are hard security faults that refuse to continue.
+//!   Save errors are propagated so the caller cannot silently run with
+//!   undurable replay state.
+//! - [INV-TL-010] WAL entries are appended with fsync for crash durability.
+//!   Full snapshots use atomic write (temp+fsync+rename) per CTR-2607.
 //!
 //! # Thread Safety
 //!
@@ -76,6 +97,12 @@ const TOKEN_NONCE_DOMAIN: &[u8] = b"apm2.fac_broker.token_nonce.v1";
 /// Domain separator for revocation receipt hashing.
 const REVOCATION_RECEIPT_HASH_DOMAIN: &[u8] = b"apm2.fac_broker.revocation_receipt.v1";
 
+/// Number of WAL entries before automatic compaction is suggested.
+///
+/// The caller is responsible for triggering compaction when
+/// `wal_entries_since_snapshot()` exceeds this threshold.
+pub const WAL_COMPACTION_THRESHOLD: usize = 256;
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -110,7 +137,7 @@ pub enum TokenLedgerError {
         max: usize,
     },
 
-    /// Nonce not found for revocation.
+    /// Nonce not found for revocation (not in issued or consumed state).
     #[error("nonce not found in ledger for revocation")]
     NonceNotFound,
 
@@ -123,13 +150,32 @@ pub enum TokenLedgerError {
 }
 
 // ---------------------------------------------------------------------------
+// Nonce lifecycle state
+// ---------------------------------------------------------------------------
+
+/// Lifecycle state of a nonce in the ledger.
+///
+/// Nonces transition: `Issued` -> `Consumed`. Both states can be
+/// revoked. This supports pre-use revocation (INV-TL-008).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NonceState {
+    /// Nonce was generated and included in a token at issuance time.
+    /// The token has not yet been presented for use.
+    Issued,
+    /// Nonce was presented and validated by the worker. The token
+    /// has been consumed and cannot be used again.
+    Consumed,
+}
+
+// ---------------------------------------------------------------------------
 // Ledger entry
 // ---------------------------------------------------------------------------
 
 /// A single entry in the token use ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TokenUseEntry {
-    /// The token nonce that was used.
+    /// The token nonce that was issued/used.
     nonce: TokenNonce,
     /// The `request_id` (`job_spec_digest`) the token was issued for.
     request_id_digest: [u8; 32],
@@ -137,6 +183,8 @@ struct TokenUseEntry {
     recorded_at_tick: u64,
     /// Broker tick at which this entry expires.
     expiry_tick: u64,
+    /// Current lifecycle state of the nonce.
+    state: NonceState,
 }
 
 // ---------------------------------------------------------------------------
@@ -204,13 +252,64 @@ fn compute_revocation_receipt_hash(
 }
 
 // ---------------------------------------------------------------------------
+// WAL entry types
+// ---------------------------------------------------------------------------
+
+/// A single WAL entry representing an incremental ledger mutation.
+///
+/// Each entry is serialized as a single JSON line for append-only I/O.
+/// Public so the broker can pass WAL entries to the persistence layer
+/// for immediate fsync before job execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "op")]
+pub enum WalEntry {
+    /// Register a nonce at issuance time (Issued state).
+    #[serde(rename = "register")]
+    Register {
+        /// Hex-encoded 32-byte nonce.
+        nonce_hex: String,
+        /// Hex-encoded request ID digest.
+        request_id_digest_hex: String,
+        /// Broker tick when the nonce was registered.
+        recorded_at_tick: u64,
+        /// Broker tick at which the entry expires.
+        expiry_tick: u64,
+    },
+    /// Record a nonce as consumed (Issued -> Consumed transition).
+    #[serde(rename = "consume")]
+    Consume {
+        /// Hex-encoded 32-byte nonce.
+        nonce_hex: String,
+        /// Broker tick when the nonce was consumed.
+        consumed_at_tick: u64,
+    },
+    /// Revoke a nonce.
+    #[serde(rename = "revoke")]
+    Revoke {
+        /// Hex-encoded 32-byte nonce.
+        nonce_hex: String,
+        /// Broker tick when the nonce was revoked.
+        revoked_at_tick: u64,
+        /// Reason for revocation.
+        reason: String,
+    },
+}
+
+/// Maximum size in bytes for a single WAL line.
+///
+/// Prevents unbounded allocation from a corrupted WAL file.
+/// A single WAL entry is at most ~300 bytes in JSON.
+const MAX_WAL_LINE_SIZE: usize = 4_096;
+
+// ---------------------------------------------------------------------------
 // Token use ledger
 // ---------------------------------------------------------------------------
 
 /// Broker-side token use ledger for replay detection and revocation.
 ///
-/// Tracks issued token nonces in a bounded `HashMap` with TTL-based FIFO
-/// eviction. Supports explicit revocation of token nonces.
+/// Tracks issued and consumed token nonces in a bounded `HashMap` with
+/// TTL-based FIFO eviction. Supports explicit revocation of token nonces
+/// in both `Issued` and `Consumed` states (INV-TL-008).
 ///
 /// # Synchronization
 ///
@@ -228,6 +327,8 @@ pub struct TokenUseLedger {
     revocation_order: VecDeque<TokenNonce>,
     /// TTL in broker ticks for ledger entries.
     ttl_ticks: u64,
+    /// Number of WAL entries written since last snapshot.
+    wal_entries_since_snapshot: usize,
 }
 
 impl TokenUseLedger {
@@ -240,6 +341,7 @@ impl TokenUseLedger {
             revoked: HashMap::new(),
             revocation_order: VecDeque::new(),
             ttl_ticks: DEFAULT_LEDGER_TTL_TICKS,
+            wal_entries_since_snapshot: 0,
         }
     }
 
@@ -255,6 +357,7 @@ impl TokenUseLedger {
             revoked: HashMap::new(),
             revocation_order: VecDeque::new(),
             ttl_ticks: if ttl_ticks == 0 { 1 } else { ttl_ticks },
+            wal_entries_since_snapshot: 0,
         }
     }
 
@@ -276,6 +379,20 @@ impl TokenUseLedger {
         self.revoked.len()
     }
 
+    /// Returns the number of WAL entries written since last snapshot.
+    ///
+    /// The caller should trigger compaction (snapshot + WAL truncation)
+    /// when this exceeds [`WAL_COMPACTION_THRESHOLD`].
+    #[must_use]
+    pub const fn wal_entries_since_snapshot(&self) -> usize {
+        self.wal_entries_since_snapshot
+    }
+
+    /// Resets the WAL entry counter (call after successful compaction).
+    pub const fn reset_wal_counter(&mut self) {
+        self.wal_entries_since_snapshot = 0;
+    }
+
     /// Generates a fresh 32-byte nonce for a new token.
     ///
     /// Uses domain-separated BLAKE3 keyed derivation seeded by OS CSPRNG
@@ -292,40 +409,26 @@ impl TokenUseLedger {
         *hasher.finalize().as_bytes()
     }
 
-    /// Records a token nonce in the ledger, performing replay detection.
+    /// Registers a nonce at issuance time in `Issued` state (INV-TL-008).
     ///
-    /// Called by the worker validation path after extracting the nonce
-    /// from a decoded token (INV-TL-001). If the nonce already exists
-    /// in the ledger, the token is a replay and this method returns
-    /// [`TokenLedgerError::ReplayDetected`].
+    /// Called by the broker when issuing a new token. The nonce is recorded
+    /// in the ledger so it can be revoked before first use. When the
+    /// worker later validates the token, `record_token_use` transitions
+    /// the entry to `Consumed` state.
     ///
-    /// If the nonce has been explicitly revoked, returns
-    /// [`TokenLedgerError::TokenRevoked`].
-    ///
-    /// Evicts expired entries when the ledger is at capacity.
+    /// Returns a WAL entry for the caller to persist.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The nonce has already been recorded (replay)
-    /// - The nonce has been explicitly revoked
-    pub fn record_token_use(
+    /// Returns an error if the nonce already exists (collision, should
+    /// be statistically impossible with CSPRNG 32-byte nonces).
+    pub fn register_nonce(
         &mut self,
         nonce: &TokenNonce,
         request_id_digest: &[u8; 32],
         current_tick: u64,
-    ) -> Result<(), TokenLedgerError> {
-        // Check revocation first (INV-TL-004: revoked tokens denied even
-        // if unexpired).
-        if let Some(entry) = self.find_revoked(nonce) {
-            return Err(TokenLedgerError::TokenRevoked {
-                reason: entry.reason.clone(),
-            });
-        }
-
-        // Check for replay (INV-TL-001: constant-time nonce comparison
-        // via HashMap key lookup -- the HashMap uses the full 32-byte key
-        // hash, and we verify with ct_eq below).
+    ) -> Result<WalEntry, TokenLedgerError> {
+        // Check for existing entry (collision detection).
         if self.find_entry(nonce).is_some() {
             return Err(TokenLedgerError::ReplayDetected);
         }
@@ -348,19 +451,119 @@ impl TokenUseLedger {
             request_id_digest: *request_id_digest,
             recorded_at_tick: current_tick,
             expiry_tick,
+            state: NonceState::Issued,
         };
 
         self.entries.insert(*nonce, entry);
         self.insertion_order.push_back((*nonce, expiry_tick));
+        self.wal_entries_since_snapshot = self.wal_entries_since_snapshot.saturating_add(1);
 
-        Ok(())
+        Ok(WalEntry::Register {
+            nonce_hex: hex::encode(nonce),
+            request_id_digest_hex: hex::encode(request_id_digest),
+            recorded_at_tick: current_tick,
+            expiry_tick,
+        })
     }
 
-    /// Checks whether a nonce has been used or revoked.
+    /// Records a token nonce as consumed, performing replay detection.
     ///
-    /// Returns `Ok(())` if the nonce is fresh (neither used nor revoked).
-    /// Returns an error if the nonce is found in the ledger or revocation
-    /// set.
+    /// Called by the worker validation path after extracting the nonce
+    /// from a decoded token (INV-TL-001). If the nonce is in `Consumed`
+    /// state, the token is a replay and this method returns
+    /// [`TokenLedgerError::ReplayDetected`].
+    ///
+    /// If the nonce has been explicitly revoked, returns
+    /// [`TokenLedgerError::TokenRevoked`].
+    ///
+    /// If the nonce is in `Issued` state, transitions it to `Consumed`.
+    /// If the nonce is not found (pre-TCK-00566 token without issuance
+    /// registration), creates a new `Consumed` entry.
+    ///
+    /// Returns a WAL entry for the caller to persist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The nonce has already been consumed (replay)
+    /// - The nonce has been explicitly revoked
+    pub fn record_token_use(
+        &mut self,
+        nonce: &TokenNonce,
+        request_id_digest: &[u8; 32],
+        current_tick: u64,
+    ) -> Result<WalEntry, TokenLedgerError> {
+        // Check revocation first (INV-TL-004: revoked tokens denied even
+        // if unexpired).
+        if let Some(entry) = self.find_revoked(nonce) {
+            return Err(TokenLedgerError::TokenRevoked {
+                reason: entry.reason.clone(),
+            });
+        }
+
+        // Check existing entry state.
+        if let Some(existing) = self.find_entry(nonce) {
+            match existing.state {
+                NonceState::Consumed => {
+                    return Err(TokenLedgerError::ReplayDetected);
+                },
+                NonceState::Issued => {
+                    // Transition from Issued to Consumed. This is the
+                    // expected first-use path.
+                },
+            }
+        }
+
+        // Evict expired entries if at capacity (INV-TL-002).
+        self.evict_expired(current_tick);
+
+        // If the nonce already exists (Issued state), update it in place.
+        if let Some(entry) = self.entries.get_mut(nonce) {
+            entry.state = NonceState::Consumed;
+            self.wal_entries_since_snapshot = self.wal_entries_since_snapshot.saturating_add(1);
+            return Ok(WalEntry::Consume {
+                nonce_hex: hex::encode(nonce),
+                consumed_at_tick: current_tick,
+            });
+        }
+
+        // Nonce not in ledger (pre-TCK-00566 token or nonce registered
+        // on a different broker instance). Create a Consumed entry directly.
+        while self.entries.len() >= MAX_LEDGER_ENTRIES {
+            if let Some((old_nonce, _)) = self.insertion_order.pop_front() {
+                self.entries.remove(&old_nonce);
+            } else {
+                break;
+            }
+        }
+
+        let expiry_tick = current_tick.saturating_add(self.ttl_ticks);
+        let entry = TokenUseEntry {
+            nonce: *nonce,
+            request_id_digest: *request_id_digest,
+            recorded_at_tick: current_tick,
+            expiry_tick,
+            state: NonceState::Consumed,
+        };
+
+        self.entries.insert(*nonce, entry);
+        self.insertion_order.push_back((*nonce, expiry_tick));
+        self.wal_entries_since_snapshot = self.wal_entries_since_snapshot.saturating_add(1);
+
+        Ok(WalEntry::Consume {
+            nonce_hex: hex::encode(nonce),
+            consumed_at_tick: current_tick,
+        })
+    }
+
+    /// Checks whether a nonce has been consumed or revoked.
+    ///
+    /// Returns `Ok(())` if the nonce is fresh (not consumed, not revoked).
+    /// A nonce in `Issued` state is considered fresh for the purpose of
+    /// this check (it has not been consumed yet).
+    ///
+    /// Returns an error if the nonce is found in `Consumed` state or in
+    /// the revocation set.
     ///
     /// This is the worker-side validation entry point: before accepting
     /// a token, the worker checks the nonce against the ledger.
@@ -368,7 +571,7 @@ impl TokenUseLedger {
     /// # Errors
     ///
     /// Returns [`TokenLedgerError::ReplayDetected`] if the nonce has been
-    /// used, or [`TokenLedgerError::TokenRevoked`] if explicitly revoked.
+    /// consumed, or [`TokenLedgerError::TokenRevoked`] if explicitly revoked.
     pub fn check_nonce(&self, nonce: &TokenNonce) -> Result<(), TokenLedgerError> {
         // Revocation takes precedence (INV-TL-004).
         if let Some(entry) = self.find_revoked(nonce) {
@@ -377,8 +580,12 @@ impl TokenUseLedger {
             });
         }
 
-        if self.find_entry(nonce).is_some() {
-            return Err(TokenLedgerError::ReplayDetected);
+        if let Some(entry) = self.find_entry(nonce) {
+            if entry.state == NonceState::Consumed {
+                return Err(TokenLedgerError::ReplayDetected);
+            }
+            // NonceState::Issued is fresh for check purposes — the token
+            // has been issued but not yet consumed.
         }
 
         Ok(())
@@ -386,16 +593,18 @@ impl TokenUseLedger {
 
     /// Explicitly revokes a token nonce.
     ///
-    /// The nonce must exist in the active ledger. After revocation, any
-    /// attempt to use or check this nonce will be denied with
+    /// The nonce must exist in the active ledger in either `Issued` or
+    /// `Consumed` state (INV-TL-008). After revocation, any attempt to
+    /// use or check this nonce will be denied with
     /// [`TokenLedgerError::TokenRevoked`], even if the token has not expired.
     ///
-    /// Emits a [`TokenRevocationReceipt`] for audit.
+    /// Emits a [`TokenRevocationReceipt`] for audit and a WAL entry for
+    /// the caller to persist.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The nonce is not found in the ledger
+    /// - The nonce is not found in the ledger (neither issued nor consumed)
     /// - The reason string exceeds `MAX_REVOCATION_REASON_LENGTH`
     /// - The revocation set is at capacity
     pub fn revoke_token(
@@ -403,7 +612,7 @@ impl TokenUseLedger {
         nonce: &TokenNonce,
         current_tick: u64,
         reason: &str,
-    ) -> Result<TokenRevocationReceipt, TokenLedgerError> {
+    ) -> Result<(TokenRevocationReceipt, WalEntry), TokenLedgerError> {
         // Validate reason length (GATE_IO_BOUNDS_AND_PARSING).
         if reason.len() > MAX_REVOCATION_REASON_LENGTH {
             return Err(TokenLedgerError::RevocationReasonTooLong {
@@ -424,8 +633,8 @@ impl TokenUseLedger {
             }
         }
 
-        // Verify the nonce exists in the ledger (fail-closed: cannot
-        // revoke a nonce we did not issue).
+        // Verify the nonce exists in the ledger in any state (INV-TL-008:
+        // revocation works on both Issued and Consumed nonces).
         if self.find_entry(nonce).is_none() {
             return Err(TokenLedgerError::NonceNotFound);
         }
@@ -441,17 +650,26 @@ impl TokenUseLedger {
         };
         self.revoked.insert(*nonce, revocation_entry);
         self.revocation_order.push_back(*nonce);
+        self.wal_entries_since_snapshot = self.wal_entries_since_snapshot.saturating_add(1);
 
         // Build receipt.
         let content_hash = compute_revocation_receipt_hash(&nonce_hex, current_tick, &reason_owned);
 
-        Ok(TokenRevocationReceipt {
+        let receipt = TokenRevocationReceipt {
             schema_id: "apm2.fac_broker.revocation_receipt.v1".to_string(),
+            nonce_hex: nonce_hex.clone(),
+            revoked_at_tick: current_tick,
+            reason: reason_owned.clone(),
+            content_hash,
+        };
+
+        let wal_entry = WalEntry::Revoke {
             nonce_hex,
             revoked_at_tick: current_tick,
             reason: reason_owned,
-            content_hash,
-        })
+        };
+
+        Ok((receipt, wal_entry))
     }
 
     /// Evicts entries that have expired based on `current_tick`.
@@ -467,9 +685,14 @@ impl TokenUseLedger {
             let nonce = *nonce;
             self.insertion_order.pop_front();
 
-            // Ghost-key prevention: only remove from HashMap if the entry's
-            // expiry matches. If the key was re-inserted, the HashMap entry
-            // has a different (later) expiry tick.
+            // Defense-in-depth ghost-key check (RSK-1304): only remove
+            // from HashMap if the entry's expiry matches. If the key was
+            // re-inserted after eviction then re-recorded, the HashMap
+            // entry has a different (later) expiry tick. This branch is
+            // currently unreachable under normal operation because
+            // `record_token_use` denies re-insertion of an existing nonce,
+            // but it is retained as defense-in-depth against future code
+            // changes that might alter insertion semantics.
             if let Some(entry) = self.entries.get(&nonce) {
                 if entry.expiry_tick <= current_tick {
                     self.entries.remove(&nonce);
@@ -529,7 +752,7 @@ impl Default for TokenUseLedger {
 }
 
 // ---------------------------------------------------------------------------
-// Persistence (TCK-00566: durable ledger)
+// Persistence (TCK-00566: durable ledger with WAL)
 // ---------------------------------------------------------------------------
 
 /// Maximum size in bytes for the persisted token ledger file.
@@ -539,11 +762,16 @@ impl Default for TokenUseLedger {
 /// under 8 MiB.
 pub const MAX_TOKEN_LEDGER_FILE_SIZE: usize = 8 * 1024 * 1024;
 
+/// Maximum size in bytes for the WAL file.
+///
+/// Bounded to prevent OOM from a WAL that was never compacted.
+pub const MAX_WAL_FILE_SIZE: usize = 4 * 1024 * 1024;
+
 /// Schema identifier for persisted token ledger state.
 const TOKEN_LEDGER_SCHEMA_ID: &str = "apm2.fac_broker.token_ledger.v1";
 
 /// Schema version for persisted token ledger state.
-const TOKEN_LEDGER_SCHEMA_VERSION: &str = "1.0.0";
+const TOKEN_LEDGER_SCHEMA_VERSION: &str = "1.1.0";
 
 /// Persisted representation of a single token use entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -557,6 +785,16 @@ struct PersistedTokenUseEntry {
     recorded_at_tick: u64,
     /// Broker tick at which the entry expires.
     expiry_tick: u64,
+    /// Lifecycle state of the nonce.
+    #[serde(default = "default_consumed_state")]
+    state: NonceState,
+}
+
+/// Default state for backwards compatibility with v1.0.0 snapshots
+/// that lack the `state` field. All entries in v1.0.0 were implicitly
+/// consumed (they were only recorded at use time).
+const fn default_consumed_state() -> NonceState {
+    NonceState::Consumed
 }
 
 /// Persisted representation of a revoked token entry.
@@ -588,7 +826,129 @@ struct PersistedTokenLedgerState {
 }
 
 impl TokenUseLedger {
-    /// Serializes the ledger state to JSON bytes for persistence.
+    /// Serializes a single WAL entry to a newline-terminated JSON line.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if JSON serialization fails.
+    pub fn serialize_wal_entry(entry: &WalEntry) -> Result<Vec<u8>, TokenLedgerError> {
+        let mut line = serde_json::to_vec(entry).map_err(|e| TokenLedgerError::Persistence {
+            detail: format!("WAL entry serialization failed: {e}"),
+        })?;
+        line.push(b'\n');
+        Ok(line)
+    }
+
+    /// Replays WAL entries from bytes, applying them to the ledger.
+    ///
+    /// Each line in the WAL is a JSON-encoded [`WalEntry`]. Lines that
+    /// fail to parse are treated as a hard error (INV-TL-009: fail-closed).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL is too large or any line fails to parse.
+    pub fn replay_wal(&mut self, wal_bytes: &[u8]) -> Result<usize, TokenLedgerError> {
+        if wal_bytes.len() > MAX_WAL_FILE_SIZE {
+            return Err(TokenLedgerError::Persistence {
+                detail: format!(
+                    "WAL file too large: {} > {MAX_WAL_FILE_SIZE}",
+                    wal_bytes.len()
+                ),
+            });
+        }
+
+        let mut replayed = 0usize;
+        for (line_num, line) in wal_bytes.split(|&b| b == b'\n').enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            if line.len() > MAX_WAL_LINE_SIZE {
+                return Err(TokenLedgerError::Persistence {
+                    detail: format!(
+                        "WAL line {line_num} too large: {} > {MAX_WAL_LINE_SIZE}",
+                        line.len()
+                    ),
+                });
+            }
+            let entry: WalEntry =
+                serde_json::from_slice(line).map_err(|e| TokenLedgerError::Persistence {
+                    detail: format!("WAL line {line_num} parse failed: {e}"),
+                })?;
+            self.apply_wal_entry(&entry)?;
+            replayed = replayed.saturating_add(1);
+        }
+
+        Ok(replayed)
+    }
+
+    /// Applies a single WAL entry to the in-memory ledger state.
+    fn apply_wal_entry(&mut self, entry: &WalEntry) -> Result<(), TokenLedgerError> {
+        match entry {
+            WalEntry::Register {
+                nonce_hex,
+                request_id_digest_hex,
+                recorded_at_tick,
+                expiry_tick,
+            } => {
+                let nonce = parse_nonce_hex(nonce_hex)?;
+                let request_id_digest = parse_digest_hex(request_id_digest_hex)?;
+                // Only insert if not already present (idempotent replay).
+                if !self.entries.contains_key(&nonce) {
+                    // Enforce cap.
+                    while self.entries.len() >= MAX_LEDGER_ENTRIES {
+                        if let Some((old_nonce, _)) = self.insertion_order.pop_front() {
+                            self.entries.remove(&old_nonce);
+                        } else {
+                            break;
+                        }
+                    }
+                    let entry = TokenUseEntry {
+                        nonce,
+                        request_id_digest,
+                        recorded_at_tick: *recorded_at_tick,
+                        expiry_tick: *expiry_tick,
+                        state: NonceState::Issued,
+                    };
+                    self.entries.insert(nonce, entry);
+                    self.insertion_order.push_back((nonce, *expiry_tick));
+                }
+            },
+            WalEntry::Consume {
+                nonce_hex,
+                consumed_at_tick: _,
+            } => {
+                let nonce = parse_nonce_hex(nonce_hex)?;
+                if let Some(entry) = self.entries.get_mut(&nonce) {
+                    entry.state = NonceState::Consumed;
+                }
+                // If nonce not found, this is a consume for a nonce that
+                // was evicted or from a pre-registration era. Safe to skip.
+            },
+            WalEntry::Revoke {
+                nonce_hex,
+                revoked_at_tick,
+                reason,
+            } => {
+                let nonce = parse_nonce_hex(nonce_hex)?;
+                // Enforce revocation cap.
+                if self.revoked.len() >= MAX_REVOKED_TOKENS {
+                    if let Some(old_nonce) = self.revocation_order.pop_front() {
+                        self.revoked.remove(&old_nonce);
+                    }
+                }
+                let revocation_entry = RevokedTokenEntry {
+                    nonce,
+                    revoked_at_tick: *revoked_at_tick,
+                    reason: reason.clone(),
+                };
+                self.revoked.insert(nonce, revocation_entry);
+                self.revocation_order.push_back(nonce);
+            },
+        }
+        Ok(())
+    }
+
+    /// Serializes the ledger state to JSON bytes for persistence (snapshot).
     ///
     /// # Errors
     ///
@@ -603,6 +963,7 @@ impl TokenUseLedger {
                     request_id_digest_hex: hex::encode(e.request_id_digest),
                     recorded_at_tick: e.recorded_at_tick,
                     expiry_tick: e.expiry_tick,
+                    state: e.state,
                 })
             })
             .collect();
@@ -644,7 +1005,7 @@ impl TokenUseLedger {
     /// Returns an error if:
     /// - The input exceeds `MAX_TOKEN_LEDGER_FILE_SIZE`
     /// - JSON deserialization fails
-    /// - Schema id/version mismatch
+    /// - Schema id mismatch
     /// - Hex-encoded nonce/digest is malformed
     pub fn deserialize_state(bytes: &[u8], current_tick: u64) -> Result<Self, TokenLedgerError> {
         // Size gate before parsing (RSK-1601).
@@ -671,10 +1032,11 @@ impl TokenUseLedger {
                 ),
             });
         }
-        if state.schema_version != TOKEN_LEDGER_SCHEMA_VERSION {
+        // Accept both v1.0.0 (pre-NonceState) and v1.1.0 snapshots.
+        if state.schema_version != TOKEN_LEDGER_SCHEMA_VERSION && state.schema_version != "1.0.0" {
             return Err(TokenLedgerError::Persistence {
                 detail: format!(
-                    "schema version mismatch: expected {TOKEN_LEDGER_SCHEMA_VERSION}, got {}",
+                    "schema version unsupported: expected {TOKEN_LEDGER_SCHEMA_VERSION} or 1.0.0, got {}",
                     state.schema_version
                 ),
             });
@@ -692,6 +1054,7 @@ impl TokenUseLedger {
             revoked: HashMap::new(),
             revocation_order: VecDeque::new(),
             ttl_ticks,
+            wal_entries_since_snapshot: 0,
         };
 
         // Restore active entries, dropping expired ones and enforcing cap.
@@ -711,6 +1074,7 @@ impl TokenUseLedger {
                 request_id_digest,
                 recorded_at_tick: persisted.recorded_at_tick,
                 expiry_tick: persisted.expiry_tick,
+                state: persisted.state,
             };
             ledger.entries.insert(nonce, entry);
             ledger
@@ -865,6 +1229,82 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Issued state and pre-use revocation (INV-TL-008)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn register_nonce_creates_issued_entry() {
+        let mut ledger = TokenUseLedger::new();
+        let nonce = nonce_from_byte(1);
+        let digest = digest_from_byte(0xAA);
+
+        let wal = ledger.register_nonce(&nonce, &digest, 10).unwrap();
+        assert!(matches!(wal, WalEntry::Register { .. }));
+        assert_eq!(ledger.len(), 1);
+
+        // Issued nonce should be considered fresh for check purposes.
+        assert!(ledger.check_nonce(&nonce).is_ok());
+    }
+
+    #[test]
+    fn registered_nonce_can_be_consumed() {
+        let mut ledger = TokenUseLedger::new();
+        let nonce = nonce_from_byte(1);
+        let digest = digest_from_byte(0xAA);
+
+        ledger.register_nonce(&nonce, &digest, 10).unwrap();
+
+        // Consume should succeed (Issued -> Consumed transition).
+        let wal = ledger.record_token_use(&nonce, &digest, 11).unwrap();
+        assert!(matches!(wal, WalEntry::Consume { .. }));
+
+        // Now check should report replay.
+        assert!(matches!(
+            ledger.check_nonce(&nonce),
+            Err(TokenLedgerError::ReplayDetected)
+        ));
+    }
+
+    #[test]
+    fn revoke_issued_nonce_denies_first_use() {
+        let mut ledger = TokenUseLedger::new();
+        let nonce = nonce_from_byte(1);
+        let digest = digest_from_byte(0xAA);
+
+        // Register at issuance time.
+        ledger.register_nonce(&nonce, &digest, 10).unwrap();
+
+        // Revoke BEFORE first use.
+        let (receipt, _wal) = ledger.revoke_token(&nonce, 11, "leaked token").unwrap();
+        assert!(receipt.verify_content_hash());
+
+        // First use should be denied (revoked).
+        let result = ledger.record_token_use(&nonce, &digest, 12);
+        assert!(matches!(result, Err(TokenLedgerError::TokenRevoked { .. })));
+
+        // Check also denied.
+        let result = ledger.check_nonce(&nonce);
+        assert!(matches!(result, Err(TokenLedgerError::TokenRevoked { .. })));
+    }
+
+    #[test]
+    fn revoke_without_prior_use_was_blocked_now_works() {
+        // Previously, revoke_token required the nonce to be in active entries
+        // (only inserted at first use). Now, register_nonce creates the entry
+        // at issuance, so pre-use revocation works.
+        let mut ledger = TokenUseLedger::new();
+        let nonce = nonce_from_byte(1);
+        let digest = digest_from_byte(0xAA);
+
+        // Register the nonce (simulates issuance).
+        ledger.register_nonce(&nonce, &digest, 10).unwrap();
+
+        // Revoke before use should succeed.
+        let result = ledger.revoke_token(&nonce, 11, "pre-use revocation");
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
     // Revocation
     // -----------------------------------------------------------------------
 
@@ -875,7 +1315,7 @@ mod tests {
         let digest = digest_from_byte(0xAA);
         ledger.record_token_use(&nonce, &digest, 10).unwrap();
 
-        let receipt = ledger.revoke_token(&nonce, 11, "compromised").unwrap();
+        let (receipt, _wal) = ledger.revoke_token(&nonce, 11, "compromised").unwrap();
         assert_eq!(receipt.reason, "compromised");
         assert!(receipt.verify_content_hash());
         assert_eq!(ledger.revoked_count(), 1);
@@ -919,7 +1359,7 @@ mod tests {
         let digest = digest_from_byte(0xBB);
         ledger.record_token_use(&nonce, &digest, 10).unwrap();
 
-        let receipt = ledger.revoke_token(&nonce, 11, "audit-test").unwrap();
+        let (receipt, _wal) = ledger.revoke_token(&nonce, 11, "audit-test").unwrap();
         assert!(receipt.verify_content_hash());
 
         // Tamper with reason -> hash mismatch.
@@ -1211,5 +1651,153 @@ mod tests {
         let restored =
             TokenUseLedger::deserialize_state(&bytes, 10).expect("deserialize should succeed");
         assert_eq!(restored.len(), MAX_LEDGER_ENTRIES);
+    }
+
+    // -----------------------------------------------------------------------
+    // WAL tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wal_register_entry_round_trips() {
+        let mut ledger = TokenUseLedger::with_ttl(100);
+        let nonce = nonce_from_byte(1);
+        let digest = digest_from_byte(0xAA);
+
+        let wal = ledger.register_nonce(&nonce, &digest, 10).unwrap();
+        let wal_bytes = TokenUseLedger::serialize_wal_entry(&wal).unwrap();
+
+        let mut restored = TokenUseLedger::with_ttl(100);
+        let replayed = restored.replay_wal(&wal_bytes).unwrap();
+        assert_eq!(replayed, 1);
+        assert_eq!(restored.len(), 1);
+
+        // Issued nonce should be fresh.
+        assert!(restored.check_nonce(&nonce).is_ok());
+    }
+
+    #[test]
+    fn wal_consume_entry_round_trips() {
+        let mut ledger = TokenUseLedger::with_ttl(100);
+        let nonce = nonce_from_byte(1);
+        let digest = digest_from_byte(0xAA);
+
+        let wal_reg = ledger.register_nonce(&nonce, &digest, 10).unwrap();
+        let wal_consume = ledger.record_token_use(&nonce, &digest, 11).unwrap();
+
+        let mut all_wal = TokenUseLedger::serialize_wal_entry(&wal_reg).unwrap();
+        all_wal.extend(TokenUseLedger::serialize_wal_entry(&wal_consume).unwrap());
+
+        let mut restored = TokenUseLedger::with_ttl(100);
+        let replayed = restored.replay_wal(&all_wal).unwrap();
+        assert_eq!(replayed, 2);
+        assert_eq!(restored.len(), 1);
+
+        // Consumed nonce should be detected as replay.
+        assert!(matches!(
+            restored.check_nonce(&nonce),
+            Err(TokenLedgerError::ReplayDetected)
+        ));
+    }
+
+    #[test]
+    fn wal_revoke_entry_round_trips() {
+        let mut ledger = TokenUseLedger::with_ttl(100);
+        let nonce = nonce_from_byte(1);
+        let digest = digest_from_byte(0xAA);
+
+        let wal_register = ledger.register_nonce(&nonce, &digest, 10).unwrap();
+        let (_receipt, wal_revoke) = ledger.revoke_token(&nonce, 11, "test").unwrap();
+
+        let mut all_wal = TokenUseLedger::serialize_wal_entry(&wal_register).unwrap();
+        all_wal.extend(TokenUseLedger::serialize_wal_entry(&wal_revoke).unwrap());
+
+        let mut restored = TokenUseLedger::with_ttl(100);
+        let replayed = restored.replay_wal(&all_wal).unwrap();
+        assert_eq!(replayed, 2);
+        assert_eq!(restored.revoked_count(), 1);
+
+        assert!(matches!(
+            restored.check_nonce(&nonce),
+            Err(TokenLedgerError::TokenRevoked { .. })
+        ));
+    }
+
+    #[test]
+    fn wal_rejects_oversized_file() {
+        let oversized = vec![b'x'; MAX_WAL_FILE_SIZE + 1];
+        let mut ledger = TokenUseLedger::new();
+        let result = ledger.replay_wal(&oversized);
+        assert!(matches!(result, Err(TokenLedgerError::Persistence { .. })));
+    }
+
+    #[test]
+    fn wal_rejects_malformed_line() {
+        let bad_wal = b"not valid json\n";
+        let mut ledger = TokenUseLedger::new();
+        let result = ledger.replay_wal(bad_wal);
+        assert!(matches!(result, Err(TokenLedgerError::Persistence { .. })));
+    }
+
+    #[test]
+    fn wal_counter_increments_and_resets() {
+        let mut ledger = TokenUseLedger::new();
+        assert_eq!(ledger.wal_entries_since_snapshot(), 0);
+
+        let nonce = nonce_from_byte(1);
+        let digest = digest_from_byte(0xAA);
+        ledger.register_nonce(&nonce, &digest, 10).unwrap();
+        assert_eq!(ledger.wal_entries_since_snapshot(), 1);
+
+        ledger.record_token_use(&nonce, &digest, 11).unwrap();
+        assert_eq!(ledger.wal_entries_since_snapshot(), 2);
+
+        ledger.reset_wal_counter();
+        assert_eq!(ledger.wal_entries_since_snapshot(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Nonce state preservation in serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn serialize_preserves_issued_state() {
+        let mut ledger = TokenUseLedger::with_ttl(100);
+        let nonce = nonce_from_byte(1);
+        let digest = digest_from_byte(0xAA);
+
+        ledger.register_nonce(&nonce, &digest, 10).unwrap();
+
+        let bytes = ledger.serialize_state().unwrap();
+        let restored = TokenUseLedger::deserialize_state(&bytes, 10).unwrap();
+        assert_eq!(restored.len(), 1);
+
+        // Issued nonce should be fresh (not replay).
+        assert!(restored.check_nonce(&nonce).is_ok());
+
+        // Should be consumable.
+        let mut restored = restored;
+        assert!(restored.record_token_use(&nonce, &digest, 11).is_ok());
+
+        // Now it should be replay.
+        assert!(matches!(
+            restored.check_nonce(&nonce),
+            Err(TokenLedgerError::ReplayDetected)
+        ));
+    }
+
+    #[test]
+    fn deserialize_v1_snapshot_defaults_to_consumed() {
+        // v1.0.0 snapshots lack the "state" field. The serde default
+        // should produce Consumed entries.
+        let v1_json = r#"{"schema_id":"apm2.fac_broker.token_ledger.v1","schema_version":"1.0.0","ttl_ticks":100,"entries":[{"nonce_hex":"0100000000000000000000000000000000000000000000000000000000000000","request_id_digest_hex":"aa00000000000000000000000000000000000000000000000000000000000000","recorded_at_tick":10,"expiry_tick":110}],"revoked":[]}"#;
+        let restored = TokenUseLedger::deserialize_state(v1_json.as_bytes(), 10).unwrap();
+        assert_eq!(restored.len(), 1);
+
+        // Should be detected as consumed (replay).
+        let nonce = nonce_from_byte(1);
+        assert!(matches!(
+            restored.check_nonce(&nonce),
+            Err(TokenLedgerError::ReplayDetected)
+        ));
     }
 }

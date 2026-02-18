@@ -419,8 +419,20 @@ pub fn run_fac_worker(
 
     // TCK-00566: Load persisted token ledger if available. The ledger
     // survives restarts so replay protection is not lost on daemon restart.
-    if let Some(ledger) = load_token_ledger(broker.current_tick()) {
-        broker.set_token_ledger(ledger);
+    // INV-TL-009: Load errors from an existing file are hard security faults.
+    match load_token_ledger(broker.current_tick()) {
+        Ok(Some(ledger)) => {
+            broker.set_token_ledger(ledger);
+        },
+        Ok(None) => {
+            // No persisted ledger (first run). Fresh ledger already
+            // initialized.
+        },
+        Err(e) => {
+            let msg = format!("FATAL: token ledger load failed (fail-closed): {e}");
+            output_worker_error(json_output, &msg);
+            return exit_codes::GENERIC_ERROR;
+        },
     }
 
     let (mut queue_state, mut cost_model) = match load_scheduler_state(&fac_root) {
@@ -780,7 +792,10 @@ pub fn run_fac_worker(
                     return exit_codes::GENERIC_ERROR;
                 }
                 let _ = save_broker_state(&broker);
-                let _ = save_token_ledger(&broker);
+                if let Err(e) = save_token_ledger(&mut broker) {
+                    output_worker_error(json_output, &format!("token ledger save failed: {e}"));
+                    return exit_codes::GENERIC_ERROR;
+                }
                 if json_output {
                     emit_worker_summary(&summary);
                 } else {
@@ -961,7 +976,10 @@ pub fn run_fac_worker(
                     return exit_codes::GENERIC_ERROR;
                 }
                 let _ = save_broker_state(&broker);
-                let _ = save_token_ledger(&broker);
+                if let Err(e) = save_token_ledger(&mut broker) {
+                    output_worker_error(json_output, &format!("token ledger save failed: {e}"));
+                    return exit_codes::GENERIC_ERROR;
+                }
                 if json_output {
                     emit_worker_summary(&summary);
                 }
@@ -1008,7 +1026,10 @@ pub fn run_fac_worker(
         return exit_codes::GENERIC_ERROR;
     }
     let _ = save_broker_state(&broker);
-    let _ = save_token_ledger(&broker);
+    if let Err(e) = save_token_ledger(&mut broker) {
+        output_worker_error(json_output, &format!("token ledger save failed: {e}"));
+        return exit_codes::GENERIC_ERROR;
+    }
     exit_codes::SUCCESS
 }
 
@@ -2612,48 +2633,97 @@ fn process_job(
     // token-use ledger. If the nonce is already consumed or revoked, deny
     // the job (fail-closed). If the nonce is fresh, record it so any
     // subsequent replay is detected.
+    //
+    // BLOCKER fix: the WAL entry MUST be persisted to disk (with fsync)
+    // BEFORE job execution begins. This ensures the "consumed" state is
+    // durable even if the process crashes during job execution.
     if let Some(binding) = boundary_check.token_binding.as_ref() {
         if let Some(ref nonce) = binding.nonce {
-            if let Err(ledger_err) =
-                broker.validate_and_record_token_nonce(nonce, &spec.actuation.request_id)
-            {
-                let denial_code = match &ledger_err {
-                    apm2_core::fac::token_ledger::TokenLedgerError::TokenRevoked { .. } => {
-                        DenialReasonCode::TokenRevoked
-                    },
-                    _ => DenialReasonCode::TokenReplayDetected,
-                };
-                let reason = format!("token nonce replay/revocation check failed: {ledger_err}");
-                let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                    .map(|p| {
-                        p.strip_prefix(queue_root)
-                            .unwrap_or(&p)
-                            .to_string_lossy()
-                            .to_string()
-                    })
-                    .ok();
-                if let Err(receipt_err) = emit_job_receipt(
-                    fac_root,
-                    spec,
-                    FacJobOutcome::Denied,
-                    Some(denial_code),
-                    &reason,
-                    Some(&boundary_trace),
-                    None,
-                    None,
-                    None,
-                    Some(canonicalizer_tuple_digest),
-                    moved_path.as_deref(),
-                    policy_hash,
-                    None,
-                    Some(&sbx_hash),
-                    Some(&resolved_net_hash),
-                ) {
-                    eprintln!(
-                        "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
-                    );
-                }
-                return JobOutcome::Denied { reason };
+            match broker.validate_and_record_token_nonce(nonce, &spec.actuation.request_id) {
+                Ok(wal_bytes) => {
+                    // INV-TL-009/INV-TL-010: Persist WAL entry BEFORE job
+                    // execution. If persistence fails, deny the job
+                    // (fail-closed: we cannot guarantee replay protection
+                    // without durable state).
+                    if let Err(wal_err) = append_token_ledger_wal(&wal_bytes) {
+                        let reason = format!(
+                            "FATAL: token ledger WAL persist failed (fail-closed): {wal_err}"
+                        );
+                        eprintln!("worker: {reason}");
+                        let moved_path =
+                            move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+                                .map(|p| {
+                                    p.strip_prefix(queue_root)
+                                        .unwrap_or(&p)
+                                        .to_string_lossy()
+                                        .to_string()
+                                })
+                                .ok();
+                        if let Err(receipt_err) = emit_job_receipt(
+                            fac_root,
+                            spec,
+                            FacJobOutcome::Denied,
+                            Some(DenialReasonCode::TokenReplayDetected),
+                            &reason,
+                            Some(&boundary_trace),
+                            None,
+                            None,
+                            None,
+                            Some(canonicalizer_tuple_digest),
+                            moved_path.as_deref(),
+                            policy_hash,
+                            None,
+                            Some(&sbx_hash),
+                            Some(&resolved_net_hash),
+                        ) {
+                            eprintln!(
+                                "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
+                            );
+                        }
+                        return JobOutcome::Denied { reason };
+                    }
+                },
+                Err(ledger_err) => {
+                    let denial_code = match &ledger_err {
+                        apm2_core::fac::token_ledger::TokenLedgerError::TokenRevoked { .. } => {
+                            DenialReasonCode::TokenRevoked
+                        },
+                        _ => DenialReasonCode::TokenReplayDetected,
+                    };
+                    let reason =
+                        format!("token nonce replay/revocation check failed: {ledger_err}");
+                    let moved_path =
+                        move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+                            .map(|p| {
+                                p.strip_prefix(queue_root)
+                                    .unwrap_or(&p)
+                                    .to_string_lossy()
+                                    .to_string()
+                            })
+                            .ok();
+                    if let Err(receipt_err) = emit_job_receipt(
+                        fac_root,
+                        spec,
+                        FacJobOutcome::Denied,
+                        Some(denial_code),
+                        &reason,
+                        Some(&boundary_trace),
+                        None,
+                        None,
+                        None,
+                        Some(canonicalizer_tuple_digest),
+                        moved_path.as_deref(),
+                        policy_hash,
+                        None,
+                        Some(&sbx_hash),
+                        Some(&resolved_net_hash),
+                    ) {
+                        eprintln!(
+                            "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
+                        );
+                    }
+                    return JobOutcome::Denied { reason };
+                },
             }
         }
         // If nonce is None (pre-TCK-00566 token), skip nonce validation.
@@ -5412,28 +5482,56 @@ fn save_broker_state(broker: &FacBroker) -> Result<(), String> {
 /// TCK-00566: Loads persisted token ledger from
 /// `$APM2_HOME/private/fac/broker/token_ledger/state.json`.
 ///
-/// Returns `None` if the file doesn't exist or deserialization fails.
+/// Returns `Ok(None)` if the file doesn't exist (first run).
+/// Returns `Err` if the file exists but cannot be read or deserialized
+/// (INV-TL-009: fail-closed — load errors from an existing ledger file
+/// are hard security faults that refuse to continue).
 /// Expired entries are dropped on load.
-fn load_token_ledger(current_tick: u64) -> Option<apm2_core::fac::token_ledger::TokenUseLedger> {
-    let fac_root = resolve_fac_root().ok()?;
+///
+/// If a WAL file exists alongside the snapshot, it is replayed after
+/// snapshot load to restore full ledger state.
+fn load_token_ledger(
+    current_tick: u64,
+) -> Result<Option<apm2_core::fac::token_ledger::TokenUseLedger>, String> {
+    let fac_root = resolve_fac_root()?;
     let ledger_dir = fac_root.join("broker").join("token_ledger");
     let state_path = ledger_dir.join("state.json");
     if !state_path.exists() {
-        return None;
+        // No WAL without a snapshot is valid on first run.
+        return Ok(None);
     }
     let bytes = read_bounded(
         &state_path,
         apm2_core::fac::token_ledger::MAX_TOKEN_LEDGER_FILE_SIZE,
-    )
-    .ok()?;
-    apm2_core::fac::token_ledger::TokenUseLedger::deserialize_state(&bytes, current_tick).ok()
+    )?;
+    let mut ledger =
+        apm2_core::fac::token_ledger::TokenUseLedger::deserialize_state(&bytes, current_tick)
+            .map_err(|e| format!("token ledger load failed (fail-closed): {e}"))?;
+
+    // Replay WAL if it exists.
+    let wal_path = ledger_dir.join("wal.jsonl");
+    if wal_path.exists() {
+        let wal_bytes = read_bounded(&wal_path, apm2_core::fac::token_ledger::MAX_WAL_FILE_SIZE)?;
+        let replayed = ledger
+            .replay_wal(&wal_bytes)
+            .map_err(|e| format!("token ledger WAL replay failed (fail-closed): {e}"))?;
+        if replayed > 0 {
+            eprintln!("worker: replayed {replayed} WAL entries for token ledger");
+        }
+    }
+
+    Ok(Some(ledger))
 }
 
-/// TCK-00566: Saves token ledger to
+/// TCK-00566: Saves token ledger snapshot to
 /// `$APM2_HOME/private/fac/broker/token_ledger/state.json`.
 ///
-/// Uses atomic write (temp+rename) for crash safety (CTR-2607).
-fn save_token_ledger(broker: &FacBroker) -> Result<(), String> {
+/// Uses `write_atomic` (`temp+fsync+dir_fsync+rename`) for crash safety
+/// per CTR-2607. After a successful snapshot, the WAL file is truncated
+/// and the WAL counter is reset (compaction).
+///
+/// Errors are propagated to the caller (INV-TL-009: fail-closed).
+fn save_token_ledger(broker: &mut FacBroker) -> Result<(), String> {
     let fac_root = resolve_fac_root()?;
     let ledger_dir = fac_root.join("broker").join("token_ledger");
     if !ledger_dir.exists() {
@@ -5444,12 +5542,44 @@ fn save_token_ledger(broker: &FacBroker) -> Result<(), String> {
     let bytes = broker
         .serialize_token_ledger()
         .map_err(|e| format!("cannot serialize token ledger: {e}"))?;
-    // Atomic write: temp file + rename.
-    let tmp_path = ledger_dir.join("state.json.tmp");
-    fs::write(&tmp_path, &bytes)
-        .map_err(|e| format!("cannot write token ledger temp file: {e}"))?;
-    fs::rename(&tmp_path, &state_path)
-        .map_err(|e| format!("cannot rename token ledger temp file: {e}"))
+    // CTR-2607: full atomic write protocol (temp+fsync+dir_fsync+rename).
+    apm2_core::determinism::write_atomic(&state_path, &bytes)
+        .map_err(|e| format!("cannot write token ledger snapshot: {e}"))?;
+    // Truncate WAL after successful snapshot (compaction).
+    let wal_path = ledger_dir.join("wal.jsonl");
+    if wal_path.exists() {
+        fs::write(&wal_path, b"").map_err(|e| format!("cannot truncate token ledger WAL: {e}"))?;
+    }
+    broker.reset_token_ledger_wal_counter();
+    Ok(())
+}
+
+/// TCK-00566: Appends a WAL entry to
+/// `$APM2_HOME/private/fac/broker/token_ledger/wal.jsonl`.
+///
+/// Uses append mode with fsync for crash durability (INV-TL-010).
+/// This MUST be called immediately after `validate_and_record_token_nonce`
+/// returns Ok and BEFORE job execution begins (BLOCKER fix).
+fn append_token_ledger_wal(wal_bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    let fac_root = resolve_fac_root()?;
+    let ledger_dir = fac_root.join("broker").join("token_ledger");
+    if !ledger_dir.exists() {
+        fac_permissions::ensure_dir_with_mode(&ledger_dir)
+            .map_err(|e| format!("cannot create token ledger dir: {e}"))?;
+    }
+    let wal_path = ledger_dir.join("wal.jsonl");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&wal_path)
+        .map_err(|e| format!("cannot open token ledger WAL: {e}"))?;
+    file.write_all(wal_bytes)
+        .map_err(|e| format!("cannot write token ledger WAL: {e}"))?;
+    file.sync_all()
+        .map_err(|e| format!("cannot fsync token ledger WAL: {e}"))?;
+    Ok(())
 }
 
 /// Atomically moves a file to a destination directory with collision-safe
