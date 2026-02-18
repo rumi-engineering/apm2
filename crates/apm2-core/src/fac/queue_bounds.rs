@@ -46,8 +46,8 @@
 //! - [INV-QB-001] Fail-closed: unreadable pending directory denies all enqueue
 //!   attempts.
 //! - [INV-QB-002] Directory scan is bounded by `MAX_SCAN_ENTRIES` to prevent
-//!   DoS from a directory with millions of entries. Truncated scans are
-//!   treated as fail-closed denials.
+//!   DoS from a directory with millions of entries. Truncated scans are treated
+//!   as fail-closed denials.
 //! - [INV-QB-003] Denial receipts include the exceeded dimension, current
 //!   usage, limit, and stable reason code for audit.
 //! - [INV-QB-004] Arithmetic uses `checked_add`; overflow returns Err.
