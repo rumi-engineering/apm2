@@ -194,6 +194,8 @@ mod systemd_properties;
 pub mod taint;
 mod terminal_verifier;
 pub mod token_ledger;
+/// Toolchain fingerprint derivation, caching, and verification (TCK-00538).
+pub mod toolchain_fingerprint;
 pub mod transcript_binding;
 pub mod warm;
 pub mod worker_heartbeat;
@@ -549,6 +551,12 @@ pub use terminal_verifier::{
     MAX_PREDICATE_NODES, MAX_REQUIRED_OUTPUTS, Predicate, PredicateOp, TerminalVerifier,
     VerifierError, VerifierKind, VerifierOutput, VerifierOutputBuilder, VerifierPolicy,
     VerifierPolicyBuilder, evaluate_predicate,
+};
+// Re-export toolchain fingerprint types (TCK-00538)
+pub use toolchain_fingerprint::{
+    FINGERPRINT_STRING_LENGTH, ToolchainFingerprintError, ToolchainVersions,
+    collect_toolchain_versions, compute_or_cached as compute_or_cached_toolchain_fingerprint,
+    derive_from_versions as derive_toolchain_fingerprint, is_valid_fingerprint,
 };
 // Re-export transcript binding types
 pub use transcript_binding::{
