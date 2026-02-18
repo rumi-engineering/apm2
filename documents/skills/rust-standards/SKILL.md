@@ -383,6 +383,7 @@ holonic_checks:
 | T27 | [42_distributed_security_invariants.md](references/42_distributed_security_invariants.md) | Distributed security |
 | T28 | [42_pcac_ajc_integration.md](references/42_pcac_ajc_integration.md) | PCAC/AJC integration |
 | T29 | [43_apm2_scp_dcp_map.md](references/43_apm2_scp_dcp_map.md) | SCP/DCP map |
+| T30 | [44_deterministic_simulated_testing.md](references/44_deterministic_simulated_testing.md) | DST / test isolation |
 
 ---
 

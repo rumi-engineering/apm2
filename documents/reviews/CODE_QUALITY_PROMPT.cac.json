@@ -119,6 +119,7 @@
       {"path": "@documents/skills/rust-standards/references/42_distributed_security_invariants.md", "purpose": "Distributed security invariants (CTR-27XX, INV-2701), consensus integrity, replication safety."},
       {"path": "@documents/skills/rust-standards/references/42_pcac_ajc_integration.md", "purpose": "PCAC/AJC integration patterns, authority continuity contracts."},
       {"path": "@documents/skills/rust-standards/references/43_apm2_scp_dcp_map.md", "purpose": "APM2 SCP/DCP mapping — system and domain context provider contracts."},
+      {"path": "@documents/skills/rust-standards/references/44_deterministic_simulated_testing.md", "purpose": "Deterministic simulated testing — test isolation, reproducibility, nondeterminism elimination, side-effect capture, simulation harnesses."},
       {"path": "@documents/skills/modes-of-reasoning/assets/06-constraint-satisfiability.json", "purpose": "REQUIRED REASONING MODE: Encode invariants as constraints — verify all contracts and invariants still hold after the change."},
       {"path": "@documents/skills/modes-of-reasoning/assets/07-type-theoretic.json", "purpose": "REQUIRED REASONING MODE: Type-level reasoning — verify types encode the right invariants and invalid states cannot be constructed."},
       {"path": "@documents/skills/modes-of-reasoning/assets/08-counterexample-guided.json", "purpose": "REQUIRED REASONING MODE: Counterexample search — find concrete inputs or states that violate claimed properties."}

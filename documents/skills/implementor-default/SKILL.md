@@ -17,7 +17,7 @@ protocol:
 variables:
   IMPLEMENTATION_SCOPE_OPTIONAL: "$1"
 
-references[16]:
+references[17]:
   - path: "@documents/security/SECURITY_POLICY.cac.json"
     purpose: "Security posture and fail-closed defaults for ambiguous trust state."
   - path: "@documents/rfcs/RFC-0019/20_fac_execution_substrate_build_farm_revision.md"
@@ -40,6 +40,9 @@ references[16]:
     purpose: "RS-40: monotonic clocks, ordering hazards, staleness detection. CRITICAL DoS: INV-2501 (Instant not SystemTime), RSK-2504 (zero-interval guards). CRITICAL TOCTOU: tick/epoch staleness."
   - path: "@documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md"
     purpose: "RS-41: fail-closed, validated construction, state machines. CRITICAL: CTR-2605 (state machines), CTR-2608 (retry backoff), RSK-2625 (unbounded channels)."
+
+  - path: "@documents/skills/rust-standards/references/44_deterministic_simulated_testing.md"
+    purpose: "RS-44: deterministic simulated testing, test isolation, and reproducibility. CRITICAL: CTR-3001 (hermetic isolation), RSK-3001 (env var mutation), RSK-3003 (sleep-based sync), CTR-3007 (simulation harnesses)."
 
   # Domain patterns and reference findings
   - path: "@documents/skills/rust-standards/references/27_collections_allocation_models.md"
@@ -315,7 +318,7 @@ decision_tree:
         - id: DONE
           action: "output DONE and nothing else, your task is complete."
 
-invariants[16]:
+invariants[17]:
   # Clean Tree Invariant (HIGHEST PRIORITY — agents repeatedly violate this)
   - "NEVER run `apm2 fac gates` or `apm2 fac push` with uncommitted changes. ALL files — code, tests, docs, tickets — MUST be committed first. Build artifacts are SHA-attested and reused as a source of truth; a dirty tree makes attestation impossible and the commands WILL FAIL."
 
@@ -338,6 +341,9 @@ invariants[16]:
   - "Loops, retries, and recursive algorithms MUST have explicit iteration/depth/time bounds; no indefinite spinning or exponential algorithms without cap."
   - "I/O reads MUST be bounded by explicit size caps BEFORE allocation; never use unbounded .read_to_end() on untrusted streams."
   - "Timeout logic uses monotonic Instant not wall-clock SystemTime; duration_since() uses checked_* variant; intervals guarded for zero before division."
+
+  # Deterministic Test Invariant
+  - "Tests MUST be deterministic and hermetically isolated: inject all external dependencies (time, I/O, randomness, environment) via traits or parameters; never share mutable process-global state between tests; never use sleep-based synchronization; never depend on HashMap iteration order, filesystem state, or network availability. Reference: RS-44 (deterministic simulated testing)."
 
   # TOCTOU Prevention Invariants
   - "If state machine state (tick, epoch, version, cursor) is read outside a lock, re-validate before enforcement; do not assume stale reads are truthful across await."
