@@ -31,7 +31,7 @@ use super::gate_attestation::{
     GateResourcePolicy, build_nextest_command, compute_gate_attestation,
     gate_command_for_attestation, short_digest,
 };
-use super::gate_cache::{GateCache, ReuseDecision};
+use super::gate_cache::{CacheSource, GateCache, ReuseDecision};
 use super::gate_checks;
 use super::merge_conflicts::{
     check_merge_conflicts_against_main, render_merge_conflict_log, render_merge_conflict_summary,
@@ -394,11 +394,56 @@ fn reuse_decision_with_v3_fallback(
     if let Some(v3) = v3_cache {
         let v3_decision = v3.check_reuse(gate_name, attestation_digest, true, verifying_key);
         if v3_decision.reusable {
-            return ReuseDecision::hit();
+            return ReuseDecision::hit_v3();
         }
     }
     // Fall back to v2.
     reuse_decision_for_gate(v2_cache, gate_name, attestation_digest, verifying_key)
+}
+
+/// Unified cached payload fields extracted from either v2 or v3.
+///
+/// Used by the cache-hit path to avoid coupling the reuse sites to a
+/// specific cache version.  The fields are the subset needed to emit
+/// evidence results and propagate cache metadata.
+struct CachedPayload {
+    duration_secs: u64,
+    evidence_log_digest: Option<String>,
+    log_path: Option<String>,
+}
+
+/// Resolve the cached payload from the appropriate cache layer based on
+/// the `ReuseDecision` source.
+///
+/// When `source == V3`, pulls from `v3_cache`; otherwise pulls from `v2_cache`.
+/// Returns `None` if the indicated source does not contain the gate entry
+/// (should not happen in a well-formed cache, but fail-closed).
+fn resolve_cached_payload(
+    reuse: &ReuseDecision,
+    v3_cache: Option<&GateCacheV3>,
+    v2_cache: Option<&GateCache>,
+    gate_name: &str,
+) -> Option<CachedPayload> {
+    match reuse.source {
+        CacheSource::V3 => {
+            let v3 = v3_cache?;
+            let entry = v3.get(gate_name)?;
+            Some(CachedPayload {
+                duration_secs: entry.duration_secs,
+                evidence_log_digest: entry.evidence_log_digest.clone(),
+                log_path: entry.log_path.clone(),
+            })
+        },
+        CacheSource::V2 | CacheSource::None => {
+            let v2 = v2_cache?;
+            let entry = v2.get(gate_name)?;
+            Some(CachedPayload {
+                duration_secs: entry.duration_secs,
+                evidence_log_digest: entry.evidence_log_digest.clone(),
+                log_path: entry.log_path.clone(),
+            })
+        },
+    }
 }
 
 fn stream_pipe_to_file<R: Read>(
@@ -1401,19 +1446,15 @@ fn finalize_status_gate_run(
     // Force a final update to ensure all gate results are posted.
     updater.force_update(status);
 
-    // TCK-00576: Sign all gate cache entries before persisting.
-    gate_cache.sign_all(signer);
-
-    // Persist gate cache (v2) so future pipeline runs can reuse results.
-    gate_cache
-        .save()
-        .map_err(|err| format!("failed to persist attested gate cache: {err}"))?;
-
-    // TCK-00541: Populate and persist v3 gate cache alongside v2.
-    // V3 writes are additive — v2 writes remain for backwards compatibility
-    // with push.rs and gates.rs callers.
+    // TCK-00541: Persist v3 gate cache as the primary (receipt-indexed) store.
+    // V3 is written first and treated as the authoritative cache. V2 follows
+    // as backward-compatible fallback for push.rs / gates.rs callers that
+    // have not yet been migrated to v3.
     if let Some(v3) = v3_gate_cache {
-        // Copy all gate results from v2 into v3 for persistence.
+        // Populate v3 from the in-memory gate_cache entries (which contain
+        // backfilled metadata from the step above). V3 entries are
+        // independently signed below so they are self-contained — a v3 hit
+        // does NOT require v2 to be present.
         for (gate_name, result) in &gate_cache.gates {
             let v3_result = apm2_core::fac::gate_cache_v3::V3GateResult {
                 status: result.status.clone(),
@@ -1430,14 +1471,22 @@ fn finalize_status_gate_run(
             // Best-effort: skip if we hit the gate limit.
             let _ = v3.set(gate_name, v3_result);
         }
-        // Sign v3 entries.
+        // Sign v3 entries (independent signatures, not derived from v2).
         v3.sign_all(signer);
-        // Persist v3 cache.
+        // Persist v3 cache (primary store).
         if let Some(root) = cache_v3_root() {
             if let Err(err) = v3.save_to_dir(&root) {
                 eprintln!("warning: failed to persist v3 gate cache: {err}");
             }
         }
+    }
+
+    // Persist gate cache (v2) as backward-compatible fallback.
+    // V2 writes are optional — v3 is the primary store. V2 persistence
+    // failures are logged but do not fail the pipeline.
+    gate_cache.sign_all(signer);
+    if let Err(err) = gate_cache.save() {
+        eprintln!("warning: failed to persist v2 gate cache (backward-compat): {err}");
     }
 
     if let Some(file) = projection_log {
@@ -2444,7 +2493,9 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             Some(&fac_verifying_key),
         );
         if reuse.reusable {
-            if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
+            if let Some(cached) =
+                resolve_cached_payload(&reuse, v3_cache_loaded.as_ref(), cache.as_ref(), gate_name)
+            {
                 emit_gate_started_cb(on_gate_progress, gate_name);
                 status.set_running(gate_name);
                 updater.update(&status);
@@ -2471,8 +2522,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cached.duration_secs,
                     attestation_digest.clone(),
                     false,
-                    cached.evidence_log_digest.clone(),
-                    cached.log_path.clone(),
+                    cached.evidence_log_digest,
+                    cached.log_path,
                 );
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
@@ -2629,7 +2680,9 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             Some(&fac_verifying_key),
         );
         if reuse.reusable {
-            if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
+            if let Some(cached) =
+                resolve_cached_payload(&reuse, v3_cache_loaded.as_ref(), cache.as_ref(), gate_name)
+            {
                 emit_gate_started_cb(on_gate_progress, gate_name);
                 status.set_running(gate_name);
                 updater.update(&status);
@@ -2656,8 +2709,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cached.duration_secs,
                     attestation_digest.clone(),
                     false,
-                    cached.evidence_log_digest.clone(),
-                    cached.log_path.clone(),
+                    cached.evidence_log_digest,
+                    cached.log_path,
                 );
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
@@ -2808,7 +2861,9 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         status.set_running(gate_name);
         updater.update(&status);
         if reuse.reusable {
-            if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
+            if let Some(cached) =
+                resolve_cached_payload(&reuse, v3_cache_loaded.as_ref(), cache.as_ref(), gate_name)
+            {
                 let stream_stats = write_cached_gate_log_marker(
                     &log_path,
                     gate_name,
@@ -2832,8 +2887,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cached.duration_secs,
                     attestation_digest.clone(),
                     false,
-                    cached.evidence_log_digest.clone(),
-                    cached.log_path.clone(),
+                    cached.evidence_log_digest,
+                    cached.log_path,
                 );
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
@@ -2988,7 +3043,9 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         status.set_running(gate_name);
         updater.update(&status);
         if reuse.reusable {
-            if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
+            if let Some(cached) =
+                resolve_cached_payload(&reuse, v3_cache_loaded.as_ref(), cache.as_ref(), gate_name)
+            {
                 let stream_stats = write_cached_gate_log_marker(
                     &log_path,
                     gate_name,
@@ -3012,8 +3069,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cached.duration_secs,
                     attestation_digest.clone(),
                     false,
-                    cached.evidence_log_digest.clone(),
-                    cached.log_path.clone(),
+                    cached.evidence_log_digest,
+                    cached.log_path,
                 );
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
@@ -3128,7 +3185,9 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             Some(&fac_verifying_key),
         );
         if reuse.reusable {
-            if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
+            if let Some(cached) =
+                resolve_cached_payload(&reuse, v3_cache_loaded.as_ref(), cache.as_ref(), gate_name)
+            {
                 emit_gate_started_cb(on_gate_progress, gate_name);
                 status.set_running(gate_name);
                 updater.update(&status);
@@ -3155,8 +3214,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cached.duration_secs,
                     attestation_digest.clone(),
                     false,
-                    cached.evidence_log_digest.clone(),
-                    cached.log_path.clone(),
+                    cached.evidence_log_digest,
+                    cached.log_path,
                 );
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
@@ -3616,6 +3675,250 @@ mod tests {
         assert!(
             log_size <= max_expected,
             "on-disk log size ({log_size}) should be bounded by {max_expected}"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00541 BLOCKER regression: v3-only cache hits must succeed without v2
+    // =========================================================================
+
+    /// Prove that when v3 has a valid signed entry but v2 is absent,
+    /// `reuse_decision_with_v3_fallback` returns a hit with `CacheSource::V3`,
+    /// and `resolve_cached_payload` successfully extracts the cached payload
+    /// from v3 alone (no v2 fallback needed).
+    #[test]
+    fn v3_only_cache_hit_succeeds_without_v2() {
+        use apm2_core::crypto::Signer;
+        use apm2_core::fac::gate_cache_v3::{GateCacheV3, V3CompoundKey, V3GateResult};
+
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+
+        // Build a v3 cache with a signed gate result.
+        let compound_key = V3CompoundKey::new(
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "b3-256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "b3-256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "b3-256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        )
+        .expect("valid compound key");
+
+        let mut v3_cache = GateCacheV3::new("test-sha-123", compound_key).expect("new v3 cache");
+        let v3_result = V3GateResult {
+            status: "PASS".to_string(),
+            duration_secs: 42,
+            completed_at: "2026-02-17T00:00:00Z".to_string(),
+            attestation_digest: Some(
+                "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            ),
+            evidence_log_digest: Some("log-digest-v3-only".to_string()),
+            quick_mode: Some(false),
+            log_bundle_hash: None,
+            log_path: Some("/tmp/v3-only-test.log".to_string()),
+            signature_hex: None,
+            signer_id: None,
+        };
+        v3_cache.set("rustfmt", v3_result).expect("set");
+        v3_cache.sign_all(&signer);
+
+        let gate_name = "rustfmt";
+        let attestation_digest =
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        // Step 1: v3 exists, v2 is None — reuse decision must be a v3 hit.
+        let reuse = reuse_decision_with_v3_fallback(
+            Some(&v3_cache),
+            None, // v2 is absent
+            gate_name,
+            Some(attestation_digest),
+            Some(&vk),
+        );
+        assert!(reuse.reusable, "v3-only cache hit must be reusable");
+        assert_eq!(
+            reuse.source,
+            CacheSource::V3,
+            "hit source must be V3 when v2 is absent"
+        );
+        assert_eq!(reuse.reason, "v3_compound_key_match");
+
+        // Step 2: resolve_cached_payload must succeed from v3 alone.
+        let payload = resolve_cached_payload(
+            &reuse,
+            Some(&v3_cache),
+            None, // v2 is absent
+            gate_name,
+        );
+        let payload = payload.expect("v3-only payload must resolve");
+        assert_eq!(payload.duration_secs, 42);
+        assert_eq!(
+            payload.evidence_log_digest.as_deref(),
+            Some("log-digest-v3-only")
+        );
+        assert_eq!(payload.log_path.as_deref(), Some("/tmp/v3-only-test.log"));
+    }
+
+    /// Prove that when both v3 and v2 exist, v3 is preferred.
+    #[test]
+    fn v3_preferred_over_v2_when_both_present() {
+        use apm2_core::crypto::Signer;
+        use apm2_core::fac::gate_cache_v3::{GateCacheV3, V3CompoundKey, V3GateResult};
+
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+
+        let compound_key = V3CompoundKey::new(
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "b3-256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "b3-256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "b3-256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        )
+        .expect("valid compound key");
+
+        // Build v3 with duration 42.
+        let mut v3_cache = GateCacheV3::new("test-sha-456", compound_key).expect("new v3 cache");
+        let v3_result = V3GateResult {
+            status: "PASS".to_string(),
+            duration_secs: 42,
+            completed_at: "2026-02-17T00:00:00Z".to_string(),
+            attestation_digest: Some(
+                "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            ),
+            evidence_log_digest: Some("v3-digest".to_string()),
+            quick_mode: Some(false),
+            log_bundle_hash: None,
+            log_path: Some("/tmp/v3-path.log".to_string()),
+            signature_hex: None,
+            signer_id: None,
+        };
+        v3_cache.set("clippy", v3_result).expect("set");
+        v3_cache.sign_all(&signer);
+
+        // Build v2 with duration 99 (different to detect which source is used).
+        let mut v2_cache = GateCache {
+            sha: "test-sha-456".to_string(),
+            gates: std::collections::BTreeMap::new(),
+        };
+        v2_cache.gates.insert(
+            "clippy".to_string(),
+            super::super::gate_cache::CachedGateResult {
+                status: "PASS".to_string(),
+                duration_secs: 99,
+                completed_at: "2026-02-17T00:00:00Z".to_string(),
+                attestation_digest: Some(
+                    "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
+                evidence_log_digest: Some("v2-digest".to_string()),
+                quick_mode: Some(false),
+                log_bundle_hash: None,
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_path: Some("/tmp/v2-path.log".to_string()),
+                signature_hex: None,
+                signer_id: None,
+            },
+        );
+
+        let gate_name = "clippy";
+        let attestation_digest =
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        // Reuse decision should prefer v3.
+        let reuse = reuse_decision_with_v3_fallback(
+            Some(&v3_cache),
+            Some(&v2_cache),
+            gate_name,
+            Some(attestation_digest),
+            Some(&vk),
+        );
+        assert!(reuse.reusable);
+        assert_eq!(reuse.source, CacheSource::V3);
+
+        // Payload must come from v3 (duration 42), not v2 (duration 99).
+        let payload = resolve_cached_payload(&reuse, Some(&v3_cache), Some(&v2_cache), gate_name);
+        let payload = payload.expect("payload must resolve");
+        assert_eq!(
+            payload.duration_secs, 42,
+            "payload must come from v3 (42), not v2 (99)"
+        );
+        assert_eq!(payload.evidence_log_digest.as_deref(), Some("v3-digest"));
+        assert_eq!(payload.log_path.as_deref(), Some("/tmp/v3-path.log"));
+    }
+
+    /// Prove that when v3 misses but v2 hits, the payload comes from v2.
+    #[test]
+    fn v2_fallback_when_v3_misses() {
+        use apm2_core::crypto::Signer;
+        use apm2_core::fac::gate_cache_v3::{GateCacheV3, V3CompoundKey};
+
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+
+        let compound_key = V3CompoundKey::new(
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "b3-256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "b3-256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "b3-256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        )
+        .expect("valid compound key");
+
+        // v3 is empty (no gates).
+        let v3_cache = GateCacheV3::new("test-sha-789", compound_key).expect("new v3 cache");
+
+        // v2 has a signed entry.
+        let mut v2_cache = GateCache {
+            sha: "test-sha-789".to_string(),
+            gates: std::collections::BTreeMap::new(),
+        };
+        let mut v2_result = super::super::gate_cache::CachedGateResult {
+            status: "PASS".to_string(),
+            duration_secs: 77,
+            completed_at: "2026-02-17T00:00:00Z".to_string(),
+            attestation_digest: Some(
+                "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            ),
+            evidence_log_digest: Some("v2-fallback-digest".to_string()),
+            quick_mode: Some(false),
+            log_bundle_hash: None,
+            bytes_written: None,
+            bytes_total: None,
+            was_truncated: None,
+            log_path: Some("/tmp/v2-fallback.log".to_string()),
+            signature_hex: None,
+            signer_id: None,
+        };
+        v2_result.sign(&signer, "test-sha-789", "doc");
+        v2_cache.gates.insert("doc".to_string(), v2_result);
+
+        let gate_name = "doc";
+        let attestation_digest =
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        // v3 cache exists but has no "doc" entry, so v2 fallback is used.
+        let reuse = reuse_decision_with_v3_fallback(
+            Some(&v3_cache),
+            Some(&v2_cache),
+            gate_name,
+            Some(attestation_digest),
+            Some(&vk),
+        );
+        assert!(reuse.reusable);
+        assert_eq!(reuse.source, CacheSource::V2);
+
+        // Payload must come from v2.
+        let payload = resolve_cached_payload(&reuse, Some(&v3_cache), Some(&v2_cache), gate_name);
+        let payload = payload.expect("v2 fallback payload must resolve");
+        assert_eq!(payload.duration_secs, 77);
+        assert_eq!(
+            payload.evidence_log_digest.as_deref(),
+            Some("v2-fallback-digest")
         );
     }
 }

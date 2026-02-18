@@ -260,10 +260,23 @@ pub struct GateCache {
     pub gates: BTreeMap<String, CachedGateResult>,
 }
 
+/// Identifies which cache layer produced a hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheSource {
+    /// Hit came from gate cache v3 (receipt-indexed, compound-key bound).
+    V3,
+    /// Hit came from gate cache v2 (SHA-indexed, attestation-only).
+    V2,
+    /// No cache hit (miss).
+    None,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReuseDecision {
     pub reusable: bool,
     pub reason: &'static str,
+    /// Which cache layer produced this hit.
+    pub source: CacheSource,
 }
 
 impl ReuseDecision {
@@ -272,6 +285,17 @@ impl ReuseDecision {
         Self {
             reusable: true,
             reason: "attestation_match",
+            source: CacheSource::V2,
+        }
+    }
+
+    /// Cache hit from v3 (compound-key-bound, receipt-indexed).
+    #[must_use]
+    pub const fn hit_v3() -> Self {
+        Self {
+            reusable: true,
+            reason: "v3_compound_key_match",
+            source: CacheSource::V3,
         }
     }
 
@@ -280,6 +304,7 @@ impl ReuseDecision {
         Self {
             reusable: false,
             reason,
+            source: CacheSource::None,
         }
     }
 }
