@@ -859,7 +859,9 @@ where
         }
     }
 
-    let latest_known_remote_comment_id = if orphaned_remote_comment_id.is_none() {
+    let mut superseded_remote_comment_id = orphaned_remote_comment_id;
+
+    let latest_known_remote_comment_id = if superseded_remote_comment_id.is_none() {
         match latest_remote_verdict_comment_id(owner_repo, pr_number) {
             Ok(value) => value,
             Err(err) => {
@@ -873,10 +875,32 @@ where
         None
     };
 
+    if superseded_remote_comment_id.is_none()
+        && let Some(latest_remote_comment_id) = latest_known_remote_comment_id
+    {
+        match fetch_comment(owner_repo, latest_remote_comment_id) {
+            Ok(Some(found)) => match update_comment(owner_repo, found.id, &body) {
+                Ok(()) => return Ok((found.id, found.html_url)),
+                Err(err) => {
+                    eprintln!(
+                        "WARNING: failed to patch latest remote verdict comment {} for PR #{pr_number}; creating replacement: {err}",
+                        found.id
+                    );
+                    superseded_remote_comment_id = Some(found.id);
+                },
+            },
+            Ok(None) => {},
+            Err(err) => {
+                eprintln!(
+                    "WARNING: failed to resolve latest remote verdict comment {latest_remote_comment_id} for PR #{pr_number}: {err}"
+                );
+            },
+        }
+    }
+
     match create_comment(owner_repo, pr_number, &body) {
         Ok(response) => {
-            if let Some(orphaned_comment_id) = orphaned_remote_comment_id
-                .or(latest_known_remote_comment_id)
+            if let Some(orphaned_comment_id) = superseded_remote_comment_id
                 .filter(|value| *value != response.id)
             {
                 let tombstone =
@@ -2474,24 +2498,38 @@ mod tests {
         };
 
         let mut update_calls = 0usize;
+        let mut create_calls = 0usize;
         let mut tombstoned_comment_id = None::<u64>;
         let (comment_id, comment_url) = super::project_decision_comment_with(
             owner_repo,
             pr_number,
             &record,
             &payload,
-            |_, id| {
-                assert_eq!(id, 120);
-                Ok(None)
+            |_, id| match id {
+                120 => Ok(None),
+                77 => Ok(Some(super::github_projection::IssueCommentResponse {
+                    id: 77,
+                    html_url: "https://github.com/example/repo/issues/666#issuecomment-77"
+                        .to_string(),
+                })),
+                other => panic!("unexpected comment lookup id {other}"),
             },
             |_, id, body| {
                 update_calls = update_calls.saturating_add(1);
-                tombstoned_comment_id = Some(id);
-                assert!(body.contains("apm2-review-verdict:tombstone:v1"));
-                assert!(body.contains("issuecomment-88"));
-                Ok(())
+                if update_calls == 1 {
+                    assert_eq!(id, 77);
+                    assert!(body.contains("apm2-review-verdict:v1"));
+                    Err("latest comment patch failed".to_string())
+                } else {
+                    tombstoned_comment_id = Some(id);
+                    assert_eq!(id, 77);
+                    assert!(body.contains("apm2-review-verdict:tombstone:v1"));
+                    assert!(body.contains("issuecomment-88"));
+                    Ok(())
+                }
             },
             |_, _, _| {
+                create_calls = create_calls.saturating_add(1);
                 Ok(super::github_projection::IssueCommentResponse {
                     id: 88,
                     html_url: "https://github.com/example/repo/issues/666#issuecomment-88"
@@ -2507,8 +2545,90 @@ mod tests {
             comment_url,
             "https://github.com/example/repo/issues/666#issuecomment-88"
         );
-        assert_eq!(update_calls, 1);
+        assert_eq!(update_calls, 2);
+        assert_eq!(create_calls, 1);
         assert_eq!(tombstoned_comment_id, Some(77));
+    }
+
+    #[test]
+    fn project_decision_comment_updates_latest_known_remote_comment_when_reinitialized() {
+        let owner_repo = "example/repo";
+        let pr_number = 667;
+        let head_sha = "0011223344556677889900112233445566778899";
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: "ok".to_string(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-18T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
+            },
+        );
+        let payload = DecisionComment {
+            schema: DECISION_SCHEMA.to_string(),
+            pr: pr_number,
+            sha: head_sha.to_string(),
+            updated_at: "2026-02-18T00:00:00Z".to_string(),
+            dimensions: dimensions.clone(),
+        };
+        let record = DecisionProjectionRecord {
+            schema: super::PROJECTION_VERDICT_SCHEMA.to_string(),
+            owner_repo: owner_repo.to_string(),
+            pr_number,
+            head_sha: head_sha.to_string(),
+            updated_at: payload.updated_at.clone(),
+            decision_comment_id: 120,
+            decision_comment_url: super::local_comment_url(owner_repo, pr_number, 120),
+            decision_signature: String::new(),
+            integrity_hmac: None,
+            dimensions,
+        };
+
+        let mut update_calls = 0usize;
+        let mut create_calls = 0usize;
+        let (comment_id, comment_url) = super::project_decision_comment_with(
+            owner_repo,
+            pr_number,
+            &record,
+            &payload,
+            |_, id| match id {
+                120 => Ok(None),
+                77 => Ok(Some(super::github_projection::IssueCommentResponse {
+                    id: 77,
+                    html_url: "https://github.com/example/repo/issues/667#issuecomment-77"
+                        .to_string(),
+                })),
+                other => panic!("unexpected comment lookup id {other}"),
+            },
+            |_, id, body| {
+                update_calls = update_calls.saturating_add(1);
+                assert_eq!(id, 77);
+                assert!(body.contains("apm2-review-verdict:v1"));
+                assert!(!body.contains("apm2-review-verdict:tombstone:v1"));
+                Ok(())
+            },
+            |_, _, _| {
+                create_calls = create_calls.saturating_add(1);
+                Ok(super::github_projection::IssueCommentResponse {
+                    id: 88,
+                    html_url: "https://github.com/example/repo/issues/667#issuecomment-88"
+                        .to_string(),
+                })
+            },
+            |_, _| Ok(Some(77)),
+        )
+        .expect("latest remote verdict comment should be updated in place");
+
+        assert_eq!(comment_id, 77);
+        assert_eq!(
+            comment_url,
+            "https://github.com/example/repo/issues/667#issuecomment-77"
+        );
+        assert_eq!(update_calls, 1);
+        assert_eq!(create_calls, 0);
     }
 
     #[test]
