@@ -2112,6 +2112,10 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cached.evidence_log_digest.clone(),
                     cached.log_path.clone(),
                 );
+                // TCK-00540 fix round 2: preserve override audit trail.
+                if reuse.reason == "legacy_cache_override_unsafe" {
+                    gate_cache.mark_legacy_override(gate_name);
+                }
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
                     now_iso8601(),
@@ -2295,6 +2299,10 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cached.evidence_log_digest.clone(),
                     cached.log_path.clone(),
                 );
+                // TCK-00540 fix round 2: preserve override audit trail.
+                if reuse.reason == "legacy_cache_override_unsafe" {
+                    gate_cache.mark_legacy_override(gate_name);
+                }
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
                     now_iso8601(),
@@ -2469,6 +2477,10 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cached.evidence_log_digest.clone(),
                     cached.log_path.clone(),
                 );
+                // TCK-00540 fix round 2: preserve override audit trail.
+                if reuse.reason == "legacy_cache_override_unsafe" {
+                    gate_cache.mark_legacy_override(gate_name);
+                }
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
                     now_iso8601(),
@@ -2647,6 +2659,10 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cached.evidence_log_digest.clone(),
                     cached.log_path.clone(),
                 );
+                // TCK-00540 fix round 2: preserve override audit trail.
+                if reuse.reason == "legacy_cache_override_unsafe" {
+                    gate_cache.mark_legacy_override(gate_name);
+                }
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
                     now_iso8601(),
@@ -2788,6 +2804,10 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cached.evidence_log_digest.clone(),
                     cached.log_path.clone(),
                 );
+                // TCK-00540 fix round 2: preserve override audit trail.
+                if reuse.reason == "legacy_cache_override_unsafe" {
+                    gate_cache.mark_legacy_override(gate_name);
+                }
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
                     now_iso8601(),
