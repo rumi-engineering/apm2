@@ -758,6 +758,12 @@ fn projection_record_to_payload(record: &DecisionProjectionRecord) -> DecisionCo
     }
 }
 
+const GITHUB_COMMENT_URL_PREFIX: &str = "https://github.com/";
+
+fn is_remote_comment_url(comment_url: &str) -> bool {
+    comment_url.trim().starts_with(GITHUB_COMMENT_URL_PREFIX)
+}
+
 fn project_decision_comment(
     owner_repo: &str,
     pr_number: u32,
@@ -808,7 +814,7 @@ where
 
     let mut orphaned_remote_comment_id: Option<u64> = None;
     if comment_id > 0 {
-        if !comment_url.starts_with("https://github.com/") {
+        if !is_remote_comment_url(&comment_url) {
             let resolved = fetch_comment(owner_repo, comment_id).map_err(|err| {
                 format!(
                     "failed to resolve existing verdict comment {comment_id} for PR #{pr_number}: {err}"
@@ -820,7 +826,7 @@ where
             }
         }
 
-        if comment_url.starts_with("https://github.com/") {
+        if is_remote_comment_url(&comment_url) {
             orphaned_remote_comment_id = Some(comment_id);
             match update_comment(owner_repo, comment_id, &body) {
                 Ok(()) => return Ok((comment_id, comment_url)),
@@ -1965,6 +1971,16 @@ mod tests {
         assert_eq!(report.overall_decision, "pending");
         assert!(!report.fail_closed);
         assert!(report.errors.is_empty());
+    }
+
+    #[test]
+    fn remote_comment_url_detection_accepts_github_and_rejects_local_projection_urls() {
+        assert!(super::is_remote_comment_url(
+            "https://github.com/example/repo/issues/42#issuecomment-99"
+        ));
+        assert!(!super::is_remote_comment_url(
+            "local://fac_projection/example/repo/pr-42/issue_comments#99"
+        ));
     }
 
     #[test]
