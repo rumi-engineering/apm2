@@ -324,6 +324,33 @@ pub enum FacSubcommand {
     /// configuration, admitted digests, and queue bounds from broker
     /// and filesystem state.
     Config(crate::commands::fac_config::ConfigArgs),
+    /// Receipt-derived metrics: throughput, queue latency, denial/quarantine
+    /// rates, GC freed bytes, and disk preflight failures (TCK-00551).
+    ///
+    /// Scans the receipt index and GC receipt store for the observation
+    /// window and computes aggregate metrics. Supports `--json` for
+    /// automation.
+    Metrics(MetricsArgs),
+}
+
+/// Arguments for `apm2 fac metrics`.
+#[derive(Debug, Args)]
+pub struct MetricsArgs {
+    /// Only include receipts with timestamp >= this epoch (seconds).
+    ///
+    /// When omitted, defaults to 24 hours ago.
+    #[arg(long)]
+    pub since: Option<u64>,
+
+    /// Only include receipts with timestamp <= this epoch (seconds).
+    ///
+    /// When omitted, defaults to now.
+    #[arg(long)]
+    pub until: Option<u64>,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac warm`.
@@ -2304,6 +2331,7 @@ pub fn run_fac(
             | FacSubcommand::Economics(_)
             | FacSubcommand::Bootstrap(_)
             | FacSubcommand::Config(_)
+            | FacSubcommand::Metrics(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -2844,6 +2872,7 @@ pub fn run_fac(
         FacSubcommand::Config(args) => {
             crate::commands::fac_config::run_config_command(args, json_output)
         },
+        FacSubcommand::Metrics(args) => run_metrics(args, json_output),
     }
 }
 
@@ -2977,7 +3006,8 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Policy(_)
         | FacSubcommand::Economics(_)
         | FacSubcommand::Bootstrap(_)
-        | FacSubcommand::Config(_) => true,
+        | FacSubcommand::Config(_)
+        | FacSubcommand::Metrics(_) => true,
     }
 }
 
@@ -6353,6 +6383,161 @@ fn run_bundle_import(args: &BundleImportArgs, json_output: bool) -> u8 {
         serde_json::to_string_pretty(&result).unwrap_or_default()
     );
     exit_codes::SUCCESS
+}
+
+// =============================================================================
+// Metrics (TCK-00551)
+// =============================================================================
+
+/// Default observation window: 24 hours (in seconds).
+const DEFAULT_METRICS_WINDOW_SECS: u64 = 86_400;
+
+/// Execute `apm2 fac metrics`.
+fn run_metrics(args: &MetricsArgs, json_output: bool) -> u8 {
+    let Some(apm2_home) = apm2_core::github::resolve_apm2_home() else {
+        return output_error(
+            json_output,
+            "apm2_home_not_found",
+            "Cannot resolve APM2_HOME for receipt store",
+            exit_codes::GENERIC_ERROR,
+        );
+    };
+
+    let receipts_dir = apm2_home.join("private").join("fac").join("receipts");
+
+    // Resolve observation window.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let since_secs = args
+        .since
+        .unwrap_or_else(|| now_secs.saturating_sub(DEFAULT_METRICS_WINDOW_SECS));
+    let until_secs = args.until.unwrap_or(now_secs);
+
+    // Load job receipts from the index.
+    let all_headers = apm2_core::fac::list_receipt_headers(&receipts_dir);
+
+    // Filter by window and load full receipts for those in range.
+    let mut job_receipts: Vec<apm2_core::fac::FacJobReceiptV1> = Vec::new();
+    for header in &all_headers {
+        if header.timestamp_secs >= since_secs && header.timestamp_secs <= until_secs {
+            if let Some(receipt) =
+                apm2_core::fac::lookup_receipt_by_hash(&receipts_dir, &header.content_hash)
+            {
+                job_receipts.push(receipt);
+            }
+        }
+    }
+
+    // Load GC receipts.
+    let gc_receipts = apm2_core::fac::load_gc_receipts(&receipts_dir, since_secs);
+    // Filter GC receipts by until bound.
+    let gc_receipts: Vec<_> = gc_receipts
+        .into_iter()
+        .filter(|r| r.timestamp_secs <= until_secs)
+        .collect();
+
+    let input = apm2_core::fac::MetricsInput {
+        job_receipts: &job_receipts,
+        gc_receipts: &gc_receipts,
+        since_epoch_secs: since_secs,
+        until_epoch_secs: until_secs,
+    };
+
+    let summary = apm2_core::fac::compute_metrics(&input);
+
+    if json_output || args.json {
+        match serde_json::to_string_pretty(&summary) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                return output_error(
+                    true,
+                    "serialization_error",
+                    &format!("Failed to serialize metrics: {e}"),
+                    exit_codes::GENERIC_ERROR,
+                );
+            },
+        }
+    } else {
+        print_metrics_human(&summary);
+    }
+
+    exit_codes::SUCCESS
+}
+
+/// Print metrics in a human-readable table format.
+#[allow(clippy::cast_precision_loss)]
+fn print_metrics_human(s: &apm2_core::fac::MetricsSummary) {
+    println!("FAC Metrics Summary");
+    println!("===================");
+    println!(
+        "  Window: epoch {} -> {}",
+        s.since_epoch_secs, s.until_epoch_secs
+    );
+    let window_hours = (s.until_epoch_secs.saturating_sub(s.since_epoch_secs)) as f64 / 3600.0;
+    println!("  Duration: {window_hours:.1} hours");
+    println!();
+
+    println!("Throughput");
+    println!("----------");
+    println!("  Completed jobs:      {}", s.completed_jobs);
+    println!("  Jobs/hour:           {:.2}", s.throughput_jobs_per_hour);
+    println!("  Denied jobs:         {}", s.denied_jobs);
+    println!("  Quarantined jobs:    {}", s.quarantined_jobs);
+    println!("  Cancelled jobs:      {}", s.cancelled_jobs);
+    println!("  Total receipts:      {}", s.total_receipts);
+    println!();
+
+    println!("Queue Latency (completed jobs)");
+    println!("------------------------------");
+    if let Some(median) = s.median_duration_ms {
+        println!("  Median:  {median} ms");
+    } else {
+        println!("  Median:  (no data)");
+    }
+    if let Some(p95) = s.p95_duration_ms {
+        println!("  P95:     {p95} ms");
+    } else {
+        println!("  P95:     (no data)");
+    }
+    println!();
+
+    if !s.denial_counts_by_reason.is_empty() {
+        println!("Denial Breakdown");
+        println!("----------------");
+        for (reason, count) in &s.denial_counts_by_reason {
+            println!("  {reason:<40} {count}");
+        }
+        println!();
+    }
+
+    println!("Disk & GC");
+    println!("---------");
+    println!("  Disk preflight failures: {}", s.disk_preflight_failures);
+    println!(
+        "  GC freed bytes:          {} ({} receipts)",
+        format_bytes_simple(s.gc_freed_bytes),
+        s.gc_receipts
+    );
+}
+
+/// Simple byte formatting for human output.
+#[allow(clippy::cast_precision_loss)]
+fn format_bytes_simple(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 // =============================================================================
