@@ -40,7 +40,11 @@ default mode.
 ### Core Capabilities
 
 - RFC-0028 `ChannelContextToken` issuance bound to `job_spec_digest` + `lease_id`
-  via `issue_channel_context_token()`.
+  via `issue_channel_context_token()`.  TCK-00567 adds optional `intent` and
+  `allowed_intents` parameters for RFC-0028 intent taxonomy enforcement.
+  When `allowed_intents` is configured, intent MUST be present AND in the
+  allowed set (fail-closed).  Missing intent with an active allowlist triggers
+  `BrokerError::IntentRequiredByPolicy`.
 - RFC-0029 `TimeAuthorityEnvelopeV1` issuance for `boundary_id` + evaluation
   window via `issue_time_authority_envelope()`.
 - TP-EIO29-002 freshness horizon refs (`freshness_horizon()`) and revocation
@@ -363,6 +367,310 @@ with hard caps.
   denial receipt, never wrapping.
 - [INV-CPRL-005] Budget denial always produces a structured
   `ControlPlaneDenialReceipt` with machine-readable evidence.
+
+## token_ledger Submodule (TCK-00566)
+
+The `token_ledger` submodule implements broker-side token replay protection via
+a bounded, TTL-evicting nonce ledger and explicit revocation. Every
+`ChannelContextToken` issued by the broker carries a unique 32-byte nonce.
+
+### Nonce Lifecycle
+
+Nonces follow a two-state lifecycle: `Issued` -> `Consumed`.
+
+1. **Issuance**: When the broker issues a token, the nonce is generated and
+   registered in the ledger in `Issued` state via `register_nonce()`. This
+   enables pre-use revocation (INV-TL-008): if the token is leaked before
+   any worker consumes it, the broker can revoke the nonce immediately.
+2. **Consumption**: When a worker validates the token via
+   `validate_and_record_token_nonce()`, the entry transitions from `Issued`
+   to `Consumed`. A second presentation of the same nonce is denied
+   (fail-closed).
+3. **Revocation**: Nonces in either `Issued` or `Consumed` state can be
+   explicitly revoked via `revoke_token()`. Revoked tokens are denied even
+   if they have not expired.
+
+### Persistence Model (WAL + Snapshot)
+
+The ledger uses a write-ahead log (WAL) for incremental persistence to avoid
+O(N) serialization on every job:
+
+- **WAL entries**: Each mutation (register, consume, revoke) produces a small
+  fixed-size `WalEntry` (single-line JSON). The worker appends this to
+  `wal.jsonl` with fsync BEFORE job execution begins (INV-TL-010).
+- **Snapshot compaction**: When `wal_entries_since_snapshot()` exceeds
+  `WAL_COMPACTION_THRESHOLD` (256), the full ledger is written as a snapshot
+  to `state.json` using `write_atomic` (temp+fsync+dir_fsync+rename per
+  CTR-2607), and the WAL is truncated.
+- **Startup recovery**: On startup, the latest snapshot is loaded and the WAL
+  is replayed to restore full ledger state. Load errors from existing files
+  are hard security faults (INV-TL-009: fail-closed).
+
+Files are stored under `$APM2_HOME/private/fac/broker/token_ledger/`:
+- `state.json`: Full ledger snapshot (schema v1.1.0, backward-compatible with v1.0.0)
+- `wal.jsonl`: Append-only WAL file (newline-delimited JSON)
+
+### Key Types
+
+- `TokenUseLedger`: Bounded nonce ledger backed by a `HashMap<TokenNonce,
+  TokenUseEntry>` for O(1) lookup and a `VecDeque<(TokenNonce, u64)>` for
+  TTL-based FIFO eviction. Not internally synchronized; protected by the same
+  external lock as `FacBroker` (`&mut self` access).
+- `NonceState`: Lifecycle state enum (`Issued`, `Consumed`). Serialized with
+  `#[serde(rename_all = "snake_case")]`. The `state` field uses
+  `#[serde(default)]` for backward compatibility with v1.0.0 snapshots
+  (missing `state` defaults to `Consumed`).
+- `WalEntry`: Tagged union (`Register`, `Consume`, `Revoke`) for incremental
+  WAL persistence. Serialized as single-line JSON with `#[serde(tag = "op")]`.
+- `TokenNonce`: Type alias for `[u8; 32]`. CSPRNG-seeded, domain-separated
+  BLAKE3 derived nonces.
+- `TokenLedgerError`: Fail-closed error taxonomy with `ReplayDetected`,
+  `TokenRevoked`, `RevocationSetAtCapacity`, `RevocationReasonTooLong`,
+  `NonceNotFound`, and `Persistence` variants.
+- `TokenRevocationReceipt`: Serializable receipt for token revocation events
+  with domain-separated BLAKE3 content hash, `#[serde(deny_unknown_fields)]`.
+  Includes `verify_content_hash()` for receipt integrity verification.
+- `TokenUseEntry` (private): Active ledger entry carrying nonce,
+  `request_id_digest`, `recorded_at_tick`, `expiry_tick`, and `state`.
+- `RevokedTokenEntry` (private): Revocation entry carrying nonce,
+  `revoked_at_tick`, and reason string.
+
+### Constants
+
+- `MAX_LEDGER_ENTRIES`: 16,384 (~1.6 MiB peak memory)
+- `MAX_REVOKED_TOKENS`: 4,096
+- `DEFAULT_LEDGER_TTL_TICKS`: 1,000 (matches default envelope TTL)
+- `MAX_REVOCATION_REASON_LENGTH`: 512
+- `WAL_COMPACTION_THRESHOLD`: 256 (entries before snapshot compaction)
+- `MAX_WAL_FILE_SIZE`: 4 MiB (prevents OOM from uncompacted WAL)
+- `MAX_WAL_LINE_SIZE`: 4,096 bytes (prevents unbounded allocation)
+
+### Core Capabilities
+
+- `TokenUseLedger::generate_nonce()`: Generates a fresh 32-byte nonce using
+  OS CSPRNG randomness with domain-separated BLAKE3 derivation
+  (`apm2.fac_broker.token_nonce.v1`).
+- `TokenUseLedger::register_nonce(nonce, request_id_digest, current_tick)`:
+  Registers a nonce in `Issued` state at issuance time (INV-TL-008). Returns
+  a `WalEntry::Register` for the caller to persist.
+- `TokenUseLedger::record_token_use(nonce, request_id_digest, current_tick)`:
+  Transitions an `Issued` nonce to `Consumed`, or creates a `Consumed` entry
+  for pre-registration nonces. Checks revocation first (INV-TL-004), then
+  replay (INV-TL-001). Returns a `WalEntry::Consume` for the caller to persist.
+- `TokenUseLedger::check_nonce(nonce)`: Worker-side validation entry point.
+  Returns `Ok(())` if the nonce is fresh (not consumed, not revoked). An
+  `Issued` nonce is considered fresh (not yet consumed).
+- `TokenUseLedger::revoke_token(nonce, current_tick, reason)`: Explicitly
+  revokes a token nonce in either `Issued` or `Consumed` state (INV-TL-008).
+  Returns a `(TokenRevocationReceipt, WalEntry::Revoke)` tuple.
+- `TokenUseLedger::evict_expired(current_tick)`: TTL-based eviction of
+  expired entries from both the active ledger and revocation set. Uses
+  ghost-key prevention (RSK-1304): expiry ticks stored in the VecDeque
+  are compared against the HashMap entry's actual expiry to detect stale
+  queue entries from re-inserted keys. The ghost-key check is retained as
+  defense-in-depth even though currently unreachable under normal operation.
+- `TokenUseLedger::serialize_wal_entry(entry)`: Serializes a `WalEntry` to
+  newline-terminated JSON bytes.
+- `TokenUseLedger::replay_wal(wal_bytes)`: Replays WAL entries from bytes,
+  applying them to the in-memory ledger. Fail-closed on parse errors.
+- `TokenUseLedger::serialize_state()`: Full ledger snapshot serialization.
+- `TokenUseLedger::deserialize_state(bytes, current_tick)`: Snapshot load
+  with TTL eviction and cap enforcement. Accepts v1.0.0 and v1.1.0 schemas.
+
+### Broker Integration
+
+- `FacBroker` holds a `TokenUseLedger` field initialized fresh in all
+  constructors. Persisted ledger state is loaded separately via
+  `set_token_ledger()` after construction.
+- `issue_channel_context_token()` generates a nonce via `generate_nonce()`,
+  registers it in the ledger via `register_nonce()` in `Issued` state
+  (INV-TL-008), and includes it in the `TokenBindingV1` payload.
+- Workers call `validate_and_record_token_nonce()` at validation time to
+  (1) check if the nonce is fresh and (2) atomically record it as consumed.
+  Returns serialized WAL entry bytes that MUST be persisted to disk with
+  fsync BEFORE job execution begins (INV-TL-009/INV-TL-010).
+- `advance_tick()` calls `token_ledger.evict_expired()` to clean up stale
+  entries as part of the broker tick lifecycle.
+- `BrokerError::TokenLedger` variant propagates ledger errors.
+- `serialize_token_ledger()` serializes the ledger for disk persistence.
+- `reset_token_ledger_wal_counter()` resets WAL counter after compaction.
+- `set_token_ledger()` replaces the ledger with a pre-loaded one from disk.
+- Accessor methods: `token_ledger()`, `check_token_nonce()`,
+  `validate_and_record_token_nonce()`, `revoke_token()`,
+  `evict_expired_tokens()`.
+
+### Worker Persistence Integration (fac_worker.rs)
+
+- `load_token_ledger()`: Fail-closed load (INV-TL-009). Returns `Err` if
+  an existing file cannot be read or deserialized. `Ok(None)` on first run.
+  Replays WAL after snapshot load.
+- `save_token_ledger()`: Uses `write_atomic` (CTR-2607) for snapshot writes.
+  Truncates WAL and resets counter after successful snapshot. Errors are
+  propagated (not silently discarded).
+- `append_token_ledger_wal()`: Appends WAL entry bytes with fsync. Called
+  immediately after `validate_and_record_token_nonce` and BEFORE job
+  execution (BLOCKER fix for pre-execution durability).
+
+### TokenBindingV1 Integration
+
+The `nonce: Option<[u8; 32]>` field was added to `TokenBindingV1` in
+`channel/enforcement.rs` with `#[serde(default)]` for backwards compatibility
+with pre-TCK-00566 tokens (which have `nonce: None`). Broker-issued tokens
+carry `nonce: Some(nonce)`. Daemon-side tokens (not issued via `FacBroker`)
+carry `nonce: None`.
+
+### Security Invariants (TCK-00566)
+
+- [INV-TL-001] Every token nonce is registered in the ledger at issuance
+  time in `Issued` state. When the worker validates and consumes the token
+  via `validate_and_record_token_nonce`, the entry transitions to `Consumed`.
+  A second presentation of the same nonce is denied (fail-closed).
+- [INV-TL-002] The ledger is bounded by `MAX_LEDGER_ENTRIES` (16,384). When
+  the cap is reached, expired entries are evicted first, then the oldest entry
+  is force-evicted (TTL-based FIFO).
+- [INV-TL-003] The revocation set is bounded by `MAX_REVOKED_TOKENS` (4,096).
+  When at capacity, the oldest revocation is evicted to make room.
+- [INV-TL-004] Revoked tokens are denied even if they have not expired.
+  Revocation check precedes replay check in both `record_token_use()` and
+  `check_nonce()`.
+- [INV-TL-005] TTL eviction uses broker ticks (not wall-clock time) for
+  monotonic, deterministic expiry (INV-2501).
+- [INV-TL-006] Nonces are 32-byte random values generated from a CSPRNG
+  with domain-separated BLAKE3 derivation.
+- [INV-TL-007] Nonce lookups use `HashMap::get()` (O(1) average) with a
+  post-lookup `subtle::ConstantTimeEq::ct_eq()` verification as defense in
+  depth against hash-collision-based timing attacks. The HashMap approach is
+  NOT constant-time over the full entry set; however, 32-byte random nonces
+  (INV-TL-006) make collision-based timing leakage infeasible in practice
+  (RSK-1909).
+- [INV-TL-008] Nonces are registered at issuance in `Issued` state.
+  `revoke_token()` can revoke nonces in either `Issued` or `Consumed` state,
+  closing the window for leaked-but-unused token exploitation (pre-use
+  revocation).
+- [INV-TL-009] Ledger persistence is fail-closed: load errors from an
+  existing ledger file are hard security faults that refuse to continue.
+  Save errors are propagated so the caller cannot silently run with
+  undurable replay state. WAL parse errors during replay are hard faults.
+- [INV-TL-010] WAL entries are appended with fsync for crash durability.
+  The worker MUST persist the WAL entry to disk BEFORE job execution begins.
+  Full snapshots use atomic write (temp+fsync+dir_fsync+rename) per CTR-2607.
+- [INV-TL-011] Revocation receipt content hash uses domain-separated BLAKE3
+  (`apm2.fac_broker.revocation_receipt.v1`) with `u64::to_le_bytes()`
+  length-prefix framing for variable-length fields (CTR-2612).
+- [INV-TL-012] Zero TTL is rejected (clamped to 1) to prevent all entries
+  from being immediately stale (fail-closed).
+- [INV-TL-013] Ghost-key prevention (RSK-1304): the insertion-order VecDeque
+  stores `(nonce, expiry_tick)` pairs. During eviction, the stored expiry
+  tick is compared against the HashMap entry's actual expiry tick; stale
+  queue entries from re-inserted keys are detected and skipped. The check
+  is retained as defense-in-depth even though currently unreachable.
+- [INV-TL-014] The ledger snapshot is persisted to disk under
+  `$APM2_HOME/private/fac/broker/token_ledger/state.json` using
+  `write_atomic` per CTR-2607. Expired entries are dropped during
+  deserialization. Persisted file size is bounded by
+  `MAX_TOKEN_LEDGER_FILE_SIZE` (8 MiB) before parsing (RSK-1601).
+  WAL file size is bounded by `MAX_WAL_FILE_SIZE` (4 MiB).
+  Replay protection survives daemon restarts.
+
+## queue_bounds Submodule (TCK-00578)
+
+The `queue_bounds` submodule enforces instantaneous queue size limits at enqueue
+time. Unlike `broker_rate_limits` (which tracks cumulative window counters),
+`queue_bounds` scans the actual `queue/pending/` directory to determine the
+current number of pending jobs and their total byte size, and denies new
+enqueue attempts that would exceed configured caps.
+
+### Key Types
+
+- `QueueBoundsPolicy`: Configuration struct with `max_pending_jobs`,
+  `max_pending_bytes`, and optional `per_lane_max_pending_jobs`. Hard cap
+  validation via `validate()`. Defaults: 10K jobs, 1 GiB bytes.
+- `PendingQueueSnapshot`: Point-in-time snapshot of the pending queue
+  (`job_count`, `total_bytes`, `truncated`).
+- `QueueBoundsDenialReceipt`: Structured denial evidence carrying dimension,
+  current usage, limit, requested increment, and stable reason code.
+- `QueueBoundsDimension`: Enum (`PendingJobs`, `PendingBytes`, `ScanTruncated`).
+- `QueueBoundsError`: Error taxonomy with `QueueBoundsExceeded`, `InvalidPolicy`,
+  and `ScanFailed` variants.
+
+### Hard Caps
+
+- `HARD_CAP_MAX_PENDING_JOBS`: 1,000,000
+- `HARD_CAP_MAX_PENDING_BYTES`: 64 GiB
+
+### Core Capabilities
+
+- `check_queue_bounds()`: Scans `queue/pending/`, computes snapshot, evaluates
+  proposed enqueue against policy, returns `Ok(snapshot)` or
+  `Err(QueueBoundsExceeded)`.
+- Filesystem scan is bounded by `MAX_SCAN_ENTRIES` (100K) to prevent DoS
+  (INV-QB-002). Truncated scans are treated as fail-closed denials with
+  `ScanTruncated` dimension.
+- `pending_dir` is verified via `symlink_metadata()` before scanning
+  (INV-QB-006). A broken symlink (target does not exist) returns `ScanFailed`,
+  not an empty snapshot. Only a true `NotFound` from `symlink_metadata()` is
+  treated as a legitimately absent queue.
+- Symlinks within the directory are skipped via `symlink_metadata()` to prevent
+  inflation attacks (INV-QB-005).
+- Filenames exceeding `MAX_FILENAME_BYTES` (4096) are skipped to bound per-entry
+  memory allocation.
+- Hidden files (starting with `.`) are skipped (temp files from atomic writes).
+- Fail-closed: zero limits deny immediately; unreadable directory denies
+  (INV-QB-001).
+- All arithmetic uses `checked_add`/`saturating_add` (INV-QB-004).
+
+### CLI Integration
+
+- `enqueue_job()` in `apm2-cli/src/commands/fac_queue_submit.rs` accepts a
+  `&QueueBoundsPolicy` loaded from the persisted FAC configuration
+  (`FacPolicyV1::queue_bounds_policy`), validates it, acquires a process-level
+  lockfile (`queue/.enqueue.lock`) for the full check-write critical section,
+  and passes it to `check_queue_bounds()`. The lockfile prevents concurrent
+  `apm2 fac` processes from bypassing queue caps via TOCTOU. Denial produces
+  a descriptive error with the `queue/quota_exceeded` reason code and persists
+  a `QueueBoundsDenialReceipt` artifact in the `denied/` directory. A
+  structured denial event is also emitted to a trusted audit log under the
+  FAC private directory (`$APM2_HOME/private/fac/audit/denial_events.jsonl`)
+  outside the writable queue directories, ensuring audit evidence resilience
+  even if the `queue/denied/` directory is tampered with.
+- `FacPolicyV1` includes a `queue_bounds_policy` field (`serde(default)` for
+  backward compatibility with pre-TCK-00578 policies).
+- Control-lane `stop_revoke` jobs bypass queue bounds (consistent with the
+  control-lane exception documented in `fac/mod.rs`).
+
+### Receipt Integration
+
+- `DenialReasonCode::QueueQuotaExceeded` variant added for receipt chain
+  integration.
+- Denial reason code: `queue/quota_exceeded`.
+- Denial receipts are persisted as JSON artifacts in `queue/denied/` when
+  `check_queue_bounds()` returns a quota error.
+
+### Security Invariants (TCK-00578)
+
+- [INV-QB-001] Fail-closed: unreadable pending directory denies all enqueue
+  attempts.
+- [INV-QB-002] Directory scan is bounded by `MAX_SCAN_ENTRIES` to prevent DoS.
+  Truncated scans are treated as fail-closed denials.
+- [INV-QB-003] Denial receipts include dimension, current usage, limit, and
+  stable reason code for audit. Receipts are persisted to `queue/denied/`.
+- [INV-QB-004] Arithmetic uses `checked_add`; overflow returns Err.
+- [INV-QB-005] Symlinks in pending directory are skipped (not counted) to
+  prevent inflation attacks.
+- [INV-QB-006] `pending_dir` is verified via `symlink_metadata()` before
+  scanning. A broken symlink (target does not exist) returns `ScanFailed`,
+  not an empty snapshot. Only a true `NotFound` from `symlink_metadata()` is
+  treated as a legitimately absent queue. This prevents bypass of the symlink
+  hardening by using `Path::exists()` which follows symlinks.
+- [INV-QB-007] Process-level lockfile (`queue/.enqueue.lock`) acquired via
+  `fs2::FileExt::lock_exclusive()` for the full check-write critical section
+  in `enqueue_job()`. Prevents concurrent `apm2 fac` processes from bypassing
+  queue caps via TOCTOU. The lock is held until after the job spec file is
+  written (dropped at scope exit).
+- [INV-QB-008] Structured denial events are emitted to a trusted audit log
+  (`$APM2_HOME/private/fac/audit/denial_events.jsonl`) outside the writable
+  queue directories, ensuring audit evidence resilience even if `queue/denied/`
+  is tampered with.
 
 ## projection_compromise Submodule
 
@@ -2180,6 +2488,49 @@ still enforced; only the token requirement is waived.
   except the token requirement.
 - All deny paths in the control-lane flow emit explicit refusal receipts before
   moving jobs to `denied/`.
+
+## Intent Taxonomy (TCK-00567)
+
+The `job_spec` module defines `FacIntent`, a typed intent taxonomy mapping FAC
+job kinds to RFC-0028 intent classes.  The mapping is authoritative and
+fail-closed:
+
+| Job Kind | Intent |
+|---|---|
+| `gates` | `intent.fac.execute_gates` |
+| `warm` | `intent.fac.warm` |
+| `gc` | `intent.fac.gc` |
+| `lane_reset` | `intent.fac.lane_reset` |
+| `stop_revoke` | `intent.fac.cancel` |
+| `bundle_export` / `bundle_import` | `intent.fac.bundle` |
+| `bulk` | `intent.fac.bulk` |
+| `control` | `intent.fac.control` |
+
+### Key Types
+
+- `FacIntent`: Enum with one variant per intent class.  `as_str()` returns the
+  stable dotted string.  Serde-serializes to/from the dotted string.
+- `job_kind_to_intent(kind) -> Option<FacIntent>`: Maps a job kind string to
+  its intent.  Returns `None` for unknown kinds.
+- `FacPolicyV1::allowed_intents`: Optional policy knob.  When `Some`, only
+  listed intents may be issued (fail-closed).  Bounded by
+  `MAX_ALLOWED_INTENTS_SIZE` (32).
+
+### Enforcement Points
+
+1. **Broker** (`issue_channel_context_token`): Embeds intent in
+   `TokenBindingV1`.  Validates intent against `allowed_intents` if configured.
+   Denies issuance when policy has an allowlist but no intent is provided
+   (`IntentRequiredByPolicy`).  Callers (`fac_warm.rs`, `gates.rs`) thread
+   `fac_policy.allowed_intents.as_deref()` into every issuance call site.
+2. **Worker** (`fac_worker.rs`): Derives `expected_intent` from job kind,
+   passes to `ExpectedTokenBinding`.  Decode fails on mismatch (fail-closed).
+   Unknown job kinds (where `job_kind_to_intent` returns `None`) are denied
+   immediately with `DenialReasonCode::UnknownJobKindIntent` (fail-closed).
+3. **PrivilegedDispatcher** (`dispatch.rs`): Issues tokens with `intent: None`
+   intentionally.  These tokens are for daemon session-level IPC boundary
+   crossing, not for FAC queue job execution; they never pass through the
+   intent-checking worker path.
 
 ## Strict Job Spec Validation Policy (TCK-00579)
 
