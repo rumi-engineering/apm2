@@ -125,9 +125,56 @@ NG3. Designing the final cryptographic actor identity model (hex key ids vs stri
 
 ### 2.3 Hard constraints (from repo reality)
 
-C1. **Core ledger is currently often in legacy read-only mode**: any plan that “starts writing kernel events” must include ledger unification.
+C1. **Core ledger is currently often in legacy read-only mode**: any plan that "starts writing kernel events" must include ledger unification.
 C2. **`apm2 fac push` remains the terminal command** through cutover; no bypassing.
 C3. Daemon is the authority boundary: ledger/CAS mutations go through the daemon operator socket (UDS) unless explicitly delegated later.
+
+### 2.4 Drift-control guardrails (mandatory)
+
+**Biggest risk:** implementation drift that *appears* to implement this RFC while silently diverging from the existing spine contracts already embedded in code + prior RFCs (event naming/encoding mismatches, missing authority pins, non-replayable state, "temporary" SQLite authority that never gets removed).
+
+This RFC therefore declares the following drift barriers as **mandatory**, not "nice to have":
+
+**D1. Single source-of-truth registries (code-enforced)**
+
+1. **CAS schema ids**: every CAS JSON schema id introduced by this RFC MUST be added to
+   `crates/apm2-core/src/schema_registry/fac_schemas.rs` (and must pass its uniqueness + prefix tests; see `test_fac_schema_ids_are_unique` / `test_fac_schema_id_prefixes`).
+2. **Topic derivation coverage**: every new canonical event type introduced by this RFC MUST have a dedicated topic-derivation test in
+   `crates/apm2-daemon/src/protocol/topic_derivation.rs` that asserts the exact topic set emitted.
+3. **Parity gate integration**: if we are in a bridge window where both legacy and canonical work events exist, parity MUST be continuously checked using
+   `apm2_core::work::parity::WorkParityValidator` and promotion MUST be blocked on defects (fail-closed).
+
+**D2. Fail-closed bounded decoding (DoS + schema drift defense)**
+
+Any IPC surface that accepts user-provided bytes for CAS-backed JSON MUST:
+
+* validate schema id using `fac_schemas::validate_schema_id`,
+* decode using `fac_schemas::bounded_from_slice_with_limit` (or equivalent) with an explicit per-artifact byte limit,
+* use `#[serde(deny_unknown_fields)]` on all CAS JSON structs defined by this RFC.
+
+**D3. Preserve the existing promotion-blocking gates**
+
+This RFC may add additional gates, but MUST NOT weaken existing ones already present in code:
+
+* **alias reconciliation promotion gate** (`crates/apm2-daemon/src/work/authority.rs`) remains promotion-blocking (fail-closed) per CTR-ALIAS-002.
+* **merge executor promotion gate** (parity/defect blocking) remains promotion-blocking.
+
+**D4. "Done" is measurable**
+
+Each migration phase MUST include a checklist that is both:
+
+* **machine-verifiable** (tests, invariants, metrics), and
+* **promotion-blocking** (gates deny on missing checklist items in production mode).
+
+### 2.5 Alignment commitments with RFC-0018 and RFC-0019 (normative)
+
+This RFC is vNext wiring, not a rewrite of the FAC physics. It MUST preserve the contracts already declared as mandatory in earlier RFCs and already partially embedded in code:
+
+* **RFC-0018 §6.3 Authority and Boundary Contract**: transitions/episodes/receipts require a complete set of boundary pins (lease id, permeability receipt hash, capability manifest hash, context pack hash, stop-condition hash, typed budgets). Missing pins are fail-closed and MUST be recorded as defects; best-effort is forbidden.
+* **RFC-0018 §7.3 Parity mapping**: legacy underscore work events must map cleanly to canonical reducer work events, including `previous_transition_count` monotonicity.
+* **RFC-0019 boundary discipline**: idempotent actuation, digest-first interfaces, and explicit stop/budget pins remain non-negotiable.
+
+If a requirement is "not yet implemented" in this RFC's phases, the RFC MUST specify which existing event/artifact currently carries the pin and how it survives ledger unification without losing replayability.
 
 ---
 
@@ -139,43 +186,78 @@ C3. Daemon is the authority boundary: ledger/CAS mutations go through the daemon
 * **CAS (`apm2-daemon DurableCas`, implementing `apm2_core::evidence::ContentAddressedStore`)** stores immutable artifacts (work specs, context entries, evidence bundles, change sets, etc.).
 * **Projections** (SQLite tables and/or in-memory reducers) are derived from ledger + CAS and are **replayable**.
 
-### 3.2 Event family convergence plan (legacy signed ↔ reducer-domain ↔ HEF typed)
+### 3.2 Event taxonomy: classify by encoding + trust boundary, not punctuation
 
-The repo already models three work-event "families" (see `crates/apm2-core/src/work/parity.rs`):
+The repo already contains multiple event families. **Underscore vs dot is not the correct classifier**:
 
-* **Daemon legacy signed**: underscored `work_claimed`, `work_transitioned`, … (canonical JSON payloads,
-  domain-separated signatures).
-* **Reducer-domain**: dotted `work.opened`, `work.transitioned`, … (protobuf `WorkEvent` payloads).
-* **Typed discriminants**: `WorkOpened`, `WorkTransitioned`, … (used by HEF topic derivation and some
-  tests today).
+* Some underscore events are **daemon-signed JSON** (`work_claimed`, `work_transitioned`, `session_started`, ...).
+* Some underscore events are already **kernel-typed protobuf payloads** that are part of the FAC spine (`changeset_published`, `review_receipt_recorded`, `review_blocked_recorded`, ...), and are already mapped in core verification logic via domain-separated prefixes (`crates/apm2-core/src/ledger/storage.rs::domain_prefix_for_event_type`).
+* Dot-prefixed events (`work.opened`, `work.transitioned`, `evidence.published`) are reducer-facing canonical event types.
 
-This RFC standardizes on:
+This RFC therefore uses the following taxonomy (normative):
 
-* **Authority** = reducer-domain dotted events in the **core `events` table** + CAS artifacts.
-* **Compatibility** = legacy underscored events may continue to be *ingested* for a bounded window,
-  but they must be deterministically translatable into reducer-domain facts.
-* **Push-based waits** = pulse topics must be derivable from either dotted event types *or* typed
-  discriminants, and must resolve to the same work-centric topics.
+1. **DaemonSignedJson events (legacy compatibility family)**
+   * Storage (today): daemon `ledger_events` table (legacy plane).
+   * Payload: canonical JSON bytes (JCS-style determinism).
+   * Signature: daemon domain-separated signature.
+   * Examples (non-exhaustive): `work_claimed`, `work_transitioned`, `session_started`, `session_terminated`, `session_event`, `stop_flags_mutated`.
+   * Policy: these events may be ingested for replay parity during cutover, but are not the target canonical encoding. Do not extend them with new semantics.
 
-Implementation consequences:
+2. **ReducerProtobuf events (canonical truth for reducers)**
+   * Storage: core ledger `events` table (post-unification).
+   * Payload: protobuf bytes (e.g., `WorkEvent`, `EvidenceEvent`) with canonicalization rules already established by `apm2_core::events::Canonicalize`.
+   * Event types: `work.opened`, `work.transitioned`, `work.completed`, `work.aborted`, `evidence.published`, etc.
+   * Reducers: `apm2_core::work::WorkReducer`, `apm2_core::evidence::EvidenceReducer`, etc.
 
-1. **Do not introduce new `work.*` event types unless the payload is a `WorkEvent`.**
-   `WorkReducer` decodes any `event_type` beginning with `work.` as a `WorkEvent` and will error if
-   decoding fails.
-2. **Bridge translations must be explicit.**
-   The daemon already does this for work lifecycle (`crates/apm2-daemon/src/work/projection.rs`
-   translates legacy signed events into `WorkEvent` payloads). This RFC extends that pattern for
-   work graph + work context.
-3. **Sunset is per-family, per-event-type.**
-   The migration plan must explicitly state when:
-   * legacy underscored writers are frozen, and
-   * typed discriminants stop being emitted/relied upon (or the topic deriver learns parity).
+3. **KernelTypedProtobuf events (FAC spine events that are not reducers' `WorkEvent`)**
+   * Storage: core ledger `events` table (post-unification).
+   * Payload: protobuf bytes (e.g., `ChangeSetPublished`, review receipts) with domain-separated signing/verification.
+   * Event types (today): `changeset_published`, `review_receipt_recorded`, `review_blocked_recorded`, `projection_receipt_recorded`, etc.
+   * Policy: these are canonical kernel facts and MUST NOT be lumped into "legacy intake" just because they use underscores.
+
+**Key rule (bridge):** during cutover windows where both DaemonSignedJson work events and ReducerProtobuf work events exist, reducer truth MUST be checked for equivalence using `WorkParityValidator`, and promotion MUST be fail-closed on parity defects.
+
+### 3.3 Payload encoding + canonicalization matrix (drift barrier)
+
+To prevent "it worked locally" drift, every event type introduced or relied on by this RFC MUST declare:
+
+* **payload encoding** (JSON vs protobuf),
+* **canonicalization contract** (what must be normalized before hashing/signing),
+* **topic derivation source-of-truth** (what fields are used to derive pulse topics).
+
+Minimum required declarations for this RFC:
+
+| Event type family | Example event types | Payload encoding | Canonicalization source | Topic derivation must use |
+|---|---|---:|---|---|
+| ReducerProtobuf (`WorkEvent`) | `work.opened`, `work.transitioned`, `work.completed` | protobuf | `apm2_core::events::Canonicalize` on payload structs | `work_id` extracted from decoded `WorkEvent` |
+| ReducerProtobuf (`EvidenceEvent`) | `evidence.published` | protobuf | `apm2_core::events::Canonicalize` | `work_id` from decoded `EvidencePublished.work_id` |
+| KernelTypedProtobuf | `changeset_published`, `review_receipt_recorded` | protobuf | event-type-specific canonicalization (existing emitters already do this) | `work_id` from decoded payload or from envelope metadata in projection |
+| DaemonSignedJson | `work_claimed`, `work_transitioned` | JSON | `canonicalize_json` before signing | `work_id` from payload JSON |
+
+**Pulse implication:** `PulsePublisher` MUST NOT assume a `KernelEvent` envelope; it MUST route on `(event_type, payload_bytes)` and decode only enough to derive topics and (optionally) render doctor hints.
 
 ---
 
 ## 4. Data model (CAS documents)
 
 All CAS documents in this RFC are **canonicalized JSON** using `apm2_core::determinism::canonicalize_json` and then hashed via the existing BLAKE3 content hash (same pattern used throughout `DurableCas`).
+
+### 4.0 Schema governance + bounded decoding (mandatory)
+
+To prevent long-lived drift between "what the RFC intended" and "what got serialized in production," all CAS-backed JSON documents introduced here MUST:
+
+1. Carry a stable `schema` id string (e.g., `apm2.work_spec.v1`).
+2. Be registered in `crates/apm2-core/src/schema_registry/fac_schemas.rs` (schema id allowlist).
+3. Be decoded from IPC bytes using bounded deserialization:
+   * `fac_schemas::bounded_from_slice_with_limit::<T>(bytes, limit)`
+   * `#[serde(deny_unknown_fields)]` on the struct `T`.
+4. Define an explicit maximum size per artifact (fail-closed). Suggested hard caps:
+   * WorkSpec: 256 KiB
+   * WorkLoopProfile: 64 KiB
+   * WorkContextEntry: 256 KiB
+   * WorkAuthorityBindings: 256 KiB
+
+**Hashing rule:** the daemon MUST canonicalize the JSON bytes first and store the canonical bytes in CAS (the hash is of canonical bytes). The daemon MUST NOT hash/store raw non-canonical input bytes.
 
 ### 4.1 WorkSpec: `apm2.work_spec.v1` (immutable)
 
@@ -186,11 +268,12 @@ This RFC **aligns WorkSpec with the existing work cutover proposal (RFC-0018)**:
 ```json
 {
   "schema": "apm2.work_spec.v1",
-  "work_id": "work-2026-02-18T12:34:56Z-abcdef",
+  "work_id": "W-<uuid>",
   "ticket_alias": "TCK-00606",
   "title": "Make fac push emit terminal markers and bind work_id",
   "summary": "Kernel-native FAC push integration; add context markers; wire PR association.",
-  "work_type": "forge_admission",
+  "work_type": "TICKET",
+  "fac": { "cycle": "forge_admission" },
   "repo": {
     "owner": "openai",
     "name": "apm2",
@@ -211,11 +294,16 @@ This RFC **aligns WorkSpec with the existing work cutover proposal (RFC-0018)**:
 ```
 
 **Important correction vs the earlier draft:**
-Do **not** require “ticket id becomes `work_id`.” The codebase already has an explicit alias reconciliation design (`apm2_core::events::alias_reconcile`) and even an alias reconciliation gate stub in `handle_spawn_episode`. Use it. Ticket IDs are aliases, not canonical ids.
+Do **not** require "ticket id becomes `work_id`." The codebase already has an explicit alias reconciliation design (`apm2_core::events::alias_reconcile`) and even an alias reconciliation gate stub in `handle_spawn_episode`. Use it. Ticket IDs are aliases, not canonical ids.
+
+**WorkType constraint (repo-aligned):**
+`work_type` MUST be one of the string forms accepted by `apm2_core::work::WorkType` (`TICKET`, `PRD_REFINEMENT`, `RFC_REFINEMENT`, `REVIEW`). If FAC needs additional sub-typing ("forge admission"), carry it as a WorkSpec facet (e.g., `fac.cycle`) rather than changing the reducer's WorkType without a dedicated RFC.
 
 ### 4.2 WorkLoopProfile: `apm2.work_loop_profile.v1` (mutable policy/config knobs)
 
 Stored in CAS; referenced by claim/session dispatch events (see §5, §6). This is operational tuning, **not** privilege escalation.
+
+**Immutability note:** CAS documents are immutable; "mutable" here means "a newer profile hash can be published and selected." The RFC MUST specify how selection occurs (event + projection), not imply in-place mutation.
 
 **Mutability note (important):** CAS is immutable. "Mutable" here means:
 publish a new profile document + anchor it in the ledger, and treat "latest anchored profile" as active
@@ -251,7 +339,7 @@ Stored in CAS; anchored by a ledger event (`evidence.published` with category `W
 {
   "schema": "apm2.work_context_entry.v1",
   "work_id": "…",
-  "entry_id": "ctx-2026-02-18T12:35:02Z-…",
+  "entry_id": "CTX-<uuid>",
   "kind": "HANDOFF_NOTE",
   "dedupe_key": "session-…",
   "actor_id": "…",
@@ -266,6 +354,10 @@ Stored in CAS; anchored by a ledger event (`evidence.published` with category `W
   ]
 }
 ```
+
+**Actor/time attribution rule (repo-aligned):**
+`actor_id` MUST be derived by the daemon from peer credentials (as `ClaimWork` already does); clients MUST NOT be the authority for `actor_id`.
+`created_at_ns` SHOULD equal the ledger event timestamp used to anchor the entry (or be derived directly from the daemon's authoritative clock source).
 
 ---
 
@@ -367,12 +459,24 @@ Projection rule:
 
 All additions are to `proto/apm2d_runtime_v1.proto` and implemented in `crates/apm2-daemon/src/protocol/dispatch.rs`, with corresponding CLI client updates.
 
-### 6.0 RPC contract: atomicity, idempotency, and error mapping (required)
+### 6.0 Protocol conventions (applies to all new RPCs)
+
+To prevent replay/duplication drift (and to align with RFC-0019's idempotent actuation requirement), all state-mutating RPCs introduced by this RFC MUST define:
+
+1. **Idempotency**: a deterministic dedupe key (explicit field or projection-enforced uniqueness) such that retrying the same request does not emit additional ledger events.
+2. **Actor attribution**: `actor_id` is derived by daemon from credentials; request fields may carry display hints but are not authoritative.
+3. **Atomicity boundary**:
+   * for "CAS then ledger" operations, the daemon stores the canonical bytes to CAS first (idempotent by hash), then appends the ledger event.
+   * if ledger append fails, the CAS object is allowed to exist "unreferenced" (garbage-collectable later); the daemon MUST NOT emit a partial ledger event that references a CAS hash that was not successfully stored.
+4. **Sequence correctness for work transitions**:
+   * any emission of `work.transitioned` MUST supply correct `previous_transition_count` as required by `apm2_core::work::WorkReducer` (monotone, fail-closed).
+
+### 6.0.1 RPC contract: atomicity, idempotency, and error mapping (required)
 
 Many of the new RPCs have the shape "store bytes in CAS, then append an anchoring ledger event."
 Without explicit atomicity/idempotency rules, retries will produce divergent state and projections.
 
-#### 6.0.1 Atomicity rule (daemon)
+#### 6.0.1.1 Atomicity rule (daemon)
 
 For any RPC that writes both CAS and ledger:
 
@@ -383,7 +487,7 @@ For any RPC that writes both CAS and ledger:
 If step (3) fails, the CAS object may be orphaned, but the truth plane remains consistent.
 The daemon MAY implement a best-effort orphan reaper, but correctness must not depend on it.
 
-#### 6.0.2 Idempotency rules (per RPC)
+#### 6.0.1.2 Idempotency rules (per RPC)
 
 * `OpenWork`: idempotent on `work_id`.
   * If `work_id` exists with the same `spec_snapshot_hash`, return success (no-op).
@@ -399,7 +503,7 @@ The daemon MAY implement a best-effort orphan reaper, but correctness must not d
   * `AddWorkEdge` MUST support caller-supplied idempotency (dedupe key or explicit edge_id).
   * `RemoveWorkEdge`/`WaiveWorkEdge` are idempotent by `edge_id`.
 
-#### 6.0.3 Error mapping
+#### 6.0.1.3 Error mapping
 
 Unless a new error code is introduced, map to existing `PrivilegedErrorCode` classes:
 
@@ -484,8 +588,18 @@ message PublishWorkContextEntryRequest {
 Daemon behavior:
 
 1. Canonicalize and store `entry_json` to CAS → `entry_hash`
-2. Append `evidence.published` with category `WORK_CONTEXT_ENTRY`, `evidence_hash=entry_hash`
-3. Enforce idempotency on `(work_id, kind, dedupe_key)` via projection uniqueness
+2. Append `evidence.published` (protobuf `EvidencePublished`) with:
+   * `category = WORK_CONTEXT_ENTRY`
+   * `artifact_hash = entry_hash`
+   * `artifact_size = len(canonical_entry_bytes)`
+   * `classification = "INTERNAL"` (unless explicitly overridden by a policy-controlled surface)
+   * `verification_command_ids = []` (work context entries are not verification results)
+   * `metadata` includes `kind=<kind>` and `dedupe_key=<dedupe_key>` (for low-cost indexing)
+3. Enforce idempotency on `(work_id, kind, dedupe_key)` via projection uniqueness; on duplicate, return success without emitting additional events.
+
+**Note:** `EvidenceReducer` rejects duplicate `evidence_id`. This RPC MUST either:
+* generate an evidence id that is unique per emitted entry (recommended: `evidence_id = entry_id`), or
+* be strictly idempotent such that the same dedupe key never produces a second publish.
 
 ### 6.5 RecordWorkPrAssociation (new)
 
@@ -684,7 +798,9 @@ Policies:
 * `CiPending` → `ReadyForReview` or `Blocked` (gate orchestrator/system actor)
 * `Blocked` → `InProgress` (fix loop)
 * `ReadyForReview` → `Review` (review claim)
-* `Review` → `Completed` (merge admission) or back to `Blocked`
+* `Review` → `Completed` (merge admission) or back to `InProgress` (rework loop)
+
+**Repo alignment note:** `WorkState::can_transition_to` currently allows `Review -> InProgress` but does not allow `Review -> Blocked`. "Blocked" should remain CI/gate-centric; review failures are rework (`InProgress`) or escalation (`NeedsInput` / `NeedsAdjudication`) depending on policy.
 
 ### 10.2 Terminal contract (hard)
 

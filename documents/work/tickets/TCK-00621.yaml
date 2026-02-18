@@ -64,6 +64,60 @@ scope:
         - Test: PREP success → EXECUTE runs → run_summary has both durations.
         - Test: EXECUTE failure → run_failed has stage=execute.
         - Test: EXECUTE makes no ambient mutations outside gate workspaces.
+    - id: "S5_DOCTOR_OUTPUT_NOISE"
+      title: "Reduce fac doctor default output: suppress tracked_prs dump"
+      detail: |
+        `apm2 fac doctor` currently dumps ~44 KB of JSON including all 100
+        tracked PRs (the tracked_prs array) even when the caller only wants
+        system health checks. This makes the output unusable for quick
+        diagnosis and overwhelms terminal buffers.
+
+        Fix:
+          - Default `fac doctor` (no flags) should emit only the checks
+            array — the 14 system health probes that answer "is my host
+            ready?". This is the primary use case.
+          - Move tracked_prs behind a flag: `--tracked-prs` or `--full`.
+            When the flag is present, include tracked_prs in the output.
+          - `fac doctor --json` retains the same schema
+            (apm2.fac.doctor.system.v1) but tracked_prs is an empty array
+            (or omitted) unless --tracked-prs is also passed.
+          - `fac doctor --wait-for-recommended-action` continues to include
+            tracked_prs (it needs them for the recommendation loop).
+          - Existing --repo filter (TCK-00617) applies within tracked_prs
+            when tracked_prs is requested.
+
+    - id: "S6_DOCTOR_WAIT_TERMINAL_STATES"
+      title: "Add terminal states to --wait-for-recommended-action"
+      detail: |
+        `fac doctor --wait-for-recommended-action` currently blocks
+        indefinitely on states that will never resolve without manual
+        intervention, and fails to exit on states that represent completion.
+
+        BUG 1: "dispatch implementor" is a manual action — the orchestrator
+        or operator must create an agent to address review findings. Waiting
+        for this state to change is pointless; the command should return
+        immediately so the caller can act on the recommendation.
+
+        BUG 2: When a PR receives approval verdicts on all dimensions
+        (security + code_quality both approve), the wait loop does not
+        recognize this as a terminal state. The command continues polling
+        instead of returning immediately with the "all verdicts approve"
+        outcome.
+
+        Fix: define a set of terminal recommended_action values that cause
+        --wait-for-recommended-action to return immediately:
+          - "dispatch_implementor" (manual action required — nothing to wait for)
+          - "merge_ready" / all-verdicts-approve (PR is done — nothing to wait for)
+          - Any other state that requires operator intervention rather than
+            waiting for an automated process to complete.
+
+        The terminal event JSON line emitted on exit (TCK-00617 S6) should
+        include a "reason" field distinguishing timeout vs terminal-state
+        exit:
+          {"event": "wait_terminal", "reason": "dispatch_implementor", ...}
+          {"event": "wait_terminal", "reason": "merge_ready", ...}
+          {"event": "wait_timeout", "elapsed_seconds": 1200}
+
   out_of_scope:
     - "Network denial enforcement (TCK-00622)."
     - "Full JSONL event schema definition (TCK-00625)."
@@ -112,6 +166,11 @@ definition_of_done:
     - "run_failed includes stage field identifying which phase failed."
     - "EXECUTE phase makes no ambient filesystem mutations outside gate workspaces."
     - "Regression tests pass for all phase separation invariants."
+    - "Default `fac doctor` output contains only checks (no tracked_prs dump)."
+    - "tracked_prs is available via explicit --tracked-prs flag."
+    - "--wait-for-recommended-action returns immediately on 'dispatch_implementor'."
+    - "--wait-for-recommended-action returns immediately when all verdicts approve."
+    - "Terminal exit emits a wait_terminal event with reason field (not wait_timeout)."
     - "Workspace validation completes successfully."
 
 notes:

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00619"
     title: "Fix: PR closed instead of merged in GitHub projection; remove post-merge worktree deletion; remove --allow-legacy-cache flag"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

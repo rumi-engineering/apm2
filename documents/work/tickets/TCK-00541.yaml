@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00541"
     title: "Gate cache v3 (optional): receipt-indexed cache store keyed by attestation+policy+toolchain (fail-closed by construction)"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

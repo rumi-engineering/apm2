@@ -27,6 +27,7 @@ notes:
   - "Use `apm2 fac logs --pr <N> --json` as the canonical per-PR log discovery command, then `tail -f` the returned review/pipeline log paths for up-to-date execution output."
   - "Use `apm2 fac doctor --pr <N> --json` as the single per-PR source of findings_summary, merge_readiness, agents, and recommended_action."
   - "Worktree naming/creation and branch/conflict repair are implementor-owned responsibilities; orchestrator validates outcomes via FAC gate/push telemetry."
+  - "Prefer blocking waits over polling: use `apm2 fac doctor --pr <N> --json --wait-for-recommended-action` as the primary per-PR monitoring command. It blocks until the recommended action changes or a terminal state is reached, then returns a single JSON snapshot. This is cheaper and more responsive than repeated `apm2 fac doctor --pr <N> --json` polls in a sleep loop."
   - "Canonical control loop: `apm2 fac doctor --pr <N> --json --wait-for-recommended-action --exit-on done`, then route by `recommended_action.action`."
   - "When doctor emits `recommended_action.command`, execute it verbatim instead of re-deriving command arguments."
 
@@ -82,7 +83,14 @@ decision_tree:
       purpose: "Run bounded, evidence-first orchestration ticks until stop condition."
       steps[5]:
         - id: SNAPSHOT
-          action: "Capture per-PR `apm2 fac doctor --pr <N> --json` snapshots as the primary lifecycle signal; use fac_logs and fac_review_tail for diagnosis context."
+          action: |
+            Prefer `apm2 fac doctor --pr <N> --json --wait-for-recommended-action`
+            over repeated polling. This blocks until the PR state changes or a
+            terminal condition is reached, then returns a single JSON snapshot.
+            Only fall back to bare `apm2 fac doctor --pr <N> --json` when you
+            need a one-shot snapshot without waiting (e.g., initial discovery or
+            multi-PR fan-out where you cannot block on a single PR).
+            Use fac_logs and fac_review_tail for diagnosis context.
         - id: GC_AND_DISK_HEALTH
           action: |
             Run `apm2 fac gc --json` if any of the following hold:
@@ -207,8 +215,7 @@ decision_tree:
             (4) proceed only when worktree is conflict-free.
         - id: REQUIRE_PRE_COMMIT_ORDER
           action: |
-            During active edits, run `apm2 fac gates --quick` for short-loop validation.
-            Immediately before push, run `apm2 fac gates` and preserve per-gate outcomes in FAC artifacts.
+            Run `apm2 fac gates` before push and preserve per-gate outcomes in FAC artifacts.
         - id: ENFORCE_BRANCH_HYGIENE_GATE
           action: |
             If branch sync facts are missing from artifacts or unresolved conflicts remain,
@@ -259,7 +266,7 @@ operational_playbook:
 
     - trigger: "Doctor reports action=wait"
       observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=wait`"
-      action: "Execute `recommended_action.command` to continue bounded polling; do not hand-roll poll loops."
+      action: "Use `apm2 fac doctor --pr <N> --json --wait-for-recommended-action` to block until the state changes. Do not hand-roll poll loops with sleep."
 
     - trigger: "Doctor reports action=fix"
       observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=fix`"
@@ -279,7 +286,7 @@ operational_playbook:
 
     - trigger: "Evidence gates failed during push"
       observed_via: "`apm2 fac push` exits with gate failures (rustfmt, clippy, test, etc.)"
-      action: "Dispatch implementor remediation; require `apm2 fac gates --quick` during iteration and `apm2 fac gates` before the next push."
+      action: "Dispatch implementor remediation; require `apm2 fac gates` before the next push."
 
     - trigger: "Stale SHA — review completed for old commit"
       observed_via: "`apm2 fac doctor --pr <N> --json` indicates stale head binding"
@@ -307,3 +314,4 @@ invariants[13]:
   - "Implementor prompts use implementor-default as the primary instruction source and add only ticket/PR-specific deltas."
   - "Run `apm2 fac gc --json` at session start and periodically (every ~10 ticks or on low-disk signal); GC is idempotent and reclaims gate cache, blobs, lane logs, and quarantine artifacts."
   - "Enqueue `apm2 fac warm --json` when a new PR first enters monitoring scope; pre-warming populates lane compilation caches and reduces cold-start gate timeouts."
+  - "Prefer `apm2 fac doctor --pr <N> --json --wait-for-recommended-action` over poll-sleep loops. The blocking wait returns on state change or terminal condition and is both cheaper and more responsive than periodic polling."

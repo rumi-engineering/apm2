@@ -17,9 +17,7 @@ protocol:
 variables:
   IMPLEMENTATION_SCOPE_OPTIONAL: "$1"
 
-references[17]:
-  - path: "@documents/theory/unified-theory-v2.json"
-    purpose: "REQUIRED READING: APM2 terminology and ontology."
+references[16]:
   - path: "@documents/security/SECURITY_POLICY.cac.json"
     purpose: "Security posture and fail-closed defaults for ambiguous trust state."
   - path: "@documents/rfcs/RFC-0019/20_fac_execution_substrate_build_farm_revision.md"
@@ -94,7 +92,7 @@ decision_tree:
             addressed in one pass across all dimensions.
             If no PR exists yet (fresh implementation), skip this step.
         - id: LOAD_REQUIRED_READING
-          action: "Read SKILL references marked REQUIRED READING and any orchestrator-provided warm handoff files before edits."
+          action: "Read any orchestrator-provided warm handoff files before edits."
         - id: LOAD_REQUIREMENT_BINDINGS
           action: |
             For each entry in binds.requirements: read the file at requirement_ref (strip the #anchor suffix). Extract the requirement's statement, acceptance_criteria, and priority. Merge these acceptance_criteria with definition_of_done.criteria to form your complete implementation checklist.
@@ -120,7 +118,15 @@ decision_tree:
         - id: SELECT_OR_CREATE_WORKTREE
           action: "Implementor agent chooses/creates the correct worktree path and branch naming convention for the assigned scope."
         - id: MAINLINE_SYNC
-          action: "Synchronize worktree ancestry with current mainline policy before editing."
+          action: |
+            Synchronize worktree with the local main branch. Local main is
+            authoritative — do NOT treat origin/main as the source of truth.
+            From your feature branch worktree run:
+              git fetch origin main:main   # fast-forward local main ref
+              git rebase main              # rebase feature branch onto main
+            If the rebase has conflicts, resolve them before proceeding.
+            Do NOT use `git pull` or `git merge origin/main` — always rebase
+            onto the local main ref.
         - id: CONFLICT_ZERO_GATE
           action: "Resolve merge conflicts to zero before code changes."
         - id: WORKTREE_HEALTH_GATE
@@ -202,7 +208,11 @@ decision_tree:
       purpose: "Execute the minimal change set while preserving boundary contracts and preventing DoS/TOCTOU regressions."
       steps[6]:
         - id: APPLY_PATCHES
-          action: "Implement the smallest coherent patch satisfying requirement bindings and pre-edit gates."
+          action: |
+            Implement the smallest coherent patch satisfying requirement bindings and pre-edit gates.
+            If a useful abstraction, refactor, or structural improvement is necessary to meet the
+            reviewer's strict quality bar, it is your responsibility to add it — do not defer
+            quality-enabling refactors to a follow-up ticket.
         - id: ADD_REGRESSION_TESTS
           action: |
             Add negative and positive tests for fixed defect classes (missing state, stale state, bypass attempts, replay/order hazards, DoS, TOCTOU).
@@ -238,32 +248,20 @@ decision_tree:
         These commands WILL FAIL on a dirty working tree. Build artifacts are attested against
         the committed HEAD SHA and reused as a source of truth — uncommitted changes produce
         unattestable results. Commit first, then run gates/push.
-      steps[10]:
-        - id: RUN_FAC_GATES_QUICK
-          action: "During active edits, run `apm2 fac gates --quick` for short-loop validation (dirty tree OK for --quick only)."
+      steps[4]:
         - id: RUN_FAC_GATES_FULL
           action: |
             COMMIT ALL CHANGES FIRST, then run `apm2 fac gates`. Full gates require a clean working tree — no uncommitted, staged, or untracked files.
             Immediately before push, run `apm2 fac gates`.
-          action: "On failure, run `apm2 fac --json logs` and inspect referenced evidence logs under `${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/`."
-        - id: HANDLE_RESOURCE_EXHAUSTION
-          action: |
-            If gate execution fails due to resource exhaustion:
-            - Reclaim disk space: `rm -rf "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"` (old evidence logs, safe to delete) and `rm -rf target/` (compilation cache, safe to delete).
-            - Re-run gates after cleanup: `apm2 fac gates`.
-            Note: Queue-based quarantine/denial is PLANNED for the FESv1 queue/worker surface and does not apply to current local gate execution.
         - id: FIX_AND_RERUN
           action: |
-            Fix failures, COMMIT, and re-run gates (`--quick` during iteration, full `apm2 fac gates` after committing before push) until PASS or BLOCKED.
-        - id: HANDLE_DISK_PRESSURE
-          action: |
-            If gate execution fails due to disk exhaustion, reclaim space by removing old evidence logs: `rm -rf "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"` and build caches: `rm -rf target/`. Check disk usage: `df -h` and `du -sh "${APM2_HOME:-$HOME/.apm2}/private/fac/"`.
+            Fix failures, COMMIT, and re-run `apm2 fac gates` until PASS or BLOCKED.
         - id: HANDLE_BUILD_FAILURES
           action: |
-            If gates fail due to build errors, check evidence logs (`apm2 fac --json logs`) for detailed output. Common causes: missing dependencies, stale Cargo.lock, compiler version mismatch.
+            If gates fail due to build errors, check evidence logs (`apm2 fac --json logs`) for detailed output.
         - id: ESCALATE_IF_BLOCKED
           action: |
-            If gate execution cannot be restored to a passing state, mark the task BLOCKED with concrete evidence (log excerpts, receipt hashes) and escalate.
+            If gate execution cannot be restored to a passing state, mark the task BLOCKED with concrete evidence and escalate.
       next: UPDATE_AGENTS_DOCS
 
     - id: UPDATE_AGENTS_DOCS
@@ -319,7 +317,7 @@ decision_tree:
 
 invariants[16]:
   # Clean Tree Invariant (HIGHEST PRIORITY — agents repeatedly violate this)
-  - "NEVER run `apm2 fac gates` (full) or `apm2 fac push` with uncommitted changes. ALL files — code, tests, docs, tickets — MUST be committed first. Build artifacts are SHA-attested and reused as a source of truth; a dirty tree makes attestation impossible and the commands WILL FAIL. `--quick` mode is the ONLY exception."
+  - "NEVER run `apm2 fac gates` or `apm2 fac push` with uncommitted changes. ALL files — code, tests, docs, tickets — MUST be committed first. Build artifacts are SHA-attested and reused as a source of truth; a dirty tree makes attestation impossible and the commands WILL FAIL."
 
   # No Backwards Compatibility by Default
   - "Backwards compatibility is expressly and intentionally NEVER required unless specifically called out as a requirement in a work object. Do not add deprecated shims, re-exports, renamed aliases, or any other backwards-compat scaffolding by default. Breaking changes are the norm; migration paths are only required when a ticket or RFC explicitly mandates them."
