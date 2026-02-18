@@ -1479,6 +1479,13 @@ and content-addressed integrity verification (TCK-00542).
   budget presence/absence byte. This preserves backward compatibility with
   pre-TCK-00555 envelopes (INV-EB-014). New-schema envelopes always include the
   presence/absence tag.
+- [INV-EB-014] (TCK-00555) Import rejects new-schema envelopes
+  (`EVIDENCE_BUNDLE_ENVELOPE_SCHEMA` / `apm2.fac.evidence_bundle_envelope.v1`) that
+  are missing `leakage_budget_decision`. Legacy envelopes
+  (`EVIDENCE_BUNDLE_SCHEMA` / `apm2.fac.evidence_bundle.v1`) are exempt for backward
+  compatibility. This prevents downgrade-by-omission attacks where an attacker strips
+  the decision field and recomputes a self-consistent content hash to bypass leakage
+  budget enforcement.
 
 ## Policy Environment Enforcement (TCK-00526, TCK-00575)
 
