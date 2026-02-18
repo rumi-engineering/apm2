@@ -113,6 +113,58 @@ scope:
         Any path used by the daemon process that has PrivateTmp=yes must not
         live under /tmp/. Redirect pid_file, log_dir, and state_file to
         $XDG_RUNTIME_DIR/apm2/ or $HOME/.local/share/apm2/ as appropriate.
+    - id: "S6_VERDICT_COMMENT_RESYNC"
+      title: "Fix: second reviewer decision fails to appear in GitHub verdict comment"
+      detail: |
+        Observed on PR #746: the GitHub verdict comment is created correctly
+        with the first reviewer's decision, but when the second reviewer's
+        decision lands the comment is not updated to show both decisions.
+
+        Location: verdict_projection.rs project_decision_comment_with()
+          (lines 788-924), persist_verdict_projection_impl() (lines 568-719).
+
+        Key invariants confirmed during initial investigation:
+          - DecisionProjectionRecord stored at:
+              ~/.apm2/fac_projection/repos/{owner_repo}/pr-{N}/verdict_projection.json
+              and SHA-specific copy at sha-{sha}/verdict_projection.json.
+          - Both reviewers on the same machine share ~/.apm2 and the fs2 lock.
+          - projection_record_to_payload() copies all record.dimensions.
+          - VERDICT_MARKER and DECISION_MARKER are the same value
+            ("apm2-review-verdict:v1"); tombstone markers also match.
+          - On the happy path (same machine, serialised by lock), the code
+            appears correct: second reviewer loads record with first
+            reviewer's dimension already present, renders body with both.
+
+        Likely root cause (not yet confirmed):
+          When the second reviewer has no local projection record (cross-
+          APM2_HOME, integrity HMAC failure, or SHA mismatch), commit 0edac29c
+          added a "discover existing remote comment and update" path via
+          fetch_latest_live_verdict_comment_id(). This path correctly finds
+          and updates the existing GitHub comment, but renders the body from
+          a fresh record containing only the current reviewer's single
+          dimension — overwriting the first reviewer's verdict on GitHub.
+
+        Possible root causes still to confirm:
+          A. Integrity HMAC verification failure on record load causes
+             load_decision_projection_for_home() to return Err, propagating
+             an error to the caller (second verdict silently fails).
+          B. SHA mismatch between reviewers (new commit pushed between
+             reviews) → record load returns None → fresh record → single-
+             dimension body overwrites comment.
+          C. Cross-APM2_HOME: second reviewer has no local record → finds
+             existing GitHub comment → updates with single-dimension body.
+          D. Race condition: record loaded before first reviewer saves
+             despite the fs2 lock (e.g., lock not held across the full
+             load-modify-save cycle).
+
+        Fix direction (to be confirmed after deeper investigation):
+          - If C/D: when updating an existing remote comment discovered via
+            fetch_latest_live_verdict_comment_id(), parse the existing
+            comment body to extract prior dimensions, merge with the incoming
+            dimension, render the merged body, then update.
+          - If A: surface the integrity verification error clearly.
+          - If B: no fix needed (SHA mismatch is correct behaviour).
+
   out_of_scope:
     - "Changes to gate execution logic or gate ordering."
     - "Network-independence enforcement (REQ-0033, TCK-00622)."
@@ -173,6 +225,7 @@ definition_of_done:
     - "EXEC-TCK00620-READINESS-CONTROLLER"
     - "EXEC-TCK00620-FRESH-WORKTREE-SUCCESS"
     - "EXEC-TCK00620-SOCKET-PATH-FIX"
+    - "EXEC-TCK00620-VERDICT-RESYNC-FIX"
     - "EXEC-TCK00620-WORKSPACE-VALIDATION"
   criteria:
     - "ReadinessController is implemented with check/autofix/recheck for all six substrate components."
@@ -186,6 +239,9 @@ definition_of_done:
     - "No daemon-written paths (pid file, log dir, state file) remain under /tmp/ in ecosystem.toml."
     - "Regression tests pass for XDG socket resolution and PrivateTmp isolation invariants."
     - "Regression tests pass for all fresh/partial/failure scenarios."
+    - "Root cause of verdict comment resync failure is confirmed and fixed."
+    - "After both reviewer decisions land, the GitHub verdict comment shows
+      all dimensions — no dimension is silently overwritten or lost."
     - "Workspace validation (fmt, clippy, doc, test) completes successfully."
 
 notes:

@@ -41,7 +41,8 @@
         "Every execution path MUST terminate with exactly one verdict set call.",
         "SHA is managed by the CLI — the reviewer never tracks, stores, or references it.",
         "ALWAYS use `cargo run -p apm2-cli --` instead of bare `apm2`. The workspace binary contains the code under review; a globally installed binary may be stale and missing fields or fixes from the current PR.",
-        "Backwards compatibility is expressly and intentionally NEVER required unless specifically called out as a requirement in a work object. Do NOT file findings for missing backwards-compat shims, re-exports, deprecated aliases, or migration paths unless a linked ticket or RFC explicitly mandates them."
+        "Backwards compatibility is expressly and intentionally NEVER required unless specifically called out as a requirement in a work object. Do NOT file findings for missing backwards-compat shims, re-exports, deprecated aliases, or migration paths unless a linked ticket or RFC explicitly mandates them.",
+        "Do NOT run or check cargo fmt, clippy, cargo test, or cargo doc. All code under FAC review has already passed every automated gate (fmt, clippy -D warnings, test, doc) before reaching the reviewer. These are verified automatically and are never part of the security review scope. Spend zero time on formatting, lint, or test-execution concerns — focus exclusively on security analysis."
       ]
     },
     "references": [

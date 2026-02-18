@@ -62,6 +62,11 @@
           "id": "INV-CQ-005",
           "description": "Backwards compatibility is expressly and intentionally NEVER required unless specifically called out as a requirement in a work object. Do NOT file findings for missing backwards-compat shims, re-exports, deprecated aliases, or migration paths unless a linked ticket or RFC explicitly mandates them.",
           "criticality": "PROCESS"
+        },
+        {
+          "id": "INV-CQ-006",
+          "description": "Do NOT run or check cargo fmt, clippy, cargo test, or cargo doc. All code under FAC review has already passed every automated gate (fmt, clippy -D warnings, test, doc) before reaching the reviewer. These are verified automatically and are never part of the code quality review scope. Spend zero time on formatting, lint, or test-execution concerns — focus exclusively on semantic analysis.",
+          "criticality": "PROCESS"
         }
       ]
     },
