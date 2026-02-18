@@ -98,10 +98,10 @@ use apm2_core::fac::{
     LaneCorruptMarkerV1, LaneProfileV1, MAX_POLICY_SIZE, PATCH_FORMAT_GIT_DIFF_V1,
     QueueAdmissionTrace as JobQueueAdmissionTrace, ReceiptPipelineError, ReceiptWritePipeline,
     RepoMirrorManager, SystemModeConfig, SystemdUnitProperties, apply_credential_mount_to_env,
-    build_github_credential_mount, build_job_environment, compute_or_cached_toolchain_fingerprint,
-    compute_policy_hash, deserialize_policy, load_or_default_boundary_id, move_job_to_terminal,
-    outcome_to_terminal_state, parse_policy_hash, persist_content_addressed_receipt,
-    persist_policy, rename_noreplace, run_preflight, select_and_validate_backend,
+    build_github_credential_mount, build_job_environment, compute_policy_hash, deserialize_policy,
+    load_or_default_boundary_id, move_job_to_terminal, outcome_to_terminal_state,
+    parse_policy_hash, persist_content_addressed_receipt, persist_policy, rename_noreplace,
+    resolve_toolchain_fingerprint, run_preflight, select_and_validate_backend,
 };
 use apm2_core::github::{parse_github_remote_url, resolve_apm2_home};
 use base64::Engine;
@@ -767,6 +767,37 @@ pub fn run_fac_worker(
         }
     }
 
+    // TCK-00538: Compute toolchain fingerprint ONCE at startup. Avoids
+    // per-job process spawning (4 subprocesses per call). On failure, use
+    // None — fail-closed telemetry, not node_fingerprint fallback.
+    let toolchain_fingerprint: Option<String> = {
+        let apm2_home = resolve_apm2_home().unwrap_or_else(|| {
+            std::env::var("HOME")
+                .unwrap_or_else(|_| "/".to_string())
+                .into()
+        });
+        let mut probe_env = std::collections::BTreeMap::new();
+        if let Ok(path) = std::env::var("PATH") {
+            probe_env.insert("PATH".to_string(), path);
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            probe_env.insert("HOME".to_string(), home);
+        }
+        if let Ok(user) = std::env::var("USER") {
+            probe_env.insert("USER".to_string(), user);
+        }
+        match resolve_toolchain_fingerprint(&apm2_home, &probe_env) {
+            Ok(fp) => Some(fp),
+            Err(e) => {
+                eprintln!(
+                    "worker: WARNING: toolchain fingerprint computation failed: {e}, \
+                     receipts will omit toolchain_fingerprint (fail-closed)"
+                );
+                None
+            },
+        }
+    };
+
     let mut total_processed: u64 = 0;
     let mut cycle_count: u64 = 0;
     let mut summary = WorkerSummary {
@@ -1005,6 +1036,7 @@ pub fn run_fac_worker(
                     summary.jobs_denied as u64,
                     summary.jobs_quarantined as u64,
                     &cost_model,
+                    toolchain_fingerprint.as_deref(),
                 );
                 cycle_scheduler.record_completion(lane);
                 outcome
@@ -1772,6 +1804,8 @@ fn execute_queued_gates_job(
     heartbeat_jobs_completed: u64,
     heartbeat_jobs_denied: u64,
     heartbeat_jobs_quarantined: u64,
+    // TCK-00538: Toolchain fingerprint computed at worker startup.
+    toolchain_fingerprint: Option<&str>,
 ) -> JobOutcome {
     let job_wall_start = Instant::now();
     let options = match parse_gates_job_options(spec) {
@@ -1799,7 +1833,7 @@ fn execute_queued_gates_job(
                 Some(net_hash),
                 None, // stop_revoke_admission
                 None, // bytes_backend
-                None, // toolchain_fingerprint
+                toolchain_fingerprint,
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -1842,7 +1876,7 @@ fn execute_queued_gates_job(
                 Some(net_hash),
                 None, // stop_revoke_admission
                 None, // bytes_backend
-                None, // toolchain_fingerprint
+                toolchain_fingerprint,
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -1882,7 +1916,7 @@ fn execute_queued_gates_job(
             Some(net_hash),
             None, // stop_revoke_admission
             None, // bytes_backend
-            None, // toolchain_fingerprint
+            toolchain_fingerprint,
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -1929,7 +1963,7 @@ fn execute_queued_gates_job(
                 Some(net_hash),
                 None, // stop_revoke_admission
                 None, // bytes_backend
-                None, // toolchain_fingerprint
+                toolchain_fingerprint,
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -1970,7 +2004,7 @@ fn execute_queued_gates_job(
                 Some(net_hash),
                 None, // stop_revoke_admission
                 None, // bytes_backend
-                None, // toolchain_fingerprint
+                toolchain_fingerprint,
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -2006,7 +2040,7 @@ fn execute_queued_gates_job(
             Some(net_hash),
             None, // stop_revoke_admission
             None, // bytes_backend
-            None, // toolchain_fingerprint
+            toolchain_fingerprint,
         ) {
             eprintln!("worker: pipeline commit failed for gates job: {commit_err}");
             if let Err(move_err) = move_to_dir_safe(
@@ -2092,7 +2126,7 @@ fn execute_queued_gates_job(
         Some(net_hash),
         None, // stop_revoke_admission
         None, // bytes_backend
-        None, // toolchain_fingerprint
+        toolchain_fingerprint,
     ) {
         return handle_pipeline_commit_failure(
             &commit_err,
@@ -2136,6 +2170,8 @@ fn process_job(
     heartbeat_jobs_denied: u64,
     heartbeat_jobs_quarantined: u64,
     cost_model: &apm2_core::economics::CostModelV1,
+    // TCK-00538: Toolchain fingerprint computed once at worker startup.
+    toolchain_fingerprint: Option<&str>,
 ) -> JobOutcome {
     let job_wall_start = Instant::now();
 
@@ -2268,7 +2304,7 @@ fn process_job(
                 Some(&resolved_net_hash),
                 None, // stop_revoke_admission
                 None, // bytes_backend
-                None, // toolchain_fingerprint
+                toolchain_fingerprint,
             ) {
                 eprintln!(
                     "worker: WARNING: pipeline commit failed for quarantined job: {commit_err}"
@@ -2317,7 +2353,7 @@ fn process_job(
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
             None, // bytes_backend
-            None, // toolchain_fingerprint
+            toolchain_fingerprint,
         ) {
             eprintln!("worker: WARNING: pipeline commit failed for denied job: {commit_err}");
             // Job stays in pending/ for reconciliation.
@@ -2372,6 +2408,7 @@ fn process_job(
                     Some(&sbx_hash),
                     Some(&resolved_net_hash),
                     None, // bytes_backend
+                    toolchain_fingerprint,
                 ) {
                     eprintln!(
                         "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -2420,6 +2457,7 @@ fn process_job(
                     Some(&sbx_hash),
                     Some(&resolved_net_hash),
                     None, // bytes_backend
+                    toolchain_fingerprint,
                 ) {
                     eprintln!(
                         "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -2521,6 +2559,7 @@ fn process_job(
                     Some(&sbx_hash),
                     Some(&resolved_net_hash),
                     None, // bytes_backend
+                    toolchain_fingerprint,
                 ) {
                     eprintln!(
                         "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -2558,6 +2597,7 @@ fn process_job(
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
                 None, // bytes_backend
+                toolchain_fingerprint,
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -2604,7 +2644,7 @@ fn process_job(
                 Some(&resolved_net_hash),
                 None, // stop_revoke_admission
                 None, // bytes_backend
-                None, // toolchain_fingerprint
+                toolchain_fingerprint,
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -2674,6 +2714,7 @@ fn process_job(
             &resolved_net_hash,
             job_wall_start,
             Some(&sr_admission_trace),
+            toolchain_fingerprint,
         );
     }
 
@@ -2708,7 +2749,7 @@ fn process_job(
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
             None, // bytes_backend
-            None, // toolchain_fingerprint
+            toolchain_fingerprint,
         ) {
             eprintln!(
                 "worker: WARNING: pipeline commit failed for policy-admission-denied job: {commit_err}"
@@ -2817,7 +2858,7 @@ fn process_job(
                 Some(&resolved_net_hash),
                 None, // stop_revoke_admission
                 None, // bytes_backend
-                None, // toolchain_fingerprint
+                toolchain_fingerprint,
             ) {
                 eprintln!(
                     "worker: WARNING: pipeline commit failed for \
@@ -2865,6 +2906,7 @@ fn process_job(
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
                 None, // bytes_backend
+                toolchain_fingerprint,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -2909,6 +2951,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // bytes_backend
+            toolchain_fingerprint,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2945,6 +2988,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // bytes_backend
+            toolchain_fingerprint,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2996,6 +3040,7 @@ fn process_job(
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
                 None, // bytes_backend
+                toolchain_fingerprint,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -3038,6 +3083,7 @@ fn process_job(
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
                 None, // bytes_backend
+                toolchain_fingerprint,
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -3074,6 +3120,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // bytes_backend
+            toolchain_fingerprint,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -3110,6 +3157,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // bytes_backend
+            toolchain_fingerprint,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -3157,6 +3205,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // bytes_backend
+            toolchain_fingerprint,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -3213,6 +3262,7 @@ fn process_job(
                             Some(&sbx_hash),
                             Some(&resolved_net_hash),
                             None, // bytes_backend
+                            toolchain_fingerprint,
                         ) {
                             eprintln!(
                                 "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
@@ -3256,6 +3306,7 @@ fn process_job(
                         Some(&sbx_hash),
                         Some(&resolved_net_hash),
                         None, // bytes_backend
+                        toolchain_fingerprint,
                     ) {
                         eprintln!(
                             "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
@@ -3306,6 +3357,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // bytes_backend
+            toolchain_fingerprint,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -3392,6 +3444,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // bytes_backend
+            toolchain_fingerprint,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -3448,6 +3501,7 @@ fn process_job(
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
                 None, // bytes_backend
+                toolchain_fingerprint,
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for budget-denied job: {receipt_err}"
@@ -3489,6 +3543,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // bytes_backend
+            toolchain_fingerprint,
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -3537,7 +3592,7 @@ fn process_job(
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
             None, // bytes_backend
-            None, // toolchain_fingerprint
+            toolchain_fingerprint,
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3574,6 +3629,7 @@ fn process_job(
             heartbeat_jobs_completed,
             heartbeat_jobs_denied,
             heartbeat_jobs_quarantined,
+            toolchain_fingerprint,
         );
     }
 
@@ -3644,7 +3700,7 @@ fn process_job(
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
             None, // bytes_backend
-            None, // toolchain_fingerprint
+            toolchain_fingerprint,
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3687,7 +3743,7 @@ fn process_job(
                 Some(&resolved_net_hash),
                 None, // stop_revoke_admission
                 None, // bytes_backend
-                None, // toolchain_fingerprint
+                toolchain_fingerprint,
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -3735,33 +3791,10 @@ fn process_job(
         .compute_hash()
         .unwrap_or_else(|_| "b3-256:unknown".to_string());
 
-    // TCK-00538: Compute toolchain fingerprint for lane lease and receipt.
-    // Uses a minimal hardened env for version probes. The fingerprint is
-    // cached per-boot under $APM2_HOME/private/fac/toolchain/.
-    let toolchain_fp = {
-        let apm2_home = resolve_apm2_home().unwrap_or_else(|| {
-            std::env::var("HOME")
-                .unwrap_or_else(|_| "/".to_string())
-                .into()
-        });
-        let mut probe_env = std::collections::BTreeMap::new();
-        if let Ok(path) = std::env::var("PATH") {
-            probe_env.insert("PATH".to_string(), path);
-        }
-        if let Ok(home) = std::env::var("HOME") {
-            probe_env.insert("HOME".to_string(), home);
-        }
-        if let Ok(user) = std::env::var("USER") {
-            probe_env.insert("USER".to_string(), user);
-        }
-        compute_or_cached_toolchain_fingerprint(&apm2_home, &probe_env).unwrap_or_else(|e| {
-            eprintln!(
-                "worker: WARNING: toolchain fingerprint computation failed: {e}, \
-                     using node_fingerprint fallback"
-            );
-            lane_profile.node_fingerprint.clone()
-        })
-    };
+    // TCK-00538: Use toolchain fingerprint from worker startup for lane lease.
+    // Falls back to "unknown" if fingerprint was not computed (fail-closed:
+    // None means probe failed at startup; lane lease still records this fact).
+    let toolchain_fp_for_lease = toolchain_fingerprint.unwrap_or("b3-256:unknown");
 
     let lane_lease = match LaneLeaseV1::new(
         &acquired_lane_id,
@@ -3770,7 +3803,7 @@ fn process_job(
         LaneState::Running,
         &current_timestamp_epoch_secs().to_string(),
         &lane_profile_hash,
-        &toolchain_fp,
+        toolchain_fp_for_lease,
     ) {
         Ok(lease) => lease,
         Err(e) => {
@@ -3797,7 +3830,7 @@ fn process_job(
                 Some(&resolved_net_hash),
                 None, // stop_revoke_admission
                 None, // bytes_backend
-                None, // toolchain_fingerprint
+                toolchain_fingerprint,
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -3834,7 +3867,7 @@ fn process_job(
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
             None, // bytes_backend
-            None, // toolchain_fingerprint
+            toolchain_fingerprint,
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3885,6 +3918,7 @@ fn process_job(
             &resolved_net_hash,
             job_wall_start,
             None, // Non-control-lane stop_revoke: standard admission path
+            toolchain_fingerprint,
         );
     }
 
@@ -3924,7 +3958,7 @@ fn process_job(
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
             None, // bytes_backend
-            None, // toolchain_fingerprint
+            toolchain_fingerprint,
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3980,7 +4014,7 @@ fn process_job(
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
             None, // bytes_backend
-            None, // toolchain_fingerprint
+            toolchain_fingerprint,
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -4041,7 +4075,7 @@ fn process_job(
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
             None, // bytes_backend
-            None, // toolchain_fingerprint
+            toolchain_fingerprint,
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -4256,7 +4290,7 @@ fn process_job(
                     Some(&resolved_net_hash),
                     None, // stop_revoke_admission
                     None, // bytes_backend
-                    None, // toolchain_fingerprint
+                    toolchain_fingerprint,
                 ) {
                     return handle_pipeline_commit_failure(
                         &commit_err,
@@ -4313,7 +4347,7 @@ fn process_job(
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
             None, // bytes_backend
-            None, // toolchain_fingerprint
+            toolchain_fingerprint,
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -4402,6 +4436,7 @@ fn process_job(
             heartbeat_jobs_denied,
             heartbeat_jobs_quarantined,
             job_wall_start,
+            toolchain_fingerprint,
         );
     }
 
@@ -4457,9 +4492,9 @@ fn process_job(
         Some(observed_cost),
         Some(&sbx_hash),
         Some(&resolved_net_hash),
-        None,                              // stop_revoke_admission
-        resolved_bytes_backend.as_deref(), // TCK-00546: bytes_backend for GC tracking
-        Some(&toolchain_fp),               // TCK-00538: toolchain fingerprint
+        None,                                      // stop_revoke_admission
+        resolved_bytes_backend.as_deref(),          // TCK-00546: bytes_backend
+        toolchain_fingerprint,
     ) {
         eprintln!("worker: pipeline commit failed, cannot complete job: {commit_err}");
         let _ = LaneLeaseV1::remove(&lane_dir);
@@ -5063,6 +5098,8 @@ fn handle_stop_revoke(
     job_wall_start: Instant,
     // TCK-00587: Stop/revoke admission trace for receipt binding.
     sr_trace: Option<&apm2_core::economics::queue_admission::StopRevokeAdmissionTrace>,
+    // TCK-00538: Toolchain fingerprint computed at worker startup.
+    toolchain_fingerprint: Option<&str>,
 ) -> JobOutcome {
     let target_job_id = match &spec.cancel_target_job_id {
         Some(id) if !id.is_empty() => id.as_str(),
@@ -5094,7 +5131,7 @@ fn handle_stop_revoke(
                 Some(net_hash),
                 sr_trace, // stop_revoke_admission
                 None,     // bytes_backend
-                None,     // toolchain_fingerprint
+                toolchain_fingerprint,
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -5153,7 +5190,7 @@ fn handle_stop_revoke(
                 Some(net_hash),
                 sr_trace, // stop_revoke_admission
                 None,     // bytes_backend
-                None,     // toolchain_fingerprint
+                toolchain_fingerprint,
             ) {
                 eprintln!(
                     "worker: pipeline commit failed for stop_revoke (target already terminal): {commit_err}"
@@ -5195,7 +5232,7 @@ fn handle_stop_revoke(
             Some(net_hash),
             sr_trace, // stop_revoke_admission
             None,     // bytes_backend
-            None,     // toolchain_fingerprint
+            toolchain_fingerprint,
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -5253,7 +5290,7 @@ fn handle_stop_revoke(
             Some(net_hash),
             sr_trace, // stop_revoke_admission
             None,     // bytes_backend
-            None,     // toolchain_fingerprint
+            toolchain_fingerprint,
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -5336,7 +5373,7 @@ fn handle_stop_revoke(
                     Some(net_hash),
                     sr_trace, // stop_revoke_admission
                     None,     // bytes_backend
-                    None,     // toolchain_fingerprint
+                    toolchain_fingerprint,
                 ) {
                     return handle_pipeline_commit_failure(
                         &commit_err,
@@ -5381,7 +5418,7 @@ fn handle_stop_revoke(
                 Some(net_hash),
                 sr_trace, // stop_revoke_admission
                 None,     // bytes_backend
-                None,     // toolchain_fingerprint
+                toolchain_fingerprint,
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -5439,7 +5476,7 @@ fn handle_stop_revoke(
             Some(net_hash),
             sr_trace, // stop_revoke_admission
             None,     // bytes_backend
-            None,     // toolchain_fingerprint
+            toolchain_fingerprint,
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -5478,7 +5515,7 @@ fn handle_stop_revoke(
         Some(net_hash),
         sr_trace, // stop_revoke_admission
         None,     // bytes_backend
-        None,     // toolchain_fingerprint
+        toolchain_fingerprint,
     ) {
         // Fail-closed: pipeline commit failed — stop_revoke job stays in claimed/.
         let reason = format!(
@@ -5536,6 +5573,8 @@ fn execute_warm_job(
     heartbeat_jobs_denied: u64,
     heartbeat_jobs_quarantined: u64,
     job_wall_start: Instant,
+    // TCK-00538: Toolchain fingerprint computed at worker startup.
+    toolchain_fingerprint: Option<&str>,
 ) -> JobOutcome {
     use apm2_core::fac::warm::{WarmContainment, WarmPhase, execute_warm};
 
@@ -5577,7 +5616,7 @@ fn execute_warm_job(
                             Some(net_hash),
                             None, // stop_revoke_admission
                             None, // bytes_backend
-                            None, // toolchain_fingerprint
+                            toolchain_fingerprint,
                         ) {
                             return handle_pipeline_commit_failure(
                                 &commit_err,
@@ -5625,7 +5664,7 @@ fn execute_warm_job(
             Some(net_hash),
             None, // stop_revoke_admission
             None, // bytes_backend
-            None, // toolchain_fingerprint
+            toolchain_fingerprint,
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -5663,7 +5702,7 @@ fn execute_warm_job(
             Some(net_hash),
             None, // stop_revoke_admission
             None, // bytes_backend
-            None, // toolchain_fingerprint
+            toolchain_fingerprint,
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -5733,7 +5772,7 @@ fn execute_warm_job(
                 Some(net_hash),
                 None, // stop_revoke_admission
                 None, // bytes_backend
-                None, // toolchain_fingerprint
+                toolchain_fingerprint,
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -5799,7 +5838,7 @@ fn execute_warm_job(
                             Some(net_hash),
                             None, // stop_revoke_admission
                             None, // bytes_backend
-                            None, // toolchain_fingerprint
+                            toolchain_fingerprint,
                         ) {
                             return handle_pipeline_commit_failure(
                                 &commit_err,
@@ -5863,7 +5902,7 @@ fn execute_warm_job(
                     Some(net_hash),
                     None, // stop_revoke_admission
                     None, // bytes_backend
-                    None, // toolchain_fingerprint
+                    toolchain_fingerprint,
                 ) {
                     return handle_pipeline_commit_failure(
                         &commit_err,
@@ -5967,7 +6006,7 @@ fn execute_warm_job(
                 Some(net_hash),
                 None, // stop_revoke_admission
                 None, // bytes_backend
-                None, // toolchain_fingerprint
+                toolchain_fingerprint,
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -6054,7 +6093,7 @@ fn execute_warm_job(
         Some(net_hash),
         None, // stop_revoke_admission
         None, // bytes_backend
-        None, // toolchain_fingerprint
+        toolchain_fingerprint,
     ) {
         eprintln!("worker: pipeline commit failed for warm job: {commit_err}");
         let _ = LaneLeaseV1::remove(lane_dir);
@@ -6675,6 +6714,8 @@ fn emit_job_receipt(
     network_policy_hash: Option<&str>,
     // TCK-00546 MAJOR-2: bytes_backend for GC tracking in non-pipeline paths.
     bytes_backend: Option<&str>,
+    // TCK-00538: Optional toolchain fingerprint.
+    toolchain_fingerprint: Option<&str>,
 ) -> Result<PathBuf, String> {
     emit_job_receipt_internal(
         fac_root,
@@ -6694,6 +6735,7 @@ fn emit_job_receipt(
         sandbox_hardening_hash,
         network_policy_hash,
         bytes_backend,
+        toolchain_fingerprint,
     )
 }
 
@@ -6723,6 +6765,8 @@ fn emit_job_receipt_with_observed_cost(
     network_policy_hash: Option<&str>,
     // TCK-00546 MAJOR-2: bytes_backend for GC tracking.
     bytes_backend: Option<&str>,
+    // TCK-00538: Optional toolchain fingerprint.
+    toolchain_fingerprint: Option<&str>,
 ) -> Result<PathBuf, String> {
     emit_job_receipt_internal(
         fac_root,
@@ -6742,6 +6786,7 @@ fn emit_job_receipt_with_observed_cost(
         sandbox_hardening_hash,
         network_policy_hash,
         bytes_backend,
+        toolchain_fingerprint,
     )
 }
 
@@ -6856,6 +6901,8 @@ fn emit_job_receipt_internal(
     network_policy_hash: Option<&str>,
     // TCK-00546 MAJOR-2: bytes_backend threaded through for GC tracking.
     bytes_backend: Option<&str>,
+    // TCK-00538: Optional toolchain fingerprint.
+    toolchain_fingerprint: Option<&str>,
 ) -> Result<PathBuf, String> {
     let receipt = build_job_receipt(
         spec,
@@ -6873,9 +6920,9 @@ fn emit_job_receipt_internal(
         observed_cost,
         sandbox_hardening_hash,
         network_policy_hash,
-        None,          // stop_revoke_admission: not used in emit_job_receipt path
-        bytes_backend, // TCK-00546 MAJOR-2: thread bytes_backend to receipt
-        None,          // toolchain_fingerprint
+        None,                  // stop_revoke_admission
+        bytes_backend,         // TCK-00546: bytes_backend
+        toolchain_fingerprint, // TCK-00538: toolchain fingerprint
     )?;
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
     let result = persist_content_addressed_receipt(&receipts_dir, &receipt)?;
@@ -7871,6 +7918,7 @@ mod tests {
             None,
             None,
             None, // bytes_backend
+            None,
         )
         .expect("emit receipt");
 
@@ -7914,6 +7962,7 @@ mod tests {
             None,
             None,
             None, // bytes_backend
+            None,
         )
         .expect("emit receipt");
 
@@ -8115,6 +8164,7 @@ mod tests {
             None,
             None,
             None, // bytes_backend
+            None,
         )
         .expect("emit receipt with containment");
 
@@ -8188,6 +8238,7 @@ mod tests {
             None,
             None,
             None, // bytes_backend
+            None,
         )
         .expect("emit receipt without containment");
 
@@ -8246,6 +8297,7 @@ mod tests {
             Some(&hardening_hash),
             None,
             None, // bytes_backend
+            None,
         )
         .expect("emit receipt with sandbox_hardening_hash");
 
@@ -8314,6 +8366,7 @@ mod tests {
             None,
             None,
             None, // bytes_backend
+            None,
         )
         .expect("emit receipt without sandbox_hardening_hash");
 
@@ -8377,6 +8430,7 @@ mod tests {
             0,
             0,
             0,
+            None, // toolchain_fingerprint
         );
         assert!(
             matches!(outcome, JobOutcome::Denied { .. }),
@@ -8482,6 +8536,7 @@ mod tests {
             0,
             0,
             0,
+            None, // toolchain_fingerprint
         );
         let reason = match outcome {
             JobOutcome::Denied { reason } => reason,
@@ -8574,6 +8629,7 @@ mod tests {
             0,
             0,
             0,
+            None, // toolchain_fingerprint
         );
         let reason = match outcome {
             JobOutcome::Denied { reason } => reason,
@@ -8661,6 +8717,7 @@ mod tests {
             0,
             0,
             0,
+            None, // toolchain_fingerprint
         );
         let reason = match outcome {
             JobOutcome::Denied { reason } => reason,
@@ -9227,6 +9284,7 @@ mod tests {
             None,
             None,
             None, // bytes_backend
+            None,
         )
         .expect("emit denied receipt");
 
