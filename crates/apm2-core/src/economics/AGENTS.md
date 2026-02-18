@@ -340,6 +340,16 @@ All admission decisions require valid temporal authority:
 - `evaluate_queue_admission(request, scheduler, verifier) -> QueueAdmissionDecision` -- Queue admission (must_use)
 - `evaluate_anti_entropy_admission(request, budget, verifier) -> QueueAdmissionDecision` -- Anti-entropy admission (must_use)
 
+#### Stop/Revoke Explicit Policy (TCK-00587)
+
+- `StopRevokeAdmissionPolicy` -- Structured policy for stop_revoke admission: lane reservation permille, max wait ticks, TP-001 emergency carve-out flag, TP-002/003 requirements, and worker first-pass priority flag. `default_policy()` returns the canonical defaults matching `STOP_REVOKE_RESERVATION_PERMILLE` (200) and `MAX_STOP_REVOKE_WAIT_TICKS` (100).
+- `StopRevokeAdmissionTrace` -- Structured admission trace bound to receipts: verdict (bounded by `MAX_DENY_REASON_LENGTH`), reservation/carve-out activation state, temporal predicate outcomes (`Option<bool>` -- `None` = not evaluated, `Some(false)` = evaluated and failed), queue backlog snapshot, and policy snapshot. All fields MUST be derived from actual runtime state (not hardcoded constants) to ensure accurate audit replay. `canonical_bytes()` returns deterministic canonical JSON bytes for replay verification.
+
+**Invariants:**
+- [INV-QA11] `StopRevokeAdmissionPolicy::default_policy()` matches the canonical constants (`STOP_REVOKE_RESERVATION_PERMILLE`, `MAX_STOP_REVOKE_WAIT_TICKS`).
+- [INV-QA12] `StopRevokeAdmissionTrace::canonical_bytes()` is deterministic across invocations for identical trace state.
+- [INV-QA13] Different trace states (verdict, carve-out, backlog) produce different canonical bytes (collision resistance).
+
 ## Cost Model (TCK-00532)
 
 The `cost_model` submodule implements per-job-kind cost estimation and post-run calibration for RFC-0029 queue admission.
