@@ -784,6 +784,7 @@ fn project_decision_comment(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn project_decision_comment_with<FFetch, FUpdate, FCreate, FLatest>(
     owner_repo: &str,
     pr_number: u32,
