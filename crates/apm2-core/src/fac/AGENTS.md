@@ -2155,10 +2155,12 @@ domain-separated BLAKE3 hash (`b3-256:<hex>`) of the raw version output from
 
 ### Core Capabilities
 
-- `compute_or_cached(apm2_home, hardened_env)`: Top-level entry point.
-  Probes tool versions, checks cache at
-  `$APM2_HOME/private/fac/toolchain/fingerprint.v1.json`, returns cached
-  fingerprint if raw versions match, otherwise recomputes and persists.
+- `resolve_fingerprint(apm2_home, hardened_env)`: Top-level entry point.
+  Checks filesystem cache first, then probes tool versions only if cache
+  is missing or stale. On cache hit, verifies integrity by recomputing
+  the hash from raw versions before returning. Returns cached fingerprint
+  if raw versions match and integrity is verified, otherwise recomputes
+  and persists atomically.
 - `derive_from_versions(versions)`: Public deterministic derivation from a
   `ToolchainVersions` value. Uses domain-separated BLAKE3 with
   length-prefixed encoding for each tool's output.

@@ -555,8 +555,8 @@ pub use terminal_verifier::{
 // Re-export toolchain fingerprint types (TCK-00538)
 pub use toolchain_fingerprint::{
     FINGERPRINT_STRING_LENGTH, ToolchainFingerprintError, ToolchainVersions,
-    collect_toolchain_versions, compute_or_cached as compute_or_cached_toolchain_fingerprint,
-    derive_from_versions as derive_toolchain_fingerprint, is_valid_fingerprint,
+    collect_toolchain_versions, derive_from_versions as derive_toolchain_fingerprint,
+    is_valid_fingerprint, resolve_fingerprint as resolve_toolchain_fingerprint,
 };
 // Re-export transcript binding types
 pub use transcript_binding::{
