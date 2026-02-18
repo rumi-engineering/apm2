@@ -2136,6 +2136,65 @@ systemd process monitoring provides.
 - [INV-WHB-005] The heartbeat file is not authoritative for admission or
   security decisions. It is an observability signal only.
 
+## toolchain_fingerprint Submodule (TCK-00538)
+
+The `toolchain_fingerprint` submodule implements stable derivation, caching, and
+validation of toolchain fingerprints. A toolchain fingerprint is a
+domain-separated BLAKE3 hash (`b3-256:<hex>`) of the raw version output from
+`rustc -Vv`, `cargo -V`, `cargo-nextest -V`, and `systemd-run --version`.
+
+### Key Types
+
+- `ToolchainVersions`: Raw version strings from the four probed tools. All
+  fields are `Option<String>` (a tool may be absent or unreachable). Implements
+  `Default`, `Serialize`, `Deserialize` with `deny_unknown_fields`.
+- `ToolchainFingerprintError`: Error taxonomy covering I/O, serialization,
+  cache corruption, oversized files, and symlink directory rejection.
+- `PersistedToolchainFingerprint` (internal): Cache file format with schema,
+  fingerprint, and raw_versions fields. Uses `deny_unknown_fields`.
+
+### Core Capabilities
+
+- `compute_or_cached(apm2_home, hardened_env)`: Top-level entry point.
+  Probes tool versions, checks cache at
+  `$APM2_HOME/private/fac/toolchain/fingerprint.v1.json`, returns cached
+  fingerprint if raw versions match, otherwise recomputes and persists.
+- `derive_from_versions(versions)`: Public deterministic derivation from a
+  `ToolchainVersions` value. Uses domain-separated BLAKE3 with
+  length-prefixed encoding for each tool's output.
+- `collect_toolchain_versions(hardened_env)`: Probes all four tools with
+  bounded stdout reads (`MAX_VERSION_OUTPUT_BYTES = 8192`) and a
+  10-second timeout. Uses the deadlock-free version probe pattern
+  (INV-WARM-013) where the calling thread owns the `Child` directly.
+- `is_valid_fingerprint(s)`: Format validation for `b3-256:<64 hex chars>`.
+
+### Security Invariants (TCK-00538)
+
+- [INV-TCF-001] Fingerprint uses domain-separated BLAKE3 with domain
+  `apm2.fac.toolchain_fingerprint.v1` and length-prefixed injective
+  framing (`GATE_HASH_PREIMAGE_FRAMING`).
+- [INV-TCF-002] Cache files are bounded-read before parsing
+  (`MAX_CACHE_FILE_SIZE = 65536`) to prevent OOM (RSK-1601).
+- [INV-TCF-003] Cache directory uses restricted permissions (0o700 dir,
+  0o600 file) via `create_restricted_dir` / `write_restricted_file`
+  from `node_identity` module (CTR-2611).
+- [INV-TCF-004] Cache directory rejects symlinks to prevent symlink
+  redirect attacks.
+- [INV-TCF-005] Cache persistence uses atomic write (temp + fsync +
+  rename) consistent with CTR-2607.
+- [INV-TCF-006] Version probes use hardened environment (env_clear +
+  selective re-injection of PATH, HOME, USER) for defense-in-depth
+  (INV-WARM-012).
+- [INV-TCF-007] Version probes use the deadlock-free design from
+  INV-WARM-013: calling thread owns `Child`, helper thread owns only
+  `ChildStdout` pipe.
+- [INV-TCF-008] All deserialized cache types use `deny_unknown_fields`.
+- [INV-TCF-009] Cache is keyed by raw version output; any tool output
+  change triggers recomputation and atomic cache replacement.
+- [INV-TCF-010] Fingerprint is included in `FacJobReceiptV1` as
+  `toolchain_fingerprint: Option<String>` with format validation in
+  both builder `try_build()` and `validate()`.
+
 ## warm Submodule (TCK-00525)
 
 The `warm` submodule implements lane-scoped prewarming with content-addressed

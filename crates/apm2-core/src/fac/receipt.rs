@@ -787,6 +787,13 @@ pub struct FacJobReceiptV1 {
     /// section 8.4: `(monotonic_time_ns, node_fingerprint, receipt_digest)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_fingerprint: Option<String>,
+    /// Toolchain fingerprint at job execution time (TCK-00538).
+    ///
+    /// A `b3-256:<hex>` BLAKE3 digest of the build toolchain (rustc, cargo,
+    /// nextest, systemd-run versions). Changes when the underlying toolchain
+    /// changes on the node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain_fingerprint: Option<String>,
     /// Epoch timestamp.
     pub timestamp_secs: u64,
     /// BLAKE3 body hash for content-addressed storage.
@@ -966,6 +973,15 @@ impl FacJobReceiptV1 {
             bytes.push(9u8);
             bytes.extend_from_slice(&(backend.len() as u32).to_be_bytes());
             bytes.extend_from_slice(backend.as_bytes());
+        }
+
+        // TCK-00538: Toolchain fingerprint. Appended at end for backward
+        // compatibility with pre-TCK-00538 receipts. Uses type-specific
+        // marker `10u8` for injective encoding (9u8 is taken by bytes_backend).
+        if let Some(fp) = &self.toolchain_fingerprint {
+            bytes.push(10u8);
+            bytes.extend_from_slice(&(fp.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(fp.as_bytes());
         }
 
         bytes
@@ -1196,6 +1212,14 @@ impl FacJobReceiptV1 {
             bytes.push(9u8);
             bytes.extend_from_slice(&(backend.len() as u32).to_be_bytes());
             bytes.extend_from_slice(backend.as_bytes());
+        }
+
+        // TCK-00538: Toolchain fingerprint. Uses type-specific marker
+        // `10u8` for injective encoding (9u8 is taken by bytes_backend).
+        if let Some(fp) = &self.toolchain_fingerprint {
+            bytes.push(10u8);
+            bytes.extend_from_slice(&(fp.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(fp.as_bytes());
         }
 
         bytes
@@ -1457,6 +1481,22 @@ impl FacJobReceiptV1 {
             }
         }
 
+        // TCK-00538: Validate toolchain fingerprint format and length.
+        if let Some(ref fp) = self.toolchain_fingerprint {
+            if fp.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "toolchain_fingerprint",
+                    actual: fp.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if !super::toolchain_fingerprint::is_valid_fingerprint(fp) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "toolchain_fingerprint must be 'b3-256:<64 hex>'".to_string(),
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -1486,6 +1526,7 @@ pub struct FacJobReceiptV1Builder {
     bytes_backend: Option<String>,
     htf_time_envelope_ns: Option<u64>,
     node_fingerprint: Option<String>,
+    toolchain_fingerprint: Option<String>,
     timestamp_secs: Option<u64>,
 }
 
@@ -1641,6 +1682,13 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn node_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
         self.node_fingerprint = Some(fingerprint.into());
+        self
+    }
+
+    /// Sets the toolchain fingerprint (TCK-00538).
+    #[must_use]
+    pub fn toolchain_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.toolchain_fingerprint = Some(fingerprint.into());
         self
     }
 
@@ -1865,6 +1913,22 @@ impl FacJobReceiptV1Builder {
             }
         }
 
+        // TCK-00538: Validate toolchain_fingerprint format if present.
+        if let Some(ref fp) = self.toolchain_fingerprint {
+            if fp.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "toolchain_fingerprint",
+                    actual: fp.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if !super::toolchain_fingerprint::is_valid_fingerprint(fp) {
+                return Err(FacJobReceiptError::InvalidData(
+                    "toolchain_fingerprint must be 'b3-256:<64 hex>'".to_string(),
+                ));
+            }
+        }
+
         let candidate = FacJobReceiptV1 {
             schema: FAC_JOB_RECEIPT_SCHEMA.to_string(),
             receipt_id,
@@ -1888,6 +1952,7 @@ impl FacJobReceiptV1Builder {
             bytes_backend: self.bytes_backend,
             htf_time_envelope_ns: self.htf_time_envelope_ns,
             node_fingerprint: self.node_fingerprint,
+            toolchain_fingerprint: self.toolchain_fingerprint,
             moved_job_path,
             timestamp_secs,
             content_hash: String::new(),
