@@ -319,4 +319,11 @@ notes:
     design (signed receipts, event emission, policy validation) but is not
     wired into the CLI lifecycle path. This ticket fixes the CLI path
     directly; unifying with the daemon executor is future work.
+    Additional hardening completed:
+    - Doctor reviewer-idle restart no longer treats elapsed runtime as idle
+      when activity is unknown.
+    - Idle age derivation now uses log-write activity and liveness idle-age
+      semantics to avoid false restart recommendations during long reviews.
+    - Regression tests added for unknown-activity running reviewers and
+      liveness idle-age timestamp derivation.
   security: "default-deny, fail-closed on origin divergence, signed merge receipts"

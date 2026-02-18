@@ -58,7 +58,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 // Re-export public API for use by `fac.rs`
 use dispatch::dispatch_single_review_with_force;
 use events::{read_last_event_values, review_events_path};
@@ -1321,17 +1321,12 @@ fn run_doctor_inner(
                     fa,
                 )
             };
-            let (run_state_nudge_counts, log_line_counts) = if lightweight {
-                (
-                    std::collections::BTreeMap::new(),
-                    std::collections::BTreeMap::new(),
-                )
+            let run_state_nudge_counts = if lightweight {
+                std::collections::BTreeMap::new()
             } else {
-                (
-                    load_run_state_nudge_counts_for_pr(pr_number),
-                    collect_log_line_counts_for_pr(pr_number),
-                )
+                load_run_state_nudge_counts_for_pr(pr_number)
             };
+            let log_activity = collect_log_activity_for_pr(pr_number, !lightweight);
             for entry in snapshot.entries {
                 let dimension = doctor_dimension_for_agent(&entry.agent_type);
                 let run_id_key = entry.run_id.trim().to_string();
@@ -1360,6 +1355,9 @@ fn run_doctor_inner(
                     if latest.is_none() {
                         latest = activity_map.get(review_type).copied();
                     }
+                    if let Some(ts) = log_activity.last_modified_at.get(&run_id_key).copied() {
+                        latest = Some(latest.map_or(ts, |current: DateTime<Utc>| current.max(ts)));
+                    }
                     if let Some(ts) = pulse_activity {
                         latest = Some(latest.map_or(ts, |current: DateTime<Utc>| current.max(ts)));
                     }
@@ -1384,7 +1382,7 @@ fn run_doctor_inner(
                             .get(&run_id_key)
                             .and_then(|count| u32::try_from(*count).ok())
                     });
-                let log_line_count = log_line_counts.get(&run_id_key).copied();
+                let log_line_count = log_activity.line_counts.get(&run_id_key).copied();
                 entries.push(DoctorAgentSnapshot {
                     agent_type: entry.agent_type,
                     state: entry.state,
@@ -1657,10 +1655,10 @@ fn build_doctor_agent_activity_summary(
             "running" => {
                 active_reviewers = active_reviewers.saturating_add(1);
                 running_reviewers = running_reviewers.saturating_add(1);
-                let idle_seconds = entry
-                    .last_activity_seconds_ago
-                    .or(entry.elapsed_seconds)
-                    .unwrap_or_default();
+                let Some(idle_seconds) = entry.last_activity_seconds_ago else {
+                    all_running_idle = false;
+                    continue;
+                };
                 max_idle_seconds = Some(
                     max_idle_seconds.map_or(idle_seconds, |current: i64| current.max(idle_seconds)),
                 );
@@ -1948,21 +1946,17 @@ fn scan_event_signals_from_reader_with_budget<R: BufRead>(
             continue;
         };
 
-        if let Some(ts) = event
-            .get("ts")
+        let event_name = event
+            .get("event")
             .and_then(serde_json::Value::as_str)
-            .and_then(parse_rfc3339_utc)
-        {
+            .unwrap_or_default();
+
+        if let Some(ts) = event_activity_timestamp(&event, event_name) {
             update_activity_timestamp(&mut signals.activity_timestamps, &key, ts);
             if let Some(run_id) = event_run_id.as_ref() {
                 update_activity_timestamp(&mut signals.activity_timestamps_by_run_id, run_id, ts);
             }
         }
-
-        let event_name = event
-            .get("event")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
 
         if event
             .get("event")
@@ -2021,6 +2015,26 @@ fn scan_event_signals_from_reader_with_budget<R: BufRead>(
             .tool_call_counts
             .entry(run_id)
             .or_insert(total_lines);
+    }
+}
+
+fn event_activity_timestamp(event: &serde_json::Value, event_name: &str) -> Option<DateTime<Utc>> {
+    let ts = event
+        .get("ts")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_rfc3339_utc)?;
+    match event_name {
+        // Polling events are heartbeat signals and do not imply progress.
+        "pulse_check" => None,
+        // This event carries authoritative idle age from the orchestrator.
+        "liveness_check" => {
+            let idle_seconds = event
+                .get("last_tool_call_age_secs")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| i64::try_from(value).ok())?;
+            Some(ts - ChronoDuration::seconds(idle_seconds))
+        },
+        _ => Some(ts),
     }
 }
 
@@ -2092,8 +2106,17 @@ fn load_run_state_nudge_counts_for_pr(pr_number: u32) -> std::collections::BTree
     counts
 }
 
-fn collect_log_line_counts_for_pr(pr_number: u32) -> std::collections::BTreeMap<String, u64> {
-    let mut counts = std::collections::BTreeMap::<String, u64>::new();
+#[derive(Default)]
+struct DoctorLogActivitySignals {
+    line_counts: std::collections::BTreeMap<String, u64>,
+    last_modified_at: std::collections::BTreeMap<String, DateTime<Utc>>,
+}
+
+fn collect_log_activity_for_pr(
+    pr_number: u32,
+    include_line_counts: bool,
+) -> DoctorLogActivitySignals {
+    let mut signals = DoctorLogActivitySignals::default();
     let _ = state::with_review_state_shared(|review_state| {
         for entry in review_state.reviewers.values() {
             if entry.pr_number != pr_number {
@@ -2103,17 +2126,30 @@ fn collect_log_line_counts_for_pr(pr_number: u32) -> std::collections::BTreeMap<
             if run_id.is_empty() {
                 continue;
             }
-            let Some(line_count) = count_log_lines_bounded(&entry.log_file) else {
-                continue;
-            };
-            counts
-                .entry(run_id.to_string())
-                .and_modify(|existing| *existing = (*existing).max(line_count))
-                .or_insert(line_count);
+            let run_id = run_id.to_string();
+            if let Ok(metadata) = fs::metadata(&entry.log_file)
+                && let Ok(modified) = metadata.modified()
+            {
+                let modified_at = DateTime::<Utc>::from(modified);
+                signals
+                    .last_modified_at
+                    .entry(run_id.clone())
+                    .and_modify(|existing| *existing = (*existing).max(modified_at))
+                    .or_insert(modified_at);
+            }
+            if include_line_counts
+                && let Some(line_count) = count_log_lines_bounded(&entry.log_file)
+            {
+                signals
+                    .line_counts
+                    .entry(run_id)
+                    .and_modify(|existing| *existing = (*existing).max(line_count))
+                    .or_insert(line_count);
+            }
         }
         Ok(())
     });
-    counts
+    signals
 }
 
 fn count_log_lines_bounded(path: &Path) -> Option<u64> {
@@ -6825,6 +6861,27 @@ mod tests {
     }
 
     #[test]
+    fn test_build_recommended_action_waits_when_running_activity_is_unknown() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = pending_findings_summary();
+        let agents = super::DoctorAgentSection {
+            max_active_agents_per_pr: 2,
+            active_agents: 1,
+            total_agents: 1,
+            entries: vec![reviewer_agent_snapshot("running", Some(700), None)],
+        };
+        let action = build_recommended_action_for_tests(
+            42,
+            Some(&doctor_lifecycle_fixture("review_in_progress", 2, 0, 11)),
+            Some(&agents),
+            &reviews,
+            &findings,
+            &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
+        );
+        assert_eq!(action.action, "wait");
+    }
+
+    #[test]
     fn test_build_recommended_action_wait_reason_warns_on_stuck_dispatched_agent() {
         let reviews = doctor_reviews_with_terminal_reason(None);
         let findings = pending_findings_summary();
@@ -7216,6 +7273,32 @@ mod tests {
         let signals =
             super::scan_event_signals_from_reader(std::io::Cursor::new(lines), 42, &run_ids);
         assert_eq!(signals.tool_call_counts.get("keep").copied(), Some(2));
+    }
+
+    #[test]
+    fn test_scan_event_signals_liveness_uses_idle_age_for_activity_timestamp() {
+        let mut lines = String::new();
+        lines.push_str(
+            &serde_json::json!({
+                "pr_number": 42,
+                "review_type": "security",
+                "run_id": "keep",
+                "event": "liveness_check",
+                "last_tool_call_age_secs": 120,
+                "ts": "2026-02-15T00:10:00Z"
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+
+        let run_ids = std::collections::BTreeSet::from(["keep".to_string()]);
+        let signals =
+            super::scan_event_signals_from_reader(std::io::Cursor::new(lines), 42, &run_ids);
+        let expected = super::parse_rfc3339_utc("2026-02-15T00:08:00Z").expect("parse expected");
+        assert_eq!(
+            signals.activity_timestamps_by_run_id.get("keep").copied(),
+            Some(expected)
+        );
     }
 
     #[test]
