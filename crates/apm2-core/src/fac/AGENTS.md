@@ -2482,26 +2482,37 @@ and emits `PatchApplyReceiptV1` receipts for audit provenance.
   `fac_root/patch_receipts/` and the receipt content hash is included in
   the job denial reason for audit traceability.
 
-## Control-Lane Exception (TCK-00533)
+## Control-Lane Exception (TCK-00533, TCK-00587)
 
-`stop_revoke` jobs bypass the standard RFC-0028 channel context token and
-RFC-0029 queue admission flow. This is an explicit, audited policy exception
-marked by `CONTROL_LANE_EXCEPTION_AUDITED` in `job_spec.rs`.
+`stop_revoke` jobs carry a self-signed RFC-0028 channel context token issued
+by the cancel command using the persistent FAC signing key. The worker
+validates this token AND verifies local-origin authority (queue directory
+ownership). This dual-layer enforcement ensures cancellation requires both
+signing key access and filesystem privilege.
+
+The RFC-0029 queue admission flow is still bypassed for control-lane jobs
+(temporal predicates are not evaluated). This is an explicit, audited policy
+exception marked by `CONTROL_LANE_EXCEPTION_AUDITED` in `job_spec.rs`.
 
 ### Justification
 
 Control-lane cancellation originates from the local operator (same trust domain
-as the queue owner) and requires filesystem-level access proof (queue directory
-write capability). A broker-issued token adds no authority beyond what
-filesystem capability already proves. All structural and digest validation is
-still enforced; only the token requirement is waived.
+as the queue owner). The self-signed token proves the cancel command had
+access to the FAC signing key material. Queue directory ownership proves
+filesystem-level privilege. Together these close the "queue-write-only"
+authorization gap identified in TCK-00587 review.
 
 ### Invariants
 
 - `validate_job_spec_control_lane()` enforces all structural/digest validation
-  except the token requirement.
+  AND requires the RFC-0028 channel context token (consistent with the
+  worker's dual-layer enforcement policy).
+- The worker validates the RFC-0028 token using `decode_channel_context_token`
+  before executing stop_revoke (fail-closed: missing/invalid token denies).
 - All deny paths in the control-lane flow emit explicit refusal receipts before
   moving jobs to `denied/`.
+- `StopRevokeAdmissionTrace` fields are derived from actual runtime state (not
+  hardcoded constants) for accurate audit replay (TCK-00587).
 
 ## Intent Taxonomy (TCK-00567)
 
@@ -2567,7 +2578,7 @@ policy bypass from malformed or adversarial job specs.
   digest, token, repo_id allowlist, bytes_backend allowlist, and filesystem
   path rejection.
 - `validate_job_spec_control_lane_with_policy()`: Control-lane variant for
-  `stop_revoke` jobs (no token required, workload repo_id allowlist
+  `stop_revoke` jobs (RFC-0028 token required, workload repo_id allowlist
   bypassed).  The workload `repo_id` allowlist is intentionally skipped,
   but `validate_job_spec_control_lane` enforces that `repo_id` equals
   `CONTROL_LANE_REPO_ID` (`"internal/control"`) fail-closed (INV-JS-007).

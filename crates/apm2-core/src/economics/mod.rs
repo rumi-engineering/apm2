@@ -101,8 +101,9 @@ pub use queue_admission::{
     ConvergenceReceipt, EnvelopeSignature, FreshnessHorizonRef, HtfEvaluationWindow,
     QueueAdmissionDecision, QueueAdmissionRequest, QueueAdmissionTrace, QueueAdmissionVerdict,
     QueueDenyDefect, QueueLane, QueueSchedulerState, RevocationFrontierSnapshot, SignatureVerifier,
-    TimeAuthorityEnvelopeV1, evaluate_anti_entropy_admission, evaluate_queue_admission,
-    validate_convergence_horizon_tp003, validate_envelope_tp001, validate_freshness_horizon_tp002,
+    StopRevokeAdmissionPolicy, StopRevokeAdmissionTrace, TimeAuthorityEnvelopeV1,
+    evaluate_anti_entropy_admission, evaluate_queue_admission, validate_convergence_horizon_tp003,
+    validate_envelope_tp001, validate_freshness_horizon_tp002,
 };
 pub use reconstruction_admissibility::{
     BftQuorumCertificate, ErasureDecodeResult, ErasureProfile, QuorumSigner,
