@@ -150,11 +150,19 @@ mod fac_review_api {
 
     #[allow(clippy::unnecessary_wraps)]
     pub fn apply_gate_result_lifecycle_for_repo_sha(
-        _owner_repo: &str,
-        _head_sha: &str,
+        owner_repo: &str,
+        head_sha: &str,
         _passed: bool,
     ) -> Result<usize, String> {
-        Ok(0)
+        // Test shim: enforce non-empty routing inputs and return a non-zero
+        // applied count so worker unit tests do not silently mask no-op behavior.
+        if owner_repo.trim().is_empty() {
+            return Err("owner_repo is empty".to_string());
+        }
+        if head_sha.trim().is_empty() {
+            return Err("head_sha is empty".to_string());
+        }
+        Ok(1)
     }
 }
 
