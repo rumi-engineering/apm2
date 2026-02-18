@@ -2475,7 +2475,6 @@ mod tests {
             let spawn_count = Arc::clone(&spawn_count);
             let barrier = Arc::clone(&barrier);
             let release_first_spawn = Arc::clone(&release_first_spawn);
-            let first_spawn_entered_tx = first_spawn_entered_tx.clone();
             std::thread::spawn(move || {
                 let spawn = |_: u32,
                              _: ReviewKind,
