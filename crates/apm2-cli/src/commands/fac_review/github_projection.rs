@@ -17,6 +17,8 @@ const VERDICT_TOMBSTONE_MARKER: &str = "apm2-review-verdict:tombstone:v1";
 pub(super) struct IssueCommentResponse {
     pub(super) id: u64,
     pub(super) html_url: String,
+    #[serde(default)]
+    pub(super) body: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

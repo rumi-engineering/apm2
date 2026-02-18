@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
-use apm2_core::config::default_data_dir;
+use apm2_core::config::{default_data_dir, normalize_pid_file_path, normalize_state_file_path};
 use apm2_core::fac::execution_backend::{probe_user_bus, select_backend};
 use apm2_core::github::{GitHubAppTokenProvider, resolve_apm2_home};
 use apm2_daemon::telemetry::is_cgroup_v2_available;
@@ -988,7 +988,7 @@ fn read_daemon_pid(pid_file: &Path) -> Option<u32> {
 fn resolve_daemon_runtime_overrides(
     config: &apm2_core::config::DaemonConfig,
 ) -> Option<DaemonRuntimePathOverrides> {
-    let pid = read_daemon_pid(&config.pid_file)?;
+    let pid = read_daemon_pid(&normalize_pid_file_path(&config.pid_file))?;
     read_daemon_runtime_overrides_for_pid(pid)
 }
 
@@ -1075,7 +1075,7 @@ fn check_projection_worker_health_with_overrides(
     // - otherwise: `{state_file_dir}/projection_cache.db`
     let effective_state_file = runtime_overrides
         .and_then(|overrides| overrides.state_file.clone())
-        .unwrap_or_else(|| config.daemon.state_file.clone());
+        .unwrap_or_else(|| normalize_state_file_path(&config.daemon.state_file));
     let effective_ledger_db = runtime_overrides
         .and_then(|overrides| overrides.ledger_db.clone())
         .or_else(|| config.daemon.ledger_db.clone());

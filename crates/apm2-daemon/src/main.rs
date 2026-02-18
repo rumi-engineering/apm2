@@ -50,7 +50,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use apm2_core::bootstrap::verify_bootstrap_hash;
-use apm2_core::config::EcosystemConfig;
+use apm2_core::config::{
+    EcosystemConfig, normalize_operator_socket_path, normalize_pid_file_path,
+    normalize_session_socket_path, normalize_state_file_path,
+};
 use apm2_core::crypto::Signer;
 use apm2_core::github::resolve_apm2_home;
 use apm2_core::process::ProcessState;
@@ -166,22 +169,26 @@ impl DaemonConfig {
         };
 
         // Determine paths (CLI args override config file)
-        let operator_socket_path = args
+        let operator_socket_raw = args
             .operator_socket
             .clone()
             .unwrap_or_else(|| config.daemon.operator_socket.clone());
-        let session_socket_path = args
+        let session_socket_raw = args
             .session_socket
             .clone()
             .unwrap_or_else(|| config.daemon.session_socket.clone());
-        let pid_path = args
+        let pid_raw = args
             .pid_file
             .clone()
             .unwrap_or_else(|| config.daemon.pid_file.clone());
-        let state_file_path = args
+        let state_file_raw = args
             .state_file
             .clone()
             .unwrap_or_else(|| config.daemon.state_file.clone());
+        let operator_socket_path = normalize_operator_socket_path(&operator_socket_raw);
+        let session_socket_path = normalize_session_socket_path(&session_socket_raw);
+        let pid_path = normalize_pid_file_path(&pid_raw);
+        let state_file_path = normalize_state_file_path(&state_file_raw);
 
         let ledger_db_path = args
             .ledger_db
@@ -209,6 +216,7 @@ impl DaemonConfig {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod daemon_config_tests {
     use super::*;
 
@@ -283,6 +291,48 @@ mod daemon_config_tests {
             daemon_config.ledger_db_path,
             Some(PathBuf::from("/tmp/apm2/from-cli.db"))
         );
+    }
+
+    #[test]
+    fn daemon_config_normalizes_tmp_runtime_paths() {
+        let temp = tempfile::TempDir::new().expect("create temp dir");
+        let runtime_dir = temp.path().join("runtime");
+        std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
+        let config_path = temp.path().join("ecosystem.toml");
+        std::fs::write(
+            &config_path,
+            "[daemon]\n\
+             pid_file = \"/tmp/apm2.pid\"\n\
+             operator_socket = \"/tmp/apm2/operator.sock\"\n\
+             session_socket = \"/tmp/apm2/session.sock\"\n\
+             state_file = \"/tmp/apm2/state.json\"\n",
+        )
+        .expect("write config");
+        // SAFETY: test-only env override scoped to this test.
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir) };
+
+        let args = args_with_config(config_path);
+        let daemon_config = DaemonConfig::new(&args).expect("daemon config should load");
+        assert_eq!(
+            daemon_config.operator_socket_path,
+            runtime_dir.join("apm2").join("operator.sock")
+        );
+        assert_eq!(
+            daemon_config.session_socket_path,
+            runtime_dir.join("apm2").join("session.sock")
+        );
+        assert_eq!(
+            daemon_config.pid_path,
+            runtime_dir.join("apm2").join("apm2.pid")
+        );
+        assert!(
+            !daemon_config
+                .state_file_path
+                .starts_with(std::path::Path::new("/tmp")),
+            "state file path should avoid /tmp under normalization"
+        );
+        // SAFETY: test cleanup for env override.
+        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
     }
 }
 

@@ -519,7 +519,11 @@ pub fn validate_directory(path: &Path, _expected_uid: u32) -> Result<(), FacPerm
 pub fn validate_fac_root_permissions() -> Result<(), FacPermissionsError> {
     let apm2_home = resolve_apm2_home()?;
 
-    validate_fac_root_permissions_at(&apm2_home)
+    validate_fac_root_permissions_for(&apm2_home)
+}
+
+pub fn validate_fac_root_permissions_for(apm2_home: &Path) -> Result<(), FacPermissionsError> {
+    validate_fac_root_permissions_at(apm2_home)
 }
 
 fn validate_fac_root_permissions_at(apm2_home: &Path) -> Result<(), FacPermissionsError> {

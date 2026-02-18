@@ -1741,6 +1741,32 @@ pub(super) fn run_evidence_gates_with_lane_context(
     } else {
         (None, None)
     };
+    // TCK-00541: Non-status path now loads native v3 cache for reuse.
+    // This closes the structural throughput gap where v3 persisted entries
+    // were never considered and every gate re-executed.
+    //
+    // Fail-closed: if any v3 context material is unavailable (APM2_HOME,
+    // policy load, sandbox/network hash, compound key parse), we simply skip
+    // v3 loading and reuse decisions fall back to miss behavior.
+    let v3_cache_loaded = if cache_reuse_active {
+        cache_reuse_policy.as_ref().and_then(|reuse_policy| {
+            let sandbox_hardening_hash = reuse_policy.sandbox_hardening.as_deref()?;
+            let network_policy_hash = reuse_policy.network_policy_hash.as_deref()?;
+            let apm2_home = apm2_core::github::resolve_apm2_home()?;
+            let fac_root = apm2_home.join("private/fac");
+            let fac_policy = load_or_create_pipeline_policy(&fac_root).ok()?;
+            let compound_key = compute_v3_compound_key(
+                sha,
+                &fac_policy,
+                sandbox_hardening_hash,
+                network_policy_hash,
+            )?;
+            let root = cache_v3_root()?;
+            GateCacheV3::load_from_dir(&root, sha, &compound_key)
+        })
+    } else {
+        None
+    };
 
     let gates: &[(&str, &[&str])] = &[
         ("rustfmt", &["cargo", "fmt", "--all", "--check"]),
@@ -1858,26 +1884,33 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 .expect("guarded by cache_reuse_active");
             let attestation_digest =
                 gate_attestation_digest(workspace_root, sha, gate_name, None, reuse_grp);
-            // [INV-GCV3-001] V2-only reuse disabled. Pass None for v3
-            // cache since this path does not load v3 infrastructure.
-            // This ensures fail-closed: gates always re-execute in the
-            // non-status path until v3 cache is wired in.
             let reuse = reuse_decision_with_v3_fallback(
-                None,
+                v3_cache_loaded.as_ref(),
                 cached_gate_cache.as_ref(),
                 gate_name,
                 attestation_digest.as_deref(),
                 fac_verifying_key.as_ref(),
             );
             if reuse.reusable {
-                if let Some(cached) = cached_gate_cache.as_ref().and_then(|c| c.get(gate_name)) {
+                if let Some(cached) = resolve_cached_payload(
+                    &reuse,
+                    v3_cache_loaded.as_ref(),
+                    cached_gate_cache.as_ref(),
+                    gate_name,
+                ) {
                     emit_gate_started(opts, gate_name);
+                    let stream_stats = write_cached_gate_log_marker(
+                        &log_path,
+                        gate_name,
+                        reuse.reason,
+                        attestation_digest.as_deref(),
+                    );
                     let cached_result = build_evidence_gate_result(
                         gate_name,
                         true,
                         cached.duration_secs,
-                        cached.log_path.as_deref().map(Path::new),
-                        None,
+                        Some(&log_path),
+                        Some(&stream_stats),
                     );
                     emit_gate_completed(opts, &cached_result);
                     gate_results.push(cached_result);
@@ -1984,26 +2017,33 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 .expect("guarded by cache_reuse_active");
             let attestation_digest =
                 gate_attestation_digest(workspace_root, sha, gate_name, None, reuse_grp);
-            // [INV-GCV3-001] V2-only reuse disabled. Pass None for v3
-            // cache since this path does not load v3 infrastructure.
-            // This ensures fail-closed: gates always re-execute in the
-            // non-status path until v3 cache is wired in.
             let reuse = reuse_decision_with_v3_fallback(
-                None,
+                v3_cache_loaded.as_ref(),
                 cached_gate_cache.as_ref(),
                 gate_name,
                 attestation_digest.as_deref(),
                 fac_verifying_key.as_ref(),
             );
             if reuse.reusable {
-                if let Some(cached) = cached_gate_cache.as_ref().and_then(|c| c.get(gate_name)) {
+                if let Some(cached) = resolve_cached_payload(
+                    &reuse,
+                    v3_cache_loaded.as_ref(),
+                    cached_gate_cache.as_ref(),
+                    gate_name,
+                ) {
                     emit_gate_started(opts, gate_name);
+                    let stream_stats = write_cached_gate_log_marker(
+                        &log_path,
+                        gate_name,
+                        reuse.reason,
+                        attestation_digest.as_deref(),
+                    );
                     let cached_result = build_evidence_gate_result(
                         gate_name,
                         true,
                         cached.duration_secs,
-                        cached.log_path.as_deref().map(Path::new),
-                        None,
+                        Some(&log_path),
+                        Some(&stream_stats),
                     );
                     emit_gate_completed(opts, &cached_result);
                     gate_results.push(cached_result);
@@ -2109,24 +2149,33 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 Some(&test_command_override),
                 reuse_grp,
             );
-            // [INV-GCV3-001] V2-only reuse disabled. Pass None for v3
-            // cache since this path does not load v3 infrastructure.
             let reuse = reuse_decision_with_v3_fallback(
-                None,
+                v3_cache_loaded.as_ref(),
                 cached_gate_cache.as_ref(),
                 "test",
                 attestation_digest.as_deref(),
                 fac_verifying_key.as_ref(),
             );
             if reuse.reusable {
-                if let Some(cached) = cached_gate_cache.as_ref().and_then(|c| c.get("test")) {
+                if let Some(cached) = resolve_cached_payload(
+                    &reuse,
+                    v3_cache_loaded.as_ref(),
+                    cached_gate_cache.as_ref(),
+                    "test",
+                ) {
                     emit_gate_started(opts, "test");
+                    let stream_stats = write_cached_gate_log_marker(
+                        &test_log,
+                        "test",
+                        reuse.reason,
+                        attestation_digest.as_deref(),
+                    );
                     let cached_result = build_evidence_gate_result(
                         "test",
                         true,
                         cached.duration_secs,
-                        cached.log_path.as_deref().map(Path::new),
-                        None,
+                        Some(&test_log),
+                        Some(&stream_stats),
                     );
                     emit_gate_completed(opts, &cached_result);
                     gate_results.push(cached_result);
@@ -2209,30 +2258,93 @@ pub(super) fn run_evidence_gates_with_lane_context(
         }
     }
 
-    emit_gate_started(opts, "workspace_integrity");
-    let wi_started = Instant::now();
     let wi_log_path = logs_dir.join("workspace_integrity.log");
-    let (wi_passed, wi_line, wi_stream_stats) =
-        verify_workspace_integrity_gate(workspace_root, sha, &wi_log_path, emit_human_logs);
-    let wi_duration = wi_started.elapsed().as_secs();
-    let wi_result = build_evidence_gate_result(
-        "workspace_integrity",
-        wi_passed,
-        wi_duration,
-        Some(&wi_log_path),
-        Some(&wi_stream_stats),
-    );
-    emit_gate_completed(opts, &wi_result);
-    gate_results.push(wi_result);
-    evidence_lines.push(wi_line);
-    if !wi_passed {
-        if let Some(file) = projection_log {
-            for line in &evidence_lines {
-                let _ = writeln!(file, "{line}");
+    let mut wi_cache_hit = false;
+    if cache_reuse_active {
+        let reuse_grp = cache_reuse_policy
+            .as_ref()
+            .expect("guarded by cache_reuse_active");
+        let attestation_digest =
+            gate_attestation_digest(workspace_root, sha, "workspace_integrity", None, reuse_grp);
+        let reuse = reuse_decision_with_v3_fallback(
+            v3_cache_loaded.as_ref(),
+            cached_gate_cache.as_ref(),
+            "workspace_integrity",
+            attestation_digest.as_deref(),
+            fac_verifying_key.as_ref(),
+        );
+        if reuse.reusable {
+            if let Some(cached) = resolve_cached_payload(
+                &reuse,
+                v3_cache_loaded.as_ref(),
+                cached_gate_cache.as_ref(),
+                "workspace_integrity",
+            ) {
+                emit_gate_started(opts, "workspace_integrity");
+                let stream_stats = write_cached_gate_log_marker(
+                    &wi_log_path,
+                    "workspace_integrity",
+                    reuse.reason,
+                    attestation_digest.as_deref(),
+                );
+                let cached_result = build_evidence_gate_result(
+                    "workspace_integrity",
+                    true,
+                    cached.duration_secs,
+                    Some(&wi_log_path),
+                    Some(&stream_stats),
+                );
+                emit_gate_completed(opts, &cached_result);
+                gate_results.push(cached_result);
+                if emit_human_logs {
+                    eprintln!(
+                        "ts={} sha={sha} gate=workspace_integrity status=PASS cached=true reuse_reason={}",
+                        now_iso8601(),
+                        reuse.reason,
+                    );
+                }
+                evidence_lines.push(format!(
+                    "ts={} sha={sha} gate=workspace_integrity status=PASS cached=true reuse_reason={}",
+                    now_iso8601(),
+                    reuse.reason,
+                ));
+                wi_cache_hit = true;
             }
         }
-        attach_log_bundle_hash(&mut gate_results, &logs_dir)?;
-        return Ok((false, gate_results));
+        if !wi_cache_hit && emit_human_logs {
+            eprintln!(
+                "ts={} sha={sha} gate=workspace_integrity reuse_status=miss reuse_reason={}",
+                now_iso8601(),
+                reuse.reason,
+            );
+        }
+    }
+
+    if !wi_cache_hit {
+        emit_gate_started(opts, "workspace_integrity");
+        let wi_started = Instant::now();
+        let (wi_passed, wi_line, wi_stream_stats) =
+            verify_workspace_integrity_gate(workspace_root, sha, &wi_log_path, emit_human_logs);
+        let wi_duration = wi_started.elapsed().as_secs();
+        let wi_result = build_evidence_gate_result(
+            "workspace_integrity",
+            wi_passed,
+            wi_duration,
+            Some(&wi_log_path),
+            Some(&wi_stream_stats),
+        );
+        emit_gate_completed(opts, &wi_result);
+        gate_results.push(wi_result);
+        evidence_lines.push(wi_line);
+        if !wi_passed {
+            if let Some(file) = projection_log {
+                for line in &evidence_lines {
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+            attach_log_bundle_hash(&mut gate_results, &logs_dir)?;
+            return Ok((false, gate_results));
+        }
     }
 
     // Phase 4: post-test native gates.
@@ -2246,26 +2358,33 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 .expect("guarded by cache_reuse_active");
             let attestation_digest =
                 gate_attestation_digest(workspace_root, sha, gate_name, None, reuse_grp);
-            // [INV-GCV3-001] V2-only reuse disabled. Pass None for v3
-            // cache since this path does not load v3 infrastructure.
-            // This ensures fail-closed: gates always re-execute in the
-            // non-status path until v3 cache is wired in.
             let reuse = reuse_decision_with_v3_fallback(
-                None,
+                v3_cache_loaded.as_ref(),
                 cached_gate_cache.as_ref(),
                 gate_name,
                 attestation_digest.as_deref(),
                 fac_verifying_key.as_ref(),
             );
             if reuse.reusable {
-                if let Some(cached) = cached_gate_cache.as_ref().and_then(|c| c.get(gate_name)) {
+                if let Some(cached) = resolve_cached_payload(
+                    &reuse,
+                    v3_cache_loaded.as_ref(),
+                    cached_gate_cache.as_ref(),
+                    gate_name,
+                ) {
                     emit_gate_started(opts, gate_name);
+                    let stream_stats = write_cached_gate_log_marker(
+                        &log_path,
+                        gate_name,
+                        reuse.reason,
+                        attestation_digest.as_deref(),
+                    );
                     let cached_result = build_evidence_gate_result(
                         gate_name,
                         true,
                         cached.duration_secs,
-                        cached.log_path.as_deref().map(Path::new),
-                        None,
+                        Some(&log_path),
+                        Some(&stream_stats),
                     );
                     emit_gate_completed(opts, &cached_result);
                     gate_results.push(cached_result);
@@ -4032,5 +4151,348 @@ mod tests {
             reuse.reason, "v3_miss_v2_fallback_disabled",
             "reason must indicate v2 fallback was disabled"
         );
+    }
+
+    /// Regression integration test: non-status evidence execution
+    /// (`run_evidence_gates_with_lane_context`) must reuse persisted v3
+    /// entries instead of re-executing all gates.
+    #[test]
+    #[allow(unsafe_code)]
+    fn non_status_evidence_path_reuses_v3_cache_entries() {
+        use std::collections::BTreeMap;
+        use std::ffi::OsString;
+
+        use apm2_core::fac::LaneManager;
+        use apm2_core::fac::gate_cache_v3::{GateCacheV3, V3GateResult};
+
+        struct EnvGuard {
+            original_apm2_home: Option<OsString>,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                if let Some(value) = self.original_apm2_home.take() {
+                    // SAFETY: environment mutation is serialized by env_var_test_lock.
+                    unsafe { std::env::set_var("APM2_HOME", value) };
+                } else {
+                    // SAFETY: environment mutation is serialized by env_var_test_lock.
+                    unsafe { std::env::remove_var("APM2_HOME") };
+                }
+            }
+        }
+
+        let _env_lock = crate::commands::env_var_test_lock()
+            .lock()
+            .expect("serialize APM2_HOME test env");
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let apm2_home = temp.path().join("apm2-home");
+        let workspace_root = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+
+        let original_apm2_home = std::env::var_os("APM2_HOME");
+        // SAFETY: environment mutation is serialized by env_var_test_lock.
+        unsafe { std::env::set_var("APM2_HOME", &apm2_home) };
+        let _env_guard = EnvGuard { original_apm2_home };
+
+        let lane_manager = LaneManager::from_default_home().expect("lane manager");
+        lane_manager
+            .ensure_directories()
+            .expect("ensure lane directories");
+        let lane_lock = lane_manager
+            .try_lock("lane-00")
+            .expect("probe lane lock")
+            .expect("acquire lane lock");
+        let lane_context = allocate_evidence_lane_context(&lane_manager, "lane-00", lane_lock)
+            .expect("allocate lane context");
+
+        let fac_root = apm2_home.join("private/fac");
+        let v3_root = fac_root.join("gate_cache_v3");
+        let fac_policy = load_or_create_pipeline_policy(&fac_root).expect("load policy");
+        std::fs::create_dir_all(&v3_root).expect("create v3 cache root");
+
+        let sha = "test-sha-v3-non-status-reuse";
+        let sandbox_hardening_hash =
+            "b3-256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let network_policy_hash =
+            "b3-256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let resource_policy = GateResourcePolicy::from_cli(
+            false,
+            60,
+            "256M",
+            256,
+            "200%",
+            true,
+            Some("balanced"),
+            Some(2),
+            Some(sandbox_hardening_hash),
+            Some(network_policy_hash),
+        );
+
+        let compound_key = compute_v3_compound_key(
+            sha,
+            &fac_policy,
+            sandbox_hardening_hash,
+            network_policy_hash,
+        )
+        .expect("compute v3 compound key");
+        let mut cache = GateCacheV3::new(sha, compound_key).expect("new v3 cache");
+        let signer =
+            crate::commands::fac_key_material::load_or_generate_persistent_signer(&fac_root)
+                .expect("persistent signer");
+        let test_command = vec!["true".to_string()];
+        let expected_durations = [
+            ("rustfmt", 11_u64),
+            ("clippy", 12_u64),
+            ("doc", 13_u64),
+            ("test_safety_guard", 14_u64),
+            ("test", 15_u64),
+            ("workspace_integrity", 16_u64),
+            ("review_artifact_lint", 17_u64),
+        ];
+        for (gate_name, duration_secs) in expected_durations {
+            let attestation_digest = if gate_name == "test" {
+                gate_attestation_digest(
+                    &workspace_root,
+                    sha,
+                    gate_name,
+                    Some(test_command.as_slice()),
+                    &resource_policy,
+                )
+            } else {
+                gate_attestation_digest(&workspace_root, sha, gate_name, None, &resource_policy)
+            }
+            .expect("attestation digest");
+            cache
+                .set(
+                    gate_name,
+                    V3GateResult {
+                        status: "PASS".to_string(),
+                        duration_secs,
+                        completed_at: "2026-02-18T00:00:00Z".to_string(),
+                        attestation_digest: Some(attestation_digest),
+                        evidence_log_digest: Some(format!("digest-{gate_name}")),
+                        quick_mode: Some(false),
+                        log_bundle_hash: None,
+                        log_path: Some(format!("/tmp/{gate_name}.log")),
+                        signature_hex: None,
+                        signer_id: None,
+                        rfc0028_receipt_bound: true,
+                        rfc0029_receipt_bound: true,
+                    },
+                )
+                .expect("set v3 cache entry");
+        }
+        cache.sign_all(&signer);
+        cache.save_to_dir(&v3_root).expect("save v3 cache");
+
+        let opts = EvidenceGateOptions {
+            test_command: Some(test_command),
+            test_command_environment: Vec::new(),
+            env_remove_keys: Vec::new(),
+            skip_test_gate: false,
+            skip_merge_conflict_gate: true,
+            emit_human_logs: false,
+            on_gate_progress: None,
+            gate_resource_policy: Some(resource_policy),
+        };
+        let (passed, gate_results) = run_evidence_gates_with_lane_context(
+            &workspace_root,
+            sha,
+            None,
+            Some(&opts),
+            lane_context,
+        )
+        .expect("run evidence gates");
+
+        assert!(
+            passed,
+            "all gates should pass when every phase is reused from v3 cache; gate_results={gate_results:?}"
+        );
+        assert_eq!(
+            gate_results.len(),
+            expected_durations.len(),
+            "all non-merge gate phases must be present"
+        );
+
+        let observed_durations: BTreeMap<String, u64> = gate_results
+            .iter()
+            .map(|result| (result.gate_name.clone(), result.duration_secs))
+            .collect();
+        for (gate_name, expected_duration) in expected_durations {
+            let observed = observed_durations
+                .get(gate_name)
+                .copied()
+                .unwrap_or_default();
+            assert_eq!(
+                observed, expected_duration,
+                "gate {gate_name} should use cached v3 duration"
+            );
+        }
+
+        for result in &gate_results {
+            assert!(result.passed, "reused gate should remain PASS");
+            let log_path = result
+                .log_path
+                .as_ref()
+                .expect("cached gate result should include log path");
+            let log = std::fs::read_to_string(log_path).expect("read cached marker log");
+            assert!(
+                log.contains("result reused from cache"),
+                "gate {} should emit cached marker",
+                result.gate_name
+            );
+        }
+    }
+
+    /// Regression integration test: the evidence-layer v3 rebind wrapper must
+    /// find the on-disk v3 cache via `APM2_HOME`, promote receipt bindings from
+    /// a durable receipt, re-sign, and make the entry reusable.
+    #[test]
+    #[allow(unsafe_code)]
+    fn rebind_v3_gate_cache_after_receipt_promotes_flags_via_wrapper() {
+        use std::ffi::OsString;
+
+        use apm2_core::crypto::Signer;
+        use apm2_core::fac::gate_cache_v3::{GateCacheV3, V3CompoundKey, V3GateResult};
+        use apm2_core::fac::{
+            ChannelBoundaryTrace, FacJobOutcome, FacJobReceiptV1, FacPolicyV1, QueueAdmissionTrace,
+            compute_job_receipt_content_hash_v2, compute_policy_hash,
+        };
+
+        struct EnvGuard {
+            original_apm2_home: Option<OsString>,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                if let Some(value) = self.original_apm2_home.take() {
+                    // SAFETY: environment mutation is serialized by env_var_test_lock.
+                    unsafe { std::env::set_var("APM2_HOME", value) };
+                } else {
+                    // SAFETY: environment mutation is serialized by env_var_test_lock.
+                    unsafe { std::env::remove_var("APM2_HOME") };
+                }
+            }
+        }
+
+        let _env_lock = crate::commands::env_var_test_lock()
+            .lock()
+            .expect("serialize APM2_HOME test env");
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let apm2_home = temp.path().join("apm2-home");
+        let fac_root = apm2_home.join("private/fac");
+        let v3_root = fac_root.join("gate_cache_v3");
+        let receipts_dir = fac_root.join("receipts");
+        std::fs::create_dir_all(&v3_root).expect("create v3 root");
+        std::fs::create_dir_all(&receipts_dir).expect("create receipts root");
+
+        let original_apm2_home = std::env::var_os("APM2_HOME");
+        // SAFETY: environment mutation is serialized by env_var_test_lock.
+        unsafe { std::env::set_var("APM2_HOME", &apm2_home) };
+        let _env_guard = EnvGuard { original_apm2_home };
+
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+
+        let sha = "test-sha-wrapper-rebind";
+        let policy_hash = compute_policy_hash(&FacPolicyV1::default_policy()).expect("policy hash");
+        let sbx_hash = "b3-256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let net_hash = "b3-256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let attestation_digest =
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let compound_key = V3CompoundKey::new(
+            sha,
+            &policy_hash,
+            &compute_toolchain_fingerprint(),
+            sbx_hash,
+            net_hash,
+        )
+        .expect("valid compound key");
+
+        let mut cache = GateCacheV3::new(sha, compound_key.clone()).expect("new v3 cache");
+        cache
+            .set(
+                "rustfmt",
+                V3GateResult {
+                    status: "PASS".to_string(),
+                    duration_secs: 11,
+                    completed_at: "2026-02-18T00:00:00Z".to_string(),
+                    attestation_digest: Some(attestation_digest.to_string()),
+                    evidence_log_digest: Some("log-digest".to_string()),
+                    quick_mode: Some(false),
+                    log_bundle_hash: None,
+                    log_path: Some("/tmp/rebind-wrapper.log".to_string()),
+                    signature_hex: None,
+                    signer_id: None,
+                    rfc0028_receipt_bound: false,
+                    rfc0029_receipt_bound: false,
+                },
+            )
+            .expect("set gate");
+        cache.sign_all(&signer);
+        cache.save_to_dir(&v3_root).expect("persist unbound cache");
+
+        let pre = GateCacheV3::load_from_dir(&v3_root, sha, &compound_key).expect("load pre");
+        let pre_decision = pre.check_reuse("rustfmt", Some(attestation_digest), true, Some(&vk));
+        assert!(!pre_decision.reusable, "must deny before receipt rebind");
+        assert_eq!(pre_decision.reason, "receipt_binding_missing");
+
+        let job_id = "job-wrapper-rebind";
+        let receipt = FacJobReceiptV1 {
+            schema: "apm2.fac.receipt.v1".to_string(),
+            receipt_id: "receipt-wrapper-rebind".to_string(),
+            job_id: job_id.to_string(),
+            job_spec_digest: "spec-digest-wrapper".to_string(),
+            outcome: FacJobOutcome::Completed,
+            reason: "test".to_string(),
+            rfc0028_channel_boundary: Some(ChannelBoundaryTrace {
+                passed: true,
+                defect_count: 0,
+                defect_classes: vec![],
+                token_fac_policy_hash: None,
+                token_canonicalizer_tuple_digest: None,
+                token_boundary_id: None,
+                token_issued_at_tick: None,
+                token_expiry_tick: None,
+            }),
+            eio29_queue_admission: Some(QueueAdmissionTrace {
+                verdict: "allow".to_string(),
+                queue_lane: "consume".to_string(),
+                defect_reason: None,
+                cost_estimate_ticks: None,
+            }),
+            ..Default::default()
+        };
+        let receipt_digest = compute_job_receipt_content_hash_v2(&receipt);
+        let receipt_path = receipts_dir.join(format!("{receipt_digest}.json"));
+        std::fs::write(
+            &receipt_path,
+            serde_json::to_string(&receipt).expect("serialize receipt"),
+        )
+        .expect("write receipt");
+
+        rebind_v3_gate_cache_after_receipt(
+            sha,
+            &policy_hash,
+            sbx_hash,
+            net_hash,
+            &receipts_dir,
+            job_id,
+            &signer,
+        );
+
+        let rebound = GateCacheV3::load_from_dir(&v3_root, sha, &compound_key).expect("load post");
+        let entry = rebound.get("rustfmt").expect("rustfmt entry");
+        assert!(entry.rfc0028_receipt_bound, "rfc0028 flag must be promoted");
+        assert!(entry.rfc0029_receipt_bound, "rfc0029 flag must be promoted");
+        let post_decision =
+            rebound.check_reuse("rustfmt", Some(attestation_digest), true, Some(&vk));
+        assert!(
+            post_decision.reusable,
+            "entry must be reusable after wrapper rebind"
+        );
+        assert_eq!(post_decision.reason, "v3_compound_key_match");
     }
 }

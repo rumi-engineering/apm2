@@ -51,8 +51,7 @@ impl EcosystemConfig {
     /// Returns an error if:
     /// - The TOML is invalid
     /// - The legacy `socket` key is present in `[daemon]` section (DD-009)
-    /// - The `operator_socket` or `session_socket` fields are missing
-    ///   (TCK-00280)
+    /// - Runtime path values are invalid after normalization
     pub fn from_toml(content: &str) -> Result<Self, ConfigError> {
         // First, check for legacy `socket` key in daemon config (DD-009 fail-closed
         // validation) Parse as raw TOML value to detect if `daemon.socket` was
@@ -71,8 +70,7 @@ impl EcosystemConfig {
                 }
             }
         }
-        // Parse the config - operator_socket and session_socket are now required fields
-        // and serde will fail if they are missing when [daemon] section is present
+        // Parse config.
         let config: Self = toml::from_str(content).map_err(ConfigError::Parse)?;
         config
             .daemon
@@ -162,13 +160,15 @@ pub struct DaemonConfig {
     /// Path to the operator socket (mode 0600, privileged operations).
     ///
     /// Added in TCK-00249 for dual-socket privilege separation.
-    /// Required field - config validation fails if not provided.
+    /// Optional in config files; defaults to an XDG-aware runtime path.
+    #[serde(default = "default_operator_socket")]
     pub operator_socket: PathBuf,
 
     /// Path to the session socket (mode 0660, session-scoped operations).
     ///
     /// Added in TCK-00249 for dual-socket privilege separation.
-    /// Required field - config validation fails if not provided.
+    /// Optional in config files; defaults to an XDG-aware runtime path.
+    #[serde(default = "default_session_socket")]
     pub session_socket: PathBuf,
 
     /// Log directory.
@@ -811,23 +811,134 @@ fn default_pid_file() -> PathBuf {
 }
 
 fn default_operator_socket() -> PathBuf {
-    // Per TCK-00249: ${XDG_RUNTIME_DIR}/apm2/operator.sock
-    std::env::var("XDG_RUNTIME_DIR").map_or_else(
-        |_| default_data_dir().join("operator.sock"),
-        |runtime_dir| {
-            PathBuf::from(runtime_dir)
-                .join("apm2")
-                .join("operator.sock")
-        },
-    )
+    default_operator_socket_with_runtime(resolve_xdg_runtime_dir().as_deref())
 }
 
 fn default_session_socket() -> PathBuf {
-    // Per TCK-00249: ${XDG_RUNTIME_DIR}/apm2/session.sock
-    std::env::var("XDG_RUNTIME_DIR").map_or_else(
-        |_| default_data_dir().join("session.sock"),
-        |runtime_dir| PathBuf::from(runtime_dir).join("apm2").join("session.sock"),
+    default_session_socket_with_runtime(resolve_xdg_runtime_dir().as_deref())
+}
+
+fn resolve_xdg_runtime_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
+}
+
+fn default_operator_socket_with_runtime(runtime_dir: Option<&std::path::Path>) -> PathBuf {
+    runtime_dir.map_or_else(
+        || default_data_dir().join("operator.sock"),
+        |runtime| runtime.join("apm2").join("operator.sock"),
     )
+}
+
+fn default_session_socket_with_runtime(runtime_dir: Option<&std::path::Path>) -> PathBuf {
+    runtime_dir.map_or_else(
+        || default_data_dir().join("session.sock"),
+        |runtime| runtime.join("apm2").join("session.sock"),
+    )
+}
+
+fn expand_xdg_runtime_literal(path: &std::path::Path) -> Option<PathBuf> {
+    expand_xdg_runtime_literal_with_runtime(path, resolve_xdg_runtime_dir().as_deref())
+}
+
+fn expand_xdg_runtime_literal_with_runtime(
+    path: &std::path::Path,
+    runtime_dir: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    let raw = path.to_string_lossy();
+    let suffix = raw
+        .strip_prefix("$XDG_RUNTIME_DIR")
+        .or_else(|| raw.strip_prefix("${XDG_RUNTIME_DIR}"))?;
+    let mut resolved = runtime_dir?.to_path_buf();
+    let trimmed = suffix.trim_start_matches('/');
+    if !trimmed.is_empty() {
+        resolved.push(trimmed);
+    }
+    Some(resolved)
+}
+
+fn is_tmp_path(path: &std::path::Path) -> bool {
+    path.starts_with(std::path::Path::new("/tmp"))
+}
+
+fn normalize_runtime_path_with_default(
+    configured: &std::path::Path,
+    fallback: impl FnOnce() -> PathBuf,
+) -> PathBuf {
+    if let Some(expanded) = expand_xdg_runtime_literal(configured) {
+        return expanded;
+    }
+    if is_tmp_path(configured) {
+        return fallback();
+    }
+    configured.to_path_buf()
+}
+
+fn normalize_runtime_path_with_default_and_runtime(
+    configured: &std::path::Path,
+    runtime_dir: Option<&std::path::Path>,
+    fallback: impl FnOnce() -> PathBuf,
+) -> PathBuf {
+    if let Some(expanded) = expand_xdg_runtime_literal_with_runtime(configured, runtime_dir) {
+        return expanded;
+    }
+    if is_tmp_path(configured) {
+        return fallback();
+    }
+    configured.to_path_buf()
+}
+
+/// Resolve operator socket path, normalizing `$XDG_RUNTIME_DIR` literals and
+/// avoiding `/tmp` paths under `PrivateTmp` deployments.
+#[must_use]
+pub fn normalize_operator_socket_path(configured: &std::path::Path) -> PathBuf {
+    normalize_runtime_path_with_default(configured, default_operator_socket)
+}
+
+/// Resolve operator socket path with an explicit runtime directory context.
+#[must_use]
+pub fn normalize_operator_socket_path_with_runtime(
+    configured: &std::path::Path,
+    runtime_dir: Option<&std::path::Path>,
+) -> PathBuf {
+    normalize_runtime_path_with_default_and_runtime(configured, runtime_dir, || {
+        default_operator_socket_with_runtime(runtime_dir)
+    })
+}
+
+/// Resolve session socket path, normalizing `$XDG_RUNTIME_DIR` literals and
+/// avoiding `/tmp` paths under `PrivateTmp` deployments.
+#[must_use]
+pub fn normalize_session_socket_path(configured: &std::path::Path) -> PathBuf {
+    normalize_runtime_path_with_default(configured, default_session_socket)
+}
+
+/// Resolve session socket path with an explicit runtime directory context.
+#[must_use]
+pub fn normalize_session_socket_path_with_runtime(
+    configured: &std::path::Path,
+    runtime_dir: Option<&std::path::Path>,
+) -> PathBuf {
+    normalize_runtime_path_with_default_and_runtime(configured, runtime_dir, || {
+        default_session_socket_with_runtime(runtime_dir)
+    })
+}
+
+/// Resolve daemon PID file path with runtime-safe defaults.
+#[must_use]
+pub fn normalize_pid_file_path(configured: &std::path::Path) -> PathBuf {
+    normalize_runtime_path_with_default(configured, default_pid_file)
+}
+
+/// Resolve daemon state file path with runtime-safe defaults.
+#[must_use]
+pub fn normalize_state_file_path(configured: &std::path::Path) -> PathBuf {
+    normalize_runtime_path_with_default(configured, default_state_file)
+}
+
+/// Resolve daemon log directory path with runtime-safe defaults.
+#[must_use]
+pub fn normalize_log_dir_path(configured: &std::path::Path) -> PathBuf {
+    normalize_runtime_path_with_default(configured, default_log_dir)
 }
 
 fn default_log_dir() -> PathBuf {
@@ -1057,6 +1168,7 @@ pub enum ConfigError {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
 
@@ -1202,65 +1314,40 @@ mod tests {
         assert_eq!(config.processes.len(), 1);
     }
 
-    /// UT-00280-02: Test that daemon config requires `operator_socket`
-    /// (TCK-00280).
+    /// TCK-00620: missing socket fields are auto-filled from runtime defaults.
     #[test]
-    fn config_requires_operator_socket() {
+    fn config_missing_socket_fields_uses_defaults() {
         let toml = r#"
             [daemon]
             pid_file = "/tmp/apm2.pid"
-            session_socket = "/tmp/apm2/session.sock"
 
             [[processes]]
             name = "test"
             command = "echo"
         "#;
 
-        let result = EcosystemConfig::from_toml(toml);
-        assert!(
-            result.is_err(),
-            "Should require operator_socket when daemon section present"
-        );
+        let config = EcosystemConfig::from_toml(toml).expect("config should parse with defaults");
+        assert!(!config.daemon.operator_socket.as_os_str().is_empty());
+        assert!(!config.daemon.session_socket.as_os_str().is_empty());
     }
 
-    /// UT-00280-03: Test that daemon config requires `session_socket`
-    /// (TCK-00280).
     #[test]
-    fn config_requires_session_socket() {
-        let toml = r#"
-            [daemon]
-            pid_file = "/tmp/apm2.pid"
-            operator_socket = "/tmp/apm2/operator.sock"
-
-            [[processes]]
-            name = "test"
-            command = "echo"
-        "#;
-
-        let result = EcosystemConfig::from_toml(toml);
-        assert!(
-            result.is_err(),
-            "Should require session_socket when daemon section present"
+    fn normalize_operator_socket_expands_xdg_literal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let resolved = normalize_operator_socket_path_with_runtime(
+            std::path::Path::new("$XDG_RUNTIME_DIR/apm2/op.sock"),
+            Some(temp.path()),
         );
+        assert_eq!(resolved, temp.path().join("apm2").join("op.sock"));
     }
 
-    /// UT-00280-04: Test that both sockets are required when daemon section is
-    /// present.
     #[test]
-    fn config_requires_both_sockets() {
-        let toml = r#"
-            [daemon]
-            pid_file = "/tmp/apm2.pid"
-
-            [[processes]]
-            name = "test"
-            command = "echo"
-        "#;
-
-        let result = EcosystemConfig::from_toml(toml);
+    fn normalize_session_socket_rewrites_tmp_prefix() {
+        let resolved =
+            normalize_session_socket_path(std::path::Path::new("/tmp/apm2/session.sock"));
         assert!(
-            result.is_err(),
-            "Should require both sockets when daemon section present"
+            !resolved.starts_with(std::path::Path::new("/tmp")),
+            "session socket path should avoid /tmp after normalization"
         );
     }
 

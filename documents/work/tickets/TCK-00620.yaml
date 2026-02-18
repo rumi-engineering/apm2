@@ -164,9 +164,38 @@ scope:
             dimension, render the merged body, then update.
           - If A: surface the integrity verification error clearly.
           - If B: no fix needed (SHA mismatch is correct behaviour).
+    - id: "S7_V3_NON_STATUS_EVIDENCE_REUSE"
+      title: "Harden non-status evidence path to reuse v3 gate cache deterministically"
+      detail: |
+        In `run_evidence_gates_with_lane_context`, load native v3 gate cache
+        material (compound key + signatures) and apply v3-first reuse decisions
+        consistently across all non-status phases:
+          - rustfmt, clippy, doc
+          - test_safety_guard
+          - test
+          - workspace_integrity
+          - review_artifact_lint
+        Reuse behavior remains fail-closed: if v3 cache context or payload
+        resolution is unavailable, treat as cache miss and execute gate.
+    - id: "S8_CACHE_HIT_MARKER_LOGS"
+      title: "Emit lane-local cache-hit marker logs for deterministic evidence artifacts"
+      detail: |
+        For non-status cache-hit paths, write marker logs using
+        `write_cached_gate_log_marker` and store lane-local log paths in
+        `EvidenceGateResult`. This ensures deterministic log-bundle hashing
+        and prevents stale/non-local cached paths from weakening evidence
+        reproducibility.
+    - id: "S9_EVIDENCE_REGRESSION_SUITE"
+      title: "Add regression tests for v3 cache integration points"
+      detail: |
+        Add/maintain targeted regressions proving:
+          - non-status evidence path reuses persisted v3 entries across all phases
+            (including workspace_integrity),
+          - v3-only cache hits succeed without v2 presence,
+          - receipt-bound rebinding promotes cache entries for reuse.
 
   out_of_scope:
-    - "Changes to gate execution logic or gate ordering."
+    - "Gate ordering changes or broad gate algorithm redesign."
     - "Network-independence enforcement (REQ-0033, TCK-00622)."
     - "Structured stdout JSONL schema (REQ-0036, TCK-00625)."
     - "Any manual operator bootstrap sequence exposed to implementors."
@@ -219,6 +248,17 @@ plan:
         cargo clippy --workspace --all-targets --all-features -- -D warnings
         cargo doc --workspace --no-deps
         cargo test --workspace
+    - id: "STEP_07"
+      title: "Backfill non-status v3 cache reuse on all gate phases"
+      detail: |
+        Ensure v3 reuse path is wired for workspace_integrity and all
+        non-status gate phases, using the same v3-first decision and payload
+        resolution flow as status-path execution.
+    - id: "STEP_08"
+      title: "Lock deterministic cache-hit evidence + regressions"
+      detail: |
+        Emit lane-local cache-hit marker logs and add integration tests that
+        reproduce historical non-status reuse failures and verify the fix.
 
 definition_of_done:
   evidence_ids:
@@ -226,6 +266,8 @@ definition_of_done:
     - "EXEC-TCK00620-FRESH-WORKTREE-SUCCESS"
     - "EXEC-TCK00620-SOCKET-PATH-FIX"
     - "EXEC-TCK00620-VERDICT-RESYNC-FIX"
+    - "EXEC-TCK00620-EVIDENCE-V3-REUSE"
+    - "EXEC-TCK00620-EVIDENCE-V3-REGRESSIONS"
     - "EXEC-TCK00620-WORKSPACE-VALIDATION"
   criteria:
     - "ReadinessController is implemented with check/autofix/recheck for all six substrate components."
@@ -242,6 +284,12 @@ definition_of_done:
     - "Root cause of verdict comment resync failure is confirmed and fixed."
     - "After both reviewer decisions land, the GitHub verdict comment shows
       all dimensions — no dimension is silently overwritten or lost."
+    - "Non-status evidence path reuses valid v3 cache entries across all phases,
+      including workspace_integrity."
+    - "Cache-hit evidence artifacts use lane-local marker logs and remain
+      deterministic for log-bundle hashing."
+    - "Regression tests pass for v3-only cache hits, receipt-rebind promotion,
+      and full non-status v3 reuse integration coverage."
     - "Workspace validation (fmt, clippy, doc, test) completes successfully."
 
 notes:
@@ -258,4 +306,11 @@ notes:
     socket/tmp path fields from ecosystem.toml entirely and makes all path resolution
     XDG-aware unconditionally, matching the invariant enforced by the systemd socket
     unit (ListenStream=%t/apm2/operator.sock) and the PrivateTmp=yes service sandbox.
+  amendments:
+    - amendment_id: "AMD-2026-02-18-EVIDENCE-V3-SCOPE-REALIGN"
+      summary: "Record executed v3 evidence-cache hardening work to prevent scope ambiguity after PR741/PR746 integration."
+      supersedes:
+        - "Out-of-scope statement excluding all gate execution logic changes."
+      replacement:
+        - "Gate ordering remains unchanged, while targeted evidence execution-path hardening for deterministic v3 cache reuse and regression prevention is in-scope."
   security: "default-deny; readiness failure is fail-closed (no gates run); XDG socket path removes /tmp TOCTOU surface from PrivateTmp=yes sandbox"

@@ -39,6 +39,7 @@ use super::gate_attestation::{
 use super::gate_cache::GateCache;
 use super::jsonl::read_log_error_hint;
 use super::merge_conflicts::{check_merge_conflicts_against_main, render_merge_conflict_summary};
+use super::readiness::{self, ReadinessFailure, ReadinessOptions, WorkerReadinessHooks};
 use super::timeout_policy::{
     MAX_MANUAL_TIMEOUT_SECONDS, TEST_TIMEOUT_SLA_MESSAGE, max_memory_bytes, parse_memory_limit,
     resolve_bounded_test_timeout,
@@ -58,9 +59,6 @@ const CONSERVATIVE_PARALLELISM: u32 = 2;
 const DEFAULT_GATES_WAIT_TIMEOUT_SECS: u64 = 1200;
 const GATES_WAIT_POLL_INTERVAL_SECS: u64 = 5;
 const INLINE_WORKER_POLL_INTERVAL_SECS: u64 = 1;
-const EXTERNAL_WORKER_BOOTSTRAP_POLL_INTERVAL_MS: u64 = 250;
-// 40 * 250ms ~= 10s bootstrap window for detached worker heartbeat.
-const EXTERNAL_WORKER_BOOTSTRAP_MAX_POLLS: u32 = 40;
 const GATES_QUEUE_LANE: &str = "consume";
 const GATES_SINGLE_FLIGHT_DIR: &str = "queue/singleflight";
 const GATES_QUEUE_PENDING_DIR: &str = "pending";
@@ -118,6 +116,24 @@ struct PreparedQueuedGatesJob {
     // Keep the lock guard alive for the whole request lifecycle so --wait
     // callers cannot concurrently trigger inline worker execution.
     _single_flight_lock: std::fs::File,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+enum QueuePreparationFailure {
+    Validation { message: String },
+    PrepNotReady { failure: ReadinessFailure },
+    Runtime { message: String },
+}
+
+impl QueuePreparationFailure {
+    fn message(&self) -> String {
+        match self {
+            Self::Validation { message } | Self::Runtime { message } => message.clone(),
+            Self::PrepNotReady { failure } => {
+                format!("{}: {}", failure.component, failure.root_cause)
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -255,7 +271,7 @@ pub(super) fn run_queued_gates_and_collect(
         );
     }
 
-    let prepared = prepare_queued_gates_job(request, true)?;
+    let prepared = prepare_queued_gates_job(request, true).map_err(|err| err.message())?;
     let timeout_secs = normalize_wait_timeout(request.wait_timeout_secs);
     wait_for_gates_job_receipt_with_mode(
         &prepared.fac_root,
@@ -318,52 +334,68 @@ const fn normalize_wait_timeout(wait_timeout_secs: u64) -> u64 {
 fn prepare_queued_gates_job(
     request: &QueuedGatesRequest,
     wait: bool,
-) -> Result<PreparedQueuedGatesJob, String> {
-    validate_timeout_seconds(request.timeout_seconds)?;
-    let memory_max_bytes = parse_memory_limit(&request.memory_max)?;
+) -> Result<PreparedQueuedGatesJob, QueuePreparationFailure> {
+    validate_timeout_seconds(request.timeout_seconds)
+        .map_err(|message| QueuePreparationFailure::Validation { message })?;
+    let memory_max_bytes = parse_memory_limit(&request.memory_max)
+        .map_err(|message| QueuePreparationFailure::Validation { message })?;
     if memory_max_bytes > max_memory_bytes() {
-        return Err(format!(
-            "--memory-max {} exceeds FAC test memory cap of {}",
-            request.memory_max,
-            max_memory_bytes(),
-        ));
+        return Err(QueuePreparationFailure::Validation {
+            message: format!(
+                "--memory-max {} exceeds FAC test memory cap of {}",
+                request.memory_max,
+                max_memory_bytes(),
+            ),
+        });
     }
-    resolve_effective_execution_profile(&request.cpu_quota, request.gate_profile)?;
+    resolve_effective_execution_profile(&request.cpu_quota, request.gate_profile)
+        .map_err(|message| QueuePreparationFailure::Validation { message })?;
 
-    let fac_root = resolve_fac_root().map_err(|err| format!("cannot resolve FAC root: {err}"))?;
-    let worker_bootstrapped = if request.require_external_worker {
-        ensure_external_worker_bootstrap(
-            &fac_root,
-            has_live_worker_heartbeat,
-            spawn_detached_worker_for_queue,
-        )
-        .map_err(|err| format!("cannot bootstrap external FAC worker: {err}"))?
-    } else if wait {
-        false
-    } else {
-        ensure_non_wait_worker_bootstrap(
-            &fac_root,
-            has_live_worker_heartbeat,
-            spawn_detached_worker_for_queue,
-        )
-        .map_err(|err| format!("cannot bootstrap FAC worker for --no-wait mode: {err}"))?
-    };
-    let boundary_id = apm2_core::fac::load_or_default_boundary_id(&fac_root)
+    let fac_root = resolve_fac_root().map_err(|err| QueuePreparationFailure::Runtime {
+        message: format!("cannot resolve FAC root: {err}"),
+    })?;
+    let readiness = readiness::run_readiness_controller(
+        ReadinessOptions {
+            require_external_worker: request.require_external_worker,
+            // For --no-wait submissions we still require a live worker to avoid
+            // enqueueing jobs that cannot drain.
+            wait_for_worker: !wait,
+        },
+        WorkerReadinessHooks {
+            has_live_worker_heartbeat: &has_live_worker_heartbeat,
+            spawn_detached_worker: &spawn_detached_worker_for_queue,
+        },
+    )
+    .map_err(|failure| QueuePreparationFailure::PrepNotReady { failure })?;
+    let worker_bootstrapped = readiness.worker_bootstrapped;
+    let apm2_home =
+        apm2_core::github::resolve_apm2_home().ok_or_else(|| QueuePreparationFailure::Runtime {
+            message: "cannot resolve APM2_HOME".to_string(),
+        })?;
+    let boundary_id = apm2_core::fac::load_or_default_boundary_id(&apm2_home)
         .unwrap_or_else(|_| "local".to_string());
-    let mut broker = init_broker(&fac_root, &boundary_id)
-        .map_err(|err| format!("cannot initialize broker: {err}"))?;
+    let mut broker =
+        init_broker(&fac_root, &boundary_id).map_err(|err| QueuePreparationFailure::Runtime {
+            message: format!("cannot initialize broker: {err}"),
+        })?;
     let (policy_hash, policy_digest, fac_policy) =
-        load_or_init_policy(&fac_root).map_err(|err| format!("cannot load FAC policy: {err}"))?;
+        load_or_init_policy(&fac_root).map_err(|err| QueuePreparationFailure::Runtime {
+            message: format!("cannot load FAC policy: {err}"),
+        })?;
     broker
         .admit_policy_digest(policy_digest)
-        .map_err(|err| format!("cannot admit FAC policy digest: {err}"))?;
+        .map_err(|err| QueuePreparationFailure::Runtime {
+            message: format!("cannot admit FAC policy digest: {err}"),
+        })?;
 
     // TCK-00579: Derive job spec validation policy from FAC policy for
     // enqueue-time enforcement of repo_id allowlist, bytes_backend
     // allowlist, and filesystem-path rejection.
-    let job_spec_policy = fac_policy
-        .job_spec_validation_policy()
-        .map_err(|err| format!("cannot derive job spec validation policy: {err}"))?;
+    let job_spec_policy = fac_policy.job_spec_validation_policy().map_err(|err| {
+        QueuePreparationFailure::Runtime {
+            message: format!("cannot derive job spec validation policy: {err}"),
+        }
+    })?;
 
     let repo_source = resolve_repo_source_info();
     let options = GatesJobOptionsV1::new(
@@ -376,10 +408,12 @@ fn prepare_queued_gates_job(
         request.gate_profile.as_str(),
         &repo_source.workspace_root,
     );
-    let queue_root =
-        resolve_queue_root().map_err(|err| format!("cannot resolve queue root: {err}"))?;
+    let queue_root = resolve_queue_root().map_err(|err| QueuePreparationFailure::Runtime {
+        message: format!("cannot resolve queue root: {err}"),
+    })?;
     let single_flight_lock =
-        acquire_gates_single_flight_lock(&fac_root, &repo_source.repo_id, &repo_source.head_sha)?;
+        acquire_gates_single_flight_lock(&fac_root, &repo_source.repo_id, &repo_source.head_sha)
+            .map_err(|message| QueuePreparationFailure::Runtime { message })?;
     let include_claimed = has_live_worker_heartbeat(&fac_root);
     if let Some(existing_spec) = find_coalescible_gates_job(
         &queue_root,
@@ -387,7 +421,9 @@ fn prepare_queued_gates_job(
         &repo_source.head_sha,
         &options,
         include_claimed,
-    )? {
+    )
+    .map_err(|message| QueuePreparationFailure::Runtime { message })?
+    {
         return Ok(PreparedQueuedGatesJob {
             fac_root,
             head_sha: repo_source.head_sha,
@@ -416,14 +452,18 @@ fn prepare_queued_gates_job(
         &job_spec_policy,
         fac_policy.allowed_intents.as_deref(),
     )
-    .map_err(|err| format!("cannot build gates job spec: {err}"))?;
+    .map_err(|err| QueuePreparationFailure::Runtime {
+        message: format!("cannot build gates job spec: {err}"),
+    })?;
     enqueue_job(
         &queue_root,
         &fac_root,
         &spec,
         &fac_policy.queue_bounds_policy,
     )
-    .map_err(|err| format!("failed to enqueue gates job: {err}"))?;
+    .map_err(|err| QueuePreparationFailure::Runtime {
+        message: format!("failed to enqueue gates job: {err}"),
+    })?;
 
     Ok(PreparedQueuedGatesJob {
         fac_root,
@@ -712,17 +752,18 @@ fn run_gates_via_worker(
     };
     let prepared = match prepare_queued_gates_job(&request, wait) {
         Ok(prepared) => prepared,
-        Err(err) => {
-            let code = if err.starts_with("--timeout-seconds")
-                || err.starts_with("--memory-max")
-                || err.starts_with("invalid cpu_quota")
-                || err.starts_with("cpu_quota")
-            {
-                exit_codes::VALIDATION_ERROR
-            } else {
-                exit_codes::GENERIC_ERROR
-            };
-            return output_worker_enqueue_error(json_output, &err, code);
+        Err(QueuePreparationFailure::Validation { message }) => {
+            return output_worker_enqueue_error(
+                json_output,
+                &message,
+                exit_codes::VALIDATION_ERROR,
+            );
+        },
+        Err(QueuePreparationFailure::PrepNotReady { failure }) => {
+            return output_worker_prep_not_ready(json_output, &failure);
+        },
+        Err(QueuePreparationFailure::Runtime { message }) => {
+            return output_worker_enqueue_error(json_output, &message, exit_codes::GENERIC_ERROR);
         },
     };
 
@@ -834,6 +875,35 @@ fn output_worker_enqueue_error(json_output: bool, message: &str, code: u8) -> u8
         eprintln!("ERROR: {message}");
     }
     code
+}
+
+fn output_worker_prep_not_ready(json_output: bool, failure: &ReadinessFailure) -> u8 {
+    if json_output {
+        let payload = serde_json::json!({
+            "status": "error",
+            "error": "prep_not_ready",
+            "component": failure.component,
+            "root_cause": failure.root_cause,
+            "remediation": failure.remediation,
+            "diagnostics": failure.diagnostics,
+            "component_reports": failure.component_reports,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+        );
+    } else {
+        eprintln!(
+            "ERROR: PREP_NOT_READY component={} cause={}",
+            failure.component, failure.root_cause
+        );
+        eprintln!("remediation: {}", failure.remediation);
+        for diagnostic in &failure.diagnostics {
+            eprintln!("diagnostic: {diagnostic}");
+        }
+    }
+    exit_codes::GENERIC_ERROR
 }
 
 fn collect_gates_queue_snapshot(
@@ -1071,6 +1141,7 @@ fn has_live_worker_heartbeat(fac_root: &Path) -> bool {
     is_pid_running(heartbeat.pid)
 }
 
+#[cfg(test)]
 fn ensure_non_wait_worker_bootstrap<F>(
     fac_root: &Path,
     has_live_heartbeat: fn(&Path) -> bool,
@@ -1086,18 +1157,7 @@ where
     Ok(true)
 }
 
-fn ensure_external_worker_bootstrap(
-    fac_root: &Path,
-    has_live_heartbeat: fn(&Path) -> bool,
-    spawn_worker: fn() -> Result<(), String>,
-) -> Result<bool, String> {
-    ensure_external_worker_bootstrap_with(fac_root, has_live_heartbeat, spawn_worker, || {
-        std::thread::sleep(Duration::from_millis(
-            EXTERNAL_WORKER_BOOTSTRAP_POLL_INTERVAL_MS,
-        ));
-    })
-}
-
+#[cfg(test)]
 fn ensure_external_worker_bootstrap_with<FHeartbeat, FSpawn, FWait>(
     fac_root: &Path,
     mut has_live_heartbeat: FHeartbeat,
@@ -1109,6 +1169,7 @@ where
     FSpawn: FnMut() -> Result<(), String>,
     FWait: FnMut(),
 {
+    const EXTERNAL_WORKER_BOOTSTRAP_MAX_POLLS: u32 = 40;
     if has_live_heartbeat(fac_root) {
         return Ok(false);
     }

@@ -765,6 +765,92 @@ fn is_remote_comment_url(comment_url: &str) -> bool {
     comment_url.trim().starts_with(GITHUB_COMMENT_URL_PREFIX)
 }
 
+fn parse_opening_fence(line: &str) -> Option<usize> {
+    let trimmed = line.trim();
+    let fence_len = trimmed.chars().take_while(|ch| *ch == '`').count();
+    if fence_len < 3 {
+        return None;
+    }
+    let rest = trimmed[fence_len..].trim();
+    if rest.is_empty() || rest.eq_ignore_ascii_case("yaml") {
+        Some(fence_len)
+    } else {
+        None
+    }
+}
+
+fn is_closing_fence(line: &str, fence_len: usize) -> bool {
+    let trimmed = line.trim();
+    trimmed.chars().count() == fence_len && trimmed.chars().all(|ch| ch == '`')
+}
+
+fn extract_fenced_yaml(body: &str) -> Option<&str> {
+    let mut offset = 0usize;
+    for line in body.split_inclusive('\n') {
+        let line_without_newline = line.trim_end_matches(['\n', '\r']);
+        let Some(fence_len) = parse_opening_fence(line_without_newline) else {
+            offset = offset.saturating_add(line.len());
+            continue;
+        };
+
+        let yaml_start = offset.saturating_add(line.len());
+        let mut inner_offset = yaml_start;
+        for inner_line in body[yaml_start..].split_inclusive('\n') {
+            let inner_without_newline = inner_line.trim_end_matches(['\n', '\r']);
+            if is_closing_fence(inner_without_newline, fence_len) {
+                return Some(body[yaml_start..inner_offset].trim());
+            }
+            inner_offset = inner_offset.saturating_add(inner_line.len());
+        }
+        return None;
+    }
+    None
+}
+
+fn parse_live_verdict_comment_payload(
+    body: &str,
+    expected_pr: u32,
+    expected_sha: &str,
+) -> Option<DecisionComment> {
+    if !is_live_verdict_comment_body(body) {
+        return None;
+    }
+    let yaml = extract_fenced_yaml(body)?;
+    let parsed: DecisionCommentProjectionPayload = serde_yaml::from_str(yaml).ok()?;
+    if parsed.pr != expected_pr || !parsed.sha.eq_ignore_ascii_case(expected_sha) {
+        return None;
+    }
+    Some(DecisionComment {
+        schema: parsed.schema,
+        pr: parsed.pr,
+        sha: parsed.sha,
+        updated_at: parsed.updated_at,
+        dimensions: parsed.dimensions,
+    })
+}
+
+fn merge_remote_dimensions_payload(
+    incoming: &DecisionComment,
+    remote_comment_body: &str,
+    expected_pr: u32,
+    expected_sha: &str,
+) -> DecisionComment {
+    let Some(mut remote_payload) =
+        parse_live_verdict_comment_payload(remote_comment_body, expected_pr, expected_sha)
+    else {
+        return incoming.clone();
+    };
+
+    for (dimension, value) in &incoming.dimensions {
+        remote_payload
+            .dimensions
+            .insert(dimension.clone(), value.clone());
+    }
+    remote_payload.schema.clone_from(&incoming.schema);
+    remote_payload.updated_at.clone_from(&incoming.updated_at);
+    remote_payload
+}
+
 fn project_decision_comment(
     owner_repo: &str,
     pr_number: u32,
@@ -801,7 +887,8 @@ where
     FCreate: FnMut(&str, u32, &str) -> Result<github_projection::IssueCommentResponse, String>,
     FLatest: FnMut(&str, u32) -> Result<Option<u64>, String>,
 {
-    let body = render_decision_comment_body(owner_repo, pr_number, &record.head_sha, payload)?;
+    let mut create_body =
+        render_decision_comment_body(owner_repo, pr_number, &record.head_sha, payload)?;
 
     let mut comment_id = record.decision_comment_id;
     if comment_id == 0 {
@@ -818,6 +905,7 @@ where
     };
 
     let mut orphaned_remote_comment_id: Option<u64> = None;
+    let mut known_remote_body = None::<String>;
     if comment_id > 0 {
         if !is_remote_comment_url(&comment_url) {
             let resolved = fetch_comment(owner_repo, comment_id).map_err(|err| {
@@ -828,12 +916,26 @@ where
             if let Some(found) = resolved {
                 comment_id = found.id;
                 comment_url = found.html_url;
+                known_remote_body = Some(found.body);
             }
+        } else if let Ok(Some(found)) = fetch_comment(owner_repo, comment_id) {
+            comment_id = found.id;
+            comment_url = found.html_url;
+            known_remote_body = Some(found.body);
         }
+
+        let body_for_update = if let Some(remote_body) = known_remote_body.as_deref() {
+            let merged =
+                merge_remote_dimensions_payload(payload, remote_body, pr_number, &record.head_sha);
+            render_decision_comment_body(owner_repo, pr_number, &record.head_sha, &merged)?
+        } else {
+            create_body.clone()
+        };
+        create_body.clone_from(&body_for_update);
 
         if is_remote_comment_url(&comment_url) {
             orphaned_remote_comment_id = Some(comment_id);
-            match update_comment(owner_repo, comment_id, &body) {
+            match update_comment(owner_repo, comment_id, &body_for_update) {
                 Ok(()) => return Ok((comment_id, comment_url)),
                 Err(err) => {
                     eprintln!(
@@ -847,7 +949,21 @@ where
                     if let Some(found) = resolved {
                         comment_id = found.id;
                         comment_url = found.html_url;
-                        update_comment(owner_repo, comment_id, &body).map_err(|retry_err| {
+                        let retry_body = {
+                            let merged = merge_remote_dimensions_payload(
+                                payload,
+                                &found.body,
+                                pr_number,
+                                &record.head_sha,
+                            );
+                            render_decision_comment_body(
+                                owner_repo,
+                                pr_number,
+                                &record.head_sha,
+                                &merged,
+                            )?
+                        };
+                        update_comment(owner_repo, comment_id, &retry_body).map_err(|retry_err| {
                             format!(
                                 "failed to patch existing verdict comment {comment_id} after revalidation for PR #{pr_number}: {retry_err}"
                             )
@@ -879,15 +995,27 @@ where
         && let Some(latest_remote_comment_id) = latest_known_remote_comment_id
     {
         match fetch_comment(owner_repo, latest_remote_comment_id) {
-            Ok(Some(found)) => match update_comment(owner_repo, found.id, &body) {
-                Ok(()) => return Ok((found.id, found.html_url)),
-                Err(err) => {
-                    eprintln!(
-                        "WARNING: failed to patch latest remote verdict comment {} for PR #{pr_number}; creating replacement: {err}",
-                        found.id
+            Ok(Some(found)) => {
+                let latest_body = {
+                    let merged = merge_remote_dimensions_payload(
+                        payload,
+                        &found.body,
+                        pr_number,
+                        &record.head_sha,
                     );
-                    superseded_remote_comment_id = Some(found.id);
-                },
+                    render_decision_comment_body(owner_repo, pr_number, &record.head_sha, &merged)?
+                };
+                create_body.clone_from(&latest_body);
+                match update_comment(owner_repo, found.id, &latest_body) {
+                    Ok(()) => return Ok((found.id, found.html_url)),
+                    Err(err) => {
+                        eprintln!(
+                            "WARNING: failed to patch latest remote verdict comment {} for PR #{pr_number}; creating replacement: {err}",
+                            found.id
+                        );
+                        superseded_remote_comment_id = Some(found.id);
+                    },
+                }
             },
             Ok(None) => {},
             Err(err) => {
@@ -898,7 +1026,7 @@ where
         }
     }
 
-    match create_comment(owner_repo, pr_number, &body) {
+    match create_comment(owner_repo, pr_number, &create_body) {
         Ok(response) => {
             if let Some(orphaned_comment_id) =
                 superseded_remote_comment_id.filter(|value| *value != response.id)
@@ -1773,7 +1901,7 @@ pub fn resolve_completion_signal_from_projection_for_home(
     }))
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DecisionCommentFinding {
     finding_id: String,
     #[serde(rename = "type")]
@@ -1797,13 +1925,14 @@ struct DecisionCommentFinding {
     timestamp: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DecisionCommentProjectionPayload {
     schema: String,
     pr: u32,
     sha: String,
     updated_at: String,
     dimensions: BTreeMap<String, DecisionEntry>,
+    #[serde(default)]
     findings: Vec<DecisionCommentFinding>,
 }
 
@@ -2189,6 +2318,7 @@ mod tests {
                     id: 88,
                     html_url: "https://github.com/example/repo/issues/661#issuecomment-88"
                         .to_string(),
+                    body: String::new(),
                 }))
             },
             |_, id, body| {
@@ -2202,6 +2332,7 @@ mod tests {
                     id: 99,
                     html_url: "https://github.com/example/repo/issues/661#issuecomment-99"
                         .to_string(),
+                    body: String::new(),
                 })
             },
             |_, _| Ok(None),
@@ -2270,6 +2401,7 @@ mod tests {
                     id: 120,
                     html_url: "https://github.com/example/repo/issues/662#issuecomment-120"
                         .to_string(),
+                    body: String::new(),
                 }))
             },
             |_, id, _| {
@@ -2287,13 +2419,14 @@ mod tests {
                     id: 999,
                     html_url: "https://github.com/example/repo/issues/662#issuecomment-999"
                         .to_string(),
+                    body: String::new(),
                 })
             },
             |_, _| Ok(None),
         )
         .expect("revalidation retry should patch existing comment");
 
-        assert_eq!(fetch_calls, 1);
+        assert_eq!(fetch_calls, 2);
         assert_eq!(update_calls, 2);
         assert_eq!(create_calls, 0);
         assert_eq!(comment_id, 120);
@@ -2368,6 +2501,7 @@ mod tests {
                     id: 88,
                     html_url: "https://github.com/example/repo/issues/663#issuecomment-88"
                         .to_string(),
+                    body: String::new(),
                 })
             },
             |_, _| Ok(None),
@@ -2445,6 +2579,7 @@ mod tests {
                     id: 89,
                     html_url: "https://github.com/example/repo/issues/665#issuecomment-89"
                         .to_string(),
+                    body: String::new(),
                 })
             },
             |_, _| Ok(None),
@@ -2511,6 +2646,7 @@ mod tests {
                     id: 77,
                     html_url: "https://github.com/example/repo/issues/666#issuecomment-77"
                         .to_string(),
+                    body: String::new(),
                 })),
                 other => panic!("unexpected comment lookup id {other}"),
             },
@@ -2534,6 +2670,7 @@ mod tests {
                     id: 88,
                     html_url: "https://github.com/example/repo/issues/666#issuecomment-88"
                         .to_string(),
+                    body: String::new(),
                 })
             },
             |_, _| Ok(Some(77)),
@@ -2600,6 +2737,7 @@ mod tests {
                     id: 77,
                     html_url: "https://github.com/example/repo/issues/667#issuecomment-77"
                         .to_string(),
+                    body: String::new(),
                 })),
                 other => panic!("unexpected comment lookup id {other}"),
             },
@@ -2616,6 +2754,7 @@ mod tests {
                     id: 88,
                     html_url: "https://github.com/example/repo/issues/667#issuecomment-88"
                         .to_string(),
+                    body: String::new(),
                 })
             },
             |_, _| Ok(Some(77)),
@@ -2628,6 +2767,112 @@ mod tests {
             "https://github.com/example/repo/issues/667#issuecomment-77"
         );
         assert_eq!(update_calls, 1);
+        assert_eq!(create_calls, 0);
+    }
+
+    #[test]
+    fn project_decision_comment_merges_remote_dimensions_on_reinitialized_update() {
+        let owner_repo = "example/repo";
+        let pr_number = 669;
+        let head_sha = "1111222233334444555566667777888899990000";
+
+        let mut remote_dimensions = BTreeMap::new();
+        remote_dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: "security-ok".to_string(),
+                set_by: "security-bot".to_string(),
+                set_at: "2026-02-18T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
+            },
+        );
+        let remote_payload = DecisionComment {
+            schema: DECISION_SCHEMA.to_string(),
+            pr: pr_number,
+            sha: head_sha.to_string(),
+            updated_at: "2026-02-18T00:00:00Z".to_string(),
+            dimensions: remote_dimensions,
+        };
+        let remote_body =
+            render_decision_comment_body(owner_repo, pr_number, head_sha, &remote_payload)
+                .expect("render remote verdict comment");
+
+        let mut local_dimensions = BTreeMap::new();
+        local_dimensions.insert(
+            "code-quality".to_string(),
+            DecisionEntry {
+                decision: "deny".to_string(),
+                reason: "quality-blocker".to_string(),
+                set_by: "quality-bot".to_string(),
+                set_at: "2026-02-18T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
+            },
+        );
+        let payload = DecisionComment {
+            schema: DECISION_SCHEMA.to_string(),
+            pr: pr_number,
+            sha: head_sha.to_string(),
+            updated_at: "2026-02-18T00:00:01Z".to_string(),
+            dimensions: local_dimensions.clone(),
+        };
+        let record = DecisionProjectionRecord {
+            schema: super::PROJECTION_VERDICT_SCHEMA.to_string(),
+            owner_repo: owner_repo.to_string(),
+            pr_number,
+            head_sha: head_sha.to_string(),
+            updated_at: payload.updated_at.clone(),
+            decision_comment_id: 120,
+            decision_comment_url: super::local_comment_url(owner_repo, pr_number, 120),
+            decision_signature: String::new(),
+            integrity_hmac: None,
+            dimensions: local_dimensions,
+        };
+
+        let mut create_calls = 0usize;
+        let (comment_id, comment_url) = super::project_decision_comment_with(
+            owner_repo,
+            pr_number,
+            &record,
+            &payload,
+            |_, id| match id {
+                120 => Ok(None),
+                77 => Ok(Some(super::github_projection::IssueCommentResponse {
+                    id: 77,
+                    html_url: "https://github.com/example/repo/issues/669#issuecomment-77"
+                        .to_string(),
+                    body: remote_body.clone(),
+                })),
+                other => panic!("unexpected comment lookup id {other}"),
+            },
+            |_, id, body| {
+                assert_eq!(id, 77);
+                assert!(body.contains("security:"));
+                assert!(body.contains("code-quality:"));
+                assert!(body.contains("security-ok"));
+                assert!(body.contains("quality-blocker"));
+                Ok(())
+            },
+            |_, _, _| {
+                create_calls = create_calls.saturating_add(1);
+                Ok(super::github_projection::IssueCommentResponse {
+                    id: 88,
+                    html_url: "https://github.com/example/repo/issues/669#issuecomment-88"
+                        .to_string(),
+                    body: String::new(),
+                })
+            },
+            |_, _| Ok(Some(77)),
+        )
+        .expect("latest remote verdict comment should merge remote+local dimensions");
+
+        assert_eq!(comment_id, 77);
+        assert_eq!(
+            comment_url,
+            "https://github.com/example/repo/issues/669#issuecomment-77"
+        );
         assert_eq!(create_calls, 0);
     }
 
@@ -2719,6 +2964,7 @@ mod tests {
                                 html_url: format!(
                                     "https://github.com/{owner_repo_for_url}/issues/{pr_number}#issuecomment-{id}"
                                 ),
+                                body: guard.bodies.get(&id).cloned().unwrap_or_default(),
                             }
                         }))
                     },
@@ -2742,6 +2988,7 @@ mod tests {
                             html_url: format!(
                                 "https://github.com/{owner_repo_for_create}/issues/{pr_number}#issuecomment-{id}"
                             ),
+                            body: body.to_string(),
                         })
                     },
                     |_, _| Ok(None),

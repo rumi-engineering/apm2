@@ -8,6 +8,9 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 use apm2_core::bootstrap::verify_bootstrap_hash;
+use apm2_core::config::{
+    normalize_operator_socket_path_with_runtime, normalize_session_socket_path_with_runtime,
+};
 use apm2_core::schema_registry::{InMemorySchemaRegistry, register_kernel_schemas};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -313,32 +316,8 @@ fn main() -> Result<()> {
     // - operator_socket: For privileged operations (ClaimWork, SpawnEpisode,
     //   Shutdown)
     // - session_socket: For session-scoped operations (RequestTool, EmitEvent)
-    let (operator_socket, session_socket) = cli.socket.as_ref().map_or_else(
-        || {
-            if daemon_config_path.exists() {
-                if let Ok(config) =
-                    apm2_core::config::EcosystemConfig::from_file(&daemon_config_path)
-                {
-                    (config.daemon.operator_socket, config.daemon.session_socket)
-                } else {
-                    (default_operator_socket(), default_session_socket())
-                }
-            } else {
-                // TCK-00595: Environment-based auto-config when no ecosystem.toml exists.
-                // Uses XDG-standard default paths and auto-detects GitHub coordinates
-                // from git remote + GITHUB_TOKEN from env for config-less startup.
-                let env_config = apm2_core::config::EcosystemConfig::from_env();
-                (
-                    env_config.daemon.operator_socket,
-                    env_config.daemon.session_socket,
-                )
-            }
-        },
-        |socket| {
-            // Legacy --socket flag maps to operator_socket only
-            (socket.clone(), socket.clone())
-        },
-    );
+    let (operator_socket, session_socket) =
+        resolve_cli_socket_paths(cli.socket.as_ref(), &daemon_config_path);
 
     // Alias for backward compatibility
     let socket_path = operator_socket.clone();
@@ -512,25 +491,74 @@ fn main() -> Result<()> {
 
 /// Returns the default operator socket path.
 ///
-/// Uses `XDG_RUNTIME_DIR` if available, otherwise /tmp/apm2.
-fn default_operator_socket() -> PathBuf {
-    std::env::var("XDG_RUNTIME_DIR").map_or_else(
-        |_| PathBuf::from("/tmp/apm2/operator.sock"),
-        |runtime_dir| {
-            PathBuf::from(runtime_dir)
-                .join("apm2")
-                .join("operator.sock")
-        },
+/// Uses `XDG_RUNTIME_DIR` if available, otherwise `APM2_DATA_DIR` / XDG data.
+fn default_operator_socket(runtime_dir: Option<&Path>) -> PathBuf {
+    runtime_dir.map_or_else(
+        || apm2_core::config::default_data_dir().join("operator.sock"),
+        |runtime| runtime.join("apm2").join("operator.sock"),
     )
 }
 
 /// Returns the default session socket path.
 ///
-/// Uses `XDG_RUNTIME_DIR` if available, otherwise /tmp/apm2.
-fn default_session_socket() -> PathBuf {
-    std::env::var("XDG_RUNTIME_DIR").map_or_else(
-        |_| PathBuf::from("/tmp/apm2/session.sock"),
-        |runtime_dir| PathBuf::from(runtime_dir).join("apm2").join("session.sock"),
+/// Uses `XDG_RUNTIME_DIR` if available, otherwise `APM2_DATA_DIR` / XDG data.
+fn default_session_socket(runtime_dir: Option<&Path>) -> PathBuf {
+    runtime_dir.map_or_else(
+        || apm2_core::config::default_data_dir().join("session.sock"),
+        |runtime| runtime.join("apm2").join("session.sock"),
+    )
+}
+
+fn resolve_cli_socket_paths(
+    legacy_socket: Option<&PathBuf>,
+    daemon_config_path: &Path,
+) -> (PathBuf, PathBuf) {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    resolve_cli_socket_paths_with_runtime(legacy_socket, daemon_config_path, runtime_dir.as_deref())
+}
+
+fn resolve_cli_socket_paths_with_runtime(
+    legacy_socket: Option<&PathBuf>,
+    daemon_config_path: &Path,
+    runtime_dir: Option<&Path>,
+) -> (PathBuf, PathBuf) {
+    let default_operator = default_operator_socket(runtime_dir);
+    let default_session = default_session_socket(runtime_dir);
+    legacy_socket.map_or_else(
+        || {
+            if daemon_config_path.exists() {
+                if let Ok(config) =
+                    apm2_core::config::EcosystemConfig::from_file(daemon_config_path)
+                {
+                    (
+                        normalize_operator_socket_path_with_runtime(
+                            &config.daemon.operator_socket,
+                            runtime_dir,
+                        ),
+                        normalize_session_socket_path_with_runtime(
+                            &config.daemon.session_socket,
+                            runtime_dir,
+                        ),
+                    )
+                } else {
+                    (default_operator, default_session)
+                }
+            } else {
+                // TCK-00595: Environment-based auto-config when no ecosystem.toml exists.
+                let env_config = apm2_core::config::EcosystemConfig::from_env();
+                (
+                    normalize_operator_socket_path_with_runtime(
+                        &env_config.daemon.operator_socket,
+                        runtime_dir,
+                    ),
+                    normalize_session_socket_path_with_runtime(
+                        &env_config.daemon.session_socket,
+                        runtime_dir,
+                    ),
+                )
+            }
+        },
+        |socket| (socket.clone(), socket.clone()),
     )
 }
 
@@ -628,5 +656,39 @@ mod tests {
             Some(PathBuf::from("/tmp/repo/.git"))
         });
         assert_eq!(resolved, PathBuf::from("custom.toml"));
+    }
+
+    #[test]
+    fn resolve_cli_socket_paths_ignores_tmp_config_when_xdg_runtime_is_available() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let xdg_runtime = temp.path().join("xdg-runtime");
+        std::fs::create_dir_all(&xdg_runtime).expect("create runtime dir");
+        let config_path = temp.path().join("ecosystem.toml");
+        std::fs::write(
+            &config_path,
+            "[daemon]\noperator_socket = \"/tmp/apm2/operator.sock\"\nsession_socket = \"/tmp/apm2/session.sock\"\n",
+        )
+        .expect("write config");
+        let (operator, session) =
+            resolve_cli_socket_paths_with_runtime(None, &config_path, Some(&xdg_runtime));
+        assert_eq!(operator, xdg_runtime.join("apm2").join("operator.sock"));
+        assert_eq!(session, xdg_runtime.join("apm2").join("session.sock"));
+    }
+
+    #[test]
+    fn resolve_cli_socket_paths_expands_xdg_literal_config_values() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let xdg_runtime = temp.path().join("xdg-runtime");
+        std::fs::create_dir_all(&xdg_runtime).expect("create runtime dir");
+        let config_path = temp.path().join("ecosystem.toml");
+        std::fs::write(
+            &config_path,
+            "[daemon]\noperator_socket = \"$XDG_RUNTIME_DIR/apm2/op.sock\"\nsession_socket = \"$XDG_RUNTIME_DIR/apm2/sess.sock\"\n",
+        )
+        .expect("write config");
+        let (operator, session) =
+            resolve_cli_socket_paths_with_runtime(None, &config_path, Some(&xdg_runtime));
+        assert_eq!(operator, xdg_runtime.join("apm2").join("op.sock"));
+        assert_eq!(session, xdg_runtime.join("apm2").join("sess.sock"));
     }
 }

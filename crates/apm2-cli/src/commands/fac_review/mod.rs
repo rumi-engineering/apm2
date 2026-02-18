@@ -41,6 +41,7 @@ mod prepare;
 mod projection;
 mod projection_store;
 mod push;
+mod readiness;
 mod recovery;
 mod restart;
 mod state;

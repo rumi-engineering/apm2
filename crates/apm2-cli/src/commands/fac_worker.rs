@@ -8371,6 +8371,12 @@ mod tests {
             .flatten()
             .find(|entry| entry.file_type().is_ok_and(|ty| ty.is_file()))
             .expect("at least one lane cleanup receipt");
+        let expected_receipt_digest = receipt_file
+            .path()
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .expect("receipt file must have digest stem")
+            .to_string();
         let receipt_json = serde_json::from_slice::<serde_json::Value>(
             &fs::read(receipt_file.path()).expect("read receipt"),
         )
@@ -8381,6 +8387,11 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("failed"),
             "cleanup failure should emit failed receipt"
+        );
+        assert_eq!(
+            marker.cleanup_receipt_digest.as_deref(),
+            Some(expected_receipt_digest.as_str()),
+            "corrupt marker must bind to the emitted failed cleanup receipt digest"
         );
     }
 
