@@ -138,6 +138,11 @@ pub enum FacSubcommand {
     /// Validates fmt, clippy, doc, test safety, tests (bounded), workspace
     /// integrity, and review artifact lint. Results are cached per-SHA so
     /// `apm2 fac pipeline` can skip gates that already passed.
+    ///
+    /// Throughput model: FAC executes full gates in single-flight mode so one
+    /// caller gets maximal host compute (CPU/memory/IO) until completion.
+    /// Concurrent callers coalesce/queue rather than splitting compute across
+    /// multiple heavyweight test runs.
     Gates(GatesArgs),
 
     /// Internal: CI preflight checks for credential posture and workflow trust.
@@ -425,6 +430,9 @@ pub struct GatesArgs {
     pub json: bool,
 
     /// Wait for queued gates job completion (default).
+    ///
+    /// While waiting, `apm2 fac gates` reports queue state so operators can
+    /// see whether the job is pending or already claimed by a worker.
     #[arg(long, default_value_t = true)]
     pub wait: bool,
 

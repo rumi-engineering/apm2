@@ -4516,7 +4516,10 @@ fn run_verdict_set_inner(
     keep_prepared_inputs: bool,
     json_output: bool,
 ) -> Result<u8, String> {
-    let projected = verdict_projection::persist_verdict_projection(
+    // Phase 1 (local-only): persist deterministic verdict intent without
+    // external side effects. Lifecycle finalization must succeed before
+    // GitHub projection is attempted.
+    let projected = verdict_projection::persist_verdict_projection_local_only(
         repo,
         pr_number,
         sha,
@@ -4525,7 +4528,6 @@ fn run_verdict_set_inner(
         reason,
         model_id,
         backend_id,
-        json_output,
     )?;
     if !keep_prepared_inputs {
         if let Err(err) = super::prepare::cleanup_prepared_review_inputs(
@@ -4539,6 +4541,7 @@ fn run_verdict_set_inner(
 
     let termination_state =
         state::load_review_run_state_strict(projected.pr_number, &projected.review_state_type)?;
+    validate_verdict_set_scope(&projected, dimension, termination_state.as_ref())?;
     let termination_state_non_terminal_alive = termination_state
         .as_ref()
         .is_some_and(|state| state.status == super::types::ReviewRunStatus::Alive);
@@ -4565,6 +4568,24 @@ fn run_verdict_set_inner(
         .is_some_and(|reviewer_pid| is_descendant_of_pid(caller_pid, reviewer_pid));
     let finalize_verdict = || -> Result<u8, String> {
         finalize_projected_verdict(&projected, dimension, &run_id, None)?;
+        // Phase 2 (full projection): project to GitHub only after lifecycle
+        // authority accepted the verdict transition.
+        let projected_full = verdict_projection::persist_verdict_projection(
+            &projected.owner_repo,
+            Some(projected.pr_number),
+            Some(&projected.head_sha),
+            dimension,
+            verdict.as_str(),
+            reason,
+            model_id,
+            backend_id,
+            json_output,
+        )
+        .map_err(|err| {
+            format!("verdict lifecycle finalized but external projection failed: {err}")
+        })?;
+        validate_post_finalize_projection(&projected, &projected_full)?;
+        rewrite_verdict_completion_receipt(&home, &projected_full, &run_id)?;
         Ok(exit_codes::SUCCESS)
     };
 
@@ -4611,6 +4632,132 @@ fn run_verdict_set_inner(
             projected.pr_number, dimension
         )),
     }
+}
+
+fn validate_verdict_set_scope(
+    projected: &verdict_projection::PersistedVerdictProjection,
+    requested_dimension: &str,
+    termination_state: Option<&super::types::ReviewRunState>,
+) -> Result<(), String> {
+    let normalized_dimension = normalize_verdict_dimension(requested_dimension)?;
+    let expected_review_state_type = match normalized_dimension {
+        "code-quality" => "quality",
+        other => other,
+    };
+    if !projected
+        .review_state_type
+        .eq_ignore_ascii_case(expected_review_state_type)
+    {
+        return Err(format!(
+            "verdict scope mismatch: requested dimension `{requested_dimension}` resolved to `{normalized_dimension}` (review_state_type `{expected_review_state_type}`) but projection targeted `{}`",
+            projected.review_state_type
+        ));
+    }
+
+    if let Some(state) = termination_state {
+        if state.pr_number != projected.pr_number {
+            return Err(format!(
+                "verdict scope mismatch: run state PR #{} does not match projection PR #{}",
+                state.pr_number, projected.pr_number
+            ));
+        }
+        if !state.owner_repo.eq_ignore_ascii_case(&projected.owner_repo) {
+            return Err(format!(
+                "verdict scope mismatch: run state repo {} does not match projection repo {}",
+                state.owner_repo, projected.owner_repo
+            ));
+        }
+        if !state
+            .review_type
+            .eq_ignore_ascii_case(&projected.review_state_type)
+        {
+            return Err(format!(
+                "verdict scope mismatch: run state type {} does not match projection type {}",
+                state.review_type, projected.review_state_type
+            ));
+        }
+        if !state.head_sha.eq_ignore_ascii_case(&projected.head_sha) {
+            return Err(format!(
+                "verdict scope mismatch: run state sha {} does not match projection sha {}",
+                state.head_sha, projected.head_sha
+            ));
+        }
+        if state.status == super::types::ReviewRunStatus::Alive && state.run_id.trim().is_empty() {
+            return Err(format!(
+                "verdict scope mismatch: active run state for PR #{} type {} has empty run_id",
+                projected.pr_number, projected.review_state_type
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_post_finalize_projection(
+    projected_local: &verdict_projection::PersistedVerdictProjection,
+    projected_full: &verdict_projection::PersistedVerdictProjection,
+) -> Result<(), String> {
+    if !projected_local
+        .owner_repo
+        .eq_ignore_ascii_case(&projected_full.owner_repo)
+    {
+        return Err(format!(
+            "post-finalize projection repo mismatch: local={} full={}",
+            projected_local.owner_repo, projected_full.owner_repo
+        ));
+    }
+    if projected_local.pr_number != projected_full.pr_number {
+        return Err(format!(
+            "post-finalize projection PR mismatch: local={} full={}",
+            projected_local.pr_number, projected_full.pr_number
+        ));
+    }
+    if !projected_local
+        .head_sha
+        .eq_ignore_ascii_case(&projected_full.head_sha)
+    {
+        return Err(format!(
+            "post-finalize projection sha mismatch: local={} full={}",
+            projected_local.head_sha, projected_full.head_sha
+        ));
+    }
+    if !projected_local
+        .review_state_type
+        .eq_ignore_ascii_case(&projected_full.review_state_type)
+    {
+        return Err(format!(
+            "post-finalize projection review_type mismatch: local={} full={}",
+            projected_local.review_state_type, projected_full.review_state_type
+        ));
+    }
+    if !projected_local
+        .decision
+        .eq_ignore_ascii_case(&projected_full.decision)
+    {
+        return Err(format!(
+            "post-finalize projection decision mismatch: local={} full={}",
+            projected_local.decision, projected_full.decision
+        ));
+    }
+    Ok(())
+}
+
+fn rewrite_verdict_completion_receipt(
+    home: &Path,
+    projected: &verdict_projection::PersistedVerdictProjection,
+    run_id: &str,
+) -> Result<(), String> {
+    let authority = TerminationAuthority::new(
+        &projected.owner_repo,
+        projected.pr_number,
+        &projected.review_state_type,
+        &projected.head_sha,
+        run_id,
+        projected.decision_comment_id,
+        &projected.decision_author,
+        &now_iso8601(),
+        &projected.decision_signature,
+    );
+    dispatch::write_completion_receipt_for_verdict(home, &authority, &projected.decision)
 }
 
 pub fn run_verdict_show(
@@ -6273,5 +6420,45 @@ mod tests {
         assert_eq!(receipt.head_sha, sha);
         assert_eq!(receipt.run_id, run_id);
         assert_eq!(receipt.decision, "deny");
+    }
+
+    #[test]
+    fn validate_verdict_set_scope_accepts_quality_aliases() {
+        let projected = super::verdict_projection::PersistedVerdictProjection {
+            owner_repo: "example/repo".to_string(),
+            pr_number: 77,
+            head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            review_state_type: "quality".to_string(),
+            decision: "approve".to_string(),
+            decision_comment_id: 1,
+            decision_author: "fac-bot".to_string(),
+            decision_signature: "sig".to_string(),
+        };
+        let run_state = ReviewRunState {
+            run_id: "run-quality-1".to_string(),
+            owner_repo: "example/repo".to_string(),
+            pr_number: 77,
+            head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            review_type: "quality".to_string(),
+            reviewer_role: "reviewer".to_string(),
+            started_at: "2026-02-18T00:00:00Z".to_string(),
+            status: ReviewRunStatus::Alive,
+            terminal_reason: None,
+            model_id: None,
+            backend_id: None,
+            restart_count: 0,
+            nudge_count: 0,
+            sequence_number: 1,
+            previous_run_id: None,
+            previous_head_sha: None,
+            pid: Some(42),
+            proc_start_time: Some(1),
+            integrity_hmac: None,
+        };
+
+        super::validate_verdict_set_scope(&projected, "quality", Some(&run_state))
+            .expect("quality alias should map to quality review state");
+        super::validate_verdict_set_scope(&projected, "code-quality", Some(&run_state))
+            .expect("code-quality alias should map to quality review state");
     }
 }

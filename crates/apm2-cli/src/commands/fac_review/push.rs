@@ -400,6 +400,39 @@ where
     Ok(gate_outcome)
 }
 
+fn apply_gate_failure_lifecycle_events_with<F>(
+    repo: &str,
+    pr_number: u32,
+    sha: &str,
+    mut apply_event_fn: F,
+) -> Result<(), String>
+where
+    F: FnMut(lifecycle::LifecycleEventKind) -> Result<(), String>,
+{
+    for (event_name, event) in [
+        ("push_observed", lifecycle::LifecycleEventKind::PushObserved),
+        ("gates_started", lifecycle::LifecycleEventKind::GatesStarted),
+        ("gates_failed", lifecycle::LifecycleEventKind::GatesFailed),
+    ] {
+        apply_event_fn(event).map_err(|err| {
+            format!(
+                "failed to record {event_name} lifecycle event for PR #{pr_number} SHA {sha} repo {repo}: {err}"
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn apply_gate_failure_lifecycle_events(
+    repo: &str,
+    pr_number: u32,
+    sha: &str,
+) -> Result<(), String> {
+    apply_gate_failure_lifecycle_events_with(repo, pr_number, sha, |event| {
+        lifecycle::apply_event(repo, pr_number, sha, &event).map(|_| ())
+    })
+}
+
 #[cfg(test)]
 fn run_blocking_evidence_gates_with<F>(
     sha: &str,
@@ -1671,35 +1704,12 @@ pub fn run_push(
                         }
                     }
                     if existing_pr_number > 0 {
-                        if let Err(state_err) = lifecycle::apply_event(
-                            repo,
-                            existing_pr_number,
-                            &sha,
-                            &lifecycle::LifecycleEventKind::PushObserved,
-                        ) {
-                            human_log!(
-                                "WARNING: failed to record push_observed lifecycle event for PR #{existing_pr_number}: {state_err}",
-                            );
-                        }
-                        if let Err(state_err) = lifecycle::apply_event(
-                            repo,
-                            existing_pr_number,
-                            &sha,
-                            &lifecycle::LifecycleEventKind::GatesStarted,
-                        ) {
-                            human_log!(
-                                "WARNING: failed to record gates_started lifecycle event for PR #{existing_pr_number}: {state_err}",
-                            );
-                        }
-                        if let Err(state_err) = lifecycle::apply_event(
-                            repo,
-                            existing_pr_number,
-                            &sha,
-                            &lifecycle::LifecycleEventKind::GatesFailed,
-                        ) {
-                            human_log!(
-                                "WARNING: failed to record gates_failed lifecycle event for PR #{existing_pr_number}: {state_err}",
-                            );
+                        if let Err(state_err) =
+                            apply_gate_failure_lifecycle_events(repo, existing_pr_number, &sha)
+                        {
+                            return Err(format!(
+                                "{err}; additionally failed to persist gate-failure lifecycle sequence: {state_err}"
+                            ));
                         }
                     }
                     return Err(err);
@@ -2212,6 +2222,47 @@ mod tests {
         assert_eq!(record.ruleset_sync.status, PUSH_STAGE_PASS);
         let failed = record.first_failed_stage().expect("failed stage");
         assert_eq!(failed.stage, "git_push");
+    }
+
+    #[test]
+    fn gate_failure_lifecycle_events_apply_canonical_sequence() {
+        let mut seen = Vec::new();
+        apply_gate_failure_lifecycle_events_with(
+            "guardian-intelligence/apm2",
+            42,
+            "0123456789abcdef0123456789abcdef01234567",
+            |event| {
+                let label = match event {
+                    lifecycle::LifecycleEventKind::PushObserved => "push_observed",
+                    lifecycle::LifecycleEventKind::GatesStarted => "gates_started",
+                    lifecycle::LifecycleEventKind::GatesFailed => "gates_failed",
+                    _ => "unexpected",
+                };
+                seen.push(label.to_string());
+                Ok(())
+            },
+        )
+        .expect("sequence should apply cleanly");
+
+        assert_eq!(seen, vec!["push_observed", "gates_started", "gates_failed"]);
+    }
+
+    #[test]
+    fn gate_failure_lifecycle_events_fail_closed_on_transition_error() {
+        let err = apply_gate_failure_lifecycle_events_with(
+            "guardian-intelligence/apm2",
+            99,
+            "fedcba9876543210fedcba9876543210fedcba98",
+            |event| match event {
+                lifecycle::LifecycleEventKind::GatesStarted => {
+                    Err("illegal transition: gates_failed + gates_started".to_string())
+                },
+                _ => Ok(()),
+            },
+        )
+        .expect_err("transition failure must surface as hard error");
+        assert!(err.contains("gates_started"));
+        assert!(err.contains("illegal transition"));
     }
 
     #[test]
