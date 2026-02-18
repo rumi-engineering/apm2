@@ -98,6 +98,8 @@ pub mod broker_rate_limits;
 pub mod builtin_profiles;
 pub mod builtin_roles;
 mod canonicalizer_tuple;
+/// Read-only bounded reader for APM2 daemon CAS filesystem layout (TCK-00546).
+pub mod cas_reader;
 mod changeset_bundle;
 mod ci_attestation;
 mod ci_import;
@@ -345,7 +347,9 @@ pub use gate_cache_v3::{
     MAX_V3_STRING_FIELD_LENGTH, V3CacheEntry, V3CompoundKey, V3GateResult, V3ReuseDecision,
     is_valid_v3_index_key, sanitize_gate_name,
 };
-pub use gc::{GcPlan, GcPlanError, GcTarget, execute_gc, plan_gc, plan_quarantine_prune};
+pub use gc::{
+    GcPlan, GcPlanError, GcTarget, execute_gc, plan_gc, plan_quarantine_prune, record_cas_ref,
+};
 pub use gc_receipt::{
     DEFAULT_MIN_FREE_BYTES, GC_RECEIPT_SCHEMA, GcAction, GcActionKind, GcError, GcReceiptV1,
     MAX_GC_ACTIONS, MAX_GC_RECEIPT_SIZE, persist_gc_receipt,

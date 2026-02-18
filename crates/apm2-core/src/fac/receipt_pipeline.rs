@@ -1037,6 +1037,7 @@ mod tests {
             observed_cost: None,
             sandbox_hardening_hash: None,
             network_policy_hash: None,
+            bytes_backend: None,
             htf_time_envelope_ns: None,
             node_fingerprint: None,
             timestamp_secs: 1000,

@@ -221,6 +221,7 @@ const fn gc_target_kind_to_str(kind: GcActionKind) -> &'static str {
         GcActionKind::QuarantinePrune => "quarantine_prune",
         GcActionKind::DeniedPrune => "denied_prune",
         GcActionKind::CargoCache => "cargo_cache",
+        GcActionKind::CasBlobPrune => "cas_blob_prune",
     }
 }
 

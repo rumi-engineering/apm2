@@ -765,6 +765,14 @@ pub struct FacJobReceiptV1 {
     /// expected network isolation posture was applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_policy_hash: Option<String>,
+    /// Patch bytes backend identifier (TCK-00546).
+    ///
+    /// Records which storage backend was used to resolve patch bytes for
+    /// this job (e.g., `"apm2_cas"`, `"fac_blobs_v1"`). `None` when patch
+    /// bytes were delivered inline or the job is not a patch injection.
+    /// Used by GC to route blob references to the correct pruning logic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_backend: Option<String>,
     /// HTF time envelope stamp in nanoseconds (RFC-0016, TCK-00543).
     ///
     /// When present, this is the primary sort key for deterministic
@@ -949,6 +957,15 @@ impl FacJobReceiptV1 {
             let canonical = trace.canonical_bytes().unwrap_or_default();
             bytes.extend_from_slice(&(canonical.len() as u32).to_be_bytes());
             bytes.extend_from_slice(&canonical);
+        }
+
+        // TCK-00546: Patch bytes backend identifier. Added as an append-only
+        // trailing optional for V1; uses type-specific marker `9u8` for
+        // injective encoding.
+        if let Some(backend) = &self.bytes_backend {
+            bytes.push(9u8);
+            bytes.extend_from_slice(&(backend.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(backend.as_bytes());
         }
 
         bytes
@@ -1172,6 +1189,15 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&canonical);
         }
 
+        // TCK-00546: Patch bytes backend identifier. Uses type-specific
+        // marker `9u8` for injective encoding. Absence is omitted for
+        // backwards compatibility with existing V2 receipts.
+        if let Some(backend) = &self.bytes_backend {
+            bytes.push(9u8);
+            bytes.extend_from_slice(&(backend.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(backend.as_bytes());
+        }
+
         bytes
     }
 
@@ -1290,6 +1316,16 @@ impl FacJobReceiptV1 {
                 return Err(FacJobReceiptError::StringTooLong {
                     field: "node_fingerprint",
                     actual: fp.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+        }
+        // TCK-00546: Validate bytes_backend length bound.
+        if let Some(backend) = &self.bytes_backend {
+            if backend.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "bytes_backend",
+                    actual: backend.len(),
                     max: MAX_STRING_LENGTH,
                 });
             }
@@ -1447,6 +1483,7 @@ pub struct FacJobReceiptV1Builder {
     observed_cost: Option<crate::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<String>,
     network_policy_hash: Option<String>,
+    bytes_backend: Option<String>,
     htf_time_envelope_ns: Option<u64>,
     node_fingerprint: Option<String>,
     timestamp_secs: Option<u64>,
@@ -1583,6 +1620,13 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn network_policy_hash(mut self, hash: impl Into<String>) -> Self {
         self.network_policy_hash = Some(hash.into());
+        self
+    }
+
+    /// Sets the patch bytes backend identifier (TCK-00546).
+    #[must_use]
+    pub fn bytes_backend(mut self, backend: impl Into<String>) -> Self {
+        self.bytes_backend = Some(backend.into());
         self
     }
 
@@ -1841,6 +1885,7 @@ impl FacJobReceiptV1Builder {
             observed_cost: self.observed_cost,
             sandbox_hardening_hash: self.sandbox_hardening_hash,
             network_policy_hash: self.network_policy_hash,
+            bytes_backend: self.bytes_backend,
             htf_time_envelope_ns: self.htf_time_envelope_ns,
             node_fingerprint: self.node_fingerprint,
             moved_job_path,

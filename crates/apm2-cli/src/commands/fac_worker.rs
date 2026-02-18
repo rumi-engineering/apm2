@@ -1798,6 +1798,7 @@ fn execute_queued_gates_job(
                 Some(sbx_hash),
                 Some(net_hash),
                 None, // stop_revoke_admission
+                None, // bytes_backend
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -1839,6 +1840,7 @@ fn execute_queued_gates_job(
                 Some(sbx_hash),
                 Some(net_hash),
                 None, // stop_revoke_admission
+                None, // bytes_backend
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -1877,6 +1879,7 @@ fn execute_queued_gates_job(
             Some(sbx_hash),
             Some(net_hash),
             None, // stop_revoke_admission
+            None, // bytes_backend
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -1922,6 +1925,7 @@ fn execute_queued_gates_job(
                 Some(sbx_hash),
                 Some(net_hash),
                 None, // stop_revoke_admission
+                None, // bytes_backend
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -1961,6 +1965,7 @@ fn execute_queued_gates_job(
                 Some(sbx_hash),
                 Some(net_hash),
                 None, // stop_revoke_admission
+                None, // bytes_backend
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -1995,6 +2000,7 @@ fn execute_queued_gates_job(
             Some(sbx_hash),
             Some(net_hash),
             None, // stop_revoke_admission
+            None, // bytes_backend
         ) {
             eprintln!("worker: pipeline commit failed for gates job: {commit_err}");
             if let Err(move_err) = move_to_dir_safe(
@@ -2079,6 +2085,7 @@ fn execute_queued_gates_job(
         Some(sbx_hash),
         Some(net_hash),
         None, // stop_revoke_admission
+        None, // bytes_backend
     ) {
         return handle_pipeline_commit_failure(
             &commit_err,
@@ -2253,6 +2260,7 @@ fn process_job(
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
                 None, // stop_revoke_admission
+                None, // bytes_backend
             ) {
                 eprintln!(
                     "worker: WARNING: pipeline commit failed for quarantined job: {commit_err}"
@@ -2300,6 +2308,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
+            None, // bytes_backend
         ) {
             eprintln!("worker: WARNING: pipeline commit failed for denied job: {commit_err}");
             // Job stays in pending/ for reconciliation.
@@ -2581,6 +2590,7 @@ fn process_job(
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
                 None, // stop_revoke_admission
+                None, // bytes_backend
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -2683,6 +2693,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
+            None, // bytes_backend
         ) {
             eprintln!(
                 "worker: WARNING: pipeline commit failed for policy-admission-denied job: {commit_err}"
@@ -2790,6 +2801,7 @@ fn process_job(
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
                 None, // stop_revoke_admission
+                None, // bytes_backend
             ) {
                 eprintln!(
                     "worker: WARNING: pipeline commit failed for \
@@ -3494,6 +3506,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
+            None, // bytes_backend
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3599,6 +3612,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
+            None, // bytes_backend
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3640,6 +3654,7 @@ fn process_job(
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
                 None, // stop_revoke_admission
+                None, // bytes_backend
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -3719,6 +3734,7 @@ fn process_job(
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
                 None, // stop_revoke_admission
+                None, // bytes_backend
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -3754,6 +3770,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
+            None, // bytes_backend
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3808,6 +3825,8 @@ fn process_job(
     }
 
     let mut patch_digest: Option<String> = None;
+    // TCK-00546: Track which bytes_backend was used for receipt binding.
+    let mut resolved_bytes_backend: Option<String> = None;
     // process_job executes one job at a time in a single worker lane, so
     // blocking mirror I/O is intentionally accepted in this default-mode
     // execution path. The entire job execution remains sequential behind the
@@ -3840,6 +3859,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
+            None, // bytes_backend
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3894,6 +3914,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
+            None, // bytes_backend
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3953,6 +3974,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
+            None, // bytes_backend
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -3968,39 +3990,124 @@ fn process_job(
     };
 
     if spec.source.kind == "patch_injection" {
-        let inline_patch_error =
-            "patch_injection requires inline patch bytes (CAS backend not yet implemented)";
+        let patch_missing_error = "patch_injection requires a patch descriptor object";
 
         let Some(patch_value) = &spec.source.patch else {
-            return deny_with_reason_and_lease_cleanup(inline_patch_error);
+            return deny_with_reason_and_lease_cleanup(patch_missing_error);
         };
         let Some(patch_obj) = patch_value.as_object() else {
-            return deny_with_reason_and_lease_cleanup(inline_patch_error);
+            return deny_with_reason_and_lease_cleanup(patch_missing_error);
         };
-        let Some(bytes_b64) = patch_obj.get("bytes").and_then(|value| value.as_str()) else {
-            return deny_with_reason_and_lease_cleanup(inline_patch_error);
-        };
-        let patch_bytes = match STANDARD.decode(bytes_b64) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                return deny_with_reason_and_lease_cleanup(&format!(
-                    "invalid base64 in patch.bytes: {err}"
-                ));
+
+        // TCK-00546: Branch on `bytes_backend` to resolve patch bytes.
+        let bytes_backend = patch_obj.get("bytes_backend").and_then(|v| v.as_str());
+
+        let patch_bytes: Vec<u8> = match bytes_backend {
+            // ---- apm2_cas backend: retrieve from daemon CAS ----
+            Some("apm2_cas") => {
+                let Some(digest_str) = patch_obj.get("digest").and_then(|v| v.as_str()) else {
+                    return deny_with_reason_and_lease_cleanup(
+                        "apm2_cas backend requires a 'digest' field in patch descriptor",
+                    );
+                };
+                let Some(hash_bytes) = apm2_core::fac::job_spec::parse_b3_256_digest(digest_str)
+                else {
+                    return deny_with_reason_and_lease_cleanup(&format!(
+                        "invalid digest format for apm2_cas backend: {digest_str}"
+                    ));
+                };
+                // Resolve CAS root: $APM2_HOME/private/cas (sibling of fac_root).
+                let cas_root = fac_root.parent().map(|private| private.join("cas"));
+                let Some(cas_root) = cas_root else {
+                    return deny_with_reason_and_lease_cleanup(
+                        "cannot resolve CAS root from FAC root (fail-closed)",
+                    );
+                };
+                let reader = match apm2_core::fac::cas_reader::CasReader::new(&cas_root) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return deny_with_reason_and_lease_cleanup(&format!(
+                            "apm2_cas backend unavailable: {e} (fail-closed)"
+                        ));
+                    },
+                };
+                match reader.retrieve(&hash_bytes) {
+                    Ok(bytes) => {
+                        // Record the CAS reference for GC tracking.
+                        if let Err(e) = apm2_core::fac::record_cas_ref(fac_root, &hash_bytes) {
+                            eprintln!("worker: WARNING: failed to record CAS ref for GC: {e}");
+                        }
+                        bytes
+                    },
+                    Err(e) => {
+                        return deny_with_reason_and_lease_cleanup(&format!(
+                            "failed to retrieve patch from CAS: {e} (fail-closed)"
+                        ));
+                    },
+                }
+            },
+
+            // ---- fac_blobs_v1 backend: retrieve from blob store ----
+            Some("fac_blobs_v1") => {
+                let Some(digest_str) = patch_obj.get("digest").and_then(|v| v.as_str()) else {
+                    return deny_with_reason_and_lease_cleanup(
+                        "fac_blobs_v1 backend requires a 'digest' field in patch descriptor",
+                    );
+                };
+                let Some(hash_bytes) = apm2_core::fac::job_spec::parse_b3_256_digest(digest_str)
+                else {
+                    return deny_with_reason_and_lease_cleanup(&format!(
+                        "invalid digest format for fac_blobs_v1 backend: {digest_str}"
+                    ));
+                };
+                let blob_store = BlobStore::new(fac_root);
+                match blob_store.retrieve(&hash_bytes) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        return deny_with_reason_and_lease_cleanup(&format!(
+                            "failed to retrieve patch from blob store: {e}"
+                        ));
+                    },
+                }
+            },
+
+            // ---- Inline bytes (no backend or unknown with bytes) ----
+            _ => {
+                let Some(bytes_b64) = patch_obj.get("bytes").and_then(|value| value.as_str())
+                else {
+                    // Fail-closed: unknown backend without inline bytes.
+                    let backend_desc = bytes_backend.unwrap_or("(none)");
+                    return deny_with_reason_and_lease_cleanup(&format!(
+                        "patch_injection: no inline bytes and unknown/missing bytes_backend={backend_desc} (fail-closed)"
+                    ));
+                };
+                let decoded = match STANDARD.decode(bytes_b64) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        return deny_with_reason_and_lease_cleanup(&format!(
+                            "invalid base64 in patch.bytes: {err}"
+                        ));
+                    },
+                };
+                // Verify digest if provided.
+                if let Some(expected_digest) = patch_obj.get("digest").and_then(|v| v.as_str()) {
+                    let actual_digest = format!("b3-256:{}", blake3::hash(&decoded).to_hex());
+                    let expected_bytes = expected_digest.as_bytes();
+                    let actual_bytes = actual_digest.as_bytes();
+                    if expected_bytes.len() != actual_bytes.len()
+                        || !bool::from(expected_bytes.ct_eq(actual_bytes))
+                    {
+                        return deny_with_reason_and_lease_cleanup(&format!(
+                            "patch digest mismatch: expected {expected_digest}, got {actual_digest}"
+                        ));
+                    }
+                }
+                decoded
             },
         };
-        if let Some(expected_digest) = patch_obj.get("digest").and_then(|v| v.as_str()) {
-            let actual_digest = format!("b3-256:{}", blake3::hash(&patch_bytes).to_hex());
-            let expected_bytes = expected_digest.as_bytes();
-            let actual_bytes = actual_digest.as_bytes();
-            if expected_bytes.len() != actual_bytes.len()
-                || !bool::from(expected_bytes.ct_eq(actual_bytes))
-            {
-                return deny_with_reason_and_lease_cleanup(&format!(
-                    "patch digest mismatch: expected {expected_digest}, got {actual_digest}"
-                ));
-            }
-        }
 
+        // Store patch bytes in blob store for local caching regardless of
+        // backend source.
         let blob_store = BlobStore::new(fac_root);
         if let Err(error) = blob_store.store(&patch_bytes) {
             return deny_with_reason_and_lease_cleanup(&format!(
@@ -4075,6 +4182,7 @@ fn process_job(
                     Some(&sbx_hash),
                     Some(&resolved_net_hash),
                     None, // stop_revoke_admission
+                    None, // bytes_backend
                 ) {
                     return handle_pipeline_commit_failure(
                         &commit_err,
@@ -4093,6 +4201,8 @@ fn process_job(
             },
         };
         patch_digest = Some(patch_outcome.patch_digest);
+        // TCK-00546: Record which backend was used for the receipt.
+        resolved_bytes_backend = bytes_backend.map(String::from);
     } else if spec.source.kind != "mirror_commit" {
         let reason = format!("unsupported source kind: {}", spec.source.kind);
         // SEC-CTRL-LANE-CLEANUP-002: This denial path is post-checkout, so the
@@ -4128,6 +4238,7 @@ fn process_job(
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None, // stop_revoke_admission
+            None, // bytes_backend
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -4270,7 +4381,8 @@ fn process_job(
         Some(observed_cost),
         Some(&sbx_hash),
         Some(&resolved_net_hash),
-        None, // stop_revoke_admission
+        None,                              // stop_revoke_admission
+        resolved_bytes_backend.as_deref(), // TCK-00546: bytes_backend for GC tracking
     ) {
         eprintln!("worker: pipeline commit failed, cannot complete job: {commit_err}");
         let _ = LaneLeaseV1::remove(&lane_dir);
@@ -4904,6 +5016,7 @@ fn handle_stop_revoke(
                 Some(sbx_hash),
                 Some(net_hash),
                 sr_trace, // stop_revoke_admission
+                None,     // bytes_backend
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -4961,6 +5074,7 @@ fn handle_stop_revoke(
                 Some(sbx_hash),
                 Some(net_hash),
                 sr_trace, // stop_revoke_admission
+                None,     // bytes_backend
             ) {
                 eprintln!(
                     "worker: pipeline commit failed for stop_revoke (target already terminal): {commit_err}"
@@ -5001,6 +5115,7 @@ fn handle_stop_revoke(
             Some(sbx_hash),
             Some(net_hash),
             sr_trace, // stop_revoke_admission
+            None,     // bytes_backend
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -5057,6 +5172,7 @@ fn handle_stop_revoke(
             Some(sbx_hash),
             Some(net_hash),
             sr_trace, // stop_revoke_admission
+            None,     // bytes_backend
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -5138,6 +5254,7 @@ fn handle_stop_revoke(
                     Some(sbx_hash),
                     Some(net_hash),
                     sr_trace, // stop_revoke_admission
+                    None,     // bytes_backend
                 ) {
                     return handle_pipeline_commit_failure(
                         &commit_err,
@@ -5181,6 +5298,7 @@ fn handle_stop_revoke(
                 Some(sbx_hash),
                 Some(net_hash),
                 sr_trace, // stop_revoke_admission
+                None,     // bytes_backend
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -5237,6 +5355,7 @@ fn handle_stop_revoke(
             Some(sbx_hash),
             Some(net_hash),
             sr_trace, // stop_revoke_admission
+            None,     // bytes_backend
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -5274,6 +5393,7 @@ fn handle_stop_revoke(
         Some(sbx_hash),
         Some(net_hash),
         sr_trace, // stop_revoke_admission
+        None,     // bytes_backend
     ) {
         // Fail-closed: pipeline commit failed — stop_revoke job stays in claimed/.
         let reason = format!(
@@ -5371,6 +5491,7 @@ fn execute_warm_job(
                             Some(sbx_hash),
                             Some(net_hash),
                             None, // stop_revoke_admission
+                            None, // bytes_backend
                         ) {
                             return handle_pipeline_commit_failure(
                                 &commit_err,
@@ -5417,6 +5538,7 @@ fn execute_warm_job(
             Some(sbx_hash),
             Some(net_hash),
             None, // stop_revoke_admission
+            None, // bytes_backend
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -5453,6 +5575,7 @@ fn execute_warm_job(
             Some(sbx_hash),
             Some(net_hash),
             None, // stop_revoke_admission
+            None, // bytes_backend
         ) {
             return handle_pipeline_commit_failure(
                 &commit_err,
@@ -5521,6 +5644,7 @@ fn execute_warm_job(
                 Some(sbx_hash),
                 Some(net_hash),
                 None, // stop_revoke_admission
+                None, // bytes_backend
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -5585,6 +5709,7 @@ fn execute_warm_job(
                             Some(sbx_hash),
                             Some(net_hash),
                             None, // stop_revoke_admission
+                            None, // bytes_backend
                         ) {
                             return handle_pipeline_commit_failure(
                                 &commit_err,
@@ -5647,6 +5772,7 @@ fn execute_warm_job(
                     Some(sbx_hash),
                     Some(net_hash),
                     None, // stop_revoke_admission
+                    None, // bytes_backend
                 ) {
                     return handle_pipeline_commit_failure(
                         &commit_err,
@@ -5749,6 +5875,7 @@ fn execute_warm_job(
                 Some(sbx_hash),
                 Some(net_hash),
                 None, // stop_revoke_admission
+                None, // bytes_backend
             ) {
                 return handle_pipeline_commit_failure(
                     &commit_err,
@@ -5834,6 +5961,7 @@ fn execute_warm_job(
         Some(sbx_hash),
         Some(net_hash),
         None, // stop_revoke_admission
+        None, // bytes_backend
     ) {
         eprintln!("worker: pipeline commit failed for warm job: {commit_err}");
         let _ = LaneLeaseV1::remove(lane_dir);
@@ -6538,6 +6666,8 @@ fn build_job_receipt(
     network_policy_hash: Option<&str>,
     // TCK-00587: Optional stop/revoke admission trace for receipt binding.
     stop_revoke_admission: Option<&apm2_core::economics::queue_admission::StopRevokeAdmissionTrace>,
+    // TCK-00546: Optional patch bytes backend identifier for GC tracking.
+    bytes_backend: Option<&str>,
 ) -> Result<FacJobReceiptV1, String> {
     let mut builder = FacJobReceiptV1Builder::new(
         format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs()),
@@ -6589,6 +6719,10 @@ fn build_job_receipt(
     if let Some(trace) = stop_revoke_admission {
         builder = builder.stop_revoke_admission(trace.clone());
     }
+    // TCK-00546: Bind bytes_backend to receipt for GC tracking.
+    if let Some(backend) = bytes_backend {
+        builder = builder.bytes_backend(backend);
+    }
 
     builder
         .try_build()
@@ -6631,6 +6765,7 @@ fn emit_job_receipt_internal(
         sandbox_hardening_hash,
         network_policy_hash,
         None, // stop_revoke_admission: not used in emit_job_receipt path
+        None, // bytes_backend: not used in emit_job_receipt path
     )?;
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
     let result = persist_content_addressed_receipt(&receipts_dir, &receipt)?;
@@ -6676,6 +6811,8 @@ fn commit_claimed_job_via_pipeline(
     network_policy_hash: Option<&str>,
     // TCK-00587: Optional stop/revoke admission trace for receipt binding.
     stop_revoke_admission: Option<&apm2_core::economics::queue_admission::StopRevokeAdmissionTrace>,
+    // TCK-00546: Optional patch bytes backend identifier for GC tracking.
+    bytes_backend: Option<&str>,
 ) -> Result<PathBuf, ReceiptPipelineError> {
     let terminal_state = outcome_to_terminal_state(outcome).ok_or_else(|| {
         ReceiptPipelineError::ReceiptPersistFailed(format!(
@@ -6700,6 +6837,7 @@ fn commit_claimed_job_via_pipeline(
         sandbox_hardening_hash,
         network_policy_hash,
         stop_revoke_admission,
+        bytes_backend,
     )
     .map_err(ReceiptPipelineError::ReceiptPersistFailed)?;
 

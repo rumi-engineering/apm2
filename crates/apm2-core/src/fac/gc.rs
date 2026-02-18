@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use crate::fac::GcReceiptV1;
 use crate::fac::blob_store::{BLOB_DIR, BlobStore};
+use crate::fac::cas_reader::CasReader;
 use crate::fac::flock_util::try_acquire_exclusive_nonblocking;
 use crate::fac::job_spec::parse_b3_256_digest;
 use crate::fac::lane::{LaneManager, LaneState, LaneStatusV1};
@@ -66,6 +67,7 @@ pub enum GcPlanError {
 /// # Errors
 ///
 /// Returns `GcPlanError::Io` when workspace inspection fails.
+#[allow(clippy::too_many_lines)] // TCK-00546: CAS blob pruning adds additional GC planning logic; extracting sub-functions would obscure the sequential plan construction flow.
 pub fn plan_gc(
     fac_root: &Path,
     lane_manager: &LaneManager,
@@ -135,20 +137,19 @@ pub fn plan_gc(
         &mut targets,
     );
 
-    let (live_blob_hashes, receipt_scan_truncated) =
-        collect_recent_receipt_blob_refs(&fac_root.join(FAC_RECEIPTS_DIR));
+    let receipt_refs = collect_recent_receipt_blob_refs(&fac_root.join(FAC_RECEIPTS_DIR));
     let blob_store = BlobStore::new(fac_root);
-    if receipt_scan_truncated {
+    if receipt_refs.truncated {
         // Fail closed: incomplete reference scan cannot prove non-reachability.
-        // Skip all blob pruning when receipt scan is truncated.
-        // Blobs will be collected in a future cycle with fewer receipts.
+        // Skip all blob and CAS pruning when receipt scan is truncated.
+        // Items will be collected in a future cycle with fewer receipts.
     } else {
         // Full scan completed — safe to prune unreferenced stale blobs.
         // Blob pruning is based on BLOB_RETENTION_SECS.
         match blob_store.list_all() {
             Ok(all_blobs) => {
                 for blob_hash in all_blobs {
-                    if live_blob_hashes.contains(&blob_hash) {
+                    if receipt_refs.blob_hashes.contains(&blob_hash) {
                         continue;
                     }
                     if !blob_store.exists(&blob_hash) {
@@ -170,6 +171,72 @@ pub fn plan_gc(
                     "failed to list blob store: {error}"
                 )));
             },
+        }
+
+        // TCK-00546: CAS blob pruning for `apm2_cas` backend digests.
+        //
+        // The explicit allowlist approach: only CAS objects whose digest
+        // appeared in a receipt with `bytes_backend=apm2_cas` are
+        // candidates for FAC GC.  This ensures GC never touches CAS
+        // data that belongs to other subsystems (evidence, projections).
+        //
+        // `receipt_refs.cas_hashes` contains the LIVE references from
+        // recent receipts.  CAS objects referenced here must NOT be
+        // pruned.  CAS objects that were once FAC-referenced but whose
+        // receipts have aged out are eligible for pruning.
+        //
+        // We infer the CAS root from `fac_root`'s parent (`$APM2_HOME/
+        // private`) and then check `$APM2_HOME/private/cas`.  If the
+        // CAS root cannot be determined or is absent, CAS pruning is
+        // skipped (fail-closed — no silent fallback).
+        if let Some(cas_root) = infer_cas_root(fac_root) {
+            if let Ok(reader) = CasReader::new(&cas_root) {
+                // Scan a FAC-specific CAS reference index if it exists.
+                // This index is populated by the worker when it retrieves
+                // CAS-backed patches, recording their digests for GC
+                // tracking.  Only objects listed here are candidates.
+                let cas_index_dir = fac_root.join("cas_refs");
+                if cas_index_dir.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(&cas_index_dir) {
+                        let mut count = 0usize;
+                        for entry in entries.flatten() {
+                            count += 1;
+                            if count > MAX_DIR_ENTRIES {
+                                break;
+                            }
+                            let name = entry.file_name();
+                            let Some(name_str) = name.to_str() else {
+                                continue;
+                            };
+                            let Some(hash) = parse_cas_ref_filename(name_str) else {
+                                continue;
+                            };
+                            // Skip if referenced by a recent receipt.
+                            if receipt_refs.cas_hashes.contains(&hash) {
+                                continue;
+                            }
+                            // Skip if the ref file itself is recent.
+                            let ref_path = entry.path();
+                            if !is_stale_by_mtime(&ref_path, BLOB_RETENTION_SECS, now_secs) {
+                                continue;
+                            }
+                            // The CAS object is a stale, unreferenced
+                            // FAC artifact — eligible for pruning.
+                            let cas_path = reader.hash_to_path(&hash);
+                            if reader.exists(&hash) {
+                                targets.push(GcTarget {
+                                    path: cas_path,
+                                    allowed_parent: cas_root.join("objects"),
+                                    kind: crate::fac::gc_receipt::GcActionKind::CasBlobPrune,
+                                    estimated_bytes: estimate_dir_size(&reader.hash_to_path(&hash)),
+                                });
+                            }
+                            // Clean up the stale ref file itself.
+                            let _ = std::fs::remove_file(&ref_path);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -685,36 +752,51 @@ fn is_recent_receipt(metadata: &std::fs::Metadata, now_secs: u64) -> bool {
     now_secs.saturating_sub(receipt_mtime) <= RECEIPT_REFERENCE_HORIZON_SECS
 }
 
-fn collect_recent_receipt_blob_refs(receipts_dir: &Path) -> (HashSet<[u8; 32]>, bool) {
-    let mut live_hashes = HashSet::new();
-    let mut truncated = false;
+/// Collected blob reference sets from receipt scanning.
+struct ReceiptBlobRefs {
+    /// Hashes referenced by `fac_blobs_v1` or unspecified backend receipts.
+    blob_hashes: HashSet<[u8; 32]>,
+    /// Hashes referenced by `apm2_cas` backend receipts (TCK-00546).
+    cas_hashes: HashSet<[u8; 32]>,
+    /// Whether the scan was truncated (fail-closed for pruning).
+    truncated: bool,
+}
+
+fn collect_recent_receipt_blob_refs(receipts_dir: &Path) -> ReceiptBlobRefs {
+    let mut refs = ReceiptBlobRefs {
+        blob_hashes: HashSet::new(),
+        cas_hashes: HashSet::new(),
+        truncated: false,
+    };
     let mut scanned_files = 0usize;
     let mut scanned_receipts = 0usize;
     let mut visited = 0usize;
     let now_secs = current_wall_clock_secs();
     if !receipts_dir.exists() {
-        return (live_hashes, truncated);
+        return refs;
     }
 
     let Ok(entries) = std::fs::read_dir(receipts_dir) else {
-        return (live_hashes, true);
+        refs.truncated = true;
+        return refs;
     };
 
     for entry_result in entries {
         let Ok(entry) = entry_result else {
-            truncated = true;
+            refs.truncated = true;
             continue;
         };
         visited += 1;
         if visited >= MAX_RECEIPT_SCAN_VISITED {
-            truncated = true;
+            refs.truncated = true;
             break;
         }
+        let total_hashes = refs.blob_hashes.len().saturating_add(refs.cas_hashes.len());
         if scanned_receipts >= MAX_RECEIPT_SCAN_ENTRIES
             || scanned_files >= MAX_RECEIPT_SCAN_FILES
-            || live_hashes.len() >= MAX_LIVE_BLOB_HASHES
+            || total_hashes >= MAX_LIVE_BLOB_HASHES
         {
-            truncated = true;
+            refs.truncated = true;
             break;
         }
         let path = entry.path();
@@ -727,10 +809,9 @@ fn collect_recent_receipt_blob_refs(receipts_dir: &Path) -> (HashSet<[u8; 32]>, 
         if metadata.is_dir() {
             collect_receipt_digests_recursive(
                 &path,
-                &mut live_hashes,
+                &mut refs,
                 &mut scanned_files,
                 &mut scanned_receipts,
-                &mut truncated,
                 &mut visited,
                 now_secs,
                 1,
@@ -743,76 +824,87 @@ fn collect_recent_receipt_blob_refs(receipts_dir: &Path) -> (HashSet<[u8; 32]>, 
             }
             scanned_receipts += 1;
             if scanned_receipts > MAX_RECEIPT_SCAN_ENTRIES {
-                truncated = true;
+                refs.truncated = true;
                 break;
             }
             scanned_files += 1;
             match patch_digest_from_receipt_file(&path) {
-                Ok(Some(hash)) => {
-                    live_hashes.insert(hash);
+                Ok(Some(info)) => {
+                    insert_digest_ref(&mut refs, &info);
                 },
                 Ok(None) => {},
                 Err(()) => {
-                    truncated = true;
+                    refs.truncated = true;
                 },
             }
-            if scanned_files >= MAX_RECEIPT_SCAN_FILES {
-                truncated = true;
-                break;
-            }
-            if live_hashes.len() >= MAX_LIVE_BLOB_HASHES {
-                truncated = true;
+            let total = refs.blob_hashes.len().saturating_add(refs.cas_hashes.len());
+            if scanned_files >= MAX_RECEIPT_SCAN_FILES || total >= MAX_LIVE_BLOB_HASHES {
+                refs.truncated = true;
                 break;
             }
         }
     }
-    (live_hashes, truncated)
+    refs
+}
+
+/// Route a digest into the appropriate reference set based on `bytes_backend`.
+fn insert_digest_ref(refs: &mut ReceiptBlobRefs, info: &PatchDigestInfo) {
+    match info.bytes_backend.as_deref() {
+        Some("apm2_cas") => {
+            refs.cas_hashes.insert(info.hash);
+        },
+        // fac_blobs_v1, unspecified (inline), or any other value -> blob set.
+        _ => {
+            refs.blob_hashes.insert(info.hash);
+        },
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn collect_receipt_digests_recursive(
     dir: &Path,
-    live_hashes: &mut HashSet<[u8; 32]>,
+    refs: &mut ReceiptBlobRefs,
     scanned_files: &mut usize,
     scanned_receipts: &mut usize,
-    truncated: &mut bool,
     visited: &mut usize,
     now_secs: u64,
     depth: usize,
 ) {
-    if *truncated
+    let total_hashes = refs.blob_hashes.len().saturating_add(refs.cas_hashes.len());
+    if refs.truncated
         || *scanned_receipts >= MAX_RECEIPT_SCAN_ENTRIES
         || *scanned_files >= MAX_RECEIPT_SCAN_FILES
-        || live_hashes.len() >= MAX_LIVE_BLOB_HASHES
+        || total_hashes >= MAX_LIVE_BLOB_HASHES
         || *visited >= MAX_RECEIPT_SCAN_VISITED
     {
-        *truncated = true;
+        refs.truncated = true;
         return;
     }
     if depth > 2 {
-        *truncated = true;
+        refs.truncated = true;
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        *truncated = true;
+        refs.truncated = true;
         return;
     };
     for entry_result in entries {
         let Ok(entry) = entry_result else {
-            *truncated = true;
+            refs.truncated = true;
             continue;
         };
         *visited += 1;
         if *visited >= MAX_RECEIPT_SCAN_VISITED {
-            *truncated = true;
+            refs.truncated = true;
             break;
         }
-        if *truncated
+        let total = refs.blob_hashes.len().saturating_add(refs.cas_hashes.len());
+        if refs.truncated
             || *scanned_receipts >= MAX_RECEIPT_SCAN_ENTRIES
             || *scanned_files >= MAX_RECEIPT_SCAN_FILES
-            || live_hashes.len() >= MAX_LIVE_BLOB_HASHES
+            || total >= MAX_LIVE_BLOB_HASHES
         {
-            *truncated = true;
+            refs.truncated = true;
             break;
         }
 
@@ -826,10 +918,9 @@ fn collect_receipt_digests_recursive(
         if metadata.is_dir() {
             collect_receipt_digests_recursive(
                 &path,
-                live_hashes,
+                refs,
                 scanned_files,
                 scanned_receipts,
-                truncated,
                 visited,
                 now_secs,
                 depth + 1,
@@ -844,32 +935,37 @@ fn collect_receipt_digests_recursive(
         }
         *scanned_receipts += 1;
         if *scanned_receipts > MAX_RECEIPT_SCAN_ENTRIES {
-            *truncated = true;
+            refs.truncated = true;
             break;
         }
         *scanned_files += 1;
         match patch_digest_from_receipt_file(&path) {
-            Ok(Some(hash)) => {
-                live_hashes.insert(hash);
-                if live_hashes.len() >= MAX_LIVE_BLOB_HASHES {
-                    *truncated = true;
-                    break;
-                }
-                if *scanned_files >= MAX_RECEIPT_SCAN_FILES {
-                    *truncated = true;
+            Ok(Some(info)) => {
+                insert_digest_ref(refs, &info);
+                let total = refs.blob_hashes.len().saturating_add(refs.cas_hashes.len());
+                if total >= MAX_LIVE_BLOB_HASHES || *scanned_files >= MAX_RECEIPT_SCAN_FILES {
+                    refs.truncated = true;
                     break;
                 }
             },
             Ok(None) => {},
             Err(()) => {
-                *truncated = true;
+                refs.truncated = true;
                 break;
             },
         }
     }
 }
 
-fn patch_digest_from_receipt_file(path: &Path) -> Result<Option<[u8; 32]>, ()> {
+/// Extracted patch digest information from a receipt file.
+struct PatchDigestInfo {
+    /// The parsed BLAKE3 hash bytes.
+    hash: [u8; 32],
+    /// The `bytes_backend` value if present (e.g., `"apm2_cas"`).
+    bytes_backend: Option<String>,
+}
+
+fn patch_digest_from_receipt_file(path: &Path) -> Result<Option<PatchDigestInfo>, ()> {
     use std::io::Read as _;
 
     if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
@@ -903,13 +999,90 @@ fn patch_digest_from_receipt_file(path: &Path) -> Result<Option<[u8; 32]>, ()> {
         return Err(()); // Read more than expected (race or special file)
     }
 
-    // Parse JSON and extract patch_digest
+    // Parse JSON and extract patch_digest + bytes_backend
     let value: Value = serde_json::from_slice(&buf).map_err(|_| ())?;
     let Some(patch_digest) = value.get("patch_digest").and_then(Value::as_str) else {
         return Ok(None);
     };
+    let bytes_backend = value
+        .get("bytes_backend")
+        .and_then(Value::as_str)
+        .map(String::from);
     // Malformed digest — fail closed (Err), absent key — Ok(None).
-    parse_b3_256_digest(patch_digest).map_or(Err(()), |hash| Ok(Some(hash)))
+    parse_b3_256_digest(patch_digest).map_or(Err(()), |hash| {
+        Ok(Some(PatchDigestInfo {
+            hash,
+            bytes_backend,
+        }))
+    })
+}
+
+/// Infer the CAS root from the FAC root.
+///
+/// Layout: `$APM2_HOME/private/fac` -> CAS at `$APM2_HOME/private/cas`.
+fn infer_cas_root(fac_root: &Path) -> Option<PathBuf> {
+    // fac_root = $APM2_HOME/private/fac
+    // CAS root = $APM2_HOME/private/cas (sibling directory)
+    let private_dir = fac_root.parent()?;
+    let cas_root = private_dir.join("cas");
+    if cas_root.is_dir() {
+        Some(cas_root)
+    } else {
+        None
+    }
+}
+
+/// Parse a CAS reference filename into a hash.
+///
+/// Ref files are named `{64-hex-chars}.ref` under `fac_root/cas_refs/`.
+fn parse_cas_ref_filename(name: &str) -> Option<[u8; 32]> {
+    let stem = name.strip_suffix(".ref")?;
+    if stem.len() != 64 {
+        return None;
+    }
+    let bytes = hex::decode(stem).ok()?;
+    bytes.try_into().ok()
+}
+
+/// Record a CAS reference in the FAC GC tracking directory.
+///
+/// Creates a marker file at `fac_root/cas_refs/{hex}.ref` so that GC can
+/// later identify stale CAS-backed patch objects.
+///
+/// # Errors
+///
+/// Returns an error if the directory cannot be created or the file cannot
+/// be written.
+pub fn record_cas_ref(fac_root: &Path, hash: &[u8; 32]) -> Result<(), std::io::Error> {
+    let cas_refs_dir = fac_root.join("cas_refs");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        builder.mode(0o700);
+        builder.create(&cas_refs_dir)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&cas_refs_dir)?;
+    }
+    let hex = hex::encode(hash);
+    let ref_path = cas_refs_dir.join(format!("{hex}.ref"));
+    // Touch the file (create or update mtime).
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&ref_path)?;
+    // SECURITY JUSTIFICATION (CTR-2501): CAS ref mtime uses wall-clock time
+    // because ref freshness is an operational GC heuristic (not a coordinated
+    // consensus operation).  The file creation itself is the authoritative
+    // signal; mtime is best-effort recency.
+    #[allow(clippy::disallowed_methods)]
+    let now = std::time::SystemTime::now();
+    let _ = std::fs::File::open(&ref_path).and_then(|f| f.set_modified(now));
+    Ok(())
 }
 
 fn infer_queue_root(fac_root: &Path) -> PathBuf {
@@ -1433,14 +1606,10 @@ mod tests {
             set_file_mtime(&receipt_path, old_receipt_time).expect("set old receipt mtime");
         }
 
-        let (live_receipt_hashes, truncated) = collect_recent_receipt_blob_refs(&receipts_dir);
-        assert_eq!(
-            live_receipt_hashes.len(),
-            0,
-            "old receipts should be ignored"
-        );
+        let refs = collect_recent_receipt_blob_refs(&receipts_dir);
+        assert_eq!(refs.blob_hashes.len(), 0, "old receipts should be ignored");
         assert!(
-            !truncated,
+            !refs.truncated,
             "older receipts beyond horizon should not trigger truncation"
         );
 

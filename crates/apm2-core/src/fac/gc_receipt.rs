@@ -107,6 +107,11 @@ pub enum GcActionKind {
     /// Gate cache v3 (receipt-indexed, TCK-00541).
     GateCacheV3,
     BlobPrune,
+    /// CAS blob prune: removes CAS objects referenced only by FAC patch
+    /// injection receipts (TCK-00546).  Only CAS entries whose digest
+    /// appears in a receipt with `bytes_backend=apm2_cas` are candidates;
+    /// all other CAS data is left untouched.
+    CasBlobPrune,
     QuarantinePrune,
     DeniedPrune,
     CargoCache,
