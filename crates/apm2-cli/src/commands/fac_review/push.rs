@@ -369,7 +369,9 @@ fn run_blocking_evidence_gates(sha: &str) -> Result<QueuedGatesOutcome, String> 
         cpu_quota: PUSH_QUEUE_GATES_CPU_QUOTA.to_string(),
         gate_profile: GateThroughputProfile::Throughput,
         wait_timeout_secs: PUSH_QUEUE_GATES_WAIT_TIMEOUT_SECS,
-        require_external_worker: true,
+        // Prefer worker execution when available, but do not hard-require it:
+        // push must remain single-command operable for callers.
+        require_external_worker: false,
     };
     let outcome = run_queued_gates_and_collect(&request)?;
     validate_queued_gates_outcome_for_push(sha, outcome)
@@ -1613,7 +1615,9 @@ pub fn run_push(
     let mut ruleset_sync_passed = false;
     let gate_outcome = match run_pre_push_sequence_with(
         || {
-            human_log!("fac push: enqueuing evidence gates job (external worker, blocking)");
+            human_log!(
+                "fac push: enqueuing evidence gates job (blocking; external worker if present, inline fallback otherwise)"
+            );
             emit_stage("gates_started", serde_json::json!({}));
             let gates_started = Instant::now();
             let gate_outcome = match run_blocking_evidence_gates(&sha) {

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use apm2_core::fac::gate_cache_v3::GateCacheV3;
+use apm2_core::fac::gate_cache_v3::{GateCacheV3, V3CompoundKey};
 use apm2_core::fac::job_spec::{
     Actuation, FacJobSpecV1, JobConstraints, JobSource, JobSpecValidationPolicy, LaneRequirements,
     MAX_QUEUE_LANE_LENGTH, validate_job_spec_with_policy,
@@ -280,11 +280,16 @@ pub(super) fn run_queued_gates_and_collect(
 
     let prepared = prepare_queued_gates_job(request, true).map_err(|err| err.message())?;
     let timeout_secs = normalize_wait_timeout(request.wait_timeout_secs);
+    let wait_mode = if request.require_external_worker {
+        WorkerExecutionMode::RequireExternalWorker
+    } else {
+        WorkerExecutionMode::AllowInlineFallback
+    };
     wait_for_gates_job_receipt_with_mode(
         &prepared.fac_root,
         &prepared.job_id,
         Duration::from_secs(timeout_secs),
-        WorkerExecutionMode::RequireExternalWorker,
+        wait_mode,
     )?;
     let receipts_dir = prepared.fac_root.join("receipts");
     let job_receipt = lookup_job_receipt(&receipts_dir, &prepared.job_id).ok_or_else(|| {
@@ -319,7 +324,13 @@ pub(super) fn run_queued_gates_and_collect(
         ));
     }
 
-    let gate_results = load_gate_results_from_cache_for_sha(&prepared.head_sha)?;
+    let gate_results = load_gate_results_from_cache_for_sha_with_context(
+        Some(&prepared.fac_root),
+        &prepared.head_sha,
+        Some(&policy_hash),
+        job_receipt.sandbox_hardening_hash.as_deref(),
+        job_receipt.network_policy_hash.as_deref(),
+    )?;
     Ok(QueuedGatesOutcome {
         job_id: prepared.job_id,
         job_receipt_id,
@@ -632,13 +643,81 @@ fn is_coalescible_gates_spec(
             .is_some_and(|patch| patch == expected_patch)
 }
 
-fn load_gate_results_from_cache_for_sha(sha: &str) -> Result<Vec<EvidenceGateResult>, String> {
+fn load_gate_results_from_cache_for_sha_with_context(
+    fac_root: Option<&Path>,
+    sha: &str,
+    policy_hash: Option<&str>,
+    sandbox_hardening_hash: Option<&str>,
+    network_policy_hash: Option<&str>,
+) -> Result<Vec<EvidenceGateResult>, String> {
+    if let Some(v3_rows) = maybe_load_gate_results_from_v3_cache(
+        fac_root,
+        sha,
+        policy_hash,
+        sandbox_hardening_hash,
+        network_policy_hash,
+    )? {
+        return Ok(v3_rows);
+    }
+    load_gate_results_from_v2_cache(sha)
+}
+
+fn maybe_load_gate_results_from_v3_cache(
+    fac_root: Option<&Path>,
+    sha: &str,
+    policy_hash: Option<&str>,
+    sandbox_hardening_hash: Option<&str>,
+    network_policy_hash: Option<&str>,
+) -> Result<Option<Vec<EvidenceGateResult>>, String> {
+    let Some(policy_hash) = policy_hash.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(sandbox_hardening_hash) = sandbox_hardening_hash
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(network_policy_hash) = network_policy_hash
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(root) = fac_root.map(|root| root.join("gate_cache_v3")) else {
+        return Ok(None);
+    };
+
+    let toolchain = super::evidence::compute_toolchain_fingerprint();
+    let compound_key = V3CompoundKey::new(
+        sha,
+        policy_hash,
+        &toolchain,
+        sandbox_hardening_hash,
+        network_policy_hash,
+    )
+    .map_err(|err| {
+        format!("queued gates cache for sha={sha} has invalid v3 compound key inputs: {err}")
+    })?;
+    let Some(v3_cache) = GateCacheV3::load_from_dir(&root, sha, &compound_key) else {
+        return Ok(None);
+    };
+    Ok(Some(materialize_gate_results_from_v3(sha, &v3_cache)?))
+}
+
+fn load_gate_results_from_v2_cache(sha: &str) -> Result<Vec<EvidenceGateResult>, String> {
     let cache = GateCache::load(sha).ok_or_else(|| {
         format!(
             "queued gates job completed for sha={sha} but no attested gate cache entry was found"
         )
     })?;
+    materialize_gate_results_from_v2(sha, &cache)
+}
 
+fn materialize_gate_results_from_v2(
+    sha: &str,
+    cache: &GateCache,
+) -> Result<Vec<EvidenceGateResult>, String> {
     let expected = LANE_EVIDENCE_GATES
         .iter()
         .map(|gate| (*gate).to_string())
@@ -692,6 +771,69 @@ fn load_gate_results_from_cache_for_sha(sha: &str) -> Result<Vec<EvidenceGateRes
             bytes_written: cached.bytes_written,
             bytes_total: cached.bytes_total,
             was_truncated: cached.was_truncated,
+            log_bundle_hash: cached.log_bundle_hash.clone(),
+        });
+    }
+    Ok(results)
+}
+
+fn materialize_gate_results_from_v3(
+    sha: &str,
+    cache: &GateCacheV3,
+) -> Result<Vec<EvidenceGateResult>, String> {
+    let expected = LANE_EVIDENCE_GATES
+        .iter()
+        .map(|gate| (*gate).to_string())
+        .collect::<BTreeSet<_>>();
+    let actual = cache.gates.keys().cloned().collect::<BTreeSet<_>>();
+
+    let missing = expected
+        .difference(&actual)
+        .cloned()
+        .collect::<Vec<String>>();
+    let extra = actual
+        .difference(&expected)
+        .cloned()
+        .collect::<Vec<String>>();
+    if !missing.is_empty() || !extra.is_empty() {
+        let missing_summary = if missing.is_empty() {
+            "-".to_string()
+        } else {
+            missing.join(",")
+        };
+        let extra_summary = if extra.is_empty() {
+            "-".to_string()
+        } else {
+            extra.join(",")
+        };
+        return Err(format!(
+            "queued gates v3 cache for sha={sha} does not match required gate set (missing={missing_summary}, extra={extra_summary})"
+        ));
+    }
+
+    let mut results = Vec::with_capacity(LANE_EVIDENCE_GATES.len());
+    for gate_name in LANE_EVIDENCE_GATES {
+        let cached = cache.gates.get(*gate_name).ok_or_else(|| {
+            format!("queued gates v3 cache for sha={sha} missing required gate `{gate_name}`")
+        })?;
+        let passed = if cached.status.eq_ignore_ascii_case("PASS") {
+            true
+        } else if cached.status.eq_ignore_ascii_case("FAIL") {
+            false
+        } else {
+            return Err(format!(
+                "queued gates v3 cache for sha={sha} has unsupported gate status for `{gate_name}`: {}",
+                cached.status
+            ));
+        };
+        results.push(EvidenceGateResult {
+            gate_name: (*gate_name).to_string(),
+            passed,
+            duration_secs: cached.duration_secs,
+            log_path: cached.log_path.as_deref().map(PathBuf::from),
+            bytes_written: None,
+            bytes_total: None,
+            was_truncated: None,
             log_bundle_hash: cached.log_bundle_hash.clone(),
         });
     }
@@ -2630,8 +2772,9 @@ mod tests {
             }
             cache.save().expect("persist cache");
 
-            let err = load_gate_results_from_cache_for_sha(&sha)
-                .expect_err("incomplete gate set must fail closed");
+            let err =
+                load_gate_results_from_cache_for_sha_with_context(None, &sha, None, None, None)
+                    .expect_err("incomplete gate set must fail closed");
             assert!(err.contains("required gate set"));
             assert!(err.contains("missing="));
         });
@@ -2657,13 +2800,88 @@ mod tests {
             cache.save().expect("persist cache");
 
             let rows =
-                load_gate_results_from_cache_for_sha(&sha).expect("full cache should materialize");
+                load_gate_results_from_cache_for_sha_with_context(None, &sha, None, None, None)
+                    .expect("full cache should materialize");
             assert_eq!(rows.len(), LANE_EVIDENCE_GATES.len());
             for (idx, row) in rows.iter().enumerate() {
                 assert_eq!(row.gate_name, LANE_EVIDENCE_GATES[idx]);
                 assert_eq!(row.duration_secs, (idx + 1) as u64);
             }
             assert!(!rows[2].passed, "third gate should preserve FAIL status");
+        });
+    }
+
+    #[test]
+    fn load_gate_results_from_cache_for_sha_with_context_reads_v3_rows() {
+        use apm2_core::fac::gate_cache_v3::V3GateResult;
+
+        with_test_apm2_home(|apm2_home| {
+            let fac_root = apm2_home.join("private/fac");
+            let v3_root = fac_root.join("gate_cache_v3");
+            fs::create_dir_all(&v3_root).expect("create v3 root");
+
+            let sha = "c".repeat(40);
+            let fac_policy = load_or_create_gate_policy(&fac_root).expect("load policy");
+            let policy_hash =
+                apm2_core::fac::compute_policy_hash(&fac_policy).expect("compute policy hash");
+            let sandbox_hardening_hash =
+                "b3-256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+            let network_policy_hash =
+                "b3-256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+            let toolchain = crate::commands::fac_review::evidence::compute_toolchain_fingerprint();
+            let compound_key = V3CompoundKey::new(
+                &sha,
+                &policy_hash,
+                &toolchain,
+                sandbox_hardening_hash,
+                network_policy_hash,
+            )
+            .expect("compound key");
+
+            let signer =
+                crate::commands::fac_key_material::load_or_generate_persistent_signer(&fac_root)
+                    .expect("load signing key");
+            let mut cache = GateCacheV3::new(&sha, compound_key).expect("new v3 cache");
+            for (idx, gate_name) in LANE_EVIDENCE_GATES.iter().enumerate() {
+                let passed = idx != 1;
+                cache
+                    .set(
+                        gate_name,
+                        V3GateResult {
+                            status: if passed { "PASS" } else { "FAIL" }.to_string(),
+                            duration_secs: (idx + 1) as u64,
+                            completed_at: "2026-02-18T00:00:00Z".to_string(),
+                            attestation_digest: Some(format!("b3-256:{}", "a".repeat(64))),
+                            evidence_log_digest: Some(format!("b3-256:{}", "b".repeat(64))),
+                            quick_mode: Some(false),
+                            log_bundle_hash: Some(format!("b3-256:{}", "c".repeat(64))),
+                            log_path: Some(format!("/tmp/{gate_name}.log")),
+                            signature_hex: None,
+                            signer_id: None,
+                            rfc0028_receipt_bound: true,
+                            rfc0029_receipt_bound: true,
+                        },
+                    )
+                    .expect("set gate");
+            }
+            cache.sign_all(&signer);
+            cache.save_to_dir(&v3_root).expect("persist v3 cache");
+
+            let rows = load_gate_results_from_cache_for_sha_with_context(
+                Some(&fac_root),
+                &sha,
+                Some(&policy_hash),
+                Some(sandbox_hardening_hash),
+                Some(network_policy_hash),
+            )
+            .expect("load v3 cache rows");
+
+            assert_eq!(rows.len(), LANE_EVIDENCE_GATES.len());
+            for (idx, row) in rows.iter().enumerate() {
+                assert_eq!(row.gate_name, LANE_EVIDENCE_GATES[idx]);
+                assert_eq!(row.duration_secs, (idx + 1) as u64);
+            }
+            assert!(!rows[1].passed, "second gate should preserve FAIL status");
         });
     }
 
