@@ -726,8 +726,7 @@ pub struct FacJobReceiptV1 {
     /// carve-out, tick-floor status, worker first-pass priority).
     /// Only populated for `stop_revoke` jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stop_revoke_admission:
-        Option<crate::economics::queue_admission::StopRevokeAdmissionTrace>,
+    pub stop_revoke_admission: Option<crate::economics::queue_admission::StopRevokeAdmissionTrace>,
     /// Containment verification trace (TCK-00548).
     ///
     /// Records whether child processes (rustc, nextest, etc.) were verified
@@ -1407,8 +1406,7 @@ pub struct FacJobReceiptV1Builder {
     rfc0028_channel_boundary: Option<ChannelBoundaryTrace>,
     eio29_queue_admission: Option<QueueAdmissionTrace>,
     eio29_budget_admission: Option<BudgetAdmissionTrace>,
-    stop_revoke_admission:
-        Option<crate::economics::queue_admission::StopRevokeAdmissionTrace>,
+    stop_revoke_admission: Option<crate::economics::queue_admission::StopRevokeAdmissionTrace>,
     containment: Option<super::containment::ContainmentTrace>,
     observed_cost: Option<crate::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<String>,

@@ -2162,7 +2162,8 @@ fn process_job(
         // This captures the explicit policy that governed this stop_revoke
         // admission, including lane reservation state, temporal predicate
         // outcomes, and anti-starvation enforcement evidence.
-        let sr_policy = apm2_core::economics::queue_admission::StopRevokeAdmissionPolicy::default_policy();
+        let sr_policy =
+            apm2_core::economics::queue_admission::StopRevokeAdmissionPolicy::default_policy();
         let sr_admission_trace = apm2_core::economics::queue_admission::StopRevokeAdmissionTrace {
             verdict: "allow".to_string(),
             reservation_used: true,

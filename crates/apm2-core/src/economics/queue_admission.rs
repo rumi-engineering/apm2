@@ -1187,7 +1187,8 @@ pub struct StopRevokeAdmissionPolicy {
     pub tp002_required: bool,
     /// Whether TP-EIO29-003 (convergence) is strictly required.
     pub tp003_required: bool,
-    /// Whether workers must process `stop_revoke` candidates before other lanes.
+    /// Whether workers must process `stop_revoke` candidates before other
+    /// lanes.
     pub worker_priority_first_pass: bool,
 }
 
@@ -3300,14 +3301,8 @@ mod tests {
             policy.tp001_emergency_carveout,
             "default policy must enable TP-001 emergency carve-out"
         );
-        assert!(
-            policy.tp002_required,
-            "default policy must require TP-002"
-        );
-        assert!(
-            policy.tp003_required,
-            "default policy must require TP-003"
-        );
+        assert!(policy.tp002_required, "default policy must require TP-002");
+        assert!(policy.tp003_required, "default policy must require TP-003");
         assert!(
             policy.worker_priority_first_pass,
             "default policy must enable first-pass processing"
@@ -3318,9 +3313,11 @@ mod tests {
     fn stop_revoke_policy_serialization_roundtrip() {
         let policy = StopRevokeAdmissionPolicy::default_policy();
         let json = serde_json::to_string(&policy).expect("serialize");
-        let parsed: StopRevokeAdmissionPolicy =
-            serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(policy, parsed, "policy must survive serialization roundtrip");
+        let parsed: StopRevokeAdmissionPolicy = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            policy, parsed,
+            "policy must survive serialization roundtrip"
+        );
     }
 
     #[test]
@@ -3366,8 +3363,7 @@ mod tests {
             policy_snapshot: policy,
         };
         let json = serde_json::to_string(&trace).expect("serialize");
-        let parsed: StopRevokeAdmissionTrace =
-            serde_json::from_str(&json).expect("deserialize");
+        let parsed: StopRevokeAdmissionTrace = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(trace, parsed, "trace must survive serialization roundtrip");
     }
 
@@ -3399,8 +3395,7 @@ mod tests {
 
         // Changing a boolean field must also produce different bytes.
         trace_allow.tp001_emergency_carveout_activated = true;
-        let bytes_carveout =
-            trace_allow.canonical_bytes().expect("carveout bytes");
+        let bytes_carveout = trace_allow.canonical_bytes().expect("carveout bytes");
         assert_ne!(
             bytes_allow, bytes_carveout,
             "different carveout states must produce different canonical bytes"
