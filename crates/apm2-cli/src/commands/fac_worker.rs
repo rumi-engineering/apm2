@@ -2392,9 +2392,40 @@ fn process_job(
     };
     // TCK-00567: Derive expected intent from job kind for intent-binding
     // verification.  The worker denies if the token intent does not match
-    // the job kind (fail-closed).
-    let expected_intent = apm2_core::fac::job_spec::job_kind_to_intent(&spec.kind);
-    let expected_intent_str = expected_intent.as_ref().map(|i| i.as_str());
+    // the job kind (fail-closed).  Unknown job kinds produce None from
+    // job_kind_to_intent — treat as hard denial to prevent fail-open bypass.
+    let Some(expected_intent) = apm2_core::fac::job_spec::job_kind_to_intent(&spec.kind) else {
+        let reason = format!("unknown job kind for intent binding: {}", spec.kind);
+        let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::UnknownJobKindIntent),
+            &reason,
+            None,
+            None,
+            None,
+            None,
+            Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
+            policy_hash,
+            None,
+            Some(&sbx_hash),
+            Some(&resolved_net_hash),
+        ) {
+            eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
+        }
+        return JobOutcome::Denied { reason };
+    };
+    let expected_intent_str = Some(expected_intent.as_str());
     let expected_binding = ExpectedTokenBinding {
         fac_policy_hash: policy_digest,
         canonicalizer_tuple_digest: &ct_digest_bytes,

@@ -237,6 +237,12 @@ pub enum BrokerError {
         intent: String,
     },
 
+    /// Policy specifies an intent allowlist but no intent was provided
+    /// (TCK-00567).  Fail-closed: intent-less tokens are not issued when
+    /// the policy requires intent binding.
+    #[error("intent required by policy but none provided")]
+    IntentRequiredByPolicy,
+
     /// Convergence receipt hash cannot be zero.
     #[error("convergence receipt contains zero hash: {field}")]
     ZeroConvergenceReceiptHash {
@@ -809,15 +815,23 @@ impl FacBroker {
         validate_boundary_id(boundary_id)?;
 
         // TCK-00567: Validate intent against allowed_intents policy.
-        // When allowed_intents is configured and an intent is provided,
-        // the intent MUST be in the allowed set (fail-closed).
-        if let Some(intent_val) = intent {
-            if let Some(allowed) = allowed_intents {
-                if !allowed.contains(intent_val) {
+        // When allowed_intents is configured, the intent MUST be present
+        // and MUST be in the allowed set (fail-closed).  A missing intent
+        // when the policy has an allowlist is a hard deny — prevents
+        // issuing unscoped tokens that bypass intent-gated worker checks.
+        if let Some(allowed) = allowed_intents {
+            match intent {
+                Some(intent_val) if allowed.contains(intent_val) => {
+                    // Intent is present and in the allowed set — proceed.
+                },
+                Some(intent_val) => {
                     return Err(BrokerError::IntentNotAllowed {
                         intent: intent_val.as_str().to_string(),
                     });
-                }
+                },
+                None => {
+                    return Err(BrokerError::IntentRequiredByPolicy);
+                },
             }
         }
 
@@ -2928,6 +2942,60 @@ mod tests {
                 None,
             )
             .expect("unconstrained policy must allow any intent");
+        assert!(!token.is_empty());
+    }
+
+    #[test]
+    fn tck_00567_broker_denies_none_intent_when_policy_has_allowlist() {
+        use crate::fac::job_spec::FacIntent;
+
+        let mut broker = FacBroker::new();
+        broker.set_admission_health_gate_for_test(true);
+        let policy_digest = [0x42; 32];
+        broker
+            .admit_policy_digest(policy_digest)
+            .expect("policy digest should admit");
+
+        // Policy has an allowlist but no intent is provided — must deny
+        // (fail-closed: intent-less tokens are not issued when the policy
+        // requires intent binding).
+        let allowed = [FacIntent::ExecuteGates, FacIntent::Warm];
+        let result = broker.issue_channel_context_token(
+            &policy_digest,
+            "lease-1",
+            "REQ-1",
+            "test-boundary",
+            None,
+            Some(&allowed),
+        );
+        assert_eq!(
+            result,
+            Err(BrokerError::IntentRequiredByPolicy),
+            "missing intent must be denied when policy has allowlist"
+        );
+    }
+
+    #[test]
+    fn tck_00567_broker_allows_none_intent_when_no_allowlist() {
+        // No allowed_intents configured and no intent provided — accepted.
+        // Pre-TCK-00567 backward compatibility path.
+        let mut broker = FacBroker::new();
+        broker.set_admission_health_gate_for_test(true);
+        let policy_digest = [0x42; 32];
+        broker
+            .admit_policy_digest(policy_digest)
+            .expect("policy digest should admit");
+
+        let token = broker
+            .issue_channel_context_token(
+                &policy_digest,
+                "lease-1",
+                "REQ-1",
+                "test-boundary",
+                None,
+                None,
+            )
+            .expect("no allowlist + no intent must be accepted");
         assert!(!token.is_empty());
     }
 }

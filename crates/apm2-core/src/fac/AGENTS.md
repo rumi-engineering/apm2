@@ -42,8 +42,9 @@ default mode.
 - RFC-0028 `ChannelContextToken` issuance bound to `job_spec_digest` + `lease_id`
   via `issue_channel_context_token()`.  TCK-00567 adds optional `intent` and
   `allowed_intents` parameters for RFC-0028 intent taxonomy enforcement.
-  When `allowed_intents` is configured, intent MUST be in the allowed set
-  (fail-closed).
+  When `allowed_intents` is configured, intent MUST be present AND in the
+  allowed set (fail-closed).  Missing intent with an active allowlist triggers
+  `BrokerError::IntentRequiredByPolicy`.
 - RFC-0029 `TimeAuthorityEnvelopeV1` issuance for `boundary_id` + evaluation
   window via `issue_time_authority_envelope()`.
 - TP-EIO29-002 freshness horizon refs (`freshness_horizon()`) and revocation
@@ -2176,8 +2177,17 @@ fail-closed:
 
 1. **Broker** (`issue_channel_context_token`): Embeds intent in
    `TokenBindingV1`.  Validates intent against `allowed_intents` if configured.
+   Denies issuance when policy has an allowlist but no intent is provided
+   (`IntentRequiredByPolicy`).  Callers (`fac_warm.rs`, `gates.rs`) thread
+   `fac_policy.allowed_intents.as_deref()` into every issuance call site.
 2. **Worker** (`fac_worker.rs`): Derives `expected_intent` from job kind,
    passes to `ExpectedTokenBinding`.  Decode fails on mismatch (fail-closed).
+   Unknown job kinds (where `job_kind_to_intent` returns `None`) are denied
+   immediately with `DenialReasonCode::UnknownJobKindIntent` (fail-closed).
+3. **PrivilegedDispatcher** (`dispatch.rs`): Issues tokens with `intent: None`
+   intentionally.  These tokens are for daemon session-level IPC boundary
+   crossing, not for FAC queue job execution; they never pass through the
+   intent-checking worker path.
 
 ## Strict Job Spec Validation Policy (TCK-00579)
 
