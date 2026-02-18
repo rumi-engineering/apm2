@@ -11,6 +11,7 @@ use apm2_core::economics::queue_admission::HtfEvaluationWindow;
 use apm2_core::fac::broker::FacBroker;
 use apm2_core::fac::broker_health::WorkerHealthPolicy;
 use apm2_core::fac::job_spec::{FacJobSpecV1, MAX_JOB_SPEC_SIZE};
+use apm2_core::fac::queue_bounds::{QueueBoundsPolicy, check_queue_bounds};
 use apm2_core::fac::{
     FacPolicyV1, MAX_POLICY_SIZE, compute_policy_hash, deserialize_policy, parse_policy_hash,
     persist_policy,
@@ -149,6 +150,11 @@ pub(super) fn load_or_init_policy(
 }
 
 /// Enqueue a validated job spec into `queue/pending`.
+///
+/// Enforces queue bounds (TCK-00578) before writing: the pending queue
+/// must not exceed `max_pending_jobs` or `max_pending_bytes` as
+/// configured by [`QueueBoundsPolicy`]. Excess enqueue attempts are
+/// denied with structured denial receipts.
 pub(super) fn enqueue_job(queue_root: &Path, spec: &FacJobSpecV1) -> Result<PathBuf, String> {
     let pending_dir = queue_root.join(PENDING_DIR);
     fs::create_dir_all(&pending_dir).map_err(|err| format!("create pending dir: {err}"))?;
@@ -166,6 +172,13 @@ pub(super) fn enqueue_job(queue_root: &Path, spec: &FacJobSpecV1) -> Result<Path
             MAX_JOB_SPEC_SIZE
         ));
     }
+
+    // TCK-00578: Enforce queue bounds before writing the job spec.
+    // Uses default policy; future work may load from FAC config.
+    let policy = QueueBoundsPolicy::default();
+    let proposed_bytes = json.len() as u64;
+    check_queue_bounds(&pending_dir, proposed_bytes, &policy)
+        .map_err(|err| format!("queue bounds check failed (queue/quota_exceeded): {err}"))?;
 
     let filename = format!("{}.json", spec.job_id);
     let target = pending_dir.join(filename);

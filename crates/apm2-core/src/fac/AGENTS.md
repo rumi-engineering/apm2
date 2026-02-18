@@ -364,6 +364,71 @@ with hard caps.
 - [INV-CPRL-005] Budget denial always produces a structured
   `ControlPlaneDenialReceipt` with machine-readable evidence.
 
+## queue_bounds Submodule (TCK-00578)
+
+The `queue_bounds` submodule enforces instantaneous queue size limits at enqueue
+time. Unlike `broker_rate_limits` (which tracks cumulative window counters),
+`queue_bounds` scans the actual `queue/pending/` directory to determine the
+current number of pending jobs and their total byte size, and denies new
+enqueue attempts that would exceed configured caps.
+
+### Key Types
+
+- `QueueBoundsPolicy`: Configuration struct with `max_pending_jobs`,
+  `max_pending_bytes`, and optional `per_lane_max_pending_jobs`. Hard cap
+  validation via `validate()`. Defaults: 10K jobs, 1 GiB bytes.
+- `PendingQueueSnapshot`: Point-in-time snapshot of the pending queue
+  (`job_count`, `total_bytes`).
+- `QueueBoundsDenialReceipt`: Structured denial evidence carrying dimension,
+  current usage, limit, requested increment, and stable reason code.
+- `QueueBoundsDimension`: Enum (`PendingJobs`, `PendingBytes`).
+- `QueueBoundsError`: Error taxonomy with `QueueBoundsExceeded`, `InvalidPolicy`,
+  and `ScanFailed` variants.
+
+### Hard Caps
+
+- `HARD_CAP_MAX_PENDING_JOBS`: 1,000,000
+- `HARD_CAP_MAX_PENDING_BYTES`: 64 GiB
+
+### Core Capabilities
+
+- `check_queue_bounds()`: Scans `queue/pending/`, computes snapshot, evaluates
+  proposed enqueue against policy, returns `Ok(snapshot)` or
+  `Err(QueueBoundsExceeded)`.
+- Filesystem scan is bounded by `MAX_SCAN_ENTRIES` (100K) to prevent DoS
+  (INV-QB-002).
+- Symlinks are skipped via `symlink_metadata()` to prevent inflation attacks
+  (INV-QB-005).
+- Hidden files (starting with `.`) are skipped (temp files from atomic writes).
+- Fail-closed: zero limits deny immediately; unreadable directory denies
+  (INV-QB-001).
+- All arithmetic uses `checked_add`/`saturating_add` (INV-QB-004).
+
+### CLI Integration
+
+- `enqueue_job()` in `apm2-cli/src/commands/fac_queue_submit.rs` calls
+  `check_queue_bounds()` before writing any job spec file. Denial produces a
+  descriptive error with the `queue/quota_exceeded` reason code.
+- Control-lane `stop_revoke` jobs bypass queue bounds (consistent with the
+  control-lane exception documented in `fac/mod.rs`).
+
+### Receipt Integration
+
+- `DenialReasonCode::QueueQuotaExceeded` variant added for receipt chain
+  integration.
+- Denial reason code: `queue/quota_exceeded`.
+
+### Security Invariants (TCK-00578)
+
+- [INV-QB-001] Fail-closed: unreadable pending directory denies all enqueue
+  attempts.
+- [INV-QB-002] Directory scan is bounded by `MAX_SCAN_ENTRIES` to prevent DoS.
+- [INV-QB-003] Denial receipts include dimension, current usage, limit, and
+  stable reason code for audit.
+- [INV-QB-004] Arithmetic uses `checked_add`; overflow returns Err.
+- [INV-QB-005] Symlinks in pending directory are skipped (not counted) to
+  prevent inflation attacks.
+
 ## projection_compromise Submodule
 
 The `projection_compromise` submodule implements compromise handling for public
