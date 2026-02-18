@@ -5012,27 +5012,23 @@ fn run_lane_mark_corrupt_with_manager(
     }
 
     // Persist the corrupt marker via LaneManager, which generates the
-    // detected_at timestamp internally as ISO-8601 (CTR-2501).
-    if let Err(e) =
-        manager.mark_corrupt(&args.lane_id, &args.reason, args.receipt_digest.as_deref())
-    {
-        return output_error(
-            json_output,
-            "persist_error",
-            &format!(
-                "Failed to persist corrupt marker for lane {}: {e}",
-                args.lane_id
-            ),
-            exit_codes::GENERIC_ERROR,
-        );
-    }
-
-    // Load the persisted marker to include the generated detected_at in output.
-    let detected_at = LaneCorruptMarkerV1::load(manager.fac_root(), &args.lane_id)
-        .ok()
-        .flatten()
-        .map(|m| m.detected_at)
-        .unwrap_or_default();
+    // detected_at timestamp internally as ISO-8601 (CTR-2501) and returns
+    // it on success — no fragile load-back round-trip needed.
+    let detected_at =
+        match manager.mark_corrupt(&args.lane_id, &args.reason, args.receipt_digest.as_deref()) {
+            Ok(ts) => ts,
+            Err(e) => {
+                return output_error(
+                    json_output,
+                    "persist_error",
+                    &format!(
+                        "Failed to persist corrupt marker for lane {}: {e}",
+                        args.lane_id
+                    ),
+                    exit_codes::GENERIC_ERROR,
+                );
+            },
+        };
 
     let response = serde_json::json!({
         "lane_id": args.lane_id,

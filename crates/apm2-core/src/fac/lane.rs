@@ -1977,7 +1977,9 @@ impl LaneManager {
     ///
     /// The `detected_at` timestamp is generated internally as an ISO-8601
     /// UTC string (CTR-2501) to ensure consistent format across all code
-    /// paths that create corrupt markers.
+    /// paths that create corrupt markers.  On success the generated
+    /// `detected_at` value is returned so callers can surface it in
+    /// command output without a fragile load-back round-trip.
     ///
     /// # Errors
     ///
@@ -1990,7 +1992,7 @@ impl LaneManager {
         lane_id: &str,
         reason: &str,
         receipt_digest: Option<&str>,
-    ) -> Result<(), LaneError> {
+    ) -> Result<String, LaneError> {
         validate_lane_id(lane_id)?;
         validate_string_field("reason", reason, MAX_STRING_LENGTH)?;
         if let Some(digest) = receipt_digest {
@@ -1998,14 +2000,16 @@ impl LaneManager {
             validate_b3_256_digest("cleanup_receipt_digest", digest)?;
         }
 
+        let detected_at = current_time_iso8601();
         let marker = LaneCorruptMarkerV1 {
             schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
             lane_id: lane_id.to_string(),
             reason: reason.to_string(),
             cleanup_receipt_digest: receipt_digest.map(String::from),
-            detected_at: current_time_iso8601(),
+            detected_at: detected_at.clone(),
         };
-        marker.persist(&self.fac_root)
+        marker.persist(&self.fac_root)?;
+        Ok(detected_at)
     }
 
     /// Get the status of all lanes.
