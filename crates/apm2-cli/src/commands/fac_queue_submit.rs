@@ -140,6 +140,22 @@ pub(super) fn init_broker(fac_root: &Path, boundary_id: &str) -> Result<FacBroke
         .evaluate_admission_health_gate(&checker, &eval_window, WorkerHealthPolicy::default())
         .map_err(|err| format!("admission health gate failed: {err}"))?;
 
+    // MAJOR fix: load persisted token ledger so CLI producer paths have
+    // access to the full nonce history for replay detection.
+    match super::fac_worker::load_token_ledger_pub(broker.current_tick()) {
+        Ok(Some(ledger)) => {
+            broker.set_token_ledger(ledger);
+        },
+        Ok(None) => {
+            // First run — no ledger file yet, default empty ledger is fine.
+        },
+        Err(e) => {
+            // Fail-closed: load errors from an existing ledger file are
+            // hard security faults (INV-TL-009).
+            return Err(format!("token ledger load failed (fail-closed): {e}"));
+        },
+    }
+
     Ok(broker)
 }
 
