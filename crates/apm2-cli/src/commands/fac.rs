@@ -4980,17 +4980,13 @@ fn run_lane_mark_corrupt_with_manager(
         );
     }
 
-    // Validate optional receipt_digest length.
+    // Validate optional receipt_digest format (b3-256:<64 lowercase hex>).
     if let Some(ref digest) = args.receipt_digest {
-        if digest.len() > apm2_core::fac::lane::MAX_STRING_LENGTH {
+        if let Err(e) = apm2_core::fac::lane::validate_b3_256_digest("receipt_digest", digest) {
             return output_error(
                 json_output,
                 "validation_error",
-                &format!(
-                    "Receipt digest exceeds maximum length ({} > {})",
-                    digest.len(),
-                    apm2_core::fac::lane::MAX_STRING_LENGTH,
-                ),
+                &format!("Invalid receipt digest: {e}"),
                 exit_codes::VALIDATION_ERROR,
             );
         }
@@ -8088,7 +8084,7 @@ mod tests {
             "--reason",
             "cleanup failure",
             "--receipt-digest",
-            "b3-256:abcdef0123456789",
+            "b3-256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
         ]);
     }
 
@@ -8150,7 +8146,8 @@ mod tests {
             .expect("create lanes and directories");
 
         let lane_id = "lane-01";
-        let digest = "b3-256:0123456789abcdef".to_string();
+        let digest =
+            "b3-256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
         let exit_code = run_lane_mark_corrupt_with_manager(
             &manager,
             &LaneMarkCorruptArgs {
@@ -8169,6 +8166,71 @@ mod tests {
         assert_eq!(
             marker.cleanup_receipt_digest.as_deref(),
             Some(digest.as_str())
+        );
+    }
+
+    #[test]
+    fn test_lane_mark_corrupt_rejects_malformed_digest() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        // Missing prefix
+        let exit_code = run_lane_mark_corrupt_with_manager(
+            &manager,
+            &LaneMarkCorruptArgs {
+                lane_id: "lane-00".to_string(),
+                reason: "test".to_string(),
+                receipt_digest: Some("not-a-digest".to_string()),
+                json: true,
+            },
+            true,
+        );
+        assert_eq!(
+            exit_code,
+            exit_codes::VALIDATION_ERROR,
+            "malformed digest must fail validation"
+        );
+
+        // Wrong hex length
+        let exit_code = run_lane_mark_corrupt_with_manager(
+            &manager,
+            &LaneMarkCorruptArgs {
+                lane_id: "lane-00".to_string(),
+                reason: "test".to_string(),
+                receipt_digest: Some("b3-256:deadbeef".to_string()),
+                json: true,
+            },
+            true,
+        );
+        assert_eq!(
+            exit_code,
+            exit_codes::VALIDATION_ERROR,
+            "short digest must fail validation"
+        );
+
+        // Uppercase hex
+        let exit_code = run_lane_mark_corrupt_with_manager(
+            &manager,
+            &LaneMarkCorruptArgs {
+                lane_id: "lane-00".to_string(),
+                reason: "test".to_string(),
+                receipt_digest: Some(
+                    "b3-256:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                ),
+                json: true,
+            },
+            true,
+        );
+        assert_eq!(
+            exit_code,
+            exit_codes::VALIDATION_ERROR,
+            "uppercase hex digest must fail validation"
         );
     }
 

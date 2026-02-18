@@ -408,6 +408,15 @@ pub enum LaneError {
         /// Why the record is invalid.
         reason: String,
     },
+
+    /// Invalid digest format (expected `b3-256:<64 lowercase hex chars>`).
+    #[error("invalid digest format for field {field}: {reason}")]
+    InvalidDigestFormat {
+        /// Name of the field containing the malformed digest.
+        field: &'static str,
+        /// What is wrong with the digest.
+        reason: String,
+    },
 }
 
 impl LaneError {
@@ -1975,6 +1984,7 @@ impl LaneManager {
         validate_string_field("detected_at", detected_at, MAX_STRING_LENGTH)?;
         if let Some(digest) = receipt_digest {
             validate_string_field("cleanup_receipt_digest", digest, MAX_STRING_LENGTH)?;
+            validate_b3_256_digest("cleanup_receipt_digest", digest)?;
         }
 
         let marker = LaneCorruptMarkerV1 {
@@ -3016,6 +3026,61 @@ const fn validate_string_field(
     Ok(())
 }
 
+/// Expected length of the hex portion of a `b3-256` digest (256 bits = 64 hex
+/// chars).
+const B3_256_HEX_LEN: usize = 64;
+
+/// The canonical prefix for BLAKE3-256 digest strings.
+const B3_256_PREFIX: &str = "b3-256:";
+
+/// Validate that a digest string conforms to the canonical `b3-256:<64
+/// lowercase hex>` format used for evidence artifact binding throughout FAC.
+///
+/// Returns `Ok(())` if the digest is valid, or `LaneError::InvalidDigestFormat`
+/// with a descriptive reason if not. This is the single canonical validation
+/// point so all callers (CLI, core, worker) share the same rules.
+///
+/// # Errors
+///
+/// Returns [`LaneError::InvalidDigestFormat`] if the digest does not match
+/// the canonical `b3-256:` prefix followed by exactly 64 lowercase hex
+/// characters.
+pub fn validate_b3_256_digest(field: &'static str, digest: &str) -> Result<(), LaneError> {
+    let Some(hex_part) = digest.strip_prefix(B3_256_PREFIX) else {
+        return Err(LaneError::InvalidDigestFormat {
+            field,
+            reason: format!(
+                "expected prefix '{B3_256_PREFIX}', got '{}'",
+                digest
+                    .get(..B3_256_PREFIX.len().min(digest.len()))
+                    .unwrap_or(digest)
+            ),
+        });
+    };
+
+    if hex_part.len() != B3_256_HEX_LEN {
+        return Err(LaneError::InvalidDigestFormat {
+            field,
+            reason: format!(
+                "expected {B3_256_HEX_LEN} hex characters after prefix, got {}",
+                hex_part.len()
+            ),
+        });
+    }
+
+    if !hex_part
+        .bytes()
+        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(LaneError::InvalidDigestFormat {
+            field,
+            reason: "hex portion must contain only lowercase hex characters (0-9, a-f)".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 /// Return the worse (higher-priority) of two reconcile outcomes.
 ///
 /// Priority order: `Failed` > `MarkedCorrupt` > `Repaired` > `Ok` > `Skipped`.
@@ -3776,11 +3841,13 @@ mod tests {
         fs::create_dir_all(fac_root.join("lanes").join("lane-00")).expect("create lane dir");
         let manager = LaneManager::new(fac_root.clone()).expect("create manager");
 
+        let valid_digest =
+            "b3-256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         manager
             .mark_corrupt(
                 "lane-00",
                 "operator maintenance",
-                Some("b3-256:deadbeef"),
+                Some(valid_digest),
                 "2026-02-18T00:00:00Z",
             )
             .expect("mark_corrupt should succeed");
@@ -3790,10 +3857,7 @@ mod tests {
             .expect("marker must be present");
         assert_eq!(marker.lane_id, "lane-00");
         assert_eq!(marker.reason, "operator maintenance");
-        assert_eq!(
-            marker.cleanup_receipt_digest.as_deref(),
-            Some("b3-256:deadbeef")
-        );
+        assert_eq!(marker.cleanup_receipt_digest.as_deref(), Some(valid_digest));
         assert_eq!(marker.detected_at, "2026-02-18T00:00:00Z");
     }
 
@@ -3807,6 +3871,153 @@ mod tests {
         let long_reason = "x".repeat(MAX_STRING_LENGTH + 1);
         let result = manager.mark_corrupt("lane-00", &long_reason, None, "2026-02-18T00:00:00Z");
         assert!(result.is_err(), "oversized reason must be rejected");
+    }
+
+    #[test]
+    fn mark_corrupt_rejects_digest_missing_prefix() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(fac_root.join("lanes").join("lane-00")).expect("create lane dir");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        let result = manager.mark_corrupt(
+            "lane-00",
+            "test",
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            "2026-02-18T00:00:00Z",
+        );
+        assert!(
+            matches!(result, Err(LaneError::InvalidDigestFormat { .. })),
+            "digest without b3-256: prefix must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn mark_corrupt_rejects_digest_wrong_prefix() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(fac_root.join("lanes").join("lane-00")).expect("create lane dir");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        let result = manager.mark_corrupt(
+            "lane-00",
+            "test",
+            Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            "2026-02-18T00:00:00Z",
+        );
+        assert!(
+            matches!(result, Err(LaneError::InvalidDigestFormat { .. })),
+            "digest with wrong prefix must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn mark_corrupt_rejects_digest_too_short() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(fac_root.join("lanes").join("lane-00")).expect("create lane dir");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        let result = manager.mark_corrupt(
+            "lane-00",
+            "test",
+            Some("b3-256:deadbeef"),
+            "2026-02-18T00:00:00Z",
+        );
+        assert!(
+            matches!(result, Err(LaneError::InvalidDigestFormat { .. })),
+            "digest with too few hex chars must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn mark_corrupt_rejects_digest_too_long() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(fac_root.join("lanes").join("lane-00")).expect("create lane dir");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        // 65 hex chars instead of 64
+        let result = manager.mark_corrupt(
+            "lane-00",
+            "test",
+            Some("b3-256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"),
+            "2026-02-18T00:00:00Z",
+        );
+        assert!(
+            matches!(result, Err(LaneError::InvalidDigestFormat { .. })),
+            "digest with too many hex chars must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn mark_corrupt_rejects_digest_uppercase_hex() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(fac_root.join("lanes").join("lane-00")).expect("create lane dir");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        let result = manager.mark_corrupt(
+            "lane-00",
+            "test",
+            Some("b3-256:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"),
+            "2026-02-18T00:00:00Z",
+        );
+        assert!(
+            matches!(result, Err(LaneError::InvalidDigestFormat { .. })),
+            "digest with uppercase hex must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn mark_corrupt_rejects_digest_non_hex_chars() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(fac_root.join("lanes").join("lane-00")).expect("create lane dir");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        let result = manager.mark_corrupt(
+            "lane-00",
+            "test",
+            Some("b3-256:not-a-digest-string-at-all-nope-not-valid-hex-chars-at-all!"),
+            "2026-02-18T00:00:00Z",
+        );
+        assert!(
+            matches!(result, Err(LaneError::InvalidDigestFormat { .. })),
+            "digest with non-hex chars must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn mark_corrupt_accepts_none_digest() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(fac_root.join("lanes").join("lane-00")).expect("create lane dir");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        manager
+            .mark_corrupt("lane-00", "test reason", None, "2026-02-18T00:00:00Z")
+            .expect("None digest must be accepted");
+    }
+
+    #[test]
+    fn validate_b3_256_digest_accepts_valid() {
+        validate_b3_256_digest(
+            "test",
+            "b3-256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("valid digest must be accepted");
+    }
+
+    #[test]
+    fn validate_b3_256_digest_rejects_empty() {
+        assert!(
+            matches!(
+                validate_b3_256_digest("test", ""),
+                Err(LaneError::InvalidDigestFormat { .. })
+            ),
+            "empty string must be rejected"
+        );
     }
 
     #[test]

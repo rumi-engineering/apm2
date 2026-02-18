@@ -20,7 +20,7 @@ ticket_meta:
   scope:
     in_scope:
       - "Define `lanes/<lane_id>/corrupt.v1.json` marker schema (reason, receipt digest, detected_at)."
-      - "Worker refuses to lease a CORRUPT lane and optionally enqueues a control job recommending reset."
+      - "Worker refuses to lease a CORRUPT lane and emits a structured reset recommendation (apm2.fac.lane_reset_recommendation.v1 JSON to stderr). When FESv1 queue-based control jobs land (RFC-0019), the recommendation can be enqueued directly."
       - "CLI: `apm2 fac lane mark-corrupt <lane_id> --reason ...` (optional) for operators."
     out_of_scope:
       - "Automated remediation policies beyond refusal."

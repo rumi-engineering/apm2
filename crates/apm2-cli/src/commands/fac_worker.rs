@@ -4143,6 +4143,47 @@ fn check_process_liveness(pid: u32) -> ProcessLiveness {
     }
 }
 
+/// Structured reset recommendation emitted when the worker encounters a
+/// CORRUPT lane during lane acquisition.  Operators and monitoring tools can
+/// parse these JSON objects from stderr to automate or triage reset actions.
+///
+/// TCK-00570: the worker refuses to lease a CORRUPT lane and emits this
+/// structured recommendation.  The `FESv1` queue-based control-job
+/// infrastructure is not yet available, so the recommendation is emitted as
+/// a JSON diagnostic to stderr.  When `FESv1` queue-based control jobs land
+/// (RFC-0019), this struct can be enqueued directly.
+#[derive(Debug, Clone, serde::Serialize)]
+struct LaneResetRecommendation {
+    /// Fixed schema identifier for forward-compatible parsing.
+    schema: &'static str,
+    /// The lane that needs operator reset.
+    lane_id: String,
+    /// Why the lane is corrupt.
+    reason: String,
+    /// Suggested operator action.
+    recommended_action: &'static str,
+}
+
+/// Schema identifier for [`LaneResetRecommendation`] payloads.
+const LANE_RESET_RECOMMENDATION_SCHEMA: &str = "apm2.fac.lane_reset_recommendation.v1";
+
+/// Emit a structured reset recommendation for a corrupt lane to stderr.
+///
+/// This is a best-effort diagnostic — serialization failures are silently
+/// ignored because the worker must not abort lane scanning due to a
+/// recommendation emission failure.
+fn emit_lane_reset_recommendation(lane_id: &str, reason: &str) {
+    let rec = LaneResetRecommendation {
+        schema: LANE_RESET_RECOMMENDATION_SCHEMA,
+        lane_id: lane_id.to_string(),
+        reason: reason.to_string(),
+        recommended_action: "apm2 fac lane reset",
+    };
+    if let Ok(json) = serde_json::to_string(&rec) {
+        eprintln!("worker: RECOMMENDATION: {json}");
+    }
+}
+
 fn acquire_worker_lane(
     lane_mgr: &LaneManager,
     lane_ids: &[String],
@@ -4163,6 +4204,8 @@ fn acquire_worker_lane(
                     "worker: WARNING: skipping corrupt lane {lane_id}: {reason}",
                     reason = marker.reason
                 );
+                // TCK-00570: Emit structured reset recommendation for corrupt lane.
+                emit_lane_reset_recommendation(lane_id, &marker.reason);
             },
             Ok(None) => {
                 let lane_dir = lane_mgr.lane_dir(lane_id);
@@ -4172,6 +4215,12 @@ fn acquire_worker_lane(
                             eprintln!(
                                 "worker: WARNING: skipping corrupt lease lane {lane_id}: {state}",
                                 state = lease.state
+                            );
+                            // TCK-00570: Emit structured reset recommendation for
+                            // corrupt lease state.
+                            emit_lane_reset_recommendation(
+                                lane_id,
+                                &format!("lease state is {}", lease.state),
                             );
                         },
                         LaneState::Running | LaneState::Cleanup => {
@@ -4210,6 +4259,9 @@ fn acquire_worker_lane(
                                             "worker: ERROR: failed to persist corrupt marker for lane {lane_id}: {err}"
                                         );
                                     }
+                                    // TCK-00570: Emit structured reset recommendation
+                                    // after marking lane corrupt.
+                                    emit_lane_reset_recommendation(lane_id, &reason);
                                 },
                                 ProcessLiveness::PermissionDenied => {
                                     // Process exists but we lack permission to
@@ -4231,6 +4283,9 @@ fn acquire_worker_lane(
                                             "worker: ERROR: failed to persist corrupt marker for lane {lane_id}: {err}"
                                         );
                                     }
+                                    // TCK-00570: Emit structured reset recommendation
+                                    // after marking lane corrupt.
+                                    emit_lane_reset_recommendation(lane_id, &reason);
                                 },
                             }
                         },
