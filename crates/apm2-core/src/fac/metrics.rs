@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use super::gc_receipt::GcReceiptV1;
 use super::receipt::{DenialReasonCode, FacJobOutcome, FacJobReceiptV1};
-use super::receipt_index::open_no_follow;
+use super::receipt_index::{is_regular_file, open_no_follow};
 
 // =============================================================================
 // Constants
@@ -262,93 +262,166 @@ const MAX_GC_RECEIPT_READ_SIZE: u64 = 256 * 1024;
 /// ~1 GiB.
 pub const MAX_GC_RECEIPTS_LOADED: usize = 4_096;
 
+/// Maximum number of shard subdirectories to visit when loading GC receipts.
+///
+/// GC receipts are stored in a sharded layout: `receipts/<2-char-hex-prefix>/
+/// <remaining-hash>.json`.  There are at most 256 possible hex-prefix shards,
+/// so a limit of 512 provides generous headroom while preventing unbounded
+/// directory traversal of attacker-created directories.
+const MAX_GC_SHARD_DIRS: usize = 512;
+
 /// Load GC receipts from the receipts directory, filtering by
 /// `since_epoch_secs`.
 ///
-/// Scans `.json` files in `receipts_dir`, attempts to parse each as a
-/// `GcReceiptV1`, and returns those with `timestamp_secs >= since_epoch_secs`.
+/// Scans the sharded hash-prefix subdirectory layout that
+/// [`super::gc_receipt::persist_gc_receipt`] produces:
+/// `receipts_dir/<2-char-hex-prefix>/<remaining-hash>.json`.  Also scans
+/// top-level `.json` files for backward compatibility with any legacy
+/// flat-layout receipts.
 ///
-/// Bounded by [`MAX_GC_RECEIPT_SCAN_FILES`] directory entries,
-/// [`MAX_GC_RECEIPTS_LOADED`] loaded receipts, and
-/// `MAX_GC_RECEIPT_READ_SIZE` per file. Parse failures are silently skipped
-/// (GC receipts share the directory with job receipts; we only care about
-/// files matching the GC schema).
+/// Bounded by [`MAX_GC_RECEIPT_SCAN_FILES`] total directory entries
+/// (across all shards), [`MAX_GC_RECEIPTS_LOADED`] loaded receipts, and
+/// `MAX_GC_RECEIPT_READ_SIZE` per file.  Parse failures are silently
+/// skipped (GC receipts share the directory with job receipts; we only
+/// care about files matching the GC schema).
 ///
 /// # Security
 ///
-/// File reads use `open_no_follow` (`O_NOFOLLOW` on Unix) to prevent
-/// symlink-following attacks (MAJOR-1). An attacker placing a symlink in
-/// the receipt directory cannot trigger arbitrary file reads.
+/// - File reads use `open_no_follow` (`O_NOFOLLOW | O_NONBLOCK` on Unix) to
+///   prevent symlink-following and FIFO blocking attacks.
+/// - After `open_no_follow`, the fd is checked via `is_regular_file` (`fstat`)
+///   to reject FIFOs, device nodes, sockets, and directories (MINOR-2 fix).
+/// - Shard directory validation requires exactly 2-character lowercase hex
+///   names to prevent path traversal through crafted directory names.
+/// - Both shard directories visited and total file entries scanned are bounded
+///   to prevent unbounded traversal.
 #[must_use]
 pub fn load_gc_receipts(receipts_dir: &std::path::Path, since_epoch_secs: u64) -> Vec<GcReceiptV1> {
     let mut results = Vec::new();
-    let Ok(entries) = std::fs::read_dir(receipts_dir) else {
-        return results;
-    };
+    let mut total_scanned: usize = 0;
 
-    let mut scanned: usize = 0;
-    for entry in entries {
-        scanned = scanned.saturating_add(1);
-        if scanned > MAX_GC_RECEIPT_SCAN_FILES {
-            break;
-        }
+    // Phase 1: Scan sharded subdirectories (canonical layout from
+    // persist_gc_receipt). Layout: `receipts_dir/<2-hex>/<rest>.json`.
+    let mut shard_dirs_visited: usize = 0;
+    if let Ok(top_entries) = std::fs::read_dir(receipts_dir) {
+        for top_entry in top_entries {
+            // Global scan cap.
+            total_scanned = total_scanned.saturating_add(1);
+            if total_scanned > MAX_GC_RECEIPT_SCAN_FILES {
+                break;
+            }
+            if results.len() >= MAX_GC_RECEIPTS_LOADED {
+                break;
+            }
 
-        // Cap loaded results to prevent unbounded memory growth.
-        if results.len() >= MAX_GC_RECEIPTS_LOADED {
-            break;
-        }
+            let Ok(top_entry) = top_entry else {
+                continue;
+            };
 
-        let Ok(entry) = entry else {
-            continue;
-        };
+            let top_path = top_entry.path();
 
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
+            // Check if this is a 2-character hex shard directory.
+            let Some(dir_name) = top_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
 
-        // Skip index subdirectory entries.
-        if path.is_dir() {
-            continue;
-        }
+            if dir_name.len() == 2
+                && dir_name.bytes().all(|b| b.is_ascii_hexdigit())
+                && top_path.is_dir()
+            {
+                // This is a shard directory — scan its contents.
+                shard_dirs_visited = shard_dirs_visited.saturating_add(1);
+                if shard_dirs_visited > MAX_GC_SHARD_DIRS {
+                    break;
+                }
 
-        // Open with O_NOFOLLOW to prevent symlink-following attacks
-        // (MAJOR-1 fix). This matches the pattern used in
-        // `load_receipt_bounded` from receipt_index.rs.
-        let Ok(file) = open_no_follow(&path) else {
-            continue;
-        };
-        let Ok(file_meta) = file.metadata() else {
-            continue;
-        };
-        if file_meta.len() > MAX_GC_RECEIPT_READ_SIZE {
-            continue;
-        }
+                let Ok(shard_entries) = std::fs::read_dir(&top_path) else {
+                    continue;
+                };
 
-        let mut buf = Vec::new();
-        let cap = MAX_GC_RECEIPT_READ_SIZE;
-        if file.take(cap + 1).read_to_end(&mut buf).is_err() {
-            continue;
-        }
-        if buf.len() as u64 > cap {
-            continue;
-        }
+                for shard_entry in shard_entries {
+                    total_scanned = total_scanned.saturating_add(1);
+                    if total_scanned > MAX_GC_RECEIPT_SCAN_FILES {
+                        break;
+                    }
+                    if results.len() >= MAX_GC_RECEIPTS_LOADED {
+                        break;
+                    }
 
-        // Try parsing as GC receipt. Skip files that don't match.
-        let Ok(receipt) = serde_json::from_slice::<GcReceiptV1>(&buf) else {
-            continue;
-        };
+                    let Ok(shard_entry) = shard_entry else {
+                        continue;
+                    };
 
-        if receipt.schema != super::gc_receipt::GC_RECEIPT_SCHEMA {
-            continue;
-        }
-
-        if receipt.timestamp_secs >= since_epoch_secs {
-            results.push(receipt);
+                    let shard_path = shard_entry.path();
+                    if let Some(receipt) = try_load_gc_receipt_file(&shard_path, since_epoch_secs) {
+                        results.push(receipt);
+                    }
+                }
+            } else {
+                // Top-level .json file (legacy flat layout or job receipts).
+                if let Some(receipt) = try_load_gc_receipt_file(&top_path, since_epoch_secs) {
+                    results.push(receipt);
+                }
+            }
         }
     }
 
     results
+}
+
+/// Attempt to load a single GC receipt from a file path.
+///
+/// Returns `Some(receipt)` if the file is a valid GC receipt with
+/// `timestamp_secs >= since_epoch_secs`. Returns `None` for non-JSON files,
+/// non-regular files, oversized files, parse failures, schema mismatches,
+/// or receipts outside the time window.
+///
+/// # Security
+///
+/// Opens with `O_NOFOLLOW | O_NONBLOCK` and validates via `fstat` that the
+/// fd refers to a regular file before reading (MINOR-2 FIFO blocking fix).
+fn try_load_gc_receipt_file(path: &std::path::Path, since_epoch_secs: u64) -> Option<GcReceiptV1> {
+    // Only process .json files.
+    if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+        return None;
+    }
+
+    // Open with O_NOFOLLOW | O_NONBLOCK to prevent symlink-following
+    // and FIFO blocking attacks.
+    let file = open_no_follow(path).ok()?;
+
+    // Verify via fstat that the fd is a regular file.  Rejects FIFOs,
+    // device nodes, sockets, and directories (MINOR-2 fix).
+    if !is_regular_file(&file) {
+        return None;
+    }
+
+    let file_meta = file.metadata().ok()?;
+    if file_meta.len() > MAX_GC_RECEIPT_READ_SIZE {
+        return None;
+    }
+
+    let mut buf = Vec::new();
+    let cap = MAX_GC_RECEIPT_READ_SIZE;
+    if file.take(cap + 1).read_to_end(&mut buf).is_err() {
+        return None;
+    }
+    if buf.len() as u64 > cap {
+        return None;
+    }
+
+    // Try parsing as GC receipt.  Skip files that don't match.
+    let receipt: GcReceiptV1 = serde_json::from_slice(&buf).ok()?;
+
+    if receipt.schema != super::gc_receipt::GC_RECEIPT_SCHEMA {
+        return None;
+    }
+
+    if receipt.timestamp_secs >= since_epoch_secs {
+        Some(receipt)
+    } else {
+        None
+    }
 }
 
 // =============================================================================
@@ -706,6 +779,183 @@ mod tests {
         let results = load_gc_receipts(receipts_dir, 1000);
         assert_eq!(results.len(), 1, "should load one GC receipt");
         assert_eq!(results[0].timestamp_secs, 2000);
+    }
+
+    // =========================================================================
+    // BLOCKER-1/BLOCKER-2 regression: load_gc_receipts sharded layout
+    // =========================================================================
+
+    #[test]
+    fn load_gc_receipts_finds_sharded_receipts() {
+        // Regression test for BLOCKER-1/BLOCKER-2: load_gc_receipts must
+        // traverse the sharded directory layout produced by persist_gc_receipt.
+        // persist_gc_receipt writes: receipts/<first_2_hex>/<remaining>.json
+        use crate::fac::gc_receipt::persist_gc_receipt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Use persist_gc_receipt to write a GC receipt in the canonical
+        // sharded layout.
+        let gc = make_gc_receipt(3000, 1_000_000);
+        let receipt_path =
+            persist_gc_receipt(receipts_dir, gc).expect("persist_gc_receipt should succeed");
+
+        // Verify the receipt was written to a sharded path (not top-level).
+        assert!(
+            receipt_path.parent().unwrap() != receipts_dir,
+            "persist_gc_receipt should write to a shard subdirectory, \
+             not top-level. Path: {receipt_path:?}"
+        );
+
+        // load_gc_receipts MUST find the sharded receipt.
+        let results = load_gc_receipts(receipts_dir, 0);
+        assert_eq!(
+            results.len(),
+            1,
+            "load_gc_receipts must find receipts in sharded layout \
+             (found {} instead of 1)",
+            results.len()
+        );
+        assert_eq!(results[0].timestamp_secs, 3000);
+    }
+
+    #[test]
+    fn load_gc_receipts_finds_multiple_sharded_receipts() {
+        // Write multiple GC receipts across different shard buckets and
+        // verify all are discovered.
+        use crate::fac::gc_receipt::persist_gc_receipt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create receipts with different content hashes to get different shards.
+        for i in 0..5 {
+            let gc = make_gc_receipt(4000 + i, (i + 1) * 100_000);
+            persist_gc_receipt(receipts_dir, gc).expect("persist");
+        }
+
+        let results = load_gc_receipts(receipts_dir, 4000);
+        assert_eq!(
+            results.len(),
+            5,
+            "should find all 5 sharded GC receipts (found {})",
+            results.len()
+        );
+    }
+
+    #[test]
+    fn load_gc_receipts_handles_mixed_sharded_and_flat() {
+        // Verify load_gc_receipts finds both sharded (canonical) and flat
+        // (legacy) GC receipt files.
+        use crate::fac::gc_receipt::persist_gc_receipt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Write one receipt via persist_gc_receipt (sharded).
+        let gc_sharded = make_gc_receipt(5000, 200_000);
+        persist_gc_receipt(receipts_dir, gc_sharded).expect("persist sharded");
+
+        // Write one receipt directly to top-level (legacy flat layout).
+        let gc_flat = make_gc_receipt(5001, 300_000);
+        let flat_bytes = serde_json::to_vec_pretty(&gc_flat).expect("ser");
+        std::fs::write(receipts_dir.join("legacy-gc-flat.json"), &flat_bytes).expect("write flat");
+
+        let results = load_gc_receipts(receipts_dir, 5000);
+        assert_eq!(
+            results.len(),
+            2,
+            "should find both sharded and flat GC receipts (found {})",
+            results.len()
+        );
+    }
+
+    #[test]
+    fn load_gc_receipts_filters_by_timestamp_in_shards() {
+        // Verify timestamp filtering works for sharded receipts.
+        use crate::fac::gc_receipt::persist_gc_receipt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Write receipts with different timestamps.
+        let gc_old = make_gc_receipt(1000, 50_000);
+        let gc_new = make_gc_receipt(3000, 100_000);
+        persist_gc_receipt(receipts_dir, gc_old).expect("persist old");
+        persist_gc_receipt(receipts_dir, gc_new).expect("persist new");
+
+        // Only the receipt at timestamp 3000 should pass the filter.
+        let results = load_gc_receipts(receipts_dir, 2000);
+        assert_eq!(
+            results.len(),
+            1,
+            "should filter old receipts from sharded layout"
+        );
+        assert_eq!(results[0].timestamp_secs, 3000);
+    }
+
+    #[test]
+    fn load_gc_receipts_ignores_non_hex_shard_dirs() {
+        // Verify that directories with non-hex names are not treated as
+        // shard directories (defense-in-depth against crafted dir names).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create a directory with a non-hex name containing a GC receipt.
+        let bad_dir = receipts_dir.join("zz");
+        std::fs::create_dir_all(&bad_dir).expect("mkdir");
+        let gc = make_gc_receipt(6000, 100);
+        let gc_bytes = serde_json::to_vec_pretty(&gc).expect("ser");
+        std::fs::write(bad_dir.join("receipt.json"), &gc_bytes).expect("write");
+
+        // "zz" contains non-hex chars, so it should NOT be treated as a shard.
+        let results = load_gc_receipts(receipts_dir, 0);
+        assert!(
+            results.is_empty(),
+            "non-hex shard dirs must not be traversed"
+        );
+    }
+
+    // =========================================================================
+    // MINOR-2 regression: FIFO/non-regular file rejection
+    // =========================================================================
+
+    #[test]
+    #[cfg(unix)]
+    fn load_gc_receipts_skips_fifo_entries() {
+        // Regression test for MINOR-2: load_gc_receipts must not block on
+        // named pipes (FIFOs). A FIFO with a .json extension in the receipt
+        // directory must be detected and skipped.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create a named pipe (FIFO) with a .json extension.
+        let fifo_path = receipts_dir.join("trap.json");
+        nix::unistd::mkfifo(&fifo_path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+        assert!(fifo_path.exists(), "FIFO must exist");
+
+        // Also create a shard dir with a FIFO inside.
+        let shard_dir = receipts_dir.join("ab");
+        std::fs::create_dir_all(&shard_dir).expect("mkdir");
+        let fifo_in_shard = shard_dir.join("fifo-in-shard.json");
+        nix::unistd::mkfifo(&fifo_in_shard, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+
+        // load_gc_receipts must NOT block on the FIFO and must return
+        // empty results (the only entries are FIFOs).
+        let start = std::time::Instant::now();
+        let results = load_gc_receipts(receipts_dir, 0);
+        let elapsed = start.elapsed();
+
+        assert!(
+            results.is_empty(),
+            "load_gc_receipts must skip FIFOs (got {} results)",
+            results.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "load_gc_receipts must not block on FIFO: took {elapsed:?}"
+        );
     }
 
     // Compile-time assertion: load cap must not exceed scan cap.
