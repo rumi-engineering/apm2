@@ -816,7 +816,7 @@ mod tests {
     // Regression tests for security findings (TCK-00586 fix round)
     // ========================================================================
 
-    /// Regression: read_lock_metadata must reject symlinks via O_NOFOLLOW
+    /// Regression: `read_lock_metadata` must reject symlinks via `O_NOFOLLOW`
     /// (BLOCKER: TOCTOU symlink attack fix).
     #[cfg(unix)]
     #[test]
@@ -848,7 +848,7 @@ mod tests {
         );
     }
 
-    /// Regression: write_lock_metadata uses unpredictable temp file name
+    /// Regression: `write_lock_metadata` uses unpredictable temp file name
     /// (MAJOR: predictable temp file name fix).
     #[test]
     fn test_write_lock_metadata_no_predictable_temp() {
@@ -881,7 +881,7 @@ mod tests {
         assert_eq!(read_back.holder_pid, std::process::id());
     }
 
-    /// Regression: write_lock_metadata sets 0600 permissions on metadata file.
+    /// Regression: `write_lock_metadata` sets 0600 permissions on metadata file.
     #[cfg(unix)]
     #[test]
     fn test_write_lock_metadata_permissions() {

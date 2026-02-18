@@ -6586,7 +6586,6 @@ fn persist_scan_lock_stuck_receipt(fac_root: &Path, receipt_json: &str) -> Resul
         let _ = tmp.as_file().set_permissions(perms);
     }
 
-    use std::io::Write;
     tmp.write_all(receipt_json.as_bytes())
         .map_err(|e| format!("write stuck receipt: {e}"))?;
     tmp.as_file()
