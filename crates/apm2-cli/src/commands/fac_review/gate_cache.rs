@@ -104,9 +104,25 @@ pub struct CachedGateResult {
 impl CachedGateResult {
     /// Returns deterministic canonical bytes for signing.
     ///
-    /// Includes all fields that are semantically meaningful for cache reuse
-    /// decisions.  `signature_hex` and `signer_id` are excluded (they are
-    /// the authentication envelope, not the authenticated content).
+    /// Includes all fields that are semantically meaningful for the gate
+    /// result's integrity (the signed content). `signature_hex` and
+    /// `signer_id` are excluded (they are the authentication envelope,
+    /// not the authenticated content).
+    ///
+    /// **TCK-00540 (fix round 4):** `rfc0028_receipt_bound`,
+    /// `rfc0029_receipt_bound`, and `legacy_cache_override` are
+    /// intentionally EXCLUDED from canonical bytes. These are enforcement
+    /// policy metadata, not part of the signed gate result. The signed
+    /// content covers: gate name, SHA, evidence digest, attestation key
+    /// material, and operational metadata. Policy flags are layered on
+    /// top *after* signature verification as a separate policy gate in
+    /// `check_reuse`. This design:
+    /// - Preserves backward compatibility: legacy entries signed without these
+    ///   fields still pass signature verification.
+    /// - Eliminates sign/verify mismatch: `mark_legacy_override` can flip
+    ///   policy flags without invalidating the signature.
+    /// - Separates concerns: integrity (signature) vs. policy (binding checks)
+    ///   are independent gates.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     fn canonical_bytes(&self, sha: &str, gate_name: &str) -> Vec<u8> {
@@ -163,10 +179,9 @@ impl CachedGateResult {
         // log_path
         Self::append_optional_string(&mut buf, self.log_path.as_deref());
 
-        // TCK-00540: RFC-0028/0029 receipt binding fields
-        buf.push(u8::from(self.rfc0028_receipt_bound));
-        buf.push(u8::from(self.rfc0029_receipt_bound));
-        buf.push(u8::from(self.legacy_cache_override));
+        // NOTE: rfc0028_receipt_bound, rfc0029_receipt_bound, and
+        // legacy_cache_override are intentionally NOT included here.
+        // See doc comment above for rationale.
 
         buf
     }
@@ -752,7 +767,7 @@ impl GateCache {
 mod tests {
     use apm2_core::crypto::Signer;
 
-    use super::{GateCache, ReuseDecision};
+    use super::{CachedGateResult, GateCache, ReuseDecision};
 
     fn make_signed_cache(signer: &Signer) -> GateCache {
         let mut cache = GateCache::new("abc123");
@@ -1131,8 +1146,12 @@ mod tests {
     // --- TCK-00540: Legacy cache reuse policy tests ---
 
     /// Helper: create a signed cache whose entries have the receipt binding
-    /// fields explicitly overridden. This allows testing the receipt binding
-    /// gate in isolation (after the signature gate passes).
+    /// fields explicitly overridden. This simulates pre-TCK-00540 legacy
+    /// entries or entries with partial bindings.
+    ///
+    /// Policy flags are NOT part of `canonical_bytes` (fix round 4), so
+    /// the signature remains valid regardless of binding field values.
+    /// Sign is called once and binding overrides happen afterward.
     fn make_signed_cache_with_bindings(signer: &Signer, rfc0028: bool, rfc0029: bool) -> GateCache {
         let mut cache = GateCache::new("abc123");
         cache.set_with_attestation(
@@ -1144,19 +1163,22 @@ mod tests {
             Some("log-digest".to_string()),
             None,
         );
+        // Sign BEFORE changing binding flags — policy flags are not part
+        // of canonical_bytes, so the signature remains valid after override.
+        cache.sign_all(signer);
         // Override the default-true bindings set by set_with_attestation.
         if let Some(entry) = cache.gates.get_mut("rustfmt") {
             entry.rfc0028_receipt_bound = rfc0028;
             entry.rfc0029_receipt_bound = rfc0029;
         }
-        // Re-sign after mutation so the signature covers the updated fields.
-        cache.sign_all(signer);
         cache
     }
 
     /// Signed cache entry (missing RFC-0028/0029 bindings) is denied by
     /// default (fail-closed). The entry is validly signed but lacks receipt
-    /// bindings, simulating a pre-TCK-00540 cache entry that was resigned.
+    /// bindings, simulating a pre-TCK-00540 cache entry. The signature
+    /// passes verification (policy flags are not in `canonical_bytes`) but the
+    /// policy gate denies reuse.
     #[test]
     fn legacy_entry_without_receipt_bindings_denied_by_default() {
         let signer = Signer::generate();
@@ -1321,6 +1343,12 @@ gates:
     /// After `mark_legacy_override`, the entry must be denied by a default-mode
     /// `check_reuse` (the whole point of the fix: one unsafe run must not erase
     /// that the result lacked RFC-0028/0029 bindings).
+    ///
+    /// **Fix round 4 regression:** Signing happens BEFORE
+    /// `mark_legacy_override` and no re-signing is needed. Policy flags are
+    /// excluded from `canonical_bytes`, so the original signature remains
+    /// valid after the policy flags are flipped. This proves the
+    /// sign/verify mismatch is eliminated.
     #[test]
     fn override_marked_entry_denied_by_default_mode() {
         let signer = Signer::generate();
@@ -1334,13 +1362,15 @@ gates:
             Some("log-digest".to_string()),
             None,
         );
-        cache.mark_legacy_override("rustfmt");
-        // Re-sign after mutation so signature covers the updated fields.
+        // Sign BEFORE mark_legacy_override — no re-signing needed because
+        // policy flags are not part of canonical_bytes.
         cache.sign_all(&signer);
+        cache.mark_legacy_override("rustfmt");
 
         let vk = signer.verifying_key();
 
-        // Default mode (allow_legacy_cache=false): must deny.
+        // Default mode (allow_legacy_cache=false): must deny via policy gate
+        // (not signature gate — signature is still valid).
         let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), false);
         assert!(
             !reuse.reusable,
@@ -1402,7 +1432,8 @@ gates:
         );
     }
 
-    // --- TCK-00540 fix round 3: End-to-end runtime behaviour regression test ---
+    // --- TCK-00540 fix round 3+4: End-to-end runtime behaviour regression tests
+    // ---
 
     /// Regression test proving the `--allow-legacy-cache` flag changes runtime
     /// behavior for the `fac gates` path. This is the key test from the BLOCKER
@@ -1410,13 +1441,20 @@ gates:
     /// (b) be accepted and stored with `legacy_cache_override=true` when the
     /// flag is set, and (c) subsequent default-mode runs must still deny the
     /// override-marked entry.
+    ///
+    /// **Fix round 4:** The `sign_all` call happens BEFORE
+    /// `mark_legacy_override` (matching production flow in
+    /// `run_gates_inner`), proving that the sign/verify mismatch is
+    /// eliminated because policy flags are excluded from `canonical_bytes`.
     #[test]
     fn allow_legacy_cache_flag_changes_runtime_behaviour() {
         let signer = Signer::generate();
         let vk = signer.verifying_key();
 
         // Simulate a pre-existing signed cache entry WITHOUT receipt bindings
-        // (as would exist from a pre-TCK-00540 gate run).
+        // (as would exist from a pre-TCK-00540 gate run). Policy flags are
+        // not in canonical_bytes, so the signature computed over the entry
+        // with true/true bindings is the same as one computed with false/false.
         let cache = make_signed_cache_with_bindings(&signer, false, false);
 
         // (a) Default mode (allow_legacy_cache=false): MUST deny.
@@ -1442,7 +1480,8 @@ gates:
         );
 
         // Simulate what run_gates_inner does after an override hit:
-        // write the gate result then call mark_legacy_override.
+        // write the gate result, sign, THEN call mark_legacy_override.
+        // Signing before mark_legacy_override is the production order.
         let mut new_cache = GateCache::new("abc123");
         new_cache.set_with_attestation(
             "rustfmt",
@@ -1453,8 +1492,12 @@ gates:
             Some("log-digest".to_string()),
             None,
         );
-        new_cache.mark_legacy_override("rustfmt");
+        // Sign FIRST (production flow: sign_all happens after all gates run
+        // but before mark_legacy_override).
         new_cache.sign_all(&signer);
+        // THEN mark override — no re-signing needed because policy flags
+        // are excluded from canonical_bytes.
+        new_cache.mark_legacy_override("rustfmt");
 
         // Verify the persisted entry has correct override markings.
         let entry = new_cache.gates.get("rustfmt").expect("entry must exist");
@@ -1473,7 +1516,9 @@ gates:
 
         // (c) Subsequent default-mode run: MUST still deny the
         // override-marked entry (the override audit trail prevents silent
-        // promotion to trusted).
+        // promotion to trusted). The signature is still valid (signed
+        // before mark_legacy_override), so denial is from the policy gate,
+        // not the signature gate.
         let reuse_subsequent =
             new_cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), false);
         assert!(
@@ -1483,6 +1528,155 @@ gates:
         assert_eq!(
             reuse_subsequent.reason, "receipt_binding_missing",
             "subsequent denial must be receipt_binding_missing"
+        );
+    }
+
+    // --- TCK-00540 fix round 4: canonical_bytes backward compatibility tests ---
+
+    /// Proves that `mark_legacy_override` does NOT invalidate the signature.
+    /// This is the core fix for the sign/verify mismatch BLOCKER: policy
+    /// flags are excluded from `canonical_bytes`, so flipping them after
+    /// signing does not change the signed content.
+    #[test]
+    fn mark_legacy_override_does_not_invalidate_signature() {
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+
+        let mut cache = GateCache::new("abc123");
+        cache.set_with_attestation(
+            "rustfmt",
+            true,
+            1,
+            Some("digest-1".to_string()),
+            false,
+            Some("log-digest".to_string()),
+            None,
+        );
+
+        // Sign with default bindings (true/true/false).
+        cache.sign_all(&signer);
+
+        // Verify signature is valid BEFORE mark.
+        let entry = cache.get("rustfmt").expect("entry exists");
+        assert!(
+            entry.verify(&vk, "abc123", "rustfmt").is_ok(),
+            "signature must be valid before mark_legacy_override"
+        );
+
+        // Flip policy flags.
+        cache.mark_legacy_override("rustfmt");
+
+        // Verify signature is STILL valid AFTER mark (the BLOCKER fix).
+        let entry = cache.get("rustfmt").expect("entry exists");
+        assert!(
+            entry.verify(&vk, "abc123", "rustfmt").is_ok(),
+            "signature must remain valid after mark_legacy_override — \
+             policy flags are excluded from canonical_bytes"
+        );
+    }
+
+    /// Proves that legacy entries (signed without policy binding fields —
+    /// simulating pre-TCK-00540 cache entries) pass signature verification
+    /// and are then denied by the policy gate (not the signature check).
+    ///
+    /// This is the backward-compatibility regression test for the BLOCKER:
+    /// legacy entries signed before the three boolean fields existed must
+    /// still have valid signatures under the new `canonical_bytes` (which
+    /// excludes those fields).
+    #[test]
+    fn legacy_entry_passes_signature_but_denied_by_policy_gate() {
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+
+        // Create and sign an entry, then simulate a legacy entry by
+        // setting binding fields to false (as if deserialized from
+        // pre-TCK-00540 YAML where these fields were absent and
+        // defaulted to false).
+        let mut cache = GateCache::new("abc123");
+        cache.set_with_attestation(
+            "rustfmt",
+            true,
+            1,
+            Some("digest-1".to_string()),
+            false,
+            Some("log-digest".to_string()),
+            None,
+        );
+        cache.sign_all(&signer);
+
+        // Simulate legacy: strip binding fields (as if deserialized from
+        // old YAML without these fields — serde defaults them to false).
+        if let Some(entry) = cache.gates.get_mut("rustfmt") {
+            entry.rfc0028_receipt_bound = false;
+            entry.rfc0029_receipt_bound = false;
+            entry.legacy_cache_override = false;
+        }
+
+        // Step 1: Signature MUST still verify (policy flags not in canonical_bytes).
+        let entry = cache.get("rustfmt").expect("entry exists");
+        assert!(
+            entry.verify(&vk, "abc123", "rustfmt").is_ok(),
+            "legacy entry signature must still verify — policy flags are \
+             excluded from canonical_bytes"
+        );
+
+        // Step 2: check_reuse denies via policy gate, not signature gate.
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), false);
+        assert!(
+            !reuse.reusable,
+            "legacy entry must be denied in default mode"
+        );
+        assert_eq!(
+            reuse.reason, "receipt_binding_missing",
+            "denial must come from policy gate (receipt_binding_missing), \
+             not from signature gate"
+        );
+
+        // Step 3: --allow-legacy-cache overrides the policy gate.
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), true);
+        assert!(
+            reuse.reusable,
+            "legacy entry must be accepted with --allow-legacy-cache"
+        );
+        assert_eq!(reuse.reason, "legacy_cache_override_unsafe");
+    }
+
+    /// Proves that `canonical_bytes` produces identical output regardless
+    /// of the policy flag values. This is a direct structural test ensuring
+    /// the three booleans do not influence the signed content.
+    #[test]
+    fn canonical_bytes_identical_regardless_of_policy_flags() {
+        let mut entry_a = CachedGateResult {
+            status: "PASS".to_string(),
+            duration_secs: 42,
+            completed_at: "2026-01-01T00:00:00Z".to_string(),
+            attestation_digest: Some("digest".to_string()),
+            evidence_log_digest: Some("evidence".to_string()),
+            quick_mode: Some(false),
+            log_bundle_hash: None,
+            bytes_written: None,
+            bytes_total: None,
+            was_truncated: None,
+            log_path: None,
+            signature_hex: None,
+            signer_id: None,
+            rfc0028_receipt_bound: true,
+            rfc0029_receipt_bound: true,
+            legacy_cache_override: false,
+        };
+
+        let bytes_bound = entry_a.canonical_bytes("sha1", "gate1");
+
+        // Flip ALL policy flags.
+        entry_a.rfc0028_receipt_bound = false;
+        entry_a.rfc0029_receipt_bound = false;
+        entry_a.legacy_cache_override = true;
+
+        let bytes_unbound = entry_a.canonical_bytes("sha1", "gate1");
+
+        assert_eq!(
+            bytes_bound, bytes_unbound,
+            "canonical_bytes must be identical regardless of policy flag values"
         );
     }
 }
