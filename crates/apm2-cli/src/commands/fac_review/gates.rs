@@ -1965,6 +1965,7 @@ mod tests {
             "200%",
             GateThroughputProfile::Balanced.as_str(),
             &workspace,
+            false,
         )
     }
 
