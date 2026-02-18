@@ -97,12 +97,13 @@ use apm2_core::fac::{
     GateReceiptBuilder, LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1,
     LaneCorruptMarkerV1, LaneProfileV1, MAX_POLICY_SIZE, PATCH_FORMAT_GIT_DIFF_V1,
     QueueAdmissionTrace as JobQueueAdmissionTrace, ReceiptPipelineError, ReceiptWritePipeline,
-    RepoMirrorManager, SystemModeConfig, SystemdUnitProperties, apply_credential_mount_to_env,
-    build_github_credential_mount, build_job_environment, compute_policy_hash, deserialize_policy,
-    fingerprint_short_hex, load_or_default_boundary_id, move_job_to_terminal,
-    outcome_to_terminal_state, parse_policy_hash, persist_content_addressed_receipt,
-    persist_policy, rename_noreplace, resolve_toolchain_fingerprint, run_preflight,
-    select_and_validate_backend,
+    RepoMirrorManager, SystemModeConfig, SystemdUnitProperties, TOOLCHAIN_MAX_CACHE_FILE_BYTES,
+    apply_credential_mount_to_env, build_github_credential_mount, build_job_environment,
+    compute_policy_hash, deserialize_policy, fingerprint_short_hex, load_or_default_boundary_id,
+    move_job_to_terminal, outcome_to_terminal_state, parse_policy_hash,
+    persist_content_addressed_receipt, persist_policy, rename_noreplace,
+    resolve_toolchain_fingerprint_cached, run_preflight, select_and_validate_backend,
+    serialize_cache, toolchain_cache_dir, toolchain_cache_file_path,
 };
 use apm2_core::github::{parse_github_remote_url, resolve_apm2_home};
 use base64::Engine;
@@ -225,6 +226,12 @@ mod fac_permissions {
 
     pub fn ensure_dir_with_mode(path: &Path) -> Result<(), io::Error> {
         fs::create_dir_all(path)
+    }
+
+    /// Test-mode stub for atomic file write with restricted permissions.
+    /// In test mode, simply writes directly without permission enforcement.
+    pub fn write_fac_file_with_mode(path: &Path, data: &[u8]) -> Result<(), io::Error> {
+        fs::write(path, data)
     }
 
     /// Test-mode stub: always passes.  Integration tests for real
@@ -768,9 +775,14 @@ pub fn run_fac_worker(
         }
     }
 
-    // TCK-00538: Compute toolchain fingerprint ONCE at startup. Fail-closed:
-    // if fingerprint resolution fails, the worker refuses to start. The
-    // fingerprint is required for receipt integrity and lane target namespacing.
+    // TCK-00538: Resolve toolchain fingerprint with cache-first strategy.
+    // Fail-closed: if fingerprint resolution fails, the worker refuses to
+    // start. The fingerprint is required for receipt integrity and lane
+    // target namespacing.
+    //
+    // Cache path: $APM2_HOME/private/fac/toolchain/fingerprint.v1.json
+    // Cache validation: re-derive fingerprint from stored raw_versions and
+    // compare (INV-TC-004). If mismatch, recompute fresh.
     let toolchain_fingerprint: String = {
         let mut probe_env = std::collections::BTreeMap::new();
         if let Ok(path) = std::env::var("PATH") {
@@ -782,8 +794,66 @@ pub fn run_fac_worker(
         if let Ok(user) = std::env::var("USER") {
             probe_env.insert("USER".to_string(), user);
         }
-        match resolve_toolchain_fingerprint(&probe_env) {
-            Ok(fp) => fp,
+
+        // Step 1: Try loading cache (bounded read, O_NOFOLLOW via
+        // fac_secure_io::read_bounded).
+        let cache_path = toolchain_cache_file_path(&fac_root);
+        let cache_bytes = if cache_path.exists() {
+            fac_secure_io::read_bounded(&cache_path, TOOLCHAIN_MAX_CACHE_FILE_BYTES).ok()
+        } else {
+            None
+        };
+
+        // Step 2: Resolve fingerprint (cache-first, fresh fallback).
+        match resolve_toolchain_fingerprint_cached(&probe_env, cache_bytes.as_deref()) {
+            Ok((fp, versions)) => {
+                // Step 3: Persist cache atomically if we computed fresh
+                // (i.e. cache was missing or invalid). We detect this by
+                // checking whether the returned fingerprint differs from
+                // what was in the cache.
+                let cache_was_valid = cache_bytes
+                    .as_deref()
+                    .and_then(apm2_core::fac::validate_cached_fingerprint)
+                    .is_some_and(|cached_fp| cached_fp == fp);
+
+                if !cache_was_valid {
+                    // Ensure cache directory exists with restricted perms
+                    // (dir 0o700).
+                    let tc_cache_dir = toolchain_cache_dir(&fac_root);
+                    if let Err(e) = fac_permissions::ensure_dir_with_mode(&tc_cache_dir) {
+                        // Cache write failure is non-fatal: log and continue.
+                        // The fingerprint was successfully computed.
+                        if json_output {
+                            emit_worker_event(
+                                "toolchain_cache_dir_error",
+                                serde_json::json!({
+                                    "path": tc_cache_dir.display().to_string(),
+                                    "error": e.to_string(),
+                                }),
+                            );
+                        }
+                    } else if let Ok(cache_data) = serialize_cache(&fp, &versions) {
+                        // Atomic write with restricted perms (file 0o600,
+                        // O_NOFOLLOW, symlink-safe via
+                        // write_fac_file_with_mode).
+                        if let Err(e) =
+                            fac_permissions::write_fac_file_with_mode(&cache_path, &cache_data)
+                        {
+                            // Cache write failure is non-fatal.
+                            if json_output {
+                                emit_worker_event(
+                                    "toolchain_cache_write_error",
+                                    serde_json::json!({
+                                        "path": cache_path.display().to_string(),
+                                        "error": e.to_string(),
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                }
+                fp
+            },
             Err(e) => {
                 output_worker_error(
                     json_output,

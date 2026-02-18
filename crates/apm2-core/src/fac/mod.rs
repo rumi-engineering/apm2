@@ -554,10 +554,14 @@ pub use terminal_verifier::{
 };
 // Re-export toolchain fingerprint types (TCK-00538)
 pub use toolchain_fingerprint::{
-    FINGERPRINT_STRING_LENGTH, ToolchainFingerprintError, ToolchainVersions,
-    collect_toolchain_versions, derive_from_versions as derive_toolchain_fingerprint,
-    fingerprint_short_hex, is_valid_fingerprint,
-    resolve_fingerprint as resolve_toolchain_fingerprint,
+    CACHE_FILE_NAME as TOOLCHAIN_CACHE_FILE_NAME, CachedFingerprint, FINGERPRINT_STRING_LENGTH,
+    MAX_CACHE_FILE_BYTES as TOOLCHAIN_MAX_CACHE_FILE_BYTES, ToolchainFingerprintError,
+    ToolchainVersions, cache_dir as toolchain_cache_dir,
+    cache_file_path as toolchain_cache_file_path, collect_toolchain_versions,
+    derive_from_versions as derive_toolchain_fingerprint, fingerprint_short_hex,
+    is_valid_fingerprint, resolve_fingerprint as resolve_toolchain_fingerprint,
+    resolve_fingerprint_cached as resolve_toolchain_fingerprint_cached, serialize_cache,
+    validate_cached_fingerprint,
 };
 // Re-export transcript binding types
 pub use transcript_binding::{
