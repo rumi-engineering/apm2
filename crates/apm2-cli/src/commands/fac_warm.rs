@@ -232,7 +232,12 @@ pub fn run_fac_warm(
             );
         },
     };
-    if let Err(e) = enqueue_job(&queue_root, &spec) {
+    if let Err(e) = enqueue_job(
+        &queue_root,
+        &fac_root,
+        &spec,
+        &fac_policy.queue_bounds_policy,
+    ) {
         return output_error(
             json_output,
             "warm_enqueue_failed",
@@ -440,7 +445,7 @@ fn build_warm_job_spec(
     // intent-bound token issuance.  Thread FacPolicyV1.allowed_intents
     // so the broker enforces the allowlist at issuance (fail-closed).
     let intent = apm2_core::fac::job_spec::job_kind_to_intent(&spec.kind);
-    let token = broker
+    let (token, wal_bytes) = broker
         .issue_channel_context_token(
             policy_digest,
             lease_id,
@@ -450,6 +455,10 @@ fn build_warm_job_spec(
             allowed_intents,
         )
         .map_err(|e| format!("broker token issuance: {e}"))?;
+    // BLOCKER fix: persist the WAL entry before releasing the token
+    // (crash durability for issuance registration).
+    super::fac_worker::append_token_ledger_wal_pub(&wal_bytes)
+        .map_err(|e| format!("token ledger WAL persist on issuance: {e}"))?;
     spec.actuation.channel_context_token = Some(token);
 
     // TCK-00579: Validate the warm spec against the policy-derived validation

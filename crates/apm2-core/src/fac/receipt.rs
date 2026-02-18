@@ -616,6 +616,15 @@ pub enum DenialReasonCode {
     /// derived, preventing unknown job kinds from bypassing intent-binding
     /// verification.
     UnknownJobKindIntent,
+    /// Token replay detected: the nonce in the token has already been
+    /// consumed by a prior job execution (TCK-00566).
+    TokenReplayDetected,
+    /// Token has been explicitly revoked before expiry (TCK-00566).
+    TokenRevoked,
+    /// Queue bounds exceeded: pending job count or pending bytes would
+    /// exceed the configured `QueueBoundsPolicy` limits (TCK-00578).
+    /// Denial reason code: `queue/quota_exceeded`.
+    QueueQuotaExceeded,
 }
 
 /// Trace of the RFC-0028 channel boundary check.

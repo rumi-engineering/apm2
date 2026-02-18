@@ -277,6 +277,15 @@ pub struct FacPolicyV1 {
     /// at validation time (CTR-1303).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_intents: Option<Vec<super::job_spec::FacIntent>>,
+
+    /// Queue bounds policy controlling maximum pending queue size (TCK-00578).
+    ///
+    /// Configures `max_pending_jobs`, `max_pending_bytes`, and optional
+    /// `per_lane_max_pending_jobs` for enqueue-time enforcement. When not
+    /// present in persisted policy (pre-TCK-00578 policies), defaults to
+    /// `QueueBoundsPolicy::default()` via `serde(default)`.
+    #[serde(default)]
+    pub queue_bounds_policy: super::queue_bounds::QueueBoundsPolicy,
 }
 
 impl Default for FacPolicyV1 {
@@ -353,6 +362,7 @@ impl FacPolicyV1 {
             network_policy: None,
             allowed_repo_ids: None,
             allowed_intents: None,
+            queue_bounds_policy: super::queue_bounds::QueueBoundsPolicy::default(),
         }
     }
 
@@ -456,6 +466,14 @@ impl FacPolicyV1 {
                 });
             }
         }
+
+        // Validate queue bounds policy (TCK-00578).
+        self.queue_bounds_policy
+            .validate()
+            .map_err(|e| FacPolicyError::InvalidFieldValue {
+                field: "queue_bounds_policy",
+                value: format!("{e}"),
+            })?;
 
         Ok(())
     }
