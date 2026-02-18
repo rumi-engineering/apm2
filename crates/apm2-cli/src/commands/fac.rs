@@ -524,6 +524,13 @@ pub struct DoctorArgs {
     #[arg(long, default_value_t = false)]
     pub full: bool,
 
+    /// Include tracked PR summaries in system doctor output.
+    ///
+    /// By default, `apm2 fac doctor` focuses on host readiness checks only.
+    /// Use this flag (or `--full`) when tracked PR details are required.
+    #[arg(long, default_value_t = false)]
+    pub tracked_prs: bool,
+
     /// Wait until doctor recommends an action other than `wait`.
     #[arg(long, visible_alias = "wait", default_value_t = false)]
     pub wait_for_recommended_action: bool,
@@ -2398,21 +2405,27 @@ pub fn run_fac(
                             );
                         },
                     };
-                let repo_hint = args.repo.clone();
-                let tracked_prs = match fac_review::collect_tracked_pr_summaries(
-                    repo_hint.as_deref(),
-                    args.repo.as_deref(),
-                ) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        let message = format!("failed to build tracked PR doctor summary: {err}");
-                        checks.push(crate::commands::daemon::DaemonDoctorCheck {
-                            name: "tracked_pr_summary".to_string(),
-                            status: "WARN",
-                            message,
-                        });
-                        Vec::new()
-                    },
+                let include_tracked_prs = args.tracked_prs || args.full;
+                let tracked_prs = if include_tracked_prs {
+                    let repo_hint = args.repo.clone();
+                    match fac_review::collect_tracked_pr_summaries(
+                        repo_hint.as_deref(),
+                        args.repo.as_deref(),
+                    ) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            let message =
+                                format!("failed to build tracked PR doctor summary: {err}");
+                            checks.push(crate::commands::daemon::DaemonDoctorCheck {
+                                name: "tracked_pr_summary".to_string(),
+                                status: "WARN",
+                                message,
+                            });
+                            Vec::new()
+                        },
+                    }
+                } else {
+                    Vec::new()
                 };
                 let payload = serde_json::json!({
                     "schema": "apm2.fac.doctor.system.v1",
@@ -7137,6 +7150,22 @@ mod tests {
         match parsed.subcommand {
             FacSubcommand::Doctor(args) => {
                 assert!(args.full);
+                assert!(!args.tracked_prs);
+                assert!(args.pr.is_none());
+                assert!(args.repo.is_none());
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_doctor_tracked_prs_flag_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "doctor", "--tracked-prs"])
+            .expect("doctor --tracked-prs should parse");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert!(args.tracked_prs);
+                assert!(!args.full);
                 assert!(args.pr.is_none());
                 assert!(args.repo.is_none());
             },

@@ -11,6 +11,14 @@ requirement:
     to `"apm2.fac.gates_event.v1"` and an `event` field identifying the event
     type.
 
+    Delivery is staged:
+      - Phase A (TCK-00621) establishes phase/gate lifecycle visibility for the
+        local worker execution path with
+        `prep_started`, `prep_step`, `execute_started`, `gate_started`,
+        `gate_finished`, and terminal `run_summary`/`run_failed`.
+      - Phase B (TCK-00625) completes the full 10-event contract below and
+        enforces schema completeness/order validation in CI.
+
     The following events are REQUIRED and MUST be emitted in the order listed
     when the corresponding phase or action occurs:
 
@@ -38,7 +46,7 @@ requirement:
     Without `--json`, a human-friendly summary MAY be emitted; the JSONL
     contract applies only to `--json` mode.
 
-    Primary delivery ticket: TCK-00625.
+    Primary delivery tickets: TCK-00621 (Phase A), TCK-00625 (Phase B).
   rationale: |
     Structured stdout is the primary observability surface for orchestrators,
     CI pipelines, and implementor agents. Without a stable schema, consumers
@@ -47,7 +55,8 @@ requirement:
     dashboards, progress indicators, and failure routing can be built without
     log access.
   acceptance_criteria:
-    - "All 10 required event types are emitted in the correct order for a successful run."
+    - "Phase A emits prep/execute/gate lifecycle events and terminal run_summary/run_failed on the local worker path."
+    - "Phase B emits all 10 required event types in the correct order for a successful run."
     - "run_failed is emitted on any failure with all required fields from the failure taxonomy (REQ-0035)."
     - "Every event includes schema: apm2.fac.gates_event.v1 and event fields."
     - "The event stream alone (no logs) is sufficient to determine: which gate failed, why cache missed, how long each phase took."

@@ -94,6 +94,12 @@ rfc_requirements_readme:
     - id: "REQ-0039"
       title: "Fresh-worktree conformance suite: zero-touch, offline, and warm-path coverage"
       file: "REQ-0039.yaml"
+    - id: "REQ-0040"
+      title: "FAC doctor system output defaults to checks-only; tracked PRs are explicit opt-in"
+      file: "REQ-0040.yaml"
+    - id: "REQ-0041"
+      title: "Doctor wait loop must terminate on manual/complete states with reasoned terminal events"
+      file: "REQ-0041.yaml"
   required_conventions:
     - "Root key MUST be requirement (RFC-0019 legacy format; migrate to rfc_requirement when tooling is ready)."
     - "requirement.id MUST match filename."

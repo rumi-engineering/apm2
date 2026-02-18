@@ -660,6 +660,7 @@ pub fn run_doctor(
     loop {
         let elapsed_seconds = started.elapsed().as_secs().min(wait_timeout_seconds);
         if exit_actions.contains(summary.recommended_action.action.as_str()) {
+            emit_doctor_wait_terminal_event(json_output, tick, &summary, elapsed_seconds);
             emit_doctor_wait_result(&summary, json_output, tick, false, elapsed_seconds);
             return exit_codes::SUCCESS;
         }
@@ -788,6 +789,41 @@ fn emit_doctor_wait_timeout_event(
         ts: jsonl::ts_now(),
     }) {
         eprintln!("WARNING: failed to emit doctor wait timeout event: {err}");
+    }
+}
+
+fn doctor_wait_terminal_reason(action: &str) -> &'static str {
+    match action {
+        "dispatch_implementor" => "dispatch_implementor",
+        // "merge" means all merge predicates already passed; "approve" means
+        // all verdict dimensions approved and merge is awaiting integration.
+        "merge" | "approve" => "merge_ready",
+        "restart_reviews" => "restart_reviews",
+        "fix" => "fix",
+        "escalate" => "escalate",
+        "done" => "done",
+        _ => "terminal_state",
+    }
+}
+
+fn emit_doctor_wait_terminal_event(
+    json_output: bool,
+    tick: u64,
+    summary: &DoctorPrSummary,
+    elapsed_seconds: u64,
+) {
+    if !json_output {
+        return;
+    }
+    if let Err(err) = jsonl::emit_jsonl(&jsonl::DoctorWaitTerminalEvent {
+        event: "wait_terminal",
+        tick,
+        reason: doctor_wait_terminal_reason(&summary.recommended_action.action).to_string(),
+        action: summary.recommended_action.action.clone(),
+        elapsed_seconds,
+        ts: jsonl::ts_now(),
+    }) {
+        eprintln!("WARNING: failed to emit doctor wait terminal event: {err}");
     }
 }
 
@@ -2821,7 +2857,6 @@ fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommended
 
     if input.merge_readiness.all_verdicts_approve
         && !has_actionable_findings
-        && active_agents == 0
         && input.merge_readiness.sha_freshness_source == DoctorShaFreshnessSource::RemoteMatch
         && input.merge_readiness.merge_conflict_status != DoctorMergeConflictStatus::HasConflicts
     {
@@ -6789,7 +6824,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_recommended_action_blocks_approve_while_reviewers_active() {
+    fn test_build_recommended_action_allows_approve_while_reviewers_active() {
         let reviews = doctor_reviews_with_terminal_reason(None);
         let findings = vec![
             findings_summary_entry("security", "approve", 0, 0, 0, 0),
@@ -6818,7 +6853,7 @@ mod tests {
             &findings,
             &readiness,
         );
-        assert_eq!(action.action, "wait");
+        assert_eq!(action.action, "approve");
     }
 
     #[test]
@@ -7159,6 +7194,16 @@ mod tests {
             .expect("escalate should be accepted");
         assert_eq!(normalized.len(), 1);
         assert!(normalized.contains("escalate"));
+    }
+
+    #[test]
+    fn test_doctor_wait_terminal_reason_maps_merge_and_approve() {
+        assert_eq!(super::doctor_wait_terminal_reason("merge"), "merge_ready");
+        assert_eq!(super::doctor_wait_terminal_reason("approve"), "merge_ready");
+        assert_eq!(
+            super::doctor_wait_terminal_reason("dispatch_implementor"),
+            "dispatch_implementor"
+        );
     }
 
     #[test]

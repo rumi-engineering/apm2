@@ -5,10 +5,13 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use apm2_core::fac::gate_cache_v3::{GateCacheV3, V3CompoundKey};
@@ -29,7 +32,7 @@ use super::bounded_test_runner::{
     BoundedTestLimits, build_bounded_test_command as build_systemd_bounded_test_command,
 };
 use super::evidence::{
-    EvidenceGateOptions, EvidenceGateResult, LANE_EVIDENCE_GATES, cache_v3_root,
+    EvidenceGateOptions, EvidenceGateResult, GateProgressEvent, LANE_EVIDENCE_GATES, cache_v3_root,
     compute_v3_compound_key, run_evidence_gates_with_lane_context,
 };
 use super::gate_attestation::{
@@ -64,6 +67,17 @@ const GATES_SINGLE_FLIGHT_DIR: &str = "queue/singleflight";
 const GATES_QUEUE_PENDING_DIR: &str = "pending";
 const GATES_QUEUE_CLAIMED_DIR: &str = "claimed";
 const DIRTY_TREE_STATUS_MAX_LINES: usize = 20;
+const GATES_EVENT_SCHEMA: &str = "apm2.fac.gates_event.v1";
+const PREP_STEP_SEQUENCE: [&str; 3] = [
+    "readiness_controller",
+    "singleflight_reap",
+    "dependency_closure_hydration",
+];
+const DEFAULT_SINGLEFLIGHT_LOCK_TIMEOUT_SECS: u64 = 120;
+const SINGLEFLIGHT_LOCK_TIMEOUT_ENV: &str = "APM2_FAC_GATES_SINGLEFLIGHT_LOCK_TIMEOUT_SECS";
+const SINGLEFLIGHT_LOCK_POLL_INTERVAL_MILLIS: u64 = 200;
+const SINGLEFLIGHT_LOCK_OWNER_FILE_READ_MAX_BYTES: u64 = 1024;
+static GATES_RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueueProcessingMode {
@@ -429,6 +443,8 @@ fn prepare_queued_gates_job(
     let queue_root = resolve_queue_root().map_err(|err| QueuePreparationFailure::Runtime {
         message: format!("cannot resolve queue root: {err}"),
     })?;
+    reap_stale_singleflight_locks(&fac_root)
+        .map_err(|message| QueuePreparationFailure::Runtime { message })?;
     let single_flight_lock =
         acquire_gates_single_flight_lock(&fac_root, &repo_source.repo_id, &repo_source.head_sha)
             .map_err(|message| QueuePreparationFailure::Runtime { message })?;
@@ -496,17 +512,22 @@ fn prepare_queued_gates_job(
     })
 }
 
-fn acquire_gates_single_flight_lock(
-    fac_root: &Path,
-    repo_id: &str,
-    head_sha: &str,
-) -> Result<std::fs::File, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SingleFlightLockOwner {
+    pid: u32,
+    start_time_ticks: Option<u64>,
+}
+
+fn gates_single_flight_lock_path(fac_root: &Path, repo_id: &str, head_sha: &str) -> PathBuf {
     let lock_name = format!(
         "gates-{}-{}.lock",
         sanitize_single_flight_segment(repo_id),
         sanitize_single_flight_segment(head_sha),
     );
-    let lock_path = fac_root.join(GATES_SINGLE_FLIGHT_DIR).join(lock_name);
+    fac_root.join(GATES_SINGLE_FLIGHT_DIR).join(lock_name)
+}
+
+fn ensure_single_flight_lock_parent(lock_path: &Path) -> Result<(), String> {
     if let Some(parent) = lock_path.parent() {
         #[cfg(unix)]
         {
@@ -531,27 +552,268 @@ fn acquire_gates_single_flight_lock(
             })?;
         }
     }
-    let lock_file = {
-        let mut options = OpenOptions::new();
-        options.create(true).truncate(false).read(true).write(true);
-        #[cfg(unix)]
-        {
-            options.mode(0o600);
-        }
-        options.open(&lock_path).map_err(|err| {
-            format!(
-                "cannot open gates single-flight lock {}: {err}",
-                lock_path.display()
-            )
-        })?
-    };
-    lock_file.lock_exclusive().map_err(|err| {
+    Ok(())
+}
+
+fn open_single_flight_lock_file(lock_path: &Path) -> Result<std::fs::File, String> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    options.open(lock_path).map_err(|err| {
         format!(
-            "cannot acquire gates single-flight lock {}: {err}",
+            "cannot open gates single-flight lock {}: {err}",
             lock_path.display()
         )
-    })?;
-    Ok(lock_file)
+    })
+}
+
+fn resolve_singleflight_lock_timeout() -> Duration {
+    let timeout_secs = std::env::var(SINGLEFLIGHT_LOCK_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SINGLEFLIGHT_LOCK_TIMEOUT_SECS);
+    Duration::from_secs(timeout_secs)
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_time_ticks(pid: u32) -> Option<u64> {
+    super::state::get_process_start_time(pid)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_start_time_ticks(pid: u32) -> Option<u64> {
+    let _ = pid;
+    None
+}
+
+fn current_single_flight_lock_owner() -> SingleFlightLockOwner {
+    let pid = std::process::id();
+    SingleFlightLockOwner {
+        pid,
+        start_time_ticks: process_start_time_ticks(pid),
+    }
+}
+
+fn parse_single_flight_lock_owner(raw: &str) -> Option<SingleFlightLockOwner> {
+    let mut pid: Option<u32> = None;
+    let mut start_time_ticks: Option<u64> = None;
+    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if let Some(value) = line.strip_prefix("pid=") {
+            if let Ok(parsed) = value.trim().parse::<u32>() {
+                pid = Some(parsed);
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("start_time_ticks=") {
+            if let Ok(parsed) = value.trim().parse::<u64>() {
+                start_time_ticks = Some(parsed);
+            }
+            continue;
+        }
+        if pid.is_none() {
+            if let Ok(parsed) = line.parse::<u32>() {
+                pid = Some(parsed);
+            }
+        }
+    }
+    pid.map(|pid| SingleFlightLockOwner {
+        pid,
+        start_time_ticks,
+    })
+}
+
+fn read_single_flight_lock_owner(
+    lock_file: &mut std::fs::File,
+) -> Result<Option<SingleFlightLockOwner>, String> {
+    lock_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|err| format!("seek single-flight lock owner read start: {err}"))?;
+    let mut content = String::new();
+    let mut bounded = lock_file.take(SINGLEFLIGHT_LOCK_OWNER_FILE_READ_MAX_BYTES);
+    bounded
+        .read_to_string(&mut content)
+        .map_err(|err| format!("read single-flight lock owner metadata: {err}"))?;
+    parse_single_flight_lock_owner(&content).map_or_else(
+        || Ok(None),
+        |owner| {
+            if owner.pid == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(owner))
+            }
+        },
+    )
+}
+
+fn write_single_flight_lock_owner(lock_file: &mut std::fs::File) -> Result<(), String> {
+    let owner = current_single_flight_lock_owner();
+    let mut content = format!("pid={}\n", owner.pid);
+    if let Some(start_time_ticks) = owner.start_time_ticks {
+        content.push_str("start_time_ticks=");
+        content.push_str(&start_time_ticks.to_string());
+        content.push('\n');
+    }
+    lock_file
+        .set_len(0)
+        .map_err(|err| format!("truncate single-flight lock owner metadata: {err}"))?;
+    lock_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|err| format!("seek single-flight lock owner write start: {err}"))?;
+    lock_file
+        .write_all(content.as_bytes())
+        .map_err(|err| format!("write single-flight lock owner metadata: {err}"))?;
+    lock_file
+        .sync_data()
+        .map_err(|err| format!("sync single-flight lock owner metadata: {err}"))?;
+    Ok(())
+}
+
+fn is_single_flight_lock_owner_alive(owner: SingleFlightLockOwner) -> bool {
+    if owner.pid == 0 || !is_pid_running(owner.pid) {
+        return false;
+    }
+    if let Some(expected_start_ticks) = owner.start_time_ticks {
+        if let Some(observed_start_ticks) = process_start_time_ticks(owner.pid) {
+            return observed_start_ticks == expected_start_ticks;
+        }
+    }
+    true
+}
+
+fn describe_single_flight_lock_owner(owner: Option<SingleFlightLockOwner>) -> String {
+    owner.map_or_else(
+        || "owner_pid=unknown owner_state=unknown".to_string(),
+        |owner| {
+            let owner_state = if is_single_flight_lock_owner_alive(owner) {
+                "alive"
+            } else {
+                "dead_or_reused"
+            };
+            let mut detail = format!("owner_pid={} owner_state={owner_state}", owner.pid);
+            if let Some(start_time_ticks) = owner.start_time_ticks {
+                detail.push_str(" owner_start_time_ticks=");
+                detail.push_str(&start_time_ticks.to_string());
+            }
+            detail
+        },
+    )
+}
+
+fn acquire_gates_single_flight_lock(
+    fac_root: &Path,
+    repo_id: &str,
+    head_sha: &str,
+) -> Result<std::fs::File, String> {
+    let lock_path = gates_single_flight_lock_path(fac_root, repo_id, head_sha);
+    ensure_single_flight_lock_parent(&lock_path)?;
+    let timeout = resolve_singleflight_lock_timeout();
+    let started = Instant::now();
+    loop {
+        let mut lock_file = open_single_flight_lock_file(&lock_path)?;
+        let owner = match FileExt::try_lock_exclusive(&lock_file) {
+            Ok(()) => {
+                write_single_flight_lock_owner(&mut lock_file)?;
+                return Ok(lock_file);
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                read_single_flight_lock_owner(&mut lock_file).ok().flatten()
+            },
+            Err(err) => {
+                return Err(format!(
+                    "cannot acquire gates single-flight lock {}: {err}",
+                    lock_path.display()
+                ));
+            },
+        };
+        if started.elapsed() >= timeout {
+            let owner_detail = describe_single_flight_lock_owner(owner);
+            return Err(format!(
+                "timed out after {}s waiting for gates single-flight lock {} ({owner_detail}); inspect the owner PID and remove the lock only when it is confirmed stale",
+                timeout.as_secs(),
+                lock_path.display(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(
+            SINGLEFLIGHT_LOCK_POLL_INTERVAL_MILLIS,
+        ));
+    }
+}
+
+fn reap_stale_singleflight_locks(fac_root: &Path) -> Result<u64, String> {
+    let lock_dir = fac_root.join(GATES_SINGLE_FLIGHT_DIR);
+    if !lock_dir.exists() {
+        return Ok(0);
+    }
+    if !lock_dir.is_dir() {
+        return Err(format!(
+            "gates single-flight lock path is not a directory: {}",
+            lock_dir.display()
+        ));
+    }
+    let mut reaped = 0_u64;
+    let entries = fs::read_dir(&lock_dir)
+        .map_err(|err| format!("cannot read gates single-flight lock directory: {err}"))?;
+    for (idx, entry) in entries.enumerate() {
+        if idx >= MAX_SCAN_ENTRIES {
+            break;
+        }
+        let entry = entry.map_err(|err| {
+            format!(
+                "cannot read gates single-flight lock directory entry in {}: {err}",
+                lock_dir.display()
+            )
+        })?;
+        let file_type = entry.file_type().map_err(|err| {
+            format!(
+                "cannot read file type for single-flight lock entry {}: {err}",
+                entry.path().display()
+            )
+        })?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("lock") {
+            continue;
+        }
+        let mut lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|err| {
+                format!(
+                    "cannot open gates single-flight lock for liveness reaping {}: {err}",
+                    path.display()
+                )
+            })?;
+        match FileExt::try_lock_exclusive(&lock_file) {
+            Ok(()) => {
+                let owner = read_single_flight_lock_owner(&mut lock_file)?;
+                let stale = owner.is_none_or(|owner| !is_single_flight_lock_owner_alive(owner));
+                if stale {
+                    fs::remove_file(&path).map_err(|err| {
+                        format!(
+                            "cannot remove stale gates single-flight lock {}: {err}",
+                            path.display()
+                        )
+                    })?;
+                    reaped = reaped.saturating_add(1);
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {},
+            Err(err) => {
+                return Err(format!(
+                    "cannot evaluate single-flight lock liveness {}: {err}",
+                    path.display()
+                ));
+            },
+        }
+    }
+    Ok(reaped)
 }
 
 fn sanitize_single_flight_segment(raw: &str) -> String {
@@ -854,7 +1116,59 @@ pub(super) fn run_gates_local_worker(
 ) -> Result<LocalGatesRunResult, String> {
     let (resolved_profile, effective_cpu_quota) =
         resolve_effective_execution_profile(cpu_quota, gate_profile)?;
-    let summary = run_gates_inner(
+    let run_id = next_gates_run_id();
+    let gate_sha = resolve_workspace_head_sha(workspace_root);
+    let execute_started_emitted = Arc::new(AtomicBool::new(false));
+    let emitted_gate_finishes = Arc::new(std::sync::Mutex::new(BTreeSet::<String>::new()));
+    emit_prep_started_event(&run_id);
+
+    let run_id_for_prep = run_id.clone();
+    let prep_step_callback: Box<dyn Fn(&PrepStepResult) + Send> =
+        Box::new(move |step: &PrepStepResult| {
+            emit_prep_step_event(&run_id_for_prep, step);
+        });
+
+    let run_id_for_progress = run_id.clone();
+    let gate_sha_for_progress = gate_sha;
+    let execute_started_for_progress = Arc::clone(&execute_started_emitted);
+    let emitted_gate_finishes_for_progress = Arc::clone(&emitted_gate_finishes);
+    let gate_progress_callback: Box<dyn Fn(GateProgressEvent) + Send> =
+        Box::new(move |event: GateProgressEvent| match event {
+            GateProgressEvent::Started { gate_name } => {
+                if !execute_started_for_progress.swap(true, Ordering::AcqRel) {
+                    emit_execute_started_event(&run_id_for_progress);
+                }
+                emit_gate_started_event(
+                    &run_id_for_progress,
+                    gate_sha_for_progress.as_deref(),
+                    &gate_name,
+                );
+            },
+            GateProgressEvent::Completed {
+                gate_name,
+                passed,
+                duration_secs,
+                error_hint,
+                ..
+            } => {
+                if let Ok(mut emitted) = emitted_gate_finishes_for_progress.lock() {
+                    emitted.insert(gate_name.clone());
+                }
+                let status = if passed { "PASS" } else { "FAIL" };
+                emit_gate_finished_event(
+                    &run_id_for_progress,
+                    gate_sha_for_progress.as_deref(),
+                    &gate_name,
+                    passed,
+                    duration_secs,
+                    status,
+                    error_hint.as_deref(),
+                );
+            },
+            GateProgressEvent::Progress { .. } => {},
+        });
+
+    let summary = match run_gates_inner_detailed(
         workspace_root,
         force,
         quick,
@@ -865,17 +1179,62 @@ pub(super) fn run_gates_local_worker(
         gate_profile,
         resolved_profile.test_parallelism,
         false,
-        None,
-    )?;
+        Some(prep_step_callback.as_ref()),
+        Some(gate_progress_callback),
+    ) {
+        Ok(summary) => summary,
+        Err(failure) => {
+            if failure.phase == GatesRunPhase::Execute
+                && !execute_started_emitted.load(Ordering::Acquire)
+            {
+                emit_execute_started_event(&run_id);
+            }
+            emit_run_failed_event(&run_id, failure.phase.as_str(), &failure.message);
+            return Err(failure.render());
+        },
+    };
+
+    if !execute_started_emitted.load(Ordering::Acquire) {
+        emit_execute_started_event(&run_id);
+    }
+
+    let emitted_snapshot = emitted_gate_finishes
+        .lock()
+        .map(|set| set.clone())
+        .unwrap_or_default();
+    for gate in &summary.gates {
+        if emitted_snapshot.contains(&gate.name) {
+            continue;
+        }
+        emit_gate_started_event(&run_id, Some(summary.sha.as_str()), &gate.name);
+        emit_gate_finished_event(
+            &run_id,
+            Some(summary.sha.as_str()),
+            &gate.name,
+            gate.status != "FAIL",
+            gate.duration_secs,
+            gate.status.as_str(),
+            gate.error_hint.as_deref(),
+        );
+    }
+
     Ok(if summary.passed {
+        emit_run_summary_event(&run_id, &summary);
         LocalGatesRunResult {
             exit_code: exit_codes::SUCCESS,
             failure_summary: None,
         }
     } else {
+        let failure_summary = summarize_gate_failures(&summary.gates)
+            .unwrap_or_else(|| "gate execution failed".to_string());
+        let phase = summary
+            .phase_failed
+            .as_deref()
+            .unwrap_or(GatesRunPhase::Execute.as_str());
+        emit_run_failed_event(&run_id, phase, &failure_summary);
         LocalGatesRunResult {
             exit_code: exit_codes::GENERIC_ERROR,
-            failure_summary: summarize_gate_failures(&summary.gates),
+            failure_summary: Some(failure_summary),
         }
     })
 }
@@ -1447,8 +1806,78 @@ struct GatesSummary {
     effective_test_parallelism: u32,
     requested_timeout_seconds: u64,
     effective_timeout_seconds: u64,
+    prep_duration_ms: u64,
+    execute_duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase_failed: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    prep_steps: Vec<PrepStepResult>,
     cache_status: String,
     gates: Vec<GateResult>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct PrepStepResult {
+    step_name: String,
+    status: String,
+    duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reaped_locks: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PrepStepTelemetry {
+    reaped_locks: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatesRunPhase {
+    Prep,
+    Execute,
+}
+
+type PrepStepCallback<'a> = &'a (dyn Fn(&PrepStepResult) + Send);
+
+impl GatesRunPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prep => "prep",
+            Self::Execute => "execute",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GatesPhaseError {
+    phase: GatesRunPhase,
+    message: String,
+}
+
+impl GatesPhaseError {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn render(self) -> String {
+        format!(
+            "run_failed stage={} root_cause={}",
+            self.phase.as_str(),
+            self.message
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GatesRunFailure {
+    phase: GatesRunPhase,
+    message: String,
+}
+
+impl GatesRunFailure {
+    fn render(self) -> String {
+        format!(
+            "run_failed stage={} root_cause={}",
+            self.phase.as_str(),
+            self.message
+        )
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1539,8 +1968,434 @@ fn bind_merge_gate_log_bundle_hash(
     Ok(())
 }
 
+fn duration_ms(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn build_gates_event(event: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut payload = match extra {
+        serde_json::Value::Object(map) => map,
+        value => {
+            let mut map = serde_json::Map::new();
+            map.insert("payload".to_string(), value);
+            map
+        },
+    };
+    payload.insert(
+        "schema".to_string(),
+        serde_json::Value::String(GATES_EVENT_SCHEMA.to_string()),
+    );
+    payload.insert(
+        "event".to_string(),
+        serde_json::Value::String(event.to_string()),
+    );
+    if !payload.contains_key("ts") {
+        payload.insert(
+            "ts".to_string(),
+            serde_json::Value::String(super::jsonl::ts_now()),
+        );
+    }
+    serde_json::Value::Object(payload)
+}
+
+fn next_gates_run_id() -> String {
+    format!(
+        "gates-{}-{}-{}",
+        Utc::now().timestamp_millis(),
+        std::process::id(),
+        GATES_RUN_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn resolve_workspace_head_sha(workspace_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspace_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sha.is_empty() {
+        return None;
+    }
+    Some(sha)
+}
+
+fn prep_started_event(run_id: &str) -> serde_json::Value {
+    build_gates_event(
+        "prep_started",
+        serde_json::json!({
+            "run_id": run_id,
+            "prep_steps": PREP_STEP_SEQUENCE,
+        }),
+    )
+}
+
+fn emit_prep_started_event(run_id: &str) {
+    if let Err(err) = super::jsonl::emit_jsonl(&prep_started_event(run_id)) {
+        eprintln!("WARNING: failed to emit gates event `prep_started`: {err}");
+    }
+}
+
+fn prep_step_event(run_id: &str, step: &PrepStepResult) -> serde_json::Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "run_id".to_string(),
+        serde_json::Value::String(run_id.to_string()),
+    );
+    payload.insert(
+        "step_name".to_string(),
+        serde_json::Value::String(step.step_name.clone()),
+    );
+    payload.insert(
+        "status".to_string(),
+        serde_json::Value::String(step.status.clone()),
+    );
+    payload.insert(
+        "duration_ms".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(step.duration_ms)),
+    );
+    if let Some(reaped_locks) = step.reaped_locks {
+        payload.insert(
+            "reaped_locks".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(reaped_locks)),
+        );
+    }
+    build_gates_event("prep_step", serde_json::Value::Object(payload))
+}
+
+fn emit_prep_step_event(run_id: &str, step: &PrepStepResult) {
+    if let Err(err) = super::jsonl::emit_jsonl(&prep_step_event(run_id, step)) {
+        eprintln!("WARNING: failed to emit gates event `prep_step`: {err}");
+    }
+}
+
+fn execute_started_event(run_id: &str) -> serde_json::Value {
+    build_gates_event(
+        "execute_started",
+        serde_json::json!({
+            "run_id": run_id,
+        }),
+    )
+}
+
+fn emit_execute_started_event(run_id: &str) {
+    if let Err(err) = super::jsonl::emit_jsonl(&execute_started_event(run_id)) {
+        eprintln!("WARNING: failed to emit gates event `execute_started`: {err}");
+    }
+}
+
+fn gate_started_event(run_id: &str, sha: Option<&str>, gate_name: &str) -> serde_json::Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "run_id".to_string(),
+        serde_json::Value::String(run_id.to_string()),
+    );
+    payload.insert(
+        "gate_name".to_string(),
+        serde_json::Value::String(gate_name.to_string()),
+    );
+    if let Some(sha) = sha {
+        payload.insert(
+            "sha".to_string(),
+            serde_json::Value::String(sha.to_string()),
+        );
+    }
+    build_gates_event("gate_started", serde_json::Value::Object(payload))
+}
+
+fn emit_gate_started_event(run_id: &str, sha: Option<&str>, gate_name: &str) {
+    if let Err(err) = super::jsonl::emit_jsonl(&gate_started_event(run_id, sha, gate_name)) {
+        eprintln!("WARNING: failed to emit gates event `gate_started`: {err}");
+    }
+}
+
+fn gate_finished_event(
+    run_id: &str,
+    sha: Option<&str>,
+    gate_name: &str,
+    passed: bool,
+    duration_secs: u64,
+    status: &str,
+    error_hint: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "run_id".to_string(),
+        serde_json::Value::String(run_id.to_string()),
+    );
+    payload.insert(
+        "gate_name".to_string(),
+        serde_json::Value::String(gate_name.to_string()),
+    );
+    payload.insert(
+        "verdict".to_string(),
+        serde_json::Value::String(if passed { "pass" } else { "fail" }.to_string()),
+    );
+    payload.insert(
+        "duration_ms".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(duration_secs.saturating_mul(1000))),
+    );
+    payload.insert(
+        "status".to_string(),
+        serde_json::Value::String(status.to_string()),
+    );
+    if let Some(sha) = sha {
+        payload.insert(
+            "sha".to_string(),
+            serde_json::Value::String(sha.to_string()),
+        );
+    }
+    if let Some(error_hint) = error_hint {
+        payload.insert(
+            "error_hint".to_string(),
+            serde_json::Value::String(error_hint.to_string()),
+        );
+    }
+    build_gates_event("gate_finished", serde_json::Value::Object(payload))
+}
+
+fn emit_gate_finished_event(
+    run_id: &str,
+    sha: Option<&str>,
+    gate_name: &str,
+    passed: bool,
+    duration_secs: u64,
+    status: &str,
+    error_hint: Option<&str>,
+) {
+    if let Err(err) = super::jsonl::emit_jsonl(&gate_finished_event(
+        run_id,
+        sha,
+        gate_name,
+        passed,
+        duration_secs,
+        status,
+        error_hint,
+    )) {
+        eprintln!("WARNING: failed to emit gates event `gate_finished`: {err}");
+    }
+}
+
+fn run_summary_event(run_id: &str, summary: &GatesSummary) -> serde_json::Value {
+    let gate_verdicts = summary
+        .gates
+        .iter()
+        .map(|gate| {
+            serde_json::json!({
+                "gate_name": gate.name.as_str(),
+                "status": gate.status.as_str(),
+            })
+        })
+        .collect::<Vec<_>>();
+    build_gates_event(
+        "run_summary",
+        serde_json::json!({
+            "run_id": run_id,
+            "sha": summary.sha.as_str(),
+            "passed": summary.passed,
+            "prep_duration_ms": summary.prep_duration_ms,
+            "execute_duration_ms": summary.execute_duration_ms,
+            "phase_failed": summary.phase_failed.as_deref(),
+            "gate_verdicts": gate_verdicts,
+        }),
+    )
+}
+
+fn emit_run_summary_event(run_id: &str, summary: &GatesSummary) {
+    if let Err(err) = super::jsonl::emit_jsonl(&run_summary_event(run_id, summary)) {
+        eprintln!("WARNING: failed to emit gates event `run_summary`: {err}");
+    }
+}
+
+fn run_failed_event(run_id: &str, stage: &str, root_cause: &str) -> serde_json::Value {
+    build_gates_event(
+        "run_failed",
+        serde_json::json!({
+            "run_id": run_id,
+            "stage": stage,
+            "root_cause": root_cause,
+        }),
+    )
+}
+
+fn emit_run_failed_event(run_id: &str, stage: &str, root_cause: &str) {
+    if let Err(err) = super::jsonl::emit_jsonl(&run_failed_event(run_id, stage, root_cause)) {
+        eprintln!("WARNING: failed to emit gates event `run_failed`: {err}");
+    }
+}
+
+fn run_prep_step<F>(
+    prep_steps: &mut Vec<PrepStepResult>,
+    step_name: &str,
+    on_step: Option<PrepStepCallback<'_>>,
+    mut run_step: F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Result<PrepStepTelemetry, String>,
+{
+    let started = Instant::now();
+    let step_outcome = run_step();
+    let (status, telemetry, error) = match step_outcome {
+        Ok(telemetry) => ("ok".to_string(), telemetry, None),
+        Err(step_error) => (
+            "failed".to_string(),
+            PrepStepTelemetry::default(),
+            Some(step_error),
+        ),
+    };
+    let step = PrepStepResult {
+        step_name: step_name.to_string(),
+        status,
+        duration_ms: duration_ms(started.elapsed()),
+        reaped_locks: telemetry.reaped_locks,
+    };
+    if let Some(on_step) = on_step {
+        on_step(&step);
+    }
+    prep_steps.push(step);
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn format_readiness_failure(failure: &ReadinessFailure) -> String {
+    let diagnostics = if failure.diagnostics.is_empty() {
+        String::new()
+    } else {
+        format!(" diagnostics={}", failure.diagnostics.join(" | "))
+    };
+    format!(
+        "component={} root_cause={} remediation={}{}",
+        failure.component, failure.root_cause, failure.remediation, diagnostics
+    )
+}
+
+fn run_dependency_closure_hydration_check(workspace_root: &Path) -> Result<(), String> {
+    // TCK-00623 placeholder: dependency closure hydration validation hook.
+    if !workspace_root.is_dir() {
+        return Err(format!(
+            "dependency closure hydration check requires a workspace directory: {}",
+            workspace_root.display()
+        ));
+    }
+    Ok(())
+}
+
+fn run_singleflight_lock_liveness_reap() -> Result<u64, String> {
+    let apm2_home = apm2_core::github::resolve_apm2_home().ok_or_else(|| {
+        "cannot resolve APM2_HOME for single-flight lock liveness reap".to_string()
+    })?;
+    let fac_root = apm2_home.join("private/fac");
+    reap_stale_singleflight_locks(&fac_root)
+}
+
+fn run_prep_phase(
+    workspace_root: &Path,
+    prep_steps: &mut Vec<PrepStepResult>,
+    on_step: Option<PrepStepCallback<'_>>,
+) -> Result<(), String> {
+    run_prep_step(prep_steps, "readiness_controller", on_step, || {
+        readiness::run_readiness_controller(
+            ReadinessOptions {
+                require_external_worker: false,
+                wait_for_worker: false,
+            },
+            WorkerReadinessHooks {
+                has_live_worker_heartbeat: &has_live_worker_heartbeat,
+                spawn_detached_worker: &spawn_detached_worker_for_queue,
+            },
+        )
+        .map(|_| PrepStepTelemetry::default())
+        .map_err(|failure| format_readiness_failure(&failure))
+    })?;
+    run_prep_step(prep_steps, "singleflight_reap", on_step, || {
+        run_singleflight_lock_liveness_reap().map(|reaped_locks| PrepStepTelemetry {
+            reaped_locks: Some(reaped_locks),
+        })
+    })?;
+    run_prep_step(prep_steps, "dependency_closure_hydration", on_step, || {
+        run_dependency_closure_hydration_check(workspace_root)
+            .map(|()| PrepStepTelemetry::default())
+    })?;
+    Ok(())
+}
+
+fn run_gates_phases<FPrep, FExecute>(
+    prep_phase: FPrep,
+    execute_phase: FExecute,
+) -> Result<(u64, u64, GatesSummary), GatesPhaseError>
+where
+    FPrep: FnOnce() -> Result<(), String>,
+    FExecute: FnOnce() -> Result<GatesSummary, String>,
+{
+    let prep_started = Instant::now();
+    prep_phase().map_err(|message| GatesPhaseError {
+        phase: GatesRunPhase::Prep,
+        message,
+    })?;
+    let prep_duration_ms = duration_ms(prep_started.elapsed());
+
+    let execute_started = Instant::now();
+    let summary = execute_phase().map_err(|message| GatesPhaseError {
+        phase: GatesRunPhase::Execute,
+        message,
+    })?;
+    let execute_duration_ms = duration_ms(execute_started.elapsed());
+
+    Ok((prep_duration_ms, execute_duration_ms, summary))
+}
+
+fn capture_workspace_tree_fingerprint(workspace_root: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=no"])
+        .current_dir(workspace_root)
+        .output()
+        .map_err(|err| format!("failed to capture workspace fingerprint: {err}"))?;
+    if !output.status.success() {
+        return Err("failed to capture workspace fingerprint via git status".to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn summarize_workspace_fingerprint(raw: &str) -> String {
+    let lines = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(DIRTY_TREE_STATUS_MAX_LINES)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return "<clean>".to_string();
+    }
+    let mut summary = lines.join(" | ");
+    if raw.lines().count() > lines.len() {
+        summary.push_str(" | ...");
+    }
+    summary
+}
+
+fn assert_execute_ambient_mutation_invariant(
+    workspace_root: &Path,
+    before_execute: &str,
+) -> Result<(), String> {
+    let after_execute = capture_workspace_tree_fingerprint(workspace_root)?;
+    if before_execute != after_execute {
+        return Err(format!(
+            "EXECUTE_AMBIENT_MUTATION before=`{}` after=`{}`",
+            summarize_workspace_fingerprint(before_execute),
+            summarize_workspace_fingerprint(&after_execute)
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::fn_params_excessive_bools)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn run_gates_inner(
     workspace_root: &Path,
     force: bool,
@@ -1552,17 +2407,113 @@ fn run_gates_inner(
     gate_profile: GateThroughputProfile,
     test_parallelism: u32,
     emit_human_logs: bool,
-    on_gate_progress: Option<Box<dyn Fn(super::evidence::GateProgressEvent) + Send>>,
+    on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
 ) -> Result<GatesSummary, String> {
-    validate_timeout_seconds(timeout_seconds)?;
-    let memory_max_bytes = parse_memory_limit(memory_max)?;
+    run_gates_inner_detailed(
+        workspace_root,
+        force,
+        quick,
+        timeout_seconds,
+        memory_max,
+        pids_max,
+        cpu_quota,
+        gate_profile,
+        test_parallelism,
+        emit_human_logs,
+        None,
+        on_gate_progress,
+    )
+    .map_err(GatesRunFailure::render)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::fn_params_excessive_bools)]
+fn run_gates_inner_detailed(
+    workspace_root: &Path,
+    force: bool,
+    quick: bool,
+    timeout_seconds: u64,
+    memory_max: &str,
+    pids_max: u64,
+    cpu_quota: &str,
+    gate_profile: GateThroughputProfile,
+    test_parallelism: u32,
+    emit_human_logs: bool,
+    on_prep_step: Option<PrepStepCallback<'_>>,
+    on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
+) -> Result<GatesSummary, GatesRunFailure> {
+    validate_timeout_seconds(timeout_seconds).map_err(|message| GatesRunFailure {
+        phase: GatesRunPhase::Prep,
+        message,
+    })?;
+    let memory_max_bytes = parse_memory_limit(memory_max).map_err(|message| GatesRunFailure {
+        phase: GatesRunPhase::Prep,
+        message,
+    })?;
     if memory_max_bytes > max_memory_bytes() {
-        return Err(format!(
-            "--memory-max {memory_max} exceeds FAC test memory cap of {max_bytes}",
-            max_bytes = max_memory_bytes()
-        ));
+        return Err(GatesRunFailure {
+            phase: GatesRunPhase::Prep,
+            message: format!(
+                "--memory-max {memory_max} exceeds FAC test memory cap of {max_bytes}",
+                max_bytes = max_memory_bytes()
+            ),
+        });
     }
 
+    let mut prep_steps = Vec::new();
+    let phase_result = run_gates_phases(
+        || run_prep_phase(workspace_root, &mut prep_steps, on_prep_step),
+        || {
+            run_execute_phase(
+                workspace_root,
+                force,
+                quick,
+                timeout_seconds,
+                memory_max,
+                pids_max,
+                cpu_quota,
+                gate_profile,
+                test_parallelism,
+                emit_human_logs,
+                on_gate_progress,
+            )
+        },
+    );
+
+    match phase_result {
+        Ok((prep_duration_ms, execute_duration_ms, mut summary)) => {
+            summary.prep_duration_ms = prep_duration_ms;
+            summary.execute_duration_ms = execute_duration_ms;
+            summary.phase_failed = if summary.passed {
+                None
+            } else {
+                Some(GatesRunPhase::Execute.as_str().to_string())
+            };
+            summary.prep_steps = prep_steps;
+            Ok(summary)
+        },
+        Err(err) => Err(GatesRunFailure {
+            phase: err.phase,
+            message: err.message,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::fn_params_excessive_bools)]
+fn run_execute_phase(
+    workspace_root: &Path,
+    force: bool,
+    quick: bool,
+    timeout_seconds: u64,
+    memory_max: &str,
+    pids_max: u64,
+    cpu_quota: &str,
+    gate_profile: GateThroughputProfile,
+    test_parallelism: u32,
+    emit_human_logs: bool,
+    on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
+) -> Result<GatesSummary, String> {
     let timeout_decision = resolve_bounded_test_timeout(workspace_root, timeout_seconds);
 
     // TCK-00526: Load FAC policy for environment enforcement.
@@ -1596,6 +2547,7 @@ fn run_gates_inner(
     // 1. Require clean working tree for full gates only. `--force` allows
     // rerunning gates for the same SHA while local edits are in progress.
     ensure_clean_working_tree(workspace_root, quick || force)?;
+    let execute_workspace_fingerprint = capture_workspace_tree_fingerprint(workspace_root)?;
 
     // 2. Resolve HEAD SHA.
     let sha_output = Command::new("git")
@@ -1616,14 +2568,14 @@ fn run_gates_inner(
     // 3. Merge-conflict gate always runs first and is never cache-reused.
     // Emit gate_started before execution for streaming observability.
     if let Some(ref cb) = on_gate_progress {
-        cb(super::evidence::GateProgressEvent::Started {
+        cb(GateProgressEvent::Started {
             gate_name: "merge_conflict_main".to_string(),
         });
     }
     let mut merge_gate = evaluate_merge_conflict_gate(workspace_root, &sha, emit_human_logs)?;
     // Emit gate_completed immediately after the merge gate finishes.
     if let Some(ref cb) = on_gate_progress {
-        cb(super::evidence::GateProgressEvent::Completed {
+        cb(GateProgressEvent::Completed {
             gate_name: merge_gate.name.clone(),
             passed: merge_gate.status == "PASS",
             duration_secs: merge_gate.duration_secs,
@@ -1636,6 +2588,7 @@ fn run_gates_inner(
         });
     }
     if merge_gate.status == "FAIL" {
+        assert_execute_ambient_mutation_invariant(workspace_root, &execute_workspace_fingerprint)?;
         return Ok(GatesSummary {
             sha,
             passed: false,
@@ -1646,6 +2599,10 @@ fn run_gates_inner(
             effective_test_parallelism: test_parallelism,
             requested_timeout_seconds: timeout_seconds,
             effective_timeout_seconds: timeout_decision.effective_seconds,
+            prep_duration_ms: 0,
+            execute_duration_ms: 0,
+            phase_failed: Some(GatesRunPhase::Execute.as_str().to_string()),
+            prep_steps: Vec::new(),
             cache_status: "disabled (merge conflicts)".to_string(),
             gates: vec![merge_gate],
         });
@@ -1934,6 +2891,8 @@ fn run_gates_inner(
         );
     }
 
+    assert_execute_ambient_mutation_invariant(workspace_root, &execute_workspace_fingerprint)?;
+
     Ok(GatesSummary {
         sha,
         passed,
@@ -1944,6 +2903,14 @@ fn run_gates_inner(
         effective_test_parallelism: test_parallelism,
         requested_timeout_seconds: timeout_seconds,
         effective_timeout_seconds: timeout_decision.effective_seconds,
+        prep_duration_ms: 0,
+        execute_duration_ms: 0,
+        phase_failed: if passed {
+            None
+        } else {
+            Some(GatesRunPhase::Execute.as_str().to_string())
+        },
+        prep_steps: Vec::new(),
         cache_status: if quick {
             "disabled (quick mode)".to_string()
         } else if force {
@@ -2192,9 +3159,12 @@ mod tests {
     use std::collections::HashSet;
     use std::ffi::OsString;
     use std::fs;
+    use std::io::BufRead;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     use super::*;
 
@@ -2299,6 +3269,225 @@ mod tests {
     fn write_queue_spec(path: &Path, spec: &FacJobSpecV1) {
         let body = serde_json::to_vec_pretty(spec).expect("serialize spec");
         fs::write(path, body).expect("write spec");
+    }
+
+    fn sample_phase_summary(passed: bool) -> GatesSummary {
+        GatesSummary {
+            sha: "a".repeat(40),
+            passed,
+            bounded: true,
+            quick: false,
+            gate_profile: GateThroughputProfile::Balanced.as_str().to_string(),
+            effective_cpu_quota: "200%".to_string(),
+            effective_test_parallelism: 2,
+            requested_timeout_seconds: 60,
+            effective_timeout_seconds: 60,
+            prep_duration_ms: 0,
+            execute_duration_ms: 0,
+            phase_failed: None,
+            prep_steps: Vec::new(),
+            cache_status: "write-through".to_string(),
+            gates: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn build_gates_event_includes_schema_and_event_type() {
+        let payload = build_gates_event("prep_started", serde_json::json!({"run_id":"run-1"}));
+        assert_eq!(
+            payload.get("schema").and_then(serde_json::Value::as_str),
+            Some(GATES_EVENT_SCHEMA)
+        );
+        assert_eq!(
+            payload.get("event").and_then(serde_json::Value::as_str),
+            Some("prep_started")
+        );
+    }
+
+    #[test]
+    fn run_summary_event_contains_phase_durations_and_phase_failed() {
+        let mut summary = sample_phase_summary(true);
+        summary.prep_duration_ms = 15;
+        summary.execute_duration_ms = 220;
+        let payload = run_summary_event("run-1", &summary);
+        assert_eq!(
+            payload
+                .get("prep_duration_ms")
+                .and_then(serde_json::Value::as_u64),
+            Some(15)
+        );
+        assert_eq!(
+            payload
+                .get("execute_duration_ms")
+                .and_then(serde_json::Value::as_u64),
+            Some(220)
+        );
+        assert!(
+            payload
+                .get("phase_failed")
+                .is_none_or(serde_json::Value::is_null)
+        );
+    }
+
+    #[test]
+    fn run_failed_event_contains_stage_field() {
+        let payload = run_failed_event("run-1", "prep", "readiness failed");
+        assert_eq!(
+            payload.get("stage").and_then(serde_json::Value::as_str),
+            Some("prep")
+        );
+        assert_eq!(
+            payload.get("event").and_then(serde_json::Value::as_str),
+            Some("run_failed")
+        );
+    }
+
+    #[test]
+    fn prep_step_event_includes_reaped_locks_when_present() {
+        let payload = prep_step_event(
+            "run-1",
+            &PrepStepResult {
+                step_name: "singleflight_reap".to_string(),
+                status: "ok".to_string(),
+                duration_ms: 12,
+                reaped_locks: Some(4),
+            },
+        );
+        assert_eq!(
+            payload
+                .get("reaped_locks")
+                .and_then(serde_json::Value::as_u64),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn next_gates_run_id_is_unique() {
+        let first = next_gates_run_id();
+        let second = next_gates_run_id();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn gate_started_event_omits_sha_when_unavailable() {
+        let payload = gate_started_event("run-1", None, "fmt");
+        assert_eq!(
+            payload.get("gate_name").and_then(serde_json::Value::as_str),
+            Some("fmt")
+        );
+        assert!(payload.get("sha").is_none());
+    }
+
+    #[test]
+    fn gate_finished_event_keeps_status_and_optional_sha() {
+        let payload = gate_finished_event("run-1", None, "test", true, 0, "SKIP", None);
+        assert_eq!(
+            payload.get("status").and_then(serde_json::Value::as_str),
+            Some("SKIP")
+        );
+        assert_eq!(
+            payload.get("verdict").and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+        assert!(payload.get("sha").is_none());
+    }
+
+    #[test]
+    fn run_prep_step_invokes_callback_with_failed_status() {
+        let emitted = Mutex::new(Vec::new());
+        let mut prep_steps = Vec::new();
+        let on_step = |step: &PrepStepResult| {
+            emitted
+                .lock()
+                .expect("lock emitted prep steps")
+                .push(format!("{}:{}", step.step_name, step.status));
+        };
+        let err = run_prep_step(
+            &mut prep_steps,
+            "readiness_controller",
+            Some(&on_step),
+            || Err("readiness failed".to_string()),
+        )
+        .expect_err("prep step should fail");
+        assert_eq!(err, "readiness failed");
+        assert_eq!(prep_steps.len(), 1);
+        assert_eq!(
+            prep_steps[0].status.as_str(),
+            "failed",
+            "prep step status must capture failure"
+        );
+        assert_eq!(
+            emitted.lock().expect("lock emitted prep steps").as_slice(),
+            &["readiness_controller:failed".to_string()]
+        );
+    }
+
+    #[test]
+    fn run_gates_phases_prep_failure_skips_execute_and_reports_stage() {
+        let mut execute_called = false;
+        let err = run_gates_phases(
+            || Err("readiness controller failed".to_string()),
+            || {
+                execute_called = true;
+                Ok(sample_phase_summary(true))
+            },
+        )
+        .expect_err("prep failure must abort execute phase");
+        assert_eq!(err.phase, GatesRunPhase::Prep);
+        assert!(
+            !execute_called,
+            "execute phase must not run after prep failure"
+        );
+        let rendered = err.render();
+        assert!(rendered.contains("stage=prep"));
+    }
+
+    #[test]
+    fn run_gates_phases_success_reports_both_phase_durations() {
+        let (prep_duration_ms, execute_duration_ms, summary) = run_gates_phases(
+            || {
+                std::thread::sleep(Duration::from_millis(2));
+                Ok(())
+            },
+            || {
+                std::thread::sleep(Duration::from_millis(2));
+                Ok(sample_phase_summary(true))
+            },
+        )
+        .expect("phases should succeed");
+        assert!(prep_duration_ms > 0, "prep duration must be recorded");
+        assert!(execute_duration_ms > 0, "execute duration must be recorded");
+        assert!(summary.passed);
+    }
+
+    #[test]
+    fn run_gates_phases_execute_failure_reports_stage_execute() {
+        let err = run_gates_phases(|| Ok(()), || Err("gate execution failed".to_string()))
+            .expect_err("execute failure must be returned");
+        assert_eq!(err.phase, GatesRunPhase::Execute);
+        let rendered = err.render();
+        assert!(rendered.contains("stage=execute"));
+    }
+
+    #[test]
+    fn execute_ambient_mutation_invariant_detects_workspace_mutation() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let repo = temp_dir.path();
+
+        run_git(repo, &["init"]);
+        run_git(repo, &["config", "user.email", "test@example.com"]);
+        run_git(repo, &["config", "user.name", "Test User"]);
+
+        fs::write(repo.join("tracked.txt"), "v1\n").expect("write tracked file");
+        run_git(repo, &["add", "tracked.txt"]);
+        run_git(repo, &["commit", "-m", "init"]);
+
+        let before = capture_workspace_tree_fingerprint(repo).expect("capture baseline");
+        fs::write(repo.join("tracked.txt"), "v2\n").expect("mutate tracked file");
+
+        let err = assert_execute_ambient_mutation_invariant(repo, &before)
+            .expect_err("ambient mutation must be detected");
+        assert!(err.contains("EXECUTE_AMBIENT_MUTATION"));
     }
 
     #[test]
@@ -2930,12 +4119,7 @@ mod tests {
 
         let _lock = acquire_gates_single_flight_lock(&fac_root, repo, sha).expect("lock");
         let lock_dir = fac_root.join(GATES_SINGLE_FLIGHT_DIR);
-        let lock_name = format!(
-            "gates-{}-{}.lock",
-            sanitize_single_flight_segment(repo),
-            sanitize_single_flight_segment(sha),
-        );
-        let lock_path = lock_dir.join(lock_name);
+        let lock_path = gates_single_flight_lock_path(&fac_root, repo, sha);
 
         let dir_mode = std::fs::metadata(&lock_dir)
             .expect("lock dir metadata")
@@ -2949,6 +4133,103 @@ mod tests {
             & 0o777;
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reap_stale_singleflight_locks_removes_dead_owner_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fac_root = temp.path().join("private").join("fac");
+        let lock_dir = fac_root.join(GATES_SINGLE_FLIGHT_DIR);
+        fs::create_dir_all(&lock_dir).expect("create lock dir");
+        let stale_lock = lock_dir.join("stale.lock");
+        fs::write(
+            &stale_lock,
+            format!("pid={}\nstart_time_ticks=1\n", u32::MAX - 1),
+        )
+        .expect("write stale lock metadata");
+
+        let reaped = reap_stale_singleflight_locks(&fac_root).expect("reap stale locks");
+        assert_eq!(reaped, 1);
+        assert!(!stale_lock.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn acquire_singleflight_lock_times_out_with_owner_diagnostics() {
+        struct EnvGuard {
+            key: &'static str,
+            value: Option<OsString>,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                if let Some(value) = self.value.take() {
+                    // SAFETY: serialized through env_var_test_lock in test scope.
+                    unsafe { std::env::set_var(self.key, value) };
+                } else {
+                    // SAFETY: serialized through env_var_test_lock in test scope.
+                    unsafe { std::env::remove_var(self.key) };
+                }
+            }
+        }
+
+        let _env_lock = crate::commands::env_var_test_lock()
+            .lock()
+            .expect("serialize lock-timeout env var test");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fac_root = temp.path().join("private").join("fac");
+        let repo = "owner/repo";
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let lock_path = gates_single_flight_lock_path(&fac_root, repo, sha);
+        ensure_single_flight_lock_parent(&lock_path).expect("create single-flight parent");
+
+        let mut holder = Command::new("python3")
+            .arg("-c")
+            .arg(
+                "import fcntl, os, sys, time\n\
+path = sys.argv[1]\n\
+f = open(path, 'a+', encoding='utf-8')\n\
+fcntl.flock(f, fcntl.LOCK_EX)\n\
+f.seek(0)\n\
+f.truncate(0)\n\
+f.write(f'pid={os.getpid()}\\n')\n\
+f.flush()\n\
+print(os.getpid(), flush=True)\n\
+time.sleep(20)\n",
+            )
+            .arg(lock_path.to_string_lossy().to_string())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn lock holder");
+        let holder_stdout = holder
+            .stdout
+            .take()
+            .expect("lock holder stdout must be piped");
+        let mut stdout_reader = std::io::BufReader::new(holder_stdout);
+        let mut owner_pid = String::new();
+        stdout_reader
+            .read_line(&mut owner_pid)
+            .expect("read lock holder pid");
+        let owner_pid = owner_pid.trim().to_string();
+        assert!(!owner_pid.is_empty(), "holder pid must be non-empty");
+
+        let original_timeout = std::env::var_os(SINGLEFLIGHT_LOCK_TIMEOUT_ENV);
+        // SAFETY: serialized through env_var_test_lock in test scope.
+        unsafe { std::env::set_var(SINGLEFLIGHT_LOCK_TIMEOUT_ENV, "1") };
+        let _timeout_guard = EnvGuard {
+            key: SINGLEFLIGHT_LOCK_TIMEOUT_ENV,
+            value: original_timeout,
+        };
+
+        let err = acquire_gates_single_flight_lock(&fac_root, repo, sha)
+            .expect_err("second lock acquisition must time out");
+        let _ = holder.kill();
+        let _ = holder.wait();
+
+        assert!(err.contains("timed out after 1s waiting for gates single-flight lock"));
+        assert!(err.contains(&format!("owner_pid={owner_pid}")));
     }
 
     #[test]
@@ -3479,7 +4760,15 @@ mod tests {
         let review_gate_dir = repo.join(".github").join("review-gate");
         let log_file = repo.join(".fac_gate_env_log");
 
-        fs::create_dir_all(apm2_home.join("private").join("fac")).expect("create apm2 home");
+        let apm2_private = apm2_home.join("private");
+        let apm2_fac = apm2_private.join("fac");
+        fs::create_dir_all(&apm2_fac).expect("create apm2 home");
+        fs::set_permissions(&apm2_home, fs::Permissions::from_mode(0o700))
+            .expect("set apm2 home mode");
+        fs::set_permissions(&apm2_private, fs::Permissions::from_mode(0o700))
+            .expect("set apm2 private mode");
+        fs::set_permissions(&apm2_fac, fs::Permissions::from_mode(0o700))
+            .expect("set apm2 fac mode");
         fs::create_dir_all(&bin_dir).expect("create fake bin dir");
         fs::create_dir_all(&review_dir).expect("create review dir");
         fs::create_dir_all(&review_gate_dir).expect("create review gate dir");
