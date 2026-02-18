@@ -147,6 +147,15 @@ mod fac_review_api {
         _signer: &apm2_core::crypto::Signer,
     ) {
     }
+
+    #[allow(clippy::unnecessary_wraps)]
+    pub fn apply_gate_result_lifecycle_for_repo_sha(
+        _owner_repo: &str,
+        _head_sha: &str,
+        _passed: bool,
+    ) -> Result<usize, String> {
+        Ok(0)
+    }
 }
 
 #[cfg(test)]
@@ -1659,6 +1668,20 @@ fn run_gates_in_workspace(
     run_result
 }
 
+fn apply_gates_job_lifecycle_events(spec: &FacJobSpecV1, passed: bool) -> Result<usize, String> {
+    fac_review_api::apply_gate_result_lifecycle_for_repo_sha(
+        &spec.source.repo_id,
+        &spec.source.head_sha,
+        passed,
+    )
+    .map_err(|err| {
+        format!(
+            "failed to persist lifecycle gate sequence for repo {} sha {}: {err}",
+            spec.source.repo_id, spec.source.head_sha
+        )
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_queued_gates_job(
     spec: &FacJobSpecV1,
@@ -1840,7 +1863,43 @@ fn execute_queued_gates_job(
         },
     };
 
+    let lifecycle_update_result =
+        apply_gates_job_lifecycle_events(spec, exit_code == exit_codes::SUCCESS);
+
     if exit_code == exit_codes::SUCCESS {
+        if let Err(err) = lifecycle_update_result {
+            let reason = format!("gates passed but lifecycle update failed: {err}");
+            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+                fac_root,
+                queue_root,
+                spec,
+                claimed_path,
+                claimed_file_name,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::ValidationFailed),
+                &reason,
+                Some(boundary_trace),
+                Some(queue_trace),
+                budget_trace,
+                None,
+                Some(canonicalizer_tuple_digest),
+                policy_hash,
+                None,
+                None,
+                Some(sbx_hash),
+                Some(net_hash),
+            ) {
+                return handle_pipeline_commit_failure(
+                    &commit_err,
+                    "denied gates job (lifecycle update failure after pass)",
+                    claimed_path,
+                    queue_root,
+                    claimed_file_name,
+                );
+            }
+            return JobOutcome::Denied { reason };
+        }
+
         let observed_cost = observed_cost_from_elapsed(job_wall_start.elapsed());
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
         if let Err(commit_err) = commit_claimed_job_via_pipeline(
@@ -1900,7 +1959,10 @@ fn execute_queued_gates_job(
     }
 
     // Gates failed: commit claimed job to denied via pipeline.
-    let reason = format!("gates failed with exit code {exit_code}");
+    let reason = match lifecycle_update_result {
+        Ok(_) => format!("gates failed with exit code {exit_code}"),
+        Err(err) => format!("gates failed with exit code {exit_code}; {err}"),
+    };
     // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
     if let Err(commit_err) = commit_claimed_job_via_pipeline(
         fac_root,

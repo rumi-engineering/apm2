@@ -152,6 +152,31 @@ pub(super) fn create_issue_comment(
         .map_err(|err| format!("failed to parse issue comment create response: {err}"))
 }
 
+pub(super) fn fetch_issue_comment(
+    owner_repo: &str,
+    comment_id: u64,
+) -> Result<Option<IssueCommentResponse>, String> {
+    let endpoint = format!("/repos/{owner_repo}/issues/comments/{comment_id}");
+    let output = gh_command()
+        .args(["api", &endpoint, "--method", "GET"])
+        .output()
+        .map_err(|err| format!("failed to execute gh api for issue comment get: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let normalized = stderr.to_ascii_lowercase();
+        if normalized.contains("404") || normalized.contains("not found") {
+            return Ok(None);
+        }
+        return Err(format!(
+            "gh api failed fetching issue comment {comment_id}: {stderr}"
+        ));
+    }
+
+    let response = serde_json::from_slice::<IssueCommentResponse>(&output.stdout)
+        .map_err(|err| format!("failed to parse issue comment get response: {err}"))?;
+    Ok(Some(response))
+}
+
 pub(super) fn update_issue_comment(
     owner_repo: &str,
     comment_id: u64,

@@ -44,6 +44,7 @@ const AGENT_REGISTRY_SCHEMA: &str = "apm2.fac.agent_registry.v1";
 const MAX_EVENT_HISTORY: usize = 256;
 const MAX_ACTIVE_AGENTS_PER_PR: usize = 2;
 const MAX_REGISTRY_ENTRIES: usize = 4096;
+const MAX_PR_STATE_SCAN_ENTRIES: usize = 4096;
 const MAX_ERROR_BUDGET: u32 = 10;
 const DEFAULT_RETRY_BUDGET: u32 = 3;
 const REGISTRY_NON_ACTIVE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
@@ -1250,6 +1251,84 @@ pub fn load_pr_lifecycle_snapshot(
         retry_budget_remaining: record.retry_budget_remaining,
         last_event_seq: record.last_event_seq,
     }))
+}
+
+fn parse_pr_number_from_state_file_name(file_name: &str) -> Option<u32> {
+    let value = file_name
+        .strip_prefix("pr-")
+        .and_then(|value| value.strip_suffix(".json"))?;
+    if value.is_empty() || !value.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u32>().ok()
+}
+
+fn list_repo_pr_numbers(owner_repo: &str) -> Result<Vec<u32>, String> {
+    let repo_dir = lifecycle_root()?
+        .join("pr")
+        .join(sanitize_for_path(owner_repo));
+    if !repo_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let entries = fs::read_dir(&repo_dir).map_err(|err| {
+        format!(
+            "failed to list lifecycle state directory {}: {err}",
+            repo_dir.display()
+        )
+    })?;
+    let mut pr_numbers = Vec::new();
+    for (idx, entry) in entries.enumerate() {
+        if idx >= MAX_PR_STATE_SCAN_ENTRIES {
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if let Some(pr_number) = parse_pr_number_from_state_file_name(&file_name) {
+            pr_numbers.push(pr_number);
+        }
+    }
+    pr_numbers.sort_unstable();
+    pr_numbers.dedup();
+    Ok(pr_numbers)
+}
+
+pub fn apply_gate_result_events_for_repo_sha(
+    owner_repo: &str,
+    head_sha: &str,
+    passed: bool,
+) -> Result<usize, String> {
+    validate_expected_head_sha(head_sha)?;
+    let mut applied = 0usize;
+    for pr_number in list_repo_pr_numbers(owner_repo)? {
+        let Some(snapshot) = load_pr_lifecycle_snapshot(owner_repo, pr_number)? else {
+            continue;
+        };
+        if !snapshot.current_sha.eq_ignore_ascii_case(head_sha) {
+            continue;
+        }
+
+        apply_event(
+            owner_repo,
+            pr_number,
+            head_sha,
+            &LifecycleEventKind::PushObserved,
+        )?;
+        apply_event(
+            owner_repo,
+            pr_number,
+            head_sha,
+            &LifecycleEventKind::GatesStarted,
+        )?;
+        let terminal_event = if passed {
+            LifecycleEventKind::GatesPassed
+        } else {
+            LifecycleEventKind::GatesFailed
+        };
+        apply_event(owner_repo, pr_number, head_sha, &terminal_event)?;
+        applied = applied.saturating_add(1);
+    }
+    Ok(applied)
 }
 
 fn load_pr_state_bypass_hmac(
@@ -4516,10 +4595,14 @@ fn run_verdict_set_inner(
     keep_prepared_inputs: bool,
     json_output: bool,
 ) -> Result<u8, String> {
+    let (lock_owner_repo, lock_pr_number) = super::target::resolve_pr_target(repo, pr_number)?;
+    let _projection_lock =
+        verdict_projection::acquire_projection_lock(&lock_owner_repo, lock_pr_number)?;
+
     // Phase 1 (local-only): persist deterministic verdict intent without
     // external side effects. Lifecycle finalization must succeed before
     // GitHub projection is attempted.
-    let projected = verdict_projection::persist_verdict_projection_local_only(
+    let projected = verdict_projection::persist_verdict_projection_local_only_locked(
         repo,
         pr_number,
         sha,
@@ -4570,7 +4653,7 @@ fn run_verdict_set_inner(
         finalize_projected_verdict(&projected, dimension, &run_id, None)?;
         // Phase 2 (full projection): project to GitHub only after lifecycle
         // authority accepted the verdict transition.
-        let projected_full = verdict_projection::persist_verdict_projection(
+        let projected_full = verdict_projection::persist_verdict_projection_locked(
             &projected.owner_repo,
             Some(projected.pr_number),
             Some(&projected.head_sha),
@@ -4799,7 +4882,8 @@ mod tests {
         FAC_STATUS_PROJECTION_MAX_ATTEMPTS, LifecycleEventKind, MERGE_EVIDENCE_END,
         MERGE_EVIDENCE_START, MERGE_RECEIPT_BINDING_SUFFIX, MergeEvidenceBinding,
         MergeProjectionContext, MergeReceiptBindingRecord, PrLifecycleState, TrackedAgentState,
-        acquire_registry_lock, active_agents_for_pr, apply_event, bind_reviewer_runtime,
+        acquire_registry_lock, active_agents_for_pr, apply_event,
+        apply_gate_result_events_for_repo_sha, bind_reviewer_runtime,
         cleanup_merged_branch_local_state_inner, compute_merge_receipt_changeset_digest,
         delete_remote_branch_projection, derive_auto_verdict_decision_from_findings,
         derive_fac_required_status_projection, enforce_pr_capacity,
@@ -5067,6 +5151,54 @@ mod tests {
         )
         .expect("quality approve");
         assert_eq!(state.pr_state, PrLifecycleState::MergeReady);
+    }
+
+    #[test]
+    fn apply_gate_result_events_for_repo_sha_recovers_from_gates_failed() {
+        let pr = next_pr();
+        let repo = next_repo("gate-retry", pr);
+        let sha = "1111111111111111111111111111111111111111";
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesStarted).expect("start");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesFailed).expect("failed");
+
+        let applied =
+            apply_gate_result_events_for_repo_sha(&repo, sha, true).expect("apply retry events");
+        assert_eq!(applied, 1);
+
+        let snapshot = super::load_pr_lifecycle_snapshot(&repo, pr)
+            .expect("snapshot")
+            .expect("lifecycle present");
+        assert_eq!(snapshot.pr_state, "gates_passed");
+
+        let record = super::load_pr_state_for_readonly(&repo, pr)
+            .expect("load record")
+            .expect("record present");
+        let events = record
+            .events
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            events.ends_with(&["push_observed", "gates_started", "gates_passed"]),
+            "expected retry sequence tail, got: {events:?}"
+        );
+    }
+
+    #[test]
+    fn apply_gate_result_events_for_repo_sha_is_noop_when_sha_untracked() {
+        let pr = next_pr();
+        let repo = next_repo("gate-retry-noop", pr);
+        let sha = "2222222222222222222222222222222222222222";
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+
+        let applied = apply_gate_result_events_for_repo_sha(
+            &repo,
+            "3333333333333333333333333333333333333333",
+            true,
+        )
+        .expect("noop for unknown sha");
+        assert_eq!(applied, 0);
     }
 
     #[test]

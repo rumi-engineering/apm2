@@ -5,6 +5,8 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -448,25 +450,43 @@ fn acquire_gates_single_flight_lock(
     );
     let lock_path = fac_root.join(GATES_SINGLE_FLIGHT_DIR).join(lock_name);
     if let Some(parent) = lock_path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
-            format!(
-                "cannot create gates single-flight lock directory {}: {err}",
-                parent.display()
-            )
-        })?;
+        #[cfg(unix)]
+        {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(|err| {
+                    format!(
+                        "cannot create gates single-flight lock directory {}: {err}",
+                        parent.display()
+                    )
+                })?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "cannot create gates single-flight lock directory {}: {err}",
+                    parent.display()
+                )
+            })?;
+        }
     }
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|err| {
+    let lock_file = {
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+        options.open(&lock_path).map_err(|err| {
             format!(
                 "cannot open gates single-flight lock {}: {err}",
                 lock_path.display()
             )
-        })?;
+        })?
+    };
     lock_file.lock_exclusive().map_err(|err| {
         format!(
             "cannot acquire gates single-flight lock {}: {err}",
@@ -2374,6 +2394,38 @@ mod tests {
         .expect("live heartbeat should bypass bootstrap");
         assert!(!result);
         assert!(!spawned);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gates_single_flight_lock_uses_restricted_permissions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fac_root = temp.path().join("private").join("fac");
+        std::fs::create_dir_all(&fac_root).expect("create fac root");
+        let repo = "example/repo";
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+
+        let _lock = acquire_gates_single_flight_lock(&fac_root, repo, sha).expect("lock");
+        let lock_dir = fac_root.join(GATES_SINGLE_FLIGHT_DIR);
+        let lock_name = format!(
+            "gates-{}-{}.lock",
+            sanitize_single_flight_segment(repo),
+            sanitize_single_flight_segment(sha),
+        );
+        let lock_path = lock_dir.join(lock_name);
+
+        let dir_mode = std::fs::metadata(&lock_dir)
+            .expect("lock dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = std::fs::metadata(&lock_path)
+            .expect("lock file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
     }
 
     #[test]

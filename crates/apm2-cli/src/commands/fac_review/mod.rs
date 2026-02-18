@@ -4306,6 +4306,15 @@ pub(super) fn rebind_gate_cache_after_receipt(
     gate_cache::rebind_gate_cache_after_receipt(sha, receipts_dir, job_id, signer);
 }
 
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn apply_gate_result_lifecycle_for_repo_sha(
+    owner_repo: &str,
+    head_sha: &str,
+    passed: bool,
+) -> Result<usize, String> {
+    lifecycle::apply_gate_result_events_for_repo_sha(owner_repo, head_sha, passed)
+}
+
 // ── Internal dispatch helper (shared with pipeline/restart) ─────────────────
 
 fn run_dispatch_inner(
