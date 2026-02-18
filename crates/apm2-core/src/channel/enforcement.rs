@@ -716,6 +716,36 @@ pub fn issue_channel_context_token_with_token_binding(
     )
 }
 
+/// Issues a base64-encoded channel context token with TCK-00565 token binding
+/// and an explicit wall-clock expiry window.
+///
+/// This is used by broker-mediated FAC queue paths where enqueue-to-claim delay
+/// can exceed the default short-lived token window.
+///
+/// # Errors
+///
+/// Returns an error if the boundary check has no channel source witness or if
+/// serialization fails.
+pub fn issue_channel_context_token_with_token_binding_and_expiry(
+    check: &ChannelBoundaryCheck,
+    lease_id: &str,
+    request_id: &str,
+    issued_at_secs: u64,
+    expires_after_secs: u64,
+    signer: &Signer,
+    binding: TokenBindingV1,
+) -> Result<String, ChannelContextTokenError> {
+    issue_channel_context_token_with_binding(
+        check,
+        lease_id,
+        request_id,
+        issued_at_secs,
+        expires_after_secs,
+        signer,
+        Some(binding),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn issue_channel_context_token_with_binding(
     check: &ChannelBoundaryCheck,
