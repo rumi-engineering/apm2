@@ -4332,15 +4332,17 @@ fn check_process_liveness(pid: u32) -> ProcessLiveness {
 
 /// Structured reset recommendation emitted when the worker encounters a
 /// CORRUPT lane during lane acquisition.  Operators and monitoring tools can
-/// parse these JSON objects from stdout to automate or triage reset actions.
+/// parse these JSON objects from stderr to automate or triage reset actions.
 ///
 /// TCK-00570: the worker refuses to lease a CORRUPT lane and emits this
 /// structured recommendation.  The `FESv1` queue-based control-job
 /// infrastructure is not yet available, so the recommendation is emitted as
-/// a JSON line to **stdout** (machine-readable NDJSON channel), while all
-/// human-readable diagnostics flow through **stderr** (tracing subscriber).
-/// This channel separation ensures downstream NDJSON parsers are never
-/// polluted by formatted tracing output or plain-text warnings.
+/// a JSON line to **stderr** (machine-readable NDJSON channel).  All other
+/// human-readable diagnostics in `acquire_worker_lane` flow through the
+/// `tracing` subscriber (structured logging), not raw `eprintln!`, so the
+/// only `eprintln!` on stderr from that path is the JSON recommendation
+/// itself.  This keeps the stderr channel JSON-only for downstream
+/// automation that consumes newline-delimited JSON.
 /// When `FESv1` queue-based control jobs land (RFC-0019), this struct can
 /// be enqueued directly.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -4349,8 +4351,8 @@ struct LaneResetRecommendation {
     schema: &'static str,
     /// The lane that needs operator reset.
     lane_id: String,
-    /// Human-readable summary for operators (encoded in JSON, not emitted
-    /// as a separate plain-text line — keeps the stderr channel JSON-only).
+    /// Human-readable summary for operators (encoded inside the JSON payload,
+    /// not emitted as a separate plain-text line — keeps stderr JSON-only).
     message: String,
     /// Why the lane is corrupt.
     reason: String,
@@ -4361,22 +4363,25 @@ struct LaneResetRecommendation {
 /// Schema identifier for [`LaneResetRecommendation`] payloads.
 const LANE_RESET_RECOMMENDATION_SCHEMA: &str = "apm2.fac.lane_reset_recommendation.v1";
 
-/// Emit a structured reset recommendation for a corrupt lane to **stdout**.
+/// Emit a structured reset recommendation for a corrupt lane to **stderr**.
 ///
-/// Channel separation contract:
-/// - **stdout** carries machine-readable NDJSON recommendations (this fn).
-/// - **stderr** carries human-readable diagnostics (tracing subscriber +
-///   operational `eprintln!` calls from the broader worker loop).
+/// Channel contract (TCK-00570 scope):
+/// - **stderr** carries machine-readable NDJSON recommendations (this fn) as
+///   `apm2.fac.lane_reset_recommendation.v1` JSON lines.
+/// - All other diagnostics in `acquire_worker_lane` use `tracing::warn!` /
+///   `tracing::info!` / `tracing::error!` (structured logging), never raw
+///   `eprintln!`, so the only `eprintln!` output from the lane-acquisition path
+///   is the JSON recommendation itself.  This keeps the stderr channel
+///   JSON-only for downstream automation.
 ///
-/// Every line written to stdout by this function is a valid, parseable JSON
+/// Every line written to stderr by this function is a valid, parseable JSON
 /// object.  Human-readable context is encoded inside the `message` field of
 /// the JSON payload rather than emitted as a separate plain-text line.
 ///
 /// This is a best-effort diagnostic -- the worker must not abort lane
 /// scanning due to a recommendation emission failure.  Serialization
-/// errors are routed through `tracing::warn!` (structured logging on
-/// stderr) so they never pollute the JSON-only stdout recommendation
-/// stream.
+/// errors are routed through `tracing::warn!` (structured logging) so they
+/// never pollute the JSON-only stderr recommendation stream.
 fn emit_lane_reset_recommendation(lane_id: &str, reason: &str) {
     let rec = LaneResetRecommendation {
         schema: LANE_RESET_RECOMMENDATION_SCHEMA,
@@ -4387,9 +4392,11 @@ fn emit_lane_reset_recommendation(lane_id: &str, reason: &str) {
     };
     match serde_json::to_string(&rec) {
         Ok(json) => {
-            // Write to stdout — the machine-readable NDJSON channel.
-            // stderr is reserved for human-readable tracing/diagnostics.
-            println!("{json}");
+            // Write to stderr — the machine-readable NDJSON recommendation
+            // channel (TCK-00570 scope: "JSON to stderr").  All other
+            // diagnostics in acquire_worker_lane use tracing::* macros,
+            // keeping the only eprintln! output as this JSON line.
+            eprintln!("{json}");
         },
         Err(e) => tracing::warn!(
             lane_id = lane_id,
@@ -8860,7 +8867,7 @@ mod tests {
     /// Verify that `LaneResetRecommendation` serializes to a standalone valid
     /// JSON object with the expected schema identifier, matching the contract
     /// that `emit_lane_reset_recommendation` emits each recommendation as a
-    /// single parseable JSON line on stdout.
+    /// single parseable JSON line on stderr.
     #[test]
     fn test_lane_reset_recommendation_serializes_as_valid_json() {
         let rec = LaneResetRecommendation {
@@ -8884,7 +8891,7 @@ mod tests {
         assert_eq!(parsed["lane_id"], "lane-42");
         assert_eq!(
             parsed["message"], "worker: RECOMMENDATION: lane lane-42 needs reset",
-            "human-readable context must be encoded inside JSON, not as a separate stderr line"
+            "human-readable context must be encoded inside JSON, not as a separate plain-text line"
         );
         assert_eq!(parsed["reason"], "cleanup failure: disk full");
         assert_eq!(parsed["recommended_action"], "apm2 fac lane reset");
@@ -8899,12 +8906,12 @@ mod tests {
     }
 
     /// Verify that `emit_lane_reset_recommendation` emits exactly one line
-    /// to stdout and that the line is valid, parseable JSON with the expected
-    /// schema.  This is the contract: the stdout recommendation channel is
+    /// to stderr and that the line is valid, parseable JSON with the expected
+    /// schema.  This is the contract: the stderr recommendation channel is
     /// JSON-only (NDJSON) — no plain-text preamble, no mixed lines.
     #[test]
-    fn test_emit_lane_reset_recommendation_stdout_is_json_only() {
-        // We cannot capture real stdout in-process without redirecting FDs,
+    fn test_emit_lane_reset_recommendation_stderr_is_json_only() {
+        // We cannot capture real stderr in-process without redirecting FDs,
         // so we replicate the emission logic and verify that every line
         // produced is valid JSON.
         let lane_id = "lane-77";
@@ -8919,7 +8926,7 @@ mod tests {
         let json_str =
             serde_json::to_string(&rec).expect("serialization must succeed for test fixture");
 
-        // Simulate what emit_lane_reset_recommendation writes to stdout:
+        // Simulate what emit_lane_reset_recommendation writes to stderr:
         // exactly one line containing the JSON.  Verify EACH line is
         // parseable JSON.
         let emitted_lines: Vec<&str> = json_str.lines().collect();
@@ -8931,7 +8938,7 @@ mod tests {
         );
         for (i, line) in emitted_lines.iter().enumerate() {
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(line);
-            assert!(parsed.is_ok(), "stdout line {i} is not valid JSON: {line}");
+            assert!(parsed.is_ok(), "stderr line {i} is not valid JSON: {line}");
             let val = parsed.unwrap();
             assert_eq!(
                 val["schema"], "apm2.fac.lane_reset_recommendation.v1",
@@ -8941,14 +8948,13 @@ mod tests {
     }
 
     /// Verify channel separation: `emit_lane_reset_recommendation` writes
-    /// JSON to stdout (via `println!`), NOT to stderr.  The
-    /// `acquire_worker_lane` function uses only `tracing::warn!` /
-    /// `tracing::info!` for diagnostics (routed to stderr by the tracing
-    /// subscriber), never `eprintln!`.  This test statically asserts that
-    /// the function body uses `println!` (stdout) and not `eprintln!`
-    /// (stderr) by verifying the source-level contract through the
-    /// serialized output: the JSON must parse as valid NDJSON, confirming
-    /// that no plain-text prefix or suffix contaminates the stdout channel.
+    /// JSON to stderr (via `eprintln!`).  The `acquire_worker_lane` function
+    /// uses only `tracing::warn!` / `tracing::info!` for diagnostics (routed
+    /// to the tracing subscriber), never raw `eprintln!`, so the only
+    /// `eprintln!` output from the lane-acquisition path is the JSON
+    /// recommendation itself.  This test verifies the serialized output
+    /// parses as valid NDJSON, confirming that no plain-text prefix or
+    /// suffix contaminates the stderr recommendation channel.
     #[test]
     fn test_recommendation_channel_separation() {
         // Verify multiple recommendations can be concatenated as NDJSON
@@ -8987,7 +8993,7 @@ mod tests {
         );
         for (i, line) in lines.iter().enumerate() {
             let parsed: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| {
-                panic!("stdout NDJSON line {i} is not valid JSON: {e}\nline: {line}")
+                panic!("stderr NDJSON line {i} is not valid JSON: {e}\nline: {line}")
             });
             assert_eq!(
                 parsed["schema"], "apm2.fac.lane_reset_recommendation.v1",
@@ -9004,7 +9010,7 @@ mod tests {
             // Verify no non-JSON prefix: first non-whitespace char must be '{'.
             assert!(
                 line.trim().starts_with('{'),
-                "line {i}: stdout NDJSON line must start with '{{', got: {line}"
+                "line {i}: stderr NDJSON line must start with '{{', got: {line}"
             );
         }
     }
