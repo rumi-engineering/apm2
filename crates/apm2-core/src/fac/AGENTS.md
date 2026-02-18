@@ -1425,7 +1425,7 @@ and content-addressed integrity verification (TCK-00542).
   `EvidenceBundleManifestEntryV1` use `#[serde(deny_unknown_fields)]` to reject
   any fields not defined in the struct during deserialization (fail-closed on
   unknown/malformed input).
-- [INV-EB-014] (TCK-00542) Envelope import accepts both the legacy schema
+- [INV-EB-026] (TCK-00542) Envelope import accepts both the legacy schema
   (`apm2.fac.evidence_bundle.v1`) and the canonical schema
   (`apm2.fac.evidence_bundle_envelope.v1`) for backwards compatibility.
 - [INV-EB-015] (TCK-00555) Export uses two-phase leakage budget enforcement with
@@ -1477,7 +1477,7 @@ and content-addressed integrity verification (TCK-00542).
   is absent AND the envelope schema is the legacy schema ID
   (`apm2.fac.evidence_bundle.v1`), the content hash is computed WITHOUT the leakage
   budget presence/absence byte. This preserves backward compatibility with
-  pre-TCK-00555 envelopes (INV-EB-014). New-schema envelopes always include the
+  pre-TCK-00555 envelopes (INV-EB-026). New-schema envelopes always include the
   presence/absence tag.
 - [INV-EB-014] (TCK-00555) Import rejects new-schema envelopes
   (`EVIDENCE_BUNDLE_ENVELOPE_SCHEMA` / `apm2.fac.evidence_bundle_envelope.v1`) that
@@ -1486,6 +1486,18 @@ and content-addressed integrity verification (TCK-00542).
   compatibility. This prevents downgrade-by-omission attacks where an attacker strips
   the decision field and recomputes a self-consistent content hash to bypass leakage
   budget enforcement.
+- [INV-EB-023] (TCK-00555) Even legacy-schema envelopes are rejected when missing
+  `leakage_budget_decision` if the boundary check carries budget-aware fields
+  (`leakage_budget_receipt`, `timing_channel_budget`, or `disclosure_policy_binding`).
+  This closes a schema-downgrade bypass where an attacker swaps the schema string to
+  legacy after stripping the decision.
+- [INV-EB-024] (TCK-00555) Export-time finalization always validates
+  `authorized_bytes >= actual_export_bytes` whenever the policy is exceeded and a
+  declassification receipt is present, regardless of which dimension triggered
+  exceedance. This aligns export with import semantics.
+- [INV-EB-025] (TCK-00555) Export fails closed when `leakage_budget_policy` is
+  `None` for new-schema output. Callers must supply a policy (even if permissive)
+  to produce importable envelopes.
 
 ## Policy Environment Enforcement (TCK-00526, TCK-00575)
 
