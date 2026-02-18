@@ -56,11 +56,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use apm2_core::fac::{
-    LANE_ENV_DIRS, LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1, LaneManager,
-    LaneReconcileReceiptV1, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
-    REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA,
-    SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
-    safe_rmtree_v1,
+    LANE_CORRUPT_MARKER_SCHEMA, LANE_ENV_DIRS, LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1,
+    LaneManager, LaneReconcileReceiptV1, LaneState, LaneStatusV1,
+    PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt,
+    SUMMARY_RECEIPT_SCHEMA, SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA,
+    TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1, safe_rmtree_v1,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
@@ -910,6 +910,16 @@ pub enum LaneSubcommand {
     /// Existing corrupt markers are reported but not cleared (use
     /// `apm2 fac lane reset` to clear them).
     Reconcile(LaneReconcileArgs),
+    /// Mark a lane as CORRUPT with an operator-provided reason.
+    ///
+    /// Writes a `corrupt.v1.json` marker file into the lane directory.
+    /// A CORRUPT lane refuses all future job leases until an operator
+    /// clears the marker via `apm2 fac lane reset`.
+    ///
+    /// This is an operator tool for manually quarantining a lane when
+    /// automated detection has not yet triggered (e.g., suspected data
+    /// corruption, external incident, or proactive maintenance).
+    MarkCorrupt(LaneMarkCorruptArgs),
 }
 
 /// Arguments for `apm2 fac lane status`.
@@ -951,6 +961,26 @@ pub struct LaneInitArgs {
 /// Arguments for `apm2 fac lane reconcile` (TCK-00539).
 #[derive(Debug, Args)]
 pub struct LaneReconcileArgs {
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Arguments for `apm2 fac lane mark-corrupt` (TCK-00570).
+#[derive(Debug, Args)]
+pub struct LaneMarkCorruptArgs {
+    /// Lane identifier to mark as corrupt (e.g., `lane-00`).
+    pub lane_id: String,
+
+    /// Human-readable reason for marking the lane as corrupt.
+    #[arg(long)]
+    pub reason: String,
+
+    /// Optional cleanup receipt digest (`b3-256:<hex>`) to bind this
+    /// marker to an evidence artifact.
+    #[arg(long)]
+    pub receipt_digest: Option<String>,
+
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -2472,6 +2502,9 @@ pub fn run_fac(
             },
             LaneSubcommand::Reconcile(reconcile_args) => {
                 run_lane_reconcile(reconcile_args, resolve_json(reconcile_args.json))
+            },
+            LaneSubcommand::MarkCorrupt(mark_args) => {
+                run_lane_mark_corrupt(mark_args, resolve_json(mark_args.json))
             },
         },
         FacSubcommand::Push(args) => {
@@ -4826,6 +4859,189 @@ fn persist_corrupt_lease(manager: &LaneManager, lane_id: &str, reason: &str) {
             eprintln!("WARNING: failed to create CORRUPT lease for lane {lane_id}: {e}");
         },
     }
+}
+
+// =============================================================================
+// Lane Mark-Corrupt Command (TCK-00570)
+// =============================================================================
+
+/// Execute `apm2 fac lane mark-corrupt <lane_id> --reason ...`.
+///
+/// Operator workflow: manually mark a lane as CORRUPT with a reason string.
+/// The lane refuses all future job leases until an operator clears the marker
+/// via `apm2 fac lane reset`.
+///
+/// # State Machine
+///
+/// - Any state except RUNNING: writes `corrupt.v1.json` marker.
+/// - Already CORRUPT: returns an error (marker already exists).
+/// - RUNNING: returns an error (use `apm2 fac lane reset --force` instead).
+///
+/// # Security
+///
+/// - Exclusive lane lock is held for the entire operation.
+/// - Marker is written via atomic write (temp + rename).
+/// - Reason and `receipt_digest` are validated for length bounds.
+fn run_lane_mark_corrupt(args: &LaneMarkCorruptArgs, json_output: bool) -> u8 {
+    let manager = match LaneManager::from_default_home() {
+        Ok(m) => m,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "lane_error",
+                &format!("Failed to initialize lane manager: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+    run_lane_mark_corrupt_with_manager(&manager, args, json_output)
+}
+
+fn run_lane_mark_corrupt_with_manager(
+    manager: &LaneManager,
+    args: &LaneMarkCorruptArgs,
+    json_output: bool,
+) -> u8 {
+    // Ensure directories exist (idempotent).
+    if let Err(e) = manager.ensure_directories() {
+        return output_error(
+            json_output,
+            "lane_error",
+            &format!("Failed to ensure lane directories: {e}"),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    // Acquire exclusive lock before any status reads or mutations.
+    let _lock_guard = match manager.acquire_lock(&args.lane_id) {
+        Ok(guard) => guard,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "lane_error",
+                &format!("Failed to acquire lock for lane {}: {e}", args.lane_id),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // Query current lane status under lock.
+    let status = match manager.lane_status(&args.lane_id) {
+        Ok(s) => s,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "lane_error",
+                &format!("Failed to query lane status: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    // Refuse to mark a RUNNING lane -- operator should use `lane reset --force`.
+    if status.state == LaneState::Running {
+        return output_error(
+            json_output,
+            "lane_running",
+            &format!(
+                "Lane {} is RUNNING (pid={}). Stop the job first or use `apm2 fac lane reset --force`.",
+                args.lane_id,
+                status.pid.unwrap_or(0)
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    // Refuse if already CORRUPT -- marker already exists.
+    if status.state == LaneState::Corrupt {
+        return output_error(
+            json_output,
+            "already_corrupt",
+            &format!(
+                "Lane {} is already CORRUPT (reason: {}). Use `apm2 fac lane reset` to clear.",
+                args.lane_id,
+                status.corrupt_reason.as_deref().unwrap_or("unknown")
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    // Validate reason length against MAX_STRING_LENGTH (512).
+    if args.reason.len() > apm2_core::fac::lane::MAX_STRING_LENGTH {
+        return output_error(
+            json_output,
+            "validation_error",
+            &format!(
+                "Reason exceeds maximum length ({} > {})",
+                args.reason.len(),
+                apm2_core::fac::lane::MAX_STRING_LENGTH,
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    // Validate optional receipt_digest length.
+    if let Some(ref digest) = args.receipt_digest {
+        if digest.len() > apm2_core::fac::lane::MAX_STRING_LENGTH {
+            return output_error(
+                json_output,
+                "validation_error",
+                &format!(
+                    "Receipt digest exceeds maximum length ({} > {})",
+                    digest.len(),
+                    apm2_core::fac::lane::MAX_STRING_LENGTH,
+                ),
+                exit_codes::VALIDATION_ERROR,
+            );
+        }
+    }
+
+    // Build and persist the corrupt marker.
+    // SECURITY JUSTIFICATION (CTR-2501): `chrono::Utc::now()` is used for
+    // the `detected_at` timestamp in the corrupt marker. This is a
+    // human-readable audit label, not a monotonic ordering primitive.
+    let detected_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let marker = LaneCorruptMarkerV1 {
+        schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+        lane_id: args.lane_id.clone(),
+        reason: args.reason.clone(),
+        cleanup_receipt_digest: args.receipt_digest.clone(),
+        detected_at,
+    };
+
+    if let Err(e) = marker.persist(manager.fac_root()) {
+        return output_error(
+            json_output,
+            "persist_error",
+            &format!(
+                "Failed to persist corrupt marker for lane {}: {e}",
+                args.lane_id
+            ),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    let response = serde_json::json!({
+        "lane_id": args.lane_id,
+        "status": "CORRUPT",
+        "reason": args.reason,
+        "cleanup_receipt_digest": args.receipt_digest,
+        "detected_at": marker.detected_at,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+
+    if !json_output {
+        eprintln!(
+            "Lane {} marked as CORRUPT. Use `apm2 fac lane reset` to clear.",
+            args.lane_id
+        );
+    }
+
+    exit_codes::SUCCESS
 }
 
 // =============================================================================
@@ -7844,5 +8060,277 @@ mod tests {
         assert!(filtered.iter().any(|h| h.job_id == "boundary"));
         assert!(filtered.iter().any(|h| h.job_id == "new"));
         assert!(!filtered.iter().any(|h| h.job_id == "old"));
+    }
+
+    // =========================================================================
+    // Lane Mark-Corrupt Command Tests (TCK-00570)
+    // =========================================================================
+
+    #[test]
+    fn test_lane_mark_corrupt_cli_parses() {
+        assert_fac_command_parses(&[
+            "test",
+            "lane",
+            "mark-corrupt",
+            "lane-00",
+            "--reason",
+            "suspected data corruption",
+        ]);
+    }
+
+    #[test]
+    fn test_lane_mark_corrupt_cli_parses_with_receipt_digest() {
+        assert_fac_command_parses(&[
+            "test",
+            "lane",
+            "mark-corrupt",
+            "lane-00",
+            "--reason",
+            "cleanup failure",
+            "--receipt-digest",
+            "b3-256:abcdef0123456789",
+        ]);
+    }
+
+    #[test]
+    fn test_lane_mark_corrupt_creates_marker() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root.clone()).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        // Verify lane starts IDLE.
+        let status = manager.lane_status(lane_id).expect("initial lane status");
+        assert_eq!(status.state, LaneState::Idle);
+
+        let exit_code = run_lane_mark_corrupt_with_manager(
+            &manager,
+            &LaneMarkCorruptArgs {
+                lane_id: lane_id.to_string(),
+                reason: "operator maintenance".to_string(),
+                receipt_digest: None,
+                json: true,
+            },
+            true,
+        );
+        assert_eq!(exit_code, exit_codes::SUCCESS, "mark-corrupt must succeed");
+
+        // Verify marker exists with correct content.
+        let marker = LaneCorruptMarkerV1::load(&fac_root, lane_id)
+            .expect("load marker")
+            .expect("marker must be present");
+        assert_eq!(marker.lane_id, lane_id);
+        assert_eq!(marker.reason, "operator maintenance");
+        assert!(marker.cleanup_receipt_digest.is_none());
+        assert!(!marker.detected_at.is_empty());
+
+        // Verify lane status shows CORRUPT.
+        let status = manager
+            .lane_status(lane_id)
+            .expect("lane status after mark-corrupt");
+        assert_eq!(status.state, LaneState::Corrupt);
+        assert_eq!(
+            status.corrupt_reason.as_deref(),
+            Some("operator maintenance")
+        );
+    }
+
+    #[test]
+    fn test_lane_mark_corrupt_with_receipt_digest() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root.clone()).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-01";
+        let digest = "b3-256:0123456789abcdef".to_string();
+        let exit_code = run_lane_mark_corrupt_with_manager(
+            &manager,
+            &LaneMarkCorruptArgs {
+                lane_id: lane_id.to_string(),
+                reason: "cleanup failed".to_string(),
+                receipt_digest: Some(digest.clone()),
+                json: true,
+            },
+            true,
+        );
+        assert_eq!(exit_code, exit_codes::SUCCESS);
+
+        let marker = LaneCorruptMarkerV1::load(&fac_root, lane_id)
+            .expect("load marker")
+            .expect("marker must be present");
+        assert_eq!(
+            marker.cleanup_receipt_digest.as_deref(),
+            Some(digest.as_str())
+        );
+    }
+
+    #[test]
+    fn test_lane_mark_corrupt_refuses_already_corrupt() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root.clone()).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+
+        // Mark corrupt the first time.
+        let first = run_lane_mark_corrupt_with_manager(
+            &manager,
+            &LaneMarkCorruptArgs {
+                lane_id: lane_id.to_string(),
+                reason: "first mark".to_string(),
+                receipt_digest: None,
+                json: true,
+            },
+            true,
+        );
+        assert_eq!(first, exit_codes::SUCCESS);
+
+        // Attempt to mark corrupt again -- must be refused.
+        let second = run_lane_mark_corrupt_with_manager(
+            &manager,
+            &LaneMarkCorruptArgs {
+                lane_id: lane_id.to_string(),
+                reason: "second mark".to_string(),
+                receipt_digest: None,
+                json: true,
+            },
+            true,
+        );
+        assert_eq!(
+            second,
+            exit_codes::VALIDATION_ERROR,
+            "mark-corrupt on already-corrupt lane must fail with VALIDATION_ERROR"
+        );
+
+        // Verify the original marker is preserved (not overwritten).
+        let marker = LaneCorruptMarkerV1::load(&fac_root, lane_id)
+            .expect("load marker")
+            .expect("marker must be present");
+        assert_eq!(marker.reason, "first mark");
+    }
+
+    #[test]
+    fn test_lane_mark_corrupt_reason_length_validation() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        // Create a reason that exceeds MAX_STRING_LENGTH (512).
+        let long_reason = "x".repeat(apm2_core::fac::lane::MAX_STRING_LENGTH + 1);
+        let exit_code = run_lane_mark_corrupt_with_manager(
+            &manager,
+            &LaneMarkCorruptArgs {
+                lane_id: "lane-00".to_string(),
+                reason: long_reason,
+                receipt_digest: None,
+                json: true,
+            },
+            true,
+        );
+        assert_eq!(
+            exit_code,
+            exit_codes::VALIDATION_ERROR,
+            "oversized reason must fail validation"
+        );
+    }
+
+    #[test]
+    fn test_lane_mark_corrupt_then_reset_clears() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root.clone()).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+
+        // Mark corrupt.
+        let mark_exit = run_lane_mark_corrupt_with_manager(
+            &manager,
+            &LaneMarkCorruptArgs {
+                lane_id: lane_id.to_string(),
+                reason: "mark then reset".to_string(),
+                receipt_digest: None,
+                json: true,
+            },
+            true,
+        );
+        assert_eq!(mark_exit, exit_codes::SUCCESS);
+
+        // Reset the lane.
+        let reset_exit = run_lane_reset_with_manager(
+            &manager,
+            &LaneResetArgs {
+                lane_id: lane_id.to_string(),
+                force: false,
+                json: false,
+            },
+            false,
+        );
+        assert_eq!(reset_exit, exit_codes::SUCCESS);
+
+        // Marker should be cleared.
+        assert!(
+            LaneCorruptMarkerV1::load(&fac_root, lane_id)
+                .expect("load marker")
+                .is_none(),
+            "corrupt marker must be cleared after reset"
+        );
+    }
+
+    #[test]
+    fn test_lane_mark_corrupt_worker_refuses_corrupt_lane() {
+        // This test validates that the existing worker lane-acquisition logic
+        // (tested in fac_worker tests) correctly refuses corrupt-marked lanes.
+        // We verify the foundational behavior here: a corrupt marker on disk
+        // causes `lane_status` to report CORRUPT.
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root.clone()).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        // Mark all lanes corrupt.
+        for lane_id in LaneManager::default_lane_ids() {
+            let marker = LaneCorruptMarkerV1 {
+                schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+                lane_id: lane_id.clone(),
+                reason: "all lanes corrupt".to_string(),
+                cleanup_receipt_digest: None,
+                detected_at: "2026-02-18T00:00:00Z".to_string(),
+            };
+            marker.persist(&fac_root).expect("persist marker");
+        }
+
+        // All lanes should report CORRUPT.
+        let statuses = manager.all_lane_statuses().expect("all lane statuses");
+        for status in &statuses {
+            assert_eq!(
+                status.state,
+                LaneState::Corrupt,
+                "lane {} must be CORRUPT",
+                status.lane_id
+            );
+        }
     }
 }

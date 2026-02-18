@@ -201,6 +201,20 @@ tables are printed by default via `print_lane_init_receipt()` and
 **LaneSubcommand** enum variants added:
 - `Init(LaneInitArgs)` -- `--json` flag
 - `Reconcile(LaneReconcileArgs)` -- `--json` flag
+- `MarkCorrupt(LaneMarkCorruptArgs)` -- `--reason`, `--receipt-digest`, `--json` flags (TCK-00570)
+
+### Lane Mark-Corrupt Command (fac.rs, TCK-00570)
+
+| Subcommand | Function | Description |
+|------------|----------|-------------|
+| `apm2 fac lane mark-corrupt <lane_id> --reason ...` | `run_lane_mark_corrupt()` | Operator tool to manually mark a lane as CORRUPT |
+
+Writes a `corrupt.v1.json` marker under exclusive lane lock. Refuses
+RUNNING lanes (use `lane reset --force`) and already-CORRUPT lanes (use
+`lane reset` first). Accepts optional `--receipt-digest` to bind the
+marker to an evidence artifact. Validates reason and digest against
+`MAX_STRING_LENGTH` (512). The marker prevents all future job leases
+until cleared via `apm2 fac lane reset`.
 
 ### Bootstrap (fac_bootstrap.rs, TCK-00599)
 

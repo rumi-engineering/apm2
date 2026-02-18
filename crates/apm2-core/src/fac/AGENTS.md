@@ -764,6 +764,41 @@ projection surfaces.
   Variable-time `==`/`!=` on `[u8; 32]` hash values is prohibited in this
   module.
 
+## lane Submodule (TCK-00515, TCK-00569, TCK-00570)
+
+The `lane` submodule implements FESv1 execution lane primitives: lane
+directories, profiles, leases, status derivation, cleanup, and corrupt
+marker persistence.
+
+### Lane CORRUPT Persistence and Refusal Semantics (TCK-00570)
+
+- `LaneCorruptMarkerV1`: Persistent marker at
+  `lanes/<lane_id>/corrupt.v1.json` with schema, lane_id, reason,
+  optional cleanup_receipt_digest (b3-256), and detected_at timestamp.
+- `LaneManager::mark_corrupt()`: Operator-facing API to create a corrupt
+  marker. Validates lane_id, reason length, and receipt_digest length
+  against `MAX_STRING_LENGTH`. Caller MUST hold the lane lock.
+- `LaneManager::clear_corrupt_marker()`: Removes the marker file.
+- Worker refusal: `acquire_worker_lane()` in the worker poll loop checks
+  for corrupt markers before leasing. A corrupt-marked lane is skipped
+  with a warning.
+- CLI: `apm2 fac lane mark-corrupt <lane_id> --reason ...` creates the
+  marker under exclusive lock. Refuses RUNNING lanes (use `lane reset
+  --force`). Refuses already-CORRUPT lanes (use `lane reset` first).
+- `apm2 fac lane reset` clears the corrupt marker and transitions the
+  lane back to IDLE.
+
+### Security Invariants (TCK-00570)
+
+- [INV-LANE-CORRUPT-001] A CORRUPT lane is never leased. The worker
+  checks the marker on each poll iteration.
+- [INV-LANE-CORRUPT-002] Marker persistence uses atomic write (temp +
+  rename). Reads are bounded to `MAX_LEASE_FILE_SIZE` (1 MiB).
+- [INV-LANE-CORRUPT-003] `detected_at` uses wall-clock time for audit
+  labelling only; monotonic ordering is not relied upon.
+- [INV-LANE-CORRUPT-004] Reason and receipt_digest string fields are
+  validated against `MAX_STRING_LENGTH` (512) before persistence.
+
 ## safe_rmtree Submodule (TCK-00516)
 
 The `safe_rmtree` submodule implements a symlink-safe recursive tree
