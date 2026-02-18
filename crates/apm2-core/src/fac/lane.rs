@@ -1940,6 +1940,53 @@ impl LaneManager {
         LaneCorruptMarkerV1::remove(&self.fac_root, lane_id)
     }
 
+    /// Mark a lane as CORRUPT with a reason and optional receipt digest.
+    ///
+    /// This is the canonical operator-facing API for marking a lane as
+    /// corrupt (TCK-00570). The caller MUST hold the lane lock before
+    /// calling this method to prevent TOCTOU between status check and
+    /// marker write.
+    ///
+    /// # Arguments
+    ///
+    /// * `lane_id` - Lane to mark (validated).
+    /// * `reason` - Human-readable reason (validated against
+    ///   `MAX_STRING_LENGTH`).
+    /// * `receipt_digest` - Optional `b3-256:<hex>` digest binding the marker
+    ///   to an evidence artifact.
+    /// * `detected_at` - ISO-8601 timestamp string for when corruption was
+    ///   detected.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LaneError::InvalidLaneId` for malformed lane IDs,
+    /// `LaneError::StringTooLong` for oversized fields, or
+    /// `LaneError::Io` / `LaneError::Serialization` for persistence
+    /// failures.
+    pub fn mark_corrupt(
+        &self,
+        lane_id: &str,
+        reason: &str,
+        receipt_digest: Option<&str>,
+        detected_at: &str,
+    ) -> Result<(), LaneError> {
+        validate_lane_id(lane_id)?;
+        validate_string_field("reason", reason, MAX_STRING_LENGTH)?;
+        validate_string_field("detected_at", detected_at, MAX_STRING_LENGTH)?;
+        if let Some(digest) = receipt_digest {
+            validate_string_field("cleanup_receipt_digest", digest, MAX_STRING_LENGTH)?;
+        }
+
+        let marker = LaneCorruptMarkerV1 {
+            schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
+            lane_id: lane_id.to_string(),
+            reason: reason.to_string(),
+            cleanup_receipt_digest: receipt_digest.map(String::from),
+            detected_at: detected_at.to_string(),
+        };
+        marker.persist(&self.fac_root)
+    }
+
     /// Get the status of all lanes.
     ///
     /// # Errors
@@ -3718,6 +3765,75 @@ mod tests {
         assert!(
             LaneCorruptMarkerV1::load(manager.fac_root(), lane_id)
                 .expect("load marker")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn lane_manager_mark_corrupt() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(fac_root.join("lanes").join("lane-00")).expect("create lane dir");
+        let manager = LaneManager::new(fac_root.clone()).expect("create manager");
+
+        manager
+            .mark_corrupt(
+                "lane-00",
+                "operator maintenance",
+                Some("b3-256:deadbeef"),
+                "2026-02-18T00:00:00Z",
+            )
+            .expect("mark_corrupt should succeed");
+
+        let marker = LaneCorruptMarkerV1::load(&fac_root, "lane-00")
+            .expect("load marker")
+            .expect("marker must be present");
+        assert_eq!(marker.lane_id, "lane-00");
+        assert_eq!(marker.reason, "operator maintenance");
+        assert_eq!(
+            marker.cleanup_receipt_digest.as_deref(),
+            Some("b3-256:deadbeef")
+        );
+        assert_eq!(marker.detected_at, "2026-02-18T00:00:00Z");
+    }
+
+    #[test]
+    fn lane_manager_mark_corrupt_rejects_oversized_reason() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(fac_root.join("lanes").join("lane-00")).expect("create lane dir");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        let long_reason = "x".repeat(MAX_STRING_LENGTH + 1);
+        let result = manager.mark_corrupt("lane-00", &long_reason, None, "2026-02-18T00:00:00Z");
+        assert!(result.is_err(), "oversized reason must be rejected");
+    }
+
+    #[test]
+    fn lane_manager_mark_corrupt_then_clear() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(fac_root.join("lanes").join("lane-01")).expect("create lane dir");
+        let manager = LaneManager::new(fac_root.clone()).expect("create manager");
+
+        manager
+            .mark_corrupt("lane-01", "test", None, "2026-02-18T00:00:00Z")
+            .expect("mark_corrupt should succeed");
+
+        // Marker should exist.
+        assert!(
+            LaneCorruptMarkerV1::load(&fac_root, "lane-01")
+                .expect("load")
+                .is_some()
+        );
+
+        // Clear it.
+        manager.clear_corrupt_marker("lane-01").expect("clear");
+
+        // Marker should be gone.
+        assert!(
+            LaneCorruptMarkerV1::load(&fac_root, "lane-01")
+                .expect("load")
                 .is_none()
         );
     }
