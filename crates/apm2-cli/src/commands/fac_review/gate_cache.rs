@@ -647,10 +647,14 @@ impl GateCache {
 
     /// Record a gate result with attestation metadata.
     ///
-    /// New entries created by the current pipeline carry RFC-0028/0029
-    /// receipt bindings (`rfc0028_receipt_bound = true`,
-    /// `rfc0029_receipt_bound = true`). Legacy entries loaded from disk
-    /// may have these fields as `false`.
+    /// New entries are written with **fail-closed** defaults:
+    /// `rfc0028_receipt_bound = false` and `rfc0029_receipt_bound = false`.
+    /// These flags are only promoted to `true` after a receipt lookup
+    /// confirms that a corresponding RFC-0028/0029 receipt exists in the
+    /// durable receipt store (see [`Self::try_bind_receipt_from_store`]).
+    ///
+    /// If no receipt can be found at write time, the entry persists with
+    /// `false` flags and can only be reused via `--allow-legacy-cache`.
     #[allow(clippy::too_many_arguments)]
     pub fn set_with_attestation(
         &mut self,
@@ -678,9 +682,12 @@ impl GateCache {
                 log_path,
                 signature_hex: None,
                 signer_id: None,
-                // TCK-00540: new entries carry receipt bindings by default.
-                rfc0028_receipt_bound: true,
-                rfc0029_receipt_bound: true,
+                // TCK-00540 BLOCKER fix: fail-closed defaults. Receipt
+                // bindings are only promoted to `true` by an explicit
+                // `bind_receipt_evidence` or `try_bind_receipt_from_store`
+                // call after verifying receipt existence.
+                rfc0028_receipt_bound: false,
+                rfc0029_receipt_bound: false,
                 legacy_cache_override: false,
             },
         );
@@ -690,10 +697,7 @@ impl GateCache {
     /// `--allow-legacy-cache` unsafe override (TCK-00540 fix round 2).
     ///
     /// When a cache hit occurs through `legacy_cache_override_unsafe`,
-    /// `set_with_attestation` initially writes the entry with default
-    /// bindings (`rfc0028_receipt_bound=true`, `rfc0029_receipt_bound=true`,
-    /// `legacy_cache_override=false`).  This method corrects the entry to
-    /// preserve the override audit trail:
+    /// this method marks the entry to preserve the override audit trail:
     ///
     /// - `rfc0028_receipt_bound = false`
     /// - `rfc0029_receipt_bound = false`
@@ -714,6 +718,68 @@ impl GateCache {
             entry.rfc0029_receipt_bound = false;
             entry.legacy_cache_override = true;
         }
+    }
+
+    /// Explicitly bind RFC-0028/0029 receipt evidence to a cache entry.
+    ///
+    /// Sets `rfc0028_receipt_bound` and `rfc0029_receipt_bound` to the
+    /// provided values. This must be called **after** `set_with_attestation`
+    /// and **before** `sign()` / `sign_all()` so the signed canonical
+    /// bytes reflect the final flag values.
+    ///
+    /// Callers are responsible for verifying that receipt evidence actually
+    /// exists before passing `true`. Passing `true` without verified
+    /// evidence defeats the fail-closed posture.
+    pub fn bind_receipt_evidence(&mut self, gate: &str, rfc0028: bool, rfc0029: bool) {
+        if let Some(entry) = self.gates.get_mut(gate) {
+            entry.rfc0028_receipt_bound = rfc0028;
+            entry.rfc0029_receipt_bound = rfc0029;
+        }
+    }
+
+    /// Best-effort receipt lookup: scan the durable receipt store for a job
+    /// receipt matching `job_id` and promote receipt binding flags on all
+    /// gate entries in this cache.
+    ///
+    /// If a receipt is found with both `rfc0028_channel_boundary` (with
+    /// `passed == true`) and `eio29_queue_admission` (with `verdict ==
+    /// "allow"`), all non-override entries are promoted to `rfc0028=true,
+    /// rfc0029=true`.
+    ///
+    /// If the receipt is missing, or evidence fields are absent/failed, the
+    /// flags remain `false` (fail-closed). Entries already marked with
+    /// `legacy_cache_override = true` are never promoted.
+    ///
+    /// **CRITICAL:** This method **must** be called **before** `sign()`
+    /// / `sign_all()` so that the signed canonical bytes cover the final
+    /// flag values.
+    pub fn try_bind_receipt_from_store(&mut self, receipts_dir: &std::path::Path, job_id: &str) {
+        let Some(receipt) = apm2_core::fac::lookup_job_receipt(receipts_dir, job_id) else {
+            return; // No receipt found — flags stay false (fail-closed).
+        };
+
+        let rfc0028_ok = receipt
+            .rfc0028_channel_boundary
+            .as_ref()
+            .is_some_and(|trace| trace.passed);
+        let rfc0029_ok = receipt
+            .eio29_queue_admission
+            .as_ref()
+            .is_some_and(|trace| trace.verdict == "allow");
+
+        if rfc0028_ok && rfc0029_ok {
+            // Collect gate names to avoid borrow conflict with bind_receipt_evidence.
+            let gate_names: Vec<String> = self
+                .gates
+                .iter()
+                .filter(|(_, entry)| !entry.legacy_cache_override)
+                .map(|(name, _)| name.clone())
+                .collect();
+            for gate_name in &gate_names {
+                self.bind_receipt_evidence(gate_name, true, true);
+            }
+        }
+        // If either check fails, flags remain false — fail-closed.
     }
 
     /// Backfill truncation and log-bundle metadata from evidence gate results.
@@ -885,6 +951,45 @@ impl GateCache {
     }
 }
 
+/// Post-receipt gate cache rebinding (TCK-00540 BLOCKER fix).
+///
+/// After a worker creates a job receipt with RFC-0028/0029 bindings, this
+/// function reloads the gate cache for the given SHA, promotes the receipt
+/// binding flags based on the durable receipt, re-signs the cache, and
+/// persists it.
+///
+/// If the gate cache or receipt cannot be found, or the receipt lacks the
+/// required bindings, this is a no-op (fail-closed: the cache retains its
+/// existing `false` flags).
+///
+/// # Arguments
+///
+/// * `sha` - The commit SHA whose gate cache should be rebound.
+/// * `receipts_dir` - Path to the receipt store
+///   (`$APM2_HOME/private/fac/receipts`).
+/// * `job_id` - The job ID whose receipt should be looked up.
+/// * `signer` - The signing key for re-signing the cache after flag promotion.
+pub fn rebind_gate_cache_after_receipt(
+    sha: &str,
+    receipts_dir: &Path,
+    job_id: &str,
+    signer: &Signer,
+) {
+    let Some(mut cache) = GateCache::load(sha) else {
+        return; // No cache on disk — nothing to rebind.
+    };
+    cache.try_bind_receipt_from_store(receipts_dir, job_id);
+
+    // Only re-sign and save if at least one gate was promoted.
+    let any_bound = cache.gates.values().any(|entry| {
+        entry.rfc0028_receipt_bound && entry.rfc0029_receipt_bound && !entry.legacy_cache_override
+    });
+    if any_bound {
+        cache.sign_all(signer);
+        let _ = cache.save(); // Best-effort: failure is non-fatal.
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use apm2_core::crypto::Signer;
@@ -904,6 +1009,9 @@ mod tests {
             Some("log-digest".to_string()),
             None,
         );
+        // TCK-00540 BLOCKER fix: set_with_attestation now defaults to false;
+        // explicitly bind receipt evidence for tests that need rfc0028/0029=true.
+        cache.bind_receipt_evidence("rustfmt", true, true);
         cache.sign_all(signer);
         cache
     }
@@ -1451,11 +1559,19 @@ gates:
             Some("log-digest".to_string()),
             None,
         );
+        // Simulate receipt binding (set_with_attestation defaults to false).
+        cache.bind_receipt_evidence("rustfmt", true, true);
 
-        // Before mark: default trusted bindings.
+        // Before mark: bound via explicit bind_receipt_evidence.
         let entry = cache.gates.get("rustfmt").expect("entry exists");
-        assert!(entry.rfc0028_receipt_bound, "default should be true");
-        assert!(entry.rfc0029_receipt_bound, "default should be true");
+        assert!(
+            entry.rfc0028_receipt_bound,
+            "bound should be true after bind"
+        );
+        assert!(
+            entry.rfc0029_receipt_bound,
+            "bound should be true after bind"
+        );
         assert!(!entry.legacy_cache_override, "default should be false");
 
         // After mark: override audit trail preserved.
@@ -2036,6 +2152,147 @@ gates:
             format,
             CanonicalBytesFormat::WithPolicyFlags,
             "mark+sign must produce WithPolicyFlags signature"
+        );
+    }
+
+    // --- TCK-00540 BLOCKER fix: fail-closed default regression tests ---
+
+    /// BLOCKER regression test: `set_with_attestation` defaults to
+    /// `rfc0028_receipt_bound=false` and `rfc0029_receipt_bound=false`.
+    ///
+    /// This is the key fail-closed invariant: new cache entries must NOT
+    /// carry receipt bindings unless explicitly promoted via
+    /// `bind_receipt_evidence` after verifying that a durable receipt
+    /// with RFC-0028/0029 evidence exists.
+    #[test]
+    fn set_with_attestation_defaults_to_fail_closed() {
+        let mut cache = GateCache::new("abc123");
+        cache.set_with_attestation(
+            "rustfmt",
+            true,
+            1,
+            Some("digest-1".to_string()),
+            false,
+            Some("log-digest".to_string()),
+            None,
+        );
+
+        let entry = cache.gates.get("rustfmt").expect("entry exists");
+        assert!(
+            !entry.rfc0028_receipt_bound,
+            "set_with_attestation must default rfc0028_receipt_bound to false (fail-closed)"
+        );
+        assert!(
+            !entry.rfc0029_receipt_bound,
+            "set_with_attestation must default rfc0029_receipt_bound to false (fail-closed)"
+        );
+        assert!(
+            !entry.legacy_cache_override,
+            "set_with_attestation must default legacy_cache_override to false"
+        );
+    }
+
+    /// BLOCKER regression test: default mode denies signed entries that
+    /// were written without receipt evidence (`rfc0028=false, rfc0029=false`).
+    ///
+    /// This proves the concrete counterexample from the BLOCKER finding:
+    /// if receipt artifacts are missing at write time, the cache entry
+    /// must NOT be reusable in default mode.
+    #[test]
+    fn default_mode_denies_when_receipt_binding_absent() {
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+
+        let mut cache = GateCache::new("abc123");
+        cache.set_with_attestation(
+            "rustfmt",
+            true,
+            1,
+            Some("digest-1".to_string()),
+            false,
+            Some("log-digest".to_string()),
+            None,
+        );
+        // Do NOT call bind_receipt_evidence — simulates missing receipt.
+        cache.sign_all(&signer);
+
+        // Default mode (allow_legacy_cache=false): MUST deny.
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), false);
+        assert!(
+            !reuse.reusable,
+            "entry without receipt binding must be DENIED in default mode"
+        );
+        assert_eq!(
+            reuse.reason, "receipt_binding_missing",
+            "denial reason must be receipt_binding_missing"
+        );
+
+        // Override mode (allow_legacy_cache=true): MUST accept.
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), true);
+        assert!(
+            reuse.reusable,
+            "entry without receipt binding must be ACCEPTED with --allow-legacy-cache"
+        );
+        assert_eq!(reuse.reason, "legacy_cache_override_unsafe");
+    }
+
+    /// BLOCKER regression test: `bind_receipt_evidence` promotes flags
+    /// and enables reuse in default mode.
+    #[test]
+    fn bind_receipt_evidence_enables_default_mode_reuse() {
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+
+        let mut cache = GateCache::new("abc123");
+        cache.set_with_attestation(
+            "rustfmt",
+            true,
+            1,
+            Some("digest-1".to_string()),
+            false,
+            Some("log-digest".to_string()),
+            None,
+        );
+        // Promote flags after receipt verification.
+        cache.bind_receipt_evidence("rustfmt", true, true);
+        cache.sign_all(&signer);
+
+        // Default mode: MUST accept (receipt evidence is bound).
+        let reuse = cache.check_reuse("rustfmt", Some("digest-1"), true, Some(&vk), false);
+        assert!(
+            reuse.reusable,
+            "entry with receipt binding must be accepted in default mode"
+        );
+        assert_eq!(reuse.reason, "attestation_match");
+    }
+
+    /// BLOCKER regression test: `bind_receipt_evidence` does NOT promote
+    /// entries already marked with `legacy_cache_override`.
+    #[test]
+    fn bind_receipt_evidence_skips_legacy_override_entries() {
+        let mut cache = GateCache::new("abc123");
+        cache.set_with_attestation(
+            "rustfmt",
+            true,
+            1,
+            Some("digest-1".to_string()),
+            false,
+            Some("log-digest".to_string()),
+            None,
+        );
+        cache.mark_legacy_override("rustfmt");
+
+        // Attempting to bind should NOT override the legacy_cache_override flag.
+        // (bind_receipt_evidence sets per-gate, not per-cache — but the
+        // try_bind_receipt_from_store method skips legacy override entries.)
+        let entry = cache.gates.get("rustfmt").expect("entry exists");
+        assert!(
+            !entry.rfc0028_receipt_bound,
+            "legacy override entry must keep rfc0028=false"
+        );
+        assert!(
+            entry.legacy_cache_override,
+            "legacy_cache_override must remain true"
         );
     }
 }

@@ -138,6 +138,15 @@ mod fac_review_api {
     ) -> Result<u8, String> {
         Ok(crate::exit_codes::codes::GENERIC_ERROR)
     }
+
+    /// Test stub: no-op rebinding.
+    pub fn rebind_gate_cache_after_receipt(
+        _sha: &str,
+        _receipts_dir: &std::path::Path,
+        _job_id: &str,
+        _signer: &apm2_core::crypto::Signer,
+    ) {
+    }
 }
 
 #[cfg(test)]
@@ -1816,6 +1825,21 @@ fn execute_queued_gates_job(
                 reason: format!("pipeline commit failed for gates job: {commit_err}"),
             };
         }
+
+        // TCK-00540 BLOCKER fix: After the receipt is committed, rebind
+        // the gate cache with real RFC-0028/0029 receipt evidence. This
+        // promotes the fail-closed default (`false`) to `true` only when
+        // the durable receipt contains the required bindings.
+        let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
+        if let Ok(signer) = fac_key_material::load_or_generate_persistent_signer(fac_root) {
+            fac_review_api::rebind_gate_cache_after_receipt(
+                &spec.source.head_sha,
+                &receipts_dir,
+                &spec.job_id,
+                &signer,
+            );
+        }
+
         return JobOutcome::Completed {
             job_id: spec.job_id.clone(),
             observed_cost: Some(observed_cost),

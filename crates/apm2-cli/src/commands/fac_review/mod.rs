@@ -4291,6 +4291,20 @@ pub(super) fn run_gates_local_worker(
     )
 }
 
+/// Post-receipt gate cache rebinding (TCK-00540 BLOCKER fix).
+///
+/// Called by the worker after persisting a job receipt to promote
+/// `rfc0028_receipt_bound` and `rfc0029_receipt_bound` flags in the
+/// gate cache based on verified receipt evidence.
+pub(super) fn rebind_gate_cache_after_receipt(
+    sha: &str,
+    receipts_dir: &std::path::Path,
+    job_id: &str,
+    signer: &apm2_core::crypto::Signer,
+) {
+    gate_cache::rebind_gate_cache_after_receipt(sha, receipts_dir, job_id, signer);
+}
+
 // ── Internal dispatch helper (shared with pipeline/restart) ─────────────────
 
 fn run_dispatch_inner(
