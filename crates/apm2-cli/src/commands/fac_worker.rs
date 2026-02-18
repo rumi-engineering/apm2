@@ -2362,6 +2362,7 @@ fn process_job(
                     None,
                     Some(&sbx_hash),
                     Some(&resolved_net_hash),
+                    None, // bytes_backend
                 ) {
                     eprintln!(
                         "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -2409,6 +2410,7 @@ fn process_job(
                     None,
                     Some(&sbx_hash),
                     Some(&resolved_net_hash),
+                    None, // bytes_backend
                 ) {
                     eprintln!(
                         "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -2509,6 +2511,7 @@ fn process_job(
                     None,
                     Some(&sbx_hash),
                     Some(&resolved_net_hash),
+                    None, // bytes_backend
                 ) {
                     eprintln!(
                         "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -2545,6 +2548,7 @@ fn process_job(
                 None,
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
+                None, // bytes_backend
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for denied stop_revoke: {receipt_err}"
@@ -2848,6 +2852,7 @@ fn process_job(
                 None,
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
+                None, // bytes_backend
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -2891,6 +2896,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // bytes_backend
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2926,6 +2932,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // bytes_backend
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -2976,6 +2983,7 @@ fn process_job(
                 None,
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
+                None, // bytes_backend
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -3017,6 +3025,7 @@ fn process_job(
                 None,
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
+                None, // bytes_backend
             ) {
                 eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
@@ -3052,6 +3061,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // bytes_backend
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -3087,6 +3097,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // bytes_backend
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -3133,6 +3144,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // bytes_backend
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -3188,6 +3200,7 @@ fn process_job(
                             None,
                             Some(&sbx_hash),
                             Some(&resolved_net_hash),
+                            None, // bytes_backend
                         ) {
                             eprintln!(
                                 "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
@@ -3230,6 +3243,7 @@ fn process_job(
                         None,
                         Some(&sbx_hash),
                         Some(&resolved_net_hash),
+                        None, // bytes_backend
                     ) {
                         eprintln!(
                             "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
@@ -3279,6 +3293,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // bytes_backend
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -3364,6 +3379,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // bytes_backend
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -3419,6 +3435,7 @@ fn process_job(
                 None,
                 Some(&sbx_hash),
                 Some(&resolved_net_hash),
+                None, // bytes_backend
             ) {
                 eprintln!(
                     "worker: WARNING: receipt emission failed for budget-denied job: {receipt_err}"
@@ -3459,6 +3476,7 @@ fn process_job(
             None,
             Some(&sbx_hash),
             Some(&resolved_net_hash),
+            None, // bytes_backend
         ) {
             eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
         }
@@ -4001,6 +4019,12 @@ fn process_job(
 
         // TCK-00546: Branch on `bytes_backend` to resolve patch bytes.
         let bytes_backend = patch_obj.get("bytes_backend").and_then(|v| v.as_str());
+        // MINOR-1 fix: Capture resolved_bytes_backend immediately at
+        // deserialization time so both success and failure receipts carry
+        // consistent metadata.  Previously this was deferred until after
+        // the patch was successfully applied, leaving failure receipts
+        // without bytes_backend.
+        resolved_bytes_backend = bytes_backend.map(String::from);
 
         let patch_bytes: Vec<u8> = match bytes_backend {
             // ---- apm2_cas backend: retrieve from daemon CAS ----
@@ -4201,8 +4225,8 @@ fn process_job(
             },
         };
         patch_digest = Some(patch_outcome.patch_digest);
-        // TCK-00546: Record which backend was used for the receipt.
-        resolved_bytes_backend = bytes_backend.map(String::from);
+        // (resolved_bytes_backend already captured at deserialization time
+        // above)
     } else if spec.source.kind != "mirror_commit" {
         let reason = format!("unsupported source kind: {}", spec.source.kind);
         // SEC-CTRL-LANE-CLEANUP-002: This denial path is post-checkout, so the
@@ -6560,6 +6584,9 @@ fn load_or_create_policy(fac_root: &Path) -> Result<(String, [u8; 32], FacPolicy
 
 /// Emit a unified `FacJobReceiptV1` and persist under
 /// `$APM2_HOME/private/fac/receipts`.
+///
+/// MAJOR-2 fix: accepts `bytes_backend` so non-pipeline emission paths
+/// carry consistent metadata for GC tracking.
 #[allow(clippy::too_many_arguments)]
 fn emit_job_receipt(
     fac_root: &Path,
@@ -6577,6 +6604,8 @@ fn emit_job_receipt(
     containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
     sandbox_hardening_hash: Option<&str>,
     network_policy_hash: Option<&str>,
+    // TCK-00546 MAJOR-2: bytes_backend for GC tracking in non-pipeline paths.
+    bytes_backend: Option<&str>,
 ) -> Result<PathBuf, String> {
     emit_job_receipt_internal(
         fac_root,
@@ -6595,6 +6624,7 @@ fn emit_job_receipt(
         None,
         sandbox_hardening_hash,
         network_policy_hash,
+        bytes_backend,
     )
 }
 
@@ -6622,6 +6652,8 @@ fn emit_job_receipt_with_observed_cost(
     observed_cost: apm2_core::economics::cost_model::ObservedJobCost,
     sandbox_hardening_hash: Option<&str>,
     network_policy_hash: Option<&str>,
+    // TCK-00546 MAJOR-2: bytes_backend for GC tracking.
+    bytes_backend: Option<&str>,
 ) -> Result<PathBuf, String> {
     emit_job_receipt_internal(
         fac_root,
@@ -6640,6 +6672,7 @@ fn emit_job_receipt_with_observed_cost(
         Some(observed_cost),
         sandbox_hardening_hash,
         network_policy_hash,
+        bytes_backend,
     )
 }
 
@@ -6747,6 +6780,8 @@ fn emit_job_receipt_internal(
     observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<&str>,
     network_policy_hash: Option<&str>,
+    // TCK-00546 MAJOR-2: bytes_backend threaded through for GC tracking.
+    bytes_backend: Option<&str>,
 ) -> Result<PathBuf, String> {
     let receipt = build_job_receipt(
         spec,
@@ -6764,8 +6799,8 @@ fn emit_job_receipt_internal(
         observed_cost,
         sandbox_hardening_hash,
         network_policy_hash,
-        None, // stop_revoke_admission: not used in emit_job_receipt path
-        None, // bytes_backend: not used in emit_job_receipt path
+        None,          // stop_revoke_admission: not used in emit_job_receipt path
+        bytes_backend, // TCK-00546 MAJOR-2: thread bytes_backend to receipt
     )?;
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
     let result = persist_content_addressed_receipt(&receipts_dir, &receipt)?;
@@ -7757,6 +7792,7 @@ mod tests {
             None,
             None,
             None,
+            None, // bytes_backend
         )
         .expect("emit receipt");
 
@@ -7799,6 +7835,7 @@ mod tests {
             None,
             None,
             None,
+            None, // bytes_backend
         )
         .expect("emit receipt");
 
@@ -7999,6 +8036,7 @@ mod tests {
             Some(&containment_trace),
             None,
             None,
+            None, // bytes_backend
         )
         .expect("emit receipt with containment");
 
@@ -8071,6 +8109,7 @@ mod tests {
             None,
             None,
             None,
+            None, // bytes_backend
         )
         .expect("emit receipt without containment");
 
@@ -8128,6 +8167,7 @@ mod tests {
             None,
             Some(&hardening_hash),
             None,
+            None, // bytes_backend
         )
         .expect("emit receipt with sandbox_hardening_hash");
 
@@ -8195,6 +8235,7 @@ mod tests {
             None,
             None,
             None,
+            None, // bytes_backend
         )
         .expect("emit receipt without sandbox_hardening_hash");
 
@@ -9107,6 +9148,7 @@ mod tests {
             None,
             None,
             None,
+            None, // bytes_backend
         )
         .expect("emit denied receipt");
 
