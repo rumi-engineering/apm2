@@ -4181,7 +4181,10 @@ fn emit_lane_reset_recommendation(lane_id: &str, reason: &str) {
         recommended_action: "apm2 fac lane reset",
     };
     match serde_json::to_string(&rec) {
-        Ok(json) => eprintln!("worker: RECOMMENDATION: {json}"),
+        Ok(json) => {
+            eprintln!("worker: RECOMMENDATION: lane {lane_id} needs reset");
+            eprintln!("{json}");
+        },
         Err(e) => eprintln!(
             "worker: WARNING: failed to serialize reset recommendation for lane {lane_id}: {e}"
         ),
@@ -8507,6 +8510,42 @@ mod tests {
             resolved.content_hash_hex(),
             deny_hash,
             "warm (allow) hash must differ from gates (deny) hash"
+        );
+    }
+
+    /// Verify that `LaneResetRecommendation` serializes to a standalone valid
+    /// JSON object with the expected schema identifier, matching the contract
+    /// that `emit_lane_reset_recommendation` emits each recommendation as a
+    /// single parseable JSON line on stderr.
+    #[test]
+    fn test_lane_reset_recommendation_serializes_as_valid_json() {
+        let rec = LaneResetRecommendation {
+            schema: LANE_RESET_RECOMMENDATION_SCHEMA,
+            lane_id: "lane-42".to_string(),
+            reason: "cleanup failure: disk full".to_string(),
+            recommended_action: "apm2 fac lane reset",
+        };
+        let json_str = serde_json::to_string(&rec).expect("serialization must succeed");
+
+        // The serialized string must parse back as valid JSON.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_str).expect("output must be valid JSON");
+
+        // Verify expected fields.
+        assert_eq!(
+            parsed["schema"], "apm2.fac.lane_reset_recommendation.v1",
+            "schema field must match LANE_RESET_RECOMMENDATION_SCHEMA"
+        );
+        assert_eq!(parsed["lane_id"], "lane-42");
+        assert_eq!(parsed["reason"], "cleanup failure: disk full");
+        assert_eq!(parsed["recommended_action"], "apm2 fac lane reset");
+
+        // The output must NOT contain any non-JSON prefix — verify the first
+        // non-whitespace character is '{'.
+        let trimmed = json_str.trim();
+        assert!(
+            trimmed.starts_with('{'),
+            "serialized recommendation must be a standalone JSON object, got: {trimmed}"
         );
     }
 
