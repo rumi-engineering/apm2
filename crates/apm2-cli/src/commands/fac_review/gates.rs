@@ -367,6 +367,7 @@ fn prepare_queued_gates_job(
         &boundary_id,
         &mut broker,
         &job_spec_policy,
+        fac_policy.allowed_intents.as_deref(),
     )
     .map_err(|err| format!("cannot build gates job spec: {err}"))?;
 
@@ -621,6 +622,7 @@ fn build_gates_job_spec(
     boundary_id: &str,
     broker: &mut apm2_core::fac::broker::FacBroker,
     job_spec_policy: &JobSpecValidationPolicy,
+    allowed_intents: Option<&[apm2_core::fac::job_spec::FacIntent]>,
 ) -> Result<FacJobSpecV1, String> {
     if GATES_QUEUE_LANE.is_empty() || GATES_QUEUE_LANE.len() > MAX_QUEUE_LANE_LENGTH {
         return Err("invalid gates queue lane configuration".to_string());
@@ -668,6 +670,8 @@ fn build_gates_job_spec(
     // specific job through request_id (= spec digest), preserving fail-closed
     // token verification while avoiding digest-domain mismatch.
     // TCK-00567: Derive intent from job kind for intent-bound token issuance.
+    // Thread FacPolicyV1.allowed_intents so the broker enforces the allowlist
+    // at issuance (fail-closed).
     let intent = apm2_core::fac::job_spec::job_kind_to_intent(&spec.kind);
     let token = broker
         .issue_channel_context_token(
@@ -676,7 +680,7 @@ fn build_gates_job_spec(
             &digest,
             boundary_id,
             intent.as_ref(),
-            None,
+            allowed_intents,
         )
         .map_err(|err| format!("issue channel context token: {err}"))?;
     spec.actuation.channel_context_token = Some(token);
