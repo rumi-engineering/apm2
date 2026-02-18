@@ -1062,14 +1062,12 @@ fn detect_queue_processing_mode(fac_root: &Path) -> QueueProcessingMode {
 
 fn has_live_worker_heartbeat(fac_root: &Path) -> bool {
     let heartbeat = apm2_core::fac::worker_heartbeat::read_heartbeat(fac_root);
-    if !heartbeat.found || heartbeat.pid == 0 {
+    if !heartbeat.found || !heartbeat.fresh || heartbeat.pid == 0 {
         return false;
     }
     if heartbeat.pid == std::process::id() {
         return false;
     }
-    // Treat a running worker process as live even if the heartbeat timestamp
-    // is stale. Long-running jobs can delay cycle-level heartbeat refresh.
     is_pid_running(heartbeat.pid)
 }
 
@@ -2532,10 +2530,10 @@ mod tests {
         )
         .expect("write heartbeat");
 
-        assert!(has_live_worker_heartbeat(temp.path()));
+        assert!(!has_live_worker_heartbeat(temp.path()));
         assert_eq!(
             detect_queue_processing_mode(temp.path()),
-            QueueProcessingMode::ExternalWorker
+            QueueProcessingMode::InlineSingleJob
         );
     }
 
