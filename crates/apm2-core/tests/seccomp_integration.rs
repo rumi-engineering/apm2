@@ -117,7 +117,10 @@ async fn test_restricted_seccomp_blocks_socket() {
     }
 
     let config = BlackBoxConfig::new("test-seccomp-socket", "python3")
-        .with_args(["-c", "import socket; socket.socket()"])
+        .with_args([
+            "-c",
+            "import socket; socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
+        ])
         .with_seccomp(SeccompProfile::restricted());
 
     assert!(config.seccomp.is_enforced(), "seccomp should be enforced");
@@ -177,7 +180,7 @@ async fn test_baseline_seccomp_allows_socket() {
     let config = BlackBoxConfig::new("test-baseline-socket", "python3")
         .with_args([
             "-c",
-            "import socket; s = socket.socket(); s.close(); print('ok')",
+            "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.close(); print('ok')",
         ])
         .with_seccomp(SeccompProfile::baseline());
 
@@ -228,7 +231,10 @@ async fn test_with_seccomp_sandbox_convenience() {
 
     // Use the convenience method instead of explicit SeccompProfile
     let config = BlackBoxConfig::new("test-convenience", "python3")
-        .with_args(["-c", "import socket; socket.socket()"])
+        .with_args([
+            "-c",
+            "import socket; socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
+        ])
         .with_seccomp_sandbox(); // Equivalent to with_seccomp(SeccompProfile::restricted())
 
     let adapter = BlackBoxAdapter::new(config);
