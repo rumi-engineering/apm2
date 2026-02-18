@@ -611,6 +611,11 @@ pub enum DenialReasonCode {
     /// through INV-PH-010, TCK-00581). Path traversal, absolute paths,
     /// unsupported format, or other patch content violation detected.
     PatchHardeningDenied,
+    /// Token replay detected: the nonce in the token has already been
+    /// consumed by a prior job execution (TCK-00566).
+    TokenReplayDetected,
+    /// Token has been explicitly revoked before expiry (TCK-00566).
+    TokenRevoked,
 }
 
 /// Trace of the RFC-0028 channel boundary check.

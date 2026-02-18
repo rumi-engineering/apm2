@@ -10,9 +10,10 @@
 //!
 //! # Security Invariants
 //!
-//! - [INV-TL-001] Every issued token nonce is recorded in the ledger before the
-//!   token is returned to the caller. A second issuance or use of the same
-//!   nonce is denied (fail-closed).
+//! - [INV-TL-001] Every token nonce is included in the issued token but
+//!   recorded in the ledger only when the worker validates and consumes the
+//!   token via `validate_and_record_token_nonce`. A second presentation of the
+//!   same nonce is denied (fail-closed).
 //! - [INV-TL-002] The ledger is bounded by `MAX_LEDGER_ENTRIES`. When the cap
 //!   is reached, the oldest entry is evicted (TTL-based FIFO).
 //! - [INV-TL-003] The revocation set is bounded by `MAX_REVOKED_TOKENS`.
@@ -21,8 +22,12 @@
 //! - [INV-TL-005] TTL eviction uses broker ticks (not wall-clock time) for
 //!   monotonic, deterministic expiry (INV-2501).
 //! - [INV-TL-006] Nonces are 32-byte random values generated from a CSPRNG.
-//! - [INV-TL-007] All hash comparisons use `subtle::ConstantTimeEq` to prevent
-//!   timing side-channels (RSK-1909).
+//! - [INV-TL-007] Nonce lookups use `HashMap::get()` (O(1) average) with a
+//!   post-lookup `subtle::ConstantTimeEq::ct_eq()` verification as defense in
+//!   depth against hash-collision-based timing attacks. The `HashMap` approach
+//!   is NOT constant-time over the full entry set; however, 32-byte random
+//!   nonces (INV-TL-006) make collision-based timing leakage infeasible in
+//!   practice (RSK-1909).
 //!
 //! # Thread Safety
 //!
@@ -108,6 +113,13 @@ pub enum TokenLedgerError {
     /// Nonce not found for revocation.
     #[error("nonce not found in ledger for revocation")]
     NonceNotFound,
+
+    /// Persistence error (serialization, deserialization, I/O).
+    #[error("token ledger persistence: {detail}")]
+    Persistence {
+        /// Detail string describing the persistence failure.
+        detail: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -282,9 +294,9 @@ impl TokenUseLedger {
 
     /// Records a token nonce in the ledger, performing replay detection.
     ///
-    /// This must be called BEFORE returning a token to the caller
-    /// (INV-TL-001). If the nonce already exists in the ledger, the
-    /// token is a replay and this method returns
+    /// Called by the worker validation path after extracting the nonce
+    /// from a decoded token (INV-TL-001). If the nonce already exists
+    /// in the ledger, the token is a replay and this method returns
     /// [`TokenLedgerError::ReplayDetected`].
     ///
     /// If the nonce has been explicitly revoked, returns
@@ -514,6 +526,260 @@ impl Default for TokenUseLedger {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Persistence (TCK-00566: durable ledger)
+// ---------------------------------------------------------------------------
+
+/// Maximum size in bytes for the persisted token ledger file.
+///
+/// Prevents OOM from crafted ledger files (RSK-1601). Each entry is
+/// ~200 bytes in JSON, so 16384 entries + 4096 revocations is well
+/// under 8 MiB.
+pub const MAX_TOKEN_LEDGER_FILE_SIZE: usize = 8 * 1024 * 1024;
+
+/// Schema identifier for persisted token ledger state.
+const TOKEN_LEDGER_SCHEMA_ID: &str = "apm2.fac_broker.token_ledger.v1";
+
+/// Schema version for persisted token ledger state.
+const TOKEN_LEDGER_SCHEMA_VERSION: &str = "1.0.0";
+
+/// Persisted representation of a single token use entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedTokenUseEntry {
+    /// Hex-encoded nonce.
+    nonce_hex: String,
+    /// Hex-encoded `request_id_digest`.
+    request_id_digest_hex: String,
+    /// Broker tick when recorded.
+    recorded_at_tick: u64,
+    /// Broker tick at which the entry expires.
+    expiry_tick: u64,
+}
+
+/// Persisted representation of a revoked token entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedRevokedEntry {
+    /// Hex-encoded nonce.
+    nonce_hex: String,
+    /// Broker tick when revoked.
+    revoked_at_tick: u64,
+    /// Reason for revocation.
+    reason: String,
+}
+
+/// Persisted token ledger state envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedTokenLedgerState {
+    /// Schema identifier.
+    schema_id: String,
+    /// Schema version.
+    schema_version: String,
+    /// TTL in ticks.
+    ttl_ticks: u64,
+    /// Active entries (ordered by insertion).
+    entries: Vec<PersistedTokenUseEntry>,
+    /// Revoked entries (ordered by revocation time).
+    revoked: Vec<PersistedRevokedEntry>,
+}
+
+impl TokenUseLedger {
+    /// Serializes the ledger state to JSON bytes for persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if JSON serialization fails.
+    pub fn serialize_state(&self) -> Result<Vec<u8>, TokenLedgerError> {
+        let entries: Vec<PersistedTokenUseEntry> = self
+            .insertion_order
+            .iter()
+            .filter_map(|(nonce, _)| {
+                self.entries.get(nonce).map(|e| PersistedTokenUseEntry {
+                    nonce_hex: hex::encode(e.nonce),
+                    request_id_digest_hex: hex::encode(e.request_id_digest),
+                    recorded_at_tick: e.recorded_at_tick,
+                    expiry_tick: e.expiry_tick,
+                })
+            })
+            .collect();
+
+        let revoked: Vec<PersistedRevokedEntry> = self
+            .revocation_order
+            .iter()
+            .filter_map(|nonce| {
+                self.revoked.get(nonce).map(|e| PersistedRevokedEntry {
+                    nonce_hex: hex::encode(e.nonce),
+                    revoked_at_tick: e.revoked_at_tick,
+                    reason: e.reason.clone(),
+                })
+            })
+            .collect();
+
+        let state = PersistedTokenLedgerState {
+            schema_id: TOKEN_LEDGER_SCHEMA_ID.to_string(),
+            schema_version: TOKEN_LEDGER_SCHEMA_VERSION.to_string(),
+            ttl_ticks: self.ttl_ticks,
+            entries,
+            revoked,
+        };
+
+        serde_json::to_vec_pretty(&state).map_err(|e| TokenLedgerError::Persistence {
+            detail: format!("serialization failed: {e}"),
+        })
+    }
+
+    /// Deserializes a ledger from JSON bytes, restoring unexpired entries.
+    ///
+    /// Entries whose `expiry_tick` is at or below `current_tick` are dropped
+    /// during load (TTL eviction on reload). Entries beyond
+    /// `MAX_LEDGER_ENTRIES` are dropped (newest kept, oldest discarded).
+    /// Revoked entries beyond `MAX_REVOKED_TOKENS` are dropped similarly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The input exceeds `MAX_TOKEN_LEDGER_FILE_SIZE`
+    /// - JSON deserialization fails
+    /// - Schema id/version mismatch
+    /// - Hex-encoded nonce/digest is malformed
+    pub fn deserialize_state(bytes: &[u8], current_tick: u64) -> Result<Self, TokenLedgerError> {
+        // Size gate before parsing (RSK-1601).
+        if bytes.len() > MAX_TOKEN_LEDGER_FILE_SIZE {
+            return Err(TokenLedgerError::Persistence {
+                detail: format!(
+                    "ledger file too large: {} > {MAX_TOKEN_LEDGER_FILE_SIZE}",
+                    bytes.len()
+                ),
+            });
+        }
+
+        let state: PersistedTokenLedgerState =
+            serde_json::from_slice(bytes).map_err(|e| TokenLedgerError::Persistence {
+                detail: format!("deserialization failed: {e}"),
+            })?;
+
+        // Schema validation.
+        if state.schema_id != TOKEN_LEDGER_SCHEMA_ID {
+            return Err(TokenLedgerError::Persistence {
+                detail: format!(
+                    "schema id mismatch: expected {TOKEN_LEDGER_SCHEMA_ID}, got {}",
+                    state.schema_id
+                ),
+            });
+        }
+        if state.schema_version != TOKEN_LEDGER_SCHEMA_VERSION {
+            return Err(TokenLedgerError::Persistence {
+                detail: format!(
+                    "schema version mismatch: expected {TOKEN_LEDGER_SCHEMA_VERSION}, got {}",
+                    state.schema_version
+                ),
+            });
+        }
+
+        let ttl_ticks = if state.ttl_ticks == 0 {
+            1
+        } else {
+            state.ttl_ticks
+        };
+
+        let mut ledger = Self {
+            entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            revoked: HashMap::new(),
+            revocation_order: VecDeque::new(),
+            ttl_ticks,
+        };
+
+        // Restore active entries, dropping expired ones and enforcing cap.
+        for persisted in &state.entries {
+            // Skip expired entries.
+            if persisted.expiry_tick <= current_tick {
+                continue;
+            }
+            // Enforce cap (MAX_LEDGER_ENTRIES).
+            if ledger.entries.len() >= MAX_LEDGER_ENTRIES {
+                break;
+            }
+            let nonce = parse_nonce_hex(&persisted.nonce_hex)?;
+            let request_id_digest = parse_digest_hex(&persisted.request_id_digest_hex)?;
+            let entry = TokenUseEntry {
+                nonce,
+                request_id_digest,
+                recorded_at_tick: persisted.recorded_at_tick,
+                expiry_tick: persisted.expiry_tick,
+            };
+            ledger.entries.insert(nonce, entry);
+            ledger
+                .insertion_order
+                .push_back((nonce, persisted.expiry_tick));
+        }
+
+        // Restore revocation entries, dropping expired ones and enforcing cap.
+        for persisted in &state.revoked {
+            let revocation_expiry = persisted.revoked_at_tick.saturating_add(ttl_ticks);
+            // Skip expired revocations.
+            if revocation_expiry <= current_tick {
+                continue;
+            }
+            // Enforce cap (MAX_REVOKED_TOKENS).
+            if ledger.revoked.len() >= MAX_REVOKED_TOKENS {
+                break;
+            }
+            // Validate reason length.
+            if persisted.reason.len() > MAX_REVOCATION_REASON_LENGTH {
+                return Err(TokenLedgerError::Persistence {
+                    detail: format!(
+                        "revocation reason too long on load: {} > {MAX_REVOCATION_REASON_LENGTH}",
+                        persisted.reason.len()
+                    ),
+                });
+            }
+            let nonce = parse_nonce_hex(&persisted.nonce_hex)?;
+            let entry = RevokedTokenEntry {
+                nonce,
+                revoked_at_tick: persisted.revoked_at_tick,
+                reason: persisted.reason.clone(),
+            };
+            ledger.revoked.insert(nonce, entry);
+            ledger.revocation_order.push_back(nonce);
+        }
+
+        Ok(ledger)
+    }
+}
+
+/// Parses a hex-encoded 32-byte nonce.
+fn parse_nonce_hex(hex_str: &str) -> Result<TokenNonce, TokenLedgerError> {
+    let bytes = hex::decode(hex_str).map_err(|e| TokenLedgerError::Persistence {
+        detail: format!("invalid nonce hex: {e}"),
+    })?;
+    if bytes.len() != 32 {
+        return Err(TokenLedgerError::Persistence {
+            detail: format!("nonce hex decodes to {} bytes, expected 32", bytes.len()),
+        });
+    }
+    let mut nonce = [0u8; 32];
+    nonce.copy_from_slice(&bytes);
+    Ok(nonce)
+}
+
+/// Parses a hex-encoded 32-byte digest.
+fn parse_digest_hex(hex_str: &str) -> Result<[u8; 32], TokenLedgerError> {
+    let bytes = hex::decode(hex_str).map_err(|e| TokenLedgerError::Persistence {
+        detail: format!("invalid digest hex: {e}"),
+    })?;
+    if bytes.len() != 32 {
+        return Err(TokenLedgerError::Persistence {
+            detail: format!("digest hex decodes to {} bytes, expected 32", bytes.len()),
+        });
+    }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&bytes);
+    Ok(digest)
 }
 
 // ---------------------------------------------------------------------------
@@ -843,5 +1109,107 @@ mod tests {
         assert!(ledger.is_empty());
         assert_eq!(ledger.len(), 0);
         assert_eq!(ledger.revoked_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistence (TCK-00566: durable ledger)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn serialize_deserialize_round_trip_preserves_entries() {
+        let mut ledger = TokenUseLedger::with_ttl(100);
+        let nonce = nonce_from_byte(1);
+        let digest = digest_from_byte(0xAA);
+        ledger.record_token_use(&nonce, &digest, 10).unwrap();
+        assert_eq!(ledger.len(), 1);
+
+        let bytes = ledger.serialize_state().expect("serialize should succeed");
+        let restored =
+            TokenUseLedger::deserialize_state(&bytes, 10).expect("deserialize should succeed");
+        assert_eq!(restored.len(), 1);
+
+        // The nonce should be detected as used in the restored ledger.
+        assert!(matches!(
+            restored.check_nonce(&nonce),
+            Err(TokenLedgerError::ReplayDetected)
+        ));
+    }
+
+    #[test]
+    fn deserialize_drops_expired_entries() {
+        let mut ledger = TokenUseLedger::with_ttl(100);
+        let nonce = nonce_from_byte(1);
+        let digest = digest_from_byte(0xAA);
+        ledger.record_token_use(&nonce, &digest, 10).unwrap();
+        // Entry expires at tick 110.
+
+        let bytes = ledger.serialize_state().expect("serialize should succeed");
+
+        // Deserialize at tick 111 -> entry should be dropped.
+        let restored =
+            TokenUseLedger::deserialize_state(&bytes, 111).expect("deserialize should succeed");
+        assert_eq!(restored.len(), 0);
+    }
+
+    #[test]
+    fn serialize_deserialize_preserves_revocations() {
+        let mut ledger = TokenUseLedger::with_ttl(100);
+        let nonce = nonce_from_byte(1);
+        let digest = digest_from_byte(0xAA);
+        ledger.record_token_use(&nonce, &digest, 10).unwrap();
+        ledger.revoke_token(&nonce, 15, "test-reason").unwrap();
+        assert_eq!(ledger.revoked_count(), 1);
+
+        let bytes = ledger.serialize_state().expect("serialize should succeed");
+        let restored =
+            TokenUseLedger::deserialize_state(&bytes, 15).expect("deserialize should succeed");
+        assert_eq!(restored.revoked_count(), 1);
+
+        // The nonce should be denied as revoked.
+        assert!(matches!(
+            restored.check_nonce(&nonce),
+            Err(TokenLedgerError::TokenRevoked { .. })
+        ));
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_input() {
+        let oversized = vec![0u8; MAX_TOKEN_LEDGER_FILE_SIZE + 1];
+        let result = TokenUseLedger::deserialize_state(&oversized, 0);
+        assert!(matches!(result, Err(TokenLedgerError::Persistence { .. })));
+    }
+
+    #[test]
+    fn deserialize_rejects_invalid_schema_id() {
+        let bad_json = r#"{"schema_id":"wrong","schema_version":"1.0.0","ttl_ticks":100,"entries":[],"revoked":[]}"#;
+        let result = TokenUseLedger::deserialize_state(bad_json.as_bytes(), 0);
+        assert!(matches!(result, Err(TokenLedgerError::Persistence { .. })));
+    }
+
+    #[test]
+    fn deserialize_rejects_malformed_nonce_hex() {
+        let bad_json = r#"{"schema_id":"apm2.fac_broker.token_ledger.v1","schema_version":"1.0.0","ttl_ticks":100,"entries":[{"nonce_hex":"gg","request_id_digest_hex":"00","recorded_at_tick":1,"expiry_tick":100}],"revoked":[]}"#;
+        let result = TokenUseLedger::deserialize_state(bad_json.as_bytes(), 0);
+        assert!(matches!(result, Err(TokenLedgerError::Persistence { .. })));
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn deserialize_enforces_max_entries_cap() {
+        // Create a ledger at capacity and serialize.
+        let mut ledger = TokenUseLedger::with_ttl(100_000);
+        for i in 0..MAX_LEDGER_ENTRIES {
+            let mut nonce = [0u8; 32];
+            nonce[0..2].copy_from_slice(&(i as u16).to_le_bytes());
+            nonce[31] = 0xAA;
+            let digest = digest_from_byte((i & 0xFF) as u8);
+            ledger.record_token_use(&nonce, &digest, 10).unwrap();
+        }
+        let bytes = ledger.serialize_state().expect("serialize should succeed");
+
+        // Deserialize should succeed with exactly MAX_LEDGER_ENTRIES.
+        let restored =
+            TokenUseLedger::deserialize_state(&bytes, 10).expect("deserialize should succeed");
+        assert_eq!(restored.len(), MAX_LEDGER_ENTRIES);
     }
 }

@@ -558,6 +558,15 @@ impl FacBroker {
         })
     }
 
+    /// Replaces the broker's token use ledger with a pre-loaded one.
+    ///
+    /// Used when restoring persisted ledger state from disk at startup.
+    /// The ledger should have been deserialized via
+    /// [`crate::fac::token_ledger::TokenUseLedger::deserialize_state`].
+    pub fn set_token_ledger(&mut self, ledger: crate::fac::token_ledger::TokenUseLedger) {
+        self.token_ledger = ledger;
+    }
+
     /// Returns the broker's verifying (public) key.
     ///
     /// Workers use this key to verify envelope signatures with a real
@@ -880,13 +889,12 @@ impl FacBroker {
             token_binding: None, // Set by issue_channel_context_token_with_token_binding below.
         };
 
-        // TCK-00566: Generate a single-use nonce and record it in the
-        // token-use ledger BEFORE returning the token (INV-TL-001).
+        // TCK-00566: Generate a single-use nonce for replay protection.
+        // The nonce is included in the token but NOT recorded in the ledger
+        // at issuance time. Recording happens at the validation path (worker)
+        // when the token is presented for use. This ensures the first
+        // legitimate use succeeds and only subsequent uses are denied.
         let nonce = crate::fac::token_ledger::TokenUseLedger::generate_nonce();
-        let request_id_digest = compute_request_id_digest(request_id);
-        self.token_ledger
-            .record_token_use(&nonce, &request_id_digest, self.state.current_tick)
-            .map_err(BrokerError::TokenLedger)?;
 
         // TCK-00565: Bind the token to policy, canonicalizer, boundary, and
         // tick-based expiry so the worker can fail-closed on any drift.
@@ -1128,10 +1136,40 @@ impl FacBroker {
         &self.token_ledger
     }
 
-    /// Checks whether a token nonce has been used or revoked.
+    /// Checks whether a token nonce has been used or revoked, then records
+    /// it in the ledger to prevent future replay.
     ///
-    /// This is the validation entry point for workers: before accepting a
-    /// token, the worker calls this to verify the nonce is fresh.
+    /// This is the validation entry point for workers: after decoding a
+    /// token and extracting the nonce, the worker calls this to (1) verify
+    /// the nonce is fresh (neither used nor revoked) and (2) atomically
+    /// record the nonce as consumed so any subsequent presentation is denied.
+    ///
+    /// The check and record are performed together (fail-closed): if the
+    /// check fails, no record is made; if the check succeeds, the nonce is
+    /// immediately recorded before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the nonce has been used (replay) or revoked.
+    pub fn validate_and_record_token_nonce(
+        &mut self,
+        nonce: &[u8; 32],
+        request_id: &str,
+    ) -> Result<(), crate::fac::token_ledger::TokenLedgerError> {
+        // Check revocation and replay first (fail-closed).
+        self.token_ledger.check_nonce(nonce)?;
+        // Record the nonce as consumed so future replays are denied.
+        let request_id_digest = compute_request_id_digest(request_id);
+        self.token_ledger
+            .record_token_use(nonce, &request_id_digest, self.state.current_tick)
+    }
+
+    /// Checks whether a token nonce has been used or revoked without
+    /// recording it.
+    ///
+    /// Use [`validate_and_record_token_nonce`](Self::validate_and_record_token_nonce)
+    /// for the production validation path. This read-only method is for
+    /// observability queries where recording is not desired.
     ///
     /// # Errors
     ///
@@ -1168,6 +1206,17 @@ impl FacBroker {
     /// prevent unbounded growth.
     pub fn evict_expired_tokens(&mut self) {
         self.token_ledger.evict_expired(self.state.current_tick);
+    }
+
+    /// Serializes the token use ledger to JSON bytes for persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails.
+    pub fn serialize_token_ledger(&self) -> Result<Vec<u8>, BrokerError> {
+        self.token_ledger
+            .serialize_state()
+            .map_err(BrokerError::TokenLedger)
     }
 
     // -----------------------------------------------------------------------
@@ -2824,7 +2873,8 @@ mod tests {
     // TCK-00566: Token replay protection integration tests
     // -----------------------------------------------------------------------
 
-    /// Helper: create a broker with health gate passed and a policy admitted.
+    /// Helper: create a broker with health gate passed and a policy admitted,
+    /// issue a token, and return the broker + raw token string.
     fn broker_with_issued_token() -> (FacBroker, String) {
         let mut broker = FacBroker::new();
         let job_digest = [0x42; 32];
@@ -2839,11 +2889,12 @@ mod tests {
     }
 
     #[test]
-    fn tck_00566_token_issuance_records_nonce_in_ledger() {
+    fn tck_00566_token_issuance_includes_nonce_but_does_not_record() {
         let (broker, token) = broker_with_issued_token();
 
-        // The ledger should have exactly 1 entry.
-        assert_eq!(broker.token_ledger().len(), 1);
+        // The ledger should be EMPTY after issuance (nonce is not recorded
+        // until validation).
+        assert_eq!(broker.token_ledger().len(), 0);
 
         // Decode the token to extract the nonce.
         let decoded = decode_channel_context_token(
@@ -2860,14 +2911,42 @@ mod tests {
         let nonce = binding.nonce.expect("nonce should be present");
         assert_ne!(nonce, [0u8; 32]);
 
-        // Checking the nonce should detect it as used.
-        let result = broker.check_token_nonce(&nonce);
+        // Before validation, the nonce should be fresh (not recorded).
+        assert!(
+            broker.check_token_nonce(&nonce).is_ok(),
+            "nonce should be fresh before validation"
+        );
+    }
+
+    #[test]
+    fn tck_00566_validate_and_record_nonce_succeeds_first_time() {
+        let (mut broker, token) = broker_with_issued_token();
+
+        // Decode and extract nonce.
+        let decoded = decode_channel_context_token(
+            &token,
+            &broker.verifying_key(),
+            "lease-1",
+            now_secs(),
+            "REQ-1",
+        )
+        .unwrap();
+        let nonce = decoded.token_binding.unwrap().nonce.unwrap();
+
+        // First validation+record should succeed.
+        broker
+            .validate_and_record_token_nonce(&nonce, "REQ-1")
+            .expect("first use should succeed");
+        assert_eq!(broker.token_ledger().len(), 1);
+
+        // Second validation+record (replay) should fail.
+        let result = broker.validate_and_record_token_nonce(&nonce, "REQ-1");
         assert!(
             matches!(
                 result,
                 Err(crate::fac::token_ledger::TokenLedgerError::ReplayDetected)
             ),
-            "nonce should be detected as used: {result:?}"
+            "second use should be denied as replay: {result:?}"
         );
     }
 
@@ -2885,7 +2964,8 @@ mod tests {
             .issue_channel_context_token(&job_digest, "lease-2", "REQ-2", "test-boundary")
             .expect("second token should succeed");
 
-        assert_eq!(broker.token_ledger().len(), 2);
+        // Ledger empty: nonces not recorded at issuance.
+        assert_eq!(broker.token_ledger().len(), 0);
 
         // Extract nonces and verify they are different.
         let decoded1 = decode_channel_context_token(
@@ -2925,6 +3005,12 @@ mod tests {
         .unwrap();
         let nonce = decoded.token_binding.unwrap().nonce.unwrap();
 
+        // First use: validate and record the nonce (so it exists in the ledger
+        // for revocation).
+        broker
+            .validate_and_record_token_nonce(&nonce, "REQ-1")
+            .expect("first use should succeed");
+
         // Revoke the token.
         let receipt = broker
             .revoke_token(&nonce, "test revocation")
@@ -2932,8 +3018,8 @@ mod tests {
         assert!(receipt.verify_content_hash());
         assert_eq!(receipt.reason, "test revocation");
 
-        // The nonce should now be denied as revoked.
-        let result = broker.check_token_nonce(&nonce);
+        // Any further use should be denied as revoked.
+        let result = broker.validate_and_record_token_nonce(&nonce, "REQ-1");
         assert!(
             matches!(
                 result,
@@ -2965,13 +3051,16 @@ mod tests {
         .unwrap();
         let nonce = decoded.token_binding.unwrap().nonce.unwrap();
 
+        // Validate and record the nonce.
+        broker
+            .validate_and_record_token_nonce(&nonce, "REQ-1")
+            .expect("first use should succeed");
+
         // Initial tick is 1, TTL is DEFAULT_LEDGER_TTL_TICKS = 1000.
-        // Entry expires at tick 1 + 1000 = 1001.
+        // Entry was recorded at tick 1, expires at tick 1 + 1000 = 1001.
         assert_eq!(broker.token_ledger().len(), 1);
 
-        // Advance tick past the TTL. The default ledger TTL is 1000 ticks.
-        // Entry was recorded at tick 1, expires at tick 1001.
-        // We need to advance to tick 1001 or beyond.
+        // Advance tick past the TTL.
         for _ in 0..1001 {
             let _ = broker.advance_tick();
         }
@@ -2990,7 +3079,7 @@ mod tests {
     }
 
     #[test]
-    fn tck_00566_replay_denied_for_same_digest() {
+    fn tck_00566_replay_denied_for_same_nonce() {
         let mut broker = FacBroker::new();
         let job_digest = [0x42; 32];
         broker.admit_policy_digest(job_digest).unwrap();
@@ -3012,10 +3101,60 @@ mod tests {
         .unwrap();
         let nonce1 = decoded1.token_binding.unwrap().nonce.unwrap();
 
-        // Checking the nonce again (simulating replay) should be denied.
-        let result = broker.check_token_nonce(&nonce1);
+        // First use: validate and record.
+        broker
+            .validate_and_record_token_nonce(&nonce1, "REQ-1")
+            .expect("first use should succeed");
+
+        // Second use (replay): should be denied.
+        let result = broker.validate_and_record_token_nonce(&nonce1, "REQ-1");
         assert!(matches!(
             result,
+            Err(crate::fac::token_ledger::TokenLedgerError::ReplayDetected)
+        ));
+    }
+
+    #[test]
+    fn tck_00566_token_ledger_serialization_round_trip() {
+        let mut broker = FacBroker::new();
+        let job_digest = [0x42; 32];
+        broker.admit_policy_digest(job_digest).unwrap();
+        broker.set_admission_health_gate_for_test(true);
+
+        // Issue and validate a token.
+        let token = broker
+            .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary")
+            .expect("token should succeed");
+        let decoded = decode_channel_context_token(
+            &token,
+            &broker.verifying_key(),
+            "lease-1",
+            now_secs(),
+            "REQ-1",
+        )
+        .unwrap();
+        let nonce = decoded.token_binding.unwrap().nonce.unwrap();
+        broker
+            .validate_and_record_token_nonce(&nonce, "REQ-1")
+            .expect("first use should succeed");
+        assert_eq!(broker.token_ledger().len(), 1);
+
+        // Serialize the ledger.
+        let bytes = broker
+            .serialize_token_ledger()
+            .expect("serialization should succeed");
+
+        // Deserialize into a new ledger.
+        let restored = crate::fac::token_ledger::TokenUseLedger::deserialize_state(
+            &bytes,
+            broker.current_tick(),
+        )
+        .expect("deserialization should succeed");
+        assert_eq!(restored.len(), 1);
+
+        // The nonce should still be detected as used in the restored ledger.
+        assert!(matches!(
+            restored.check_nonce(&nonce),
             Err(crate::fac::token_ledger::TokenLedgerError::ReplayDetected)
         ));
     }

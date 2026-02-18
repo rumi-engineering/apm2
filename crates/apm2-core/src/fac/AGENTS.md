@@ -369,9 +369,15 @@ with hard caps.
 The `token_ledger` submodule implements broker-side token replay protection via
 a bounded, TTL-evicting nonce ledger and explicit revocation. Every
 `ChannelContextToken` issued by the broker carries a unique 32-byte nonce. The
-ledger records each nonce at issuance time; a second use of the same nonce is
-denied (fail-closed). Tokens can also be explicitly revoked before their natural
+nonce is included in the token at issuance time but is NOT recorded in the
+ledger until the worker validates and consumes the token. This ensures the
+first legitimate use succeeds; any subsequent use (replay) is denied
+(fail-closed). Tokens can also be explicitly revoked before their natural
 expiry, and workers consult the revocation set when validating tokens.
+
+The ledger is persisted to disk under `$APM2_HOME/private/fac/broker/token_ledger/`
+and loaded on broker startup. Expired entries are dropped on load; unexpired
+entries are preserved across daemon restarts.
 
 ### Key Types
 
@@ -382,8 +388,8 @@ expiry, and workers consult the revocation set when validating tokens.
 - `TokenNonce`: Type alias for `[u8; 32]`. CSPRNG-seeded, domain-separated
   BLAKE3 derived nonces.
 - `TokenLedgerError`: Fail-closed error taxonomy with `ReplayDetected`,
-  `TokenRevoked`, `RevocationSetAtCapacity`, `RevocationReasonTooLong`, and
-  `NonceNotFound` variants.
+  `TokenRevoked`, `RevocationSetAtCapacity`, `RevocationReasonTooLong`,
+  `NonceNotFound`, and `Persistence` variants.
 - `TokenRevocationReceipt`: Serializable receipt for token revocation events
   with domain-separated BLAKE3 content hash, `#[serde(deny_unknown_fields)]`.
   Includes `verify_content_hash()` for receipt integrity verification.
@@ -422,15 +428,21 @@ expiry, and workers consult the revocation set when validating tokens.
 
 ### Broker Integration
 
-- `FacBroker` holds a `TokenUseLedger` field initialized in all constructors
-  (`new`, `with_limits`, `from_signer_and_state`, `from_signer_state_and_limits`).
-- `issue_channel_context_token()` generates a nonce via `generate_nonce()`,
-  records it in the ledger via `record_token_use()`, and includes the nonce
-  in the `TokenBindingV1` payload (`nonce: Some(nonce)`).
+- `FacBroker` holds a `TokenUseLedger` field initialized fresh in all
+  constructors. Persisted ledger state is loaded separately via
+  `set_token_ledger()` after construction.
+- `issue_channel_context_token()` generates a nonce via `generate_nonce()`
+  and includes it in the `TokenBindingV1` payload (`nonce: Some(nonce)`).
+  The nonce is NOT recorded in the ledger at issuance time.
+- Workers call `validate_and_record_token_nonce()` at validation time to
+  (1) check if the nonce is fresh and (2) atomically record it as consumed.
 - `advance_tick()` calls `token_ledger.evict_expired()` to clean up stale
   entries as part of the broker tick lifecycle.
 - `BrokerError::TokenLedger` variant propagates ledger errors.
-- Accessor methods: `token_ledger()`, `check_token_nonce()`, `revoke_token()`,
+- `serialize_token_ledger()` serializes the ledger for disk persistence.
+- `set_token_ledger()` replaces the ledger with a pre-loaded one from disk.
+- Accessor methods: `token_ledger()`, `check_token_nonce()`,
+  `validate_and_record_token_nonce()`, `revoke_token()`,
   `evict_expired_tokens()`.
 
 ### TokenBindingV1 Integration
@@ -443,9 +455,9 @@ carry `nonce: None`.
 
 ### Security Invariants (TCK-00566)
 
-- [INV-TL-001] Every issued token nonce is recorded in the ledger before the
-  token is returned to the caller. A second issuance or use of the same
-  nonce is denied (fail-closed).
+- [INV-TL-001] Every token nonce is included in the token at issuance but
+  recorded in the ledger only when the worker validates and consumes the
+  token. A second presentation of the same nonce is denied (fail-closed).
 - [INV-TL-002] The ledger is bounded by `MAX_LEDGER_ENTRIES` (16,384). When
   the cap is reached, expired entries are evicted first, then the oldest entry
   is force-evicted (TTL-based FIFO).
@@ -458,9 +470,12 @@ carry `nonce: None`.
   monotonic, deterministic expiry (INV-2501).
 - [INV-TL-006] Nonces are 32-byte random values generated from a CSPRNG
   with domain-separated BLAKE3 derivation.
-- [INV-TL-007] All nonce comparisons in `find_entry()` and `find_revoked()`
-  use `subtle::ConstantTimeEq::ct_eq()` to prevent timing side-channels
-  (RSK-1909). Non-short-circuiting iteration ensures constant-time lookup.
+- [INV-TL-007] Nonce lookups use `HashMap::get()` (O(1) average) with a
+  post-lookup `subtle::ConstantTimeEq::ct_eq()` verification as defense in
+  depth against hash-collision-based timing attacks. The HashMap approach is
+  NOT constant-time over the full entry set; however, 32-byte random nonces
+  (INV-TL-006) make collision-based timing leakage infeasible in practice
+  (RSK-1909).
 - [INV-TL-008] Ghost-key prevention (RSK-1304): the insertion-order VecDeque
   stores `(nonce, expiry_tick)` pairs. During eviction, the stored expiry
   tick is compared against the HashMap entry's actual expiry tick; stale
@@ -470,6 +485,12 @@ carry `nonce: None`.
   length-prefix framing for variable-length fields (CTR-2612).
 - [INV-TL-010] Zero TTL is rejected (clamped to 1) to prevent all entries
   from being immediately stale (fail-closed).
+- [INV-TL-011] The ledger is persisted to disk under
+  `$APM2_HOME/private/fac/broker/token_ledger/state.json` using atomic
+  write (temp+rename) per CTR-2607. Expired entries are dropped during
+  deserialization. Persisted file size is bounded by
+  `MAX_TOKEN_LEDGER_FILE_SIZE` (8 MiB) before parsing (RSK-1601).
+  Replay protection survives daemon restarts.
 
 ## projection_compromise Submodule
 
