@@ -1878,6 +1878,7 @@ pub(super) fn seed_decision_projection_for_home_for_tests(
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::sync::{Arc, Barrier, Mutex};
 
     use super::{
         DECISION_SCHEMA, DecisionComment, DecisionEntry, DecisionProjectionRecord,
@@ -2276,6 +2277,155 @@ mod tests {
         );
         assert_eq!(update_calls, 2);
         assert!(tombstone_seen);
+    }
+
+    #[test]
+    fn concurrent_dual_dimension_projection_persists_single_comment_id() {
+        #[derive(Default)]
+        struct CommentStore {
+            next_comment_id: u64,
+            create_calls: usize,
+            bodies: BTreeMap<u64, String>,
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().to_path_buf();
+        let owner_repo = "example/repo".to_string();
+        let pr_number = 664_u32;
+        let head_sha = "0123456789abcdef0123456789abcdef01234567".to_string();
+        let start_barrier = Arc::new(Barrier::new(2));
+        let comment_store = Arc::new(Mutex::new(CommentStore {
+            next_comment_id: 900,
+            ..CommentStore::default()
+        }));
+
+        let mut handles = Vec::new();
+        for (dimension, reviewer) in [
+            ("security", "security-bot"),
+            ("code-quality", "quality-bot"),
+        ] {
+            let home = home.clone();
+            let owner_repo = owner_repo.clone();
+            let head_sha = head_sha.clone();
+            let start_barrier = Arc::clone(&start_barrier);
+            let comment_store = Arc::clone(&comment_store);
+            handles.push(std::thread::spawn(move || {
+                start_barrier.wait();
+                let _projection_lock = super::acquire_projection_lock_for_home(
+                    &home, &owner_repo, pr_number,
+                )
+                .expect("acquire projection lock");
+
+                let mut record = super::load_decision_projection_for_home(
+                    &home, &owner_repo, pr_number, &head_sha,
+                )
+                .expect("load projection")
+                .unwrap_or_else(|| DecisionProjectionRecord {
+                    schema: super::PROJECTION_VERDICT_SCHEMA.to_string(),
+                    owner_repo: owner_repo.to_ascii_lowercase(),
+                    pr_number,
+                    head_sha: head_sha.to_ascii_lowercase(),
+                    updated_at: super::now_iso8601(),
+                    decision_comment_id: super::allocate_local_comment_id(pr_number, None),
+                    decision_comment_url: String::new(),
+                    decision_signature: String::new(),
+                    integrity_hmac: None,
+                    dimensions: BTreeMap::new(),
+                });
+
+                record.updated_at = super::now_iso8601();
+                record.dimensions.insert(
+                    dimension.to_string(),
+                    DecisionEntry {
+                        decision: "approve".to_string(),
+                        reason: "ok".to_string(),
+                        set_by: reviewer.to_string(),
+                        set_at: super::now_iso8601(),
+                        model_id: None,
+                        backend_id: None,
+                    },
+                );
+                let payload = super::projection_record_to_payload(&record);
+                record.decision_signature =
+                    super::signature_for_payload(&payload).expect("sign projection payload");
+
+                let fetch_store = Arc::clone(&comment_store);
+                let update_store = Arc::clone(&comment_store);
+                let create_store = Arc::clone(&comment_store);
+                let owner_repo_for_url = owner_repo.clone();
+                let owner_repo_for_create = owner_repo.clone();
+                let (comment_id, comment_url) = super::project_decision_comment_with(
+                    &owner_repo,
+                    pr_number,
+                    &record,
+                    &payload,
+                    move |_, id| {
+                        let guard = fetch_store.lock().expect("lock fetch store");
+                        Ok(guard.bodies.get(&id).map(|_| {
+                            super::github_projection::IssueCommentResponse {
+                                id,
+                                html_url: format!(
+                                    "https://github.com/{owner_repo_for_url}/issues/{pr_number}#issuecomment-{id}"
+                                ),
+                            }
+                        }))
+                    },
+                    move |_, id, body| {
+                        let mut guard = update_store.lock().expect("lock update store");
+                        let existing = guard
+                            .bodies
+                            .get_mut(&id)
+                            .ok_or_else(|| format!("missing comment id {id} during update"))?;
+                        *existing = body.to_string();
+                        Ok(())
+                    },
+                    move |_, _, body| {
+                        let mut guard = create_store.lock().expect("lock create store");
+                        let id = guard.next_comment_id;
+                        guard.next_comment_id = guard.next_comment_id.saturating_add(1);
+                        guard.create_calls = guard.create_calls.saturating_add(1);
+                        guard.bodies.insert(id, body.to_string());
+                        Ok(super::github_projection::IssueCommentResponse {
+                            id,
+                            html_url: format!(
+                                "https://github.com/{owner_repo_for_create}/issues/{pr_number}#issuecomment-{id}"
+                            ),
+                        })
+                    },
+                )
+                .expect("project shared verdict comment");
+                record.decision_comment_id = comment_id;
+                record.decision_comment_url = comment_url;
+                super::save_decision_projection_for_home(&home, &record)
+                    .expect("save updated projection");
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("join projection writer");
+        }
+
+        let loaded =
+            super::load_decision_projection_for_home(&home, &owner_repo, pr_number, &head_sha)
+                .expect("load merged projection")
+                .expect("projection should exist");
+        assert!(loaded.dimensions.contains_key("security"));
+        assert!(loaded.dimensions.contains_key("code-quality"));
+
+        let guard = comment_store.lock().expect("lock final store");
+        assert_eq!(
+            guard.create_calls, 1,
+            "concurrent writers must share one comment"
+        );
+        assert_eq!(
+            guard.bodies.len(),
+            1,
+            "only one canonical comment body expected"
+        );
+        let (&comment_id, body) = guard.bodies.first_key_value().expect("canonical body");
+        assert_eq!(loaded.decision_comment_id, comment_id);
+        assert!(body.contains("security"));
+        assert!(body.contains("code-quality"));
     }
 
     #[test]
