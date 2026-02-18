@@ -245,13 +245,6 @@ decision_tree:
           action: |
             COMMIT ALL CHANGES FIRST, then run `apm2 fac gates`. Full gates require a clean working tree — no uncommitted, staged, or untracked files.
             Immediately before push, run `apm2 fac gates`.
-        - id: VERIFY_GATE_HEALTH
-          action: |
-            If gates fail to start, check: (1) evidence log directory exists: `ls "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"`; (2) process health: `systemctl --user status apm2-daemon`; (3) disk space: `df -h`. If disk is full, reclaim space by removing old evidence logs: `rm -rf "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"`.
-        - id: WARM_BUILD_IF_COLD
-          action: |
-            If gate execution hits cold-start timeouts (600s wall-time exceeded during large compilations), pre-warm by running `cargo build --workspace` before retrying gates. This populates compiled dependencies so subsequent gate runs avoid full recompilation.
-        - id: READ_FAC_LOGS_ON_FAIL
           action: "On failure, run `apm2 fac --json logs` and inspect referenced evidence logs under `${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/`."
         - id: HANDLE_RESOURCE_EXHAUSTION
           action: |
@@ -302,7 +295,7 @@ decision_tree:
       purpose: "Push through FAC-only surface and handle interstitial branch/worktree failures. Requires a clean committed tree."
       steps[4]:
         - id: RUN_FAC_PUSH
-          action: "`apm2 fac push` REQUIRES a clean working tree with all changes committed. It will not stage or commit for you. Run `timeout 180s apm2 fac push --ticket <TICKET_YAML>` (or `--branch <BRANCH>` when ticket metadata is unavailable)."
+          action: "`apm2 fac push` REQUIRES a clean working tree with all changes committed. It will not stage or commit for you. Run `apm2 fac push --ticket <TICKET_YAML>` (or `--branch <BRANCH>` when ticket metadata is unavailable). Expect it to take about 5-10 minutes on a fresh worktree"
         - id: CAPTURE_PR_CONTEXT
           action: "Capture PR number/URL from `apm2 fac push` output for monitoring and restart."
         - id: HANDLE_PUSH_FAILURE
