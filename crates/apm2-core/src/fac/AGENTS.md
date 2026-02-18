@@ -801,7 +801,10 @@ marker persistence.
   checks the marker on each poll iteration.
 - [INV-LANE-CORRUPT-002] Marker persistence uses atomic write (temp +
   rename). Reads are bounded to `MAX_LEASE_FILE_SIZE` (1 MiB).
-  `persist()` performs defense-in-depth field validation before write.
+  `persist()` performs defense-in-depth field validation before write,
+  including schema identifier equality check against
+  `LANE_CORRUPT_MARKER_SCHEMA` (rejects markers with mismatched schema
+  before any I/O).
 - [INV-LANE-CORRUPT-003] `detected_at` uses wall-clock time in ISO-8601
   UTC format for audit labelling only; monotonic ordering is not relied
   upon. All code paths (reconcile, worker, CLI) use the same format via
