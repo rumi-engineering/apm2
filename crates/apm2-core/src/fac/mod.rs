@@ -176,6 +176,9 @@ pub mod role_conformance;
 mod role_spec;
 mod role_spec_v2;
 pub mod safe_rmtree;
+/// Queue scan lock: optional short-lived lease for scan ownership to prevent
+/// multi-worker stampede scanning (TCK-00586).
+pub mod scan_lock;
 pub mod scheduler_state;
 pub mod sd_notify;
 pub mod selection_policy;
