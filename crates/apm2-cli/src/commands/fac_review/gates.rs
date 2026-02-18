@@ -966,14 +966,19 @@ fn build_gates_job_spec(
     // TCK-00567: Derive intent from job kind for intent-bound token issuance.
     // Thread FacPolicyV1.allowed_intents so the broker enforces the allowlist
     // at issuance (fail-closed).
-    let intent = apm2_core::fac::job_spec::job_kind_to_intent(&spec.kind);
+    let intent = apm2_core::fac::job_spec::job_kind_to_intent(&spec.kind).ok_or_else(|| {
+        format!(
+            "cannot derive RFC-0028 intent binding for gates job kind `{}`",
+            spec.kind
+        )
+    })?;
     let (token, wal_bytes) = broker
         .issue_channel_context_token(
             policy_digest,
             lease_id,
             &digest,
             boundary_id,
-            intent.as_ref(),
+            Some(&intent),
             allowed_intents,
         )
         .map_err(|err| format!("issue channel context token: {err}"))?;
@@ -2000,6 +2005,92 @@ mod tests {
     fn write_queue_spec(path: &Path, spec: &FacJobSpecV1) {
         let body = serde_json::to_vec_pretty(spec).expect("serialize spec");
         fs::write(path, body).expect("write spec");
+    }
+
+    #[test]
+    fn build_gates_job_spec_embeds_execute_gates_intent_in_token_binding() {
+        with_test_apm2_home(|apm2_home| {
+            use base64::Engine as _;
+
+            let fac_root = apm2_home.join("private/fac");
+            let boundary_id = apm2_core::fac::load_or_default_boundary_id(&fac_root)
+                .unwrap_or_else(|_| "apm2.fac.local".to_string());
+            let mut broker = init_broker(&fac_root, &boundary_id).expect("init broker");
+            let (_policy_hash, policy_digest, fac_policy) =
+                load_or_init_policy(&fac_root).expect("load policy");
+            broker
+                .admit_policy_digest(policy_digest)
+                .expect("admit policy digest");
+            let job_spec_policy = fac_policy
+                .job_spec_validation_policy()
+                .expect("validation policy");
+            let options = sample_gates_options();
+            let spec = build_gates_job_spec(
+                "gates-intent-test",
+                "gates-lease-intent-test",
+                "guardian-intelligence/apm2",
+                &"d".repeat(40),
+                &policy_digest,
+                256 * 1024 * 1024,
+                &options,
+                &boundary_id,
+                &mut broker,
+                &job_spec_policy,
+                fac_policy.allowed_intents.as_deref(),
+            )
+            .expect("build gates spec");
+            let token = spec
+                .actuation
+                .channel_context_token
+                .expect("channel context token must be present");
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(token)
+                .expect("decode token");
+            let payload: serde_json::Value =
+                serde_json::from_slice(&decoded).expect("parse token payload");
+            let intent = payload
+                .pointer("/payload/token_binding/intent")
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(intent, Some("intent.fac.execute_gates"));
+        });
+    }
+
+    #[test]
+    fn fac_broker_issue_token_carries_execute_gates_intent() {
+        with_test_apm2_home(|apm2_home| {
+            use base64::Engine as _;
+
+            let fac_root = apm2_home.join("private/fac");
+            let boundary_id = apm2_core::fac::load_or_default_boundary_id(&fac_root)
+                .unwrap_or_else(|_| "apm2.fac.local".to_string());
+            let mut broker = init_broker(&fac_root, &boundary_id).expect("init broker");
+            let (_policy_hash, policy_digest, fac_policy) =
+                load_or_init_policy(&fac_root).expect("load policy");
+            broker
+                .admit_policy_digest(policy_digest)
+                .expect("admit policy digest");
+            let request_id =
+                "b3-256:9b8f808f6f8f3fb18b7160676f3fdaf23fba278cca11dd5358db8c7525f1de8c";
+            let (token, _wal_bytes) = broker
+                .issue_channel_context_token(
+                    &policy_digest,
+                    "gates-lease-intent-direct",
+                    request_id,
+                    &boundary_id,
+                    Some(&apm2_core::fac::job_spec::FacIntent::ExecuteGates),
+                    fac_policy.allowed_intents.as_deref(),
+                )
+                .expect("issue channel context token");
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(token)
+                .expect("decode token");
+            let payload: serde_json::Value =
+                serde_json::from_slice(&decoded).expect("parse token payload");
+            let intent = payload
+                .pointer("/payload/token_binding/intent")
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(intent, Some("intent.fac.execute_gates"));
+        });
     }
 
     #[test]
