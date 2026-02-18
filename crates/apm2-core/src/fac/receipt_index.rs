@@ -598,6 +598,11 @@ impl ReceiptIndexV1 {
 
 /// Open a file for reading without following symlinks (`O_NOFOLLOW` on Unix).
 ///
+/// On Unix, opens with `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC` to:
+/// - Refuse symlinks atomically (`O_NOFOLLOW`).
+/// - Prevent indefinite blocking on FIFOs/named pipes (`O_NONBLOCK`).
+/// - Prevent fd leaks to child processes (`O_CLOEXEC`).
+///
 /// On non-Unix platforms, falls back to a plain open (no symlink protection).
 pub(crate) fn open_no_follow(path: &Path) -> Result<std::fs::File, std::io::Error> {
     #[cfg(unix)]
@@ -605,7 +610,7 @@ pub(crate) fn open_no_follow(path: &Path) -> Result<std::fs::File, std::io::Erro
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)
     }
 
@@ -613,6 +618,19 @@ pub(crate) fn open_no_follow(path: &Path) -> Result<std::fs::File, std::io::Erro
     {
         std::fs::File::open(path)
     }
+}
+
+/// Check that an already-opened file descriptor refers to a regular file.
+///
+/// Returns `true` if `fstat` reports a regular file, `false` for FIFOs,
+/// device nodes, sockets, directories, etc.  This MUST be called on the fd
+/// returned by [`open_no_follow`] — checking the path via `stat` would be a
+/// TOCTOU race.
+pub(crate) fn is_regular_file(file: &std::fs::File) -> bool {
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    meta.is_file()
 }
 
 // =============================================================================
@@ -675,7 +693,7 @@ pub fn list_receipt_headers(receipts_dir: &Path) -> Vec<ReceiptHeaderV1> {
 ///
 /// Reads the receipt file at `receipts_dir/{content_hash}.json` with bounded
 /// I/O and `O_NOFOLLOW`. Returns `None` if the file is missing, oversized,
-/// or fails to parse.
+/// fails to parse, or fails integrity verification.
 ///
 /// # Security
 ///
@@ -684,6 +702,11 @@ pub fn list_receipt_headers(receipts_dir: &Path) -> Vec<ReceiptHeaderV1> {
 /// non-authoritative and attacker-writable — a poisoned entry with
 /// `content_hash` set to `../../../../etc/passwd` must never result in
 /// arbitrary file reads (BLOCKER-1/BLOCKER-2 fix).
+///
+/// After loading, the receipt's content hash is **recomputed** and compared
+/// against the requested `content_hash` using constant-time comparison.
+/// Under the non-authoritative index threat model, tampered receipt files
+/// must never drive metrics without detection (MAJOR-1/MAJOR-2 fix).
 ///
 /// This is used by the metrics module to load full receipts when the header
 /// index does not contain all required fields (e.g., `denial_reason`,
@@ -696,7 +719,17 @@ pub fn lookup_receipt_by_hash(receipts_dir: &Path, content_hash: &str) -> Option
         return None;
     }
     let path = receipts_dir.join(format!("{content_hash}.json"));
-    load_receipt_bounded(&path)
+    let receipt = load_receipt_bounded(&path)?;
+
+    // Recompute the BLAKE3-256 hash and compare against the requested digest
+    // using constant-time comparison. Under the non-authoritative index threat
+    // model, the loaded receipt bytes could be tampered — we must never trust
+    // receipt.content_hash as the source of truth (MAJOR-1/MAJOR-2 fix).
+    if !verify_receipt_integrity(&receipt, content_hash) {
+        return None;
+    }
+
+    Some(receipt)
 }
 
 /// Check whether a receipt exists for the given job ID using the index.
@@ -806,9 +839,17 @@ fn verify_receipt_integrity(receipt: &FacJobReceiptV1, expected_digest: &str) ->
     false
 }
 
-/// Load a single receipt file with bounded read and `O_NOFOLLOW`.
+/// Load a single receipt file with bounded read, `O_NOFOLLOW`, and
+/// regular-file verification.
+///
+/// Opens with `O_NOFOLLOW | O_NONBLOCK`, verifies the fd is a regular file
+/// via `fstat` (prevents FIFO blocking), then reads bounded bytes.
 fn load_receipt_bounded(path: &Path) -> Option<FacJobReceiptV1> {
     let file = open_no_follow(path).ok()?;
+    // Verify the fd is a regular file (reject FIFOs, devices, sockets).
+    if !is_regular_file(&file) {
+        return None;
+    }
     let meta = file.metadata().ok()?;
     if meta.len() > MAX_JOB_RECEIPT_SIZE as u64 {
         return None;
@@ -1981,5 +2022,98 @@ mod tests {
             "must accept well-formed digest in lookup_receipt_by_hash"
         );
         assert_eq!(found.unwrap().job_id, "job-hash-lookup");
+    }
+
+    // =========================================================================
+    // MAJOR-1/MAJOR-2 regression: lookup_receipt_by_hash integrity verification
+    // =========================================================================
+
+    #[test]
+    fn test_lookup_receipt_by_hash_rejects_tampered_payload() {
+        // Regression test for MAJOR-1/MAJOR-2: lookup_receipt_by_hash must
+        // recompute the BLAKE3-256 hash and reject receipts whose content
+        // does not match the requested digest. Under the non-authoritative
+        // index threat model, tampered receipt files must never drive metrics.
+        use crate::fac::receipt::compute_job_receipt_content_hash;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create a receipt with a correct content hash.
+        let mut receipt = make_receipt("job-tamper-hash", "placeholder", 11000);
+        let real_hash = compute_job_receipt_content_hash(&receipt);
+        receipt.content_hash = real_hash.clone();
+
+        // Write the receipt with the correct filename.
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{real_hash}.json")), &bytes).expect("write");
+
+        // Tamper the receipt payload: change the reason field so content
+        // no longer matches the filename hash.
+        receipt.reason = "tampered-payload-for-metrics-attack".to_string();
+        let tampered_bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(
+            receipts_dir.join(format!("{real_hash}.json")),
+            &tampered_bytes,
+        )
+        .expect("write tampered");
+
+        // lookup_receipt_by_hash must reject the tampered receipt.
+        let found = lookup_receipt_by_hash(receipts_dir, &real_hash);
+        assert!(
+            found.is_none(),
+            "lookup_receipt_by_hash must reject tampered receipt payload"
+        );
+    }
+
+    #[test]
+    fn test_lookup_receipt_by_hash_accepts_untampered_receipt() {
+        // Positive test: lookup_receipt_by_hash accepts a receipt whose
+        // content matches the requested digest after recomputation.
+        use crate::fac::receipt::compute_job_receipt_content_hash;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let mut receipt = make_receipt("job-untampered-hash", "placeholder", 12000);
+        let hash = compute_job_receipt_content_hash(&receipt);
+        receipt.content_hash = hash.clone();
+
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{hash}.json")), &bytes).expect("write");
+
+        let found = lookup_receipt_by_hash(receipts_dir, &hash);
+        assert!(
+            found.is_some(),
+            "lookup_receipt_by_hash must accept untampered receipt"
+        );
+        assert_eq!(found.unwrap().job_id, "job-untampered-hash");
+    }
+
+    #[test]
+    fn test_lookup_receipt_by_hash_rejects_self_reported_hash_bypass() {
+        // Regression test: an attacker writes a receipt file whose
+        // content_hash field matches the filename but whose actual content
+        // does NOT hash to that value. lookup_receipt_by_hash must reject
+        // it because verify_receipt_integrity recomputes the hash from
+        // canonical content, not the content_hash field.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Use a fake hex digest as the filename (valid format but wrong content).
+        let fake_digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let receipt = FacJobReceiptV1 {
+            content_hash: fake_digest.to_string(),
+            ..make_receipt("job-self-hash-bypass", "placeholder", 13000)
+        };
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{fake_digest}.json")), &bytes).expect("write");
+
+        let found = lookup_receipt_by_hash(receipts_dir, fake_digest);
+        assert!(
+            found.is_none(),
+            "must reject receipt whose content_hash field matches filename \
+             but actual content does not hash to that value"
+        );
     }
 }

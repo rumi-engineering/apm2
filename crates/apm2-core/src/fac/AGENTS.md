@@ -2023,8 +2023,9 @@ All receipt-touching hot paths consult the index first:
 - [INV-IDX-002] All in-memory collections bounded by `MAX_INDEX_ENTRIES` (16384)
   and `MAX_JOB_INDEX_ENTRIES` (16384). Overflow returns Err, not truncation.
   Upsert checks ALL capacities before ANY mutation (no dangling entries).
-- [INV-IDX-003] Index file reads use open-once with `O_NOFOLLOW` + bounded
-  streaming reads from the same handle (no stat-then-read TOCTOU).
+- [INV-IDX-003] Index file reads use open-once with `O_NOFOLLOW | O_NONBLOCK |
+  O_CLOEXEC` + `fstat` regular-file check + bounded streaming reads from the same
+  handle (no stat-then-read TOCTOU, no FIFO blocking).
 - [INV-IDX-004] Rebuild scans count EVERY directory entry (not just `.json`
   files) toward `MAX_REBUILD_SCAN_FILES` (65536). Adversarial non-JSON entries
   cannot bypass the scan cap.
@@ -2033,7 +2034,8 @@ All receipt-touching hot paths consult the index first:
 - [INV-IDX-006] Index persistence uses `NamedTempFile` with random name, fsync,
   and atomic rename. No predictable temp paths.
 - [INV-IDX-007] Individual receipt file reads during rebuild use open-once with
-  `O_NOFOLLOW` + bounded streaming reads (no stat-then-read TOCTOU).
+  `O_NOFOLLOW | O_NONBLOCK` + `fstat` regular-file check + bounded streaming
+  reads (no stat-then-read TOCTOU, no FIFO blocking).
 - [INV-IDX-008] `lookup_job_receipt` verifies content-addressed integrity by
   recomputing the BLAKE3 hash (v1 and v2 schemes) of loaded receipts against the
   index key using constant-time comparison (`subtle::ConstantTimeEq`, INV-PC-001).
@@ -2052,6 +2054,12 @@ All receipt-touching hot paths consult the index first:
   This prevents unverified or tampered receipts from driving terminal routing in
   worker duplicate handling and reconcile torn-state repair (MAJOR-1 round 8 fix,
   TCK-00564).
+- [INV-IDX-011] `lookup_receipt_by_hash(receipts_dir, content_hash)` recomputes
+  the BLAKE3-256 hash after loading the receipt and compares it against the
+  requested `content_hash` using constant-time comparison via
+  `verify_receipt_integrity`. Under the non-authoritative index threat model,
+  tampered receipt files must never drive metrics without detection. Returns
+  `None` on hash mismatch (MAJOR-1/MAJOR-2 round 3 fix, TCK-00551).
 
 ## sd_notify Submodule (TCK-00600)
 
@@ -3234,10 +3242,16 @@ no side effects); callers provide loaded receipt data and receive a
   and sums GC freed bytes. Zero-window yields zero throughput (no division by
   zero).
 - `load_gc_receipts(receipts_dir, since_epoch_secs) -> Vec<GcReceiptV1>`: I/O
-  helper that scans `.json` files in the receipts directory, attempts to parse
-  each as `GcReceiptV1`, and returns those matching the GC schema with timestamp
-  >= since. Bounded by `MAX_GC_RECEIPT_SCAN_FILES` (16384) and
-  `MAX_GC_RECEIPT_READ_SIZE` (256 KiB). Parse failures silently skipped.
+  helper that traverses the sharded hash-prefix directory layout produced by
+  `persist_gc_receipt` (`receipts/<2-hex-prefix>/<remaining>.json`) plus
+  top-level `.json` files (legacy flat layout). Bounded by
+  `MAX_GC_RECEIPT_SCAN_FILES` (65536) total directory entries across all shards,
+  `MAX_GC_SHARD_DIRS` (512) shard directories, `MAX_GC_RECEIPTS_LOADED` (4096)
+  loaded receipts, and `MAX_GC_RECEIPT_READ_SIZE` (256 KiB) per file. Shard
+  directory names are validated as exactly 2-character hex to prevent traversal.
+  All file opens use `open_no_follow` (`O_NOFOLLOW | O_NONBLOCK`) and verify via
+  `fstat` that the fd is a regular file (rejects FIFOs, device nodes, sockets).
+  Parse failures silently skipped.
 
 ### Bounded Collections
 
