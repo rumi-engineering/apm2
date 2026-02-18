@@ -200,6 +200,9 @@ scope:
           - propagate deterministic failure summaries from `fac_review::gates`
             into queued worker denial reasons,
           - include failed gate names and first actionable failure hint/log pointer,
+          - parse propagated `failed_gates=...` markers in push fallback paths
+            so `gate_error` telemetry no longer degrades to `gate=unknown` when
+            cache artifacts are unavailable,
           - enforce UTF-8-safe bounded reason strings for FAC receipt compatibility
             (512-char cap),
           - add regression tests for summary propagation and truncation behavior.
@@ -302,6 +305,8 @@ definition_of_done:
       and full non-status v3 reuse integration coverage."
     - "Queued gates denial reasons include deterministic gate-level failure
       summaries when available and remain UTF-8-safe within receipt bounds."
+    - "Push telemetry emits concrete failed gate identifiers when failure
+      summaries include `failed_gates=...` markers."
     - "Workspace validation (fmt, clippy, doc, test) completes successfully."
 
 notes:
