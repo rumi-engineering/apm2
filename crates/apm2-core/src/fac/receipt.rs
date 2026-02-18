@@ -611,6 +611,10 @@ pub enum DenialReasonCode {
     /// through INV-PH-010, TCK-00581). Path traversal, absolute paths,
     /// unsupported format, or other patch content violation detected.
     PatchHardeningDenied,
+    /// Queue bounds exceeded: pending job count or pending bytes would
+    /// exceed the configured `QueueBoundsPolicy` limits (TCK-00578).
+    /// Denial reason code: `queue/quota_exceeded`.
+    QueueQuotaExceeded,
 }
 
 /// Trace of the RFC-0028 channel boundary check.
