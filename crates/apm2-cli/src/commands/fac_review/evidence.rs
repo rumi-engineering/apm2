@@ -145,14 +145,11 @@ pub struct EvidenceGateOptions {
     /// progress instead of buffering all events until `run_evidence_gates`
     /// returns.
     pub on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
-    /// TCK-00540: When `true`, permit reuse of legacy gate cache entries that
-    /// lack RFC-0028/0029 receipt bindings. This is an **unsafe** escape hatch
-    /// for migration; default-deny is the fail-closed posture.
-    pub allow_legacy_cache: bool,
     /// TCK-00540 fix round 3: Gate resource policy for attestation digest
     /// computation during cache-reuse decisions. When `Some`, enables
     /// cache-reuse in `run_evidence_gates_with_lane_context` so that the
-    /// `allow_legacy_cache` flag is operational.
+    /// fail-closed receipt-binding policy is evaluated against attested cache
+    /// entries.
     pub gate_resource_policy: Option<GateResourcePolicy>,
 }
 
@@ -168,12 +165,6 @@ pub struct EvidenceGateResult {
     pub bytes_total: Option<u64>,
     pub was_truncated: Option<bool>,
     pub log_bundle_hash: Option<String>,
-    /// TCK-00540: When `true`, this gate result was reused from a legacy
-    /// cache entry via the `--allow-legacy-cache` unsafe override. The
-    /// caller (e.g., `run_gates_inner`) should call
-    /// `GateCache::mark_legacy_override()` on this gate when persisting
-    /// the cache, to preserve the audit trail.
-    pub legacy_cache_override: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -323,19 +314,10 @@ fn reuse_decision_for_gate(
     gate_name: &str,
     attestation_digest: Option<&str>,
     verifying_key: Option<&apm2_core::crypto::VerifyingKey>,
-    allow_legacy_cache: bool,
 ) -> ReuseDecision {
     cache.map_or_else(
         || ReuseDecision::miss("no_record"),
-        |cached| {
-            cached.check_reuse(
-                gate_name,
-                attestation_digest,
-                true,
-                verifying_key,
-                allow_legacy_cache,
-            )
-        },
+        |cached| cached.check_reuse(gate_name, attestation_digest, true, verifying_key),
     )
 }
 
@@ -1276,7 +1258,6 @@ fn build_evidence_gate_result(
         bytes_total: stream_stats.map(|stats| stats.bytes_total),
         was_truncated: stream_stats.map(|stats| stats.was_truncated),
         log_bundle_hash: None,
-        legacy_cache_override: false,
     }
 }
 
@@ -1492,17 +1473,14 @@ pub(super) fn run_evidence_gates_with_lane_context(
     };
 
     // TCK-00540 fix round 3: Load the gate cache and signing material for
-    // cache-reuse decisions in the `fac gates` path.  Without this, the
-    // `allow_legacy_cache` flag was dead — unbound legacy entries could never
-    // be reused (or denied) because the function never consulted the cache.
+    // cache-reuse decisions in the `fac gates` path.
     //
     // Cache reuse is only active in full (non-quick) mode because quick mode
     // does not persist attested gate cache entries.
     let skip_test_gate = opts.is_some_and(|o| o.skip_test_gate);
-    let allow_legacy_cache = opts.is_some_and(|o| o.allow_legacy_cache);
     let cache_reuse_policy = opts.and_then(|o| o.gate_resource_policy.clone());
     let cache_reuse_active = !skip_test_gate && cache_reuse_policy.is_some();
-    let (cached_gate_cache, fac_verifying_key, reuse_policy) = if cache_reuse_active {
+    let (cached_gate_cache, fac_verifying_key) = if cache_reuse_active {
         let fac_signer_result = {
             let apm2_home = apm2_core::github::resolve_apm2_home()
                 .ok_or_else(|| "cannot resolve APM2_HOME for gate cache signing".to_string())?;
@@ -1512,13 +1490,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
         };
         // If we cannot load the signer, cache reuse is not possible
         // (fail-closed: unsigned receipts are rejected).
-        fac_signer_result.map_or((None, None, None), |signer| {
+        fac_signer_result.map_or((None, None), |signer| {
             let vk = signer.verifying_key();
             let cache = GateCache::load(sha);
-            (cache, Some(vk), Some(allow_legacy_cache))
+            (cache, Some(vk))
         })
     } else {
-        (None, None, None)
+        (None, None)
     };
 
     let gates: &[(&str, &[&str])] = &[
@@ -1629,12 +1607,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
         let log_path = logs_dir.join(format!("{gate_name}.log"));
 
         // TCK-00540 fix round 3: Check gate cache for reuse before execution.
-        // This makes the `allow_legacy_cache` flag operational in the `fac gates`
-        // path — unbound legacy entries are denied by default (fail-closed) or
-        // accepted when `--allow-legacy-cache` is set.
-        if let Some(allow_legacy) = reuse_policy {
-            // SAFETY: `cache_reuse_policy` is guaranteed `Some` when `reuse_policy`
-            // is `Some` — both are gated on `cache_reuse_active`.
+        if cache_reuse_active {
+            // SAFETY: `cache_reuse_policy` is guaranteed `Some` here because
+            // `cache_reuse_active` is gated on `cache_reuse_policy.is_some()`.
             let reuse_grp = cache_reuse_policy
                 .as_ref()
                 .expect("guarded by cache_reuse_active");
@@ -1645,23 +1620,17 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 gate_name,
                 attestation_digest.as_deref(),
                 fac_verifying_key.as_ref(),
-                allow_legacy,
             );
             if reuse.reusable {
                 if let Some(cached) = cached_gate_cache.as_ref().and_then(|c| c.get(gate_name)) {
                     emit_gate_started(opts, gate_name);
-                    let mut cached_result = build_evidence_gate_result(
+                    let cached_result = build_evidence_gate_result(
                         gate_name,
                         true,
                         cached.duration_secs,
                         cached.log_path.as_deref().map(Path::new),
                         None,
                     );
-                    // TCK-00540: Mark the result as a legacy override so
-                    // the caller can call mark_legacy_override() on the cache.
-                    if reuse.reason == "legacy_cache_override_unsafe" {
-                        cached_result.legacy_cache_override = true;
-                    }
                     emit_gate_completed(opts, &cached_result);
                     gate_results.push(cached_result);
                     if emit_human_logs {
@@ -1761,7 +1730,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
         let log_path = logs_dir.join(format!("{gate_name}.log"));
 
         // TCK-00540 fix round 3: Cache reuse for pre-test native gates.
-        if let Some(allow_legacy) = reuse_policy {
+        if cache_reuse_active {
             let reuse_grp = cache_reuse_policy
                 .as_ref()
                 .expect("guarded by cache_reuse_active");
@@ -1772,21 +1741,17 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 gate_name,
                 attestation_digest.as_deref(),
                 fac_verifying_key.as_ref(),
-                allow_legacy,
             );
             if reuse.reusable {
                 if let Some(cached) = cached_gate_cache.as_ref().and_then(|c| c.get(gate_name)) {
                     emit_gate_started(opts, gate_name);
-                    let mut cached_result = build_evidence_gate_result(
+                    let cached_result = build_evidence_gate_result(
                         gate_name,
                         true,
                         cached.duration_secs,
                         cached.log_path.as_deref().map(Path::new),
                         None,
                     );
-                    if reuse.reason == "legacy_cache_override_unsafe" {
-                        cached_result.legacy_cache_override = true;
-                    }
                     emit_gate_completed(opts, &cached_result);
                     gate_results.push(cached_result);
                     if emit_human_logs {
@@ -1880,7 +1845,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
         let test_command_override =
             resolve_evidence_test_command_override(opts.and_then(|o| o.test_command.as_deref()));
         let mut test_cache_hit = false;
-        if let Some(allow_legacy) = reuse_policy {
+        if cache_reuse_active {
             let reuse_grp = cache_reuse_policy
                 .as_ref()
                 .expect("guarded by cache_reuse_active");
@@ -1896,21 +1861,17 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 "test",
                 attestation_digest.as_deref(),
                 fac_verifying_key.as_ref(),
-                allow_legacy,
             );
             if reuse.reusable {
                 if let Some(cached) = cached_gate_cache.as_ref().and_then(|c| c.get("test")) {
                     emit_gate_started(opts, "test");
-                    let mut cached_result = build_evidence_gate_result(
+                    let cached_result = build_evidence_gate_result(
                         "test",
                         true,
                         cached.duration_secs,
                         cached.log_path.as_deref().map(Path::new),
                         None,
                     );
-                    if reuse.reason == "legacy_cache_override_unsafe" {
-                        cached_result.legacy_cache_override = true;
-                    }
                     emit_gate_completed(opts, &cached_result);
                     gate_results.push(cached_result);
                     if emit_human_logs {
@@ -2023,7 +1984,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
         let log_path = logs_dir.join(format!("{gate_name}.log"));
 
         // TCK-00540 fix round 3: Cache reuse for post-test native gates.
-        if let Some(allow_legacy) = reuse_policy {
+        if cache_reuse_active {
             let reuse_grp = cache_reuse_policy
                 .as_ref()
                 .expect("guarded by cache_reuse_active");
@@ -2034,21 +1995,17 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 gate_name,
                 attestation_digest.as_deref(),
                 fac_verifying_key.as_ref(),
-                allow_legacy,
             );
             if reuse.reusable {
                 if let Some(cached) = cached_gate_cache.as_ref().and_then(|c| c.get(gate_name)) {
                     emit_gate_started(opts, gate_name);
-                    let mut cached_result = build_evidence_gate_result(
+                    let cached_result = build_evidence_gate_result(
                         gate_name,
                         true,
                         cached.duration_secs,
                         cached.log_path.as_deref().map(Path::new),
                         None,
                     );
-                    if reuse.reason == "legacy_cache_override_unsafe" {
-                        cached_result.legacy_cache_override = true;
-                    }
                     emit_gate_completed(opts, &cached_result);
                     gate_results.push(cached_result);
                     if emit_human_logs {
@@ -2156,10 +2113,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     lane_context: EvidenceLaneContext,
 ) -> Result<(bool, Vec<EvidenceGateResult>), String> {
     let logs_dir = lane_context.logs_dir;
-    // TCK-00540: Pipeline path always enforces fail-closed legacy cache deny.
-    // The `--allow-legacy-cache` unsafe override is only available via the
-    // `apm2 fac gates` CLI path (not the PR pipeline).
-    let allow_legacy_cache = false;
+    // Pipeline path enforces fail-closed cache reuse decisions.
 
     // TCK-00526: Build policy-filtered environment for ALL gates.
     // TCK-00575 round 2: Use the lane_dir from the actually-locked lane
@@ -2348,7 +2302,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
-            allow_legacy_cache,
         );
         if reuse.reusable {
             if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
@@ -2381,10 +2334,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cached.evidence_log_digest.clone(),
                     cached.log_path.clone(),
                 );
-                // TCK-00540 fix round 2: preserve override audit trail.
-                if reuse.reason == "legacy_cache_override_unsafe" {
-                    gate_cache.mark_legacy_override(gate_name);
-                }
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
                     now_iso8601(),
@@ -2535,7 +2484,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
-            allow_legacy_cache,
         );
         if reuse.reusable {
             if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
@@ -2568,10 +2516,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cached.evidence_log_digest.clone(),
                     cached.log_path.clone(),
                 );
-                // TCK-00540 fix round 2: preserve override audit trail.
-                if reuse.reason == "legacy_cache_override_unsafe" {
-                    gate_cache.mark_legacy_override(gate_name);
-                }
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
                     now_iso8601(),
@@ -2712,7 +2656,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
-            allow_legacy_cache,
         );
         let log_path = logs_dir.join("test.log");
         emit_gate_started_cb(on_gate_progress, gate_name);
@@ -2746,10 +2689,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cached.evidence_log_digest.clone(),
                     cached.log_path.clone(),
                 );
-                // TCK-00540 fix round 2: preserve override audit trail.
-                if reuse.reason == "legacy_cache_override_unsafe" {
-                    gate_cache.mark_legacy_override(gate_name);
-                }
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
                     now_iso8601(),
@@ -2894,7 +2833,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
-            allow_legacy_cache,
         );
         let log_path = logs_dir.join("workspace_integrity.log");
         emit_gate_started_cb(on_gate_progress, gate_name);
@@ -2928,10 +2866,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cached.evidence_log_digest.clone(),
                     cached.log_path.clone(),
                 );
-                // TCK-00540 fix round 2: preserve override audit trail.
-                if reuse.reason == "legacy_cache_override_unsafe" {
-                    gate_cache.mark_legacy_override(gate_name);
-                }
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
                     now_iso8601(),
@@ -3040,7 +2974,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
-            allow_legacy_cache,
         );
         if reuse.reusable {
             if let Some(cached) = cache.as_ref().and_then(|c| c.get(gate_name)) {
@@ -3073,10 +3006,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cached.evidence_log_digest.clone(),
                     cached.log_path.clone(),
                 );
-                // TCK-00540 fix round 2: preserve override audit trail.
-                if reuse.reason == "legacy_cache_override_unsafe" {
-                    gate_cache.mark_legacy_override(gate_name);
-                }
                 evidence_lines.push(format!(
                     "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
                     now_iso8601(),

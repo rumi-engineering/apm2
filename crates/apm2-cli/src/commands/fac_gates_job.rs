@@ -19,12 +19,6 @@ pub(super) struct GatesJobOptionsV1 {
     pub cpu_quota: String,
     pub gate_profile: String,
     pub workspace_root: String,
-    /// TCK-00540: Allow reuse of legacy gate cache entries without
-    /// RFC-0028/0029 receipt bindings (unsafe migration override).
-    /// Defaults to `false` (fail-closed) for backward compatibility with
-    /// payloads that pre-date TCK-00540.
-    #[serde(default)]
-    pub allow_legacy_cache: bool,
 }
 
 impl GatesJobOptionsV1 {
@@ -39,7 +33,6 @@ impl GatesJobOptionsV1 {
         cpu_quota: &str,
         gate_profile: &str,
         workspace_root: &Path,
-        allow_legacy_cache: bool,
     ) -> Self {
         Self {
             schema: GATES_JOB_OPTIONS_SCHEMA.to_string(),
@@ -51,7 +44,6 @@ impl GatesJobOptionsV1 {
             cpu_quota: cpu_quota.to_string(),
             gate_profile: gate_profile.to_string(),
             workspace_root: workspace_root.to_string_lossy().to_string(),
-            allow_legacy_cache,
         }
     }
 }

@@ -19,6 +19,42 @@ pub(super) struct IssueCommentResponse {
     pub(super) html_url: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct PullRequestStateResponse {
+    state: String,
+    merged: bool,
+}
+
+fn parse_commit_sha(sha: &str) -> Result<String, String> {
+    let normalized = sha.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err("merge projection requires non-empty sha".to_string());
+    }
+    if normalized.len() != 40 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "merge projection requires 40-char hex sha, found `{sha}`"
+        ));
+    }
+    Ok(normalized)
+}
+
+fn load_pr_state(repo: &str, pr_number: u32) -> Result<PullRequestStateResponse, String> {
+    let endpoint = format!("/repos/{repo}/pulls/{pr_number}");
+    let output = gh_command()
+        .args(["api", &endpoint, "--method", "GET"])
+        .output()
+        .map_err(|err| format!("failed to execute gh api for PR state lookup: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh api failed reading PR #{pr_number} state: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    serde_json::from_slice::<PullRequestStateResponse>(&output.stdout)
+        .map_err(|err| format!("failed to parse PR #{pr_number} state response: {err}"))
+}
+
 fn clamp_commit_status_description(description: &str) -> String {
     description
         .chars()
@@ -382,42 +418,64 @@ pub(super) fn update_pr(repo: &str, pr_number: u32, title: &str, body: &str) -> 
     Ok(())
 }
 
-pub(super) fn close_pr_if_open(repo: &str, pr_number: u32) -> Result<(), String> {
-    let endpoint = format!("/repos/{repo}/pulls/{pr_number}");
-    let state_output = gh_command()
-        .args(["api", &endpoint, "--jq", ".state"])
-        .output()
-        .map_err(|err| format!("failed to execute gh api for PR state lookup: {err}"))?;
-    if !state_output.status.success() {
-        return Err(format!(
-            "gh api failed reading PR #{pr_number} state: {}",
-            String::from_utf8_lossy(&state_output.stderr).trim()
-        ));
-    }
-    let state = String::from_utf8_lossy(&state_output.stdout)
-        .trim()
-        .to_ascii_lowercase();
-    if state != "open" {
+pub(super) fn merge_pr_on_github(repo: &str, pr_number: u32, sha: &str) -> Result<(), String> {
+    let sha = parse_commit_sha(sha)?;
+    let state = load_pr_state(repo, pr_number)?;
+    let pr_state = state.state.trim().to_ascii_lowercase();
+    if state.merged || pr_state != "open" {
         return Ok(());
     }
 
-    let patch_output = gh_command()
-        .args(["api", &endpoint, "--method", "PATCH", "-f", "state=closed"])
+    let mut payload_file = tempfile::NamedTempFile::new()
+        .map_err(|err| format!("failed to create temp payload for PR merge: {err}"))?;
+    let payload = serde_json::json!({
+        "sha": sha,
+        "merge_method": "merge",
+    });
+    let payload_text = serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to serialize PR merge payload: {err}"))?;
+    payload_file
+        .write_all(payload_text.as_bytes())
+        .map_err(|err| format!("failed to write PR merge payload: {err}"))?;
+    payload_file
+        .flush()
+        .map_err(|err| format!("failed to flush PR merge payload: {err}"))?;
+
+    let endpoint = format!("/repos/{repo}/pulls/{pr_number}/merge");
+    let output = gh_command()
+        .args([
+            "api",
+            &endpoint,
+            "--method",
+            "PUT",
+            "--input",
+            &payload_file.path().display().to_string(),
+        ])
         .output()
-        .map_err(|err| format!("failed to execute gh api for PR close projection: {err}"))?;
-    if !patch_output.status.success() {
-        return Err(format!(
-            "gh api failed closing PR #{pr_number}: {}",
-            String::from_utf8_lossy(&patch_output.stderr).trim()
-        ));
+        .map_err(|err| format!("failed to execute gh api for PR merge projection: {err}"))?;
+    if output.status.success() {
+        return Ok(());
     }
-    Ok(())
+
+    // Idempotent race guard: another actor may have merged/closed between
+    // our state read and merge API call.
+    if let Ok(state_after) = load_pr_state(repo, pr_number) {
+        let state_after_name = state_after.state.trim().to_ascii_lowercase();
+        if state_after.merged || state_after_name != "open" {
+            return Ok(());
+        }
+    }
+
+    Err(format!(
+        "gh api failed merging PR #{pr_number} with sha {sha}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_COMMIT_STATUS_DESCRIPTION_CHARS, clamp_commit_status_description,
+        MAX_COMMIT_STATUS_DESCRIPTION_CHARS, clamp_commit_status_description, parse_commit_sha,
         validate_commit_status_state,
     };
 
@@ -433,5 +491,11 @@ mod tests {
         let err =
             validate_commit_status_state("flaky").expect_err("invalid state should be rejected");
         assert!(err.contains("expected error|failure|pending|success"));
+    }
+
+    #[test]
+    fn merge_sha_parser_rejects_invalid_values() {
+        let err = parse_commit_sha("not-a-sha").expect_err("invalid sha should be rejected");
+        assert!(err.contains("40-char hex sha"));
     }
 }

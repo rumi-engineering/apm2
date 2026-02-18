@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00578"
     title: "Queue bounds + backpressure: max pending jobs/bytes; denial with receipts; integrate RFC-0029 control-plane budgets"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

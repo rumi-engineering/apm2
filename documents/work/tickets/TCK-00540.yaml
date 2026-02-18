@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00540"
     title: "Legacy gate cache v2 reuse policy: default deny unless bound to RFC-0028/0029 receipts; add unsafe override flag"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"
@@ -34,3 +34,15 @@ ticket_meta:
     evidence_ids: []
     criteria:
       - "Default mode never accepts a cache hit unless there is an auditable receipt with RFC-0028/0029 bindings."
+
+amendments:
+  - ticket_id: "TCK-00619"
+    date: "2026-02-18"
+    note: |
+      The --allow-legacy-cache migration flag introduced by this ticket is
+      removed in TCK-00619 (S5_REMOVE_ALLOW_LEGACY_CACHE). The migration
+      period is complete; all live cache entries now carry RFC-0028/0029
+      receipt bindings. TCK-00619 deletes the flag and the
+      legacy_cache_override_unsafe branch in gate_cache::check_reuse(),
+      making the fail-closed default unconditional across the entire gate
+      evaluation stack.

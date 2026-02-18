@@ -68,8 +68,10 @@ decision_tree:
             Discovery phase is mandatory. Run this exact help checklist before command execution:
             (1) `apm2 fac --help`
             (2) `apm2 fac pr --help`
-            (4) `apm2 fac doctor --help`
-            (5) `apm2 fac review findings --help`
+            (3) `apm2 fac doctor --help`
+            (4) `apm2 fac review findings --help`
+            (5) `apm2 fac gc --help`
+            (6) `apm2 fac warm --help`
         - id: RESOLVE_PR_SCOPE
           action: "If explicit PR numbers were provided, use them. Otherwise run `apm2 fac doctor --json` (no --pr filter) to discover all tracked PRs from FAC review entries/recent events. This global view is for PR discovery ONLY — capacity enforcement is always per-PR."
         - id: ENFORCE_SCOPE_BOUND
@@ -78,9 +80,18 @@ decision_tree:
 
     - id: HEARTBEAT_LOOP
       purpose: "Run bounded, evidence-first orchestration ticks until stop condition."
-      steps[4]:
+      steps[5]:
         - id: SNAPSHOT
           action: "Capture per-PR `apm2 fac doctor --pr <N> --json` snapshots as the primary lifecycle signal; use fac_logs and fac_review_tail for diagnosis context."
+        - id: GC_AND_DISK_HEALTH
+          action: |
+            Run `apm2 fac gc --json` if any of the following hold:
+            (1) this is the first tick of the session,
+            (2) >=10 ticks have elapsed since the last gc run,
+            (3) a previous tick observed a disk-related gate failure.
+            GC is idempotent and safe to run at any tick boundary.
+            Do not block action dispatch on gc completion — run gc as a
+            background hygiene step and proceed with COLLECT_FINDINGS_FROM_FAC.
         - id: COLLECT_FINDINGS_FROM_FAC
           action: |
             For each PR, use `apm2 fac doctor --pr <PR_NUMBER> --json` and read
@@ -104,7 +115,7 @@ decision_tree:
 
     - id: EXECUTE_ACTIONS
       purpose: "Apply bounded actions while preventing duplicate workers per PR."
-      steps[4]:
+      steps[5]:
         - id: TERMINAL_ACTION
           action: |
             For `recommended_action.action in {done, merge}`, mark the PR completed for this wave.
@@ -122,6 +133,15 @@ decision_tree:
             in the warm handoff payload.
         - id: NO_DUPLICATE_OWNERSHIP
           action: "Never run two implementor agents or two review batches for the same PR in the same tick."
+        - id: WARM_NEW_PR
+          action: |
+            When a PR enters monitoring scope for the first time in this session
+            (first tick it appears in the doctor snapshot), enqueue a pre-warm job:
+              apm2 fac warm --json
+            This uses the default bulk lane and fetch,build phases. Pre-warming
+            ensures lane compilation caches are populated before gate execution
+            begins, reducing cold-start timeout risk. Do not block on warm
+            completion — enqueue and continue orchestration.
       next: STALL_AND_BACKPRESSURE
 
     - id: STALL_AND_BACKPRESSURE
@@ -216,7 +236,7 @@ decision_tree:
 
 operational_playbook:
   purpose: "Action table keyed to FAC CLI observations. Use this to decide what to do next."
-  scenarios[12]:
+  scenarios[14]:
     - trigger: "Doctor reports action=done"
       observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=done`"
       action: "PR is complete. Remove it from active monitoring scope."
@@ -265,7 +285,15 @@ operational_playbook:
       observed_via: "`apm2 fac doctor --pr <N> --json` indicates stale head binding"
       action: "Execute doctor-provided restart recommendation for the current head SHA."
 
-invariants[11]:
+    - trigger: "Low disk or large cache accumulation"
+      observed_via: "Gate failure mentions disk space, or gc --dry-run shows >5 GB prunable artifacts"
+      action: "Run `apm2 fac gc --json` to reclaim disk space. GC is idempotent and safe at any time. If disk is critically low (<5 GB), run gc before the next implementor dispatch."
+
+    - trigger: "New PR enters monitoring scope"
+      observed_via: "A PR number appears for the first time in `apm2 fac doctor --json` output during this session"
+      action: "Enqueue `apm2 fac warm --json` to pre-warm lane targets before gate execution. Do not block orchestration on warm completion."
+
+invariants[13]:
   - "GitHub PR status, CI check status, and GitHub review state are projections, not truth. Always use `apm2 fac doctor --pr <N> --json` as the authoritative orchestration surface."
   - "Bounded search: orchestrate only 1-20 PRs per run; >20 requires explicit user partitioning into waves."
   - "When doctor provides `recommended_action.command`, execute it verbatim. Do not re-derive commands from raw JSON fields."
@@ -277,3 +305,5 @@ invariants[11]:
   - "All implementor dispatches include a warm handoff with implementor_warm_handoff_required_payload."
   - "Default implementor dispatch starts with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
   - "Implementor prompts use implementor-default as the primary instruction source and add only ticket/PR-specific deltas."
+  - "Run `apm2 fac gc --json` at session start and periodically (every ~10 ticks or on low-disk signal); GC is idempotent and reclaims gate cache, blobs, lane logs, and quarantine artifacts."
+  - "Enqueue `apm2 fac warm --json` when a new PR first enters monitoring scope; pre-warming populates lane compilation caches and reduces cold-start gate timeouts."

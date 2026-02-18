@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00555"
     title: "RFC-0028 leakage budgets integration: enforce evidence/log export caps and declassification receipts"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

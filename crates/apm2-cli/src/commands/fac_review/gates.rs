@@ -91,9 +91,6 @@ pub(super) struct QueuedGatesRequest {
     pub(super) gate_profile: GateThroughputProfile,
     pub(super) wait_timeout_secs: u64,
     pub(super) require_external_worker: bool,
-    /// TCK-00540: Allow reuse of legacy gate cache entries without
-    /// RFC-0028/0029 receipt bindings (unsafe migration override).
-    pub(super) allow_legacy_cache: bool,
 }
 
 /// Queue-backed FAC gates outcome with materialized per-gate rows.
@@ -231,7 +228,6 @@ pub fn run_gates(
     json_output: bool,
     wait: bool,
     wait_timeout_secs: u64,
-    allow_legacy_cache: bool,
 ) -> u8 {
     run_gates_via_worker(
         force,
@@ -244,7 +240,6 @@ pub fn run_gates(
         wait,
         wait_timeout_secs,
         json_output,
-        allow_legacy_cache,
     )
 }
 
@@ -379,7 +374,6 @@ fn prepare_queued_gates_job(
         &request.cpu_quota,
         request.gate_profile.as_str(),
         &repo_source.workspace_root,
-        request.allow_legacy_cache,
     );
     let queue_root =
         resolve_queue_root().map_err(|err| format!("cannot resolve queue root: {err}"))?;
@@ -651,7 +645,6 @@ fn load_gate_results_from_cache_for_sha(sha: &str) -> Result<Vec<EvidenceGateRes
             bytes_total: cached.bytes_total,
             was_truncated: cached.was_truncated,
             log_bundle_hash: cached.log_bundle_hash.clone(),
-            legacy_cache_override: cached.legacy_cache_override,
         });
     }
     Ok(results)
@@ -668,7 +661,6 @@ pub(super) fn run_gates_local_worker(
     cpu_quota: &str,
     gate_profile: GateThroughputProfile,
     workspace_root: &Path,
-    allow_legacy_cache: bool,
 ) -> Result<u8, String> {
     let (resolved_profile, effective_cpu_quota) =
         resolve_effective_execution_profile(cpu_quota, gate_profile)?;
@@ -684,7 +676,6 @@ pub(super) fn run_gates_local_worker(
         resolved_profile.test_parallelism,
         false,
         None,
-        allow_legacy_cache,
     )?;
     Ok(if summary.passed {
         exit_codes::SUCCESS
@@ -706,7 +697,6 @@ fn run_gates_via_worker(
     wait: bool,
     wait_timeout_secs: u64,
     json_output: bool,
-    allow_legacy_cache: bool,
 ) -> u8 {
     let request = QueuedGatesRequest {
         force,
@@ -718,7 +708,6 @@ fn run_gates_via_worker(
         gate_profile,
         wait_timeout_secs,
         require_external_worker: false,
-        allow_legacy_cache,
     };
     let prepared = match prepare_queued_gates_job(&request, wait) {
         Ok(prepared) => prepared,
@@ -1297,7 +1286,6 @@ fn run_gates_inner(
     test_parallelism: u32,
     emit_human_logs: bool,
     on_gate_progress: Option<Box<dyn Fn(super::evidence::GateProgressEvent) + Send>>,
-    allow_legacy_cache: bool,
 ) -> Result<GatesSummary, String> {
     validate_timeout_seconds(timeout_seconds)?;
     let memory_max_bytes = parse_memory_limit(memory_max)?;
@@ -1488,7 +1476,6 @@ fn run_gates_inner(
         skip_merge_conflict_gate: true,
         emit_human_logs,
         on_gate_progress,
-        allow_legacy_cache,
         gate_resource_policy: Some(policy.clone()),
     };
 
@@ -1566,13 +1553,6 @@ fn run_gates_inner(
                     .and_then(|p| p.to_str())
                     .map(str::to_string),
             );
-            // TCK-00540 fix round 3: Preserve the legacy override audit trail.
-            // When a gate result was reused via `--allow-legacy-cache`, downgrade
-            // the cache entry so future default-mode runs still detect and deny
-            // the unbound entry.
-            if result.legacy_cache_override {
-                cache.mark_legacy_override(&result.gate_name);
-            }
         }
         cache.backfill_evidence_metadata(
             &merge_gate.name,
@@ -1950,7 +1930,6 @@ mod tests {
             gate_profile: GateThroughputProfile::Conservative,
             wait_timeout_secs: 60,
             require_external_worker,
-            allow_legacy_cache: false,
         }
     }
 
@@ -1965,7 +1944,6 @@ mod tests {
             "200%",
             GateThroughputProfile::Balanced.as_str(),
             &workspace,
-            false,
         )
     }
 
@@ -2753,7 +2731,6 @@ mod tests {
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: Some(shared.clone()),
-                legacy_cache_override: false,
             },
             EvidenceGateResult {
                 gate_name: "clippy".to_string(),
@@ -2764,7 +2741,6 @@ mod tests {
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: Some(shared.clone()),
-                legacy_cache_override: false,
             },
         ];
 
@@ -2796,7 +2772,6 @@ mod tests {
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: None,
-                legacy_cache_override: false,
             },
             EvidenceGateResult {
                 gate_name: "clippy".to_string(),
@@ -2807,7 +2782,6 @@ mod tests {
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: Some("b3-256:nothex".to_string()),
-                legacy_cache_override: false,
             },
         ];
 
@@ -2840,7 +2814,6 @@ mod tests {
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: Some(format!("b3-256:{}", "b".repeat(64))),
-                legacy_cache_override: false,
             },
             EvidenceGateResult {
                 gate_name: "clippy".to_string(),
@@ -2851,7 +2824,6 @@ mod tests {
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: Some(format!("b3-256:{}", "c".repeat(64))),
-                legacy_cache_override: false,
             },
         ];
 
@@ -2913,7 +2885,6 @@ mod tests {
             skip_merge_conflict_gate: true,
             emit_human_logs: false,
             on_gate_progress: Some(callback),
-            allow_legacy_cache: false,
             gate_resource_policy: None,
         };
 
@@ -3151,7 +3122,6 @@ mod tests {
             2,
             false,
             None,
-            false,
         )
         .expect("gates should run in single-lane mode");
         assert!(summary.passed);
