@@ -368,16 +368,43 @@ with hard caps.
 
 The `token_ledger` submodule implements broker-side token replay protection via
 a bounded, TTL-evicting nonce ledger and explicit revocation. Every
-`ChannelContextToken` issued by the broker carries a unique 32-byte nonce. The
-nonce is included in the token at issuance time but is NOT recorded in the
-ledger until the worker validates and consumes the token. This ensures the
-first legitimate use succeeds; any subsequent use (replay) is denied
-(fail-closed). Tokens can also be explicitly revoked before their natural
-expiry, and workers consult the revocation set when validating tokens.
+`ChannelContextToken` issued by the broker carries a unique 32-byte nonce.
 
-The ledger is persisted to disk under `$APM2_HOME/private/fac/broker/token_ledger/`
-and loaded on broker startup. Expired entries are dropped on load; unexpired
-entries are preserved across daemon restarts.
+### Nonce Lifecycle
+
+Nonces follow a two-state lifecycle: `Issued` -> `Consumed`.
+
+1. **Issuance**: When the broker issues a token, the nonce is generated and
+   registered in the ledger in `Issued` state via `register_nonce()`. This
+   enables pre-use revocation (INV-TL-008): if the token is leaked before
+   any worker consumes it, the broker can revoke the nonce immediately.
+2. **Consumption**: When a worker validates the token via
+   `validate_and_record_token_nonce()`, the entry transitions from `Issued`
+   to `Consumed`. A second presentation of the same nonce is denied
+   (fail-closed).
+3. **Revocation**: Nonces in either `Issued` or `Consumed` state can be
+   explicitly revoked via `revoke_token()`. Revoked tokens are denied even
+   if they have not expired.
+
+### Persistence Model (WAL + Snapshot)
+
+The ledger uses a write-ahead log (WAL) for incremental persistence to avoid
+O(N) serialization on every job:
+
+- **WAL entries**: Each mutation (register, consume, revoke) produces a small
+  fixed-size `WalEntry` (single-line JSON). The worker appends this to
+  `wal.jsonl` with fsync BEFORE job execution begins (INV-TL-010).
+- **Snapshot compaction**: When `wal_entries_since_snapshot()` exceeds
+  `WAL_COMPACTION_THRESHOLD` (256), the full ledger is written as a snapshot
+  to `state.json` using `write_atomic` (temp+fsync+dir_fsync+rename per
+  CTR-2607), and the WAL is truncated.
+- **Startup recovery**: On startup, the latest snapshot is loaded and the WAL
+  is replayed to restore full ledger state. Load errors from existing files
+  are hard security faults (INV-TL-009: fail-closed).
+
+Files are stored under `$APM2_HOME/private/fac/broker/token_ledger/`:
+- `state.json`: Full ledger snapshot (schema v1.1.0, backward-compatible with v1.0.0)
+- `wal.jsonl`: Append-only WAL file (newline-delimited JSON)
 
 ### Key Types
 
@@ -385,6 +412,12 @@ entries are preserved across daemon restarts.
   TokenUseEntry>` for O(1) lookup and a `VecDeque<(TokenNonce, u64)>` for
   TTL-based FIFO eviction. Not internally synchronized; protected by the same
   external lock as `FacBroker` (`&mut self` access).
+- `NonceState`: Lifecycle state enum (`Issued`, `Consumed`). Serialized with
+  `#[serde(rename_all = "snake_case")]`. The `state` field uses
+  `#[serde(default)]` for backward compatibility with v1.0.0 snapshots
+  (missing `state` defaults to `Consumed`).
+- `WalEntry`: Tagged union (`Register`, `Consume`, `Revoke`) for incremental
+  WAL persistence. Serialized as single-line JSON with `#[serde(tag = "op")]`.
 - `TokenNonce`: Type alias for `[u8; 32]`. CSPRNG-seeded, domain-separated
   BLAKE3 derived nonces.
 - `TokenLedgerError`: Fail-closed error taxonomy with `ReplayDetected`,
@@ -394,7 +427,7 @@ entries are preserved across daemon restarts.
   with domain-separated BLAKE3 content hash, `#[serde(deny_unknown_fields)]`.
   Includes `verify_content_hash()` for receipt integrity verification.
 - `TokenUseEntry` (private): Active ledger entry carrying nonce,
-  `request_id_digest`, `recorded_at_tick`, and `expiry_tick`.
+  `request_id_digest`, `recorded_at_tick`, `expiry_tick`, and `state`.
 - `RevokedTokenEntry` (private): Revocation entry carrying nonce,
   `revoked_at_tick`, and reason string.
 
@@ -404,46 +437,75 @@ entries are preserved across daemon restarts.
 - `MAX_REVOKED_TOKENS`: 4,096
 - `DEFAULT_LEDGER_TTL_TICKS`: 1,000 (matches default envelope TTL)
 - `MAX_REVOCATION_REASON_LENGTH`: 512
+- `WAL_COMPACTION_THRESHOLD`: 256 (entries before snapshot compaction)
+- `MAX_WAL_FILE_SIZE`: 4 MiB (prevents OOM from uncompacted WAL)
+- `MAX_WAL_LINE_SIZE`: 4,096 bytes (prevents unbounded allocation)
 
 ### Core Capabilities
 
 - `TokenUseLedger::generate_nonce()`: Generates a fresh 32-byte nonce using
   OS CSPRNG randomness with domain-separated BLAKE3 derivation
   (`apm2.fac_broker.token_nonce.v1`).
+- `TokenUseLedger::register_nonce(nonce, request_id_digest, current_tick)`:
+  Registers a nonce in `Issued` state at issuance time (INV-TL-008). Returns
+  a `WalEntry::Register` for the caller to persist.
 - `TokenUseLedger::record_token_use(nonce, request_id_digest, current_tick)`:
-  Records a nonce in the ledger. Checks revocation first (INV-TL-004), then
-  replay (INV-TL-001). Evicts expired entries when at capacity. Forces FIFO
-  eviction of oldest entry if still at capacity after TTL eviction.
+  Transitions an `Issued` nonce to `Consumed`, or creates a `Consumed` entry
+  for pre-registration nonces. Checks revocation first (INV-TL-004), then
+  replay (INV-TL-001). Returns a `WalEntry::Consume` for the caller to persist.
 - `TokenUseLedger::check_nonce(nonce)`: Worker-side validation entry point.
-  Returns `Ok(())` if the nonce is fresh (neither used nor revoked).
+  Returns `Ok(())` if the nonce is fresh (not consumed, not revoked). An
+  `Issued` nonce is considered fresh (not yet consumed).
 - `TokenUseLedger::revoke_token(nonce, current_tick, reason)`: Explicitly
-  revokes a token nonce. Validates reason length, checks revocation set
-  capacity, verifies nonce existence in ledger (fail-closed: cannot revoke
-  a nonce not issued). Emits a `TokenRevocationReceipt`.
+  revokes a token nonce in either `Issued` or `Consumed` state (INV-TL-008).
+  Returns a `(TokenRevocationReceipt, WalEntry::Revoke)` tuple.
 - `TokenUseLedger::evict_expired(current_tick)`: TTL-based eviction of
   expired entries from both the active ledger and revocation set. Uses
   ghost-key prevention (RSK-1304): expiry ticks stored in the VecDeque
   are compared against the HashMap entry's actual expiry to detect stale
-  queue entries from re-inserted keys.
+  queue entries from re-inserted keys. The ghost-key check is retained as
+  defense-in-depth even though currently unreachable under normal operation.
+- `TokenUseLedger::serialize_wal_entry(entry)`: Serializes a `WalEntry` to
+  newline-terminated JSON bytes.
+- `TokenUseLedger::replay_wal(wal_bytes)`: Replays WAL entries from bytes,
+  applying them to the in-memory ledger. Fail-closed on parse errors.
+- `TokenUseLedger::serialize_state()`: Full ledger snapshot serialization.
+- `TokenUseLedger::deserialize_state(bytes, current_tick)`: Snapshot load
+  with TTL eviction and cap enforcement. Accepts v1.0.0 and v1.1.0 schemas.
 
 ### Broker Integration
 
 - `FacBroker` holds a `TokenUseLedger` field initialized fresh in all
   constructors. Persisted ledger state is loaded separately via
   `set_token_ledger()` after construction.
-- `issue_channel_context_token()` generates a nonce via `generate_nonce()`
-  and includes it in the `TokenBindingV1` payload (`nonce: Some(nonce)`).
-  The nonce is NOT recorded in the ledger at issuance time.
+- `issue_channel_context_token()` generates a nonce via `generate_nonce()`,
+  registers it in the ledger via `register_nonce()` in `Issued` state
+  (INV-TL-008), and includes it in the `TokenBindingV1` payload.
 - Workers call `validate_and_record_token_nonce()` at validation time to
   (1) check if the nonce is fresh and (2) atomically record it as consumed.
+  Returns serialized WAL entry bytes that MUST be persisted to disk with
+  fsync BEFORE job execution begins (INV-TL-009/INV-TL-010).
 - `advance_tick()` calls `token_ledger.evict_expired()` to clean up stale
   entries as part of the broker tick lifecycle.
 - `BrokerError::TokenLedger` variant propagates ledger errors.
 - `serialize_token_ledger()` serializes the ledger for disk persistence.
+- `reset_token_ledger_wal_counter()` resets WAL counter after compaction.
 - `set_token_ledger()` replaces the ledger with a pre-loaded one from disk.
 - Accessor methods: `token_ledger()`, `check_token_nonce()`,
   `validate_and_record_token_nonce()`, `revoke_token()`,
   `evict_expired_tokens()`.
+
+### Worker Persistence Integration (fac_worker.rs)
+
+- `load_token_ledger()`: Fail-closed load (INV-TL-009). Returns `Err` if
+  an existing file cannot be read or deserialized. `Ok(None)` on first run.
+  Replays WAL after snapshot load.
+- `save_token_ledger()`: Uses `write_atomic` (CTR-2607) for snapshot writes.
+  Truncates WAL and resets counter after successful snapshot. Errors are
+  propagated (not silently discarded).
+- `append_token_ledger_wal()`: Appends WAL entry bytes with fsync. Called
+  immediately after `validate_and_record_token_nonce` and BEFORE job
+  execution (BLOCKER fix for pre-execution durability).
 
 ### TokenBindingV1 Integration
 
@@ -455,9 +517,10 @@ carry `nonce: None`.
 
 ### Security Invariants (TCK-00566)
 
-- [INV-TL-001] Every token nonce is included in the token at issuance but
-  recorded in the ledger only when the worker validates and consumes the
-  token. A second presentation of the same nonce is denied (fail-closed).
+- [INV-TL-001] Every token nonce is registered in the ledger at issuance
+  time in `Issued` state. When the worker validates and consumes the token
+  via `validate_and_record_token_nonce`, the entry transitions to `Consumed`.
+  A second presentation of the same nonce is denied (fail-closed).
 - [INV-TL-002] The ledger is bounded by `MAX_LEDGER_ENTRIES` (16,384). When
   the cap is reached, expired entries are evicted first, then the oldest entry
   is force-evicted (TTL-based FIFO).
@@ -476,20 +539,33 @@ carry `nonce: None`.
   NOT constant-time over the full entry set; however, 32-byte random nonces
   (INV-TL-006) make collision-based timing leakage infeasible in practice
   (RSK-1909).
-- [INV-TL-008] Ghost-key prevention (RSK-1304): the insertion-order VecDeque
-  stores `(nonce, expiry_tick)` pairs. During eviction, the stored expiry
-  tick is compared against the HashMap entry's actual expiry tick; stale
-  queue entries from re-inserted keys are detected and skipped.
-- [INV-TL-009] Revocation receipt content hash uses domain-separated BLAKE3
+- [INV-TL-008] Nonces are registered at issuance in `Issued` state.
+  `revoke_token()` can revoke nonces in either `Issued` or `Consumed` state,
+  closing the window for leaked-but-unused token exploitation (pre-use
+  revocation).
+- [INV-TL-009] Ledger persistence is fail-closed: load errors from an
+  existing ledger file are hard security faults that refuse to continue.
+  Save errors are propagated so the caller cannot silently run with
+  undurable replay state. WAL parse errors during replay are hard faults.
+- [INV-TL-010] WAL entries are appended with fsync for crash durability.
+  The worker MUST persist the WAL entry to disk BEFORE job execution begins.
+  Full snapshots use atomic write (temp+fsync+dir_fsync+rename) per CTR-2607.
+- [INV-TL-011] Revocation receipt content hash uses domain-separated BLAKE3
   (`apm2.fac_broker.revocation_receipt.v1`) with `u64::to_le_bytes()`
   length-prefix framing for variable-length fields (CTR-2612).
-- [INV-TL-010] Zero TTL is rejected (clamped to 1) to prevent all entries
+- [INV-TL-012] Zero TTL is rejected (clamped to 1) to prevent all entries
   from being immediately stale (fail-closed).
-- [INV-TL-011] The ledger is persisted to disk under
-  `$APM2_HOME/private/fac/broker/token_ledger/state.json` using atomic
-  write (temp+rename) per CTR-2607. Expired entries are dropped during
+- [INV-TL-013] Ghost-key prevention (RSK-1304): the insertion-order VecDeque
+  stores `(nonce, expiry_tick)` pairs. During eviction, the stored expiry
+  tick is compared against the HashMap entry's actual expiry tick; stale
+  queue entries from re-inserted keys are detected and skipped. The check
+  is retained as defense-in-depth even though currently unreachable.
+- [INV-TL-014] The ledger snapshot is persisted to disk under
+  `$APM2_HOME/private/fac/broker/token_ledger/state.json` using
+  `write_atomic` per CTR-2607. Expired entries are dropped during
   deserialization. Persisted file size is bounded by
   `MAX_TOKEN_LEDGER_FILE_SIZE` (8 MiB) before parsing (RSK-1601).
+  WAL file size is bounded by `MAX_WAL_FILE_SIZE` (4 MiB).
   Replay protection survives daemon restarts.
 
 ## projection_compromise Submodule

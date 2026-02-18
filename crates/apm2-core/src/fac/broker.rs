@@ -890,11 +890,19 @@ impl FacBroker {
         };
 
         // TCK-00566: Generate a single-use nonce for replay protection.
-        // The nonce is included in the token but NOT recorded in the ledger
-        // at issuance time. Recording happens at the validation path (worker)
-        // when the token is presented for use. This ensures the first
-        // legitimate use succeeds and only subsequent uses are denied.
+        // The nonce is registered in the ledger at issuance time in `Issued`
+        // state (INV-TL-008). This allows pre-use revocation: if the token
+        // is leaked, the broker can revoke the nonce before any worker
+        // consumes it. When the worker validates the token, the entry
+        // transitions to `Consumed` state.
         let nonce = crate::fac::token_ledger::TokenUseLedger::generate_nonce();
+
+        // Register the nonce in the ledger at issuance time (INV-TL-008).
+        let request_id_digest = compute_request_id_digest(request_id);
+        let _wal_entry = self
+            .token_ledger
+            .register_nonce(&nonce, &request_id_digest, self.state.current_tick)
+            .map_err(BrokerError::TokenLedger)?;
 
         // TCK-00565: Bind the token to policy, canonicalizer, boundary, and
         // tick-based expiry so the worker can fail-closed on any drift.
@@ -1141,27 +1149,36 @@ impl FacBroker {
     ///
     /// This is the validation entry point for workers: after decoding a
     /// token and extracting the nonce, the worker calls this to (1) verify
-    /// the nonce is fresh (neither used nor revoked) and (2) atomically
+    /// the nonce is fresh (neither consumed nor revoked) and (2) atomically
     /// record the nonce as consumed so any subsequent presentation is denied.
     ///
     /// The check and record are performed together (fail-closed): if the
     /// check fails, no record is made; if the check succeeds, the nonce is
     /// immediately recorded before returning.
     ///
+    /// Returns the serialized WAL entry bytes that the caller MUST persist
+    /// to disk (with fsync) BEFORE executing the job. This ensures the
+    /// "consumed" state is durable before any action is taken (INV-TL-009).
+    ///
     /// # Errors
     ///
-    /// Returns an error if the nonce has been used (replay) or revoked.
+    /// Returns an error if the nonce has been consumed (replay) or revoked.
     pub fn validate_and_record_token_nonce(
         &mut self,
         nonce: &[u8; 32],
         request_id: &str,
-    ) -> Result<(), crate::fac::token_ledger::TokenLedgerError> {
+    ) -> Result<Vec<u8>, crate::fac::token_ledger::TokenLedgerError> {
         // Check revocation and replay first (fail-closed).
         self.token_ledger.check_nonce(nonce)?;
         // Record the nonce as consumed so future replays are denied.
         let request_id_digest = compute_request_id_digest(request_id);
-        self.token_ledger
-            .record_token_use(nonce, &request_id_digest, self.state.current_tick)
+        let wal_entry = self.token_ledger.record_token_use(
+            nonce,
+            &request_id_digest,
+            self.state.current_tick,
+        )?;
+        // Serialize the WAL entry for the caller to persist immediately.
+        crate::fac::token_ledger::TokenUseLedger::serialize_wal_entry(&wal_entry)
     }
 
     /// Checks whether a token nonce has been used or revoked without
@@ -1184,7 +1201,8 @@ impl FacBroker {
     /// Explicitly revokes a token nonce.
     ///
     /// Returns a [`crate::fac::token_ledger::TokenRevocationReceipt`] for audit
-    /// purposes.
+    /// purposes. The nonce can be in either `Issued` or `Consumed` state
+    /// (INV-TL-008), enabling pre-use revocation of leaked tokens.
     ///
     /// # Errors
     ///
@@ -1195,9 +1213,11 @@ impl FacBroker {
         nonce: &[u8; 32],
         reason: &str,
     ) -> Result<crate::fac::token_ledger::TokenRevocationReceipt, BrokerError> {
-        self.token_ledger
+        let (receipt, _wal_entry) = self
+            .token_ledger
             .revoke_token(nonce, self.state.current_tick, reason)
-            .map_err(BrokerError::TokenLedger)
+            .map_err(BrokerError::TokenLedger)?;
+        Ok(receipt)
     }
 
     /// Evicts expired entries from the token use ledger.
@@ -1217,6 +1237,14 @@ impl FacBroker {
         self.token_ledger
             .serialize_state()
             .map_err(BrokerError::TokenLedger)
+    }
+
+    /// Resets the WAL entry counter after a successful snapshot+compaction.
+    ///
+    /// Called by the persistence layer after writing a full snapshot
+    /// and truncating the WAL file.
+    pub const fn reset_token_ledger_wal_counter(&mut self) {
+        self.token_ledger.reset_wal_counter();
     }
 
     // -----------------------------------------------------------------------
@@ -2889,12 +2917,12 @@ mod tests {
     }
 
     #[test]
-    fn tck_00566_token_issuance_includes_nonce_but_does_not_record() {
+    fn tck_00566_token_issuance_registers_nonce_in_issued_state() {
         let (broker, token) = broker_with_issued_token();
 
-        // The ledger should be EMPTY after issuance (nonce is not recorded
-        // until validation).
-        assert_eq!(broker.token_ledger().len(), 0);
+        // INV-TL-008: The ledger should have ONE entry after issuance (nonce
+        // is registered at issuance time in Issued state).
+        assert_eq!(broker.token_ledger().len(), 1);
 
         // Decode the token to extract the nonce.
         let decoded = decode_channel_context_token(
@@ -2911,10 +2939,11 @@ mod tests {
         let nonce = binding.nonce.expect("nonce should be present");
         assert_ne!(nonce, [0u8; 32]);
 
-        // Before validation, the nonce should be fresh (not recorded).
+        // Before validation, the nonce should be fresh (Issued state counts
+        // as fresh for check purposes — it has not been consumed yet).
         assert!(
             broker.check_token_nonce(&nonce).is_ok(),
-            "nonce should be fresh before validation"
+            "nonce should be fresh (Issued) before validation"
         );
     }
 
@@ -2933,10 +2962,12 @@ mod tests {
         .unwrap();
         let nonce = decoded.token_binding.unwrap().nonce.unwrap();
 
-        // First validation+record should succeed.
-        broker
+        // First validation+record should succeed and return WAL bytes.
+        let wal_bytes = broker
             .validate_and_record_token_nonce(&nonce, "REQ-1")
             .expect("first use should succeed");
+        assert!(!wal_bytes.is_empty(), "WAL entry bytes should be non-empty");
+        // Ledger still has 1 entry (Issued -> Consumed transition, same key).
         assert_eq!(broker.token_ledger().len(), 1);
 
         // Second validation+record (replay) should fail.
@@ -2964,8 +2995,8 @@ mod tests {
             .issue_channel_context_token(&job_digest, "lease-2", "REQ-2", "test-boundary")
             .expect("second token should succeed");
 
-        // Ledger empty: nonces not recorded at issuance.
-        assert_eq!(broker.token_ledger().len(), 0);
+        // INV-TL-008: Both nonces registered at issuance in Issued state.
+        assert_eq!(broker.token_ledger().len(), 2);
 
         // Extract nonces and verify they are different.
         let decoded1 = decode_channel_context_token(
@@ -3005,20 +3036,15 @@ mod tests {
         .unwrap();
         let nonce = decoded.token_binding.unwrap().nonce.unwrap();
 
-        // First use: validate and record the nonce (so it exists in the ledger
-        // for revocation).
-        broker
-            .validate_and_record_token_nonce(&nonce, "REQ-1")
-            .expect("first use should succeed");
-
-        // Revoke the token.
+        // INV-TL-008: Revoke BEFORE first use (pre-use revocation).
+        // The nonce is in Issued state from issuance registration.
         let receipt = broker
             .revoke_token(&nonce, "test revocation")
-            .expect("revocation should succeed");
+            .expect("pre-use revocation should succeed");
         assert!(receipt.verify_content_hash());
         assert_eq!(receipt.reason, "test revocation");
 
-        // Any further use should be denied as revoked.
+        // First use should be denied as revoked (pre-use revocation).
         let result = broker.validate_and_record_token_nonce(&nonce, "REQ-1");
         assert!(
             matches!(
@@ -3051,13 +3077,16 @@ mod tests {
         .unwrap();
         let nonce = decoded.token_binding.unwrap().nonce.unwrap();
 
-        // Validate and record the nonce.
+        // INV-TL-008: Entry already in ledger from issuance (Issued state).
+        assert_eq!(broker.token_ledger().len(), 1);
+
+        // Validate and record the nonce (transitions Issued -> Consumed).
         broker
             .validate_and_record_token_nonce(&nonce, "REQ-1")
             .expect("first use should succeed");
 
         // Initial tick is 1, TTL is DEFAULT_LEDGER_TTL_TICKS = 1000.
-        // Entry was recorded at tick 1, expires at tick 1 + 1000 = 1001.
+        // Entry was registered at tick 1, expires at tick 1 + 1000 = 1001.
         assert_eq!(broker.token_ledger().len(), 1);
 
         // Advance tick past the TTL.
@@ -3101,10 +3130,11 @@ mod tests {
         .unwrap();
         let nonce1 = decoded1.token_binding.unwrap().nonce.unwrap();
 
-        // First use: validate and record.
-        broker
+        // First use: validate and record (returns WAL bytes).
+        let wal_bytes = broker
             .validate_and_record_token_nonce(&nonce1, "REQ-1")
             .expect("first use should succeed");
+        assert!(!wal_bytes.is_empty());
 
         // Second use (replay): should be denied.
         let result = broker.validate_and_record_token_nonce(&nonce1, "REQ-1");
@@ -3134,7 +3164,7 @@ mod tests {
         )
         .unwrap();
         let nonce = decoded.token_binding.unwrap().nonce.unwrap();
-        broker
+        let _wal_bytes = broker
             .validate_and_record_token_nonce(&nonce, "REQ-1")
             .expect("first use should succeed");
         assert_eq!(broker.token_ledger().len(), 1);
