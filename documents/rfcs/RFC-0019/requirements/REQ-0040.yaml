@@ -1,0 +1,41 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0040"
+  title: "FAC doctor system output defaults to checks-only; tracked PRs are explicit opt-in"
+  category: "NON_FUNCTIONAL"
+  priority: "P1"
+  status: "PROPOSED"
+  statement: |
+    The system-level `apm2 fac doctor` output (no `--pr`) MUST prioritize host
+    readiness diagnostics and suppress tracked PR payload noise by default.
+
+    Default behavior:
+      - Output schema remains `apm2.fac.doctor.system.v1`.
+      - `checks` remains authoritative and complete.
+      - `tracked_prs` is present as an empty array unless explicitly requested.
+
+    Opt-in behavior:
+      - `--tracked-prs` includes tracked PR summaries.
+      - `--full` also includes tracked PR summaries.
+      - When tracked PR summaries are requested, `--repo owner/repo` filters
+        the tracked PR entries before serialization.
+
+    This requirement applies only to system doctor mode (no `--pr`).
+
+    Primary delivery ticket: TCK-00621.
+  rationale: |
+    Operators frequently run doctor to answer one question quickly: "is this
+    host ready to execute FAC workflows?" Dumping all tracked PR summaries by
+    default floods the output, hides actionable readiness failures, and makes
+    automation brittle. Checks-first output preserves signal while still
+    allowing explicit projection detail when requested.
+  acceptance_criteria:
+    - "`apm2 fac doctor` emits `checks` and `tracked_prs: []` by default."
+    - "`apm2 fac doctor --tracked-prs` includes tracked PR summaries."
+    - "`apm2 fac doctor --full` includes tracked PR summaries."
+    - "Schema identifier remains `apm2.fac.doctor.system.v1` in all three modes."
+    - "`--repo owner/repo` filters tracked PR entries when tracked PR output is enabled."
+  evidence_ids:
+    - "EVID-0040"
+  source_refs:
+    - "documents/work/tickets/TCK-00621.yaml"

@@ -10,7 +10,10 @@ requirement:
 
     PREP phase:
       - Invokes the readiness controller (REQ-0031).
-      - Hydrates the dependency closure (REQ-0034) if missing or incomplete.
+      - Executes the dependency-closure readiness/hydration hook.
+      - Full dependency closure hydration semantics are delivered by
+        REQ-0033/REQ-0034 tickets; this requirement establishes the
+        phase boundary and fail-closed sequencing contract.
       - MAY perform network I/O, filesystem mutations, and service calls.
       - MUST complete successfully before EXECUTE begins.
       - If PREP fails, no gates execute. Failure is reported with structured
@@ -24,9 +27,10 @@ requirement:
         only pre-hydrated artifacts.
       - Each gate result MUST be individually reported (per REQ-0036).
 
-    PREP and EXECUTE outcomes MUST be separately reported in structured stdout
-    output (per REQ-0036). A structured `run_summary` event MUST identify which
-    phase caused any failure.
+    PREP and EXECUTE outcomes MUST be separately timed and reported in
+    structured stdout output (per REQ-0036). `run_summary` MUST include
+    `prep_duration_ms`, `execute_duration_ms`, and `phase_failed`; `run_failed`
+    MUST include `stage`.
 
     Primary delivery ticket: TCK-00621.
   rationale: |
@@ -40,7 +44,8 @@ requirement:
     - "If PREP fails, zero gate processes are started and the run exits with stage=prep in the structured failure."
     - "EXECUTE phase performs no ambient mutations outside gate workspaces."
     - "Structured output includes distinct prep_started and execute_started events."
-    - "run_summary identifies phase (prep or execute) for any run-level failure."
+    - "run_summary includes prep_duration_ms, execute_duration_ms, and phase_failed."
+    - "run_failed includes stage=prep or stage=execute."
     - "PREP and EXECUTE are separately timed and reported."
   evidence_ids:
     - "EVID-0032"

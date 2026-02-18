@@ -143,6 +143,16 @@ pub struct DoctorWaitTimeoutEvent {
 }
 
 #[derive(Debug, Serialize)]
+pub struct DoctorWaitTerminalEvent {
+    pub event: &'static str,
+    pub tick: u64,
+    pub reason: String,
+    pub action: String,
+    pub elapsed_seconds: u64,
+    pub ts: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct DoctorResultEvent {
     pub event: &'static str,
     pub tick: u64,
@@ -231,6 +241,27 @@ mod tests {
         assert_eq!(
             payload.get("elapsed_seconds").and_then(Value::as_u64),
             Some(1200)
+        );
+    }
+
+    #[test]
+    fn doctor_wait_terminal_event_serialization_includes_reason() {
+        let payload = serde_json::to_value(DoctorWaitTerminalEvent {
+            event: "wait_terminal",
+            tick: 5,
+            reason: "merge_ready".to_string(),
+            action: "approve".to_string(),
+            elapsed_seconds: 45,
+            ts: "2026-02-17T00:00:00.000Z".to_string(),
+        })
+        .expect("serialize doctor wait terminal event");
+        assert_eq!(
+            payload.get("event").and_then(Value::as_str),
+            Some("wait_terminal")
+        );
+        assert_eq!(
+            payload.get("reason").and_then(Value::as_str),
+            Some("merge_ready")
         );
     }
 }
