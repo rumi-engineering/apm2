@@ -4,7 +4,7 @@
 //! pipeline can skip already-validated gates.
 
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -19,6 +19,7 @@ use apm2_core::fac::{
     lookup_job_receipt, parse_b3_256_digest, parse_policy_hash, resolve_host_test_parallelism,
 };
 use chrono::{SecondsFormat, Utc};
+use fs2::FileExt;
 use sha2::{Digest, Sha256};
 
 use super::bounded_test_runner::{
@@ -44,6 +45,7 @@ use crate::commands::fac_queue_submit::{
     enqueue_job, generate_job_suffix, init_broker, load_or_init_policy, resolve_fac_root,
     resolve_queue_root, resolve_repo_source_info,
 };
+use crate::commands::fac_utils::{MAX_SCAN_ENTRIES, read_job_spec_bounded};
 use crate::exit_codes::codes as exit_codes;
 
 const DEFAULT_TEST_KILL_AFTER_SECONDS: u64 = 20;
@@ -57,6 +59,9 @@ const EXTERNAL_WORKER_BOOTSTRAP_POLL_INTERVAL_MS: u64 = 250;
 // 40 * 250ms ~= 10s bootstrap window for detached worker heartbeat.
 const EXTERNAL_WORKER_BOOTSTRAP_MAX_POLLS: u32 = 40;
 const GATES_QUEUE_LANE: &str = "consume";
+const GATES_SINGLE_FLIGHT_DIR: &str = "queue/singleflight";
+const GATES_QUEUE_PENDING_DIR: &str = "pending";
+const GATES_QUEUE_CLAIMED_DIR: &str = "claimed";
 const DIRTY_TREE_STATUS_MAX_LINES: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,9 +111,19 @@ struct PreparedQueuedGatesJob {
     head_sha: String,
     job_id: String,
     spec: FacJobSpecV1,
+    coalesced_with_existing: bool,
     worker_bootstrapped: bool,
     policy_hash: String,
     options: GatesJobOptionsV1,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+struct GatesQueueSnapshot {
+    pending_gates: usize,
+    claimed_gates: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ahead_of_job: Option<usize>,
+    job_state: String,
 }
 
 /// Throughput profile for bounded FAC gate execution.
@@ -349,8 +364,6 @@ fn prepare_queued_gates_job(
         .job_spec_validation_policy()
         .map_err(|err| format!("cannot derive job spec validation policy: {err}"))?;
 
-    let job_id = format!("gates-{}", generate_job_suffix());
-    let lease_id = format!("gates-lease-{}", generate_job_suffix());
     let repo_source = resolve_repo_source_info();
     let options = GatesJobOptionsV1::new(
         request.force,
@@ -363,6 +376,32 @@ fn prepare_queued_gates_job(
         &repo_source.workspace_root,
         request.allow_legacy_cache,
     );
+    let queue_root =
+        resolve_queue_root().map_err(|err| format!("cannot resolve queue root: {err}"))?;
+    let _single_flight_lock =
+        acquire_gates_single_flight_lock(&fac_root, &repo_source.repo_id, &repo_source.head_sha)?;
+    let include_claimed = has_live_worker_heartbeat(&fac_root);
+    if let Some(existing_spec) = find_coalescible_gates_job(
+        &queue_root,
+        &repo_source.repo_id,
+        &repo_source.head_sha,
+        &options,
+        include_claimed,
+    )? {
+        return Ok(PreparedQueuedGatesJob {
+            fac_root,
+            head_sha: repo_source.head_sha,
+            job_id: existing_spec.job_id.clone(),
+            spec: existing_spec,
+            coalesced_with_existing: true,
+            worker_bootstrapped,
+            policy_hash,
+            options,
+        });
+    }
+
+    let job_id = format!("gates-{}", generate_job_suffix());
+    let lease_id = format!("gates-lease-{}", generate_job_suffix());
     let spec = build_gates_job_spec(
         &job_id,
         &lease_id,
@@ -377,9 +416,6 @@ fn prepare_queued_gates_job(
         fac_policy.allowed_intents.as_deref(),
     )
     .map_err(|err| format!("cannot build gates job spec: {err}"))?;
-
-    let queue_root =
-        resolve_queue_root().map_err(|err| format!("cannot resolve queue root: {err}"))?;
     enqueue_job(
         &queue_root,
         &fac_root,
@@ -393,10 +429,140 @@ fn prepare_queued_gates_job(
         head_sha: repo_source.head_sha,
         job_id,
         spec,
+        coalesced_with_existing: false,
         worker_bootstrapped,
         policy_hash,
         options,
     })
+}
+
+fn acquire_gates_single_flight_lock(
+    fac_root: &Path,
+    repo_id: &str,
+    head_sha: &str,
+) -> Result<std::fs::File, String> {
+    let lock_name = format!(
+        "gates-{}-{}.lock",
+        sanitize_single_flight_segment(repo_id),
+        sanitize_single_flight_segment(head_sha),
+    );
+    let lock_path = fac_root.join(GATES_SINGLE_FLIGHT_DIR).join(lock_name);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "cannot create gates single-flight lock directory {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| {
+            format!(
+                "cannot open gates single-flight lock {}: {err}",
+                lock_path.display()
+            )
+        })?;
+    lock_file.lock_exclusive().map_err(|err| {
+        format!(
+            "cannot acquire gates single-flight lock {}: {err}",
+            lock_path.display()
+        )
+    })?;
+    Ok(lock_file)
+}
+
+fn sanitize_single_flight_segment(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    while out.starts_with('-') || out.starts_with('_') || out.starts_with('.') {
+        out.remove(0);
+    }
+    while out.ends_with('-') || out.ends_with('_') || out.ends_with('.') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
+}
+
+fn find_coalescible_gates_job(
+    queue_root: &Path,
+    repo_id: &str,
+    head_sha: &str,
+    options: &GatesJobOptionsV1,
+    include_claimed: bool,
+) -> Result<Option<FacJobSpecV1>, String> {
+    let expected_patch =
+        serde_json::to_value(options).map_err(|err| format!("serialize gates options: {err}"))?;
+    let mut selected: Option<FacJobSpecV1> = None;
+    for dir_name in [
+        Some(GATES_QUEUE_PENDING_DIR),
+        include_claimed.then_some(GATES_QUEUE_CLAIMED_DIR),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let dir = queue_root.join(dir_name);
+        if !dir.is_dir() {
+            continue;
+        }
+        let entries = fs::read_dir(&dir)
+            .map_err(|err| format!("cannot read queue directory {}: {err}", dir.display()))?;
+        for (idx, entry) in entries.enumerate() {
+            if idx >= MAX_SCAN_ENTRIES {
+                break;
+            }
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(spec) = read_job_spec_bounded(&path) else {
+                continue;
+            };
+            if !is_coalescible_gates_spec(&spec, repo_id, head_sha, &expected_patch) {
+                continue;
+            }
+            let replace = selected.as_ref().is_none_or(|current| {
+                spec.enqueue_time < current.enqueue_time
+                    || (spec.enqueue_time == current.enqueue_time && spec.job_id < current.job_id)
+            });
+            if replace {
+                selected = Some(spec);
+            }
+        }
+    }
+    Ok(selected)
+}
+
+fn is_coalescible_gates_spec(
+    spec: &FacJobSpecV1,
+    repo_id: &str,
+    head_sha: &str,
+    expected_patch: &serde_json::Value,
+) -> bool {
+    spec.kind == "gates"
+        && spec.queue_lane == GATES_QUEUE_LANE
+        && spec.source.repo_id.eq_ignore_ascii_case(repo_id)
+        && spec.source.head_sha.eq_ignore_ascii_case(head_sha)
+        && spec
+            .source
+            .patch
+            .as_ref()
+            .is_some_and(|patch| patch == expected_patch)
 }
 
 fn load_gate_results_from_cache_for_sha(sha: &str) -> Result<Vec<EvidenceGateResult>, String> {
@@ -548,18 +714,25 @@ fn run_gates_via_worker(
     let queued_job_id = prepared.job_id.clone();
     let queued_head_sha = prepared.head_sha.clone();
     let queued_lane = prepared.spec.queue_lane.clone();
+    let queued_coalesced = prepared.coalesced_with_existing;
     let queued_bootstrapped = prepared.worker_bootstrapped;
+    let queue_snapshot = resolve_queue_root()
+        .ok()
+        .and_then(|queue_root| collect_gates_queue_snapshot(&queue_root, &queued_job_id).ok());
 
     if json_output {
         let payload = serde_json::json!({
-            "status": "enqueued",
+            "status": if queued_coalesced { "coalesced" } else { "enqueued" },
             "job_kind": "gates",
             "job_id": queued_job_id,
             "queue_lane": queued_lane,
             "policy_hash": &prepared.policy_hash,
             "head_sha": queued_head_sha,
+            "coalesced_with_existing": queued_coalesced,
             "worker_bootstrapped": queued_bootstrapped,
             "options": &prepared.options,
+            "queue_snapshot": queue_snapshot,
+            "throughput_mode": "single_flight_max_compute",
         });
         println!(
             "{}",
@@ -567,8 +740,13 @@ fn run_gates_via_worker(
                 .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
         );
     } else {
+        let action = if queued_coalesced {
+            "coalesced with queued worker job"
+        } else {
+            "enqueued worker job"
+        };
         eprintln!(
-            "fac gates: enqueued worker job {job_id} lane={} head_sha={}{}",
+            "fac gates: {action} {job_id} lane={} head_sha={}{}",
             queued_lane,
             queued_head_sha,
             if queued_bootstrapped {
@@ -578,6 +756,21 @@ fn run_gates_via_worker(
             },
             job_id = queued_job_id,
         );
+        if let Some(snapshot) = queue_snapshot.as_ref() {
+            let ahead = snapshot
+                .ahead_of_job
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string());
+            eprintln!(
+                "fac gates: queue snapshot state={} ahead={} pending_gates={} claimed_gates={}",
+                snapshot.job_state, ahead, snapshot.pending_gates, snapshot.claimed_gates
+            );
+        }
+        if wait {
+            eprintln!(
+                "fac gates: execution mode is single-flight max-compute \
+                 (one full gates job gets the host at a time per VPS)."
+            );
+        }
     }
 
     if wait {
@@ -626,6 +819,69 @@ fn output_worker_enqueue_error(json_output: bool, message: &str, code: u8) -> u8
         eprintln!("ERROR: {message}");
     }
     code
+}
+
+fn collect_gates_queue_snapshot(
+    queue_root: &Path,
+    job_id: &str,
+) -> Result<GatesQueueSnapshot, String> {
+    let pending_specs =
+        collect_gates_specs_in_queue_dir(&queue_root.join(GATES_QUEUE_PENDING_DIR))?;
+    let claimed_specs =
+        collect_gates_specs_in_queue_dir(&queue_root.join(GATES_QUEUE_CLAIMED_DIR))?;
+
+    let mut snapshot = GatesQueueSnapshot {
+        pending_gates: pending_specs.len(),
+        claimed_gates: claimed_specs.len(),
+        ahead_of_job: None,
+        job_state: "missing".to_string(),
+    };
+
+    if let Some(position) = claimed_specs.iter().position(|spec| spec.job_id == job_id) {
+        snapshot.ahead_of_job = Some(position);
+        snapshot.job_state = "claimed".to_string();
+        return Ok(snapshot);
+    }
+    if let Some(position) = pending_specs.iter().position(|spec| spec.job_id == job_id) {
+        snapshot.ahead_of_job = Some(claimed_specs.len().saturating_add(position));
+        snapshot.job_state = "pending".to_string();
+        return Ok(snapshot);
+    }
+
+    Ok(snapshot)
+}
+
+fn collect_gates_specs_in_queue_dir(dir: &Path) -> Result<Vec<FacJobSpecV1>, String> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut specs = Vec::new();
+    let entries = fs::read_dir(dir)
+        .map_err(|err| format!("cannot read queue directory {}: {err}", dir.display()))?;
+    for (idx, entry) in entries.enumerate() {
+        if idx >= MAX_SCAN_ENTRIES {
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(spec) = read_job_spec_bounded(&path) else {
+            continue;
+        };
+        if spec.kind == "gates" && spec.queue_lane == GATES_QUEUE_LANE {
+            specs.push(spec);
+        }
+    }
+    specs.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.enqueue_time.cmp(&right.enqueue_time))
+            .then_with(|| left.job_id.cmp(&right.job_id))
+    });
+    Ok(specs)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -786,12 +1042,14 @@ fn detect_queue_processing_mode(fac_root: &Path) -> QueueProcessingMode {
 
 fn has_live_worker_heartbeat(fac_root: &Path) -> bool {
     let heartbeat = apm2_core::fac::worker_heartbeat::read_heartbeat(fac_root);
-    if !heartbeat.found || !heartbeat.fresh || heartbeat.pid == 0 {
+    if !heartbeat.found || heartbeat.pid == 0 {
         return false;
     }
     if heartbeat.pid == std::process::id() {
         return false;
     }
+    // Treat a running worker process as live even if the heartbeat timestamp
+    // is stale. Long-running jobs can delay cycle-level heartbeat refresh.
     is_pid_running(heartbeat.pid)
 }
 
@@ -1668,6 +1926,64 @@ mod tests {
         }
     }
 
+    fn sample_gates_options() -> GatesJobOptionsV1 {
+        let workspace = std::env::current_dir().expect("workspace root");
+        GatesJobOptionsV1::new(
+            false,
+            false,
+            60,
+            "256M",
+            128,
+            "200%",
+            GateThroughputProfile::Balanced.as_str(),
+            &workspace,
+        )
+    }
+
+    fn sample_gates_spec(
+        job_id: &str,
+        repo_id: &str,
+        head_sha: &str,
+        enqueue_time: &str,
+        options: &GatesJobOptionsV1,
+    ) -> FacJobSpecV1 {
+        FacJobSpecV1 {
+            schema: apm2_core::fac::job_spec::JOB_SPEC_SCHEMA_ID.to_string(),
+            job_id: job_id.to_string(),
+            job_spec_digest: String::new(),
+            kind: "gates".to_string(),
+            queue_lane: GATES_QUEUE_LANE.to_string(),
+            priority: 40,
+            enqueue_time: enqueue_time.to_string(),
+            actuation: Actuation {
+                lease_id: format!("lease-{job_id}"),
+                request_id: String::new(),
+                channel_context_token: None,
+                decoded_source: Some("fac_gates_worker".to_string()),
+            },
+            source: JobSource {
+                kind: "mirror_commit".to_string(),
+                repo_id: repo_id.to_string(),
+                head_sha: head_sha.to_string(),
+                patch: Some(serde_json::to_value(options).expect("serialize options")),
+            },
+            lane_requirements: LaneRequirements {
+                lane_profile_hash: None,
+            },
+            constraints: JobConstraints {
+                require_nextest: !options.quick,
+                test_timeout_seconds: Some(options.timeout_seconds),
+                memory_max_bytes: Some(256 * 1024 * 1024),
+            },
+            cancel_target_job_id: None,
+        }
+    }
+
+    fn write_queue_spec(path: &Path, spec: &FacJobSpecV1) {
+        let body = serde_json::to_vec_pretty(spec).expect("serialize spec");
+        fs::write(path, body).expect("write spec");
+    }
+
     #[test]
     fn gate_execution_profile_resolves_auto_quota_from_profile() {
         let (profile, effective_quota) =
@@ -1723,6 +2039,195 @@ mod tests {
         let err = run_queued_gates_and_collect(&request)
             .expect_err("quick mode must be rejected for queue collection");
         assert!(err.contains("quick=false"));
+    }
+
+    #[test]
+    fn find_coalescible_gates_job_returns_matching_pending_job() {
+        with_test_apm2_home(|apm2_home| {
+            let queue_root = apm2_home.join("queue");
+            fs::create_dir_all(queue_root.join("pending")).expect("create pending");
+            let options = sample_gates_options();
+            let repo_id = "guardian-intelligence/apm2";
+            let head_sha = "a".repeat(40);
+            let spec = sample_gates_spec(
+                "gates-existing-pending",
+                repo_id,
+                &head_sha,
+                "2026-02-18T01:00:00Z",
+                &options,
+            );
+            write_queue_spec(
+                &queue_root
+                    .join("pending")
+                    .join("gates-existing-pending.json"),
+                &spec,
+            );
+
+            let found =
+                find_coalescible_gates_job(&queue_root, repo_id, &head_sha, &options, false)
+                    .expect("scan")
+                    .expect("matching spec");
+            assert_eq!(found.job_id, "gates-existing-pending");
+        });
+    }
+
+    #[test]
+    fn find_coalescible_gates_job_rejects_option_mismatch() {
+        with_test_apm2_home(|apm2_home| {
+            let queue_root = apm2_home.join("queue");
+            fs::create_dir_all(queue_root.join("pending")).expect("create pending");
+            let repo_id = "guardian-intelligence/apm2";
+            let head_sha = "b".repeat(40);
+
+            let expected_options = sample_gates_options();
+            let mut mismatched_options = sample_gates_options();
+            mismatched_options.cpu_quota = "300%".to_string();
+
+            let spec = sample_gates_spec(
+                "gates-option-mismatch",
+                repo_id,
+                &head_sha,
+                "2026-02-18T01:00:01Z",
+                &mismatched_options,
+            );
+            write_queue_spec(
+                &queue_root
+                    .join("pending")
+                    .join("gates-option-mismatch.json"),
+                &spec,
+            );
+
+            let found = find_coalescible_gates_job(
+                &queue_root,
+                repo_id,
+                &head_sha,
+                &expected_options,
+                false,
+            )
+            .expect("scan result");
+            assert!(found.is_none(), "mismatched options must not coalesce");
+        });
+    }
+
+    #[test]
+    fn find_coalescible_gates_job_ignores_claimed_without_live_worker() {
+        with_test_apm2_home(|apm2_home| {
+            let queue_root = apm2_home.join("queue");
+            fs::create_dir_all(queue_root.join("claimed")).expect("create claimed");
+            let options = sample_gates_options();
+            let repo_id = "guardian-intelligence/apm2";
+            let head_sha = "c".repeat(40);
+
+            let claimed = sample_gates_spec(
+                "gates-claimed-only",
+                repo_id,
+                &head_sha,
+                "2026-02-18T01:00:00Z",
+                &options,
+            );
+            write_queue_spec(
+                &queue_root.join("claimed").join("gates-claimed-only.json"),
+                &claimed,
+            );
+
+            let found =
+                find_coalescible_gates_job(&queue_root, repo_id, &head_sha, &options, false)
+                    .expect("scan");
+            assert!(
+                found.is_none(),
+                "claimed entries must be ignored without live worker heartbeat"
+            );
+        });
+    }
+
+    #[test]
+    fn find_coalescible_gates_job_prefers_oldest_enqueue_time() {
+        with_test_apm2_home(|apm2_home| {
+            let queue_root = apm2_home.join("queue");
+            fs::create_dir_all(queue_root.join("pending")).expect("create pending");
+            fs::create_dir_all(queue_root.join("claimed")).expect("create claimed");
+            let options = sample_gates_options();
+            let repo_id = "guardian-intelligence/apm2";
+            let head_sha = "c".repeat(40);
+
+            let newer = sample_gates_spec(
+                "gates-newer",
+                repo_id,
+                &head_sha,
+                "2026-02-18T02:00:00Z",
+                &options,
+            );
+            write_queue_spec(&queue_root.join("pending").join("gates-newer.json"), &newer);
+
+            let older = sample_gates_spec(
+                "gates-older",
+                repo_id,
+                &head_sha,
+                "2026-02-18T01:00:00Z",
+                &options,
+            );
+            write_queue_spec(&queue_root.join("claimed").join("gates-older.json"), &older);
+
+            let found = find_coalescible_gates_job(&queue_root, repo_id, &head_sha, &options, true)
+                .expect("scan")
+                .expect("matching spec");
+            assert_eq!(found.job_id, "gates-older");
+        });
+    }
+
+    #[test]
+    fn collect_gates_queue_snapshot_reports_pending_position() {
+        with_test_apm2_home(|apm2_home| {
+            let queue_root = apm2_home.join("queue");
+            fs::create_dir_all(queue_root.join("pending")).expect("create pending");
+            fs::create_dir_all(queue_root.join("claimed")).expect("create claimed");
+
+            let options = sample_gates_options();
+            let repo_id = "guardian-intelligence/apm2";
+            let head_sha = "e".repeat(40);
+
+            let claimed = sample_gates_spec(
+                "gates-running",
+                repo_id,
+                &head_sha,
+                "2026-02-18T01:00:00Z",
+                &options,
+            );
+            let pending_target = sample_gates_spec(
+                "gates-target",
+                repo_id,
+                &head_sha,
+                "2026-02-18T01:00:02Z",
+                &options,
+            );
+            let pending_other = sample_gates_spec(
+                "gates-ahead",
+                repo_id,
+                &head_sha,
+                "2026-02-18T01:00:01Z",
+                &options,
+            );
+
+            write_queue_spec(
+                &queue_root.join("claimed").join("gates-running.json"),
+                &claimed,
+            );
+            write_queue_spec(
+                &queue_root.join("pending").join("gates-target.json"),
+                &pending_target,
+            );
+            write_queue_spec(
+                &queue_root.join("pending").join("gates-ahead.json"),
+                &pending_other,
+            );
+
+            let snapshot =
+                collect_gates_queue_snapshot(&queue_root, "gates-target").expect("snapshot");
+            assert_eq!(snapshot.claimed_gates, 1);
+            assert_eq!(snapshot.pending_gates, 2);
+            assert_eq!(snapshot.ahead_of_job, Some(2));
+            assert_eq!(snapshot.job_state, "pending");
+        });
     }
 
     #[test]
@@ -1931,6 +2436,42 @@ mod tests {
             "jobs_denied": 0,
             "jobs_quarantined": 0,
             "health_status": "healthy",
+        });
+        fs::write(
+            temp.path()
+                .join(apm2_core::fac::worker_heartbeat::HEARTBEAT_FILENAME),
+            serde_json::to_vec_pretty(&heartbeat).expect("serialize heartbeat"),
+        )
+        .expect("write heartbeat");
+
+        assert!(has_live_worker_heartbeat(temp.path()));
+        assert_eq!(
+            detect_queue_processing_mode(temp.path()),
+            QueueProcessingMode::ExternalWorker
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn has_live_worker_heartbeat_accepts_stale_foreign_pid_if_process_exists() {
+        if !Path::new("/proc/1").is_dir() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let stale_epoch_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs()
+            .saturating_sub(apm2_core::fac::worker_heartbeat::MAX_HEARTBEAT_AGE_SECS + 30);
+        let heartbeat = serde_json::json!({
+            "schema": apm2_core::fac::worker_heartbeat::HEARTBEAT_SCHEMA,
+            "pid": 1_u32,
+            "timestamp_epoch_secs": stale_epoch_secs,
+            "cycle_count": 7,
+            "jobs_completed": 3,
+            "jobs_denied": 0,
+            "jobs_quarantined": 0,
+            "health_status": "stale",
         });
         fs::write(
             temp.path()

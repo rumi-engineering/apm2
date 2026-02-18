@@ -222,6 +222,7 @@ const DEFAULT_GATES_PIDS_MAX: u64 = 1536;
 const DEFAULT_GATES_CPU_QUOTA: &str = "auto";
 const UNKNOWN_REPO_SEGMENT: &str = "unknown";
 const ALLOWED_WORKSPACE_ROOTS_ENV: &str = "APM2_FAC_ALLOWED_WORKSPACE_ROOTS";
+const GATES_HEARTBEAT_REFRESH_SECS: u64 = 5;
 
 #[cfg(test)]
 pub fn env_var_test_lock() -> &'static std::sync::Mutex<()> {
@@ -1604,8 +1605,44 @@ fn resolve_workspace_head(workspace_root: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn run_gates_in_workspace(options: &GatesJobOptions) -> Result<u8, String> {
-    fac_review_api::run_gates_local_worker(
+#[allow(clippy::too_many_arguments)]
+fn run_gates_in_workspace(
+    options: &GatesJobOptions,
+    fac_root: &Path,
+    heartbeat_cycle_count: u64,
+    heartbeat_jobs_completed: u64,
+    heartbeat_jobs_denied: u64,
+    heartbeat_jobs_quarantined: u64,
+    heartbeat_job_id: &str,
+) -> Result<u8, String> {
+    let stop_refresh = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_refresh_bg = std::sync::Arc::clone(&stop_refresh);
+    let heartbeat_fac_root = fac_root.to_path_buf();
+    let heartbeat_job_id = heartbeat_job_id.to_string();
+    let heartbeat_handle = std::thread::spawn(move || {
+        while !stop_refresh_bg.load(std::sync::atomic::Ordering::Acquire) {
+            if let Err(error) = apm2_core::fac::worker_heartbeat::write_heartbeat(
+                &heartbeat_fac_root,
+                heartbeat_cycle_count,
+                heartbeat_jobs_completed,
+                heartbeat_jobs_denied,
+                heartbeat_jobs_quarantined,
+                "healthy",
+            ) {
+                eprintln!(
+                    "worker: WARNING: heartbeat refresh failed during gates job {heartbeat_job_id}: {error}"
+                );
+            }
+            for _ in 0..(GATES_HEARTBEAT_REFRESH_SECS * 10) {
+                if stop_refresh_bg.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    });
+
+    let run_result = fac_review_api::run_gates_local_worker(
         options.force,
         options.quick,
         options.timeout_seconds,
@@ -1615,7 +1652,11 @@ fn run_gates_in_workspace(options: &GatesJobOptions) -> Result<u8, String> {
         options.gate_profile,
         &options.workspace_root,
         options.allow_legacy_cache,
-    )
+    );
+
+    stop_refresh.store(true, std::sync::atomic::Ordering::Release);
+    let _ = heartbeat_handle.join();
+    run_result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1632,6 +1673,10 @@ fn execute_queued_gates_job(
     policy_hash: &str,
     sbx_hash: &str,
     net_hash: &str,
+    heartbeat_cycle_count: u64,
+    heartbeat_jobs_completed: u64,
+    heartbeat_jobs_denied: u64,
+    heartbeat_jobs_quarantined: u64,
 ) -> JobOutcome {
     let job_wall_start = Instant::now();
     let options = match parse_gates_job_options(spec) {
@@ -1749,7 +1794,15 @@ fn execute_queued_gates_job(
         return JobOutcome::Denied { reason };
     }
 
-    let exit_code = match run_gates_in_workspace(&options) {
+    let exit_code = match run_gates_in_workspace(
+        &options,
+        fac_root,
+        heartbeat_cycle_count,
+        heartbeat_jobs_completed,
+        heartbeat_jobs_denied,
+        heartbeat_jobs_quarantined,
+        &spec.job_id,
+    ) {
         Ok(code) => code,
         Err(err) => {
             let reason = format!("failed to execute gates in workspace: {err}");
@@ -3316,6 +3369,10 @@ fn process_job(
             policy_hash,
             &sbx_hash,
             &resolved_net_hash,
+            heartbeat_cycle_count,
+            heartbeat_jobs_completed,
+            heartbeat_jobs_denied,
+            heartbeat_jobs_quarantined,
         );
     }
 
@@ -7771,6 +7828,10 @@ mod tests {
             &spec.job_spec_digest,
             &hardening_hash,
             &apm2_core::fac::NetworkPolicy::deny().content_hash_hex(),
+            1,
+            0,
+            0,
+            0,
         );
         assert!(
             matches!(outcome, JobOutcome::Denied { .. }),

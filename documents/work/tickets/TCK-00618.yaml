@@ -1,0 +1,279 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00618"
+    title: "Fix: lifecycle stuck at gates_failed after gate retry succeeds; fix duplicate verdict comments on second reviewer completion"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_SECURITY", "DOMAIN_CI"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00617"
+        reason: "Merge path hardening; related lifecycle and projection infrastructure."
+
+root_cause_analysis:
+  summary: |
+    Two compounding bugs observed across PR 739 and PR 740, both introduced
+    recently and both serious enough to block local merges and corrupt the
+    audit trail.
+
+    BUG 1: Lifecycle state machine stuck at `gates_failed` after gate retry
+      Location: push.rs (worker retry path), lifecycle.rs (apply_event)
+      Observed: PR 740 doctor shows lifecycle.state="gates_failed",
+        updated_at="2026-02-18T04:54:41Z". All gate results show
+        completed_at="2026-02-18T04:58:44Z" with status PASS. The lifecycle
+        event log's last_event_seq=18 with no GatesStarted/GatesPassed events
+        recorded after the GatesFailed. The local merge never triggered.
+      Cause: When the FAC worker retries gates after a failure, the gate
+        results and PR body gate-status block are updated successfully, but
+        the lifecycle state machine does not receive the required
+        GatesStarted event before GatesPassed. The transition
+        `gates_failed + gates_passed` is an illegal transition in the
+        state machine (lifecycle.rs:3736-3739); it returns an error that
+        is silently swallowed (WARNING log, not a fail-closed abort).
+        The lifecycle therefore remains at `gates_failed` indefinitely.
+        The gate store (save_gates_admission) and PR body are updated by
+        the gate runner independently of the lifecycle state machine, which
+        is why gates show PASS everywhere except the lifecycle. The merge
+        trigger (maybe_auto_merge_if_ready) reads lifecycle state, so it
+        never fires.
+      Evidence: push.rs:1933-1964 (success path) emits PushObserved →
+        GatesStarted → GatesPassed in sequence. The worker retry path
+        must be omitting PushObserved or GatesStarted, landing directly
+        on GatesPassed from gates_failed which is illegal.
+
+    BUG 2: Second reviewer creates a new verdict comment instead of
+      editing the first reviewer's comment
+      Location: verdict_projection.rs:689-733 (project_decision_comment),
+        verdict_projection.rs:535-563 (record initialization)
+      Observed: PR 740 GitHub issue comments show three comments:
+        - #3918509559 (old SHA 9a1b7dc6, both s1 reviewers correctly shared)
+        - #3918628330 (new SHA eb5992f7, created by security reviewer s2)
+        - #3918654234 (new SHA eb5992f7, created by quality reviewer s2)
+        The two comments on eb5992f7 are identical in structure but posted
+        separately. The s1 pair correctly shared one comment.
+      Cause: When the first reviewer (security) completes, it finds no
+        existing projection record for SHA eb5992f7, creates a new record
+        with a local placeholder comment ID, then calls
+        project_decision_comment. Inside project_decision_comment, since
+        decision_comment_url is empty for a newly created record, it
+        resolves to `local://fac_projection/...`. This means
+        can_patch_existing=false (line 711: URL must start with
+        "https://github.com/"), so create_issue_comment is called and
+        returns the real GitHub comment ID 3918628330. The record is then
+        saved with decision_comment_id=3918628330 and
+        decision_comment_url="https://github.com/...".
+        When the second reviewer (quality) calls the same function, it
+        SHOULD load the existing record via load_decision_projection_for_home
+        and find decision_comment_url populated. However, quality instead
+        creates comment #3918654234, implying it did not find the saved
+        record. The most likely cause is that quality's
+        load_decision_projection_for_home call either:
+          (a) Raced with security's save (projection_lock scope too narrow),
+              so quality saw no record and created a fresh one; or
+          (b) The quality reviewer's verdict_projection call was initiated
+              during a model-fallback restart (restart_count=3 observed),
+              and an earlier write from a failed restart left the record in
+              an inconsistent state (e.g., decision_comment_url empty or
+              pointing to a local:// URL), causing can_patch_existing=false
+              on the final attempt, which then fell through to create.
+        In either case the fallback `create_issue_comment` (line 723) fires
+        unconditionally when can_patch_existing is false or when
+        update_issue_comment returns an error, creating a duplicate comment
+        with no mechanism to reconcile or tombstone the orphaned one.
+
+scope:
+  in_scope:
+    - id: "S1_FIX_LIFECYCLE_GATE_RETRY"
+      title: "Ensure gate retry path emits GatesStarted before GatesPassed"
+      detail: |
+        In the worker retry path for failed gates, emit lifecycle events in
+        the correct order:
+          PushObserved → GatesStarted → (gate run) → GatesPassed or GatesFailed
+        PushObserved must fire before GatesStarted so the state machine
+        transitions: gates_failed → pushed → gates_running → gates_passed.
+        Skipping PushObserved leaves the state at gates_failed; then
+        GatesStarted (gates_failed + gates_started → gates_running) will
+        succeed, but if even GatesStarted is missing the illegal transition
+        GatesPassed from gates_failed will be silently ignored.
+        Audit all code paths that run gates and emit lifecycle events to
+        confirm the canonical PushObserved → GatesStarted → GatesPassed/
+        GatesFailed ordering is always preserved.
+
+    - id: "S2_FAIL_CLOSED_LIFECYCLE_ILLEGAL_TRANSITION"
+      title: "Fail closed (not WARNING) on illegal lifecycle transitions in push path"
+      detail: |
+        In push.rs:1682-1701 (failure path) and analogous worker paths,
+        illegal lifecycle transitions currently emit WARNING and continue.
+        This masks bugs like the gates_failed stuck state for an unbounded
+        time. The push/worker should fail-closed on lifecycle event
+        application errors, not swallow them. At minimum, any illegal
+        transition on GatesStarted or GatesPassed must be treated as a
+        hard error that surfaces in the push attempt receipt and triggers
+        the error budget / retry logic.
+
+    - id: "S3_FIX_DUPLICATE_VERDICT_COMMENT"
+      title: "Fix project_decision_comment to always patch existing comment"
+      detail: |
+        In verdict_projection.rs:project_decision_comment (lines 689-733):
+        The can_patch_existing guard (line 711) requires
+        decision_comment_url to start with "https://github.com/". For
+        newly created records, decision_comment_url is always empty,
+        forcing create_issue_comment even when a sibling reviewer has
+        already posted a comment for this SHA.
+        Fix: after loading or creating the projection record, if
+        decision_comment_id > 0 and decision_comment_url is empty or
+        local://, attempt to resolve the real GitHub comment URL from the
+        GitHub API (GET /repos/{owner}/{repo}/issues/comments/{id}) before
+        falling back to create. If the comment exists on GitHub, patch it;
+        only create a new comment if no real GitHub comment exists for
+        this SHA.
+        Additionally, hold the projection_lock for the full duration of
+        the record-load → comment-post → record-save cycle to prevent
+        races between concurrent reviewer completions.
+
+    - id: "S4_LOCK_SCOPE_PROJECTION_WRITE"
+      title: "Hold projection lock across load → post → save cycle"
+      detail: |
+        The _projection_lock (verdict_projection.rs:533) is currently
+        acquired before load_decision_projection_for_home but may be
+        released before project_decision_comment returns and the record
+        is saved. This creates a window where two concurrent reviewers
+        each see no existing record, each call create_issue_comment, and
+        each save a different comment ID into the record (last writer wins,
+        first comment orphaned).
+        Ensure the lock is held across: load → upsert dimension → sign
+        → post comment → save record. The lock must be exclusive per-PR
+        (not per-dimension) so security and quality cannot interleave.
+
+    - id: "S5_TOMBSTONE_ORPHANED_COMMENTS"
+      title: "Detect and tombstone orphaned verdict comments"
+      detail: |
+        When a second comment is erroneously created for a SHA that already
+        has a verdict comment, the first comment becomes orphaned (it will
+        not receive future dimension updates). Add a check on
+        project_decision_comment: if create_issue_comment is called and
+        succeeds, compare the returned comment ID against any existing
+        known comment ID for this PR. If they differ, edit the older
+        comment with a tombstone body ("superseded by #NEW_ID") to prevent
+        reviewers reading two conflicting verdict blocks.
+
+    - id: "S6_REGRESSION_TESTS"
+      title: "Regression tests"
+      detail: |
+        - Test: after gate retry succeeds (GatesFailed → worker re-run →
+          all gates pass), lifecycle.state advances to gates_passed and
+          then to a merge-ready state, not stuck at gates_failed.
+        - Test: concurrent security + quality reviewer completions for the
+          same SHA produce exactly one GitHub issue comment, not two.
+        - Test: if update_issue_comment fails (mock GitHub error), the
+          comment URL is resolved via GET before falling back to create.
+        - Test: illegal lifecycle transition in gate success path is a
+          hard error, not a WARNING.
+
+  out_of_scope:
+    - "Quality reviewer model-fallback loop (stall_detected cycling through
+      models); that is a separate liveness/nudge issue."
+    - "Unifying the CLI merge path with the daemon MergeExecutor (TCK-00617)."
+    - "Distributed or multi-repo verdict comment coordination."
+
+plan:
+  steps:
+    - id: "STEP_01"
+      title: "Audit all gate-run code paths for lifecycle event ordering"
+      detail: |
+        Search push.rs and fac_worker.rs for every site that runs gates
+        and emits lifecycle events. For each: confirm PushObserved →
+        GatesStarted → (run) → GatesPassed/GatesFailed ordering.
+        Identify the worker retry path that is missing PushObserved or
+        GatesStarted.
+    - id: "STEP_02"
+      title: "Fix gate retry lifecycle event sequence"
+      detail: |
+        In the worker retry gate path: emit PushObserved before
+        GatesStarted. Gate the GatesPassed emission behind GatesStarted
+        succeeding (not WARNING). Add fail-closed error handling.
+    - id: "STEP_03"
+      title: "Fix illegal lifecycle transition handling"
+      detail: |
+        Change WARNING-and-continue on lifecycle apply_event errors in
+        the push/worker gate paths to hard errors that propagate to the
+        attempt receipt.
+    - id: "STEP_04"
+      title: "Fix projection lock scope in verdict_projection.rs"
+      detail: |
+        Widen the _projection_lock critical section to cover
+        load → upsert → post → save atomically.
+    - id: "STEP_05"
+      title: "Fix project_decision_comment URL resolution"
+      detail: |
+        Before can_patch_existing check: if decision_comment_id > 0 and
+        decision_comment_url is empty/local://, attempt GET of GitHub
+        comment to resolve real URL. Set can_patch_existing=true if
+        comment exists on GitHub.
+    - id: "STEP_06"
+      title: "Add orphaned comment tombstoning"
+      detail: |
+        After create_issue_comment succeeds: if returned ID != existing
+        projection comment ID (and existing ID > 0), patch the older
+        comment with a superseded-by tombstone body.
+    - id: "STEP_07"
+      title: "Add regression tests"
+      detail: |
+        Tests for: gate retry lifecycle progression, single verdict comment
+        on concurrent reviewer completion, URL resolution before fallback
+        create, illegal transition is hard error.
+    - id: "STEP_08"
+      title: "Run full workspace validation"
+      detail: |
+        cargo fmt --all
+        cargo clippy --workspace --all-targets --all-features -- -D warnings
+        cargo doc --workspace --no-deps
+        cargo test --workspace
+
+definition_of_done:
+  evidence_ids:
+    - "EXEC-TCK00618-LIFECYCLE-GATE-RETRY"
+    - "EXEC-TCK00618-SINGLE-VERDICT-COMMENT"
+    - "EXEC-TCK00618-WORKSPACE-VALIDATION"
+  criteria:
+    - "After a gate failure and successful retry, lifecycle.state advances
+      past gates_failed to gates_passed (and onward to merge_ready if
+      verdicts approve). The stuck-at-gates_failed state is unreachable
+      after a recovered gate run."
+    - "Concurrent security and quality reviewer completions for the same
+      SHA produce exactly one GitHub issue comment, with both dimensions
+      present in the verdict block."
+    - "Illegal lifecycle transition on GatesStarted or GatesPassed in the
+      push/worker path is a hard error surfaced in the attempt receipt,
+      not a swallowed WARNING."
+    - "The projection lock covers the full load → post → save cycle,
+      preventing concurrent-reviewer split-brain on comment ID."
+    - "If a duplicate comment is created despite the above, the older
+      comment receives a tombstone body pointing to the newer comment."
+    - "All regression tests pass."
+    - "Workspace validation (fmt, clippy, doc, test) completes successfully."
+
+notes:
+  context: |
+    Both bugs were observed live on PR 740 (TCK-00567, SHA eb5992f7):
+    - lifecycle.state stuck at gates_failed (updated_at 2026-02-18T04:54:41Z)
+      while all gate results show PASS at 2026-02-18T04:58:44Z.
+      Local merge did not trigger. TCK-00567 commits are on the feature
+      branch only, not on local main.
+    - GitHub issue comments #3918628330 (security s2, 04:57:44) and
+      #3918654234 (quality s2, 05:01:04) are two separate comments on
+      SHA eb5992f7, each containing only one reviewer's verdict.
+      The s1 pair on old SHA 9a1b7dc6 correctly shared comment #3918509559.
+    The gate retry lifecycle bug is the more critical of the two: it
+    silently prevents all local merges whenever any gate fails and retries.
+    The duplicate comment bug corrupts the review audit trail and can cause
+    the orchestrator to read an incomplete verdict block.
+  security: "default-deny, fail-closed on lifecycle transition errors"
