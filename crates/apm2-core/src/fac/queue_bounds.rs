@@ -28,26 +28,33 @@
 //!   bytes (conservative: may under-count bytes but never under-count jobs).
 //! - A `max_pending_jobs` or `max_pending_bytes` of `0` means the dimension is
 //!   disabled (all enqueue attempts denied).
+//! - If the scan is truncated at `MAX_SCAN_ENTRIES`, the check **denies**
+//!   (fail-closed) because a partial count cannot safely approve enqueue.
 //!
 //! # Thread Safety
 //!
-//! The check is a point-in-time filesystem scan. Concurrent enqueue
-//! callers may race, but since each caller independently checks and
-//! writes atomically (temp+rename), the worst case is a brief transient
-//! where the count slightly exceeds the cap. This is acceptable for a
-//! local single-process broker; distributed enforcement is out of scope.
+//! ACKNOWLEDGED TOCTOU (RSK-1501): The check is a point-in-time filesystem
+//! scan. The check and subsequent write are not atomic. In the current
+//! single-process broker architecture, only one `enqueue_job` call is active
+//! at a time, so the race window is limited to external filesystem mutations.
+//! Concurrent enqueue from separate processes could briefly exceed the cap
+//! by a small margin. A file lock is out of scope per TCK-00578; the
+//! single-process mitigation is sufficient for the local broker context.
 //!
 //! # Security Invariants
 //!
 //! - [INV-QB-001] Fail-closed: unreadable pending directory denies all enqueue
 //!   attempts.
 //! - [INV-QB-002] Directory scan is bounded by `MAX_SCAN_ENTRIES` to prevent
-//!   DoS from a directory with millions of entries.
+//!   DoS from a directory with millions of entries. Truncated scans are
+//!   treated as fail-closed denials.
 //! - [INV-QB-003] Denial receipts include the exceeded dimension, current
 //!   usage, limit, and stable reason code for audit.
 //! - [INV-QB-004] Arithmetic uses `checked_add`; overflow returns Err.
 //! - [INV-QB-005] Symlinks in pending directory are skipped (not counted) to
 //!   prevent inflation attacks.
+//! - [INV-QB-006] `pending_dir` is verified not to be a symlink before
+//!   scanning, preventing DoS via symlink-swapped queue directories.
 
 use std::path::Path;
 
@@ -79,6 +86,12 @@ pub const DENY_REASON_QUEUE_QUOTA_EXCEEDED: &str = "queue/quota_exceeded";
 
 /// Maximum length for denial reason strings.
 const MAX_DENIAL_REASON_LENGTH: usize = 256;
+
+/// Maximum filename byte length before conversion to String.
+///
+/// Bounds memory allocation per entry during scan, preventing `DoS`
+/// via maliciously crafted long filenames (security NIT).
+const MAX_FILENAME_BYTES: usize = 4096;
 
 // ============================================================================
 // Errors
@@ -192,6 +205,8 @@ pub struct PendingQueueSnapshot {
     pub job_count: u64,
     /// Total bytes of regular files in `queue/pending/`.
     pub total_bytes: u64,
+    /// Whether the scan was truncated at `MAX_SCAN_ENTRIES`.
+    pub truncated: bool,
 }
 
 // ============================================================================
@@ -206,6 +221,9 @@ pub enum QueueBoundsDimension {
     PendingJobs,
     /// Pending bytes exceeded.
     PendingBytes,
+    /// Directory scan was truncated at `MAX_SCAN_ENTRIES`; fail-closed
+    /// because partial counts cannot safely approve enqueue.
+    ScanTruncated,
 }
 
 /// Structured denial receipt for queue bounds violations.
@@ -250,105 +268,181 @@ pub fn check_queue_bounds(
     proposed_bytes: u64,
     policy: &QueueBoundsPolicy,
 ) -> Result<PendingQueueSnapshot, QueueBoundsError> {
+    // ACKNOWLEDGED TOCTOU (RSK-1501): The filesystem scan and the subsequent
+    // file write (by the caller) are not atomic. In the current single-process
+    // broker architecture, only one `enqueue_job` call is active at a time,
+    // so the race window is limited to external filesystem mutations.
+    // Concurrent enqueue from separate processes could briefly exceed the cap
+    // by a small margin. A file lock is out of scope per TCK-00578; the
+    // single-process mitigation is sufficient for the local broker context.
+
     // Fail-closed: zero limits deny everything (INV-QB-001).
-    if policy.max_pending_jobs == 0 {
-        return Err(QueueBoundsError::QueueBoundsExceeded {
-            reason: DENY_REASON_QUEUE_QUOTA_EXCEEDED.to_string(),
-            receipt: QueueBoundsDenialReceipt {
-                dimension: QueueBoundsDimension::PendingJobs,
-                current_usage: 0,
-                limit: 0,
-                requested_increment: 1,
-                reason: truncate_reason(DENY_REASON_QUEUE_QUOTA_EXCEEDED),
-            },
-        });
-    }
-    if policy.max_pending_bytes == 0 {
-        return Err(QueueBoundsError::QueueBoundsExceeded {
-            reason: DENY_REASON_QUEUE_QUOTA_EXCEEDED.to_string(),
-            receipt: QueueBoundsDenialReceipt {
-                dimension: QueueBoundsDimension::PendingBytes,
-                current_usage: 0,
-                limit: 0,
-                requested_increment: proposed_bytes,
-                reason: truncate_reason(DENY_REASON_QUEUE_QUOTA_EXCEEDED),
-            },
-        });
-    }
+    check_zero_limits(policy, proposed_bytes)?;
 
     // If the directory does not exist, the queue is empty.
     if !pending_dir.exists() {
         return Ok(PendingQueueSnapshot {
             job_count: 0,
             total_bytes: 0,
+            truncated: false,
         });
     }
+
+    // [INV-QB-006] Reject symlinked pending_dir to prevent `DoS` via a
+    // symlink-swapped queue directory pointing at a large filesystem tree.
+    // Uses `symlink_metadata()` to detect symlinks without following them.
+    reject_symlink_pending_dir(pending_dir)?;
 
     let snapshot = scan_pending_dir(pending_dir)?;
 
-    // Check job count: snapshot.job_count + 1 > max_pending_jobs
-    let next_job_count =
-        snapshot
-            .job_count
-            .checked_add(1)
-            .ok_or_else(|| QueueBoundsError::QueueBoundsExceeded {
-                reason: DENY_REASON_QUEUE_QUOTA_EXCEEDED.to_string(),
-                receipt: QueueBoundsDenialReceipt {
-                    dimension: QueueBoundsDimension::PendingJobs,
-                    current_usage: snapshot.job_count,
-                    limit: policy.max_pending_jobs,
-                    requested_increment: 1,
-                    reason: truncate_reason("queue/quota_exceeded: job count overflow"),
-                },
-            })?;
-    if next_job_count > policy.max_pending_jobs {
-        return Err(QueueBoundsError::QueueBoundsExceeded {
-            reason: DENY_REASON_QUEUE_QUOTA_EXCEEDED.to_string(),
-            receipt: QueueBoundsDenialReceipt {
-                dimension: QueueBoundsDimension::PendingJobs,
-                current_usage: snapshot.job_count,
-                limit: policy.max_pending_jobs,
-                requested_increment: 1,
-                reason: truncate_reason(DENY_REASON_QUEUE_QUOTA_EXCEEDED),
-            },
-        });
+    // Fail-closed on truncated scan: a partial count that looks under-limit
+    // is not safe to approve. Treat truncation as a quota denial.
+    if snapshot.truncated {
+        return Err(quota_exceeded(
+            QueueBoundsDimension::ScanTruncated,
+            snapshot.job_count,
+            policy.max_pending_jobs,
+            1,
+            "queue/quota_exceeded: scan truncated at MAX_SCAN_ENTRIES; fail-closed",
+        ));
     }
 
-    // Check bytes: snapshot.total_bytes + proposed_bytes > max_pending_bytes
+    // Check job count and bytes against policy limits.
+    enforce_job_limit(&snapshot, policy)?;
+    enforce_byte_limit(&snapshot, proposed_bytes, policy)?;
+
+    Ok(snapshot)
+}
+
+/// Returns an error if either zero-limit dimension is configured.
+fn check_zero_limits(
+    policy: &QueueBoundsPolicy,
+    proposed_bytes: u64,
+) -> Result<(), QueueBoundsError> {
+    if policy.max_pending_jobs == 0 {
+        return Err(quota_exceeded(
+            QueueBoundsDimension::PendingJobs,
+            0,
+            0,
+            1,
+            DENY_REASON_QUEUE_QUOTA_EXCEEDED,
+        ));
+    }
+    if policy.max_pending_bytes == 0 {
+        return Err(quota_exceeded(
+            QueueBoundsDimension::PendingBytes,
+            0,
+            0,
+            proposed_bytes,
+            DENY_REASON_QUEUE_QUOTA_EXCEEDED,
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects a pending directory that is a symlink (INV-QB-006).
+fn reject_symlink_pending_dir(pending_dir: &Path) -> Result<(), QueueBoundsError> {
+    let dir_meta = pending_dir
+        .symlink_metadata()
+        .map_err(|e| QueueBoundsError::ScanFailed {
+            detail: format!(
+                "cannot stat pending directory {}: {e}",
+                pending_dir.display()
+            ),
+        })?;
+    if dir_meta.file_type().is_symlink() {
+        return Err(QueueBoundsError::ScanFailed {
+            detail: format!(
+                "pending directory {} is a symlink; refusing to scan (INV-QB-006)",
+                pending_dir.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Enforces the job count limit against the snapshot.
+fn enforce_job_limit(
+    snapshot: &PendingQueueSnapshot,
+    policy: &QueueBoundsPolicy,
+) -> Result<(), QueueBoundsError> {
+    let next_job_count = snapshot.job_count.checked_add(1).ok_or_else(|| {
+        quota_exceeded(
+            QueueBoundsDimension::PendingJobs,
+            snapshot.job_count,
+            policy.max_pending_jobs,
+            1,
+            "queue/quota_exceeded: job count overflow",
+        )
+    })?;
+    if next_job_count > policy.max_pending_jobs {
+        return Err(quota_exceeded(
+            QueueBoundsDimension::PendingJobs,
+            snapshot.job_count,
+            policy.max_pending_jobs,
+            1,
+            DENY_REASON_QUEUE_QUOTA_EXCEEDED,
+        ));
+    }
+    Ok(())
+}
+
+/// Enforces the byte limit against the snapshot.
+fn enforce_byte_limit(
+    snapshot: &PendingQueueSnapshot,
+    proposed_bytes: u64,
+    policy: &QueueBoundsPolicy,
+) -> Result<(), QueueBoundsError> {
     let next_bytes = snapshot
         .total_bytes
         .checked_add(proposed_bytes)
-        .ok_or_else(|| QueueBoundsError::QueueBoundsExceeded {
-            reason: DENY_REASON_QUEUE_QUOTA_EXCEEDED.to_string(),
-            receipt: QueueBoundsDenialReceipt {
-                dimension: QueueBoundsDimension::PendingBytes,
-                current_usage: snapshot.total_bytes,
-                limit: policy.max_pending_bytes,
-                requested_increment: proposed_bytes,
-                reason: truncate_reason("queue/quota_exceeded: byte count overflow"),
-            },
+        .ok_or_else(|| {
+            quota_exceeded(
+                QueueBoundsDimension::PendingBytes,
+                snapshot.total_bytes,
+                policy.max_pending_bytes,
+                proposed_bytes,
+                "queue/quota_exceeded: byte count overflow",
+            )
         })?;
     if next_bytes > policy.max_pending_bytes {
-        return Err(QueueBoundsError::QueueBoundsExceeded {
-            reason: DENY_REASON_QUEUE_QUOTA_EXCEEDED.to_string(),
-            receipt: QueueBoundsDenialReceipt {
-                dimension: QueueBoundsDimension::PendingBytes,
-                current_usage: snapshot.total_bytes,
-                limit: policy.max_pending_bytes,
-                requested_increment: proposed_bytes,
-                reason: truncate_reason(DENY_REASON_QUEUE_QUOTA_EXCEEDED),
-            },
-        });
+        return Err(quota_exceeded(
+            QueueBoundsDimension::PendingBytes,
+            snapshot.total_bytes,
+            policy.max_pending_bytes,
+            proposed_bytes,
+            DENY_REASON_QUEUE_QUOTA_EXCEEDED,
+        ));
     }
+    Ok(())
+}
 
-    Ok(snapshot)
+/// Constructs a `QueueBoundsExceeded` error with a denial receipt.
+fn quota_exceeded(
+    dimension: QueueBoundsDimension,
+    current_usage: u64,
+    limit: u64,
+    requested_increment: u64,
+    reason_str: &str,
+) -> QueueBoundsError {
+    QueueBoundsError::QueueBoundsExceeded {
+        reason: DENY_REASON_QUEUE_QUOTA_EXCEEDED.to_string(),
+        receipt: QueueBoundsDenialReceipt {
+            dimension,
+            current_usage,
+            limit,
+            requested_increment,
+            reason: truncate_reason(reason_str),
+        },
+    }
 }
 
 /// Scans the pending directory and returns a snapshot of current state.
 ///
 /// Only counts regular files (not symlinks, directories, or special
 /// files) per INV-QB-005. The scan is bounded by [`MAX_SCAN_ENTRIES`]
-/// per INV-QB-002.
+/// per INV-QB-002. When the scan cap is hit, `truncated` is set to `true`
+/// so the caller can apply fail-closed logic.
 fn scan_pending_dir(pending_dir: &Path) -> Result<PendingQueueSnapshot, QueueBoundsError> {
     let read_dir = std::fs::read_dir(pending_dir).map_err(|e| QueueBoundsError::ScanFailed {
         detail: format!(
@@ -359,16 +453,14 @@ fn scan_pending_dir(pending_dir: &Path) -> Result<PendingQueueSnapshot, QueueBou
 
     let mut job_count: u64 = 0;
     let mut total_bytes: u64 = 0;
+    let mut truncated = false;
 
     for (entries_scanned, entry_result) in read_dir.enumerate() {
         if entries_scanned >= MAX_SCAN_ENTRIES {
-            // Hit the scan cap -- report what we have so far.
-            // This is conservative: we stop counting, so the actual
-            // count may be higher. The check will still enforce
-            // bounds against the partial count, which may allow
-            // a few more jobs than the cap. This is acceptable
-            // because the scan cap itself (100K) far exceeds any
-            // reasonable max_pending_jobs setting.
+            // Hit the scan cap -- mark as truncated so the caller
+            // can apply fail-closed logic. A partial count that looks
+            // under-limit is not safe to approve.
+            truncated = true;
             break;
         }
 
@@ -378,6 +470,17 @@ fn scan_pending_dir(pending_dir: &Path) -> Result<PendingQueueSnapshot, QueueBou
             job_count = job_count.saturating_add(1);
             continue;
         };
+
+        // Check filename byte length before converting to String to
+        // bound memory allocation per entry (security NIT: prevents
+        // DoS via maliciously crafted long filenames).
+        let file_name = entry.file_name();
+        if file_name.len() > MAX_FILENAME_BYTES {
+            // Skip entries with excessively long filenames. Count as
+            // a job with 0 bytes (conservative for job count).
+            job_count = job_count.saturating_add(1);
+            continue;
+        }
 
         // Use symlink_metadata to detect symlinks without following them.
         let Ok(metadata) = entry.path().symlink_metadata() else {
@@ -392,7 +495,6 @@ fn scan_pending_dir(pending_dir: &Path) -> Result<PendingQueueSnapshot, QueueBou
         }
 
         // Skip hidden/temporary files (start with '.')
-        let file_name = entry.file_name();
         let name_str = file_name.to_string_lossy();
         if name_str.starts_with('.') {
             continue;
@@ -405,6 +507,7 @@ fn scan_pending_dir(pending_dir: &Path) -> Result<PendingQueueSnapshot, QueueBou
     Ok(PendingQueueSnapshot {
         job_count,
         total_bytes,
+        truncated,
     })
 }
 
@@ -779,6 +882,62 @@ mod tests {
             denied_count, 100,
             "all 100 excess enqueue attempts must be denied"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Symlink pending_dir rejection (INV-QB-006)
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_pending_dir_is_rejected() {
+        let policy = QueueBoundsPolicy {
+            max_pending_jobs: 100,
+            max_pending_bytes: 100_000,
+            per_lane_max_pending_jobs: None,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real_pending");
+        std::fs::create_dir_all(&real_dir).unwrap();
+
+        // Create a symlink to the real directory.
+        let symlink_dir = tmp.path().join("symlink_pending");
+        std::os::unix::fs::symlink(&real_dir, &symlink_dir).unwrap();
+
+        // Scanning the symlink must fail with ScanFailed.
+        let err = check_queue_bounds(&symlink_dir, 10, &policy).unwrap_err();
+        match err {
+            QueueBoundsError::ScanFailed { detail } => {
+                assert!(
+                    detail.contains("symlink"),
+                    "error must mention symlink, got: {detail}"
+                );
+            },
+            other => panic!("expected ScanFailed for symlinked dir, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Truncated scan fail-closed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scan_truncated_dimension_serializes_correctly() {
+        let receipt = QueueBoundsDenialReceipt {
+            dimension: QueueBoundsDimension::ScanTruncated,
+            current_usage: 100_000,
+            limit: 10_000,
+            requested_increment: 1,
+            reason: "queue/quota_exceeded: scan truncated at MAX_SCAN_ENTRIES; fail-closed"
+                .to_string(),
+        };
+        let json = serde_json::to_string(&receipt).expect("serialize");
+        assert!(
+            json.contains("scan_truncated"),
+            "ScanTruncated must serialize as 'scan_truncated', got: {json}"
+        );
+        let loaded: QueueBoundsDenialReceipt = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(receipt, loaded);
     }
 
     // -----------------------------------------------------------------------

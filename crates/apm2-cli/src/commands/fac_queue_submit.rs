@@ -11,7 +11,9 @@ use apm2_core::economics::queue_admission::HtfEvaluationWindow;
 use apm2_core::fac::broker::FacBroker;
 use apm2_core::fac::broker_health::WorkerHealthPolicy;
 use apm2_core::fac::job_spec::{FacJobSpecV1, MAX_JOB_SPEC_SIZE};
-use apm2_core::fac::queue_bounds::{QueueBoundsPolicy, check_queue_bounds};
+use apm2_core::fac::queue_bounds::{
+    QueueBoundsDenialReceipt, QueueBoundsError, QueueBoundsPolicy, check_queue_bounds,
+};
 use apm2_core::fac::{
     FacPolicyV1, MAX_POLICY_SIZE, compute_policy_hash, deserialize_policy, parse_policy_hash,
     persist_policy,
@@ -153,9 +155,21 @@ pub(super) fn load_or_init_policy(
 ///
 /// Enforces queue bounds (TCK-00578) before writing: the pending queue
 /// must not exceed `max_pending_jobs` or `max_pending_bytes` as
-/// configured by [`QueueBoundsPolicy`]. Excess enqueue attempts are
-/// denied with structured denial receipts.
-pub(super) fn enqueue_job(queue_root: &Path, spec: &FacJobSpecV1) -> Result<PathBuf, String> {
+/// configured by the provided [`QueueBoundsPolicy`]. Excess enqueue
+/// attempts are denied with structured denial receipts persisted to
+/// the `denied/` directory.
+///
+/// # Arguments
+///
+/// * `queue_root` - Path to the queue root directory.
+/// * `spec` - The job spec to enqueue.
+/// * `queue_bounds_policy` - The queue bounds policy loaded from FAC
+///   configuration. Must be pre-validated via `QueueBoundsPolicy::validate()`.
+pub(super) fn enqueue_job(
+    queue_root: &Path,
+    spec: &FacJobSpecV1,
+    queue_bounds_policy: &QueueBoundsPolicy,
+) -> Result<PathBuf, String> {
     let pending_dir = queue_root.join(PENDING_DIR);
     fs::create_dir_all(&pending_dir).map_err(|err| format!("create pending dir: {err}"))?;
 
@@ -173,12 +187,26 @@ pub(super) fn enqueue_job(queue_root: &Path, spec: &FacJobSpecV1) -> Result<Path
         ));
     }
 
-    // TCK-00578: Enforce queue bounds before writing the job spec.
-    // Uses default policy; future work may load from FAC config.
-    let policy = QueueBoundsPolicy::default();
+    // TCK-00578: Validate and enforce queue bounds before writing the job spec.
+    // Policy is loaded from the persisted FAC configuration by the caller.
+    queue_bounds_policy
+        .validate()
+        .map_err(|err| format!("queue bounds policy validation failed: {err}"))?;
+
     let proposed_bytes = json.len() as u64;
-    check_queue_bounds(&pending_dir, proposed_bytes, &policy)
-        .map_err(|err| format!("queue bounds check failed (queue/quota_exceeded): {err}"))?;
+    if let Err(err) = check_queue_bounds(&pending_dir, proposed_bytes, queue_bounds_policy) {
+        // Persist denial receipt for downstream tooling (TCK-00578).
+        if let QueueBoundsError::QueueBoundsExceeded {
+            ref receipt,
+            ref reason,
+        } = err
+        {
+            persist_denial_receipt(queue_root, &spec.job_id, receipt, reason);
+        }
+        return Err(format!(
+            "queue bounds check failed (queue/quota_exceeded): {err}"
+        ));
+    }
 
     let filename = format!("{}.json", spec.job_id);
     let target = pending_dir.join(filename);
@@ -200,6 +228,57 @@ pub(super) fn enqueue_job(queue_root: &Path, spec: &FacJobSpecV1) -> Result<Path
         .map_err(|err| format!("persist: {}", err.error))?;
 
     Ok(target)
+}
+
+/// Persist a `QueueBoundsDenialReceipt` to the `denied/` directory.
+///
+/// Best-effort: if persistence fails, the denial is still enforced
+/// (the enqueue is rejected), but the receipt is not written. This
+/// avoids masking the primary denial error.
+fn persist_denial_receipt(
+    queue_root: &Path,
+    job_id: &str,
+    receipt: &QueueBoundsDenialReceipt,
+    reason: &str,
+) {
+    let denied_dir = queue_root.join("denied");
+    if fs::create_dir_all(&denied_dir).is_err() {
+        return;
+    }
+
+    let denial_artifact = serde_json::json!({
+        "schema": "apm2.fac.queue_bounds_denial.v1",
+        "job_id": job_id,
+        "reason": reason,
+        "receipt": receipt,
+        "denied_at_unix_secs": current_epoch_secs(),
+    });
+
+    let filename = format!("denial-{job_id}.json");
+    let target = denied_dir.join(&filename);
+
+    // Best-effort atomic write (temp+rename).
+    let Ok(temp) = tempfile::NamedTempFile::new_in(&denied_dir) else {
+        return;
+    };
+    let mut file = temp.as_file();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
+    if file
+        .write_all(
+            serde_json::to_string_pretty(&denial_artifact)
+                .unwrap_or_default()
+                .as_bytes(),
+        )
+        .is_err()
+    {
+        return;
+    }
+    let _ = file.sync_all();
+    let _ = temp.persist(&target);
 }
 
 /// Build a deterministic suffix for job and lease identifiers.

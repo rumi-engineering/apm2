@@ -231,7 +231,7 @@ pub fn run_fac_warm(
             );
         },
     };
-    if let Err(e) = enqueue_job(&queue_root, &spec) {
+    if let Err(e) = enqueue_job(&queue_root, &spec, &fac_policy.queue_bounds_policy) {
         return output_error(
             json_output,
             "warm_enqueue_failed",
