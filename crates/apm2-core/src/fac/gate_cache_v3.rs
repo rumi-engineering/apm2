@@ -2280,4 +2280,169 @@ mod tests {
             "loaded cache must NOT have gates from both writers"
         );
     }
+
+    // =========================================================================
+    // Receipt Rebind Tests (TCK-00541 round-3 MAJOR fix)
+    // =========================================================================
+
+    /// Verify that `check_reuse` returns a hit after
+    /// `try_bind_receipt_from_store` promotes `rfc0028_receipt_bound` and
+    /// `rfc0029_receipt_bound`, followed by re-signing and a disk
+    /// round-trip.
+    #[test]
+    fn check_reuse_hit_after_receipt_rebind_roundtrip() {
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+        let key = sample_compound_key();
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        // Step 1: Create a v3 cache with receipt flags defaulting to false
+        // (simulating what `finalize_status_gate_run` produces).
+        let mut cache = GateCacheV3::new("abc123", key.clone()).expect("new");
+        let unbound_result = V3GateResult {
+            rfc0028_receipt_bound: false,
+            rfc0029_receipt_bound: false,
+            ..sample_gate_result()
+        };
+        cache.set("rustfmt", unbound_result).expect("set");
+        cache.sign_all(&signer);
+
+        // Confirm check_reuse denies before rebind (receipt_binding_missing).
+        let pre_decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
+        assert!(!pre_decision.reusable, "must deny before rebind");
+        assert_eq!(pre_decision.reason, "receipt_binding_missing");
+
+        // Step 2: Persist to disk.
+        let root = tempfile::tempdir().expect("tmpdir");
+        cache.save_to_dir(root.path()).expect("save");
+
+        // Step 3: Create a receipt file with passing RFC-0028/0029 evidence.
+        // The file must be named by content hash (computed via canonical bytes
+        // with domain separator) so `lookup_job_receipt` finds and verifies it.
+        let receipts_dir = tempfile::tempdir().expect("tmpdir receipts");
+        let receipt = crate::fac::receipt::FacJobReceiptV1 {
+            schema: "apm2.fac.receipt.v1".to_string(),
+            receipt_id: "receipt-001".to_string(),
+            job_id: "job-rebind-test".to_string(),
+            job_spec_digest: "spec-digest".to_string(),
+            outcome: crate::fac::receipt::FacJobOutcome::Completed,
+            reason: "test".to_string(),
+            rfc0028_channel_boundary: Some(crate::fac::receipt::ChannelBoundaryTrace {
+                passed: true,
+                defect_count: 0,
+                defect_classes: vec![],
+                token_fac_policy_hash: None,
+                token_canonicalizer_tuple_digest: None,
+                token_boundary_id: None,
+                token_issued_at_tick: None,
+                token_expiry_tick: None,
+            }),
+            eio29_queue_admission: Some(crate::fac::receipt::QueueAdmissionTrace {
+                verdict: "allow".to_string(),
+                queue_lane: "test".to_string(),
+                defect_reason: None,
+                cost_estimate_ticks: None,
+            }),
+            ..Default::default()
+        };
+        let receipt_json = serde_json::to_string(&receipt).expect("serialize receipt");
+        // Use the v2 content hash (current standard) for the filename.
+        let receipt_digest = crate::fac::receipt::compute_job_receipt_content_hash_v2(&receipt);
+        let receipt_path = receipts_dir.path().join(format!("{receipt_digest}.json"));
+        std::fs::write(&receipt_path, &receipt_json).expect("write receipt");
+
+        // Step 4: Reload from disk, rebind, re-sign, save (the rebind path).
+        let mut reloaded = GateCacheV3::load_from_dir(root.path(), "abc123", &key).expect("reload");
+        reloaded.try_bind_receipt_from_store(receipts_dir.path(), "job-rebind-test");
+
+        // Verify flags were promoted.
+        let entry = reloaded.get("rustfmt").expect("entry exists");
+        assert!(entry.rfc0028_receipt_bound, "rfc0028 must be promoted");
+        assert!(entry.rfc0029_receipt_bound, "rfc0029 must be promoted");
+
+        // Re-sign after flag promotion (required: canonical bytes include flags).
+        reloaded.sign_all(&signer);
+
+        // Save rebound cache back to disk.
+        reloaded.save_to_dir(root.path()).expect("save rebound");
+
+        // Step 5: Load one more time from disk and verify check_reuse hits.
+        let final_cache =
+            GateCacheV3::load_from_dir(root.path(), "abc123", &key).expect("final load");
+        let post_decision = final_cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
+        assert!(post_decision.reusable, "must hit after rebind round-trip");
+        assert_eq!(post_decision.reason, "v3_compound_key_match");
+    }
+
+    /// Verify that `try_bind_receipt_from_store` does NOT promote flags when
+    /// the receipt has a failing RFC-0028 trace (fail-closed).
+    #[test]
+    fn receipt_rebind_no_promotion_on_failed_rfc0028() {
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+        let key = sample_compound_key();
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        let mut cache = GateCacheV3::new("abc123", key).expect("new");
+        let unbound = V3GateResult {
+            rfc0028_receipt_bound: false,
+            rfc0029_receipt_bound: false,
+            ..sample_gate_result()
+        };
+        cache.set("rustfmt", unbound).expect("set");
+        cache.sign_all(&signer);
+
+        // Receipt with RFC-0028 *failing*.
+        let receipts_dir = tempfile::tempdir().expect("tmpdir");
+        let receipt = crate::fac::receipt::FacJobReceiptV1 {
+            schema: "apm2.fac.receipt.v1".to_string(),
+            receipt_id: "receipt-002".to_string(),
+            job_id: "job-fail-0028".to_string(),
+            job_spec_digest: "spec-digest".to_string(),
+            outcome: crate::fac::receipt::FacJobOutcome::Completed,
+            reason: "test".to_string(),
+            rfc0028_channel_boundary: Some(crate::fac::receipt::ChannelBoundaryTrace {
+                passed: false,
+                defect_count: 1,
+                defect_classes: vec!["test-defect".to_string()],
+                token_fac_policy_hash: None,
+                token_canonicalizer_tuple_digest: None,
+                token_boundary_id: None,
+                token_issued_at_tick: None,
+                token_expiry_tick: None,
+            }),
+            eio29_queue_admission: Some(crate::fac::receipt::QueueAdmissionTrace {
+                verdict: "allow".to_string(),
+                queue_lane: "test".to_string(),
+                defect_reason: None,
+                cost_estimate_ticks: None,
+            }),
+            ..Default::default()
+        };
+        let receipt_json = serde_json::to_string(&receipt).expect("serialize");
+        let receipt_digest = crate::fac::receipt::compute_job_receipt_content_hash_v2(&receipt);
+        std::fs::write(
+            receipts_dir.path().join(format!("{receipt_digest}.json")),
+            &receipt_json,
+        )
+        .expect("write");
+
+        cache.try_bind_receipt_from_store(receipts_dir.path(), "job-fail-0028");
+
+        // Flags must remain false (fail-closed).
+        let entry = cache.get("rustfmt").expect("entry");
+        assert!(
+            !entry.rfc0028_receipt_bound,
+            "must not promote on failed 0028"
+        );
+        assert!(
+            !entry.rfc0029_receipt_bound,
+            "must not promote on failed 0028"
+        );
+
+        // check_reuse must still deny.
+        let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
+        assert!(!decision.reusable, "must deny with failed 0028");
+        assert_eq!(decision.reason, "receipt_binding_missing");
+    }
 }

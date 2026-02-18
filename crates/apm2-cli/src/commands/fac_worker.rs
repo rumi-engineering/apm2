@@ -164,9 +164,21 @@ mod fac_review_api {
         Ok(crate::exit_codes::codes::GENERIC_ERROR)
     }
 
-    /// Test stub: no-op rebinding.
+    /// Test stub: no-op rebinding (v2).
     pub fn rebind_gate_cache_after_receipt(
         _sha: &str,
+        _receipts_dir: &std::path::Path,
+        _job_id: &str,
+        _signer: &apm2_core::crypto::Signer,
+    ) {
+    }
+
+    /// Test stub: no-op rebinding (v3).
+    pub fn rebind_v3_gate_cache_after_receipt(
+        _sha: &str,
+        _policy_hash: &str,
+        _sbx_hash: &str,
+        _net_hash: &str,
         _receipts_dir: &std::path::Path,
         _job_id: &str,
         _signer: &apm2_core::crypto::Signer,
@@ -1978,6 +1990,19 @@ fn execute_queued_gates_job(
         if let Ok(signer) = fac_key_material::load_or_generate_persistent_signer(fac_root) {
             fac_review_api::rebind_gate_cache_after_receipt(
                 &spec.source.head_sha,
+                &receipts_dir,
+                &spec.job_id,
+                &signer,
+            );
+            // TCK-00541 round-3 MAJOR fix: Also rebind the v3 gate cache.
+            // Without this, v3 entries persist with `rfc0028_receipt_bound =
+            // false` and `rfc0029_receipt_bound = false`, causing
+            // `check_reuse` to deny all hits and defeating v3 cache reuse.
+            fac_review_api::rebind_v3_gate_cache_after_receipt(
+                &spec.source.head_sha,
+                policy_hash,
+                sbx_hash,
+                net_hash,
                 &receipts_dir,
                 &spec.job_id,
                 &signer,

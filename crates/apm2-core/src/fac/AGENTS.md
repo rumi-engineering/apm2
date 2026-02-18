@@ -3102,3 +3102,10 @@ distinguishes v3 prune targets from v2.
   is provided, preventing forged-signature bypass (fail-closed).
 - [INV-GCV3-010] V2 read fallback validates SHA match before accepting
   entries, preventing cross-SHA cache poisoning.
+- [INV-GCV3-011] **Post-receipt rebind required for v3 cache reuse.**
+  `try_bind_receipt_from_store()` must be called after receipt commit to
+  promote `rfc0028_receipt_bound`/`rfc0029_receipt_bound` from `false` to
+  `true`. Without rebind, `check_reuse()` denies all v3 entries via
+  `receipt_binding_missing`. The `fac_worker` calls
+  `rebind_v3_gate_cache_after_receipt()` (in `evidence.rs`) after the v2
+  rebind to load, promote, re-sign, and persist the v3 cache.

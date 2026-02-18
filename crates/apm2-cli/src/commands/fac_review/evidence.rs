@@ -1515,6 +1515,71 @@ fn finalize_status_gate_run(
     Ok(())
 }
 
+/// Post-receipt v3 gate cache rebinding (TCK-00541 round-3 MAJOR fix).
+///
+/// After a receipt is committed, loads the persisted v3 cache from disk,
+/// promotes `rfc0028_receipt_bound` and `rfc0029_receipt_bound` flags based
+/// on verified receipt evidence, re-signs all entries, and saves back.
+///
+/// This is the v3 counterpart of
+/// [`super::gate_cache::rebind_gate_cache_after_receipt`] (which only rebinds
+/// v2 `GateCache`). Without this call, v3 entries persist with `false` defaults
+/// and `check_reuse` never returns a hit.
+///
+/// # Arguments
+///
+/// * `sha` - The commit SHA whose v3 gate cache should be rebound.
+/// * `policy_hash` - The FAC policy hash used to reconstruct the compound key.
+/// * `sbx_hash` - Sandbox hardening hash for compound key reconstruction.
+/// * `net_hash` - Network policy hash for compound key reconstruction.
+/// * `receipts_dir` - Path to the receipt store
+///   (`$APM2_HOME/private/fac/receipts`).
+/// * `job_id` - The job ID whose receipt should be looked up.
+/// * `signer` - The signing key for re-signing the cache after flag promotion.
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn rebind_v3_gate_cache_after_receipt(
+    sha: &str,
+    policy_hash: &str,
+    sbx_hash: &str,
+    net_hash: &str,
+    receipts_dir: &std::path::Path,
+    job_id: &str,
+    signer: &apm2_core::crypto::Signer,
+) {
+    let toolchain = compute_toolchain_fingerprint();
+    let Ok(compound_key) = apm2_core::fac::gate_cache_v3::V3CompoundKey::new(
+        sha,
+        policy_hash,
+        &toolchain,
+        sbx_hash,
+        net_hash,
+    ) else {
+        return; // Cannot reconstruct compound key — nothing to rebind.
+    };
+    let Some(root) = cache_v3_root() else {
+        return; // No v3 cache root — nothing to rebind.
+    };
+    let Some(mut cache) =
+        apm2_core::fac::gate_cache_v3::GateCacheV3::load_from_dir(&root, sha, &compound_key)
+    else {
+        return; // No v3 cache on disk — nothing to rebind.
+    };
+
+    cache.try_bind_receipt_from_store(receipts_dir, job_id);
+
+    // Only re-sign and save if at least one gate was promoted.
+    let any_bound = cache
+        .gates
+        .values()
+        .any(|entry| entry.rfc0028_receipt_bound && entry.rfc0029_receipt_bound);
+    if any_bound {
+        cache.sign_all(signer);
+        if let Err(err) = cache.save_to_dir(&root) {
+            eprintln!("warning: failed to re-persist v3 gate cache after receipt rebind: {err}");
+        }
+    }
+}
+
 /// Maximum bytes to read from a single log file during bundle hashing.
 /// Slightly larger than `LOG_STREAM_MAX_BYTES` to account for stream prefixes
 /// (`=== stdout ===\n`, `=== stderr ===\n`) and any separator overhead that the

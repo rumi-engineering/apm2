@@ -4302,6 +4302,32 @@ pub(super) fn rebind_gate_cache_after_receipt(
     gate_cache::rebind_gate_cache_after_receipt(sha, receipts_dir, job_id, signer);
 }
 
+/// Post-receipt v3 gate cache rebinding (TCK-00541 round-3 MAJOR fix).
+///
+/// Promotes `rfc0028_receipt_bound`/`rfc0029_receipt_bound` flags in the
+/// persisted v3 cache after a receipt is committed. Without this, v3
+/// entries remain fail-closed (`false`) and `check_reuse` never hits.
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn rebind_v3_gate_cache_after_receipt(
+    sha: &str,
+    policy_hash: &str,
+    sbx_hash: &str,
+    net_hash: &str,
+    receipts_dir: &std::path::Path,
+    job_id: &str,
+    signer: &apm2_core::crypto::Signer,
+) {
+    evidence::rebind_v3_gate_cache_after_receipt(
+        sha,
+        policy_hash,
+        sbx_hash,
+        net_hash,
+        receipts_dir,
+        job_id,
+        signer,
+    );
+}
+
 #[cfg_attr(test, allow(dead_code))]
 pub(super) fn apply_gate_result_lifecycle_for_repo_sha(
     owner_repo: &str,
