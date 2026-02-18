@@ -10,6 +10,8 @@ use apm2_core::fac::gh_command;
 use serde::Deserialize;
 
 const MAX_COMMIT_STATUS_DESCRIPTION_CHARS: usize = 140;
+const VERDICT_MARKER: &str = "apm2-review-verdict:v1";
+const VERDICT_TOMBSTONE_MARKER: &str = "apm2-review-verdict:tombstone:v1";
 
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct IssueCommentResponse {
@@ -152,6 +154,31 @@ pub(super) fn create_issue_comment(
         .map_err(|err| format!("failed to parse issue comment create response: {err}"))
 }
 
+pub(super) fn fetch_issue_comment(
+    owner_repo: &str,
+    comment_id: u64,
+) -> Result<Option<IssueCommentResponse>, String> {
+    let endpoint = format!("/repos/{owner_repo}/issues/comments/{comment_id}");
+    let output = gh_command()
+        .args(["api", &endpoint, "--method", "GET"])
+        .output()
+        .map_err(|err| format!("failed to execute gh api for issue comment get: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let normalized = stderr.to_ascii_lowercase();
+        if normalized.contains("404") || normalized.contains("not found") {
+            return Ok(None);
+        }
+        return Err(format!(
+            "gh api failed fetching issue comment {comment_id}: {stderr}"
+        ));
+    }
+
+    let response = serde_json::from_slice::<IssueCommentResponse>(&output.stdout)
+        .map_err(|err| format!("failed to parse issue comment get response: {err}"))?;
+    Ok(Some(response))
+}
+
 pub(super) fn update_issue_comment(
     owner_repo: &str,
     comment_id: u64,
@@ -189,6 +216,39 @@ pub(super) fn update_issue_comment(
     }
 
     Ok(())
+}
+
+pub(super) fn fetch_latest_live_verdict_comment_id(
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<Option<u64>, String> {
+    let endpoint = format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100");
+    let jq = format!(
+        ".[] | select((.body // \"\") | contains(\"{VERDICT_MARKER}\")) | select(((.body // \"\") | contains(\"{VERDICT_TOMBSTONE_MARKER}\")) | not) | .id"
+    );
+    let output = gh_command()
+        .args(["api", "--paginate", &endpoint, "--jq", &jq])
+        .output()
+        .map_err(|err| format!("failed to execute gh api for issue comment list: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh api failed listing issue comments: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let mut max_id = None::<u64>;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed = trimmed
+            .parse::<u64>()
+            .map_err(|_| format!("invalid issue comment id `{trimmed}` in gh api response"))?;
+        max_id = Some(max_id.map_or(parsed, |value| value.max(parsed)));
+    }
+    Ok(max_id)
 }
 
 #[allow(dead_code)]

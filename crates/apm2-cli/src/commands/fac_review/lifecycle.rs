@@ -44,6 +44,7 @@ const AGENT_REGISTRY_SCHEMA: &str = "apm2.fac.agent_registry.v1";
 const MAX_EVENT_HISTORY: usize = 256;
 const MAX_ACTIVE_AGENTS_PER_PR: usize = 2;
 const MAX_REGISTRY_ENTRIES: usize = 4096;
+const MAX_PR_STATE_SCAN_ENTRIES: usize = 4096;
 const MAX_ERROR_BUDGET: u32 = 10;
 const DEFAULT_RETRY_BUDGET: u32 = 3;
 const REGISTRY_NON_ACTIVE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
@@ -1250,6 +1251,126 @@ pub fn load_pr_lifecycle_snapshot(
         retry_budget_remaining: record.retry_budget_remaining,
         last_event_seq: record.last_event_seq,
     }))
+}
+
+fn parse_pr_number_from_state_file_name(file_name: &str) -> Option<u32> {
+    let value = file_name
+        .strip_prefix("pr-")
+        .and_then(|value| value.strip_suffix(".json"))?;
+    if value.is_empty() || !value.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u32>().ok()
+}
+
+fn list_repo_pr_numbers(owner_repo: &str) -> Result<Vec<u32>, String> {
+    let repo_dir = lifecycle_root()?
+        .join("pr")
+        .join(sanitize_for_path(owner_repo));
+    if !repo_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let entries = fs::read_dir(&repo_dir).map_err(|err| {
+        format!(
+            "failed to list lifecycle state directory {}: {err}",
+            repo_dir.display()
+        )
+    })?;
+    let mut pr_numbers = Vec::new();
+    for (idx, entry) in entries.enumerate() {
+        if idx >= MAX_PR_STATE_SCAN_ENTRIES {
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if let Some(pr_number) = parse_pr_number_from_state_file_name(&file_name) {
+            pr_numbers.push(pr_number);
+        }
+    }
+    pr_numbers.sort_unstable();
+    pr_numbers.dedup();
+    Ok(pr_numbers)
+}
+
+fn apply_gate_result_replay_event(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    event: &LifecycleEventKind,
+    event_name: &str,
+) -> Result<(), String> {
+    apply_event(owner_repo, pr_number, head_sha, event)
+        .map(|_| ())
+        .map_err(|err| {
+            format!(
+                "failed gate-result replay event `{event_name}` for PR #{pr_number} ({owner_repo}@{head_sha}): {err}"
+            )
+        })
+}
+
+fn replay_gate_result_events_for_pr(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    passed: bool,
+) -> Result<(), String> {
+    apply_gate_result_replay_event(
+        owner_repo,
+        pr_number,
+        head_sha,
+        &LifecycleEventKind::PushObserved,
+        "push_observed",
+    )?;
+    apply_gate_result_replay_event(
+        owner_repo,
+        pr_number,
+        head_sha,
+        &LifecycleEventKind::GatesStarted,
+        "gates_started",
+    )?;
+    let (terminal_event, terminal_name) = if passed {
+        (LifecycleEventKind::GatesPassed, "gates_passed")
+    } else {
+        (LifecycleEventKind::GatesFailed, "gates_failed")
+    };
+    apply_gate_result_replay_event(
+        owner_repo,
+        pr_number,
+        head_sha,
+        &terminal_event,
+        terminal_name,
+    )
+}
+
+pub fn apply_gate_result_events_for_repo_sha(
+    owner_repo: &str,
+    head_sha: &str,
+    passed: bool,
+) -> Result<usize, String> {
+    validate_expected_head_sha(head_sha)?;
+    let mut applied = 0usize;
+    for pr_number in list_repo_pr_numbers(owner_repo)? {
+        let Some(snapshot) = load_pr_lifecycle_snapshot(owner_repo, pr_number)? else {
+            continue;
+        };
+        if !snapshot.current_sha.eq_ignore_ascii_case(head_sha) {
+            continue;
+        }
+        if !is_gate_result_replay_candidate_state(&snapshot.pr_state) {
+            continue;
+        }
+        replay_gate_result_events_for_pr(owner_repo, pr_number, head_sha, passed)?;
+        applied = applied.saturating_add(1);
+    }
+    Ok(applied)
+}
+
+fn is_gate_result_replay_candidate_state(state: &str) -> bool {
+    matches!(
+        state,
+        "pushed" | "gates_running" | "gates_failed" | "recovering"
+    )
 }
 
 fn load_pr_state_bypass_hmac(
@@ -4516,7 +4637,14 @@ fn run_verdict_set_inner(
     keep_prepared_inputs: bool,
     json_output: bool,
 ) -> Result<u8, String> {
-    let projected = verdict_projection::persist_verdict_projection(
+    let (lock_owner_repo, lock_pr_number) = super::target::resolve_pr_target(repo, pr_number)?;
+    let _projection_lock =
+        verdict_projection::acquire_projection_lock(&lock_owner_repo, lock_pr_number)?;
+
+    // Phase 1 (local-only): persist deterministic verdict intent without
+    // external side effects. Lifecycle finalization must succeed before
+    // GitHub projection is attempted.
+    let projected = verdict_projection::persist_verdict_projection_local_only_locked(
         repo,
         pr_number,
         sha,
@@ -4525,7 +4653,6 @@ fn run_verdict_set_inner(
         reason,
         model_id,
         backend_id,
-        json_output,
     )?;
     if !keep_prepared_inputs {
         if let Err(err) = super::prepare::cleanup_prepared_review_inputs(
@@ -4539,6 +4666,7 @@ fn run_verdict_set_inner(
 
     let termination_state =
         state::load_review_run_state_strict(projected.pr_number, &projected.review_state_type)?;
+    validate_verdict_set_scope(&projected, dimension, termination_state.as_ref())?;
     let termination_state_non_terminal_alive = termination_state
         .as_ref()
         .is_some_and(|state| state.status == super::types::ReviewRunStatus::Alive);
@@ -4565,6 +4693,24 @@ fn run_verdict_set_inner(
         .is_some_and(|reviewer_pid| is_descendant_of_pid(caller_pid, reviewer_pid));
     let finalize_verdict = || -> Result<u8, String> {
         finalize_projected_verdict(&projected, dimension, &run_id, None)?;
+        // Phase 2 (full projection): project to GitHub only after lifecycle
+        // authority accepted the verdict transition.
+        let projected_full = verdict_projection::persist_verdict_projection_locked(
+            &projected.owner_repo,
+            Some(projected.pr_number),
+            Some(&projected.head_sha),
+            dimension,
+            verdict.as_str(),
+            reason,
+            model_id,
+            backend_id,
+            json_output,
+        )
+        .map_err(|err| {
+            format!("verdict lifecycle finalized but external projection failed: {err}")
+        })?;
+        validate_post_finalize_projection(&projected, &projected_full)?;
+        rewrite_verdict_completion_receipt(&home, &projected_full, &run_id)?;
         Ok(exit_codes::SUCCESS)
     };
 
@@ -4613,6 +4759,132 @@ fn run_verdict_set_inner(
     }
 }
 
+fn validate_verdict_set_scope(
+    projected: &verdict_projection::PersistedVerdictProjection,
+    requested_dimension: &str,
+    termination_state: Option<&super::types::ReviewRunState>,
+) -> Result<(), String> {
+    let normalized_dimension = normalize_verdict_dimension(requested_dimension)?;
+    let expected_review_state_type = match normalized_dimension {
+        "code-quality" => "quality",
+        other => other,
+    };
+    if !projected
+        .review_state_type
+        .eq_ignore_ascii_case(expected_review_state_type)
+    {
+        return Err(format!(
+            "verdict scope mismatch: requested dimension `{requested_dimension}` resolved to `{normalized_dimension}` (review_state_type `{expected_review_state_type}`) but projection targeted `{}`",
+            projected.review_state_type
+        ));
+    }
+
+    if let Some(state) = termination_state {
+        if state.pr_number != projected.pr_number {
+            return Err(format!(
+                "verdict scope mismatch: run state PR #{} does not match projection PR #{}",
+                state.pr_number, projected.pr_number
+            ));
+        }
+        if !state.owner_repo.eq_ignore_ascii_case(&projected.owner_repo) {
+            return Err(format!(
+                "verdict scope mismatch: run state repo {} does not match projection repo {}",
+                state.owner_repo, projected.owner_repo
+            ));
+        }
+        if !state
+            .review_type
+            .eq_ignore_ascii_case(&projected.review_state_type)
+        {
+            return Err(format!(
+                "verdict scope mismatch: run state type {} does not match projection type {}",
+                state.review_type, projected.review_state_type
+            ));
+        }
+        if !state.head_sha.eq_ignore_ascii_case(&projected.head_sha) {
+            return Err(format!(
+                "verdict scope mismatch: run state sha {} does not match projection sha {}",
+                state.head_sha, projected.head_sha
+            ));
+        }
+        if state.status == super::types::ReviewRunStatus::Alive && state.run_id.trim().is_empty() {
+            return Err(format!(
+                "verdict scope mismatch: active run state for PR #{} type {} has empty run_id",
+                projected.pr_number, projected.review_state_type
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_post_finalize_projection(
+    projected_local: &verdict_projection::PersistedVerdictProjection,
+    projected_full: &verdict_projection::PersistedVerdictProjection,
+) -> Result<(), String> {
+    if !projected_local
+        .owner_repo
+        .eq_ignore_ascii_case(&projected_full.owner_repo)
+    {
+        return Err(format!(
+            "post-finalize projection repo mismatch: local={} full={}",
+            projected_local.owner_repo, projected_full.owner_repo
+        ));
+    }
+    if projected_local.pr_number != projected_full.pr_number {
+        return Err(format!(
+            "post-finalize projection PR mismatch: local={} full={}",
+            projected_local.pr_number, projected_full.pr_number
+        ));
+    }
+    if !projected_local
+        .head_sha
+        .eq_ignore_ascii_case(&projected_full.head_sha)
+    {
+        return Err(format!(
+            "post-finalize projection sha mismatch: local={} full={}",
+            projected_local.head_sha, projected_full.head_sha
+        ));
+    }
+    if !projected_local
+        .review_state_type
+        .eq_ignore_ascii_case(&projected_full.review_state_type)
+    {
+        return Err(format!(
+            "post-finalize projection review_type mismatch: local={} full={}",
+            projected_local.review_state_type, projected_full.review_state_type
+        ));
+    }
+    if !projected_local
+        .decision
+        .eq_ignore_ascii_case(&projected_full.decision)
+    {
+        return Err(format!(
+            "post-finalize projection decision mismatch: local={} full={}",
+            projected_local.decision, projected_full.decision
+        ));
+    }
+    Ok(())
+}
+
+fn rewrite_verdict_completion_receipt(
+    home: &Path,
+    projected: &verdict_projection::PersistedVerdictProjection,
+    run_id: &str,
+) -> Result<(), String> {
+    let authority = TerminationAuthority::new(
+        &projected.owner_repo,
+        projected.pr_number,
+        &projected.review_state_type,
+        &projected.head_sha,
+        run_id,
+        projected.decision_comment_id,
+        &projected.decision_author,
+        &now_iso8601(),
+        &projected.decision_signature,
+    );
+    dispatch::write_completion_receipt_for_verdict(home, &authority, &projected.decision)
+}
+
 pub fn run_verdict_show(
     repo: &str,
     pr_number: Option<u32>,
@@ -4652,13 +4924,14 @@ mod tests {
         FAC_STATUS_PROJECTION_MAX_ATTEMPTS, LifecycleEventKind, MERGE_EVIDENCE_END,
         MERGE_EVIDENCE_START, MERGE_RECEIPT_BINDING_SUFFIX, MergeEvidenceBinding,
         MergeProjectionContext, MergeReceiptBindingRecord, PrLifecycleState, TrackedAgentState,
-        acquire_registry_lock, active_agents_for_pr, apply_event, bind_reviewer_runtime,
-        cleanup_merged_branch_local_state_inner, compute_merge_receipt_changeset_digest,
-        delete_remote_branch_projection, derive_auto_verdict_decision_from_findings,
-        derive_fac_required_status_projection, enforce_pr_capacity,
-        fac_required_status_projection_for_decision, finalize_auto_verdict_candidate,
-        load_fac_required_status_contexts, load_registry, normalize_hash_list,
-        normalize_sha256_hex_digest, persist_merge_receipt_binding_record,
+        acquire_registry_lock, active_agents_for_pr, apply_event,
+        apply_gate_result_events_for_repo_sha, apply_gate_result_replay_event,
+        bind_reviewer_runtime, cleanup_merged_branch_local_state_inner,
+        compute_merge_receipt_changeset_digest, delete_remote_branch_projection,
+        derive_auto_verdict_decision_from_findings, derive_fac_required_status_projection,
+        enforce_pr_capacity, fac_required_status_projection_for_decision,
+        finalize_auto_verdict_candidate, load_fac_required_status_contexts, load_registry,
+        normalize_hash_list, normalize_sha256_hex_digest, persist_merge_receipt_binding_record,
         project_fac_required_status_to_contexts_with, project_fac_required_status_with,
         project_merge_to_github_with, register_agent_spawn, register_reviewer_dispatch,
         save_registry, sync_local_main_with_origin, token_hash, try_fast_forward_main,
@@ -4920,6 +5193,164 @@ mod tests {
         )
         .expect("quality approve");
         assert_eq!(state.pr_state, PrLifecycleState::MergeReady);
+    }
+
+    #[test]
+    fn apply_gate_result_events_for_repo_sha_recovers_from_gates_failed() {
+        let pr = next_pr();
+        let repo = next_repo("gate-retry", pr);
+        let sha = "1111111111111111111111111111111111111111";
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesStarted).expect("start");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesFailed).expect("failed");
+
+        let applied =
+            apply_gate_result_events_for_repo_sha(&repo, sha, true).expect("apply retry events");
+        assert_eq!(applied, 1);
+
+        let snapshot = super::load_pr_lifecycle_snapshot(&repo, pr)
+            .expect("snapshot")
+            .expect("lifecycle present");
+        assert_eq!(snapshot.pr_state, "gates_passed");
+
+        let record = super::load_pr_state_for_readonly(&repo, pr)
+            .expect("load record")
+            .expect("record present");
+        let events = record
+            .events
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            events.ends_with(&["push_observed", "gates_started", "gates_passed"]),
+            "expected retry sequence tail, got: {events:?}"
+        );
+    }
+
+    #[test]
+    fn apply_gate_result_events_for_repo_sha_is_noop_when_sha_untracked() {
+        let pr = next_pr();
+        let repo = next_repo("gate-retry-noop", pr);
+        let sha = "2222222222222222222222222222222222222222";
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+
+        let applied = apply_gate_result_events_for_repo_sha(
+            &repo,
+            "3333333333333333333333333333333333333333",
+            true,
+        )
+        .expect("noop for unknown sha");
+        assert_eq!(applied, 0);
+    }
+
+    #[test]
+    fn apply_gate_result_replay_event_fails_closed_on_illegal_gates_started_transition() {
+        let pr = next_pr();
+        let repo = next_repo("gate-replay-illegal-gates-started", pr);
+        let sha = "1234123412341234123412341234123412341234";
+
+        let err = apply_gate_result_replay_event(
+            &repo,
+            pr,
+            sha,
+            &LifecycleEventKind::GatesStarted,
+            "gates_started",
+        )
+        .expect_err("gates_started from untracked state must fail closed");
+        assert!(err.contains("illegal transition"));
+        assert!(err.contains("gates_started"));
+    }
+
+    #[test]
+    fn apply_gate_result_replay_event_fails_closed_on_illegal_terminal_transition() {
+        let pr = next_pr();
+        let repo = next_repo("gate-replay-illegal-terminal", pr);
+        let sha = "5678567856785678567856785678567856785678";
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+
+        let err = apply_gate_result_replay_event(
+            &repo,
+            pr,
+            sha,
+            &LifecycleEventKind::GatesPassed,
+            "gates_passed",
+        )
+        .expect_err("terminal replay from pushed state must fail closed");
+        assert!(err.contains("illegal transition"));
+        assert!(err.contains("gates_passed"));
+    }
+
+    #[test]
+    fn apply_gate_result_events_for_repo_sha_skips_terminal_sibling_states() {
+        let repo = next_repo("gate-retry-terminal-skip", next_pr());
+        let sha = "7777777777777777777777777777777777777777";
+        let merged_pr = next_pr();
+        let active_pr = next_pr();
+
+        let _ =
+            apply_event(&repo, merged_pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+        let _ =
+            apply_event(&repo, merged_pr, sha, &LifecycleEventKind::GatesStarted).expect("start");
+        let _ =
+            apply_event(&repo, merged_pr, sha, &LifecycleEventKind::GatesPassed).expect("passed");
+        let _ = apply_event(
+            &repo,
+            merged_pr,
+            sha,
+            &LifecycleEventKind::ReviewsDispatched,
+        )
+        .expect("dispatch");
+        let _ = apply_event(
+            &repo,
+            merged_pr,
+            sha,
+            &LifecycleEventKind::VerdictSet {
+                dimension: "security".to_string(),
+                decision: "approve".to_string(),
+            },
+        )
+        .expect("security approve");
+        let _ = apply_event(
+            &repo,
+            merged_pr,
+            sha,
+            &LifecycleEventKind::VerdictSet {
+                dimension: "code-quality".to_string(),
+                decision: "approve".to_string(),
+            },
+        )
+        .expect("quality approve");
+        let merged = apply_event(
+            &repo,
+            merged_pr,
+            sha,
+            &LifecycleEventKind::Merged {
+                source: "unit_test".to_string(),
+            },
+        )
+        .expect("merged");
+        assert_eq!(merged.pr_state, PrLifecycleState::Merged);
+
+        let _ =
+            apply_event(&repo, active_pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+        let _ =
+            apply_event(&repo, active_pr, sha, &LifecycleEventKind::GatesStarted).expect("start");
+        let _ =
+            apply_event(&repo, active_pr, sha, &LifecycleEventKind::GatesFailed).expect("failed");
+
+        let applied =
+            apply_gate_result_events_for_repo_sha(&repo, sha, true).expect("apply retry events");
+        assert_eq!(applied, 1);
+
+        let merged_snapshot = super::load_pr_lifecycle_snapshot(&repo, merged_pr)
+            .expect("merged snapshot")
+            .expect("merged lifecycle");
+        assert_eq!(merged_snapshot.pr_state, "merged");
+
+        let active_snapshot = super::load_pr_lifecycle_snapshot(&repo, active_pr)
+            .expect("active snapshot")
+            .expect("active lifecycle");
+        assert_eq!(active_snapshot.pr_state, "gates_passed");
     }
 
     #[test]
@@ -6273,5 +6704,45 @@ mod tests {
         assert_eq!(receipt.head_sha, sha);
         assert_eq!(receipt.run_id, run_id);
         assert_eq!(receipt.decision, "deny");
+    }
+
+    #[test]
+    fn validate_verdict_set_scope_accepts_quality_aliases() {
+        let projected = super::verdict_projection::PersistedVerdictProjection {
+            owner_repo: "example/repo".to_string(),
+            pr_number: 77,
+            head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            review_state_type: "quality".to_string(),
+            decision: "approve".to_string(),
+            decision_comment_id: 1,
+            decision_author: "fac-bot".to_string(),
+            decision_signature: "sig".to_string(),
+        };
+        let run_state = ReviewRunState {
+            run_id: "run-quality-1".to_string(),
+            owner_repo: "example/repo".to_string(),
+            pr_number: 77,
+            head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            review_type: "quality".to_string(),
+            reviewer_role: "reviewer".to_string(),
+            started_at: "2026-02-18T00:00:00Z".to_string(),
+            status: ReviewRunStatus::Alive,
+            terminal_reason: None,
+            model_id: None,
+            backend_id: None,
+            restart_count: 0,
+            nudge_count: 0,
+            sequence_number: 1,
+            previous_run_id: None,
+            previous_head_sha: None,
+            pid: Some(42),
+            proc_start_time: Some(1),
+            integrity_hmac: None,
+        };
+
+        super::validate_verdict_set_scope(&projected, "quality", Some(&run_state))
+            .expect("quality alias should map to quality review state");
+        super::validate_verdict_set_scope(&projected, "code-quality", Some(&run_state))
+            .expect("code-quality alias should map to quality review state");
     }
 }

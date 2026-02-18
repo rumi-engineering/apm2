@@ -33,6 +33,10 @@
 //! - [INV-WHB-004] Heartbeat writes use atomic write (temp + rename) to prevent
 //!   partial reads.
 
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -170,13 +174,21 @@ pub fn write_heartbeat(
         .map_err(|e| format!("heartbeat serialization failed: {e}"))?;
 
     let heartbeat_path = fac_root.join(HEARTBEAT_FILENAME);
-
-    // Atomic write: temp file + rename.
-    // We use a simple approach: write to .tmp then rename.
-    let tmp_path = fac_root.join(format!(".{HEARTBEAT_FILENAME}.tmp"));
-    std::fs::write(&tmp_path, &json).map_err(|e| format!("heartbeat tmp write failed: {e}"))?;
-    std::fs::rename(&tmp_path, &heartbeat_path)
-        .map_err(|e| format!("heartbeat rename failed: {e}"))?;
+    let mut temp = tempfile::NamedTempFile::new_in(fac_root)
+        .map_err(|e| format!("heartbeat temp-file create failed: {e}"))?;
+    #[cfg(unix)]
+    {
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("heartbeat temp-file chmod failed: {e}"))?;
+    }
+    temp.write_all(&json)
+        .map_err(|e| format!("heartbeat temp-file write failed: {e}"))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|e| format!("heartbeat temp-file sync failed: {e}"))?;
+    temp.persist(&heartbeat_path)
+        .map_err(|e| format!("heartbeat persist failed: {e}"))?;
 
     Ok(())
 }
@@ -397,6 +409,17 @@ mod tests {
         assert_eq!(status.health_status, "healthy");
         assert!(status.error.is_none());
         assert!(status.pid > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_heartbeat_write_uses_restricted_permissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_heartbeat(tmp.path(), 1, 0, 0, 0, "healthy").unwrap();
+
+        let path = tmp.path().join(HEARTBEAT_FILENAME);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

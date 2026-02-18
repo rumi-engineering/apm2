@@ -26,6 +26,7 @@ use super::{fenced_yaml, findings_store, github_projection, projection_store};
 use crate::exit_codes::codes as exit_codes;
 
 const DECISION_MARKER: &str = "apm2-review-verdict:v1";
+const DECISION_TOMBSTONE_MARKER: &str = "apm2-review-verdict:tombstone:v1";
 const DECISION_SCHEMA: &str = "apm2.review.verdict.v1";
 const PROJECTION_VERDICT_SCHEMA: &str = "apm2.fac.projection.verdict.v1";
 const PROJECTION_REVIEWER_SCHEMA: &str = "apm2.fac.projection.reviewer.v1";
@@ -193,6 +194,12 @@ pub struct PersistedVerdictProjection {
 enum ProjectionMode {
     Full,
     LocalOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionLockBehavior {
+    Acquire,
+    AlreadyHeld,
 }
 
 fn local_only_author_login_with_fallback(
@@ -447,6 +454,7 @@ fn clear_dimension_verdicts_for_home(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub fn persist_verdict_projection(
     repo: &str,
     pr_number: Option<u32>,
@@ -470,6 +478,7 @@ pub fn persist_verdict_projection(
         ProjectionMode::Full,
         true,
         json_output,
+        ProjectionLockBehavior::Acquire,
     )
 }
 
@@ -496,6 +505,62 @@ pub(super) fn persist_verdict_projection_local_only(
         ProjectionMode::LocalOnly,
         false,
         false,
+        ProjectionLockBehavior::Acquire,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn persist_verdict_projection_local_only_locked(
+    repo: &str,
+    pr_number: Option<u32>,
+    sha: Option<&str>,
+    dimension: &str,
+    decision: &str,
+    reason: Option<&str>,
+    model_id: Option<&str>,
+    backend_id: Option<&str>,
+) -> Result<PersistedVerdictProjection, String> {
+    persist_verdict_projection_impl(
+        repo,
+        pr_number,
+        sha,
+        dimension,
+        decision,
+        reason,
+        model_id,
+        backend_id,
+        ProjectionMode::LocalOnly,
+        false,
+        false,
+        ProjectionLockBehavior::AlreadyHeld,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn persist_verdict_projection_locked(
+    repo: &str,
+    pr_number: Option<u32>,
+    sha: Option<&str>,
+    dimension: &str,
+    decision: &str,
+    reason: Option<&str>,
+    model_id: Option<&str>,
+    backend_id: Option<&str>,
+    json_output: bool,
+) -> Result<PersistedVerdictProjection, String> {
+    persist_verdict_projection_impl(
+        repo,
+        pr_number,
+        sha,
+        dimension,
+        decision,
+        reason,
+        model_id,
+        backend_id,
+        ProjectionMode::Full,
+        true,
+        json_output,
+        ProjectionLockBehavior::AlreadyHeld,
     )
 }
 
@@ -512,6 +577,7 @@ fn persist_verdict_projection_impl(
     projection_mode: ProjectionMode,
     emit_report: bool,
     json_output: bool,
+    lock_behavior: ProjectionLockBehavior,
 ) -> Result<PersistedVerdictProjection, String> {
     let normalized_dimension = normalize_decision_dimension(dimension)?;
     let normalized_decision = normalize_decision_value(decision)
@@ -530,7 +596,14 @@ fn persist_verdict_projection_impl(
     };
     let head_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
     let home = super::types::apm2_home_dir()?;
-    let _projection_lock = acquire_projection_lock_for_home(&home, &owner_repo, resolved_pr)?;
+    let _projection_lock = match lock_behavior {
+        ProjectionLockBehavior::Acquire => Some(acquire_projection_lock_for_home(
+            &home,
+            &owner_repo,
+            resolved_pr,
+        )?),
+        ProjectionLockBehavior::AlreadyHeld => None,
+    };
 
     let mut record = load_decision_projection_for_home(&home, &owner_repo, resolved_pr, &head_sha)?
         .unwrap_or_else(|| {
@@ -686,12 +759,48 @@ fn projection_record_to_payload(record: &DecisionProjectionRecord) -> DecisionCo
     }
 }
 
+const GITHUB_COMMENT_URL_PREFIX: &str = "https://github.com/";
+
+fn is_remote_comment_url(comment_url: &str) -> bool {
+    comment_url.trim().starts_with(GITHUB_COMMENT_URL_PREFIX)
+}
+
 fn project_decision_comment(
     owner_repo: &str,
     pr_number: u32,
     record: &DecisionProjectionRecord,
     payload: &DecisionComment,
 ) -> Result<(u64, String), String> {
+    project_decision_comment_with(
+        owner_repo,
+        pr_number,
+        record,
+        payload,
+        github_projection::fetch_issue_comment,
+        github_projection::update_issue_comment,
+        github_projection::create_issue_comment,
+        fetch_latest_known_remote_verdict_comment_id,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
+fn project_decision_comment_with<FFetch, FUpdate, FCreate, FLatest>(
+    owner_repo: &str,
+    pr_number: u32,
+    record: &DecisionProjectionRecord,
+    payload: &DecisionComment,
+    mut fetch_comment: FFetch,
+    mut update_comment: FUpdate,
+    mut create_comment: FCreate,
+    mut latest_remote_verdict_comment_id: FLatest,
+) -> Result<(u64, String), String>
+where
+    FFetch: FnMut(&str, u64) -> Result<Option<github_projection::IssueCommentResponse>, String>,
+    FUpdate: FnMut(&str, u64, &str) -> Result<(), String>,
+    FCreate: FnMut(&str, u32, &str) -> Result<github_projection::IssueCommentResponse, String>,
+    FLatest: FnMut(&str, u32) -> Result<Option<u64>, String>,
+{
     let body = render_decision_comment_body(owner_repo, pr_number, &record.head_sha, payload)?;
 
     let mut comment_id = record.decision_comment_id;
@@ -708,20 +817,79 @@ fn project_decision_comment(
         record.decision_comment_url.clone()
     };
 
-    let can_patch_existing = comment_url.starts_with("https://github.com/") && comment_id > 0;
-    if can_patch_existing {
-        match github_projection::update_issue_comment(owner_repo, comment_id, &body) {
-            Ok(()) => return Ok((comment_id, comment_url)),
-            Err(err) => {
-                eprintln!(
-                    "WARNING: failed to project decision comment update to GitHub for PR #{pr_number}: {err}"
-                );
-            },
+    let mut orphaned_remote_comment_id: Option<u64> = None;
+    if comment_id > 0 {
+        if !is_remote_comment_url(&comment_url) {
+            let resolved = fetch_comment(owner_repo, comment_id).map_err(|err| {
+                format!(
+                    "failed to resolve existing verdict comment {comment_id} for PR #{pr_number}: {err}"
+                )
+            })?;
+            if let Some(found) = resolved {
+                comment_id = found.id;
+                comment_url = found.html_url;
+            }
+        }
+
+        if is_remote_comment_url(&comment_url) {
+            orphaned_remote_comment_id = Some(comment_id);
+            match update_comment(owner_repo, comment_id, &body) {
+                Ok(()) => return Ok((comment_id, comment_url)),
+                Err(err) => {
+                    eprintln!(
+                        "WARNING: failed to project decision comment update to GitHub for PR #{pr_number}: {err}"
+                    );
+                    let resolved = fetch_comment(owner_repo, comment_id).map_err(|fetch_err| {
+                        format!(
+                            "failed to revalidate verdict comment {comment_id} after update error on PR #{pr_number}: {fetch_err}"
+                        )
+                    })?;
+                    if let Some(found) = resolved {
+                        comment_id = found.id;
+                        comment_url = found.html_url;
+                        update_comment(owner_repo, comment_id, &body).map_err(|retry_err| {
+                            format!(
+                                "failed to patch existing verdict comment {comment_id} after revalidation for PR #{pr_number}: {retry_err}"
+                            )
+                        })?;
+                        return Ok((comment_id, comment_url));
+                    }
+                },
+            }
         }
     }
 
-    match github_projection::create_issue_comment(owner_repo, pr_number, &body) {
-        Ok(response) => Ok((response.id, response.html_url)),
+    let latest_known_remote_comment_id = if orphaned_remote_comment_id.is_none() {
+        match latest_remote_verdict_comment_id(owner_repo, pr_number) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!(
+                    "WARNING: failed to discover latest remote verdict comment for PR #{pr_number}: {err}"
+                );
+                None
+            },
+        }
+    } else {
+        None
+    };
+
+    match create_comment(owner_repo, pr_number, &body) {
+        Ok(response) => {
+            if let Some(orphaned_comment_id) = orphaned_remote_comment_id
+                .or(latest_known_remote_comment_id)
+                .filter(|value| *value != response.id)
+            {
+                let tombstone =
+                    render_tombstoned_decision_comment_body(response.id, &response.html_url);
+                if let Err(err) = update_comment(owner_repo, orphaned_comment_id, &tombstone) {
+                    eprintln!(
+                        "WARNING: created replacement verdict comment {} for PR #{pr_number} but failed to tombstone superseded comment {orphaned_comment_id}: {err}",
+                        response.id
+                    );
+                }
+            }
+            Ok((response.id, response.html_url))
+        },
         Err(err) => {
             eprintln!(
                 "WARNING: failed to project decision comment create to GitHub for PR #{pr_number}: {err}"
@@ -730,6 +898,15 @@ fn project_decision_comment(
             Ok((comment_id, comment_url))
         },
     }
+}
+
+fn render_tombstoned_decision_comment_body(
+    replacement_comment_id: u64,
+    replacement_comment_url: &str,
+) -> String {
+    format!(
+        "<!-- {DECISION_TOMBSTONE_MARKER} -->\nSuperseded by verdict comment {replacement_comment_url} (id {replacement_comment_id})."
+    )
 }
 
 fn local_comment_url(owner_repo: &str, pr_number: u32, comment_id: u64) -> String {
@@ -1023,6 +1200,14 @@ fn acquire_projection_lock_for_home(
     Ok(lock_file)
 }
 
+pub(super) fn acquire_projection_lock(
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<std::fs::File, String> {
+    let home = super::types::apm2_home_dir()?;
+    acquire_projection_lock_for_home(&home, owner_repo, pr_number)
+}
+
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     super::types::ensure_parent_dir(path)?;
     let parent = path
@@ -1117,6 +1302,47 @@ fn max_cached_issue_comment_id(owner_repo: &str, pr_number: u32) -> Option<u64> 
                 .filter_map(|value| value.get("id").and_then(serde_json::Value::as_u64))
                 .max()
         })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CachedIssueComment {
+    id: u64,
+    #[serde(default)]
+    html_url: String,
+    #[serde(default)]
+    body: String,
+}
+
+fn is_live_verdict_comment_body(body: &str) -> bool {
+    body.contains(DECISION_MARKER) && !body.contains(DECISION_TOMBSTONE_MARKER)
+}
+
+fn max_cached_live_verdict_comment_id(owner_repo: &str, pr_number: u32) -> Option<u64> {
+    projection_store::load_issue_comments_cache::<CachedIssueComment>(owner_repo, pr_number)
+        .ok()
+        .flatten()
+        .and_then(|comments| {
+            comments
+                .into_iter()
+                .filter(|entry| entry.id > 0)
+                .filter(|entry| is_remote_comment_url(&entry.html_url))
+                .filter(|entry| is_live_verdict_comment_body(&entry.body))
+                .map(|entry| entry.id)
+                .max()
+        })
+}
+
+fn fetch_latest_known_remote_verdict_comment_id(
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<Option<u64>, String> {
+    let cached = max_cached_live_verdict_comment_id(owner_repo, pr_number);
+    let remote = github_projection::fetch_latest_live_verdict_comment_id(owner_repo, pr_number)?;
+    Ok(match (cached, remote) {
+        (Some(lhs), Some(rhs)) => Some(lhs.max(rhs)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    })
 }
 
 fn load_decision_projection_for_home(
@@ -1719,6 +1945,7 @@ pub(super) fn seed_decision_projection_for_home_for_tests(
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::sync::{Arc, Barrier, Mutex};
 
     use super::{
         DECISION_SCHEMA, DecisionComment, DecisionEntry, DecisionProjectionRecord,
@@ -1808,6 +2035,16 @@ mod tests {
     }
 
     #[test]
+    fn remote_comment_url_detection_accepts_github_and_rejects_local_projection_urls() {
+        assert!(super::is_remote_comment_url(
+            "https://github.com/example/repo/issues/42#issuecomment-99"
+        ));
+        assert!(!super::is_remote_comment_url(
+            "local://fac_projection/example/repo/pr-42/issue_comments#99"
+        ));
+    }
+
+    #[test]
     fn decision_comment_body_is_yaml_only_with_structured_findings_array() {
         let mut dimensions = BTreeMap::new();
         dimensions.insert(
@@ -1875,6 +2112,553 @@ mod tests {
         let report = build_show_report_from_record(head_sha, &record);
         assert_eq!(report.overall_decision, "pending");
         assert!(!report.fail_closed);
+    }
+
+    #[test]
+    fn project_decision_comment_resolves_remote_comment_before_create() {
+        let owner_repo = "example/repo";
+        let pr_number = 661;
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: "ok".to_string(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-18T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
+            },
+        );
+        let payload = DecisionComment {
+            schema: DECISION_SCHEMA.to_string(),
+            pr: pr_number,
+            sha: head_sha.to_string(),
+            updated_at: "2026-02-18T00:00:00Z".to_string(),
+            dimensions: dimensions.clone(),
+        };
+        let record = DecisionProjectionRecord {
+            schema: super::PROJECTION_VERDICT_SCHEMA.to_string(),
+            owner_repo: owner_repo.to_string(),
+            pr_number,
+            head_sha: head_sha.to_string(),
+            updated_at: payload.updated_at.clone(),
+            decision_comment_id: 88,
+            decision_comment_url: super::local_comment_url(owner_repo, pr_number, 88),
+            decision_signature: String::new(),
+            integrity_hmac: None,
+            dimensions,
+        };
+
+        let mut fetched = 0usize;
+        let mut created = 0usize;
+        let (comment_id, comment_url) = super::project_decision_comment_with(
+            owner_repo,
+            pr_number,
+            &record,
+            &payload,
+            |_, id| {
+                fetched = fetched.saturating_add(1);
+                assert_eq!(id, 88);
+                Ok(Some(super::github_projection::IssueCommentResponse {
+                    id: 88,
+                    html_url: "https://github.com/example/repo/issues/661#issuecomment-88"
+                        .to_string(),
+                }))
+            },
+            |_, id, body| {
+                assert_eq!(id, 88);
+                assert!(body.contains("apm2-review-verdict:v1"));
+                Ok(())
+            },
+            |_, _, _| {
+                created = created.saturating_add(1);
+                Ok(super::github_projection::IssueCommentResponse {
+                    id: 99,
+                    html_url: "https://github.com/example/repo/issues/661#issuecomment-99"
+                        .to_string(),
+                })
+            },
+            |_, _| Ok(None),
+        )
+        .expect("resolve+patch existing comment");
+
+        assert_eq!(fetched, 1);
+        assert_eq!(created, 0);
+        assert_eq!(comment_id, 88);
+        assert_eq!(
+            comment_url,
+            "https://github.com/example/repo/issues/661#issuecomment-88"
+        );
+    }
+
+    #[test]
+    fn project_decision_comment_revalidates_update_failure_before_create_fallback() {
+        let owner_repo = "example/repo";
+        let pr_number = 662;
+        let head_sha = "89abcdef0123456789abcdef0123456789abcdef";
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "code-quality".to_string(),
+            DecisionEntry {
+                decision: "deny".to_string(),
+                reason: "blocker".to_string(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-18T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
+            },
+        );
+        let payload = DecisionComment {
+            schema: DECISION_SCHEMA.to_string(),
+            pr: pr_number,
+            sha: head_sha.to_string(),
+            updated_at: "2026-02-18T00:00:00Z".to_string(),
+            dimensions: dimensions.clone(),
+        };
+        let record = DecisionProjectionRecord {
+            schema: super::PROJECTION_VERDICT_SCHEMA.to_string(),
+            owner_repo: owner_repo.to_string(),
+            pr_number,
+            head_sha: head_sha.to_string(),
+            updated_at: payload.updated_at.clone(),
+            decision_comment_id: 120,
+            decision_comment_url: "https://github.com/example/repo/issues/662#issuecomment-120"
+                .to_string(),
+            decision_signature: String::new(),
+            integrity_hmac: None,
+            dimensions,
+        };
+
+        let mut update_calls = 0usize;
+        let mut fetch_calls = 0usize;
+        let mut create_calls = 0usize;
+        let (comment_id, comment_url) = super::project_decision_comment_with(
+            owner_repo,
+            pr_number,
+            &record,
+            &payload,
+            |_, id| {
+                fetch_calls = fetch_calls.saturating_add(1);
+                assert_eq!(id, 120);
+                Ok(Some(super::github_projection::IssueCommentResponse {
+                    id: 120,
+                    html_url: "https://github.com/example/repo/issues/662#issuecomment-120"
+                        .to_string(),
+                }))
+            },
+            |_, id, _| {
+                update_calls = update_calls.saturating_add(1);
+                assert_eq!(id, 120);
+                if update_calls == 1 {
+                    Err("transient patch failure".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _, _| {
+                create_calls = create_calls.saturating_add(1);
+                Ok(super::github_projection::IssueCommentResponse {
+                    id: 999,
+                    html_url: "https://github.com/example/repo/issues/662#issuecomment-999"
+                        .to_string(),
+                })
+            },
+            |_, _| Ok(None),
+        )
+        .expect("revalidation retry should patch existing comment");
+
+        assert_eq!(fetch_calls, 1);
+        assert_eq!(update_calls, 2);
+        assert_eq!(create_calls, 0);
+        assert_eq!(comment_id, 120);
+        assert_eq!(
+            comment_url,
+            "https://github.com/example/repo/issues/662#issuecomment-120"
+        );
+    }
+
+    #[test]
+    fn project_decision_comment_tombstones_superseded_remote_comment() {
+        let owner_repo = "example/repo";
+        let pr_number = 663;
+        let head_sha = "00112233445566778899aabbccddeeff00112233";
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: "ok".to_string(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-18T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
+            },
+        );
+        let payload = DecisionComment {
+            schema: DECISION_SCHEMA.to_string(),
+            pr: pr_number,
+            sha: head_sha.to_string(),
+            updated_at: "2026-02-18T00:00:00Z".to_string(),
+            dimensions: dimensions.clone(),
+        };
+        let record = DecisionProjectionRecord {
+            schema: super::PROJECTION_VERDICT_SCHEMA.to_string(),
+            owner_repo: owner_repo.to_string(),
+            pr_number,
+            head_sha: head_sha.to_string(),
+            updated_at: payload.updated_at.clone(),
+            decision_comment_id: 77,
+            decision_comment_url: "https://github.com/example/repo/issues/663#issuecomment-77"
+                .to_string(),
+            decision_signature: String::new(),
+            integrity_hmac: None,
+            dimensions,
+        };
+
+        let mut update_calls = 0usize;
+        let mut tombstone_seen = false;
+        let (comment_id, comment_url) = super::project_decision_comment_with(
+            owner_repo,
+            pr_number,
+            &record,
+            &payload,
+            |_, id| {
+                assert_eq!(id, 77);
+                Ok(None)
+            },
+            |_, id, body| {
+                update_calls = update_calls.saturating_add(1);
+                assert_eq!(id, 77);
+                if update_calls == 1 {
+                    Err("comment no longer patchable".to_string())
+                } else {
+                    tombstone_seen = body.contains("apm2-review-verdict:tombstone:v1")
+                        && body.contains("issuecomment-88");
+                    Ok(())
+                }
+            },
+            |_, _, _| {
+                Ok(super::github_projection::IssueCommentResponse {
+                    id: 88,
+                    html_url: "https://github.com/example/repo/issues/663#issuecomment-88"
+                        .to_string(),
+                })
+            },
+            |_, _| Ok(None),
+        )
+        .expect("fallback create should tombstone superseded comment");
+
+        assert_eq!(comment_id, 88);
+        assert_eq!(
+            comment_url,
+            "https://github.com/example/repo/issues/663#issuecomment-88"
+        );
+        assert_eq!(update_calls, 2);
+        assert!(tombstone_seen);
+    }
+
+    #[test]
+    fn project_decision_comment_tombstone_failure_is_best_effort() {
+        let owner_repo = "example/repo";
+        let pr_number = 665;
+        let head_sha = "aabbccddeeff0011223344556677889900112233";
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: "ok".to_string(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-18T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
+            },
+        );
+        let payload = DecisionComment {
+            schema: DECISION_SCHEMA.to_string(),
+            pr: pr_number,
+            sha: head_sha.to_string(),
+            updated_at: "2026-02-18T00:00:00Z".to_string(),
+            dimensions: dimensions.clone(),
+        };
+        let record = DecisionProjectionRecord {
+            schema: super::PROJECTION_VERDICT_SCHEMA.to_string(),
+            owner_repo: owner_repo.to_string(),
+            pr_number,
+            head_sha: head_sha.to_string(),
+            updated_at: payload.updated_at.clone(),
+            decision_comment_id: 77,
+            decision_comment_url: "https://github.com/example/repo/issues/665#issuecomment-77"
+                .to_string(),
+            decision_signature: String::new(),
+            integrity_hmac: None,
+            dimensions,
+        };
+
+        let mut update_calls = 0usize;
+        let (comment_id, comment_url) = super::project_decision_comment_with(
+            owner_repo,
+            pr_number,
+            &record,
+            &payload,
+            |_, id| {
+                assert_eq!(id, 77);
+                Ok(None)
+            },
+            |_, id, _| {
+                update_calls = update_calls.saturating_add(1);
+                assert_eq!(id, 77);
+                if update_calls == 1 {
+                    Err("comment no longer patchable".to_string())
+                } else {
+                    Err("tombstone update denied".to_string())
+                }
+            },
+            |_, _, _| {
+                Ok(super::github_projection::IssueCommentResponse {
+                    id: 89,
+                    html_url: "https://github.com/example/repo/issues/665#issuecomment-89"
+                        .to_string(),
+                })
+            },
+            |_, _| Ok(None),
+        )
+        .expect("replacement comment should be accepted even when tombstone fails");
+
+        assert_eq!(comment_id, 89);
+        assert_eq!(
+            comment_url,
+            "https://github.com/example/repo/issues/665#issuecomment-89"
+        );
+        assert_eq!(update_calls, 2);
+    }
+
+    #[test]
+    fn project_decision_comment_tombstones_latest_known_remote_comment_when_record_reinitialized() {
+        let owner_repo = "example/repo";
+        let pr_number = 666;
+        let head_sha = "ddeeff0011223344556677889900112233445566";
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: "ok".to_string(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-18T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
+            },
+        );
+        let payload = DecisionComment {
+            schema: DECISION_SCHEMA.to_string(),
+            pr: pr_number,
+            sha: head_sha.to_string(),
+            updated_at: "2026-02-18T00:00:00Z".to_string(),
+            dimensions: dimensions.clone(),
+        };
+        let record = DecisionProjectionRecord {
+            schema: super::PROJECTION_VERDICT_SCHEMA.to_string(),
+            owner_repo: owner_repo.to_string(),
+            pr_number,
+            head_sha: head_sha.to_string(),
+            updated_at: payload.updated_at.clone(),
+            // Simulates a reconstructed local record where projection state was lost.
+            decision_comment_id: 120,
+            decision_comment_url: super::local_comment_url(owner_repo, pr_number, 120),
+            decision_signature: String::new(),
+            integrity_hmac: None,
+            dimensions,
+        };
+
+        let mut update_calls = 0usize;
+        let mut tombstoned_comment_id = None::<u64>;
+        let (comment_id, comment_url) = super::project_decision_comment_with(
+            owner_repo,
+            pr_number,
+            &record,
+            &payload,
+            |_, id| {
+                assert_eq!(id, 120);
+                Ok(None)
+            },
+            |_, id, body| {
+                update_calls = update_calls.saturating_add(1);
+                tombstoned_comment_id = Some(id);
+                assert!(body.contains("apm2-review-verdict:tombstone:v1"));
+                assert!(body.contains("issuecomment-88"));
+                Ok(())
+            },
+            |_, _, _| {
+                Ok(super::github_projection::IssueCommentResponse {
+                    id: 88,
+                    html_url: "https://github.com/example/repo/issues/666#issuecomment-88"
+                        .to_string(),
+                })
+            },
+            |_, _| Ok(Some(77)),
+        )
+        .expect("create should tombstone latest known remote verdict comment");
+
+        assert_eq!(comment_id, 88);
+        assert_eq!(
+            comment_url,
+            "https://github.com/example/repo/issues/666#issuecomment-88"
+        );
+        assert_eq!(update_calls, 1);
+        assert_eq!(tombstoned_comment_id, Some(77));
+    }
+
+    #[test]
+    fn concurrent_dual_dimension_projection_persists_single_comment_id() {
+        #[derive(Default)]
+        struct CommentStore {
+            next_comment_id: u64,
+            create_calls: usize,
+            bodies: BTreeMap<u64, String>,
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().to_path_buf();
+        let owner_repo = "example/repo".to_string();
+        let pr_number = 664_u32;
+        let head_sha = "0123456789abcdef0123456789abcdef01234567".to_string();
+        let start_barrier = Arc::new(Barrier::new(2));
+        let comment_store = Arc::new(Mutex::new(CommentStore {
+            next_comment_id: 900,
+            ..CommentStore::default()
+        }));
+
+        let mut handles = Vec::new();
+        for (dimension, reviewer) in [
+            ("security", "security-bot"),
+            ("code-quality", "quality-bot"),
+        ] {
+            let home = home.clone();
+            let owner_repo = owner_repo.clone();
+            let head_sha = head_sha.clone();
+            let start_barrier = Arc::clone(&start_barrier);
+            let comment_store = Arc::clone(&comment_store);
+            handles.push(std::thread::spawn(move || {
+                start_barrier.wait();
+                let _projection_lock = super::acquire_projection_lock_for_home(
+                    &home, &owner_repo, pr_number,
+                )
+                .expect("acquire projection lock");
+
+                let mut record = super::load_decision_projection_for_home(
+                    &home, &owner_repo, pr_number, &head_sha,
+                )
+                .expect("load projection")
+                .unwrap_or_else(|| DecisionProjectionRecord {
+                    schema: super::PROJECTION_VERDICT_SCHEMA.to_string(),
+                    owner_repo: owner_repo.to_ascii_lowercase(),
+                    pr_number,
+                    head_sha: head_sha.to_ascii_lowercase(),
+                    updated_at: super::now_iso8601(),
+                    decision_comment_id: super::allocate_local_comment_id(pr_number, None),
+                    decision_comment_url: String::new(),
+                    decision_signature: String::new(),
+                    integrity_hmac: None,
+                    dimensions: BTreeMap::new(),
+                });
+
+                record.updated_at = super::now_iso8601();
+                record.dimensions.insert(
+                    dimension.to_string(),
+                    DecisionEntry {
+                        decision: "approve".to_string(),
+                        reason: "ok".to_string(),
+                        set_by: reviewer.to_string(),
+                        set_at: super::now_iso8601(),
+                        model_id: None,
+                        backend_id: None,
+                    },
+                );
+                let payload = super::projection_record_to_payload(&record);
+                record.decision_signature =
+                    super::signature_for_payload(&payload).expect("sign projection payload");
+
+                let fetch_store = Arc::clone(&comment_store);
+                let update_store = Arc::clone(&comment_store);
+                let create_store = Arc::clone(&comment_store);
+                let owner_repo_for_url = owner_repo.clone();
+                let owner_repo_for_create = owner_repo.clone();
+                let (comment_id, comment_url) = super::project_decision_comment_with(
+                    &owner_repo,
+                    pr_number,
+                    &record,
+                    &payload,
+                    move |_, id| {
+                        let guard = fetch_store.lock().expect("lock fetch store");
+                        Ok(guard.bodies.get(&id).map(|_| {
+                            super::github_projection::IssueCommentResponse {
+                                id,
+                                html_url: format!(
+                                    "https://github.com/{owner_repo_for_url}/issues/{pr_number}#issuecomment-{id}"
+                                ),
+                            }
+                        }))
+                    },
+                    move |_, id, body| {
+                        let mut guard = update_store.lock().expect("lock update store");
+                        let existing = guard
+                            .bodies
+                            .get_mut(&id)
+                            .ok_or_else(|| format!("missing comment id {id} during update"))?;
+                        *existing = body.to_string();
+                        Ok(())
+                    },
+                    move |_, _, body| {
+                        let mut guard = create_store.lock().expect("lock create store");
+                        let id = guard.next_comment_id;
+                        guard.next_comment_id = guard.next_comment_id.saturating_add(1);
+                        guard.create_calls = guard.create_calls.saturating_add(1);
+                        guard.bodies.insert(id, body.to_string());
+                        Ok(super::github_projection::IssueCommentResponse {
+                            id,
+                            html_url: format!(
+                                "https://github.com/{owner_repo_for_create}/issues/{pr_number}#issuecomment-{id}"
+                            ),
+                        })
+                    },
+                    |_, _| Ok(None),
+                )
+                .expect("project shared verdict comment");
+                record.decision_comment_id = comment_id;
+                record.decision_comment_url = comment_url;
+                super::save_decision_projection_for_home(&home, &record)
+                    .expect("save updated projection");
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("join projection writer");
+        }
+
+        let loaded =
+            super::load_decision_projection_for_home(&home, &owner_repo, pr_number, &head_sha)
+                .expect("load merged projection")
+                .expect("projection should exist");
+        assert!(loaded.dimensions.contains_key("security"));
+        assert!(loaded.dimensions.contains_key("code-quality"));
+
+        let guard = comment_store.lock().expect("lock final store");
+        assert_eq!(
+            guard.create_calls, 1,
+            "concurrent writers must share one comment"
+        );
+        assert_eq!(
+            guard.bodies.len(),
+            1,
+            "only one canonical comment body expected"
+        );
+        let (&comment_id, body) = guard.bodies.first_key_value().expect("canonical body");
+        assert_eq!(loaded.decision_comment_id, comment_id);
+        assert!(body.contains("security"));
+        assert!(body.contains("code-quality"));
     }
 
     #[test]
