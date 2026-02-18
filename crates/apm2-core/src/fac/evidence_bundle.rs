@@ -41,6 +41,15 @@
 //! - [INV-EB-007] Import refuses when the embedded leakage budget receipt
 //!   declares `leakage_bits > budget_bits` or exceeds the policy ceiling
 //!   carried in the envelope (TCK-00555).
+//! - [INV-EB-008] Import independently verifies that when `exceeded_policy` is
+//!   false, actual values (`actual_export_bytes`, `actual_export_classes`,
+//!   `actual_leakage_bits`) are within the policy ceilings (TCK-00555).
+//! - [INV-EB-009] Import cross-checks `actual_export_classes` against the count
+//!   of `blob_refs` in the envelope plus fixed overhead (TCK-00555).
+//! - [INV-EB-010] Import cross-checks `actual_leakage_bits` against the
+//!   `leakage_budget_receipt` in the boundary check (TCK-00555).
+//! - [INV-EB-011] Export converges `actual_export_bytes` to match the final
+//!   serialized envelope size via iterative re-measurement (TCK-00555).
 
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -113,6 +122,13 @@ const DECLASSIFICATION_RECEIPT_HASH_DOMAIN: &[u8] =
 
 /// Maximum length for declassification receipt reason strings.
 pub const MAX_DECLASSIFICATION_REASON_LENGTH: usize = 512;
+
+/// Maximum convergence iterations for the two-phase byte enforcement loop.
+/// The loop converges once `actual_export_bytes` in the decision matches the
+/// serialized envelope size. Since the only variable is the integer
+/// representation length (at most ~20 digits for u64), convergence is
+/// guaranteed within 3 rounds.
+const MAX_BYTE_CONVERGENCE_ROUNDS: usize = 5;
 
 /// Maximum length for declassification receipt `authority_id` strings.
 pub const MAX_DECLASSIFICATION_AUTHORITY_ID_LENGTH: usize = 256;
@@ -686,6 +702,7 @@ pub struct BundleExportConfig {
 /// # Errors
 ///
 /// Returns `EvidenceBundleError` if the receipt lacks required traces.
+#[allow(clippy::too_many_lines)]
 pub fn build_evidence_bundle_envelope(
     receipt: &FacJobReceiptV1,
     config: &BundleExportConfig,
@@ -773,22 +790,96 @@ pub fn build_evidence_bundle_envelope(
     // INV-EB-006: Leakage budget enforcement (TCK-00555), phase 2.
     // Enforce max_export_bytes against the exact bytes that will be
     // written to disk (serde_json::to_vec_pretty with populated hash).
+    //
+    // Convergence loop: the serialized size depends on the
+    // `actual_export_bytes` integer representation (e.g., "0" vs "1234"),
+    // and the content hash depends on `actual_export_bytes`. After
+    // setting the real byte count and re-hashing, the serialized size
+    // may shift by a few bytes. We iterate until the recorded size
+    // matches the actual serialized size. This converges in at most
+    // MAX_BYTE_CONVERGENCE_ROUNDS rounds because the integer
+    // representation stabilizes quickly.
     if let Some(mut decision) = envelope.leakage_budget_decision.take() {
-        let final_bytes =
+        // Initial measurement with the placeholder (0) byte count.
+        let initial_bytes =
             serde_json::to_vec_pretty(&envelope).map_err(|e| EvidenceBundleError::ParseError {
                 detail: format!("final serialization for byte enforcement failed: {e}"),
             })?;
-        let final_byte_count = final_bytes.len() as u64;
+        let mut measured_size = initial_bytes.len() as u64;
 
-        enforce_leakage_budget_final(&mut decision, final_byte_count, config)?;
+        enforce_leakage_budget_final(&mut decision, measured_size, config)?;
 
-        // Put the decision back.
+        // Put the decision back and converge.
         envelope.leakage_budget_decision = Some(decision);
 
-        // Always recompute the content hash because actual_export_bytes
-        // changed from the preliminary placeholder (0) to the real value.
-        let rehash = compute_envelope_content_hash(&envelope);
-        envelope.content_hash = format!("b3-256:{}", hex::encode(rehash));
+        // Convergence: re-serialize with the real actual_export_bytes,
+        // re-hash, and check if the size is still consistent.
+        for _ in 0..MAX_BYTE_CONVERGENCE_ROUNDS {
+            let rehash = compute_envelope_content_hash(&envelope);
+            envelope.content_hash = format!("b3-256:{}", hex::encode(rehash));
+
+            let final_bytes = serde_json::to_vec_pretty(&envelope).map_err(|e| {
+                EvidenceBundleError::ParseError {
+                    detail: format!("convergence serialization failed: {e}"),
+                }
+            })?;
+            let new_size = final_bytes.len() as u64;
+
+            if new_size == measured_size {
+                break; // Converged: recorded size matches actual serialized size.
+            }
+
+            // Update the decision with the corrected size and re-check
+            // policy enforcement.
+            measured_size = new_size;
+            if let Some(ref mut d) = envelope.leakage_budget_decision {
+                d.actual_export_bytes = new_size;
+                // Re-check byte ceiling: if the new size newly exceeds
+                // policy, we need to validate declassification again.
+                let byte_exceeded = new_size > d.policy.max_export_bytes;
+                if byte_exceeded && !d.exceeded_policy {
+                    match &config.declassification_receipt {
+                        Some(declass) => {
+                            validate_declassification_receipt(
+                                declass,
+                                new_size,
+                                d.actual_export_classes,
+                                d.actual_leakage_bits > d.policy.max_leakage_bits,
+                                config.leakage_budget_receipt.as_ref(),
+                            )?;
+                            d.exceeded_policy = true;
+                            d.declassification_authorized = true;
+                            d.declassification_receipt_id = Some(declass.receipt_id.clone());
+                            d.declassification_receipt = Some(declass.clone());
+                        },
+                        None => {
+                            return Err(EvidenceBundleError::LeakageBudgetDenied {
+                                reason: format!(
+                                    "export exceeds leakage budget policy (converged bytes: {new_size}/{}) and no declassification receipt provided",
+                                    d.policy.max_export_bytes,
+                                ),
+                            });
+                        },
+                    }
+                } else if byte_exceeded {
+                    // Already exceeded — verify byte coverage.
+                    if let Some(declass) = &config.declassification_receipt {
+                        if declass.authorized_bytes < new_size {
+                            return Err(EvidenceBundleError::LeakageBudgetDenied {
+                                reason: format!(
+                                    "declassification receipt authorizes {} bytes but converged export is {} bytes",
+                                    declass.authorized_bytes, new_size,
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Final hash after convergence.
+        let final_hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(final_hash));
     }
 
     Ok(envelope)
@@ -1020,6 +1111,20 @@ pub fn import_evidence_bundle(
     data: &[u8],
 ) -> Result<EvidenceBundleEnvelopeV1, EvidenceBundleError> {
     // INV-EB-003: Bounded read.
+    //
+    // Design note (NIT): This global MAX_ENVELOPE_SIZE (256 KiB) check runs
+    // before parsing, which means more restrictive per-policy ceilings
+    // (e.g., Tier2 at 4 MiB) are not enforced until after deserialization
+    // completes and validate_leakage_budget_decision runs. A two-stage
+    // parse that peeks at the policy tier before full deserialization was
+    // considered but rejected as too invasive: the envelope schema is
+    // self-describing JSON where the policy lives inside a nested
+    // leakage_budget_decision field, making reliable pre-parse extraction
+    // fragile. The global guard prevents OOM from malicious payloads;
+    // per-policy byte enforcement follows during decision validation.
+    // The MAX_ENVELOPE_SIZE constant is already conservative (256 KiB)
+    // and well below the Tier0 ceiling (64 MiB), so the practical
+    // memory exposure is bounded.
     if data.len() > MAX_ENVELOPE_SIZE {
         return Err(EvidenceBundleError::EnvelopeTooLarge {
             size: data.len(),
@@ -1686,16 +1791,95 @@ fn validate_economics_traces(
 ///
 /// INV-EB-007: When a leakage budget decision is present, validate:
 /// - If `exceeded_policy` is true, `declassification_authorized` must be true.
+/// - If `exceeded_policy` is false, actual values must be within policy
+///   ceilings.
+/// - `actual_export_classes` must match `blob_refs.len() + 2` (fixed overhead:
+///   the envelope itself and the receipt).
+/// - `actual_leakage_bits` must match the `leakage_budget_receipt` in the
+///   boundary check (if present), or be 0 (if absent).
 /// - If `leakage_budget_receipt` is present in the boundary check, verify that
 ///   `leakage_bits` does not exceed the policy ceiling from the decision.
 /// - The actual export bytes/classes must not exceed policy without
 ///   declassification.
+#[allow(clippy::too_many_lines)]
 fn validate_leakage_budget_decision(
     envelope: &EvidenceBundleEnvelopeV1,
 ) -> Result<(), EvidenceBundleError> {
     let Some(decision) = &envelope.leakage_budget_decision else {
         return Ok(()); // No enforcement applied at export time
     };
+
+    // ---- Consistency check 1: when exceeded_policy is false, actual values
+    // must be within policy ceilings. An attacker cannot forge
+    // exceeded_policy=false while the actual values exceed policy. ----
+    if !decision.exceeded_policy {
+        if decision.actual_export_bytes > decision.policy.max_export_bytes {
+            return Err(EvidenceBundleError::LeakageBudgetDenied {
+                reason: format!(
+                    "import rejected: actual_export_bytes ({}) exceeds policy ceiling ({}) but exceeded_policy is false",
+                    decision.actual_export_bytes, decision.policy.max_export_bytes,
+                ),
+            });
+        }
+        if decision.actual_export_classes > decision.policy.max_export_classes {
+            return Err(EvidenceBundleError::LeakageBudgetDenied {
+                reason: format!(
+                    "import rejected: actual_export_classes ({}) exceeds policy ceiling ({}) but exceeded_policy is false",
+                    decision.actual_export_classes, decision.policy.max_export_classes,
+                ),
+            });
+        }
+        if decision.actual_leakage_bits > decision.policy.max_leakage_bits {
+            return Err(EvidenceBundleError::LeakageBudgetDenied {
+                reason: format!(
+                    "import rejected: actual_leakage_bits ({}) exceeds policy ceiling ({}) but exceeded_policy is false",
+                    decision.actual_leakage_bits, decision.policy.max_leakage_bits,
+                ),
+            });
+        }
+    }
+
+    // ---- Consistency check 2: actual_export_classes must match blob_refs
+    // count plus fixed overhead (envelope + receipt = 2). ----
+    // Safety: blob_refs.len() is bounded by MAX_BUNDLE_BLOB_COUNT (256),
+    // validated earlier in import_evidence_bundle. 256 + 2 = 258 fits u32.
+    let blob_count_u32 = u32::try_from(envelope.blob_refs.len()).unwrap_or(u32::MAX);
+    let expected_classes = blob_count_u32.saturating_add(2);
+    if decision.actual_export_classes != expected_classes {
+        return Err(EvidenceBundleError::LeakageBudgetDenied {
+            reason: format!(
+                "import rejected: actual_export_classes ({}) does not match expected count from blob_refs ({} blobs + 2 overhead = {})",
+                decision.actual_export_classes,
+                envelope.blob_refs.len(),
+                expected_classes,
+            ),
+        });
+    }
+
+    // ---- Consistency check 3: actual_leakage_bits must match the
+    // leakage_budget_receipt in the boundary check (if present). ----
+    match &envelope.boundary_check.leakage_budget_receipt {
+        Some(lbr) => {
+            if decision.actual_leakage_bits != lbr.leakage_bits {
+                return Err(EvidenceBundleError::LeakageBudgetDenied {
+                    reason: format!(
+                        "import rejected: actual_leakage_bits ({}) does not match leakage_budget_receipt.leakage_bits ({})",
+                        decision.actual_leakage_bits, lbr.leakage_bits,
+                    ),
+                });
+            }
+        },
+        None => {
+            if decision.actual_leakage_bits != 0 {
+                return Err(EvidenceBundleError::LeakageBudgetDenied {
+                    reason: format!(
+                        "import rejected: actual_leakage_bits ({}) must be 0 when no leakage_budget_receipt is present",
+                        decision.actual_leakage_bits,
+                    ),
+                });
+            }
+        },
+    }
 
     // If the policy was exceeded, declassification must have been authorized.
     if decision.exceeded_policy && !decision.declassification_authorized {
@@ -4815,6 +4999,270 @@ pub mod tests {
         assert!(
             result.is_ok(),
             "valid exceeded envelope with embedded receipt should import: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // Finding 1 (MAJOR): Import-side consistency checks for forged decisions
+    // =========================================================================
+
+    #[test]
+    fn import_rejects_forged_exceeded_false_with_bytes_over_ceiling() {
+        // An attacker forges exceeded_policy=false but sets actual_export_bytes
+        // above the policy ceiling. Import must reject.
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+
+        let mut envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+
+        // Tamper: inflate actual_export_bytes above policy ceiling.
+        if let Some(ref mut d) = envelope.leakage_budget_decision {
+            d.actual_export_bytes = d.policy.max_export_bytes + 1;
+            d.exceeded_policy = false; // lie
+        }
+
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::LeakageBudgetDenied { .. })),
+            "forged exceeded_policy=false with bytes over ceiling must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn import_rejects_forged_exceeded_false_with_classes_over_ceiling() {
+        // An attacker forges exceeded_policy=false but sets actual_export_classes
+        // above the policy ceiling. Import must reject.
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+
+        let mut envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+
+        // Tamper: inflate actual_export_classes above policy ceiling
+        // AND match the expected class count from blob_refs to pass
+        // the class cross-check (by adding fake blob_refs).
+        if let Some(ref mut d) = envelope.leakage_budget_decision {
+            let target_classes = d.policy.max_export_classes + 1;
+            // We need blob_refs.len() + 2 == target_classes.
+            let needed_blobs = target_classes.saturating_sub(2) as usize;
+            envelope.blob_refs = (0..needed_blobs)
+                .map(|i| format!("b3-256:{i:064x}"))
+                .collect();
+            d.actual_export_classes = target_classes;
+            d.exceeded_policy = false; // lie
+        }
+
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::LeakageBudgetDenied { .. })),
+            "forged exceeded_policy=false with classes over ceiling must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn import_rejects_forged_exceeded_false_with_leakage_bits_over_ceiling() {
+        // An attacker forges exceeded_policy=false but sets actual_leakage_bits
+        // above the policy ceiling. Import must reject.
+        let receipt = make_valid_receipt();
+        let mut config = make_valid_export_config();
+        // Set leakage budget receipt to match the forged bits.
+        config.leakage_budget_receipt = Some(LeakageBudgetReceipt {
+            leakage_bits: 9999,
+            budget_bits: 10000,
+            estimator_family: LeakageEstimatorFamily::MutualInformationUpperBound,
+            confidence_bps: 9500,
+            confidence_label: "high".to_string(),
+        });
+        config.leakage_budget_policy = Some(LeakageBudgetPolicy {
+            max_export_bytes: 100 * 1024 * 1024,
+            max_export_classes: 128,
+            max_leakage_bits: 10000, // generous so export succeeds
+        });
+
+        let mut envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+
+        // Tamper: lower policy ceiling below actual leakage bits but
+        // keep exceeded_policy=false.
+        if let Some(ref mut d) = envelope.leakage_budget_decision {
+            d.policy.max_leakage_bits = 10; // way below 9999
+            d.exceeded_policy = false; // lie
+        }
+
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::LeakageBudgetDenied { .. })),
+            "forged exceeded_policy=false with leakage bits over ceiling must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn import_rejects_class_count_mismatch_with_blob_refs() {
+        // actual_export_classes does not match blob_refs.len() + 2.
+        // Import must reject regardless of exceeded_policy.
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+
+        let mut envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+
+        // Tamper: set actual_export_classes to a value that does not match.
+        if let Some(ref mut d) = envelope.leakage_budget_decision {
+            d.actual_export_classes = 99; // does not match blob_refs.len() + 2
+        }
+
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::LeakageBudgetDenied { .. })),
+            "class count mismatch with blob_refs must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn import_rejects_leakage_bits_mismatch_with_receipt() {
+        // actual_leakage_bits does not match the leakage_budget_receipt's
+        // leakage_bits. Import must reject.
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+
+        let mut envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+
+        // Tamper: set actual_leakage_bits to a value that does not match
+        // the leakage_budget_receipt.
+        if let Some(ref mut d) = envelope.leakage_budget_decision {
+            // The receipt has leakage_bits=0 (from make_valid_export_config),
+            // so set actual to something non-zero.
+            d.actual_leakage_bits = 42;
+        }
+
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::LeakageBudgetDenied { .. })),
+            "leakage bits mismatch with receipt must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn import_rejects_nonzero_leakage_bits_without_receipt() {
+        // When no leakage_budget_receipt is present in the boundary check,
+        // actual_leakage_bits must be 0. Import must reject nonzero values.
+        let receipt = make_valid_receipt();
+        let mut config = make_valid_export_config();
+        config.leakage_budget_receipt = None; // no receipt
+
+        let mut envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+
+        // Tamper: set actual_leakage_bits to nonzero without a receipt.
+        if let Some(ref mut d) = envelope.leakage_budget_decision {
+            d.actual_leakage_bits = 100;
+        }
+
+        let hash = compute_envelope_content_hash(&envelope);
+        envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
+
+        let data = serialize_envelope(&envelope).expect("serialize");
+        let result = import_evidence_bundle(&data);
+        assert!(
+            matches!(result, Err(EvidenceBundleError::LeakageBudgetDenied { .. })),
+            "nonzero leakage bits without receipt must be rejected: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // Finding 2 (MINOR): actual_export_bytes matches final serialized size
+    // =========================================================================
+
+    #[test]
+    fn actual_export_bytes_matches_final_serialized_size() {
+        // Verify that the recorded actual_export_bytes in the decision
+        // exactly matches the final serialized envelope size.
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+
+        let envelope =
+            build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
+
+        let serialized = serialize_envelope(&envelope).expect("serialize");
+        let decision = envelope.leakage_budget_decision.as_ref().unwrap();
+
+        assert_eq!(
+            decision.actual_export_bytes,
+            serialized.len() as u64,
+            "actual_export_bytes ({}) must equal final serialized size ({})",
+            decision.actual_export_bytes,
+            serialized.len(),
+        );
+    }
+
+    #[test]
+    fn actual_export_bytes_matches_with_blobs() {
+        // Same test but with blob references to increase envelope size.
+        let receipt = make_valid_receipt();
+        let config = make_valid_export_config();
+        let blob_refs: Vec<String> = (0..10).map(|i| format!("b3-256:{i:064x}")).collect();
+
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &blob_refs)
+            .expect("export should succeed");
+
+        let serialized = serialize_envelope(&envelope).expect("serialize");
+        let decision = envelope.leakage_budget_decision.as_ref().unwrap();
+
+        assert_eq!(
+            decision.actual_export_bytes,
+            serialized.len() as u64,
+            "actual_export_bytes ({}) must equal final serialized size ({}) with blobs",
+            decision.actual_export_bytes,
+            serialized.len(),
+        );
+    }
+
+    #[test]
+    fn actual_export_bytes_matches_with_declassification() {
+        // Verify convergence works when declassification receipt is present.
+        let receipt = make_valid_receipt();
+        let mut config = make_valid_export_config();
+        config.leakage_budget_policy = Some(LeakageBudgetPolicy {
+            max_export_bytes: 1,
+            max_export_classes: 1,
+            max_leakage_bits: 0,
+        });
+        config.declassification_receipt = Some(make_valid_declassification_receipt());
+
+        let envelope = build_evidence_bundle_envelope(&receipt, &config, &[])
+            .expect("export with declassification should succeed");
+
+        let serialized = serialize_envelope(&envelope).expect("serialize");
+        let decision = envelope.leakage_budget_decision.as_ref().unwrap();
+
+        assert_eq!(
+            decision.actual_export_bytes,
+            serialized.len() as u64,
+            "actual_export_bytes ({}) must equal final serialized size ({}) with declassification",
+            decision.actual_export_bytes,
+            serialized.len(),
         );
     }
 }

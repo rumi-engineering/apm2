@@ -1260,9 +1260,12 @@ and content-addressed integrity verification (TCK-00542).
   honestly-absent optional sub-evidence tolerated), RFC-0029 economics receipt
   validation (Allow verdicts required), policy binding digest matching
   (including cross-field consistency with receipt's policy_hash and
-  canonicalizer_tuple_digest), and INV-EB-007 leakage budget decision consistency
-  (TCK-00555): if `exceeded_policy` then `declassification_authorized` must be true
-  with a valid receipt ID; cross-checks leakage bits against policy ceiling.
+  canonicalizer_tuple_digest), and INV-EB-007/018/019/020 leakage budget decision
+  consistency (TCK-00555): if `exceeded_policy` then `declassification_authorized`
+  must be true with a valid receipt ID; when `exceeded_policy=false`, independently
+  verifies that actual values are within policy ceilings; cross-checks
+  `actual_export_classes` against `blob_refs.len() + 2`; cross-checks
+  `actual_leakage_bits` against the boundary check's leakage budget receipt.
 - `verify_blob_refs()`: Verifies all blob_refs in an imported envelope exist in the
   bundle directory and their BLAKE3 hashes match declared values. Bounded reads,
   path traversal prevention, constant-time hash comparison.
@@ -1374,15 +1377,19 @@ and content-addressed integrity verification (TCK-00542).
 - [INV-EB-014] (TCK-00542) Envelope import accepts both the legacy schema
   (`apm2.fac.evidence_bundle.v1`) and the canonical schema
   (`apm2.fac.evidence_bundle_envelope.v1`) for backwards compatibility.
-- [INV-EB-015] (TCK-00555) Export uses two-phase leakage budget enforcement:
-  phase 1 checks class count and leakage bits before hash computation; phase 2
-  enforces `max_export_bytes` against the exact `serde_json::to_vec_pretty` bytes
-  that will be written to disk (not the smaller pre-hash compact JSON). This
-  prevents the byte cap from being applied against a smaller representation than
-  what is actually exported. Declassification receipt validation includes structural
-  well-formedness, BLAKE3 content hash verification (constant-time comparison), and
-  authorization coverage checks. The full `DeclassificationExportReceipt` is embedded
-  in the `LeakageBudgetDecision` for import-side audit.
+- [INV-EB-015] (TCK-00555) Export uses two-phase leakage budget enforcement with
+  convergence: phase 1 checks class count and leakage bits before hash computation;
+  phase 2 enforces `max_export_bytes` against the exact `serde_json::to_vec_pretty`
+  bytes. The convergence loop re-measures the serialized size after updating
+  `actual_export_bytes` and re-hashing, iterating until the recorded size matches
+  the actual serialized size (converges in at most `MAX_BYTE_CONVERGENCE_ROUNDS`
+  rounds). This ensures the "exact byte enforcement" invariant: the
+  `actual_export_bytes` in the decision equals the actual byte count of the
+  envelope as written to disk. Declassification receipt validation includes
+  structural well-formedness, BLAKE3 content hash verification (constant-time
+  comparison), and authorization coverage checks. The full
+  `DeclassificationExportReceipt` is embedded in the `LeakageBudgetDecision` for
+  import-side audit.
 - [INV-EB-016] (TCK-00555) Import verifies embedded `DeclassificationExportReceipt`
   when `exceeded_policy=true` and `declassification_authorized=true`: validates receipt
   structural well-formedness, verifies BLAKE3 content hash, and confirms
@@ -1393,6 +1400,17 @@ and content-addressed integrity verification (TCK-00542).
   Cross-checks leakage bits from the boundary check's leakage budget receipt against
   the policy ceiling when `exceeded_policy=false`. The leakage budget decision is
   included in the BLAKE3 content hash computation, preventing tampering.
+- [INV-EB-018] (TCK-00555) Import independently verifies that when
+  `exceeded_policy=false`, actual values (`actual_export_bytes`,
+  `actual_export_classes`, `actual_leakage_bits`) are within the policy ceilings.
+  Prevents forged `exceeded_policy=false` from bypassing declassification
+  requirements.
+- [INV-EB-019] (TCK-00555) Import cross-checks `actual_export_classes` against
+  `blob_refs.len() + 2` (fixed overhead: envelope + receipt). Prevents forged
+  class counts from understating the actual export volume.
+- [INV-EB-020] (TCK-00555) Import cross-checks `actual_leakage_bits` against the
+  `leakage_budget_receipt.leakage_bits` in the boundary check (or requires 0 when
+  no receipt is present). Prevents forged leakage bit counts.
 - [INV-EB-017] (TCK-00555) Legacy hash compatibility: when `leakage_budget_decision`
   is absent AND the envelope schema is the legacy schema ID
   (`apm2.fac.evidence_bundle.v1`), the content hash is computed WITHOUT the leakage
