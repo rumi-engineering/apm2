@@ -1728,6 +1728,77 @@ pre-populating build caches in the lane target namespace.
   `execute_warm`/`execute_warm_phase` and runs synchronously on the same
   thread (no cross-thread sharing).
 
+## receipt_merge Submodule (TCK-00543)
+
+The `receipt_merge` submodule implements set-union merge for receipt directories.
+It copies receipts from a source directory into a target directory, skipping
+duplicates (same digest already present). The merge emits a structured audit
+report containing: receipts copied, duplicates skipped, job_id mismatches
+(same digest with different job_id, which should never happen and indicates
+corruption), and parse failures.
+
+### Key Types
+
+- `MergeAuditReport`: Full merge result with statistics and anomalies.
+- `MergedReceiptHeader`: Per-receipt header with origin tracking (`source`,
+  `target`, or `both`).
+- `JobIdMismatch`: Corruption indicator: same digest, different job_id.
+- `ParseFailure`: File that could not be parsed as a valid receipt.
+- `ReceiptMergeError`: Error taxonomy for merge operations.
+
+### Core Capabilities
+
+- Set-union merge on receipt digests (idempotent). Scan maps key receipts
+  by canonical `b3-256:<hex>` form so that bare-hex and prefixed filenames
+  for the same logical receipt map to the same key, preventing duplicate-
+  detection bypass via mixed filename forms.
+- Deterministic presentation ordering per RFC-0019 section 8.4:
+  1. Primary: `htf_time_envelope_ns` descending (when present; HTF-bearing
+     receipts sort before non-HTF receipts).
+  2. Fallback: `timestamp_secs` descending > `node_fingerprint` ascending >
+     `content_hash` ascending.
+  Both `htf_time_envelope_ns` and `node_fingerprint` are optional fields on
+  `FacJobReceiptV1` and `MergedReceiptHeader`; the comparator handles their
+  absence correctly (None sorts after Some for fingerprints; None-None uses
+  next tiebreaker).
+- Atomic writes using `tempfile::NamedTempFile::new_in()` + `persist()` for
+  secure temp file creation (`O_EXCL`) and atomic rename.
+- Bounded directory scans (`MAX_MERGE_SCAN_FILES = 65,536`).
+- Content-hash integrity verification (recomputes BLAKE3, never trusts
+  self-reported `content_hash`). Normalizes filename stems to canonical
+  `b3-256:<hex>` form before comparison, accepting both bare hex and
+  prefixed filenames.
+- Symlink-safe reads via `O_NOFOLLOW`.
+- Directory entry type checks via `entry.file_type()` (`lstat`) instead of
+  `path.is_dir()` (`stat`) to avoid following symlinks during scans.
+
+### Security Invariants (TCK-00543)
+
+- [INV-MERGE-001] All receipt reads are bounded by `MAX_JOB_RECEIPT_SIZE`
+  (64 KiB) to prevent memory exhaustion.
+- [INV-MERGE-002] Digest filenames are validated before use as filesystem
+  path components (path traversal prevention).
+- [INV-MERGE-003] Content-hash integrity is verified by recomputing the
+  BLAKE3 hash (v1 and v2) before accepting any receipt. Filename stems
+  are normalized to canonical `b3-256:<hex>` form before comparison so
+  both bare-hex and prefixed filenames verify correctly.
+- [INV-MERGE-004] Directory scans are bounded by `MAX_MERGE_SCAN_FILES`
+  to prevent unbounded traversal.
+- [INV-MERGE-005] Writes use `tempfile::NamedTempFile::new_in()` with
+  `O_EXCL` for secure randomized temp file creation, then `persist()` for
+  atomic rename. This prevents symlink attacks on deterministic temp file
+  names (CWE-367 / CWE-59).
+- [INV-MERGE-006] Parse failures and job_id mismatches are bounded in the
+  audit report (`MAX_PARSE_FAILURES`, `MAX_JOB_ID_MISMATCHES`).
+- [INV-MERGE-007] Directory entry type checks use `entry.file_type()`
+  (`lstat`) instead of `path.is_dir()` (`stat`) to avoid following
+  symlinks and the associated TOCTOU / hang risk.
+- [INV-MERGE-008] Scan map keys are normalized to canonical `b3-256:<hex>`
+  form before insertion, so that bare-hex and `b3-256:`-prefixed filenames
+  for the same receipt hash are deduplicated correctly. Without this,
+  an attacker could store the same logical receipt under both forms to
+  bypass duplicate detection and inflate receipt stores.
+
 ## receipt_pipeline Submodule (TCK-00564)
 
 The `receipt_pipeline` submodule implements an atomic commit protocol for job
