@@ -881,7 +881,8 @@ mod tests {
         assert_eq!(read_back.holder_pid, std::process::id());
     }
 
-    /// Regression: `write_lock_metadata` sets 0600 permissions on metadata file.
+    /// Regression: `write_lock_metadata` sets 0600 permissions on metadata
+    /// file.
     #[cfg(unix)]
     #[test]
     fn test_write_lock_metadata_permissions() {
