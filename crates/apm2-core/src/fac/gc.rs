@@ -242,10 +242,17 @@ fn collect_stale_gate_cache_targets(fac_root: &Path, now_secs: u64, targets: &mu
     }
 
     // Gate cache v3 (TCK-00541): receipt-indexed cache store.
+    // MAJOR fix (round 5): lock files (`.{index_key}.lock`) are excluded from
+    // GC targeting. On Unix, unlinking a locked file removes the path without
+    // releasing the existing flock — a second writer can recreate the path,
+    // acquire flock on a different inode, and bypass mutual exclusion.
     let gate_cache_v3_root = fac_root.join("gate_cache_v3");
     if let Ok(entries) = std::fs::read_dir(&gate_cache_v3_root) {
         for entry in entries.flatten() {
             let path = entry.path();
+            if is_v3_lock_file(&path) {
+                continue; // Never GC lock files — see MAJOR fix comment above.
+            }
             if is_stale_by_mtime(&path, GATE_CACHE_TTL_SECS, now_secs) {
                 targets.push(GcTarget {
                     path: path.clone(),
@@ -623,6 +630,23 @@ fn estimate_dir_size(path: &Path) -> u64 {
         }
     }
     total
+}
+
+/// Returns `true` if `path` is a v3 gate cache lock file.
+///
+/// Lock files follow the naming convention `.{index_key}.lock` and live
+/// directly under the `gate_cache_v3` root. They MUST NOT be deleted by
+/// GC because unlinking a locked file on Unix removes the path without
+/// releasing the flock, allowing a second writer to create a new inode
+/// and bypass mutual exclusion.
+fn is_v3_lock_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.starts_with('.')
+        && std::path::Path::new(name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("lock"))
 }
 
 fn is_stale_by_mtime(path: &Path, ttl_seconds: u64, now_secs: u64) -> bool {
@@ -1479,5 +1503,87 @@ mod tests {
             )),
             "malformed patch_digest must trigger truncated scan and suppress all BlobPrune targets"
         );
+    }
+
+    // =========================================================================
+    // TCK-00541 round-5 MAJOR fix: GC must never target v3 lock files
+    // =========================================================================
+
+    #[test]
+    fn gc_plan_excludes_v3_lock_files() {
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root.clone()).expect("manager");
+        lane_manager.ensure_directories().expect("directories");
+
+        // Create a stale v3 cache entry directory AND a stale lock file.
+        let v3_root = fac_root.join("gate_cache_v3");
+        std::fs::create_dir_all(&v3_root).expect("v3 root");
+
+        let stale_index_dir = v3_root.join("some_index_key_abc123");
+        std::fs::create_dir_all(&stale_index_dir).expect("index dir");
+        std::fs::write(stale_index_dir.join("gate.json"), b"{}").expect("gate file");
+
+        let lock_file = v3_root.join(".some_index_key_abc123.lock");
+        std::fs::write(&lock_file, b"").expect("lock file");
+
+        // Make both stale.
+        let stale_secs = GATE_CACHE_TTL_SECS.saturating_mul(2) + 120;
+        let stale_time = filetime_from_secs(current_wall_clock_secs().saturating_sub(stale_secs));
+        set_file_mtime(&stale_index_dir, stale_time).expect("set dir mtime");
+        set_file_mtime(&lock_file, stale_time).expect("set lock mtime");
+
+        let plan = plan_gc(
+            &fac_root,
+            &lane_manager,
+            QUARANTINE_RETENTION_SECS,
+            DENIED_RETENTION_SECS,
+        )
+        .expect("plan");
+
+        // The stale index directory SHOULD be targeted for GC.
+        assert!(
+            plan.targets.iter().any(|t| t.path == stale_index_dir
+                && matches!(t.kind, crate::fac::gc_receipt::GcActionKind::GateCacheV3)),
+            "stale v3 index directory must be targeted for GC"
+        );
+
+        // The lock file MUST NOT be targeted for GC.
+        assert!(
+            !plan.targets.iter().any(|t| t.path == lock_file),
+            "v3 lock files must never be targeted for GC — \
+             unlinking a locked file breaks flock serialization"
+        );
+    }
+
+    #[test]
+    fn is_v3_lock_file_matches_lock_naming_convention() {
+        use std::path::PathBuf;
+
+        // Positive cases: files matching `.{key}.lock`.
+        assert!(super::is_v3_lock_file(&PathBuf::from(
+            "/tmp/gate_cache_v3/.abc123.lock"
+        )));
+        assert!(super::is_v3_lock_file(&PathBuf::from(
+            "/root/.some_key.lock"
+        )));
+
+        // Negative cases: normal directories/files, non-lock dot files.
+        assert!(!super::is_v3_lock_file(&PathBuf::from(
+            "/tmp/gate_cache_v3/abc123"
+        )));
+        assert!(!super::is_v3_lock_file(&PathBuf::from(
+            "/tmp/gate_cache_v3/abc123.lock"
+        ))); // No leading dot.
+        assert!(!super::is_v3_lock_file(&PathBuf::from(
+            "/tmp/gate_cache_v3/.abc123.json"
+        ))); // Wrong extension.
+        // Bare `.lock` is treated by Rust's Path as a hidden file with
+        // stem "lock" and no extension — so it does NOT match. This is fine:
+        // no legitimate v3 index key produces a bare `.lock` filename.
+        assert!(!super::is_v3_lock_file(&PathBuf::from(
+            "/tmp/gate_cache_v3/.lock"
+        )));
     }
 }
