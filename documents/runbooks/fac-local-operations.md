@@ -73,40 +73,62 @@ cargo build --release -p apm2-cli
 
 ### 1.4 Initialize FAC directory structure
 
-The FAC substrate creates its directory structure under `$APM2_HOME`
-(defaults to `~/.apm2`) on first use. The current layout is:
+Running `apm2 fac bootstrap --user` performs one-shot idempotent host
+provisioning and creates the full FAC directory tree. The same structure is
+also created lazily on first use. The full layout under `$APM2_HOME`
+(defaults to `~/.apm2`) is:
 
 ```
 $APM2_HOME/private/fac/
+  lanes/              # Execution lanes (bounded workspaces)
+  queue/              # Job queue (filesystem-backed)
+    pending/
+    claimed/
+    completed/
+    cancelled/
+    denied/
+    quarantine/
+  receipts/           # Content-addressed receipt objects
+  locks/lanes/        # Lane and queue locks
   evidence/           # Per-gate evidence logs (written by apm2 fac gates)
+  repo_mirror/        # Node-local bare git mirror
+  cargo_home/         # FAC-managed CARGO_HOME (isolated from ~/.cargo)
+  broker/             # Broker state (policy roots, horizons)
+  scheduler/          # Scheduler state persistence
+  policy/             # FacPolicyV1 files
+  blobs/              # Blob storage
   gate_cache_v2/      # Gate cache for SHA-based result reuse
 ```
 
-> **PLANNED — not yet implemented.** The FESv1 execution substrate will
-> introduce additional directories when the queue/worker surface is
-> implemented in a future ticket:
->
-> ```
-> $APM2_HOME/private/fac/
->   lanes/              # Execution lanes (bounded workspaces)
->   queue/              # Job queue (filesystem-backed)
->   receipts/           # Content-addressed receipt objects
->   locks/              # Lane and queue locks
->   repo_mirror/        # Node-local bare git mirror
->   cargo_home/         # FAC-managed CARGO_HOME (isolated from ~/.cargo)
->   broker/             # Broker state (policy roots, horizons)
->   scheduler/          # Scheduler state persistence
-> ```
+Directories are created with restricted permissions (0o700 in user mode,
+0o770 in system mode) via `create_dir_restricted` (no TOCTOU). Policy files
+are written 0o600. The operation is additive-only — it never destroys
+existing state.
+
+```bash
+# User-mode provisioning (recommended for single-operator hosts)
+apm2 fac bootstrap --user
+
+# System-mode provisioning (multi-user / system service deployment)
+apm2 fac bootstrap --system
+
+# Preview what would be created without making changes
+apm2 fac bootstrap --user --dry-run
+
+# Machine-readable output
+apm2 fac bootstrap --user --json
+```
+
+Bootstrap runs five idempotent phases:
+1. Create the `$APM2_HOME/private/fac/**` directory tree with restricted permissions
+2. Write default `FacPolicyV1` — skipped if the policy file already exists
+3. Initialize lane pool
+4. Optionally install systemd templates from `contrib/systemd/`
+5. Run doctor checks; exit code is gated on the result (INV-BOOT-004, fail-closed)
 
 ---
 
-## 2. PLANNED — FESv1 lane bootstrap (not yet implemented)
-
-> **This entire section describes PLANNED behavior.** The FESv1 lane/queue
-> execution substrate is not yet implemented. Current FAC operation uses
-> `apm2 fac gates` for local in-process gate execution (see section 3.1).
-> The concepts below will apply when the FESv1 queue/worker surface is
-> implemented in a future ticket.
+## 2. FESv1 bootstrap and lane management
 
 ### 2.1 Understanding lanes (PLANNED)
 
@@ -128,11 +150,48 @@ per lane = 3 concurrent lanes, with headroom for OS and non-FAC processes).
 > exist in the current CLI. Lane status inspection is planned for a future
 > ticket implementing the FESv1 lane management surface.
 
-### 2.3 Pre-warm lane targets (PLANNED)
+### 2.3 Pre-warm lane targets
 
-> **PLANNED -- not yet implemented.** The `apm2 fac warm` subcommand does not
-> exist in the current CLI. Lane pre-warming is planned for a future ticket
-> implementing the FESv1 lane management surface.
+The `apm2 fac warm` command enqueues a lane-scoped pre-warm job. It obtains
+an RFC-0028 channel context token from the broker, builds a `FacJobSpecV1`
+with warm kind, enqueues it to `queue/pending/`, and optionally waits for a
+receipt.
+
+```bash
+# Enqueue a warm job on the default lane (bulk) with default phases (fetch,build)
+apm2 fac warm
+
+# Wait for the warm job to complete (up to 1200 seconds)
+apm2 fac warm --wait
+
+# Specify a custom wait timeout
+apm2 fac warm --wait --wait-timeout-secs 600
+
+# Warm specific phases only
+apm2 fac warm --phases fetch,build
+
+# Target a specific lane
+apm2 fac warm --lane bulk
+
+# Machine-readable output
+apm2 fac warm --json
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--phases <CSV>` | `fetch,build` | Comma-separated list of phases to warm |
+| `--lane <NAME>` | `bulk` | Lane to target for the warm job |
+| `--wait` | off | Block until receipt is available |
+| `--wait-timeout-secs <N>` | `1200` | Maximum seconds to wait when `--wait` is set |
+| `--json` | off | Emit machine-readable JSON output |
+
+**Returns:** `job_id`, `phases`, `queue_lane`, `policy_hash`.
+
+**Policy enforcement:** `repo_id` allowlist and `bytes_backend` allowlist are
+enforced at enqueue time. A minimum of 100 MiB free disk is required to
+enqueue a warm job.
 
 ---
 
@@ -173,22 +232,63 @@ apm2 fac gates --quick
 
 ### 3.3 Running GC (garbage collection)
 
-> **PLANNED -- not yet implemented.** The `apm2 fac gc` subcommand does not
-> exist in the current CLI. Automated garbage collection is planned for a
-> future ticket. For now, reclaim disk space manually:
+The `apm2 fac gc` command reclaims disk space across all FAC roots. It is
+safe to run at any time and is idempotent.
 
 ```bash
-# Remove old evidence logs
-rm -rf "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"
+# Preview what would be removed without making changes
+apm2 fac gc --dry-run
 
-# Check disk usage
-du -sh "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/" 2>/dev/null
+# Run garbage collection
+apm2 fac gc
+
+# Enforce a custom free-space floor (default: 1 GB)
+apm2 fac gc --min-free-bytes 2147483648
+
+# Machine-readable output
+apm2 fac gc --json
 ```
 
-Run manual cleanup when:
-- Disk usage exceeds comfortable thresholds
-- Before large batch operations
-- Periodically via cron/systemd timer
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dry-run` | off | Print GC plan without removing anything |
+| `--json` | off | Emit machine-readable JSON output |
+| `--min-free-bytes <N>` | `1073741824` (1 GB) | Minimum free bytes floor to enforce |
+
+**GC target kinds and TTLs:**
+
+| Kind | TTL / rule |
+|------|-----------|
+| `gate_cache` | 30-day TTL; entries at `gate_cache_v2/{sha}/{gate}.yaml` |
+| `blob_prune` | Policy-determined |
+| `lane_target` | On lane reset or explicit GC |
+| `lane_log` | On lane reset or explicit GC |
+| `quarantine_prune` | Default TTL from policy |
+| `denied_prune` | Default TTL from policy |
+| `cargo_cache` | Policy-determined |
+
+GC emits a `GcReceiptV1` persisted under `$APM2_HOME/private/fac/receipts/`.
+
+#### gate_cache_v2 unbound-entry wipe (TCK-00619 migration)
+
+When deploying the TCK-00619 binary (which removes `--allow-legacy-cache`),
+any existing gate cache entries that lack RFC-0028/0029 receipt bindings will
+be treated as cache misses and cause gates to re-run. To avoid unnecessary
+re-execution:
+
+```bash
+# Option A: wipe the entire gate cache (simplest, safest)
+rm -rf "${APM2_HOME:-$HOME/.apm2}/private/fac/gate_cache_v2/"
+
+# Option B: let GC expire them naturally (30-day TTL)
+apm2 fac gc --dry-run   # preview what would be removed
+apm2 fac gc             # run GC (unbound entries become misses; they expire within 30 days)
+```
+
+Option A is recommended for the migration moment; Option B is acceptable if
+re-running some gates is not a concern.
 
 ### 3.4 Enqueueing jobs manually (PLANNED)
 
@@ -323,9 +423,13 @@ Symptom: apm2 fac gates hangs or returns immediately with no output
 Symptom: Test gate fails with timeout during large compilation
 ```
 
-1. Pre-warm the build by running `cargo build --workspace` before running gates
-2. If warming itself times out, check if dependencies changed significantly
-3. Consider freeing disk space manually (see section 3.3)
+1. Pre-warm the build using the dedicated warm command (preferred path):
+   ```bash
+   apm2 fac warm --wait --wait-timeout-secs 1200
+   ```
+2. Fallback: run `cargo build --workspace` manually before running gates
+3. If warming itself times out, check if dependencies changed significantly
+4. Consider running GC to free disk space (see section 3.3)
 
 ### 6.3 bounded test execution unavailable
 
@@ -362,10 +466,18 @@ Symptom: "Failed to connect to user bus" or similar systemd error
 Symptom: Builds fail with "No space left on device"
 ```
 
-1. Free disk space manually (see section 3.3)
+1. Run GC to reclaim disk space (primary path):
+   ```bash
+   apm2 fac gc --dry-run   # preview what would be removed
+   apm2 fac gc             # reclaim disk space
+   ```
+   Use `--min-free-bytes <N>` to enforce a specific free-space floor.
 2. Check for orphaned evidence logs: `du -sh "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"`
 3. Check build target directories: `du -sh target/`
-4. Target directories are compilation caches (safe to delete): `rm -rf target/`
+4. Last resort — target directories are compilation caches (safe to delete):
+   ```bash
+   rm -rf target/
+   ```
 
 ### 6.6 Stale lease (PLANNED — FESv1 future)
 
@@ -407,6 +519,9 @@ Symptom: Builds fail with "No space left on device"
 | `apm2 fac resume` | Show crash-only resume helpers from ledger anchor |
 | `apm2 fac role-launch` | Launch a FAC role with hash-bound admission checks |
 | `apm2 fac pr` | GitHub App credential management and PR operations |
+| `apm2 fac bootstrap` | One-shot idempotent host provisioning (`--dry-run`, `--user`, `--system`, `--json`) |
+| `apm2 fac warm` | Enqueue a lane-scoped pre-warm job (`--phases`, `--lane`, `--wait`, `--wait-timeout-secs`, `--json`) |
+| `apm2 fac gc` | Reclaim disk space across all FAC roots (`--dry-run`, `--json`, `--min-free-bytes`) |
 
 ### PLANNED -- not yet implemented (FESv1 queue/worker/lane surface)
 
@@ -415,10 +530,6 @@ Symptom: Builds fail with "No space left on device"
 | `apm2 fac lane status` | Show all lane states |
 | `apm2 fac lane reset <id>` | Reset a lane to known-good state |
 | `apm2 fac lane reset <id> --force` | Force-reset a running lane |
-| `apm2 fac warm` | Pre-warm all lane targets |
-| `apm2 fac warm --lane <id>` | Pre-warm a specific lane |
-| `apm2 fac gc` | Reclaim disk space across all FAC roots |
-| `apm2 fac gc --lane <id>` | Reclaim disk space for a specific lane |
 | `apm2 fac worker --once` | Run one job claim/execute cycle |
 | `apm2 fac worker` | Run worker continuously |
 | `apm2 fac enqueue <spec>` | Enqueue a job from a spec file |
