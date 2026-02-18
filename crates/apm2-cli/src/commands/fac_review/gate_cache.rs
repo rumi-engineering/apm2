@@ -753,6 +753,7 @@ impl GateCache {
     /// **CRITICAL:** This method **must** be called **before** `sign()`
     /// / `sign_all()` so that the signed canonical bytes cover the final
     /// flag values.
+    #[cfg_attr(test, allow(dead_code))]
     pub fn try_bind_receipt_from_store(&mut self, receipts_dir: &std::path::Path, job_id: &str) {
         let Some(receipt) = apm2_core::fac::lookup_job_receipt(receipts_dir, job_id) else {
             return; // No receipt found — flags stay false (fail-closed).
@@ -969,6 +970,7 @@ impl GateCache {
 ///   (`$APM2_HOME/private/fac/receipts`).
 /// * `job_id` - The job ID whose receipt should be looked up.
 /// * `signer` - The signing key for re-signing the cache after flag promotion.
+#[cfg_attr(test, allow(dead_code))]
 pub fn rebind_gate_cache_after_receipt(
     sha: &str,
     receipts_dir: &Path,

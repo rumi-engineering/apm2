@@ -4296,6 +4296,7 @@ pub(super) fn run_gates_local_worker(
 /// Called by the worker after persisting a job receipt to promote
 /// `rfc0028_receipt_bound` and `rfc0029_receipt_bound` flags in the
 /// gate cache based on verified receipt evidence.
+#[cfg_attr(test, allow(dead_code))]
 pub(super) fn rebind_gate_cache_after_receipt(
     sha: &str,
     receipts_dir: &std::path::Path,
