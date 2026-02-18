@@ -56,11 +56,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use apm2_core::fac::{
-    LANE_CORRUPT_MARKER_SCHEMA, LANE_ENV_DIRS, LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1,
-    LaneManager, LaneReconcileReceiptV1, LaneState, LaneStatusV1,
-    PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt,
-    SUMMARY_RECEIPT_SCHEMA, SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA,
-    TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1, safe_rmtree_v1,
+    LANE_ENV_DIRS, LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1, LaneManager,
+    LaneReconcileReceiptV1, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
+    REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA,
+    SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
+    safe_rmtree_v1,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
@@ -4992,21 +4992,11 @@ fn run_lane_mark_corrupt_with_manager(
         }
     }
 
-    // Build and persist the corrupt marker.
-    // SECURITY JUSTIFICATION (CTR-2501): `chrono::Utc::now()` is used for
-    // the `detected_at` timestamp in the corrupt marker. This is a
-    // human-readable audit label, not a monotonic ordering primitive.
-    let detected_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-    let marker = LaneCorruptMarkerV1 {
-        schema: LANE_CORRUPT_MARKER_SCHEMA.to_string(),
-        lane_id: args.lane_id.clone(),
-        reason: args.reason.clone(),
-        cleanup_receipt_digest: args.receipt_digest.clone(),
-        detected_at,
-    };
-
-    if let Err(e) = marker.persist(manager.fac_root()) {
+    // Persist the corrupt marker via LaneManager, which generates the
+    // detected_at timestamp internally as ISO-8601 (CTR-2501).
+    if let Err(e) =
+        manager.mark_corrupt(&args.lane_id, &args.reason, args.receipt_digest.as_deref())
+    {
         return output_error(
             json_output,
             "persist_error",
@@ -5018,12 +5008,19 @@ fn run_lane_mark_corrupt_with_manager(
         );
     }
 
+    // Load the persisted marker to include the generated detected_at in output.
+    let detected_at = LaneCorruptMarkerV1::load(manager.fac_root(), &args.lane_id)
+        .ok()
+        .flatten()
+        .map(|m| m.detected_at)
+        .unwrap_or_default();
+
     let response = serde_json::json!({
         "lane_id": args.lane_id,
         "status": "CORRUPT",
         "reason": args.reason,
         "cleanup_receipt_digest": args.receipt_digest,
-        "detected_at": marker.detected_at,
+        "detected_at": detected_at,
     });
     println!(
         "{}",
@@ -6338,6 +6335,7 @@ fn run_bundle_import(args: &BundleImportArgs, json_output: bool) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use apm2_core::fac::LANE_CORRUPT_MARKER_SCHEMA;
     use clap::Parser;
 
     use super::*;
