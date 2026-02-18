@@ -26,6 +26,7 @@ use super::{fenced_yaml, findings_store, github_projection, projection_store};
 use crate::exit_codes::codes as exit_codes;
 
 const DECISION_MARKER: &str = "apm2-review-verdict:v1";
+const DECISION_TOMBSTONE_MARKER: &str = "apm2-review-verdict:tombstone:v1";
 const DECISION_SCHEMA: &str = "apm2.review.verdict.v1";
 const PROJECTION_VERDICT_SCHEMA: &str = "apm2.fac.projection.verdict.v1";
 const PROJECTION_REVIEWER_SCHEMA: &str = "apm2.fac.projection.reviewer.v1";
@@ -778,11 +779,12 @@ fn project_decision_comment(
         github_projection::fetch_issue_comment,
         github_projection::update_issue_comment,
         github_projection::create_issue_comment,
+        fetch_latest_known_remote_verdict_comment_id,
     )
 }
 
 #[allow(clippy::too_many_lines)]
-fn project_decision_comment_with<FFetch, FUpdate, FCreate>(
+fn project_decision_comment_with<FFetch, FUpdate, FCreate, FLatest>(
     owner_repo: &str,
     pr_number: u32,
     record: &DecisionProjectionRecord,
@@ -790,11 +792,13 @@ fn project_decision_comment_with<FFetch, FUpdate, FCreate>(
     mut fetch_comment: FFetch,
     mut update_comment: FUpdate,
     mut create_comment: FCreate,
+    mut latest_remote_verdict_comment_id: FLatest,
 ) -> Result<(u64, String), String>
 where
     FFetch: FnMut(&str, u64) -> Result<Option<github_projection::IssueCommentResponse>, String>,
     FUpdate: FnMut(&str, u64, &str) -> Result<(), String>,
     FCreate: FnMut(&str, u32, &str) -> Result<github_projection::IssueCommentResponse, String>,
+    FLatest: FnMut(&str, u32) -> Result<Option<u64>, String>,
 {
     let body = render_decision_comment_body(owner_repo, pr_number, &record.head_sha, payload)?;
 
@@ -854,10 +858,25 @@ where
         }
     }
 
+    let latest_known_remote_comment_id = if orphaned_remote_comment_id.is_none() {
+        match latest_remote_verdict_comment_id(owner_repo, pr_number) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!(
+                    "WARNING: failed to discover latest remote verdict comment for PR #{pr_number}: {err}"
+                );
+                None
+            },
+        }
+    } else {
+        None
+    };
+
     match create_comment(owner_repo, pr_number, &body) {
         Ok(response) => {
-            if let Some(orphaned_comment_id) =
-                orphaned_remote_comment_id.filter(|value| *value != response.id)
+            if let Some(orphaned_comment_id) = orphaned_remote_comment_id
+                .or(latest_known_remote_comment_id)
+                .filter(|value| *value != response.id)
             {
                 let tombstone =
                     render_tombstoned_decision_comment_body(response.id, &response.html_url);
@@ -885,7 +904,7 @@ fn render_tombstoned_decision_comment_body(
     replacement_comment_url: &str,
 ) -> String {
     format!(
-        "<!-- apm2-review-verdict:tombstone:v1 -->\nSuperseded by verdict comment {replacement_comment_url} (id {replacement_comment_id})."
+        "<!-- {DECISION_TOMBSTONE_MARKER} -->\nSuperseded by verdict comment {replacement_comment_url} (id {replacement_comment_id})."
     )
 }
 
@@ -1282,6 +1301,47 @@ fn max_cached_issue_comment_id(owner_repo: &str, pr_number: u32) -> Option<u64> 
                 .filter_map(|value| value.get("id").and_then(serde_json::Value::as_u64))
                 .max()
         })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CachedIssueComment {
+    id: u64,
+    #[serde(default)]
+    html_url: String,
+    #[serde(default)]
+    body: String,
+}
+
+fn is_live_verdict_comment_body(body: &str) -> bool {
+    body.contains(DECISION_MARKER) && !body.contains(DECISION_TOMBSTONE_MARKER)
+}
+
+fn max_cached_live_verdict_comment_id(owner_repo: &str, pr_number: u32) -> Option<u64> {
+    projection_store::load_issue_comments_cache::<CachedIssueComment>(owner_repo, pr_number)
+        .ok()
+        .flatten()
+        .and_then(|comments| {
+            comments
+                .into_iter()
+                .filter(|entry| entry.id > 0)
+                .filter(|entry| is_remote_comment_url(&entry.html_url))
+                .filter(|entry| is_live_verdict_comment_body(&entry.body))
+                .map(|entry| entry.id)
+                .max()
+        })
+}
+
+fn fetch_latest_known_remote_verdict_comment_id(
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<Option<u64>, String> {
+    let cached = max_cached_live_verdict_comment_id(owner_repo, pr_number);
+    let remote = github_projection::fetch_latest_live_verdict_comment_id(owner_repo, pr_number)?;
+    Ok(match (cached, remote) {
+        (Some(lhs), Some(rhs)) => Some(lhs.max(rhs)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    })
 }
 
 fn load_decision_projection_for_home(
@@ -2119,6 +2179,7 @@ mod tests {
                         .to_string(),
                 })
             },
+            |_, _| Ok(None),
         )
         .expect("resolve+patch existing comment");
 
@@ -2203,6 +2264,7 @@ mod tests {
                         .to_string(),
                 })
             },
+            |_, _| Ok(None),
         )
         .expect("revalidation retry should patch existing comment");
 
@@ -2283,6 +2345,7 @@ mod tests {
                         .to_string(),
                 })
             },
+            |_, _| Ok(None),
         )
         .expect("fallback create should tombstone superseded comment");
 
@@ -2359,6 +2422,7 @@ mod tests {
                         .to_string(),
                 })
             },
+            |_, _| Ok(None),
         )
         .expect("replacement comment should be accepted even when tombstone fails");
 
@@ -2368,6 +2432,82 @@ mod tests {
             "https://github.com/example/repo/issues/665#issuecomment-89"
         );
         assert_eq!(update_calls, 2);
+    }
+
+    #[test]
+    fn project_decision_comment_tombstones_latest_known_remote_comment_when_record_reinitialized() {
+        let owner_repo = "example/repo";
+        let pr_number = 666;
+        let head_sha = "ddeeff0011223344556677889900112233445566";
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: "ok".to_string(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-18T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
+            },
+        );
+        let payload = DecisionComment {
+            schema: DECISION_SCHEMA.to_string(),
+            pr: pr_number,
+            sha: head_sha.to_string(),
+            updated_at: "2026-02-18T00:00:00Z".to_string(),
+            dimensions: dimensions.clone(),
+        };
+        let record = DecisionProjectionRecord {
+            schema: super::PROJECTION_VERDICT_SCHEMA.to_string(),
+            owner_repo: owner_repo.to_string(),
+            pr_number,
+            head_sha: head_sha.to_string(),
+            updated_at: payload.updated_at.clone(),
+            // Simulates a reconstructed local record where projection state was lost.
+            decision_comment_id: 120,
+            decision_comment_url: super::local_comment_url(owner_repo, pr_number, 120),
+            decision_signature: String::new(),
+            integrity_hmac: None,
+            dimensions,
+        };
+
+        let mut update_calls = 0usize;
+        let mut tombstoned_comment_id = None::<u64>;
+        let (comment_id, comment_url) = super::project_decision_comment_with(
+            owner_repo,
+            pr_number,
+            &record,
+            &payload,
+            |_, id| {
+                assert_eq!(id, 120);
+                Ok(None)
+            },
+            |_, id, body| {
+                update_calls = update_calls.saturating_add(1);
+                tombstoned_comment_id = Some(id);
+                assert!(body.contains("apm2-review-verdict:tombstone:v1"));
+                assert!(body.contains("issuecomment-88"));
+                Ok(())
+            },
+            |_, _, _| {
+                Ok(super::github_projection::IssueCommentResponse {
+                    id: 88,
+                    html_url: "https://github.com/example/repo/issues/666#issuecomment-88"
+                        .to_string(),
+                })
+            },
+            |_, _| Ok(Some(77)),
+        )
+        .expect("create should tombstone latest known remote verdict comment");
+
+        assert_eq!(comment_id, 88);
+        assert_eq!(
+            comment_url,
+            "https://github.com/example/repo/issues/666#issuecomment-88"
+        );
+        assert_eq!(update_calls, 1);
+        assert_eq!(tombstoned_comment_id, Some(77));
     }
 
     #[test]
@@ -2483,6 +2623,7 @@ mod tests {
                             ),
                         })
                     },
+                    |_, _| Ok(None),
                 )
                 .expect("project shared verdict comment");
                 record.decision_comment_id = comment_id;
