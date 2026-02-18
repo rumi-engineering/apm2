@@ -85,7 +85,12 @@ APM2 currently has **two ledger planes** plus several “shadow truth” stores 
 
 2. **Core ledger** (`events` table + hash chaining + optional BFT wrapper) in `crates/apm2-core/src/ledger/*`.
 
-   * Today, the core ledger is frequently forced into **`LegacyModeReadOnly`** (see `determine_read_mode`), because `ledger_events` exists and the canonical `events` table is empty. This blocks forward progress: you cannot safely “just start writing kernel events” without a unification plan.
+   * Today, the core ledger is frequently in `LedgerReadMode::LegacyLedgerEvents` (see `determine_read_mode`) because `ledger_events` exists and the canonical `events` table is empty.
+
+     * In this mode, `LedgerStorage::ensure_writable()` rejects canonical appends with `LedgerStorageError::LegacyModeReadOnly`.
+     * If both `ledger_events` **and** `events` contain rows, `determine_read_mode` fails fast with `LedgerReadModeError::AmbiguousSchemaState`.
+
+     This blocks forward progress: you cannot safely start writing canonical events without first eliminating the ambiguous two-ledger state.
 
 3. **FAC v0 (CLI-local) ticket/YAML truth** and `fac_review` orchestrator state:
 
@@ -125,7 +130,7 @@ NG3. Designing the final cryptographic actor identity model (hex key ids vs stri
 
 ### 2.3 Hard constraints (from repo reality)
 
-C1. **Core ledger is currently often in legacy read-only mode**: any plan that "starts writing kernel events" must include ledger unification.
+C1. **Core ledger is currently often in `LedgerReadMode::LegacyLedgerEvents`**: any plan that starts writing canonical events must first eliminate the ambiguous two-ledger state (see `determine_read_mode`).
 C2. **`apm2 fac push` remains the terminal command** through cutover; no bypassing.
 C3. Daemon is the authority boundary: ledger/CAS mutations go through the daemon operator socket (UDS) unless explicitly delegated later.
 
@@ -142,7 +147,7 @@ This RFC therefore declares the following drift barriers as **mandatory**, not "
 2. **Topic derivation coverage**: every new canonical event type introduced by this RFC MUST have a dedicated topic-derivation test in
    `crates/apm2-daemon/src/protocol/topic_derivation.rs` that asserts the exact topic set emitted.
 3. **Parity gate integration**: if we are in a bridge window where both legacy and canonical work events exist, parity MUST be continuously checked using
-   `apm2_core::work::parity::WorkParityValidator` and promotion MUST be blocked on defects (fail-closed).
+   `apm2_core::work::parity::{ParityValidator, EventFamilyPromotionGate}` (see existing production usage in `crates/apm2-daemon/src/gate/merge_executor.rs`), and promotion MUST be blocked on defects (fail-closed).
 
 **D2. Fail-closed bounded decoding (DoS + schema drift defense)**
 
@@ -191,7 +196,7 @@ If a requirement is "not yet implemented" in this RFC's phases, the RFC MUST spe
 The repo already contains multiple event families. **Underscore vs dot is not the correct classifier**:
 
 * Some underscore events are **daemon-signed JSON** (`work_claimed`, `work_transitioned`, `session_started`, ...).
-* Some underscore events are already **kernel-typed protobuf payloads** that are part of the FAC spine (`changeset_published`, `review_receipt_recorded`, `review_blocked_recorded`, ...), and are already mapped in core verification logic via domain-separated prefixes (`crates/apm2-core/src/ledger/storage.rs::domain_prefix_for_event_type`).
+* Many underscore events are daemon-signed JSON today (including FAC spine facts like `changeset_published` and review receipts). The corresponding domain prefixes already exist in `crates/apm2-core/src/ledger/storage.rs::domain_prefix_for_event_type`, and this RFC upgrades the canonical encoding for those facts to protobuf in the core ledger.
 * Dot-prefixed events (`work.opened`, `work.transitioned`, `evidence.published`) are reducer-facing canonical event types.
 
 This RFC therefore uses the following taxonomy (normative):
@@ -209,13 +214,16 @@ This RFC therefore uses the following taxonomy (normative):
    * Event types: `work.opened`, `work.transitioned`, `work.completed`, `work.aborted`, `evidence.published`, etc.
    * Reducers: `apm2_core::work::WorkReducer`, `apm2_core::evidence::EvidenceReducer`, etc.
 
-3. **KernelTypedProtobuf events (FAC spine events that are not reducers' `WorkEvent`)**
+3. **KernelTyped events (FAC spine facts that are not reducers' `WorkEvent`)**
    * Storage: core ledger `events` table (post-unification).
-   * Payload: protobuf bytes (e.g., `ChangeSetPublished`, review receipts) with domain-separated signing/verification.
-   * Event types (today): `changeset_published`, `review_receipt_recorded`, `review_blocked_recorded`, `projection_receipt_recorded`, etc.
-   * Policy: these are canonical kernel facts and MUST NOT be lumped into "legacy intake" just because they use underscores.
+   * Payload encoding:
+     * **Today (repo reality):** these facts are emitted by the daemon as **signed JSON payloads** in the legacy ledger (`crates/apm2-daemon/src/ledger.rs`).
+     * **End state (this RFC):** these facts are emitted as **protobuf payloads** using the corresponding messages in `proto/kernel_events.proto` and canonicalized via `apm2_core::events::Canonicalize`.
+   * Event types: `changeset_published`, `review_receipt_recorded`, `review_blocked_recorded`, `projection_receipt_recorded`, etc.
+   * Policy: these are canonical kernel facts and MUST NOT be lumped into "legacy intake" just because they use underscores. During the bridge, topic derivation + projections MUST accept **both** encodings for the same `event_type` until emissions are frozen.
 
-**Key rule (bridge):** during cutover windows where both DaemonSignedJson work events and ReducerProtobuf work events exist, reducer truth MUST be checked for equivalence using `WorkParityValidator`, and promotion MUST be fail-closed on parity defects.
+**Key rule (bridge):** during cutover windows where both DaemonSignedJson work events and ReducerProtobuf work events exist, reducer truth MUST be checked for equivalence using
+`apm2_core::work::parity::{ParityValidator, EventFamilyPromotionGate}`, and any promotion-capable system actor MUST fail-closed on parity defects.
 
 ### 3.3 Payload encoding + canonicalization matrix (drift barrier)
 
@@ -231,10 +239,12 @@ Minimum required declarations for this RFC:
 |---|---|---:|---|---|
 | ReducerProtobuf (`WorkEvent`) | `work.opened`, `work.transitioned`, `work.completed` | protobuf | `apm2_core::events::Canonicalize` on payload structs | `work_id` extracted from decoded `WorkEvent` |
 | ReducerProtobuf (`EvidenceEvent`) | `evidence.published` | protobuf | `apm2_core::events::Canonicalize` | `work_id` from decoded `EvidencePublished.work_id` |
-| KernelTypedProtobuf | `changeset_published`, `review_receipt_recorded` | protobuf | event-type-specific canonicalization (existing emitters already do this) | `work_id` from decoded payload or from envelope metadata in projection |
+| KernelTyped (bridge: JSON → protobuf) | `changeset_published`, `review_receipt_recorded` | **bridge:** JSON today; **end:** protobuf | **end state:** `apm2_core::events::Canonicalize` on the protobuf payload | `work_id` from decoded payload (bridge: JSON parse; end: protobuf decode) |
 | DaemonSignedJson | `work_claimed`, `work_transitioned` | JSON | `canonicalize_json` before signing | `work_id` from payload JSON |
 
 **Pulse implication:** `PulsePublisher` MUST NOT assume a `KernelEvent` envelope; it MUST route on `(event_type, payload_bytes)` and decode only enough to derive topics and (optionally) render doctor hints.
+
+**Normative decision:** the core ledger stores **event-type-specific payload bytes** in `events.payload` (e.g., `WorkEvent` bytes for `work.*`, `EvidenceEvent` bytes for `evidence.*`, and typed bytes for kernel facts). `KernelEvent` is treated as a *derived* representation (useful for network APIs), not the on-disk payload encoding.
 
 ---
 
@@ -251,13 +261,43 @@ To prevent long-lived drift between "what the RFC intended" and "what got serial
 3. Be decoded from IPC bytes using bounded deserialization:
    * `fac_schemas::bounded_from_slice_with_limit::<T>(bytes, limit)`
    * `#[serde(deny_unknown_fields)]` on the struct `T`.
-4. Define an explicit maximum size per artifact (fail-closed). Suggested hard caps:
-   * WorkSpec: 256 KiB
-   * WorkLoopProfile: 64 KiB
-   * WorkContextEntry: 256 KiB
-   * WorkAuthorityBindings: 256 KiB
+4. Define an explicit maximum size per artifact (fail-closed).
+
+Hard caps (normative; fail-closed):
+
+* WorkSpec: **≤ 256 KiB**
+* WorkLoopProfile: **≤ 64 KiB**
+* WorkContextEntry: **≤ 256 KiB**
+* WorkAuthorityBindings: **≤ 256 KiB**
 
 **Hashing rule:** the daemon MUST canonicalize the JSON bytes first and store the canonical bytes in CAS (the hash is of canonical bytes). The daemon MUST NOT hash/store raw non-canonical input bytes.
+
+### 4.0.1 Deterministic IDs for idempotent evidence anchors (mandatory)
+
+Several RPCs in this RFC are *idempotent* and anchor CAS artifacts via `evidence.published`. To make idempotency implementable without "read-before-write" races, the daemon MUST generate **deterministic identifiers** for:
+
+* `entry_id` (for `WorkContextEntry`)
+* `evidence_id` (for the anchoring `EvidencePublished`)
+* optional `edge_id` (when callers do not supply one)
+
+**Rule:** when an RPC defines idempotency on `(work_id, kind, dedupe_key)` (or `(work_id, dedupe_key)`), the daemon MUST deterministically derive:
+
+* `entry_id` and `evidence_id` from `(category, work_id, kind, dedupe_key)`
+* using BLAKE3 over canonical UTF-8 bytes, and a stable prefix.
+
+Recommended format (normative prefixes; exact base encoding is an implementation detail):
+
+* `WorkContextEntry`:
+  * `entry_id = "CTX-" + blake3("WORK_CONTEXT_ENTRY" || work_id || kind || dedupe_key)`
+  * `evidence_id = entry_id`
+* `WorkLoopProfile`:
+  * `evidence_id = "WLP-" + blake3("WORK_LOOP_PROFILE" || work_id || dedupe_key)`
+* `WorkAuthorityBindings`:
+  * `evidence_id = "WAB-" + blake3("WORK_AUTHORITY_BINDINGS" || work_id || role || lease_id)`
+* `WorkEdge` (when callers do not supply `edge_id`):
+  * `edge_id = "EDGE-" + blake3("WORK_EDGE" || from_work_id || to_work_id || edge_type || dedupe_key)`
+
+**Fail-closed:** if `dedupe_key` is required by the RPC, empty `dedupe_key` MUST be rejected.
 
 ### 4.1 WorkSpec: `apm2.work_spec.v1` (immutable)
 
@@ -339,10 +379,11 @@ Stored in CAS; anchored by a ledger event (`evidence.published` with category `W
 {
   "schema": "apm2.work_context_entry.v1",
   "work_id": "…",
-  "entry_id": "CTX-<uuid>",
+  "entry_id": "CTX-<blake3>",
   "kind": "HANDOFF_NOTE",
-  "dedupe_key": "session-…",
-  "actor_id": "…",
+  "dedupe_key": "session:S-…",
+  "source_session_id": "S-…",
+  "actor_id": "actor:uid:…:gid:…",
   "created_at_ns": 0,
   "body": {
     "format": "markdown",
@@ -358,6 +399,54 @@ Stored in CAS; anchored by a ledger event (`evidence.published` with category `W
 **Actor/time attribution rule (repo-aligned):**
 `actor_id` MUST be derived by the daemon from peer credentials (as `ClaimWork` already does); clients MUST NOT be the authority for `actor_id`.
 `created_at_ns` SHOULD equal the ledger event timestamp used to anchor the entry (or be derived directly from the daemon's authoritative clock source).
+
+**Kind allowlist (mandatory):** `kind` MUST be one of:
+
+* `HANDOFF_NOTE`
+* `IMPLEMENTER_TERMINAL`
+* `DIAGNOSIS`
+* `REVIEW_FINDING`
+* `REVIEW_VERDICT`
+* `GATE_NOTE`
+* `LINKOUT`
+
+**Normalization rule:** the daemon MUST verify that `entry_json.kind` equals request `kind` and `entry_json.dedupe_key` equals request `dedupe_key`. If the client omits `entry_id`, `actor_id`, or `created_at_ns`, the daemon MUST fill them prior to canonicalization. If the client supplies them, the daemon MUST overwrite them with authoritative values (fail-closed if overwriting would change a non-empty client value).
+
+### 4.4 WorkAuthorityBindings: `apm2.work_authority_bindings.v1` (immutable, append-only)
+
+Stored in CAS; anchored by `evidence.published` with category `WORK_AUTHORITY_BINDINGS`.
+
+**Purpose:** eliminate WorkRegistry as an authority source by recording all authority-relevant pins required by RFC-0018 §6.3 for claim → spawn → privileged actions.
+
+```json
+{
+  "schema": "apm2.work_authority_bindings.v1",
+  "work_id": "W-…",
+  "role": "IMPLEMENTER",
+  "lease_id": "L-…",
+  "actor_id": "actor:uid:…:gid:…",
+  "claimed_at_ns": 0,
+  "transition_count": 1,
+  "policy_resolution": {
+    "resolved_policy_hash": "…",
+    "policy_resolved_ref": "…",
+    "resolved_risk_tier": 2,
+    "role_spec_hash": "…",
+    "context_pack_recipe_hash": "…",
+    "context_pack_hash": "…",
+    "capability_manifest_hash": "…",
+    "expected_adapter_profile_hash": "…"
+  },
+  "boundary_pins": {
+    "permeability_receipt_hash": null,
+    "stop_condition_hash": "…",
+    "typed_budget_contract_hash": "…",
+    "typed_budget_hash": "…",
+    "typed_budgets": { "entropy_budget": 1234 },
+    "stop_conditions": [ { "type": "manual_stop" } ]
+  }
+}
+```
 
 ---
 
@@ -375,11 +464,16 @@ Canonical event types are dot-prefixed (as already referenced in `work/authority
 * `work.aborted`
 * `work.pr_associated`
 
+**Session boundary pins (required by RFC-0018 §6.3):** session-start events MUST record the complete boundary pin set used to spawn the episode. Implementation choice: extend `SessionStarted` in `proto/kernel_events.proto` to include these hash fields so `session.started` is replay-self-contained.
+
 ### 5.2 Work graph events (new): `WorkGraphEvent`
 
 We introduce a new protobuf message family in `proto/kernel_events.proto`:
 
 ```proto
+// Kernel events for the mutable dependency graph.
+// NOTE: event types are `work_graph.*` (do not start with `work.`) to avoid WorkReducer decoding.
+
 message WorkGraphEvent {
   oneof event {
     WorkEdgeAdded edge_added = 1;
@@ -388,24 +482,36 @@ message WorkGraphEvent {
   }
 }
 
+enum WorkEdgeType {
+  WORK_EDGE_TYPE_UNSPECIFIED = 0;
+  WORK_EDGE_TYPE_BLOCKS = 1;
+}
+
 message WorkEdgeAdded {
-  string edge_id = 1;
+  string edge_id = 1;          // "EDGE-…" unless caller supplies
   string from_work_id = 2;
   string to_work_id = 3;
-  string edge_type = 4;        // "BLOCKS" initially
+  WorkEdgeType edge_type = 4;
   string rationale = 5;
+  string dedupe_key = 6;       // required when edge_id not supplied (idempotency)
 }
 
 message WorkEdgeRemoved {
   string edge_id = 1;
-  string rationale = 2;
+  string from_work_id = 2;
+  string to_work_id = 3;
+  WorkEdgeType edge_type = 4;
+  string rationale = 5;
 }
 
 message WorkEdgeWaived {
   string edge_id = 1;
-  string waiver_id = 2;
-  uint64 expires_at_ns = 3;    // 0 = never
-  string rationale = 4;
+  string from_work_id = 2;
+  string to_work_id = 3;
+  WorkEdgeType edge_type = 4;
+  string waiver_id = 5;
+  uint64 expires_at_ns = 6;
+  string rationale = 7;
 }
 ```
 
@@ -500,18 +606,20 @@ The daemon MAY implement a best-effort orphan reaper, but correctness must not d
 * `RecordWorkPrAssociation`: idempotent on `(work_id, pr_number, commit_sha)` and SHOULD be checked
   against existing association to avoid "PR flapping."
 * Work graph RPCs:
-  * `AddWorkEdge` MUST support caller-supplied idempotency (dedupe key or explicit edge_id).
-  * `RemoveWorkEdge`/`WaiveWorkEdge` are idempotent by `edge_id`.
+  * `AddWorkEdge` is idempotent on `(from_work_id, to_work_id, edge_type, dedupe_key)`; daemon derives `edge_id` deterministically if not supplied.
+  * `RemoveWorkEdge` and `WaiveWorkEdge` are idempotent by `edge_id`.
 
 #### 6.0.1.3 Error mapping
 
-Unless a new error code is introduced, map to existing `PrivilegedErrorCode` classes:
+Map to existing `PrivilegedErrorCode` variants in `proto/apm2d_runtime_v1.proto`:
 
-* invalid schema / canonicalization failure → `INVALID_ARGUMENT`
-* missing work / missing edge → `NOT_FOUND`
-* violates dependency closure / cycle detected → `FAILED_PRECONDITION`
-* lease/role mismatch → `PERMISSION_DENIED`
-* idempotency conflict (same key, different content) → `ALREADY_EXISTS`
+* invalid schema / canonicalization failure / invalid hashes → `INVALID_ARGUMENT`
+* missing work → `WORK_NOT_FOUND`
+* missing session → `SESSION_NOT_FOUND`
+* missing edge / missing artifact reference → `VALIDATION_FAILED`
+* violates dependency closure / cycle detected / graph policy violation → `CAPABILITY_REQUEST_REJECTED`
+* lease/role mismatch / role not authorized for operation → `CAPABILITY_DENIED` (or `PERMISSION_DENIED` when the caller lacks daemon-level privilege)
+* idempotency conflict (same key, different content) → `VALIDATION_FAILED` (include a stable machine-readable reason string)
 
 ### 6.1 OpenWork (new)
 
@@ -564,11 +672,12 @@ Daemon behavior:
 
 ### 6.3 Add/Remove/Waive WorkEdge (new)
 
-Requests:
+Requests (authorization + idempotency are explicit):
 
-* `AddWorkEdgeRequest { from_work_id, to_work_id, edge_type, rationale }`
-* `RemoveWorkEdgeRequest { edge_id, rationale }`
-* `WaiveWorkEdgeRequest { edge_id, expires_at_ns, rationale }`
+* `AddWorkEdgeRequest { from_work_id, to_work_id, edge_type, rationale, dedupe_key, lease_id }`
+  * `lease_id` MUST be a valid `COORDINATOR` lease for `to_work_id` (see §7.6).
+* `RemoveWorkEdgeRequest { edge_id, from_work_id, to_work_id, edge_type, rationale, lease_id }`
+* `WaiveWorkEdgeRequest { edge_id, from_work_id, to_work_id, edge_type, expires_at_ns, rationale, lease_id }`
 
 Emit `work_graph.*` events and update projections.
 
@@ -587,19 +696,20 @@ message PublishWorkContextEntryRequest {
 
 Daemon behavior:
 
-1. Canonicalize and store `entry_json` to CAS → `entry_hash`
-2. Append `evidence.published` (protobuf `EvidencePublished`) with:
+1. Validate + canonicalize `entry_json` (schema id + bounded decode).
+2. Fill/overwrite daemon-authoritative fields (`entry_id`, `actor_id`, `created_at_ns`) and re-canonicalize.
+   * `entry_id` MUST be derived deterministically from `(work_id, kind, dedupe_key)` per §4.0.1.
+3. Store canonical bytes to CAS → `entry_hash`
+4. Append `evidence.published` (protobuf `EvidencePublished`) with:
    * `category = WORK_CONTEXT_ENTRY`
    * `artifact_hash = entry_hash`
    * `artifact_size = len(canonical_entry_bytes)`
    * `classification = "INTERNAL"` (unless explicitly overridden by a policy-controlled surface)
    * `verification_command_ids = []` (work context entries are not verification results)
    * `metadata` includes `kind=<kind>` and `dedupe_key=<dedupe_key>` (for low-cost indexing)
-3. Enforce idempotency on `(work_id, kind, dedupe_key)` via projection uniqueness; on duplicate, return success without emitting additional events.
+5. Enforce idempotency on `(work_id, kind, dedupe_key)` via projection uniqueness; on duplicate, return success without emitting additional events.
 
-**Note:** `EvidenceReducer` rejects duplicate `evidence_id`. This RPC MUST either:
-* generate an evidence id that is unique per emitted entry (recommended: `evidence_id = entry_id`), or
-* be strictly idempotent such that the same dedupe key never produces a second publish.
+**Note:** `EvidenceReducer` rejects duplicate `evidence_id`. This RFC requires `evidence_id = entry_id` (see §4.0.1).
 
 ### 6.5 RecordWorkPrAssociation (new)
 
@@ -610,11 +720,9 @@ Request:
 ```proto
 message RecordWorkPrAssociationRequest {
   string work_id = 1;
-  string repo_owner = 2;
-  string repo_name = 3;
-  uint64 pr_number = 4;
-  bytes commit_sha = 5;
-  string pr_url = 6;
+  uint64 pr_number = 2;
+  string commit_sha = 3; // 40-hex; daemon validates
+  string pr_url = 4;     // optional; stored as a linkout context entry when present
 }
 ```
 
@@ -643,11 +751,11 @@ message PublishWorkLoopProfileRequest {
 
 Daemon behavior:
 
-1. Canonicalize + validate JSON schema (`apm2.work_loop_profile.v1`).
-2. Store to CAS → `profile_hash`
-3. Append `evidence.published` with category `WORK_LOOP_PROFILE`, `evidence_hash=profile_hash`,
-   and metadata containing `dedupe_key`.
-4. Projections treat the latest anchored profile as active for `(work_id)`.
+1. Canonicalize + validate JSON schema (`apm2.work_loop_profile.v1`) via the fac schema registry.
+2. Reject empty `dedupe_key`.
+3. Store canonical bytes to CAS → `profile_hash`
+4. Append `evidence.published` with deterministic `evidence_id` derived from `(work_id, dedupe_key)` per §4.0.1, category `WORK_LOOP_PROFILE`, `evidence_hash=profile_hash`, and metadata containing `dedupe_key`.
+5. Projections treat the latest anchored profile as active for `(work_id)`.
 
 ---
 
@@ -657,7 +765,7 @@ Daemon behavior:
 
 Initial required edge type:
 
-* `BLOCKS`: prerequisite (`from_work_id`) must be `Completed` or waived before dependent (`to_work_id`) is implementer-claimable.
+* `BLOCKS` (`WORK_EDGE_TYPE_BLOCKS`): prerequisite (`from_work_id`) must be `Completed` or waived before dependent (`to_work_id`) is implementer-claimable.
 
 ### 7.2 Claimability rule (implementer role)
 
@@ -682,16 +790,18 @@ Waivers are separate events, do not mutate history:
 This RFC introduces mutable DAG edges; without explicit edge idempotency and cycle handling the system
 will diverge under retries and/or deadlock under accidental cycles.
 
-* **Edge IDs**: generated by the daemon as `EDGE-<uuid_v4>` (same style as `W-`, `L-`, `S-`), returned
-  to callers in the RPC response.
-* **Idempotency**:
-  * `AddWorkEdge` must accept an optional `dedupe_key` (client-supplied) OR accept a caller-supplied
-    `edge_id`. Without this, retries can introduce duplicate edges and make claimability non-deterministic.
-  * `RemoveWorkEdge` and `WaiveWorkEdge` are idempotent: re-applying the same operation to the same
-    `edge_id` must be a no-op.
-* **Cycle detection**: `AddWorkEdge(BLOCKS)` must reject any edge that creates a cycle in the active
-  `BLOCKS` graph. Otherwise the daemon can create works that are permanently unclaimable without waivers.
-  Cycle detection is performed against the current projection graph, not by scanning history.
+* **Edge IDs**
+  * Caller MAY supply `edge_id`, otherwise daemon MUST derive:
+    * `edge_id = "EDGE-" + blake3("WORK_EDGE" || from_work_id || to_work_id || edge_type || dedupe_key)`
+  * `dedupe_key` required when caller does not supply `edge_id`.
+
+* **Idempotency**
+  * `AddWorkEdge` idempotent on `(from_work_id, to_work_id, edge_type, dedupe_key)`.
+  * `RemoveWorkEdge` / `WaiveWorkEdge` idempotent by `edge_id`.
+
+* **Cycle detection**
+  * Reject edges creating cycles in the **active** BLOCKS graph (removed/waived edges excluded).
+  * Implementation MUST be bounded and fail-closed on bound exceed.
 
 ### 7.5 Late edges and in-flight work (explicit policy)
 
@@ -703,6 +813,17 @@ If a `BLOCKS` edge is added where `to_work_id` is already `Claimed`/`InProgress`
 * Doctor output MUST surface the late edge as a high-severity diagnostic and recommend either:
   * adding a waiver, or
   * intentionally transitioning the work to `Blocked` via a policy-controlled system actor.
+
+### 7.6 Edge mutation authorization (mandatory)
+
+Work graph edits change claimability and therefore admission behavior. They are **not** implementer-controlled.
+
+**Authorization rule:** edge mutations MUST require either:
+
+1. an active `COORDINATOR` lease for `to_work_id`, provided in the request, or
+2. a daemon-internal system actor.
+
+**Audit rule:** actor identity is taken from the ledger envelope; clients MUST NOT set `actor_id` in payloads.
 
 ---
 
@@ -827,16 +948,14 @@ Required post-push behavior:
 
 Then daemon transitions:
 
-* `apm2 fac push` MUST NOT directly emit `work.transitioned(InProgress -> CiPending)` as the caller's
-  actor. In `apm2-core`, the `InProgress -> CiPending` transition is currently authorized only for the
-  CI system actor (`CI_SYSTEM_ACTOR_ID = "system:ci-processor"` in `crates/apm2-core/src/work/reducer.rs`).
+* **This RFC's rule:** `apm2 fac push` MUST NOT emit any `work.transitioned` events. It publishes the latest changeset + required context markers only.
 
 Instead:
 
-1. `apm2 fac push` publishes the latest changeset + required context markers.
-2. A daemon-side **CI processor** (which may be the gate orchestrator) observes `changeset_published`
-   for the work's latest digest and emits:
-   * `work.transitioned(InProgress -> CiPending)` as actor `"system:ci-processor"`
+* **CI processor responsibility:** a daemon-side CI processor observes `changeset_published` for the work's latest digest and emits:
+
+  * `work.transitioned(InProgress -> CiPending)` as actor `"system:ci-processor"`
+  * `work.transitioned(CiPending -> ReadyForReview)` **or** `work.transitioned(CiPending -> Blocked)` as actor `"system:ci-processor"` (these transitions are CI-restricted today by `WorkReducer`).
 
 ### 10.4 Reaper/nudge loop (new daemon WorkLoopManager)
 
@@ -908,7 +1027,7 @@ PulsePublisher must operate on:
 
 Topic derivation must return `Vec<String>`, not a single topic, because:
 
-* work graph edges touch two work ids
+* work graph edges touch two work ids (and work_graph payloads MUST carry both ids so the deriver can be stateless)
 * receipts can affect both work and PR indices
 
 ### 12.3 Topic namespace
@@ -985,9 +1104,13 @@ Implement a daemon startup migration that turns the core `events` table into the
 
 Grounding in repo reality:
 
-* `determine_read_mode` in `crates/apm2-core/src/ledger/storage.rs` forces `LegacyModeReadOnly` when
-  `ledger_events` exists and `events` is empty. This is the exact state that blocks kernel-native
-  writes today.
+* `determine_read_mode` selects `LedgerReadMode::LegacyLedgerEvents` when `ledger_events` exists and `events` is empty.
+
+  * Canonical append APIs then fail-closed via `LedgerStorageError::LegacyModeReadOnly`.
+  * If we copy into `events` without removing/renaming `ledger_events`, startup will fail fast with `LedgerReadModeError::AmbiguousSchemaState`.
+
+  Phase 0 must therefore both (a) migrate rows and (b) eliminate the legacy table name from the active schema.
+
 * The existing compat view `events_legacy_compat_v1` returns `NULL` for `prev_hash`/`event_hash`,
   which prevents core-ledger appenders from building a hash chain (`last_event_hash()` falls back to
   genesis when `event_hash` is NULL).
@@ -995,26 +1118,33 @@ Grounding in repo reality:
 Migration requirements (implementation-grade):
 
 1. **Single transaction, exclusive lock**
-   * Acquire an exclusive SQLite transaction for the duration of the copy + hash chain computation.
-2. **Preserve ordering**
-   * Read `ledger_events` ordered by `seq_id ASC`.
-   * Insert into `events` in the same order. (Whether `seq_id` is preserved or re-numbered is a local
-     choice; ordering must remain identical.)
-3. **Compute a real 32-byte hash chain**
-   * Compute `prev_hash`/`event_hash` using `apm2_core::crypto::EventHasher` (BLAKE3) with a genesis
-     previous hash of 32 zero bytes.
-   * Persist computed hashes into `events.prev_hash` and `events.event_hash` for every migrated row.
-4. **Signature handling**
-   * Preserve legacy `signature` bytes as opaque data; do not attempt to retrofit "verified" mode during
-     this migration (legacy actor ids are not hex-encoded verifying keys, so `append_verified` cannot
-     validate them without a separate identity migration).
-5. **Freeze legacy writers**
-   * After successful migration, prevent further writes to `ledger_events` (rename table, drop triggers,
-     or hard-fail in the daemon emitter).
-   * Daemon must switch to appending to core `events` immediately after migration.
-6. **Idempotency**
+   * Acquire an exclusive SQLite transaction for the duration of the copy + hash-chain computation.
+
+2. **Preserve ordering (legacy truth)**
+   * Read `ledger_events` ordered by `rowid ASC` (matches legacy hash-chain ordering; see `backfill_hash_chain`).
+   * Insert into `events` in the same order. `seq_id` is auto-assigned by `events`; ordering is what matters.
+
+3. **Populate required core columns**
+   * `record_version = 1`
+   * `namespace = 'default'` (schema default)
+   * `session_id`: parse for session events; else set `''` (empty string).
+   * Leave `schema_digest`, `canonicalizer_id`, `consensus_*`, `hlc_*` NULL during migration.
+
+4. **Compute a real 32-byte hash chain**
+   * `event_hash = blake3(prev_hash || payload_bytes)` with genesis `prev_hash = 32x00`, via `apm2_core::crypto::EventHasher`.
+
+5. **Signature handling (explicitly unverified)**
+   * Copy signature bytes unchanged; do not attempt verification during migration.
+
+6. **Eliminate ambiguous schema state**
+   * Rename `ledger_events` to `ledger_events_legacy_frozen` (or export+drop) so `determine_read_mode` cannot enter `AmbiguousSchemaState`.
+
+7. **Freeze legacy writers**
+   * Hard-fail any codepath that tries to write the legacy emitter; new facts MUST append to `events`.
+
+8. **Idempotency**
    * If `events` already contains rows, migration is a no-op.
-   * If migration partially completed, daemon must detect and fail fast (do not attempt to "continue").
+   * If migration partially completed, fail fast (do not attempt to continue).
 
 ### Phase 1 — Work open (CAS WorkSpec + work.opened)
 
@@ -1130,19 +1260,34 @@ AT-5: Merge completion alignment
 
 ---
 
-## 18. Open issues (must be resolved during implementation)
+## 18. Resolved decisions and follow-ups
 
-O1. Actor identity model: reconcile string actor ids (`system:ci-processor`) with verification-bound ids; this RFC proposes a config indirection as an interim fix.
-O2. Canonical event naming convergence: this RFC pushes canonical dot-prefixed events for reducers; legacy underscore intake remains for a bridge window. Decide timeline for freezing underscored emissions.
-O3. Exact change set bundle construction from `fac push`: define how to produce `ChangeSetBundleV1` deterministically from git state in the CLI, and how to bind it to PR association.
-O4. Ledger signature scheme during/after migration: migrated legacy signatures cannot be "verified-mode"
-    without an actor-id/key migration. Decide:
-    * whether to treat legacy signatures as opaque historical artifacts, or
-    * implement an identity bridge that maps legacy actor ids to verifying keys.
-O5. Reducer configuration plumbing: if CI actor ids (and similar) are to become configurable, specify
-    how config is injected into `apm2-core` reducers (constructor parameter vs wrapper).
-O6. WorkSpec schema validation and size bounds: define a hard maximum size for WorkSpec and context
-    entry artifacts to prevent CAS abuse, and specify daemon-side JSON schema validation behavior.
-O7. Backfill strategy for existing WorkRegistry authority records: define how existing `work_claims`
-    rows are converted into `WORK_AUTHORITY_BINDINGS` evidence on migration (or how long the system
-    tolerates mixed sources).
+This RFC removes "open issue" blockers by making explicit vNext decisions.
+
+### 18.1 Actor identity and signature mode
+
+* Actor IDs remain daemon-derived strings (not verifying keys).
+* Ledger writes run in unverified mode for vNext; signatures retained for tamper evidence.
+* Verified actor identity is deferred to a dedicated identity RFC.
+
+### 18.2 Canonical event naming and encoding convergence
+
+* Work/evidence lifecycle: only `work.*`, `session.*`, `evidence.*` post-Phase-2; freeze legacy underscore lifecycle emissions.
+* Kernel facts with underscore names may keep event_type strings, but payload encoding converges to protobuf in core ledger; JSON supported only for historical migrated rows.
+
+### 18.3 Deterministic changeset bundle construction
+
+* `apm2 fac push` MUST build changesets via `crates/apm2-core/src/fac/changeset_bundle.rs` and publish the computed digest + CAS hash.
+
+### 18.4 Reducer configuration plumbing
+
+* Keep `CI_SYSTEM_ACTOR_ID = "system:ci-processor"`; configurable reducer identities are out of scope.
+
+### 18.5 Size bounds and schema validation
+
+* Hard caps in §4.0 are mandatory and fail-closed.
+
+### 18.6 Backfilling legacy WorkRegistry authority
+
+* During Phase 6, backfill `WORK_AUTHORITY_BINDINGS` evidence for each active `work_claims` row.
+* Missing boundary pins MUST be marked incomplete; incomplete claims are non-authoritative for new episode spawns until re-claimed under ClaimWorkV2.
