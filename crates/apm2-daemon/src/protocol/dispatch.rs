@@ -8192,12 +8192,20 @@ impl PrivilegedDispatcher {
                         b.admitted_canonicalizer_tuple_digest,
                     )
                 });
+        // TCK-00567: intent is intentionally None for PrivilegedDispatcher.
+        // This dispatcher issues tokens for daemon session-level tool requests
+        // (IPC boundary crossing), not for FAC queue job execution.  These
+        // tokens do not flow through the intent-checking worker path
+        // (fac_worker.rs), so intent binding is not applicable here.
+        // FAC job tokens are issued by FacBroker::issue_channel_context_token
+        // in fac_warm.rs / gates.rs with proper intent derivation.
         let token_binding = TokenBindingV1 {
             fac_policy_hash: policy_hash,
             canonicalizer_tuple_digest: ct_digest,
             boundary_id: self.token_binding_boundary_id.clone(),
             issued_at_tick: current_tick,
             expiry_tick: current_tick.saturating_add(DEFAULT_ENVELOPE_TTL_TICKS),
+            intent: None,
             // TCK-00566: Nonce is None here because the daemon-side token
             // issuance path (session dispatch) does not go through the
             // FacBroker token-use ledger. Broker-side replay protection
