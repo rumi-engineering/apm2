@@ -556,18 +556,90 @@ fn ensure_single_flight_lock_parent(lock_path: &Path) -> Result<(), String> {
 }
 
 fn open_single_flight_lock_file(lock_path: &Path) -> Result<std::fs::File, String> {
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(false).read(true).write(true);
-    #[cfg(unix)]
-    {
-        options.mode(0o600);
-    }
-    options.open(lock_path).map_err(|err| {
+    open_single_flight_lock_file_with_create(lock_path, true).map_err(|err| {
         format!(
             "cannot open gates single-flight lock {}: {err}",
             lock_path.display()
         )
     })
+}
+
+fn open_existing_single_flight_lock_file(
+    lock_path: &Path,
+) -> Result<Option<std::fs::File>, String> {
+    match open_single_flight_lock_file_with_create(lock_path, false) {
+        Ok(file) => Ok(Some(file)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!(
+            "cannot open gates single-flight lock {}: {err}",
+            lock_path.display()
+        )),
+    }
+}
+
+fn open_single_flight_lock_file_with_create(
+    lock_path: &Path,
+    create: bool,
+) -> Result<std::fs::File, std::io::Error> {
+    let mut options = OpenOptions::new();
+    options
+        .create(create)
+        .truncate(false)
+        .read(true)
+        .write(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    options.open(lock_path)
+}
+
+#[cfg(unix)]
+fn single_flight_lock_file_matches_path(
+    lock_file: &std::fs::File,
+    lock_path: &Path,
+) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let locked_meta = lock_file
+        .metadata()
+        .map_err(|err| format!("cannot stat locked single-flight file handle: {err}"))?;
+    if locked_meta.nlink() == 0 {
+        return Ok(false);
+    }
+    let path_meta = match fs::symlink_metadata(lock_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(format!(
+                "cannot stat single-flight lock path {}: {err}",
+                lock_path.display()
+            ));
+        },
+    };
+    if path_meta.file_type().is_symlink() || !path_meta.file_type().is_file() {
+        return Ok(false);
+    }
+    Ok(locked_meta.dev() == path_meta.dev() && locked_meta.ino() == path_meta.ino())
+}
+
+#[cfg(not(unix))]
+fn single_flight_lock_file_matches_path(
+    _lock_file: &std::fs::File,
+    lock_path: &Path,
+) -> Result<bool, String> {
+    let path_meta = match fs::metadata(lock_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(format!(
+                "cannot stat single-flight lock path {}: {err}",
+                lock_path.display()
+            ));
+        },
+    };
+    Ok(path_meta.is_file())
 }
 
 fn resolve_singleflight_lock_timeout() -> Duration {
@@ -716,7 +788,21 @@ fn acquire_gates_single_flight_lock(
         let mut lock_file = open_single_flight_lock_file(&lock_path)?;
         let owner = match FileExt::try_lock_exclusive(&lock_file) {
             Ok(()) => {
+                if !single_flight_lock_file_matches_path(&lock_file, &lock_path)? {
+                    let _ = FileExt::unlock(&lock_file);
+                    std::thread::sleep(Duration::from_millis(
+                        SINGLEFLIGHT_LOCK_POLL_INTERVAL_MILLIS,
+                    ));
+                    continue;
+                }
                 write_single_flight_lock_owner(&mut lock_file)?;
+                if !single_flight_lock_file_matches_path(&lock_file, &lock_path)? {
+                    let _ = FileExt::unlock(&lock_file);
+                    std::thread::sleep(Duration::from_millis(
+                        SINGLEFLIGHT_LOCK_POLL_INTERVAL_MILLIS,
+                    ));
+                    continue;
+                }
                 return Ok(lock_file);
             },
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -740,6 +826,49 @@ fn acquire_gates_single_flight_lock(
         std::thread::sleep(Duration::from_millis(
             SINGLEFLIGHT_LOCK_POLL_INTERVAL_MILLIS,
         ));
+    }
+}
+
+fn reap_singleflight_lock_entry(path: &Path) -> Result<bool, String> {
+    let Some(mut lock_file) = open_existing_single_flight_lock_file(path)? else {
+        return Ok(false);
+    };
+    match FileExt::try_lock_exclusive(&lock_file) {
+        Ok(()) => {
+            if !single_flight_lock_file_matches_path(&lock_file, path)? {
+                let _ = FileExt::unlock(&lock_file);
+                return Ok(false);
+            }
+            let owner = read_single_flight_lock_owner(&mut lock_file)?;
+            let stale = owner.is_none_or(|owner| !is_single_flight_lock_owner_alive(owner));
+            if !stale {
+                let _ = FileExt::unlock(&lock_file);
+                return Ok(false);
+            }
+            if !single_flight_lock_file_matches_path(&lock_file, path)? {
+                let _ = FileExt::unlock(&lock_file);
+                return Ok(false);
+            }
+            match fs::remove_file(path) {
+                Ok(()) => {
+                    let _ = FileExt::unlock(&lock_file);
+                    Ok(true)
+                },
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    let _ = FileExt::unlock(&lock_file);
+                    Ok(false)
+                },
+                Err(err) => Err(format!(
+                    "cannot remove stale gates single-flight lock {}: {err}",
+                    path.display()
+                )),
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(err) => Err(format!(
+            "cannot evaluate single-flight lock liveness {}: {err}",
+            path.display()
+        )),
     }
 }
 
@@ -780,38 +909,12 @@ fn reap_stale_singleflight_locks(fac_root: &Path) -> Result<u64, String> {
         if path.extension().and_then(|ext| ext.to_str()) != Some("lock") {
             continue;
         }
-        let mut lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(|err| {
-                format!(
-                    "cannot open gates single-flight lock for liveness reaping {}: {err}",
-                    path.display()
-                )
-            })?;
-        match FileExt::try_lock_exclusive(&lock_file) {
-            Ok(()) => {
-                let owner = read_single_flight_lock_owner(&mut lock_file)?;
-                let stale = owner.is_none_or(|owner| !is_single_flight_lock_owner_alive(owner));
-                if stale {
-                    fs::remove_file(&path).map_err(|err| {
-                        format!(
-                            "cannot remove stale gates single-flight lock {}: {err}",
-                            path.display()
-                        )
-                    })?;
-                    reaped = reaped.saturating_add(1);
-                }
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {},
-            Err(err) => {
-                return Err(format!(
-                    "cannot evaluate single-flight lock liveness {}: {err}",
-                    path.display()
-                ));
-            },
+        let entry_reaped = reap_singleflight_lock_entry(&path);
+        if matches!(entry_reaped, Ok(true)) {
+            reaped = reaped.saturating_add(1);
         }
+        // Per-entry failures must not block stale lock recovery for other
+        // files.
     }
     Ok(reaped)
 }
@@ -1769,12 +1872,40 @@ fn spawn_detached_worker_for_queue() -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn is_pid_running(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
     Path::new("/proc").join(pid.to_string()).is_dir()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
+#[allow(unsafe_code)]
 fn is_pid_running(pid: u32) -> bool {
-    pid > 0
+    if pid == 0 {
+        return false;
+    }
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: libc::kill with signal 0 is a process-liveness probe and does
+    // not deliver a signal.
+    let rc = unsafe { libc::kill(raw_pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn is_pid_running(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let mut system = System::new();
+    let target = Pid::from_u32(pid);
+    system.refresh_processes(ProcessesToUpdate::Some(&[target]), true);
+    system.process(target).is_some()
 }
 
 fn run_inline_worker_cycle() -> Result<(), String> {
@@ -4135,6 +4266,56 @@ mod tests {
         assert_eq!(file_mode, 0o600);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn single_flight_lock_open_rejects_symlink() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fac_root = temp.path().join("private").join("fac");
+        let lock_dir = fac_root.join(GATES_SINGLE_FLIGHT_DIR);
+        fs::create_dir_all(&lock_dir).expect("create lock dir");
+        let victim = temp.path().join("victim.txt");
+        fs::write(&victim, b"immutable").expect("seed victim");
+        let lock_path = lock_dir.join("symlink.lock");
+        std::os::unix::fs::symlink(&victim, &lock_path).expect("create symlink lock");
+
+        let err = open_single_flight_lock_file(&lock_path)
+            .expect_err("symlink lock path must be rejected");
+        assert!(
+            err.contains("cannot open gates single-flight lock"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            fs::read(&victim).expect("read victim"),
+            b"immutable",
+            "symlink open must not truncate target file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_flight_lock_binding_detects_inode_replacement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fac_root = temp.path().join("private").join("fac");
+        let lock_dir = fac_root.join(GATES_SINGLE_FLIGHT_DIR);
+        fs::create_dir_all(&lock_dir).expect("create lock dir");
+        let lock_path = lock_dir.join("replace.lock");
+        let lock_file = open_single_flight_lock_file(&lock_path).expect("open lock file");
+        FileExt::try_lock_exclusive(&lock_file).expect("acquire lock");
+        assert!(
+            single_flight_lock_file_matches_path(&lock_file, &lock_path)
+                .expect("verify initial binding")
+        );
+
+        let moved_path = lock_dir.join("replace.old.lock");
+        fs::rename(&lock_path, &moved_path).expect("move original lock path");
+        fs::write(&lock_path, b"replacement").expect("write replacement lock");
+        assert!(
+            !single_flight_lock_file_matches_path(&lock_file, &lock_path)
+                .expect("detect replacement"),
+            "locked descriptor must not be treated as bound after path inode replacement"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn reap_stale_singleflight_locks_removes_dead_owner_files() {
@@ -4152,6 +4333,37 @@ mod tests {
         let reaped = reap_stale_singleflight_locks(&fac_root).expect("reap stale locks");
         assert_eq!(reaped, 1);
         assert!(!stale_lock.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reap_stale_singleflight_locks_continues_after_unreadable_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fac_root = temp.path().join("private").join("fac");
+        let lock_dir = fac_root.join(GATES_SINGLE_FLIGHT_DIR);
+        fs::create_dir_all(&lock_dir).expect("create lock dir");
+        let stale_lock = lock_dir.join("stale.lock");
+        fs::write(
+            &stale_lock,
+            format!("pid={}\nstart_time_ticks=1\n", u32::MAX - 1),
+        )
+        .expect("write stale lock metadata");
+
+        let unreadable = lock_dir.join("unreadable.lock");
+        fs::write(&unreadable, "pid=1\n").expect("write unreadable lock");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+            .expect("restrict unreadable lock permissions");
+
+        let reaped = reap_stale_singleflight_locks(&fac_root).expect("reap stale locks");
+
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600))
+            .expect("restore unreadable lock permissions");
+
+        assert_eq!(reaped, 1);
+        assert!(!stale_lock.exists());
+        assert!(unreadable.exists());
     }
 
     #[cfg(target_os = "linux")]
