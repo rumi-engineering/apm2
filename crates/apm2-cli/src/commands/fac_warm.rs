@@ -439,7 +439,7 @@ fn build_warm_job_spec(
     // where Hash = [u8; 32].
     // Bind token policy fields to the admitted FAC policy digest while
     // keeping request_id bound to this concrete job spec digest.
-    let token = broker
+    let (token, wal_bytes) = broker
         .issue_channel_context_token(
             policy_digest,
             lease_id,
@@ -447,6 +447,10 @@ fn build_warm_job_spec(
             boundary_id,
         )
         .map_err(|e| format!("broker token issuance: {e}"))?;
+    // BLOCKER fix: persist the WAL entry before releasing the token
+    // (crash durability for issuance registration).
+    super::fac_worker::append_token_ledger_wal_pub(&wal_bytes)
+        .map_err(|e| format!("token ledger WAL persist on issuance: {e}"))?;
     spec.actuation.channel_context_token = Some(token);
 
     // TCK-00579: Validate the warm spec against the policy-derived validation

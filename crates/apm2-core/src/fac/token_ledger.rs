@@ -73,6 +73,9 @@ pub type TokenNonce = [u8; 32];
 /// Sized for default-mode broker operation where a single broker handles
 /// a moderate number of concurrent jobs. Each entry is ~100 bytes, so
 /// 16384 entries ≈ 1.6 MiB peak memory.
+///
+/// NOTE: These are compile-time constants. A future revision may accept
+/// them via the `TokenUseLedger` constructor for deployment flexibility.
 pub const MAX_LEDGER_ENTRIES: usize = 16_384;
 
 /// Maximum number of explicitly revoked tokens tracked.
@@ -80,6 +83,8 @@ pub const MAX_LEDGER_ENTRIES: usize = 16_384;
 /// Revoked tokens that expire naturally are cleaned up during TTL
 /// eviction sweeps, so the revocation set only needs to track
 /// actively-revoked unexpired tokens.
+///
+/// NOTE: Compile-time constant; see `MAX_LEDGER_ENTRIES` note.
 pub const MAX_REVOKED_TOKENS: usize = 4_096;
 
 /// Default TTL for ledger entries in broker ticks.
@@ -208,7 +213,9 @@ struct RevokedTokenEntry {
 
 /// Receipt emitted when a token is revoked.
 ///
-/// Contains enough fields to audit the revocation decision.
+/// Contains enough fields to audit the revocation decision. The receipt is
+/// signed by the broker's Ed25519 key with domain separation (INV-BRK-002)
+/// so it constitutes authoritative evidence of the revocation event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TokenRevocationReceipt {
@@ -222,6 +229,38 @@ pub struct TokenRevocationReceipt {
     pub reason: String,
     /// BLAKE3 content hash over the receipt fields.
     pub content_hash: [u8; 32],
+    /// Broker signer public key (Ed25519 verifying key bytes).
+    /// Present on receipts signed by the broker. Absent on legacy
+    /// unsigned receipts (backwards-compatible via `serde(default)`).
+    #[serde(default, skip_serializing_if = "is_zero_hash_32")]
+    pub signer_id: [u8; 32],
+    /// Ed25519 signature over `REVOCATION_RECEIPT_SIGNATURE_PREFIX ||
+    /// content_hash`. Present on receipts signed by the broker.
+    #[serde(
+        default = "default_zero_signature",
+        skip_serializing_if = "is_zero_signature",
+        with = "serde_bytes"
+    )]
+    pub signature: [u8; 64],
+}
+
+/// Domain separator for revocation receipt signatures (INV-BRK-002).
+pub const REVOCATION_RECEIPT_SIGNATURE_PREFIX: &[u8] = b"TOKEN_REVOCATION_RECEIPT:";
+
+/// Default zero signature for serde deserialization of legacy unsigned
+/// receipts.
+const fn default_zero_signature() -> [u8; 64] {
+    [0u8; 64]
+}
+
+/// Returns true if a 32-byte array is all zeros (serde skip helper).
+fn is_zero_hash_32(v: &[u8; 32]) -> bool {
+    v.iter().all(|&b| b == 0)
+}
+
+/// Returns true if a 64-byte array is all zeros (serde skip helper).
+fn is_zero_signature(v: &[u8; 64]) -> bool {
+    v.iter().all(|&b| b == 0)
 }
 
 impl TokenRevocationReceipt {
@@ -231,6 +270,32 @@ impl TokenRevocationReceipt {
         let computed =
             compute_revocation_receipt_hash(&self.nonce_hex, self.revoked_at_tick, &self.reason);
         bool::from(computed.ct_eq(&self.content_hash))
+    }
+
+    /// Verifies the broker signature on this receipt.
+    ///
+    /// Returns `true` if the signature is valid, `false` if the receipt is
+    /// unsigned (legacy) or the signature does not verify.
+    #[must_use]
+    pub fn verify_signature(&self, verifying_key: &crate::crypto::VerifyingKey) -> bool {
+        // Unsigned legacy receipt — cannot verify.
+        if is_zero_signature(&self.signature) {
+            return false;
+        }
+        // Verify signer matches the provided key.
+        if !bool::from(self.signer_id.ct_eq(&verifying_key.to_bytes())) {
+            return false;
+        }
+        let Ok(sig) = crate::crypto::parse_signature(&self.signature) else {
+            return false;
+        };
+        crate::fac::domain_separator::verify_with_domain(
+            verifying_key,
+            REVOCATION_RECEIPT_SIGNATURE_PREFIX,
+            &self.content_hash,
+            &sig,
+        )
+        .is_ok()
     }
 }
 
@@ -276,12 +341,24 @@ pub enum WalEntry {
         expiry_tick: u64,
     },
     /// Record a nonce as consumed (Issued -> Consumed transition).
+    ///
+    /// Carries sufficient fields to reconstruct the entry on replay
+    /// even if no prior `Register` WAL entry exists (crash after WAL
+    /// truncation but before snapshot write — MAJOR finding fix).
     #[serde(rename = "consume")]
     Consume {
         /// Hex-encoded 32-byte nonce.
         nonce_hex: String,
+        /// Hex-encoded request ID digest (needed for crash replay
+        /// reconstruction when no prior Register entry exists).
+        #[serde(default)]
+        request_id_digest_hex: Option<String>,
         /// Broker tick when the nonce was consumed.
         consumed_at_tick: u64,
+        /// Expiry tick for reconstruction on replay (needed when no
+        /// prior Register entry exists).
+        #[serde(default)]
+        expiry_tick: Option<u64>,
     },
     /// Revoke a nonce.
     #[serde(rename = "revoke")]
@@ -519,11 +596,14 @@ impl TokenUseLedger {
 
         // If the nonce already exists (Issued state), update it in place.
         if let Some(entry) = self.entries.get_mut(nonce) {
+            let existing_expiry = entry.expiry_tick;
             entry.state = NonceState::Consumed;
             self.wal_entries_since_snapshot = self.wal_entries_since_snapshot.saturating_add(1);
             return Ok(WalEntry::Consume {
                 nonce_hex: hex::encode(nonce),
+                request_id_digest_hex: Some(hex::encode(request_id_digest)),
                 consumed_at_tick: current_tick,
+                expiry_tick: Some(existing_expiry),
             });
         }
 
@@ -552,7 +632,9 @@ impl TokenUseLedger {
 
         Ok(WalEntry::Consume {
             nonce_hex: hex::encode(nonce),
+            request_id_digest_hex: Some(hex::encode(request_id_digest)),
             consumed_at_tick: current_tick,
+            expiry_tick: Some(expiry_tick),
         })
     }
 
@@ -598,8 +680,9 @@ impl TokenUseLedger {
     /// use or check this nonce will be denied with
     /// [`TokenLedgerError::TokenRevoked`], even if the token has not expired.
     ///
-    /// Emits a [`TokenRevocationReceipt`] for audit and a WAL entry for
-    /// the caller to persist.
+    /// Emits a signed [`TokenRevocationReceipt`] for audit and a WAL entry
+    /// for the caller to persist. The receipt is signed by the provided
+    /// `signer` (INV-BRK-002).
     ///
     /// # Errors
     ///
@@ -612,6 +695,7 @@ impl TokenUseLedger {
         nonce: &TokenNonce,
         current_tick: u64,
         reason: &str,
+        signer: &crate::crypto::Signer,
     ) -> Result<(TokenRevocationReceipt, WalEntry), TokenLedgerError> {
         // Validate reason length (GATE_IO_BOUNDS_AND_PARSING).
         if reason.len() > MAX_REVOCATION_REASON_LENGTH {
@@ -652,8 +736,15 @@ impl TokenUseLedger {
         self.revocation_order.push_back(*nonce);
         self.wal_entries_since_snapshot = self.wal_entries_since_snapshot.saturating_add(1);
 
-        // Build receipt.
+        // Build receipt with broker signature (INV-BRK-002).
         let content_hash = compute_revocation_receipt_hash(&nonce_hex, current_tick, &reason_owned);
+
+        // Sign content_hash with domain separation.
+        let sig = crate::fac::domain_separator::sign_with_domain(
+            signer,
+            REVOCATION_RECEIPT_SIGNATURE_PREFIX,
+            &content_hash,
+        );
 
         let receipt = TokenRevocationReceipt {
             schema_id: "apm2.fac_broker.revocation_receipt.v1".to_string(),
@@ -661,6 +752,8 @@ impl TokenUseLedger {
             revoked_at_tick: current_tick,
             reason: reason_owned.clone(),
             content_hash,
+            signer_id: signer.verifying_key().to_bytes(),
+            signature: sig.to_bytes(),
         };
 
         let wal_entry = WalEntry::Revoke {
@@ -915,14 +1008,44 @@ impl TokenUseLedger {
             },
             WalEntry::Consume {
                 nonce_hex,
-                consumed_at_tick: _,
+                request_id_digest_hex,
+                consumed_at_tick,
+                expiry_tick,
             } => {
                 let nonce = parse_nonce_hex(nonce_hex)?;
                 if let Some(entry) = self.entries.get_mut(&nonce) {
+                    // Idempotent: already consumed is a no-op.
                     entry.state = NonceState::Consumed;
+                } else {
+                    // MAJOR fix: reconstruct a Consumed entry even if no
+                    // prior Register entry exists. This happens when the
+                    // WAL survived a crash but the snapshot did not include
+                    // the registration.
+                    let reconstructed_expiry = expiry_tick
+                        .unwrap_or_else(|| consumed_at_tick.saturating_add(self.ttl_ticks));
+                    let reconstructed_digest = match request_id_digest_hex {
+                        Some(hex_str) => parse_digest_hex(hex_str)?,
+                        None => [0u8; 32], // Legacy WAL entry without digest.
+                    };
+                    // Enforce cap.
+                    while self.entries.len() >= MAX_LEDGER_ENTRIES {
+                        if let Some((old_nonce, _)) = self.insertion_order.pop_front() {
+                            self.entries.remove(&old_nonce);
+                        } else {
+                            break;
+                        }
+                    }
+                    let entry = TokenUseEntry {
+                        nonce,
+                        request_id_digest: reconstructed_digest,
+                        recorded_at_tick: *consumed_at_tick,
+                        expiry_tick: reconstructed_expiry,
+                        state: NonceState::Consumed,
+                    };
+                    self.entries.insert(nonce, entry);
+                    self.insertion_order
+                        .push_back((nonce, reconstructed_expiry));
                 }
-                // If nonce not found, this is a consume for a nonce that
-                // was evicted or from a pre-registration era. Safe to skip.
             },
             WalEntry::Revoke {
                 nonce_hex,
@@ -930,19 +1053,25 @@ impl TokenUseLedger {
                 reason,
             } => {
                 let nonce = parse_nonce_hex(nonce_hex)?;
-                // Enforce revocation cap.
-                if self.revoked.len() >= MAX_REVOKED_TOKENS {
-                    if let Some(old_nonce) = self.revocation_order.pop_front() {
-                        self.revoked.remove(&old_nonce);
+                // MAJOR fix: idempotent — skip if already revoked to
+                // prevent duplicate entries in revocation_order on replay.
+                if self.revoked.contains_key(&nonce) {
+                    // Already revoked — no-op for idempotent replay.
+                } else {
+                    // Enforce revocation cap.
+                    if self.revoked.len() >= MAX_REVOKED_TOKENS {
+                        if let Some(old_nonce) = self.revocation_order.pop_front() {
+                            self.revoked.remove(&old_nonce);
+                        }
                     }
+                    let revocation_entry = RevokedTokenEntry {
+                        nonce,
+                        revoked_at_tick: *revoked_at_tick,
+                        reason: reason.clone(),
+                    };
+                    self.revoked.insert(nonce, revocation_entry);
+                    self.revocation_order.push_back(nonce);
                 }
-                let revocation_entry = RevokedTokenEntry {
-                    nonce,
-                    revoked_at_tick: *revoked_at_tick,
-                    reason: reason.clone(),
-                };
-                self.revoked.insert(nonce, revocation_entry);
-                self.revocation_order.push_back(nonce);
             },
         }
         Ok(())
@@ -1170,6 +1299,10 @@ mod tests {
         d
     }
 
+    fn test_signer() -> crate::crypto::Signer {
+        crate::crypto::Signer::generate()
+    }
+
     // -----------------------------------------------------------------------
     // Basic replay detection
     // -----------------------------------------------------------------------
@@ -1275,7 +1408,9 @@ mod tests {
         ledger.register_nonce(&nonce, &digest, 10).unwrap();
 
         // Revoke BEFORE first use.
-        let (receipt, _wal) = ledger.revoke_token(&nonce, 11, "leaked token").unwrap();
+        let (receipt, _wal) = ledger
+            .revoke_token(&nonce, 11, "leaked token", &test_signer())
+            .unwrap();
         assert!(receipt.verify_content_hash());
 
         // First use should be denied (revoked).
@@ -1300,7 +1435,7 @@ mod tests {
         ledger.register_nonce(&nonce, &digest, 10).unwrap();
 
         // Revoke before use should succeed.
-        let result = ledger.revoke_token(&nonce, 11, "pre-use revocation");
+        let result = ledger.revoke_token(&nonce, 11, "pre-use revocation", &test_signer());
         assert!(result.is_ok());
     }
 
@@ -1315,7 +1450,9 @@ mod tests {
         let digest = digest_from_byte(0xAA);
         ledger.record_token_use(&nonce, &digest, 10).unwrap();
 
-        let (receipt, _wal) = ledger.revoke_token(&nonce, 11, "compromised").unwrap();
+        let (receipt, _wal) = ledger
+            .revoke_token(&nonce, 11, "compromised", &test_signer())
+            .unwrap();
         assert_eq!(receipt.reason, "compromised");
         assert!(receipt.verify_content_hash());
         assert_eq!(ledger.revoked_count(), 1);
@@ -1333,7 +1470,7 @@ mod tests {
     fn revoke_token_fails_for_unknown_nonce() {
         let mut ledger = TokenUseLedger::new();
         let nonce = nonce_from_byte(1);
-        let result = ledger.revoke_token(&nonce, 10, "test");
+        let result = ledger.revoke_token(&nonce, 10, "test", &test_signer());
         assert!(matches!(result, Err(TokenLedgerError::NonceNotFound)));
     }
 
@@ -1345,7 +1482,7 @@ mod tests {
         ledger.record_token_use(&nonce, &digest, 10).unwrap();
 
         let long_reason = "x".repeat(MAX_REVOCATION_REASON_LENGTH + 1);
-        let result = ledger.revoke_token(&nonce, 11, &long_reason);
+        let result = ledger.revoke_token(&nonce, 11, &long_reason, &test_signer());
         assert!(matches!(
             result,
             Err(TokenLedgerError::RevocationReasonTooLong { .. })
@@ -1359,7 +1496,9 @@ mod tests {
         let digest = digest_from_byte(0xBB);
         ledger.record_token_use(&nonce, &digest, 10).unwrap();
 
-        let (receipt, _wal) = ledger.revoke_token(&nonce, 11, "audit-test").unwrap();
+        let (receipt, _wal) = ledger
+            .revoke_token(&nonce, 11, "audit-test", &test_signer())
+            .unwrap();
         assert!(receipt.verify_content_hash());
 
         // Tamper with reason -> hash mismatch.
@@ -1411,7 +1550,9 @@ mod tests {
         let nonce = nonce_from_byte(1);
         let digest = digest_from_byte(0xAA);
         ledger.record_token_use(&nonce, &digest, 10).unwrap();
-        ledger.revoke_token(&nonce, 15, "test").unwrap();
+        ledger
+            .revoke_token(&nonce, 15, "test", &test_signer())
+            .unwrap();
         assert_eq!(ledger.revoked_count(), 1);
 
         // Revocation expires at revoked_at_tick(15) + ttl(100) = 115.
@@ -1470,7 +1611,9 @@ mod tests {
             nonce[0..2].copy_from_slice(&(i as u16).to_le_bytes());
             let digest = digest_from_byte((i & 0xFF) as u8);
             ledger.record_token_use(&nonce, &digest, 10).unwrap();
-            ledger.revoke_token(&nonce, 11, "capacity-test").unwrap();
+            ledger
+                .revoke_token(&nonce, 11, "capacity-test", &test_signer())
+                .unwrap();
         }
         assert_eq!(ledger.revoked_count(), MAX_REVOKED_TOKENS);
 
@@ -1482,7 +1625,7 @@ mod tests {
         };
         let digest = digest_from_byte(0xFF);
         ledger.record_token_use(&extra_nonce, &digest, 12).unwrap();
-        let result = ledger.revoke_token(&extra_nonce, 13, "overflow-test");
+        let result = ledger.revoke_token(&extra_nonce, 13, "overflow-test", &test_signer());
         assert!(result.is_ok());
     }
 
@@ -1597,7 +1740,9 @@ mod tests {
         let nonce = nonce_from_byte(1);
         let digest = digest_from_byte(0xAA);
         ledger.record_token_use(&nonce, &digest, 10).unwrap();
-        ledger.revoke_token(&nonce, 15, "test-reason").unwrap();
+        ledger
+            .revoke_token(&nonce, 15, "test-reason", &test_signer())
+            .unwrap();
         assert_eq!(ledger.revoked_count(), 1);
 
         let bytes = ledger.serialize_state().expect("serialize should succeed");
@@ -1706,7 +1851,9 @@ mod tests {
         let digest = digest_from_byte(0xAA);
 
         let wal_register = ledger.register_nonce(&nonce, &digest, 10).unwrap();
-        let (_receipt, wal_revoke) = ledger.revoke_token(&nonce, 11, "test").unwrap();
+        let (_receipt, wal_revoke) = ledger
+            .revoke_token(&nonce, 11, "test", &test_signer())
+            .unwrap();
 
         let mut all_wal = TokenUseLedger::serialize_wal_entry(&wal_register).unwrap();
         all_wal.extend(TokenUseLedger::serialize_wal_entry(&wal_revoke).unwrap());
@@ -1799,5 +1946,199 @@ mod tests {
             restored.check_nonce(&nonce),
             Err(TokenLedgerError::ReplayDetected)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for fix-round review findings
+    // -----------------------------------------------------------------------
+
+    /// MAJOR regression: WAL Consume replay without prior Register must
+    /// reconstruct a Consumed entry (crash recovery path). Before the fix,
+    /// `apply_wal_entry(Consume)` was a no-op when the nonce was absent,
+    /// leaving the ledger unaware of the consumed nonce and allowing replay.
+    #[test]
+    fn wal_consume_replay_without_prior_register_reconstructs_entry() {
+        let mut ledger = TokenUseLedger::with_ttl(100);
+        let nonce = nonce_from_byte(42);
+        let nonce_hex = hex::encode(nonce);
+        let digest_hex = hex::encode(digest_from_byte(0xBB));
+
+        // Simulate a WAL with only a Consume entry (Register was in snapshot
+        // but snapshot was lost / never written before crash).
+        let consume_entry = WalEntry::Consume {
+            nonce_hex,
+            request_id_digest_hex: Some(digest_hex),
+            consumed_at_tick: 50,
+            expiry_tick: Some(150),
+        };
+        let wal_bytes = TokenUseLedger::serialize_wal_entry(&consume_entry).unwrap();
+        let replayed = ledger.replay_wal(&wal_bytes).unwrap();
+        assert_eq!(replayed, 1);
+
+        // The nonce must now be present as Consumed — replay denied.
+        assert!(matches!(
+            ledger.check_nonce(&nonce),
+            Err(TokenLedgerError::ReplayDetected)
+        ));
+        assert_eq!(ledger.len(), 1);
+    }
+
+    /// MAJOR regression: WAL Consume replay without digest or expiry
+    /// (legacy WAL format) still reconstructs the entry.
+    #[test]
+    fn wal_consume_replay_legacy_format_without_digest_or_expiry() {
+        let mut ledger = TokenUseLedger::with_ttl(100);
+        let nonce = nonce_from_byte(43);
+        let nonce_hex = hex::encode(nonce);
+
+        // Legacy WAL entry: no request_id_digest_hex, no expiry_tick.
+        let consume_entry = WalEntry::Consume {
+            nonce_hex,
+            request_id_digest_hex: None,
+            consumed_at_tick: 50,
+            expiry_tick: None,
+        };
+        let wal_bytes = TokenUseLedger::serialize_wal_entry(&consume_entry).unwrap();
+        let replayed = ledger.replay_wal(&wal_bytes).unwrap();
+        assert_eq!(replayed, 1);
+
+        // Should still be detected as consumed.
+        assert!(matches!(
+            ledger.check_nonce(&nonce),
+            Err(TokenLedgerError::ReplayDetected)
+        ));
+    }
+
+    /// MAJOR regression: WAL Revoke replay must be idempotent — replaying
+    /// the same Revoke entry twice must not push duplicate nonces into
+    /// `revocation_order`. Before the fix, each replay appended a new
+    /// entry, inflating the revocation set and eventually hitting capacity.
+    #[test]
+    fn wal_revoke_replay_idempotent_no_duplicate_revocation_order() {
+        let mut ledger = TokenUseLedger::with_ttl(100);
+        let nonce = nonce_from_byte(44);
+        let digest = digest_from_byte(0xCC);
+
+        // Register and consume the nonce first so revoke_token works.
+        ledger.register_nonce(&nonce, &digest, 10).unwrap();
+
+        let signer = test_signer();
+        let (_receipt, wal_entry) = ledger.revoke_token(&nonce, 20, "test", &signer).unwrap();
+        assert_eq!(ledger.revoked_count(), 1);
+
+        // Serialize and replay the same Revoke WAL entry twice.
+        let wal_bytes = TokenUseLedger::serialize_wal_entry(&wal_entry).unwrap();
+        let mut wal_double = wal_bytes.clone();
+        wal_double.extend_from_slice(&wal_bytes);
+
+        let mut fresh_ledger = TokenUseLedger::with_ttl(100);
+        // Re-register so the nonce exists for the replay context.
+        fresh_ledger.register_nonce(&nonce, &digest, 10).unwrap();
+        let replayed = fresh_ledger.replay_wal(&wal_double).unwrap();
+        assert_eq!(replayed, 2); // 2 entries parsed...
+
+        // ...but only 1 revocation in the set (idempotent).
+        assert_eq!(fresh_ledger.revoked_count(), 1);
+    }
+
+    /// MAJOR regression: Signed revocation receipts must verify with the
+    /// broker's public key. Before the fix, receipts had no signature.
+    #[test]
+    fn revocation_receipt_signed_and_verifiable() {
+        let mut ledger = TokenUseLedger::with_ttl(100);
+        let nonce = nonce_from_byte(45);
+        let digest = digest_from_byte(0xDD);
+        ledger.register_nonce(&nonce, &digest, 10).unwrap();
+
+        let signer = test_signer();
+        let vk = signer.verifying_key();
+        let (receipt, _wal) = ledger
+            .revoke_token(&nonce, 20, "signed test", &signer)
+            .unwrap();
+
+        // Signature must be non-zero.
+        assert!(!is_zero_signature(&receipt.signature));
+        // Signer ID must match.
+        assert_eq!(receipt.signer_id, vk.to_bytes());
+        // Verification must succeed.
+        assert!(receipt.verify_signature(&vk));
+
+        // Verification must fail with a different key.
+        let other_signer = test_signer();
+        let other_vk = other_signer.verifying_key();
+        assert!(!receipt.verify_signature(&other_vk));
+    }
+
+    /// MAJOR regression: unsigned (legacy) revocation receipt returns
+    /// false from `verify_signature`, not a panic or error.
+    #[test]
+    fn unsigned_legacy_receipt_verify_returns_false() {
+        let receipt = TokenRevocationReceipt {
+            schema_id: "apm2.fac_broker.revocation_receipt.v1".to_string(),
+            nonce_hex: hex::encode(nonce_from_byte(99)),
+            revoked_at_tick: 10,
+            reason: "legacy".to_string(),
+            content_hash: [0u8; 32],
+            signer_id: [0u8; 32],
+            signature: [0u8; 64],
+        };
+        let signer = test_signer();
+        assert!(!receipt.verify_signature(&signer.verifying_key()));
+    }
+
+    /// BLOCKER regression: WAL entry produced by `record_token_use`
+    /// (Consume) must carry the `request_id_digest_hex` and `expiry_tick`
+    /// fields for crash-replay reconstruction.
+    #[test]
+    fn record_token_use_wal_entry_carries_reconstruction_fields() {
+        let mut ledger = TokenUseLedger::with_ttl(100);
+        let nonce = nonce_from_byte(46);
+        let digest = digest_from_byte(0xEE);
+
+        // Register first so the Issued->Consumed path is taken.
+        ledger.register_nonce(&nonce, &digest, 10).unwrap();
+        let wal_entry = ledger.record_token_use(&nonce, &digest, 15).unwrap();
+
+        match wal_entry {
+            WalEntry::Consume {
+                request_id_digest_hex,
+                expiry_tick,
+                ..
+            } => {
+                assert!(
+                    request_id_digest_hex.is_some(),
+                    "digest must be present for replay reconstruction"
+                );
+                assert!(
+                    expiry_tick.is_some(),
+                    "expiry must be present for replay reconstruction"
+                );
+                assert_eq!(request_id_digest_hex.unwrap(), hex::encode(digest));
+                assert_eq!(expiry_tick.unwrap(), 110); // 10 + ttl(100)
+            },
+            other => panic!("expected Consume WAL entry, got {other:?}"),
+        }
+    }
+
+    /// Regression: `TokenRevocationReceipt` with signature round-trips
+    /// through `serde_json` (exercises `serde_bytes` integration).
+    #[test]
+    fn revocation_receipt_serde_round_trip_with_signature() {
+        let mut ledger = TokenUseLedger::with_ttl(100);
+        let nonce = nonce_from_byte(47);
+        let digest = digest_from_byte(0xFF);
+        ledger.register_nonce(&nonce, &digest, 10).unwrap();
+
+        let signer = test_signer();
+        let (receipt, _wal) = ledger
+            .revoke_token(&nonce, 20, "serde test", &signer)
+            .unwrap();
+
+        let json = serde_json::to_string(&receipt).unwrap();
+        let restored: TokenRevocationReceipt = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.signature, receipt.signature);
+        assert_eq!(restored.signer_id, receipt.signer_id);
+        assert!(restored.verify_signature(&signer.verifying_key()));
     }
 }

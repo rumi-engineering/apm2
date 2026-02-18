@@ -794,7 +794,7 @@ impl FacBroker {
         lease_id: &str,
         request_id: &str,
         boundary_id: &str,
-    ) -> Result<String, BrokerError> {
+    ) -> Result<(String, Vec<u8>), BrokerError> {
         // INV-BRK-HEALTH-GATE-001: Enforce admission health gate before
         // any token issuance. This is the mandatory pre-issuance guard
         // ensuring all production admission/token issuance paths through
@@ -898,10 +898,14 @@ impl FacBroker {
         let nonce = crate::fac::token_ledger::TokenUseLedger::generate_nonce();
 
         // Register the nonce in the ledger at issuance time (INV-TL-008).
+        // BLOCKER fix: serialize the WAL entry so callers can persist it
+        // (with fsync) before releasing the token, ensuring crash durability.
         let request_id_digest = compute_request_id_digest(request_id);
-        let _wal_entry = self
+        let wal_entry = self
             .token_ledger
             .register_nonce(&nonce, &request_id_digest, self.state.current_tick)
+            .map_err(BrokerError::TokenLedger)?;
+        let wal_bytes = crate::fac::token_ledger::TokenUseLedger::serialize_wal_entry(&wal_entry)
             .map_err(BrokerError::TokenLedger)?;
 
         // TCK-00565: Bind the token to policy, canonicalizer, boundary, and
@@ -919,14 +923,15 @@ impl FacBroker {
             nonce: Some(nonce),
         };
 
-        Ok(issue_channel_context_token_with_token_binding(
+        let token = issue_channel_context_token_with_token_binding(
             &check,
             lease_id,
             request_id,
             current_time_secs(),
             &self.signer,
             token_binding,
-        )?)
+        )?;
+        Ok((token, wal_bytes))
     }
 
     // -----------------------------------------------------------------------
@@ -1212,12 +1217,14 @@ impl FacBroker {
         &mut self,
         nonce: &[u8; 32],
         reason: &str,
-    ) -> Result<crate::fac::token_ledger::TokenRevocationReceipt, BrokerError> {
-        let (receipt, _wal_entry) = self
+    ) -> Result<(crate::fac::token_ledger::TokenRevocationReceipt, Vec<u8>), BrokerError> {
+        let (receipt, wal_entry) = self
             .token_ledger
-            .revoke_token(nonce, self.state.current_tick, reason)
+            .revoke_token(nonce, self.state.current_tick, reason, &self.signer)
             .map_err(BrokerError::TokenLedger)?;
-        Ok(receipt)
+        let wal_bytes = crate::fac::token_ledger::TokenUseLedger::serialize_wal_entry(&wal_entry)
+            .map_err(BrokerError::TokenLedger)?;
+        Ok((receipt, wal_bytes))
     }
 
     /// Evicts expired entries from the token use ledger.
@@ -1876,7 +1883,7 @@ mod tests {
             .admit_policy_digest(policy_digest)
             .expect("policy digest should admit");
 
-        let token = broker
+        let (token, _wal_bytes) = broker
             .issue_channel_context_token(&policy_digest, lease_id, request_id, "test-boundary")
             .expect("token issuance should succeed");
 
@@ -2085,7 +2092,7 @@ mod tests {
         );
 
         // Now token issuance should succeed
-        let token = broker
+        let (token, _wal_bytes) = broker
             .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary")
             .expect("token issuance should succeed after healthy check");
         assert!(!token.is_empty());
@@ -2158,7 +2165,7 @@ mod tests {
             .admit_policy_digest(job_digest)
             .expect("job digest should admit on attacker broker");
 
-        let forged_token = attacker
+        let (forged_token, _wal_bytes) = attacker
             .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary")
             .expect("attacker token should encode");
         let decode_now = now_secs();
@@ -2825,7 +2832,7 @@ mod tests {
             .expect("job digest should admit");
 
         // 1. Issue channel token
-        let token = broker
+        let (token, _wal_bytes) = broker
             .issue_channel_context_token(&job_digest, lease_id, request_id, "test-boundary")
             .expect("token should issue");
         let decode_now = now_secs();
@@ -2909,7 +2916,7 @@ mod tests {
         broker.admit_policy_digest(job_digest).unwrap();
         broker.set_admission_health_gate_for_test(true);
 
-        let token = broker
+        let (token, _wal_bytes) = broker
             .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary")
             .expect("token issuance should succeed");
 
@@ -2988,10 +2995,10 @@ mod tests {
         broker.admit_policy_digest(job_digest).unwrap();
         broker.set_admission_health_gate_for_test(true);
 
-        let token1 = broker
+        let (token1, _wal1) = broker
             .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary")
             .expect("first token should succeed");
-        let token2 = broker
+        let (token2, _wal2) = broker
             .issue_channel_context_token(&job_digest, "lease-2", "REQ-2", "test-boundary")
             .expect("second token should succeed");
 
@@ -3038,10 +3045,11 @@ mod tests {
 
         // INV-TL-008: Revoke BEFORE first use (pre-use revocation).
         // The nonce is in Issued state from issuance registration.
-        let receipt = broker
+        let (receipt, _revoke_wal) = broker
             .revoke_token(&nonce, "test revocation")
             .expect("pre-use revocation should succeed");
         assert!(receipt.verify_content_hash());
+        assert!(receipt.verify_signature(&broker.verifying_key()));
         assert_eq!(receipt.reason, "test revocation");
 
         // First use should be denied as revoked (pre-use revocation).
@@ -3062,7 +3070,7 @@ mod tests {
         broker.admit_policy_digest(job_digest).unwrap();
         broker.set_admission_health_gate_for_test(true);
 
-        let token = broker
+        let (token, _wal_bytes) = broker
             .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary")
             .expect("token should succeed");
 
@@ -3115,7 +3123,7 @@ mod tests {
         broker.set_admission_health_gate_for_test(true);
 
         // Issue first token.
-        let token1 = broker
+        let (token1, _wal_bytes) = broker
             .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary")
             .expect("first token should succeed");
 
@@ -3152,7 +3160,7 @@ mod tests {
         broker.set_admission_health_gate_for_test(true);
 
         // Issue and validate a token.
-        let token = broker
+        let (token, _wal_bytes) = broker
             .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary")
             .expect("token should succeed");
         let decoded = decode_channel_context_token(
@@ -3187,5 +3195,79 @@ mod tests {
             restored.check_nonce(&nonce),
             Err(crate::fac::token_ledger::TokenLedgerError::ReplayDetected)
         ));
+    }
+
+    /// BLOCKER regression: `issue_channel_context_token` returns non-empty
+    /// WAL bytes for caller-side persistence. Before the fix, the WAL
+    /// entry from `register_nonce` was silently discarded.
+    #[test]
+    fn tck_00566_issue_token_returns_non_empty_wal_bytes() {
+        let mut broker = FacBroker::new();
+        let job_digest = [0x42; 32];
+        broker.admit_policy_digest(job_digest).unwrap();
+        broker.set_admission_health_gate_for_test(true);
+
+        let (_token, wal_bytes) = broker
+            .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary")
+            .expect("token issuance should succeed");
+
+        assert!(
+            !wal_bytes.is_empty(),
+            "WAL bytes must be non-empty so callers can persist the Register entry"
+        );
+
+        // WAL bytes should be valid JSON (single newline-terminated entry).
+        let wal_str = std::str::from_utf8(&wal_bytes).expect("WAL bytes should be valid UTF-8");
+        assert!(
+            wal_str.ends_with('\n'),
+            "WAL entry should be newline-terminated"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(wal_str.trim()).expect("WAL entry should be valid JSON");
+        assert_eq!(
+            parsed.get("op").and_then(|v| v.as_str()),
+            Some("register"),
+            "WAL entry op must be 'register'"
+        );
+    }
+
+    /// MAJOR regression: `revoke_token` returns signed receipt with
+    /// non-empty WAL bytes.
+    #[test]
+    fn tck_00566_revoke_token_returns_signed_receipt_and_wal_bytes() {
+        let mut broker = FacBroker::new();
+        let job_digest = [0x42; 32];
+        broker.admit_policy_digest(job_digest).unwrap();
+        broker.set_admission_health_gate_for_test(true);
+
+        let (token, _issue_wal) = broker
+            .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary")
+            .expect("issuance should succeed");
+
+        let decoded = decode_channel_context_token(
+            &token,
+            &broker.verifying_key(),
+            "lease-1",
+            now_secs(),
+            "REQ-1",
+        )
+        .expect("decode should succeed");
+        let nonce = decoded.token_binding.unwrap().nonce.unwrap();
+
+        let (receipt, revoke_wal) = broker
+            .revoke_token(&nonce, "revoke regression test")
+            .expect("revocation should succeed");
+
+        // WAL bytes must be non-empty.
+        assert!(
+            !revoke_wal.is_empty(),
+            "revoke WAL bytes must be non-empty for persistence"
+        );
+
+        // Receipt must be signed.
+        assert!(
+            receipt.verify_signature(&broker.verifying_key()),
+            "receipt must verify with broker's public key"
+        );
     }
 }

@@ -673,9 +673,13 @@ fn build_gates_job_spec(
     // Bind policy fields to the admitted FAC policy digest and bind the
     // specific job through request_id (= spec digest), preserving fail-closed
     // token verification while avoiding digest-domain mismatch.
-    let token = broker
+    let (token, wal_bytes) = broker
         .issue_channel_context_token(policy_digest, lease_id, &digest, boundary_id)
         .map_err(|err| format!("issue channel context token: {err}"))?;
+    // BLOCKER fix: persist the WAL entry before releasing the token
+    // (crash durability for issuance registration).
+    super::super::fac_worker::append_token_ledger_wal_pub(&wal_bytes)
+        .map_err(|err| format!("token ledger WAL persist on issuance: {err}"))?;
     spec.actuation.channel_context_token = Some(token);
     validate_job_spec_with_policy(&spec, job_spec_policy)
         .map_err(|err| format!("validate job spec: {err}"))?;

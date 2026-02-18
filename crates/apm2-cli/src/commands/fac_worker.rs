@@ -5490,6 +5490,13 @@ fn save_broker_state(broker: &FacBroker) -> Result<(), String> {
 ///
 /// If a WAL file exists alongside the snapshot, it is replayed after
 /// snapshot load to restore full ledger state.
+#[allow(dead_code)] // Called from fac_queue_submit; dead_code false positive in test targets.
+pub fn load_token_ledger_pub(
+    current_tick: u64,
+) -> Result<Option<apm2_core::fac::token_ledger::TokenUseLedger>, String> {
+    load_token_ledger(current_tick)
+}
+
 fn load_token_ledger(
     current_tick: u64,
 ) -> Result<Option<apm2_core::fac::token_ledger::TokenUseLedger>, String> {
@@ -5538,6 +5545,23 @@ fn save_token_ledger(broker: &mut FacBroker) -> Result<(), String> {
         fac_permissions::ensure_dir_with_mode(&ledger_dir)
             .map_err(|e| format!("cannot create token ledger dir: {e}"))?;
     }
+
+    // BLOCKER fix: acquire exclusive flock on compaction.lock to prevent
+    // multi-process compaction races. Worker A truncates WAL after snapshot,
+    // but Worker B may have appended between snapshot and truncation — B's
+    // entry would be lost without this lock.
+    let lock_path = ledger_dir.join("compaction.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false) // Lock file only — never truncate its contents.
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("cannot open compaction lock: {e}"))?;
+    // Exclusive lock — blocks until acquired. Flock::lock takes ownership and
+    // automatically unlocks on drop.
+    let _lock_guard = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive)
+        .map_err(|(_file, e)| format!("cannot acquire compaction lock: {e}"))?;
+
     let state_path = ledger_dir.join("state.json");
     let bytes = broker
         .serialize_token_ledger()
@@ -5545,12 +5569,25 @@ fn save_token_ledger(broker: &mut FacBroker) -> Result<(), String> {
     // CTR-2607: full atomic write protocol (temp+fsync+dir_fsync+rename).
     apm2_core::determinism::write_atomic(&state_path, &bytes)
         .map_err(|e| format!("cannot write token ledger snapshot: {e}"))?;
-    // Truncate WAL after successful snapshot (compaction).
+    // MAJOR fix: Truncate WAL with fsync after successful snapshot (compaction).
+    // Uses open+set_len(0)+sync_all instead of fs::write to ensure the
+    // truncation is durable before releasing the compaction lock.
     let wal_path = ledger_dir.join("wal.jsonl");
     if wal_path.exists() {
-        fs::write(&wal_path, b"").map_err(|e| format!("cannot truncate token ledger WAL: {e}"))?;
+        let wal_file = fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .map_err(|e| format!("cannot open token ledger WAL for truncation: {e}"))?;
+        wal_file
+            .set_len(0)
+            .map_err(|e| format!("cannot truncate token ledger WAL: {e}"))?;
+        wal_file
+            .sync_all()
+            .map_err(|e| format!("cannot fsync token ledger WAL truncation: {e}"))?;
     }
     broker.reset_token_ledger_wal_counter();
+
+    // _lock_guard dropped here — exclusive flock released automatically.
     Ok(())
 }
 
@@ -5560,6 +5597,11 @@ fn save_token_ledger(broker: &mut FacBroker) -> Result<(), String> {
 /// Uses append mode with fsync for crash durability (INV-TL-010).
 /// This MUST be called immediately after `validate_and_record_token_nonce`
 /// returns Ok and BEFORE job execution begins (BLOCKER fix).
+#[allow(dead_code)] // Called from fac_warm and gates; dead_code false positive in test targets.
+pub fn append_token_ledger_wal_pub(wal_bytes: &[u8]) -> Result<(), String> {
+    append_token_ledger_wal(wal_bytes)
+}
+
 fn append_token_ledger_wal(wal_bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
 
