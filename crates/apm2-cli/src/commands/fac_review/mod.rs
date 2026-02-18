@@ -184,6 +184,12 @@ struct DoctorAgentActivitySummary {
     max_dispatched_pending_seconds: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LocalGatesRunResult {
+    pub(super) exit_code: u8,
+    pub(super) failure_summary: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct DoctorFindingsCounts {
     blocker: u32,
@@ -4275,8 +4281,8 @@ pub(super) fn run_gates_local_worker(
     cpu_quota: &str,
     gate_profile: GateThroughputProfile,
     workspace_root: &Path,
-) -> Result<u8, String> {
-    gates::run_gates_local_worker(
+) -> Result<LocalGatesRunResult, String> {
+    let result = gates::run_gates_local_worker(
         force,
         quick,
         timeout_seconds,
@@ -4285,7 +4291,11 @@ pub(super) fn run_gates_local_worker(
         cpu_quota,
         gate_profile,
         workspace_root,
-    )
+    )?;
+    Ok(LocalGatesRunResult {
+        exit_code: result.exit_code,
+        failure_summary: result.failure_summary,
+    })
 }
 
 /// Post-receipt gate cache rebinding (TCK-00540 BLOCKER fix).

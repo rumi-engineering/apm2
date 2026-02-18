@@ -125,14 +125,22 @@ mod fac_review_api {
         Conservative,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct LocalGatesRunResult {
+        pub exit_code: u8,
+        pub failure_summary: Option<String>,
+    }
+
     thread_local! {
-        static RUN_GATES_LOCAL_WORKER_OVERRIDE: RefCell<Option<Result<u8, String>>> =
+        static RUN_GATES_LOCAL_WORKER_OVERRIDE: RefCell<Option<Result<LocalGatesRunResult, String>>> =
             const { RefCell::new(None) };
         static GATE_LIFECYCLE_OVERRIDE: RefCell<Option<Result<usize, String>>> =
             const { RefCell::new(None) };
     }
 
-    pub fn set_run_gates_local_worker_override(result: Option<Result<u8, String>>) {
+    pub fn set_run_gates_local_worker_override(
+        result: Option<Result<LocalGatesRunResult, String>>,
+    ) {
         RUN_GATES_LOCAL_WORKER_OVERRIDE.with(|slot| {
             *slot.borrow_mut() = result;
         });
@@ -155,13 +163,16 @@ mod fac_review_api {
         _cpu_quota: &str,
         _gate_profile: GateThroughputProfile,
         _workspace_root: &std::path::Path,
-    ) -> Result<u8, String> {
+    ) -> Result<LocalGatesRunResult, String> {
         if let Some(override_result) =
             RUN_GATES_LOCAL_WORKER_OVERRIDE.with(|slot| slot.borrow().clone())
         {
             return override_result;
         }
-        Ok(crate::exit_codes::codes::GENERIC_ERROR)
+        Ok(LocalGatesRunResult {
+            exit_code: crate::exit_codes::codes::GENERIC_ERROR,
+            failure_summary: None,
+        })
     }
 
     /// Test stub: no-op rebinding (v2).
@@ -1667,7 +1678,7 @@ fn run_gates_in_workspace(
     heartbeat_jobs_denied: u64,
     heartbeat_jobs_quarantined: u64,
     heartbeat_job_id: &str,
-) -> Result<u8, String> {
+) -> Result<fac_review_api::LocalGatesRunResult, String> {
     let stop_refresh = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_refresh_bg = std::sync::Arc::clone(&stop_refresh);
     let heartbeat_fac_root = fac_root.to_path_buf();
@@ -1723,6 +1734,24 @@ fn apply_gates_job_lifecycle_events(spec: &FacJobSpecV1, passed: bool) -> Result
             spec.source.repo_id, spec.source.head_sha
         )
     })
+}
+
+const MAX_FAC_RECEIPT_REASON_CHARS: usize = 512;
+
+fn truncate_receipt_reason(raw: &str) -> String {
+    let len = raw.chars().count();
+    if len <= MAX_FAC_RECEIPT_REASON_CHARS {
+        return raw.to_string();
+    }
+    if MAX_FAC_RECEIPT_REASON_CHARS <= 3 {
+        return raw.chars().take(MAX_FAC_RECEIPT_REASON_CHARS).collect();
+    }
+    let mut out = raw
+        .chars()
+        .take(MAX_FAC_RECEIPT_REASON_CHARS - 3)
+        .collect::<String>();
+    out.push_str("...");
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1860,7 +1889,7 @@ fn execute_queued_gates_job(
         return JobOutcome::Denied { reason };
     }
 
-    let exit_code = match run_gates_in_workspace(
+    let gate_run_result = match run_gates_in_workspace(
         &options,
         fac_root,
         heartbeat_cycle_count,
@@ -1907,9 +1936,9 @@ fn execute_queued_gates_job(
     };
 
     let lifecycle_update_result =
-        apply_gates_job_lifecycle_events(spec, exit_code == exit_codes::SUCCESS);
+        apply_gates_job_lifecycle_events(spec, gate_run_result.exit_code == exit_codes::SUCCESS);
 
-    if exit_code == exit_codes::SUCCESS {
+    if gate_run_result.exit_code == exit_codes::SUCCESS {
         if let Err(err) = lifecycle_update_result {
             let reason = format!("gates passed but lifecycle update failed: {err}");
             if let Err(commit_err) = commit_claimed_job_via_pipeline(
@@ -2016,9 +2045,18 @@ fn execute_queued_gates_job(
     }
 
     // Gates failed: commit claimed job to denied via pipeline.
-    let reason = match lifecycle_update_result {
-        Ok(_) => format!("gates failed with exit code {exit_code}"),
-        Err(err) => format!("gates failed with exit code {exit_code}; {err}"),
+    let base_reason = match lifecycle_update_result {
+        Ok(_) => format!("gates failed with exit code {}", gate_run_result.exit_code),
+        Err(err) => format!(
+            "gates failed with exit code {}; {err}",
+            gate_run_result.exit_code
+        ),
+    };
+    let reason = match gate_run_result.failure_summary.as_deref() {
+        Some(summary) if !summary.trim().is_empty() => {
+            truncate_receipt_reason(&format!("{base_reason}; {summary}"))
+        },
+        _ => truncate_receipt_reason(&base_reason),
     };
     // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
     if let Err(commit_err) = commit_claimed_job_via_pipeline(
@@ -5053,11 +5091,7 @@ fn handle_stop_revoke(
             "cancelled by stop_revoke job {}: {cancel_reason}",
             spec.job_id
         );
-        let bounded_reason = if reason.len() > 512 {
-            reason[..512].to_string()
-        } else {
-            reason
-        };
+        let bounded_reason = truncate_receipt_reason(&reason);
 
         let receipt_id = format!(
             "cancel-{}-{}",
@@ -7417,7 +7451,7 @@ mod tests {
 
     impl FacReviewApiOverrideGuard {
         fn install(
-            run_result: Result<u8, String>,
+            run_result: Result<fac_review_api::LocalGatesRunResult, String>,
             lifecycle_result: Result<usize, String>,
         ) -> Self {
             fac_review_api::set_run_gates_local_worker_override(Some(run_result));
@@ -8120,7 +8154,10 @@ mod tests {
     #[test]
     fn test_execute_queued_gates_job_denies_when_lifecycle_replay_returns_illegal_transition() {
         let _override_guard = FacReviewApiOverrideGuard::install(
-            Ok(exit_codes::SUCCESS),
+            Ok(fac_review_api::LocalGatesRunResult {
+                exit_code: exit_codes::SUCCESS,
+                failure_summary: None,
+            }),
             Err("illegal transition: pushed + gates_started".to_string()),
         );
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8202,6 +8239,182 @@ mod tests {
                 .is_file(),
             "job should be moved to denied on lifecycle replay failure"
         );
+    }
+
+    #[test]
+    fn test_execute_queued_gates_job_denied_reason_includes_gate_failure_summary() {
+        let _override_guard = FacReviewApiOverrideGuard::install(
+            Ok(fac_review_api::LocalGatesRunResult {
+                exit_code: exit_codes::GENERIC_ERROR,
+                failure_summary: Some(
+                    "failed_gates=test; first_failure=test: timeout exceeded".to_string(),
+                ),
+            }),
+            Ok(1),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let queue_root = dir.path().join("queue");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        ensure_queue_dirs(&queue_root).expect("create queue dirs");
+
+        let claimed_path = queue_root
+            .join(CLAIMED_DIR)
+            .join("gates-failure-summary.json");
+        fs::write(&claimed_path, b"{}").expect("seed claimed file");
+        let claimed_file_name = "gates-failure-summary.json";
+
+        let repo_root = PathBuf::from(repo_toplevel_for_tests());
+        let current_head = resolve_workspace_head(&repo_root).expect("resolve workspace head");
+        let mut spec = make_receipt_test_spec();
+        spec.source.head_sha = current_head;
+        spec.source.patch = Some(serde_json::json!({
+            "schema": GATES_JOB_OPTIONS_SCHEMA,
+            "force": false,
+            "quick": false,
+            "timeout_seconds": 600,
+            "memory_max": "48G",
+            "pids_max": 1536,
+            "cpu_quota": "auto",
+            "gate_profile": "throughput",
+            "workspace_root": repo_root.to_string_lossy(),
+        }));
+
+        let boundary_trace = ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
+        };
+        let queue_trace = JobQueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "consume".to_string(),
+            defect_reason: None,
+            cost_estimate_ticks: None,
+        };
+        let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
+        let hardening_hash = apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
+        let network_hash = apm2_core::fac::NetworkPolicy::deny().content_hash_hex();
+
+        let outcome = execute_queued_gates_job(
+            &spec,
+            &claimed_path,
+            claimed_file_name,
+            &queue_root,
+            &fac_root,
+            &boundary_trace,
+            &queue_trace,
+            None,
+            &tuple_digest,
+            &spec.job_spec_digest,
+            &hardening_hash,
+            &network_hash,
+            1,
+            0,
+            0,
+            0,
+        );
+        let reason = match outcome {
+            JobOutcome::Denied { reason } => reason,
+            other => panic!("expected denied outcome, got {other:?}"),
+        };
+        assert!(reason.contains("gates failed with exit code 1"));
+        assert!(reason.contains("failed_gates=test"));
+        assert!(reason.contains("first_failure=test: timeout exceeded"));
+    }
+
+    #[test]
+    fn test_execute_queued_gates_job_denied_reason_is_utf8_safe_and_bounded() {
+        let _override_guard = FacReviewApiOverrideGuard::install(
+            Ok(fac_review_api::LocalGatesRunResult {
+                exit_code: exit_codes::GENERIC_ERROR,
+                failure_summary: Some(format!(
+                    "failed_gates=test; first_failure=test: {}",
+                    "🚧".repeat(700)
+                )),
+            }),
+            Ok(1),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let queue_root = dir.path().join("queue");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        ensure_queue_dirs(&queue_root).expect("create queue dirs");
+
+        let claimed_path = queue_root
+            .join(CLAIMED_DIR)
+            .join("gates-bounded-reason.json");
+        fs::write(&claimed_path, b"{}").expect("seed claimed file");
+        let claimed_file_name = "gates-bounded-reason.json";
+
+        let repo_root = PathBuf::from(repo_toplevel_for_tests());
+        let current_head = resolve_workspace_head(&repo_root).expect("resolve workspace head");
+        let mut spec = make_receipt_test_spec();
+        spec.source.head_sha = current_head;
+        spec.source.patch = Some(serde_json::json!({
+            "schema": GATES_JOB_OPTIONS_SCHEMA,
+            "force": false,
+            "quick": false,
+            "timeout_seconds": 600,
+            "memory_max": "48G",
+            "pids_max": 1536,
+            "cpu_quota": "auto",
+            "gate_profile": "throughput",
+            "workspace_root": repo_root.to_string_lossy(),
+        }));
+
+        let boundary_trace = ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
+        };
+        let queue_trace = JobQueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "consume".to_string(),
+            defect_reason: None,
+            cost_estimate_ticks: None,
+        };
+        let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
+        let hardening_hash = apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
+        let network_hash = apm2_core::fac::NetworkPolicy::deny().content_hash_hex();
+
+        let outcome = execute_queued_gates_job(
+            &spec,
+            &claimed_path,
+            claimed_file_name,
+            &queue_root,
+            &fac_root,
+            &boundary_trace,
+            &queue_trace,
+            None,
+            &tuple_digest,
+            &spec.job_spec_digest,
+            &hardening_hash,
+            &network_hash,
+            1,
+            0,
+            0,
+            0,
+        );
+        let reason = match outcome {
+            JobOutcome::Denied { reason } => reason,
+            other => panic!("expected denied outcome, got {other:?}"),
+        };
+        assert!(
+            reason.chars().count() <= MAX_FAC_RECEIPT_REASON_CHARS,
+            "reason must be bounded to FAC receipt limit"
+        );
+        assert!(reason.ends_with("..."), "long reason should be truncated");
+        assert!(reason.contains("failed_gates=test"));
     }
 
     fn init_test_workspace_git_repo(workspace: &Path) {

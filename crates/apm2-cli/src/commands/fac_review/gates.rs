@@ -103,6 +103,13 @@ pub(super) struct QueuedGatesOutcome {
     pub(super) gate_results: Vec<EvidenceGateResult>,
 }
 
+/// Local worker execution result used by the FAC worker queue path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LocalGatesRunResult {
+    pub(super) exit_code: u8,
+    pub(super) failure_summary: Option<String>,
+}
+
 #[derive(Debug)]
 struct PreparedQueuedGatesJob {
     fac_root: PathBuf,
@@ -702,7 +709,7 @@ pub(super) fn run_gates_local_worker(
     cpu_quota: &str,
     gate_profile: GateThroughputProfile,
     workspace_root: &Path,
-) -> Result<u8, String> {
+) -> Result<LocalGatesRunResult, String> {
     let (resolved_profile, effective_cpu_quota) =
         resolve_effective_execution_profile(cpu_quota, gate_profile)?;
     let summary = run_gates_inner(
@@ -719,10 +726,66 @@ pub(super) fn run_gates_local_worker(
         None,
     )?;
     Ok(if summary.passed {
-        exit_codes::SUCCESS
+        LocalGatesRunResult {
+            exit_code: exit_codes::SUCCESS,
+            failure_summary: None,
+        }
     } else {
-        exit_codes::GENERIC_ERROR
+        LocalGatesRunResult {
+            exit_code: exit_codes::GENERIC_ERROR,
+            failure_summary: summarize_gate_failures(&summary.gates),
+        }
     })
+}
+
+fn summarize_gate_failures(gates: &[GateResult]) -> Option<String> {
+    let failed = gates
+        .iter()
+        .filter(|gate| gate.status == "FAIL")
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        return None;
+    }
+
+    let names = failed
+        .iter()
+        .map(|gate| gate.name.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let first = failed[0];
+    let first_detail = first
+        .error_hint
+        .as_deref()
+        .map(compact_summary_text)
+        .filter(|value| !value.is_empty())
+        .map(|hint| format!("{}: {hint}", first.name))
+        .or_else(|| {
+            first
+                .log_path
+                .as_deref()
+                .map(|path| format!("{} log={path}", first.name))
+        })
+        .unwrap_or_else(|| first.name.clone());
+
+    let raw = format!("failed_gates={names}; first_failure={first_detail}");
+    Some(truncate_summary_chars(&raw, 320))
+}
+
+fn compact_summary_text(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_summary_chars(raw: &str, max_chars: usize) -> String {
+    let len = raw.chars().count();
+    if len <= max_chars {
+        return raw.to_string();
+    }
+    if max_chars <= 3 {
+        return raw.chars().take(max_chars).collect();
+    }
+    let mut out = raw.chars().take(max_chars - 3).collect::<String>();
+    out.push_str("...");
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2094,6 +2157,70 @@ mod tests {
     fn write_queue_spec(path: &Path, spec: &FacJobSpecV1) {
         let body = serde_json::to_vec_pretty(spec).expect("serialize spec");
         fs::write(path, body).expect("write spec");
+    }
+
+    #[test]
+    fn summarize_gate_failures_includes_failed_gate_names_and_first_detail() {
+        let gates = vec![
+            GateResult {
+                name: "fmt".to_string(),
+                status: "PASS".to_string(),
+                duration_secs: 1,
+                log_path: None,
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_bundle_hash: None,
+                error_hint: None,
+            },
+            GateResult {
+                name: "test".to_string(),
+                status: "FAIL".to_string(),
+                duration_secs: 7,
+                log_path: Some("/tmp/gates/test.log".to_string()),
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_bundle_hash: None,
+                error_hint: Some("thread 'x' panicked".to_string()),
+            },
+            GateResult {
+                name: "clippy".to_string(),
+                status: "FAIL".to_string(),
+                duration_secs: 3,
+                log_path: Some("/tmp/gates/clippy.log".to_string()),
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_bundle_hash: None,
+                error_hint: None,
+            },
+        ];
+
+        let summary = summarize_gate_failures(&gates).expect("summary");
+        assert!(summary.contains("failed_gates=test,clippy"));
+        assert!(summary.contains("first_failure=test: thread 'x' panicked"));
+    }
+
+    #[test]
+    fn summarize_gate_failures_compacts_whitespace_and_bounds_output() {
+        let gates = vec![GateResult {
+            name: "test".to_string(),
+            status: "FAIL".to_string(),
+            duration_secs: 7,
+            log_path: None,
+            bytes_written: None,
+            bytes_total: None,
+            was_truncated: None,
+            log_bundle_hash: None,
+            error_hint: Some(format!("line1\nline2\t{}", "x".repeat(600))),
+        }];
+
+        let summary = summarize_gate_failures(&gates).expect("summary");
+        assert!(!summary.contains('\n'));
+        assert!(!summary.contains('\t'));
+        assert!(summary.chars().count() <= 320);
+        assert!(summary.ends_with("..."));
     }
 
     #[test]

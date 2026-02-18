@@ -193,6 +193,16 @@ scope:
             (including workspace_integrity),
           - v3-only cache hits succeed without v2 presence,
           - receipt-bound rebinding promotes cache entries for reuse.
+    - id: "S10_GATES_FAILURE_O11Y"
+      title: "Improve queued gates failure observability"
+      detail: |
+        Preserve gate-level failure context when worker-executed gates fail:
+          - propagate deterministic failure summaries from `fac_review::gates`
+            into queued worker denial reasons,
+          - include failed gate names and first actionable failure hint/log pointer,
+          - enforce UTF-8-safe bounded reason strings for FAC receipt compatibility
+            (512-char cap),
+          - add regression tests for summary propagation and truncation behavior.
 
   out_of_scope:
     - "Gate ordering changes or broad gate algorithm redesign."
@@ -290,6 +300,8 @@ definition_of_done:
       deterministic for log-bundle hashing."
     - "Regression tests pass for v3-only cache hits, receipt-rebind promotion,
       and full non-status v3 reuse integration coverage."
+    - "Queued gates denial reasons include deterministic gate-level failure
+      summaries when available and remain UTF-8-safe within receipt bounds."
     - "Workspace validation (fmt, clippy, doc, test) completes successfully."
 
 notes:
@@ -313,4 +325,10 @@ notes:
         - "Out-of-scope statement excluding all gate execution logic changes."
       replacement:
         - "Gate ordering remains unchanged, while targeted evidence execution-path hardening for deterministic v3 cache reuse and regression prevention is in-scope."
+    - amendment_id: "AMD-2026-02-18-GATES-O11Y"
+      summary: "Scope explicitly includes gate-failure observability hardening for queued worker execution."
+      supersedes:
+        - "Implicit assumption that gate failure reasons can remain exit-code only."
+      replacement:
+        - "Queued gate failures must surface deterministic per-gate failure context in denial receipts while preserving bounded, replay-safe reason strings."
   security: "default-deny; readiness failure is fail-closed (no gates run); XDG socket path removes /tmp TOCTOU surface from PrivateTmp=yes sandbox"
