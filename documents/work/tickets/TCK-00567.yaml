@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00567"
     title: "RFC-0028 intent taxonomy for FAC: typed tool-intent classes and per-kind authorization policy"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

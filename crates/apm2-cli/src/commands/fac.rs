@@ -443,16 +443,6 @@ pub struct GatesArgs {
     /// Maximum wait time in seconds when wait mode is enabled.
     #[arg(long, default_value_t = 1200)]
     pub wait_timeout_secs: u64,
-
-    /// **UNSAFE**: Allow reuse of legacy gate cache entries that lack
-    /// RFC-0028/0029 receipt bindings (TCK-00540).
-    ///
-    /// By default, gate cache entries without auditable receipt bindings are
-    /// treated as untrusted and rejected (fail-closed). This flag permits
-    /// reuse of those unbound entries for migration purposes. Reused entries
-    /// are marked `legacy_cache_override` in the receipt for audit trail.
-    #[arg(long, default_value_t = false)]
-    pub allow_legacy_cache: bool,
 }
 
 /// Arguments for `apm2 fac preflight`.
@@ -2296,7 +2286,6 @@ pub fn run_fac(
             resolve_json(args.json),
             args.wait && !args.no_wait,
             args.wait_timeout_secs,
-            args.allow_legacy_cache,
         ),
         FacSubcommand::Preflight(args) => match &args.subcommand {
             PreflightSubcommand::Credential(credential_args) => fac_preflight::run_credential(
