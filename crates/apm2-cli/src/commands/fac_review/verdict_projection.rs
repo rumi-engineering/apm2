@@ -900,8 +900,8 @@ where
 
     match create_comment(owner_repo, pr_number, &body) {
         Ok(response) => {
-            if let Some(orphaned_comment_id) = superseded_remote_comment_id
-                .filter(|value| *value != response.id)
+            if let Some(orphaned_comment_id) =
+                superseded_remote_comment_id.filter(|value| *value != response.id)
             {
                 let tombstone =
                     render_tombstoned_decision_comment_body(response.id, &response.html_url);
