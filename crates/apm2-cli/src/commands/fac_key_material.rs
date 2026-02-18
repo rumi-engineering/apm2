@@ -1,12 +1,15 @@
 //! Shared FAC signing-key lifecycle helpers.
 
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use apm2_core::crypto::Signer;
+use apm2_core::fac::receipt_pipeline::rename_noreplace;
 
 use super::fac_secure_io;
 
@@ -66,6 +69,7 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
 
 fn write_new_signing_key(path: &Path, key_bytes: &[u8]) -> Result<(), String> {
     ensure_parent_dir(path)?;
+    let temp_path = temporary_signing_key_path(path)?;
 
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -76,15 +80,46 @@ fn write_new_signing_key(path: &Path, key_bytes: &[u8]) -> Result<(), String> {
     }
 
     let mut file = options
-        .open(path)
-        .map_err(|err| format!("open {} for create_new: {err}", path.display()))?;
+        .open(&temp_path)
+        .map_err(|err| format!("open {} for create_new: {err}", temp_path.display()))?;
     file.write_all(key_bytes)
-        .map_err(|err| format!("write {}: {err}", path.display()))?;
+        .map_err(|err| format!("write {}: {err}", temp_path.display()))?;
     file.sync_all()
-        .map_err(|err| format!("fsync {}: {err}", path.display()))?;
+        .map_err(|err| format!("fsync {}: {err}", temp_path.display()))?;
     drop(file);
+    match rename_noreplace(&temp_path, path) {
+        Ok(()) => {},
+        Err(err) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(format!(
+                "rename {} -> {}: {err}",
+                temp_path.display(),
+                path.display()
+            ));
+        },
+    }
     fsync_parent_dir(path)?;
     Ok(())
+}
+
+fn temporary_signing_key_path(path: &Path) -> Result<PathBuf, String> {
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("path {} has no parent", path.display()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("path {} has no filename", path.display()))?;
+
+    let mut temp_name = OsString::from(".");
+    temp_name.push(file_name);
+    temp_name.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    Ok(parent.join(temp_name))
 }
 
 /// Load existing persistent signer from `fac_root/signing_key`.
@@ -123,7 +158,7 @@ pub fn load_or_generate_persistent_signer(fac_root: &Path) -> Result<Signer, Str
 mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     use super::*;
@@ -134,29 +169,33 @@ mod tests {
         let fac_root = dir.path().join("private").join("fac");
         fs::create_dir_all(&fac_root).expect("create fac root");
         let fac_root = Arc::new(fac_root);
+        let workers = 8usize;
+        let barrier = Arc::new(Barrier::new(workers));
 
         let mut handles = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..workers {
             let root = Arc::clone(&fac_root);
+            let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
+                barrier.wait();
                 load_or_generate_persistent_signer(&root).expect("load_or_generate signer")
             }));
         }
-
-        let first = handles
-            .remove(0)
-            .join()
-            .expect("thread should join")
-            .secret_key_bytes()
-            .to_vec();
-        let second = handles
-            .remove(0)
-            .join()
-            .expect("thread should join")
-            .secret_key_bytes()
-            .to_vec();
-
-        assert_eq!(first, second, "both creators must converge to same key");
+        let mut keys = handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .expect("thread should join")
+                    .secret_key_bytes()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        let first = keys.pop().expect("at least one worker");
+        assert!(
+            keys.into_iter().all(|candidate| candidate == first),
+            "all creators must converge to same key"
+        );
         let on_disk = fac_secure_io::read_bounded(&fac_root.join("signing_key"), SIGNING_KEY_SIZE)
             .expect("read key");
         assert_eq!(on_disk, first);

@@ -22,6 +22,11 @@ fn read_fac_workflow_yaml() -> serde_yaml::Value {
     serde_yaml::from_str(&raw).expect("parse FAC workflow YAML")
 }
 
+fn read_fac_push_source() -> String {
+    let path = repo_root().join("crates/apm2-cli/src/commands/fac_review/push.rs");
+    std::fs::read_to_string(path).expect("read fac push source")
+}
+
 fn required_status_contexts(ruleset: &serde_json::Value) -> BTreeSet<String> {
     let rules = ruleset
         .get("rules")
@@ -335,6 +340,19 @@ fn forge_workflow_does_not_compute_fac_with_rust_binary_or_pr_triggers() {
     assert!(
         fac_compute_commands.is_empty(),
         "workflow must not run FAC computation commands: {fac_compute_commands:?}"
+    );
+}
+
+#[test]
+fn fac_push_does_not_enable_github_auto_merge() {
+    let source = read_fac_push_source();
+    assert!(
+        !source.contains("enable_auto_merge("),
+        "fac push must not call GitHub auto-merge enablement"
+    );
+    assert!(
+        !source.contains("gh pr merge --auto"),
+        "fac push must not shell out to gh auto-merge path"
     );
 }
 

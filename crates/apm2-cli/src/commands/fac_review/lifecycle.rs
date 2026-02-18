@@ -1903,6 +1903,46 @@ fn git_stdout_checked(current_dir: &Path, args: &[&str]) -> Result<String, Strin
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn git_common_dir_checked(current_dir: &Path) -> Result<PathBuf, String> {
+    let git_common_dir = git_stdout_checked(
+        current_dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let trimmed = git_common_dir.trim();
+    if trimmed.is_empty() {
+        return Err("`git rev-parse --git-common-dir` returned empty output".to_string());
+    }
+    Ok(PathBuf::from(trimmed))
+}
+
+fn git_run_checked_with_git_dir(git_dir: &Path, args: &[&str]) -> Result<(), String> {
+    let git_dir_arg = format!("--git-dir={}", git_dir.display());
+    let output = Command::new("git")
+        .arg(&git_dir_arg)
+        .args(args)
+        .current_dir(std::env::temp_dir())
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to execute `git {git_dir_arg} {}`: {err}",
+                args.join(" ")
+            )
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(format!(
+        "`git {git_dir_arg} {}` failed: {}",
+        args.join(" "),
+        if stderr.is_empty() {
+            "unknown error"
+        } else {
+            &stderr
+        }
+    ))
+}
+
 fn git_commit_sha_if_exists(current_dir: &Path, reference: &str) -> Result<Option<String>, String> {
     let output = Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", reference])
@@ -2246,33 +2286,56 @@ fn cleanup_merged_branch_local_state_inner(
 ) -> Result<(), String> {
     let mut errors = Vec::new();
     maybe_cleanup_worktree_target(worktree);
-    let mut skipped_worktree_removal_for_current_dir = false;
+    let git_common_dir = match git_common_dir_checked(reference_dir) {
+        Ok(path) => Some(path),
+        Err(err) => {
+            errors.push(format!(
+                "failed to resolve git common dir for local cleanup: {err}"
+            ));
+            None
+        },
+    };
+    let run_cleanup_git = |args: &[&str]| -> Result<(), String> {
+        let Some(git_common_dir) = git_common_dir.as_ref() else {
+            return Err("git common dir unavailable for cleanup commands".to_string());
+        };
+        git_run_checked_with_git_dir(git_common_dir, args)
+    };
+
+    let is_missing_worktree_error = |err: &str| -> bool {
+        let lower = err.to_ascii_lowercase();
+        lower.contains("is not a working tree")
+            || lower.contains("no such file or directory")
+            || lower.contains("does not exist")
+    };
+    let is_missing_branch_error = |err: &str| -> bool {
+        let lower = err.to_ascii_lowercase();
+        lower.contains("branch")
+            && (lower.contains("not found")
+                || lower.contains("not a valid branch")
+                || lower.contains("unknown revision"))
+    };
+
     if let Some(worktree_path) = worktree {
-        let current_dir = std::env::current_dir().ok();
-        let remove_ok = current_dir
-            .as_ref()
-            .is_none_or(|cwd| cwd != Path::new(worktree_path));
-        if !remove_ok {
-            skipped_worktree_removal_for_current_dir = true;
-            errors.push(format!(
-                "skipped worktree removal for `{worktree_path}` because it is the current working directory"
-            ));
-        } else if let Err(err) = git_run_checked(
-            reference_dir,
-            &["worktree", "remove", "--force", worktree_path],
-        ) {
-            errors.push(format!(
-                "failed to remove worktree `{worktree_path}`: {err}"
-            ));
+        if let Err(err) = run_cleanup_git(&["worktree", "remove", "--force", worktree_path]) {
+            if is_missing_worktree_error(&err) {
+                // Idempotent cleanup: missing worktree is treated as
+                // already-clean.
+            } else {
+                errors.push(format!(
+                    "failed to remove worktree `{worktree_path}`: {err}"
+                ));
+            }
         }
     }
     if !branch.eq_ignore_ascii_case("main") {
-        if skipped_worktree_removal_for_current_dir {
-            errors.push(format!(
-                "skipped deleting local branch `{branch}` because its worktree is still active in the current directory"
-            ));
-        } else if let Err(err) = git_run_checked(reference_dir, &["branch", "-D", branch]) {
-            errors.push(format!("failed to delete local branch `{branch}`: {err}"));
+        if let Err(err) = run_cleanup_git(&["branch", "-D", branch]) {
+            if is_missing_branch_error(&err) {
+                // Idempotent cleanup: missing branch is treated as
+                // already-clean.
+            } else {
+                errors.push(format!("failed to delete local branch `{branch}`: {err}"));
+            }
         }
     }
     if errors.is_empty() {
@@ -2828,17 +2891,43 @@ fn project_merge_to_github(
     merge_dir: &Path,
     context: &MergeProjectionContext,
 ) -> Result<(), String> {
+    project_merge_to_github_with(
+        merge_dir,
+        context,
+        github_projection::close_pr_if_open,
+        delete_remote_branch_projection,
+        |owner_repo, pr_number, head_sha, decision| {
+            project_fac_required_status_for_decision(owner_repo, pr_number, head_sha, decision)
+        },
+        project_merge_evidence_to_pr_body,
+    )
+}
+
+fn project_merge_to_github_with<FClose, FDelete, FStatus, FBody>(
+    merge_dir: &Path,
+    context: &MergeProjectionContext,
+    mut close_pr_fn: FClose,
+    mut delete_remote_branch_fn: FDelete,
+    mut project_status_fn: FStatus,
+    mut project_pr_body_fn: FBody,
+) -> Result<(), String>
+where
+    FClose: FnMut(&str, u32) -> Result<(), String>,
+    FDelete: FnMut(&Path, &str) -> Result<(), String>,
+    FStatus: FnMut(&str, u32, &str, &str) -> Result<(), String>,
+    FBody: FnMut(&MergeProjectionContext) -> Result<(), String>,
+{
     let mut errors = Vec::new();
-    if let Err(err) = github_projection::close_pr_if_open(&context.owner_repo, context.pr_number) {
+    if let Err(err) = close_pr_fn(&context.owner_repo, context.pr_number) {
         errors.push(format!("close_pr: {err}"));
     }
-    if let Err(err) = delete_remote_branch_projection(merge_dir, &context.source_branch) {
+    if let Err(err) = delete_remote_branch_fn(merge_dir, &context.source_branch) {
         errors.push(format!(
             "delete_remote_branch `{}`: {err}",
             context.source_branch
         ));
     }
-    if let Err(err) = project_fac_required_status_for_decision(
+    if let Err(err) = project_status_fn(
         &context.owner_repo,
         context.pr_number,
         &context.merge_sha,
@@ -2846,7 +2935,7 @@ fn project_merge_to_github(
     ) {
         errors.push(format!("commit_status: {err}"));
     }
-    if let Err(err) = project_merge_evidence_to_pr_body(context) {
+    if let Err(err) = project_pr_body_fn(context) {
         errors.push(format!("pr_body: {err}"));
     }
     if errors.is_empty() {
@@ -4562,16 +4651,18 @@ mod tests {
         AgentType, AutoVerdictCandidate, AutoVerdictFinalizeResult, FAC_RECEIPTS_DIR,
         FAC_STATUS_PROJECTION_MAX_ATTEMPTS, LifecycleEventKind, MERGE_EVIDENCE_END,
         MERGE_EVIDENCE_START, MERGE_RECEIPT_BINDING_SUFFIX, MergeEvidenceBinding,
-        MergeReceiptBindingRecord, PrLifecycleState, TrackedAgentState, acquire_registry_lock,
-        active_agents_for_pr, apply_event, bind_reviewer_runtime,
-        compute_merge_receipt_changeset_digest, delete_remote_branch_projection,
-        derive_auto_verdict_decision_from_findings, derive_fac_required_status_projection,
-        enforce_pr_capacity, fac_required_status_projection_for_decision,
-        finalize_auto_verdict_candidate, load_fac_required_status_contexts, load_registry,
-        normalize_hash_list, normalize_sha256_hex_digest, persist_merge_receipt_binding_record,
+        MergeProjectionContext, MergeReceiptBindingRecord, PrLifecycleState, TrackedAgentState,
+        acquire_registry_lock, active_agents_for_pr, apply_event, bind_reviewer_runtime,
+        cleanup_merged_branch_local_state_inner, compute_merge_receipt_changeset_digest,
+        delete_remote_branch_projection, derive_auto_verdict_decision_from_findings,
+        derive_fac_required_status_projection, enforce_pr_capacity,
+        fac_required_status_projection_for_decision, finalize_auto_verdict_candidate,
+        load_fac_required_status_contexts, load_registry, normalize_hash_list,
+        normalize_sha256_hex_digest, persist_merge_receipt_binding_record,
         project_fac_required_status_to_contexts_with, project_fac_required_status_with,
-        register_agent_spawn, register_reviewer_dispatch, save_registry,
-        sync_local_main_with_origin, token_hash, try_fast_forward_main, upsert_marker_section,
+        project_merge_to_github_with, register_agent_spawn, register_reviewer_dispatch,
+        save_registry, sync_local_main_with_origin, token_hash, try_fast_forward_main,
+        upsert_marker_section,
     };
     use crate::commands::fac_review::lifecycle::tracked_agent_id;
     use crate::commands::fac_review::state::{
@@ -5166,6 +5257,216 @@ mod tests {
 
         delete_remote_branch_projection(dir, "ticket/missing")
             .expect("missing remote branch should not fail projection");
+    }
+
+    #[test]
+    fn delete_remote_branch_projection_removes_existing_branch() {
+        let temp = init_git_repo_for_merge_tests();
+        let dir = temp.path();
+        let origin_path = dir.join("origin.git");
+        let origin_str = origin_path.to_string_lossy().to_string();
+
+        git_checked(dir, &["clone", "--bare", ".", &origin_str]);
+        git_checked(dir, &["remote", "add", "origin", &origin_str]);
+        git_checked(dir, &["push", "origin", "main"]);
+
+        git_checked(dir, &["checkout", "-b", "ticket/delete-branch"]);
+        fs::write(dir.join("README.md"), "feature branch\n").expect("write feature branch change");
+        git_checked(dir, &["add", "README.md"]);
+        git_checked(dir, &["commit", "-m", "feature branch"]);
+        git_checked(dir, &["push", "-u", "origin", "ticket/delete-branch"]);
+
+        let remote_before = git_stdout(
+            dir,
+            &[
+                "ls-remote",
+                "--heads",
+                "origin",
+                "refs/heads/ticket/delete-branch",
+            ],
+        );
+        assert!(
+            !remote_before.trim().is_empty(),
+            "remote feature branch should exist before projection cleanup"
+        );
+
+        delete_remote_branch_projection(dir, "ticket/delete-branch")
+            .expect("delete remote feature branch");
+
+        let remote_after = git_stdout(
+            dir,
+            &[
+                "ls-remote",
+                "--heads",
+                "origin",
+                "refs/heads/ticket/delete-branch",
+            ],
+        );
+        assert!(
+            remote_after.trim().is_empty(),
+            "remote feature branch should be deleted after projection cleanup"
+        );
+    }
+
+    #[test]
+    fn cleanup_merged_branch_local_state_removes_worktree_and_branch() {
+        let temp = init_git_repo_for_merge_tests();
+        let dir = temp.path();
+        let ticket_worktree = dir.join("ticket-cleanup-wt");
+        let ticket_worktree_str = ticket_worktree.to_string_lossy().to_string();
+
+        git_checked(
+            dir,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "ticket/cleanup-local-state",
+                &ticket_worktree_str,
+                "main",
+            ],
+        );
+        fs::write(ticket_worktree.join("README.md"), "cleanup worktree\n")
+            .expect("write cleanup worktree change");
+        git_checked(&ticket_worktree, &["add", "README.md"]);
+        git_checked(&ticket_worktree, &["commit", "-m", "cleanup worktree"]);
+
+        cleanup_merged_branch_local_state_inner(
+            &ticket_worktree,
+            "ticket/cleanup-local-state",
+            Some(&ticket_worktree_str),
+        )
+        .expect("cleanup should remove feature worktree and branch");
+
+        assert!(
+            !ticket_worktree.exists(),
+            "feature worktree directory should be removed after cleanup"
+        );
+        let branch_exists = Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/ticket/cleanup-local-state^{commit}",
+            ])
+            .current_dir(dir)
+            .status()
+            .expect("check feature branch ref");
+        assert_eq!(
+            branch_exists.code(),
+            Some(1),
+            "feature branch ref should be deleted after cleanup"
+        );
+    }
+
+    #[test]
+    fn project_merge_to_github_with_executes_all_projection_steps() {
+        let calls = std::cell::RefCell::new(Vec::<String>::new());
+        let merge_dir = std::path::Path::new("/tmp/apm2-merge-projection");
+        let context = MergeProjectionContext {
+            owner_repo: "guardian-intelligence/apm2".to_string(),
+            pr_number: 735,
+            merge_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            source_branch: "ticket/RFC-0019/TCK-00617".to_string(),
+            merge_receipt_hash: format!("b3-256:{}", "aa".repeat(32)),
+            merged_at_iso: "2026-02-18T00:00:00Z".to_string(),
+            gate_job_id: "gate-job-1".to_string(),
+            gate_receipt_id: "gate-receipt-1".to_string(),
+            policy_hash: format!("b3-256:{}", "bb".repeat(32)),
+            gate_evidence_hashes: vec![format!("b3-256:{}", "cc".repeat(32))],
+            verdict_hashes: vec![format!("b3-256:{}", "dd".repeat(32))],
+        };
+
+        project_merge_to_github_with(
+            merge_dir,
+            &context,
+            |owner_repo, pr_number| {
+                calls
+                    .borrow_mut()
+                    .push(format!("close_pr:{owner_repo}:{pr_number}"));
+                Ok(())
+            },
+            |dir, branch| {
+                calls
+                    .borrow_mut()
+                    .push(format!("delete_remote_branch:{}:{branch}", dir.display()));
+                Ok(())
+            },
+            |owner_repo, pr_number, sha, decision| {
+                calls.borrow_mut().push(format!(
+                    "commit_status:{owner_repo}:{pr_number}:{sha}:{decision}"
+                ));
+                Ok(())
+            },
+            |ctx| {
+                calls
+                    .borrow_mut()
+                    .push(format!("pr_body:{}:{}", ctx.owner_repo, ctx.pr_number));
+                Ok(())
+            },
+        )
+        .expect("projection steps should all succeed");
+
+        assert_eq!(
+            calls.into_inner(),
+            vec![
+                "close_pr:guardian-intelligence/apm2:735".to_string(),
+                "delete_remote_branch:/tmp/apm2-merge-projection:ticket/RFC-0019/TCK-00617"
+                    .to_string(),
+                "commit_status:guardian-intelligence/apm2:735:0123456789abcdef0123456789abcdef01234567:approve"
+                    .to_string(),
+                "pr_body:guardian-intelligence/apm2:735".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn project_merge_to_github_with_aggregates_errors_without_short_circuiting() {
+        let calls = std::cell::RefCell::new(Vec::<&'static str>::new());
+        let merge_dir = std::path::Path::new("/tmp/apm2-merge-projection");
+        let context = MergeProjectionContext {
+            owner_repo: "guardian-intelligence/apm2".to_string(),
+            pr_number: 735,
+            merge_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            source_branch: "ticket/RFC-0019/TCK-00617".to_string(),
+            merge_receipt_hash: format!("b3-256:{}", "aa".repeat(32)),
+            merged_at_iso: "2026-02-18T00:00:00Z".to_string(),
+            gate_job_id: "gate-job-1".to_string(),
+            gate_receipt_id: "gate-receipt-1".to_string(),
+            policy_hash: format!("b3-256:{}", "bb".repeat(32)),
+            gate_evidence_hashes: vec![format!("b3-256:{}", "cc".repeat(32))],
+            verdict_hashes: vec![format!("b3-256:{}", "dd".repeat(32))],
+        };
+
+        let err = project_merge_to_github_with(
+            merge_dir,
+            &context,
+            |_, _| {
+                calls.borrow_mut().push("close");
+                Err("close failed".to_string())
+            },
+            |_, _| {
+                calls.borrow_mut().push("delete");
+                Err("delete failed".to_string())
+            },
+            |_, _, _, _| {
+                calls.borrow_mut().push("status");
+                Ok(())
+            },
+            |_| {
+                calls.borrow_mut().push("body");
+                Err("body failed".to_string())
+            },
+        )
+        .expect_err("projection should aggregate failing steps");
+
+        assert_eq!(
+            calls.into_inner(),
+            vec!["close", "delete", "status", "body"]
+        );
+        assert!(err.contains("close_pr: close failed"));
+        assert!(err.contains("delete_remote_branch `ticket/RFC-0019/TCK-00617`: delete failed"));
+        assert!(err.contains("pr_body: body failed"));
     }
 
     #[test]

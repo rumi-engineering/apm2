@@ -4,7 +4,8 @@ ticket_meta:
   ticket:
     id: "TCK-00435"
     title: "Refactor fac_review.rs monolith into clean directory module"
-    status: "OPEN"
+    status: "CLOSED"
+    note: "Refactor completed organically across RFC-0019 ticket work. fac_review is now a directory module."
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

@@ -4,7 +4,11 @@ ticket_meta:
   ticket:
     id: "TCK-00615"
     title: "CI smoke test: verify new CI workflow configuration"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 714
+        merge_commit: "d158a3e8a2b184b8c2ff11c1e6e59e4d9c94cf90"
+        merged_at: "2026-02-17T06:17:32Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

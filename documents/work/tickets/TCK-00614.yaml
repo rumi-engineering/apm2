@@ -4,7 +4,11 @@ ticket_meta:
   ticket:
     id: "TCK-00614"
     title: "FAC projection-model merge safety: required status simplification + regression tests"
-    status: "OPEN"
+    status: "MERGED"
+    merge_evidence:
+      - pr: 712
+        merge_commit: "13749691cc6c72922196a719da894ab6375ccbbc"
+        merged_at: "2026-02-17T04:39:18Z"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

@@ -497,13 +497,49 @@ fn ensure_regular_file_no_symlink(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::sync::MutexGuard;
 
     use serial_test::serial;
 
     use super::{ensure_regular_file_no_symlink, validate_github_id};
+
+    struct Apm2HomeEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    impl Apm2HomeEnvGuard {
+        #[allow(unsafe_code)]
+        fn set(apm2_home: &Path) -> Self {
+            let lock = crate::commands::env_var_test_lock()
+                .lock()
+                .expect("serialize env tests");
+            let previous = std::env::var_os("APM2_HOME");
+            // SAFETY: protected by env_var_test_lock for deterministic env mutation.
+            unsafe { std::env::set_var("APM2_HOME", apm2_home) };
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for Apm2HomeEnvGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            match self.previous.take() {
+                // SAFETY: protected by env_var_test_lock for deterministic env mutation.
+                Some(value) => unsafe { std::env::set_var("APM2_HOME", value) },
+                // SAFETY: protected by env_var_test_lock for deterministic env mutation.
+                None => unsafe { std::env::remove_var("APM2_HOME") },
+            }
+        }
+    }
 
     // =========================================================================
     // Symlink rejection (INV-SETUP-003)
@@ -651,7 +687,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial]
-    #[allow(unsafe_code)] // Env var mutation is required for test setup and teardown.
     fn headless_setup_writes_config_and_pem() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(tmp.path(), PermissionsExt::from_mode(0o700))
@@ -665,11 +700,8 @@ mod tests {
         )
         .expect("write source pem");
 
-        // Point APM2_HOME to our temp dir.
-        let prev_home = std::env::var("APM2_HOME").ok();
         let apm2_home = tmp.path().join("apm2_home");
-        // SAFETY: This modifies process-global state; acceptable in serial test.
-        unsafe { std::env::set_var("APM2_HOME", &apm2_home) };
+        let _env_guard = Apm2HomeEnvGuard::set(&apm2_home);
 
         let args = super::super::PrAuthSetupCliArgs {
             app_id: "12345".to_string(),
@@ -726,12 +758,6 @@ mod tests {
 
         // Verify source PEM was deleted.
         assert!(!src_pem.exists(), "source PEM should be deleted");
-
-        // Restore env.
-        match prev_home {
-            Some(val) => unsafe { std::env::set_var("APM2_HOME", val) },
-            None => unsafe { std::env::remove_var("APM2_HOME") },
-        }
     }
 
     // =========================================================================
@@ -741,7 +767,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial]
-    #[allow(unsafe_code)]
     fn headless_setup_source_equals_dest_skips_deletion() {
         // When the source PEM path is the same as the destination
         // ($APM2_HOME/app-{app_id}.pem), deletion must be skipped to avoid
@@ -750,10 +775,8 @@ mod tests {
         std::fs::set_permissions(tmp.path(), PermissionsExt::from_mode(0o700))
             .expect("harden temp dir");
 
-        let prev_home = std::env::var("APM2_HOME").ok();
         let apm2_home = tmp.path().join("apm2_home");
-        // SAFETY: This modifies process-global state; acceptable in serial test.
-        unsafe { std::env::set_var("APM2_HOME", &apm2_home) };
+        let _env_guard = Apm2HomeEnvGuard::set(&apm2_home);
 
         // Create the APM2 home directory and the PEM file at the destination path.
         fs::create_dir_all(&apm2_home).expect("create apm2_home");
@@ -794,12 +817,6 @@ mod tests {
             content.contains("BEGIN RSA PRIVATE KEY"),
             "PEM content must be preserved: {content}"
         );
-
-        // Restore env.
-        match prev_home {
-            Some(val) => unsafe { std::env::set_var("APM2_HOME", val) },
-            None => unsafe { std::env::remove_var("APM2_HOME") },
-        }
     }
 
     // =========================================================================
@@ -818,7 +835,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial]
-    #[allow(unsafe_code)]
     fn gates_prerequisites_work_without_github_app_config() {
         use apm2_core::github::resolve_apm2_home;
 
@@ -828,10 +844,8 @@ mod tests {
         std::fs::set_permissions(tmp.path(), PermissionsExt::from_mode(0o700))
             .expect("harden temp dir");
 
-        let prev_home = std::env::var("APM2_HOME").ok();
         let apm2_home = tmp.path().join("apm2_home");
-        // SAFETY: This modifies process-global state; acceptable in serial test.
-        unsafe { std::env::set_var("APM2_HOME", &apm2_home) };
+        let _env_guard = Apm2HomeEnvGuard::set(&apm2_home);
 
         // Resolve APM2 home succeeds without github_app.toml.
         let resolved = resolve_apm2_home();
@@ -859,12 +873,6 @@ mod tests {
             !config_path.exists(),
             "github_app.toml must not exist for this test"
         );
-
-        // Restore env.
-        match prev_home {
-            Some(val) => unsafe { std::env::set_var("APM2_HOME", val) },
-            None => unsafe { std::env::remove_var("APM2_HOME") },
-        }
     }
 
     // =========================================================================
@@ -878,7 +886,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial]
-    #[allow(unsafe_code)]
     fn headless_dod_command_succeeds_with_for_systemd() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(tmp.path(), PermissionsExt::from_mode(0o700))
@@ -891,10 +898,8 @@ mod tests {
         )
         .expect("write pem");
 
-        let prev_home = std::env::var("APM2_HOME").ok();
         let apm2_home = tmp.path().join("apm2_home");
-        // SAFETY: This modifies process-global state; acceptable in serial test.
-        unsafe { std::env::set_var("APM2_HOME", &apm2_home) };
+        let _env_guard = Apm2HomeEnvGuard::set(&apm2_home);
 
         // This is the exact definition-of-done command contract: --app-id,
         // --installation-id, --private-key-file, and --for-systemd. No keyring
@@ -923,12 +928,6 @@ mod tests {
         // Verify PEM was stored.
         let dest_pem = apm2_home.join("app-99999.pem");
         assert!(dest_pem.exists(), "PEM must be written to APM2_HOME");
-
-        // Restore env.
-        match prev_home {
-            Some(val) => unsafe { std::env::set_var("APM2_HOME", val) },
-            None => unsafe { std::env::remove_var("APM2_HOME") },
-        }
     }
 
     // =========================================================================
@@ -981,7 +980,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial]
-    #[allow(unsafe_code)]
     fn headless_setup_rejects_path_traversal_app_id() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(tmp.path(), PermissionsExt::from_mode(0o700))
@@ -994,10 +992,8 @@ mod tests {
         )
         .expect("write pem");
 
-        let prev_home = std::env::var("APM2_HOME").ok();
         let apm2_home = tmp.path().join("apm2_home");
-        // SAFETY: This modifies process-global state; acceptable in serial test.
-        unsafe { std::env::set_var("APM2_HOME", &apm2_home) };
+        let _env_guard = Apm2HomeEnvGuard::set(&apm2_home);
 
         let args = super::super::PrAuthSetupCliArgs {
             app_id: "../../../etc/evil".to_string(),
@@ -1013,11 +1009,5 @@ mod tests {
 
         let exit = super::run_pr_auth_setup(&args, true);
         assert_ne!(exit, 0, "path-traversal app_id must be rejected");
-
-        // Restore env.
-        match prev_home {
-            Some(val) => unsafe { std::env::set_var("APM2_HOME", val) },
-            None => unsafe { std::env::remove_var("APM2_HOME") },
-        }
     }
 }

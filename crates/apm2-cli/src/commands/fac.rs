@@ -196,7 +196,8 @@ pub enum FacSubcommand {
     /// Push code and create/update PR (lean push).
     ///
     /// Pushes to remote, creates or updates a PR from ticket YAML metadata,
-    /// blocks on evidence gates, enables auto-merge, and dispatches reviews.
+    /// blocks on evidence gates, synchronizes ruleset projection, and
+    /// dispatches reviews.
     Push(PushArgs),
 
     /// Restart the evidence/review pipeline from the optimal point.
@@ -4478,7 +4479,14 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
             );
         },
     };
+    run_lane_reset_with_manager(&manager, args, json_output)
+}
 
+fn run_lane_reset_with_manager(
+    manager: &LaneManager,
+    args: &LaneResetArgs,
+    json_output: bool,
+) -> u8 {
     // Ensure directories exist
     if let Err(e) = manager.ensure_directories() {
         return output_error(
@@ -4542,7 +4550,7 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
                     "failed to kill process {} for lane {} -- process may still be running or PID was reused",
                     pid, args.lane_id
                 );
-                persist_corrupt_lease(&manager, &args.lane_id, &corrupt_reason);
+                persist_corrupt_lease(manager, &args.lane_id, &corrupt_reason);
                 return output_error(
                     json_output,
                     "kill_failed",
@@ -4611,7 +4619,7 @@ fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
 
         // Persist CORRUPT state to the lease file so that lane_status
         // reflects the corruption even after restart.
-        persist_corrupt_lease(&manager, &args.lane_id, &corrupt_reason);
+        persist_corrupt_lease(manager, &args.lane_id, &corrupt_reason);
 
         let response = serde_json::json!({
             "lane_id": args.lane_id,
@@ -6106,7 +6114,6 @@ mod tests {
     #[test]
     fn test_lane_reset_clears_corrupt_marker() {
         let home = tempfile::tempdir().expect("temp dir");
-        let _home_guard = Apm2HomeGuard::new(home.path());
         let fac_root = home.path().join("private").join("fac");
 
         let manager = LaneManager::new(fac_root).expect("create lane manager");
@@ -6126,7 +6133,8 @@ mod tests {
         let status = manager.lane_status(lane_id).expect("initial lane status");
         assert_eq!(status.state, LaneState::Corrupt);
 
-        let exit_code = run_lane_reset(
+        let exit_code = run_lane_reset_with_manager(
+            &manager,
             &LaneResetArgs {
                 lane_id: lane_id.to_string(),
                 force: false,
@@ -6150,7 +6158,6 @@ mod tests {
     #[test]
     fn test_lane_reset_removes_all_per_lane_env_dirs() {
         let home = tempfile::tempdir().expect("temp dir");
-        let _home_guard = Apm2HomeGuard::new(home.path());
         let fac_root = home.path().join("private").join("fac");
 
         let manager = LaneManager::new(fac_root).expect("create lane manager");
@@ -6175,7 +6182,8 @@ mod tests {
             std::fs::write(target.join("stale-state"), b"stale").expect("write stale state");
         }
 
-        let exit_code = run_lane_reset(
+        let exit_code = run_lane_reset_with_manager(
+            &manager,
             &LaneResetArgs {
                 lane_id: lane_id.to_string(),
                 force: false,
