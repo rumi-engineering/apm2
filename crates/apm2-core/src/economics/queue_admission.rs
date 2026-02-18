@@ -3380,7 +3380,7 @@ mod tests {
             total_queue_items_at_admission: 10,
             tick_floor_active: true,
             worker_first_pass: true,
-            policy_snapshot: policy.clone(),
+            policy_snapshot: policy,
         };
         let trace_deny = StopRevokeAdmissionTrace {
             verdict: "deny".to_string(),
