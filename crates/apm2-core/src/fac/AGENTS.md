@@ -131,6 +131,57 @@ Snapshots are persisted under `$APM2_HOME/private/fac/scheduler/state.v1.json`.
 - [INV-SCH-004] Restarted workers preserve anti-starvation continuity for
   `max_wait_ticks` via snapshot restoration.
 
+## scan_lock Submodule (TCK-00586)
+
+The `scan_lock` submodule implements an optional advisory scan lock for
+multi-worker fairness. When multiple workers poll the same `queue/pending/`
+directory, redundant directory scans cause a CPU/IO stampede. The scan lock
+ensures at most one worker scans per poll cycle; others wait with jitter and
+rely on the atomic claim (rename) for correctness.
+
+### Key Types
+
+- `ScanLockGuard`: RAII guard holding the scan lock via `flock(LOCK_EX)`.
+  Dropping the guard releases the lock. Not internally synchronized; used
+  only from the synchronous worker poll loop.
+- `ScanLockResult`: Three-variant enum (`Acquired`, `Held`, `Unavailable`)
+  returned by `try_acquire_scan_lock()`.
+- `ScanLockMetadata`: JSON metadata written to a sidecar file on acquisition,
+  recording holder PID and epoch timestamp for stuck detection.
+- `ScanLockStuckReceipt`: Structured receipt emitted when a stuck lock is
+  detected (dead holder PID + duration exceeds `MAX_SCAN_LOCK_HOLD_DURATION`).
+
+### Core Functions
+
+- `try_acquire_scan_lock(queue_root)`: Non-blocking lock attempt. Returns
+  `Acquired(guard)` on success, `Held` if another worker holds the lock,
+  `Unavailable` if queue root is absent.
+- `check_stuck_scan_lock(queue_root)`: Probes whether the lock is stuck
+  (held by a dead process beyond the TTL). Returns `Some(receipt)` if stuck.
+- `scan_lock_jitter_duration(base_interval_secs)`: Computes a jittered sleep
+  duration to prevent thundering-herd retries.
+
+### Security Invariants (TCK-00586)
+
+- [INV-SL-001] Lock file creation and metadata reads use `O_NOFOLLOW` to
+  prevent symlink attacks atomically (no TOCTOU between check and open).
+- [INV-SL-002] Lock metadata reads are bounded to `MAX_SCAN_LOCK_FILE_SIZE`
+  (1 KiB). Size check performed on the opened fd (no TOCTOU).
+- [INV-SL-003] CTR-2501 deviation documented: `SystemTime::now()` used for
+  persisted epoch timestamp (cross-process readable); elapsed comparisons
+  use `saturating_sub` for safety.
+- [INV-SL-004] Lock metadata writes use atomic write via
+  `tempfile::NamedTempFile` (unpredictable name + O_EXCL) then `persist()`
+  (rename). No predictable temp file names in shared directories.
+- [INV-SL-005] All string fields in `ScanLockMetadata` are bounded during
+  deserialization (`deny_unknown_fields` + length check).
+
+### Determinism Preservation
+
+The scan lock does NOT change the claim selection order. Candidates are
+still sorted by `(priority ASC, enqueue_time ASC, job_id ASC)` per
+INV-WRK-005. The lock only determines WHICH worker scans in a given cycle.
+
 ## broker_health Submodule (TCK-00585)
 
 The `broker_health` submodule implements RFC-0029 invariant health monitoring for

@@ -88,6 +88,7 @@ use apm2_core::fac::job_spec::{
     parse_b3_256_digest, validate_job_spec_control_lane_with_policy, validate_job_spec_with_policy,
 };
 use apm2_core::fac::lane::{LaneLeaseV1, LaneLockGuard, LaneManager, LaneState};
+use apm2_core::fac::scan_lock::{ScanLockResult, check_stuck_scan_lock, try_acquire_scan_lock};
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
 use apm2_core::fac::{
     BlobStore, BudgetAdmissionTrace as FacBudgetAdmissionTrace, CanonicalizerTupleV1,
@@ -757,6 +758,69 @@ pub fn run_fac_worker(
             }
         }
 
+        // TCK-00586: Multi-worker fairness — try scan lock before scanning.
+        //
+        // When multiple workers poll the same queue, redundant directory scans
+        // cause a CPU/IO stampede. The optional scan lock ensures at most one
+        // worker scans per cycle; others wait with jitter and rely on atomic
+        // claim (rename) for correctness.
+        //
+        // The lock is purely advisory: if acquisition fails due to I/O error
+        // the worker falls through to scan anyway (fail-open for availability,
+        // correctness preserved by atomic rename).
+        let scan_lock_guard = match try_acquire_scan_lock(&queue_root) {
+            Ok(ScanLockResult::Acquired(guard)) => Some(guard),
+            Ok(ScanLockResult::Held) => {
+                // Another worker holds the scan lock. Check for stuck lock
+                // and emit receipt if detected.
+                if let Ok(Some(stuck_receipt)) = check_stuck_scan_lock(&queue_root) {
+                    if json_output {
+                        emit_worker_event(
+                            "scan_lock_stuck",
+                            serde_json::json!({
+                                "schema": stuck_receipt.schema,
+                                "stuck_holder_pid": stuck_receipt.stuck_holder_pid,
+                                "acquired_epoch_secs": stuck_receipt.acquired_epoch_secs,
+                                "detected_epoch_secs": stuck_receipt.detected_epoch_secs,
+                                "held_duration_secs": stuck_receipt.held_duration_secs,
+                            }),
+                        );
+                    } else {
+                        eprintln!(
+                            "WARNING: scan lock stuck (holder_pid={}, held={}s)",
+                            stuck_receipt.stuck_holder_pid, stuck_receipt.held_duration_secs,
+                        );
+                    }
+                    // Persist stuck receipt for audit.
+                    let receipt_json =
+                        serde_json::to_string_pretty(&stuck_receipt).unwrap_or_default();
+                    let _ = persist_scan_lock_stuck_receipt(&fac_root, &receipt_json);
+                }
+
+                // Skip scan this cycle; sleep with jitter to avoid thundering
+                // herd retries.
+                if once {
+                    // In --once mode we cannot skip; fall through to scan
+                    // regardless (correctness via atomic rename).
+                    None
+                } else {
+                    let jitter =
+                        apm2_core::fac::scan_lock::scan_lock_jitter_duration(poll_interval_secs);
+                    std::thread::sleep(jitter);
+                    continue;
+                }
+            },
+            Ok(ScanLockResult::Unavailable) => None, // No queue dir yet; scan anyway.
+            Err(e) => {
+                // I/O error acquiring lock; log and fall through to scan.
+                // Fail-open: availability over efficiency.
+                if !json_output {
+                    eprintln!("WARNING: scan lock acquisition failed: {e}");
+                }
+                None
+            },
+        };
+
         // Scan pending directory (quarantines malformed files inline).
         let candidates = match scan_pending(&queue_root, &fac_root, &current_tuple_digest) {
             Ok(c) => c,
@@ -777,6 +841,10 @@ pub fn run_fac_worker(
                 continue;
             },
         };
+
+        // Drop the scan lock guard now that scanning is complete.
+        // This releases the flock so other workers can proceed.
+        drop(scan_lock_guard);
 
         let mut cycle_scheduler = queue_state.clone();
 
@@ -6473,6 +6541,62 @@ fn compute_evidence_hash(data: &[u8]) -> [u8; 32] {
     hasher.update(b"apm2.fac_worker.evidence.v1");
     hasher.update(data);
     *hasher.finalize().as_bytes()
+}
+
+/// Persists a stuck scan lock receipt under `$APM2_HOME/private/fac/receipts/`.
+///
+/// Best-effort: errors are logged but not propagated (stuck detection is
+/// observability, not correctness).
+///
+/// Atomic write protocol (CTR-1502): writes to a temp file via
+/// `NamedTempFile::new_in()` then `persist()` to rename into place.
+/// Directory created with mode 0700 (CTR-2611).
+fn persist_scan_lock_stuck_receipt(fac_root: &Path, receipt_json: &str) -> Result<(), String> {
+    let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
+
+    // Create receipts directory with restricted permissions (CTR-2611).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&receipts_dir)
+            .map_err(|e| format!("create receipts dir: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(&receipts_dir).map_err(|e| format!("create receipts dir: {e}"))?;
+    }
+
+    let filename = format!(
+        "scan_lock_stuck_{}.json",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
+    );
+
+    // Atomic write: temp file + persist (rename) to prevent partial reads
+    // (CTR-1502). NamedTempFile provides unpredictable name + O_EXCL.
+    let mut tmp = tempfile::NamedTempFile::new_in(&receipts_dir)
+        .map_err(|e| format!("create stuck receipt temp file: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = tmp.as_file().set_permissions(perms);
+    }
+
+    tmp.write_all(receipt_json.as_bytes())
+        .map_err(|e| format!("write stuck receipt: {e}"))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("sync stuck receipt: {e}"))?;
+
+    let receipt_path = receipts_dir.join(&filename);
+    tmp.persist(&receipt_path)
+        .map_err(|e| format!("rename stuck receipt: {e}"))?;
+
+    Ok(())
 }
 
 /// Sleeps for the remaining time in the poll interval.
