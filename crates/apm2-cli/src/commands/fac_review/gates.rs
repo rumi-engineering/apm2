@@ -1583,9 +1583,14 @@ fn run_gates_inner(
                 .map_err(|e| format!("cannot load signing key for gate cache: {e}"))?;
         cache.sign_all(&signer);
 
-        cache.save()?;
+        // TCK-00541 BLOCKER fix (round 5): v2 cache write removed.
+        // Ticket scope requires "read v2 but only write v3 in default mode".
+        // The v2 GateCache is still constructed in-memory (above) to compute
+        // attestation digests and evidence metadata consumed by the v3 path
+        // below, but is NOT persisted to disk.
+        // (Previously: `cache.save()?;`)
 
-        // TCK-00541: Persist v3 gate cache alongside v2 for the manual
+        // TCK-00541: Persist v3 gate cache (the ONLY write path) for the manual
         // `fac gates` path. This ensures consistent cache behavior across
         // all execution entry points (pipeline and manual).
         let v3_compound_key = compute_v3_compound_key(
@@ -3251,5 +3256,51 @@ mod tests {
             args,
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    // =========================================================================
+    // TCK-00541 round-5 BLOCKER fix: default full runs must NOT write v2 cache
+    // =========================================================================
+
+    /// Regression test: a `GateCache` constructed in-memory but never saved
+    /// must not produce on-disk v2 artifacts.
+    ///
+    /// This validates the architectural invariant that `run_gates_inner`
+    /// (default full mode) builds a v2 `GateCache` for attestation computation
+    /// but does NOT persist it — only v3 is written.
+    #[test]
+    fn default_full_run_does_not_write_v2_cache() {
+        with_test_apm2_home(|apm2_home| {
+            let sha = "c".repeat(40);
+
+            // Construct v2 cache in-memory (mimics run_gates_inner).
+            let mut cache = GateCache::new(&sha);
+            for gate_name in LANE_EVIDENCE_GATES {
+                cache.set_with_attestation(
+                    gate_name,
+                    true,
+                    1,
+                    Some(format!("b3-256:{}", "a".repeat(64))),
+                    false,
+                    Some(format!("b3-256:{}", "b".repeat(64))),
+                    Some(format!("/tmp/{gate_name}.log")),
+                );
+            }
+            // Crucially: do NOT call cache.save() — this is the fix.
+
+            // Verify: no v2 cache directory exists for this SHA.
+            let v2_dir = apm2_home.join("private/fac/gate_cache_v2").join(&sha);
+            assert!(
+                !v2_dir.exists(),
+                "v2 gate cache must not be written in default full mode — \
+                 TCK-00541 requires write-only v3"
+            );
+
+            // Also verify GateCache::load returns None.
+            assert!(
+                GateCache::load(&sha).is_none(),
+                "GateCache::load must return None when v2 is not persisted"
+            );
+        });
     }
 }

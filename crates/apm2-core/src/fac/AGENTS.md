@@ -3063,6 +3063,13 @@ Stale v3 entries are pruned by mtime after `GATE_CACHE_TTL_SECS` (30 days)
 by the GC planner (`gc.rs`). The `GcActionKind::GateCacheV3` variant
 distinguishes v3 prune targets from v2.
 
+**Lock file exclusion (MAJOR fix, PR-741 round 5)**: `collect_stale_gate_cache_targets`
+now skips v3 lock files (files matching `.{key}.lock` under `gate_cache_v3/`) via
+`is_v3_lock_file()`. On Unix, unlinking a locked file removes the path without
+releasing the existing flock; a second writer recreates the path, acquires flock on
+a different inode, and bypasses mutual exclusion. GC must never target these files.
+Regression tests: `gc_plan_excludes_v3_lock_files`, `is_v3_lock_file_matches_lock_naming_convention`.
+
 ### Security Invariants (TCK-00541)
 
 - [INV-GCV3-001] **V2-sourced entries are structurally excluded from the
