@@ -1226,16 +1226,24 @@ impl StopRevokeAdmissionPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StopRevokeAdmissionTrace {
     /// The admission verdict for this `stop_revoke` job.
+    /// Bounded at deserialization time to `MAX_DENY_REASON_LENGTH` bytes.
+    #[serde(deserialize_with = "deser_deny_reason")]
     pub verdict: String,
     /// Whether the lane reservation was used to bypass total queue capacity.
     pub reservation_used: bool,
     /// Whether the TP-001 emergency carve-out was activated (envelope
     /// validation bypassed for authority-reducing operation).
     pub tp001_emergency_carveout_activated: bool,
-    /// Whether TP-002 passed.
-    pub tp002_passed: bool,
-    /// Whether TP-003 passed.
-    pub tp003_passed: bool,
+    /// Whether TP-002 passed (`Some(true/false)`) or was not evaluated
+    /// (`None`). `None` indicates the predicate was bypassed (e.g.,
+    /// control-lane `stop_revoke` jobs), distinguishing bypass from
+    /// evaluation failure.
+    pub tp002_passed: Option<bool>,
+    /// Whether TP-003 passed (`Some(true/false)`) or was not evaluated
+    /// (`None`). `None` indicates the predicate was bypassed (e.g.,
+    /// control-lane `stop_revoke` jobs), distinguishing bypass from
+    /// evaluation failure.
+    pub tp003_passed: Option<bool>,
     /// Current lane backlog at admission time.
     pub lane_backlog_at_admission: usize,
     /// Total queue items at admission time.
@@ -3330,8 +3338,8 @@ mod tests {
             verdict: "allow".to_string(),
             reservation_used: true,
             tp001_emergency_carveout_activated: false,
-            tp002_passed: true,
-            tp003_passed: true,
+            tp002_passed: Some(true),
+            tp003_passed: Some(true),
             lane_backlog_at_admission: 3,
             total_queue_items_at_admission: 42,
             tick_floor_active: true,
@@ -3357,8 +3365,8 @@ mod tests {
             verdict: "allow".to_string(),
             reservation_used: true,
             tp001_emergency_carveout_activated: true,
-            tp002_passed: false,
-            tp003_passed: true,
+            tp002_passed: Some(false),
+            tp003_passed: Some(true),
             lane_backlog_at_admission: 0,
             total_queue_items_at_admission: 100,
             tick_floor_active: false,
@@ -3377,8 +3385,8 @@ mod tests {
             verdict: "allow".to_string(),
             reservation_used: true,
             tp001_emergency_carveout_activated: false,
-            tp002_passed: true,
-            tp003_passed: true,
+            tp002_passed: Some(true),
+            tp003_passed: Some(true),
             lane_backlog_at_admission: 0,
             total_queue_items_at_admission: 10,
             tick_floor_active: true,
@@ -3402,6 +3410,57 @@ mod tests {
         assert_ne!(
             bytes_allow, bytes_carveout,
             "different carveout states must produce different canonical bytes"
+        );
+    }
+
+    #[test]
+    fn stop_revoke_trace_none_tp_fields_roundtrip() {
+        // Verify that None (not evaluated) tp002/tp003 roundtrips correctly
+        // and produces different canonical bytes from Some(false).
+        let policy = StopRevokeAdmissionPolicy::default_policy();
+        let trace_none = StopRevokeAdmissionTrace {
+            verdict: "allow".to_string(),
+            reservation_used: false,
+            tp001_emergency_carveout_activated: false,
+            tp002_passed: None,
+            tp003_passed: None,
+            lane_backlog_at_admission: 0,
+            total_queue_items_at_admission: 5,
+            tick_floor_active: false,
+            worker_first_pass: true,
+            policy_snapshot: policy,
+        };
+        let trace_false = StopRevokeAdmissionTrace {
+            tp002_passed: Some(false),
+            tp003_passed: Some(false),
+            ..trace_none.clone()
+        };
+
+        // Roundtrip None values.
+        let json = serde_json::to_string(&trace_none).expect("serialize");
+        let parsed: StopRevokeAdmissionTrace = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(trace_none, parsed, "None tp fields must roundtrip");
+
+        // None and Some(false) must produce different canonical bytes.
+        let bytes_none = trace_none.canonical_bytes().expect("none bytes");
+        let bytes_false = trace_false.canonical_bytes().expect("false bytes");
+        assert_ne!(
+            bytes_none, bytes_false,
+            "None (not evaluated) must differ from Some(false) (evaluated and failed)"
+        );
+    }
+
+    #[test]
+    fn stop_revoke_trace_verdict_bounded_deserialization() {
+        // Verify that an oversized verdict is rejected during deserialization.
+        let oversized_verdict = "x".repeat(MAX_DENY_REASON_LENGTH + 1);
+        let json = format!(
+            r#"{{"verdict":"{oversized_verdict}","reservation_used":false,"tp001_emergency_carveout_activated":false,"tp002_passed":null,"tp003_passed":null,"lane_backlog_at_admission":0,"total_queue_items_at_admission":0,"tick_floor_active":false,"worker_first_pass":false,"policy_snapshot":{{"lane_reservation_permille":200,"max_wait_ticks":5,"tp001_emergency_carveout":true,"tp002_required":true,"tp003_required":true,"worker_priority_first_pass":true}}}}"#
+        );
+        let result = serde_json::from_str::<StopRevokeAdmissionTrace>(&json);
+        assert!(
+            result.is_err(),
+            "oversized verdict must be rejected: {result:?}"
         );
     }
 }

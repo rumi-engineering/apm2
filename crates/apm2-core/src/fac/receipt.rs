@@ -924,12 +924,14 @@ impl FacJobReceiptV1 {
 
         // TCK-00587: Stop/revoke admission trace. Added as an append-only
         // trailing optional for V1; uses type-specific marker `7u8` for
-        // injective encoding.
+        // injective encoding. Uses canonical JSON (JCS) via
+        // `trace.canonical_bytes()` to ensure deterministic hashing
+        // independent of field order (CTR-1605).
         if let Some(trace) = &self.stop_revoke_admission {
             bytes.push(7u8);
-            let trace_json = serde_json::to_string(trace).unwrap_or_default();
-            bytes.extend_from_slice(&(trace_json.len() as u32).to_be_bytes());
-            bytes.extend_from_slice(trace_json.as_bytes());
+            let canonical = trace.canonical_bytes().unwrap_or_default();
+            bytes.extend_from_slice(&(canonical.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(&canonical);
         }
 
         bytes
@@ -1141,12 +1143,14 @@ impl FacJobReceiptV1 {
 
         // TCK-00587: Stop/revoke admission trace. Uses type-specific
         // marker `8u8` for injective encoding (V2 only -- `7u8` is
-        // already allocated to node_fingerprint in V2).
+        // already allocated to node_fingerprint in V2). Uses canonical
+        // JSON (JCS) via `trace.canonical_bytes()` to ensure deterministic
+        // hashing independent of field order (CTR-1605).
         if let Some(trace) = &self.stop_revoke_admission {
             bytes.push(8u8);
-            let trace_json = serde_json::to_string(trace).unwrap_or_default();
-            bytes.extend_from_slice(&(trace_json.len() as u32).to_be_bytes());
-            bytes.extend_from_slice(trace_json.as_bytes());
+            let canonical = trace.canonical_bytes().unwrap_or_default();
+            bytes.extend_from_slice(&(canonical.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(&canonical);
         }
 
         bytes
