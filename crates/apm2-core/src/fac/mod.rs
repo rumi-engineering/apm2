@@ -181,6 +181,7 @@ pub mod signed_receipt;
 mod systemd_properties;
 pub mod taint;
 mod terminal_verifier;
+pub mod token_ledger;
 pub mod transcript_binding;
 pub mod warm;
 pub mod worker_heartbeat;

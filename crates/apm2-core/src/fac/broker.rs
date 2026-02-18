@@ -236,6 +236,10 @@ pub enum BrokerError {
         /// Which field was zero.
         field: &'static str,
     },
+
+    /// TCK-00566: Token ledger error (replay detected, revoked, etc.).
+    #[error("token ledger: {0}")]
+    TokenLedger(#[from] crate::fac::token_ledger::TokenLedgerError),
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +456,13 @@ pub struct FacBroker {
     /// bundle export operations. Admission is checked BEFORE mutation
     /// (INV-CPRL-002). Protected by the same external lock as `&mut self`.
     control_plane_budget: ControlPlaneBudget,
+    /// TCK-00566: Token use ledger for replay protection.
+    ///
+    /// Records nonces for issued tokens. A second issuance or use of the
+    /// same nonce is denied. Bounded by `MAX_LEDGER_ENTRIES` with
+    /// TTL-based eviction. Protected by the same external lock as
+    /// `&mut self`.
+    token_ledger: crate::fac::token_ledger::TokenUseLedger,
 }
 
 impl Default for FacBroker {
@@ -484,6 +495,7 @@ impl FacBroker {
             state: BrokerState::default(),
             admission_health_gate_passed: false,
             control_plane_budget,
+            token_ledger: crate::fac::token_ledger::TokenUseLedger::new(),
         }
     }
 
@@ -499,6 +511,7 @@ impl FacBroker {
             state: BrokerState::default(),
             admission_health_gate_passed: false,
             control_plane_budget,
+            token_ledger: crate::fac::token_ledger::TokenUseLedger::new(),
         })
     }
 
@@ -519,6 +532,7 @@ impl FacBroker {
             state,
             admission_health_gate_passed: false,
             control_plane_budget,
+            token_ledger: crate::fac::token_ledger::TokenUseLedger::new(),
         })
     }
 
@@ -540,6 +554,7 @@ impl FacBroker {
             state,
             admission_health_gate_passed: false,
             control_plane_budget,
+            token_ledger: crate::fac::token_ledger::TokenUseLedger::new(),
         })
     }
 
@@ -591,12 +606,17 @@ impl FacBroker {
     /// rate limits are per-tick, not per-process-lifetime. Without this
     /// reset, one burst permanently exhausts the budget (Security MAJOR).
     ///
+    /// TCK-00566: Also evicts expired entries from the token-use ledger
+    /// to prevent unbounded growth.
+    ///
     /// Returns the new tick value.
     #[must_use]
-    pub const fn advance_tick(&mut self) -> u64 {
+    pub fn advance_tick(&mut self) -> u64 {
         self.state.current_tick = self.state.current_tick.saturating_add(1);
         // Reset control-plane budget counters for the new tick window.
         self.control_plane_budget.reset();
+        // TCK-00566: Evict expired token ledger entries.
+        self.token_ledger.evict_expired(self.state.current_tick);
         self.state.current_tick
     }
 
@@ -758,6 +778,7 @@ impl FacBroker {
     /// - `request_id` is empty
     /// - `boundary_id` is empty or exceeds `MAX_BOUNDARY_ID_LENGTH`
     /// - Token serialization or signing fails
+    #[allow(clippy::too_many_lines)]
     pub fn issue_channel_context_token(
         &mut self,
         policy_digest: &Hash,
@@ -859,8 +880,17 @@ impl FacBroker {
             token_binding: None, // Set by issue_channel_context_token_with_token_binding below.
         };
 
+        // TCK-00566: Generate a single-use nonce and record it in the
+        // token-use ledger BEFORE returning the token (INV-TL-001).
+        let nonce = crate::fac::token_ledger::TokenUseLedger::generate_nonce();
+        let request_id_digest = compute_request_id_digest(request_id);
+        self.token_ledger
+            .record_token_use(&nonce, &request_id_digest, self.state.current_tick)
+            .map_err(BrokerError::TokenLedger)?;
+
         // TCK-00565: Bind the token to policy, canonicalizer, boundary, and
         // tick-based expiry so the worker can fail-closed on any drift.
+        // TCK-00566: Include nonce for replay protection.
         let token_binding = TokenBindingV1 {
             fac_policy_hash: policy_root_digest,
             canonicalizer_tuple_digest,
@@ -870,6 +900,7 @@ impl FacBroker {
                 .state
                 .current_tick
                 .saturating_add(DEFAULT_ENVELOPE_TTL_TICKS),
+            nonce: Some(nonce),
         };
 
         Ok(issue_channel_context_token_with_token_binding(
@@ -1085,6 +1116,58 @@ impl FacBroker {
         hasher.update(&self.state.current_tick.to_le_bytes());
         hasher.update(&self.state.revocation_frontier_hash);
         self.state.revocation_frontier_hash = *hasher.finalize().as_bytes();
+    }
+
+    // -----------------------------------------------------------------------
+    // TCK-00566: Token replay protection
+    // -----------------------------------------------------------------------
+
+    /// Returns a reference to the token use ledger for observability.
+    #[must_use]
+    pub const fn token_ledger(&self) -> &crate::fac::token_ledger::TokenUseLedger {
+        &self.token_ledger
+    }
+
+    /// Checks whether a token nonce has been used or revoked.
+    ///
+    /// This is the validation entry point for workers: before accepting a
+    /// token, the worker calls this to verify the nonce is fresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the nonce has been used (replay) or revoked.
+    pub fn check_token_nonce(
+        &self,
+        nonce: &[u8; 32],
+    ) -> Result<(), crate::fac::token_ledger::TokenLedgerError> {
+        self.token_ledger.check_nonce(nonce)
+    }
+
+    /// Explicitly revokes a token nonce.
+    ///
+    /// Returns a [`crate::fac::token_ledger::TokenRevocationReceipt`] for audit
+    /// purposes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the nonce is not found, the reason is too long,
+    /// or the revocation set is at capacity.
+    pub fn revoke_token(
+        &mut self,
+        nonce: &[u8; 32],
+        reason: &str,
+    ) -> Result<crate::fac::token_ledger::TokenRevocationReceipt, BrokerError> {
+        self.token_ledger
+            .revoke_token(nonce, self.state.current_tick, reason)
+            .map_err(BrokerError::TokenLedger)
+    }
+
+    /// Evicts expired entries from the token use ledger.
+    ///
+    /// Should be called periodically (e.g., at tick advancement) to
+    /// prevent unbounded growth.
+    pub fn evict_expired_tokens(&mut self) {
+        self.token_ledger.evict_expired(self.state.current_tick);
     }
 
     // -----------------------------------------------------------------------
@@ -1606,6 +1689,17 @@ fn compute_disclosure_policy_digest(policy_root_digest: &Hash) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"apm2.fac_broker.disclosure_policy_digest.v1");
     hasher.update(policy_root_digest);
+    *hasher.finalize().as_bytes()
+}
+
+/// Computes a BLAKE3 digest of a `request_id` string for ledger keying.
+///
+/// Used by the token-use ledger (TCK-00566) to store a fixed-size key
+/// derived from the variable-length `request_id`.
+fn compute_request_id_digest(request_id: &str) -> Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"apm2.fac_broker.request_id_digest.v1");
+    hasher.update(request_id.as_bytes());
     *hasher.finalize().as_bytes()
 }
 
@@ -2724,5 +2818,205 @@ mod tests {
             [0x11; 32]
         );
         assert_eq!(restored.convergence_receipts()[0].proof_hash, [0x22; 32]);
+    }
+
+    // -----------------------------------------------------------------------
+    // TCK-00566: Token replay protection integration tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a broker with health gate passed and a policy admitted.
+    fn broker_with_issued_token() -> (FacBroker, String) {
+        let mut broker = FacBroker::new();
+        let job_digest = [0x42; 32];
+        broker.admit_policy_digest(job_digest).unwrap();
+        broker.set_admission_health_gate_for_test(true);
+
+        let token = broker
+            .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary")
+            .expect("token issuance should succeed");
+
+        (broker, token)
+    }
+
+    #[test]
+    fn tck_00566_token_issuance_records_nonce_in_ledger() {
+        let (broker, token) = broker_with_issued_token();
+
+        // The ledger should have exactly 1 entry.
+        assert_eq!(broker.token_ledger().len(), 1);
+
+        // Decode the token to extract the nonce.
+        let decoded = decode_channel_context_token(
+            &token,
+            &broker.verifying_key(),
+            "lease-1",
+            now_secs(),
+            "REQ-1",
+        )
+        .expect("token decode should succeed");
+
+        // The token binding should have a nonce.
+        let binding = decoded.token_binding.expect("binding should be present");
+        let nonce = binding.nonce.expect("nonce should be present");
+        assert_ne!(nonce, [0u8; 32]);
+
+        // Checking the nonce should detect it as used.
+        let result = broker.check_token_nonce(&nonce);
+        assert!(
+            matches!(
+                result,
+                Err(crate::fac::token_ledger::TokenLedgerError::ReplayDetected)
+            ),
+            "nonce should be detected as used: {result:?}"
+        );
+    }
+
+    #[test]
+    fn tck_00566_second_issuance_uses_different_nonce() {
+        let mut broker = FacBroker::new();
+        let job_digest = [0x42; 32];
+        broker.admit_policy_digest(job_digest).unwrap();
+        broker.set_admission_health_gate_for_test(true);
+
+        let token1 = broker
+            .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary")
+            .expect("first token should succeed");
+        let token2 = broker
+            .issue_channel_context_token(&job_digest, "lease-2", "REQ-2", "test-boundary")
+            .expect("second token should succeed");
+
+        assert_eq!(broker.token_ledger().len(), 2);
+
+        // Extract nonces and verify they are different.
+        let decoded1 = decode_channel_context_token(
+            &token1,
+            &broker.verifying_key(),
+            "lease-1",
+            now_secs(),
+            "REQ-1",
+        )
+        .unwrap();
+        let decoded2 = decode_channel_context_token(
+            &token2,
+            &broker.verifying_key(),
+            "lease-2",
+            now_secs(),
+            "REQ-2",
+        )
+        .unwrap();
+
+        let nonce1 = decoded1.token_binding.unwrap().nonce.unwrap();
+        let nonce2 = decoded2.token_binding.unwrap().nonce.unwrap();
+        assert_ne!(nonce1, nonce2, "each token must have a unique nonce");
+    }
+
+    #[test]
+    fn tck_00566_revoked_token_denied_even_if_unexpired() {
+        let (mut broker, token) = broker_with_issued_token();
+
+        // Decode and extract nonce.
+        let decoded = decode_channel_context_token(
+            &token,
+            &broker.verifying_key(),
+            "lease-1",
+            now_secs(),
+            "REQ-1",
+        )
+        .unwrap();
+        let nonce = decoded.token_binding.unwrap().nonce.unwrap();
+
+        // Revoke the token.
+        let receipt = broker
+            .revoke_token(&nonce, "test revocation")
+            .expect("revocation should succeed");
+        assert!(receipt.verify_content_hash());
+        assert_eq!(receipt.reason, "test revocation");
+
+        // The nonce should now be denied as revoked.
+        let result = broker.check_token_nonce(&nonce);
+        assert!(
+            matches!(
+                result,
+                Err(crate::fac::token_ledger::TokenLedgerError::TokenRevoked { .. })
+            ),
+            "revoked nonce should be denied: {result:?}"
+        );
+    }
+
+    #[test]
+    fn tck_00566_tick_advance_evicts_expired_ledger_entries() {
+        let mut broker = FacBroker::new();
+        let job_digest = [0x42; 32];
+        broker.admit_policy_digest(job_digest).unwrap();
+        broker.set_admission_health_gate_for_test(true);
+
+        let token = broker
+            .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary")
+            .expect("token should succeed");
+
+        // Extract nonce.
+        let decoded = decode_channel_context_token(
+            &token,
+            &broker.verifying_key(),
+            "lease-1",
+            now_secs(),
+            "REQ-1",
+        )
+        .unwrap();
+        let nonce = decoded.token_binding.unwrap().nonce.unwrap();
+
+        // Initial tick is 1, TTL is DEFAULT_LEDGER_TTL_TICKS = 1000.
+        // Entry expires at tick 1 + 1000 = 1001.
+        assert_eq!(broker.token_ledger().len(), 1);
+
+        // Advance tick past the TTL. The default ledger TTL is 1000 ticks.
+        // Entry was recorded at tick 1, expires at tick 1001.
+        // We need to advance to tick 1001 or beyond.
+        for _ in 0..1001 {
+            let _ = broker.advance_tick();
+        }
+        // Now at tick 1002, entry should have been evicted.
+        assert_eq!(
+            broker.token_ledger().len(),
+            0,
+            "expired entry should be evicted after tick advance"
+        );
+
+        // The nonce should no longer be detected as used.
+        assert!(
+            broker.check_token_nonce(&nonce).is_ok(),
+            "evicted nonce should be fresh again"
+        );
+    }
+
+    #[test]
+    fn tck_00566_replay_denied_for_same_digest() {
+        let mut broker = FacBroker::new();
+        let job_digest = [0x42; 32];
+        broker.admit_policy_digest(job_digest).unwrap();
+        broker.set_admission_health_gate_for_test(true);
+
+        // Issue first token.
+        let token1 = broker
+            .issue_channel_context_token(&job_digest, "lease-1", "REQ-1", "test-boundary")
+            .expect("first token should succeed");
+
+        // Decode to get the nonce.
+        let decoded1 = decode_channel_context_token(
+            &token1,
+            &broker.verifying_key(),
+            "lease-1",
+            now_secs(),
+            "REQ-1",
+        )
+        .unwrap();
+        let nonce1 = decoded1.token_binding.unwrap().nonce.unwrap();
+
+        // Checking the nonce again (simulating replay) should be denied.
+        let result = broker.check_token_nonce(&nonce1);
+        assert!(matches!(
+            result,
+            Err(crate::fac::token_ledger::TokenLedgerError::ReplayDetected)
+        ));
     }
 }

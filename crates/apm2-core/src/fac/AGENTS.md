@@ -364,6 +364,113 @@ with hard caps.
 - [INV-CPRL-005] Budget denial always produces a structured
   `ControlPlaneDenialReceipt` with machine-readable evidence.
 
+## token_ledger Submodule (TCK-00566)
+
+The `token_ledger` submodule implements broker-side token replay protection via
+a bounded, TTL-evicting nonce ledger and explicit revocation. Every
+`ChannelContextToken` issued by the broker carries a unique 32-byte nonce. The
+ledger records each nonce at issuance time; a second use of the same nonce is
+denied (fail-closed). Tokens can also be explicitly revoked before their natural
+expiry, and workers consult the revocation set when validating tokens.
+
+### Key Types
+
+- `TokenUseLedger`: Bounded nonce ledger backed by a `HashMap<TokenNonce,
+  TokenUseEntry>` for O(1) lookup and a `VecDeque<(TokenNonce, u64)>` for
+  TTL-based FIFO eviction. Not internally synchronized; protected by the same
+  external lock as `FacBroker` (`&mut self` access).
+- `TokenNonce`: Type alias for `[u8; 32]`. CSPRNG-seeded, domain-separated
+  BLAKE3 derived nonces.
+- `TokenLedgerError`: Fail-closed error taxonomy with `ReplayDetected`,
+  `TokenRevoked`, `RevocationSetAtCapacity`, `RevocationReasonTooLong`, and
+  `NonceNotFound` variants.
+- `TokenRevocationReceipt`: Serializable receipt for token revocation events
+  with domain-separated BLAKE3 content hash, `#[serde(deny_unknown_fields)]`.
+  Includes `verify_content_hash()` for receipt integrity verification.
+- `TokenUseEntry` (private): Active ledger entry carrying nonce,
+  `request_id_digest`, `recorded_at_tick`, and `expiry_tick`.
+- `RevokedTokenEntry` (private): Revocation entry carrying nonce,
+  `revoked_at_tick`, and reason string.
+
+### Constants
+
+- `MAX_LEDGER_ENTRIES`: 16,384 (~1.6 MiB peak memory)
+- `MAX_REVOKED_TOKENS`: 4,096
+- `DEFAULT_LEDGER_TTL_TICKS`: 1,000 (matches default envelope TTL)
+- `MAX_REVOCATION_REASON_LENGTH`: 512
+
+### Core Capabilities
+
+- `TokenUseLedger::generate_nonce()`: Generates a fresh 32-byte nonce using
+  OS CSPRNG randomness with domain-separated BLAKE3 derivation
+  (`apm2.fac_broker.token_nonce.v1`).
+- `TokenUseLedger::record_token_use(nonce, request_id_digest, current_tick)`:
+  Records a nonce in the ledger. Checks revocation first (INV-TL-004), then
+  replay (INV-TL-001). Evicts expired entries when at capacity. Forces FIFO
+  eviction of oldest entry if still at capacity after TTL eviction.
+- `TokenUseLedger::check_nonce(nonce)`: Worker-side validation entry point.
+  Returns `Ok(())` if the nonce is fresh (neither used nor revoked).
+- `TokenUseLedger::revoke_token(nonce, current_tick, reason)`: Explicitly
+  revokes a token nonce. Validates reason length, checks revocation set
+  capacity, verifies nonce existence in ledger (fail-closed: cannot revoke
+  a nonce not issued). Emits a `TokenRevocationReceipt`.
+- `TokenUseLedger::evict_expired(current_tick)`: TTL-based eviction of
+  expired entries from both the active ledger and revocation set. Uses
+  ghost-key prevention (RSK-1304): expiry ticks stored in the VecDeque
+  are compared against the HashMap entry's actual expiry to detect stale
+  queue entries from re-inserted keys.
+
+### Broker Integration
+
+- `FacBroker` holds a `TokenUseLedger` field initialized in all constructors
+  (`new`, `with_limits`, `from_signer_and_state`, `from_signer_state_and_limits`).
+- `issue_channel_context_token()` generates a nonce via `generate_nonce()`,
+  records it in the ledger via `record_token_use()`, and includes the nonce
+  in the `TokenBindingV1` payload (`nonce: Some(nonce)`).
+- `advance_tick()` calls `token_ledger.evict_expired()` to clean up stale
+  entries as part of the broker tick lifecycle.
+- `BrokerError::TokenLedger` variant propagates ledger errors.
+- Accessor methods: `token_ledger()`, `check_token_nonce()`, `revoke_token()`,
+  `evict_expired_tokens()`.
+
+### TokenBindingV1 Integration
+
+The `nonce: Option<[u8; 32]>` field was added to `TokenBindingV1` in
+`channel/enforcement.rs` with `#[serde(default)]` for backwards compatibility
+with pre-TCK-00566 tokens (which have `nonce: None`). Broker-issued tokens
+carry `nonce: Some(nonce)`. Daemon-side tokens (not issued via `FacBroker`)
+carry `nonce: None`.
+
+### Security Invariants (TCK-00566)
+
+- [INV-TL-001] Every issued token nonce is recorded in the ledger before the
+  token is returned to the caller. A second issuance or use of the same
+  nonce is denied (fail-closed).
+- [INV-TL-002] The ledger is bounded by `MAX_LEDGER_ENTRIES` (16,384). When
+  the cap is reached, expired entries are evicted first, then the oldest entry
+  is force-evicted (TTL-based FIFO).
+- [INV-TL-003] The revocation set is bounded by `MAX_REVOKED_TOKENS` (4,096).
+  When at capacity, the oldest revocation is evicted to make room.
+- [INV-TL-004] Revoked tokens are denied even if they have not expired.
+  Revocation check precedes replay check in both `record_token_use()` and
+  `check_nonce()`.
+- [INV-TL-005] TTL eviction uses broker ticks (not wall-clock time) for
+  monotonic, deterministic expiry (INV-2501).
+- [INV-TL-006] Nonces are 32-byte random values generated from a CSPRNG
+  with domain-separated BLAKE3 derivation.
+- [INV-TL-007] All nonce comparisons in `find_entry()` and `find_revoked()`
+  use `subtle::ConstantTimeEq::ct_eq()` to prevent timing side-channels
+  (RSK-1909). Non-short-circuiting iteration ensures constant-time lookup.
+- [INV-TL-008] Ghost-key prevention (RSK-1304): the insertion-order VecDeque
+  stores `(nonce, expiry_tick)` pairs. During eviction, the stored expiry
+  tick is compared against the HashMap entry's actual expiry tick; stale
+  queue entries from re-inserted keys are detected and skipped.
+- [INV-TL-009] Revocation receipt content hash uses domain-separated BLAKE3
+  (`apm2.fac_broker.revocation_receipt.v1`) with `u64::to_le_bytes()`
+  length-prefix framing for variable-length fields (CTR-2612).
+- [INV-TL-010] Zero TTL is rejected (clamped to 1) to prevent all entries
+  from being immediately stale (fail-closed).
+
 ## projection_compromise Submodule
 
 The `projection_compromise` submodule implements compromise handling for public
