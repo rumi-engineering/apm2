@@ -1302,6 +1302,33 @@ fn dispatch_single_review_for_home_with_spawn_force_workspace<F>(
 where
     F: Fn(&Path, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
 {
+    dispatch_single_review_for_home_with_spawn_force_workspace_and_lock(
+        home,
+        workspace_root,
+        key,
+        review_kind,
+        dispatch_epoch,
+        force_same_sha_retry,
+        spawn_review,
+        &acquire_dispatch_lock,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_single_review_for_home_with_spawn_force_workspace_and_lock<F, L>(
+    home: &Path,
+    workspace_root: &Path,
+    key: &DispatchIdempotencyKey,
+    review_kind: ReviewKind,
+    dispatch_epoch: u64,
+    force_same_sha_retry: bool,
+    spawn_review: &F,
+    acquire_lock: &L,
+) -> Result<DispatchReviewResult, String>
+where
+    F: Fn(&Path, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+    L: Fn(&Path) -> Result<File, DispatchLockError>,
+{
     key.validate()?;
     if !key.review_type.eq_ignore_ascii_case(review_kind.as_str()) {
         return Err(format!(
@@ -1312,7 +1339,7 @@ where
     }
 
     let scope_lock_path = review_dispatch_scope_lock_path_for_home(home, key);
-    let _scope_lock = match acquire_dispatch_lock(&scope_lock_path) {
+    let _scope_lock = match acquire_lock(&scope_lock_path) {
         Ok(lock) => lock,
         Err(error @ DispatchLockError::Timeout { .. }) => {
             return deny_dispatch_without_state_mutation(
@@ -1326,7 +1353,7 @@ where
     };
 
     let lock_path = review_dispatch_lock_path_for_home(home, key);
-    let _lock = match acquire_dispatch_lock(&lock_path) {
+    let _lock = match acquire_lock(&lock_path) {
         Ok(lock) => lock,
         Err(error @ DispatchLockError::Timeout { .. }) => {
             return deny_dispatch_without_state_mutation(
@@ -1598,14 +1625,15 @@ fn spawn_detached_review(
 mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
     use std::time::Duration;
 
     use super::{
-        DispatchIdempotencyKey, DispatchReviewResult, ReviewRunStateLoad, acquire_dispatch_lock,
+        DispatchIdempotencyKey, DispatchLockError, DispatchReviewResult, ReviewRunStateLoad,
         build_systemd_setenv_args, dispatch_single_review_for_home_with_spawn,
-        dispatch_single_review_for_home_with_spawn_force, first_existing_dispatch_executable,
-        review_dispatch_scope_lock_path_for_home, run_state_has_live_process,
+        dispatch_single_review_for_home_with_spawn_force,
+        dispatch_single_review_for_home_with_spawn_force_workspace_and_lock,
+        first_existing_dispatch_executable, run_state_has_live_process,
         strip_deleted_executable_suffix, write_pending_dispatch_for_home,
     };
     use crate::commands::fac_review::state::{
@@ -1613,9 +1641,9 @@ mod tests {
         write_review_run_state_for_home,
     };
     use crate::commands::fac_review::types::{
-        DISPATCH_LOCK_ACQUIRE_TIMEOUT, ReviewKind, ReviewRunState, ReviewRunStatus,
-        TERMINAL_AMBIGUOUS_DISPATCH_OWNERSHIP, TERMINAL_DISPATCH_LOCK_TIMEOUT,
-        TERMINAL_SHA_DRIFT_SUPERSEDED, TERMINAL_STALE_HEAD_AMBIGUITY,
+        ReviewKind, ReviewRunState, ReviewRunStatus, TERMINAL_AMBIGUOUS_DISPATCH_OWNERSHIP,
+        TERMINAL_DISPATCH_LOCK_TIMEOUT, TERMINAL_SHA_DRIFT_SUPERSEDED,
+        TERMINAL_STALE_HEAD_AMBIGUITY,
     };
 
     fn sample_run_state(pid: Option<u32>) -> ReviewRunState {
@@ -2391,25 +2419,35 @@ mod tests {
         let key = dispatch_key("0123456789abcdef0123456789abcdef01234567");
 
         let spawn_count = Arc::new(AtomicUsize::new(0));
-        let spawned_children = Arc::new(Mutex::new(Vec::new()));
         let barrier = Arc::new(Barrier::new(3));
+        let release_first_spawn = Arc::new((Mutex::new(false), Condvar::new()));
+        let (first_spawn_entered_tx, first_spawn_entered_rx) = mpsc::channel();
 
         let run_one = {
             let home = home.clone();
             let key = key.clone();
             let spawn_count = Arc::clone(&spawn_count);
-            let spawned_children = Arc::clone(&spawned_children);
             let barrier = Arc::clone(&barrier);
+            let release_first_spawn = Arc::clone(&release_first_spawn);
+            let first_spawn_entered_tx = first_spawn_entered_tx.clone();
             std::thread::spawn(move || {
                 let spawn = |_: u32,
                              _: ReviewKind,
                              _: &str,
                              _: u64|
                  -> Result<DispatchReviewResult, String> {
-                    spawn_count.fetch_add(1, Ordering::SeqCst);
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    let pid = spawn_long_lived_pid();
-                    spawned_children.lock().expect("children lock").push(pid);
+                    let previous = spawn_count.fetch_add(1, Ordering::SeqCst);
+                    if previous == 0 {
+                        first_spawn_entered_tx
+                            .send(())
+                            .expect("notify first spawn entry");
+                        let (released_lock, released_cv) = &*release_first_spawn;
+                        let mut released = released_lock.lock().expect("release lock");
+                        while !*released {
+                            released = released_cv.wait(released).expect("release wait");
+                        }
+                    }
+                    let pid = std::process::id();
                     Ok(DispatchReviewResult {
                         review_type: "security".to_string(),
                         mode: "started".to_string(),
@@ -2435,17 +2473,27 @@ mod tests {
 
         let run_two = {
             let spawn_count = Arc::clone(&spawn_count);
-            let spawned_children = Arc::clone(&spawned_children);
             let barrier = Arc::clone(&barrier);
+            let release_first_spawn = Arc::clone(&release_first_spawn);
+            let first_spawn_entered_tx = first_spawn_entered_tx.clone();
             std::thread::spawn(move || {
                 let spawn = |_: u32,
                              _: ReviewKind,
                              _: &str,
                              _: u64|
                  -> Result<DispatchReviewResult, String> {
-                    spawn_count.fetch_add(1, Ordering::SeqCst);
-                    let pid = spawn_long_lived_pid();
-                    spawned_children.lock().expect("children lock").push(pid);
+                    let previous = spawn_count.fetch_add(1, Ordering::SeqCst);
+                    if previous == 0 {
+                        first_spawn_entered_tx
+                            .send(())
+                            .expect("notify first spawn entry");
+                        let (released_lock, released_cv) = &*release_first_spawn;
+                        let mut released = released_lock.lock().expect("release lock");
+                        while !*released {
+                            released = released_cv.wait(released).expect("release wait");
+                        }
+                    }
+                    let pid = std::process::id();
                     Ok(DispatchReviewResult {
                         review_type: "security".to_string(),
                         mode: "started".to_string(),
@@ -2470,6 +2518,15 @@ mod tests {
         };
 
         barrier.wait();
+        first_spawn_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first spawn should enter deterministically");
+        {
+            let (released_lock, released_cv) = &*release_first_spawn;
+            let mut released = released_lock.lock().expect("release lock");
+            *released = true;
+            released_cv.notify_all();
+        }
         let one = run_one
             .join()
             .expect("thread one join")
@@ -2483,8 +2540,6 @@ mod tests {
         modes.sort();
         assert_eq!(modes, vec!["joined".to_string(), "started".to_string()]);
         assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
-
-        cleanup_children(&spawned_children);
     }
 
     #[test]
@@ -2500,30 +2555,31 @@ mod tests {
         let canonical = review_run_state_path_for_home(&home, 441, "security");
         let before = fs::read_to_string(&canonical).expect("read seeded state");
 
-        let scope_lock_path = review_dispatch_scope_lock_path_for_home(&home, &key);
-        let barrier = Arc::new(Barrier::new(2));
-        let holder = {
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                let _lock = acquire_dispatch_lock(&scope_lock_path).expect("acquire scope lock");
-                barrier.wait();
-                std::thread::sleep(DISPATCH_LOCK_ACQUIRE_TIMEOUT + Duration::from_millis(250));
-            })
+        let spawn = |_: &std::path::Path,
+                     _: u32,
+                     _: ReviewKind,
+                     _: &str,
+                     _: u64|
+         -> Result<DispatchReviewResult, String> {
+            panic!("spawn should not execute when lock acquisition times out");
         };
-
-        barrier.wait();
-
-        let spawn =
-            |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
-                panic!("spawn should not execute when lock acquisition times out");
+        let timeout_path = home.join("dispatch.timeout.lock");
+        let acquire_timeout =
+            |_path: &std::path::Path| -> Result<std::fs::File, DispatchLockError> {
+                Err(DispatchLockError::Timeout {
+                    path: timeout_path.clone(),
+                })
             };
 
-        let err = dispatch_single_review_for_home_with_spawn(
+        let err = dispatch_single_review_for_home_with_spawn_force_workspace_and_lock(
             &home,
+            std::path::Path::new("."),
             &key,
             ReviewKind::Security,
             99,
+            false,
             &spawn,
+            &acquire_timeout,
         )
         .expect_err("lock-timeout dispatch must fail");
         assert!(
@@ -2531,7 +2587,6 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        holder.join().expect("holder join");
         let after = fs::read_to_string(&canonical).expect("read seeded state after timeout");
         assert_eq!(
             after, before,
