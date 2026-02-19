@@ -2200,4 +2200,110 @@ mod tests {
              but actual content does not hash to that value"
         );
     }
+
+    // =========================================================================
+    // TCK-00551 round 9: Timestamp poisoning regression test
+    //
+    // Proves that a poisoned index header with a tampered timestamp_secs
+    // does NOT affect the verified receipt's timestamp returned by
+    // lookup_receipt_by_hash.  The verified receipt's timestamp_secs is
+    // authoritative because it is part of the BLAKE3 content hash preimage.
+    // =========================================================================
+
+    #[test]
+    fn test_poisoned_index_timestamp_does_not_affect_verified_receipt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create and persist a receipt with timestamp 5000.
+        let (receipt, digest) = make_and_persist_receipt(receipts_dir, "job-ts-poison", 5000);
+        assert_eq!(receipt.timestamp_secs, 5000);
+
+        // Build the index normally (header will have timestamp 5000).
+        let mut index = ReceiptIndexV1::rebuild_from_store(receipts_dir).expect("rebuild");
+
+        // Verify the index header has the correct timestamp.
+        let header_before = index.header_for_digest(&digest).expect("header");
+        assert_eq!(header_before.timestamp_secs, 5000);
+
+        // Tamper: overwrite the index header's timestamp to 9999.
+        // This simulates an attacker who modifies the non-authoritative index
+        // to move a receipt across an observation window boundary.
+        let tampered_header = ReceiptHeaderV1 {
+            timestamp_secs: 9999,
+            ..header_before.clone()
+        };
+        // Remove the old header and insert the tampered one.
+        index.header_index.remove(&digest);
+        index.header_index.insert(digest.clone(), tampered_header);
+        index.persist(receipts_dir).expect("persist tampered index");
+
+        // Verify the tampered index now reports timestamp 9999.
+        let reloaded_index =
+            ReceiptIndexV1::load_or_rebuild(receipts_dir).expect("load tampered index");
+        let tampered_hdr = reloaded_index.header_for_digest(&digest).expect("header");
+        assert_eq!(
+            tampered_hdr.timestamp_secs, 9999,
+            "index header should reflect the tampered timestamp"
+        );
+
+        // The verified receipt from lookup_receipt_by_hash must still have
+        // the ORIGINAL timestamp (5000), because the receipt's timestamp_secs
+        // is part of the BLAKE3 content hash preimage and cannot be modified
+        // without invalidating the hash.
+        let verified = lookup_receipt_by_hash(receipts_dir, &digest).expect("receipt must load");
+        assert_eq!(
+            verified.timestamp_secs, 5000,
+            "verified receipt must have the original timestamp (5000), \
+             not the tampered index timestamp (9999)"
+        );
+
+        // Demonstrate the mismatch that the CLI uses for tamper detection:
+        assert_ne!(
+            tampered_hdr.timestamp_secs, verified.timestamp_secs,
+            "header and receipt timestamps must differ (tamper indicator)"
+        );
+    }
+
+    #[test]
+    fn test_list_headers_with_poisoned_timestamp_exposes_mismatch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create two receipts: one normal, one that we will tamper.
+        let (_r1, _d1) = make_and_persist_receipt(receipts_dir, "job-normal", 3000);
+        let (_r2, d2) = make_and_persist_receipt(receipts_dir, "job-tampered", 4000);
+
+        // Build index, then tamper the second receipt's header timestamp.
+        let mut index = ReceiptIndexV1::rebuild_from_store(receipts_dir).expect("rebuild");
+        let original_header = index.header_for_digest(&d2).expect("header").clone();
+        assert_eq!(original_header.timestamp_secs, 4000);
+
+        let tampered = ReceiptHeaderV1 {
+            timestamp_secs: 1000, // Move from 4000 to 1000 (outside a hypothetical window)
+            ..original_header
+        };
+        index.header_index.remove(&d2);
+        index.header_index.insert(d2.clone(), tampered);
+        index.persist(receipts_dir).expect("persist tampered index");
+
+        // List headers and verify: the tampered header will have timestamp 1000,
+        // but the verified receipt will have timestamp 4000.
+        let headers_result = list_receipt_headers(receipts_dir);
+        let tampered_hdr = headers_result
+            .headers
+            .iter()
+            .find(|h| h.content_hash == d2)
+            .expect("tampered header must be in list");
+        assert_eq!(tampered_hdr.timestamp_secs, 1000, "header has tampered ts");
+
+        let verified = lookup_receipt_by_hash(receipts_dir, &d2).expect("receipt loads");
+        assert_eq!(verified.timestamp_secs, 4000, "receipt has original ts");
+
+        // The mismatch is detectable — this is the exact check the CLI performs.
+        assert_ne!(
+            tampered_hdr.timestamp_secs, verified.timestamp_secs,
+            "mismatch between index header and verified receipt is tamper evidence"
+        );
+    }
 }
