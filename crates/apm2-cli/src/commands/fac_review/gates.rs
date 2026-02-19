@@ -519,11 +519,11 @@ fn prepare_queued_gates_job(
         load_or_init_policy(&fac_root).map_err(|err| QueuePreparationFailure::Runtime {
             message: format!("cannot load FAC policy: {err}"),
         })?;
-    broker
-        .admit_policy_digest(policy_digest)
-        .map_err(|err| QueuePreparationFailure::AuthorityDenied {
+    broker.admit_policy_digest(policy_digest).map_err(|err| {
+        QueuePreparationFailure::AuthorityDenied {
             message: format!("cannot admit FAC policy digest: {err}"),
-        })?;
+        }
+    })?;
 
     // TCK-00579: Derive job spec validation policy from FAC policy for
     // enqueue-time enforcement of repo_id allowlist, bytes_backend
@@ -1892,8 +1892,7 @@ fn output_worker_prep_failure(
     } else {
         eprintln!(
             "ERROR: {failure_code} component={} cause={}",
-            failure.component,
-            failure.root_cause
+            failure.component, failure.root_cause
         );
         eprintln!("remediation: {}", failure.remediation);
         for diagnostic in &failure.diagnostics {
