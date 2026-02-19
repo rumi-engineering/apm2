@@ -3278,9 +3278,7 @@ fn replay_pending_verdict_projection_for_pr_locked(
         .filter(|entry| {
             normalized_expected_head_sha
                 .as_deref()
-                .map_or(true, |expected| {
-                    entry.head_sha.eq_ignore_ascii_case(expected)
-                })
+                .is_none_or(|expected| entry.head_sha.eq_ignore_ascii_case(expected))
         })
         .min_by(|lhs, rhs| {
             lhs.attempt_count
