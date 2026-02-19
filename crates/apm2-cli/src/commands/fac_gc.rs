@@ -58,23 +58,34 @@ pub fn run_gc(args: &GcArgs, parent_json_output: bool) -> u8 {
     // `evidence/` to `legacy/` during routine garbage collection. The
     // migration helper is bounded and idempotent; it is a no-op when the
     // legacy evidence directory does not exist or has already been migrated.
-    match run_migration_to_completion(&fac_root) {
-        Ok(receipt) if !receipt.skipped && !json_output => {
-            let status = if receipt.is_complete {
-                "complete"
-            } else {
-                "partial"
-            };
-            eprintln!(
-                "legacy evidence migration: {status}, {} moved, {} failed",
-                receipt.files_moved, receipt.files_failed
-            );
-        },
-        Ok(_) => {}, // skipped or json mode — no human output
-        Err(error) => {
-            // Migration failure is non-fatal for GC — log and continue.
-            eprintln!("WARNING: legacy evidence migration failed: {error}, continuing with GC");
-        },
+    //
+    // Migration is skipped in --dry-run mode because it is a mutating
+    // operation (moves files, removes directories, writes receipts). In
+    // dry-run mode we only report whether migration WOULD run.
+    if args.dry_run {
+        let evidence_dir = fac_root.join("evidence");
+        if evidence_dir.is_dir() && !json_output {
+            eprintln!("legacy evidence migration: would migrate (skipped in --dry-run mode)");
+        }
+    } else {
+        match run_migration_to_completion(&fac_root) {
+            Ok(receipt) if !receipt.skipped && !json_output => {
+                let status = if receipt.is_complete {
+                    "complete"
+                } else {
+                    "partial"
+                };
+                eprintln!(
+                    "legacy evidence migration: {status}, {} moved, {} failed",
+                    receipt.files_moved, receipt.files_failed
+                );
+            },
+            Ok(_) => {}, // skipped or json mode — no human output
+            Err(error) => {
+                // Migration failure is non-fatal for GC — log and continue.
+                eprintln!("WARNING: legacy evidence migration failed: {error}, continuing with GC");
+            },
+        }
     }
 
     let quarantine_ttl_secs = u64::from(policy.quarantine_ttl_days).saturating_mul(24 * 3600);
