@@ -3074,10 +3074,16 @@ for economics calibration and metrics.
 
 ### Stat Files Read
 
-- `cpu.stat`: Extracts `usage_usec` line.
+- `cpu.stat`: Extracts `usage_usec` line via exact key match (whitespace-
+  delimited, not prefix match — prevents false positives from keys like
+  `usage_usec_ext`).
 - `memory.peak` (fallback: `memory.current`): Single integer value.
-- `io.stat`: Sums `rbytes` and `wbytes` across all devices.
-- `pids.current`: Single integer (current task count).
+- `io.stat`: Sums `rbytes` and `wbytes` across all devices with per-field
+  independent tracking (only fields actually found are `Some`; absent fields
+  are `None`, never `Some(0)`).
+- `pids.peak` (fallback: `pids.current`): Tasks count high watermark.
+  `pids.peak` provides the lifetime maximum; `pids.current` is used only
+  when `pids.peak` is unavailable (older kernels).
 
 ### Security Invariants (TCK-00572)
 
@@ -3090,6 +3096,9 @@ for economics calibration and metrics.
 - [INV-CGSTAT-004] Validation rejects out-of-bounds values via `MAX_*`
   constants: `MAX_CPU_TIME_US`, `MAX_PEAK_MEMORY_BYTES`, `MAX_IO_BYTES`,
   `MAX_TASKS_COUNT`.
+- [INV-CGSTAT-005] `cgroup_path` is validated against path traversal (`..`
+  components) before joining with the cgroup root. Paths containing `..`
+  return all-`None` results.
 
 ### Production Wiring
 
@@ -3097,6 +3106,17 @@ The `observed_usage` field is populated in `build_job_receipt()` in
 `fac_worker.rs` from the containment trace's `cgroup_path`. The field is
 included in both V1 and V2 canonical byte encodings with type marker `11u8`
 and length-prefixed payload for injective hash stability.
+
+### Metrics and Calibration Consumption
+
+The `observed_usage` data is consumed by `compute_metrics()` in the
+`metrics` module. For completed jobs with non-empty `observed_usage`, the
+following aggregates appear in `MetricsSummary`:
+- `resource_usage_samples`: count of completed jobs with data
+- `mean_cpu_time_us`: mean CPU time across samples
+- `mean_peak_memory_bytes`: mean peak memory across samples
+- `total_io_read_bytes` / `total_io_write_bytes`: total IO
+- `max_tasks_count`: maximum tasks count high watermark observed
 
 ## credential_gate Submodule (TCK-00596)
 

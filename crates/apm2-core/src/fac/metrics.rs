@@ -89,6 +89,31 @@ pub struct MetricsSummary {
     /// Count of denials due to insufficient disk space.
     pub disk_preflight_failures: u64,
 
+    // -- Observed resource usage (TCK-00572) --
+    /// Number of completed jobs with non-empty `observed_usage` data.
+    /// Used as the sample size for resource usage aggregates.
+    #[serde(default)]
+    pub resource_usage_samples: u64,
+    /// Mean CPU time in microseconds across completed jobs with
+    /// `observed_usage`. `None` when no completed jobs have
+    /// `observed_usage.cpu_time_us`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_cpu_time_us: Option<u64>,
+    /// Mean peak memory in bytes across completed jobs with `observed_usage`.
+    /// `None` when no completed jobs have `observed_usage.peak_memory_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_peak_memory_bytes: Option<u64>,
+    /// Total IO bytes read across all completed jobs with `observed_usage`.
+    #[serde(default)]
+    pub total_io_read_bytes: u64,
+    /// Total IO bytes written across all completed jobs with `observed_usage`.
+    #[serde(default)]
+    pub total_io_write_bytes: u64,
+    /// Maximum tasks count high watermark observed across completed jobs.
+    /// `None` when no completed jobs have `observed_usage.tasks_count`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tasks_count: Option<u32>,
+
     // -- GC --
     /// Total bytes freed by GC in the window.
     pub gc_freed_bytes: u64,
@@ -195,7 +220,7 @@ pub struct MetricsInput<'a> {
 ///
 /// This is a pure function with no I/O. All collections are bounded.
 #[must_use]
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 pub fn compute_metrics(input: &MetricsInput<'_>) -> MetricsSummary {
     let mut summary = MetricsSummary {
         schema: METRICS_SUMMARY_SCHEMA.to_string(),
@@ -214,6 +239,12 @@ pub fn compute_metrics(input: &MetricsInput<'_>) -> MetricsSummary {
     let mut receipt_cancelled: u64 = 0;
     let mut receipt_total: u64 = 0;
 
+    // -- Observed resource usage accumulators (TCK-00572) --
+    let mut cpu_time_sum: u64 = 0;
+    let mut cpu_time_count: u64 = 0;
+    let mut peak_mem_sum: u64 = 0;
+    let mut peak_mem_count: u64 = 0;
+
     for receipt in input.job_receipts {
         receipt_total += 1;
 
@@ -223,6 +254,29 @@ pub fn compute_metrics(input: &MetricsInput<'_>) -> MetricsSummary {
                 // Collect duration for percentile computation.
                 if let Some(ref cost) = receipt.observed_cost {
                     durations.push(cost.duration_ms);
+                }
+                // Aggregate observed resource usage (TCK-00572).
+                if let Some(ref usage) = receipt.observed_usage {
+                    summary.resource_usage_samples += 1;
+                    if let Some(cpu) = usage.cpu_time_us {
+                        cpu_time_sum = cpu_time_sum.saturating_add(cpu);
+                        cpu_time_count += 1;
+                    }
+                    if let Some(mem) = usage.peak_memory_bytes {
+                        peak_mem_sum = peak_mem_sum.saturating_add(mem);
+                        peak_mem_count += 1;
+                    }
+                    if let Some(r) = usage.io_read_bytes {
+                        summary.total_io_read_bytes = summary.total_io_read_bytes.saturating_add(r);
+                    }
+                    if let Some(w) = usage.io_write_bytes {
+                        summary.total_io_write_bytes =
+                            summary.total_io_write_bytes.saturating_add(w);
+                    }
+                    if let Some(tc) = usage.tasks_count {
+                        summary.max_tasks_count =
+                            Some(summary.max_tasks_count.map_or(tc, |prev| prev.max(tc)));
+                    }
                 }
             },
             FacJobOutcome::Denied => {
@@ -272,6 +326,14 @@ pub fn compute_metrics(input: &MetricsInput<'_>) -> MetricsSummary {
         durations.sort_unstable();
         summary.median_duration_ms = Some(percentile(&durations, 50));
         summary.p95_duration_ms = Some(percentile(&durations, 95));
+    }
+
+    // -- Observed resource usage means (TCK-00572) --
+    if cpu_time_count > 0 {
+        summary.mean_cpu_time_us = Some(cpu_time_sum / cpu_time_count);
+    }
+    if peak_mem_count > 0 {
+        summary.mean_peak_memory_bytes = Some(peak_mem_sum / peak_mem_count);
     }
 
     // -- Throughput --
@@ -668,6 +730,7 @@ fn try_load_gc_receipt_file(path: &std::path::Path, since_epoch_secs: u64) -> Op
 mod tests {
     use super::*;
     use crate::economics::cost_model::ObservedJobCost;
+    use crate::fac::cgroup_stats::ObservedCgroupUsage;
     use crate::fac::receipt::{DenialReasonCode, FacJobOutcome, FacJobReceiptV1};
 
     fn make_job_receipt(
@@ -1340,6 +1403,23 @@ mod tests {
             deserialized.unverified_headers_skipped, 0,
             "unverified_headers_skipped must default to 0 for old JSON"
         );
+        // TCK-00572: resource usage fields must default for old JSON.
+        assert_eq!(
+            deserialized.resource_usage_samples, 0,
+            "resource_usage_samples must default to 0 for old JSON"
+        );
+        assert_eq!(
+            deserialized.mean_cpu_time_us, None,
+            "mean_cpu_time_us must default to None for old JSON"
+        );
+        assert_eq!(
+            deserialized.total_io_read_bytes, 0,
+            "total_io_read_bytes must default to 0 for old JSON"
+        );
+        assert_eq!(
+            deserialized.max_tasks_count, None,
+            "max_tasks_count must default to None for old JSON"
+        );
     }
 
     // =========================================================================
@@ -1607,6 +1687,201 @@ mod tests {
                 new.content_hash, old.content_hash
             );
         }
+    }
+
+    // =========================================================================
+    // TCK-00572: observed_usage consumed by metrics pipeline
+    // =========================================================================
+
+    fn make_job_receipt_with_usage(
+        timestamp_secs: u64,
+        usage: ObservedCgroupUsage,
+    ) -> FacJobReceiptV1 {
+        let mut receipt =
+            make_job_receipt(FacJobOutcome::Completed, None, Some(100), timestamp_secs);
+        receipt.observed_usage = Some(usage);
+        receipt
+    }
+
+    #[test]
+    fn observed_usage_aggregated_in_metrics() {
+        // Prove that observed_usage from completed job receipts is consumed
+        // (not just persisted) by the metrics pipeline.
+        let receipts = vec![
+            make_job_receipt_with_usage(
+                1000,
+                ObservedCgroupUsage {
+                    cpu_time_us: Some(500_000),
+                    peak_memory_bytes: Some(1 << 30), // 1 GiB
+                    io_read_bytes: Some(10_000),
+                    io_write_bytes: Some(20_000),
+                    tasks_count: Some(8),
+                },
+            ),
+            make_job_receipt_with_usage(
+                1001,
+                ObservedCgroupUsage {
+                    cpu_time_us: Some(300_000),
+                    peak_memory_bytes: Some(2 << 30), // 2 GiB
+                    io_read_bytes: Some(5_000),
+                    io_write_bytes: Some(15_000),
+                    tasks_count: Some(16),
+                },
+            ),
+            // A completed receipt without observed_usage should not
+            // break the computation.
+            make_job_receipt(FacJobOutcome::Completed, None, Some(50), 1002),
+        ];
+        let input = MetricsInput {
+            job_receipts: &receipts,
+            gc_receipts: &[],
+            since_epoch_secs: 1000,
+            until_epoch_secs: 2000,
+            header_counts: None,
+        };
+        let summary = compute_metrics(&input);
+
+        // 2 out of 3 completed receipts have observed_usage.
+        assert_eq!(summary.resource_usage_samples, 2);
+
+        // Mean CPU time: (500_000 + 300_000) / 2 = 400_000
+        assert_eq!(summary.mean_cpu_time_us, Some(400_000));
+
+        // Mean peak memory: (1 GiB + 2 GiB) / 2 = 1.5 GiB
+        assert_eq!(
+            summary.mean_peak_memory_bytes,
+            Some(u64::midpoint(1u64 << 30, 2u64 << 30))
+        );
+
+        // Total IO: 10_000 + 5_000 = 15_000 read, 20_000 + 15_000 = 35_000 write
+        assert_eq!(summary.total_io_read_bytes, 15_000);
+        assert_eq!(summary.total_io_write_bytes, 35_000);
+
+        // Max tasks count: max(8, 16) = 16
+        assert_eq!(summary.max_tasks_count, Some(16));
+    }
+
+    #[test]
+    fn observed_usage_partial_fields_handled() {
+        // Some receipts have only partial observed_usage fields.
+        let receipts = vec![
+            make_job_receipt_with_usage(
+                1000,
+                ObservedCgroupUsage {
+                    cpu_time_us: Some(100_000),
+                    peak_memory_bytes: None,
+                    io_read_bytes: None,
+                    io_write_bytes: Some(500),
+                    tasks_count: None,
+                },
+            ),
+            make_job_receipt_with_usage(
+                1001,
+                ObservedCgroupUsage {
+                    cpu_time_us: None,
+                    peak_memory_bytes: Some(1024),
+                    io_read_bytes: Some(200),
+                    io_write_bytes: None,
+                    tasks_count: Some(4),
+                },
+            ),
+        ];
+        let input = MetricsInput {
+            job_receipts: &receipts,
+            gc_receipts: &[],
+            since_epoch_secs: 1000,
+            until_epoch_secs: 2000,
+            header_counts: None,
+        };
+        let summary = compute_metrics(&input);
+
+        assert_eq!(summary.resource_usage_samples, 2);
+        // Only 1 receipt had cpu_time_us.
+        assert_eq!(summary.mean_cpu_time_us, Some(100_000));
+        // Only 1 receipt had peak_memory_bytes.
+        assert_eq!(summary.mean_peak_memory_bytes, Some(1024));
+        // IO read: only 200 from second receipt.
+        assert_eq!(summary.total_io_read_bytes, 200);
+        // IO write: only 500 from first receipt.
+        assert_eq!(summary.total_io_write_bytes, 500);
+        // Tasks count: only 4 from second receipt.
+        assert_eq!(summary.max_tasks_count, Some(4));
+    }
+
+    #[test]
+    fn observed_usage_not_counted_for_denied_jobs() {
+        // observed_usage should only be aggregated for Completed outcomes.
+        let mut denied_receipt = make_job_receipt(
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::DigestMismatch),
+            None,
+            1000,
+        );
+        denied_receipt.observed_usage = Some(ObservedCgroupUsage {
+            cpu_time_us: Some(999_999),
+            peak_memory_bytes: Some(999_999),
+            io_read_bytes: Some(999_999),
+            io_write_bytes: Some(999_999),
+            tasks_count: Some(999),
+        });
+        let input = MetricsInput {
+            job_receipts: &[denied_receipt],
+            gc_receipts: &[],
+            since_epoch_secs: 1000,
+            until_epoch_secs: 2000,
+            header_counts: None,
+        };
+        let summary = compute_metrics(&input);
+
+        assert_eq!(
+            summary.resource_usage_samples, 0,
+            "denied jobs must not contribute to resource usage aggregates"
+        );
+        assert_eq!(summary.mean_cpu_time_us, None);
+        assert_eq!(summary.mean_peak_memory_bytes, None);
+        assert_eq!(summary.total_io_read_bytes, 0);
+        assert_eq!(summary.total_io_write_bytes, 0);
+        assert_eq!(summary.max_tasks_count, None);
+    }
+
+    #[test]
+    fn observed_usage_fields_serialize_in_summary() {
+        let receipts = vec![make_job_receipt_with_usage(
+            1000,
+            ObservedCgroupUsage {
+                cpu_time_us: Some(42_000),
+                peak_memory_bytes: Some(1024),
+                io_read_bytes: Some(100),
+                io_write_bytes: Some(200),
+                tasks_count: Some(5),
+            },
+        )];
+        let input = MetricsInput {
+            job_receipts: &receipts,
+            gc_receipts: &[],
+            since_epoch_secs: 1000,
+            until_epoch_secs: 2000,
+            header_counts: None,
+        };
+        let summary = compute_metrics(&input);
+        let json_str = serde_json::to_string_pretty(&summary).expect("serialize");
+
+        assert!(
+            json_str.contains("resource_usage_samples"),
+            "resource_usage_samples must appear in JSON"
+        );
+        assert!(
+            json_str.contains("mean_cpu_time_us"),
+            "mean_cpu_time_us must appear in JSON"
+        );
+        assert!(
+            json_str.contains("total_io_read_bytes"),
+            "total_io_read_bytes must appear in JSON"
+        );
+        assert!(
+            json_str.contains("max_tasks_count"),
+            "max_tasks_count must appear in JSON"
+        );
     }
 
     // Compile-time assertion: load cap must not exceed scan cap.

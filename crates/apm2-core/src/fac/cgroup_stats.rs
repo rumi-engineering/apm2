@@ -14,7 +14,7 @@
 //! | `cpu.stat`      | `usage_usec` -> `cpu_time_us`    |
 //! | `memory.peak`   | single value -> `peak_memory_bytes` (fallback: `memory.current`) |
 //! | `io.stat`       | `rbytes`/`wbytes` summed across devices |
-//! | `pids.current`  | single value -> `tasks_count`    |
+//! | `pids.peak`     | single value -> `tasks_count` (fallback: `pids.current`) |
 //!
 //! # Security Invariants
 //!
@@ -22,10 +22,12 @@
 //! - \[INV-CGSTAT-002\] Parse failures yield `None`, never panic.
 //! - \[INV-CGSTAT-003\] IO reads/writes are summed with saturating arithmetic.
 //! - \[INV-CGSTAT-004\] Validation rejects out-of-bounds values (fail-closed).
+//! - \[INV-CGSTAT-005\] `cgroup_path` is validated against path traversal (`..`
+//!   components).
 
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::Path;
+use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -85,8 +87,9 @@ pub struct ObservedCgroupUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub io_write_bytes: Option<u64>,
 
-    /// Number of tasks (threads/processes) in the cgroup at collection time.
-    /// Parsed from `pids.current`.
+    /// Peak number of tasks (threads/processes) in the cgroup during its
+    /// lifetime. Parsed from `pids.peak` (preferred) or `pids.current`
+    /// (fallback for older kernels without `pids.peak`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tasks_count: Option<u32>,
 }
@@ -208,19 +211,36 @@ pub fn collect_cgroup_usage(cgroup_path: &str) -> ObservedCgroupUsage {
 /// Collects cgroup v2 usage stats with a configurable cgroupfs root.
 ///
 /// This variant enables testing with mock filesystem layouts.
+///
+/// \[INV-CGSTAT-005\] Rejects `cgroup_path` containing path traversal
+/// (`..`) components. Returns an all-`None` result for traversal paths.
 #[must_use]
 pub fn collect_cgroup_usage_from_root(
     cgroup_path: &str,
     cgroup_root: &Path,
 ) -> ObservedCgroupUsage {
-    // Strip leading `/` from cgroup_path to join correctly.
+    let empty = ObservedCgroupUsage {
+        cpu_time_us: None,
+        peak_memory_bytes: None,
+        io_read_bytes: None,
+        io_write_bytes: None,
+        tasks_count: None,
+    };
+
+    // [INV-CGSTAT-005] Validate against path traversal before joining.
     let relative_path = cgroup_path.trim_start_matches('/');
+    for component in Path::new(relative_path).components() {
+        if matches!(component, Component::ParentDir) {
+            return empty;
+        }
+    }
+
     let cgroup_dir = cgroup_root.join(relative_path);
 
     let cpu_time_us = read_cpu_stat(&cgroup_dir);
     let peak_memory_bytes = read_memory_peak(&cgroup_dir);
     let (io_read_bytes, io_write_bytes) = read_io_stat(&cgroup_dir);
-    let tasks_count = read_pids_current(&cgroup_dir);
+    let tasks_count = read_pids_peak(&cgroup_dir);
 
     ObservedCgroupUsage {
         cpu_time_us,
@@ -248,9 +268,13 @@ fn read_cpu_stat(cgroup_dir: &Path) -> Option<u64> {
     let content = read_bounded_file(&cgroup_dir.join("cpu.stat"))?;
     for line in content.lines() {
         let line = line.trim();
-        if let Some(value_str) = line.strip_prefix("usage_usec") {
-            let value_str = value_str.trim();
-            return value_str.parse::<u64>().ok();
+        // Exact key match: split on whitespace so "usage_usec_ext" cannot
+        // accidentally match "usage_usec" (tightened per INV-CGSTAT-002).
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some("usage_usec") {
+            if let Some(value_str) = parts.next() {
+                return value_str.parse::<u64>().ok();
+            }
         }
     }
     None
@@ -286,7 +310,8 @@ fn read_io_stat(cgroup_dir: &Path) -> (Option<u64>, Option<u64>) {
 
     let mut total_read: u64 = 0;
     let mut total_write: u64 = 0;
-    let mut found_any = false;
+    let mut found_read = false;
+    let mut found_write = false;
 
     for line in content.lines() {
         let line = line.trim();
@@ -297,26 +322,37 @@ fn read_io_stat(cgroup_dir: &Path) -> (Option<u64>, Option<u64>) {
             if let Some(val_str) = kv.strip_prefix("rbytes=") {
                 if let Ok(v) = val_str.parse::<u64>() {
                     total_read = total_read.saturating_add(v);
-                    found_any = true;
+                    found_read = true;
                 }
             } else if let Some(val_str) = kv.strip_prefix("wbytes=") {
                 if let Ok(v) = val_str.parse::<u64>() {
                     total_write = total_write.saturating_add(v);
-                    found_any = true;
+                    found_write = true;
                 }
             }
         }
     }
 
-    if found_any {
-        (Some(total_read), Some(total_write))
-    } else {
-        (None, None)
-    }
+    (
+        if found_read { Some(total_read) } else { None },
+        if found_write { Some(total_write) } else { None },
+    )
 }
 
-/// Reads `pids.current` — single integer value (current task count).
-fn read_pids_current(cgroup_dir: &Path) -> Option<u32> {
+/// Reads `pids.peak` (preferred) or falls back to `pids.current`.
+///
+/// `pids.peak` provides the high watermark of tasks count during the
+/// cgroup's lifetime, which is more useful for economics calibration
+/// than the instantaneous `pids.current` (which may already be zero
+/// after job exit).
+fn read_pids_peak(cgroup_dir: &Path) -> Option<u32> {
+    // Try pids.peak first (available on newer kernels, e.g., Linux 6.2+).
+    if let Some(content) = read_bounded_file(&cgroup_dir.join("pids.peak")) {
+        if let Ok(v) = content.trim().parse::<u32>() {
+            return Some(v);
+        }
+    }
+    // Fallback to pids.current for older kernels.
     let content = read_bounded_file(&cgroup_dir.join("pids.current"))?;
     content.trim().parse::<u32>().ok()
 }
@@ -582,16 +618,45 @@ mod tests {
     }
 
     #[test]
-    fn parse_pids_current() {
+    fn parse_pids_peak() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("pids.current"), "42\n").unwrap();
-        assert_eq!(read_pids_current(dir.path()), Some(42));
+        std::fs::write(dir.path().join("pids.peak"), "128\n").unwrap();
+        // pids.current also present with lower value — peak should win.
+        std::fs::write(dir.path().join("pids.current"), "0\n").unwrap();
+        assert_eq!(read_pids_peak(dir.path()), Some(128));
     }
 
     #[test]
-    fn parse_pids_current_missing() {
+    fn parse_pids_peak_fallback_to_current() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert_eq!(read_pids_current(dir.path()), None);
+        // No pids.peak, but pids.current exists.
+        std::fs::write(dir.path().join("pids.current"), "42\n").unwrap();
+        assert_eq!(read_pids_peak(dir.path()), Some(42));
+    }
+
+    #[test]
+    fn parse_pids_peak_distinguishes_peak_from_current() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Peak is 50, current is 3 (job processes mostly exited).
+        std::fs::write(dir.path().join("pids.peak"), "50\n").unwrap();
+        std::fs::write(dir.path().join("pids.current"), "3\n").unwrap();
+        // Must return the peak value, not current.
+        assert_eq!(read_pids_peak(dir.path()), Some(50));
+    }
+
+    #[test]
+    fn parse_pids_peak_neither_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(read_pids_peak(dir.path()), None);
+    }
+
+    #[test]
+    fn parse_pids_peak_invalid_value_falls_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // pids.peak has invalid content, should fall back to pids.current.
+        std::fs::write(dir.path().join("pids.peak"), "not_a_number\n").unwrap();
+        std::fs::write(dir.path().join("pids.current"), "7\n").unwrap();
+        assert_eq!(read_pids_peak(dir.path()), Some(7));
     }
 
     // -------------------------------------------------------------------------
@@ -612,7 +677,7 @@ mod tests {
         .unwrap();
         std::fs::write(cgroup_dir.join("memory.peak"), "4096\n").unwrap();
         std::fs::write(cgroup_dir.join("io.stat"), "8:0 rbytes=100 wbytes=200\n").unwrap();
-        std::fs::write(cgroup_dir.join("pids.current"), "7\n").unwrap();
+        std::fs::write(cgroup_dir.join("pids.peak"), "7\n").unwrap();
 
         let usage = collect_cgroup_usage_from_root(cgroup_path, root.path());
 
@@ -636,7 +701,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let cgroup_dir = root.path().join("system.slice/unit.scope");
         std::fs::create_dir_all(&cgroup_dir).unwrap();
-        std::fs::write(cgroup_dir.join("pids.current"), "3\n").unwrap();
+        std::fs::write(cgroup_dir.join("pids.peak"), "3\n").unwrap();
 
         let usage = collect_cgroup_usage_from_root("/system.slice/unit.scope", root.path());
         assert_eq!(usage.tasks_count, Some(3));
@@ -746,5 +811,122 @@ mod tests {
         // saturating_add should cap at u64::MAX
         assert_eq!(r, Some(u64::MAX));
         assert_eq!(w, Some(u64::MAX));
+    }
+
+    // -------------------------------------------------------------------------
+    // io.stat per-field None regression tests (MAJOR-1)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn io_stat_only_rbytes_yields_none_for_wbytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Device line has only rbytes, no wbytes.
+        std::fs::write(dir.path().join("io.stat"), "8:0 rbytes=1234 rios=10\n").unwrap();
+        let (r, w) = read_io_stat(dir.path());
+        assert_eq!(r, Some(1234));
+        assert_eq!(w, None, "wbytes must be None when absent, not Some(0)");
+    }
+
+    #[test]
+    fn io_stat_only_wbytes_yields_none_for_rbytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Device line has only wbytes, no rbytes.
+        std::fs::write(dir.path().join("io.stat"), "8:0 wbytes=5678 wios=20\n").unwrap();
+        let (r, w) = read_io_stat(dir.path());
+        assert_eq!(r, None, "rbytes must be None when absent, not Some(0)");
+        assert_eq!(w, Some(5678));
+    }
+
+    #[test]
+    fn io_stat_malformed_values_yield_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Both rbytes and wbytes have non-numeric values.
+        std::fs::write(dir.path().join("io.stat"), "8:0 rbytes=xyz wbytes=abc\n").unwrap();
+        let (r, w) = read_io_stat(dir.path());
+        assert_eq!(r, None);
+        assert_eq!(w, None);
+    }
+
+    #[test]
+    fn io_stat_partial_malformed_per_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // rbytes is valid on first device, wbytes is invalid everywhere.
+        std::fs::write(
+            dir.path().join("io.stat"),
+            "8:0 rbytes=100 wbytes=bad\n8:16 rbytes=200 wbytes=also_bad\n",
+        )
+        .unwrap();
+        let (r, w) = read_io_stat(dir.path());
+        assert_eq!(r, Some(300));
+        assert_eq!(w, None, "all-malformed wbytes must yield None");
+    }
+
+    // -------------------------------------------------------------------------
+    // Path traversal regression tests (INV-CGSTAT-005)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn collect_rejects_path_traversal_dotdot() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let usage = collect_cgroup_usage_from_root("../../../etc/passwd", root.path());
+        assert!(usage.is_empty(), "path traversal must return all-None");
+    }
+
+    #[test]
+    fn collect_rejects_embedded_dotdot() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let usage = collect_cgroup_usage_from_root("system.slice/../../../etc", root.path());
+        assert!(usage.is_empty(), "embedded .. must return all-None");
+    }
+
+    #[test]
+    fn collect_rejects_leading_slash_with_dotdot() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let usage = collect_cgroup_usage_from_root("/system.slice/../../etc", root.path());
+        assert!(usage.is_empty(), "leading / with .. must return all-None");
+    }
+
+    #[test]
+    fn collect_allows_valid_cgroup_path_with_dots_in_name() {
+        let root = tempfile::tempdir().expect("tempdir");
+        // A path segment named "my.service" (single dots in names are fine).
+        let cgroup_dir = root.path().join("system.slice/my.service.scope");
+        std::fs::create_dir_all(&cgroup_dir).unwrap();
+        std::fs::write(cgroup_dir.join("pids.peak"), "1\n").unwrap();
+        let usage = collect_cgroup_usage_from_root("system.slice/my.service.scope", root.path());
+        assert_eq!(usage.tasks_count, Some(1));
+    }
+
+    // -------------------------------------------------------------------------
+    // cpu.stat exact key match regression test (Security NIT 1)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cpu_stat_rejects_prefix_overlap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A hypothetical future kernel key "usage_usec_ext" must NOT be
+        // confused with "usage_usec".
+        std::fs::write(
+            dir.path().join("cpu.stat"),
+            "usage_usec_ext 999999\nuser_usec 100000\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_cpu_stat(dir.path()),
+            None,
+            "usage_usec_ext must not match usage_usec"
+        );
+    }
+
+    #[test]
+    fn cpu_stat_exact_key_match_works() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Both a prefix-collision key and the exact key present.
+        std::fs::write(
+            dir.path().join("cpu.stat"),
+            "usage_usec_ext 999999\nusage_usec 42\n",
+        )
+        .unwrap();
+        assert_eq!(read_cpu_stat(dir.path()), Some(42));
     }
 }
