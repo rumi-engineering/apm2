@@ -208,6 +208,25 @@ pub enum ContainmentError {
         /// Maximum allowed.
         max: usize,
     },
+
+    /// Unreadable `/proc/<pid>/comm` during sccache server discovery.
+    ///
+    /// Fail-closed: if a non-descendant process has an unreadable comm
+    /// entry, we cannot determine whether it is an sccache server. An
+    /// out-of-cgroup sccache server with unreadable comm would be missed,
+    /// violating containment. The caller must treat this as a discovery
+    /// failure and auto-disable sccache.
+    #[error(
+        "unreadable /proc/{pid}/comm during sccache server discovery ({unreadable_count} unreadable of {scanned} scanned)"
+    )]
+    UnreadableCommDuringDiscovery {
+        /// The first PID whose comm could not be read.
+        pid: u32,
+        /// Total number of unreadable comm entries encountered.
+        unreadable_count: usize,
+        /// Total number of entries scanned so far.
+        scanned: usize,
+    },
 }
 
 // =============================================================================
@@ -1320,9 +1339,12 @@ fn discover_sccache_server_pids(
         }
 
         // Check if this is an sccache process.
-        // NIT-1 fix: Log unreadable comm files instead of silently ignoring.
-        // An unreadable comm file means we cannot rule out the process being
-        // an escaped sccache server.
+        // MAJOR fix (fix-round-5): Fail-closed on unreadable comm.
+        // An unreadable comm file for a non-descendant PID means we
+        // cannot determine whether the process is an sccache server.
+        // An out-of-cgroup sccache server hiding behind an unreadable
+        // comm would be missed, violating containment. Return an error
+        // so callers auto-disable sccache (Option A: conservative).
         if let Ok(comm) = read_comm(pid, proc_root) {
             if comm.trim() == "sccache" {
                 found.push(pid);
@@ -1336,10 +1358,11 @@ fn discover_sccache_server_pids(
             }
         } else {
             unreadable_count = unreadable_count.saturating_add(1);
-            eprintln!(
-                "worker: WARNING: cannot read /proc/{pid}/comm during sccache server \
-                 discovery — process may be an undetected sccache server"
-            );
+            return Err(ContainmentError::UnreadableCommDuringDiscovery {
+                pid,
+                unreadable_count,
+                scanned,
+            });
         }
     }
 
@@ -3711,5 +3734,104 @@ mod tests {
         assert_eq!(result.len(), 2, "must find both sccache PIDs");
         assert!(result.contains(&200));
         assert!(result.contains(&300));
+    }
+
+    // ========================================================================
+    // Regression test for MAJOR fix (fix-round-5): fail-closed on unreadable
+    // /proc/<pid>/comm during sccache server discovery
+    // ========================================================================
+
+    #[test]
+    fn discover_sccache_server_pids_fails_closed_on_unreadable_comm() {
+        // A non-descendant PID with an unreadable comm file must cause
+        // discovery to return Err (fail-closed), because the process
+        // identity is unknown and could be an out-of-cgroup sccache server.
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        fs::create_dir_all(&proc_root).unwrap();
+
+        // Reference process (PID 100) — readable, not sccache.
+        let ref_dir = proc_root.join("100");
+        fs::create_dir_all(&ref_dir).unwrap();
+        fs::write(ref_dir.join("status"), "Name:\tcargo\nPPid:\t1\n").unwrap();
+        fs::write(ref_dir.join("cgroup"), "0::/test\n").unwrap();
+        fs::write(ref_dir.join("comm"), "cargo\n").unwrap();
+
+        // PID 200 — readable non-sccache process (benign).
+        let benign_dir = proc_root.join("200");
+        fs::create_dir_all(&benign_dir).unwrap();
+        fs::write(benign_dir.join("status"), "Name:\trustc\nPPid:\t1\n").unwrap();
+        fs::write(benign_dir.join("cgroup"), "0::/test\n").unwrap();
+        fs::write(benign_dir.join("comm"), "rustc\n").unwrap();
+
+        // PID 300 — NO comm file (unreadable). This non-descendant process
+        // has an unknown identity; it could be an escaped sccache server.
+        let unreadable_dir = proc_root.join("300");
+        fs::create_dir_all(&unreadable_dir).unwrap();
+        fs::write(unreadable_dir.join("status"), "Name:\tunknown\nPPid:\t1\n").unwrap();
+        fs::write(unreadable_dir.join("cgroup"), "0::/other\n").unwrap();
+        // Intentionally: no comm file written for PID 300.
+
+        let result = discover_sccache_server_pids(100, &proc_root);
+        assert!(
+            result.is_err(),
+            "must fail-closed when a non-descendant PID has unreadable comm"
+        );
+
+        let err = result.unwrap_err();
+        let err_msg = format!("{err}");
+        assert!(
+            err_msg.contains("unreadable"),
+            "error message must mention unreadable comm: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("300"),
+            "error message must identify the PID with unreadable comm: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn discover_sccache_server_pids_unreadable_comm_propagates_auto_disable() {
+        // End-to-end: when discover_sccache_server_pids returns the
+        // UnreadableCommDuringDiscovery error, the containment protocol
+        // must auto-disable sccache. This tests the caller integration in
+        // `execute_sccache_server_containment_protocol_with_proc`.
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        fs::create_dir_all(&proc_root).unwrap();
+
+        // Reference process (PID 100)
+        let ref_dir = proc_root.join("100");
+        fs::create_dir_all(&ref_dir).unwrap();
+        fs::write(ref_dir.join("status"), "Name:\tcargo\nPPid:\t1\n").unwrap();
+        fs::write(ref_dir.join("cgroup"), "0::/test/unit\n").unwrap();
+        fs::write(ref_dir.join("comm"), "cargo\n").unwrap();
+
+        // PID 200 — no comm file (unreadable non-descendant)
+        let unreadable_dir = proc_root.join("200");
+        fs::create_dir_all(&unreadable_dir).unwrap();
+        fs::write(unreadable_dir.join("status"), "Name:\tmystery\nPPid:\t1\n").unwrap();
+        fs::write(unreadable_dir.join("cgroup"), "0::/other\n").unwrap();
+        // Intentionally: no comm file.
+
+        // Use isolated PATH so sccache binary is never found.
+        let env = vec![("PATH".to_string(), "/nonexistent-path-for-test".to_string())];
+        let result = execute_sccache_server_containment_protocol_with_proc(
+            100,
+            "/test/unit",
+            &env,
+            &proc_root,
+        );
+
+        assert!(result.protocol_executed);
+        assert!(
+            result.auto_disabled,
+            "must auto-disable when comm is unreadable during server discovery"
+        );
+        assert!(
+            result.reason.as_ref().unwrap().contains("unreadable"),
+            "reason must explain unreadable comm failure: {:?}",
+            result.reason
+        );
     }
 }
