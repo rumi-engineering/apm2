@@ -1177,6 +1177,7 @@ pub fn run_fac_worker(
                     append_completed_gates_fingerprint_if_loaded(
                         &mut completed_gates_cache,
                         &candidate.spec,
+                        &current_tuple_digest,
                     );
 
                     if let Some(cost) = observed_cost {
@@ -2366,6 +2367,10 @@ struct CompletedGatesFingerprint {
     enqueue_time: String,
     repo_id: String,
     head_sha: String,
+    /// Canonicalizer tuple digest of the binary that ran this job.
+    /// Dedup only matches when the current binary's digest equals this value,
+    /// ensuring that a rebuilt binary re-gates the same SHA.
+    toolchain_digest: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2388,7 +2393,7 @@ struct CompletedGatesFingerprintSource {
 }
 
 impl CompletedGatesFingerprint {
-    fn from_spec(spec: &FacJobSpecV1) -> Option<Self> {
+    fn from_spec(spec: &FacJobSpecV1, toolchain_digest: &str) -> Option<Self> {
         if !spec.kind.eq_ignore_ascii_case("gates") {
             return None;
         }
@@ -2397,19 +2402,7 @@ impl CompletedGatesFingerprint {
             enqueue_time: spec.enqueue_time.clone(),
             repo_id: spec.source.repo_id.clone(),
             head_sha: spec.source.head_sha.clone(),
-        })
-    }
-
-    fn from_job_spec_json(bytes: &[u8]) -> Option<Self> {
-        let parsed: CompletedGatesFingerprintSpec = serde_json::from_slice(bytes).ok()?;
-        if !parsed.kind.eq_ignore_ascii_case("gates") {
-            return None;
-        }
-        Some(Self {
-            job_id: parsed.job_id,
-            enqueue_time: parsed.enqueue_time,
-            repo_id: parsed.source.repo_id,
-            head_sha: parsed.source.head_sha,
+            toolchain_digest: toolchain_digest.to_string(),
         })
     }
 }
@@ -2435,11 +2428,12 @@ impl CompletedGatesCache {
 fn append_completed_gates_fingerprint_if_loaded(
     completed_gates_cache: &mut Option<CompletedGatesCache>,
     spec: &FacJobSpecV1,
+    toolchain_digest: &str,
 ) {
     let Some(cache) = completed_gates_cache.as_mut() else {
         return;
     };
-    let Some(fingerprint) = CompletedGatesFingerprint::from_spec(spec) else {
+    let Some(fingerprint) = CompletedGatesFingerprint::from_spec(spec, toolchain_digest) else {
         return;
     };
     cache.insert(fingerprint);
@@ -2478,12 +2472,16 @@ fn load_completed_gates_fingerprints(
         let Ok(bytes) = read_bounded(&path, MAX_JOB_SPEC_SIZE) else {
             continue;
         };
-        let Some(fingerprint) = CompletedGatesFingerprint::from_job_spec_json(&bytes) else {
-            continue;
+        let parsed: CompletedGatesFingerprintSpec = match serde_json::from_slice(&bytes) {
+            Ok(p) => p,
+            Err(_) => continue,
         };
+        if !parsed.kind.eq_ignore_ascii_case("gates") {
+            continue;
+        }
 
         let Some(existing_receipt) =
-            apm2_core::fac::find_receipt_for_job(&receipts_dir, &fingerprint.job_id)
+            apm2_core::fac::find_receipt_for_job(&receipts_dir, &parsed.job_id)
         else {
             continue;
         };
@@ -2491,7 +2489,15 @@ fn load_completed_gates_fingerprints(
             continue;
         }
 
-        fingerprints.push(fingerprint);
+        fingerprints.push(CompletedGatesFingerprint {
+            job_id: parsed.job_id,
+            enqueue_time: parsed.enqueue_time,
+            repo_id: parsed.source.repo_id,
+            head_sha: parsed.source.head_sha,
+            toolchain_digest: existing_receipt
+                .canonicalizer_tuple_digest
+                .unwrap_or_default(),
+        });
     }
 
     fingerprints
@@ -2504,17 +2510,22 @@ fn load_completed_gates_cache(queue_root: &Path, fac_root: &Path) -> CompletedGa
 fn find_completed_gates_duplicate_in_cache(
     incoming: &FacJobSpecV1,
     completed_gates_cache: &CompletedGatesCache,
+    current_toolchain_digest: &str,
 ) -> Option<ShaDuplicateMatch> {
     let key = (
         normalize_dedupe_key_component(incoming.source.repo_id.as_str()),
         normalize_dedupe_key_component(incoming.source.head_sha.as_str()),
     );
     let existing_fingerprints = completed_gates_cache.by_repo_sha.get(&key)?;
-    let existing = existing_fingerprints.first()?;
+    // Only match when the toolchain digest is identical — a rebuilt binary must
+    // re-gate the same SHA so that gate results reflect the current toolchain.
+    let existing = existing_fingerprints
+        .iter()
+        .find(|fp| fp.toolchain_digest == current_toolchain_digest)?;
     Some(ShaDuplicateMatch {
         existing_job_id: existing.job_id.clone(),
         existing_enqueue_time: existing.enqueue_time.clone(),
-        matched_by: "repo_sha",
+        matched_by: "repo_sha_toolchain",
     })
 }
 
@@ -2523,6 +2534,7 @@ fn find_completed_gates_duplicate(
     fac_root: &Path,
     incoming: &FacJobSpecV1,
     completed_gates_cache: &mut Option<CompletedGatesCache>,
+    current_toolchain_digest: &str,
 ) -> Option<ShaDuplicateMatch> {
     if !incoming.kind.eq_ignore_ascii_case("gates") {
         return None;
@@ -2530,7 +2542,7 @@ fn find_completed_gates_duplicate(
 
     let cache = completed_gates_cache
         .get_or_insert_with(|| load_completed_gates_cache(queue_root, fac_root));
-    find_completed_gates_duplicate_in_cache(incoming, cache)
+    find_completed_gates_duplicate_in_cache(incoming, cache, current_toolchain_digest)
 }
 
 fn serialize_denial_reason_code(denial_reason: DenialReasonCode) -> String {
@@ -2792,13 +2804,17 @@ fn process_job(
     // TCK-00622 S8: SHA-level gates dedupe.
     //
     // For `gates` jobs, deny duplicate submissions when a completed receipt
-    // already exists for the same `(repo_id, head_sha)`. The request_id is
-    // unique per invocation (includes job_id/enqueue_time in its hash) and
-    // is therefore not a useful dedup key. Matching on the repo+SHA content
-    // tuple ensures duplicate pushes of the same commit are not re-gated.
-    if let Some(dupe) =
-        find_completed_gates_duplicate(queue_root, fac_root, spec, completed_gates_cache)
-    {
+    // already exists for the same `(repo_id, head_sha)` AND the same
+    // toolchain (canonicalizer_tuple_digest). Including the toolchain digest
+    // ensures that a rebuilt binary re-gates the same SHA, while identical
+    // binaries still benefit from dedup.
+    if let Some(dupe) = find_completed_gates_duplicate(
+        queue_root,
+        fac_root,
+        spec,
+        completed_gates_cache,
+        canonicalizer_tuple_digest,
+    ) {
         let reason = format!(
             "already completed: repo={} sha={} kind={} existing_job_id={} matched_by={} existing_enqueue_time={}",
             spec.source.repo_id,
@@ -10278,20 +10294,23 @@ mod tests {
             &fac_root,
             &incoming,
             &mut completed_gates_cache,
+            &tuple_digest,
         )
         .expect("duplicate");
         assert_eq!(duplicate.existing_job_id, completed_spec.job_id);
-        assert_eq!(duplicate.matched_by, "repo_sha");
+        assert_eq!(duplicate.matched_by, "repo_sha_toolchain");
     }
 
     #[test]
-    fn test_find_completed_gates_duplicate_matches_on_repo_sha_regardless_of_request_id() {
+    fn test_find_completed_gates_duplicate_matches_on_repo_sha_and_toolchain() {
+        let toolchain = "b3-256:aaaa";
         let mut cache = CompletedGatesCache::default();
         cache.insert(CompletedGatesFingerprint {
             job_id: "job-completed-sha".to_string(),
             enqueue_time: "2026-02-19T01:00:00Z".to_string(),
             repo_id: "owner/repo".to_string(),
             head_sha: "abc123".to_string(),
+            toolchain_digest: toolchain.to_string(),
         });
 
         let mut incoming = make_receipt_test_spec();
@@ -10300,14 +10319,23 @@ mod tests {
         incoming.actuation.request_id = "request-new".to_string();
         incoming.enqueue_time = "2026-02-19T01:10:00Z".to_string();
 
-        let duplicate = find_completed_gates_duplicate_in_cache(&incoming, &cache)
-            .expect("same (repo_id, head_sha) must match");
+        // Same toolchain -> match.
+        let duplicate = find_completed_gates_duplicate_in_cache(&incoming, &cache, toolchain)
+            .expect("same (repo_id, head_sha, toolchain) must match");
         assert_eq!(duplicate.existing_job_id, "job-completed-sha");
-        assert_eq!(duplicate.matched_by, "repo_sha");
+        assert_eq!(duplicate.matched_by, "repo_sha_toolchain");
+
+        // Different toolchain -> no match (binary changed, must re-gate).
+        let no_match = find_completed_gates_duplicate_in_cache(&incoming, &cache, "b3-256:bbbb");
+        assert!(
+            no_match.is_none(),
+            "different toolchain digest must NOT match"
+        );
     }
 
     #[test]
     fn test_append_completed_gates_fingerprint_if_loaded_supports_same_cycle_dedupe() {
+        let toolchain = "b3-256:cccc";
         let mut completed_spec = make_receipt_test_spec();
         completed_spec.job_id = "job-completed-sha".to_string();
         completed_spec.enqueue_time = "2026-02-19T01:00:00Z".to_string();
@@ -10317,14 +10345,15 @@ mod tests {
         incoming.enqueue_time = "2026-02-19T01:03:00Z".to_string();
 
         let mut cache = Some(CompletedGatesCache::default());
-        append_completed_gates_fingerprint_if_loaded(&mut cache, &completed_spec);
+        append_completed_gates_fingerprint_if_loaded(&mut cache, &completed_spec, toolchain);
         let duplicate = find_completed_gates_duplicate_in_cache(
             &incoming,
             cache.as_ref().expect("cache loaded"),
+            toolchain,
         )
         .expect("duplicate");
         assert_eq!(duplicate.existing_job_id, "job-completed-sha");
-        assert_eq!(duplicate.matched_by, "repo_sha");
+        assert_eq!(duplicate.matched_by, "repo_sha_toolchain");
     }
 
     #[test]
