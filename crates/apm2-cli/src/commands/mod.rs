@@ -80,6 +80,7 @@ pub struct EnvVarTestLock(std::sync::Mutex<()>);
 
 #[cfg(test)]
 impl EnvVarTestLock {
+    #[allow(clippy::unnecessary_wraps)]
     pub fn lock(&self) -> Result<std::sync::MutexGuard<'_, ()>, std::convert::Infallible> {
         Ok(match self.0.lock() {
             Ok(guard) => guard,
