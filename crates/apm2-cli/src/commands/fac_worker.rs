@@ -96,13 +96,13 @@ use apm2_core::fac::{
     ChannelBoundaryTrace, DenialReasonCode, ExecutionBackend, FAC_LANE_CLEANUP_RECEIPT_SCHEMA,
     FacJobOutcome, FacJobReceiptV1, FacJobReceiptV1Builder, FacPolicyV1, GateReceipt,
     GateReceiptBuilder, LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1,
-    LaneCorruptMarkerV1, LaneProfileV1, MAX_POLICY_SIZE, PATCH_FORMAT_GIT_DIFF_V1,
-    QueueAdmissionTrace as JobQueueAdmissionTrace, ReceiptPipelineError, ReceiptWritePipeline,
-    RepoMirrorManager, SystemModeConfig, SystemdUnitProperties, TOOLCHAIN_MAX_CACHE_FILE_BYTES,
-    apply_credential_mount_to_env, build_github_credential_mount, build_job_environment,
-    compute_policy_hash, deserialize_policy, fingerprint_short_hex, load_or_default_boundary_id,
-    move_job_to_terminal, outcome_to_terminal_state, parse_policy_hash,
-    persist_content_addressed_receipt, persist_policy, rename_noreplace,
+    LaneCorruptMarkerV1, LaneProfileV1, LogRetentionConfig, MAX_POLICY_SIZE,
+    PATCH_FORMAT_GIT_DIFF_V1, QueueAdmissionTrace as JobQueueAdmissionTrace, ReceiptPipelineError,
+    ReceiptWritePipeline, RepoMirrorManager, SystemModeConfig, SystemdUnitProperties,
+    TOOLCHAIN_MAX_CACHE_FILE_BYTES, apply_credential_mount_to_env, build_github_credential_mount,
+    build_job_environment, compute_policy_hash, deserialize_policy, fingerprint_short_hex,
+    load_or_default_boundary_id, move_job_to_terminal, outcome_to_terminal_state,
+    parse_policy_hash, persist_content_addressed_receipt, persist_policy, rename_noreplace,
     resolve_toolchain_fingerprint_cached, run_preflight, select_and_validate_backend,
     serialize_cache, toolchain_cache_dir, toolchain_cache_file_path,
 };
@@ -4580,9 +4580,13 @@ fn process_job(
         // SEC-CTRL-LANE-CLEANUP-002: Checkout failure may leave the workspace
         // in a partially modified state. Run lane cleanup to restore isolation
         // before denying the job. On cleanup failure, the lane is marked CORRUPT.
-        if let Err(cleanup_err) =
-            execute_lane_cleanup(fac_root, &lane_mgr, &acquired_lane_id, &lane_workspace)
-        {
+        if let Err(cleanup_err) = execute_lane_cleanup(
+            fac_root,
+            &lane_mgr,
+            &acquired_lane_id,
+            &lane_workspace,
+            &log_retention_from_policy(policy),
+        ) {
             eprintln!(
                 "worker: WARNING: lane cleanup during checkout-failure denial failed for {acquired_lane_id}: {cleanup_err}"
             );
@@ -4640,9 +4644,13 @@ fn process_job(
     let deny_with_reason_and_lease_cleanup = |reason: &str| -> JobOutcome {
         // Run full lane cleanup to restore workspace isolation.
         // This is the same cleanup path used after successful job completion.
-        if let Err(cleanup_err) =
-            execute_lane_cleanup(fac_root, &lane_mgr, &acquired_lane_id, &lane_workspace)
-        {
+        if let Err(cleanup_err) = execute_lane_cleanup(
+            fac_root,
+            &lane_mgr,
+            &acquired_lane_id,
+            &lane_workspace,
+            &log_retention_from_policy(policy),
+        ) {
             eprintln!(
                 "worker: WARNING: lane cleanup during denial failed for {acquired_lane_id}: {cleanup_err}"
             );
@@ -4859,9 +4867,13 @@ fn process_job(
                 }
 
                 // Run lane cleanup and commit denial via pipeline.
-                if let Err(cleanup_err) =
-                    execute_lane_cleanup(fac_root, &lane_mgr, &acquired_lane_id, &lane_workspace)
-                {
+                if let Err(cleanup_err) = execute_lane_cleanup(
+                    fac_root,
+                    &lane_mgr,
+                    &acquired_lane_id,
+                    &lane_workspace,
+                    &log_retention_from_policy(policy),
+                ) {
                     eprintln!(
                         "worker: WARNING: lane cleanup during patch hardening denial failed for {acquired_lane_id}: {cleanup_err}"
                     );
@@ -4913,9 +4925,13 @@ fn process_job(
         // SEC-CTRL-LANE-CLEANUP-002: This denial path is post-checkout, so the
         // workspace may have been modified by a prior checkout. Run lane cleanup
         // to restore workspace isolation before denying the job.
-        if let Err(cleanup_err) =
-            execute_lane_cleanup(fac_root, &lane_mgr, &acquired_lane_id, &lane_workspace)
-        {
+        if let Err(cleanup_err) = execute_lane_cleanup(
+            fac_root,
+            &lane_mgr,
+            &acquired_lane_id,
+            &lane_workspace,
+            &log_retention_from_policy(policy),
+        ) {
             eprintln!(
                 "worker: WARNING: lane cleanup during source-kind denial failed for {acquired_lane_id}: {cleanup_err}"
             );
@@ -5230,9 +5246,13 @@ fn process_job(
     // Cleanup failures are logged and result in lane corruption markers,
     // but they do NOT change the already-recorded job outcome. This
     // decouples infrastructure lifecycle from job execution integrity.
-    if let Err(cleanup_err) =
-        execute_lane_cleanup(fac_root, &lane_mgr, &acquired_lane_id, &lane_workspace)
-    {
+    if let Err(cleanup_err) = execute_lane_cleanup(
+        fac_root,
+        &lane_mgr,
+        &acquired_lane_id,
+        &lane_workspace,
+        &log_retention_from_policy(policy),
+    ) {
         eprintln!(
             "worker: WARNING: post-completion lane cleanup failed for {acquired_lane_id}: {cleanup_err}"
         );
@@ -5616,17 +5636,35 @@ impl std::fmt::Display for LaneCleanupError {
     }
 }
 
+/// Build a `LogRetentionConfig` from `FacPolicyV1` fields (TCK-00571).
+///
+/// This is the single conversion point ensuring post-job cleanup and GC
+/// derive their retention config from the same policy fields.
+fn log_retention_from_policy(policy: &FacPolicyV1) -> LogRetentionConfig {
+    LogRetentionConfig {
+        per_lane_log_max_bytes: policy.per_lane_log_max_bytes,
+        per_job_log_ttl_secs: u64::from(policy.per_job_log_ttl_days).saturating_mul(24 * 3600),
+        keep_last_n_jobs_per_lane: policy.keep_last_n_jobs_per_lane,
+    }
+}
+
 /// Run lane cleanup and emit cleanup receipts.
 /// On failure, mark the lane as corrupt.
+///
+/// TCK-00571 (CQ-BLOCKER-1 fix): Accepts a `LogRetentionConfig` to ensure
+/// post-job cleanup enforces the same retention policy as GC. The config
+/// is derived from `FacPolicyV1` fields (`per_lane_log_max_bytes`,
+/// `per_job_log_ttl_days`, `keep_last_n_jobs_per_lane`).
 fn execute_lane_cleanup(
     fac_root: &Path,
     lane_mgr: &LaneManager,
     lane_id: &str,
     lane_workspace: &Path,
+    log_retention: &LogRetentionConfig,
 ) -> Result<(), LaneCleanupError> {
     let cleanup_timestamp = current_timestamp_epoch_secs();
 
-    match lane_mgr.run_lane_cleanup(lane_id, lane_workspace) {
+    match lane_mgr.run_lane_cleanup_with_retention(lane_id, lane_workspace, log_retention) {
         Ok(steps_completed) => {
             if let Err(receipt_err) = emit_lane_cleanup_receipt(
                 fac_root,
@@ -6922,9 +6960,13 @@ fn execute_warm_job(
     }
 
     // Post-completion lane cleanup (same as standard jobs).
-    if let Err(cleanup_err) =
-        execute_lane_cleanup(fac_root, lane_mgr, acquired_lane_id, lane_workspace)
-    {
+    if let Err(cleanup_err) = execute_lane_cleanup(
+        fac_root,
+        lane_mgr,
+        acquired_lane_id,
+        lane_workspace,
+        &log_retention_from_policy(policy),
+    ) {
         eprintln!(
             "worker: WARNING: post-completion lane cleanup failed for warm job on {acquired_lane_id}: {cleanup_err}"
         );
@@ -9732,8 +9774,14 @@ mod tests {
         persist_running_lease(&lane_mgr, lane_id);
         init_test_workspace_git_repo(&workspace);
 
-        execute_lane_cleanup(&fac_root, &lane_mgr, lane_id, &workspace)
-            .expect("lane cleanup should succeed");
+        execute_lane_cleanup(
+            &fac_root,
+            &lane_mgr,
+            lane_id,
+            &workspace,
+            &LogRetentionConfig::default(),
+        )
+        .expect("lane cleanup should succeed");
 
         let status = lane_mgr.lane_status(lane_id).expect("lane status");
         assert_eq!(status.state, LaneState::Idle);
@@ -9775,8 +9823,14 @@ mod tests {
         let workspace = lane_mgr.lane_dir(lane_id).join("workspace");
         persist_running_lease(&lane_mgr, lane_id);
 
-        let err = execute_lane_cleanup(&fac_root, &lane_mgr, lane_id, &workspace)
-            .expect_err("cleanup should fail when workspace is not a git repo");
+        let err = execute_lane_cleanup(
+            &fac_root,
+            &lane_mgr,
+            lane_id,
+            &workspace,
+            &LogRetentionConfig::default(),
+        )
+        .expect_err("cleanup should fail when workspace is not a git repo");
         assert!(err.to_string().contains("lane cleanup failed"));
 
         let status = lane_mgr.lane_status(lane_id).expect("lane status");
@@ -9995,8 +10049,14 @@ mod tests {
         assert_eq!(readme_content, "modified content");
 
         // Run lane cleanup (same function used on denial paths).
-        execute_lane_cleanup(&fac_root, &lane_mgr, lane_id, &workspace)
-            .expect("lane cleanup should succeed");
+        execute_lane_cleanup(
+            &fac_root,
+            &lane_mgr,
+            lane_id,
+            &workspace,
+            &LogRetentionConfig::default(),
+        )
+        .expect("lane cleanup should succeed");
 
         // Verify workspace is restored to clean state.
         assert!(
@@ -10032,8 +10092,14 @@ mod tests {
         // Do NOT init git repo — this will cause cleanup to fail.
         fs::create_dir_all(&workspace).expect("create workspace dir");
 
-        let err = execute_lane_cleanup(&fac_root, &lane_mgr, lane_id, &workspace)
-            .expect_err("cleanup should fail on non-git workspace");
+        let err = execute_lane_cleanup(
+            &fac_root,
+            &lane_mgr,
+            lane_id,
+            &workspace,
+            &LogRetentionConfig::default(),
+        )
+        .expect_err("cleanup should fail on non-git workspace");
         assert!(err.to_string().contains("lane cleanup failed"));
 
         // Verify lane is marked CORRUPT.

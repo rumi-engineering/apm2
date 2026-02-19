@@ -80,17 +80,23 @@ const CLEANUP_STEP_LOG_QUOTA: &str = "log_quota";
 const CLEANUP_STEP_WORKSPACE_VALIDATION: &str = "workspace_path_validation";
 
 /// Maximum log directory size in bytes (100 MB).
+///
+/// Used by the legacy `enforce_log_quota` (test-only). Production cleanup
+/// now uses `enforce_log_retention` with policy-derived `LogRetentionConfig`.
+#[cfg(test)]
 const MAX_LOG_QUOTA_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Maximum number of collected log entries during quota enforcement.
 const MAX_LOG_ENTRIES: usize = 10_000;
 
 /// Maximum directory recursion depth while enforcing log quota.
+#[cfg(test)]
 const MAX_LOG_QUOTA_DIR_DEPTH: usize = 8;
 
 /// Maximum number of directory entries read per directory during log quota
 /// enforcement. Prevents directory-flood `DoS` where an attacker creates
 /// millions of subdirectories. Matches INV-RMTREE-009 from `safe_rmtree_v1`.
+#[cfg(test)]
 const MAX_DIR_ENTRIES: usize = 10_000;
 
 /// Default lane count when not configured via environment.
@@ -2139,14 +2145,40 @@ impl LaneManager {
         Ok(statuses)
     }
 
-    /// Run lane cleanup:
+    /// Run lane cleanup with default log retention config.
+    ///
+    /// Delegates to [`Self::run_lane_cleanup_with_retention`] using
+    /// [`LogRetentionConfig::default()`](super::gc::LogRetentionConfig).
+    ///
+    /// # Errors
+    ///
+    /// Returns `LaneCleanupError::GitCommandFailed` on git failures, and
+    /// `LaneCleanupError::TempPruneFailed` or
+    /// `LaneCleanupError::LogQuotaFailed` for cleanup actions.
+    pub fn run_lane_cleanup(
+        &self,
+        lane_id: &str,
+        workspace_path: &Path,
+    ) -> Result<Vec<String>, LaneCleanupError> {
+        self.run_lane_cleanup_with_retention(
+            lane_id,
+            workspace_path,
+            &super::gc::LogRetentionConfig::default(),
+        )
+    }
+
+    /// Run lane cleanup with explicit log retention policy (TCK-00571).
+    ///
+    /// Steps:
     /// 1. Reset workspace (`git reset --hard HEAD`)
     /// 2. Remove untracked files (`git clean -ffdxq`)
     /// 3. Remove temporary directory (`tmp`) via safe deletion
     /// 4. Prune per-lane env dirs from `LANE_ENV_DIRS` (excluding `tmp`):
     ///    (`home/`, `xdg_cache/`, `xdg_config/`, `xdg_data/`, `xdg_state/`,
     ///    `xdg_runtime/`)
-    /// 5. Enforce log quota by pruning oldest logs to 100 MiB
+    /// 5. Enforce log retention policy using the provided
+    ///    [`LogRetentionConfig`](super::gc::LogRetentionConfig), ensuring
+    ///    cleanup and GC enforce the same retention contract.
     ///
     /// # Errors
     ///
@@ -2154,10 +2186,11 @@ impl LaneManager {
     /// `LaneCleanupError::TempPruneFailed` or
     /// `LaneCleanupError::LogQuotaFailed` for cleanup actions.
     #[allow(clippy::too_many_lines)]
-    pub fn run_lane_cleanup(
+    pub fn run_lane_cleanup_with_retention(
         &self,
         lane_id: &str,
         workspace_path: &Path,
+        log_retention: &super::gc::LogRetentionConfig,
     ) -> Result<Vec<String>, LaneCleanupError> {
         validate_lane_id(lane_id).map_err(|e| {
             LaneCleanupError::Io(io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
@@ -2313,8 +2346,16 @@ impl LaneManager {
         }
         steps_completed.push(CLEANUP_STEP_ENV_DIR_PRUNE.to_string());
 
-        // Step 4: Enforce log quota.
-        if let Err(err) = Self::enforce_log_quota(&lanes_dir.join("logs"), &steps_completed) {
+        // Step 4: Enforce log retention policy (TCK-00571).
+        //
+        // CQ-BLOCKER-1 fix: Uses the caller-provided LogRetentionConfig
+        // (derived from FacPolicyV1 fields per_job_log_ttl_days,
+        // keep_last_n_jobs_per_lane, per_lane_log_max_bytes) instead of a
+        // hardcoded 100 MiB file-level quota. This ensures post-job cleanup
+        // and GC enforce the same retention contract.
+        if let Err(err) =
+            Self::enforce_log_retention(&lanes_dir.join("logs"), log_retention, &steps_completed)
+        {
             persist_lease_state(&mut lease, LaneState::Corrupt)?;
             return Err(err);
         }
@@ -2329,6 +2370,11 @@ impl LaneManager {
         Ok(steps_completed)
     }
 
+    /// Legacy log quota enforcement (file-level, hardcoded 100 MiB).
+    ///
+    /// Retained for existing test coverage. Production cleanup now uses
+    /// `enforce_log_retention` with policy-derived `LogRetentionConfig`.
+    #[cfg(test)]
     fn enforce_log_quota(
         logs_dir: &Path,
         steps_completed: &[String],
@@ -2377,6 +2423,7 @@ impl LaneManager {
         Ok(())
     }
 
+    #[cfg(test)]
     fn collect_log_entries(
         base: &Path,
         entries: &mut Vec<(PathBuf, u64, SystemTime)>,
@@ -2465,6 +2512,189 @@ impl LaneManager {
             let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             entries.push((path, size, mtime));
             *total_size = total_size.saturating_add(size);
+        }
+
+        Ok(())
+    }
+
+    /// Enforce log retention policy on a lane's `logs/` directory (TCK-00571).
+    ///
+    /// This is the post-job cleanup counterpart to the GC planner's
+    /// `collect_lane_log_retention_targets`. It applies the same three
+    /// retention criteria (TTL, keep-last-N, byte quota) to ensure cleanup
+    /// and GC enforce an identical retention contract (CQ-BLOCKER-1 fix).
+    ///
+    /// Unlike the old `enforce_log_quota` (which operated on individual files),
+    /// this method operates at the job-log-directory level: each immediate
+    /// subdirectory of `logs/` is treated as a single pruning unit.
+    #[allow(clippy::too_many_lines, clippy::items_after_statements)]
+    fn enforce_log_retention(
+        logs_dir: &Path,
+        config: &super::gc::LogRetentionConfig,
+        steps_completed: &[String],
+    ) -> Result<(), LaneCleanupError> {
+        if !logs_dir.exists() {
+            return Ok(());
+        }
+
+        let effective_ttl = config.effective_ttl_secs();
+        let now_secs = {
+            // SECURITY JUSTIFICATION (CTR-2501): Log retention staleness
+            // uses wall-clock time because it is an operational maintenance
+            // task, not a coordinated consensus operation.
+            #[allow(clippy::disallowed_methods)]
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        };
+
+        // Collect immediate subdirectories (job log dirs) with metadata.
+        let entries = fs::read_dir(logs_dir).map_err(|e| LaneCleanupError::LogQuotaFailed {
+            step: CLEANUP_STEP_LOG_QUOTA,
+            reason: format!("cannot read logs directory {}: {e}", logs_dir.display()),
+            steps_completed: steps_completed.to_vec(),
+            failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+        })?;
+
+        struct JobLogDirEntry {
+            path: PathBuf,
+            modified_secs: u64,
+            estimated_bytes: u64,
+            pruned: bool,
+        }
+
+        let mut job_dirs: Vec<JobLogDirEntry> = Vec::new();
+        let mut scan_count = 0usize;
+        for entry_result in entries {
+            scan_count += 1;
+            if scan_count > MAX_LOG_ENTRIES {
+                return Err(LaneCleanupError::LogQuotaFailed {
+                    step: CLEANUP_STEP_LOG_QUOTA,
+                    reason: format!(
+                        "log directory {} contains more than {MAX_LOG_ENTRIES} entries \
+                         (directory-flood DoS prevention)",
+                        logs_dir.display()
+                    ),
+                    steps_completed: steps_completed.to_vec(),
+                    failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+                });
+            }
+
+            let entry = entry_result.map_err(|e| LaneCleanupError::LogQuotaFailed {
+                step: CLEANUP_STEP_LOG_QUOTA,
+                reason: format!("cannot read log directory entry: {e}"),
+                steps_completed: steps_completed.to_vec(),
+                failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+            })?;
+
+            let path = entry.path();
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|e| LaneCleanupError::LogQuotaFailed {
+                    step: CLEANUP_STEP_LOG_QUOTA,
+                    reason: format!("cannot stat log entry {}: {e}", path.display()),
+                    steps_completed: steps_completed.to_vec(),
+                    failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+                })?;
+
+            // Skip non-directories (files, symlinks) — retention operates
+            // at the directory level.
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                continue;
+            }
+
+            let modified_secs = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+
+            // Shallow size estimation: sum immediate children file sizes.
+            let estimated_bytes = super::gc::estimate_job_log_dir_size_shallow(&path);
+
+            job_dirs.push(JobLogDirEntry {
+                path,
+                modified_secs,
+                estimated_bytes,
+                pruned: false,
+            });
+        }
+
+        if job_dirs.is_empty() {
+            return Ok(());
+        }
+
+        // Sort by mtime ascending (oldest first), then by path.
+        job_dirs.sort_by(|a, b| {
+            a.modified_secs
+                .cmp(&b.modified_secs)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+
+        let keep_last_n = config.keep_last_n_jobs_per_lane as usize;
+        let total_count = job_dirs.len();
+        let protected_start = total_count.saturating_sub(keep_last_n);
+
+        // Phase 1: TTL-based pruning outside keep-last-N window.
+        for (idx, entry) in job_dirs.iter_mut().enumerate() {
+            if idx >= protected_start {
+                break;
+            }
+            if effective_ttl > 0 && entry.modified_secs.saturating_add(effective_ttl) <= now_secs {
+                entry.pruned = true;
+            }
+        }
+
+        // Phase 2: Byte quota enforcement.
+        if config.per_lane_log_max_bytes > 0 {
+            let mut total_bytes: u64 = job_dirs
+                .iter()
+                .map(|e| e.estimated_bytes)
+                .fold(0u64, u64::saturating_add);
+
+            // Subtract bytes already marked for TTL pruning.
+            for entry in &job_dirs {
+                if entry.pruned {
+                    total_bytes = total_bytes.saturating_sub(entry.estimated_bytes);
+                }
+            }
+
+            if total_bytes > config.per_lane_log_max_bytes {
+                for (idx, entry) in job_dirs.iter_mut().enumerate() {
+                    if total_bytes <= config.per_lane_log_max_bytes {
+                        break;
+                    }
+                    if idx >= protected_start {
+                        break;
+                    }
+                    if entry.pruned {
+                        continue;
+                    }
+                    entry.pruned = true;
+                    total_bytes = total_bytes.saturating_sub(entry.estimated_bytes);
+                }
+            }
+        }
+
+        // Execute pruning via safe_rmtree for each marked directory.
+        for entry in &job_dirs {
+            if !entry.pruned {
+                continue;
+            }
+            match safe_rmtree_v1(&entry.path, logs_dir) {
+                Ok(_) => {},
+                Err(err) => {
+                    return Err(LaneCleanupError::LogQuotaFailed {
+                        step: CLEANUP_STEP_LOG_QUOTA,
+                        reason: format!(
+                            "cannot prune log directory {}: {err}",
+                            entry.path.display()
+                        ),
+                        steps_completed: steps_completed.to_vec(),
+                        failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+                    });
+                },
+            }
         }
 
         Ok(())
@@ -4668,7 +4898,14 @@ mod tests {
     }
 
     #[test]
-    fn run_lane_cleanup_preserves_steps_for_log_quota_failure() {
+    fn run_lane_cleanup_deeply_nested_logs_succeeds() {
+        // With enforce_log_retention (TCK-00571), cleanup operates at the
+        // job-log-directory level (immediate children of logs/). Deep
+        // nesting inside a job log directory is not a failure condition
+        // because the scanner does not recurse into job dirs — it only
+        // examines top-level entries. This test verifies that deeply
+        // nested content inside a single job log dir does NOT cause a
+        // cleanup failure.
         let root = tempfile::tempdir().expect("tempdir");
         let fac_root = root.path().join("private").join("fac");
         fs::create_dir_all(&fac_root).expect("create fac root");
@@ -4682,28 +4919,21 @@ mod tests {
         persist_running_lease(&manager, lane_id);
 
         let logs_dir = lane_dir.join("logs");
-        let mut depth_dir = logs_dir;
-        for level in 0..(MAX_LOG_QUOTA_DIR_DEPTH + 2) {
+        // Create a single job-log directory with deeply nested content.
+        let mut depth_dir = logs_dir.join("job-deep");
+        for level in 0..20 {
             depth_dir = depth_dir.join(format!("level_{level}"));
         }
         fs::create_dir_all(&depth_dir).expect("create deep logs directory");
         fs::write(depth_dir.join("deep.log"), b"payload").expect("write deep log file");
 
-        let err = manager
+        let steps = manager
             .run_lane_cleanup(lane_id, &workspace)
-            .expect_err("cleanup should fail from log quota traversal depth check");
-        assert!(matches!(err, LaneCleanupError::LogQuotaFailed { .. }));
-        assert_eq!(
-            err.steps_completed(),
-            [
-                CLEANUP_STEP_GIT_RESET.to_string(),
-                CLEANUP_STEP_GIT_CLEAN.to_string(),
-                CLEANUP_STEP_TEMP_PRUNE.to_string(),
-                CLEANUP_STEP_ENV_DIR_PRUNE.to_string(),
-            ]
-            .as_slice()
+            .expect("cleanup should succeed — deep nesting is inside a job dir");
+        assert!(
+            steps.contains(&CLEANUP_STEP_LOG_QUOTA.to_string()),
+            "log quota step should have completed"
         );
-        assert_eq!(err.failure_step(), Some(CLEANUP_STEP_LOG_QUOTA));
     }
 
     #[test]
@@ -5327,6 +5557,110 @@ mod tests {
             steps.contains(&CLEANUP_STEP_GIT_CLEAN.to_string()),
             "git clean should have completed"
         );
+    }
+
+    // ── TCK-00571: Log retention cleanup tests ──────────────────────────
+
+    #[test]
+    fn run_lane_cleanup_with_retention_prunes_stale_job_dirs() {
+        // CQ-BLOCKER-1 regression: run_lane_cleanup_with_retention must use
+        // the provided LogRetentionConfig, not a hardcoded 100 MiB quota.
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = &lane_ids[0];
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        let logs_dir = lane_dir.join("logs");
+
+        // Initialize a git repo in the workspace.
+        let out = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&workspace)
+            .output()
+            .expect("git init");
+        assert!(out.status.success(), "git init must succeed");
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@test.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .current_dir(&workspace)
+            .output()
+            .expect("git commit");
+        assert!(out.status.success(), "git commit must succeed");
+
+        // Create a lease so run_lane_cleanup_with_retention can proceed.
+        let lease = LaneLeaseV1 {
+            schema: LANE_LEASE_V1_SCHEMA.to_string(),
+            lane_id: lane_id.clone(),
+            state: LaneState::Running,
+            job_id: "test-job".to_string(),
+            pid: std::process::id(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            toolchain_fingerprint: "test-fp".to_string(),
+            lane_profile_hash:
+                "b3-256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+        };
+        lease.persist(&lane_dir).expect("persist lease");
+
+        // Create job log directories — one stale (will be pruned), one fresh.
+        let stale_dir = logs_dir.join("job-stale");
+        fs::create_dir_all(&stale_dir).expect("create stale dir");
+        let stale_file = stale_dir.join("output.log");
+        let file = std::fs::File::create(&stale_file).expect("create file");
+        file.set_len(100).expect("set len");
+        // Backdate the directory mtime to 30 days ago.
+        // SECURITY JUSTIFICATION (CTR-2501): Test-only wall-clock usage for
+        // backdating file mtime; not a coordination or consensus path.
+        #[allow(clippy::disallowed_methods)]
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        #[allow(clippy::cast_possible_wrap)]
+        let stale_time = filetime::FileTime::from_unix_time((now - 30 * 86400) as i64, 0);
+        filetime::set_file_mtime(&stale_dir, stale_time).expect("set mtime");
+
+        let fresh_dir = logs_dir.join("job-fresh");
+        fs::create_dir_all(&fresh_dir).expect("create fresh dir");
+        let fresh_file = fresh_dir.join("output.log");
+        let file = std::fs::File::create(&fresh_file).expect("create file");
+        file.set_len(100).expect("set len");
+
+        // Use a short TTL to demonstrate that the config is actually used.
+        let retention = crate::fac::gc::LogRetentionConfig {
+            per_lane_log_max_bytes: 0,
+            per_job_log_ttl_secs: 86400, // 1 day
+            keep_last_n_jobs_per_lane: 0,
+        };
+
+        let steps = manager
+            .run_lane_cleanup_with_retention(lane_id, &workspace, &retention)
+            .expect("cleanup should succeed");
+
+        assert!(
+            steps.contains(&CLEANUP_STEP_LOG_QUOTA.to_string()),
+            "log quota step should have completed"
+        );
+        // The stale directory should have been pruned.
+        assert!(
+            !stale_dir.exists(),
+            "stale job log dir must be pruned by retention policy"
+        );
+        // The fresh directory should still exist.
+        assert!(fresh_dir.exists(), "fresh job log dir must be retained");
     }
 
     // ── Init and Reconcile Tests (TCK-00539) ────────────────────────────

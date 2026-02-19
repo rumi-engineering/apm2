@@ -46,6 +46,11 @@ const RECEIPT_REFERENCE_HORIZON_SECS: u64 = BLOB_RETENTION_SECS * 2;
 const MAX_TRAVERSAL_DEPTH: usize = 64;
 // Must not exceed safe_rmtree::MAX_DIR_ENTRIES.
 
+/// Default per-job log TTL in seconds (7 days).
+///
+/// Used when `per_job_log_ttl_secs` is 0 (documented as "use default").
+const DEFAULT_PER_JOB_LOG_TTL_SECS: u64 = 7 * 24 * 3600;
+
 /// Configuration for per-lane log retention pruning (TCK-00571).
 ///
 /// Controls which job log directories are eligible for pruning based on
@@ -56,11 +61,26 @@ pub struct LogRetentionConfig {
     /// oldest-first. A value of 0 means "no byte quota" (unlimited).
     pub per_lane_log_max_bytes: u64,
     /// Per-job log TTL in seconds. Job log directories older than this are
-    /// pruning candidates. A value of 0 means "no TTL pruning".
+    /// pruning candidates. A value of 0 means "use default" (7 days),
+    /// matching the documented `FacPolicyV1::per_job_log_ttl_days` semantics.
     pub per_job_log_ttl_secs: u64,
     /// Number of most-recent job log directories to keep per lane regardless
     /// of TTL or byte quota. A value of 0 means "no keep-last-N protection".
     pub keep_last_n_jobs_per_lane: u32,
+}
+
+impl LogRetentionConfig {
+    /// Returns the effective TTL in seconds, mapping 0 to the default (7 days).
+    ///
+    /// This ensures `per_job_log_ttl_secs == 0` uses the documented default
+    /// rather than silently disabling age pruning (CQ-NIT-1 fix).
+    pub(crate) const fn effective_ttl_secs(&self) -> u64 {
+        if self.per_job_log_ttl_secs == 0 {
+            DEFAULT_PER_JOB_LOG_TTL_SECS
+        } else {
+            self.per_job_log_ttl_secs
+        }
+    }
 }
 
 impl Default for LogRetentionConfig {
@@ -326,11 +346,37 @@ pub fn plan_gc_with_log_retention(
     }
 
     // TCK-00571: Per-lane log retention pruning.
+    //
+    // CQ-MAJOR-1/3 fix: Only scan IDLE lanes for log retention pruning.
+    // Active/running lanes must never have their logs pruned.
+    //
+    // CQ-MAJOR-2 fix: Build a set of lane IDs whose logs/ directory is
+    // already scheduled for full removal (LaneLog target). Suppress
+    // LaneLogRetention child targets for these lanes to prevent
+    // overlapping parent/child deletion and double-counting bytes_freed.
+    let idle_lane_ids: Vec<String> = statuses
+        .iter()
+        .filter(|s| s.state == LaneState::Idle)
+        .map(|s| s.lane_id.clone())
+        .collect();
+
+    let lanes_with_full_log_gc: HashSet<String> = targets
+        .iter()
+        .filter(|t| matches!(t.kind, crate::fac::gc_receipt::GcActionKind::LaneLog))
+        .filter_map(|t| {
+            // Extract lane_id from path: .../lanes/{lane_id}/logs
+            t.path
+                .parent()
+                .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+        })
+        .collect();
+
     collect_lane_log_retention_targets(
         lane_manager,
-        &known_lane_ids,
+        &idle_lane_ids,
         log_retention,
         now_secs,
+        &lanes_with_full_log_gc,
         &mut targets,
     );
 
@@ -392,44 +438,86 @@ const MAX_JOB_LOG_ENTRIES_PER_LANE: usize = 10_000;
 
 /// Collect per-lane log retention pruning targets (TCK-00571).
 ///
-/// For each lane, scans the `logs/` directory for job log subdirectories,
-/// then applies three pruning criteria in order:
+/// For each **idle** lane (caller ensures only idle lane IDs are passed),
+/// scans the `logs/` directory for job log subdirectories, then applies
+/// three pruning criteria in order:
 ///
 /// 1. **Keep-last-N**: The N most-recent job log directories (by mtime) are
 ///    always retained.
-/// 2. **TTL**: Job log directories older than the configured TTL are eligible
-///    for pruning.
+/// 2. **TTL**: Job log directories older than the effective TTL (0 maps to
+///    7-day default) are eligible for pruning.
 /// 3. **Byte quota**: If total log bytes still exceed the per-lane cap after
 ///    TTL pruning, the oldest remaining directories are pruned until the lane
 ///    is within quota.
 ///
 /// Pruning order is deterministic: entries are sorted by mtime ascending,
 /// then by path (lexicographic) for tiebreaking.
+///
+/// # Fail-Closed Behavior (S-MAJOR-1/2 fix)
+///
+/// - If `read_dir` on the logs directory fails, the lane is **skipped
+///   entirely** (fail-closed: no partial pruning).
+/// - If the scan exceeds `MAX_JOB_LOG_ENTRIES_PER_LANE`, the lane is **skipped
+///   entirely** rather than proceeding with a partial candidate set that could
+///   be starved by decoy directories.
+///
+/// # Deduplication (CQ-MAJOR-2 fix)
+///
+/// Lanes whose logs directory is already scheduled for full removal
+/// (`LaneLog` target) are excluded via `lanes_with_full_log_gc` to prevent
+/// overlapping parent/child targets and double-counting `bytes_freed`.
+///
+/// # Size Estimation (S-BLOCKER-1 fix)
+///
+/// Uses lightweight `metadata.len()` from the directory entry stat call
+/// (single-level) rather than recursive `estimate_dir_size()` traversal.
+/// This reduces the aggregate I/O from O(N * M * depth) to O(N) per lane,
+/// preventing the `DoS` from 10,000 job logs with 10,000 files each.
+#[allow(clippy::too_many_lines)]
 fn collect_lane_log_retention_targets(
     lane_manager: &LaneManager,
     lane_ids: &[String],
     config: &LogRetentionConfig,
     now_secs: u64,
+    lanes_with_full_log_gc: &HashSet<String>,
     targets: &mut Vec<GcTarget>,
 ) {
+    // CQ-NIT-1 fix: Apply effective TTL (0 -> 7-day default).
+    let effective_ttl = config.effective_ttl_secs();
+
     for lane_id in lane_ids {
+        // CQ-MAJOR-2 fix: Skip lanes whose logs/ is already scheduled for
+        // full removal — child targets would be redundant.
+        if lanes_with_full_log_gc.contains(lane_id) {
+            continue;
+        }
+
         let lane_dir = lane_manager.lane_dir(lane_id);
         let log_dir = lane_dir.join("logs");
         if !log_dir.exists() {
             continue;
         }
 
+        // S-MAJOR-1/2 fix: Fail-closed on read_dir error — skip lane
+        // entirely rather than proceeding with zero candidates.
         let Ok(entries) = std::fs::read_dir(&log_dir) else {
+            // Fail-closed: cannot enumerate log directory. Lane is
+            // skipped; retention will be retried on the next GC cycle.
             continue;
         };
 
         // Collect job log subdirectories with their metadata.
         let mut job_logs: Vec<JobLogEntry> = Vec::new();
         let mut scan_count = 0usize;
+        let mut scan_overflow = false;
         for entry in entries.flatten() {
             scan_count += 1;
             if scan_count > MAX_JOB_LOG_ENTRIES_PER_LANE {
-                break; // Bounded traversal (CTR-1303).
+                // S-MAJOR-1/2 fix: Fail-closed on overflow — do NOT
+                // proceed with a partial candidate set that could be
+                // starved by decoy directories with crafted mtime.
+                scan_overflow = true;
+                break;
             }
             let path = entry.path();
             let Ok(metadata) = path.symlink_metadata() else {
@@ -448,12 +536,28 @@ fn collect_lane_log_retention_targets(
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |d| d.as_secs());
-            let estimated_bytes = estimate_dir_size(&path);
+            // S-BLOCKER-1 fix: Use lightweight directory metadata size
+            // instead of recursive estimate_dir_size(). The directory
+            // entry's metadata.len() returns the inode size on most
+            // filesystems. For byte quota enforcement, we use a
+            // single-level scan of the job log directory to sum
+            // immediate children file sizes, bounded by MAX_DIR_ENTRIES.
+            let estimated_bytes = estimate_job_log_dir_size_shallow(&path);
             job_logs.push(JobLogEntry {
                 path,
                 modified_secs,
                 estimated_bytes,
+                pruned: false,
             });
+        }
+
+        // S-MAJOR-1/2 fix: If scan overflowed, skip this lane entirely.
+        // The lane's log retention will be retried on the next GC cycle
+        // after some entries have been organically pruned or manually
+        // cleaned. This is fail-closed: we do NOT proceed with a partial
+        // set that could be manipulated by decoy flooding.
+        if scan_overflow {
+            continue;
         }
 
         if job_logs.is_empty() {
@@ -474,28 +578,24 @@ fn collect_lane_log_retention_targets(
         // (most recent by mtime) are protected.
         let protected_start = total_count.saturating_sub(keep_last_n);
 
-        let mut prune_candidates: Vec<usize> = Vec::new();
-
         // Phase 1: TTL-based pruning for entries outside the keep-last-N window.
-        if config.per_job_log_ttl_secs > 0 {
-            for (idx, entry) in job_logs.iter().enumerate() {
-                if idx >= protected_start {
-                    // Protected by keep-last-N — skip TTL pruning.
-                    break;
-                }
-                if is_stale_by_mtime_seconds(
-                    entry.modified_secs,
-                    config.per_job_log_ttl_secs,
-                    now_secs,
-                ) {
-                    prune_candidates.push(idx);
-                }
+        // CQ-NIT-1 fix: Uses effective_ttl (0 -> default 7 days) so age
+        // pruning is always applied when documented default semantics apply.
+        for (idx, entry) in job_logs.iter_mut().enumerate() {
+            if idx >= protected_start {
+                // Protected by keep-last-N — skip TTL pruning.
+                break;
+            }
+            if is_stale_by_mtime_seconds(entry.modified_secs, effective_ttl, now_secs) {
+                entry.pruned = true;
             }
         }
 
         // Phase 2: Byte quota enforcement.
         // Calculate total log bytes and prune oldest entries (outside
         // keep-last-N) until within quota.
+        // S-NIT-1 / S-MAJOR-3 fix: Use boolean `pruned` flag on
+        // JobLogEntry for O(1) lookup instead of Vec::contains() O(N).
         if config.per_lane_log_max_bytes > 0 {
             let mut total_bytes: u64 = job_logs
                 .iter()
@@ -503,40 +603,73 @@ fn collect_lane_log_retention_targets(
                 .fold(0u64, u64::saturating_add);
 
             // Subtract bytes already marked for TTL pruning.
-            for &idx in &prune_candidates {
-                total_bytes = total_bytes.saturating_sub(job_logs[idx].estimated_bytes);
+            for entry in &job_logs {
+                if entry.pruned {
+                    total_bytes = total_bytes.saturating_sub(entry.estimated_bytes);
+                }
             }
 
             if total_bytes > config.per_lane_log_max_bytes {
                 // Prune oldest non-protected entries that haven't been
                 // TTL-pruned yet.
-                for (idx, entry) in job_logs.iter().enumerate() {
+                for (idx, entry) in job_logs.iter_mut().enumerate() {
                     if total_bytes <= config.per_lane_log_max_bytes {
                         break;
                     }
                     if idx >= protected_start {
                         break; // Cannot prune protected entries.
                     }
-                    if prune_candidates.contains(&idx) {
-                        continue; // Already marked.
+                    if entry.pruned {
+                        continue; // Already marked by TTL phase.
                     }
-                    prune_candidates.push(idx);
+                    entry.pruned = true;
                     total_bytes = total_bytes.saturating_sub(entry.estimated_bytes);
                 }
             }
         }
 
         // Emit GC targets for all prune candidates.
-        for idx in prune_candidates {
-            let entry = &job_logs[idx];
-            targets.push(GcTarget {
-                path: entry.path.clone(),
-                allowed_parent: log_dir.clone(),
-                kind: crate::fac::gc_receipt::GcActionKind::LaneLogRetention,
-                estimated_bytes: entry.estimated_bytes,
-            });
+        for entry in &job_logs {
+            if entry.pruned {
+                targets.push(GcTarget {
+                    path: entry.path.clone(),
+                    allowed_parent: log_dir.clone(),
+                    kind: crate::fac::gc_receipt::GcActionKind::LaneLogRetention,
+                    estimated_bytes: entry.estimated_bytes,
+                });
+            }
         }
     }
+}
+
+/// Estimate the total file size of a job log directory using a single-level
+/// scan (no recursion). This is the S-BLOCKER-1 fix: avoids recursive
+/// `estimate_dir_size()` that could visit 10,000 files per job log directory,
+/// causing 100M+ stat calls across 10,000 job logs per lane.
+///
+/// Only sums sizes of immediate children (files). Subdirectories contribute
+/// their metadata size but are not recursed into. The scan is bounded by
+/// `MAX_DIR_ENTRIES` to prevent unbounded traversal.
+pub(super) fn estimate_job_log_dir_size_shallow(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    let mut count = 0usize;
+    for entry in entries.flatten() {
+        count += 1;
+        if count > MAX_DIR_ENTRIES {
+            return total;
+        }
+        let Ok(metadata) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        total = total.saturating_add(metadata.len());
+    }
+    total
 }
 
 /// Metadata for a single job log subdirectory within a lane's `logs/` dir.
@@ -545,6 +678,10 @@ struct JobLogEntry {
     path: PathBuf,
     modified_secs: u64,
     estimated_bytes: u64,
+    /// Whether this entry has been marked for pruning (used for O(1) lookup
+    /// in Phase 2 byte quota enforcement, fixing S-MAJOR-3/S-NIT-1 O(N^2)
+    /// complexity).
+    pruned: bool,
 }
 
 fn collect_stale_gate_cache_targets(fac_root: &Path, now_secs: u64, targets: &mut Vec<GcTarget>) {
@@ -831,13 +968,35 @@ pub fn execute_gc(plan: &GcPlan) -> GcReceiptV1 {
             continue;
         }
 
-        let result = if matches!(
+        // CQ-MAJOR-1 fix: Require lane lock for LaneLogRetention targets
+        // (child targets within a lane's logs/ directory) in addition to
+        // LaneTarget and LaneLog. This prevents pruning log directories
+        // of a lane that became active between planning and execution.
+        let needs_lane_lock = matches!(
             target.kind,
             crate::fac::gc_receipt::GcActionKind::LaneTarget
                 | crate::fac::gc_receipt::GcActionKind::LaneLog
-        ) {
-            let _lock_guard = match try_acquire_lane_lock(&target.path) {
-                Ok(Some(lock_guard)) => lock_guard,
+                | crate::fac::gc_receipt::GcActionKind::LaneLogRetention
+        );
+        // Acquire lane lock if needed (LaneTarget, LaneLog, LaneLogRetention).
+        // The lock guard must remain alive for the scope of the deletion.
+        let _lock_guard: Option<std::fs::File> = if needs_lane_lock {
+            // For LaneLogRetention targets, the path is a subdirectory
+            // of logs/ (e.g., .../lanes/{lane_id}/logs/{job_id}).
+            // try_acquire_lane_lock expects the path to resolve to a
+            // lane root by checking if the filename is "target" or "logs".
+            // For LaneLogRetention, we pass the parent `logs/` directory
+            // to the lock function.
+            let lock_path = if matches!(
+                target.kind,
+                crate::fac::gc_receipt::GcActionKind::LaneLogRetention
+            ) {
+                &target.allowed_parent
+            } else {
+                &target.path
+            };
+            match try_acquire_lane_lock(lock_path) {
+                Ok(Some(lock_guard)) => Some(lock_guard),
                 Ok(None) => {
                     errors.push(crate::fac::gc_receipt::GcError {
                         target_path: target.path.display().to_string(),
@@ -856,26 +1015,30 @@ pub fn execute_gc(plan: &GcPlan) -> GcReceiptV1 {
                     });
                     continue;
                 },
-            };
-            // `_lock_guard` remains alive for the scope of this deletion.
-            safe_rmtree_v1(&target.path, &target.allowed_parent)
+            }
         } else {
-            safe_rmtree_v1(&target.path, &target.allowed_parent)
+            None
         };
+
+        let result = safe_rmtree_v1(&target.path, &target.allowed_parent);
 
         match result {
             Ok(outcome) => {
-                let (files_deleted, dirs_deleted) = match outcome {
+                // CQ-MAJOR-2 fix: Report actual bytes_freed as 0 for
+                // AlreadyAbsent paths. Previously, estimated_bytes was
+                // reported even when nothing was deleted, causing
+                // over-reporting when parent/child targets overlap.
+                let (files_deleted, dirs_deleted, bytes_freed) = match outcome {
                     SafeRmtreeOutcome::Deleted {
                         files_deleted,
                         dirs_deleted,
-                    } => (files_deleted, dirs_deleted),
-                    SafeRmtreeOutcome::AlreadyAbsent => (0, 0),
+                    } => (files_deleted, dirs_deleted, target.estimated_bytes),
+                    SafeRmtreeOutcome::AlreadyAbsent => (0, 0, 0),
                 };
                 actions.push(crate::fac::gc_receipt::GcAction {
                     target_path: target.path.display().to_string(),
                     action_kind: target.kind,
-                    bytes_freed: target.estimated_bytes,
+                    bytes_freed,
                     files_deleted,
                     dirs_deleted,
                 });
@@ -2370,7 +2533,14 @@ mod tests {
         };
 
         let mut targets = Vec::new();
-        collect_lane_log_retention_targets(&lane_manager, &lane_ids, &config, now, &mut targets);
+        collect_lane_log_retention_targets(
+            &lane_manager,
+            &lane_ids,
+            &config,
+            now,
+            &HashSet::new(),
+            &mut targets,
+        );
 
         // Stale job should be pruned.
         assert!(
@@ -2419,7 +2589,14 @@ mod tests {
         };
 
         let mut targets = Vec::new();
-        collect_lane_log_retention_targets(&lane_manager, &lane_ids, &config, now, &mut targets);
+        collect_lane_log_retention_targets(
+            &lane_manager,
+            &lane_ids,
+            &config,
+            now,
+            &HashSet::new(),
+            &mut targets,
+        );
 
         // The 2 oldest (a, b) should be pruned; the 2 newest (c, d) are protected.
         assert_eq!(
@@ -2460,7 +2637,14 @@ mod tests {
         };
 
         let mut targets = Vec::new();
-        collect_lane_log_retention_targets(&lane_manager, &lane_ids, &config, now, &mut targets);
+        collect_lane_log_retention_targets(
+            &lane_manager,
+            &lane_ids,
+            &config,
+            now,
+            &HashSet::new(),
+            &mut targets,
+        );
 
         // The oldest job (a) should be pruned to bring total within 250 bytes.
         assert_eq!(
@@ -2502,7 +2686,14 @@ mod tests {
         };
 
         let mut targets = Vec::new();
-        collect_lane_log_retention_targets(&lane_manager, &lane_ids, &config, now, &mut targets);
+        collect_lane_log_retention_targets(
+            &lane_manager,
+            &lane_ids,
+            &config,
+            now,
+            &HashSet::new(),
+            &mut targets,
+        );
 
         // No pruning because all entries are protected by keep-last-N.
         assert_eq!(
@@ -2546,7 +2737,14 @@ mod tests {
         };
 
         let mut targets = Vec::new();
-        collect_lane_log_retention_targets(&lane_manager, &lane_ids, &config, now, &mut targets);
+        collect_lane_log_retention_targets(
+            &lane_manager,
+            &lane_ids,
+            &config,
+            now,
+            &HashSet::new(),
+            &mut targets,
+        );
 
         // Neither the file nor the symlink should appear as targets.
         assert!(
@@ -2565,8 +2763,11 @@ mod tests {
 
     #[test]
     fn log_retention_integrated_with_plan_gc() {
-        // Verify that plan_gc_with_log_retention includes LaneLogRetention
-        // targets alongside other GC targets.
+        // Verify that plan_gc_with_log_retention includes log-related targets
+        // for idle lanes. Idle lanes always receive a full LaneLog target
+        // (via collect_idle_lane_targets), which supersedes per-job
+        // LaneLogRetention targets (CQ-MAJOR-2 dedup). The plan should
+        // therefore contain LaneLog for idle lanes with stale logs.
         let dir = tempdir().expect("tmp");
         let fac_root = dir.path().join("fac");
         std::fs::create_dir_all(&fac_root).expect("fac");
@@ -2600,12 +2801,36 @@ mod tests {
         )
         .expect("plan");
 
+        // Idle lanes get LaneLog (full removal) which supersedes per-job
+        // LaneLogRetention. Verify that the plan includes coverage for
+        // the lane's log directory via either target type.
+        let has_log_coverage = plan.targets.iter().any(|t| {
+            matches!(
+                t.kind,
+                crate::fac::gc_receipt::GcActionKind::LaneLog
+                    | crate::fac::gc_receipt::GcActionKind::LaneLogRetention
+            )
+        });
         assert!(
-            plan.targets.iter().any(|t| matches!(
+            has_log_coverage,
+            "plan must include log cleanup targets (LaneLog or LaneLogRetention) for idle lane"
+        );
+
+        // CQ-MAJOR-2 regression check: LaneLogRetention must NOT appear
+        // alongside LaneLog for the same lane (dedup).
+        let has_full_log = plan
+            .targets
+            .iter()
+            .any(|t| matches!(t.kind, crate::fac::gc_receipt::GcActionKind::LaneLog));
+        let has_retention = plan.targets.iter().any(|t| {
+            matches!(
                 t.kind,
                 crate::fac::gc_receipt::GcActionKind::LaneLogRetention
-            )),
-            "plan_gc_with_log_retention must include LaneLogRetention targets for stale job logs"
+            )
+        });
+        assert!(
+            !(has_full_log && has_retention),
+            "LaneLog and LaneLogRetention must not coexist for the same lane (CQ-MAJOR-2)"
         );
     }
 
@@ -2636,12 +2861,207 @@ mod tests {
         };
 
         let mut targets = Vec::new();
-        collect_lane_log_retention_targets(&lane_manager, &lane_ids, &config, now, &mut targets);
+        collect_lane_log_retention_targets(
+            &lane_manager,
+            &lane_ids,
+            &config,
+            now,
+            &HashSet::new(),
+            &mut targets,
+        );
 
         assert_eq!(
             targets.len(),
             0,
             "no pruning should occur when all job logs are within policy"
+        );
+    }
+
+    // =========================================================================
+    // Regression tests for review findings
+    // =========================================================================
+
+    #[test]
+    fn log_retention_skips_lanes_with_full_log_gc_target() {
+        // CQ-MAJOR-2 regression: LaneLogRetention targets must be suppressed
+        // when the parent LaneLog is already scheduled for full removal.
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
+
+        let now = current_wall_clock_secs();
+        let _stale_dir =
+            create_job_log_dir(&logs_dir, "job-stale", 200, now.saturating_sub(86400 * 30));
+
+        let config = LogRetentionConfig {
+            per_lane_log_max_bytes: 0,
+            per_job_log_ttl_secs: 3600,
+            keep_last_n_jobs_per_lane: 0,
+        };
+
+        // Simulate that this lane's LaneLog is already scheduled for GC.
+        let lanes_with_full_gc: HashSet<String> = std::iter::once(lane_id.clone()).collect();
+
+        let mut targets = Vec::new();
+        collect_lane_log_retention_targets(
+            &lane_manager,
+            &lane_ids,
+            &config,
+            now,
+            &lanes_with_full_gc,
+            &mut targets,
+        );
+
+        assert_eq!(
+            targets.len(),
+            0,
+            "LaneLogRetention targets must be suppressed when parent LaneLog \
+             is already scheduled for full removal"
+        );
+    }
+
+    #[test]
+    fn log_retention_zero_ttl_uses_default() {
+        // CQ-NIT-1 regression: per_job_log_ttl_secs=0 must use the default
+        // 7-day TTL, not disable age pruning entirely.
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
+
+        let now = current_wall_clock_secs();
+        // Create a job log older than 7 days.
+        let stale_dir = create_job_log_dir(
+            &logs_dir,
+            "job-old",
+            100,
+            now.saturating_sub(8 * 86400), // 8 days old
+        );
+
+        let config = LogRetentionConfig {
+            per_lane_log_max_bytes: 0,
+            per_job_log_ttl_secs: 0, // 0 means "use default" (7 days)
+            keep_last_n_jobs_per_lane: 0,
+        };
+
+        // Verify effective_ttl_secs maps 0 to 7 days.
+        assert_eq!(
+            config.effective_ttl_secs(),
+            7 * 24 * 3600,
+            "effective_ttl_secs must map 0 to default 7-day TTL"
+        );
+
+        let mut targets = Vec::new();
+        collect_lane_log_retention_targets(
+            &lane_manager,
+            &lane_ids,
+            &config,
+            now,
+            &HashSet::new(),
+            &mut targets,
+        );
+
+        // The 8-day-old job log should be pruned (older than default 7-day TTL).
+        assert!(
+            targets.iter().any(|t| t.path == stale_dir),
+            "zero TTL must apply default 7-day TTL and prune 8-day-old job log"
+        );
+    }
+
+    #[test]
+    fn execute_gc_reports_zero_bytes_freed_for_already_absent() {
+        // CQ-MAJOR-2 regression: bytes_freed must be 0 when the target was
+        // AlreadyAbsent (parent already deleted the child).
+        let temp = tempdir().expect("tmp");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let perms = std::fs::Permissions::from_mode(0o700);
+            std::fs::set_permissions(temp.path(), perms).expect("set permissions");
+        }
+
+        // Create a target that does NOT exist on disk.
+        let absent_path = temp.path().join("absent_dir");
+        let plan = GcPlan {
+            targets: vec![GcTarget {
+                path: absent_path,
+                allowed_parent: temp.path().to_path_buf(),
+                kind: crate::fac::gc_receipt::GcActionKind::CargoCache,
+                estimated_bytes: 42,
+            }],
+        };
+
+        let receipt = execute_gc(&plan);
+        assert_eq!(receipt.actions.len(), 1, "should have one action");
+        assert_eq!(
+            receipt.actions[0].bytes_freed, 0,
+            "bytes_freed must be 0 for AlreadyAbsent targets"
+        );
+    }
+
+    #[test]
+    fn log_retention_scan_overflow_skips_lane() {
+        // S-MAJOR-1/2 regression: When scan exceeds MAX_JOB_LOG_ENTRIES_PER_LANE,
+        // the lane must be skipped entirely (fail-closed) rather than proceeding
+        // with a partial candidate set.
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
+
+        let now = current_wall_clock_secs();
+
+        // Create MAX_JOB_LOG_ENTRIES_PER_LANE + 1 directories to trigger overflow.
+        for i in 0..=MAX_JOB_LOG_ENTRIES_PER_LANE {
+            let name = format!("job-{i:06}");
+            let job_dir = logs_dir.join(&name);
+            std::fs::create_dir_all(&job_dir).expect("create job dir");
+            let file = job_dir.join("output.log");
+            write_file(&file, 10);
+            // Make them all stale so they would be pruned if scanned.
+            set_file_mtime(&job_dir, filetime_from_secs(now.saturating_sub(86400 * 30)))
+                .expect("set mtime");
+        }
+
+        let config = LogRetentionConfig {
+            per_lane_log_max_bytes: 0,
+            per_job_log_ttl_secs: 3600,
+            keep_last_n_jobs_per_lane: 0,
+        };
+
+        let mut targets = Vec::new();
+        collect_lane_log_retention_targets(
+            &lane_manager,
+            &lane_ids,
+            &config,
+            now,
+            &HashSet::new(),
+            &mut targets,
+        );
+
+        // The lane must be skipped entirely — no partial pruning.
+        assert_eq!(
+            targets.len(),
+            0,
+            "scan overflow must cause lane to be skipped entirely (fail-closed), \
+             got {} targets",
+            targets.len()
         );
     }
 }
