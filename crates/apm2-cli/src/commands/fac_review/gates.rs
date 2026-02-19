@@ -178,7 +178,7 @@ impl QueuePreparationFailure {
 }
 
 fn classify_queue_readiness_failure(failure: ReadinessFailure) -> QueuePreparationFailure {
-    let root_cause = failure.root_cause.to_ascii_lowercase();
+    let root_cause = failure.root_cause.as_str().to_ascii_lowercase();
     if failure.component.eq_ignore_ascii_case("cargo_dependencies")
         || root_cause.contains("supply")
         || root_cause.contains("network")
