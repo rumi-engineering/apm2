@@ -3276,11 +3276,11 @@ fn replay_pending_verdict_projection_for_pr_locked(
         .into_iter()
         .filter(|entry| entry.pr_number == pr_number)
         .filter(|entry| {
-            if let Some(expected) = normalized_expected_head_sha.as_deref() {
-                entry.head_sha.eq_ignore_ascii_case(expected)
-            } else {
-                true
-            }
+            normalized_expected_head_sha
+                .as_deref()
+                .map_or(true, |expected| {
+                    entry.head_sha.eq_ignore_ascii_case(expected)
+                })
         })
         .min_by(|lhs, rhs| {
             lhs.attempt_count
