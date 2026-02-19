@@ -19,7 +19,8 @@
 //! The denial-reason map is capped at [`MAX_DENIAL_REASON_ENTRIES`]. Overflow
 //! is aggregated into an `"other"` bucket to keep totals accurate.
 
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::io::Read as _;
 
 use serde::{Deserialize, Serialize};
@@ -326,11 +327,13 @@ pub const MAX_GC_RECEIPT_SCAN_FILES: usize = 65_536;
 /// Maximum GC receipt file size to read (256 KiB).
 const MAX_GC_RECEIPT_READ_SIZE: u64 = 256 * 1024;
 
-/// Maximum number of GC receipts to load into memory.
+/// Maximum number of GC receipts to retain in memory at any time.
 ///
-/// Prevents unbounded memory growth from a large number of GC receipts.
-/// At ~256 KiB per receipt and 4,096 receipts, the worst-case memory is
-/// ~1 GiB.
+/// Enforced *during* collection via a bounded min-heap (not just
+/// post-collection truncation), so in-memory receipt count never exceeds
+/// this constant regardless of how many files match on disk.  At ~256 KiB
+/// per receipt and 4,096 entries, the worst-case memory for the receipt
+/// set is ~1 GiB.
 pub const MAX_GC_RECEIPTS_LOADED: usize = 4_096;
 
 /// Maximum number of shard subdirectories to visit when loading GC receipts.
@@ -340,6 +343,45 @@ pub const MAX_GC_RECEIPTS_LOADED: usize = 4_096;
 /// so a limit of 512 provides generous headroom while preventing unbounded
 /// directory traversal of attacker-created directories.
 const MAX_GC_SHARD_DIRS: usize = 512;
+
+/// Wrapper for `GcReceiptV1` that orders by "newness" for use in a bounded
+/// min-heap.  The [`Ord`] implementation defines *ascending* newness:
+/// `(timestamp_secs ASC, content_hash DESC)`.  When wrapped in
+/// [`std::cmp::Reverse`] inside a [`BinaryHeap`] (which is a max-heap),
+/// the *oldest* (least new) receipt sits at the heap root and is evicted
+/// first, ensuring the heap retains the newest `MAX_GC_RECEIPTS_LOADED`
+/// receipts at all times during scanning.
+///
+/// Only the comparison key fields (`timestamp_secs`, `content_hash`) are
+/// used for ordering; the full receipt is carried along for extraction.
+struct GcReceiptHeapEntry(GcReceiptV1);
+
+impl PartialEq for GcReceiptHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.timestamp_secs == other.0.timestamp_secs
+            && self.0.content_hash == other.0.content_hash
+    }
+}
+
+impl Eq for GcReceiptHeapEntry {}
+
+impl PartialOrd for GcReceiptHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GcReceiptHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Ascending newness: higher timestamp = newer = greater.
+        // For equal timestamps, *lower* content_hash = newer (comes first
+        // in the final descending sort), so we reverse the hash comparison.
+        self.0
+            .timestamp_secs
+            .cmp(&other.0.timestamp_secs)
+            .then_with(|| other.0.content_hash.cmp(&self.0.content_hash))
+    }
+}
 
 /// Result of loading GC receipts from disk.
 #[derive(Debug, Clone)]
@@ -353,6 +395,35 @@ pub struct LoadGcReceiptsResult {
     /// content-hash tiebreaker) are included — older receipts beyond the
     /// cap are discarded.
     pub truncated: bool,
+}
+
+/// Insert a receipt into the bounded min-heap used by [`load_gc_receipts`].
+///
+/// If the heap has fewer than [`MAX_GC_RECEIPTS_LOADED`] entries, the receipt
+/// is pushed unconditionally.  If the heap is full, the new receipt replaces
+/// the oldest entry when it is strictly newer; otherwise it is discarded.
+/// `truncated` is set to `true` whenever any receipt is discarded (whether the
+/// new one or an evicted old one).
+fn gc_heap_insert(
+    heap: &mut BinaryHeap<Reverse<GcReceiptHeapEntry>>,
+    receipt: GcReceiptV1,
+    truncated: &mut bool,
+) {
+    let entry = Reverse(GcReceiptHeapEntry(receipt));
+    if heap.len() < MAX_GC_RECEIPTS_LOADED {
+        heap.push(entry);
+    } else if let Some(min) = heap.peek() {
+        // `entry.0` is the new receipt's heap entry.
+        // `min.0` is the current oldest receipt's heap entry.
+        // If the new receipt is newer (greater in our Ord), evict the oldest.
+        if entry.0 > min.0 {
+            heap.pop();
+            heap.push(entry);
+        }
+        // Either the old min was evicted or the new entry was discarded —
+        // in both cases a receipt was dropped, so mark truncated.
+        *truncated = true;
+    }
 }
 
 /// Load GC receipts from the receipts directory, filtering by
@@ -370,15 +441,24 @@ pub struct LoadGcReceiptsResult {
 /// skipped (GC receipts share the directory with job receipts; we only
 /// care about files matching the GC schema).
 ///
-/// # Deterministic cap (MAJOR-2 fix)
+/// # Bounded collection via min-heap
 ///
-/// All matching receipts are collected (up to the scan cap), then sorted
-/// by `(timestamp_secs DESC, content_hash ASC)` (newest first) to ensure
-/// a deterministic ordering regardless of filesystem enumeration order.
-/// If the sorted list exceeds [`MAX_GC_RECEIPTS_LOADED`], it is truncated
-/// to the newest entries and `LoadGcReceiptsResult::truncated` is set to
-/// `true`.  This is consistent with job receipt handling which prioritizes
-/// recent data.
+/// To enforce the [`MAX_GC_RECEIPTS_LOADED`] cap *during* collection
+/// (not just after), a bounded min-heap is used.  The heap is keyed by
+/// "newness" (ascending `timestamp_secs`, descending `content_hash`) so
+/// the *oldest* receipt sits at the root.  When a new receipt is found:
+///
+/// 1. If the heap has fewer than `MAX_GC_RECEIPTS_LOADED` entries, push.
+/// 2. If the heap is full and the new receipt is *newer* than the root
+///    (oldest), pop the root and push the new receipt.
+/// 3. Otherwise the new receipt is discarded and `truncated` is set.
+///
+/// After scanning, the heap is drained into a `Vec` and sorted
+/// descending (newest first by `timestamp_secs`, then ascending
+/// `content_hash` as tiebreaker) — producing the same deterministic
+/// result as the previous collect-sort-truncate approach, but with
+/// worst-case memory bounded to `MAX_GC_RECEIPTS_LOADED` receipts
+/// (~1 GiB at 256 KiB per receipt and 4,096 entries).
 ///
 /// # Security
 ///
@@ -398,7 +478,11 @@ pub fn load_gc_receipts(
     receipts_dir: &std::path::Path,
     since_epoch_secs: u64,
 ) -> LoadGcReceiptsResult {
-    let mut results = Vec::new();
+    // Bounded min-heap: `Reverse` turns the max-heap into a min-heap
+    // by "newness", so the oldest (least desirable) receipt is at the root.
+    let mut heap: BinaryHeap<Reverse<GcReceiptHeapEntry>> =
+        BinaryHeap::with_capacity(MAX_GC_RECEIPTS_LOADED.saturating_add(1));
+    let mut truncated = false;
     let mut total_scanned: usize = 0;
 
     // Phase 1: Scan sharded subdirectories (canonical layout from
@@ -457,34 +541,30 @@ pub fn load_gc_receipts(
 
                     let shard_path = shard_entry.path();
                     if let Some(receipt) = try_load_gc_receipt_file(&shard_path, since_epoch_secs) {
-                        results.push(receipt);
+                        gc_heap_insert(&mut heap, receipt, &mut truncated);
                     }
                 }
             } else {
                 // Top-level .json file (legacy flat layout or job receipts).
                 if let Some(receipt) = try_load_gc_receipt_file(&top_path, since_epoch_secs) {
-                    results.push(receipt);
+                    gc_heap_insert(&mut heap, receipt, &mut truncated);
                 }
             }
         }
     }
 
-    // MAJOR-2 fix: Sort deterministically by (timestamp_secs, content_hash)
-    // before applying the cap, so the same subset is always selected
-    // regardless of filesystem enumeration order.
-    // Sort DESCENDING (newest first) so truncation preserves the most
-    // recent receipts — consistent with job receipt handling which
-    // prioritizes newer entries (MINOR security fix, round 6).
+    // Drain the bounded heap and sort deterministically: newest first
+    // (timestamp_secs DESC, content_hash ASC).
+    let mut results: Vec<GcReceiptV1> = heap
+        .into_sorted_vec()
+        .into_iter()
+        .map(|Reverse(entry)| entry.0)
+        .collect();
     results.sort_by(|a, b| {
         b.timestamp_secs
             .cmp(&a.timestamp_secs)
             .then_with(|| a.content_hash.cmp(&b.content_hash))
     });
-
-    let truncated = results.len() > MAX_GC_RECEIPTS_LOADED;
-    if truncated {
-        results.truncate(MAX_GC_RECEIPTS_LOADED);
-    }
 
     LoadGcReceiptsResult {
         receipts: results,
@@ -1314,6 +1394,134 @@ mod tests {
             json_str2.contains("\"job_receipts_truncated\": false"),
             "job_receipts_truncated=false must appear in JSON"
         );
+    }
+
+    // =========================================================================
+    // Bounded heap regression: gc_heap_insert memory cap during collection
+    // =========================================================================
+
+    #[test]
+    fn gc_heap_insert_enforces_cap_during_collection() {
+        // Regression test for MAJOR finding: the bounded min-heap must never
+        // hold more than MAX_GC_RECEIPTS_LOADED entries at any point during
+        // collection.  We simulate inserting more receipts than the cap and
+        // verify the heap stays bounded and retains the newest entries.
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
+        let cap = 5_usize; // Use a small cap for testing.
+        // We can't change the constant, so test gc_heap_insert at the real cap
+        // by testing the logic directly with a controlled heap.
+        let mut heap: BinaryHeap<Reverse<GcReceiptHeapEntry>> = BinaryHeap::with_capacity(cap + 1);
+        let mut truncated = false;
+
+        // Insert exactly MAX_GC_RECEIPTS_LOADED receipts.
+        for i in 0..MAX_GC_RECEIPTS_LOADED {
+            let receipt = make_gc_receipt(1000 + i as u64, 100);
+            gc_heap_insert(&mut heap, receipt, &mut truncated);
+            assert!(
+                heap.len() <= MAX_GC_RECEIPTS_LOADED,
+                "heap must never exceed MAX_GC_RECEIPTS_LOADED (len={}, cap={})",
+                heap.len(),
+                MAX_GC_RECEIPTS_LOADED
+            );
+        }
+        assert_eq!(heap.len(), MAX_GC_RECEIPTS_LOADED);
+        assert!(!truncated, "no truncation when exactly at cap");
+
+        // Insert one more receipt that is NEWER than the oldest in the heap.
+        // The oldest has timestamp_secs = 1000.
+        let newer = make_gc_receipt(999_999, 100);
+        gc_heap_insert(&mut heap, newer, &mut truncated);
+        assert_eq!(
+            heap.len(),
+            MAX_GC_RECEIPTS_LOADED,
+            "heap must not grow beyond cap after insert"
+        );
+        assert!(truncated, "truncated must be set when a receipt is evicted");
+
+        // Insert one more receipt that is OLDER than everything in the heap.
+        // This receipt should be discarded immediately.
+        let older = make_gc_receipt(1, 100);
+        gc_heap_insert(&mut heap, older, &mut truncated);
+        assert_eq!(
+            heap.len(),
+            MAX_GC_RECEIPTS_LOADED,
+            "heap must stay at cap when older receipt is discarded"
+        );
+
+        // Drain and verify the newest receipt (999_999) is present and the
+        // discarded receipt (timestamp=1) is not.
+        let drained: Vec<GcReceiptV1> = heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse(entry)| entry.0)
+            .collect();
+        assert!(
+            drained.iter().any(|r| r.timestamp_secs == 999_999),
+            "newest receipt must be retained"
+        );
+        assert!(
+            drained.iter().all(|r| r.timestamp_secs != 1),
+            "oldest discarded receipt must not be in heap"
+        );
+    }
+
+    #[test]
+    fn gc_heap_produces_same_result_as_sort_truncate() {
+        // Verify that the bounded heap approach produces the exact same
+        // deterministic result as the old collect-sort-truncate approach
+        // for a set of receipts exceeding the cap.
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
+        // Create receipts: timestamps from 1 to MAX_GC_RECEIPTS_LOADED + 100.
+        let total = MAX_GC_RECEIPTS_LOADED + 100;
+        let receipts: Vec<GcReceiptV1> = (1..=total)
+            .map(|i| make_gc_receipt(i as u64, (i * 7) as u64))
+            .collect();
+
+        // --- Old approach: collect all, sort, truncate ---
+        let mut old_results = receipts.clone();
+        old_results.sort_by(|a, b| {
+            b.timestamp_secs
+                .cmp(&a.timestamp_secs)
+                .then_with(|| a.content_hash.cmp(&b.content_hash))
+        });
+        old_results.truncate(MAX_GC_RECEIPTS_LOADED);
+
+        // --- New approach: bounded heap ---
+        let mut heap: BinaryHeap<Reverse<GcReceiptHeapEntry>> =
+            BinaryHeap::with_capacity(MAX_GC_RECEIPTS_LOADED + 1);
+        let mut truncated = false;
+        for receipt in receipts {
+            gc_heap_insert(&mut heap, receipt, &mut truncated);
+        }
+        let mut new_results: Vec<GcReceiptV1> = heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse(entry)| entry.0)
+            .collect();
+        new_results.sort_by(|a, b| {
+            b.timestamp_secs
+                .cmp(&a.timestamp_secs)
+                .then_with(|| a.content_hash.cmp(&b.content_hash))
+        });
+
+        assert!(truncated, "should be truncated with excess receipts");
+        assert_eq!(new_results.len(), old_results.len());
+        for (i, (new, old)) in new_results.iter().zip(old_results.iter()).enumerate() {
+            assert_eq!(
+                new.timestamp_secs, old.timestamp_secs,
+                "mismatch at index {i}: new ts={}, old ts={}",
+                new.timestamp_secs, old.timestamp_secs
+            );
+            assert_eq!(
+                new.content_hash, old.content_hash,
+                "mismatch at index {i}: new hash={}, old hash={}",
+                new.content_hash, old.content_hash
+            );
+        }
     }
 
     // Compile-time assertion: load cap must not exceed scan cap.
