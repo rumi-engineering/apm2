@@ -100,6 +100,9 @@ pub mod builtin_roles;
 mod canonicalizer_tuple;
 /// Read-only bounded reader for APM2 daemon CAS filesystem layout (TCK-00546).
 pub mod cas_reader;
+/// Cgroup v2 usage accounting: cpu/mem/IO/tasks stats per job for economics
+/// calibration (TCK-00572).
+pub mod cgroup_stats;
 mod changeset_bundle;
 mod ci_attestation;
 mod ci_import;
@@ -276,6 +279,11 @@ pub use builtin_profiles::{
 };
 // Re-export canonicalizer tuple types
 pub use canonicalizer_tuple::{CANONICALIZER_TUPLE_SCHEMA, CanonicalizerTupleV1};
+// Re-export cgroup usage accounting types (TCK-00572)
+pub use cgroup_stats::{
+    CgroupUsageValidationError, MAX_CPU_TIME_US, MAX_IO_BYTES, MAX_PEAK_MEMORY_BYTES,
+    MAX_TASKS_COUNT, ObservedCgroupUsage, collect_cgroup_usage, collect_cgroup_usage_from_root,
+};
 // Re-export changeset bundle types
 pub use changeset_bundle::{
     ChangeKind, ChangeSetBundleError, ChangeSetBundleV1, ChangeSetBundleV1Builder,

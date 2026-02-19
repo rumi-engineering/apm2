@@ -7673,6 +7673,14 @@ fn build_job_receipt(
     }
     if let Some(trace) = containment {
         builder = builder.containment(trace.clone());
+        // TCK-00572: Collect cgroup usage stats from the containment cgroup path.
+        // Best-effort: if stats cannot be read, observed_usage is None.
+        if !trace.cgroup_path.is_empty() {
+            let usage = apm2_core::fac::cgroup_stats::collect_cgroup_usage(&trace.cgroup_path);
+            if !usage.is_empty() {
+                builder = builder.observed_usage(usage);
+            }
+        }
     }
     if let Some(cost) = observed_cost {
         builder = builder.observed_cost(cost);
