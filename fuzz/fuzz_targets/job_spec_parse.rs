@@ -12,7 +12,10 @@
 //! - [RSK-1601] Parsing is a DoS surface: size cap enforced before JSON parse.
 //! - [RSK-0701] No `unwrap`/`expect`/indexing panic on untrusted input.
 
-use apm2_core::fac::{deserialize_job_spec, validate_job_spec};
+use apm2_core::fac::{
+    JobSpecValidationPolicy, deserialize_job_spec, validate_job_spec,
+    validate_job_spec_with_policy,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -25,6 +28,11 @@ fuzz_target!(|data: &[u8]| {
     // Phase 2: structural + digest + token validation — must never panic.
     let _ = validate_job_spec(&spec);
 
-    // Phase 3: digest computation — must never panic.
+    // Phase 3: policy-driven validation with open policy — exercises the
+    // full pipeline including `reject_filesystem_paths` and allowlist
+    // checks.  Must never panic.
+    let _ = validate_job_spec_with_policy(&spec, &JobSpecValidationPolicy::open());
+
+    // Phase 4: digest computation — must never panic.
     let _ = spec.compute_digest();
 });

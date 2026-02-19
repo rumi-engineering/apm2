@@ -810,6 +810,15 @@ impl FacJobSpecV1 {
 pub fn validate_job_spec(spec: &FacJobSpecV1) -> Result<(), JobSpecError> {
     spec.validate_structure()?;
 
+    // Filesystem path rejection in key fields (INV-JS-006).  Enforced at the
+    // core layer so that all callers (including those that skip policy-driven
+    // validation) are protected.  `job_id` already has strict charset
+    // validation (`[A-Za-z0-9_-]`) via `validate_job_id`, but
+    // `reject_filesystem_paths` provides defense-in-depth for repo_id and a
+    // second barrier for job_id.
+    reject_filesystem_paths("source.repo_id", &spec.source.repo_id)?;
+    reject_filesystem_paths("job_id", &spec.job_id)?;
+
     if parse_b3_256_digest(&spec.job_spec_digest).is_none() {
         return Err(JobSpecError::InvalidDigest {
             field: "job_spec_digest",
@@ -921,6 +930,11 @@ pub fn validate_job_spec_control_lane(spec: &FacJobSpecV1) -> Result<(), JobSpec
     }
 
     spec.validate_structure()?;
+
+    // Filesystem path rejection in key fields (INV-JS-006).  Mirrors the
+    // same defense-in-depth check in `validate_job_spec`.
+    reject_filesystem_paths("source.repo_id", &spec.source.repo_id)?;
+    reject_filesystem_paths("job_id", &spec.job_id)?;
 
     if parse_b3_256_digest(&spec.job_spec_digest).is_none() {
         return Err(JobSpecError::InvalidDigest {
@@ -1184,6 +1198,17 @@ fn validate_patch_bytes_backend(source: &JobSource) -> Result<(), JobSpecError> 
 /// path traversal attacks.
 fn reject_filesystem_paths(field: &'static str, value: &str) -> Result<(), JobSpecError> {
     let bytes = value.as_bytes();
+
+    // NUL byte: embedded NUL bytes in logical identifiers can truncate
+    // strings at the C/OS layer, creating a discrepancy between the
+    // validated value and the value that the OS actually processes.
+    // Reject unconditionally.
+    if bytes.contains(&0) {
+        return Err(JobSpecError::FilesystemPathRejected {
+            field,
+            value: truncate_for_error(value),
+        });
+    }
 
     // Unix absolute path.
     if bytes.first() == Some(&b'/') {
