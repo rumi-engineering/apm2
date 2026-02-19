@@ -509,6 +509,7 @@ fn collect_lane_log_retention_targets(
         // Collect job log subdirectories with their metadata.
         let mut job_logs: Vec<JobLogEntry> = Vec::new();
         let mut scan_count = 0usize;
+        let mut lane_visited_count = 0usize;
         let mut scan_overflow = false;
         for entry in entries.flatten() {
             scan_count += 1;
@@ -536,13 +537,10 @@ fn collect_lane_log_retention_targets(
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |d| d.as_secs());
-            // S-BLOCKER-1 fix: Use lightweight directory metadata size
-            // instead of recursive estimate_dir_size(). The directory
-            // entry's metadata.len() returns the inode size on most
-            // filesystems. For byte quota enforcement, we use a
-            // single-level scan of the job log directory to sum
-            // immediate children file sizes, bounded by MAX_DIR_ENTRIES.
-            let estimated_bytes = estimate_job_log_dir_size_shallow(&path);
+            // S-BLOCKER-1 fix: Use bounded recursive estimator (DoS protection
+            // via lane_visited_count).
+            let estimated_bytes =
+                estimate_job_log_dir_size_recursive(&path, &mut lane_visited_count);
             job_logs.push(JobLogEntry {
                 path,
                 modified_secs,
@@ -642,32 +640,52 @@ fn collect_lane_log_retention_targets(
     }
 }
 
-/// Estimate the total file size of a job log directory using a single-level
-/// scan (no recursion). This is the S-BLOCKER-1 fix: avoids recursive
-/// `estimate_dir_size()` that could visit 10,000 files per job log directory,
-/// causing 100M+ stat calls across 10,000 job logs per lane.
-///
-/// Only sums sizes of immediate children (files). Subdirectories contribute
-/// their metadata size but are not recursed into. The scan is bounded by
-/// `MAX_DIR_ENTRIES` to prevent unbounded traversal.
-pub(super) fn estimate_job_log_dir_size_shallow(path: &Path) -> u64 {
+/// Maximum total directory entries scanned per lane during log retention
+/// size estimation. Prevents unbounded recursion/traversal DoS.
+pub const MAX_LANE_SCAN_ENTRIES: usize = 100_000;
+
+pub(super) fn estimate_job_log_dir_size_recursive(path: &Path, visited_count: &mut usize) -> u64 {
+    estimate_job_log_dir_size_recursive_inner(path, visited_count, 0)
+}
+
+fn estimate_job_log_dir_size_recursive_inner(
+    path: &Path,
+    visited_count: &mut usize,
+    depth: usize,
+) -> u64 {
+    if depth >= MAX_TRAVERSAL_DEPTH {
+        return 0;
+    }
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
     };
     let mut total = 0u64;
-    let mut count = 0usize;
     for entry in entries.flatten() {
-        count += 1;
-        if count > MAX_DIR_ENTRIES {
-            return total;
+        *visited_count += 1;
+        if *visited_count > MAX_LANE_SCAN_ENTRIES {
+            return u64::MAX;
         }
+
         let Ok(metadata) = entry.path().symlink_metadata() else {
             continue;
         };
         if metadata.file_type().is_symlink() {
             continue;
         }
-        total = total.saturating_add(metadata.len());
+
+        if metadata.is_dir() {
+            let sub = estimate_job_log_dir_size_recursive_inner(
+                &entry.path(),
+                visited_count,
+                depth + 1,
+            );
+            if sub == u64::MAX {
+                return u64::MAX;
+            }
+            total = total.saturating_add(sub);
+        } else {
+            total = total.saturating_add(metadata.len());
+        }
     }
     total
 }
@@ -3062,6 +3080,49 @@ mod tests {
             "scan overflow must cause lane to be skipped entirely (fail-closed), \
              got {} targets",
             targets.len()
+        );
+    }
+
+    #[test]
+    fn test_recursive_estimator_counts_nested_files() {
+        let dir = tempdir().expect("tmp");
+        let log_dir = dir.path().join("log");
+        std::fs::create_dir(&log_dir).expect("mkdir");
+        let nested = log_dir.join("nested");
+        std::fs::create_dir(&nested).expect("mkdir nested");
+
+        let file = nested.join("large.log");
+        write_file(&file, 1024);
+
+        let mut visited = 0;
+        let size = estimate_job_log_dir_size_recursive(&log_dir, &mut visited);
+
+        // Metadata for 'nested' dir (usually 4096 on Linux ext4) + file size (1024).
+        // Shallow estimator would return only dir metadata (~4096).
+        // Recursive should be at least 1024 + dir metadata.
+        assert!(size >= 1024, "recursive estimator must count nested file size");
+    }
+
+    #[test]
+    fn test_recursive_estimator_enforces_limit() {
+        let dir = tempdir().expect("tmp");
+        let log_dir = dir.path().join("log");
+        std::fs::create_dir(&log_dir).expect("mkdir");
+
+        // Create enough files to trip the limit if we start near it.
+        for i in 0..10 {
+            write_file(&log_dir.join(format!("{i}")), 10);
+        }
+
+        // Initialize visited count close to the limit to simulate a large scan
+        // having already happened.
+        let mut visited = MAX_LANE_SCAN_ENTRIES.saturating_sub(5);
+        let size = estimate_job_log_dir_size_recursive(&log_dir, &mut visited);
+
+        assert_eq!(
+            size,
+            u64::MAX,
+            "must return u64::MAX (fail-closed) when scan limit is exceeded"
         );
     }
 }

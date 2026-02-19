@@ -2566,6 +2566,7 @@ impl LaneManager {
 
         let mut job_dirs: Vec<JobLogDirEntry> = Vec::new();
         let mut scan_count = 0usize;
+        let mut lane_visited_count = 0usize;
         for entry_result in entries {
             scan_count += 1;
             if scan_count > MAX_LOG_ENTRIES {
@@ -2609,8 +2610,10 @@ impl LaneManager {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |d| d.as_secs());
 
-            // Shallow size estimation: sum immediate children file sizes.
-            let estimated_bytes = super::gc::estimate_job_log_dir_size_shallow(&path);
+            // S-BLOCKER-1 fix: Use bounded recursive estimator (DoS protection
+            // via lane_visited_count).
+            let estimated_bytes =
+                super::gc::estimate_job_log_dir_size_recursive(&path, &mut lane_visited_count);
 
             job_dirs.push(JobLogDirEntry {
                 path,
