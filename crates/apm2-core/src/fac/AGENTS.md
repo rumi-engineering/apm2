@@ -3049,6 +3049,55 @@ job unit, preventing cache poisoning via escaped sccache daemons.
   creation time; the validation check guards against tampering or corruption
   in deserialized receipts.
 
+## cgroup_stats Submodule (TCK-00572)
+
+The `cgroup_stats` submodule provides best-effort cgroup v2 usage accounting
+for FAC job receipts. After a job completes, stats are collected from the
+job unit's cgroup hierarchy and stored in `FacJobReceiptV1.observed_usage`
+for economics calibration and metrics.
+
+### Key Types
+
+- `ObservedCgroupUsage`: Struct with all-`Option` fields for cpu_time_us,
+  peak_memory_bytes, io_read_bytes, io_write_bytes, and tasks_count. A
+  `None` field means that particular stat could not be read.
+- `CgroupUsageValidationError`: Typed error for out-of-bounds field values.
+
+### Core Functions
+
+- `collect_cgroup_usage(cgroup_path)`: Production entry point. Reads from
+  `/sys/fs/cgroup/<path>/` and returns `ObservedCgroupUsage`.
+- `collect_cgroup_usage_from_root(cgroup_path, root)`: Testable variant
+  with configurable cgroupfs root for mock filesystem layouts.
+- `append_option_u64`, `append_option_u32`: Canonical byte encoding helpers
+  with injective presence markers (0u8 for None, 1u8 + value for Some).
+
+### Stat Files Read
+
+- `cpu.stat`: Extracts `usage_usec` line.
+- `memory.peak` (fallback: `memory.current`): Single integer value.
+- `io.stat`: Sums `rbytes` and `wbytes` across all devices.
+- `pids.current`: Single integer (current task count).
+
+### Security Invariants (TCK-00572)
+
+- [INV-CGSTAT-001] All file reads bounded by `MAX_CGROUP_STAT_READ` (8 KiB)
+  using `file.take()` before reading. Rejects files exceeding the cap.
+- [INV-CGSTAT-002] Parse failures yield `None`, never panic. All parsing
+  uses fallible `.parse::<T>().ok()`.
+- [INV-CGSTAT-003] IO reads/writes summed with `saturating_add` to prevent
+  overflow.
+- [INV-CGSTAT-004] Validation rejects out-of-bounds values via `MAX_*`
+  constants: `MAX_CPU_TIME_US`, `MAX_PEAK_MEMORY_BYTES`, `MAX_IO_BYTES`,
+  `MAX_TASKS_COUNT`.
+
+### Production Wiring
+
+The `observed_usage` field is populated in `build_job_receipt()` in
+`fac_worker.rs` from the containment trace's `cgroup_path`. The field is
+included in both V1 and V2 canonical byte encodings with type marker `11u8`
+and length-prefixed payload for injective hash stability.
+
 ## credential_gate Submodule (TCK-00596)
 
 The `credential_gate` submodule provides fail-fast credential posture
