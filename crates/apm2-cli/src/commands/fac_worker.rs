@@ -4734,23 +4734,23 @@ fn process_job(
     }
 }
 
-/// Returns `true` if the containment trace indicates this unit started or
-/// verified a server (i.e., it "owns" the sccache server and is responsible
-/// for stopping it at unit end).
+/// Determines whether this unit owns the sccache server for shutdown purposes.
 ///
-/// TCK-00554 MINOR-1 fix: In multi-lane operation, multiple lanes may share
-/// the same `SCCACHE_DIR`. If this unit never started or verified a server,
-/// blindly calling `--stop-server` could terminate a server owned by another
-/// lane. The ownership check inspects the server containment sub-trace:
+/// Ownership for shutdown is based on `server_started` / `started_server_pid`,
+/// independent of `auto_disabled`. The `auto_disabled` flag controls build-time
+/// enablement (whether sccache is USED for builds), not lifecycle cleanup.
+/// A server we started must always be stopped at unit end, even if containment
+/// verification failed and sccache was auto-disabled for builds.
 ///
-/// - If the protocol was never executed, this unit does not own a server.
-/// - If the protocol auto-disabled sccache, this unit did not successfully
-///   acquire a server.
-/// - If `server_started` is true, this unit started a fresh server.
-/// - If a pre-existing server was detected AND verified in-cgroup, this unit
-///   adopted an existing server that it may later need to stop.
+/// Returns `true` when:
+/// - The unit started a new server (`server_started` is true), OR
+/// - The unit recorded a `started_server_pid`, OR
+/// - A pre-existing server was detected AND verified in-cgroup (adopted
+///   server).
 ///
-/// Only in the last two cases does this function return `true`.
+/// MAJOR fix (fix-round-3): Previously returned `false` whenever
+/// `auto_disabled` was `true`, causing servers started on the auto-disabled
+/// path to leak beyond the unit lifecycle.
 fn owns_sccache_server(
     containment_trace: Option<&apm2_core::fac::containment::ContainmentTrace>,
 ) -> bool {
@@ -4760,11 +4760,11 @@ fn owns_sccache_server(
     let Some(ref sc) = trace.sccache_server_containment else {
         return false;
     };
-    if !sc.protocol_executed || sc.auto_disabled {
+    if !sc.protocol_executed {
         return false;
     }
-    // This unit started a new server.
-    if sc.server_started && sc.server_cgroup_verified {
+    // This unit started a new server — must stop it regardless of auto_disabled.
+    if sc.server_started || sc.started_server_pid.is_some() {
         return true;
     }
     // This unit adopted a pre-existing in-cgroup server.
@@ -9872,6 +9872,92 @@ mod tests {
             resolved.content_hash_hex(),
             override_allow.content_hash_hex(),
             "hash must match the override policy, not the default deny"
+        );
+    }
+
+    // ========================================================================
+    // owns_sccache_server tests (fix-round-3)
+    // ========================================================================
+
+    fn make_trace_with_sc(
+        sc: apm2_core::fac::containment::SccacheServerContainment,
+    ) -> apm2_core::fac::containment::ContainmentTrace {
+        apm2_core::fac::containment::ContainmentTrace {
+            verified: true,
+            cgroup_path: "/test".to_string(),
+            processes_checked: 1,
+            mismatch_count: 0,
+            sccache_auto_disabled: sc.auto_disabled,
+            sccache_enabled: !sc.auto_disabled,
+            sccache_version: None,
+            sccache_server_containment: Some(sc),
+        }
+    }
+
+    #[test]
+    fn owns_server_started_auto_disabled_returns_true() {
+        let sc = apm2_core::fac::containment::SccacheServerContainment {
+            protocol_executed: true,
+            server_started: true,
+            auto_disabled: true,
+            server_cgroup_verified: false,
+            ..Default::default()
+        };
+        let trace = make_trace_with_sc(sc);
+        assert!(
+            owns_sccache_server(Some(&trace)),
+            "server_started=true must own for shutdown even when auto_disabled"
+        );
+    }
+
+    #[test]
+    fn owns_server_not_started_auto_disabled_returns_false() {
+        let sc = apm2_core::fac::containment::SccacheServerContainment {
+            protocol_executed: true,
+            server_started: false,
+            auto_disabled: true,
+            server_cgroup_verified: false,
+            ..Default::default()
+        };
+        let trace = make_trace_with_sc(sc);
+        assert!(
+            !owns_sccache_server(Some(&trace)),
+            "server_started=false auto_disabled=true must not own"
+        );
+    }
+
+    #[test]
+    fn owns_server_started_pid_auto_disabled_returns_true() {
+        let sc = apm2_core::fac::containment::SccacheServerContainment {
+            protocol_executed: true,
+            server_started: false,
+            started_server_pid: Some(12345),
+            auto_disabled: true,
+            server_cgroup_verified: false,
+            ..Default::default()
+        };
+        let trace = make_trace_with_sc(sc);
+        assert!(
+            owns_sccache_server(Some(&trace)),
+            "started_server_pid=Some must own for shutdown even when auto_disabled"
+        );
+    }
+
+    #[test]
+    fn owns_preexisting_in_cgroup_returns_true() {
+        let sc = apm2_core::fac::containment::SccacheServerContainment {
+            protocol_executed: true,
+            preexisting_server_detected: true,
+            preexisting_server_in_cgroup: Some(true),
+            server_started: false,
+            auto_disabled: false,
+            server_cgroup_verified: true,
+            ..Default::default()
+        };
+        let trace = make_trace_with_sc(sc);
+        assert!(
+            owns_sccache_server(Some(&trace)),
+            "preexisting in-cgroup server must own"
         );
     }
 }
