@@ -1896,16 +1896,35 @@ fn is_pid_running(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+#[allow(unsafe_code)]
 fn is_pid_running(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    use sysinfo::{Pid, ProcessesToUpdate, System};
-    let mut system = System::new();
-    let target = Pid::from_u32(pid);
-    system.refresh_processes(ProcessesToUpdate::Some(&[target]), true);
-    system.process(target).is_some()
+    type Handle = *mut std::ffi::c_void;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> Handle;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+
+    // SAFETY: OpenProcess is invoked with read-only query rights for liveness
+    // probing and does not mutate process state.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if !handle.is_null() {
+        // SAFETY: handle is valid when non-null and must be closed.
+        let _ = unsafe { CloseHandle(handle) };
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_pid_running(pid: u32) -> bool {
+    pid > 0
 }
 
 fn run_inline_worker_cycle() -> Result<(), String> {

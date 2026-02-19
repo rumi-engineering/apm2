@@ -55,7 +55,6 @@ tempfile.workspace = true
 chrono.workspace = true
 regex.workspace = true
 fs2 = "0.4"
-sysinfo.workspace = true
 hmac = "0.12"
 rand = "0.8"
 sha2 = "0.10"

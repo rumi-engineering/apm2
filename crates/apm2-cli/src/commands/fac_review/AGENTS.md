@@ -296,6 +296,19 @@ pub use types::ReviewRunType;
 
 ## Ticket Notes
 
+- TCK-00621: Single-flight lock liveness and security hardening for `gates.rs`.
+  - Lock file opens now enforce `O_NOFOLLOW | O_CLOEXEC` on Unix for both
+    acquisition and reaper paths, preventing symlink-target truncation and
+    TOCTOU substitution attacks.
+  - After acquiring a lock, `single_flight_lock_file_matches_path()` verifies
+    the locked file descriptor still matches the lock path inode/dev (and
+    `nlink > 0`) before writing owner metadata, closing the reaper/acquirer
+    race where two processes could hold "exclusive" locks on different inodes.
+  - Stale lock reaping is per-entry fail-soft: malformed/unreadable lock files
+    no longer abort the whole scan; remaining entries continue to be processed.
+  - PID liveness checks are now platform-specific: Linux uses `/proc/<pid>`,
+    non-Linux Unix uses `kill(pid, 0)`, and Windows uses `OpenProcess` probe
+    semantics (including `ERROR_ACCESS_DENIED` as "process exists").
 - TCK-00523: Attestation fail-closed fixes.
   - Added `.cargo/config.toml` to gate input digest paths for cargo-based gates.
   - Added `rustfmt --version` to environment digest inputs.
