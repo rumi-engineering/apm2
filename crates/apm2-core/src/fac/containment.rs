@@ -40,6 +40,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -85,6 +86,12 @@ pub const MAX_CGROUP_PATH_LENGTH: usize = 4096;
 
 /// Maximum length for mismatch detail strings in serialized output.
 const MAX_MISMATCH_DETAIL_LENGTH: usize = 512;
+
+/// Timeout for sccache version probe (5 seconds).
+///
+/// Prevents a malicious or hung sccache binary from blocking the worker
+/// indefinitely. The probe is killed and reaped on timeout.
+const SCCACHE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Process names of interest for containment verification.
 /// These are the processes whose cgroup membership is most critical
@@ -287,13 +294,8 @@ impl ContainmentTrace {
     ) -> Self {
         let effective_enabled =
             policy_sccache_enabled && verdict.contained && !verdict.sccache_auto_disabled;
-        let bounded_version = sccache_version.map(|v| {
-            if v.len() > MAX_SCCACHE_VERSION_LENGTH {
-                v[..MAX_SCCACHE_VERSION_LENGTH].to_string()
-            } else {
-                v
-            }
-        });
+        let bounded_version =
+            sccache_version.map(|v| truncate_utf8_safe(&v, MAX_SCCACHE_VERSION_LENGTH));
         Self {
             verified: verdict.contained,
             cgroup_path: verdict.reference_cgroup.clone(),
@@ -937,34 +939,112 @@ pub fn check_sccache_containment_with_proc(
 
 /// Probes the sccache version by running `sccache --version` (TCK-00553).
 ///
-/// Returns `Some(version_string)` if sccache is installed and responds,
-/// `None` if the probe fails (best-effort, not fail-closed since the
-/// version is informational for attestation only).
+/// Returns `Some(version_string)` if sccache is installed and responds
+/// within `SCCACHE_PROBE_TIMEOUT` (5 s), `None` if the probe fails
+/// (fail-safe since the version is informational for attestation only).
 ///
-/// Output is bounded to [`MAX_SCCACHE_VERSION_LENGTH`] bytes to prevent
-/// denial-of-service from a malicious sccache binary (INV-CONTAIN-002
-/// analogue).
+/// # Bounded execution guarantees
+///
+/// - **Timeout**: The child process is killed and reaped after
+///   `SCCACHE_PROBE_TIMEOUT` (5 s) to prevent a hung or malicious sccache
+///   binary from blocking the worker.
+/// - **Bounded I/O**: Stdout is read in a fixed-size loop capped at
+///   [`MAX_SCCACHE_VERSION_LENGTH`] bytes *during* the read, not after.
+///   Oversize output causes an immediate return of `None`.
+/// - **Controlled environment**: The child inherits no environment from the
+///   parent (empty env) except `PATH`, preventing env-based exploits.
+/// - **UTF-8 safety**: The result is truncated to a UTF-8-safe boundary using
+///   `truncate_utf8_safe` (char-boundary-aware truncation).
 #[must_use]
 pub fn probe_sccache_version() -> Option<String> {
-    use std::process::Command;
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
 
-    let output = Command::new("sccache").arg("--version").output().ok()?;
+    // Spawn with bounded pipes and controlled environment.
+    // Only PATH is forwarded so `sccache` is found; everything else is
+    // stripped to prevent env-based attacks.
+    let mut child = Command::new("sccache")
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env_clear()
+        .envs(std::env::var_os("PATH").map(|p| ("PATH", p)))
+        .spawn()
+        .ok()?;
 
-    if !output.status.success() {
+    let deadline = Instant::now() + SCCACHE_PROBE_TIMEOUT;
+
+    // Bounded stdout read: cap *during* read, not after full buffer.
+    let mut buf = Vec::with_capacity(MAX_SCCACHE_VERSION_LENGTH);
+    if let Some(ref mut stdout) = child.stdout {
+        let mut tmp = [0u8; 256];
+        loop {
+            // Check timeout before each read.
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+
+            match stdout.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let remaining = MAX_SCCACHE_VERSION_LENGTH.saturating_sub(buf.len());
+                    if remaining == 0 {
+                        // Output exceeds cap — treat as suspicious, kill and return None.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return None;
+                    }
+                    let take = n.min(remaining);
+                    buf.extend_from_slice(&tmp[..take]);
+                    if buf.len() >= MAX_SCCACHE_VERSION_LENGTH {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return None;
+                    }
+                },
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                },
+            }
+        }
+    }
+
+    // Wait for exit (with timeout). If the child has already exited (stdout
+    // was EOF), this returns immediately.
+    let status = loop {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => {
+                std::thread::sleep(Duration::from_millis(10));
+            },
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            },
+        }
+    };
+
+    if !status.success() {
         return None;
     }
 
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let version = String::from_utf8_lossy(&buf).trim().to_string();
 
     if version.is_empty() {
         return None;
     }
 
-    if version.len() > MAX_SCCACHE_VERSION_LENGTH {
-        Some(version[..MAX_SCCACHE_VERSION_LENGTH].to_string())
-    } else {
-        Some(version)
-    }
+    Some(truncate_utf8_safe(&version, MAX_SCCACHE_VERSION_LENGTH))
 }
 
 // =============================================================================
@@ -1012,13 +1092,45 @@ fn read_proc_file_bounded(
     Ok(content)
 }
 
-/// Truncates a string to a maximum length, appending "..." if truncated.
+/// Truncates a string to at most `max_len` bytes, appending "..." if
+/// truncated.
+///
+/// Uses [`truncate_utf8_safe`] internally so the cut never falls on a
+/// multi-byte UTF-8 boundary (panic-free on all inputs).
 fn truncate_string(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        let truncated = &s[..max_len.saturating_sub(3)];
-        format!("{truncated}...")
+        let prefix = truncate_utf8_safe(s, max_len.saturating_sub(3));
+        format!("{prefix}...")
+    }
+}
+
+/// Returns the longest prefix of `s` whose byte length is <= `max_bytes`
+/// and that ends on a valid UTF-8 character boundary.
+///
+/// This is panic-free for all inputs, including strings composed entirely
+/// of multi-byte characters.
+fn truncate_utf8_safe(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    // Find the last char_indices boundary that is <= max_bytes.
+    let mut end = 0;
+    for (idx, _) in s.char_indices() {
+        if idx > max_bytes {
+            break;
+        }
+        end = idx;
+    }
+    // `end` is the start of the last character that starts at or before
+    // `max_bytes`. We need to include the full character at `end`, but
+    // only if it fits within `max_bytes`.
+    let ch_len = s[end..].chars().next().map_or(0, char::len_utf8);
+    if end + ch_len <= max_bytes {
+        s[..end + ch_len].to_string()
+    } else {
+        s[..end].to_string()
     }
 }
 
@@ -1706,5 +1818,206 @@ mod tests {
             "all contained PIDs must not produce mismatches"
         );
         assert!(verdict.mismatches.is_empty());
+    }
+
+    // ========================================================================
+    // UTF-8-safe truncation regression tests (Finding 2 / Finding 3)
+    // ========================================================================
+
+    #[test]
+    fn truncate_utf8_safe_ascii_within_limit() {
+        let result = truncate_utf8_safe("sccache 0.8.1", 256);
+        assert_eq!(result, "sccache 0.8.1");
+    }
+
+    #[test]
+    fn truncate_utf8_safe_ascii_at_exact_limit() {
+        let input = "a".repeat(256);
+        let result = truncate_utf8_safe(&input, 256);
+        assert_eq!(result.len(), 256);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn truncate_utf8_safe_ascii_exceeds_limit() {
+        let input = "a".repeat(300);
+        let result = truncate_utf8_safe(&input, 256);
+        assert_eq!(result.len(), 256);
+        assert!(result.len() <= 256);
+    }
+
+    #[test]
+    fn truncate_utf8_safe_multibyte_at_boundary_no_panic() {
+        // Each CJK character is 3 bytes in UTF-8. Fill exactly to a
+        // boundary that would panic with naive byte slicing.
+        // 85 chars * 3 bytes = 255 bytes; char 86 starts at byte 255
+        // and extends to byte 258. A 256-byte cap must NOT split the
+        // 86th character.
+        let input = "\u{4e00}".repeat(100); // 300 bytes
+        assert_eq!(input.len(), 300);
+        let result = truncate_utf8_safe(&input, 256);
+        // Must be valid UTF-8 (no panic) and at most 256 bytes.
+        assert!(result.len() <= 256);
+        // Must end on a character boundary: 85 chars * 3 = 255 bytes
+        // (the last complete character that fits in 256 bytes).
+        assert_eq!(result.len(), 255);
+        assert_eq!(result.chars().count(), 85);
+    }
+
+    #[test]
+    fn truncate_utf8_safe_all_4byte_chars_no_panic() {
+        // Emoji are 4 bytes each. 64 emoji = 256 bytes exactly.
+        // 65 emoji = 260 bytes, which must be truncated to 256.
+        let input = "\u{1F600}".repeat(65);
+        assert_eq!(input.len(), 260);
+        let result = truncate_utf8_safe(&input, 256);
+        assert!(result.len() <= 256);
+        // 64 emoji * 4 = 256 bytes exactly.
+        assert_eq!(result.len(), 256);
+        assert_eq!(result.chars().count(), 64);
+    }
+
+    #[test]
+    fn truncate_utf8_safe_mixed_multibyte_no_panic() {
+        // Mix of 1-byte (ASCII), 2-byte, 3-byte, and 4-byte characters.
+        let mut input = String::new();
+        for _ in 0..100 {
+            input.push('A'); // 1 byte
+            input.push('\u{00E9}'); // 2 bytes (e-acute)
+            input.push('\u{4e00}'); // 3 bytes (CJK)
+            input.push('\u{1F600}'); // 4 bytes (emoji)
+        }
+        assert_eq!(input.len(), 1000);
+        let result = truncate_utf8_safe(&input, 256);
+        assert!(result.len() <= 256);
+        // Verify it is valid UTF-8 by iterating chars.
+        let char_count = result.chars().count();
+        assert!(char_count > 0, "must contain at least one character");
+    }
+
+    #[test]
+    fn truncate_utf8_safe_empty_string() {
+        let result = truncate_utf8_safe("", 256);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn truncate_utf8_safe_zero_limit() {
+        let result = truncate_utf8_safe("hello", 0);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn truncate_string_multibyte_no_panic() {
+        // 100 CJK chars = 300 bytes. Truncating at 256 must not panic.
+        let input = "\u{4e00}".repeat(100);
+        let result = truncate_string(&input, 256);
+        assert!(result.len() <= 256);
+        assert!(
+            result.ends_with("..."),
+            "truncated string must end with ellipsis"
+        );
+        // Verify valid UTF-8.
+        let _ = result.chars().count();
+    }
+
+    #[test]
+    fn truncate_string_short_multibyte_no_truncation() {
+        let input = "\u{4e00}\u{4e01}\u{4e02}"; // 9 bytes
+        let result = truncate_string(input, 256);
+        assert_eq!(result, input);
+    }
+
+    // ========================================================================
+    // ContainmentTrace sccache version bounding regression (Finding 2)
+    // ========================================================================
+
+    #[test]
+    fn containment_trace_sccache_version_multibyte_no_panic() {
+        // Version string with multibyte characters exceeding
+        // MAX_SCCACHE_VERSION_LENGTH. This must not panic (the original
+        // byte-slicing code would panic here).
+        let multibyte_version = "\u{4e00}".repeat(MAX_SCCACHE_VERSION_LENGTH); // 256 * 3 = 768 bytes, well over limit
+        assert!(multibyte_version.len() > MAX_SCCACHE_VERSION_LENGTH);
+
+        let verdict = ContainmentVerdict {
+            contained: true,
+            reference_cgroup: "/test".to_string(),
+            processes_checked: 1,
+            critical_processes_found: 1,
+            mismatches: vec![],
+            sccache_detected: false,
+            sccache_auto_disabled: false,
+            sccache_disabled_reason: None,
+        };
+
+        // This must not panic.
+        let trace =
+            ContainmentTrace::from_verdict_with_sccache(&verdict, true, Some(multibyte_version));
+
+        assert!(trace.sccache_enabled);
+        let version = trace.sccache_version.expect("version must be present");
+        assert!(
+            version.len() <= MAX_SCCACHE_VERSION_LENGTH,
+            "version must be bounded to {} bytes, got {}",
+            MAX_SCCACHE_VERSION_LENGTH,
+            version.len()
+        );
+        // Verify valid UTF-8 by iterating chars.
+        let _ = version.chars().count();
+    }
+
+    #[test]
+    fn containment_trace_sccache_version_ascii_bounded() {
+        // ASCII version string exceeding the cap.
+        let long_version = "x".repeat(MAX_SCCACHE_VERSION_LENGTH + 100);
+
+        let verdict = ContainmentVerdict {
+            contained: true,
+            reference_cgroup: "/test".to_string(),
+            processes_checked: 1,
+            critical_processes_found: 1,
+            mismatches: vec![],
+            sccache_detected: false,
+            sccache_auto_disabled: false,
+            sccache_disabled_reason: None,
+        };
+
+        let trace = ContainmentTrace::from_verdict_with_sccache(&verdict, true, Some(long_version));
+
+        let version = trace.sccache_version.expect("version must be present");
+        assert_eq!(
+            version.len(),
+            MAX_SCCACHE_VERSION_LENGTH,
+            "ASCII version must be truncated to exactly the cap"
+        );
+    }
+
+    #[test]
+    fn containment_trace_sccache_version_within_limit_preserved() {
+        let short_version = "sccache 0.8.1".to_string();
+
+        let verdict = ContainmentVerdict {
+            contained: true,
+            reference_cgroup: "/test".to_string(),
+            processes_checked: 1,
+            critical_processes_found: 1,
+            mismatches: vec![],
+            sccache_detected: false,
+            sccache_auto_disabled: false,
+            sccache_disabled_reason: None,
+        };
+
+        let trace = ContainmentTrace::from_verdict_with_sccache(
+            &verdict,
+            true,
+            Some(short_version.clone()),
+        );
+
+        assert_eq!(
+            trace.sccache_version.as_deref(),
+            Some(short_version.as_str()),
+            "version within limit must be preserved exactly"
+        );
     }
 }

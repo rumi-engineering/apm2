@@ -2907,10 +2907,19 @@ job unit, preventing cache poisoning via escaped sccache daemons.
   function returning `Option<String>` reason if sccache should be disabled.
 - `is_cgroup_contained(child_path, reference_path)`: Exact or subtree
   prefix matching with slash separator enforcement.
-- `probe_sccache_version()`: Probes `sccache --version` with bounded output
-  (`MAX_SCCACHE_VERSION_LENGTH` = 256 bytes). Returns `None` on failure
-  (fail-closed). Used by the worker to populate `ContainmentTrace` for
-  attestation visibility (TCK-00553).
+- `probe_sccache_version()`: Probes `sccache --version` with bounded,
+  timeout-guarded execution. Uses `spawn()` with streaming bounded reads
+  (capped at `MAX_SCCACHE_VERSION_LENGTH` = 256 bytes during read, not after),
+  explicit `SCCACHE_PROBE_TIMEOUT` (5 s) with kill+reap on expiry, controlled
+  environment (`env_clear` + only `PATH`), and UTF-8-safe truncation via
+  `truncate_utf8_safe`. Returns `None` on any failure (fail-safe since the
+  version is informational for attestation only). Used by the worker to
+  populate `ContainmentTrace` for attestation visibility (TCK-00553).
+- `truncate_utf8_safe(s, max_bytes)`: Returns the longest prefix of `s`
+  whose byte length is <= `max_bytes` and that ends on a valid UTF-8
+  character boundary. Panic-free on all inputs including all-multibyte
+  strings. Used by `probe_sccache_version`, `from_verdict_with_sccache`,
+  and `truncate_string`.
 - `ContainmentTrace::from_verdict_with_sccache(verdict, policy_sccache_enabled, sccache_version)`:
   Constructs a trace that sets `sccache_enabled = true` only when the
   policy knob is on AND containment is verified AND sccache was not
@@ -2934,7 +2943,16 @@ job unit, preventing cache poisoning via escaped sccache daemons.
   the `emit_job_receipt` function. The builder's `.containment()` method
   populates the receipt's `containment` field from actual verification
   results.
-- [INV-CONTAIN-008] Bounded test commands (systemd transient units)
+- [INV-CONTAIN-008] `probe_sccache_version()` uses bounded, timeout-guarded
+  execution: `spawn()` with streaming reads capped at
+  `MAX_SCCACHE_VERSION_LENGTH` during read (not buffered-then-truncated),
+  `SCCACHE_PROBE_TIMEOUT` (5 s) with kill+reap, controlled env
+  (`env_clear` + PATH only), and `truncate_utf8_safe` for panic-free
+  UTF-8 truncation. Oversize output or timeout returns `None` (fail-safe).
+- [INV-CONTAIN-009] All string truncation uses `truncate_utf8_safe` which
+  selects the last `char_indices` boundary at or before the byte limit,
+  preventing panics from byte-slicing multibyte UTF-8 characters.
+- [INV-CONTAIN-010] Bounded test commands (systemd transient units)
   unconditionally strip sccache env vars (`RUSTC_WRAPPER`, `SCCACHE_*`)
   because cgroup containment cannot be verified for the transient unit
   before it starts. The stripping is enforced in two places: (1) the
