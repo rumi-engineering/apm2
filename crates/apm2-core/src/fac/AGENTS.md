@@ -3232,9 +3232,9 @@ no side effects); callers provide loaded receipt data and receive a
   jobs-per-hour), queue latency percentiles (median and p95 wall-clock duration
   from `observed_cost`), per-`DenialReasonCode` denial breakdown, disk preflight
   failure count, GC bytes freed, `gc_receipts_truncated`,
-  `job_receipts_truncated`, `aggregates_may_be_incomplete`, and
-  `unverified_headers_skipped` fields. Serialized to JSON via serde with
-  `deny_unknown_fields`.
+  `job_receipts_truncated`, `aggregates_may_be_incomplete`,
+  `unverified_headers_skipped`, and `timestamp_mismatches` fields. Serialized to
+  JSON via serde with `deny_unknown_fields`.
 - `HeaderCounts`: Pre-counted aggregate totals (completed/denied/quarantined/
   cancelled/total) derived from **verified** receipt headers in the observation
   window. Each header's `content_hash` is verified against the content-addressed
@@ -3289,16 +3289,23 @@ aggregated into an `"other"` bucket to keep totals accurate.
 ### CLI Integration
 
 The `apm2 fac metrics` command (in `fac.rs`) uses a single verified pass:
-1. **Pass 1 (verified headers + detail receipts)**: For each receipt header in
-   the time window, verifies its `content_hash` via `lookup_receipt_by_hash`
-   (bounded I/O + BLAKE3 integrity check). Only headers whose content hash
-   binds to a verified receipt payload are counted — forged index headers are
-   excluded (security finding: MAJOR, round 7). Verified receipts up to
-   `MAX_METRICS_RECEIPTS = 16384` are retained for detail analysis (latency
-   percentiles, denial-reason breakdowns). The index completeness signal
-   (`may_be_incomplete`) is propagated to the output as
-   `aggregates_may_be_incomplete`, and the count of unverified headers is
-   emitted as `unverified_headers_skipped`.
+1. **Pass 1 (verified headers + detail receipts)**: For each receipt header, a
+   coarse pre-filter using the non-authoritative header timestamp (with a
+   generous +/-1 day margin) avoids verifying receipts clearly outside the
+   window. This pre-filter is a **performance optimization only**, not a
+   security boundary. Each candidate header's `content_hash` is then verified
+   via `lookup_receipt_by_hash` (bounded I/O + BLAKE3 integrity check). After
+   verification, the **authoritative window gate** uses the verified receipt's
+   `timestamp_secs` (not the header's) for since/until inclusion. If the
+   header's `timestamp_secs` does not match the verified receipt's, the receipt
+   is excluded and `timestamp_mismatches` is incremented (tamper indicator —
+   security finding: MAJOR, round 9). Only integrity-verified headers whose
+   receipt timestamp falls within the authoritative window contribute to
+   aggregate counts. Verified receipts up to `MAX_METRICS_RECEIPTS = 16384`
+   are retained for detail analysis (latency percentiles, denial-reason
+   breakdowns). The index completeness signal (`may_be_incomplete`) is
+   propagated to the output as `aggregates_may_be_incomplete`, and the count
+   of unverified headers is emitted as `unverified_headers_skipped`.
 
 The command emits JSON only (TCK-00606 S12 machine-output invariant), is
 local-only (no daemon IPC), and is excluded from daemon auto-start.

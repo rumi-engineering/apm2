@@ -125,6 +125,16 @@ pub struct MetricsSummary {
     /// tampered receipt files in the store.
     #[serde(default)]
     pub unverified_headers_skipped: u64,
+
+    /// Number of receipt index headers whose `timestamp_secs` did not match
+    /// the verified receipt's `timestamp_secs`.  These receipts were excluded
+    /// from aggregate counts and detail analysis.
+    ///
+    /// A non-zero value is a strong tamper indicator: the non-authoritative
+    /// index has been modified to move receipts across observation window
+    /// boundaries without altering the receipt payload.
+    #[serde(default)]
+    pub timestamp_mismatches: u64,
 }
 
 /// Pre-counted aggregate totals derived from **verified** receipt headers.
