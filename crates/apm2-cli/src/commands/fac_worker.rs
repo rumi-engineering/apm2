@@ -4457,6 +4457,11 @@ fn process_job(
     // TCK-00554: Build sccache env for server lifecycle management.
     // Defined before the containment match so it's accessible for both
     // the server containment protocol and the stop call at unit end.
+    //
+    // fix-round-4 MAJOR: Use lane-scoped SCCACHE_DIR to prevent server
+    // lifecycle collisions across concurrent lanes. Each lane gets its own
+    // sccache directory (and therefore its own Unix domain socket), so
+    // --stop-server in one lane cannot terminate another lane's server.
     let sccache_server_env: Vec<(String, String)> = if policy.sccache_enabled {
         let apm2_home = resolve_apm2_home().unwrap_or_else(|| {
             fac_root
@@ -4465,7 +4470,9 @@ fn process_job(
                 .unwrap_or_else(|| Path::new("/"))
                 .to_path_buf()
         });
-        let sccache_dir = policy.resolve_sccache_dir(&apm2_home);
+        let sccache_dir = policy
+            .resolve_sccache_dir(&apm2_home)
+            .join(&acquired_lane_id);
         vec![(
             "SCCACHE_DIR".to_string(),
             sccache_dir.to_string_lossy().to_string(),
@@ -5992,6 +5999,20 @@ fn execute_warm_job(
     });
     let ambient_env: Vec<(String, String)> = std::env::vars().collect();
     let mut hardened_env = build_job_environment(policy, &ambient_env, &apm2_home);
+
+    // fix-round-4 MAJOR: Override SCCACHE_DIR with lane-scoped path to prevent
+    // server lifecycle collisions across concurrent lanes. build_job_environment
+    // injects the global resolve_sccache_dir() path; we narrow it to a per-lane
+    // subdirectory so each lane has its own sccache server Unix domain socket.
+    if effective_sccache_enabled {
+        let lane_sccache_dir = policy
+            .resolve_sccache_dir(&apm2_home)
+            .join(acquired_lane_id);
+        hardened_env.insert(
+            "SCCACHE_DIR".to_string(),
+            lane_sccache_dir.to_string_lossy().to_string(),
+        );
+    }
 
     // TCK-00554 BLOCKER-1 fix: If the server containment protocol auto-disabled
     // sccache, strip RUSTC_WRAPPER and SCCACHE_* from the hardened environment.

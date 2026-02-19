@@ -333,7 +333,7 @@ impl Default for SccacheServerContainment {
 }
 
 /// Maximum length for the `reason` field in `SccacheServerContainment`.
-const MAX_SERVER_CONTAINMENT_REASON_LENGTH: usize = 512;
+pub const MAX_SERVER_CONTAINMENT_REASON_LENGTH: usize = 512;
 
 /// Maximum number of sccache server PIDs that the set-based discovery
 /// will collect. Exceeding this bound triggers fail-closed auto-disable.

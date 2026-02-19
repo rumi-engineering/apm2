@@ -1576,6 +1576,49 @@ impl FacJobReceiptV1 {
                     max: super::containment::MAX_CGROUP_PATH_LENGTH,
                 });
             }
+
+            // TCK-00554 fix-round-4 MINOR: Defense-in-depth validation for
+            // sccache containment fields. These are truncated at creation time,
+            // but we validate again during deserialization to catch tampering or
+            // corruption.
+            if let Some(ref version) = trace.sccache_version {
+                if version.len() > super::containment::MAX_SCCACHE_VERSION_LENGTH {
+                    return Err(FacJobReceiptError::StringTooLong {
+                        field: "containment.sccache_version",
+                        actual: version.len(),
+                        max: super::containment::MAX_SCCACHE_VERSION_LENGTH,
+                    });
+                }
+            }
+            if let Some(ref sc) = trace.sccache_server_containment {
+                if let Some(ref reason) = sc.reason {
+                    if reason.len() > super::containment::MAX_SERVER_CONTAINMENT_REASON_LENGTH {
+                        return Err(FacJobReceiptError::StringTooLong {
+                            field: "containment.sccache_server_containment.reason",
+                            actual: reason.len(),
+                            max: super::containment::MAX_SERVER_CONTAINMENT_REASON_LENGTH,
+                        });
+                    }
+                }
+                if let Some(pid) = sc.preexisting_server_pid {
+                    if pid == 0 || pid > super::containment::MAX_PID_VALUE {
+                        return Err(FacJobReceiptError::InvalidData(format!(
+                            "containment.sccache_server_containment.preexisting_server_pid \
+                             {pid} out of range (1..={})",
+                            super::containment::MAX_PID_VALUE,
+                        )));
+                    }
+                }
+                if let Some(pid) = sc.started_server_pid {
+                    if pid == 0 || pid > super::containment::MAX_PID_VALUE {
+                        return Err(FacJobReceiptError::InvalidData(format!(
+                            "containment.sccache_server_containment.started_server_pid \
+                             {pid} out of range (1..={})",
+                            super::containment::MAX_PID_VALUE,
+                        )));
+                    }
+                }
+            }
         }
 
         // TCK-00587: Validate stop_revoke_admission trace bounds.
@@ -4200,6 +4243,198 @@ pub mod tests {
             sccache_server_containment: None,
         });
         // Recompute content hash so hash validation passes
+        let bytes = receipt.canonical_bytes();
+        receipt.content_hash = format!("b3-256:{}", blake3::hash(&bytes).to_hex());
+
+        assert!(receipt.validate().is_ok());
+    }
+
+    // ── TCK-00554 fix-round-4: defense-in-depth validation tests ──
+
+    #[test]
+    fn test_validate_rejects_oversized_sccache_version() {
+        let mut receipt = make_valid_receipt();
+        receipt.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: true,
+            cgroup_path: "/system.slice/test.service".to_string(),
+            processes_checked: 1,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+            sccache_enabled: true,
+            sccache_version: Some(
+                "x".repeat(crate::fac::containment::MAX_SCCACHE_VERSION_LENGTH + 1),
+            ),
+            sccache_server_containment: None,
+        });
+        let bytes = receipt.canonical_bytes();
+        receipt.content_hash = format!("b3-256:{}", blake3::hash(&bytes).to_hex());
+
+        assert!(matches!(
+            receipt.validate(),
+            Err(FacJobReceiptError::StringTooLong {
+                field: "containment.sccache_version",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_oversized_server_containment_reason() {
+        let mut receipt = make_valid_receipt();
+        receipt.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: true,
+            cgroup_path: "/system.slice/test.service".to_string(),
+            processes_checked: 1,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+            sccache_enabled: true,
+            sccache_version: None,
+            sccache_server_containment: Some(crate::fac::containment::SccacheServerContainment {
+                reason: Some(
+                    "x".repeat(crate::fac::containment::MAX_SERVER_CONTAINMENT_REASON_LENGTH + 1),
+                ),
+                ..Default::default()
+            }),
+        });
+        let bytes = receipt.canonical_bytes();
+        receipt.content_hash = format!("b3-256:{}", blake3::hash(&bytes).to_hex());
+
+        assert!(matches!(
+            receipt.validate(),
+            Err(FacJobReceiptError::StringTooLong {
+                field: "containment.sccache_server_containment.reason",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_preexisting_server_pid() {
+        let mut receipt = make_valid_receipt();
+        receipt.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: true,
+            cgroup_path: "/system.slice/test.service".to_string(),
+            processes_checked: 1,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+            sccache_enabled: true,
+            sccache_version: None,
+            sccache_server_containment: Some(crate::fac::containment::SccacheServerContainment {
+                preexisting_server_pid: Some(0),
+                ..Default::default()
+            }),
+        });
+        let bytes = receipt.canonical_bytes();
+        receipt.content_hash = format!("b3-256:{}", blake3::hash(&bytes).to_hex());
+
+        assert!(matches!(
+            receipt.validate(),
+            Err(FacJobReceiptError::InvalidData(ref msg))
+            if msg.contains("preexisting_server_pid")
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_excessive_preexisting_server_pid() {
+        let mut receipt = make_valid_receipt();
+        receipt.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: true,
+            cgroup_path: "/system.slice/test.service".to_string(),
+            processes_checked: 1,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+            sccache_enabled: true,
+            sccache_version: None,
+            sccache_server_containment: Some(crate::fac::containment::SccacheServerContainment {
+                preexisting_server_pid: Some(crate::fac::containment::MAX_PID_VALUE + 1),
+                ..Default::default()
+            }),
+        });
+        let bytes = receipt.canonical_bytes();
+        receipt.content_hash = format!("b3-256:{}", blake3::hash(&bytes).to_hex());
+
+        assert!(matches!(
+            receipt.validate(),
+            Err(FacJobReceiptError::InvalidData(ref msg))
+            if msg.contains("preexisting_server_pid")
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_started_server_pid() {
+        let mut receipt = make_valid_receipt();
+        receipt.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: true,
+            cgroup_path: "/system.slice/test.service".to_string(),
+            processes_checked: 1,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+            sccache_enabled: true,
+            sccache_version: None,
+            sccache_server_containment: Some(crate::fac::containment::SccacheServerContainment {
+                started_server_pid: Some(0),
+                ..Default::default()
+            }),
+        });
+        let bytes = receipt.canonical_bytes();
+        receipt.content_hash = format!("b3-256:{}", blake3::hash(&bytes).to_hex());
+
+        assert!(matches!(
+            receipt.validate(),
+            Err(FacJobReceiptError::InvalidData(ref msg))
+            if msg.contains("started_server_pid")
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_excessive_started_server_pid() {
+        let mut receipt = make_valid_receipt();
+        receipt.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: true,
+            cgroup_path: "/system.slice/test.service".to_string(),
+            processes_checked: 1,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+            sccache_enabled: true,
+            sccache_version: None,
+            sccache_server_containment: Some(crate::fac::containment::SccacheServerContainment {
+                started_server_pid: Some(crate::fac::containment::MAX_PID_VALUE + 1),
+                ..Default::default()
+            }),
+        });
+        let bytes = receipt.canonical_bytes();
+        receipt.content_hash = format!("b3-256:{}", blake3::hash(&bytes).to_hex());
+
+        assert!(matches!(
+            receipt.validate(),
+            Err(FacJobReceiptError::InvalidData(ref msg))
+            if msg.contains("started_server_pid")
+        ));
+    }
+
+    #[test]
+    fn test_validate_accepts_valid_server_containment_pids() {
+        let mut receipt = make_valid_receipt();
+        receipt.containment = Some(crate::fac::containment::ContainmentTrace {
+            verified: true,
+            cgroup_path: "/system.slice/test.service".to_string(),
+            processes_checked: 1,
+            mismatch_count: 0,
+            sccache_auto_disabled: false,
+            sccache_enabled: true,
+            sccache_version: Some("sccache 0.8.1".to_string()),
+            sccache_server_containment: Some(crate::fac::containment::SccacheServerContainment {
+                protocol_executed: true,
+                preexisting_server_detected: true,
+                preexisting_server_in_cgroup: Some(true),
+                preexisting_server_pid: Some(1234),
+                server_started: true,
+                started_server_pid: Some(5678),
+                server_cgroup_verified: true,
+                auto_disabled: false,
+                reason: Some("all good".to_string()),
+            }),
+        });
         let bytes = receipt.canonical_bytes();
         receipt.content_hash = format!("b3-256:{}", blake3::hash(&bytes).to_hex());
 

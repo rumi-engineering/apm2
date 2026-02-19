@@ -3028,12 +3028,21 @@ job unit, preventing cache poisoning via escaped sccache daemons.
 - [INV-CONTAIN-011] (TCK-00554) Stop the sccache server at unit end to prevent
   cgroup escape. Best-effort: logged but does not block job completion.
   In multi-lane environments, the stop is gated on ownership — only the unit
-  that started or verified the server issues the stop command, preventing
-  cross-lane interference when lanes share the same SCCACHE_DIR.
+  that started or verified the server issues the stop command. Each lane uses
+  a lane-scoped SCCACHE_DIR (`$APM2_HOME/private/fac/sccache/<lane_id>`) so
+  concurrent lanes have independent Unix domain sockets and cannot interfere
+  with each other's server lifecycle (fix-round-4 MAJOR).
 - [INV-CONTAIN-012] (TCK-00554) Auto-disable sccache if server containment
   cannot be verified (fail-closed). Covers: unable to scan for servers,
   pre-existing server outside cgroup, unable to start server, started server
   found outside cgroup.
+- [INV-CONTAIN-013] (TCK-00554 fix-round-4) `FacJobReceiptV1::validate()`
+  performs defense-in-depth bounds checking on sccache containment fields:
+  `sccache_version` <= `MAX_SCCACHE_VERSION_LENGTH`, server containment
+  `reason` <= `MAX_SERVER_CONTAINMENT_REASON_LENGTH`, PID fields in range
+  `1..=MAX_PID_VALUE`. These fields are already truncated/validated at
+  creation time; the validation check guards against tampering or corruption
+  in deserialized receipts.
 
 ## credential_gate Submodule (TCK-00596)
 

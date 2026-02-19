@@ -298,9 +298,9 @@ pub use ci_import::{
 pub use containment::{
     ContainmentError, ContainmentMismatch, ContainmentTrace, ContainmentVerdict,
     MAX_CHILD_PROCESSES, MAX_CONTAINMENT_MISMATCHES, MAX_PROC_READ_SIZE, MAX_PROC_SCAN_ENTRIES,
-    MAX_SCCACHE_VERSION_LENGTH, SccacheServerContainment, check_sccache_containment,
-    check_sccache_containment_with_proc, discover_children, discover_children_from_proc,
-    execute_sccache_server_containment_protocol,
+    MAX_SCCACHE_VERSION_LENGTH, MAX_SERVER_CONTAINMENT_REASON_LENGTH, SccacheServerContainment,
+    check_sccache_containment, check_sccache_containment_with_proc, discover_children,
+    discover_children_from_proc, execute_sccache_server_containment_protocol,
     execute_sccache_server_containment_protocol_with_proc, is_cgroup_contained,
     probe_sccache_version, read_cgroup_path, read_cgroup_path_from_proc, stop_sccache_server,
     verify_containment, verify_containment_with_proc,
