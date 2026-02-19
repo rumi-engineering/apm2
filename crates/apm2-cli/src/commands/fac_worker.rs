@@ -4453,6 +4453,27 @@ fn process_job(
         || std::env::var("RUSTC_WRAPPER")
             .ok()
             .is_some_and(|v| v.contains("sccache"));
+
+    // TCK-00554: Build sccache env for server lifecycle management.
+    // Defined before the containment match so it's accessible for both
+    // the server containment protocol and the stop call at unit end.
+    let sccache_server_env: Vec<(String, String)> = if policy.sccache_enabled {
+        let apm2_home = resolve_apm2_home().unwrap_or_else(|| {
+            fac_root
+                .parent()
+                .and_then(|p| p.parent())
+                .unwrap_or_else(|| Path::new("/"))
+                .to_path_buf()
+        });
+        let sccache_dir = policy.resolve_sccache_dir(&apm2_home);
+        vec![(
+            "SCCACHE_DIR".to_string(),
+            sccache_dir.to_string_lossy().to_string(),
+        )]
+    } else {
+        vec![]
+    };
+
     let containment_trace = match apm2_core::fac::containment::verify_containment(
         std::process::id(),
         sccache_active,
@@ -4477,13 +4498,56 @@ fn process_job(
             } else {
                 None
             };
-            Some(
-                apm2_core::fac::containment::ContainmentTrace::from_verdict_with_sccache(
-                    &verdict,
-                    policy.sccache_enabled,
-                    sccache_version,
-                ),
-            )
+
+            // TCK-00554: Execute sccache server containment protocol.
+            //
+            // When the policy enables sccache, verify that the sccache
+            // server is inside the unit cgroup. If a pre-existing server
+            // is outside the cgroup, refuse to use it and start a new one.
+            // If server containment cannot be verified, auto-disable sccache.
+            let server_containment = if policy.sccache_enabled {
+                let sc = apm2_core::fac::containment::execute_sccache_server_containment_protocol(
+                    std::process::id(),
+                    &verdict.reference_cgroup,
+                    &sccache_server_env,
+                );
+                eprintln!(
+                    "worker: sccache server containment: protocol_executed={} \
+                     server_started={} server_cgroup_verified={} auto_disabled={}",
+                    sc.protocol_executed,
+                    sc.server_started,
+                    sc.server_cgroup_verified,
+                    sc.auto_disabled,
+                );
+                if sc.auto_disabled {
+                    eprintln!(
+                        "worker: WARNING: sccache auto-disabled by server containment: {}",
+                        sc.reason.as_deref().unwrap_or("unknown"),
+                    );
+                }
+                Some(sc)
+            } else {
+                None
+            };
+
+            if let Some(ref sc) = server_containment {
+                Some(
+                    apm2_core::fac::containment::ContainmentTrace::from_verdict_with_server_containment(
+                        &verdict,
+                        policy.sccache_enabled,
+                        sccache_version,
+                        sc.clone(),
+                    ),
+                )
+            } else {
+                Some(
+                    apm2_core::fac::containment::ContainmentTrace::from_verdict_with_sccache(
+                        &verdict,
+                        policy.sccache_enabled,
+                        sccache_version,
+                    ),
+                )
+            }
         },
         Err(err) => {
             eprintln!("worker: ERROR: containment check failed: {err}");
@@ -4499,7 +4563,7 @@ fn process_job(
     // lane workspace and lane-managed CARGO_HOME/CARGO_TARGET_DIR. The warm
     // receipt is persisted to the FAC receipts directory alongside the job receipt.
     if spec.kind == "warm" {
-        return execute_warm_job(
+        let warm_outcome = execute_warm_job(
             spec,
             &claimed_path,
             &claimed_file_name,
@@ -4530,6 +4594,15 @@ fn process_job(
             job_wall_start,
             toolchain_fingerprint,
         );
+
+        // TCK-00554: Stop sccache server at unit end (INV-CONTAIN-011).
+        // Best-effort: failure to stop is logged but does not affect job outcome.
+        if policy.sccache_enabled && !sccache_server_env.is_empty() {
+            let stopped = apm2_core::fac::stop_sccache_server(&sccache_server_env);
+            eprintln!("worker: sccache server stop (warm unit end): stopped={stopped}");
+        }
+
+        return warm_outcome;
     }
 
     // Step 9: Write authoritative GateReceipt and move to completed.
@@ -4617,6 +4690,13 @@ fn process_job(
         // Lane is already marked corrupt by execute_lane_cleanup on failure.
         // The job outcome remains Completed — infrastructure failures do not
         // retroactively negate successful execution.
+    }
+
+    // TCK-00554: Stop sccache server at unit end (INV-CONTAIN-011).
+    // Best-effort: failure to stop is logged but does not affect job outcome.
+    if policy.sccache_enabled && !sccache_server_env.is_empty() {
+        let stopped = apm2_core::fac::stop_sccache_server(&sccache_server_env);
+        eprintln!("worker: sccache server stop (unit end): stopped={stopped}");
     }
 
     // Lane guard is dropped here (RAII), releasing the lane lock.
@@ -8260,6 +8340,7 @@ mod tests {
             sccache_auto_disabled: false,
             sccache_enabled: false,
             sccache_version: None,
+            sccache_server_containment: None,
         };
 
         let receipt_path = emit_job_receipt(

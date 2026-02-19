@@ -934,6 +934,19 @@ impl FacJobReceiptV1 {
             } else {
                 bytes.push(0u8);
             }
+            // TCK-00554: sccache server containment protocol attestation.
+            if let Some(ref sc) = trace.sccache_server_containment {
+                bytes.push(1u8);
+                bytes.push(u8::from(sc.protocol_executed));
+                bytes.push(u8::from(sc.preexisting_server_detected));
+                bytes.push(u8::from(sc.preexisting_server_in_cgroup.unwrap_or(false)));
+                bytes.push(u8::from(sc.server_started));
+                bytes.push(u8::from(sc.server_cgroup_verified));
+                bytes.push(u8::from(sc.auto_disabled));
+                bytes.push(u8::from(sc.server_stopped));
+            } else {
+                bytes.push(0u8);
+            }
         }
 
         // TCK-00532: Observed job cost. V1 trailing optionals omit absence
@@ -1169,6 +1182,19 @@ impl FacJobReceiptV1 {
                 bytes.push(1u8);
                 bytes.extend_from_slice(&(version.len() as u32).to_be_bytes());
                 bytes.extend_from_slice(version.as_bytes());
+            } else {
+                bytes.push(0u8);
+            }
+            // TCK-00554: sccache server containment protocol attestation.
+            if let Some(ref sc) = trace.sccache_server_containment {
+                bytes.push(1u8);
+                bytes.push(u8::from(sc.protocol_executed));
+                bytes.push(u8::from(sc.preexisting_server_detected));
+                bytes.push(u8::from(sc.preexisting_server_in_cgroup.unwrap_or(false)));
+                bytes.push(u8::from(sc.server_started));
+                bytes.push(u8::from(sc.server_cgroup_verified));
+                bytes.push(u8::from(sc.auto_disabled));
+                bytes.push(u8::from(sc.server_stopped));
             } else {
                 bytes.push(0u8);
             }
@@ -4059,6 +4085,7 @@ pub mod tests {
             sccache_auto_disabled: false,
             sccache_enabled: false,
             sccache_version: None,
+            sccache_server_containment: None,
         });
         // Recompute content hash so other validations pass
         let bytes = receipt.canonical_bytes();
@@ -4084,6 +4111,7 @@ pub mod tests {
             sccache_auto_disabled: false,
             sccache_enabled: false,
             sccache_version: None,
+            sccache_server_containment: None,
         });
         // Recompute content hash so hash validation passes
         let bytes = receipt.canonical_bytes();
@@ -4106,6 +4134,7 @@ pub mod tests {
             sccache_auto_disabled: false,
             sccache_enabled: false,
             sccache_version: None,
+            sccache_server_containment: None,
         });
         let hash_some = r.canonical_bytes();
 
@@ -4126,6 +4155,7 @@ pub mod tests {
             sccache_auto_disabled: false,
             sccache_enabled: false,
             sccache_version: None,
+            sccache_server_containment: None,
         });
         let hash_a = r.canonical_bytes();
 
@@ -4137,6 +4167,7 @@ pub mod tests {
             sccache_auto_disabled: true,
             sccache_enabled: false,
             sccache_version: None,
+            sccache_server_containment: None,
         });
         let hash_b = r.canonical_bytes();
 
@@ -4177,6 +4208,7 @@ pub mod tests {
             sccache_auto_disabled: false,
             sccache_enabled: false,
             sccache_version: None,
+            sccache_server_containment: None,
         });
         let hash_some = r.canonical_bytes_v2();
 
@@ -4337,6 +4369,7 @@ pub mod tests {
                 sccache_auto_disabled: false,
                 sccache_enabled: false,
                 sccache_version: None,
+                sccache_server_containment: None,
             })
             .try_build()
             .unwrap();
@@ -4373,6 +4406,7 @@ pub mod tests {
                 sccache_auto_disabled: false,
                 sccache_enabled: false,
                 sccache_version: None,
+                sccache_server_containment: None,
             })
             .try_build()
             .unwrap();

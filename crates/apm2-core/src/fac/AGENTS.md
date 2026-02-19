@@ -1950,7 +1950,12 @@ Both `canonical_bytes()` and `canonical_bytes_v2()` use type-specific presence
 markers for trailing optional fields to ensure injective encoding:
 
 - `1u8` — `moved_job_path` (TCK-00518)
-- `2u8` — `containment` trace (TCK-00548)
+- `2u8` — `containment` trace (TCK-00548). Within the containment trace,
+  the `sccache_server_containment` sub-field (TCK-00554) is serialized as
+  a 1u8 presence marker followed by boolean bytes for `protocol_executed`,
+  `preexisting_server_detected`, `preexisting_server_in_cgroup`,
+  `server_started`, `server_cgroup_verified`, `auto_disabled`, and
+  `server_stopped` (or 0u8 when absent).
 - `3u8` — `sandbox_hardening_hash` (TCK-00573)
 
 `GateReceipt::canonical_bytes()` uses marker `4u8` for its own
@@ -2888,7 +2893,7 @@ policy bypass from malformed or adversarial job specs.
 - `DenialReasonCode::PolicyViolation` is emitted for policy-level denials
   (including `InvalidControlLaneRepoId`).
 
-## containment Submodule (TCK-00548, TCK-00553)
+## containment Submodule (TCK-00548, TCK-00553, TCK-00554)
 
 The `containment` submodule implements cgroup membership verification for
 child processes during FAC job execution. It verifies that child processes
@@ -2902,8 +2907,15 @@ job unit, preventing cache poisoning via escaped sccache daemons.
 - `ContainmentMismatch`: Single escaped process with PID, name, expected and
   actual cgroup paths.
 - `ContainmentTrace`: Lightweight trace for inclusion in `FacJobReceiptV1`.
-  Includes `sccache_enabled` (policy-gated activation status) and
-  `sccache_version` (probed version string for attestation) fields (TCK-00553).
+  Includes `sccache_enabled` (policy-gated activation status),
+  `sccache_version` (probed version string for attestation, TCK-00553), and
+  `sccache_server_containment` (per-unit server lifecycle outcome, TCK-00554).
+- `SccacheServerContainment`: Full outcome of the per-unit sccache server
+  lifecycle protocol (TCK-00554). Records `protocol_executed`,
+  `preexisting_server_detected`, `preexisting_server_in_cgroup`,
+  `preexisting_server_pid`, `server_started`, `started_server_pid`,
+  `server_cgroup_verified`, `auto_disabled`, `reason`, and `server_stopped`.
+  Fail-closed default: all bools false, all options None.
 - `ContainmentError`: Fail-closed error taxonomy for proc read failures,
   parse failures, and resource bounds.
 
@@ -2940,8 +2952,22 @@ job unit, preventing cache poisoning via escaped sccache daemons.
   Constructs a trace that sets `sccache_enabled = true` only when the
   policy knob is on AND containment is verified AND sccache was not
   auto-disabled (fail-closed gate chain, TCK-00553).
+- `ContainmentTrace::from_verdict_with_server_containment(verdict, policy_sccache_enabled, sccache_version, server_containment)`:
+  Extends `from_verdict_with_sccache` by attaching the server containment
+  protocol outcome (TCK-00554). If server containment auto-disabled sccache,
+  overrides `sccache_enabled` to `false` (fail-closed: INV-CONTAIN-012).
+- `execute_sccache_server_containment_protocol(reference_pid, reference_cgroup, sccache_env)`:
+  Executes the 5-step per-unit sccache server lifecycle protocol (TCK-00554):
+  (1) detect pre-existing server, (2) verify cgroup membership, (3) refuse
+  out-of-cgroup servers, (4) start new server inside unit cgroup, (5) verify
+  new server containment. Returns `SccacheServerContainment`. Fail-closed:
+  any verification failure sets `auto_disabled = true`.
+- `execute_sccache_server_containment_protocol_with_proc(...)`: Testable
+  variant with configurable procfs root.
+- `stop_sccache_server(sccache_env)`: Best-effort server stop at unit end
+  (INV-CONTAIN-011). Returns `true` on success, `false` on failure.
 
-### Security Invariants (TCK-00548)
+### Security Invariants (TCK-00548, TCK-00554)
 
 - [INV-CONTAIN-001] Fail-closed: unreadable `/proc` entries result in
   mismatch verdict. Default `ContainmentVerdict::default()` has
@@ -2974,7 +3000,15 @@ job unit, preventing cache poisoning via escaped sccache daemons.
 - [INV-CONTAIN-009] All string truncation uses `truncate_utf8_safe` which
   selects the last `char_indices` boundary at or before the byte limit,
   preventing panics from byte-slicing multibyte UTF-8 characters.
-- [INV-CONTAIN-010] Bounded test commands (systemd transient units)
+- [INV-CONTAIN-009] (TCK-00554) Refuse to attach to a pre-existing sccache
+  server that is outside the unit cgroup. Verified by checking the PID of any
+  running sccache server against the reference cgroup. When an out-of-cgroup
+  server is found, the protocol stops it and starts a new one inside the unit
+  cgroup.
+- [INV-CONTAIN-010] (TCK-00554) Start a new sccache server inside the unit
+  cgroup when policy enables sccache and no in-cgroup server exists. The
+  server inherits the caller's cgroup membership by being spawned within the
+  unit process tree. Bounded test commands (systemd transient units)
   unconditionally strip sccache env vars (`RUSTC_WRAPPER`, `SCCACHE_*`)
   because cgroup containment cannot be verified for the transient unit
   before it starts. The stripping is enforced in two places: (1) the
@@ -2983,6 +3017,12 @@ job unit, preventing cache poisoning via escaped sccache daemons.
   these keys from appearing in `--setenv` args; (2) `env_remove_keys`
   strips them from the spawned process environment to prevent parent
   env inheritance.
+- [INV-CONTAIN-011] (TCK-00554) Stop the sccache server at unit end to prevent
+  cgroup escape. Best-effort: logged but does not block job completion.
+- [INV-CONTAIN-012] (TCK-00554) Auto-disable sccache if server containment
+  cannot be verified (fail-closed). Covers: unable to scan for servers,
+  pre-existing server outside cgroup, unable to start server, started server
+  found outside cgroup.
 
 ## credential_gate Submodule (TCK-00596)
 
