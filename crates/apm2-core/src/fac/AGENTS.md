@@ -1986,7 +1986,10 @@ queue_lane, etc.).
   content-hash integrity before returning true. Falls back to bounded directory
   scan. Used by the worker for duplicate detection.
 - `list_receipt_headers(receipts_dir)`: List all indexed headers sorted by
-  timestamp (most recent first). No directory scanning.
+  timestamp (most recent first). No directory scanning. Returns a
+  `ListReceiptHeadersResult` with a `may_be_incomplete` flag that is `true`
+  when the index is at capacity (`MAX_INDEX_ENTRIES`) and may not cover all
+  receipts in the store.
 - CLI: `apm2 fac receipts list` — list indexed receipts.
 - CLI: `apm2 fac receipts status <job_id>` — look up latest receipt for a job.
 - CLI: `apm2 fac receipts reindex` — force full rebuild from receipt store.
@@ -3228,12 +3231,16 @@ no side effects); callers provide loaded receipt data and receive a
   window bounds, throughput (completed/denied/quarantined/cancelled counts,
   jobs-per-hour), queue latency percentiles (median and p95 wall-clock duration
   from `observed_cost`), per-`DenialReasonCode` denial breakdown, disk preflight
-  failure count, GC bytes freed, `gc_receipts_truncated`, and
-  `job_receipts_truncated` flags. Serialized to JSON via serde with
+  failure count, GC bytes freed, `gc_receipts_truncated`,
+  `job_receipts_truncated`, `aggregates_may_be_incomplete`, and
+  `unverified_headers_skipped` fields. Serialized to JSON via serde with
   `deny_unknown_fields`.
 - `HeaderCounts`: Pre-counted aggregate totals (completed/denied/quarantined/
-  cancelled/total) derived from ALL receipt headers in the observation window.
-  Not subject to the receipt-loading cap, ensuring accurate aggregate metrics.
+  cancelled/total) derived from **verified** receipt headers in the observation
+  window. Each header's `content_hash` is verified against the content-addressed
+  store via `lookup_receipt_by_hash` before counting; headers that fail
+  verification are excluded (fail-closed). Not subject to the receipt-loading
+  cap, ensuring accurate aggregate metrics.
 - `MetricsInput`: Input parameters struct holding slices of job and GC receipts,
   observation window bounds, and an optional `HeaderCounts` override. When
   `header_counts` is `Some`, aggregate counts come from the header pass;
@@ -3281,13 +3288,17 @@ aggregated into an `"other"` bucket to keep totals accurate.
 
 ### CLI Integration
 
-The `apm2 fac metrics` command (in `fac.rs`) uses a two-pass approach:
-1. **Pass 1 (headers)**: Iterates ALL receipt headers in the time window to
-   compute accurate aggregate counts (completed/denied/quarantined/cancelled/
-   total) and throughput. This is not subject to the memory cap.
-2. **Pass 2 (full receipts)**: Loads full receipts (capped at
-   `MAX_METRICS_RECEIPTS = 16384`) for latency percentiles and denial-reason
-   breakdowns.
+The `apm2 fac metrics` command (in `fac.rs`) uses a single verified pass:
+1. **Pass 1 (verified headers + detail receipts)**: For each receipt header in
+   the time window, verifies its `content_hash` via `lookup_receipt_by_hash`
+   (bounded I/O + BLAKE3 integrity check). Only headers whose content hash
+   binds to a verified receipt payload are counted — forged index headers are
+   excluded (security finding: MAJOR, round 7). Verified receipts up to
+   `MAX_METRICS_RECEIPTS = 16384` are retained for detail analysis (latency
+   percentiles, denial-reason breakdowns). The index completeness signal
+   (`may_be_incomplete`) is propagated to the output as
+   `aggregates_may_be_incomplete`, and the count of unverified headers is
+   emitted as `unverified_headers_skipped`.
 
 The command emits JSON only (TCK-00606 S12 machine-output invariant), is
 local-only (no daemon IPC), and is excluded from daemon auto-start.

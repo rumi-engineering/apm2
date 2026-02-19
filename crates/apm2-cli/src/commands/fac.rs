@@ -3754,7 +3754,8 @@ fn run_receipt_list(args: &ReceiptListArgs, json_output: bool) -> u8 {
     };
 
     let receipts_dir = apm2_home.join("private").join("fac").join("receipts");
-    let mut headers = apm2_core::fac::list_receipt_headers(&receipts_dir);
+    let headers_result = apm2_core::fac::list_receipt_headers(&receipts_dir);
+    let mut headers = headers_result.headers;
 
     // Deterministic ordering: timestamp descending, content_hash ascending
     // for equal timestamps. This ensures stable output across runs.
@@ -6423,59 +6424,103 @@ fn run_metrics(args: &MetricsArgs, json_output: bool) -> u8 {
         .unwrap_or_else(|| now_secs.saturating_sub(DEFAULT_METRICS_WINDOW_SECS));
     let until_secs = args.until.unwrap_or(now_secs);
 
-    // Load all receipt headers from the index.
-    let all_headers = apm2_core::fac::list_receipt_headers(&receipts_dir);
+    // Load all receipt headers from the index, with completeness signal.
+    let headers_result = apm2_core::fac::list_receipt_headers(&receipts_dir);
+    let index_may_be_incomplete = headers_result.may_be_incomplete;
 
     // ---------------------------------------------------------------
-    // Pass 1: Iterate ALL headers in the observation window to compute
-    // accurate aggregate counts.  Headers are lightweight (no full
-    // receipt loading), so this is not subject to the memory cap.
+    // Pass 1: Iterate ALL headers in the observation window.  For each
+    // header, verify that its content_hash binds to actual verified
+    // receipt bytes via lookup_receipt_by_hash.  Only verified headers
+    // contribute to aggregate counts.  This prevents an attacker who
+    // tampers receipt_index.v1.json from forging aggregate metrics
+    // (security finding: MAJOR — round 7).
+    //
+    // Streaming verification: each receipt is loaded, verified, and
+    // counted one at a time.  Only the receipt loaded for detail
+    // analysis (pass 2) is retained in memory; the verification-only
+    // receipts are dropped immediately after counting.
     // ---------------------------------------------------------------
     let mut header_counts = apm2_core::fac::HeaderCounts::default();
-    let mut window_headers: Vec<&apm2_core::fac::ReceiptHeaderV1> = Vec::new();
-    for header in &all_headers {
+    let mut unverified_headers_skipped: u64 = 0;
+    // Collect verified headers for pass 2 (detail analysis).
+    // We store (header_ref_index, verified_receipt) pairs so pass 2
+    // can reuse already-loaded receipts without re-reading from disk.
+    let mut verified_window: Vec<(usize, apm2_core::fac::FacJobReceiptV1)> = Vec::new();
+    let mut truncated = false;
+
+    for (idx, header) in headers_result.headers.iter().enumerate() {
         if header.timestamp_secs >= since_secs && header.timestamp_secs <= until_secs {
-            header_counts.total += 1;
-            match header.outcome {
-                apm2_core::fac::FacJobOutcome::Completed => header_counts.completed += 1,
-                apm2_core::fac::FacJobOutcome::Denied => header_counts.denied += 1,
-                apm2_core::fac::FacJobOutcome::Quarantined => header_counts.quarantined += 1,
-                apm2_core::fac::FacJobOutcome::Cancelled
-                | apm2_core::fac::FacJobOutcome::CancellationRequested => {
-                    header_counts.cancelled += 1;
-                },
-                // Fail-closed: unknown outcome variants are counted in total
-                // but not attributed to any category.
-                _ => {},
+            // Verify: content_hash must bind to a verified receipt in the store.
+            // lookup_receipt_by_hash validates digest format, loads with bounded
+            // I/O + O_NOFOLLOW, and recomputes the BLAKE3-256 hash for integrity.
+            if let Some(receipt) =
+                apm2_core::fac::lookup_receipt_by_hash(&receipts_dir, &header.content_hash)
+            {
+                // Verified — count using the receipt's actual outcome (not the
+                // potentially-forged index header outcome).
+                header_counts.total += 1;
+                match receipt.outcome {
+                    apm2_core::fac::FacJobOutcome::Completed => header_counts.completed += 1,
+                    apm2_core::fac::FacJobOutcome::Denied => header_counts.denied += 1,
+                    apm2_core::fac::FacJobOutcome::Quarantined => {
+                        header_counts.quarantined += 1;
+                    },
+                    apm2_core::fac::FacJobOutcome::Cancelled
+                    | apm2_core::fac::FacJobOutcome::CancellationRequested => {
+                        header_counts.cancelled += 1;
+                    },
+                    // Fail-closed: unknown outcome variants are counted in total
+                    // but not attributed to any category.
+                    _ => {},
+                }
+
+                // Retain for pass 2 if within the detail cap.
+                if verified_window.len() < MAX_METRICS_RECEIPTS {
+                    verified_window.push((idx, receipt));
+                } else {
+                    truncated = true;
+                    // Drop the receipt — only needed for counting, which is
+                    // done.
+                }
+            } else {
+                // Verification failed: forged/tampered/missing receipt.
+                // Fail-closed: do NOT count this header.
+                unverified_headers_skipped += 1;
             }
-            window_headers.push(header);
         }
     }
 
     // ---------------------------------------------------------------
-    // Pass 2: Load full receipts for detail analysis (latency
-    // percentiles, denial-reason breakdowns).  Bounded by
-    // MAX_METRICS_RECEIPTS to prevent unbounded memory growth.
+    // Pass 2: Extract already-loaded verified receipts for detail
+    // analysis (latency percentiles, denial-reason breakdowns).
+    // These were retained during pass 1, bounded by MAX_METRICS_RECEIPTS.
     // ---------------------------------------------------------------
-    let mut job_receipts: Vec<apm2_core::fac::FacJobReceiptV1> = Vec::new();
-    let mut truncated = false;
-    for header in &window_headers {
-        if job_receipts.len() >= MAX_METRICS_RECEIPTS {
-            truncated = true;
-            break;
-        }
-        if let Some(receipt) =
-            apm2_core::fac::lookup_receipt_by_hash(&receipts_dir, &header.content_hash)
-        {
-            job_receipts.push(receipt);
-        }
-    }
+    let job_receipts: Vec<apm2_core::fac::FacJobReceiptV1> =
+        verified_window.into_iter().map(|(_idx, r)| r).collect();
 
     if truncated {
         eprintln!(
-            "warning: receipt count exceeds MAX_METRICS_RECEIPTS ({MAX_METRICS_RECEIPTS}); \
-             latency and denial-reason details are computed from the first \
-             {MAX_METRICS_RECEIPTS} receipts only (aggregate counts are accurate)"
+            "warning: verified receipt count exceeds MAX_METRICS_RECEIPTS \
+             ({MAX_METRICS_RECEIPTS}); latency and denial-reason details are \
+             computed from the first {MAX_METRICS_RECEIPTS} receipts only \
+             (aggregate counts cover all verified receipts)"
+        );
+    }
+
+    if unverified_headers_skipped > 0 {
+        eprintln!(
+            "warning: {unverified_headers_skipped} receipt index header(s) failed \
+             content-hash verification and were excluded from aggregate counts. \
+             This may indicate index corruption or tampered receipt files."
+        );
+    }
+
+    if index_may_be_incomplete {
+        eprintln!(
+            "warning: receipt index is at capacity and may not contain all \
+             receipts in the store. Aggregate counts may undercount. \
+             Run `apm2 fac reindex` to rebuild."
         );
     }
 
@@ -6500,6 +6545,8 @@ fn run_metrics(args: &MetricsArgs, json_output: bool) -> u8 {
     let mut summary = apm2_core::fac::compute_metrics(&input);
     summary.gc_receipts_truncated = gc_receipts_truncated;
     summary.job_receipts_truncated = truncated;
+    summary.aggregates_may_be_incomplete = index_may_be_incomplete;
+    summary.unverified_headers_skipped = unverified_headers_skipped;
 
     // TCK-00606 S12: FAC commands are machine-output only.
     match serde_json::to_string_pretty(&summary) {

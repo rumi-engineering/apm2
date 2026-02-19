@@ -674,19 +674,46 @@ pub fn lookup_job_receipt(receipts_dir: &Path, job_id: &str) -> Option<FacJobRec
     scan_receipt_for_job(receipts_dir, job_id)
 }
 
+/// Result of listing receipt headers from the index.
+///
+/// Includes a completeness signal so callers can detect when the index
+/// may not cover all receipts in the store (e.g., because the index
+/// reached capacity during rebuild).
+#[derive(Debug, Clone)]
+pub struct ListReceiptHeadersResult {
+    /// Receipt headers sorted by timestamp descending (most recent first).
+    pub headers: Vec<ReceiptHeaderV1>,
+    /// `true` when the index is at capacity ([`MAX_INDEX_ENTRIES`]) and
+    /// therefore may not contain all receipts in the store.  Callers
+    /// should flag aggregate metrics derived from these headers as
+    /// potentially incomplete.
+    pub may_be_incomplete: bool,
+}
+
 /// List receipt headers from the index without directory scanning.
 ///
-/// Returns an iterator-like vec of headers from the index, sorted by
-/// timestamp descending (most recent first). If the index cannot be loaded,
-/// returns an empty vec.
+/// Returns headers sorted by timestamp descending (most recent first)
+/// together with a completeness signal.  If the index cannot be loaded,
+/// returns an empty result with `may_be_incomplete = true` (fail-closed:
+/// an unavailable index cannot guarantee completeness).
 #[must_use]
-pub fn list_receipt_headers(receipts_dir: &Path) -> Vec<ReceiptHeaderV1> {
+pub fn list_receipt_headers(receipts_dir: &Path) -> ListReceiptHeadersResult {
     let Ok(index) = ReceiptIndexV1::load_or_rebuild(receipts_dir) else {
-        return Vec::new();
+        return ListReceiptHeadersResult {
+            headers: Vec::new(),
+            may_be_incomplete: true,
+        };
     };
+    // The index may be incomplete if it is at capacity — rebuild_from_store
+    // stops inserting when the cap is reached, so receipts beyond the cap
+    // are silently dropped.
+    let may_be_incomplete = index.header_index.len() >= MAX_INDEX_ENTRIES;
     let mut headers: Vec<ReceiptHeaderV1> = index.header_index.into_values().collect();
     headers.sort_by(|a, b| b.timestamp_secs.cmp(&a.timestamp_secs));
-    headers
+    ListReceiptHeadersResult {
+        headers,
+        may_be_incomplete,
+    }
 }
 
 /// Load a `FacJobReceiptV1` from the receipt store by content hash (TCK-00551).
@@ -1406,18 +1433,75 @@ mod tests {
         index.persist(receipts_dir).expect("persist");
 
         // List headers — should be sorted by timestamp descending.
-        let headers = list_receipt_headers(receipts_dir);
-        assert_eq!(headers.len(), 3);
-        assert_eq!(headers[0].timestamp_secs, 3000);
-        assert_eq!(headers[1].timestamp_secs, 2000);
-        assert_eq!(headers[2].timestamp_secs, 1000);
+        let result = list_receipt_headers(receipts_dir);
+        assert_eq!(result.headers.len(), 3);
+        assert_eq!(result.headers[0].timestamp_secs, 3000);
+        assert_eq!(result.headers[1].timestamp_secs, 2000);
+        assert_eq!(result.headers[2].timestamp_secs, 1000);
+        // Small index should not be flagged as incomplete.
+        assert!(
+            !result.may_be_incomplete,
+            "index with 3 entries should not be flagged incomplete"
+        );
     }
 
     #[test]
     fn test_list_receipt_headers_empty() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let headers = list_receipt_headers(tmp.path());
-        assert!(headers.is_empty());
+        let result = list_receipt_headers(tmp.path());
+        // Empty directory triggers rebuild which returns empty index.
+        // An empty index from a successful rebuild is not incomplete.
+        assert!(result.headers.is_empty());
+    }
+
+    #[test]
+    fn test_list_receipt_headers_signals_incomplete_at_capacity() {
+        // Regression test for code-quality MAJOR (round 7): when the index
+        // is at MAX_INDEX_ENTRIES capacity, list_receipt_headers must flag
+        // may_be_incomplete = true so callers know aggregate counts may
+        // undercount.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Build an index manually at exactly MAX_INDEX_ENTRIES capacity.
+        let mut index = ReceiptIndexV1::new();
+        for i in 0..MAX_INDEX_ENTRIES {
+            let hash = format!("b3-256:{i:064x}");
+            let header = make_header(&format!("job-cap-{i}"), &hash, 1000 + i as u64);
+            index.upsert(header).expect("upsert within cap");
+        }
+        assert_eq!(index.len(), MAX_INDEX_ENTRIES);
+        index.persist(receipts_dir).expect("persist");
+
+        let result = list_receipt_headers(receipts_dir);
+        assert_eq!(result.headers.len(), MAX_INDEX_ENTRIES);
+        assert!(
+            result.may_be_incomplete,
+            "index at MAX_INDEX_ENTRIES must signal may_be_incomplete"
+        );
+    }
+
+    #[test]
+    fn test_list_receipt_headers_not_incomplete_below_capacity() {
+        // Positive test: an index below capacity should not signal
+        // may_be_incomplete.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let mut index = ReceiptIndexV1::new();
+        for i in 0_u64..10 {
+            let hash = format!("b3-256:{i:064x}");
+            let header = make_header(&format!("job-below-{i}"), &hash, 2000 + i);
+            index.upsert(header).expect("upsert");
+        }
+        index.persist(receipts_dir).expect("persist");
+
+        let result = list_receipt_headers(receipts_dir);
+        assert_eq!(result.headers.len(), 10);
+        assert!(
+            !result.may_be_incomplete,
+            "index below capacity must not signal may_be_incomplete"
+        );
     }
 
     // =========================================================================
