@@ -46,6 +46,33 @@ const RECEIPT_REFERENCE_HORIZON_SECS: u64 = BLOB_RETENTION_SECS * 2;
 const MAX_TRAVERSAL_DEPTH: usize = 64;
 // Must not exceed safe_rmtree::MAX_DIR_ENTRIES.
 
+/// Configuration for per-lane log retention pruning (TCK-00571).
+///
+/// Controls which job log directories are eligible for pruning based on
+/// TTL, keep-last-N count, and per-lane byte quota.
+#[derive(Debug, Clone)]
+pub struct LogRetentionConfig {
+    /// Maximum total log bytes per lane. Directories exceeding this are pruned
+    /// oldest-first. A value of 0 means "no byte quota" (unlimited).
+    pub per_lane_log_max_bytes: u64,
+    /// Per-job log TTL in seconds. Job log directories older than this are
+    /// pruning candidates. A value of 0 means "no TTL pruning".
+    pub per_job_log_ttl_secs: u64,
+    /// Number of most-recent job log directories to keep per lane regardless
+    /// of TTL or byte quota. A value of 0 means "no keep-last-N protection".
+    pub keep_last_n_jobs_per_lane: u32,
+}
+
+impl Default for LogRetentionConfig {
+    fn default() -> Self {
+        Self {
+            per_lane_log_max_bytes: 100 * 1024 * 1024, // 100 MiB
+            per_job_log_ttl_secs: 7 * 24 * 3600,       // 7 days
+            keep_last_n_jobs_per_lane: 5,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GcPlan {
     pub targets: Vec<GcTarget>,
@@ -77,6 +104,31 @@ pub fn plan_gc(
     lane_manager: &LaneManager,
     quarantine_ttl_secs: u64,
     denied_ttl_secs: u64,
+) -> Result<GcPlan, GcPlanError> {
+    plan_gc_with_log_retention(
+        fac_root,
+        lane_manager,
+        quarantine_ttl_secs,
+        denied_ttl_secs,
+        &LogRetentionConfig::default(),
+    )
+}
+
+/// Create a garbage-collection plan with explicit log retention policy.
+///
+/// This is the extended version of [`plan_gc`] that accepts a
+/// [`LogRetentionConfig`] for per-lane log retention pruning (TCK-00571).
+///
+/// # Errors
+///
+/// Returns `GcPlanError::Io` when workspace inspection fails.
+#[allow(clippy::too_many_lines)]
+pub fn plan_gc_with_log_retention(
+    fac_root: &Path,
+    lane_manager: &LaneManager,
+    quarantine_ttl_secs: u64,
+    denied_ttl_secs: u64,
+    log_retention: &LogRetentionConfig,
 ) -> Result<GcPlan, GcPlanError> {
     let effective_quarantine_ttl =
         effective_retention_seconds(quarantine_ttl_secs, QUARANTINE_RETENTION_SECS);
@@ -273,6 +325,15 @@ pub fn plan_gc(
         });
     }
 
+    // TCK-00571: Per-lane log retention pruning.
+    collect_lane_log_retention_targets(
+        lane_manager,
+        &known_lane_ids,
+        log_retention,
+        now_secs,
+        &mut targets,
+    );
+
     targets.sort_by(|a, b| b.estimated_bytes.cmp(&a.estimated_bytes));
     Ok(GcPlan { targets })
 }
@@ -322,6 +383,168 @@ fn collect_idle_lane_targets(
         }
     }
     targets
+}
+
+/// Maximum number of job log subdirectories scanned per lane during
+/// retention planning. Prevents unbounded traversal of a lane's `logs/`
+/// directory (CTR-1303, INV-RMTREE-009).
+const MAX_JOB_LOG_ENTRIES_PER_LANE: usize = 10_000;
+
+/// Collect per-lane log retention pruning targets (TCK-00571).
+///
+/// For each lane, scans the `logs/` directory for job log subdirectories,
+/// then applies three pruning criteria in order:
+///
+/// 1. **Keep-last-N**: The N most-recent job log directories (by mtime) are
+///    always retained.
+/// 2. **TTL**: Job log directories older than the configured TTL are eligible
+///    for pruning.
+/// 3. **Byte quota**: If total log bytes still exceed the per-lane cap after
+///    TTL pruning, the oldest remaining directories are pruned until the lane
+///    is within quota.
+///
+/// Pruning order is deterministic: entries are sorted by mtime ascending,
+/// then by path (lexicographic) for tiebreaking.
+fn collect_lane_log_retention_targets(
+    lane_manager: &LaneManager,
+    lane_ids: &[String],
+    config: &LogRetentionConfig,
+    now_secs: u64,
+    targets: &mut Vec<GcTarget>,
+) {
+    for lane_id in lane_ids {
+        let lane_dir = lane_manager.lane_dir(lane_id);
+        let log_dir = lane_dir.join("logs");
+        if !log_dir.exists() {
+            continue;
+        }
+
+        let Ok(entries) = std::fs::read_dir(&log_dir) else {
+            continue;
+        };
+
+        // Collect job log subdirectories with their metadata.
+        let mut job_logs: Vec<JobLogEntry> = Vec::new();
+        let mut scan_count = 0usize;
+        for entry in entries.flatten() {
+            scan_count += 1;
+            if scan_count > MAX_JOB_LOG_ENTRIES_PER_LANE {
+                break; // Bounded traversal (CTR-1303).
+            }
+            let path = entry.path();
+            let Ok(metadata) = path.symlink_metadata() else {
+                continue;
+            };
+            // Skip symlinks (security: no symlink following).
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            // Only consider directories (job log subdirectories).
+            if !metadata.is_dir() {
+                continue;
+            }
+            let modified_secs = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            let estimated_bytes = estimate_dir_size(&path);
+            job_logs.push(JobLogEntry {
+                path,
+                modified_secs,
+                estimated_bytes,
+            });
+        }
+
+        if job_logs.is_empty() {
+            continue;
+        }
+
+        // Sort by mtime ascending (oldest first), then by path for determinism.
+        job_logs.sort_by(|a, b| {
+            a.modified_secs
+                .cmp(&b.modified_secs)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+
+        let keep_last_n = config.keep_last_n_jobs_per_lane as usize;
+        let total_count = job_logs.len();
+
+        // Mark entries as protected by keep-last-N. The last N entries
+        // (most recent by mtime) are protected.
+        let protected_start = total_count.saturating_sub(keep_last_n);
+
+        let mut prune_candidates: Vec<usize> = Vec::new();
+
+        // Phase 1: TTL-based pruning for entries outside the keep-last-N window.
+        if config.per_job_log_ttl_secs > 0 {
+            for (idx, entry) in job_logs.iter().enumerate() {
+                if idx >= protected_start {
+                    // Protected by keep-last-N — skip TTL pruning.
+                    break;
+                }
+                if is_stale_by_mtime_seconds(
+                    entry.modified_secs,
+                    config.per_job_log_ttl_secs,
+                    now_secs,
+                ) {
+                    prune_candidates.push(idx);
+                }
+            }
+        }
+
+        // Phase 2: Byte quota enforcement.
+        // Calculate total log bytes and prune oldest entries (outside
+        // keep-last-N) until within quota.
+        if config.per_lane_log_max_bytes > 0 {
+            let mut total_bytes: u64 = job_logs
+                .iter()
+                .map(|e| e.estimated_bytes)
+                .fold(0u64, u64::saturating_add);
+
+            // Subtract bytes already marked for TTL pruning.
+            for &idx in &prune_candidates {
+                total_bytes = total_bytes.saturating_sub(job_logs[idx].estimated_bytes);
+            }
+
+            if total_bytes > config.per_lane_log_max_bytes {
+                // Prune oldest non-protected entries that haven't been
+                // TTL-pruned yet.
+                for (idx, entry) in job_logs.iter().enumerate() {
+                    if total_bytes <= config.per_lane_log_max_bytes {
+                        break;
+                    }
+                    if idx >= protected_start {
+                        break; // Cannot prune protected entries.
+                    }
+                    if prune_candidates.contains(&idx) {
+                        continue; // Already marked.
+                    }
+                    prune_candidates.push(idx);
+                    total_bytes = total_bytes.saturating_sub(entry.estimated_bytes);
+                }
+            }
+        }
+
+        // Emit GC targets for all prune candidates.
+        for idx in prune_candidates {
+            let entry = &job_logs[idx];
+            targets.push(GcTarget {
+                path: entry.path.clone(),
+                allowed_parent: log_dir.clone(),
+                kind: crate::fac::gc_receipt::GcActionKind::LaneLogRetention,
+                estimated_bytes: entry.estimated_bytes,
+            });
+        }
+    }
+}
+
+/// Metadata for a single job log subdirectory within a lane's `logs/` dir.
+#[derive(Debug, Clone)]
+struct JobLogEntry {
+    path: PathBuf,
+    modified_secs: u64,
+    estimated_bytes: u64,
 }
 
 fn collect_stale_gate_cache_targets(fac_root: &Path, now_secs: u64, targets: &mut Vec<GcTarget>) {
@@ -2095,6 +2318,330 @@ mod tests {
         assert!(
             mtime_after > mtime_before,
             "mtime must advance after re-recording (before={mtime_before}, after={mtime_after})"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00571: Per-lane log retention pruning tests
+    // =========================================================================
+
+    /// Helper: create a fake job log directory under `logs_dir` with a
+    /// specified size and mtime.
+    fn create_job_log_dir(logs_dir: &Path, name: &str, size: u64, mtime_secs: u64) -> PathBuf {
+        let job_dir = logs_dir.join(name);
+        std::fs::create_dir_all(&job_dir).expect("create job log dir");
+        let file = job_dir.join("output.log");
+        write_file(&file, size);
+        set_file_mtime(&job_dir, filetime_from_secs(mtime_secs)).expect("set job dir mtime");
+        set_file_mtime(&file, filetime_from_secs(mtime_secs)).expect("set job file mtime");
+        job_dir
+    }
+
+    #[test]
+    fn log_retention_prunes_stale_job_dirs_by_ttl() {
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
+
+        let now = current_wall_clock_secs();
+        let ttl_secs: u64 = 3600; // 1 hour
+
+        // Create a stale job log (older than TTL).
+        let stale_dir = create_job_log_dir(
+            &logs_dir,
+            "job-stale",
+            100,
+            now.saturating_sub(ttl_secs + 60),
+        );
+
+        // Create a fresh job log (within TTL).
+        let fresh_dir = create_job_log_dir(&logs_dir, "job-fresh", 100, now);
+
+        let config = LogRetentionConfig {
+            per_lane_log_max_bytes: 0, // No byte quota.
+            per_job_log_ttl_secs: ttl_secs,
+            keep_last_n_jobs_per_lane: 0, // No keep-last-N protection.
+        };
+
+        let mut targets = Vec::new();
+        collect_lane_log_retention_targets(&lane_manager, &lane_ids, &config, now, &mut targets);
+
+        // Stale job should be pruned.
+        assert!(
+            targets.iter().any(|t| t.path == stale_dir
+                && matches!(
+                    t.kind,
+                    crate::fac::gc_receipt::GcActionKind::LaneLogRetention
+                )),
+            "stale job log directory must be targeted for pruning"
+        );
+
+        // Fresh job should NOT be pruned.
+        assert!(
+            !targets.iter().any(|t| t.path == fresh_dir),
+            "fresh job log directory must not be targeted for pruning"
+        );
+    }
+
+    #[test]
+    fn log_retention_respects_keep_last_n() {
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
+
+        let now = current_wall_clock_secs();
+        let ttl_secs: u64 = 60; // Very short TTL to make everything stale.
+
+        // Create 4 job logs, all stale, but keep_last_n=2.
+        let _dir_a =
+            create_job_log_dir(&logs_dir, "job-a", 100, now.saturating_sub(ttl_secs + 400));
+        let _dir_b =
+            create_job_log_dir(&logs_dir, "job-b", 100, now.saturating_sub(ttl_secs + 300));
+        let dir_c = create_job_log_dir(&logs_dir, "job-c", 100, now.saturating_sub(ttl_secs + 200));
+        let dir_d = create_job_log_dir(&logs_dir, "job-d", 100, now.saturating_sub(ttl_secs + 100));
+
+        let config = LogRetentionConfig {
+            per_lane_log_max_bytes: 0,
+            per_job_log_ttl_secs: ttl_secs,
+            keep_last_n_jobs_per_lane: 2, // Keep the 2 most recent.
+        };
+
+        let mut targets = Vec::new();
+        collect_lane_log_retention_targets(&lane_manager, &lane_ids, &config, now, &mut targets);
+
+        // The 2 oldest (a, b) should be pruned; the 2 newest (c, d) are protected.
+        assert_eq!(
+            targets.len(),
+            2,
+            "exactly 2 stale job log dirs (outside keep-last-2) should be pruned, got {}",
+            targets.len()
+        );
+        assert!(
+            !targets.iter().any(|t| t.path == dir_c || t.path == dir_d),
+            "protected (keep-last-N) job log dirs must not be pruned"
+        );
+    }
+
+    #[test]
+    fn log_retention_enforces_byte_quota() {
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
+
+        let now = current_wall_clock_secs();
+
+        // Create 3 job logs totaling 300 bytes, all recent (no TTL pruning).
+        let dir_a = create_job_log_dir(&logs_dir, "job-a", 100, now.saturating_sub(30));
+        let _dir_b = create_job_log_dir(&logs_dir, "job-b", 100, now.saturating_sub(20));
+        let _dir_c = create_job_log_dir(&logs_dir, "job-c", 100, now.saturating_sub(10));
+
+        let config = LogRetentionConfig {
+            per_lane_log_max_bytes: 250,  // Quota: 250 bytes, total is ~300.
+            per_job_log_ttl_secs: 0,      // No TTL pruning.
+            keep_last_n_jobs_per_lane: 0, // No keep-last-N protection.
+        };
+
+        let mut targets = Vec::new();
+        collect_lane_log_retention_targets(&lane_manager, &lane_ids, &config, now, &mut targets);
+
+        // The oldest job (a) should be pruned to bring total within 250 bytes.
+        assert_eq!(
+            targets.len(),
+            1,
+            "exactly 1 job log dir should be pruned to meet byte quota, got {}",
+            targets.len()
+        );
+        assert_eq!(
+            targets[0].path, dir_a,
+            "oldest job log directory should be pruned first"
+        );
+    }
+
+    #[test]
+    fn log_retention_byte_quota_respects_keep_last_n() {
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
+
+        let now = current_wall_clock_secs();
+
+        // Create 3 job logs totaling 300 bytes, with keep_last_n=3.
+        // Even though quota is 100 bytes, all 3 must be retained.
+        let _dir_a = create_job_log_dir(&logs_dir, "job-a", 100, now.saturating_sub(30));
+        let _dir_b = create_job_log_dir(&logs_dir, "job-b", 100, now.saturating_sub(20));
+        let _dir_c = create_job_log_dir(&logs_dir, "job-c", 100, now.saturating_sub(10));
+
+        let config = LogRetentionConfig {
+            per_lane_log_max_bytes: 100, // Very tight quota.
+            per_job_log_ttl_secs: 0,
+            keep_last_n_jobs_per_lane: 3, // All 3 protected.
+        };
+
+        let mut targets = Vec::new();
+        collect_lane_log_retention_targets(&lane_manager, &lane_ids, &config, now, &mut targets);
+
+        // No pruning because all entries are protected by keep-last-N.
+        assert_eq!(
+            targets.len(),
+            0,
+            "no job log dirs should be pruned when all are protected by keep-last-N"
+        );
+    }
+
+    #[test]
+    fn log_retention_skips_symlinks_and_files() {
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
+
+        let now = current_wall_clock_secs();
+
+        // Create a regular file (not a directory) in the logs dir.
+        let file_path = logs_dir.join("stray-file.log");
+        write_file(&file_path, 100);
+        set_file_mtime(&file_path, filetime_from_secs(now.saturating_sub(86400)))
+            .expect("set file mtime");
+
+        // Create a symlink in the logs dir.
+        #[cfg(unix)]
+        {
+            let symlink_path = logs_dir.join("symlink-job");
+            let _ = std::os::unix::fs::symlink("/tmp", &symlink_path);
+        }
+
+        let config = LogRetentionConfig {
+            per_lane_log_max_bytes: 0,
+            per_job_log_ttl_secs: 1, // Very short TTL — everything should be stale.
+            keep_last_n_jobs_per_lane: 0,
+        };
+
+        let mut targets = Vec::new();
+        collect_lane_log_retention_targets(&lane_manager, &lane_ids, &config, now, &mut targets);
+
+        // Neither the file nor the symlink should appear as targets.
+        assert!(
+            !targets.iter().any(|t| t.path == file_path),
+            "regular files in logs dir must not be targeted"
+        );
+        #[cfg(unix)]
+        {
+            let symlink_path = logs_dir.join("symlink-job");
+            assert!(
+                !targets.iter().any(|t| t.path == symlink_path),
+                "symlinks in logs dir must not be targeted"
+            );
+        }
+    }
+
+    #[test]
+    fn log_retention_integrated_with_plan_gc() {
+        // Verify that plan_gc_with_log_retention includes LaneLogRetention
+        // targets alongside other GC targets.
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
+
+        let now = current_wall_clock_secs();
+        let _stale_job = create_job_log_dir(
+            &logs_dir,
+            "job-stale",
+            200,
+            now.saturating_sub(86400 * 30), // 30 days old
+        );
+
+        let config = LogRetentionConfig {
+            per_lane_log_max_bytes: 100 * 1024 * 1024,
+            per_job_log_ttl_secs: 7 * 86400, // 7 days
+            keep_last_n_jobs_per_lane: 0,
+        };
+
+        let plan = plan_gc_with_log_retention(
+            lane_manager.fac_root(),
+            &lane_manager,
+            QUARANTINE_RETENTION_SECS,
+            DENIED_RETENTION_SECS,
+            &config,
+        )
+        .expect("plan");
+
+        assert!(
+            plan.targets.iter().any(|t| matches!(
+                t.kind,
+                crate::fac::gc_receipt::GcActionKind::LaneLogRetention
+            )),
+            "plan_gc_with_log_retention must include LaneLogRetention targets for stale job logs"
+        );
+    }
+
+    #[test]
+    fn log_retention_no_pruning_when_all_within_policy() {
+        // When all job logs are recent and within byte quota, no pruning
+        // should occur.
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
+
+        let now = current_wall_clock_secs();
+
+        // Create 2 recent, small job logs.
+        let _dir_a = create_job_log_dir(&logs_dir, "job-a", 50, now.saturating_sub(10));
+        let _dir_b = create_job_log_dir(&logs_dir, "job-b", 50, now.saturating_sub(5));
+
+        let config = LogRetentionConfig {
+            per_lane_log_max_bytes: 1000, // Well within quota.
+            per_job_log_ttl_secs: 86400,  // 1 day TTL.
+            keep_last_n_jobs_per_lane: 5,
+        };
+
+        let mut targets = Vec::new();
+        collect_lane_log_retention_targets(&lane_manager, &lane_ids, &config, now, &mut targets);
+
+        assert_eq!(
+            targets.len(),
+            0,
+            "no pruning should occur when all job logs are within policy"
         );
     }
 }

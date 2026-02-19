@@ -4,8 +4,8 @@ use std::path::Path;
 
 use apm2_core::fac::{
     DEFAULT_MIN_FREE_BYTES, FacPolicyV1, GcActionKind, GcPlan, GcReceiptV1, LaneManager,
-    MAX_POLICY_SIZE, check_disk_space, deserialize_policy, execute_gc, persist_gc_receipt,
-    persist_policy, plan_gc, run_migration_to_completion,
+    LogRetentionConfig, MAX_POLICY_SIZE, check_disk_space, deserialize_policy, execute_gc,
+    persist_gc_receipt, persist_policy, plan_gc_with_log_retention, run_migration_to_completion,
 };
 use serde_json;
 use serde_json::json;
@@ -91,11 +91,19 @@ pub fn run_gc(args: &GcArgs, parent_json_output: bool) -> u8 {
     let quarantine_ttl_secs = u64::from(policy.quarantine_ttl_days).saturating_mul(24 * 3600);
     let denied_ttl_secs = u64::from(policy.denied_ttl_days).saturating_mul(24 * 3600);
 
-    let plan = match plan_gc(
+    // TCK-00571: Derive log retention config from policy.
+    let log_retention = LogRetentionConfig {
+        per_lane_log_max_bytes: policy.per_lane_log_max_bytes,
+        per_job_log_ttl_secs: u64::from(policy.per_job_log_ttl_days).saturating_mul(24 * 3600),
+        keep_last_n_jobs_per_lane: policy.keep_last_n_jobs_per_lane,
+    };
+
+    let plan = match plan_gc_with_log_retention(
         &fac_root,
         &lane_manager,
         quarantine_ttl_secs,
         denied_ttl_secs,
+        &log_retention,
     ) {
         Ok(plan) => plan,
         Err(error) => {
@@ -259,6 +267,7 @@ const fn gc_target_kind_to_str(kind: GcActionKind) -> &'static str {
         GcActionKind::CasBlobPrune => "cas_blob_prune",
         GcActionKind::SccacheCache => "sccache_cache",
         GcActionKind::IndexCompaction => "index_compaction",
+        GcActionKind::LaneLogRetention => "lane_log_retention",
     }
 }
 

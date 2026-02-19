@@ -371,7 +371,8 @@ pub use gate_cache_v3::{
     is_valid_v3_index_key, sanitize_gate_name,
 };
 pub use gc::{
-    GcPlan, GcPlanError, GcTarget, execute_gc, plan_gc, plan_quarantine_prune, record_cas_ref,
+    GcPlan, GcPlanError, GcTarget, LogRetentionConfig, execute_gc, plan_gc,
+    plan_gc_with_log_retention, plan_quarantine_prune, record_cas_ref,
 };
 pub use gc_receipt::{
     DEFAULT_MIN_FREE_BYTES, GC_RECEIPT_SCHEMA, GcAction, GcActionKind, GcError, GcReceiptV1,

@@ -68,6 +68,21 @@ const fn default_denied_ttl_days() -> u32 {
     7
 }
 
+/// Default per-lane log maximum bytes (100 MiB).
+const fn default_per_lane_log_max_bytes() -> u64 {
+    100 * 1024 * 1024
+}
+
+/// Default per-job log TTL in days.
+const fn default_per_job_log_ttl_days() -> u32 {
+    7
+}
+
+/// Default number of recent job logs to keep per lane.
+const fn default_keep_last_n_jobs_per_lane() -> u32 {
+    5
+}
+
 /// Errors returned by policy parsing, validation, and persistence.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -309,6 +324,44 @@ pub struct FacPolicyV1 {
     /// This field is only meaningful when `sccache_enabled` is `true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sccache_dir: Option<String>,
+
+    /// Maximum total log bytes per lane before oldest job logs are pruned
+    /// (TCK-00571). Default: 100 MiB.
+    ///
+    /// When the total size of a lane's `logs/` directory exceeds this value,
+    /// the GC planner emits pruning targets for the oldest job log
+    /// subdirectories until the lane is below quota.
+    ///
+    /// Note: `serde(default)` is safe here because the default is a
+    /// conservative retention limit (100 MiB), not an unbounded value.
+    /// Existing policies that predate TCK-00571 will default to a reasonable
+    /// cap.
+    #[serde(default = "default_per_lane_log_max_bytes")]
+    pub per_lane_log_max_bytes: u64,
+
+    /// Days to retain per-job log directories before pruning (TCK-00571).
+    /// Default: 7.
+    ///
+    /// Job log directories whose mtime is older than this TTL are eligible
+    /// for pruning during GC. A value of 0 means "use default" (7 days).
+    ///
+    /// Note: `serde(default)` is safe because the default (7 days) is a
+    /// conservative retention window.
+    #[serde(default = "default_per_job_log_ttl_days")]
+    pub per_job_log_ttl_days: u32,
+
+    /// Number of most-recent job log directories to keep per lane regardless
+    /// of TTL or size quota (TCK-00571). Default: 5.
+    ///
+    /// During retention pruning, at least this many job log directories
+    /// (sorted by mtime descending) are always retained, even if they exceed
+    /// the TTL. A value of 0 means "no keep-last-N protection" (all stale
+    /// logs are eligible).
+    ///
+    /// Note: `serde(default)` is safe because the default (5) is a
+    /// conservative keep-last count.
+    #[serde(default = "default_keep_last_n_jobs_per_lane")]
+    pub keep_last_n_jobs_per_lane: u32,
 }
 
 impl Default for FacPolicyV1 {
@@ -388,6 +441,9 @@ impl FacPolicyV1 {
             queue_bounds_policy: super::queue_bounds::QueueBoundsPolicy::default(),
             sccache_enabled: false,
             sccache_dir: None,
+            per_lane_log_max_bytes: default_per_lane_log_max_bytes(),
+            per_job_log_ttl_days: default_per_job_log_ttl_days(),
+            keep_last_n_jobs_per_lane: default_keep_last_n_jobs_per_lane(),
         }
     }
 
