@@ -1001,7 +1001,12 @@ pub fn run_fac_worker(
         };
 
         // Scan pending directory (quarantines malformed files inline).
-        let candidates = match scan_pending(&queue_root, &fac_root, &current_tuple_digest) {
+        let candidates = match scan_pending(
+            &queue_root,
+            &fac_root,
+            &current_tuple_digest,
+            Some(toolchain_fingerprint.as_str()),
+        ) {
             Ok(c) => c,
             Err(e) => {
                 output_worker_error(json_output, &format!("scan error: {e}"));
@@ -1349,6 +1354,8 @@ fn scan_pending(
     queue_root: &Path,
     fac_root: &Path,
     canonicalizer_tuple_digest: &str,
+    // TCK-00538: Optional toolchain fingerprint for scan receipt provenance.
+    toolchain_fingerprint: Option<&str>,
 ) -> Result<Vec<PendingCandidate>, String> {
     let pending_dir = queue_root.join(PENDING_DIR);
     if !pending_dir.is_dir() {
@@ -1406,6 +1413,7 @@ fn scan_pending(
                     moved_path.as_deref(),
                     &reason,
                     canonicalizer_tuple_digest,
+                    toolchain_fingerprint,
                 );
                 continue;
             },
@@ -1437,6 +1445,7 @@ fn scan_pending(
                     moved_path.as_deref(),
                     &reason,
                     canonicalizer_tuple_digest,
+                    toolchain_fingerprint,
                 );
                 continue;
             },
@@ -5401,7 +5410,7 @@ fn handle_stop_revoke(
             target_job_id,
             current_timestamp_epoch_secs()
         );
-        let builder = FacJobReceiptV1Builder::new(
+        let mut builder = FacJobReceiptV1Builder::new(
             receipt_id,
             &target_spec.job_id,
             &target_spec.job_spec_digest,
@@ -5411,6 +5420,10 @@ fn handle_stop_revoke(
         .denial_reason(DenialReasonCode::Cancelled)
         .reason(&bounded_reason)
         .timestamp_secs(current_timestamp_epoch_secs());
+        // TCK-00538: Bind toolchain fingerprint to cancellation receipt.
+        if let Some(fp) = toolchain_fingerprint {
+            builder = builder.toolchain_fingerprint(fp);
+        }
 
         let receipt = match builder.try_build() {
             Ok(r) => r,
@@ -6676,6 +6689,8 @@ fn emit_scan_receipt(
     moved_job_path: Option<&str>,
     reason: &str,
     canonicalizer_tuple_digest: &str,
+    // TCK-00538: Optional toolchain fingerprint for receipt provenance.
+    toolchain_fingerprint: Option<&str>,
 ) -> Result<PathBuf, String> {
     let mut builder = FacJobReceiptV1Builder::new(
         format!("wkr-scan-{}-{}", file_name, current_timestamp_epoch_secs()),
@@ -6690,6 +6705,10 @@ fn emit_scan_receipt(
 
     if let Some(path) = moved_job_path {
         builder = builder.moved_job_path(path);
+    }
+    // TCK-00538: Bind toolchain fingerprint to scan receipt.
+    if let Some(fp) = toolchain_fingerprint {
+        builder = builder.toolchain_fingerprint(fp);
     }
 
     let receipt = builder
@@ -7534,6 +7553,7 @@ mod tests {
             None,
             &long_reason,
             &CanonicalizerTupleV1::from_current().compute_digest(),
+            None, // toolchain_fingerprint
         );
 
         assert!(
@@ -8074,6 +8094,7 @@ mod tests {
             &queue_root,
             &fac_root,
             &CanonicalizerTupleV1::from_current().compute_digest(),
+            None, // toolchain_fingerprint
         )
         .expect("scan");
 
@@ -8122,6 +8143,7 @@ mod tests {
             &queue_root,
             &fac_root,
             &CanonicalizerTupleV1::from_current().compute_digest(),
+            None, // toolchain_fingerprint
         )
         .expect("scan");
 
