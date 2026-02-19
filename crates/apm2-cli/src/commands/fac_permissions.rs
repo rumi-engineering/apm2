@@ -41,6 +41,7 @@ const FAC_SUBDIRS: &[&str] = &[
     "private/fac/prepared",
     "private/fac/tickets",
     "private/fac/evidence",
+    "private/fac/legacy",
     "fac_lifecycle",
     "fac_projection",
 ];

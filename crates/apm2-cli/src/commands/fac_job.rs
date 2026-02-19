@@ -1082,32 +1082,37 @@ fn discover_log_pointers(job_id: &str) -> (Vec<String>, bool) {
     // Helper: check if we've hit the global cap.
     let at_cap = |p: &Vec<String>| p.len() >= MAX_LOG_POINTERS;
 
-    // Check evidence directory for job-related logs.
+    // TCK-00589: Check legacy evidence and migrated legacy directories for
+    // job-related logs (compatibility reads for old tooling).
     if let Some(apm2_home) = apm2_core::github::resolve_apm2_home() {
-        let evidence_dir = apm2_home.join("private").join("fac").join("evidence");
-        // Symlink guard: validate evidence_dir is a real directory.
-        if validate_real_directory(&evidence_dir).is_ok() && !at_cap(&pointers) {
-            if let Ok(entries) = fs::read_dir(&evidence_dir) {
-                let mut scan_count = 0usize;
-                for entry in entries {
-                    if scan_count >= MAX_SCAN_ENTRIES || at_cap(&pointers) {
-                        // Finding 4 fix: report truncation for both
-                        // scan-entry cap and log-pointer cap.
-                        truncated = true;
-                        break;
-                    }
-                    scan_count = scan_count.saturating_add(1);
-                    let Ok(entry) = entry else { continue };
-                    // Symlink guard: skip symlinked entries.
-                    if is_symlink_entry(&entry) {
-                        continue;
-                    }
-                    let name = entry.file_name();
-                    let Some(name_str) = name.to_str() else {
-                        continue;
-                    };
-                    if name_str.contains(job_id) {
-                        pointers.push(entry.path().display().to_string());
+        // Scan both legacy paths: evidence/ (pre-migration) and legacy/
+        // (post-migration).
+        for legacy_subdir in &["evidence", "legacy"] {
+            let compat_dir = apm2_home.join("private").join("fac").join(legacy_subdir);
+            // Symlink guard: validate dir is a real directory.
+            if validate_real_directory(&compat_dir).is_ok() && !at_cap(&pointers) {
+                if let Ok(entries) = fs::read_dir(&compat_dir) {
+                    let mut scan_count = 0usize;
+                    for entry in entries {
+                        if scan_count >= MAX_SCAN_ENTRIES || at_cap(&pointers) {
+                            // Finding 4 fix: report truncation for both
+                            // scan-entry cap and log-pointer cap.
+                            truncated = true;
+                            break;
+                        }
+                        scan_count = scan_count.saturating_add(1);
+                        let Ok(entry) = entry else { continue };
+                        // Symlink guard: skip symlinked entries.
+                        if is_symlink_entry(&entry) {
+                            continue;
+                        }
+                        let name = entry.file_name();
+                        let Some(name_str) = name.to_str() else {
+                            continue;
+                        };
+                        if name_str.contains(job_id) {
+                            pointers.push(entry.path().display().to_string());
+                        }
                     }
                 }
             }

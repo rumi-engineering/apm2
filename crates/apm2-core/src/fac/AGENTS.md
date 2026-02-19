@@ -3261,3 +3261,73 @@ Regression tests: `gc_plan_excludes_v3_lock_files`, `is_v3_lock_file_matches_loc
   `receipt_binding_missing`. The `fac_worker` calls
   `rebind_v3_gate_cache_after_receipt()` (in `evidence.rs`) after the v2
   rebind to load, promote, re-sign, and persist the v3 cache.
+
+## legacy_evidence_migration Submodule (TCK-00589)
+
+The `legacy_evidence_migration` submodule provides a one-time migration
+helper that moves files from the deprecated `private/fac/evidence/`
+directory to `private/fac/legacy/` and emits a migration receipt under
+`private/fac/receipts/`. This is part of the legacy evidence log
+deprecation: after TCK-00520 introduced per-job logs under lane
+directories, the old `evidence/` path is no longer written to by any
+production code path. This module bridges existing installations to the
+new layout.
+
+### Directory Layout (post-migration)
+
+- `$APM2_HOME/private/fac/legacy/` — migrated files land here
+- `$APM2_HOME/private/fac/receipts/` — migration receipt persisted here
+- `$APM2_HOME/private/fac/evidence/` — removed after successful migration
+
+### Key Types
+
+- `LegacyEvidenceMigrationReceiptV1`: Receipt emitted after a migration
+  run. Contains `files_moved`, `files_failed`, `legacy_dir_removed`,
+  `skipped`, `skip_reason`, and a bounded `file_results` vector.
+  Schema: `apm2.fac.legacy_evidence_migration.v1`.
+  Uses `#[serde(deny_unknown_fields)]`.
+- `FileMigrationResult`: Per-file migration outcome with `filename`,
+  `success`, and optional `error` message.
+
+### Core Functions
+
+- `migrate_legacy_evidence(fac_root: &Path)`: Primary entry point. Checks
+  whether `evidence/` exists and is a real directory, reads entries
+  (bounded by `MAX_LEGACY_FILES`), moves each file to `legacy/`, and
+  emits a migration receipt. If `evidence/` does not exist or is empty,
+  returns a "skipped" receipt (INV-LEM-001).
+- `migrate_entry(entry, legacy_dir)`: Migrates a single directory entry.
+  Skips symlinks (INV-LEM-005) and uses `move_file()` for the actual move.
+- `move_file(src, dst)`: Tries `fs::rename()` first (atomic on same
+  filesystem). Falls back to copy-then-remove for cross-device moves
+  (EXDEV).
+- `skip_receipt(fac_root, reason, legacy_dir_removed)`: Builds and
+  persists a "skipped" receipt.
+- `persist_migration_receipt(fac_root, receipt)`: Serializes the receipt
+  to JSON, hashes with blake3, and writes atomically under `receipts/`.
+
+### Related Changes (TCK-00589)
+
+- **lane.rs**: Receipt writes for `init_lanes()` and `reconcile_lanes()`
+  redirected from `fac_root/evidence/` to `fac_root/receipts/`. The
+  legacy evidence path is no longer written to.
+- **gc.rs**: Added `FAC_LEGACY_MIGRATED_DIR` constant and GC target for
+  the post-migration `legacy/` directory.
+- **fac_job.rs** (apm2-cli): Compatibility reads updated to scan both
+  `evidence/` (pre-migration) and `legacy/` (post-migration) directories.
+- **fac_permissions.rs** (apm2-cli): `"private/fac/legacy"` added to
+  `FAC_SUBDIRS`.
+
+### Security Invariants (TCK-00589)
+
+- [INV-LEM-001] Migration is idempotent: re-running after completion is
+  a no-op returning the "already migrated" receipt.
+- [INV-LEM-002] Files are moved via `fs::rename()` (atomic on same
+  filesystem). Cross-device moves fall back to copy-then-remove.
+- [INV-LEM-003] The legacy `evidence/` directory is removed only after
+  all files have been successfully moved.
+- [INV-LEM-004] In-memory collections are bounded by `MAX_LEGACY_FILES`
+  (10,000).
+- [INV-LEM-005] Symlink entries are skipped (fail-closed). The evidence
+  directory itself is validated as a real directory (not a symlink) before
+  processing.

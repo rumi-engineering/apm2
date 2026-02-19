@@ -1405,8 +1405,8 @@ impl LaneManager {
             boundary_id,
         };
 
-        // Persist receipt under evidence directory.
-        let receipt_dir = self.fac_root.join("evidence");
+        // TCK-00589: Persist receipt under receipts directory (not legacy evidence/).
+        let receipt_dir = self.fac_root.join("receipts");
         create_dir_restricted(&receipt_dir)?;
         let receipt_bytes = serde_json::to_vec_pretty(&receipt)
             .map_err(|e| LaneError::Serialization(e.to_string()))?;
@@ -1478,8 +1478,8 @@ impl LaneManager {
 
         let receipt = Self::build_reconcile_receipt(&lane_ids, actions);
 
-        // Persist receipt under evidence directory.
-        let receipt_dir = self.fac_root.join("evidence");
+        // TCK-00589: Persist receipt under receipts directory (not legacy evidence/).
+        let receipt_dir = self.fac_root.join("receipts");
         create_dir_restricted(&receipt_dir)?;
         let receipt_bytes = serde_json::to_vec_pretty(&receipt)
             .map_err(|e| LaneError::Serialization(e.to_string()))?;
@@ -5263,15 +5263,23 @@ mod tests {
             assert!(lane_dir.join("profile.v1.json").is_file());
         }
 
-        // Verify receipt was persisted.
-        let evidence_dir = fac_root.join("evidence");
-        assert!(evidence_dir.is_dir());
-        let entry_count = fs::read_dir(&evidence_dir)
-            .expect("read evidence dir")
+        // TCK-00589: Verify receipt was persisted under receipts/ (not legacy
+        // evidence/).
+        let receipts_dir = fac_root.join("receipts");
+        assert!(receipts_dir.is_dir());
+        let entry_count = fs::read_dir(&receipts_dir)
+            .expect("read receipts dir")
             .filter_map(std::result::Result::ok)
             .filter(|e| e.file_name().to_string_lossy().starts_with("lane_init_"))
             .count();
         assert_eq!(entry_count, 1, "exactly one init receipt should exist");
+
+        // TCK-00589: Verify legacy evidence/ directory is NOT created.
+        let legacy_evidence_dir = fac_root.join("evidence");
+        assert!(
+            !legacy_evidence_dir.exists(),
+            "legacy evidence/ directory must not be created by init_lanes"
+        );
     }
 
     #[test]

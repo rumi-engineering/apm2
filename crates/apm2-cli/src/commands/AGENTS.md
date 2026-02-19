@@ -268,7 +268,7 @@ Security invariants:
 ## Security / Permission Invariants (Updated for TCK-00536)
 
 - FAC command entry (`run_fac`) now enforces strict ownership and 0700-mode validation on
-  `$APM2_HOME` critical subdirectories (`private`, `private/fac`, and related cache/evidence roots).
+  `$APM2_HOME` critical subdirectories (`private`, `private/fac`, and related cache/evidence/legacy roots).
 - Command modules now use shared helpers in `fac_permissions` when creating FAC directories/files so
   sensitive artifacts are created with safe modes (`0700` for directories, `0600` for files).
 
@@ -428,14 +428,16 @@ Security invariants:
 - **Job show** (`fac_job.rs`): `apm2 fac job show <job_id>` locates a job across all queue
   directories, reads the spec with bounded I/O (reuses `read_job_spec_bounded` from
   `fac_utils`), resolves the latest receipt from the receipt index, and discovers log
-  pointers from the evidence directory and lane logs. Returns NOT_FOUND (exit 12) if the
+  pointers from the legacy evidence/legacy directories and lane logs. Returns NOT_FOUND (exit 12) if the
   job is absent. State labels use canonical directory tokens via `JobState::state_label()`
   (e.g., "quarantine" not "quarantined").
 - **Bounded log pointers** (`fac_job.rs`): `discover_log_pointers` caps total discovered
-  log paths at MAX_LOG_POINTERS=256 across all scan locations (evidence directory + lane
-  logs). The function resolves lanes from `resolve_fac_root().join("lanes")` (the canonical
-  FAC root) rather than inferring from queue root parentage. Truncation is reported in both
-  text and JSON output via `log_pointers_truncated`.
+  log paths at MAX_LOG_POINTERS=256 across all scan locations (legacy directories + lane
+  logs). TCK-00589 updated the function to scan both `evidence/` (pre-migration) and
+  `legacy/` (post-migration) subdirectories for compatibility reads. The function resolves
+  lanes from `resolve_fac_root().join("lanes")` (the canonical FAC root) rather than
+  inferring from queue root parentage. Truncation is reported in both text and JSON output
+  via `log_pointers_truncated`.
 - **Symlink and FIFO guards** (`fac_utils.rs`, `fac_job.rs`): `read_job_spec_bounded` uses
   an open-once pattern with `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK` (via
   `OpenOptionsExt::custom_flags` on Unix) to atomically refuse symlinks at the kernel level

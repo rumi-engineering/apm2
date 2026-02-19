@@ -141,6 +141,9 @@ pub mod job_spec;
 mod key_policy;
 pub mod lane;
 mod lease;
+/// Legacy evidence log deprecation: one-time migration from `evidence/` to
+/// `legacy/` namespace with migration receipt (TCK-00589).
+pub mod legacy_evidence_migration;
 pub mod merge_receipt;
 mod node_identity;
 /// Patch injection hardening: path traversal rejection, safe apply mode,
@@ -747,6 +750,10 @@ pub use lane::{
     MAX_MEMORY_MAX_BYTES, MAX_PROFILE_FILE_SIZE, MAX_STRING_LENGTH as MAX_LANE_STRING_LENGTH,
     MAX_TEST_TIMEOUT_SECONDS, ResourceProfile, compute_test_env_for_parallelism,
     create_dir_restricted, current_time_iso8601, resolve_host_test_parallelism,
+};
+// Re-export legacy evidence migration types (TCK-00589).
+pub use legacy_evidence_migration::{
+    FileMigrationResult, LegacyEvidenceMigrationReceiptV1, migrate_legacy_evidence,
 };
 // Re-export node identity types (TCK-00556).
 pub use node_identity::{
