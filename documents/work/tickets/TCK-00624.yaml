@@ -76,6 +76,17 @@ scope:
         - Test: remediation field alone is sufficient for recovery without logs
           (assert non-empty and action-oriented for PREP_NOT_READY and
           PREP_SUPPLY_UNAVAILABLE).
+    - id: "S5_SHARED_DST_MODULE_POST_PUSH_CLOSURE"
+      title: "Create shared DST test module after fac push closure-complete"
+      detail: |
+        Shared deterministic simulated testing helpers (env mutation
+        serialization + panic-safe restoration) are in-scope for this ticket
+        only after closure-complete validation of `apm2 fac push` is done:
+          - bounded completion (no stuck caller path),
+          - local CLI dogfood pass,
+          - edge-case regressions green.
+        This sequencing is mandatory to avoid mixing stabilization and test
+        harness refactors in one unresolved change window.
   out_of_scope:
     - "Adding new top-level failure codes beyond the four defined."
     - "JSONL full event schema (TCK-00625 owns the broader stdout contract)."

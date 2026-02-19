@@ -2433,9 +2433,10 @@ pub(super) fn run_evidence_gates_with_lane_context(
 
 /// Run evidence gates with PR-body gate status updates.
 ///
-/// Same as [`run_evidence_gates`] but also updates the PR body gate section
-/// after each gate completes. Checks the per-SHA gate cache before each gate
-/// and skips execution if the gate already passed for this SHA.
+/// Same as [`run_evidence_gates_with_lane_context`] but also updates the PR
+/// body gate section after each gate completes. Checks the per-SHA gate cache
+/// before each gate and skips execution if the gate already passed for this
+/// SHA.
 #[allow(clippy::too_many_arguments)]
 pub fn run_evidence_gates_with_status(
     workspace_root: &Path,

@@ -21,15 +21,25 @@
 //! isolation and apply bounded wall-clock timeouts to detect hangs.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+struct EnvVarTestLock(std::sync::Mutex<()>);
+
+impl EnvVarTestLock {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, ()>, std::convert::Infallible> {
+        Ok(match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        })
+    }
+}
 
 /// Process-wide lock for tests that mutate environment variables.
 /// Env vars are process-global state; concurrent mutations cause data races.
 /// All env-mutating tests in this module MUST hold this lock.
-fn env_var_test_lock() -> &'static Mutex<()> {
-    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+fn env_var_test_lock() -> &'static EnvVarTestLock {
+    static LOCK: std::sync::OnceLock<EnvVarTestLock> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| EnvVarTestLock(std::sync::Mutex::new(())))
 }
 
 #[allow(unsafe_code)]
@@ -40,6 +50,32 @@ fn set_env_var_for_test<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(ke
 #[allow(unsafe_code)]
 fn remove_env_var_for_test<K: AsRef<std::ffi::OsStr>>(key: K) {
     unsafe { std::env::remove_var(key) };
+}
+
+/// RAII wrapper for deterministic env-var restoration in tests.
+struct ScopedEnvVar {
+    key: String,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        set_env_var_for_test(key, value);
+        Self {
+            key: key.to_string(),
+            previous,
+        }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => set_env_var_for_test(&self.key, value),
+            None => remove_env_var_for_test(&self.key),
+        }
+    }
 }
 
 /// Maximum wall-clock time any single subprocess test is allowed to run
@@ -684,24 +720,14 @@ fn credential_error_message_contains_no_secrets() {
         ("GITHUB_TOKEN", "ghp_CRED_ERR_CANARY_00601_abcdef1234"),
         ("GH_TOKEN", "ghs_CRED_ERR_CANARY_00601_zyxwvu9876"),
     ];
-    let previous_values: Vec<(&str, Option<String>)> = env_canaries
-        .iter()
-        .map(|(name, _)| (*name, std::env::var(name).ok()))
-        .collect();
-    for (name, value) in env_canaries {
-        set_env_var_for_test(name, value);
-    }
-
-    let error = apm2_core::fac::credential_gate::CredentialGateError::GitHubCredentialsMissing;
-    let message = error.to_string();
-
-    // Restore environment before assertions.
-    for (name, prev) in &previous_values {
-        match prev {
-            Some(val) => set_env_var_for_test(name, val),
-            None => remove_env_var_for_test(name),
-        }
-    }
+    let message = {
+        let _env_guards: Vec<ScopedEnvVar> = env_canaries
+            .iter()
+            .map(|(name, value)| ScopedEnvVar::set(name, value))
+            .collect();
+        let error = apm2_core::fac::credential_gate::CredentialGateError::GitHubCredentialsMissing;
+        error.to_string()
+    };
 
     // Check that neither the env canary values nor generic token patterns
     // appear in the error message.
@@ -730,24 +756,17 @@ fn credential_posture_debug_no_secret_leakage() {
         .expect("serialize env-mutating test");
 
     let canary_value = "ghp_POSTURE_DEBUG_CANARY_00601_secretval";
-    let previous_github_token = std::env::var("GITHUB_TOKEN").ok();
-    set_env_var_for_test("GITHUB_TOKEN", canary_value);
-
-    let posture = apm2_core::fac::credential_gate::CredentialPosture {
-        credential_name: "github-token".to_string(),
-        resolved: true,
-        source: Some(apm2_core::fac::credential_gate::CredentialSource::EnvVar {
-            var_name: "GITHUB_TOKEN".to_string(),
-        }),
+    let debug = {
+        let _github_token_guard = ScopedEnvVar::set("GITHUB_TOKEN", canary_value);
+        let posture = apm2_core::fac::credential_gate::CredentialPosture {
+            credential_name: "github-token".to_string(),
+            resolved: true,
+            source: Some(apm2_core::fac::credential_gate::CredentialSource::EnvVar {
+                var_name: "GITHUB_TOKEN".to_string(),
+            }),
+        };
+        format!("{posture:?}")
     };
-
-    let debug = format!("{posture:?}");
-
-    // Restore environment before assertions.
-    match &previous_github_token {
-        Some(val) => set_env_var_for_test("GITHUB_TOKEN", val),
-        None => remove_env_var_for_test("GITHUB_TOKEN"),
-    }
 
     assert!(
         debug.contains("GITHUB_TOKEN"),
@@ -812,37 +831,26 @@ fn receipts_contain_no_secret_env_values() {
     //
     // Inject synthetic canary secrets into the test process environment
     // so the receipt builder executes with known secret values present.
-    // Save previous values for restoration.
-    let previous_values: Vec<(&str, Option<String>)> = synthetic_secrets
-        .iter()
-        .map(|(name, _)| (*name, std::env::var(name).ok()))
-        .collect();
+    // Restoration is handled via RAII.
+    let receipt_json = {
+        let _env_guards: Vec<ScopedEnvVar> = synthetic_secrets
+            .iter()
+            .map(|(name, value)| ScopedEnvVar::set(name, value))
+            .collect();
 
-    for (name, value) in synthetic_secrets {
-        set_env_var_for_test(name, value);
-    }
+        let receipt = apm2_core::fac::FacJobReceiptV1Builder::new(
+            "test-receipt-001",
+            "test-job-001",
+            "b3-256:0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .outcome(apm2_core::fac::FacJobOutcome::Denied)
+        .denial_reason(apm2_core::fac::DenialReasonCode::ValidationFailed)
+        .reason("test denied for secret leak verification")
+        .try_build()
+        .expect("build receipt");
 
-    let receipt = apm2_core::fac::FacJobReceiptV1Builder::new(
-        "test-receipt-001",
-        "test-job-001",
-        "b3-256:0000000000000000000000000000000000000000000000000000000000000000",
-    )
-    .outcome(apm2_core::fac::FacJobOutcome::Denied)
-    .denial_reason(apm2_core::fac::DenialReasonCode::ValidationFailed)
-    .reason("test denied for secret leak verification")
-    .try_build()
-    .expect("build receipt");
-
-    let receipt_json = serde_json::to_string_pretty(&receipt).expect("serialize receipt");
-
-    // Restore previous environment state before assertions (cleanup first
-    // so panics in assertions don't leave stale env vars).
-    for (name, prev) in &previous_values {
-        match prev {
-            Some(val) => set_env_var_for_test(name, val),
-            None => remove_env_var_for_test(name),
-        }
-    }
+        serde_json::to_string_pretty(&receipt).expect("serialize receipt")
+    };
 
     for (name, value) in synthetic_secrets {
         assert!(

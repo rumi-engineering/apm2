@@ -76,9 +76,22 @@ pub mod tool;
 pub mod work;
 
 #[cfg(test)]
-pub fn env_var_test_lock() -> &'static std::sync::Mutex<()> {
-    use std::sync::{Mutex, OnceLock};
+pub struct EnvVarTestLock(std::sync::Mutex<()>);
 
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+#[cfg(test)]
+impl EnvVarTestLock {
+    pub fn lock(&self) -> Result<std::sync::MutexGuard<'_, ()>, std::convert::Infallible> {
+        Ok(match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        })
+    }
+}
+
+#[cfg(test)]
+pub fn env_var_test_lock() -> &'static EnvVarTestLock {
+    use std::sync::OnceLock;
+
+    static LOCK: OnceLock<EnvVarTestLock> = OnceLock::new();
+    LOCK.get_or_init(|| EnvVarTestLock(std::sync::Mutex::new(())))
 }
