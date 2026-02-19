@@ -4563,6 +4563,16 @@ fn process_job(
     // lane workspace and lane-managed CARGO_HOME/CARGO_TARGET_DIR. The warm
     // receipt is persisted to the FAC receipts directory alongside the job receipt.
     if spec.kind == "warm" {
+        // TCK-00554 BLOCKER-1 fix: Derive effective sccache enablement from
+        // server containment protocol result. If the containment protocol
+        // auto-disabled sccache, the warm execution environment MUST NOT
+        // inject RUSTC_WRAPPER/SCCACHE_* — even though `policy.sccache_enabled`
+        // is true. This prevents build paths from using an untrusted server
+        // that was refused by containment verification.
+        let effective_sccache_enabled = policy.sccache_enabled
+            && containment_trace
+                .as_ref()
+                .is_some_and(|ct| !ct.sccache_auto_disabled);
         let warm_outcome = execute_warm_job(
             spec,
             &claimed_path,
@@ -4593,6 +4603,7 @@ fn process_job(
             heartbeat_jobs_quarantined,
             job_wall_start,
             toolchain_fingerprint,
+            effective_sccache_enabled,
         );
 
         // TCK-00554: Stop sccache server at unit end (INV-CONTAIN-011).
@@ -4669,6 +4680,14 @@ fn process_job(
             &claimed_file_name,
         ) {
             eprintln!("worker: WARNING: failed to return claimed job to pending: {move_err}");
+        }
+        // TCK-00554 MINOR-1 fix: Stop sccache server on early-return path.
+        // The containment protocol may have started a server; failing to stop
+        // it here would leak a daemon beyond the unit lifecycle, violating
+        // INV-CONTAIN-011.
+        if policy.sccache_enabled && !sccache_server_env.is_empty() {
+            let stopped = apm2_core::fac::stop_sccache_server(&sccache_server_env);
+            eprintln!("worker: sccache server stop (pipeline commit failure): stopped={stopped}");
         }
         return JobOutcome::Skipped {
             reason: format!("pipeline commit failed: {commit_err}"),
@@ -5751,6 +5770,12 @@ fn execute_warm_job(
     job_wall_start: Instant,
     // TCK-00538: Toolchain fingerprint computed at worker startup.
     toolchain_fingerprint: Option<&str>,
+    // TCK-00554 BLOCKER-1 fix: Effective sccache enablement derived from
+    // server containment protocol. When false, RUSTC_WRAPPER/SCCACHE_* are
+    // stripped from the warm execution environment even if
+    // `policy.sccache_enabled` is true. This prevents builds from using an
+    // untrusted sccache server that was refused by containment verification.
+    effective_sccache_enabled: bool,
 ) -> JobOutcome {
     use apm2_core::fac::warm::{WarmContainment, WarmPhase, execute_warm};
 
@@ -5920,6 +5945,22 @@ fn execute_warm_job(
     });
     let ambient_env: Vec<(String, String)> = std::env::vars().collect();
     let mut hardened_env = build_job_environment(policy, &ambient_env, &apm2_home);
+
+    // TCK-00554 BLOCKER-1 fix: If the server containment protocol auto-disabled
+    // sccache, strip RUSTC_WRAPPER and SCCACHE_* from the hardened environment.
+    // `build_job_environment` injects these when `policy.sccache_enabled` is true,
+    // but the containment protocol may have determined that the server is
+    // untrusted. Fail-closed: an untrusted server MUST NOT be used for
+    // compilation.
+    if !effective_sccache_enabled && policy.sccache_enabled {
+        eprintln!(
+            "worker: warm job {}: sccache auto-disabled by containment — \
+             stripping RUSTC_WRAPPER and SCCACHE_* from environment",
+            spec.job_id,
+        );
+        hardened_env.remove("RUSTC_WRAPPER");
+        hardened_env.retain(|key, _| !key.starts_with("SCCACHE_"));
+    }
 
     // TCK-00596: Plumb credential mount metadata into execution environment.
     // This selectively re-introduces credential env vars (for example

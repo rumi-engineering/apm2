@@ -294,9 +294,6 @@ pub struct SccacheServerContainment {
     /// Human-readable reason for the disposition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// Whether the server was successfully stopped at unit end.
-    #[serde(default)]
-    pub server_stopped: bool,
 }
 
 impl Default for SccacheServerContainment {
@@ -312,7 +309,6 @@ impl Default for SccacheServerContainment {
             server_cgroup_verified: false,
             auto_disabled: false,
             reason: None,
-            server_stopped: false,
         }
     }
 }
@@ -1282,10 +1278,20 @@ fn discover_sccache_server_pid(
     };
 
     let mut scanned: usize = 0;
+    let mut unreadable_count: usize = 0;
     for entry in proc_dir {
         scanned = scanned.saturating_add(1);
         if scanned > MAX_PROC_SCAN_ENTRIES {
-            break; // Best-effort scan; the main containment check is authoritative.
+            // MAJOR-1 fix: Fail-closed on scan limit. Unlike the previous
+            // best-effort break, exceeding the scan limit means we cannot
+            // guarantee we've found all sccache processes. Return an error
+            // so callers auto-disable sccache (consistent with
+            // discover_children_from_proc which raises ProcScanOverflow).
+            return Err(ContainmentError::ProcScanOverflow {
+                scanned,
+                max: MAX_PROC_SCAN_ENTRIES,
+                ppid_failures: unreadable_count,
+            });
         }
 
         let Ok(entry) = entry else { continue };
@@ -1303,10 +1309,19 @@ fn discover_sccache_server_pid(
         }
 
         // Check if this is an sccache process.
+        // NIT-1 fix: Log unreadable comm files instead of silently ignoring.
+        // An unreadable comm file means we cannot rule out the process being
+        // an escaped sccache server.
         if let Ok(comm) = read_comm(pid, proc_root) {
             if comm.trim() == "sccache" {
                 return Ok(Some(pid));
             }
+        } else {
+            unreadable_count = unreadable_count.saturating_add(1);
+            eprintln!(
+                "worker: WARNING: cannot read /proc/{pid}/comm during sccache server \
+                 discovery — process may be an undetected sccache server"
+            );
         }
     }
 
@@ -1588,13 +1603,17 @@ fn verify_started_server(
             }
         },
         Ok(None) => {
-            // Server started but not found — it may have already exited.
-            // Treat as success since `sccache --start-server` succeeded
-            // and the server might be a short-lived process that became
-            // a daemon we'll find later when the first compilation triggers it.
-            result.server_cgroup_verified = true;
-            result.reason =
-                Some("sccache server started (daemon not yet visible in /proc)".to_string());
+            // MAJOR-1 fix: Fail-closed when server PID cannot be found.
+            // A positively identified PID plus cgroup match is required
+            // before setting server_cgroup_verified=true. If the server
+            // is not visible in /proc, we cannot verify containment.
+            result.auto_disabled = true;
+            result.server_cgroup_verified = false;
+            result.reason = Some(
+                "sccache server started but not found in /proc — \
+                 cannot verify cgroup containment (fail-closed)"
+                    .to_string(),
+            );
         },
         Err(e) => {
             // Fail-closed: cannot rescan for server.
@@ -2776,7 +2795,6 @@ mod tests {
         assert!(!sc.server_started);
         assert!(!sc.server_cgroup_verified);
         assert!(!sc.auto_disabled);
-        assert!(!sc.server_stopped);
     }
 
     #[test]
@@ -2791,7 +2809,6 @@ mod tests {
             server_cgroup_verified: true,
             auto_disabled: false,
             reason: Some("test reason".to_string()),
-            server_stopped: false,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let sc2: SccacheServerContainment = serde_json::from_str(&json).unwrap();
@@ -2833,25 +2850,19 @@ mod tests {
         assert!(result.protocol_executed);
         assert!(!result.preexisting_server_detected);
 
-        if result.server_started {
-            // sccache binary is available — server started successfully.
-            // The real PID is not in our mock proc, so verification
-            // falls through to the "daemon not yet visible" path.
-            assert!(
-                result.server_cgroup_verified,
-                "started server (not visible in mock proc) must be treated as verified"
-            );
-            assert!(
-                !result.auto_disabled,
-                "successful start must not auto-disable"
-            );
-        } else {
-            // sccache binary is not available — fail-closed.
-            assert!(
-                result.auto_disabled,
-                "must auto-disable when server start fails"
-            );
-        }
+        // MAJOR-1 fix: Both outcomes now result in auto_disabled = true.
+        // - If sccache is NOT available: start fails → auto_disabled = true
+        // - If sccache IS available: start succeeds but the real server PID is not in
+        //   our mock proc → Ok(None) from discover_sccache_server_pid → fail-closed:
+        //   auto_disabled = true (no positive PID + cgroup proof)
+        assert!(
+            result.auto_disabled,
+            "must auto-disable when server PID cannot be positively verified"
+        );
+        assert!(
+            !result.server_cgroup_verified,
+            "server_cgroup_verified must be false without positive PID proof"
+        );
 
         // Clean up: stop any server we may have started.
         let _ = run_sccache_command(&["--stop-server"], &[], SCCACHE_SERVER_STOP_TIMEOUT);
@@ -2984,7 +2995,6 @@ mod tests {
             server_cgroup_verified: true,
             auto_disabled: false,
             reason: Some("server started in cgroup".to_string()),
-            server_stopped: false,
         };
 
         let trace = ContainmentTrace {
@@ -3028,7 +3038,6 @@ mod tests {
             server_cgroup_verified: false,
             auto_disabled: true,
             reason: Some("server outside cgroup".to_string()),
-            server_stopped: false,
         };
 
         let trace = ContainmentTrace::from_verdict_with_server_containment(
@@ -3144,6 +3153,103 @@ mod tests {
         assert!(
             result.is_none(),
             "child sccache must be skipped as it's part of the build"
+        );
+    }
+
+    // ========================================================================
+    // Regression tests for MAJOR-1 fix: fail-closed on verify_started_server
+    // ========================================================================
+
+    #[test]
+    fn verify_started_server_fails_closed_when_pid_not_found() {
+        // When `discover_sccache_server_pid` returns `Ok(None)` (server
+        // not visible in /proc), verify_started_server MUST set
+        // `auto_disabled = true` and `server_cgroup_verified = false`.
+        // Regression: previously treated as success (server_cgroup_verified=true).
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        fs::create_dir_all(&proc_root).unwrap();
+
+        // Reference process (PID 100) — no sccache process present.
+        let ref_dir = proc_root.join("100");
+        fs::create_dir_all(&ref_dir).unwrap();
+        fs::write(ref_dir.join("status"), "Name:\tcargo\nPPid:\t1\n").unwrap();
+        fs::write(ref_dir.join("cgroup"), "0::/test/unit\n").unwrap();
+        fs::write(ref_dir.join("comm"), "cargo\n").unwrap();
+
+        let mut result = SccacheServerContainment {
+            protocol_executed: true,
+            server_started: true,
+            ..Default::default()
+        };
+
+        verify_started_server(&mut result, 100, "/test/unit", &proc_root);
+
+        assert!(
+            result.auto_disabled,
+            "fail-closed: must auto-disable when server PID not found"
+        );
+        assert!(
+            !result.server_cgroup_verified,
+            "must not verify cgroup without positive PID proof"
+        );
+        assert!(
+            result.reason.as_ref().unwrap().contains("not found"),
+            "reason must explain the failure"
+        );
+    }
+
+    #[test]
+    fn containment_trace_auto_disabled_produces_effective_sccache_false() {
+        // Regression test for BLOCKER-1: when server containment auto-disables,
+        // the containment trace MUST have sccache_auto_disabled=true and
+        // sccache_enabled=false, so callers deriving effective_sccache_enabled
+        // from `!ct.sccache_auto_disabled` get false.
+        let verdict = ContainmentVerdict {
+            contained: true,
+            reference_cgroup: "/test".to_string(),
+            processes_checked: 1,
+            critical_processes_found: 0,
+            mismatches: vec![],
+            sccache_detected: false,
+            sccache_auto_disabled: false,
+            sccache_disabled_reason: None,
+        };
+
+        let sc = SccacheServerContainment {
+            protocol_executed: true,
+            auto_disabled: true,
+            reason: Some("server not found in /proc".to_string()),
+            ..Default::default()
+        };
+
+        let trace = ContainmentTrace::from_verdict_with_server_containment(
+            &verdict,
+            true, // policy enables sccache
+            Some("sccache 0.8.1".to_string()),
+            sc,
+        );
+
+        assert!(
+            trace.sccache_auto_disabled,
+            "trace must reflect auto-disable from server containment"
+        );
+        assert!(
+            !trace.sccache_enabled,
+            "sccache_enabled must be false when auto-disabled"
+        );
+        assert!(
+            trace.sccache_version.is_none(),
+            "version must be cleared when auto-disabled"
+        );
+
+        // Verify the derivation pattern used in fac_worker.rs:
+        // `policy.sccache_enabled && !trace.sccache_auto_disabled`
+        let policy_sccache_enabled = true;
+        let effective_sccache_enabled = policy_sccache_enabled && !trace.sccache_auto_disabled;
+        assert!(
+            !effective_sccache_enabled,
+            "effective_sccache_enabled must be false when trace shows auto-disabled"
         );
     }
 }

@@ -1954,8 +1954,8 @@ markers for trailing optional fields to ensure injective encoding:
   the `sccache_server_containment` sub-field (TCK-00554) is serialized as
   a 1u8 presence marker followed by boolean bytes for `protocol_executed`,
   `preexisting_server_detected`, `preexisting_server_in_cgroup`,
-  `server_started`, `server_cgroup_verified`, `auto_disabled`, and
-  `server_stopped` (or 0u8 when absent).
+  `server_started`, `server_cgroup_verified`, and `auto_disabled`.
+  Absence (None) is omitted entirely for V1 backward compatibility.
 - `3u8` — `sandbox_hardening_hash` (TCK-00573)
 
 `GateReceipt::canonical_bytes()` uses marker `4u8` for its own
@@ -2914,7 +2914,7 @@ job unit, preventing cache poisoning via escaped sccache daemons.
   lifecycle protocol (TCK-00554). Records `protocol_executed`,
   `preexisting_server_detected`, `preexisting_server_in_cgroup`,
   `preexisting_server_pid`, `server_started`, `started_server_pid`,
-  `server_cgroup_verified`, `auto_disabled`, `reason`, and `server_stopped`.
+  `server_cgroup_verified`, `auto_disabled`, and `reason`.
   Fail-closed default: all bools false, all options None.
 - `ContainmentError`: Fail-closed error taxonomy for proc read failures,
   parse failures, and resource bounds.
