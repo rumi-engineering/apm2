@@ -1466,6 +1466,7 @@ impl LaneManager {
         }
 
         for lane_id in &lane_ids {
+            self.reconcile_orphan_lease(lane_id, &mut actions);
             Self::reconcile_single_lane(
                 &self.fac_root,
                 &self.lane_dir(lane_id),
@@ -1489,6 +1490,105 @@ impl LaneManager {
         atomic_write(&receipt_path, &receipt_bytes)?;
 
         Ok(receipt)
+    }
+
+    /// Reconcile orphan lease state for a lane before directory/profile repair.
+    ///
+    /// S10: Detect `LEASED` lanes with missing/dead PID and proactively remove
+    /// stale lease metadata when the lane lock can be acquired.
+    fn reconcile_orphan_lease(&self, lane_id: &str, actions: &mut Vec<LaneReconcileAction>) {
+        let lane_dir = self.lane_dir(lane_id);
+        let orphan_detail = match LaneLeaseV1::load(&lane_dir) {
+            Ok(Some(lease)) => {
+                if lease.state == LaneState::Leased && !is_pid_alive(lease.pid) {
+                    Some(format!(
+                        "lease state=LEASED with dead pid {} (stale lease)",
+                        lease.pid
+                    ))
+                } else {
+                    return;
+                }
+            },
+            Ok(None) => {
+                // Production-reported orphan: derived LEASED with pid/job_id null
+                // (lock held, no lease metadata). Flag this as orphaned even
+                // though there is no lease file to remove.
+                let status = match self.lane_status(lane_id) {
+                    Ok(status) => status,
+                    Err(err) => {
+                        actions.push(LaneReconcileAction {
+                            lane_id: lane_id.to_string(),
+                            action: "inspect_orphan_lease".to_string(),
+                            outcome: LaneReconcileOutcome::Failed,
+                            detail: Some(format!(
+                                "failed to read lane status for orphan-lease check: {err}"
+                            )),
+                        });
+                        return;
+                    },
+                };
+                if status.state == LaneState::Leased && status.pid.is_none() {
+                    Some("derived LEASED with missing lease metadata (pid/job_id null)".to_string())
+                } else {
+                    return;
+                }
+            },
+            Err(err) => {
+                actions.push(LaneReconcileAction {
+                    lane_id: lane_id.to_string(),
+                    action: "inspect_orphan_lease".to_string(),
+                    outcome: LaneReconcileOutcome::Failed,
+                    detail: Some(format!(
+                        "failed to load lease for orphan-lease check: {err}"
+                    )),
+                });
+                return;
+            },
+        };
+
+        let Some(orphan_detail) = orphan_detail else {
+            return;
+        };
+        match self.try_lock(lane_id) {
+            Ok(Some(_guard)) => match LaneLeaseV1::remove(&lane_dir) {
+                Ok(()) => {
+                    actions.push(LaneReconcileAction {
+                        lane_id: lane_id.to_string(),
+                        action: "reap_orphan_lease".to_string(),
+                        outcome: LaneReconcileOutcome::Repaired,
+                        detail: Some(format!("released orphaned leased state: {orphan_detail}")),
+                    });
+                },
+                Err(err) => {
+                    actions.push(LaneReconcileAction {
+                        lane_id: lane_id.to_string(),
+                        action: "reap_orphan_lease".to_string(),
+                        outcome: LaneReconcileOutcome::Failed,
+                        detail: Some(format!("failed to remove orphaned lease: {err}")),
+                    });
+                },
+            },
+            Ok(None) => {
+                actions.push(LaneReconcileAction {
+                    lane_id: lane_id.to_string(),
+                    action: "reap_orphan_lease".to_string(),
+                    outcome: LaneReconcileOutcome::Failed,
+                    detail: Some(
+                        "lane lock is held; cannot reap orphaned leased state safely".to_string(),
+                    ),
+                });
+            },
+            Err(err) => {
+                actions.push(LaneReconcileAction {
+                    lane_id: lane_id.to_string(),
+                    action: "reap_orphan_lease".to_string(),
+                    outcome: LaneReconcileOutcome::Failed,
+                    detail: Some(format!(
+                        "failed to acquire lane lock for orphan-lease reap: {err}"
+                    )),
+                });
+            },
+        }
     }
 
     /// Reconcile a single lane: repair missing directories/profiles and mark
@@ -5401,6 +5501,84 @@ mod tests {
             })
             .count();
         assert_eq!(skip_count, 1, "should report existing corrupt marker");
+    }
+
+    #[test]
+    fn reconcile_reaps_orphan_leased_lane_with_dead_pid() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        manager.init_lanes().expect("init_lanes");
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+
+        // Simulate orphaned lease: LEASED state with dead pid.
+        let lease = LaneLeaseV1::new(
+            lane_id,
+            "job-orphan",
+            4_000_000,
+            LaneState::Leased,
+            "2026-01-01T00:00:00Z",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "b3-256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .expect("lease");
+        lease.persist(&lane_dir).expect("persist lease");
+
+        let receipt = manager.reconcile_lanes().expect("reconcile_lanes");
+
+        assert!(
+            receipt.actions.iter().any(|action| {
+                action.lane_id == lane_id
+                    && action.action == "reap_orphan_lease"
+                    && action.outcome == LaneReconcileOutcome::Repaired
+            }),
+            "expected reap_orphan_lease repaired action, got: {:?}",
+            receipt.actions
+        );
+        assert!(
+            LaneLeaseV1::load(&lane_dir)
+                .expect("load lane lease")
+                .is_none(),
+            "orphaned lease should be removed"
+        );
+        let status = manager.lane_status(lane_id).expect("lane status");
+        assert_eq!(status.state, LaneState::Idle, "lane should return to IDLE");
+    }
+
+    #[test]
+    fn reconcile_detects_orphan_leased_lane_without_pid_when_lock_held() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+
+        manager.init_lanes().expect("init_lanes");
+        let lane_id = "lane-00";
+
+        // Hold the lock without writing a lease: lane_status derives LEASED with
+        // pid=None, matching the observed orphaned state from production.
+        let _guard = manager
+            .try_lock(lane_id)
+            .expect("try_lock")
+            .expect("acquire lock");
+
+        let receipt = manager.reconcile_lanes().expect("reconcile_lanes");
+        assert!(
+            receipt.actions.iter().any(|action| {
+                action.lane_id == lane_id
+                    && action.action == "reap_orphan_lease"
+                    && action.outcome == LaneReconcileOutcome::Failed
+                    && action
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("lock is held"))
+            }),
+            "expected failed orphan-lease reap action for lock-held lane, got: {:?}",
+            receipt.actions
+        );
     }
 
     #[test]

@@ -7305,7 +7305,7 @@ mod tests {
             "preflight",
             "credential",
             "lint",
-            ".github/workflows/forge-admission-cycle.yml",
+            ".github/workflows/ci.yml",
             "crates/apm2-cli/src/commands/fac_preflight.rs",
         ])
         .expect("preflight credential lint should parse");
@@ -7316,7 +7316,7 @@ mod tests {
                     assert_eq!(credential_args.paths.len(), 2);
                     assert_eq!(
                         credential_args.paths[0],
-                        PathBuf::from(".github/workflows/forge-admission-cycle.yml")
+                        PathBuf::from(".github/workflows/ci.yml")
                     );
                     assert_eq!(
                         credential_args.paths[1],

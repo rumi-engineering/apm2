@@ -625,6 +625,9 @@ pub enum DenialReasonCode {
     /// exceed the configured `QueueBoundsPolicy` limits (TCK-00578).
     /// Denial reason code: `queue/quota_exceeded`.
     QueueQuotaExceeded,
+    /// Duplicate gates submission for a repo/SHA that already has a
+    /// completed receipt in the same push freshness window (TCK-00622 S8).
+    AlreadyCompleted,
 }
 
 /// Trace of the RFC-0028 channel boundary check.
@@ -3628,6 +3631,7 @@ pub mod tests {
                 DenialReasonCode::EconomicsAdmissionDenied,
                 "\"economics_admission_denied\"",
             ),
+            (DenialReasonCode::AlreadyCompleted, "\"already_completed\""),
         ];
 
         for (variant, expected) in map {

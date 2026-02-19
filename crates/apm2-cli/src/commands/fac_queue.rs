@@ -273,8 +273,9 @@ fn scan_directory(dir_path: &Path, dir_name: &str) -> DirectoryStatus {
 /// Collects denial/quarantine reason stats from job specs in a directory.
 ///
 /// Uses canonical `denial_reason` from receipts (via `lookup_job_receipt`)
-/// as the aggregation key.  Falls back to an explicit `"unknown"` bucket
-/// only when receipt data is unavailable. This satisfies the forensics-first
+/// as the aggregation key. Falls back to an explicit
+/// `"missing_denial_reason"` bucket only when receipt data is unavailable.
+/// This satisfies the forensics-first
 /// requirement: operators see denial/quarantine *cause taxonomy*, not job
 /// types (BLOCKER finding: spec.kind is a job type, not a reason code).
 ///
@@ -314,12 +315,12 @@ fn collect_reason_stats(
             let reason_key = apm2_core::fac::lookup_job_receipt(receipts_dir, &spec.job_id)
                 .and_then(|receipt| receipt.denial_reason)
                 .map_or_else(
-                    || "unknown".to_string(),
+                    || "missing_denial_reason".to_string(),
                     |dr| {
                         serde_json::to_value(dr)
                             .ok()
                             .and_then(|v| v.as_str().map(String::from))
-                            .unwrap_or_else(|| "unknown".to_string())
+                            .unwrap_or_else(|| "missing_denial_reason".to_string())
                     },
                 );
 
@@ -533,7 +534,7 @@ mod tests {
     /// Regression test: `collect_reason_stats` uses receipt-based
     /// `denial_reason` as the aggregation key, NOT `spec.kind` (BLOCKER
     /// finding from review). When no receipt exists for a job, it falls
-    /// back to `"unknown"`.
+    /// back to `"missing_denial_reason"`.
     #[test]
     fn test_collect_reason_stats_uses_receipt_denial_reason() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -543,7 +544,8 @@ mod tests {
         fs::create_dir_all(&receipts_dir).unwrap();
 
         // Create a job spec in denied/ with kind="gates".
-        // Without a receipt, it should aggregate under "unknown" -- NOT "gates".
+        // Without a receipt, it should aggregate under "missing_denial_reason"
+        // -- NOT "gates".
         let spec = make_test_spec("no-receipt-job", "2026-02-15T10:00:00Z");
         let json = serde_json::to_string_pretty(&spec).unwrap();
         fs::write(denied_dir.join("no-receipt-job.json"), &json).unwrap();
@@ -579,16 +581,17 @@ mod tests {
         );
         assert_eq!(reasons["digest_mismatch"], 1);
 
-        // The job without a receipt should be keyed by "unknown", NOT "gates".
+        // The job without a receipt should be keyed by
+        // "missing_denial_reason", NOT "gates".
         assert!(
             !reasons.contains_key("gates"),
             "spec.kind must NOT be used as reason key: {reasons:?}"
         );
         assert!(
-            reasons.contains_key("unknown"),
-            "expected 'unknown' fallback for missing receipt: {reasons:?}"
+            reasons.contains_key("missing_denial_reason"),
+            "expected 'missing_denial_reason' fallback for missing receipt: {reasons:?}"
         );
-        assert_eq!(reasons["unknown"], 1);
+        assert_eq!(reasons["missing_denial_reason"], 1);
     }
 
     /// Finding 4 regression: malformed `.json` files must NOT inflate the
@@ -671,8 +674,8 @@ mod tests {
         assert_eq!(reasons.len(), MAX_REASON_CODES);
 
         // Simulate an overflow scenario: create a dir with a job spec
-        // that has no receipt (will produce an "unknown" key). Since
-        // "unknown" is not yet in the map, it should go to "other".
+        // that has no receipt (will produce a "missing_denial_reason" key).
+        // Since that key is not yet in the map, it should go to "other".
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join("denied");
         let receipts_dir = tmp.path().join("receipts");
@@ -685,17 +688,19 @@ mod tests {
 
         collect_reason_stats(&dir, &receipts_dir, &mut reasons);
 
-        // The new reason ("unknown") was not in the map and the map was
+        // The new reason ("missing_denial_reason") was not in the map and
+        // the map was
         // at capacity, so it should have been aggregated into "other".
         assert!(
             reasons.contains_key("other"),
             "overflow codes must aggregate into 'other': {reasons:?}"
         );
         assert_eq!(reasons["other"], 1);
-        // "unknown" should NOT have been inserted since map was at capacity.
+        // "missing_denial_reason" should NOT have been inserted since map was
+        // at capacity.
         assert!(
-            !reasons.contains_key("unknown"),
-            "'unknown' should not be inserted when map is at capacity: {reasons:?}"
+            !reasons.contains_key("missing_denial_reason"),
+            "'missing_denial_reason' should not be inserted when map is at capacity: {reasons:?}"
         );
     }
 }

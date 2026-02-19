@@ -71,6 +71,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::flock_util::try_acquire_exclusive_nonblocking;
 use super::lane::{
     LANE_CORRUPT_MARKER_SCHEMA, LaneCorruptMarkerV1, LaneLeaseV1, LaneManager, LaneState,
     MAX_STRING_LENGTH, atomic_write, create_dir_restricted, is_pid_alive,
@@ -1261,6 +1262,39 @@ fn reconcile_queue(
         {
             continue;
         }
+
+        // S11: Reconciliation must not move files currently flock'd by a
+        // worker commit. Acquire a non-blocking exclusive flock and keep it
+        // held for this iteration to serialize with worker-side commit.
+        let claimed_lock_file = match open_file_no_follow(&path) {
+            Ok(file) => file,
+            Err(err) => {
+                eprintln!(
+                    "reconcile: skipping claimed entry {} (cannot open for flock probe: {err})",
+                    path.display()
+                );
+                continue;
+            },
+        };
+        let lock_acquired = match try_acquire_exclusive_nonblocking(&claimed_lock_file) {
+            Ok(locked) => locked,
+            Err(err) => {
+                eprintln!(
+                    "reconcile: skipping claimed entry {} (flock probe failed: {err})",
+                    path.display()
+                );
+                continue;
+            },
+        };
+        if !lock_acquired {
+            let inferred_job_id = file_name.trim_end_matches(".json").to_string();
+            actions.push(QueueRecoveryAction::StillActive {
+                job_id: inferred_job_id,
+                lane_id: "flock_held".to_string(),
+            });
+            continue;
+        }
+        let _claimed_lock_guard = claimed_lock_file;
 
         // Try to extract `job_id` from the file contents.
         // If unparseable, fall back to filename stem as ID.
@@ -2918,6 +2952,39 @@ mod tests {
         // The important thing is no MoveFailed error.
         assert_eq!(receipt.orphaned_jobs_requeued, 0);
         assert_eq!(receipt.orphaned_jobs_failed, 0);
+    }
+
+    #[test]
+    fn test_reconcile_skips_claimed_file_when_worker_flock_is_held() {
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+        write_claimed_job(&queue_root, "job-locked");
+
+        let claimed_path = queue_root.join("claimed").join("job-locked.json");
+        let claimed_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&claimed_path)
+            .expect("open claimed file");
+        crate::fac::flock_util::acquire_exclusive_blocking(&claimed_file)
+            .expect("acquire worker flock");
+
+        let receipt =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::MarkFailed, false)
+                .expect("reconcile should succeed when file is worker-locked");
+
+        assert!(
+            claimed_path.exists(),
+            "reconcile must not move a claimed file while worker lock is held"
+        );
+        assert!(
+            receipt.queue_actions.iter().any(|action| matches!(
+                action,
+                QueueRecoveryAction::StillActive { job_id, lane_id }
+                if job_id == "job-locked" && lane_id == "flock_held"
+            )),
+            "expected StillActive action with flock_held lane marker, got: {:?}",
+            receipt.queue_actions
+        );
     }
 
     // ── MINOR R7: Partial receipt inspected count accuracy ─────────────

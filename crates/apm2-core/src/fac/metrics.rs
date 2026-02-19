@@ -236,7 +236,10 @@ pub fn compute_metrics(input: &MetricsInput<'_>) -> MetricsSummary {
                         summary.disk_preflight_failures += 1;
                     }
                 } else {
-                    increment_bounded_map(&mut summary.denial_counts_by_reason, "unknown");
+                    increment_bounded_map(
+                        &mut summary.denial_counts_by_reason,
+                        "missing_denial_reason",
+                    );
                 }
             },
             FacJobOutcome::Quarantined => {
@@ -302,7 +305,7 @@ pub fn compute_metrics(input: &MetricsInput<'_>) -> MetricsSummary {
 fn serialize_denial_reason(reason: DenialReasonCode) -> String {
     // Use serde's snake_case serialization for stable keys.
     serde_json::to_string(&reason)
-        .unwrap_or_else(|_| "\"unknown\"".to_string())
+        .unwrap_or_else(|_| "\"missing_denial_reason_code\"".to_string())
         .trim_matches('"')
         .to_string()
 }
@@ -955,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn denial_without_reason_classified_as_unknown() {
+    fn denial_without_reason_classified_as_missing_denial_reason() {
         let receipts = vec![make_job_receipt(
             FacJobOutcome::Denied,
             None, // no denial reason
@@ -971,7 +974,10 @@ mod tests {
         };
         let summary = compute_metrics(&input);
         assert_eq!(summary.denied_jobs, 1);
-        assert_eq!(summary.denial_counts_by_reason.get("unknown"), Some(&1));
+        assert_eq!(
+            summary.denial_counts_by_reason.get("missing_denial_reason"),
+            Some(&1)
+        );
     }
 
     // =========================================================================

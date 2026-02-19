@@ -291,10 +291,15 @@ fn read_required_status_policy_from_ruleset(
     if contexts.is_empty() {
         return Err(format!("{source}: required_status_checks cannot be empty"));
     }
-    let strict = params
-        .get("strict_required_status_checks_policy")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| format!("{source}: missing strict_required_status_checks_policy boolean"))?;
+    let strict = match params.get("strict_required_status_checks_policy") {
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(format!(
+                "{source}: strict_required_status_checks_policy must be a boolean when present"
+            ));
+        },
+        None => false,
+    };
 
     Ok(RequiredStatusPolicy {
         contexts,
@@ -602,6 +607,29 @@ mod tests {
         let err = read_required_status_policy_from_ruleset(&ruleset, "fixture")
             .expect_err("empty policy must fail");
         assert!(err.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn read_required_status_policy_defaults_missing_strict_flag_to_false() {
+        let ruleset = json!({
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "required_status_checks": [
+                            { "context": "apm2 / Forge Admission Cycle" }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let policy =
+            read_required_status_policy_from_ruleset(&ruleset, "fixture").expect("policy parsed");
+        assert!(
+            !policy.strict_required_status_checks_policy,
+            "missing strict flag must default fail-open for outdated local files and enforce false"
+        );
     }
 
     #[test]

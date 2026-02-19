@@ -12,8 +12,8 @@ use crate::exit_codes::codes as exit_codes;
 
 const FAC_PRECHECK_PREFIX: &str = "fac-credential";
 const FAC_AUTH_PREFIX: &str = "fac-preflight";
-const DEFAULT_POLICY_PATH: &str = ".github/review-gate/workflow-trust-policy.json";
-const DEFAULT_LINT_PATHS: &[&str] = &[".github/workflows/forge-admission-cycle.yml"];
+const DEFAULT_POLICY_PATH: &str = "documents/reviews/workflow-trust-policy.json";
+const DEFAULT_LINT_PATHS: &[&str] = &[".github/workflows/ci.yml"];
 const MAX_CMDLINE_CONTEXT_SIZE: usize = 128 * 1024;
 const MAX_LINT_SCAN_FILE_SIZE: usize = 10 * 1024 * 1024;
 const MAX_EVENT_JSON_SIZE: usize = 10 * 1024 * 1024;

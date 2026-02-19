@@ -665,13 +665,27 @@ fn persist_verdict_projection_impl(
 
     let payload = projection_record_to_payload(&record);
     record.decision_signature = signature_for_payload(&payload)?;
+    let all_dimensions_resolved = all_active_dimensions_resolved(&record);
 
     match projection_mode {
         ProjectionMode::Full => {
-            let (projected_comment_id, projected_comment_url) =
-                project_decision_comment(&owner_repo, resolved_pr, &record, &payload)?;
-            record.decision_comment_id = projected_comment_id;
-            record.decision_comment_url = projected_comment_url;
+            if all_dimensions_resolved {
+                let (projected_comment_id, projected_comment_url) =
+                    project_decision_comment(&owner_repo, resolved_pr, &record, &payload)?;
+                record.decision_comment_id = projected_comment_id;
+                record.decision_comment_url = projected_comment_url;
+            } else {
+                if record.decision_comment_id == 0 {
+                    record.decision_comment_id = allocate_local_comment_id(
+                        resolved_pr,
+                        max_cached_issue_comment_id(&owner_repo, resolved_pr),
+                    );
+                }
+                if record.decision_comment_url.trim().is_empty() {
+                    record.decision_comment_url =
+                        local_comment_url(&owner_repo, resolved_pr, record.decision_comment_id);
+                }
+            }
         },
         ProjectionMode::LocalOnly => {
             if record.decision_comment_id == 0 {
@@ -757,6 +771,16 @@ fn projection_record_to_payload(record: &DecisionProjectionRecord) -> DecisionCo
         updated_at: record.updated_at.clone(),
         dimensions: record.dimensions.clone(),
     }
+}
+
+fn all_active_dimensions_resolved(record: &DecisionProjectionRecord) -> bool {
+    ACTIVE_DIMENSIONS.iter().all(|dimension| {
+        record
+            .dimensions
+            .get(*dimension)
+            .and_then(|entry| normalize_decision_value(&entry.decision))
+            .is_some()
+    })
 }
 
 const GITHUB_COMMENT_URL_PREFIX: &str = "https://github.com/";
@@ -2265,6 +2289,60 @@ mod tests {
         let report = build_show_report_from_record(head_sha, &record);
         assert_eq!(report.overall_decision, "pending");
         assert!(!report.fail_closed);
+    }
+
+    #[test]
+    fn all_active_dimensions_resolved_requires_security_and_quality() {
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let mut record = DecisionProjectionRecord {
+            schema: super::PROJECTION_VERDICT_SCHEMA.to_string(),
+            owner_repo: "example/repo".to_string(),
+            pr_number: 442,
+            head_sha: head_sha.to_string(),
+            updated_at: "2026-02-13T00:00:00Z".to_string(),
+            decision_comment_id: 1,
+            decision_comment_url: String::new(),
+            decision_signature: String::new(),
+            dimensions: BTreeMap::new(),
+            integrity_hmac: None,
+        };
+
+        assert!(
+            !super::all_active_dimensions_resolved(&record),
+            "empty projection cannot be resolved"
+        );
+
+        record.dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: String::new(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-13T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
+            },
+        );
+        assert!(
+            !super::all_active_dimensions_resolved(&record),
+            "single-dimension projection must remain unresolved"
+        );
+
+        record.dimensions.insert(
+            "code-quality".to_string(),
+            DecisionEntry {
+                decision: "deny".to_string(),
+                reason: String::new(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-13T00:00:01Z".to_string(),
+                model_id: None,
+                backend_id: None,
+            },
+        );
+        assert!(
+            super::all_active_dimensions_resolved(&record),
+            "both dimensions resolved should unlock projection"
+        );
     }
 
     #[test]

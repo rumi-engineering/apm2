@@ -77,6 +77,10 @@ const DEFAULT_SINGLEFLIGHT_LOCK_TIMEOUT_SECS: u64 = 120;
 const SINGLEFLIGHT_LOCK_TIMEOUT_ENV: &str = "APM2_FAC_GATES_SINGLEFLIGHT_LOCK_TIMEOUT_SECS";
 const SINGLEFLIGHT_LOCK_POLL_INTERVAL_MILLIS: u64 = 200;
 const SINGLEFLIGHT_LOCK_OWNER_FILE_READ_MAX_BYTES: u64 = 1024;
+const PREP_SUPPLY_UNAVAILABLE_CODE: &str = "PREP_SUPPLY_UNAVAILABLE";
+const PREP_SUPPLY_FAILURE_CLASS: &str = "supply";
+const PREP_SUPPLY_REMEDIATION: &str = "connect to network and retry to hydrate dependency closure";
+const CLOSURE_DIAGNOSTIC_MAX_BYTES: usize = 2048;
 static GATES_RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1221,6 +1225,7 @@ pub(super) fn run_gates_local_worker(
         resolve_effective_execution_profile(cpu_quota, gate_profile)?;
     let run_id = next_gates_run_id();
     let gate_sha = resolve_workspace_head_sha(workspace_root);
+    let execute_network_enforcement_method = resolve_execute_network_enforcement_method(quick);
     let execute_started_emitted = Arc::new(AtomicBool::new(false));
     let emitted_gate_finishes = Arc::new(std::sync::Mutex::new(BTreeSet::<String>::new()));
     emit_prep_started_event(&run_id);
@@ -1233,13 +1238,18 @@ pub(super) fn run_gates_local_worker(
 
     let run_id_for_progress = run_id.clone();
     let gate_sha_for_progress = gate_sha;
+    let execute_network_enforcement_method_for_progress =
+        execute_network_enforcement_method.clone();
     let execute_started_for_progress = Arc::clone(&execute_started_emitted);
     let emitted_gate_finishes_for_progress = Arc::clone(&emitted_gate_finishes);
     let gate_progress_callback: Box<dyn Fn(GateProgressEvent) + Send> =
         Box::new(move |event: GateProgressEvent| match event {
             GateProgressEvent::Started { gate_name } => {
                 if !execute_started_for_progress.swap(true, Ordering::AcqRel) {
-                    emit_execute_started_event(&run_id_for_progress);
+                    emit_execute_started_event(
+                        &run_id_for_progress,
+                        &execute_network_enforcement_method_for_progress,
+                    );
                 }
                 emit_gate_started_event(
                     &run_id_for_progress,
@@ -1290,15 +1300,15 @@ pub(super) fn run_gates_local_worker(
             if failure.phase == GatesRunPhase::Execute
                 && !execute_started_emitted.load(Ordering::Acquire)
             {
-                emit_execute_started_event(&run_id);
+                emit_execute_started_event(&run_id, &execute_network_enforcement_method);
             }
-            emit_run_failed_event(&run_id, failure.phase.as_str(), &failure.message);
+            emit_run_failed_event(&run_id, &failure);
             return Err(failure.render());
         },
     };
 
     if !execute_started_emitted.load(Ordering::Acquire) {
-        emit_execute_started_event(&run_id);
+        emit_execute_started_event(&run_id, &execute_network_enforcement_method);
     }
 
     let emitted_snapshot = emitted_gate_finishes
@@ -1334,7 +1344,15 @@ pub(super) fn run_gates_local_worker(
             .phase_failed
             .as_deref()
             .unwrap_or(GatesRunPhase::Execute.as_str());
-        emit_run_failed_event(&run_id, phase, &failure_summary);
+        let phase = if phase == GatesRunPhase::Prep.as_str() {
+            GatesRunPhase::Prep
+        } else {
+            GatesRunPhase::Execute
+        };
+        emit_run_failed_event(
+            &run_id,
+            &GatesRunFailure::simple(phase, failure_summary.clone()),
+        );
         LocalGatesRunResult {
             exit_code: exit_codes::GENERIC_ERROR,
             failure_summary: Some(failure_summary),
@@ -1986,6 +2004,41 @@ enum GatesRunPhase {
     Execute,
 }
 
+#[derive(Debug, Clone, Default)]
+struct GatesFailureDetails {
+    failure_code: Option<String>,
+    failure_class: Option<String>,
+    remediation: Option<String>,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GatesStepError {
+    message: String,
+    details: Box<GatesFailureDetails>,
+}
+
+impl GatesStepError {
+    fn simple(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            details: Box::new(GatesFailureDetails::default()),
+        }
+    }
+
+    fn prep_supply_unavailable(root_cause: String, diagnostics: Vec<String>) -> Self {
+        Self {
+            message: root_cause,
+            details: Box::new(GatesFailureDetails {
+                failure_code: Some(PREP_SUPPLY_UNAVAILABLE_CODE.to_string()),
+                failure_class: Some(PREP_SUPPLY_FAILURE_CLASS.to_string()),
+                remediation: Some(PREP_SUPPLY_REMEDIATION.to_string()),
+                diagnostics,
+            }),
+        }
+    }
+}
+
 type PrepStepCallback<'a> = &'a (dyn Fn(&PrepStepResult) + Send);
 
 impl GatesRunPhase {
@@ -2001,6 +2054,7 @@ impl GatesRunPhase {
 struct GatesPhaseError {
     phase: GatesRunPhase,
     message: String,
+    details: Box<GatesFailureDetails>,
 }
 
 impl GatesPhaseError {
@@ -2018,9 +2072,18 @@ impl GatesPhaseError {
 struct GatesRunFailure {
     phase: GatesRunPhase,
     message: String,
+    details: Box<GatesFailureDetails>,
 }
 
 impl GatesRunFailure {
+    fn simple(phase: GatesRunPhase, message: impl Into<String>) -> Self {
+        Self {
+            phase,
+            message: message.into(),
+            details: Box::new(GatesFailureDetails::default()),
+        }
+    }
+
     fn render(self) -> String {
         format!(
             "run_failed stage={} root_cause={}",
@@ -2173,6 +2236,28 @@ fn resolve_workspace_head_sha(workspace_root: &Path) -> Option<String> {
     Some(sha)
 }
 
+fn resolve_execute_network_enforcement_method(quick: bool) -> String {
+    if quick {
+        return "quick_mode_no_network_isolation".to_string();
+    }
+
+    let Some(apm2_home) = apm2_core::github::resolve_apm2_home() else {
+        return "network_policy_unresolved".to_string();
+    };
+    let fac_root = apm2_home.join("private/fac");
+    let policy = load_or_create_gate_policy(&fac_root).ok();
+    let network_policy = apm2_core::fac::resolve_network_policy(
+        "gates",
+        policy.as_ref().and_then(|p| p.network_policy.as_ref()),
+    );
+
+    if network_policy.allow_network {
+        return "network_policy_allow".to_string();
+    }
+
+    "systemd_network_policy_deny".to_string()
+}
+
 fn prep_started_event(run_id: &str) -> serde_json::Value {
     build_gates_event(
         "prep_started",
@@ -2222,17 +2307,18 @@ fn emit_prep_step_event(run_id: &str, step: &PrepStepResult) {
     }
 }
 
-fn execute_started_event(run_id: &str) -> serde_json::Value {
+fn execute_started_event(run_id: &str, enforcement_method: &str) -> serde_json::Value {
     build_gates_event(
         "execute_started",
         serde_json::json!({
             "run_id": run_id,
+            "network_enforcement_method": enforcement_method,
         }),
     )
 }
 
-fn emit_execute_started_event(run_id: &str) {
-    if let Err(err) = super::jsonl::emit_jsonl(&execute_started_event(run_id)) {
+fn emit_execute_started_event(run_id: &str, enforcement_method: &str) {
+    if let Err(err) = super::jsonl::emit_jsonl(&execute_started_event(run_id, enforcement_method)) {
         eprintln!("WARNING: failed to emit gates event `execute_started`: {err}");
     }
 }
@@ -2360,19 +2446,56 @@ fn emit_run_summary_event(run_id: &str, summary: &GatesSummary) {
     }
 }
 
-fn run_failed_event(run_id: &str, stage: &str, root_cause: &str) -> serde_json::Value {
-    build_gates_event(
-        "run_failed",
-        serde_json::json!({
-            "run_id": run_id,
-            "stage": stage,
-            "root_cause": root_cause,
-        }),
-    )
+fn run_failed_event(run_id: &str, failure: &GatesRunFailure) -> serde_json::Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "run_id".to_string(),
+        serde_json::Value::String(run_id.to_string()),
+    );
+    payload.insert(
+        "stage".to_string(),
+        serde_json::Value::String(failure.phase.as_str().to_string()),
+    );
+    payload.insert(
+        "root_cause".to_string(),
+        serde_json::Value::String(failure.message.clone()),
+    );
+    if let Some(code) = failure.details.failure_code.as_deref() {
+        payload.insert(
+            "failure_code".to_string(),
+            serde_json::Value::String(code.to_string()),
+        );
+    }
+    if let Some(class) = failure.details.failure_class.as_deref() {
+        payload.insert(
+            "failure_class".to_string(),
+            serde_json::Value::String(class.to_string()),
+        );
+    }
+    if let Some(remediation) = failure.details.remediation.as_deref() {
+        payload.insert(
+            "remediation".to_string(),
+            serde_json::Value::String(remediation.to_string()),
+        );
+    }
+    if !failure.details.diagnostics.is_empty() {
+        payload.insert(
+            "diagnostics".to_string(),
+            serde_json::Value::Array(
+                failure
+                    .details
+                    .diagnostics
+                    .iter()
+                    .map(|entry| serde_json::Value::String(entry.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    build_gates_event("run_failed", serde_json::Value::Object(payload))
 }
 
-fn emit_run_failed_event(run_id: &str, stage: &str, root_cause: &str) {
-    if let Err(err) = super::jsonl::emit_jsonl(&run_failed_event(run_id, stage, root_cause)) {
+fn emit_run_failed_event(run_id: &str, failure: &GatesRunFailure) {
+    if let Err(err) = super::jsonl::emit_jsonl(&run_failed_event(run_id, failure)) {
         eprintln!("WARNING: failed to emit gates event `run_failed`: {err}");
     }
 }
@@ -2382,9 +2505,9 @@ fn run_prep_step<F>(
     step_name: &str,
     on_step: Option<PrepStepCallback<'_>>,
     mut run_step: F,
-) -> Result<(), String>
+) -> Result<(), GatesStepError>
 where
-    F: FnMut() -> Result<PrepStepTelemetry, String>,
+    F: FnMut() -> Result<PrepStepTelemetry, GatesStepError>,
 {
     let started = Instant::now();
     let step_outcome = run_step();
@@ -2424,15 +2547,124 @@ fn format_readiness_failure(failure: &ReadinessFailure) -> String {
     )
 }
 
-fn run_dependency_closure_hydration_check(workspace_root: &Path) -> Result<(), String> {
-    // TCK-00623 placeholder: dependency closure hydration validation hook.
+fn summarize_diagnostic(kind: &str, raw: &str) -> String {
+    let mut trimmed = raw.trim().replace('\n', " | ");
+    if trimmed.len() > CLOSURE_DIAGNOSTIC_MAX_BYTES {
+        trimmed.truncate(CLOSURE_DIAGNOSTIC_MAX_BYTES);
+        trimmed.push_str("...");
+    }
+    format!("{kind}={trimmed}")
+}
+
+fn check_dependency_closure_offline(workspace_root: &Path) -> Result<(), String> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--offline", "--locked", "--format-version", "1"])
+        .current_dir(workspace_root)
+        .output()
+        .map_err(|err| format!("failed to run cargo metadata --offline: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let raw = if stderr.trim().is_empty() {
+        stdout.to_string()
+    } else {
+        stderr.to_string()
+    };
+    Err(raw.trim().to_string())
+}
+
+fn hydrate_dependency_closure_online(workspace_root: &Path) -> Result<(), String> {
+    let output = Command::new("cargo")
+        .args(["fetch", "--locked"])
+        .current_dir(workspace_root)
+        .output()
+        .map_err(|err| format!("failed to run cargo fetch --locked: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let raw = if stderr.trim().is_empty() {
+        stdout.to_string()
+    } else {
+        stderr.to_string()
+    };
+    Err(raw.trim().to_string())
+}
+
+fn fetch_error_indicates_network_unavailable(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    [
+        "could not resolve host",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "network is unreachable",
+        "no route to host",
+        "connection refused",
+        "connection timed out",
+        "operation timed out",
+        "timed out",
+        "dns error",
+        "failed to connect",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn run_dependency_closure_hydration_check_with<FCheck, FHydrate>(
+    workspace_root: &Path,
+    mut check_offline: FCheck,
+    mut hydrate_online: FHydrate,
+) -> Result<(), GatesStepError>
+where
+    FCheck: FnMut() -> Result<(), String>,
+    FHydrate: FnMut() -> Result<(), String>,
+{
     if !workspace_root.is_dir() {
-        return Err(format!(
+        return Err(GatesStepError::simple(format!(
             "dependency closure hydration check requires a workspace directory: {}",
             workspace_root.display()
+        )));
+    }
+
+    let first_offline_err = match check_offline() {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+    let mut diagnostics = vec![summarize_diagnostic("offline_probe", &first_offline_err)];
+
+    if let Err(fetch_err) = hydrate_online() {
+        diagnostics.push(summarize_diagnostic("fetch_attempt", &fetch_err));
+        let root_cause = if fetch_error_indicates_network_unavailable(&fetch_err) {
+            "dependency closure incomplete and network unavailable during PREP hydration"
+        } else {
+            "dependency closure hydration failed during PREP fetch"
+        };
+        return Err(GatesStepError::prep_supply_unavailable(
+            root_cause.to_string(),
+            diagnostics,
         ));
     }
+
+    if let Err(recheck_err) = check_offline() {
+        diagnostics.push(summarize_diagnostic("post_fetch_probe", &recheck_err));
+        return Err(GatesStepError::prep_supply_unavailable(
+            "dependency closure remained incomplete after PREP hydration attempt".to_string(),
+            diagnostics,
+        ));
+    }
+
     Ok(())
+}
+
+fn run_dependency_closure_hydration_check(workspace_root: &Path) -> Result<(), GatesStepError> {
+    run_dependency_closure_hydration_check_with(
+        workspace_root,
+        || check_dependency_closure_offline(workspace_root),
+        || hydrate_dependency_closure_online(workspace_root),
+    )
 }
 
 fn run_singleflight_lock_liveness_reap() -> Result<u64, String> {
@@ -2447,7 +2679,7 @@ fn run_prep_phase(
     workspace_root: &Path,
     prep_steps: &mut Vec<PrepStepResult>,
     on_step: Option<PrepStepCallback<'_>>,
-) -> Result<(), String> {
+) -> Result<(), GatesStepError> {
     run_prep_step(prep_steps, "readiness_controller", on_step, || {
         readiness::run_readiness_controller(
             ReadinessOptions {
@@ -2460,12 +2692,14 @@ fn run_prep_phase(
             },
         )
         .map(|_| PrepStepTelemetry::default())
-        .map_err(|failure| format_readiness_failure(&failure))
+        .map_err(|failure| GatesStepError::simple(format_readiness_failure(&failure)))
     })?;
     run_prep_step(prep_steps, "singleflight_reap", on_step, || {
-        run_singleflight_lock_liveness_reap().map(|reaped_locks| PrepStepTelemetry {
-            reaped_locks: Some(reaped_locks),
-        })
+        run_singleflight_lock_liveness_reap()
+            .map(|reaped_locks| PrepStepTelemetry {
+                reaped_locks: Some(reaped_locks),
+            })
+            .map_err(GatesStepError::simple)
     })?;
     run_prep_step(prep_steps, "dependency_closure_hydration", on_step, || {
         run_dependency_closure_hydration_check(workspace_root)
@@ -2479,20 +2713,22 @@ fn run_gates_phases<FPrep, FExecute>(
     execute_phase: FExecute,
 ) -> Result<(u64, u64, GatesSummary), GatesPhaseError>
 where
-    FPrep: FnOnce() -> Result<(), String>,
-    FExecute: FnOnce() -> Result<GatesSummary, String>,
+    FPrep: FnOnce() -> Result<(), GatesStepError>,
+    FExecute: FnOnce() -> Result<GatesSummary, GatesStepError>,
 {
     let prep_started = Instant::now();
-    prep_phase().map_err(|message| GatesPhaseError {
+    prep_phase().map_err(|error| GatesPhaseError {
         phase: GatesRunPhase::Prep,
-        message,
+        message: error.message,
+        details: error.details,
     })?;
     let prep_duration_ms = duration_ms(prep_started.elapsed());
 
     let execute_started = Instant::now();
-    let summary = execute_phase().map_err(|message| GatesPhaseError {
+    let summary = execute_phase().map_err(|error| GatesPhaseError {
         phase: GatesRunPhase::Execute,
-        message,
+        message: error.message,
+        details: error.details,
     })?;
     let execute_duration_ms = duration_ms(execute_started.elapsed());
 
@@ -2595,10 +2831,12 @@ fn run_gates_inner_detailed(
     validate_timeout_seconds(timeout_seconds).map_err(|message| GatesRunFailure {
         phase: GatesRunPhase::Prep,
         message,
+        details: Box::new(GatesFailureDetails::default()),
     })?;
     let memory_max_bytes = parse_memory_limit(memory_max).map_err(|message| GatesRunFailure {
         phase: GatesRunPhase::Prep,
         message,
+        details: Box::new(GatesFailureDetails::default()),
     })?;
     if memory_max_bytes > max_memory_bytes() {
         return Err(GatesRunFailure {
@@ -2607,6 +2845,7 @@ fn run_gates_inner_detailed(
                 "--memory-max {memory_max} exceeds FAC test memory cap of {max_bytes}",
                 max_bytes = max_memory_bytes()
             ),
+            details: Box::new(GatesFailureDetails::default()),
         });
     }
 
@@ -2627,6 +2866,7 @@ fn run_gates_inner_detailed(
                 emit_human_logs,
                 on_gate_progress,
             )
+            .map_err(GatesStepError::simple)
         },
     );
 
@@ -2645,6 +2885,7 @@ fn run_gates_inner_detailed(
         Err(err) => Err(GatesRunFailure {
             phase: err.phase,
             message: err.message,
+            details: err.details,
         }),
     }
 }
@@ -3481,7 +3722,10 @@ mod tests {
 
     #[test]
     fn run_failed_event_contains_stage_field() {
-        let payload = run_failed_event("run-1", "prep", "readiness failed");
+        let payload = run_failed_event(
+            "run-1",
+            &GatesRunFailure::simple(GatesRunPhase::Prep, "readiness failed"),
+        );
         assert_eq!(
             payload.get("stage").and_then(serde_json::Value::as_str),
             Some("prep")
@@ -3489,6 +3733,47 @@ mod tests {
         assert_eq!(
             payload.get("event").and_then(serde_json::Value::as_str),
             Some("run_failed")
+        );
+    }
+
+    #[test]
+    fn run_failed_event_includes_supply_failure_metadata_when_present() {
+        let failure = GatesRunFailure {
+            phase: GatesRunPhase::Prep,
+            message: "dependency closure incomplete and network unavailable during PREP hydration"
+                .to_string(),
+            details: Box::new(GatesFailureDetails {
+                failure_code: Some(PREP_SUPPLY_UNAVAILABLE_CODE.to_string()),
+                failure_class: Some(PREP_SUPPLY_FAILURE_CLASS.to_string()),
+                remediation: Some(PREP_SUPPLY_REMEDIATION.to_string()),
+                diagnostics: vec!["offline_probe=cargo registry unavailable".to_string()],
+            }),
+        };
+        let payload = run_failed_event("run-1", &failure);
+        assert_eq!(
+            payload
+                .get("failure_code")
+                .and_then(serde_json::Value::as_str),
+            Some(PREP_SUPPLY_UNAVAILABLE_CODE)
+        );
+        assert_eq!(
+            payload
+                .get("failure_class")
+                .and_then(serde_json::Value::as_str),
+            Some(PREP_SUPPLY_FAILURE_CLASS)
+        );
+        assert_eq!(
+            payload
+                .get("remediation")
+                .and_then(serde_json::Value::as_str),
+            Some(PREP_SUPPLY_REMEDIATION)
+        );
+        assert_eq!(
+            payload
+                .get("diagnostics")
+                .and_then(serde_json::Value::as_array)
+                .map(std::vec::Vec::len),
+            Some(1)
         );
     }
 
@@ -3543,6 +3828,17 @@ mod tests {
     }
 
     #[test]
+    fn execute_started_event_includes_network_enforcement_method() {
+        let payload = execute_started_event("run-1", "systemd_private_network_ipaddressdeny_any");
+        assert_eq!(
+            payload
+                .get("network_enforcement_method")
+                .and_then(serde_json::Value::as_str),
+            Some("systemd_private_network_ipaddressdeny_any")
+        );
+    }
+
+    #[test]
     fn run_prep_step_invokes_callback_with_failed_status() {
         let emitted = Mutex::new(Vec::new());
         let mut prep_steps = Vec::new();
@@ -3556,10 +3852,10 @@ mod tests {
             &mut prep_steps,
             "readiness_controller",
             Some(&on_step),
-            || Err("readiness failed".to_string()),
+            || Err(GatesStepError::simple("readiness failed")),
         )
         .expect_err("prep step should fail");
-        assert_eq!(err, "readiness failed");
+        assert_eq!(err.message, "readiness failed");
         assert_eq!(prep_steps.len(), 1);
         assert_eq!(
             prep_steps[0].status.as_str(),
@@ -3576,7 +3872,7 @@ mod tests {
     fn run_gates_phases_prep_failure_skips_execute_and_reports_stage() {
         let mut execute_called = false;
         let err = run_gates_phases(
-            || Err("readiness controller failed".to_string()),
+            || Err(GatesStepError::simple("readiness controller failed")),
             || {
                 execute_called = true;
                 Ok(sample_phase_summary(true))
@@ -3612,11 +3908,147 @@ mod tests {
 
     #[test]
     fn run_gates_phases_execute_failure_reports_stage_execute() {
-        let err = run_gates_phases(|| Ok(()), || Err("gate execution failed".to_string()))
-            .expect_err("execute failure must be returned");
+        let err = run_gates_phases(
+            || Ok(()),
+            || Err(GatesStepError::simple("gate execution failed")),
+        )
+        .expect_err("execute failure must be returned");
         assert_eq!(err.phase, GatesRunPhase::Execute);
         let rendered = err.render();
         assert!(rendered.contains("stage=execute"));
+    }
+
+    #[test]
+    fn dependency_closure_hydration_offline_without_network_emits_supply_unavailable() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let err = run_dependency_closure_hydration_check_with(
+            repo.path(),
+            || Err("cargo metadata failed: crate index unavailable".to_string()),
+            || Err("failed to fetch registry index: network is unreachable".to_string()),
+        )
+        .expect_err("offline closure miss without network must fail");
+        assert_eq!(
+            err.message,
+            "dependency closure incomplete and network unavailable during PREP hydration"
+        );
+        assert_eq!(
+            err.details.failure_code.as_deref(),
+            Some(PREP_SUPPLY_UNAVAILABLE_CODE)
+        );
+        assert_eq!(
+            err.details.failure_class.as_deref(),
+            Some(PREP_SUPPLY_FAILURE_CLASS)
+        );
+        assert_eq!(
+            err.details.remediation.as_deref(),
+            Some(PREP_SUPPLY_REMEDIATION)
+        );
+        assert!(
+            !err.details.diagnostics.is_empty(),
+            "diagnostics should carry captured cargo detail"
+        );
+    }
+
+    #[test]
+    fn dependency_closure_hydration_fetch_failure_surfaces_structured_message() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let err = run_dependency_closure_hydration_check_with(
+            repo.path(),
+            || Err("offline closure incomplete".to_string()),
+            || Err("cargo fetch failed: invalid cargo config".to_string()),
+        )
+        .expect_err("fetch failure must fail prep with structured diagnostics");
+        assert_eq!(
+            err.message,
+            "dependency closure hydration failed during PREP fetch"
+        );
+        assert_eq!(
+            err.details.failure_code.as_deref(),
+            Some(PREP_SUPPLY_UNAVAILABLE_CODE)
+        );
+    }
+
+    #[test]
+    fn dependency_closure_hydration_online_fetch_rechecks_offline_closure() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mut probe_calls = 0usize;
+        run_dependency_closure_hydration_check_with(
+            repo.path(),
+            || {
+                probe_calls += 1;
+                if probe_calls == 1 {
+                    Err("offline closure incomplete".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok(()),
+        )
+        .expect("online hydration should recheck and pass");
+        assert_eq!(probe_calls, 2, "offline closure probe must run twice");
+    }
+
+    #[test]
+    fn dependency_closure_hydration_skips_fetch_when_offline_probe_is_ready() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mut fetch_calls = 0usize;
+        run_dependency_closure_hydration_check_with(
+            repo.path(),
+            || Ok(()),
+            || {
+                fetch_calls += 1;
+                Ok(())
+            },
+        )
+        .expect("offline-ready closure must not attempt fetch");
+        assert_eq!(
+            fetch_calls, 0,
+            "fetch should not run when offline probe passes"
+        );
+    }
+
+    #[test]
+    fn dependency_closure_hydration_post_fetch_failure_keeps_structured_supply_error() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mut probe_calls = 0usize;
+        let err = run_dependency_closure_hydration_check_with(
+            repo.path(),
+            || {
+                probe_calls += 1;
+                if probe_calls == 1 {
+                    Err("offline closure incomplete: missing crate".to_string())
+                } else {
+                    Err("offline closure still incomplete after fetch".to_string())
+                }
+            },
+            || Ok(()),
+        )
+        .expect_err("post-fetch miss must fail with structured PREP supply error");
+        assert_eq!(
+            err.message,
+            "dependency closure remained incomplete after PREP hydration attempt"
+        );
+        assert_eq!(
+            err.details.failure_code.as_deref(),
+            Some(PREP_SUPPLY_UNAVAILABLE_CODE)
+        );
+        assert!(
+            err.details
+                .diagnostics
+                .iter()
+                .any(|entry| entry.starts_with("post_fetch_probe=")),
+            "post-fetch probe diagnostics should be preserved"
+        );
+    }
+
+    #[test]
+    fn fetch_error_indicates_network_unavailable_is_case_insensitive() {
+        assert!(fetch_error_indicates_network_unavailable(
+            "CARGO FETCH failed: NETWORK IS UNREACHABLE"
+        ));
+        assert!(!fetch_error_indicates_network_unavailable(
+            "cargo fetch failed: invalid cargo config"
+        ));
     }
 
     #[test]
@@ -4988,7 +5420,7 @@ time.sleep(20)\n",
         let apm2_home = temp_dir.path().join("apm2_home");
         let bin_dir = temp_dir.path().join("fake-bin");
         let review_dir = repo.join("documents").join("reviews");
-        let review_gate_dir = repo.join(".github").join("review-gate");
+        let review_gate_dir = repo.join("documents").join("reviews");
         let log_file = repo.join(".fac_gate_env_log");
 
         let apm2_private = apm2_home.join("private");

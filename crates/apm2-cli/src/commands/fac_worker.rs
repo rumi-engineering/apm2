@@ -60,9 +60,10 @@
 //! - [INV-WRK-008] Lane lease is acquired before job execution; jobs that
 //!   cannot acquire a lane are moved back to pending.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -109,7 +110,7 @@ use apm2_core::github::{parse_github_remote_url, resolve_apm2_home};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use chrono::{SecondsFormat, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use super::fac_gates_job::{GATES_JOB_OPTIONS_SCHEMA, GatesJobOptionsV1};
@@ -299,6 +300,10 @@ const DEFAULT_GATES_CPU_QUOTA: &str = "auto";
 const UNKNOWN_REPO_SEGMENT: &str = "unknown";
 const ALLOWED_WORKSPACE_ROOTS_ENV: &str = "APM2_FAC_ALLOWED_WORKSPACE_ROOTS";
 const GATES_HEARTBEAT_REFRESH_SECS: u64 = 5;
+const ORPHAN_LEASE_WARNING_MULTIPLIER: u64 = 2;
+const MAX_COMPLETED_SCAN_ENTRIES: usize = 4096;
+const SHA_DEDUPE_PUSH_WINDOW_SECS: u64 = 900;
+const MAX_TERMINAL_JOB_METADATA_FILE_SIZE: usize = MAX_JOB_SPEC_SIZE * 4;
 
 #[cfg(test)]
 pub fn env_var_test_lock() -> &'static std::sync::Mutex<()> {
@@ -937,6 +942,9 @@ pub fn run_fac_worker(
             }
         }
 
+        // S10: Proactively reap orphaned LEASED lanes each poll tick.
+        reap_orphaned_leases_on_tick(&fac_root, json_output);
+
         // TCK-00586: Multi-worker fairness — try scan lock before scanning.
         //
         // When multiple workers poll the same queue, redundant directory scans
@@ -1031,6 +1039,7 @@ pub fn run_fac_worker(
         drop(scan_lock_guard);
 
         let mut cycle_scheduler = queue_state.clone();
+        let mut completed_gates_cache: Option<CompletedGatesCache> = None;
 
         if candidates.is_empty() {
             if once {
@@ -1091,6 +1100,7 @@ pub fn run_fac_worker(
                     candidate,
                     &queue_root,
                     &fac_root,
+                    &mut completed_gates_cache,
                     &verifying_key,
                     &cycle_scheduler,
                     lane,
@@ -1165,6 +1175,10 @@ pub fn run_fac_worker(
                     observed_cost,
                 } => {
                     summary.jobs_completed += 1;
+                    append_completed_gates_fingerprint_if_loaded(
+                        &mut completed_gates_cache,
+                        &candidate.spec,
+                    );
 
                     if let Some(cost) = observed_cost {
                         let job_kind = &candidate.spec.kind;
@@ -1291,6 +1305,129 @@ pub fn run_fac_worker(
         return exit_codes::GENERIC_ERROR;
     }
     exit_codes::SUCCESS
+}
+
+fn reap_orphaned_leases_on_tick(fac_root: &Path, json_output: bool) {
+    let lane_mgr = match LaneManager::new(fac_root.to_path_buf()) {
+        Ok(manager) => manager,
+        Err(err) => {
+            tracing::warn!(error = %err, "lane maintenance skipped: cannot initialize lane manager");
+            return;
+        },
+    };
+
+    for lane_id in LaneManager::default_lane_ids() {
+        let lane_dir = lane_mgr.lane_dir(&lane_id);
+        let status = match lane_mgr.lane_status(&lane_id) {
+            Ok(status) => status,
+            Err(err) => {
+                tracing::warn!(lane_id = lane_id.as_str(), error = %err, "lane maintenance status read failed");
+                continue;
+            },
+        };
+        let orphaned = match LaneLeaseV1::load(&lane_dir) {
+            Ok(Some(lease)) => {
+                lease.state == LaneState::Leased
+                    && matches!(check_process_liveness(lease.pid), ProcessLiveness::Dead)
+            },
+            Ok(None) => status.state == LaneState::Leased && status.pid.is_none(),
+            Err(err) => {
+                tracing::warn!(
+                    lane_id = lane_id.as_str(),
+                    error = %err,
+                    "lane maintenance lease load failed"
+                );
+                false
+            },
+        };
+        if !orphaned {
+            continue;
+        }
+
+        let expected_runtime_secs = load_lane_expected_runtime_secs(&lane_mgr, &lane_id);
+        let warning_threshold_secs =
+            expected_runtime_secs.saturating_mul(ORPHAN_LEASE_WARNING_MULTIPLIER);
+        let age_secs = parse_started_at_age_secs(status.started_at.as_deref());
+        if age_secs.is_none_or(|age| age >= warning_threshold_secs) {
+            if json_output {
+                emit_worker_event(
+                    "lane_orphan_lease_warning",
+                    serde_json::json!({
+                        "lane_id": lane_id,
+                        "state": status.state.to_string(),
+                        "pid": status.pid,
+                        "pid_alive": status.pid_alive,
+                        "age_secs": age_secs,
+                        "warning_threshold_secs": warning_threshold_secs,
+                    }),
+                );
+            } else {
+                eprintln!(
+                    "WARNING: orphaned lane lease detected (lane={}, pid={:?}, pid_alive={:?}, age_secs={:?}, threshold_secs={})",
+                    lane_id, status.pid, status.pid_alive, age_secs, warning_threshold_secs
+                );
+            }
+        }
+
+        match lane_mgr.try_lock(&lane_id) {
+            Ok(Some(_guard)) => match LaneLeaseV1::remove(&lane_dir) {
+                Ok(()) => {
+                    tracing::warn!(
+                        lane_id = lane_id.as_str(),
+                        pid = ?status.pid,
+                        pid_alive = ?status.pid_alive,
+                        "reaped orphaned lane lease during poll tick"
+                    );
+                    if json_output {
+                        emit_worker_event(
+                            "lane_orphan_lease_reaped",
+                            serde_json::json!({
+                                "lane_id": lane_id,
+                                "pid": status.pid,
+                                "pid_alive": status.pid_alive,
+                            }),
+                        );
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        lane_id = lane_id.as_str(),
+                        error = %err,
+                        "failed to remove orphaned lease during poll tick"
+                    );
+                },
+            },
+            Ok(None) => {
+                tracing::debug!(
+                    lane_id = lane_id.as_str(),
+                    "orphaned lease reap deferred: lane lock held"
+                );
+            },
+            Err(err) => {
+                tracing::warn!(
+                    lane_id = lane_id.as_str(),
+                    error = %err,
+                    "orphaned lease reap failed: could not acquire lane lock"
+                );
+            },
+        }
+    }
+}
+
+fn load_lane_expected_runtime_secs(lane_mgr: &LaneManager, lane_id: &str) -> u64 {
+    let lane_dir = lane_mgr.lane_dir(lane_id);
+    LaneProfileV1::load(&lane_dir)
+        .map(|profile| profile.timeouts.job_runtime_max_seconds)
+        .unwrap_or(1_800)
+}
+
+fn parse_started_at_age_secs(started_at: Option<&str>) -> Option<u64> {
+    let started_at = started_at?;
+    let parsed = chrono::DateTime::parse_from_rfc3339(started_at).ok()?;
+    let age_secs = Utc::now()
+        .signed_duration_since(parsed.with_timezone(&Utc))
+        .num_seconds();
+    u64::try_from(age_secs).ok()
 }
 
 fn persist_queue_scheduler_state(
@@ -2217,6 +2354,372 @@ fn execute_queued_gates_job(
     JobOutcome::Denied { reason }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShaDuplicateMatch {
+    existing_job_id: String,
+    existing_enqueue_time: String,
+    matched_by: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletedGatesFingerprint {
+    job_id: String,
+    request_id: String,
+    enqueue_time: String,
+    enqueue_epoch_secs: Option<u64>,
+    repo_id: String,
+    head_sha: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CompletedGatesCache {
+    by_repo_sha: HashMap<(String, String), Vec<CompletedGatesFingerprint>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletedGatesFingerprintSpec {
+    job_id: String,
+    kind: String,
+    enqueue_time: String,
+    actuation: CompletedGatesFingerprintActuation,
+    source: CompletedGatesFingerprintSource,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletedGatesFingerprintActuation {
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletedGatesFingerprintSource {
+    repo_id: String,
+    head_sha: String,
+}
+
+impl CompletedGatesFingerprint {
+    fn from_spec(spec: &FacJobSpecV1) -> Option<Self> {
+        if !spec.kind.eq_ignore_ascii_case("gates") {
+            return None;
+        }
+        Some(Self {
+            job_id: spec.job_id.clone(),
+            request_id: spec.actuation.request_id.clone(),
+            enqueue_time: spec.enqueue_time.clone(),
+            enqueue_epoch_secs: parse_enqueue_time_epoch_secs(&spec.enqueue_time),
+            repo_id: spec.source.repo_id.clone(),
+            head_sha: spec.source.head_sha.clone(),
+        })
+    }
+
+    fn from_job_spec_json(bytes: &[u8]) -> Option<Self> {
+        let parsed: CompletedGatesFingerprintSpec = serde_json::from_slice(bytes).ok()?;
+        if !parsed.kind.eq_ignore_ascii_case("gates") {
+            return None;
+        }
+        Some(Self {
+            job_id: parsed.job_id,
+            request_id: parsed.actuation.request_id,
+            enqueue_epoch_secs: parse_enqueue_time_epoch_secs(&parsed.enqueue_time),
+            enqueue_time: parsed.enqueue_time,
+            repo_id: parsed.source.repo_id,
+            head_sha: parsed.source.head_sha,
+        })
+    }
+}
+
+impl CompletedGatesCache {
+    fn from_fingerprints(fingerprints: Vec<CompletedGatesFingerprint>) -> Self {
+        let mut cache = Self::default();
+        for fingerprint in fingerprints {
+            cache.insert(fingerprint);
+        }
+        cache
+    }
+
+    fn insert(&mut self, fingerprint: CompletedGatesFingerprint) {
+        let key = (
+            normalize_dedupe_key_component(&fingerprint.repo_id),
+            normalize_dedupe_key_component(&fingerprint.head_sha),
+        );
+        self.by_repo_sha.entry(key).or_default().push(fingerprint);
+    }
+}
+
+fn append_completed_gates_fingerprint_if_loaded(
+    completed_gates_cache: &mut Option<CompletedGatesCache>,
+    spec: &FacJobSpecV1,
+) {
+    let Some(cache) = completed_gates_cache.as_mut() else {
+        return;
+    };
+    let Some(fingerprint) = CompletedGatesFingerprint::from_spec(spec) else {
+        return;
+    };
+    cache.insert(fingerprint);
+}
+
+fn parse_enqueue_time_epoch_secs(value: &str) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .and_then(|dt| u64::try_from(dt.timestamp()).ok())
+}
+
+fn normalize_dedupe_key_component(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn sha_dedupe_match_basis(
+    incoming_request_id: &str,
+    incoming_enqueue_epoch_secs: Option<u64>,
+    existing_request_id: &str,
+    existing_enqueue_epoch_secs: Option<u64>,
+) -> Option<&'static str> {
+    let incoming_request_id = incoming_request_id.trim();
+    let existing_request_id = existing_request_id.trim();
+    if !incoming_request_id.is_empty()
+        && !existing_request_id.is_empty()
+        && incoming_request_id.eq_ignore_ascii_case(existing_request_id)
+    {
+        return Some("request_id");
+    }
+
+    let incoming_enqueue = incoming_enqueue_epoch_secs?;
+    let existing_enqueue = existing_enqueue_epoch_secs?;
+    if incoming_enqueue.abs_diff(existing_enqueue) <= SHA_DEDUPE_PUSH_WINDOW_SECS {
+        return Some("enqueue_time_window");
+    }
+
+    None
+}
+
+fn load_completed_gates_fingerprints(
+    queue_root: &Path,
+    fac_root: &Path,
+) -> Vec<CompletedGatesFingerprint> {
+    let mut fingerprints = Vec::new();
+    let completed_dir = queue_root.join(COMPLETED_DIR);
+    if !completed_dir.is_dir() {
+        return fingerprints;
+    }
+
+    let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
+    let Ok(entries) = fs::read_dir(&completed_dir) else {
+        return fingerprints;
+    };
+
+    for (idx, entry) in entries.enumerate() {
+        if idx >= MAX_COMPLETED_SCAN_ENTRIES {
+            break;
+        }
+
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+
+        let Ok(bytes) = read_bounded(&path, MAX_JOB_SPEC_SIZE) else {
+            continue;
+        };
+        let Some(fingerprint) = CompletedGatesFingerprint::from_job_spec_json(&bytes) else {
+            continue;
+        };
+
+        let Some(existing_receipt) =
+            apm2_core::fac::find_receipt_for_job(&receipts_dir, &fingerprint.job_id)
+        else {
+            continue;
+        };
+        if existing_receipt.outcome != FacJobOutcome::Completed {
+            continue;
+        }
+
+        fingerprints.push(fingerprint);
+    }
+
+    fingerprints
+}
+
+fn load_completed_gates_cache(queue_root: &Path, fac_root: &Path) -> CompletedGatesCache {
+    CompletedGatesCache::from_fingerprints(load_completed_gates_fingerprints(queue_root, fac_root))
+}
+
+fn find_completed_gates_duplicate_in_cache(
+    incoming: &FacJobSpecV1,
+    completed_gates_cache: &CompletedGatesCache,
+) -> Option<ShaDuplicateMatch> {
+    let key = (
+        normalize_dedupe_key_component(incoming.source.repo_id.as_str()),
+        normalize_dedupe_key_component(incoming.source.head_sha.as_str()),
+    );
+    let existing_fingerprints = completed_gates_cache.by_repo_sha.get(&key)?;
+    let incoming_enqueue_epoch_secs = parse_enqueue_time_epoch_secs(incoming.enqueue_time.as_str());
+    for existing in existing_fingerprints {
+        let Some(matched_by) = sha_dedupe_match_basis(
+            incoming.actuation.request_id.as_str(),
+            incoming_enqueue_epoch_secs,
+            existing.request_id.as_str(),
+            existing.enqueue_epoch_secs,
+        ) else {
+            continue;
+        };
+
+        return Some(ShaDuplicateMatch {
+            existing_job_id: existing.job_id.clone(),
+            existing_enqueue_time: existing.enqueue_time.clone(),
+            matched_by,
+        });
+    }
+
+    None
+}
+
+fn find_completed_gates_duplicate(
+    queue_root: &Path,
+    fac_root: &Path,
+    incoming: &FacJobSpecV1,
+    completed_gates_cache: &mut Option<CompletedGatesCache>,
+) -> Option<ShaDuplicateMatch> {
+    if !incoming.kind.eq_ignore_ascii_case("gates") {
+        return None;
+    }
+
+    let cache = completed_gates_cache
+        .get_or_insert_with(|| load_completed_gates_cache(queue_root, fac_root));
+    find_completed_gates_duplicate_in_cache(incoming, cache)
+}
+
+fn serialize_denial_reason_code(denial_reason: DenialReasonCode) -> String {
+    serde_json::to_value(denial_reason)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "missing_denial_reason_code".to_string())
+}
+
+fn derive_queue_root_from_fac_root(fac_root: &Path) -> Option<PathBuf> {
+    let apm2_home = fac_root.parent()?.parent()?;
+    Some(apm2_home.join(QUEUE_DIR))
+}
+
+fn annotate_denied_job_file(
+    denied_path: &Path,
+    denial_reason: Option<DenialReasonCode>,
+    reason: &str,
+) -> Result<(), String> {
+    let bytes = read_bounded(denied_path, MAX_TERMINAL_JOB_METADATA_FILE_SIZE)?;
+    let mut payload: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        format!(
+            "cannot parse denied job file {}: {e}",
+            denied_path.display()
+        )
+    })?;
+    let Some(map) = payload.as_object_mut() else {
+        return Err(format!(
+            "denied job payload is not a JSON object: {}",
+            denied_path.display()
+        ));
+    };
+
+    let denial_reason_code = denial_reason.map_or_else(
+        || "missing_denial_reason_code".to_string(),
+        serialize_denial_reason_code,
+    );
+    let denial_reason_text = {
+        let trimmed = reason.trim();
+        if trimmed.is_empty() {
+            format!("denied ({denial_reason_code})")
+        } else {
+            trimmed.to_string()
+        }
+    };
+
+    map.insert(
+        "denial_reason_code".to_string(),
+        serde_json::Value::String(denial_reason_code),
+    );
+    map.insert(
+        "denial_reason".to_string(),
+        serde_json::Value::String(denial_reason_text),
+    );
+    map.insert(
+        "denied_at".to_string(),
+        serde_json::Value::String(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+    );
+
+    let output = serde_json::to_vec_pretty(&payload).map_err(|e| {
+        format!(
+            "cannot serialize denied job metadata update {}: {e}",
+            denied_path.display()
+        )
+    })?;
+    if output.len() > MAX_TERMINAL_JOB_METADATA_FILE_SIZE {
+        return Err(format!(
+            "denied job metadata payload exceeds max size ({} > {}) for {}",
+            output.len(),
+            MAX_TERMINAL_JOB_METADATA_FILE_SIZE,
+            denied_path.display()
+        ));
+    }
+
+    fac_permissions::write_fac_file_with_mode(denied_path, &output).map_err(|e| {
+        format!(
+            "cannot persist denied job metadata for {}: {e}",
+            denied_path.display()
+        )
+    })
+}
+
+fn annotate_denied_job_metadata_from_receipt(terminal_path: &Path, receipt: &FacJobReceiptV1) {
+    if receipt.outcome != FacJobOutcome::Denied {
+        return;
+    }
+    if let Err(err) = annotate_denied_job_file(
+        terminal_path,
+        receipt.denial_reason,
+        receipt.reason.as_str(),
+    ) {
+        eprintln!(
+            "worker: WARNING: duplicate denied job metadata update failed for {}: {err}",
+            terminal_path.display()
+        );
+    }
+}
+
+fn annotate_denied_job_from_moved_path(
+    fac_root: &Path,
+    moved_job_path: &str,
+    denial_reason: Option<DenialReasonCode>,
+    reason: &str,
+) {
+    let normalized = moved_job_path.trim().trim_start_matches('/');
+    if normalized.is_empty() || !normalized.starts_with("denied/") {
+        return;
+    }
+
+    let rel_path = Path::new(normalized);
+    if rel_path.is_absolute()
+        || rel_path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
+    {
+        eprintln!(
+            "worker: WARNING: refusing denied metadata update for unsafe moved path: {moved_job_path}"
+        );
+        return;
+    }
+
+    let Some(queue_root) = derive_queue_root_from_fac_root(fac_root) else {
+        return;
+    };
+    let denied_path = queue_root.join(rel_path);
+    if let Err(err) = annotate_denied_job_file(&denied_path, denial_reason, reason) {
+        eprintln!(
+            "worker: WARNING: failed to populate denied job metadata for {}: {err}",
+            denied_path.display()
+        );
+    }
+}
+
 // =============================================================================
 // Job processing
 // =============================================================================
@@ -2229,6 +2732,7 @@ fn process_job(
     candidate: &PendingCandidate,
     queue_root: &Path,
     fac_root: &Path,
+    completed_gates_cache: &mut Option<CompletedGatesCache>,
     verifying_key: &apm2_core::crypto::VerifyingKey,
     scheduler: &QueueSchedulerState,
     lane: QueueLane,
@@ -2302,18 +2806,23 @@ fn process_job(
         // BLOCKER-2 fix (round 7): Use hardened move_job_to_terminal instead
         // of move_to_dir_safe. move_job_to_terminal includes symlink checks,
         // ownership verification, and restrictive directory creation mode.
-        if let Err(move_err) = move_job_to_terminal(path, &terminal_dir, &file_name) {
-            eprintln!(
-                "worker: duplicate job {} detected but move to terminal failed: {move_err}",
-                spec.job_id,
-            );
-            return JobOutcome::Skipped {
-                reason: format!(
-                    "receipt already exists for job {} but move to terminal failed: {move_err}",
+        let moved_terminal_path = match move_job_to_terminal(path, &terminal_dir, &file_name) {
+            Ok(path) => path,
+            Err(move_err) => {
+                eprintln!(
+                    "worker: duplicate job {} detected but move to terminal failed: {move_err}",
                     spec.job_id,
-                ),
-            };
-        }
+                );
+                return JobOutcome::Skipped {
+                    reason: format!(
+                        "receipt already exists for job {} but move to terminal failed: {move_err}",
+                        spec.job_id,
+                    ),
+                };
+            },
+        };
+
+        annotate_denied_job_metadata_from_receipt(&moved_terminal_path, &existing_receipt);
         return JobOutcome::Skipped {
             reason: format!(
                 "receipt already exists for job {} (index lookup, outcome={:?})",
@@ -2335,6 +2844,59 @@ fn process_job(
     let resolved_net_hash =
         apm2_core::fac::resolve_network_policy(&spec.kind, policy.network_policy.as_ref())
             .content_hash_hex();
+
+    // TCK-00622 S8: SHA-level gates dedupe.
+    //
+    // For `gates` jobs, deny duplicate submissions when a completed receipt
+    // already exists for the same `(repo_id, head_sha, kind)` in the same
+    // push freshness window. This prevents queue starvation from replayed
+    // submissions while still allowing explicit re-runs on later force-push
+    // events (request-id change and enqueue-time drift beyond window).
+    if let Some(dupe) =
+        find_completed_gates_duplicate(queue_root, fac_root, spec, completed_gates_cache)
+    {
+        let reason = format!(
+            "already completed: repo={} sha={} kind={} existing_job_id={} matched_by={} existing_enqueue_time={}",
+            spec.source.repo_id,
+            spec.source.head_sha,
+            spec.kind,
+            dupe.existing_job_id,
+            dupe.matched_by,
+            dupe.existing_enqueue_time
+        );
+        let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+            .map(|p| {
+                p.strip_prefix(queue_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok();
+        if let Err(receipt_err) = emit_job_receipt(
+            fac_root,
+            spec,
+            FacJobOutcome::Denied,
+            Some(DenialReasonCode::AlreadyCompleted),
+            &reason,
+            None,
+            None,
+            None,
+            None,
+            Some(canonicalizer_tuple_digest),
+            moved_path.as_deref(),
+            policy_hash,
+            None,
+            Some(&sbx_hash),
+            Some(&resolved_net_hash),
+            None, // bytes_backend
+            toolchain_fingerprint,
+        ) {
+            eprintln!(
+                "worker: WARNING: receipt emission failed for dedup-denied job: {receipt_err}"
+            );
+        }
+        return JobOutcome::Denied { reason };
+    }
 
     // Step 1+2: Use the bounded bytes already loaded by scan_pending.
     //
@@ -7235,6 +7797,12 @@ fn emit_job_receipt_internal(
         }
     }
 
+    if outcome == FacJobOutcome::Denied
+        && let Some(path) = moved_job_path
+    {
+        annotate_denied_job_from_moved_path(fac_root, path, denial_reason, reason);
+    }
+
     Ok(result)
 }
 
@@ -7325,6 +7893,15 @@ fn commit_claimed_job_via_pipeline(
             pipeline.commit(&receipt, claimed_path, claimed_file_name, terminal_state)?
         },
     };
+
+    if outcome == FacJobOutcome::Denied
+        && let Err(err) = annotate_denied_job_file(&result.job_terminal_path, denial_reason, reason)
+    {
+        eprintln!(
+            "worker: WARNING: failed to update denied job metadata for {}: {err}",
+            result.job_terminal_path.display()
+        );
+    }
 
     Ok(result.job_terminal_path)
 }
@@ -7446,7 +8023,7 @@ fn build_queue_admission_trace(decision: &QueueAdmissionDecision) -> JobQueueAdm
 }
 
 fn serialize_to_json_string<T: Serialize>(value: &T) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "\"unknown\"".to_string())
+    serde_json::to_string(value).unwrap_or_else(|_| "\"serialization_error\"".to_string())
 }
 
 fn strip_json_string_quotes(value: &str) -> String {
@@ -9131,6 +9708,53 @@ mod tests {
     }
 
     #[test]
+    fn test_reap_orphaned_leases_on_tick_reaps_dead_leased_lane() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let lane_mgr = LaneManager::new(fac_root.clone()).expect("create lane manager");
+        lane_mgr.ensure_directories().expect("ensure lanes");
+
+        let dead_pid = find_dead_pid();
+        persist_lease_with_pid(&lane_mgr, "lane-00", LaneState::Leased, dead_pid);
+        let lane_dir = lane_mgr.lane_dir("lane-00");
+        assert!(
+            LaneLeaseV1::load(&lane_dir).expect("load lease").is_some(),
+            "test precondition: lease exists before maintenance"
+        );
+
+        reap_orphaned_leases_on_tick(&fac_root, false);
+
+        assert!(
+            LaneLeaseV1::load(&lane_dir)
+                .expect("load lease after maintenance")
+                .is_none(),
+            "dead leased lane should be reaped during poll tick maintenance"
+        );
+    }
+
+    #[test]
+    fn test_reap_orphaned_leases_on_tick_keeps_alive_leased_lane() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let lane_mgr = LaneManager::new(fac_root.clone()).expect("create lane manager");
+        lane_mgr.ensure_directories().expect("ensure lanes");
+
+        persist_lease_with_pid(&lane_mgr, "lane-00", LaneState::Leased, std::process::id());
+        let lane_dir = lane_mgr.lane_dir("lane-00");
+
+        reap_orphaned_leases_on_tick(&fac_root, false);
+
+        assert!(
+            LaneLeaseV1::load(&lane_dir)
+                .expect("load lease after maintenance")
+                .is_some(),
+            "alive leased lane should not be reaped"
+        );
+    }
+
+    #[test]
     fn test_execute_lane_cleanup_success_emits_success_receipt() {
         let dir = tempfile::tempdir().expect("tempdir");
         let fac_root = dir.path().join("private").join("fac");
@@ -9640,6 +10264,270 @@ mod tests {
         assert!(
             !pending_file.exists(),
             "pending file must be removed after routing"
+        );
+    }
+
+    #[test]
+    fn test_find_completed_gates_duplicate_matches_completed_receipt_by_request_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let queue_root = dir.path().join("queue");
+        ensure_queue_dirs(&queue_root).expect("create queue dirs");
+        fs::create_dir_all(queue_root.join(COMPLETED_DIR)).expect("create completed dir");
+
+        let mut completed_spec = make_receipt_test_spec();
+        completed_spec.job_id = "job-completed-sha".to_string();
+        completed_spec.enqueue_time = "2026-02-19T01:00:00Z".to_string();
+        fs::write(
+            queue_root
+                .join(COMPLETED_DIR)
+                .join("job-completed-sha.json"),
+            serde_json::to_vec(&completed_spec).expect("serialize completed spec"),
+        )
+        .expect("write completed spec");
+
+        let boundary_trace = ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
+        };
+        let queue_trace = JobQueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "control".to_string(),
+            defect_reason: None,
+            cost_estimate_ticks: None,
+        };
+        let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
+        emit_job_receipt(
+            &fac_root,
+            &completed_spec,
+            FacJobOutcome::Completed,
+            None,
+            "completed for dedupe",
+            Some(&boundary_trace),
+            Some(&queue_trace),
+            None,
+            None,
+            Some(&tuple_digest),
+            Some("completed/job-completed-sha.json"),
+            &completed_spec.job_spec_digest,
+            None,
+            None,
+            None,
+            None, // bytes_backend
+            None,
+        )
+        .expect("emit completed receipt");
+
+        let mut incoming = completed_spec.clone();
+        incoming.job_id = "job-incoming-sha".to_string();
+        incoming.enqueue_time = "2026-02-19T01:03:00Z".to_string();
+
+        let mut completed_gates_cache = None;
+        let duplicate = find_completed_gates_duplicate(
+            &queue_root,
+            &fac_root,
+            &incoming,
+            &mut completed_gates_cache,
+        )
+        .expect("duplicate");
+        assert_eq!(duplicate.existing_job_id, completed_spec.job_id);
+        assert_eq!(duplicate.matched_by, "request_id");
+    }
+
+    #[test]
+    fn test_find_completed_gates_duplicate_matches_by_enqueue_window_when_request_id_differs() {
+        let mut cache = CompletedGatesCache::default();
+        cache.insert(CompletedGatesFingerprint {
+            job_id: "job-completed-sha".to_string(),
+            request_id: "request-old".to_string(),
+            enqueue_time: "2026-02-19T01:00:00Z".to_string(),
+            enqueue_epoch_secs: parse_enqueue_time_epoch_secs("2026-02-19T01:00:00Z"),
+            repo_id: "owner/repo".to_string(),
+            head_sha: "abc123".to_string(),
+        });
+
+        let mut incoming = make_receipt_test_spec();
+        incoming.source.repo_id = "OWNER/REPO".to_string();
+        incoming.source.head_sha = "ABC123".to_string();
+        incoming.actuation.request_id = "request-new".to_string();
+        incoming.enqueue_time = "2026-02-19T01:10:00Z".to_string();
+
+        let duplicate =
+            find_completed_gates_duplicate_in_cache(&incoming, &cache).expect("duplicate");
+        assert_eq!(duplicate.existing_job_id, "job-completed-sha");
+        assert_eq!(duplicate.matched_by, "enqueue_time_window");
+    }
+
+    #[test]
+    fn test_find_completed_gates_duplicate_ignores_outside_push_window() {
+        let mut cache = CompletedGatesCache::default();
+        cache.insert(CompletedGatesFingerprint {
+            job_id: "job-completed-sha".to_string(),
+            request_id: "request-old".to_string(),
+            enqueue_time: "2026-02-19T01:00:00Z".to_string(),
+            enqueue_epoch_secs: parse_enqueue_time_epoch_secs("2026-02-19T01:00:00Z"),
+            repo_id: "owner/repo".to_string(),
+            head_sha: "abc123".to_string(),
+        });
+
+        let mut incoming = make_receipt_test_spec();
+        incoming.source.repo_id = "owner/repo".to_string();
+        incoming.source.head_sha = "abc123".to_string();
+        incoming.actuation.request_id = "request-new".to_string();
+        incoming.enqueue_time = "2026-02-19T02:00:00Z".to_string();
+
+        let duplicate = find_completed_gates_duplicate_in_cache(&incoming, &cache);
+        assert!(
+            duplicate.is_none(),
+            "same SHA beyond push window should remain eligible for re-execution"
+        );
+    }
+
+    #[test]
+    fn test_append_completed_gates_fingerprint_if_loaded_supports_same_cycle_dedupe() {
+        let mut completed_spec = make_receipt_test_spec();
+        completed_spec.job_id = "job-completed-sha".to_string();
+        completed_spec.enqueue_time = "2026-02-19T01:00:00Z".to_string();
+
+        let mut incoming = completed_spec.clone();
+        incoming.job_id = "job-incoming-sha".to_string();
+        incoming.enqueue_time = "2026-02-19T01:03:00Z".to_string();
+
+        let mut cache = Some(CompletedGatesCache::default());
+        append_completed_gates_fingerprint_if_loaded(&mut cache, &completed_spec);
+        let duplicate = find_completed_gates_duplicate_in_cache(
+            &incoming,
+            cache.as_ref().expect("cache loaded"),
+        )
+        .expect("duplicate");
+        assert_eq!(duplicate.existing_job_id, "job-completed-sha");
+        assert_eq!(duplicate.matched_by, "request_id");
+    }
+
+    #[test]
+    fn test_annotate_denied_job_file_populates_reason_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let denied_path = dir.path().join("job-denied.json");
+        let spec = make_receipt_test_spec();
+        fs::write(
+            &denied_path,
+            serde_json::to_vec_pretty(&spec).expect("serialize job spec"),
+        )
+        .expect("write denied job file");
+
+        annotate_denied_job_file(
+            &denied_path,
+            Some(DenialReasonCode::AlreadyCompleted),
+            "already completed in this push window",
+        )
+        .expect("annotate denied job");
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&fs::read(&denied_path).expect("read denied metadata"))
+                .expect("parse denied metadata");
+        assert_eq!(
+            payload
+                .get("denial_reason_code")
+                .and_then(serde_json::Value::as_str),
+            Some("already_completed")
+        );
+        assert_eq!(
+            payload
+                .get("denial_reason")
+                .and_then(serde_json::Value::as_str),
+            Some("already completed in this push window")
+        );
+        assert!(
+            payload
+                .get("denied_at")
+                .and_then(serde_json::Value::as_str)
+                .is_some(),
+            "denied file must include denied_at"
+        );
+    }
+
+    #[test]
+    fn test_annotate_denied_job_file_defaults_when_reason_and_code_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let denied_path = dir.path().join("job-denied.json");
+        let spec = make_receipt_test_spec();
+        fs::write(
+            &denied_path,
+            serde_json::to_vec_pretty(&spec).expect("serialize job spec"),
+        )
+        .expect("write denied job file");
+
+        annotate_denied_job_file(&denied_path, None, "   ").expect("annotate denied job");
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&fs::read(&denied_path).expect("read denied metadata"))
+                .expect("parse denied metadata");
+        assert_eq!(
+            payload
+                .get("denial_reason_code")
+                .and_then(serde_json::Value::as_str),
+            Some("missing_denial_reason_code")
+        );
+        assert_eq!(
+            payload
+                .get("denial_reason")
+                .and_then(serde_json::Value::as_str),
+            Some("denied (missing_denial_reason_code)")
+        );
+    }
+
+    #[test]
+    fn test_annotate_denied_job_metadata_from_receipt_updates_denied_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let denied_path = dir.path().join("job-denied.json");
+        fs::write(
+            &denied_path,
+            serde_json::to_vec_pretty(&make_receipt_test_spec()).expect("serialize job spec"),
+        )
+        .expect("write denied job file");
+
+        let denied_receipt = FacJobReceiptV1 {
+            outcome: FacJobOutcome::Denied,
+            denial_reason: Some(DenialReasonCode::AlreadyCompleted),
+            reason: "already completed".to_string(),
+            ..FacJobReceiptV1::default()
+        };
+        annotate_denied_job_metadata_from_receipt(&denied_path, &denied_receipt);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&fs::read(&denied_path).expect("read denied metadata"))
+                .expect("parse denied metadata");
+        assert_eq!(
+            payload
+                .get("denial_reason")
+                .and_then(serde_json::Value::as_str),
+            Some("already completed")
+        );
+
+        let completed_path = dir.path().join("job-completed.json");
+        fs::write(
+            &completed_path,
+            serde_json::to_vec_pretty(&make_receipt_test_spec()).expect("serialize job spec"),
+        )
+        .expect("write completed job file");
+        let completed_receipt = FacJobReceiptV1 {
+            outcome: FacJobOutcome::Completed,
+            denial_reason: None,
+            reason: "completed".to_string(),
+            ..FacJobReceiptV1::default()
+        };
+        annotate_denied_job_metadata_from_receipt(&completed_path, &completed_receipt);
+        let completed_payload: serde_json::Value =
+            serde_json::from_slice(&fs::read(&completed_path).expect("read completed metadata"))
+                .expect("parse completed metadata");
+        assert!(
+            completed_payload.get("denial_reason").is_none(),
+            "completed outcomes must not be annotated as denied"
         );
     }
 

@@ -52,6 +52,7 @@
 //! - File operations use `O_NOFOLLOW` where available.
 //! - Directories are created with mode 0o700 (CTR-2611).
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,7 @@ use super::receipt::{
 };
 use super::receipt_index::ReceiptIndexV1;
 use super::signed_receipt::{persist_signed_envelope, sign_receipt};
+use crate::fac::flock_util::acquire_exclusive_blocking;
 
 // =============================================================================
 // Constants
@@ -485,11 +487,59 @@ impl ReceiptWritePipeline {
         // Validate file_name confinement before any mutation (CTR-1504).
         validate_file_name(file_name)?;
 
+        let content_hash = compute_job_receipt_content_hash(receipt);
+        let expected_receipt_path = self.receipts_dir.join(format!("{content_hash}.json"));
+        let dest_dir = self.queue_root.join(terminal_state.dir_name());
+
+        // S11: Acquire advisory lock on claimed file BEFORE receipt write.
+        // This serializes worker commit against reconciler/file movers.
+        let claimed_file = match open_claimed_file_for_lock(claimed_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(existing_terminal_path) =
+                    find_existing_terminal_job_path(&dest_dir, file_name)
+                {
+                    if expected_receipt_path.exists() {
+                        tracing::warn!(
+                            job_id = %receipt.job_id,
+                            claimed_path = %claimed_path.display(),
+                            terminal_path = %existing_terminal_path.display(),
+                            "claimed file already moved before lock acquisition; treating commit as idempotent success"
+                        );
+                        return Ok(CommitResult {
+                            receipt_path: expected_receipt_path,
+                            content_hash,
+                            job_terminal_path: existing_terminal_path,
+                        });
+                    }
+                }
+
+                return Err(ReceiptPipelineError::JobMoveFailed {
+                    from: claimed_path.to_string_lossy().to_string(),
+                    to: dest_dir.to_string_lossy().to_string(),
+                    reason: format!("claimed file missing before lock acquisition: {e}"),
+                });
+            },
+            Err(e) => {
+                return Err(ReceiptPipelineError::JobMoveFailed {
+                    from: claimed_path.to_string_lossy().to_string(),
+                    to: dest_dir.to_string_lossy().to_string(),
+                    reason: format!("failed to open claimed file for locking: {e}"),
+                });
+            },
+        };
+        acquire_exclusive_blocking(&claimed_file).map_err(|e| {
+            ReceiptPipelineError::JobMoveFailed {
+                from: claimed_path.to_string_lossy().to_string(),
+                to: dest_dir.to_string_lossy().to_string(),
+                reason: format!("failed to acquire advisory lock on claimed file: {e}"),
+            }
+        })?;
+        let _claimed_lock_guard = claimed_file;
+
         // Step 1: Persist the receipt (content-addressed, idempotent).
         let receipt_path = persist_content_addressed_receipt(&self.receipts_dir, receipt)
             .map_err(ReceiptPipelineError::ReceiptPersistFailed)?;
-
-        let content_hash = compute_job_receipt_content_hash(receipt);
 
         // Step 2: Update receipt index (best-effort, non-authoritative).
         // Index failure does not block the commit. On failure, delete the
@@ -501,7 +551,6 @@ impl ReceiptWritePipeline {
         }
 
         // Step 3: Move job file to terminal directory (commit point).
-        let dest_dir = self.queue_root.join(terminal_state.dir_name());
         let job_terminal_path =
             move_job_to_terminal(claimed_path, &dest_dir, file_name).map_err(|reason| {
                 ReceiptPipelineError::TornState {
@@ -546,11 +595,58 @@ impl ReceiptWritePipeline {
         // Validate file_name confinement before any mutation (CTR-1504).
         validate_file_name(file_name)?;
 
+        let content_hash = compute_job_receipt_content_hash(receipt);
+        let expected_receipt_path = self.receipts_dir.join(format!("{content_hash}.json"));
+        let dest_dir = self.queue_root.join(terminal_state.dir_name());
+
+        // S11: Acquire advisory lock on claimed file BEFORE receipt write.
+        let claimed_file = match open_claimed_file_for_lock(claimed_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(existing_terminal_path) =
+                    find_existing_terminal_job_path(&dest_dir, file_name)
+                {
+                    if expected_receipt_path.exists() {
+                        tracing::warn!(
+                            job_id = %receipt.job_id,
+                            claimed_path = %claimed_path.display(),
+                            terminal_path = %existing_terminal_path.display(),
+                            "claimed file already moved before lock acquisition; treating signed commit as idempotent success"
+                        );
+                        return Ok(CommitResult {
+                            receipt_path: expected_receipt_path,
+                            content_hash,
+                            job_terminal_path: existing_terminal_path,
+                        });
+                    }
+                }
+
+                return Err(ReceiptPipelineError::JobMoveFailed {
+                    from: claimed_path.to_string_lossy().to_string(),
+                    to: dest_dir.to_string_lossy().to_string(),
+                    reason: format!("claimed file missing before lock acquisition: {e}"),
+                });
+            },
+            Err(e) => {
+                return Err(ReceiptPipelineError::JobMoveFailed {
+                    from: claimed_path.to_string_lossy().to_string(),
+                    to: dest_dir.to_string_lossy().to_string(),
+                    reason: format!("failed to open claimed file for locking: {e}"),
+                });
+            },
+        };
+        acquire_exclusive_blocking(&claimed_file).map_err(|e| {
+            ReceiptPipelineError::JobMoveFailed {
+                from: claimed_path.to_string_lossy().to_string(),
+                to: dest_dir.to_string_lossy().to_string(),
+                reason: format!("failed to acquire advisory lock on claimed file: {e}"),
+            }
+        })?;
+        let _claimed_lock_guard = claimed_file;
+
         // Step 1: Persist the receipt (content-addressed, idempotent).
         let receipt_path = persist_content_addressed_receipt(&self.receipts_dir, receipt)
             .map_err(ReceiptPipelineError::ReceiptPersistFailed)?;
-
-        let content_hash = compute_job_receipt_content_hash(receipt);
 
         // Step 1b (TCK-00576): Persist signed envelope alongside receipt.
         // Non-fatal: if signing fails, the receipt is still valid but
@@ -573,7 +669,6 @@ impl ReceiptWritePipeline {
         }
 
         // Step 3: Move job file to terminal directory (commit point).
-        let dest_dir = self.queue_root.join(terminal_state.dir_name());
         let job_terminal_path =
             move_job_to_terminal(claimed_path, &dest_dir, file_name).map_err(|reason| {
                 ReceiptPipelineError::TornState {
@@ -876,6 +971,24 @@ pub fn move_job_to_terminal(
     // Attempt no-replace rename. On collision, generate a timestamped name.
     match rename_noreplace(src, &dest) {
         Ok(()) => Ok(dest),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(existing_terminal_path) =
+                find_existing_terminal_job_path(dest_dir, file_name)
+            {
+                tracing::warn!(
+                    source = %src.display(),
+                    terminal = %existing_terminal_path.display(),
+                    "source missing during terminal move; treating as idempotent success"
+                );
+                return Ok(existing_terminal_path);
+            }
+
+            Err(format!(
+                "rename {} -> {}: {e}",
+                src.display(),
+                dest.display()
+            ))
+        },
         Err(e)
             if e.raw_os_error() == Some(libc::EEXIST)
                 || e.raw_os_error() == Some(libc::ENOTEMPTY)
@@ -900,6 +1013,68 @@ pub fn move_job_to_terminal(
             dest.display()
         )),
     }
+}
+
+/// Open a claimed job file for advisory locking with symlink rejection.
+fn open_claimed_file_for_lock(path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+    }
+}
+
+/// Locate an already-moved terminal job path for idempotent commit handling.
+///
+/// Returns either the exact destination filename or a collision-safe filename
+/// generated by `move_job_to_terminal` (`{stem}-{nanos}.json`).
+fn find_existing_terminal_job_path(dest_dir: &Path, file_name: &str) -> Option<PathBuf> {
+    let exact_path = dest_dir.join(file_name);
+    if exact_path.is_file() {
+        return Some(exact_path);
+    }
+
+    let stem = file_name.trim_end_matches(".json");
+    let entries = std::fs::read_dir(dest_dir).ok()?;
+    for entry in entries.take(4096).flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str == file_name {
+            return Some(path);
+        }
+        let is_json = std::path::Path::new(name_str)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+        if !name_str.starts_with(stem) || !is_json {
+            continue;
+        }
+        if let Some(remainder) = name_str
+            .rsplit_once('.')
+            .map(|(base, _)| base)
+            .and_then(|base| base.strip_prefix(stem))
+        {
+            if remainder.starts_with('-') {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 /// Atomic rename that fails (instead of overwriting) when the destination
@@ -1417,6 +1592,38 @@ mod tests {
             TerminalState::Completed,
         );
         assert!(result.is_err(), "commit must fail when source is missing");
+    }
+
+    #[test]
+    fn test_commit_missing_claimed_is_idempotent_when_terminal_and_receipt_exist() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        let queue_root = tmp.path().join("queue");
+        let completed_dir = queue_root.join("completed");
+        std::fs::create_dir_all(&completed_dir).expect("create completed dir");
+
+        let terminal_file = completed_dir.join("ghost.json");
+        std::fs::write(&terminal_file, br#"{"job_id":"ghost"}"#).expect("write terminal file");
+
+        // Simulate prior successful completion from a competing process.
+        let receipt = make_receipt("ghost", FacJobOutcome::Completed);
+        let _persisted =
+            persist_content_addressed_receipt(&receipts_dir, &receipt).expect("persist receipt");
+
+        // Source claimed file no longer exists.
+        let claimed_path = queue_root.join("claimed").join("ghost.json");
+        let pipeline = ReceiptWritePipeline::new(receipts_dir, queue_root);
+
+        let result = pipeline
+            .commit(
+                &receipt,
+                &claimed_path,
+                "ghost.json",
+                TerminalState::Completed,
+            )
+            .expect("commit should treat already-moved source as idempotent success");
+
+        assert_eq!(result.job_terminal_path, terminal_file);
     }
 
     // =========================================================================

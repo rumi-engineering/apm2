@@ -18,9 +18,9 @@ use sha2::{Digest, Sha256};
 
 use crate::commands::fac_secure_io;
 
-pub const TEST_SAFETY_ALLOWLIST_REL_PATH: &str = ".github/review-gate/test-safety-allowlist.txt";
+pub const TEST_SAFETY_ALLOWLIST_REL_PATH: &str = "documents/reviews/test-safety-allowlist.txt";
 pub const REVIEW_ARTIFACTS_REL_PATH: &str = "documents/reviews";
-pub const TRUSTED_REVIEWERS_REL_PATH: &str = ".github/review-gate/trusted-reviewers.json";
+pub const TRUSTED_REVIEWERS_REL_PATH: &str = "documents/reviews/trusted-reviewers.json";
 pub const WORKSPACE_INTEGRITY_SNAPSHOT_REL_PATH: &str =
     "target/ci/workspace_integrity.snapshot.tsv";
 
@@ -526,7 +526,7 @@ pub fn run_test_safety_guard(workspace_root: &Path) -> Result<CheckExecution, St
         .ok();
         writeln!(
             output,
-            "ERROR: Add tightly-scoped entries to .github/review-gate/test-safety-allowlist.txt only when justified."
+            "ERROR: Add tightly-scoped entries to documents/reviews/test-safety-allowlist.txt only when justified."
         )
         .ok();
         Ok(CheckExecution {
@@ -1265,7 +1265,7 @@ mod tests {
 
     fn write_valid_review_artifacts(repo: &Path) {
         let review_dir = repo.join("documents/reviews");
-        let gate_dir = repo.join(".github/review-gate");
+        let gate_dir = repo.join("documents/reviews");
         fs::create_dir_all(&review_dir).expect("create review dir");
         fs::create_dir_all(&gate_dir).expect("create review gate dir");
 
@@ -1364,10 +1364,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
         fs::create_dir_all(repo.join("tests")).expect("create tests");
-        fs::create_dir_all(repo.join(".github/review-gate")).expect("create review-gate");
+        fs::create_dir_all(repo.join("documents/reviews")).expect("create review-gate");
         fs::write(repo.join("tests/unsafe_test.sh"), b"rm -rf /\n").expect("write unsafe test");
         fs::write(
-            repo.join(".github/review-gate/test-safety-allowlist.txt"),
+            repo.join("documents/reviews/test-safety-allowlist.txt"),
             b"# empty\n",
         )
         .expect("write allowlist");
@@ -1382,10 +1382,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
         fs::create_dir_all(repo.join("tests")).expect("create tests");
-        fs::create_dir_all(repo.join(".github/review-gate")).expect("create review-gate");
+        fs::create_dir_all(repo.join("documents/reviews")).expect("create review-gate");
         fs::write(repo.join("tests/unsafe_test.sh"), b"rm -rf /\n").expect("write unsafe test");
         fs::write(
-            repo.join(".github/review-gate/test-safety-allowlist.txt"),
+            repo.join("documents/reviews/test-safety-allowlist.txt"),
             b"TSG001|tests/unsafe_test.sh:1\n",
         )
         .expect("write allowlist");
@@ -1396,7 +1396,7 @@ mod tests {
         assert!(check.passed, "unexpected output:\n{}", check.output);
 
         fs::write(
-            repo.join(".github/review-gate/test-safety-allowlist.txt"),
+            repo.join("documents/reviews/test-safety-allowlist.txt"),
             b"# empty\n",
         )
         .expect("clear allowlist");
@@ -1410,9 +1410,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
         fs::create_dir_all(repo.join("src")).expect("create src");
-        fs::create_dir_all(repo.join(".github/review-gate")).expect("create review-gate");
+        fs::create_dir_all(repo.join("documents/reviews")).expect("create review-gate");
         fs::write(
-            repo.join(".github/review-gate/test-safety-allowlist.txt"),
+            repo.join("documents/reviews/test-safety-allowlist.txt"),
             b"# empty\n",
         )
         .expect("write allowlist");
@@ -1442,9 +1442,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
         fs::create_dir_all(repo.join("src")).expect("create src");
-        fs::create_dir_all(repo.join(".github/review-gate")).expect("create review-gate");
+        fs::create_dir_all(repo.join("documents/reviews")).expect("create review-gate");
         fs::write(
-            repo.join(".github/review-gate/test-safety-allowlist.txt"),
+            repo.join("documents/reviews/test-safety-allowlist.txt"),
             b"# empty\n",
         )
         .expect("write allowlist");
@@ -1477,9 +1477,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
         fs::create_dir_all(repo.join("src")).expect("create src");
-        fs::create_dir_all(repo.join(".github/review-gate")).expect("create review-gate");
+        fs::create_dir_all(repo.join("documents/reviews")).expect("create review-gate");
         fs::write(
-            repo.join(".github/review-gate/test-safety-allowlist.txt"),
+            repo.join("documents/reviews/test-safety-allowlist.txt"),
             b"# empty\n",
         )
         .expect("write allowlist");
@@ -1513,9 +1513,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
         fs::create_dir_all(repo.join("src")).expect("create src");
-        fs::create_dir_all(repo.join(".github/review-gate")).expect("create review-gate");
+        fs::create_dir_all(repo.join("documents/reviews")).expect("create review-gate");
         fs::write(
-            repo.join(".github/review-gate/test-safety-allowlist.txt"),
+            repo.join("documents/reviews/test-safety-allowlist.txt"),
             b"# empty\n",
         )
         .expect("write allowlist");
@@ -1549,9 +1549,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
         fs::create_dir_all(repo.join("tests")).expect("create tests");
-        fs::create_dir_all(repo.join(".github/review-gate")).expect("create review-gate");
+        fs::create_dir_all(repo.join("documents/reviews")).expect("create review-gate");
         fs::write(
-            repo.join(".github/review-gate/test-safety-allowlist.txt"),
+            repo.join("documents/reviews/test-safety-allowlist.txt"),
             b"# empty\n",
         )
         .expect("write allowlist");

@@ -91,7 +91,8 @@ Description=APM2 FAC Worker\n\
 Documentation=https://github.com/guardian-intelligence/apm2\n\
 After=network-online.target apm2-daemon.service\n\
 Wants=apm2-daemon.service\n\
-Requires=apm2-daemon.service\n\
+BindsTo=apm2-daemon.service\n\
+PartOf=apm2-daemon.service\n\
 \n\
 [Service]\n\
 Type=notify\n\
@@ -120,7 +121,8 @@ Description=APM2 FAC Worker (%i)\n\
 Documentation=https://github.com/guardian-intelligence/apm2\n\
 After=network-online.target apm2-daemon.service\n\
 Wants=apm2-daemon.service\n\
-Requires=apm2-daemon.service\n\
+BindsTo=apm2-daemon.service\n\
+PartOf=apm2-daemon.service\n\
 \n\
 [Service]\n\
 Type=notify\n\
@@ -1624,6 +1626,20 @@ mod tests {
             WORKER_TEMPLATE_SERVICE_TEMPLATE.contains("fac worker --poll-interval-secs 10"),
             "worker@ template must use --poll-interval-secs"
         );
+        for worker_template in [WORKER_SERVICE_TEMPLATE, WORKER_TEMPLATE_SERVICE_TEMPLATE] {
+            assert!(
+                worker_template.contains("BindsTo=apm2-daemon.service"),
+                "worker templates must co-lifecycle with daemon via BindsTo"
+            );
+            assert!(
+                worker_template.contains("PartOf=apm2-daemon.service"),
+                "worker templates must co-lifecycle with daemon via PartOf"
+            );
+            assert!(
+                !worker_template.contains("Requires=apm2-daemon.service"),
+                "worker templates must not use Requires=apm2-daemon.service"
+            );
+        }
         for template in [
             DAEMON_SERVICE_TEMPLATE,
             WORKER_SERVICE_TEMPLATE,

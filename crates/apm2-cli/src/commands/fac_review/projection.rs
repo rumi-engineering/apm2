@@ -128,6 +128,15 @@ pub fn latest_state_head_sha(state: &ReviewStateFile, pr_number: u32) -> Option<
         .map(|entry| entry.head_sha.clone())
 }
 
+fn latest_state_owner_repo(state: &ReviewStateFile, pr_number: u32) -> Option<String> {
+    state
+        .reviewers
+        .values()
+        .filter(|entry| entry_pr_number(entry).is_some_and(|value| value == pr_number))
+        .max_by_key(|entry| entry.started_at)
+        .map(|entry| entry.owner_repo.clone())
+}
+
 pub fn latest_event_head_sha(events: &[serde_json::Value]) -> Option<String> {
     events.iter().rev().find_map(|event| {
         event
@@ -566,7 +575,11 @@ pub fn run_project_inner(
         },
         Clone::clone,
     );
-    let current_head_sha = latest_pulse_head_sha(pr_number)
+    let authoritative_current_head = latest_state_owner_repo(&state, pr_number)
+        .or_else(|| super::target::derive_repo_from_origin().ok())
+        .and_then(|owner_repo| fetch_pr_head_sha_authoritative(&owner_repo, pr_number).ok());
+    let current_head_sha = authoritative_current_head
+        .or_else(|| latest_pulse_head_sha(pr_number))
         .or(latest_run_state_head)
         .or_else(|| latest_event_head_sha(&events))
         .or_else(|| latest_state_head_sha(&state, pr_number))
