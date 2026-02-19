@@ -1,4 +1,5 @@
 #![cfg(feature = "e2e-agent-tests")]
+#![allow(missing_docs)]
 
 //! TCK-00313: FAC v0 E2E Harness - Full End-to-End Verification
 //!
