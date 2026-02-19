@@ -107,27 +107,47 @@ pub struct MetricsSummary {
     /// and denial-reason breakdowns are computed from a partial subset
     /// of receipts, but aggregate counts (completed, denied, quarantined,
     /// cancelled, total) and throughput are still accurate because they
-    /// are derived from receipt headers (not full receipt loading).
+    /// are derived from verified receipt headers (not full receipt loading).
     #[serde(default)]
     pub job_receipts_truncated: bool,
+
+    /// Whether aggregate counts may be incomplete because the receipt
+    /// index was at capacity.  When `true`, the index may not contain
+    /// all receipts in the store, so aggregate totals and throughput
+    /// should be treated as lower bounds.  Operators should run
+    /// `apm2 fac reindex` to rebuild the index.
+    #[serde(default)]
+    pub aggregates_may_be_incomplete: bool,
+
+    /// Number of receipt index headers that failed content-hash
+    /// verification and were excluded from aggregate counts.
+    /// A non-zero value indicates either index corruption or
+    /// tampered receipt files in the store.
+    #[serde(default)]
+    pub unverified_headers_skipped: u64,
 }
 
-/// Pre-counted aggregate totals derived from receipt headers.
+/// Pre-counted aggregate totals derived from **verified** receipt headers.
 ///
-/// These counts are computed from ALL headers in the observation window
-/// (not subject to the receipt-loading cap), ensuring accurate aggregate
-/// metrics even when full receipt loading is truncated.
+/// These counts are computed from all headers in the observation window
+/// whose `content_hash` binds to a verified receipt payload in the
+/// content-addressed store.  Headers that fail verification (tampered
+/// or missing receipt bytes) are excluded — only integrity-verified
+/// headers contribute to aggregate counts.
+///
+/// Not subject to the detail-receipt-loading cap, ensuring accurate
+/// aggregate metrics even when full receipt loading is truncated.
 #[derive(Debug, Clone, Default)]
 pub struct HeaderCounts {
-    /// Total completed jobs in the window (from headers).
+    /// Total completed jobs in the window (from verified headers).
     pub completed: u64,
-    /// Total denied jobs in the window (from headers).
+    /// Total denied jobs in the window (from verified headers).
     pub denied: u64,
-    /// Total quarantined jobs in the window (from headers).
+    /// Total quarantined jobs in the window (from verified headers).
     pub quarantined: u64,
-    /// Total cancelled jobs in the window (from headers).
+    /// Total cancelled jobs in the window (from verified headers).
     pub cancelled: u64,
-    /// Total receipts scanned in the window (from headers).
+    /// Total verified receipts scanned in the window.
     pub total: u64,
 }
 
@@ -1295,6 +1315,14 @@ mod tests {
             !deserialized.job_receipts_truncated,
             "job_receipts_truncated must default to false for old JSON"
         );
+        assert!(
+            !deserialized.aggregates_may_be_incomplete,
+            "aggregates_may_be_incomplete must default to false for old JSON"
+        );
+        assert_eq!(
+            deserialized.unverified_headers_skipped, 0,
+            "unverified_headers_skipped must default to 0 for old JSON"
+        );
     }
 
     // =========================================================================
@@ -1393,6 +1421,46 @@ mod tests {
         assert!(
             json_str2.contains("\"job_receipts_truncated\": false"),
             "job_receipts_truncated=false must appear in JSON"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR fix (round 8): aggregates_may_be_incomplete and
+    // unverified_headers_skipped fields
+    // =========================================================================
+
+    #[test]
+    fn aggregates_incomplete_field_serializes() {
+        let mut summary = MetricsSummary {
+            schema: METRICS_SUMMARY_SCHEMA.to_string(),
+            aggregates_may_be_incomplete: true,
+            ..MetricsSummary::default()
+        };
+        let json_str = serde_json::to_string_pretty(&summary).expect("serialize");
+        assert!(
+            json_str.contains("\"aggregates_may_be_incomplete\": true"),
+            "aggregates_may_be_incomplete=true must appear in JSON"
+        );
+
+        summary.aggregates_may_be_incomplete = false;
+        let json_str2 = serde_json::to_string_pretty(&summary).expect("serialize");
+        assert!(
+            json_str2.contains("\"aggregates_may_be_incomplete\": false"),
+            "aggregates_may_be_incomplete=false must appear in JSON"
+        );
+    }
+
+    #[test]
+    fn unverified_headers_skipped_field_serializes() {
+        let summary = MetricsSummary {
+            schema: METRICS_SUMMARY_SCHEMA.to_string(),
+            unverified_headers_skipped: 42,
+            ..MetricsSummary::default()
+        };
+        let json_str = serde_json::to_string_pretty(&summary).expect("serialize");
+        assert!(
+            json_str.contains("\"unverified_headers_skipped\": 42"),
+            "unverified_headers_skipped=42 must appear in JSON"
         );
     }
 

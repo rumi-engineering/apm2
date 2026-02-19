@@ -481,10 +481,10 @@ pub use receipt::{
 };
 // Re-export receipt index types (TCK-00560)
 pub use receipt_index::{
-    INDEX_FILE_NAME, INDEX_SUBDIR, MAX_INDEX_ENTRIES, MAX_INDEX_FILE_SIZE, MAX_JOB_INDEX_ENTRIES,
-    MAX_REBUILD_SCAN_FILES, RECEIPT_INDEX_SCHEMA, ReceiptHeaderV1, ReceiptIndexError,
-    ReceiptIndexV1, find_receipt_for_job, has_receipt_for_job, list_receipt_headers,
-    lookup_job_receipt, lookup_receipt_by_hash,
+    INDEX_FILE_NAME, INDEX_SUBDIR, ListReceiptHeadersResult, MAX_INDEX_ENTRIES,
+    MAX_INDEX_FILE_SIZE, MAX_JOB_INDEX_ENTRIES, MAX_REBUILD_SCAN_FILES, RECEIPT_INDEX_SCHEMA,
+    ReceiptHeaderV1, ReceiptIndexError, ReceiptIndexV1, find_receipt_for_job, has_receipt_for_job,
+    list_receipt_headers, lookup_job_receipt, lookup_receipt_by_hash,
 };
 // Re-export receipt merge types (TCK-00543)
 pub use receipt_merge::{
