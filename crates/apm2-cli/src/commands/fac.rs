@@ -6423,32 +6423,59 @@ fn run_metrics(args: &MetricsArgs, json_output: bool) -> u8 {
         .unwrap_or_else(|| now_secs.saturating_sub(DEFAULT_METRICS_WINDOW_SECS));
     let until_secs = args.until.unwrap_or(now_secs);
 
-    // Load job receipts from the index.
+    // Load all receipt headers from the index.
     let all_headers = apm2_core::fac::list_receipt_headers(&receipts_dir);
 
-    // Filter by window and load full receipts for those in range.
-    // Bounded by MAX_METRICS_RECEIPTS to prevent unbounded memory growth
-    // (MINOR-2 fix).
+    // ---------------------------------------------------------------
+    // Pass 1: Iterate ALL headers in the observation window to compute
+    // accurate aggregate counts.  Headers are lightweight (no full
+    // receipt loading), so this is not subject to the memory cap.
+    // ---------------------------------------------------------------
+    let mut header_counts = apm2_core::fac::HeaderCounts::default();
+    let mut window_headers: Vec<&apm2_core::fac::ReceiptHeaderV1> = Vec::new();
+    for header in &all_headers {
+        if header.timestamp_secs >= since_secs && header.timestamp_secs <= until_secs {
+            header_counts.total += 1;
+            match header.outcome {
+                apm2_core::fac::FacJobOutcome::Completed => header_counts.completed += 1,
+                apm2_core::fac::FacJobOutcome::Denied => header_counts.denied += 1,
+                apm2_core::fac::FacJobOutcome::Quarantined => header_counts.quarantined += 1,
+                apm2_core::fac::FacJobOutcome::Cancelled
+                | apm2_core::fac::FacJobOutcome::CancellationRequested => {
+                    header_counts.cancelled += 1;
+                },
+                // Fail-closed: unknown outcome variants are counted in total
+                // but not attributed to any category.
+                _ => {},
+            }
+            window_headers.push(header);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Pass 2: Load full receipts for detail analysis (latency
+    // percentiles, denial-reason breakdowns).  Bounded by
+    // MAX_METRICS_RECEIPTS to prevent unbounded memory growth.
+    // ---------------------------------------------------------------
     let mut job_receipts: Vec<apm2_core::fac::FacJobReceiptV1> = Vec::new();
     let mut truncated = false;
-    for header in &all_headers {
+    for header in &window_headers {
         if job_receipts.len() >= MAX_METRICS_RECEIPTS {
             truncated = true;
             break;
         }
-        if header.timestamp_secs >= since_secs && header.timestamp_secs <= until_secs {
-            if let Some(receipt) =
-                apm2_core::fac::lookup_receipt_by_hash(&receipts_dir, &header.content_hash)
-            {
-                job_receipts.push(receipt);
-            }
+        if let Some(receipt) =
+            apm2_core::fac::lookup_receipt_by_hash(&receipts_dir, &header.content_hash)
+        {
+            job_receipts.push(receipt);
         }
     }
 
     if truncated {
         eprintln!(
             "warning: receipt count exceeds MAX_METRICS_RECEIPTS ({MAX_METRICS_RECEIPTS}); \
-             metrics are computed from the first {MAX_METRICS_RECEIPTS} receipts only"
+             latency and denial-reason details are computed from the first \
+             {MAX_METRICS_RECEIPTS} receipts only (aggregate counts are accurate)"
         );
     }
 
@@ -6467,108 +6494,27 @@ fn run_metrics(args: &MetricsArgs, json_output: bool) -> u8 {
         gc_receipts: &gc_receipts,
         since_epoch_secs: since_secs,
         until_epoch_secs: until_secs,
+        header_counts: Some(header_counts),
     };
 
     let mut summary = apm2_core::fac::compute_metrics(&input);
     summary.gc_receipts_truncated = gc_receipts_truncated;
+    summary.job_receipts_truncated = truncated;
 
-    if json_output || args.json {
-        match serde_json::to_string_pretty(&summary) {
-            Ok(json) => println!("{json}"),
-            Err(e) => {
-                return output_error(
-                    true,
-                    "serialization_error",
-                    &format!("Failed to serialize metrics: {e}"),
-                    exit_codes::GENERIC_ERROR,
-                );
-            },
-        }
-    } else {
-        print_metrics_human(&summary);
+    // TCK-00606 S12: FAC commands are machine-output only.
+    match serde_json::to_string_pretty(&summary) {
+        Ok(json) => println!("{json}"),
+        Err(e) => {
+            return output_error(
+                true,
+                "serialization_error",
+                &format!("Failed to serialize metrics: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
     }
 
     exit_codes::SUCCESS
-}
-
-/// Print metrics in a human-readable table format.
-#[allow(clippy::cast_precision_loss)]
-fn print_metrics_human(s: &apm2_core::fac::MetricsSummary) {
-    println!("FAC Metrics Summary");
-    println!("===================");
-    println!(
-        "  Window: epoch {} -> {}",
-        s.since_epoch_secs, s.until_epoch_secs
-    );
-    let window_hours = (s.until_epoch_secs.saturating_sub(s.since_epoch_secs)) as f64 / 3600.0;
-    println!("  Duration: {window_hours:.1} hours");
-    println!();
-
-    println!("Throughput");
-    println!("----------");
-    println!("  Completed jobs:      {}", s.completed_jobs);
-    println!("  Jobs/hour:           {:.2}", s.throughput_jobs_per_hour);
-    println!("  Denied jobs:         {}", s.denied_jobs);
-    println!("  Quarantined jobs:    {}", s.quarantined_jobs);
-    println!("  Cancelled jobs:      {}", s.cancelled_jobs);
-    println!("  Total receipts:      {}", s.total_receipts);
-    println!();
-
-    println!("Queue Latency (completed jobs)");
-    println!("------------------------------");
-    if let Some(median) = s.median_duration_ms {
-        println!("  Median:  {median} ms");
-    } else {
-        println!("  Median:  (no data)");
-    }
-    if let Some(p95) = s.p95_duration_ms {
-        println!("  P95:     {p95} ms");
-    } else {
-        println!("  P95:     (no data)");
-    }
-    println!();
-
-    if !s.denial_counts_by_reason.is_empty() {
-        println!("Denial Breakdown");
-        println!("----------------");
-        for (reason, count) in &s.denial_counts_by_reason {
-            println!("  {reason:<40} {count}");
-        }
-        println!();
-    }
-
-    println!("Disk & GC");
-    println!("---------");
-    println!("  Disk preflight failures: {}", s.disk_preflight_failures);
-    println!(
-        "  GC freed bytes:          {} ({} receipts)",
-        format_bytes_simple(s.gc_freed_bytes),
-        s.gc_receipts
-    );
-    if s.gc_receipts_truncated {
-        println!(
-            "  WARNING: GC receipt list truncated at {} entries",
-            apm2_core::fac::MAX_GC_RECEIPTS_LOADED
-        );
-    }
-}
-
-/// Simple byte formatting for human output.
-#[allow(clippy::cast_precision_loss)]
-fn format_bytes_simple(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * 1024;
-    const GIB: u64 = 1024 * 1024 * 1024;
-
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 // =============================================================================

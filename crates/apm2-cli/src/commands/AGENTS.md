@@ -547,8 +547,11 @@ Security invariants:
 - **`apm2 fac metrics`** (`fac.rs`): Local-only observability command that computes
   aggregate metrics from FAC receipts. Accepts `--since <epoch_secs>`,
   `--until <epoch_secs>`, and `--json` flags. Default window is 24 hours
-  (`DEFAULT_METRICS_WINDOW_SECS = 86_400`). Loads receipt headers via the receipt
-  index, filters by time window, loads full `FacJobReceiptV1` receipts via
-  `lookup_receipt_by_hash`, and scans `GcReceiptV1` files via `load_gc_receipts`.
-  Calls `compute_metrics()` (pure, bounded) and emits JSON or human-readable
-  table. Excluded from daemon auto-start and listed in `is_local_fac_command()`.
+  (`DEFAULT_METRICS_WINDOW_SECS = 86_400`). Uses a two-pass approach: (1) iterate
+  ALL receipt headers in the window for accurate aggregate counts and throughput,
+  (2) load full receipts (capped at `MAX_METRICS_RECEIPTS = 16384`) for latency
+  percentiles and denial-reason breakdowns. Passes `HeaderCounts` to
+  `compute_metrics()` so aggregate metrics remain accurate even when full receipt
+  loading is truncated. Sets `job_receipts_truncated` and `gc_receipts_truncated`
+  flags in the output. Emits JSON only (TCK-00606 S12). Excluded from daemon
+  auto-start and listed in `is_local_fac_command()`.

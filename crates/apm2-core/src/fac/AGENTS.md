@@ -3228,10 +3228,16 @@ no side effects); callers provide loaded receipt data and receive a
   window bounds, throughput (completed/denied/quarantined/cancelled counts,
   jobs-per-hour), queue latency percentiles (median and p95 wall-clock duration
   from `observed_cost`), per-`DenialReasonCode` denial breakdown, disk preflight
-  failure count, and GC bytes freed. Serialized to JSON via serde with
+  failure count, GC bytes freed, `gc_receipts_truncated`, and
+  `job_receipts_truncated` flags. Serialized to JSON via serde with
   `deny_unknown_fields`.
-- `MetricsInput`: Input parameters struct holding slices of job and GC receipts
-  plus the observation window bounds.
+- `HeaderCounts`: Pre-counted aggregate totals (completed/denied/quarantined/
+  cancelled/total) derived from ALL receipt headers in the observation window.
+  Not subject to the receipt-loading cap, ensuring accurate aggregate metrics.
+- `MetricsInput`: Input parameters struct holding slices of job and GC receipts,
+  observation window bounds, and an optional `HeaderCounts` override. When
+  `header_counts` is `Some`, aggregate counts come from the header pass;
+  otherwise they fall back to the (possibly truncated) receipt slice.
 
 ### Key Functions
 
@@ -3239,19 +3245,22 @@ no side effects); callers provide loaded receipt data and receive a
   aggregates job outcomes, computes throughput (completed jobs / window hours),
   extracts duration percentiles (nearest-rank method), counts denial reasons with
   bounded map (`MAX_DENIAL_REASON_ENTRIES = 64`, overflow to `"other"` bucket),
-  and sums GC freed bytes. Zero-window yields zero throughput (no division by
-  zero).
-- `load_gc_receipts(receipts_dir, since_epoch_secs) -> Vec<GcReceiptV1>`: I/O
-  helper that traverses the sharded hash-prefix directory layout produced by
+  and sums GC freed bytes. When `header_counts` is provided, aggregate outcome
+  counts and throughput use the header-derived totals (covering ALL receipts),
+  while latency/denial detail comes from the loaded receipt slice. Zero-window
+  yields zero throughput (no division by zero).
+- `load_gc_receipts(receipts_dir, since_epoch_secs) -> LoadGcReceiptsResult`:
+  I/O helper that traverses the sharded hash-prefix directory layout produced by
   `persist_gc_receipt` (`receipts/<2-hex-prefix>/<remaining>.json`) plus
   top-level `.json` files (legacy flat layout). Bounded by
   `MAX_GC_RECEIPT_SCAN_FILES` (65536) total directory entries across all shards,
   `MAX_GC_SHARD_DIRS` (512) shard directories, `MAX_GC_RECEIPTS_LOADED` (4096)
-  loaded receipts, and `MAX_GC_RECEIPT_READ_SIZE` (256 KiB) per file. Shard
-  directory names are validated as exactly 2-character hex to prevent traversal.
-  All file opens use `open_no_follow` (`O_NOFOLLOW | O_NONBLOCK`) and verify via
-  `fstat` that the fd is a regular file (rejects FIFOs, device nodes, sockets).
-  Parse failures silently skipped.
+  loaded receipts, and `MAX_GC_RECEIPT_READ_SIZE` (256 KiB) per file. Results
+  sorted newest-first (descending timestamp) so truncation preserves recent data.
+  Shard directory names are validated as exactly 2-character hex to prevent
+  traversal. All file opens use `open_no_follow` (`O_NOFOLLOW | O_NONBLOCK`) and
+  verify via `fstat` that the fd is a regular file (rejects FIFOs, device nodes,
+  sockets). Parse failures silently skipped.
 
 ### Bounded Collections
 
@@ -3261,8 +3270,13 @@ aggregated into an `"other"` bucket to keep totals accurate.
 
 ### CLI Integration
 
-The `apm2 fac metrics` command (in `fac.rs`) loads receipt headers via the
-receipt index, filters by `--since`/`--until` time window (default: 24 hours),
-loads full receipts and GC receipts, calls `compute_metrics()`, and emits JSON
-(`--json`) or human-readable table output. The command is local-only (no daemon
-IPC) and excluded from daemon auto-start.
+The `apm2 fac metrics` command (in `fac.rs`) uses a two-pass approach:
+1. **Pass 1 (headers)**: Iterates ALL receipt headers in the time window to
+   compute accurate aggregate counts (completed/denied/quarantined/cancelled/
+   total) and throughput. This is not subject to the memory cap.
+2. **Pass 2 (full receipts)**: Loads full receipts (capped at
+   `MAX_METRICS_RECEIPTS = 16384`) for latency percentiles and denial-reason
+   breakdowns.
+
+The command emits JSON only (TCK-00606 S12 machine-output invariant), is
+local-only (no daemon IPC), and is excluded from daemon auto-start.

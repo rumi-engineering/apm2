@@ -398,7 +398,7 @@ pub use merge_receipt::{
 };
 // Re-export metrics types (TCK-00551)
 pub use metrics::{
-    LoadGcReceiptsResult, MAX_DENIAL_REASON_ENTRIES, MAX_GC_RECEIPT_SCAN_FILES,
+    HeaderCounts, LoadGcReceiptsResult, MAX_DENIAL_REASON_ENTRIES, MAX_GC_RECEIPT_SCAN_FILES,
     MAX_GC_RECEIPTS_LOADED, METRICS_SUMMARY_SCHEMA, MetricsInput, MetricsSummary, compute_metrics,
     load_gc_receipts,
 };

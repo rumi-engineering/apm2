@@ -95,17 +95,46 @@ pub struct MetricsSummary {
     pub gc_receipts: u64,
     /// Whether the GC receipt list was truncated due to the
     /// [`MAX_GC_RECEIPTS_LOADED`] cap.  When `true`, the GC metrics
-    /// reflect only a deterministic subset (oldest-first by timestamp,
+    /// reflect only a deterministic subset (newest-first by timestamp,
     /// then content-hash tiebreaker) and operators should investigate
     /// why the receipt count exceeds the cap.
     #[serde(default)]
     pub gc_receipts_truncated: bool,
+
+    /// Whether the job receipt list was truncated due to the caller's
+    /// `MAX_METRICS_RECEIPTS` cap.  When `true`, latency percentiles
+    /// and denial-reason breakdowns are computed from a partial subset
+    /// of receipts, but aggregate counts (completed, denied, quarantined,
+    /// cancelled, total) and throughput are still accurate because they
+    /// are derived from receipt headers (not full receipt loading).
+    #[serde(default)]
+    pub job_receipts_truncated: bool,
+}
+
+/// Pre-counted aggregate totals derived from receipt headers.
+///
+/// These counts are computed from ALL headers in the observation window
+/// (not subject to the receipt-loading cap), ensuring accurate aggregate
+/// metrics even when full receipt loading is truncated.
+#[derive(Debug, Clone, Default)]
+pub struct HeaderCounts {
+    /// Total completed jobs in the window (from headers).
+    pub completed: u64,
+    /// Total denied jobs in the window (from headers).
+    pub denied: u64,
+    /// Total quarantined jobs in the window (from headers).
+    pub quarantined: u64,
+    /// Total cancelled jobs in the window (from headers).
+    pub cancelled: u64,
+    /// Total receipts scanned in the window (from headers).
+    pub total: u64,
 }
 
 /// Input parameters for metrics computation.
 #[derive(Debug, Clone)]
 pub struct MetricsInput<'a> {
-    /// Job receipts within the observation window.
+    /// Job receipts within the observation window (may be truncated).
+    /// Used for latency percentiles and denial-reason breakdowns.
     pub job_receipts: &'a [FacJobReceiptV1],
     /// GC receipts within the observation window.
     pub gc_receipts: &'a [GcReceiptV1],
@@ -113,6 +142,11 @@ pub struct MetricsInput<'a> {
     pub since_epoch_secs: u64,
     /// Observation window end (Unix epoch seconds, inclusive).
     pub until_epoch_secs: u64,
+    /// Pre-counted aggregate totals from ALL receipt headers in the window.
+    /// When `Some`, these override the counts derived from `job_receipts`
+    /// (which may be a truncated subset).  When `None`, counts are derived
+    /// from `job_receipts` (backwards-compatible behavior for tests).
+    pub header_counts: Option<HeaderCounts>,
 }
 
 // =============================================================================
@@ -120,6 +154,13 @@ pub struct MetricsInput<'a> {
 // =============================================================================
 
 /// Compute a [`MetricsSummary`] from the provided receipt data.
+///
+/// When `input.header_counts` is `Some`, the aggregate outcome counts
+/// (completed, denied, quarantined, cancelled, total) and throughput are
+/// derived from the header counts (which cover ALL receipts in the window,
+/// not just the truncated subset loaded for detail analysis).  Latency
+/// percentiles and denial-reason breakdowns are always computed from the
+/// (possibly truncated) `job_receipts` slice.
 ///
 /// This is a pure function with no I/O. All collections are bounded.
 #[must_use]
@@ -132,22 +173,29 @@ pub fn compute_metrics(input: &MetricsInput<'_>) -> MetricsSummary {
         ..MetricsSummary::default()
     };
 
-    // -- Job receipt aggregation --
+    // -- Job receipt detail aggregation (from loaded receipts, may be truncated) --
     let mut durations: Vec<u64> = Vec::new();
 
+    // Track receipt-derived counts (used as fallback when header_counts is None).
+    let mut receipt_completed: u64 = 0;
+    let mut receipt_denied: u64 = 0;
+    let mut receipt_quarantined: u64 = 0;
+    let mut receipt_cancelled: u64 = 0;
+    let mut receipt_total: u64 = 0;
+
     for receipt in input.job_receipts {
-        summary.total_receipts += 1;
+        receipt_total += 1;
 
         match receipt.outcome {
             FacJobOutcome::Completed => {
-                summary.completed_jobs += 1;
+                receipt_completed += 1;
                 // Collect duration for percentile computation.
                 if let Some(ref cost) = receipt.observed_cost {
                     durations.push(cost.duration_ms);
                 }
             },
             FacJobOutcome::Denied => {
-                summary.denied_jobs += 1;
+                receipt_denied += 1;
                 // Aggregate denial reason.
                 if let Some(reason) = receipt.denial_reason {
                     let key = serialize_denial_reason(reason);
@@ -161,12 +209,28 @@ pub fn compute_metrics(input: &MetricsInput<'_>) -> MetricsSummary {
                 }
             },
             FacJobOutcome::Quarantined => {
-                summary.quarantined_jobs += 1;
+                receipt_quarantined += 1;
             },
             FacJobOutcome::Cancelled | FacJobOutcome::CancellationRequested => {
-                summary.cancelled_jobs += 1;
+                receipt_cancelled += 1;
             },
         }
+    }
+
+    // -- Aggregate counts: prefer header_counts (covers ALL receipts) --
+    if let Some(ref hc) = input.header_counts {
+        summary.completed_jobs = hc.completed;
+        summary.denied_jobs = hc.denied;
+        summary.quarantined_jobs = hc.quarantined;
+        summary.cancelled_jobs = hc.cancelled;
+        summary.total_receipts = hc.total;
+    } else {
+        // Fallback: derive from loaded receipts (backwards-compatible).
+        summary.completed_jobs = receipt_completed;
+        summary.denied_jobs = receipt_denied;
+        summary.quarantined_jobs = receipt_quarantined;
+        summary.cancelled_jobs = receipt_cancelled;
+        summary.total_receipts = receipt_total;
     }
 
     // -- Duration percentiles --
@@ -281,12 +345,13 @@ const MAX_GC_SHARD_DIRS: usize = 512;
 #[derive(Debug, Clone)]
 pub struct LoadGcReceiptsResult {
     /// The loaded GC receipts, sorted deterministically by
-    /// `(timestamp_secs, content_hash)`.
+    /// `(timestamp_secs DESC, content_hash ASC)` (newest first).
     pub receipts: Vec<GcReceiptV1>,
     /// Whether the result was truncated due to the
-    /// [`MAX_GC_RECEIPTS_LOADED`] cap.  When `true`, only the oldest
-    /// `MAX_GC_RECEIPTS_LOADED` receipts (by timestamp, then
-    /// content-hash tiebreaker) are included.
+    /// [`MAX_GC_RECEIPTS_LOADED`] cap.  When `true`, only the newest
+    /// `MAX_GC_RECEIPTS_LOADED` receipts (by timestamp descending, then
+    /// content-hash tiebreaker) are included — older receipts beyond the
+    /// cap are discarded.
     pub truncated: bool,
 }
 
@@ -308,10 +373,12 @@ pub struct LoadGcReceiptsResult {
 /// # Deterministic cap (MAJOR-2 fix)
 ///
 /// All matching receipts are collected (up to the scan cap), then sorted
-/// by `(timestamp_secs, content_hash)` to ensure a deterministic ordering
-/// regardless of filesystem enumeration order.  If the sorted list exceeds
-/// [`MAX_GC_RECEIPTS_LOADED`], it is truncated to the oldest entries and
-/// `LoadGcReceiptsResult::truncated` is set to `true`.
+/// by `(timestamp_secs DESC, content_hash ASC)` (newest first) to ensure
+/// a deterministic ordering regardless of filesystem enumeration order.
+/// If the sorted list exceeds [`MAX_GC_RECEIPTS_LOADED`], it is truncated
+/// to the newest entries and `LoadGcReceiptsResult::truncated` is set to
+/// `true`.  This is consistent with job receipt handling which prioritizes
+/// recent data.
 ///
 /// # Security
 ///
@@ -405,9 +472,12 @@ pub fn load_gc_receipts(
     // MAJOR-2 fix: Sort deterministically by (timestamp_secs, content_hash)
     // before applying the cap, so the same subset is always selected
     // regardless of filesystem enumeration order.
+    // Sort DESCENDING (newest first) so truncation preserves the most
+    // recent receipts — consistent with job receipt handling which
+    // prioritizes newer entries (MINOR security fix, round 6).
     results.sort_by(|a, b| {
-        a.timestamp_secs
-            .cmp(&b.timestamp_secs)
+        b.timestamp_secs
+            .cmp(&a.timestamp_secs)
             .then_with(|| a.content_hash.cmp(&b.content_hash))
     });
 
@@ -521,6 +591,7 @@ mod tests {
             bytes_backend: None,
             htf_time_envelope_ns: None,
             node_fingerprint: None,
+            toolchain_fingerprint: None,
             timestamp_secs,
             content_hash: "abc123".to_string(),
         }
@@ -553,6 +624,7 @@ mod tests {
             gc_receipts: &[],
             since_epoch_secs: 1000,
             until_epoch_secs: 2000,
+            header_counts: None,
         };
         let summary = compute_metrics(&input);
         assert_eq!(summary.completed_jobs, 0);
@@ -581,6 +653,7 @@ mod tests {
             gc_receipts: &[],
             since_epoch_secs: 1000,
             until_epoch_secs: 1000 + 7200, // 2 hours
+            header_counts: None,
         };
         let summary = compute_metrics(&input);
         assert_eq!(summary.completed_jobs, 10);
@@ -600,6 +673,7 @@ mod tests {
             gc_receipts: &[],
             since_epoch_secs: 1000,
             until_epoch_secs: 1000, // zero window
+            header_counts: None,
         };
         let summary = compute_metrics(&input);
         assert_eq!(summary.completed_jobs, 1);
@@ -639,6 +713,7 @@ mod tests {
             gc_receipts: &[],
             since_epoch_secs: 1000,
             until_epoch_secs: 2000,
+            header_counts: None,
         };
         let summary = compute_metrics(&input);
         assert_eq!(summary.denied_jobs, 4);
@@ -671,6 +746,7 @@ mod tests {
             gc_receipts: &[],
             since_epoch_secs: 1000,
             until_epoch_secs: 2000,
+            header_counts: None,
         };
         let summary = compute_metrics(&input);
         assert_eq!(summary.quarantined_jobs, 2);
@@ -688,6 +764,7 @@ mod tests {
             gc_receipts: &[],
             since_epoch_secs: 1000,
             until_epoch_secs: 2000,
+            header_counts: None,
         };
         let summary = compute_metrics(&input);
         // Median of 20 items: 50th percentile => ceil(0.5 * 20) = 10 => index 9 =>
@@ -708,6 +785,7 @@ mod tests {
             gc_receipts: &gc_receipts,
             since_epoch_secs: 1000,
             until_epoch_secs: 2000,
+            header_counts: None,
         };
         let summary = compute_metrics(&input);
         assert_eq!(summary.gc_freed_bytes, 800_000_000);
@@ -756,6 +834,7 @@ mod tests {
             gc_receipts: &[],
             since_epoch_secs: 1000,
             until_epoch_secs: 4600, // 1 hour
+            header_counts: None,
         };
         let summary = compute_metrics(&input);
         let json = serde_json::to_string_pretty(&summary);
@@ -778,6 +857,7 @@ mod tests {
             gc_receipts: &[],
             since_epoch_secs: 1000,
             until_epoch_secs: 2000,
+            header_counts: None,
         };
         let summary = compute_metrics(&input);
         assert_eq!(summary.denied_jobs, 1);
@@ -1080,10 +1160,10 @@ mod tests {
         let result = load_gc_receipts(receipts_dir, 0);
         assert_eq!(result.receipts.len(), 3);
         assert!(!result.truncated, "should not be truncated");
-        // Must be sorted by timestamp ascending.
-        assert_eq!(result.receipts[0].timestamp_secs, 7000);
+        // Must be sorted by timestamp descending (newest first).
+        assert_eq!(result.receipts[0].timestamp_secs, 9000);
         assert_eq!(result.receipts[1].timestamp_secs, 8000);
-        assert_eq!(result.receipts[2].timestamp_secs, 9000);
+        assert_eq!(result.receipts[2].timestamp_secs, 7000);
     }
 
     #[test]
@@ -1130,6 +1210,109 @@ mod tests {
         assert!(
             !deserialized.gc_receipts_truncated,
             "gc_receipts_truncated must default to false for old JSON"
+        );
+        assert!(
+            !deserialized.job_receipts_truncated,
+            "job_receipts_truncated must default to false for old JSON"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR fix (round 6): header_counts override for accurate aggregates
+    // =========================================================================
+
+    #[test]
+    fn header_counts_override_receipt_derived_counts() {
+        // When header_counts is provided, aggregate counts must come from
+        // the header pass (covering ALL receipts), not from the truncated
+        // job_receipts slice.
+        let receipts = vec![
+            make_job_receipt(FacJobOutcome::Completed, None, Some(100), 1000),
+            make_job_receipt(
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::DigestMismatch),
+                None,
+                1001,
+            ),
+        ];
+        let header_counts = HeaderCounts {
+            completed: 500,
+            denied: 200,
+            quarantined: 50,
+            cancelled: 30,
+            total: 780,
+        };
+        let input = MetricsInput {
+            job_receipts: &receipts,
+            gc_receipts: &[],
+            since_epoch_secs: 1000,
+            until_epoch_secs: 1000 + 7200, // 2 hours
+            header_counts: Some(header_counts),
+        };
+        let summary = compute_metrics(&input);
+
+        // Aggregate counts must come from header_counts, not receipts.
+        assert_eq!(summary.completed_jobs, 500);
+        assert_eq!(summary.denied_jobs, 200);
+        assert_eq!(summary.quarantined_jobs, 50);
+        assert_eq!(summary.cancelled_jobs, 30);
+        assert_eq!(summary.total_receipts, 780);
+        // Throughput uses header_counts.completed.
+        assert!((summary.throughput_jobs_per_hour - 250.0).abs() < 0.001);
+
+        // Detail metrics still come from loaded receipts.
+        assert_eq!(summary.median_duration_ms, Some(100));
+        assert_eq!(
+            summary.denial_counts_by_reason.get("digest_mismatch"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn header_counts_none_falls_back_to_receipt_counts() {
+        // When header_counts is None, counts are derived from job_receipts
+        // (backwards-compatible behavior).
+        let receipts = vec![
+            make_job_receipt(FacJobOutcome::Completed, None, Some(200), 1000),
+            make_job_receipt(FacJobOutcome::Completed, None, Some(300), 1001),
+            make_job_receipt(
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::MalformedSpec),
+                None,
+                1002,
+            ),
+        ];
+        let input = MetricsInput {
+            job_receipts: &receipts,
+            gc_receipts: &[],
+            since_epoch_secs: 1000,
+            until_epoch_secs: 2000,
+            header_counts: None,
+        };
+        let summary = compute_metrics(&input);
+        assert_eq!(summary.completed_jobs, 2);
+        assert_eq!(summary.denied_jobs, 1);
+        assert_eq!(summary.total_receipts, 3);
+    }
+
+    #[test]
+    fn job_receipts_truncated_field_serializes() {
+        let mut summary = MetricsSummary {
+            schema: METRICS_SUMMARY_SCHEMA.to_string(),
+            job_receipts_truncated: true,
+            ..MetricsSummary::default()
+        };
+        let json_str = serde_json::to_string_pretty(&summary).expect("serialize");
+        assert!(
+            json_str.contains("\"job_receipts_truncated\": true"),
+            "job_receipts_truncated=true must appear in JSON"
+        );
+
+        summary.job_receipts_truncated = false;
+        let json_str2 = serde_json::to_string_pretty(&summary).expect("serialize");
+        assert!(
+            json_str2.contains("\"job_receipts_truncated\": false"),
+            "job_receipts_truncated=false must appear in JSON"
         );
     }
 
