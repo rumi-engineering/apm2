@@ -4607,8 +4607,11 @@ fn process_job(
         );
 
         // TCK-00554: Stop sccache server at unit end (INV-CONTAIN-011).
-        // Best-effort: failure to stop is logged but does not affect job outcome.
-        if policy.sccache_enabled && !sccache_server_env.is_empty() {
+        // MINOR-1 fix: Gate shutdown on ownership — only stop the server if
+        // this unit started one or verified a pre-existing in-cgroup server.
+        // This prevents one lane from terminating a shared sccache server
+        // that another concurrent lane is using.
+        if owns_sccache_server(containment_trace.as_ref()) && !sccache_server_env.is_empty() {
             let stopped = apm2_core::fac::stop_sccache_server(&sccache_server_env);
             eprintln!("worker: sccache server stop (warm unit end): stopped={stopped}");
         }
@@ -4685,7 +4688,8 @@ fn process_job(
         // The containment protocol may have started a server; failing to stop
         // it here would leak a daemon beyond the unit lifecycle, violating
         // INV-CONTAIN-011.
-        if policy.sccache_enabled && !sccache_server_env.is_empty() {
+        // Gate on ownership: only stop the server this unit started/verified.
+        if owns_sccache_server(containment_trace.as_ref()) && !sccache_server_env.is_empty() {
             let stopped = apm2_core::fac::stop_sccache_server(&sccache_server_env);
             eprintln!("worker: sccache server stop (pipeline commit failure): stopped={stopped}");
         }
@@ -4712,8 +4716,11 @@ fn process_job(
     }
 
     // TCK-00554: Stop sccache server at unit end (INV-CONTAIN-011).
-    // Best-effort: failure to stop is logged but does not affect job outcome.
-    if policy.sccache_enabled && !sccache_server_env.is_empty() {
+    // MINOR-1 fix: Gate shutdown on ownership — only stop the server if
+    // this unit started one or verified a pre-existing in-cgroup server.
+    // This prevents one lane from terminating a shared sccache server
+    // that another concurrent lane is using.
+    if owns_sccache_server(containment_trace.as_ref()) && !sccache_server_env.is_empty() {
         let stopped = apm2_core::fac::stop_sccache_server(&sccache_server_env);
         eprintln!("worker: sccache server stop (unit end): stopped={stopped}");
     }
@@ -4725,6 +4732,46 @@ fn process_job(
         job_id: spec.job_id.clone(),
         observed_cost: Some(observed_cost),
     }
+}
+
+/// Returns `true` if the containment trace indicates this unit started or
+/// verified a server (i.e., it "owns" the sccache server and is responsible
+/// for stopping it at unit end).
+///
+/// TCK-00554 MINOR-1 fix: In multi-lane operation, multiple lanes may share
+/// the same `SCCACHE_DIR`. If this unit never started or verified a server,
+/// blindly calling `--stop-server` could terminate a server owned by another
+/// lane. The ownership check inspects the server containment sub-trace:
+///
+/// - If the protocol was never executed, this unit does not own a server.
+/// - If the protocol auto-disabled sccache, this unit did not successfully
+///   acquire a server.
+/// - If `server_started` is true, this unit started a fresh server.
+/// - If a pre-existing server was detected AND verified in-cgroup, this unit
+///   adopted an existing server that it may later need to stop.
+///
+/// Only in the last two cases does this function return `true`.
+fn owns_sccache_server(
+    containment_trace: Option<&apm2_core::fac::containment::ContainmentTrace>,
+) -> bool {
+    let Some(trace) = containment_trace else {
+        return false;
+    };
+    let Some(ref sc) = trace.sccache_server_containment else {
+        return false;
+    };
+    if !sc.protocol_executed || sc.auto_disabled {
+        return false;
+    }
+    // This unit started a new server.
+    if sc.server_started && sc.server_cgroup_verified {
+        return true;
+    }
+    // This unit adopted a pre-existing in-cgroup server.
+    if sc.preexisting_server_detected && sc.preexisting_server_in_cgroup == Some(true) {
+        return true;
+    }
+    false
 }
 
 /// Result of a process liveness check via `kill(pid, 0)`.

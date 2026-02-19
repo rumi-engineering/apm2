@@ -939,14 +939,31 @@ impl FacJobReceiptV1 {
             // preserve bit-for-bit compatibility with historical receipts
             // signed before this field was added (same pattern as
             // `moved_job_path` and `sandbox_hardening_hash`).
+            //
+            // FIX (MAJOR): Hash-bind ALL normative fields with injective
+            // Option encoding. Option<bool> uses 0=None, 1=Some(false),
+            // 2=Some(true) to preserve injectivity between None and
+            // Some(false). Option<u32> uses 0u8/1u8 presence marker.
+            // Option<String> uses 0u8 for None, 1u8+length-prefix for Some.
             if let Some(ref sc) = trace.sccache_server_containment {
                 bytes.push(1u8);
                 bytes.push(u8::from(sc.protocol_executed));
                 bytes.push(u8::from(sc.preexisting_server_detected));
-                bytes.push(u8::from(sc.preexisting_server_in_cgroup.unwrap_or(false)));
+                // Option<bool>: 0=None, 1=Some(false), 2=Some(true)
+                bytes.push(match sc.preexisting_server_in_cgroup {
+                    None => 0u8,
+                    Some(false) => 1u8,
+                    Some(true) => 2u8,
+                });
+                // Option<u32>: preexisting_server_pid
+                Self::append_option_u32(&mut bytes, sc.preexisting_server_pid);
                 bytes.push(u8::from(sc.server_started));
+                // Option<u32>: started_server_pid
+                Self::append_option_u32(&mut bytes, sc.started_server_pid);
                 bytes.push(u8::from(sc.server_cgroup_verified));
                 bytes.push(u8::from(sc.auto_disabled));
+                // Option<String>: reason (length-prefixed)
+                Self::append_option_string(&mut bytes, sc.reason.as_deref());
             }
         }
 
@@ -1031,6 +1048,38 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&cost.duration_ms.to_be_bytes());
             bytes.extend_from_slice(&cost.cpu_time_ms.to_be_bytes());
             bytes.extend_from_slice(&cost.bytes_written.to_be_bytes());
+        }
+    }
+
+    /// Appends an `Option<u32>` with explicit presence marker.
+    ///
+    /// Encoding: `0u8` for `None`, `1u8 + value.to_be_bytes()` for `Some(v)`.
+    /// This preserves injectivity: `None` and `Some(0)` produce distinct bytes.
+    fn append_option_u32(bytes: &mut Vec<u8>, value: Option<u32>) {
+        match value {
+            None => bytes.push(0u8),
+            Some(v) => {
+                bytes.push(1u8);
+                bytes.extend_from_slice(&v.to_be_bytes());
+            },
+        }
+    }
+
+    /// Appends an `Option<&str>` with explicit presence marker and length
+    /// prefix.
+    ///
+    /// Encoding: `0u8` for `None`, `1u8 + len(u32 BE) + bytes` for `Some(s)`.
+    /// This preserves injectivity: `None` and `Some("")` produce distinct
+    /// bytes (`[0]` vs `[1, 0, 0, 0, 0]`).
+    #[allow(clippy::cast_possible_truncation)] // reason strings are bounded by MAX_SERVER_CONTAINMENT_REASON_LENGTH (512)
+    fn append_option_string(bytes: &mut Vec<u8>, value: Option<&str>) {
+        match value {
+            None => bytes.push(0u8),
+            Some(s) => {
+                bytes.push(1u8);
+                bytes.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(s.as_bytes());
+            },
         }
     }
 
@@ -1187,18 +1236,27 @@ impl FacJobReceiptV1 {
                 bytes.push(0u8);
             }
             // TCK-00554: sccache server containment protocol attestation.
-            // V1 trailing optional: absence marker is OMITTED when None to
-            // preserve bit-for-bit compatibility with historical receipts
-            // signed before this field was added (same pattern as
-            // `moved_job_path` and `sandbox_hardening_hash`).
+            // V2 trailing optional: same injective encoding as V1 for
+            // consistency. See V1 block for encoding rationale.
             if let Some(ref sc) = trace.sccache_server_containment {
                 bytes.push(1u8);
                 bytes.push(u8::from(sc.protocol_executed));
                 bytes.push(u8::from(sc.preexisting_server_detected));
-                bytes.push(u8::from(sc.preexisting_server_in_cgroup.unwrap_or(false)));
+                // Option<bool>: 0=None, 1=Some(false), 2=Some(true)
+                bytes.push(match sc.preexisting_server_in_cgroup {
+                    None => 0u8,
+                    Some(false) => 1u8,
+                    Some(true) => 2u8,
+                });
+                // Option<u32>: preexisting_server_pid
+                Self::append_option_u32(&mut bytes, sc.preexisting_server_pid);
                 bytes.push(u8::from(sc.server_started));
+                // Option<u32>: started_server_pid
+                Self::append_option_u32(&mut bytes, sc.started_server_pid);
                 bytes.push(u8::from(sc.server_cgroup_verified));
                 bytes.push(u8::from(sc.auto_disabled));
+                // Option<String>: reason (length-prefixed)
+                Self::append_option_string(&mut bytes, sc.reason.as_deref());
             }
         }
 
@@ -4258,6 +4316,191 @@ pub mod tests {
         // We verify this indirectly: the "without" bytes should be a strict
         // prefix of what "with" bytes would start with (minus the server
         // containment data).
+    }
+
+    /// TCK-00554 MAJOR-1 fix (round 2): Option<bool> injectivity —
+    /// `preexisting_server_in_cgroup` must produce distinct canonical bytes
+    /// for None, Some(false), and Some(true).
+    #[test]
+    fn test_server_containment_option_bool_injectivity() {
+        let make_sc = |in_cgroup: Option<bool>| {
+            let mut r = make_valid_receipt();
+            r.containment = Some(crate::fac::containment::ContainmentTrace {
+                verified: true,
+                cgroup_path: "/test".to_string(),
+                processes_checked: 1,
+                mismatch_count: 0,
+                sccache_auto_disabled: false,
+                sccache_enabled: true,
+                sccache_version: None,
+                sccache_server_containment: Some(
+                    crate::fac::containment::SccacheServerContainment {
+                        protocol_executed: true,
+                        preexisting_server_detected: true,
+                        preexisting_server_in_cgroup: in_cgroup,
+                        preexisting_server_pid: None,
+                        server_started: false,
+                        started_server_pid: None,
+                        server_cgroup_verified: false,
+                        auto_disabled: false,
+                        reason: None,
+                    },
+                ),
+            });
+            r
+        };
+
+        let bytes_none = make_sc(None).canonical_bytes();
+        let bytes_false = make_sc(Some(false)).canonical_bytes();
+        let bytes_true = make_sc(Some(true)).canonical_bytes();
+
+        assert_ne!(
+            bytes_none, bytes_false,
+            "None and Some(false) must produce distinct canonical bytes"
+        );
+        assert_ne!(
+            bytes_none, bytes_true,
+            "None and Some(true) must produce distinct canonical bytes"
+        );
+        assert_ne!(
+            bytes_false, bytes_true,
+            "Some(false) and Some(true) must produce distinct canonical bytes"
+        );
+
+        // Same check for V2
+        let bytes_none_v2 = make_sc(None).canonical_bytes_v2();
+        let bytes_false_v2 = make_sc(Some(false)).canonical_bytes_v2();
+        let bytes_true_v2 = make_sc(Some(true)).canonical_bytes_v2();
+
+        assert_ne!(bytes_none_v2, bytes_false_v2, "V2: None vs Some(false)");
+        assert_ne!(bytes_none_v2, bytes_true_v2, "V2: None vs Some(true)");
+        assert_ne!(
+            bytes_false_v2, bytes_true_v2,
+            "V2: Some(false) vs Some(true)"
+        );
+    }
+
+    /// TCK-00554 MAJOR-1 fix (round 2): PID fields must be hash-bound.
+    /// Changing `preexisting_server_pid` or `started_server_pid` must
+    /// produce distinct canonical bytes.
+    #[test]
+    fn test_server_containment_pid_fields_hash_bound() {
+        let make_sc = |pre_pid: Option<u32>, started_pid: Option<u32>| {
+            let mut r = make_valid_receipt();
+            r.containment = Some(crate::fac::containment::ContainmentTrace {
+                verified: true,
+                cgroup_path: "/test".to_string(),
+                processes_checked: 1,
+                mismatch_count: 0,
+                sccache_auto_disabled: false,
+                sccache_enabled: true,
+                sccache_version: None,
+                sccache_server_containment: Some(
+                    crate::fac::containment::SccacheServerContainment {
+                        protocol_executed: true,
+                        preexisting_server_detected: true,
+                        preexisting_server_in_cgroup: Some(false),
+                        preexisting_server_pid: pre_pid,
+                        server_started: true,
+                        started_server_pid: started_pid,
+                        server_cgroup_verified: true,
+                        auto_disabled: false,
+                        reason: None,
+                    },
+                ),
+            });
+            r
+        };
+
+        // preexisting_server_pid: None vs Some(100) vs Some(200)
+        let bytes_no_pid = make_sc(None, None).canonical_bytes();
+        let bytes_pid_100 = make_sc(Some(100), None).canonical_bytes();
+        let bytes_pid_200 = make_sc(Some(200), None).canonical_bytes();
+
+        assert_ne!(
+            bytes_no_pid, bytes_pid_100,
+            "preexisting_server_pid None vs Some(100)"
+        );
+        assert_ne!(
+            bytes_pid_100, bytes_pid_200,
+            "preexisting_server_pid Some(100) vs Some(200)"
+        );
+
+        // started_server_pid: None vs Some(300)
+        let bytes_no_started = make_sc(None, None).canonical_bytes();
+        let bytes_started_300 = make_sc(None, Some(300)).canonical_bytes();
+
+        assert_ne!(
+            bytes_no_started, bytes_started_300,
+            "started_server_pid None vs Some(300)"
+        );
+
+        // V2 checks
+        let bytes_no_pid_v2 = make_sc(None, None).canonical_bytes_v2();
+        let bytes_pid_100_v2 = make_sc(Some(100), None).canonical_bytes_v2();
+        assert_ne!(
+            bytes_no_pid_v2, bytes_pid_100_v2,
+            "V2: preexisting_server_pid None vs Some(100)"
+        );
+    }
+
+    /// TCK-00554 MAJOR-1 fix (round 2): `reason` field must be
+    /// hash-bound. Changing the reason string must produce distinct
+    /// canonical bytes.
+    #[test]
+    fn test_server_containment_reason_field_hash_bound() {
+        let make_sc = |reason: Option<&str>| {
+            let mut r = make_valid_receipt();
+            r.containment = Some(crate::fac::containment::ContainmentTrace {
+                verified: true,
+                cgroup_path: "/test".to_string(),
+                processes_checked: 1,
+                mismatch_count: 0,
+                sccache_auto_disabled: false,
+                sccache_enabled: true,
+                sccache_version: None,
+                sccache_server_containment: Some(
+                    crate::fac::containment::SccacheServerContainment {
+                        protocol_executed: true,
+                        preexisting_server_detected: false,
+                        preexisting_server_in_cgroup: None,
+                        preexisting_server_pid: None,
+                        server_started: true,
+                        started_server_pid: Some(999),
+                        server_cgroup_verified: true,
+                        auto_disabled: false,
+                        reason: reason.map(String::from),
+                    },
+                ),
+            });
+            r
+        };
+
+        let bytes_none = make_sc(None).canonical_bytes();
+        let bytes_empty = make_sc(Some("")).canonical_bytes();
+        let bytes_text = make_sc(Some("server started")).canonical_bytes();
+        let bytes_other = make_sc(Some("server verified")).canonical_bytes();
+
+        assert_ne!(
+            bytes_none, bytes_empty,
+            "reason None vs Some(\"\") must differ"
+        );
+        assert_ne!(
+            bytes_empty, bytes_text,
+            "reason empty vs non-empty must differ"
+        );
+        assert_ne!(
+            bytes_text, bytes_other,
+            "different reason strings must differ"
+        );
+
+        // V2 checks
+        let bytes_none_v2 = make_sc(None).canonical_bytes_v2();
+        let bytes_text_v2 = make_sc(Some("server started")).canonical_bytes_v2();
+        assert_ne!(
+            bytes_none_v2, bytes_text_v2,
+            "V2: reason None vs Some(text)"
+        );
     }
 
     #[test]

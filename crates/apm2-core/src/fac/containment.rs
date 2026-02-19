@@ -3071,8 +3071,12 @@ mod tests {
 
     #[test]
     fn stop_sccache_server_returns_false_without_binary() {
-        // When sccache is not installed, stop should return false.
-        let result = stop_sccache_server(&[]);
+        // Hermetic: override PATH via env vars so sccache binary is never
+        // found, regardless of whether an ambient sccache server is running.
+        // `run_sccache_command` applies caller-provided env vars AFTER
+        // the process PATH, so this override is authoritative.
+        let isolated_env = vec![("PATH".to_string(), "/nonexistent-path-for-test".to_string())];
+        let result = stop_sccache_server(&isolated_env);
         assert!(
             !result,
             "stop must return false when sccache is not available"

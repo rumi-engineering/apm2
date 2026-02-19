@@ -1952,9 +1952,14 @@ markers for trailing optional fields to ensure injective encoding:
 - `1u8` — `moved_job_path` (TCK-00518)
 - `2u8` — `containment` trace (TCK-00548). Within the containment trace,
   the `sccache_server_containment` sub-field (TCK-00554) is serialized as
-  a 1u8 presence marker followed by boolean bytes for `protocol_executed`,
-  `preexisting_server_detected`, `preexisting_server_in_cgroup`,
-  `server_started`, `server_cgroup_verified`, and `auto_disabled`.
+  a 1u8 presence marker followed by: `protocol_executed` (bool),
+  `preexisting_server_detected` (bool), `preexisting_server_in_cgroup`
+  (3-state: 0=None, 1=Some(false), 2=Some(true)), `preexisting_server_pid`
+  (Option<u32> with 0/1 presence marker), `server_started` (bool),
+  `started_server_pid` (Option<u32> with 0/1 presence marker),
+  `server_cgroup_verified` (bool), `auto_disabled` (bool), and `reason`
+  (Option<String> with 0/1 presence marker + u32 length prefix).
+  All normative fields are hash-bound for tamper-evident integrity.
   Absence (None) is omitted entirely for V1 backward compatibility.
 - `3u8` — `sandbox_hardening_hash` (TCK-00573)
 
@@ -2966,6 +2971,9 @@ job unit, preventing cache poisoning via escaped sccache daemons.
   variant with configurable procfs root.
 - `stop_sccache_server(sccache_env)`: Best-effort server stop at unit end
   (INV-CONTAIN-011). Returns `true` on success, `false` on failure.
+  Callers in multi-lane environments MUST gate the stop on ownership —
+  use `owns_sccache_server(containment_trace)` in fac_worker.rs to verify
+  this unit started or verified the server before calling stop.
 
 ### Security Invariants (TCK-00548, TCK-00554)
 
@@ -3019,6 +3027,9 @@ job unit, preventing cache poisoning via escaped sccache daemons.
   env inheritance.
 - [INV-CONTAIN-011] (TCK-00554) Stop the sccache server at unit end to prevent
   cgroup escape. Best-effort: logged but does not block job completion.
+  In multi-lane environments, the stop is gated on ownership — only the unit
+  that started or verified the server issues the stop command, preventing
+  cross-lane interference when lanes share the same SCCACHE_DIR.
 - [INV-CONTAIN-012] (TCK-00554) Auto-disable sccache if server containment
   cannot be verified (fail-closed). Covers: unable to scan for servers,
   pre-existing server outside cgroup, unable to start server, started server
