@@ -27,6 +27,21 @@
 //! - [INV-RMTREE-005] Both paths must be absolute.
 //! - [INV-RMTREE-010] Dot-segment paths are rejected.
 
+// ── Shared helpers ──────────────────────────────────────────────────────
+//
+// Extracted to file level so inner modules can reuse without duplication.
+
+use apm2_core::fac::JobSource;
+
+fn sample_source() -> JobSource {
+    JobSource {
+        kind: "mirror_commit".to_string(),
+        repo_id: "org-repo".to_string(),
+        head_sha: "a".repeat(40),
+        patch: None,
+    }
+}
+
 // =============================================================================
 // Part 1: FacJobSpecV1 Adversarial Parsing
 // =============================================================================
@@ -41,16 +56,9 @@ mod job_spec_adversarial {
         MAX_JOB_SPEC_SIZE, deserialize_job_spec,
     };
 
-    // ── Helpers ─────────────────────────────────────────────────────────
+    use super::sample_source;
 
-    fn sample_source() -> JobSource {
-        JobSource {
-            kind: "mirror_commit".to_string(),
-            repo_id: "org-repo".to_string(),
-            head_sha: "a".repeat(40),
-            patch: None,
-        }
-    }
+    // ── Helpers ─────────────────────────────────────────────────────────
 
     fn build_valid_spec() -> FacJobSpecV1 {
         FacJobSpecV1Builder::new(
@@ -220,32 +228,18 @@ mod job_spec_adversarial {
         )
         .channel_context_token("valid-token")
         .build();
-        // The builder currently accepts null bytes in job_id (structural
-        // validation does not check for embedded NUL).  Assert the concrete
-        // outcome so any future change (accept→reject or reject→accept)
-        // is detected.
-        match &result {
-            Ok(spec) => {
-                // If builder succeeds, the full validation pipeline must
-                // also be exercised.  validate_job_spec_with_policy with
-                // open policy performs reject_filesystem_paths which does
-                // not currently catch NUL.  Assert that the spec is at
-                // least structurally sound (digest + request_id computed).
-                assert!(
-                    !spec.job_spec_digest.is_empty(),
-                    "builder must compute digest even with NUL in job_id"
-                );
-                assert_eq!(spec.job_id, "job\0id", "job_id must be preserved exactly");
-            },
-            Err(e) => {
-                // If the builder ever starts rejecting NUL bytes, ensure
-                // the error is deterministic and not a panic.
-                assert!(
-                    !format!("{e:?}").is_empty(),
-                    "error must have a debug representation"
-                );
-            },
-        }
+        // NUL bytes in job_id MUST be rejected by strict charset validation
+        // (INV-JS-006).  job_id only allows [A-Za-z0-9_-].
+        assert!(
+            matches!(
+                result,
+                Err(JobSpecError::InvalidFormat {
+                    field: "job_id",
+                    ..
+                })
+            ),
+            "NUL bytes in job_id must be rejected: {result:?}"
+        );
     }
 
     #[test]
@@ -563,16 +557,9 @@ mod queue_tampering {
         validate_job_spec_control_lane,
     };
 
-    // ── Helpers ─────────────────────────────────────────────────────────
+    use super::sample_source;
 
-    fn sample_source() -> JobSource {
-        JobSource {
-            kind: "mirror_commit".to_string(),
-            repo_id: "org-repo".to_string(),
-            head_sha: "a".repeat(40),
-            patch: None,
-        }
-    }
+    // ── Helpers ─────────────────────────────────────────────────────────
 
     fn control_lane_source() -> JobSource {
         JobSource {
