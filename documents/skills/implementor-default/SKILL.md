@@ -20,7 +20,7 @@ references[17]:
   - path: "@documents/security/SECURITY_POLICY.cac.json"
     purpose: "Security posture and fail-closed defaults for ambiguous trust state."
   - path: "@documents/rfcs/RFC-0019/20_fac_execution_substrate_build_farm_revision.md"
-    purpose: "FESv1 execution substrate design: lanes, broker/worker queue, warm lifecycle, GC, and failure mode handling. Read for future operational context (PLANNED — not yet implemented; current gates run locally via `apm2 fac gates`)."
+    purpose: "FESv1 execution substrate design: lanes, broker/worker queue, warm lifecycle, GC, and failure mode handling. Read for future operational context (PLANNED — not yet implemented; gates are run internally by `apm2 fac push`)."
 
   # Core standards
   - path: "@documents/skills/rust-standards/references/15_errors_panics_diagnostics.md"
@@ -235,23 +235,22 @@ decision_tree:
       next: VERIFY_WITH_FAC
 
     - id: VERIFY_WITH_FAC
-      purpose: "Run deterministic merge-gate verification via FAC. Default mode runs gates locally using `apm2 fac gates`."
+      purpose: "Run deterministic merge-gate verification via FAC. Gates run internally as part of `apm2 fac push` — there is no separate gates command to invoke."
       CRITICAL_PREREQUISITE: |
-        ALL changes MUST be committed before running `apm2 fac gates` in full mode or `apm2 fac push`.
-        These commands WILL FAIL on a dirty working tree. Build artifacts are attested against
+        ALL changes MUST be committed before running `apm2 fac push`.
+        This command WILL FAIL on a dirty working tree. Build artifacts are attested against
         the committed HEAD SHA and reused as a source of truth — uncommitted changes produce
-        unattestable results. Commit first, then run gates/push.
+        unattestable results. Commit first, then run push.
       steps[4]:
-        - id: RUN_FAC_GATES_FULL
+        - id: RUN_FAC_PUSH
           action: |
-            COMMIT ALL CHANGES FIRST, then run `apm2 fac gates`. Full gates require a clean working tree — no uncommitted, staged, or untracked files.
-            Immediately before push, run `apm2 fac gates`.
+            COMMIT ALL CHANGES FIRST, then run `apm2 fac push`. Push requires a clean working tree — no uncommitted, staged, or untracked files. Gates execute internally as part of push.
         - id: FIX_AND_RERUN
           action: |
-            Fix failures, COMMIT, and re-run `apm2 fac gates` until PASS or BLOCKED.
+            Fix failures, COMMIT, and re-run `apm2 fac push` until PASS or BLOCKED.
         - id: HANDLE_BUILD_FAILURES
           action: |
-            If gates fail due to build errors, check evidence logs (`apm2 fac --json logs`) for detailed output.
+            If push fails due to build errors, check evidence logs (`apm2 fac --json logs`) for detailed output.
         - id: ESCALATE_IF_BLOCKED
           action: |
             If gate execution cannot be restored to a passing state, mark the task BLOCKED with concrete evidence and escalate.
@@ -270,8 +269,7 @@ decision_tree:
 
     - id: COMMIT
       purpose: |
-        MANDATORY: Stage and commit ALL work before gates or push.
-        `apm2 fac gates` and `apm2 fac push` WILL FAIL on a dirty working tree.
+        MANDATORY: Stage and commit ALL work before gates or push. `apm2 fac push` WILL FAIL on a dirty working tree.
         Build artifacts are attested against the committed HEAD SHA and reused as
         a source of truth — uncommitted changes make attestation impossible.
         There is NO workaround. Commit everything first.
@@ -310,7 +308,7 @@ decision_tree:
 
 invariants[17]:
   # Clean Tree Invariant (HIGHEST PRIORITY — agents repeatedly violate this)
-  - "NEVER run `apm2 fac gates` or `apm2 fac push` with uncommitted changes. ALL files — code, tests, docs, tickets — MUST be committed first. Build artifacts are SHA-attested and reused as a source of truth; a dirty tree makes attestation impossible and the commands WILL FAIL."
+  - "NEVER run `apm2 fac push` with uncommitted changes. ALL files — code, tests, docs, tickets — MUST be committed first. Build artifacts are SHA-attested and reused as a source of truth; a dirty tree makes attestation impossible and the command WILL FAIL."
 
   # No Backwards Compatibility by Default
   - "Backwards compatibility is expressly and intentionally NEVER required unless specifically called out as a requirement in a work object. Do not add deprecated shims, re-exports, renamed aliases, or any other backwards-compat scaffolding by default. Breaking changes are the norm; migration paths are only required when a ticket or RFC explicitly mandates them."
