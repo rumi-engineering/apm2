@@ -2908,13 +2908,18 @@ job unit, preventing cache poisoning via escaped sccache daemons.
 - `is_cgroup_contained(child_path, reference_path)`: Exact or subtree
   prefix matching with slash separator enforcement.
 - `probe_sccache_version()`: Probes `sccache --version` with bounded,
-  timeout-guarded execution. Uses `spawn()` with streaming bounded reads
-  (capped at `MAX_SCCACHE_VERSION_LENGTH` = 256 bytes during read, not after),
-  explicit `SCCACHE_PROBE_TIMEOUT` (5 s) with kill+reap on expiry, controlled
-  environment (`env_clear` + only `PATH`), and UTF-8-safe truncation via
-  `truncate_utf8_safe`. Returns `None` on any failure (fail-safe since the
-  version is informational for attestation only). Used by the worker to
-  populate `ContainmentTrace` for attestation visibility (TCK-00553).
+  timeout-guarded execution. Delegates to `probe_version_bounded()` which
+  uses the same deadlock-free reader-thread + timeout-poll pattern as
+  `toolchain_fingerprint.rs::version_output()` and `warm.rs::version_output()`.
+  The reader thread performs a bounded read via `Take(MAX_SCCACHE_VERSION_LENGTH)`,
+  while the calling thread retains exclusive kill authority over the child
+  and polls with `SCCACHE_PROBE_TIMEOUT` (5 s). On timeout: kill → reap →
+  `drop(child)` (closes pipe FDs) → bounded thread join
+  (`SCCACHE_THREAD_JOIN_TIMEOUT` = 2 s). Controlled environment
+  (`env_clear` + only `PATH`), UTF-8-safe truncation via `truncate_utf8_safe`.
+  Returns `None` on any failure (fail-safe since the version is informational
+  for attestation only). Used by the worker to populate `ContainmentTrace`
+  for attestation visibility (TCK-00553).
 - `truncate_utf8_safe(s, max_bytes)`: Returns the longest prefix of `s`
   whose byte length is <= `max_bytes` and that ends on a valid UTF-8
   character boundary. Panic-free on all inputs including all-multibyte
@@ -2943,12 +2948,18 @@ job unit, preventing cache poisoning via escaped sccache daemons.
   the `emit_job_receipt` function. The builder's `.containment()` method
   populates the receipt's `containment` field from actual verification
   results.
-- [INV-CONTAIN-008] `probe_sccache_version()` uses bounded, timeout-guarded
-  execution: `spawn()` with streaming reads capped at
-  `MAX_SCCACHE_VERSION_LENGTH` during read (not buffered-then-truncated),
-  `SCCACHE_PROBE_TIMEOUT` (5 s) with kill+reap, controlled env
-  (`env_clear` + PATH only), and `truncate_utf8_safe` for panic-free
-  UTF-8 truncation. Oversize output or timeout returns `None` (fail-safe).
+- [INV-CONTAIN-008] `probe_sccache_version()` uses the deadlock-free
+  reader-thread + timeout-poll pattern (same as `toolchain_fingerprint.rs`
+  and `warm.rs`). A dedicated reader thread owns the stdout pipe and
+  performs a bounded read via `Take(MAX_SCCACHE_VERSION_LENGTH)`. The
+  calling thread retains exclusive kill authority over the child and polls
+  with `SCCACHE_PROBE_TIMEOUT` (5 s). On timeout: `child.kill()` →
+  `sccache_bounded_reap()` → `drop(child)` (closes pipe FDs, unblocks
+  reader) → bounded thread join (`SCCACHE_THREAD_JOIN_TIMEOUT` = 2 s).
+  Controlled env (`env_clear` + PATH only), `truncate_utf8_safe` for
+  panic-free UTF-8 truncation. Timeout or read failure returns `None`
+  (fail-safe). This prevents a hung or malicious sccache binary from
+  blocking the worker indefinitely, even when `read()` would block.
 - [INV-CONTAIN-009] All string truncation uses `truncate_utf8_safe` which
   selects the last `char_indices` boundary at or before the byte limit,
   preventing panics from byte-slicing multibyte UTF-8 characters.

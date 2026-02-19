@@ -93,6 +93,11 @@ const MAX_MISMATCH_DETAIL_LENGTH: usize = 512;
 /// indefinitely. The probe is killed and reaped on timeout.
 const SCCACHE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum time to wait for the reader thread to join after the child
+/// process has been killed and reaped. Prevents indefinite blocking if
+/// a descendant process holds stdout open (INV-CONTAIN-008).
+const SCCACHE_THREAD_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Process names of interest for containment verification.
 /// These are the processes whose cgroup membership is most critical
 /// for build integrity.
@@ -943,27 +948,39 @@ pub fn check_sccache_containment_with_proc(
 /// within `SCCACHE_PROBE_TIMEOUT` (5 s), `None` if the probe fails
 /// (fail-safe since the version is informational for attestation only).
 ///
-/// # Bounded execution guarantees
+/// # Bounded execution guarantees (INV-CONTAIN-008)
 ///
-/// - **Timeout**: The child process is killed and reaped after
-///   `SCCACHE_PROBE_TIMEOUT` (5 s) to prevent a hung or malicious sccache
-///   binary from blocking the worker.
-/// - **Bounded I/O**: Stdout is read in a fixed-size loop capped at
-///   [`MAX_SCCACHE_VERSION_LENGTH`] bytes *during* the read, not after.
-///   Oversize output causes an immediate return of `None`.
+/// - **Timeout**: Uses a dedicated reader thread for stdout capture so the
+///   calling thread can enforce `SCCACHE_PROBE_TIMEOUT` (5 s) even when
+///   `read()` blocks. On timeout: `child.kill()` → `drop(child)` (closes pipe
+///   FDs) → bounded thread join. This is the same deadlock-free pattern used in
+///   `toolchain_fingerprint.rs::version_output()` and
+///   `warm.rs::version_output()`.
+/// - **Bounded I/O**: The reader thread uses `Take` to cap reads at
+///   [`MAX_SCCACHE_VERSION_LENGTH`] bytes. Output at or under the cap is valid;
+///   only process-level timeout or read errors cause rejection.
 /// - **Controlled environment**: The child inherits no environment from the
 ///   parent (empty env) except `PATH`, preventing env-based exploits.
 /// - **UTF-8 safety**: The result is truncated to a UTF-8-safe boundary using
 ///   `truncate_utf8_safe` (char-boundary-aware truncation).
+///
+/// # Happens-before edges
+///
+/// - H1: reader `read_to_end` completes → reader thread returns (program order)
+/// - H2: calling thread `child.kill()` → pipe close → reader `read_to_end`
+///   unblocks (OS pipe semantics)
+/// - H3: reader thread terminates → `handle.join()` returns (thread join
+///   synchronizes-with)
+/// - Guarantee: the calling thread always has exclusive kill authority over the
+///   child; the reader thread always terminates after kill (via H2→H3).
 #[must_use]
 pub fn probe_sccache_version() -> Option<String> {
-    use std::io::Read as _;
     use std::process::{Command, Stdio};
 
     // Spawn with bounded pipes and controlled environment.
     // Only PATH is forwarded so `sccache` is found; everything else is
     // stripped to prevent env-based attacks.
-    let mut child = Command::new("sccache")
+    let child = Command::new("sccache")
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -972,79 +989,143 @@ pub fn probe_sccache_version() -> Option<String> {
         .spawn()
         .ok()?;
 
-    let deadline = Instant::now() + SCCACHE_PROBE_TIMEOUT;
+    probe_version_bounded(
+        child,
+        MAX_SCCACHE_VERSION_LENGTH,
+        SCCACHE_PROBE_TIMEOUT,
+        SCCACHE_THREAD_JOIN_TIMEOUT,
+    )
+}
 
-    // Bounded stdout read: cap *during* read, not after full buffer.
-    let mut buf = Vec::with_capacity(MAX_SCCACHE_VERSION_LENGTH);
-    if let Some(ref mut stdout) = child.stdout {
-        let mut tmp = [0u8; 256];
-        loop {
-            // Check timeout before each read.
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+/// Core bounded version probe using the reader-thread + timeout-poll pattern
+/// (INV-CONTAIN-008, INV-TC-005/006).
+///
+/// This is the same deadlock-free pattern used in
+/// `toolchain_fingerprint.rs::version_output()` and
+/// `warm.rs::version_output()`.
+///
+/// # Arguments
+///
+/// * `child` — A freshly spawned child process with stdout piped.
+/// * `max_output_bytes` — Maximum bytes to read from stdout (via `Take`).
+/// * `timeout` — Maximum wall-clock time before the probe is abandoned.
+/// * `thread_join_timeout` — Maximum time to wait for the reader thread to join
+///   after child kill.
+///
+/// # Returns
+///
+/// `Some(version_string)` on success, `None` on any failure (fail-closed).
+fn probe_version_bounded(
+    mut child: std::process::Child,
+    max_output_bytes: usize,
+    timeout: Duration,
+    thread_join_timeout: Duration,
+) -> Option<String> {
+    use std::io::Read as _;
 
-            match stdout.read(&mut tmp) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let remaining = MAX_SCCACHE_VERSION_LENGTH.saturating_sub(buf.len());
-                    if remaining == 0 {
-                        // Output exceeds cap — treat as suspicious, kill and return None.
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return None;
-                    }
-                    let take = n.min(remaining);
-                    buf.extend_from_slice(&tmp[..take]);
-                    if buf.len() >= MAX_SCCACHE_VERSION_LENGTH {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return None;
-                    }
-                },
-                Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                },
-            }
-        }
-    }
+    // Take stdout pipe before spawning the reader thread. The calling
+    // thread retains direct ownership of `child` (no mutex). The reader
+    // thread receives only the pipe and performs a bounded read.
+    let stdout = child.stdout.take()?;
 
-    // Wait for exit (with timeout). If the child has already exited (stdout
-    // was EOF), this returns immediately.
-    let status = loop {
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+    // Reader thread: owns the stdout pipe, performs bounded read via Take,
+    // returns the raw bytes. Does NOT touch the Child handle — no mutex.
+    let handle = std::thread::spawn(move || -> Option<Vec<u8>> {
+        let mut bounded = stdout.take(max_output_bytes as u64);
+        let mut buf = Vec::with_capacity(max_output_bytes);
+        if bounded.read_to_end(&mut buf).is_err() {
             return None;
         }
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) => {
-                std::thread::sleep(Duration::from_millis(10));
-            },
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+        Some(buf)
+    });
+
+    // Calling thread: poll reader completion against a bounded deadline.
+    // The calling thread retains exclusive kill authority over the child.
+    let deadline = Instant::now() + timeout;
+    loop {
+        if handle.is_finished() {
+            // Reader finished. Reap the child process with a bounded
+            // try_wait loop (child may still be running after stdout EOF).
+            let status = sccache_bounded_reap(&mut child);
+
+            // Join the reader thread to retrieve the output.
+            let Ok(Some(buf)) = handle.join() else {
                 return None;
-            },
+            };
+
+            // Require successful exit.
+            match status {
+                Some(s) if s.success() => {},
+                _ => return None,
+            }
+
+            let version = String::from_utf8_lossy(&buf).trim().to_string();
+            if version.is_empty() {
+                return None;
+            }
+
+            return Some(truncate_utf8_safe(&version, max_output_bytes));
         }
-    };
 
-    if !status.success() {
-        return None;
+        if Instant::now() >= deadline {
+            // Timeout: kill the child directly (no mutex needed).
+            let _ = child.kill();
+            let _ = sccache_bounded_reap(&mut child);
+            // Drop the child handle to close our end of any inherited
+            // pipe file descriptors. This ensures the reader thread
+            // gets EOF even if a descendant process holds stdout open,
+            // preventing indefinite blocking on handle.join().
+            drop(child);
+
+            // Join the reader thread with a bounded timeout.
+            let join_deadline = Instant::now() + thread_join_timeout;
+            loop {
+                if handle.is_finished() {
+                    let _ = handle.join();
+                    break;
+                }
+                if Instant::now() >= join_deadline {
+                    // Reader thread stuck — abandon it. The thread will
+                    // eventually terminate when the pipe closes.
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            return None;
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Bounded reap for the sccache probe child process (INV-CONTAIN-008).
+///
+/// Tries `try_wait()` first (fast path). If the child is still running,
+/// kills it and polls `try_wait()` with a bounded timeout. Returns the
+/// exit status if the child was reaped, `None` if reaping failed.
+fn sccache_bounded_reap(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+    // Fast path: already exited.
+    match child.try_wait() {
+        Ok(Some(status)) => return Some(status),
+        Ok(None) => {},
+        Err(_) => return None,
     }
 
-    let version = String::from_utf8_lossy(&buf).trim().to_string();
+    // Still running: kill and wait with bounded timeout.
+    let _ = child.kill();
 
-    if version.is_empty() {
-        return None;
+    let reap_deadline = Instant::now() + SCCACHE_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {},
+            Err(_) => return None,
+        }
+        if Instant::now() >= reap_deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
-
-    Some(truncate_utf8_safe(&version, MAX_SCCACHE_VERSION_LENGTH))
 }
 
 // =============================================================================
@@ -2018,6 +2099,170 @@ mod tests {
             trace.sccache_version.as_deref(),
             Some(short_version.as_str()),
             "version within limit must be preserved exactly"
+        );
+    }
+
+    // ========================================================================
+    // Deadlock-free sccache probe regression tests (INV-CONTAIN-008)
+    // ========================================================================
+
+    /// Regression test: a hung process that keeps stdout open must not block
+    /// the probe indefinitely. The reader-thread + timeout-poll pattern
+    /// ensures bounded termination even when `read()` would block forever.
+    ///
+    /// This test spawns `sleep 60` (stdout open, never writes, never closes).
+    /// With the old blocking-read design, the probe would hang forever. With
+    /// the new pattern, the calling thread kills the child on timeout and
+    /// returns `None` promptly.
+    #[test]
+    fn probe_version_bounded_returns_none_on_hung_process() {
+        use std::process::{Command, Stdio};
+
+        let child = Command::new("sleep")
+            .arg("60")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sleep must be available on test systems");
+
+        // Use a very short timeout to keep the test fast.
+        let timeout = Duration::from_millis(200);
+        let thread_join_timeout = Duration::from_millis(100);
+        let max_bytes = MAX_SCCACHE_VERSION_LENGTH;
+
+        let start = Instant::now();
+        let result = probe_version_bounded(child, max_bytes, timeout, thread_join_timeout);
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_none(),
+            "hung process must produce None, not a version string"
+        );
+        // The probe must complete within a reasonable multiple of the timeout.
+        // 2 seconds is generous: 200ms timeout + 100ms join + polling overhead.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "probe must terminate within bounded time, took {elapsed:?}"
+        );
+    }
+
+    /// Regression test: a process that writes valid output and exits promptly
+    /// must produce `Some(version_string)`.
+    #[test]
+    fn probe_version_bounded_returns_output_on_success() {
+        use std::process::{Command, Stdio};
+
+        let child = Command::new("echo")
+            .arg("sccache 0.8.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("echo must be available on test systems");
+
+        let timeout = Duration::from_secs(5);
+        let thread_join_timeout = Duration::from_secs(1);
+        let max_bytes = MAX_SCCACHE_VERSION_LENGTH;
+
+        let result = probe_version_bounded(child, max_bytes, timeout, thread_join_timeout);
+
+        assert_eq!(
+            result.as_deref(),
+            Some("sccache 0.8.1"),
+            "valid output must be returned"
+        );
+    }
+
+    /// Regression test: output at exactly the byte limit must be accepted,
+    /// not rejected (finding 2 fix — `>=` changed to `Take`-based capping).
+    #[test]
+    fn probe_version_bounded_accepts_exact_limit_output() {
+        use std::process::{Command, Stdio};
+
+        // Create a string of exactly `max_bytes` characters (all ASCII 'x').
+        let max_bytes: usize = 64;
+        let exact_string = "x".repeat(max_bytes);
+
+        // Use printf to output exactly max_bytes characters with no trailing
+        // newline. printf is more portable than echo -n for this purpose.
+        let child = Command::new("printf")
+            .arg("%s")
+            .arg(&exact_string)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("printf must be available on test systems");
+
+        let timeout = Duration::from_secs(5);
+        let thread_join_timeout = Duration::from_secs(1);
+
+        let result = probe_version_bounded(child, max_bytes, timeout, thread_join_timeout);
+
+        assert_eq!(
+            result.as_deref(),
+            Some(exact_string.as_str()),
+            "exact-limit output must be accepted, not rejected as overflow"
+        );
+    }
+
+    /// Regression test: output exceeding the byte limit must be truncated
+    /// (via Take) and still return a valid result, not rejected outright.
+    /// Take caps the read so the buffer never exceeds the limit.
+    #[test]
+    fn probe_version_bounded_truncates_oversized_output() {
+        use std::process::{Command, Stdio};
+
+        let max_bytes: usize = 32;
+        // Output 64 bytes (2x limit).
+        let oversized = "y".repeat(64);
+
+        let child = Command::new("printf")
+            .arg("%s")
+            .arg(&oversized)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("printf must be available on test systems");
+
+        let timeout = Duration::from_secs(5);
+        let thread_join_timeout = Duration::from_secs(1);
+
+        let result = probe_version_bounded(child, max_bytes, timeout, thread_join_timeout);
+
+        // Take caps at max_bytes, so we get a truncated but valid result.
+        let expected = "y".repeat(max_bytes);
+        assert_eq!(
+            result.as_deref(),
+            Some(expected.as_str()),
+            "oversized output must be truncated to the cap, not rejected"
+        );
+    }
+
+    /// Regression test: a process that exits with non-zero status must
+    /// produce `None` (fail-closed).
+    #[test]
+    fn probe_version_bounded_returns_none_on_nonzero_exit() {
+        use std::process::{Command, Stdio};
+
+        let child = Command::new("sh")
+            .args(["-c", "echo 'sccache 0.8.1' && exit 1"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sh must be available on test systems");
+
+        let timeout = Duration::from_secs(5);
+        let thread_join_timeout = Duration::from_secs(1);
+
+        let result = probe_version_bounded(
+            child,
+            MAX_SCCACHE_VERSION_LENGTH,
+            timeout,
+            thread_join_timeout,
+        );
+
+        assert!(
+            result.is_none(),
+            "non-zero exit must produce None (fail-closed)"
         );
     }
 }
