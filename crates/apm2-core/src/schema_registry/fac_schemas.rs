@@ -105,6 +105,10 @@ pub const EFFICIENCY_PRIMITIVES_SCHEMA_ID: &str = "apm2.efficiency_primitives.v1
 /// Schema ID for credential mount descriptor v1.
 pub const CREDENTIAL_MOUNT_SCHEMA_ID: &str = "apm2.fac.credential_mount.v1";
 
+// -- Toolchain fingerprint --
+/// Schema ID for toolchain fingerprint v1.
+pub const TOOLCHAIN_FINGERPRINT_SCHEMA_ID: &str = "apm2.fac.toolchain_fingerprint.v1";
+
 // ---------------------------------------------------------------------------
 // Central registry list
 // ---------------------------------------------------------------------------
@@ -133,6 +137,7 @@ pub const ALL_FAC_SCHEMA_IDS: &[&str] = &[
     REVIEW_BLOCKED_SCHEMA_ID,
     EFFICIENCY_PRIMITIVES_SCHEMA_ID,
     CREDENTIAL_MOUNT_SCHEMA_ID,
+    TOOLCHAIN_FINGERPRINT_SCHEMA_ID,
 ];
 
 // ---------------------------------------------------------------------------
@@ -348,7 +353,7 @@ mod tests {
         // ALL_FAC_SCHEMA_IDS, acting as a change-detection gate.
         assert_eq!(
             ALL_FAC_SCHEMA_IDS.len(),
-            14,
+            15,
             "ALL_FAC_SCHEMA_IDS count changed — update this test after adding new schemas"
         );
     }

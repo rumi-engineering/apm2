@@ -331,6 +331,20 @@ Security invariants:
   commit failures are handled via `handle_pipeline_commit_failure` which leaves the job
   in `claimed/` for reconcile to repair. No denial returns without an atomic terminal
   queue state transition.
+- **Fingerprint-namespaced lane target dir** (`fac_worker.rs`, TCK-00538 fix round 2):
+  CARGO_TARGET_DIR within lanes is namespaced by toolchain fingerprint as
+  `target-<hex16>` (first 16 hex characters of the fingerprint). This ensures that
+  toolchain changes produce a fresh build directory, preventing stale incremental
+  compilation artifacts from a different compiler version.
+- **Cached toolchain fingerprint** (`fac_worker.rs`, TCK-00538 fix round 3):
+  Worker startup resolves the toolchain fingerprint with a cache-first strategy:
+  load from `$APM2_HOME/private/fac/toolchain/fingerprint.v1.json` (bounded read,
+  O_NOFOLLOW), validate by re-deriving fingerprint from stored raw versions, and
+  skip probes if valid. On cache miss/invalid, compute fresh via probes and persist
+  atomically with restricted permissions (dir 0o700, file 0o600). Cache write
+  failure is non-fatal. Required probes (rustc, cargo) propagate errors for
+  fail-closed startup. Process reaping after read completion uses bounded
+  `try_wait()` + `kill()` loop (5s timeout) to prevent indefinite blocking.
 - **Systemd-run containment** (`fac_worker.rs`, `warm.rs`): Warm phase subprocesses
   (which compile untrusted repository code including `build.rs` and proc-macros) are
   wrapped in `systemd-run` transient units with MemoryMax/CPUQuota/TasksMax/RuntimeMaxSec

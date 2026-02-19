@@ -2136,6 +2136,96 @@ systemd process monitoring provides.
 - [INV-WHB-005] The heartbeat file is not authoritative for admission or
   security decisions. It is an observability signal only.
 
+## toolchain_fingerprint Submodule (TCK-00538)
+
+The `toolchain_fingerprint` submodule implements stable derivation, caching,
+and validation of toolchain fingerprints. A toolchain fingerprint is a
+domain-separated BLAKE3 hash (`b3-256:<hex>`) of the raw version output from
+`rustc -Vv`, `cargo -V`, `cargo-nextest -V`, and `systemd-run --version`.
+
+The fingerprint is resolved once at worker startup with a cache-first strategy:
+1. Try loading cache from `$APM2_HOME/private/fac/toolchain/fingerprint.v1.json`
+   using bounded reads (`MAX_CACHE_FILE_BYTES = 65536`, `O_NOFOLLOW`).
+2. If cache exists, validate integrity by re-deriving fingerprint from stored
+   raw versions and comparing (INV-TC-004). If valid, skip process spawning.
+3. If cache is missing/invalid/corrupt, compute fresh via probes.
+4. Persist new fingerprint atomically with restricted perms (dir 0o700,
+   file 0o600, symlink-safe writes). Cache write failure is non-fatal.
+
+Required probes (rustc, cargo) must succeed or the worker refuses to start
+(fail-closed, INV-TC-003). Optional probes (nextest, systemd-run) produce
+`None` on failure.
+
+### Key Types
+
+- `ToolchainVersions`: Raw version strings from the four probed tools. All
+  fields are `Option<String>` (a tool may be absent or unreachable). Implements
+  `Default`, `Serialize`, `Deserialize`.
+- `CachedFingerprint`: On-disk cache structure containing the fingerprint
+  string and raw versions for integrity validation.
+- `ToolchainFingerprintError`: Error taxonomy covering I/O failures,
+  required probe failures (`RequiredProbeFailed`), and process reap
+  timeouts (`ReapTimeout`).
+
+### Core Capabilities
+
+- `resolve_fingerprint(hardened_env)`: Top-level entry point. Collects tool
+  version probes, derives the fingerprint hash, and returns. Required probes
+  (rustc, cargo) propagate errors for fail-closed startup.
+- `resolve_fingerprint_cached(hardened_env, cache_bytes)`: Cache-first
+  resolution. Validates cached fingerprint if present, falls through to
+  fresh probes on cache miss/invalid.
+- `derive_from_versions(versions)`: Public deterministic derivation from a
+  `ToolchainVersions` value. Uses domain-separated BLAKE3 with
+  length-prefixed encoding for each tool's output.
+- `collect_toolchain_versions(hardened_env)`: Probes all four tools with
+  bounded stdout reads (`MAX_VERSION_OUTPUT_BYTES = 8192`) and a
+  10-second timeout. Required probes (rustc, cargo) return errors on
+  failure. Uses the deadlock-free version probe pattern (INV-WARM-013)
+  where the calling thread owns the `Child` directly.
+- `validate_cached_fingerprint(bytes)`: Validates a cache file by
+  re-deriving the fingerprint from stored raw versions (INV-TC-004).
+- `serialize_cache(fingerprint, versions)`: Produces JSON bytes for
+  atomic cache persistence.
+- `cache_dir(fac_root)` / `cache_file_path(fac_root)`: Path helpers for
+  the cache location under `<fac_root>/toolchain/`.
+- `is_valid_fingerprint(s)`: Format validation for `b3-256:<64 hex chars>`.
+- `fingerprint_short_hex(s)`: Extracts the first 16 hex characters from a
+  fingerprint string, suitable for use as a directory name suffix (e.g.,
+  lane target dir namespacing).
+
+### Security Invariants (TCK-00538)
+
+- [INV-TC-001] Fingerprint changes when any toolchain component changes.
+- [INV-TC-002] Fingerprint is consistent across processes on the same node
+  (deterministic hash over deterministic inputs).
+- [INV-TC-003] Required probes (rustc, cargo) must succeed or the worker
+  refuses to start (fail-closed).
+- [INV-TC-004] Cache is validated by re-deriving the fingerprint from
+  stored raw versions before use.
+- [INV-TC-005] Tool version probes are bounded by `MAX_VERSION_OUTPUT_BYTES`
+  and `VERSION_PROBE_TIMEOUT` to prevent OOM and hang.
+- [INV-TC-006] Process reaping is bounded by `PROCESS_REAP_TIMEOUT` (5s).
+  After read completion, `try_wait()` checks for exit; if still running,
+  `kill()` + bounded `try_wait()` loop prevents indefinite blocking.
+- [INV-TCF-001] Fingerprint uses domain-separated BLAKE3 with domain
+  `apm2.fac.toolchain_fingerprint.v1` and length-prefixed injective
+  framing (`GATE_HASH_PREIMAGE_FRAMING`).
+- [INV-TCF-006] Version probes use hardened environment (env_clear +
+  selective re-injection of PATH, HOME, USER) for defense-in-depth
+  (INV-WARM-012).
+- [INV-TCF-007] Version probes use the deadlock-free design from
+  INV-WARM-013: calling thread owns `Child`, helper thread owns only
+  `ChildStdout` pipe.
+- [INV-TCF-010] Fingerprint is included in `FacJobReceiptV1` as
+  `toolchain_fingerprint: Option<String>` with format validation in
+  both builder `try_build()` and `validate()`.
+- [INV-TCF-011] Lane CARGO_TARGET_DIR is namespaced by toolchain fingerprint
+  (first 16 hex chars as `target-<hex16>`) so toolchain changes get fresh
+  build directories, preventing stale artifact corruption.
+- [INV-TCF-012] Worker startup is fail-closed: if fingerprint resolution
+  fails, the worker refuses to start and returns an error exit code.
+
 ## warm Submodule (TCK-00525)
 
 The `warm` submodule implements lane-scoped prewarming with content-addressed

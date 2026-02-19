@@ -909,6 +909,7 @@ mod tests {
             bytes_backend: None,
             htf_time_envelope_ns: None,
             node_fingerprint: None,
+            toolchain_fingerprint: None,
             timestamp_secs: timestamp,
             content_hash: content_hash.to_string(),
         }

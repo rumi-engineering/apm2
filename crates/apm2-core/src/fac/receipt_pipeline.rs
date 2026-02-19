@@ -1040,6 +1040,7 @@ mod tests {
             bytes_backend: None,
             htf_time_envelope_ns: None,
             node_fingerprint: None,
+            toolchain_fingerprint: None,
             timestamp_secs: 1000,
             content_hash: String::new(),
         };
