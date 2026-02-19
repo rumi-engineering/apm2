@@ -180,13 +180,27 @@ scope:
           the error, so posting failures are invisible to the user and not
           retried.
 
+        Additional observed bug:
+          When a comment does get posted, `project_decision_comment_with`
+          resolves an existing comment via `fetch_latest_live_verdict_comment_id`
+          and issues an UPDATE (PATCH) rather than a CREATE (POST).  This means
+          re-reviews on a new head SHA silently edit the old round's comment
+          instead of posting a fresh one.  Each review round (scoped to a
+          specific head SHA) must produce its own new comment.
+
         Required fix:
           1. In `verdict_projection.rs`, remove the `all_dimensions_resolved`
              guard in the `ProjectionMode::Full` arm.  Always call
              `project_decision_comment`; rely on the existing merge logic in
              `project_decision_comment_with` to handle partial/cross-process
              records.
-          2. Propagate `create_issue_comment` / `update_issue_comment`
+          2. Scope comment identity to `(pr_number, head_sha)`.  When posting
+             a verdict comment, never look up or reuse a comment ID from a
+             prior head SHA.  Within a single review round (same head SHA),
+             the first dimension to post creates the comment; the second
+             dimension updates that same comment to include both.  Across
+             rounds (different head SHA), always create a new comment.
+          3. Propagate `create_issue_comment` / `update_issue_comment`
              failures as hard errors (return `Err(...)`) rather than
              silently falling back to a local placeholder URL.
 
@@ -194,9 +208,11 @@ scope:
           - After both review dimensions resolve, the projection record
             contains a real GitHub comment URL (https://github.com/...)
             and a real comment ID (not in the `PR# × 10^9` placeholder range).
-          - When security resolves first, a partial verdict comment is created
-            on GitHub; when quality resolves, the same comment is updated to
-            include both dimensions.
+          - When security resolves first, a new comment is created on GitHub;
+            when quality resolves, that same comment is updated to include
+            both dimensions.
+          - When a PR is updated (new head SHA) and re-reviewed, a brand-new
+            comment is posted — the prior round's comment is never edited.
           - A `create_issue_comment` failure surfaces as a non-zero exit and
             is not silently replaced by a local placeholder.
 
