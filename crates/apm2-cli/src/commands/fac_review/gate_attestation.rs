@@ -185,7 +185,6 @@ fn gate_input_paths(gate_name: &str) -> &'static [&'static str] {
             "crates/apm2-cli/src/commands/fac_review/gate_checks.rs",
             "documents/reviews/CODE_QUALITY_PROMPT.cac.json",
             "documents/reviews/SECURITY_REVIEW_PROMPT.cac.json",
-            "documents/reviews/trusted-reviewers.json",
         ],
         _ => &[],
     }

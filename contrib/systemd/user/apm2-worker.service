@@ -2,8 +2,7 @@
 Description=APM2 FAC Worker
 Documentation=https://github.com/guardian-intelligence/apm2
 After=network-online.target apm2-daemon.service
-Wants=apm2-daemon.service
-Requires=apm2-daemon.service
+BindsTo=apm2-daemon.service
 
 [Service]
 # TCK-00600: Type=notify — worker sends READY=1 after broker connection,

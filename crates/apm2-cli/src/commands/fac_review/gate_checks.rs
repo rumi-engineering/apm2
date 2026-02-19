@@ -20,7 +20,6 @@ use crate::commands::fac_secure_io;
 
 pub const TEST_SAFETY_ALLOWLIST_REL_PATH: &str = "documents/reviews/test-safety-allowlist.txt";
 pub const REVIEW_ARTIFACTS_REL_PATH: &str = "documents/reviews";
-pub const TRUSTED_REVIEWERS_REL_PATH: &str = "documents/reviews/trusted-reviewers.json";
 pub const WORKSPACE_INTEGRITY_SNAPSHOT_REL_PATH: &str =
     "target/ci/workspace_integrity.snapshot.tsv";
 
@@ -30,7 +29,6 @@ const MAX_TEST_SAFETY_TOTAL_SOURCE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_TEST_SAFETY_ALLOWLIST_FILE_SIZE: usize = 512 * 1024;
 const MAX_REVIEW_ARTIFACT_FILE_SIZE: usize = 10 * 1024 * 1024;
 const MAX_PROMPT_FILE_SIZE: usize = 4 * 1024 * 1024;
-const MAX_TRUSTED_REVIEWERS_FILE_SIZE: usize = 1024 * 1024;
 const MAX_WORKSPACE_SNAPSHOT_FILE_SIZE: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -903,32 +901,6 @@ pub fn run_review_artifact_lint(workspace_root: &Path) -> Result<CheckExecution,
         }
     }
 
-    writeln!(output, "INFO: Checking trusted-reviewers.json integrity...").ok();
-    let trusted_reviewers = workspace_root.join(TRUSTED_REVIEWERS_REL_PATH);
-    if trusted_reviewers.is_file() {
-        let bytes =
-            fac_secure_io::read_bounded(&trusted_reviewers, MAX_TRUSTED_REVIEWERS_FILE_SIZE)
-                .map_err(|err| format!("failed to read {}: {err}", trusted_reviewers.display()))?;
-        if let Err(err) = serde_json::from_slice::<Value>(&bytes) {
-            violations.push(format!(
-                "Invalid JSON in {}: {err}",
-                trusted_reviewers.display()
-            ));
-        } else {
-            writeln!(
-                output,
-                "INFO:   {}: valid JSON",
-                trusted_reviewers.display()
-            )
-            .ok();
-        }
-    } else {
-        violations.push(format!(
-            "Missing trusted-reviewers.json at {}",
-            trusted_reviewers.display()
-        ));
-    }
-
     if violations.is_empty() {
         writeln!(output).ok();
         writeln!(
@@ -1265,9 +1237,7 @@ mod tests {
 
     fn write_valid_review_artifacts(repo: &Path) {
         let review_dir = repo.join("documents/reviews");
-        let gate_dir = repo.join("documents/reviews");
         fs::create_dir_all(&review_dir).expect("create review dir");
-        fs::create_dir_all(&gate_dir).expect("create review gate dir");
 
         let prompt = r#"{
   "payload": {
@@ -1292,8 +1262,6 @@ mod tests {
             .expect("write code quality prompt");
         fs::write(review_dir.join("SECURITY_REVIEW_PROMPT.cac.json"), prompt)
             .expect("write security prompt");
-        fs::write(gate_dir.join("trusted-reviewers.json"), b"[]\n")
-            .expect("write trusted reviewers");
     }
 
     #[test]

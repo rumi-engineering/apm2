@@ -5478,9 +5478,6 @@ time.sleep(20)\n",
             .expect("write code quality prompt");
         fs::write(review_dir.join("SECURITY_REVIEW_PROMPT.cac.json"), prompt)
             .expect("write security prompt");
-        fs::write(review_gate_dir.join("trusted-reviewers.json"), b"[]\n")
-            .expect("write trusted reviewers");
-
         let cargo_path = bin_dir.join("cargo");
         fs::set_permissions(cargo_path, fs::Permissions::from_mode(0o755))
             .expect("set fake cargo mode");

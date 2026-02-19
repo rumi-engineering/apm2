@@ -302,7 +302,6 @@ const ALLOWED_WORKSPACE_ROOTS_ENV: &str = "APM2_FAC_ALLOWED_WORKSPACE_ROOTS";
 const GATES_HEARTBEAT_REFRESH_SECS: u64 = 5;
 const ORPHAN_LEASE_WARNING_MULTIPLIER: u64 = 2;
 const MAX_COMPLETED_SCAN_ENTRIES: usize = 4096;
-const SHA_DEDUPE_PUSH_WINDOW_SECS: u64 = 900;
 const MAX_TERMINAL_JOB_METADATA_FILE_SIZE: usize = MAX_JOB_SPEC_SIZE * 4;
 
 #[cfg(test)]
@@ -2364,9 +2363,7 @@ struct ShaDuplicateMatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CompletedGatesFingerprint {
     job_id: String,
-    request_id: String,
     enqueue_time: String,
-    enqueue_epoch_secs: Option<u64>,
     repo_id: String,
     head_sha: String,
 }
@@ -2381,13 +2378,7 @@ struct CompletedGatesFingerprintSpec {
     job_id: String,
     kind: String,
     enqueue_time: String,
-    actuation: CompletedGatesFingerprintActuation,
     source: CompletedGatesFingerprintSource,
-}
-
-#[derive(Debug, Deserialize)]
-struct CompletedGatesFingerprintActuation {
-    request_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2403,9 +2394,7 @@ impl CompletedGatesFingerprint {
         }
         Some(Self {
             job_id: spec.job_id.clone(),
-            request_id: spec.actuation.request_id.clone(),
             enqueue_time: spec.enqueue_time.clone(),
-            enqueue_epoch_secs: parse_enqueue_time_epoch_secs(&spec.enqueue_time),
             repo_id: spec.source.repo_id.clone(),
             head_sha: spec.source.head_sha.clone(),
         })
@@ -2418,8 +2407,6 @@ impl CompletedGatesFingerprint {
         }
         Some(Self {
             job_id: parsed.job_id,
-            request_id: parsed.actuation.request_id,
-            enqueue_epoch_secs: parse_enqueue_time_epoch_secs(&parsed.enqueue_time),
             enqueue_time: parsed.enqueue_time,
             repo_id: parsed.source.repo_id,
             head_sha: parsed.source.head_sha,
@@ -2458,38 +2445,8 @@ fn append_completed_gates_fingerprint_if_loaded(
     cache.insert(fingerprint);
 }
 
-fn parse_enqueue_time_epoch_secs(value: &str) -> Option<u64> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .ok()
-        .and_then(|dt| u64::try_from(dt.timestamp()).ok())
-}
-
 fn normalize_dedupe_key_component(value: &str) -> String {
     value.trim().to_ascii_lowercase()
-}
-
-fn sha_dedupe_match_basis(
-    incoming_request_id: &str,
-    incoming_enqueue_epoch_secs: Option<u64>,
-    existing_request_id: &str,
-    existing_enqueue_epoch_secs: Option<u64>,
-) -> Option<&'static str> {
-    let incoming_request_id = incoming_request_id.trim();
-    let existing_request_id = existing_request_id.trim();
-    if !incoming_request_id.is_empty()
-        && !existing_request_id.is_empty()
-        && incoming_request_id.eq_ignore_ascii_case(existing_request_id)
-    {
-        return Some("request_id");
-    }
-
-    let incoming_enqueue = incoming_enqueue_epoch_secs?;
-    let existing_enqueue = existing_enqueue_epoch_secs?;
-    if incoming_enqueue.abs_diff(existing_enqueue) <= SHA_DEDUPE_PUSH_WINDOW_SECS {
-        return Some("enqueue_time_window");
-    }
-
-    None
 }
 
 fn load_completed_gates_fingerprints(
@@ -2553,25 +2510,12 @@ fn find_completed_gates_duplicate_in_cache(
         normalize_dedupe_key_component(incoming.source.head_sha.as_str()),
     );
     let existing_fingerprints = completed_gates_cache.by_repo_sha.get(&key)?;
-    let incoming_enqueue_epoch_secs = parse_enqueue_time_epoch_secs(incoming.enqueue_time.as_str());
-    for existing in existing_fingerprints {
-        let Some(matched_by) = sha_dedupe_match_basis(
-            incoming.actuation.request_id.as_str(),
-            incoming_enqueue_epoch_secs,
-            existing.request_id.as_str(),
-            existing.enqueue_epoch_secs,
-        ) else {
-            continue;
-        };
-
-        return Some(ShaDuplicateMatch {
-            existing_job_id: existing.job_id.clone(),
-            existing_enqueue_time: existing.enqueue_time.clone(),
-            matched_by,
-        });
-    }
-
-    None
+    let existing = existing_fingerprints.first()?;
+    Some(ShaDuplicateMatch {
+        existing_job_id: existing.job_id.clone(),
+        existing_enqueue_time: existing.enqueue_time.clone(),
+        matched_by: "repo_sha",
+    })
 }
 
 fn find_completed_gates_duplicate(
@@ -2848,10 +2792,10 @@ fn process_job(
     // TCK-00622 S8: SHA-level gates dedupe.
     //
     // For `gates` jobs, deny duplicate submissions when a completed receipt
-    // already exists for the same `(repo_id, head_sha, kind)` in the same
-    // push freshness window. This prevents queue starvation from replayed
-    // submissions while still allowing explicit re-runs on later force-push
-    // events (request-id change and enqueue-time drift beyond window).
+    // already exists for the same `(repo_id, head_sha)`. The request_id is
+    // unique per invocation (includes job_id/enqueue_time in its hash) and
+    // is therefore not a useful dedup key. Matching on the repo+SHA content
+    // tuple ensures duplicate pushes of the same commit are not re-gated.
     if let Some(dupe) =
         find_completed_gates_duplicate(queue_root, fac_root, spec, completed_gates_cache)
     {
@@ -10337,17 +10281,15 @@ mod tests {
         )
         .expect("duplicate");
         assert_eq!(duplicate.existing_job_id, completed_spec.job_id);
-        assert_eq!(duplicate.matched_by, "request_id");
+        assert_eq!(duplicate.matched_by, "repo_sha");
     }
 
     #[test]
-    fn test_find_completed_gates_duplicate_matches_by_enqueue_window_when_request_id_differs() {
+    fn test_find_completed_gates_duplicate_matches_on_repo_sha_regardless_of_request_id() {
         let mut cache = CompletedGatesCache::default();
         cache.insert(CompletedGatesFingerprint {
             job_id: "job-completed-sha".to_string(),
-            request_id: "request-old".to_string(),
             enqueue_time: "2026-02-19T01:00:00Z".to_string(),
-            enqueue_epoch_secs: parse_enqueue_time_epoch_secs("2026-02-19T01:00:00Z"),
             repo_id: "owner/repo".to_string(),
             head_sha: "abc123".to_string(),
         });
@@ -10358,35 +10300,10 @@ mod tests {
         incoming.actuation.request_id = "request-new".to_string();
         incoming.enqueue_time = "2026-02-19T01:10:00Z".to_string();
 
-        let duplicate =
-            find_completed_gates_duplicate_in_cache(&incoming, &cache).expect("duplicate");
+        let duplicate = find_completed_gates_duplicate_in_cache(&incoming, &cache)
+            .expect("same (repo_id, head_sha) must match");
         assert_eq!(duplicate.existing_job_id, "job-completed-sha");
-        assert_eq!(duplicate.matched_by, "enqueue_time_window");
-    }
-
-    #[test]
-    fn test_find_completed_gates_duplicate_ignores_outside_push_window() {
-        let mut cache = CompletedGatesCache::default();
-        cache.insert(CompletedGatesFingerprint {
-            job_id: "job-completed-sha".to_string(),
-            request_id: "request-old".to_string(),
-            enqueue_time: "2026-02-19T01:00:00Z".to_string(),
-            enqueue_epoch_secs: parse_enqueue_time_epoch_secs("2026-02-19T01:00:00Z"),
-            repo_id: "owner/repo".to_string(),
-            head_sha: "abc123".to_string(),
-        });
-
-        let mut incoming = make_receipt_test_spec();
-        incoming.source.repo_id = "owner/repo".to_string();
-        incoming.source.head_sha = "abc123".to_string();
-        incoming.actuation.request_id = "request-new".to_string();
-        incoming.enqueue_time = "2026-02-19T02:00:00Z".to_string();
-
-        let duplicate = find_completed_gates_duplicate_in_cache(&incoming, &cache);
-        assert!(
-            duplicate.is_none(),
-            "same SHA beyond push window should remain eligible for re-execution"
-        );
+        assert_eq!(duplicate.matched_by, "repo_sha");
     }
 
     #[test]
@@ -10407,7 +10324,7 @@ mod tests {
         )
         .expect("duplicate");
         assert_eq!(duplicate.existing_job_id, "job-completed-sha");
-        assert_eq!(duplicate.matched_by, "request_id");
+        assert_eq!(duplicate.matched_by, "repo_sha");
     }
 
     #[test]
@@ -10424,7 +10341,7 @@ mod tests {
         annotate_denied_job_file(
             &denied_path,
             Some(DenialReasonCode::AlreadyCompleted),
-            "already completed in this push window",
+            "already completed for repo+sha",
         )
         .expect("annotate denied job");
 
@@ -10441,7 +10358,7 @@ mod tests {
             payload
                 .get("denial_reason")
                 .and_then(serde_json::Value::as_str),
-            Some("already completed in this push window")
+            Some("already completed for repo+sha")
         );
         assert!(
             payload
