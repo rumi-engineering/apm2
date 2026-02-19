@@ -976,26 +976,17 @@ where
     if superseded_remote_comment_id.is_none()
         && let Some(latest_remote_comment_id) = latest_known_remote_comment_id
     {
-        if ALWAYS_CREATE_NEW_VERDICT_COMMENT {
-            superseded_remote_comment_id = Some(latest_remote_comment_id);
-        } else {
-            match fetch_comment(owner_repo, latest_remote_comment_id) {
-                Ok(Some(found)) => {
-                    let latest_body = {
-                        let merged = merge_remote_dimensions_payload(
-                            payload,
-                            &found.body,
-                            pr_number,
-                            &record.head_sha,
-                        );
-                        render_decision_comment_body(
-                            owner_repo,
-                            pr_number,
-                            &record.head_sha,
-                            &merged,
-                        )?
-                    };
-                    create_body.clone_from(&latest_body);
+        match fetch_comment(owner_repo, latest_remote_comment_id) {
+            Ok(Some(found)) => {
+                let latest_body = {
+                    let merged =
+                        merge_remote_dimensions_payload(payload, &found.body, pr_number, &record.head_sha);
+                    render_decision_comment_body(owner_repo, pr_number, &record.head_sha, &merged)?
+                };
+                create_body.clone_from(&latest_body);
+                if ALWAYS_CREATE_NEW_VERDICT_COMMENT {
+                    superseded_remote_comment_id = Some(found.id);
+                } else {
                     match update_comment(owner_repo, found.id, &latest_body) {
                         Ok(()) => return Ok((found.id, found.html_url)),
                         Err(err) => {
@@ -1006,14 +997,14 @@ where
                             superseded_remote_comment_id = Some(found.id);
                         },
                     }
-                },
-                Ok(None) => {},
-                Err(err) => {
-                    eprintln!(
-                        "WARNING: failed to resolve latest remote verdict comment {latest_remote_comment_id} for PR #{pr_number}: {err}"
-                    );
-                },
-            }
+                }
+            },
+            Ok(None) => {},
+            Err(err) => {
+                eprintln!(
+                    "WARNING: failed to resolve latest remote verdict comment {latest_remote_comment_id} for PR #{pr_number}: {err}"
+                );
+            },
         }
     }
 
@@ -2807,7 +2798,7 @@ mod tests {
             comment_url,
             "https://github.com/example/repo/issues/666#issuecomment-88"
         );
-        assert_eq!(fetch_calls, 0);
+        assert_eq!(fetch_calls, 1);
         assert_eq!(update_calls, 1);
         assert_eq!(create_calls, 1);
         assert_eq!(tombstoned_comment_id, Some(77));
@@ -2882,7 +2873,7 @@ mod tests {
         )
         .expect("latest remote verdict comment should be superseded by create+tombstone");
 
-        assert_eq!(fetch_calls, 0);
+        assert_eq!(fetch_calls, 1);
         assert_eq!(comment_id, 88);
         assert_eq!(
             comment_url,
@@ -2893,7 +2884,7 @@ mod tests {
     }
 
     #[test]
-    fn project_decision_comment_creates_new_comment_without_remote_merge_on_reinitialize() {
+    fn project_decision_comment_creates_new_comment_with_remote_merge_on_reinitialize() {
         let owner_repo = "example/repo";
         let pr_number = 669;
         let head_sha = "1111222233334444555566667777888899990000";
@@ -2962,9 +2953,15 @@ mod tests {
             pr_number,
             &record,
             &payload,
-            |_, _| {
+            |_, id| {
                 fetch_calls = fetch_calls.saturating_add(1);
-                Ok(None)
+                assert_eq!(id, 77);
+                Ok(Some(super::github_projection::IssueCommentResponse {
+                    id,
+                    html_url: "https://github.com/example/repo/issues/669#issuecomment-77"
+                        .to_string(),
+                    body: remote_body.clone(),
+                }))
             },
             |_, id, body| {
                 update_calls = update_calls.saturating_add(1);
@@ -2987,7 +2984,7 @@ mod tests {
         )
         .expect("reinitialized projection should create a fresh comment");
 
-        assert_eq!(fetch_calls, 0);
+        assert_eq!(fetch_calls, 1);
         assert_eq!(update_calls, 1);
         assert_eq!(comment_id, 88);
         assert_eq!(
@@ -2997,8 +2994,8 @@ mod tests {
         assert_eq!(create_calls, 1);
         assert!(created_body.contains("code-quality:"));
         assert!(created_body.contains("quality-blocker"));
-        assert!(!created_body.contains("security:"));
-        let _ = remote_body;
+        assert!(created_body.contains("security:"));
+        assert!(created_body.contains("security-ok"));
     }
 
     #[test]

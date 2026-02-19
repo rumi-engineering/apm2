@@ -3,12 +3,12 @@ ticket_meta:
   template_version: "2026-01-29"
   ticket:
     id: "TCK-00623"
-    title: "Define and implement signed content-addressed dependency closure artifact"
+    title: "FAC review/push closure-complete hardening, projection durability, and CLI surface cleanup"
     status: "OPEN"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"
-    requirements: ["REQ-0034"]
+    requirements: ["REQ-0034", "REQ-0042"]
     evidence_artifacts: []
   custody:
     agent_roles: ["AGENT_IMPLEMENTER"]
@@ -16,326 +16,126 @@ ticket_meta:
   dependencies:
     tickets:
       - ticket_id: "TCK-00621"
-        reason: "PREP phase hook for closure hydration must exist before closure artifact can be wired."
+        reason: "PREP phase infrastructure and queue/lifecycle hardening are prerequisites."
       - ticket_id: "TCK-00622"
-        reason: "Network policy for hydration is defined in TCK-00622; closure artifact must be consistent with it."
+        reason: "Worker dedup/network posture semantics are consumed by push/gates closure behavior."
 
 root_cause_analysis:
   summary: |
-    Gate execution has no formal definition of its dependency supply. Cargo
-    registry fetches, git dependency clones, and toolchain resolution happen
-    implicitly at build time with no content-addressed record. This means:
-    cache reuse cannot reason about supply changes (toolchain upgrade silently
-    invalidates results without a cache miss), network access cannot be
-    eliminated during EXECUTE (nothing is pre-fetched), and supply chain
-    tampering has no detection surface. A signed closure artifact closes all
-    three gaps.
+    FAC push/review had several brittle integration edges that could stall the
+    lifecycle or degrade reviewer trust:
+    1) `fac review prepare` could diff against an incorrect base after main
+       advanced, producing empty or misleading review inputs.
+    2) Verdict projection behavior around comment lifecycle/fan-in was fragile,
+       especially across re-runs and per-SHA comment identity.
+    3) Legacy CLI subcommands overlapped with lifecycle/doctor semantics and
+       increased operational confusion.
+    4) Push warm-path dedup behavior needed to stay closure-complete and
+       non-blocking when gates were already satisfied.
 
 scope:
   in_scope:
-    - id: "S1_CLOSURE_SCHEMA"
-      title: "Define GateSupplyClosureV1 schema"
-      detail: |
-        GateSupplyClosureV1:
-          schema: "apm2.fac.gate_supply_closure.v1"
-          closure_hash: String  (blake3 of canonical serialization of all entries)
-          entries:
-            - kind: registry | git | toolchain
-              name: String
-              version: String
-              content_hash: String  (sha256 of content)
-              source_url: Option<String>  (for hydration; not used in EXECUTE)
-          signed_at: Timestamp
-          signer_key_id: String
-          signature: String  (ed25519 over closure_hash + signed_at)
-        Store at: $APM2_HOME/private/fac/closure/{closure_hash}.yaml
-    - id: "S2_CLOSURE_HASH_IN_ATTESTATION"
-      title: "Bind closure_hash into gate attestation receipts"
-      detail: |
-        Add closure_hash field to GateCacheEntryV2 and gate attestation
-        receipt. Cache lookup MUST reject entries where closure_hash does
-        not match the current closure_hash. This deterministically invalidates
-        cache entries when the closure changes.
-    - id: "S3_PREP_HYDRATION"
-      title: "Implement closure hydration in PREP phase"
-      detail: |
-        Wire PREP closure hydration hook (from TCK-00621/TCK-00622):
-          1. Load existing closure if present.
-          2. Compute expected closure_hash for current workspace state.
-          3. If hash matches and all entries are present: no-op.
-          4. If entries are missing and network available: fetch missing entries,
-             update closure, re-sign.
-          5. If entries are missing and network unavailable: emit
-             PREP_SUPPLY_UNAVAILABLE (per TCK-00622).
-    - id: "S4_DAEMON_SIGNING"
-      title: "Daemon signs closure before EXECUTE"
-      detail: |
-        Before EXECUTE begins, daemon signs the closure artifact with its
-        operator key (reusing existing broker signing infrastructure). Gate
-        processes receive the signed closure path and verify the signature
-        before accessing any supply entry.
-    - id: "S5_REGRESSION_TESTS"
-      title: "Regression tests for closure schema, cache invalidation, and signing"
-      detail: |
-        - Test: closure_hash change → cache miss for all affected gate entries.
-        - Test: closure with all entries present + network denied → EXECUTE succeeds.
-        - Test: unsigned closure → EXECUTE rejects it.
-        - Test: PREP hydrates missing entries when network available.
     - id: "S6_PREPARE_BASE_SHA"
       title: "Fix fac review prepare to use pr.base.sha instead of origin/main"
       detail: |
-        BUG REPORT — observed 2026-02-19.
+        Ensure `apm2 fac review prepare` resolves base from GitHub PR metadata
+        (`pr.base.sha`) when available, with strict SHA validation and reachable
+        fallback to local main refs for offline operation.
 
-        `apm2 fac prepare` diffs against the local `origin/main` ref to
-        produce the reviewer's diff and commit history.  However, `apm2 fac
-        push` calls `sync_local_main_with_origin` (fast-forward + push to
-        GitHub) as part of the merge step BEFORE dispatching reviews.  By the
-        time the reviewer calls `prepare`, the local `origin/main` ref has been
-        advanced to the PR tip, so `git diff origin/main...{head_sha}` resolves
-        to an empty diff.  Reviewers then have no diff to read and fall back to
-        expensive file-by-file exploration (86–100 tool calls), inflating review
-        duration from ~1 min to 10–14 min.
-
-        Required fix:
-          In `prepare.rs`, resolve the diff base via `fetch_pr_base_sha` from
-          the GitHub API (`pr.base.sha`) rather than from the local
-          `origin/main` ref.  `pr.base.sha` is stable post-merge — GitHub
-          preserves it on the PR object.  Fall back to `origin/main` when the
-          API is unavailable or the SHA is not reachable locally (e.g. shallow
-          clone).
-
-        Acceptance criteria:
-          - After `apm2 fac push` completes and fast-forwards main, a
-            subsequent `apm2 fac review prepare --json` on the same PR emits
-            non-empty `diff_content` covering all PR commits.
-          - Fallback to `origin/main` when GitHub API is unreachable; no
-            regression in offline environments.
-          - Unit tests: `sha_is_locally_reachable` returns true for the
-            empty-tree object and false for the all-zeros SHA.
     - id: "S7_REMOVE_OBSOLETE_COMMANDS"
-      title: "Remove five obsolete FAC CLI subcommands"
+      title: "Remove obsolete FAC CLI subcommands"
       detail: |
-        The following subcommands are superseded by the lifecycle state machine
-        and the `doctor` command and should be removed entirely to reduce
-        surface area and confusion:
+        Remove superseded review subcommands now covered by lifecycle + doctor:
+        `fac review dispatch`, `fac review wait`, `fac review status`,
+        `fac review project`, and `fac resume`.
 
-          1. `apm2 fac review dispatch`
-             Reason: the lifecycle state machine now dispatches reviews
-             automatically; manual dispatch is no longer needed.
-
-          2. `apm2 fac review wait`
-             Reason: superseded by `apm2 fac doctor --wait-for-recommended-action`,
-             which provides richer status and handles all lifecycle phases.
-
-          3. `apm2 fac review status`
-             Reason: `apm2 fac doctor` is a strict superset — it shows review
-             status alongside gate status, verdict, and recommended action.
-
-          4. `apm2 fac review project`
-             Reason: redundant with `apm2 fac doctor`; no unique functionality
-             that doctor does not already cover.
-
-          5. `apm2 fac resume`
-             Reason: superseded by `apm2 fac restart`, which handles all
-             continuation scenarios including force-restart.
-
-        Acceptance criteria:
-          - All five subcommands are removed from the CLI binary (no parser
-            entry, no handler, no help text).
-          - `cargo clippy --workspace --all-targets --all-features -D warnings`
-            passes with no dead-code warnings from removed handlers.
-          - Any integration tests referencing the removed commands are deleted
-            or updated to use their replacements.
     - id: "S8_VERDICT_COMMENT_POSTING"
-      title: "Fix verdict comment never posted to GitHub after review completes"
+      title: "Harden verdict projection fan-in and per-SHA comment behavior"
       detail: |
-        BUG REPORT — observed 2026-02-19.
-
-        After both security and quality reviewers complete and approve a PR,
-        no verdict comment is posted to GitHub.  The `decision_comment_url`
-        in the projection record has the form `local://fac_projection/...`
-        (a synthetic placeholder), not a real GitHub URL.
-
-        Root cause:
-          `verdict_projection.rs` — `persist_verdict_projection_impl` —
-          contains an `all_dimensions_resolved` guard (line ~672) that
-          requires BOTH review dimensions to be present in the local
-          `~/.apm2` record before calling `project_decision_comment`.
-          Because each reviewer runs in an independent process with its own
-          `~/.apm2` home, neither reviewer ever sees both dimensions locally.
-          The guard evaluates to `false` for every reviewer → falls through
-          to the "write local placeholder only" branch → no GitHub API call
-          is ever made.
-
-          The `merge_remote_dimensions_payload` logic already present inside
-          `project_decision_comment_with` (added in TCK-00620) handles
-          exactly this cross-process scenario: it fetches any existing
-          partial comment from GitHub, merges the incoming dimension, and
-          upserts the combined result.  However, this logic is unreachable
-          because the guard above it prevents the call.
-
-        Secondary issue:
-          `create_issue_comment` failure is silently swallowed — the
-          function returns `Ok(local_placeholder)` instead of propagating
-          the error, so posting failures are invisible to the user and not
-          retried.
-
-        Additional observed bug:
-          When a comment does get posted, `project_decision_comment_with`
-          resolves an existing comment via `fetch_latest_live_verdict_comment_id`
-          and issues an UPDATE (PATCH) rather than a CREATE (POST).  This means
-          re-reviews on a new head SHA silently edit the old round's comment
-          instead of posting a fresh one.  Each review round (scoped to a
-          specific head SHA) must produce its own new comment.
-
-        Required fix:
-          1. In `verdict_projection.rs`, remove the `all_dimensions_resolved`
-             guard in the `ProjectionMode::Full` arm.  Always call
-             `project_decision_comment`; rely on the existing merge logic in
-             `project_decision_comment_with` to handle partial/cross-process
-             records.
-          2. Scope comment identity to `(pr_number, head_sha)`.  When posting
-             a verdict comment, never look up or reuse a comment ID from a
-             prior head SHA.  Within a single review round (same head SHA),
-             the first dimension to post creates the comment; the second
-             dimension updates that same comment to include both.  Across
-             rounds (different head SHA), always create a new comment.
-          3. Propagate `create_issue_comment` / `update_issue_comment`
-             failures as hard errors (return `Err(...)`) rather than
-             silently falling back to a local placeholder URL.
-
-        Acceptance criteria:
-          - After both review dimensions resolve, the projection record
-            contains a real GitHub comment URL (https://github.com/...)
-            and a real comment ID (not in the `PR# × 10^9` placeholder range).
-          - When security resolves first, a new comment is created on GitHub;
-            when quality resolves, that same comment is updated to include
-            both dimensions.
-          - When a PR is updated (new head SHA) and re-reviewed, a brand-new
-            comment is posted — the prior round's comment is never edited.
-          - A `create_issue_comment` failure surfaces as a non-zero exit and
-            is not silently replaced by a local placeholder.
+        Projection behavior for GitHub verdict comments must satisfy:
+        1. One combined verdict comment per PR head SHA, emitted once all active
+           dimensions are resolved for that SHA.
+        2. New review rounds (new head SHA) post a new comment; previous-round
+           comments are not edited as live state.
+        3. Projection rendering includes all findings and the decision model ID
+           per dimension (`model_id`) in place of `set_by`.
+        4. Create-path posting must preserve merged dimension payload for the
+           same SHA (no dimension loss during reinitialization/replay).
+        5. Projection failures must be surfaced as hard errors.
 
     - id: "S9_DEDUP_CACHE_AND_PUSH"
-      title: "Fix AlreadyCompleted denial blocking push when gates already passed"
+      title: "Treat AlreadyCompleted dedup as pass-through for push"
       detail: |
-        BUG REPORT — observed 2026-02-19.
+        `DenialReasonCode::AlreadyCompleted` indicates deduplicated success for
+        an already-completed SHA and must not block `apm2 fac push`. Use
+        existing cache/context fields to resolve gate outcomes without rerun.
 
-        When `apm2 fac push` is called for a SHA whose gates already completed
-        in a prior run, the worker's SHA-level dedup check (TCK-00622 S8,
-        `fac_worker.rs:2804-2858`) emits a `Denied` receipt with
-        `DenialReasonCode::AlreadyCompleted`.  The push pathway in `gates.rs`
-        treats ALL `Denied` receipts as hard errors (line ~1776-1778):
-
-            FacJobOutcome::Denied =>
-                Err(format!("gates job {job_id} denied: ..."))
-
-        This causes `apm2 fac push` to fail with a non-zero exit even though
-        the gates passed and the results are fully present in the v3 gate
-        cache.  The workaround is to make a trivial commit to force a new SHA.
-
-        Root cause:
-          `AlreadyCompleted` is a "friendly" denial — it means "we already
-          have results for this SHA, nothing to rerun".  It is not a policy
-          rejection.  Treating it as a hard error is incorrect; the intent of
-          the dedup check was to avoid redundant gate execution, not to block
-          the push.
-
-          The denied receipt carries `policy_hash`, `sandbox_hardening_hash`,
-          and `network_policy_hash` (populated at `fac_worker.rs:2847-2850`)
-          so the gate cache lookup path in `run_queued_gates_and_collect`
-          (`gates.rs:345-351`) already has everything it needs to find the
-          cached results.
-
-        Required fix:
-          In `gates.rs` — `wait_for_gates_job_receipt_with_mode` — add a
-          special-case for `DenialReasonCode::AlreadyCompleted`:  return
-          `Ok(())` (treat as pass-through) instead of `Err`.  The existing
-          `load_gate_results_from_cache_for_sha_with_context` path will then
-          resolve the cached v3 gate results using the denied receipt's hash
-          context fields, and the push proceeds normally.
-
-        Acceptance criteria:
-          - `apm2 fac push` succeeds for a SHA whose gates already passed in
-            a prior run (no trivial-commit workaround needed).
-          - A genuine `Denied` receipt (any `denial_reason` other than
-            `AlreadyCompleted`) still surfaces as a hard error.
-          - Gate cache results from the original completed job are used as-is;
-            no gates are re-executed.
     - id: "S10_HIDE_GATES_COMMAND"
-      title: "Hide `apm2 fac gates` from the public CLI surface"
+      title: "Hide `apm2 fac gates` from public CLI help"
       detail: |
-        `apm2 fac gates` is an internal implementation detail invoked by
-        `apm2 fac push` under the hood.  Exposing it as a top-level user
-        command creates confusion (users may invoke it directly, bypassing
-        push-level policy), adds surface area to document and support, and
-        implies it is a stable public API it is not.
-
-        Required change:
-          Mark the `gates` subcommand as hidden in the clap parser (`.hide(true)`)
-          so it does not appear in `apm2 fac --help` output but remains callable
-          internally.  No functional change to the command itself.
-
-        Acceptance criteria:
-          - `apm2 fac --help` does not list `gates` in the subcommand list.
-          - `apm2 fac gates ...` still works when invoked directly (for
-            internal / debugging use), it is just not advertised.
-          - `apm2 fac push` continues to dispatch gates normally.
+        Keep command callable for internal/debug use, but hide it from public
+        help output to reduce accidental operator misuse.
 
   out_of_scope:
-    - "Full supply chain provenance verification (future work)."
-    - "Multi-registry or private registry support."
-    - "Toolchain download automation (assume toolchain is pre-installed)."
+    - "S1_CLOSURE_SCHEMA deferred to TCK-00624."
+    - "S2_CLOSURE_HASH_IN_ATTESTATION deferred to TCK-00624."
+    - "S3_PREP_HYDRATION deferred to TCK-00624."
+    - "S4_DAEMON_SIGNING deferred to TCK-00624."
+    - "S5_REGRESSION_TESTS (closure schema/signing matrix) deferred to TCK-00624."
+    - "Shared DST module extraction is tracked in TCK-00624 after closure-complete push hardening is stable."
 
 plan:
   steps:
     - id: "STEP_01"
-      title: "Define GateSupplyClosureV1 struct and serialization"
+      title: "Stabilize prepare head/base resolution"
       detail: |
-        In a new fac_closure module: define schema, closure_hash computation
-        (blake3 over canonical entry list), and YAML serialization.
+        Keep strict SHA validation for cached/API refs, prefer PR base SHA,
+        and treat stale local identity as non-authoritative hint with fallback.
+
     - id: "STEP_02"
-      title: "Add closure_hash to GateCacheEntryV2 and implement invalidation"
+      title: "Finalize per-SHA verdict projection semantics"
       detail: |
-        Add closure_hash field to gate cache entry. In check_reuse(), if
-        cached closure_hash != current closure_hash, return cache miss with
-        reason="closure_drift".
+        Ensure create/update paths preserve merged payload for same SHA,
+        maintain per-SHA round separation, and surface projection failures.
+
     - id: "STEP_03"
-      title: "Implement PREP hydration and daemon signing"
+      title: "Align lifecycle replay and projection wiring"
       detail: |
-        Wire PREP hook: check closure, fetch missing entries, re-sign.
-        Daemon signing uses existing Signer infrastructure from gate_cache.rs.
+        Keep replay scoped to matching PR + SHA, prevent stale-SHA fanout,
+        and maintain closure-complete push progression.
+
     - id: "STEP_04"
-      title: "Wire closure verification into gate process startup"
+      title: "Wire typed queue/pipeline failure taxonomy"
       detail: |
-        Before each gate process starts in EXECUTE, verify closure signature.
-        On verification failure: emit AUTHORITY_DENIED failure, abort run.
+        Distinguish prep supply unavailable, authority denied, and gate
+        execution failures in gates queue path outputs.
+
     - id: "STEP_05"
-      title: "Add regression tests and workspace validation"
+      title: "Dogfood push/review and verify idempotent warm-path"
       detail: |
-        cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings
-        cargo doc --workspace --no-deps && cargo test --workspace
+        Validate no stuck `apm2 fac push` behavior, warm-path dedup reuse, and
+        reviewer lifecycle progression under repeated pushes.
 
 definition_of_done:
   evidence_ids:
-    - "EXEC-TCK00623-CLOSURE-SCHEMA"
-    - "EXEC-TCK00623-CACHE-INVALIDATION"
-    - "EXEC-TCK00623-SIGNING"
-    - "EXEC-TCK00623-WORKSPACE-VALIDATION"
+    - "EXEC-TCK00623-PREPARE-BASE-SHA"
+    - "EXEC-TCK00623-VERDICT-PROJECTION"
+    - "EXEC-TCK00623-PUSH-DEDUP"
+    - "EXEC-TCK00623-CLI-SURFACE"
   criteria:
-    - "GateSupplyClosureV1 schema is defined with all four entry kinds."
-    - "closure_hash is bound in gate attestation receipts and gate cache entries."
-    - "Cache miss is triggered deterministically when closure_hash changes."
-    - "PREP auto-hydrates missing closure entries when network is available."
-    - "Closure is signed by daemon; gate processes reject unsigned or mismatched supply."
-    - "Gate execution with pre-seeded closure and network denied: succeeds."
-    - "Regression tests pass for all closure invariants."
-    - "Workspace validation completes successfully."
+    - "Prepare emits correct non-empty diff for reviewed SHA after push/main advance, with offline fallback intact."
+    - "Verdict projection posts per-SHA combined comment with findings and model IDs, without cross-SHA comment mutation."
+    - "Create/update projection failures are visible and fail-closed."
+    - "`AlreadyCompleted` dedup does not block push; cached results are reused."
+    - "Obsolete review subcommands are removed and `fac gates` is hidden from public help."
+    - "Dogfooded `apm2 fac push` warm-path remains bounded and idempotent."
 
 notes:
   context: |
-    The closure artifact is the supply-side anchor for the entire gates
-    usability redesign. Cache reuse explainability (TCK-00626), warm-path
-    SLO (TCK-00627), and the conformance suite (TCK-00628) all depend on
-    the closure_hash being a stable, deterministic cache key dimension.
-  security: "daemon-signed closure; gate processes reject unsigned supply; closure drift is fail-closed cache miss"
+    This ticket now tracks closure-complete push/review hardening and lifecycle
+    correctness. Foundational closure-schema/signing work is explicitly tracked
+    in TCK-00624 to avoid mixed-scope acceptance ambiguity.
+  security: |
+    Strict SHA validation, stale-state rejection, typed failure surfaces, and
+    per-SHA projection isolation preserve audit integrity and fail-closed
+    behavior.

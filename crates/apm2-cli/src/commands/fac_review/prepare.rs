@@ -252,10 +252,15 @@ where
     {
         match validate_expected_head_sha(&local_identity_head_sha) {
             Ok(()) => {
-                return Ok(OwnedResolvedHead {
-                    head_sha: local_identity_head_sha,
-                    head_source: "local_identity",
-                });
+                if local_identity_head_sha.eq_ignore_ascii_case(local_head_sha) {
+                    return Ok(OwnedResolvedHead {
+                        head_sha: local_identity_head_sha,
+                        head_source: "local_identity",
+                    });
+                }
+                eprintln!(
+                    "warn: local identity head SHA for PR #{pr_number} does not match local HEAD; treating identity as stale and attempting remote/local fallback"
+                );
             },
             Err(err) => {
                 eprintln!(
@@ -804,7 +809,7 @@ mod tests {
 
     #[test]
     fn resolve_head_sha_uses_local_identity_without_remote_fetch() {
-        let local_head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let local_head = "dddddddddddddddddddddddddddddddddddddddd";
         let resolved = resolve_head_sha_with(
             "example/repo",
             42,
@@ -823,6 +828,27 @@ mod tests {
             "dddddddddddddddddddddddddddddddddddddddd"
         );
         assert_eq!(resolved.head_source, "local_identity");
+    }
+
+    #[test]
+    fn resolve_head_sha_ignores_stale_local_identity_and_uses_remote() {
+        let local_head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let resolved = resolve_head_sha_with(
+            "example/repo",
+            42,
+            None,
+            local_head,
+            |_owner_repo, _pr_number| {
+                Ok(Some("dddddddddddddddddddddddddddddddddddddddd".to_string()))
+            },
+            |_owner_repo, _pr_number| Ok("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string()),
+        )
+        .expect("resolve head");
+        assert_eq!(
+            resolved.head_sha,
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        );
+        assert_eq!(resolved.head_source, "github_pr_head");
     }
 
     #[test]
