@@ -658,12 +658,10 @@ fn persist_verdict_projection_impl(
     }
 
     save_decision_projection_for_home(&home, &record)?;
-    let _ = projection_store::save_identity_with_context(
-        &owner_repo,
-        resolved_pr,
-        &head_sha,
-        "verdict.set",
-    );
+    // Do not mutate the authoritative PR identity from verdict writes.
+    // Reviewer agents may complete late for an older SHA; letting `verdict.set`
+    // retarget identity can roll local state backward after a newer `fac push`.
+    // Identity is managed by push/restart/dispatch refresh paths instead.
     if persist_trusted_reviewer_id {
         let _ = projection_store::save_trusted_reviewer_id(
             &owner_repo,

@@ -167,7 +167,7 @@ fn run_finding_inner(
         repo: owner_repo.clone(),
         pr_number: resolved_pr,
         pr_url: format!("https://github.com/{owner_repo}/pull/{resolved_pr}"),
-        head_sha: head_sha.clone(),
+        head_sha,
         review_type: dimension.to_string(),
         severity: finding.severity.clone(),
         finding_id: finding.finding_id.clone(),
@@ -185,8 +185,9 @@ fn run_finding_inner(
         raw_evidence_pointer: finding.raw_evidence_pointer,
     };
 
-    let _ =
-        projection_store::save_identity_with_context(&owner_repo, resolved_pr, &head_sha, source);
+    // Do not retarget authoritative PR identity when appending findings.
+    // Findings can arrive from delayed reviewer runs bound to an older SHA.
+    // Identity progression is owned by push/restart/dispatch refresh paths.
     let _ = json_output;
     println!(
         "{}",
