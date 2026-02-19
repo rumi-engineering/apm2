@@ -257,21 +257,36 @@ pub fn migrate_legacy_evidence(
     // Read directory entries (bounded by MAX_LEGACY_FILES).
     // We read up to MAX_LEGACY_FILES + 1 to detect overflow, then only
     // process the first MAX_LEGACY_FILES entries.
+    //
+    // Iterator errors from `read_dir` are counted explicitly rather than
+    // silently dropped via `filter_map(Result::ok)`, so the receipt
+    // accurately reflects whether the scan was complete.
+    let mut iterator_errors: usize = 0;
     let all_entries: Vec<fs::DirEntry> = if let Ok(rd) = fs::read_dir(&evidence_dir) {
-        rd.filter_map(std::result::Result::ok)
-            .take(MAX_LEGACY_FILES.saturating_add(1))
-            .collect()
+        let mut entries = Vec::new();
+        for result in rd {
+            if entries.len() >= MAX_LEGACY_FILES.saturating_add(1) {
+                break;
+            }
+            match result {
+                Ok(entry) => entries.push(entry),
+                Err(_) => {
+                    iterator_errors = iterator_errors.saturating_add(1);
+                },
+            }
+        }
+        entries
     } else {
         return skip_receipt(fac_root, "cannot read legacy evidence directory", false);
     };
 
-    if all_entries.is_empty() {
+    if all_entries.is_empty() && iterator_errors == 0 {
         let removed = fs::remove_dir(&evidence_dir).is_ok();
         return skip_receipt(fac_root, "legacy evidence directory is empty", removed);
     }
 
-    let total_entries_seen = all_entries.len();
-    let has_more = total_entries_seen > MAX_LEGACY_FILES;
+    let total_entries_seen = all_entries.len().saturating_add(iterator_errors);
+    let has_more = all_entries.len() > MAX_LEGACY_FILES;
     let entries = if has_more {
         &all_entries[..MAX_LEGACY_FILES]
     } else {
@@ -289,7 +304,13 @@ pub fn migrate_legacy_evidence(
         .collect();
 
     let files_moved = file_results.iter().filter(|r| r.success).count();
-    let files_failed = file_results.iter().filter(|r| !r.success).count();
+    // Include iterator errors in files_failed so the receipt accurately
+    // reflects whether the directory scan was complete and unimpaired.
+    let files_failed = file_results
+        .iter()
+        .filter(|r| !r.success)
+        .count()
+        .saturating_add(iterator_errors);
 
     // Remove the legacy evidence directory only if all files were moved
     // successfully AND this batch was complete (INV-LEM-003).
@@ -356,11 +377,23 @@ pub fn run_migration_to_completion(
         last_receipt = migrate_legacy_evidence(fac_root)?;
         iterations = iterations.saturating_add(1);
 
-        // Early exit: if the last batch made no forward progress (zero files
-        // moved) and there are no more entries beyond the batch cap, further
-        // iterations cannot make progress. This prevents spinning when the
-        // directory contains only non-movable entries.
-        if last_receipt.files_moved == 0 && prev_moved == 0 && !last_receipt.skipped {
+        // Early exit when no further iterations can make progress.
+        //
+        // The zero-progress guard MUST NOT fire when `is_complete` is
+        // false, because overflow scenarios may have migratable entries
+        // beyond the current batch window. We only break early when the
+        // batch reports `is_complete` (all entries have been scanned) —
+        // if two consecutive batches moved nothing AND all entries have
+        // been seen, further iterations are pointless.
+        //
+        // Note: the while-loop condition already exits on `is_complete`,
+        // so this break is a fast-path that avoids one extra
+        // `migrate_legacy_evidence` call.
+        if last_receipt.is_complete
+            && last_receipt.files_moved == 0
+            && prev_moved == 0
+            && !last_receipt.skipped
+        {
             break;
         }
     }
