@@ -1003,7 +1003,11 @@ where
                     }
                 }
             },
-            Ok(None) => {},
+            Ok(None) => {
+                if ALWAYS_CREATE_NEW_VERDICT_COMMENT {
+                    superseded_remote_comment_id = Some(latest_remote_comment_id);
+                }
+            },
             Err(err) => {
                 eprintln!(
                     "WARNING: failed to resolve latest remote verdict comment {latest_remote_comment_id} for PR #{pr_number}: {err}"
