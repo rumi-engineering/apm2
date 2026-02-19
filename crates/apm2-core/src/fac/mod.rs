@@ -754,6 +754,7 @@ pub use lane::{
 // Re-export legacy evidence migration types (TCK-00589).
 pub use legacy_evidence_migration::{
     FileMigrationResult, LegacyEvidenceMigrationReceiptV1, migrate_legacy_evidence,
+    run_migration_to_completion,
 };
 // Re-export node identity types (TCK-00556).
 pub use node_identity::{

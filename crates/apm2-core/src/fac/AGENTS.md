@@ -3283,19 +3283,30 @@ new layout.
 
 - `LegacyEvidenceMigrationReceiptV1`: Receipt emitted after a migration
   run. Contains `files_moved`, `files_failed`, `legacy_dir_removed`,
-  `skipped`, `skip_reason`, and a bounded `file_results` vector.
+  `skipped`, `skip_reason`, `is_complete`, `total_entries_seen`, and a
+  bounded `file_results` vector.
   Schema: `apm2.fac.legacy_evidence_migration.v1`.
   Uses `#[serde(deny_unknown_fields)]`.
+  The `is_complete` field defaults to `true` via serde for backwards
+  compatibility with pre-existing receipts. The `total_entries_seen`
+  field defaults to `0`.
 - `FileMigrationResult`: Per-file migration outcome with `filename`,
   `success`, and optional `error` message.
 
 ### Core Functions
 
-- `migrate_legacy_evidence(fac_root: &Path)`: Primary entry point. Checks
-  whether `evidence/` exists and is a real directory, reads entries
-  (bounded by `MAX_LEGACY_FILES`), moves each file to `legacy/`, and
-  emits a migration receipt. If `evidence/` does not exist or is empty,
-  returns a "skipped" receipt (INV-LEM-001).
+- `migrate_legacy_evidence(fac_root: &Path)`: Single-batch entry point.
+  Checks whether `evidence/` exists and is a real directory, reads up to
+  `MAX_LEGACY_FILES + 1` entries to detect overflow, processes the first
+  `MAX_LEGACY_FILES` entries, and emits a migration receipt. When
+  overflow is detected, the receipt has `is_complete = false` and
+  `total_entries_seen > MAX_LEGACY_FILES`. If `evidence/` does not
+  exist or is empty, returns a "skipped" receipt (INV-LEM-001).
+- `run_migration_to_completion(fac_root: &Path)`: Production entry point.
+  Repeatedly calls `migrate_legacy_evidence` until `is_complete == true`
+  or `MAX_MIGRATION_ITERATIONS` (100) is reached. This handles
+  installations with more than `MAX_LEGACY_FILES` entries. Invoked
+  automatically by `apm2 fac gc` before GC planning.
 - `migrate_entry(entry, legacy_dir)`: Migrates a single directory entry.
   Skips symlinks (INV-LEM-005) and uses `move_file()` for the actual move.
 - `move_file(src, dst)`: Tries `fs::rename()` first (atomic on same
@@ -3305,6 +3316,14 @@ new layout.
   persists a "skipped" receipt.
 - `persist_migration_receipt(fac_root, receipt)`: Serializes the receipt
   to JSON, hashes with blake3, and writes atomically under `receipts/`.
+
+### Production Callsite
+
+`run_migration_to_completion` is invoked by `apm2 fac gc` (in
+`crates/apm2-cli/src/commands/fac_gc.rs`) before GC planning. This
+ensures upgraded installations automatically migrate legacy evidence
+during routine garbage collection. Migration failure is non-fatal for
+GC (logged as a warning, GC continues).
 
 ### Related Changes (TCK-00589)
 
@@ -3327,7 +3346,11 @@ new layout.
 - [INV-LEM-003] The legacy `evidence/` directory is removed only after
   all files have been successfully moved.
 - [INV-LEM-004] In-memory collections are bounded by `MAX_LEGACY_FILES`
-  (10,000).
+  (10,000). When more entries exist, migration reports `is_complete =
+  false` with `total_entries_seen > MAX_LEGACY_FILES`.
 - [INV-LEM-005] Symlink entries are skipped (fail-closed). The evidence
   directory itself is validated as a real directory (not a symlink) before
   processing.
+- [INV-LEM-006] `run_migration_to_completion` is bounded by
+  `MAX_MIGRATION_ITERATIONS` (100) to prevent unbounded looping if the
+  directory is being refilled by an external actor.

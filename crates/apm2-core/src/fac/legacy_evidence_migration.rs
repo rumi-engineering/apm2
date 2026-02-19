@@ -69,8 +69,26 @@ pub struct LegacyEvidenceMigrationReceiptV1 {
     /// Human-readable reason if skipped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skip_reason: Option<String>,
+    /// Whether this invocation fully completed the migration. `false` when
+    /// the legacy directory contained more entries than `MAX_LEGACY_FILES`
+    /// and a subsequent invocation is required to finish.
+    #[serde(default = "default_true")]
+    pub is_complete: bool,
+    /// Total number of directory entries observed in the legacy evidence
+    /// directory (capped at `MAX_LEGACY_FILES + 1` for overflow detection).
+    /// When `total_entries_seen > MAX_LEGACY_FILES`, partial migration
+    /// occurred and `is_complete` is `false`.
+    #[serde(default)]
+    pub total_entries_seen: usize,
     /// Individual file migration results (bounded by `MAX_LEGACY_FILES`).
     pub file_results: Vec<FileMigrationResult>,
+}
+
+/// Serde default helper — returns `true` for backwards compatibility with
+/// receipts that predate the `is_complete` field (those receipts were always
+/// single-batch completions).
+const fn default_true() -> bool {
+    true
 }
 
 /// Result of migrating a single file.
@@ -103,6 +121,8 @@ fn skip_receipt(
         legacy_dir_removed,
         skipped: true,
         skip_reason: Some(reason.to_string()),
+        is_complete: true,
+        total_entries_seen: 0,
         file_results: Vec::new(),
     };
     persist_migration_receipt(fac_root, &receipt)?;
@@ -225,19 +245,29 @@ pub fn migrate_legacy_evidence(
         );
     }
 
-    // Read directory entries (bounded).
-    let entries: Vec<fs::DirEntry> = if let Ok(rd) = fs::read_dir(&evidence_dir) {
+    // Read directory entries (bounded by MAX_LEGACY_FILES).
+    // We read up to MAX_LEGACY_FILES + 1 to detect overflow, then only
+    // process the first MAX_LEGACY_FILES entries.
+    let all_entries: Vec<fs::DirEntry> = if let Ok(rd) = fs::read_dir(&evidence_dir) {
         rd.filter_map(std::result::Result::ok)
-            .take(MAX_LEGACY_FILES)
+            .take(MAX_LEGACY_FILES.saturating_add(1))
             .collect()
     } else {
         return skip_receipt(fac_root, "cannot read legacy evidence directory", false);
     };
 
-    if entries.is_empty() {
+    if all_entries.is_empty() {
         let removed = fs::remove_dir(&evidence_dir).is_ok();
         return skip_receipt(fac_root, "legacy evidence directory is empty", removed);
     }
+
+    let total_entries_seen = all_entries.len();
+    let has_more = total_entries_seen > MAX_LEGACY_FILES;
+    let entries = if has_more {
+        &all_entries[..MAX_LEGACY_FILES]
+    } else {
+        &all_entries[..]
+    };
 
     // Ensure legacy destination and receipts directories exist.
     create_dir_restricted(&legacy_dir)?;
@@ -253,8 +283,9 @@ pub fn migrate_legacy_evidence(
     let files_failed = file_results.iter().filter(|r| !r.success).count();
 
     // Remove the legacy evidence directory only if all files were moved
-    // successfully (INV-LEM-003).
-    let legacy_dir_removed = files_failed == 0 && fs::remove_dir(&evidence_dir).is_ok();
+    // successfully AND this batch was complete (INV-LEM-003).
+    let legacy_dir_removed =
+        !has_more && files_failed == 0 && fs::remove_dir(&evidence_dir).is_ok();
 
     let receipt = LegacyEvidenceMigrationReceiptV1 {
         schema: MIGRATION_RECEIPT_SCHEMA.to_string(),
@@ -263,11 +294,54 @@ pub fn migrate_legacy_evidence(
         legacy_dir_removed,
         skipped: false,
         skip_reason: None,
+        is_complete: !has_more && files_failed == 0,
+        total_entries_seen,
         file_results,
     };
 
     persist_migration_receipt(fac_root, &receipt)?;
     Ok(receipt)
+}
+
+/// Hard cap on re-invocations of `migrate_legacy_evidence` when running
+/// migration to completion. Prevents unbounded looping if the directory is
+/// being refilled by an external actor.
+const MAX_MIGRATION_ITERATIONS: usize = 100;
+
+/// Run legacy evidence migration to completion with bounded iterations.
+///
+/// Repeatedly calls [`migrate_legacy_evidence`] until the migration reports
+/// `is_complete == true` or the iteration cap (`MAX_MIGRATION_ITERATIONS`)
+/// is reached. This ensures installations with more than `MAX_LEGACY_FILES`
+/// entries are fully migrated across multiple batches.
+///
+/// Returns the final receipt. If the migration could not complete within the
+/// iteration cap, the returned receipt will have `is_complete == false`.
+///
+/// # Production callsite
+///
+/// This function is invoked by `apm2 fac gc` before GC planning, so
+/// upgraded installations automatically migrate legacy evidence during
+/// routine garbage collection.
+///
+/// # Errors
+///
+/// Returns `LaneError` on filesystem errors that prevent migration.
+pub fn run_migration_to_completion(
+    fac_root: &Path,
+) -> Result<LegacyEvidenceMigrationReceiptV1, LaneError> {
+    let mut last_receipt = migrate_legacy_evidence(fac_root)?;
+    let mut iterations = 1usize;
+
+    while !last_receipt.is_complete
+        && !last_receipt.skipped
+        && iterations < MAX_MIGRATION_ITERATIONS
+    {
+        last_receipt = migrate_legacy_evidence(fac_root)?;
+        iterations = iterations.saturating_add(1);
+    }
+
+    Ok(last_receipt)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -291,6 +365,8 @@ mod tests {
 
         let receipt = migrate_legacy_evidence(&fac_root).expect("migrate");
         assert!(receipt.skipped);
+        assert!(receipt.is_complete);
+        assert_eq!(receipt.total_entries_seen, 0);
         assert_eq!(receipt.files_moved, 0);
         assert_eq!(receipt.files_failed, 0);
         assert!(
@@ -351,6 +427,8 @@ mod tests {
         assert_eq!(receipt.files_moved, 2);
         assert_eq!(receipt.files_failed, 0);
         assert!(receipt.legacy_dir_removed);
+        assert!(receipt.is_complete);
+        assert_eq!(receipt.total_entries_seen, 2);
 
         // Files should now be in legacy/.
         let legacy_dir = fac_root.join("legacy");
@@ -371,10 +449,12 @@ mod tests {
         let first = migrate_legacy_evidence(&fac_root).expect("first migration");
         assert_eq!(first.files_moved, 1);
         assert!(!first.skipped);
+        assert!(first.is_complete);
 
         // Second run: evidence dir no longer exists.
         let second = migrate_legacy_evidence(&fac_root).expect("second migration");
         assert!(second.skipped);
+        assert!(second.is_complete);
         assert_eq!(second.files_moved, 0);
     }
 
@@ -435,11 +515,13 @@ mod tests {
             .collect();
         assert_eq!(receipt_files.len(), 1);
 
-        // Verify receipt content is valid JSON.
+        // Verify receipt content is valid JSON with new fields.
         let content = fs::read_to_string(receipt_files[0].path()).expect("read receipt");
         let parsed: LegacyEvidenceMigrationReceiptV1 =
             serde_json::from_str(&content).expect("parse receipt");
         assert_eq!(parsed.files_moved, 1);
+        assert!(parsed.is_complete);
+        assert_eq!(parsed.total_entries_seen, 1);
     }
 
     #[test]
@@ -462,5 +544,85 @@ mod tests {
             !evidence_dir.exists(),
             "legacy evidence dir must not exist post-migration"
         );
+    }
+
+    #[test]
+    fn complete_migration_reports_is_complete_true() {
+        let (_root, fac_root) = setup_fac_root();
+        let evidence_dir = fac_root.join("evidence");
+        fs::create_dir_all(&evidence_dir).expect("create evidence dir");
+        fs::write(evidence_dir.join("a.json"), b"{}").expect("write");
+
+        let receipt = migrate_legacy_evidence(&fac_root).expect("migrate");
+        assert!(
+            receipt.is_complete,
+            "single-batch migration must be complete"
+        );
+        assert_eq!(receipt.total_entries_seen, 1);
+    }
+
+    #[test]
+    fn receipt_roundtrip_with_new_fields() {
+        // Verify the new `is_complete` and `total_entries_seen` fields
+        // serialize and deserialize correctly, including serde defaults
+        // for backwards compatibility.
+        let receipt = LegacyEvidenceMigrationReceiptV1 {
+            schema: MIGRATION_RECEIPT_SCHEMA.to_string(),
+            files_moved: 5,
+            files_failed: 0,
+            legacy_dir_removed: true,
+            skipped: false,
+            skip_reason: None,
+            is_complete: false,
+            total_entries_seen: 10_001,
+            file_results: Vec::new(),
+        };
+
+        let json = serde_json::to_string(&receipt).expect("serialize");
+        let parsed: LegacyEvidenceMigrationReceiptV1 =
+            serde_json::from_str(&json).expect("deserialize");
+        assert!(!parsed.is_complete);
+        assert_eq!(parsed.total_entries_seen, 10_001);
+
+        // Backwards compatibility: a receipt WITHOUT `is_complete` should
+        // default to `true` (pre-existing receipts were single-batch).
+        let legacy_json = r#"{
+            "schema": "apm2.fac.legacy_evidence_migration.v1",
+            "files_moved": 3,
+            "files_failed": 0,
+            "legacy_dir_removed": true,
+            "skipped": false,
+            "file_results": []
+        }"#;
+        let legacy: LegacyEvidenceMigrationReceiptV1 =
+            serde_json::from_str(legacy_json).expect("parse legacy");
+        assert!(
+            legacy.is_complete,
+            "legacy receipt without is_complete must default to true"
+        );
+        assert_eq!(legacy.total_entries_seen, 0);
+    }
+
+    #[test]
+    fn run_migration_to_completion_noop_when_no_evidence() {
+        let (_root, fac_root) = setup_fac_root();
+        let receipt = run_migration_to_completion(&fac_root).expect("migrate");
+        assert!(receipt.skipped);
+        assert!(receipt.is_complete);
+    }
+
+    #[test]
+    fn run_migration_to_completion_single_batch() {
+        let (_root, fac_root) = setup_fac_root();
+        let evidence_dir = fac_root.join("evidence");
+        fs::create_dir_all(&evidence_dir).expect("create evidence dir");
+        for i in 0..5 {
+            fs::write(evidence_dir.join(format!("file_{i}.json")), b"{}").expect("write");
+        }
+
+        let receipt = run_migration_to_completion(&fac_root).expect("migrate");
+        assert!(receipt.is_complete);
+        assert_eq!(receipt.files_moved, 5);
+        assert!(!evidence_dir.exists(), "evidence dir should be removed");
     }
 }

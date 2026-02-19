@@ -5,7 +5,7 @@ use std::path::Path;
 use apm2_core::fac::{
     DEFAULT_MIN_FREE_BYTES, FacPolicyV1, GcActionKind, GcPlan, GcReceiptV1, LaneManager,
     MAX_POLICY_SIZE, check_disk_space, deserialize_policy, execute_gc, persist_gc_receipt,
-    persist_policy, plan_gc,
+    persist_policy, plan_gc, run_migration_to_completion,
 };
 use serde_json;
 use serde_json::json;
@@ -52,6 +52,30 @@ pub fn run_gc(args: &GcArgs, parent_json_output: bool) -> u8 {
             );
         },
     };
+
+    // TCK-00589: Run legacy evidence migration before GC planning.
+    // This ensures upgraded installations automatically migrate files from
+    // `evidence/` to `legacy/` during routine garbage collection. The
+    // migration helper is bounded and idempotent; it is a no-op when the
+    // legacy evidence directory does not exist or has already been migrated.
+    match run_migration_to_completion(&fac_root) {
+        Ok(receipt) if !receipt.skipped && !json_output => {
+            let status = if receipt.is_complete {
+                "complete"
+            } else {
+                "partial"
+            };
+            eprintln!(
+                "legacy evidence migration: {status}, {} moved, {} failed",
+                receipt.files_moved, receipt.files_failed
+            );
+        },
+        Ok(_) => {}, // skipped or json mode — no human output
+        Err(error) => {
+            // Migration failure is non-fatal for GC — log and continue.
+            eprintln!("WARNING: legacy evidence migration failed: {error}, continuing with GC");
+        },
+    }
 
     let quarantine_ttl_secs = u64::from(policy.quarantine_ttl_days).saturating_mul(24 * 3600);
     let denied_ttl_secs = u64::from(policy.denied_ttl_days).saturating_mul(24 * 3600);
