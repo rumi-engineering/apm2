@@ -2002,7 +2002,10 @@ queue_lane, etc.).
   content-hash integrity before returning true. Falls back to bounded directory
   scan. Used by the worker for duplicate detection.
 - `list_receipt_headers(receipts_dir)`: List all indexed headers sorted by
-  timestamp (most recent first). No directory scanning.
+  timestamp (most recent first). No directory scanning. Returns a
+  `ListReceiptHeadersResult` with a `may_be_incomplete` flag that is `true`
+  when the index is at capacity (`MAX_INDEX_ENTRIES`) and may not cover all
+  receipts in the store.
 - CLI: `apm2 fac receipts list` — list indexed receipts.
 - CLI: `apm2 fac receipts status <job_id>` — look up latest receipt for a job.
 - CLI: `apm2 fac receipts reindex` — force full rebuild from receipt store.
@@ -2039,8 +2042,9 @@ All receipt-touching hot paths consult the index first:
 - [INV-IDX-002] All in-memory collections bounded by `MAX_INDEX_ENTRIES` (16384)
   and `MAX_JOB_INDEX_ENTRIES` (16384). Overflow returns Err, not truncation.
   Upsert checks ALL capacities before ANY mutation (no dangling entries).
-- [INV-IDX-003] Index file reads use open-once with `O_NOFOLLOW` + bounded
-  streaming reads from the same handle (no stat-then-read TOCTOU).
+- [INV-IDX-003] Index file reads use open-once with `O_NOFOLLOW | O_NONBLOCK |
+  O_CLOEXEC` + `fstat` regular-file check + bounded streaming reads from the same
+  handle (no stat-then-read TOCTOU, no FIFO blocking).
 - [INV-IDX-004] Rebuild scans count EVERY directory entry (not just `.json`
   files) toward `MAX_REBUILD_SCAN_FILES` (65536). Adversarial non-JSON entries
   cannot bypass the scan cap.
@@ -2049,7 +2053,8 @@ All receipt-touching hot paths consult the index first:
 - [INV-IDX-006] Index persistence uses `NamedTempFile` with random name, fsync,
   and atomic rename. No predictable temp paths.
 - [INV-IDX-007] Individual receipt file reads during rebuild use open-once with
-  `O_NOFOLLOW` + bounded streaming reads (no stat-then-read TOCTOU).
+  `O_NOFOLLOW | O_NONBLOCK` + `fstat` regular-file check + bounded streaming
+  reads (no stat-then-read TOCTOU, no FIFO blocking).
 - [INV-IDX-008] `lookup_job_receipt` verifies content-addressed integrity by
   recomputing the BLAKE3 hash (v1 and v2 schemes) of loaded receipts against the
   index key using constant-time comparison (`subtle::ConstantTimeEq`, INV-PC-001).
@@ -2068,6 +2073,12 @@ All receipt-touching hot paths consult the index first:
   This prevents unverified or tampered receipts from driving terminal routing in
   worker duplicate handling and reconcile torn-state repair (MAJOR-1 round 8 fix,
   TCK-00564).
+- [INV-IDX-011] `lookup_receipt_by_hash(receipts_dir, content_hash)` recomputes
+  the BLAKE3-256 hash after loading the receipt and compares it against the
+  requested `content_hash` using constant-time comparison via
+  `verify_receipt_integrity`. Under the non-authoritative index threat model,
+  tampered receipt files must never drive metrics without detection. Returns
+  `None` on hash mismatch (MAJOR-1/MAJOR-2 round 3 fix, TCK-00551).
 
 ## sd_notify Submodule (TCK-00600)
 
@@ -3261,3 +3272,95 @@ Regression tests: `gc_plan_excludes_v3_lock_files`, `is_v3_lock_file_matches_loc
   `receipt_binding_missing`. The `fac_worker` calls
   `rebind_v3_gate_cache_after_receipt()` (in `evidence.rs`) after the v2
   rebind to load, promote, re-sign, and persist the v3 cache.
+
+## metrics Submodule (TCK-00551)
+
+The `metrics` submodule extracts operator-facing observability metrics from FAC
+receipts (`FacJobReceiptV1` and `GcReceiptV1`). All computation is pure (no I/O,
+no side effects); callers provide loaded receipt data and receive a
+`MetricsSummary`.
+
+### Core Types
+
+- `MetricsSummary`: Aggregate metrics summary with schema identifier, observation
+  window bounds, throughput (completed/denied/quarantined/cancelled counts,
+  jobs-per-hour), queue latency percentiles (median and p95 wall-clock duration
+  from `observed_cost`), per-`DenialReasonCode` denial breakdown, disk preflight
+  failure count, GC bytes freed, `gc_receipts_truncated`,
+  `job_receipts_truncated`, `aggregates_may_be_incomplete`,
+  `unverified_headers_skipped`, and `timestamp_mismatches` fields. Serialized to
+  JSON via serde with `deny_unknown_fields`.
+- `HeaderCounts`: Pre-counted aggregate totals (completed/denied/quarantined/
+  cancelled/total) derived from **verified** receipt headers in the observation
+  window. Each header's `content_hash` is verified against the content-addressed
+  store via `lookup_receipt_by_hash` before counting; headers that fail
+  verification are excluded (fail-closed). Not subject to the receipt-loading
+  cap, ensuring accurate aggregate metrics.
+- `MetricsInput`: Input parameters struct holding slices of job and GC receipts,
+  observation window bounds, and an optional `HeaderCounts` override. When
+  `header_counts` is `Some`, aggregate counts come from the header pass;
+  otherwise they fall back to the (possibly truncated) receipt slice.
+
+### Key Functions
+
+- `compute_metrics(input: &MetricsInput) -> MetricsSummary`: Pure function that
+  aggregates job outcomes, computes throughput (completed jobs / window hours),
+  extracts duration percentiles (nearest-rank method), counts denial reasons with
+  bounded map (`MAX_DENIAL_REASON_ENTRIES = 64`, overflow to `"other"` bucket),
+  and sums GC freed bytes. When `header_counts` is provided, aggregate outcome
+  counts and throughput use the header-derived totals (covering ALL receipts),
+  while latency/denial detail comes from the loaded receipt slice. Zero-window
+  yields zero throughput (no division by zero).
+- `load_gc_receipts(receipts_dir, since_epoch_secs) -> LoadGcReceiptsResult`:
+  I/O helper that traverses the sharded hash-prefix directory layout produced by
+  `persist_gc_receipt` (`receipts/<2-hex-prefix>/<remaining>.json`) plus
+  top-level `.json` files (legacy flat layout). Bounded by
+  `MAX_GC_RECEIPT_SCAN_FILES` (65536) total directory entries across all shards,
+  `MAX_GC_SHARD_DIRS` (512) shard directories, `MAX_GC_RECEIPTS_LOADED` (4096)
+  retained receipts, and `MAX_GC_RECEIPT_READ_SIZE` (256 KiB) per file.
+  Uses a bounded min-heap (`BinaryHeap<Reverse<GcReceiptHeapEntry>>`) during
+  collection to enforce `MAX_GC_RECEIPTS_LOADED` *during* scanning — in-memory
+  receipt count never exceeds the cap regardless of how many files match on disk
+  (worst-case ~1 GiB at 256 KiB x 4096 entries). The heap is keyed by ascending
+  newness (timestamp ASC, content_hash DESC) so the oldest receipt sits at the
+  root and is evicted first when a newer receipt arrives. After scanning, the
+  heap is drained and sorted newest-first (timestamp DESC, content_hash ASC)
+  for deterministic output.
+  Shard directory names are validated as exactly 2-character hex to prevent
+  traversal. All file opens use `open_no_follow` (`O_NOFOLLOW | O_NONBLOCK`) and
+  verify via `fstat` that the fd is a regular file (rejects FIFOs, device nodes,
+  sockets). Parse failures silently skipped.
+- `gc_heap_insert(heap, receipt, truncated)`: Helper that inserts a receipt into
+  the bounded min-heap. If below cap, pushes unconditionally. If at cap and
+  the new receipt is newer than the root, evicts the root and pushes. Otherwise
+  discards the new receipt. Sets `truncated = true` on any discard.
+
+### Bounded Collections
+
+The denial-reason map uses `BTreeMap<String, u64>` for deterministic JSON key
+ordering. It is capped at `MAX_DENIAL_REASON_ENTRIES` (64); overflow is
+aggregated into an `"other"` bucket to keep totals accurate.
+
+### CLI Integration
+
+The `apm2 fac metrics` command (in `fac.rs`) uses a single verified pass:
+1. **Pass 1 (verified headers + detail receipts)**: For each receipt header, a
+   coarse pre-filter using the non-authoritative header timestamp (with a
+   generous +/-1 day margin) avoids verifying receipts clearly outside the
+   window. This pre-filter is a **performance optimization only**, not a
+   security boundary. Each candidate header's `content_hash` is then verified
+   via `lookup_receipt_by_hash` (bounded I/O + BLAKE3 integrity check). After
+   verification, the **authoritative window gate** uses the verified receipt's
+   `timestamp_secs` (not the header's) for since/until inclusion. If the
+   header's `timestamp_secs` does not match the verified receipt's, the receipt
+   is excluded and `timestamp_mismatches` is incremented (tamper indicator —
+   security finding: MAJOR, round 9). Only integrity-verified headers whose
+   receipt timestamp falls within the authoritative window contribute to
+   aggregate counts. Verified receipts up to `MAX_METRICS_RECEIPTS = 16384`
+   are retained for detail analysis (latency percentiles, denial-reason
+   breakdowns). The index completeness signal (`may_be_incomplete`) is
+   propagated to the output as `aggregates_may_be_incomplete`, and the count
+   of unverified headers is emitted as `unverified_headers_skipped`.
+
+The command emits JSON only (TCK-00606 S12 machine-output invariant), is
+local-only (no daemon IPC), and is excluded from daemon auto-start.
