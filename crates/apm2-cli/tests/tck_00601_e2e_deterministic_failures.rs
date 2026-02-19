@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 struct EnvVarTestLock(std::sync::Mutex<()>);
 
 impl EnvVarTestLock {
+    #[allow(clippy::unnecessary_wraps)]
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, ()>, std::convert::Infallible> {
         Ok(match self.0.lock() {
             Ok(guard) => guard,
