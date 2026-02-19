@@ -27,6 +27,10 @@
 //! - [INV-LEM-005] Symlink entries are skipped (fail-closed).
 //! - [INV-LEM-006] Directory entries are skipped (only regular files are
 //!   migrated).
+//! - [INV-LEM-007] Non-regular file types (FIFOs, sockets, device nodes) are
+//!   rejected with a deterministic error.
+//! - [INV-LEM-008] `read_dir` failures on an existing evidence directory are
+//!   propagated as `LaneError`, not silently skipped.
 
 use std::path::{Path, PathBuf};
 use std::{fs, io};
@@ -159,7 +163,16 @@ fn migrate_entry(entry: &fs::DirEntry, legacy_dir: &Path) -> FileMigrationResult
                 error: Some(format!("cannot stat entry: {e}")),
             };
         },
-        Ok(_) => {}, // regular file — proceed
+        Ok(meta) if meta.is_file() => {}, // regular file — proceed
+        Ok(_) => {
+            // Reject all non-regular file types: FIFOs, sockets, device
+            // nodes, etc. Only regular files pass the gate above.
+            return FileMigrationResult {
+                filename,
+                success: false,
+                error: Some("skipped: not a regular file".to_string()),
+            };
+        },
     }
 
     let dst_path = legacy_dir.join(entry.file_name());
@@ -262,23 +275,25 @@ pub fn migrate_legacy_evidence(
     // silently dropped via `filter_map(Result::ok)`, so the receipt
     // accurately reflects whether the scan was complete.
     let mut iterator_errors: usize = 0;
-    let all_entries: Vec<fs::DirEntry> = if let Ok(rd) = fs::read_dir(&evidence_dir) {
-        let mut entries = Vec::new();
-        for result in rd {
-            if entries.len() >= MAX_LEGACY_FILES.saturating_add(1) {
-                break;
-            }
-            match result {
-                Ok(entry) => entries.push(entry),
-                Err(_) => {
-                    iterator_errors = iterator_errors.saturating_add(1);
-                },
-            }
+    let rd = fs::read_dir(&evidence_dir).map_err(|e| LaneError::Io {
+        context: format!(
+            "cannot read legacy evidence directory: {}",
+            evidence_dir.display()
+        ),
+        source: e,
+    })?;
+    let mut all_entries: Vec<fs::DirEntry> = Vec::new();
+    for result in rd {
+        if all_entries.len() >= MAX_LEGACY_FILES.saturating_add(1) {
+            break;
         }
-        entries
-    } else {
-        return skip_receipt(fac_root, "cannot read legacy evidence directory", false);
-    };
+        match result {
+            Ok(entry) => all_entries.push(entry),
+            Err(_) => {
+                iterator_errors = iterator_errors.saturating_add(1);
+            },
+        }
+    }
 
     if all_entries.is_empty() && iterator_errors == 0 {
         let removed = fs::remove_dir(&evidence_dir).is_ok();
@@ -731,6 +746,125 @@ mod tests {
             "legacy receipt without is_complete must default to true"
         );
         assert_eq!(legacy.total_entries_seen, 0);
+    }
+
+    /// Regression: `read_dir` failure on an existing evidence directory must
+    /// propagate as `LaneError`, not return a silent skip receipt.
+    #[cfg(unix)]
+    #[test]
+    fn read_dir_permission_denied_is_lane_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_root, fac_root) = setup_fac_root();
+        let evidence_dir = fac_root.join("evidence");
+        fs::create_dir_all(&evidence_dir).expect("create evidence dir");
+        fs::write(evidence_dir.join("file.json"), b"{}").expect("write file");
+
+        // Remove read permission on the evidence directory so `read_dir` fails.
+        fs::set_permissions(&evidence_dir, fs::Permissions::from_mode(0o000))
+            .expect("set permissions");
+
+        let result = migrate_legacy_evidence(&fac_root);
+
+        // Restore permissions before assertions so tempdir cleanup succeeds.
+        fs::set_permissions(&evidence_dir, fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+
+        assert!(
+            result.is_err(),
+            "read_dir failure must return Err, not a skip receipt"
+        );
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("cannot read legacy evidence directory"),
+            "error should mention directory read failure, got: {err_msg}"
+        );
+    }
+
+    /// Regression: non-regular file types (FIFOs) must be rejected, not
+    /// treated as regular files.
+    #[cfg(unix)]
+    #[test]
+    fn migration_rejects_fifo_entries() {
+        let (_root, fac_root) = setup_fac_root();
+        let evidence_dir = fac_root.join("evidence");
+        fs::create_dir_all(&evidence_dir).expect("create evidence dir");
+
+        // Create a regular file and a FIFO.
+        fs::write(evidence_dir.join("real.json"), b"{}").expect("write real file");
+        let fifo_path = evidence_dir.join("test.fifo");
+        nix::unistd::mkfifo(&fifo_path, nix::sys::stat::Mode::S_IRWXU).expect("create fifo");
+
+        let receipt = migrate_legacy_evidence(&fac_root).expect("migrate");
+        assert_eq!(receipt.files_moved, 1, "regular file should be moved");
+        assert_eq!(receipt.files_failed, 1, "FIFO should be counted as failed");
+
+        // Verify the FIFO rejection is recorded with the correct error.
+        let fifo_result = receipt
+            .file_results
+            .iter()
+            .find(|r| r.filename == "test.fifo")
+            .expect("should have result for FIFO");
+        assert!(!fifo_result.success);
+        assert!(
+            fifo_result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("not a regular file"),
+            "error message should indicate non-regular file rejection, got: {:?}",
+            fifo_result.error
+        );
+
+        // FIFO should still be in evidence/ (not moved).
+        assert!(
+            evidence_dir.join("test.fifo").exists(),
+            "FIFO should remain in evidence directory"
+        );
+
+        // Regular file should be in legacy/.
+        let legacy_dir = fac_root.join("legacy");
+        assert!(legacy_dir.join("real.json").exists());
+    }
+
+    /// Regression: unix sockets must be rejected the same as FIFOs.
+    #[cfg(unix)]
+    #[test]
+    fn migration_rejects_unix_socket_entries() {
+        use std::os::unix::net::UnixListener;
+
+        let (_root, fac_root) = setup_fac_root();
+        let evidence_dir = fac_root.join("evidence");
+        fs::create_dir_all(&evidence_dir).expect("create evidence dir");
+
+        // Create a regular file and a unix socket.
+        fs::write(evidence_dir.join("real.json"), b"{}").expect("write real file");
+        let sock_path = evidence_dir.join("test.sock");
+        let _listener = UnixListener::bind(&sock_path).expect("bind socket");
+
+        let receipt = migrate_legacy_evidence(&fac_root).expect("migrate");
+        assert_eq!(receipt.files_moved, 1, "regular file should be moved");
+        assert_eq!(
+            receipt.files_failed, 1,
+            "socket should be counted as failed"
+        );
+
+        let sock_result = receipt
+            .file_results
+            .iter()
+            .find(|r| r.filename == "test.sock")
+            .expect("should have result for socket");
+        assert!(!sock_result.success);
+        assert!(
+            sock_result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("not a regular file"),
+            "error message should indicate non-regular file rejection, got: {:?}",
+            sock_result.error
+        );
     }
 
     #[test]
