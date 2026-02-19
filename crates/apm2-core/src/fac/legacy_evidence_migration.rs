@@ -23,7 +23,7 @@
 //!   filesystem). Cross-device moves fall back to copy-then-remove.
 //! - [INV-LEM-003] The legacy `evidence/` directory is removed only after all
 //!   files have been successfully moved.
-//! - [INV-LEM-004] In-memory collections are bounded by `MAX_LEGACY_FILES`.
+//! - [INV-LEM-004] Migration processes all directory entries in a single pass.
 //! - [INV-LEM-005] Symlink entries are skipped (fail-closed).
 //! - [INV-LEM-006] Directory entries are skipped (only regular files are
 //!   migrated).
@@ -44,9 +44,6 @@ use super::lane::{LaneError, atomic_write, create_dir_restricted};
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MIGRATION_RECEIPT_SCHEMA: &str = "apm2.fac.legacy_evidence_migration.v1";
-
-/// Hard cap on files processed during migration (INV-LEM-004).
-const MAX_LEGACY_FILES: usize = 10_000;
 
 /// Subdirectory name for migrated legacy files.
 const LEGACY_DIR: &str = "legacy";
@@ -76,15 +73,12 @@ pub struct LegacyEvidenceMigrationReceiptV1 {
     /// Human-readable reason if skipped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skip_reason: Option<String>,
-    /// Whether this invocation fully completed the migration. `false` when
-    /// the legacy directory contained more entries than `MAX_LEGACY_FILES`
-    /// and a subsequent invocation is required to finish.
+    /// Whether this invocation fully completed the migration. Always `true`
+    /// for single-pass processing (all entries are scanned in one call).
     #[serde(default = "default_true")]
     pub is_complete: bool,
     /// Total number of directory entries observed in the legacy evidence
-    /// directory (capped at `MAX_LEGACY_FILES + 1` for overflow detection).
-    /// When `total_entries_seen > MAX_LEGACY_FILES`, partial migration
-    /// occurred and `is_complete` is `false`.
+    /// directory.
     #[serde(default)]
     pub total_entries_seen: usize,
     /// Whether the migration is settled — all migratable (regular) files
@@ -94,7 +88,7 @@ pub struct LegacyEvidenceMigrationReceiptV1 {
     /// or subdirectories).
     #[serde(default)]
     pub migration_settled: bool,
-    /// Individual file migration results (bounded by `MAX_LEGACY_FILES`).
+    /// Individual file migration results.
     pub file_results: Vec<FileMigrationResult>,
 }
 
@@ -311,9 +305,10 @@ pub fn migrate_legacy_evidence(
         );
     }
 
-    // Read directory entries (bounded by MAX_LEGACY_FILES).
-    // We read up to MAX_LEGACY_FILES + 1 to detect overflow, then only
-    // process the first MAX_LEGACY_FILES entries.
+    // Read ALL directory entries in a single pass (INV-LEM-004).
+    // This is a one-time migration, so processing the entire directory is
+    // acceptable and avoids the starvation bug where batched iteration
+    // could never advance past non-migratable entries.
     //
     // Iterator errors from `read_dir` are counted explicitly rather than
     // silently dropped via `filter_map(Result::ok)`, so the receipt
@@ -328,9 +323,6 @@ pub fn migrate_legacy_evidence(
     })?;
     let mut all_entries: Vec<fs::DirEntry> = Vec::new();
     for result in rd {
-        if all_entries.len() >= MAX_LEGACY_FILES.saturating_add(1) {
-            break;
-        }
         match result {
             Ok(entry) => all_entries.push(entry),
             Err(_) => {
@@ -345,19 +337,13 @@ pub fn migrate_legacy_evidence(
     }
 
     let total_entries_seen = all_entries.len().saturating_add(iterator_errors);
-    let has_more = all_entries.len() > MAX_LEGACY_FILES;
-    let entries = if has_more {
-        &all_entries[..MAX_LEGACY_FILES]
-    } else {
-        &all_entries[..]
-    };
 
     // Ensure legacy destination and receipts directories exist.
     create_dir_restricted(&legacy_dir)?;
     create_dir_restricted(&fac_root.join("receipts"))?;
 
     // Migrate each entry.
-    let file_results: Vec<FileMigrationResult> = entries
+    let file_results: Vec<FileMigrationResult> = all_entries
         .iter()
         .map(|e| migrate_entry(e, &legacy_dir))
         .collect();
@@ -371,29 +357,26 @@ pub fn migrate_legacy_evidence(
         .count()
         .saturating_add(iterator_errors);
 
-    // `is_complete` means all directory entries have been SEEN (processed or
-    // skipped), not that all moves succeeded. When `!has_more` we have
-    // enumerated every entry in the directory, so no further iterations are
-    // needed — even if some entries failed (symlinks, directories, permission
-    // errors). This prevents the caller from looping indefinitely when
-    // non-movable entries are present.
-    let is_complete = !has_more;
+    // Single-pass processing: all directory entries are always scanned in
+    // one call, so `is_complete` is unconditionally `true`. This eliminates
+    // the starvation bug where a batch dominated by non-migratable entries
+    // (symlinks, directories, FIFOs) could prevent progress across
+    // iterations.
+    let is_complete = true;
 
-    // Determine if migration is settled: all entries have been scanned
-    // and all migratable (regular) files have been processed. When
-    // `is_complete` is true, every entry in the directory has been seen.
-    // Since `migrate_entry` only moves regular files and deterministically
-    // skips non-migratable types (symlinks, dirs, special files), there
-    // are no retryable failures — callers can stop scanning.
-    let migration_settled = is_complete;
+    // Migration is settled: all entries have been scanned and all migratable
+    // (regular) files have been processed. Since `migrate_entry` only moves
+    // regular files and deterministically skips non-migratable types
+    // (symlinks, dirs, special files), there are no retryable failures —
+    // callers can stop scanning.
+    let migration_settled = true;
 
-    // Attempt to remove the legacy evidence directory when all entries
-    // have been scanned (INV-LEM-003). This covers both the clean case
-    // (all files moved, directory is empty) and the settled case (only
-    // non-migratable entries remain). `remove_dir` will fail if the
-    // directory is not empty, which is fine — the `migration_settled`
-    // flag tells callers to stop scanning regardless.
-    let legacy_dir_removed = is_complete && fs::remove_dir(&evidence_dir).is_ok();
+    // Attempt to remove the legacy evidence directory (INV-LEM-003). This
+    // covers both the clean case (all files moved, directory is empty) and
+    // the settled case (only non-migratable entries remain). `remove_dir`
+    // will fail if the directory is not empty, which is fine — the
+    // `migration_settled` flag tells callers to stop scanning regardless.
+    let legacy_dir_removed = fs::remove_dir(&evidence_dir).is_ok();
 
     let receipt = LegacyEvidenceMigrationReceiptV1 {
         schema: MIGRATION_RECEIPT_SCHEMA.to_string(),
@@ -412,20 +395,15 @@ pub fn migrate_legacy_evidence(
     Ok(receipt)
 }
 
-/// Hard cap on re-invocations of `migrate_legacy_evidence` when running
-/// migration to completion. Prevents unbounded looping if the directory is
-/// being refilled by an external actor.
-const MAX_MIGRATION_ITERATIONS: usize = 100;
-
-/// Run legacy evidence migration to completion with bounded iterations.
+/// Run legacy evidence migration to completion.
 ///
-/// Repeatedly calls [`migrate_legacy_evidence`] until the migration reports
-/// `is_complete == true` or the iteration cap (`MAX_MIGRATION_ITERATIONS`)
-/// is reached. This ensures installations with more than `MAX_LEGACY_FILES`
-/// entries are fully migrated across multiple batches.
+/// Delegates to [`migrate_legacy_evidence`], which processes all directory
+/// entries in a single pass. This wrapper exists as the canonical public
+/// entry point invoked by production callsites (e.g. `apm2 fac gc`).
 ///
-/// Returns the final receipt. If the migration could not complete within the
-/// iteration cap, the returned receipt will have `is_complete == false`.
+/// Since `migrate_legacy_evidence` now processes the entire directory in one
+/// call, no iteration loop is needed — the migration always completes in a
+/// single invocation.
 ///
 /// # Production callsite
 ///
@@ -439,18 +417,7 @@ const MAX_MIGRATION_ITERATIONS: usize = 100;
 pub fn run_migration_to_completion(
     fac_root: &Path,
 ) -> Result<LegacyEvidenceMigrationReceiptV1, LaneError> {
-    let mut last_receipt = migrate_legacy_evidence(fac_root)?;
-    let mut iterations = 1usize;
-
-    while !last_receipt.is_complete
-        && !last_receipt.skipped
-        && iterations < MAX_MIGRATION_ITERATIONS
-    {
-        last_receipt = migrate_legacy_evidence(fac_root)?;
-        iterations = iterations.saturating_add(1);
-    }
-
-    Ok(last_receipt)
+    migrate_legacy_evidence(fac_root)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

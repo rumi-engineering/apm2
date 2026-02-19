@@ -3306,19 +3306,16 @@ new layout.
 
 ### Core Functions
 
-- `migrate_legacy_evidence(fac_root: &Path)`: Single-batch entry point.
-  Checks whether `evidence/` exists and is a real directory, reads up to
-  `MAX_LEGACY_FILES + 1` entries to detect overflow, processes the first
-  `MAX_LEGACY_FILES` entries, and emits a migration receipt. When
-  overflow is detected, the receipt has `is_complete = false` and
-  `total_entries_seen > MAX_LEGACY_FILES`. If `evidence/` does not
-  exist or is empty, returns a "skipped" receipt (INV-LEM-001).
+- `migrate_legacy_evidence(fac_root: &Path)`: Single-pass entry point.
+  Checks whether `evidence/` exists and is a real directory, reads ALL
+  directory entries in a single pass, migrates regular files, and emits
+  a migration receipt. Always sets `is_complete = true` since all entries
+  are processed in one call. If `evidence/` does not exist or is empty,
+  returns a "skipped" receipt (INV-LEM-001).
 - `run_migration_to_completion(fac_root: &Path)`: Production entry point.
-  Repeatedly calls `migrate_legacy_evidence` until `is_complete == true`
-  or `MAX_MIGRATION_ITERATIONS` (100) is reached, with early exit on
-  two consecutive zero-progress iterations. This handles installations
-  with more than `MAX_LEGACY_FILES` entries. Invoked automatically by
-  `apm2 fac gc` before GC planning.
+  Delegates to `migrate_legacy_evidence`, which processes the entire
+  directory in a single pass. No iteration loop is needed. Invoked
+  automatically by `apm2 fac gc` before GC planning.
 - `migrate_entry(entry, legacy_dir)`: Migrates a single directory entry.
   Skips symlinks (INV-LEM-005) and directories (INV-LEM-007), and uses
   `move_file()` for regular files.
@@ -3358,24 +3355,22 @@ GC (logged as a warning, GC continues).
   filesystem). Cross-device moves fall back to copy-then-remove.
 - [INV-LEM-003] The legacy `evidence/` directory is removed only after
   all files have been successfully moved.
-- [INV-LEM-004] In-memory collections are bounded by `MAX_LEGACY_FILES`
-  (10,000). When more entries exist, migration reports `is_complete =
-  false` with `total_entries_seen > MAX_LEGACY_FILES`.
+- [INV-LEM-004] Migration processes all directory entries in a single
+  pass. No batch cap is applied — the entire `evidence/` directory is
+  scanned in one call, eliminating the starvation bug where batched
+  iteration could never advance past non-migratable entries.
 - [INV-LEM-005] Symlink entries are skipped (fail-closed). The evidence
   directory itself is validated as a real directory (not a symlink) before
   processing.
-- [INV-LEM-006] `is_complete` means "all directory entries have been
-  SEEN", not that all moves succeeded. When `!has_more` (i.e., total
-  entries fit in one batch), `is_complete = true` even if some entries
-  failed (symlinks, directories, permission errors). This prevents
-  `run_migration_to_completion` from looping indefinitely on non-movable
-  entries. `run_migration_to_completion` also terminates early on two
-  consecutive zero-progress iterations as a belt-and-suspenders defense.
+- [INV-LEM-006] `is_complete` is always `true` for single-pass
+  processing — all directory entries are scanned in one call. Failed
+  entries (symlinks, directories, permission errors) are recorded in
+  the receipt but do not block completion.
 - [INV-LEM-007] Directory entries are skipped (only regular files are
   migrated). Counted as `files_failed` with an appropriate error message.
-- [INV-LEM-008] `run_migration_to_completion` is bounded by
-  `MAX_MIGRATION_ITERATIONS` (100) to prevent unbounded looping if the
-  directory is being refilled by an external actor.
+- [INV-LEM-008] `run_migration_to_completion` delegates to
+  `migrate_legacy_evidence` which processes all entries in a single pass.
+  No iteration loop or cap is needed.
 
 ## metrics Submodule (TCK-00551)
 
