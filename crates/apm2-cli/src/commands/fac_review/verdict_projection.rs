@@ -979,8 +979,12 @@ where
         match fetch_comment(owner_repo, latest_remote_comment_id) {
             Ok(Some(found)) => {
                 let latest_body = {
-                    let merged =
-                        merge_remote_dimensions_payload(payload, &found.body, pr_number, &record.head_sha);
+                    let merged = merge_remote_dimensions_payload(
+                        payload,
+                        &found.body,
+                        pr_number,
+                        &record.head_sha,
+                    );
                     render_decision_comment_body(owner_repo, pr_number, &record.head_sha, &merged)?
                 };
                 create_body.clone_from(&latest_body);
