@@ -398,8 +398,9 @@ pub use merge_receipt::{
 };
 // Re-export metrics types (TCK-00551)
 pub use metrics::{
-    MAX_DENIAL_REASON_ENTRIES, MAX_GC_RECEIPT_SCAN_FILES, MAX_GC_RECEIPTS_LOADED,
-    METRICS_SUMMARY_SCHEMA, MetricsInput, MetricsSummary, compute_metrics, load_gc_receipts,
+    LoadGcReceiptsResult, MAX_DENIAL_REASON_ENTRIES, MAX_GC_RECEIPT_SCAN_FILES,
+    MAX_GC_RECEIPTS_LOADED, METRICS_SUMMARY_SCHEMA, MetricsInput, MetricsSummary, compute_metrics,
+    load_gc_receipts,
 };
 // Re-export patch hardening types (TCK-00581)
 pub use patch_hardening::{
