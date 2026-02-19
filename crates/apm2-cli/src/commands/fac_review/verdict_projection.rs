@@ -977,7 +977,12 @@ where
                             pr_number,
                             &record.head_sha,
                         );
-                        render_decision_comment_body(owner_repo, pr_number, &record.head_sha, &merged)?
+                        render_decision_comment_body(
+                            owner_repo,
+                            pr_number,
+                            &record.head_sha,
+                            &merged,
+                        )?
                     };
                     create_body.clone_from(&latest_body);
                     match update_comment(owner_repo, found.id, &latest_body) {
