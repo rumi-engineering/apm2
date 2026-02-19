@@ -593,6 +593,7 @@ impl FacJobSpecV1 {
         }
 
         check_non_empty("job_id", &self.job_id)?;
+        validate_job_id(&self.job_id)?;
         check_non_empty("job_spec_digest", &self.job_spec_digest)?;
         check_non_empty("kind", &self.kind)?;
         check_non_empty("queue_lane", &self.queue_lane)?;
@@ -1526,6 +1527,33 @@ fn validate_head_sha(head_sha: &str) -> Result<(), JobSpecError> {
             value: head_sha.to_string(),
         }),
     }
+}
+
+/// Validates `job_id` as a strict logical identifier (INV-JS-006).
+///
+/// `job_id` is used in filesystem path construction (e.g. `claimed/`,
+/// `completed/`, `bundles/`), so it MUST be restricted to a safe charset.
+/// The same `[A-Za-z0-9_-]` pattern used for `cancel_target_job_id` is
+/// enforced here to prevent path traversal, glob injection, shell
+/// metacharacter abuse, and NUL byte injection.
+///
+/// # Rules
+///
+/// - Non-empty (already checked by `check_non_empty` in the caller).
+/// - At most [`MAX_JOB_ID_LENGTH`] bytes (already checked by
+///   `validate_field_lengths` in the caller).
+/// - Every byte must be ASCII alphanumeric, underscore, or hyphen.
+fn validate_job_id(job_id: &str) -> Result<(), JobSpecError> {
+    if !job_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(JobSpecError::InvalidFormat {
+            field: "job_id",
+            value: truncate_for_error(job_id),
+        });
+    }
+    Ok(())
 }
 
 const fn check_non_empty(field: &'static str, value: &str) -> Result<(), JobSpecError> {
