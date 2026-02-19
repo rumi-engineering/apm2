@@ -69,7 +69,6 @@ pub(super) struct ComponentReport {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(super) struct ReadinessOutcome {
     pub(super) worker_bootstrapped: bool,
     pub(super) component_reports: Vec<ComponentReport>,

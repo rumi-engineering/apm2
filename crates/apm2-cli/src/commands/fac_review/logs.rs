@@ -327,32 +327,6 @@ fn lane_evidence_log_dirs(home: &Path) -> Vec<PathBuf> {
     logs.sort();
     logs
 }
-
-#[allow(dead_code)] // Retained for future log discovery / fallback use cases.
-fn find_latest_evidence_gate_log(home: &Path, gate: &str) -> Option<PathBuf> {
-    let expected_name = format!("{gate}.log");
-    let mut latest: Option<(PathBuf, SystemTime)> = None;
-    for path in lane_evidence_log_dirs(home) {
-        if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
-            continue;
-        }
-        if !path.exists() {
-            continue;
-        }
-        let modified = path
-            .metadata()
-            .and_then(|meta| meta.modified())
-            .unwrap_or(UNIX_EPOCH);
-        if latest
-            .as_ref()
-            .is_none_or(|(_, current)| modified > *current)
-        {
-            latest = Some((path, modified));
-        }
-    }
-    latest.map(|(path, _)| path)
-}
-
 // ── Log discovery ───────────────────────────────────────────────────────────
 
 fn discover_logs(pr_number: Option<u32>) -> Result<LogsSummary, String> {

@@ -295,16 +295,6 @@ pub fn read_run_secret_for_home(
     }
     Ok(Some(secret))
 }
-
-#[allow(dead_code)]
-pub fn review_run_secret_path(pr_number: u32, review_type: &str) -> Result<PathBuf, String> {
-    Ok(review_run_secret_path_for_home(
-        &apm2_home_dir()?,
-        pr_number,
-        review_type,
-    ))
-}
-
 pub fn run_state_integrity_binding_payload(state: &ReviewRunState) -> Result<Vec<u8>, String> {
     let binding = ReviewRunStateIntegrityBinding {
         run_id: &state.run_id,
@@ -504,12 +494,6 @@ pub fn review_run_state_path(pr_number: u32, review_type: &str) -> Result<PathBu
 pub fn review_locks_dir_path_for_home(home: &Path) -> PathBuf {
     home.join("review_locks")
 }
-
-#[allow(dead_code)]
-pub fn review_locks_dir_path() -> Result<PathBuf, String> {
-    Ok(review_locks_dir_path_for_home(&apm2_home_dir()?))
-}
-
 #[allow(clippy::unnecessary_wraps)]
 pub fn review_lock_path_for_home(
     home: &Path,
@@ -863,14 +847,6 @@ fn load_review_run_state_unverified_for_home_inner(
     Ok(ReviewRunStateLoad::Present(parsed))
 }
 
-pub fn load_review_run_state_unverified_for_home(
-    home: &Path,
-    pr_number: u32,
-    review_type: &str,
-) -> Result<ReviewRunStateLoad, String> {
-    load_review_run_state_unverified_for_home_inner(home, pr_number, review_type)
-}
-
 pub fn load_review_run_state_for_home(
     home: &Path,
     pr_number: u32,
@@ -900,16 +876,6 @@ pub fn load_review_run_state_verified_for_home(
         other => Ok(other),
     }
 }
-
-#[allow(dead_code)]
-pub fn load_review_run_state_verified(
-    pr_number: u32,
-    review_type: &str,
-) -> Result<ReviewRunStateLoad, String> {
-    let home = apm2_home_dir()?;
-    load_review_run_state_verified_for_home(&home, pr_number, review_type)
-}
-
 pub fn load_review_run_state(
     pr_number: u32,
     review_type: &str,
@@ -917,16 +883,6 @@ pub fn load_review_run_state(
     let home = apm2_home_dir()?;
     load_review_run_state_for_home(&home, pr_number, review_type)
 }
-
-#[allow(dead_code)]
-pub fn load_review_run_state_unverified(
-    pr_number: u32,
-    review_type: &str,
-) -> Result<ReviewRunStateLoad, String> {
-    let home = apm2_home_dir()?;
-    load_review_run_state_unverified_for_home(&home, pr_number, review_type)
-}
-
 pub fn load_review_run_state_strict_for_home(
     home: &Path,
     pr_number: u32,
@@ -978,16 +934,6 @@ pub fn load_review_run_state_verified_strict_for_home(
         },
     }
 }
-
-#[allow(dead_code)]
-pub fn load_review_run_state_verified_strict(
-    pr_number: u32,
-    review_type: &str,
-) -> Result<Option<ReviewRunState>, String> {
-    let home = apm2_home_dir()?;
-    load_review_run_state_verified_strict_for_home(&home, pr_number, review_type)
-}
-
 pub fn load_review_run_state_strict(
     pr_number: u32,
     review_type: &str,
@@ -1205,16 +1151,6 @@ pub fn load_review_run_termination_receipt_for_home(
     })?;
     Ok(Some(receipt))
 }
-
-#[allow(dead_code)]
-pub fn load_review_run_termination_receipt(
-    pr_number: u32,
-    review_type: &str,
-) -> Result<Option<ReviewRunTerminationReceipt>, String> {
-    let home = apm2_home_dir()?;
-    load_review_run_termination_receipt_for_home(&home, pr_number, review_type)
-}
-
 pub fn verify_review_run_state_integrity_binding(
     home: &Path,
     state: &ReviewRunState,

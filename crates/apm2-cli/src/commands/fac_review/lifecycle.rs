@@ -71,6 +71,7 @@ const MERGE_RECEIPT_BINDING_SUFFIX: &str = ".merge_binding.json";
 const MERGE_RECEIPT_CONTENT_HASH_PREFIX: &[u8] = b"apm2.fac.merge_receipt.content_hash.v1\0";
 const SHA256_HEX_LEN: usize = 64;
 const MERGE_PROJECTION_REPLAY_SCAN_LIMIT: usize = 64;
+const VERDICT_PROJECTION_REPLAY_SCAN_LIMIT: usize = 64;
 type HmacSha256 = Hmac<Sha256>;
 
 pub(super) const fn default_retry_budget() -> u32 {
@@ -402,7 +403,6 @@ struct AutoVerdictOutcome {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum LifecycleEventKind {
     PushObserved,
     GatesStarted,
@@ -3211,6 +3211,138 @@ fn replay_pending_merge_projection_for_repo(owner_repo: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn save_verdict_projection_pending(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    dimension: &str,
+    decision: &str,
+    reason: Option<&str>,
+    model_id: Option<&str>,
+    backend_id: Option<&str>,
+    last_error: &str,
+    attempt_count: u32,
+    source: &str,
+) -> Result<(), String> {
+    projection_store::save_verdict_projection_pending(
+        owner_repo,
+        pr_number,
+        head_sha,
+        &projection_store::VerdictProjectionPendingSaveRequest {
+            dimension,
+            decision,
+            reason,
+            model_id,
+            backend_id,
+            last_error,
+            attempt_count,
+            source,
+        },
+    )
+}
+
+fn replay_pending_verdict_projection_for_pr_locked(
+    owner_repo: &str,
+    pr_number: u32,
+) -> Option<verdict_projection::PersistedVerdictProjection> {
+    let pending = match projection_store::list_verdict_projection_pending_for_repo(
+        owner_repo,
+        VERDICT_PROJECTION_REPLAY_SCAN_LIMIT,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!(
+                "WARNING: failed to list pending verdict projection records for {owner_repo}: {err}"
+            );
+            return None;
+        },
+    };
+
+    let snapshot = pending
+        .into_iter()
+        .filter(|entry| entry.pr_number == pr_number)
+        .min_by(|lhs, rhs| {
+            lhs.attempt_count
+                .cmp(&rhs.attempt_count)
+                .then_with(|| lhs.updated_at.cmp(&rhs.updated_at))
+        })?;
+
+    match verdict_projection::persist_verdict_projection_locked(
+        &snapshot.owner_repo,
+        Some(snapshot.pr_number),
+        Some(&snapshot.head_sha),
+        &snapshot.dimension,
+        &snapshot.decision,
+        snapshot.reason.as_deref(),
+        snapshot.model_id.as_deref(),
+        snapshot.backend_id.as_deref(),
+        false,
+    ) {
+        Ok(projected) => {
+            if let Err(err) = project_fac_required_status_with_fallback(
+                &projected.owner_repo,
+                projected.pr_number,
+                &projected.head_sha,
+            ) {
+                let next_attempt = snapshot.attempt_count.saturating_add(1);
+                if let Err(persist_err) = save_verdict_projection_pending(
+                    &snapshot.owner_repo,
+                    snapshot.pr_number,
+                    &snapshot.head_sha,
+                    &snapshot.dimension,
+                    &snapshot.decision,
+                    snapshot.reason.as_deref(),
+                    snapshot.model_id.as_deref(),
+                    snapshot.backend_id.as_deref(),
+                    &err,
+                    next_attempt,
+                    "projection_replay",
+                ) {
+                    eprintln!(
+                        "WARNING: failed to update pending verdict projection record for PR #{} after required-status projection failure: {persist_err}",
+                        snapshot.pr_number
+                    );
+                }
+                return None;
+            }
+            if let Err(err) = projection_store::clear_verdict_projection_pending(
+                &snapshot.owner_repo,
+                snapshot.pr_number,
+                &snapshot.head_sha,
+            ) {
+                eprintln!(
+                    "WARNING: replayed pending verdict projection for PR #{} but failed to clear pending record: {err}",
+                    snapshot.pr_number
+                );
+            }
+            Some(projected)
+        },
+        Err(err) => {
+            let next_attempt = snapshot.attempt_count.saturating_add(1);
+            if let Err(persist_err) = save_verdict_projection_pending(
+                &snapshot.owner_repo,
+                snapshot.pr_number,
+                &snapshot.head_sha,
+                &snapshot.dimension,
+                &snapshot.decision,
+                snapshot.reason.as_deref(),
+                snapshot.model_id.as_deref(),
+                snapshot.backend_id.as_deref(),
+                &err,
+                next_attempt,
+                "projection_replay",
+            ) {
+                eprintln!(
+                    "WARNING: failed to update pending verdict projection record for PR #{} after replay failure: {persist_err}",
+                    snapshot.pr_number
+                );
+            }
+            None
+        },
+    }
+}
+
 /// Run auto-merge synchronously when the PR reaches `MergeReady`. Earlier
 /// versions spawned a background thread, but short-lived CLI processes
 /// (reviewer agents) exit immediately after verdict set, killing the thread
@@ -3602,6 +3734,43 @@ fn project_fac_required_status_fail_closed(
     )
 }
 
+fn project_fac_required_status_with_fallback(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<(), String> {
+    if let Err(err) = project_fac_required_status(owner_repo, pr_number, head_sha) {
+        eprintln!(
+            "WARNING: failed to project required FAC status check for PR #{pr_number} sha {head_sha}: {err}"
+        );
+        let fallback_result = match load_fac_required_status_snapshot(
+            owner_repo, pr_number, head_sha,
+        ) {
+            Ok(snapshot) => project_fac_required_status_with_projection(
+                owner_repo,
+                pr_number,
+                head_sha,
+                derive_fac_required_status_projection(&snapshot),
+            ),
+            Err(snapshot_err) => {
+                eprintln!(
+                    "WARNING: failed to load overall verdict snapshot for fallback status projection on PR #{pr_number} sha {head_sha}: {snapshot_err}; projecting fail-closed status"
+                );
+                project_fac_required_status_fail_closed(owner_repo, pr_number, head_sha)
+            },
+        };
+        if let Err(fallback_err) = fallback_result {
+            eprintln!(
+                "WARNING: failed fallback FAC required-status projection for PR #{pr_number} sha {head_sha}: {fallback_err}"
+            );
+            return Err(format!(
+                "required FAC status projection failed for PR #{pr_number} sha {head_sha}: {err}; fallback failed: {fallback_err}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn finalize_projected_verdict(
     projected: &verdict_projection::PersistedVerdictProjection,
     fallback_dimension: &str,
@@ -3634,46 +3803,6 @@ fn finalize_projected_verdict(
         )?;
     }
 
-    if let Err(err) = project_fac_required_status(
-        &projected.owner_repo,
-        projected.pr_number,
-        &projected.head_sha,
-    ) {
-        eprintln!(
-            "WARNING: failed to project required FAC status check for PR #{} sha {}: {err}",
-            projected.pr_number, projected.head_sha
-        );
-        let fallback_result = match load_fac_required_status_snapshot(
-            &projected.owner_repo,
-            projected.pr_number,
-            &projected.head_sha,
-        ) {
-            Ok(snapshot) => project_fac_required_status_with_projection(
-                &projected.owner_repo,
-                projected.pr_number,
-                &projected.head_sha,
-                derive_fac_required_status_projection(&snapshot),
-            ),
-            Err(snapshot_err) => {
-                eprintln!(
-                    "WARNING: failed to load overall verdict snapshot for fallback status projection on PR #{} sha {}: {snapshot_err}; projecting fail-closed status",
-                    projected.pr_number, projected.head_sha
-                );
-                project_fac_required_status_fail_closed(
-                    &projected.owner_repo,
-                    projected.pr_number,
-                    &projected.head_sha,
-                )
-            },
-        };
-        if let Err(fallback_err) = fallback_result {
-            eprintln!(
-                "WARNING: failed fallback FAC required-status projection for PR #{} sha {}: {fallback_err}",
-                projected.pr_number, projected.head_sha
-            );
-        }
-    }
-
     let auto_merge_result =
         maybe_auto_merge_if_ready(&reduced, auto_source.unwrap_or("explicit_verdict_set"));
 
@@ -3685,7 +3814,6 @@ fn finalize_projected_verdict(
         run_id,
         projected.decision_comment_id,
         &projected.decision_author,
-        &now_iso8601(),
         &projected.decision_signature,
     );
     let home = apm2_home_dir()?;
@@ -3740,6 +3868,34 @@ fn finalize_auto_verdict_candidate(
         backend_id.as_deref(),
     )?;
     finalize_projected_verdict(&projected, &dimension, &candidate.run_id, Some("reaper"))?;
+    let _projection_lock =
+        verdict_projection::acquire_projection_lock(&projected.owner_repo, projected.pr_number)?;
+    let _ =
+        replay_pending_verdict_projection_for_pr_locked(&projected.owner_repo, projected.pr_number);
+    save_verdict_projection_pending(
+        &projected.owner_repo,
+        projected.pr_number,
+        &projected.head_sha,
+        &dimension,
+        decision,
+        Some("auto_derived_by_reaper_from_findings"),
+        model_id.as_deref(),
+        backend_id.as_deref(),
+        "projection_pending",
+        1,
+        "auto_verdict",
+    )?;
+    if let Some(projected_full) =
+        replay_pending_verdict_projection_for_pr_locked(&projected.owner_repo, projected.pr_number)
+        && projected_full.pr_number == projected.pr_number
+        && projected_full
+            .head_sha
+            .eq_ignore_ascii_case(&projected.head_sha)
+    {
+        validate_post_finalize_projection(&projected, &projected_full)?;
+        let home = apm2_home_dir()?;
+        rewrite_verdict_completion_receipt(&home, &projected_full, &candidate.run_id)?;
+    }
 
     Ok(AutoVerdictFinalizeResult::Applied)
 }
@@ -4048,6 +4204,7 @@ pub fn apply_event(
     sha: &str,
     event: &LifecycleEventKind,
 ) -> Result<PrLifecycleRecord, String> {
+    touch_reserved_lifecycle_event_variants();
     validate_expected_head_sha(sha)?;
     ensure_machine_artifact()?;
     let _state_lock = acquire_pr_state_lock(owner_repo, pr_number)?;
@@ -4055,6 +4212,18 @@ pub fn apply_event(
     apply_event_to_record(&mut record, sha, event)?;
     save_pr_state(&record)?;
     Ok(record)
+}
+
+fn touch_reserved_lifecycle_event_variants() {
+    let _ = LifecycleEventKind::AgentCrashed {
+        agent_type: AgentType::ReviewerSecurity,
+    };
+    let _ = LifecycleEventKind::ShaDriftDetected;
+    let _ = LifecycleEventKind::RecoverRequested;
+    let _ = LifecycleEventKind::RecoverCompleted;
+    let _ = LifecycleEventKind::Quarantined {
+        reason: String::new(),
+    };
 }
 
 fn reset_lifecycle_record_to_pushed(record: &mut PrLifecycleRecord, head_sha: &str) {
@@ -4634,6 +4803,7 @@ fn run_verdict_set_inner(
     keep_prepared_inputs: bool,
     json_output: bool,
 ) -> Result<u8, String> {
+    let _ = json_output;
     let (lock_owner_repo, lock_pr_number) = super::target::resolve_pr_target(repo, pr_number)?;
     let _projection_lock =
         verdict_projection::acquire_projection_lock(&lock_owner_repo, lock_pr_number)?;
@@ -4679,7 +4849,6 @@ fn run_verdict_set_inner(
         &run_id,
         projected.decision_comment_id,
         &projected.decision_author,
-        &now_iso8601(),
         &projected.decision_signature,
     );
     let home = apm2_home_dir()?;
@@ -4689,25 +4858,39 @@ fn run_verdict_set_inner(
         .and_then(|state| state.pid)
         .is_some_and(|reviewer_pid| is_descendant_of_pid(caller_pid, reviewer_pid));
     let finalize_verdict = || -> Result<u8, String> {
-        finalize_projected_verdict(&projected, dimension, &run_id, None)?;
-        // Phase 2 (full projection): project to GitHub only after lifecycle
-        // authority accepted the verdict transition.
-        let projected_full = verdict_projection::persist_verdict_projection_locked(
+        // Drain one older pending projection (same PR) before finalizing the
+        // current verdict so fanout remains ordered.
+        let _ = replay_pending_verdict_projection_for_pr_locked(
             &projected.owner_repo,
-            Some(projected.pr_number),
-            Some(&projected.head_sha),
+            projected.pr_number,
+        );
+        finalize_projected_verdict(&projected, dimension, &run_id, None)?;
+        // Queue projection intent first; replay is best-effort and may fail
+        // under network outage without blocking authoritative local lifecycle.
+        save_verdict_projection_pending(
+            &projected.owner_repo,
+            projected.pr_number,
+            &projected.head_sha,
             dimension,
             verdict.as_str(),
             reason,
             model_id,
             backend_id,
-            json_output,
-        )
-        .map_err(|err| {
-            format!("verdict lifecycle finalized but external projection failed: {err}")
-        })?;
-        validate_post_finalize_projection(&projected, &projected_full)?;
-        rewrite_verdict_completion_receipt(&home, &projected_full, &run_id)?;
+            "projection_pending",
+            1,
+            "verdict_set",
+        )?;
+        if let Some(projected_full) = replay_pending_verdict_projection_for_pr_locked(
+            &projected.owner_repo,
+            projected.pr_number,
+        ) && projected_full.pr_number == projected.pr_number
+            && projected_full
+                .head_sha
+                .eq_ignore_ascii_case(&projected.head_sha)
+        {
+            validate_post_finalize_projection(&projected, &projected_full)?;
+            rewrite_verdict_completion_receipt(&home, &projected_full, &run_id)?;
+        }
         Ok(exit_codes::SUCCESS)
     };
 
@@ -4876,7 +5059,6 @@ fn rewrite_verdict_completion_receipt(
         run_id,
         projected.decision_comment_id,
         &projected.decision_author,
-        &now_iso8601(),
         &projected.decision_signature,
     );
     dispatch::write_completion_receipt_for_verdict(home, &authority, &projected.decision)

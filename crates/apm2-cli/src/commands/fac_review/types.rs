@@ -19,8 +19,6 @@ pub const LOOP_SLEEP: std::time::Duration = std::time::Duration::from_millis(100
 pub const LOCAL_COMMENT_ID_BASE_MULTIPLIER: u64 = 1_000_000_000;
 pub const COMMENT_PERMISSION_SCAN_LINES: usize = 200;
 pub const DISPATCH_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(120);
-#[allow(dead_code)]
-pub const MAX_EVENT_PAYLOAD_BYTES: u64 = 1024 * 1024;
 pub const DEFAULT_PROVIDER_SLOT_COUNT: usize = 10;
 pub const PROVIDER_SLOT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 pub const PROVIDER_SLOT_WAIT_JITTER_MS: u64 = 250;
@@ -224,7 +222,6 @@ fn normalize_dispatch_review_type(review_type: &str) -> String {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct TerminationAuthority {
     pub repo: String,
     pub pr_number: u32,
@@ -233,11 +230,8 @@ pub struct TerminationAuthority {
     pub run_id: String,
     pub decision_comment_id: u64,
     pub decision_author: String,
-    pub decision_set_at: String,
     pub decision_signature: String,
 }
-
-#[allow(dead_code)]
 impl TerminationAuthority {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -248,7 +242,6 @@ impl TerminationAuthority {
         run_id: &str,
         decision_comment_id: u64,
         decision_author: &str,
-        decision_set_at: &str,
         decision_signature: &str,
     ) -> Self {
         Self {
@@ -259,7 +252,6 @@ impl TerminationAuthority {
             run_id: run_id.to_string(),
             decision_comment_id,
             decision_author: decision_author.to_string(),
-            decision_set_at: decision_set_at.to_string(),
             decision_signature: decision_signature.to_string(),
         }
     }
@@ -466,65 +458,12 @@ pub struct DispatchSummary {
     pub dispatch_epoch: u64,
     pub results: Vec<DispatchReviewResult>,
 }
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize)]
-pub struct BarrierSummary {
-    pub repo: String,
-    pub event_name: String,
-    pub pr_number: u32,
-    pub pr_url: String,
-    pub head_sha: String,
-    pub base_ref: String,
-    pub default_branch: String,
-    pub author_login: String,
-    pub author_association: String,
-    pub actor_login: String,
-    pub actor_permission: Option<String>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize)]
-pub struct KickoffSummary {
-    pub repo: String,
-    pub event_name: String,
-    pub pr_number: u32,
-    pub pr_url: String,
-    pub head_sha: String,
-    pub dispatch_epoch: u64,
-    pub total_secs: u64,
-    pub terminal_state: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ProjectionError {
-    pub ts: String,
-    pub event: String,
-    pub review_type: String,
-    pub seq: u64,
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ProjectionStatus {
-    pub line: String,
-    pub sha: String,
-    pub current_head_sha: String,
-    pub security: String,
-    pub quality: String,
-    pub recent_events: String,
-    pub terminal_failure: bool,
-    pub last_seq: u64,
-    pub errors: Vec<ProjectionError>,
-}
-
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
     pub pr_number: u32,
     pub seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
-
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct FacEventContext {
     pub repo: String,
@@ -620,16 +559,6 @@ pub fn allocate_local_comment_id(pr_number: u32, max_existing_comment_id: Option
     max_existing_comment_id
         .unwrap_or_else(|| u64::from(pr_number).saturating_mul(LOCAL_COMMENT_ID_BASE_MULTIPLIER))
         .saturating_add(1)
-}
-
-/// Wrap a value in single quotes for shell interpolation.
-///
-/// **Deprecated**: prefer structured `SpawnCommand` argv to avoid shell parsing
-/// entirely. This function is retained only for any remaining shell-based
-/// callers outside the review orchestrator.
-#[allow(dead_code)]
-pub fn sh_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn hex_nibble_to_upper(nibble: u8) -> char {

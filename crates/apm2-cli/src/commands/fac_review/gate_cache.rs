@@ -28,11 +28,16 @@ use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use apm2_core::crypto::{Signer, VerifyingKey};
-use apm2_core::fac::{GATE_CACHE_RECEIPT_PREFIX, sign_with_domain, verify_with_domain};
+use apm2_core::crypto::Signer;
+#[cfg(test)]
+use apm2_core::crypto::VerifyingKey;
+#[cfg(test)]
+use apm2_core::fac::verify_with_domain;
+use apm2_core::fac::{GATE_CACHE_RECEIPT_PREFIX, sign_with_domain};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 use super::gate_attestation::MERGE_CONFLICT_GATE_NAME;
 use super::types::{apm2_home_dir, now_iso8601};
 use crate::commands::fac_permissions;
@@ -43,6 +48,7 @@ const MAX_CACHE_READ_BYTES: usize = 1_048_576;
 /// Maximum length of `signature_hex` and `signer_id` fields (TCK-00576).
 /// Ed25519 signature = 64 bytes = 128 hex chars; public key = 32 bytes = 64
 /// hex chars.  256 is generous but bounded.
+#[cfg(test)]
 const MAX_SIG_FIELD_LENGTH: usize = 256;
 
 /// Result of a single cached gate execution.
@@ -190,6 +196,7 @@ impl CachedGateResult {
     /// Verify the signature on this entry against the expected verifying key.
     ///
     /// Returns `Ok(())` on success, or `Err` with a human-readable reason.
+    #[cfg(test)]
     pub fn verify(
         &self,
         expected_key: &VerifyingKey,
@@ -270,7 +277,7 @@ pub enum CacheSource {
     /// [INV-GCV3-001] V2 reuse is disabled (TCK-00541 MAJOR fix). This
     /// variant is retained for match exhaustiveness in `resolve_cached_payload`
     /// but is no longer constructable from production reuse decisions.
-    #[allow(dead_code)]
+    #[cfg(test)]
     V2,
     /// No cache hit (miss).
     None,
@@ -291,7 +298,7 @@ impl ReuseDecision {
     /// constructor is retained for test compatibility but is no longer
     /// called from production reuse decision paths.
     #[must_use]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub const fn hit() -> Self {
         Self {
             reusable: true,
@@ -632,7 +639,7 @@ impl GateCache {
     /// **CRITICAL:** This method **must** be called **before** `sign()`
     /// / `sign_all()` so that the signed canonical bytes cover the final
     /// flag values.
-    #[cfg_attr(test, allow(dead_code))]
+    #[cfg(not(test))]
     pub fn try_bind_receipt_from_store(&mut self, receipts_dir: &std::path::Path, job_id: &str) {
         let Some(receipt) = apm2_core::fac::lookup_job_receipt(receipts_dir, job_id) else {
             return; // No receipt found — flags stay false (fail-closed).
@@ -705,7 +712,7 @@ impl GateCache {
     /// to skip signature verification (developer/test mode only).
     ///
     /// `require_full_mode` should be true for normal push pipeline runs.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn check_reuse(
         &self,
         gate: &str,
@@ -768,7 +775,7 @@ impl GateCache {
     ///
     /// Returns `Ok(())` on success, or `Err(reason)` on failure.
     /// Used by the `apm2 fac receipts verify` CLI command.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn verify_gate(&self, gate: &str, verifying_key: &VerifyingKey) -> Result<(), String> {
         let cached = self
             .get(gate)
@@ -795,7 +802,7 @@ impl GateCache {
 ///   (`$APM2_HOME/private/fac/receipts`).
 /// * `job_id` - The job ID whose receipt should be looked up.
 /// * `signer` - The signing key for re-signing the cache after flag promotion.
-#[cfg_attr(test, allow(dead_code))]
+#[cfg(not(test))]
 pub fn rebind_gate_cache_after_receipt(
     sha: &str,
     receipts_dir: &Path,

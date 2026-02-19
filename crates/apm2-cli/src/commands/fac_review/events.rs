@@ -52,15 +52,3 @@ pub fn emit_review_event_to_path(
         .append_value(event)
         .map_err(|err| err.to_string())
 }
-
-pub fn read_last_event_values(max_lines: usize) -> Result<Vec<serde_json::Value>, String> {
-    let path = review_events_path()?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let lines = super::state::read_last_lines(&path, max_lines)?;
-    Ok(lines
-        .into_iter()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
-        .collect::<Vec<_>>())
-}

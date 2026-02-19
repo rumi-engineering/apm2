@@ -10,6 +10,7 @@
 //! - Intelligent pipeline restart (`apm2 fac restart`) with CI state analysis
 
 mod backend;
+#[cfg(test)]
 mod barrier;
 mod bounded_test_runner;
 mod ci_status;
@@ -62,14 +63,13 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 // Re-export public API for use by `fac.rs`
 use dispatch::dispatch_single_review_with_force;
-use events::{read_last_event_values, review_events_path};
+use events::review_events_path;
 pub use finding::{
     ReviewFindingSeverityArg as ReviewCommentSeverityArg, ReviewFindingSeverityArg,
     ReviewFindingTypeArg as ReviewCommentTypeArg, ReviewFindingTypeArg,
 };
 pub use gates::GateThroughputProfile;
 pub use lifecycle::VerdictValueArg;
-use projection::{projection_state_done, projection_state_failed, run_project_inner};
 use serde::Serialize;
 use state::{
     list_review_pr_numbers, load_review_run_state, load_review_run_state_strict, read_pulse_file,
@@ -77,9 +77,8 @@ use state::{
 };
 pub use types::ReviewRunType;
 use types::{
-    DispatchReviewResult, DispatchSummary, ProjectionStatus, ReviewKind,
-    TERMINAL_MANUAL_TERMINATION_DECISION_BOUND, TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED,
-    TERMINATE_TIMEOUT, is_verdict_finalized_agent_stop_reason, validate_expected_head_sha,
+    DispatchReviewResult, DispatchSummary, ReviewKind, TERMINAL_MANUAL_TERMINATION_DECISION_BOUND,
+    TERMINATE_TIMEOUT, validate_expected_head_sha,
 };
 
 use crate::exit_codes::codes as exit_codes;
@@ -184,6 +183,7 @@ struct DoctorAgentActivitySummary {
     max_dispatched_pending_seconds: Option<i64>,
 }
 
+#[cfg(not(test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LocalGatesRunResult {
     pub(super) exit_code: u8,
@@ -214,16 +214,6 @@ enum DoctorMergeConflictStatus {
     Unknown,
 }
 
-impl DoctorMergeConflictStatus {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::NoConflicts => "no_conflicts",
-            Self::HasConflicts => "has_conflicts",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum DoctorShaFreshnessSource {
@@ -231,17 +221,6 @@ enum DoctorShaFreshnessSource {
     LocalAuthoritative,
     Stale,
     Unknown,
-}
-
-impl DoctorShaFreshnessSource {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::RemoteMatch => "remote_match",
-            Self::LocalAuthoritative => "local_authoritative",
-            Self::Stale => "stale",
-            Self::Unknown => "unknown",
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -3114,262 +3093,6 @@ fn format_freshness_age(seconds: Option<i64>) -> String {
         format!("{}h", seconds / (60 * 60))
     }
 }
-
-#[allow(dead_code)]
-fn emit_doctor_report(summary: &DoctorPrSummary) {
-    println!("FAC Doctor");
-    println!("  PR:         #{}", summary.pr_number);
-    println!("  Repo:       {}", summary.owner_repo);
-    println!(
-        "  Identity SHA local={} remote={}",
-        summary.identity.local_sha.as_deref().unwrap_or("-"),
-        summary.identity.remote_head_sha.as_deref().unwrap_or("-")
-    );
-    if summary.identity.stale {
-        println!("  Identity:   STALE");
-    }
-    println!(
-        "  Branch:     {}",
-        summary.identity.branch.as_deref().unwrap_or("-")
-    );
-    println!(
-        "  Worktree:   {}",
-        summary.identity.worktree.as_deref().unwrap_or("-")
-    );
-    println!(
-        "  Identity source: {}",
-        summary.identity.source.as_deref().unwrap_or("-")
-    );
-
-    println!("IDENTITY");
-    println!(
-        "  local_sha:  {}{}",
-        summary.identity.local_sha.as_deref().unwrap_or("unknown"),
-        if summary.identity.stale {
-            " [STALE]"
-        } else {
-            ""
-        }
-    );
-    println!(
-        "  remote_sha: {}",
-        summary
-            .identity
-            .remote_head_sha
-            .as_deref()
-            .unwrap_or("unavailable")
-    );
-    println!(
-        "  branch:     {}",
-        summary.identity.branch.as_deref().unwrap_or("n/a")
-    );
-    println!(
-        "  worktree:   {}",
-        summary.identity.worktree.as_deref().unwrap_or("n/a")
-    );
-    println!(
-        "  updated_at: {}",
-        summary.identity.updated_at.as_deref().unwrap_or("n/a")
-    );
-
-    println!("LIFECYCLE");
-    if let Some(lifecycle) = &summary.lifecycle {
-        println!("  state:           {}", lifecycle.state);
-        println!("  time_in_state:   {}s", lifecycle.time_in_state_seconds);
-        println!("  error_budget:    {}", lifecycle.error_budget_used);
-        println!("  retry_budget:    {}", lifecycle.retry_budget_remaining);
-        println!("  updated_at:      {}", lifecycle.updated_at);
-        println!("  last_event_seq:  {}", lifecycle.last_event_seq);
-    } else {
-        println!("  unavailable");
-    }
-
-    println!("GATES");
-    if summary.gates.is_empty() {
-        println!("  no gate cache entries found");
-    } else {
-        for gate in &summary.gates {
-            println!(
-                "  {}: {} (freshness={})",
-                gate.name,
-                gate.status,
-                format_freshness_age(gate.freshness_seconds)
-            );
-            if let Some(completed_at) = gate.completed_at.as_deref() {
-                println!("    completed_at: {completed_at}");
-            }
-        }
-    }
-
-    println!("REVIEWS");
-    if summary.reviews.is_empty() {
-        println!("  no review projection found");
-    } else {
-        for review in &summary.reviews {
-            println!("  {}: {}", review.dimension, review.verdict);
-            println!(
-                "    reviewed_sha: {}  reviewed_by: {}",
-                if review.reviewed_sha.is_empty() {
-                    "-"
-                } else {
-                    &review.reviewed_sha
-                },
-                if review.reviewed_by.is_empty() {
-                    "-"
-                } else {
-                    &review.reviewed_by
-                }
-            );
-            if !review.reason.is_empty() {
-                println!("    reason: {}", review.reason);
-            }
-            if !review.reviewed_at.is_empty() {
-                println!("    reviewed_at: {}", review.reviewed_at);
-            }
-            if let Some(reason) = review.terminal_reason.as_deref() {
-                println!("    terminal_reason: {reason}");
-            }
-        }
-    }
-
-    println!("FINDINGS_SUMMARY");
-    for entry in &summary.findings_summary {
-        println!(
-            "  {}: formal={} computed={} counts={{blocker:{}, major:{}, minor:{}, nit:{}}}",
-            entry.dimension,
-            entry.formal_verdict,
-            entry.computed_verdict,
-            entry.counts.blocker,
-            entry.counts.major,
-            entry.counts.minor,
-            entry.counts.nit
-        );
-    }
-
-    println!("MERGE_READINESS");
-    println!("  merge_ready: {}", summary.merge_readiness.merge_ready);
-    println!(
-        "  checks: all_verdicts_approve={} gates_pass={} sha_fresh={} no_merge_conflicts={}",
-        summary.merge_readiness.all_verdicts_approve,
-        summary.merge_readiness.gates_pass,
-        summary.merge_readiness.sha_fresh,
-        summary.merge_readiness.no_merge_conflicts
-    );
-    println!(
-        "  status: sha_freshness_source={} merge_conflict_status={}",
-        summary.merge_readiness.sha_freshness_source.as_str(),
-        summary.merge_readiness.merge_conflict_status.as_str()
-    );
-
-    println!("WORKTREE");
-    println!(
-        "  exists={} clean={} merge_conflicts={}",
-        summary.worktree_status.worktree_exists,
-        summary.worktree_status.worktree_clean,
-        summary.worktree_status.merge_conflicts
-    );
-
-    println!("RECOMMENDED_ACTION");
-    println!(
-        "  action={} priority={} reason={}",
-        summary.recommended_action.action,
-        summary.recommended_action.priority,
-        summary.recommended_action.reason
-    );
-    if let Some(command) = summary.recommended_action.command.as_deref() {
-        println!("  command={command}");
-    }
-
-    println!("AGENTS");
-    if let Some(agents) = &summary.agents {
-        println!(
-            "  active_slots: {}/{}",
-            agents.active_agents, agents.max_active_agents_per_pr
-        );
-        println!("  total_entries: {}", agents.total_agents);
-        if agents.entries.is_empty() {
-            println!("  no entries");
-        } else {
-            for entry in &agents.entries {
-                println!(
-                    "  {} {} pid={:?} alive={} sha={} run_id={}",
-                    entry.agent_type,
-                    entry.state,
-                    entry.pid,
-                    entry.pid_alive,
-                    entry.sha,
-                    entry.run_id
-                );
-                if let Some(elapsed) = entry.elapsed_seconds {
-                    println!("    elapsed_seconds: {elapsed}");
-                }
-                if !entry.models_attempted.is_empty() {
-                    println!(
-                        "    models_attempted: {}",
-                        entry.models_attempted.join(", ")
-                    );
-                }
-                if let Some(tool_call_count) = entry.tool_call_count {
-                    println!("    tool_call_count: {tool_call_count}");
-                }
-                if let Some(log_line_count) = entry.log_line_count {
-                    println!("    log_line_count: {log_line_count}");
-                }
-                if let Some(nudge_count) = entry.nudge_count {
-                    println!("    nudge_count: {nudge_count}");
-                }
-                if let Some(activity_age) = entry.last_activity_seconds_ago {
-                    println!("    last_activity_seconds_ago: {activity_age}");
-                }
-            }
-        }
-    } else {
-        println!("  unavailable");
-    }
-
-    if let Some(attempt) = summary.latest_push_attempt.as_ref() {
-        println!("LATEST_PUSH_ATTEMPT");
-        println!("  ts={} sha={}", attempt.ts, attempt.sha);
-        if let Some(stage) = attempt.failed_stage.as_deref() {
-            println!(
-                "  failed_stage={} exit_code={:?} duration_s={:?} hint={}",
-                stage,
-                attempt.exit_code,
-                attempt.duration_s,
-                attempt.error_hint.as_deref().unwrap_or("-")
-            );
-        } else {
-            println!("  failed_stage=none");
-        }
-    }
-
-    if !summary.repairs_applied.is_empty() {
-        println!("REPAIRS_APPLIED");
-        for repair in &summary.repairs_applied {
-            println!(
-                "  {} before={} after={}",
-                repair.operation,
-                repair.before.as_deref().unwrap_or("-"),
-                repair.after.as_deref().unwrap_or("-")
-            );
-        }
-    }
-
-    println!("HEALTH");
-    if summary.health.is_empty() {
-        println!("  PASS: no blockers");
-    } else {
-        for item in &summary.health {
-            println!(
-                "  [{}] {}",
-                item.severity.to_ascii_uppercase(),
-                item.message
-            );
-            println!("      remediation: {}", item.remediation);
-        }
-    }
-}
-
 // ── Public entry points ─────────────────────────────────────────────────────
 
 pub fn run_review(
@@ -3441,223 +3164,6 @@ pub fn run_review(
             let payload = serde_json::json!({
                 "error": "fac_review_run_failed",
                 "message": err,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-            );
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
-pub fn run_dispatch(
-    repo: &str,
-    pr_number: Option<u32>,
-    review_type: ReviewRunType,
-    expected_head_sha: Option<&str>,
-    force: bool,
-    _json_output: bool,
-) -> u8 {
-    // TCK-00596: Fail-fast credential gate for GitHub-facing dispatch command.
-    if let Err(err) = apm2_core::fac::require_github_credentials() {
-        let message = err.to_string();
-        eprintln!("ERROR: {message}");
-        let payload = serde_json::json!({
-            "error": "fac_dispatch_credentials_missing",
-            "message": message,
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload)
-                .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-        );
-        return exit_codes::GENERIC_ERROR;
-    }
-
-    let (owner_repo, resolved_pr) = match target::resolve_pr_target(repo, pr_number) {
-        Ok(value) => value,
-        Err(err) => {
-            let payload = serde_json::json!({
-                "error": "fac_review_dispatch_target_resolution_failed",
-                "message": err,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-            );
-            return exit_codes::GENERIC_ERROR;
-        },
-    };
-    match run_dispatch_inner(
-        &owner_repo,
-        resolved_pr,
-        review_type,
-        expected_head_sha,
-        force,
-    ) {
-        Ok(summary) => {
-            let payload = serde_json::json!({
-                "schema": "apm2.fac.review.dispatch.v1",
-                "summary": summary,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-            );
-            exit_codes::SUCCESS
-        },
-        Err(err) => {
-            let payload = serde_json::json!({
-                "error": "fac_review_dispatch_failed",
-                "message": err,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-            );
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
-pub fn run_status(
-    pr_number: Option<u32>,
-    review_type_filter: Option<&str>,
-    json_output: bool,
-) -> u8 {
-    match run_status_inner(pr_number, review_type_filter, json_output) {
-        Ok(fail_closed) => {
-            if fail_closed {
-                exit_codes::GENERIC_ERROR
-            } else {
-                exit_codes::SUCCESS
-            }
-        },
-        Err(err) => {
-            let payload = serde_json::json!({
-                "error": "fac_review_status_failed",
-                "message": err,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-            );
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
-fn annotate_verdict_finalized_status_entry(
-    entry: &mut serde_json::Value,
-    current_head_sha: Option<&str>,
-) {
-    let Some(reason) = entry
-        .get("terminal_reason")
-        .and_then(serde_json::Value::as_str)
-    else {
-        return;
-    };
-    if !is_verdict_finalized_agent_stop_reason(reason) {
-        return;
-    }
-
-    if entry
-        .get("state")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|state| state == "failed")
-    {
-        entry["state"] = serde_json::json!("done");
-    }
-    entry["terminal_reason"] = serde_json::json!(TERMINAL_VERDICT_FINALIZED_AGENT_STOPPED);
-    entry["state_explanation"] = serde_json::json!(
-        "verdict was recorded and the reviewer process was intentionally stopped to prevent extra token spend"
-    );
-
-    let pr_number = entry
-        .get("pr_number")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let review_type = entry
-        .get("review_type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("security");
-    let state_head_sha = entry.get("head_sha").and_then(serde_json::Value::as_str);
-    let action = match (state_head_sha, current_head_sha) {
-        (Some(state_sha), Some(current_sha))
-            if !state_sha.is_empty() && !state_sha.eq_ignore_ascii_case(current_sha) =>
-        {
-            serde_json::json!({
-                "action_required": true,
-                "next_action": format!(
-                    "head moved to {current_sha}; rerun this lane: `apm2 fac review dispatch --pr {pr_number} --type {review_type} --force`"
-                ),
-            })
-        },
-        _ => serde_json::json!({
-            "action_required": false,
-            "next_action": "no action required; rerun only if you want a fresh verdict on demand",
-        }),
-    };
-    entry["action_required"] = action["action_required"].clone();
-    entry["next_action"] = action["next_action"].clone();
-}
-
-pub fn run_wait(
-    pr_number: u32,
-    review_type_filter: Option<&str>,
-    wait_for_sha: Option<&str>,
-    timeout_seconds: Option<u64>,
-    poll_interval_seconds: u64,
-    _json_output: bool,
-) -> u8 {
-    let max_interval = poll_interval_seconds.max(1);
-    let poll_interval = Duration::from_secs(max_interval);
-    match run_wait_inner(
-        pr_number,
-        review_type_filter,
-        wait_for_sha,
-        timeout_seconds.map(Duration::from_secs),
-        poll_interval,
-    ) {
-        Ok((status, attempts, elapsed)) => {
-            let elapsed_seconds = elapsed.as_secs();
-            let has_failed = status.terminal_failure
-                || review_types_terminal_failed(&status, review_type_filter);
-            let payload = serde_json::json!({
-                "schema": "apm2.fac.review.wait.v1",
-                "status": "completed",
-                "filter_pr": pr_number,
-                "filter_review_type": review_type_filter,
-                "wait_for_sha": wait_for_sha,
-                "attempts": attempts,
-                "elapsed_seconds": elapsed_seconds,
-                "poll_interval_seconds": max_interval,
-                "project": status,
-                "fail_closed": has_failed,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-            );
-
-            if has_failed {
-                exit_codes::GENERIC_ERROR
-            } else {
-                exit_codes::SUCCESS
-            }
-        },
-        Err(err) => {
-            let payload = serde_json::json!({
-                "error": "fac_review_wait_failed",
-                "message": err,
-                "filter_pr": pr_number,
-                "filter_review_type": review_type_filter,
             });
             println!(
                 "{}",
@@ -3830,181 +3336,6 @@ pub fn run_verdict_show(
     json_output: bool,
 ) -> u8 {
     lifecycle::run_verdict_show(repo, pr_number, sha, json_output)
-}
-
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
-pub fn run_project(
-    pr_number: u32,
-    head_sha: Option<&str>,
-    since_epoch: Option<u64>,
-    after_seq: u64,
-    _emit_errors: bool,
-    fail_on_terminal: bool,
-    _format_json: bool,
-    _json_output: bool,
-) -> u8 {
-    match run_project_inner(pr_number, head_sha, since_epoch, after_seq) {
-        Ok(status) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&status).unwrap_or_else(|_| "{}".to_string())
-            );
-
-            if fail_on_terminal && status.terminal_failure {
-                exit_codes::GENERIC_ERROR
-            } else {
-                exit_codes::SUCCESS
-            }
-        },
-        Err(err) => {
-            let payload = serde_json::json!({
-                "schema": "apm2.fac.review.project.v1",
-                "status": "unavailable",
-                "error": "fac_review_project_failed",
-                "message": err,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-            );
-            // Projection is a debug/observability surface; do not fail callers by default.
-            exit_codes::SUCCESS
-        },
-    }
-}
-
-fn review_type_filter_vec(review_type_filter: Option<&str>) -> Result<Vec<String>, String> {
-    review_type_filter.map_or_else(
-        || Ok(vec!["security".to_string(), "quality".to_string()]),
-        |value| {
-            let normalized = value.trim().to_ascii_lowercase();
-            if matches!(normalized.as_str(), "security" | "quality") {
-                Ok(vec![normalized])
-            } else {
-                Err(format!(
-                    "invalid review type filter `{value}` (expected security|quality)"
-                ))
-            }
-        },
-    )
-}
-
-fn run_wait_inner(
-    pr_number: u32,
-    review_type_filter: Option<&str>,
-    wait_for_sha: Option<&str>,
-    timeout: Option<Duration>,
-    poll_interval: Duration,
-) -> Result<(ProjectionStatus, u64, Duration), String> {
-    if let Some(expected_sha) = wait_for_sha {
-        validate_expected_head_sha(expected_sha)?;
-    }
-
-    let start = Instant::now();
-    let mut attempts = 0_u64;
-    let mut last_status = run_project_inner(pr_number, wait_for_sha, None, 0)?;
-    if let Some(expected_head) = wait_for_sha {
-        if !last_status
-            .current_head_sha
-            .eq_ignore_ascii_case(expected_head)
-        {
-            return Err(format!(
-                "stale projection for PR #{pr_number}: expected head {expected_head}, observed {}",
-                last_status.current_head_sha
-            ));
-        }
-    }
-    if review_types_all_terminal(&last_status, review_type_filter)? {
-        return Ok((last_status, attempts, start.elapsed()));
-    }
-
-    loop {
-        attempts = attempts.saturating_add(1);
-        if let Some(timeout) = timeout {
-            if start.elapsed() >= timeout {
-                return Err(format!(
-                    "timed out waiting for PR #{pr_number} review completion after {timeout:?}"
-                ));
-            }
-        }
-
-        thread::sleep(poll_interval);
-        last_status = run_project_inner(pr_number, wait_for_sha, None, 0)?;
-        if let Some(expected_head) = wait_for_sha {
-            if !last_status
-                .current_head_sha
-                .eq_ignore_ascii_case(expected_head)
-            {
-                return Err(format!(
-                    "stale projection for PR #{pr_number}: expected head {expected_head}, observed {}",
-                    last_status.current_head_sha
-                ));
-            }
-        }
-        if review_types_all_terminal(&last_status, review_type_filter)? {
-            return Ok((last_status, attempts, start.elapsed()));
-        }
-    }
-}
-
-fn review_type_state<'a>(
-    status: &'a ProjectionStatus,
-    review_type: &str,
-) -> Result<&'a str, String> {
-    match review_type {
-        "security" => Ok(status.security.as_str()),
-        "quality" => Ok(status.quality.as_str()),
-        other => Err(format!(
-            "invalid review type `{other}` (expected security|quality)"
-        )),
-    }
-}
-
-fn review_types_terminal_done(status: &ProjectionStatus, review_type_filter: Option<&str>) -> bool {
-    let Ok(review_types) = review_type_filter_vec(review_type_filter) else {
-        return false;
-    };
-    review_types
-        .iter()
-        .all(|value| review_type_state(status, value).is_ok_and(projection_state_done))
-}
-
-fn review_types_terminal_failed(
-    status: &ProjectionStatus,
-    review_type_filter: Option<&str>,
-) -> bool {
-    let Ok(review_types) = review_type_filter_vec(review_type_filter) else {
-        return false;
-    };
-    if !review_types_terminal_done(status, review_type_filter) {
-        return false;
-    }
-    for value in &review_types {
-        if let Ok(state) = review_type_state(status, value)
-            && projection_state_failed(state)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn review_types_all_terminal(
-    status: &ProjectionStatus,
-    review_type_filter: Option<&str>,
-) -> Result<bool, String> {
-    let review_types = review_type_filter_vec(review_type_filter)?;
-    if review_types.is_empty() {
-        return Ok(false);
-    }
-    for value in &review_types {
-        let state = review_type_state(status, value)?;
-        if !projection_state_done(state) && !projection_state_failed(state) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 pub fn run_tail(lines: usize, follow: bool) -> u8 {
@@ -4305,8 +3636,8 @@ pub fn run_gates(
     )
 }
 
+#[cfg(not(test))]
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(test, allow(dead_code))]
 pub(super) fn run_gates_local_worker(
     force: bool,
     quick: bool,
@@ -4333,12 +3664,7 @@ pub(super) fn run_gates_local_worker(
     })
 }
 
-/// Post-receipt gate cache rebinding (TCK-00540 BLOCKER fix).
-///
-/// Called by the worker after persisting a job receipt to promote
-/// `rfc0028_receipt_bound` and `rfc0029_receipt_bound` flags in the
-/// gate cache based on verified receipt evidence.
-#[cfg_attr(test, allow(dead_code))]
+#[cfg(not(test))]
 pub(super) fn rebind_gate_cache_after_receipt(
     sha: &str,
     receipts_dir: &std::path::Path,
@@ -4348,12 +3674,7 @@ pub(super) fn rebind_gate_cache_after_receipt(
     gate_cache::rebind_gate_cache_after_receipt(sha, receipts_dir, job_id, signer);
 }
 
-/// Post-receipt v3 gate cache rebinding (TCK-00541 round-3 MAJOR fix).
-///
-/// Promotes `rfc0028_receipt_bound`/`rfc0029_receipt_bound` flags in the
-/// persisted v3 cache after a receipt is committed. Without this, v3
-/// entries remain fail-closed (`false`) and `check_reuse` never hits.
-#[cfg_attr(test, allow(dead_code))]
+#[cfg(not(test))]
 pub(super) fn rebind_v3_gate_cache_after_receipt(
     sha: &str,
     policy_hash: &str,
@@ -4374,7 +3695,7 @@ pub(super) fn rebind_v3_gate_cache_after_receipt(
     );
 }
 
-#[cfg_attr(test, allow(dead_code))]
+#[cfg(not(test))]
 pub(super) fn apply_gate_result_lifecycle_for_repo_sha(
     owner_repo: &str,
     head_sha: &str,
@@ -4506,179 +3827,7 @@ pub(super) fn dispatch_reviews_with_lifecycle(
     Ok(summary.results)
 }
 
-// ── Status / Tail ───────────────────────────────────────────────────────────
-
-fn run_status_inner(
-    pr_number: Option<u32>,
-    review_type_filter: Option<&str>,
-    _json_output: bool,
-) -> Result<bool, String> {
-    let normalized_review_type = review_type_filter.map(|value| value.trim().to_ascii_lowercase());
-    if let Some(value) = normalized_review_type.as_deref() {
-        if !matches!(value, "security" | "quality") {
-            return Err(format!(
-                "invalid review type filter `{value}` (expected security|quality)"
-            ));
-        }
-    }
-
-    let filter_pr = pr_number;
-
-    let target_prs = if let Some(number) = filter_pr {
-        vec![number]
-    } else {
-        list_review_pr_numbers()?
-    };
-    let review_types = normalized_review_type
-        .as_deref()
-        .map_or_else(|| vec!["security", "quality"], |value| vec![value]);
-
-    let mut entries = Vec::new();
-    let mut fail_closed = false;
-    for pr in &target_prs {
-        for review_type in &review_types {
-            let state_path = review_run_state_path(*pr, review_type)?;
-            match load_review_run_state(*pr, review_type)? {
-                state::ReviewRunStateLoad::Present(state) => {
-                    entries.push(serde_json::json!({
-                        "pr_number": pr,
-                        "review_type": review_type,
-                        "state": state.status.as_str(),
-                        "run_id": state.run_id,
-                        "sequence_number": state.sequence_number,
-                        "owner_repo": state.owner_repo,
-                        "head_sha": state.head_sha,
-                        "started_at": state.started_at,
-                        "model_id": state.model_id,
-                        "backend_id": state.backend_id,
-                        "restart_count": state.restart_count,
-                        "terminal_reason": state.terminal_reason,
-                        "state_path": state_path.display().to_string(),
-                    }));
-                },
-                state::ReviewRunStateLoad::Missing { path } => {
-                    if filter_pr.is_some() {
-                        fail_closed = true;
-                    }
-                    entries.push(serde_json::json!({
-                        "pr_number": pr,
-                        "review_type": review_type,
-                        "state": "no-run-state",
-                        "state_path": path.display().to_string(),
-                    }));
-                },
-                state::ReviewRunStateLoad::Corrupt { path, error } => {
-                    fail_closed = true;
-                    entries.push(serde_json::json!({
-                        "pr_number": pr,
-                        "review_type": review_type,
-                        "state": "corrupt-state",
-                        "state_path": path.display().to_string(),
-                        "detail": error,
-                    }));
-                },
-                state::ReviewRunStateLoad::Ambiguous { dir, candidates } => {
-                    fail_closed = true;
-                    entries.push(serde_json::json!({
-                        "pr_number": pr,
-                        "review_type": review_type,
-                        "state": "ambiguous-state",
-                        "state_dir": dir.display().to_string(),
-                        "candidates": candidates
-                            .iter()
-                            .map(|path| path.display().to_string())
-                            .collect::<Vec<_>>(),
-                    }));
-                },
-            }
-        }
-    }
-
-    let filtered_events = read_last_event_values(40)?
-        .into_iter()
-        .filter(|event| {
-            filter_pr.is_none_or(|number| {
-                event
-                    .get("pr_number")
-                    .and_then(serde_json::Value::as_u64)
-                    .is_some_and(|value| value == u64::from(number))
-            }) && normalized_review_type.as_deref().is_none_or(|wanted| {
-                event
-                    .get("review_type")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|value| {
-                        value.eq_ignore_ascii_case(wanted) || value.eq_ignore_ascii_case("all")
-                    })
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let pulse_security = if let Some(number) = filter_pr {
-        if normalized_review_type
-            .as_deref()
-            .is_some_and(|value| value != "security")
-        {
-            None
-        } else {
-            read_pulse_file(number, "security")?
-        }
-    } else {
-        None
-    };
-    let pulse_quality = if let Some(number) = filter_pr {
-        if normalized_review_type
-            .as_deref()
-            .is_some_and(|value| value != "quality")
-        {
-            None
-        } else {
-            read_pulse_file(number, "quality")?
-        }
-    } else {
-        None
-    };
-
-    let current_head_sha = filter_pr.and_then(|number| {
-        entries
-            .iter()
-            .filter(|entry| {
-                entry
-                    .get("pr_number")
-                    .and_then(serde_json::Value::as_u64)
-                    .is_some_and(|value| value == u64::from(number))
-            })
-            .filter_map(|entry| entry.get("head_sha").and_then(serde_json::Value::as_str))
-            .find(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .or_else(|| {
-                pulse_security
-                    .as_ref()
-                    .map(|pulse| pulse.head_sha.clone())
-                    .or_else(|| pulse_quality.as_ref().map(|pulse| pulse.head_sha.clone()))
-            })
-    });
-    for entry in &mut entries {
-        annotate_verdict_finalized_status_entry(entry, current_head_sha.as_deref());
-    }
-
-    let payload = serde_json::json!({
-        "schema": "apm2.fac.review.status.v1",
-        "filter_pr": filter_pr,
-        "filter_review_type": normalized_review_type,
-        "fail_closed": fail_closed,
-        "entries": entries,
-        "recent_events": filtered_events,
-        "pulse_security": pulse_security,
-        "pulse_quality": pulse_quality,
-        "current_head_sha": current_head_sha,
-    });
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&payload)
-            .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-    );
-    Ok(fail_closed)
-}
+// ── Tail ────────────────────────────────────────────────────────────────────
 
 fn run_tail_inner(lines: usize, follow: bool) -> Result<(), String> {
     let path = review_events_path()?;
@@ -4743,14 +3892,10 @@ mod tests {
     };
     use super::state::{read_last_lines, read_pulse_file_from_path, write_pulse_file_to_path};
     use super::types::{
-        EVENT_ROTATE_BYTES, FacEventContext, ProjectionStatus, ReviewBackend, ReviewKind,
-        ReviewRunState, ReviewRunStatus, ReviewStateEntry, ReviewStateFile, default_model,
-        default_review_type, now_iso8601_millis,
+        EVENT_ROTATE_BYTES, FacEventContext, ReviewBackend, ReviewKind, ReviewRunState,
+        ReviewRunStatus, ReviewStateEntry, ReviewStateFile, default_model, default_review_type,
+        now_iso8601_millis,
     };
-    use super::{
-        review_types_all_terminal, review_types_terminal_done, review_types_terminal_failed,
-    };
-
     static TEST_PR_COUNTER: AtomicU32 = AtomicU32::new(441_000);
 
     fn next_test_pr() -> u32 {
@@ -4883,71 +4028,12 @@ mod tests {
     }
 
     #[test]
-    fn test_status_annotation_for_verdict_finalized_lane_requires_rerun_when_head_drifts() {
-        let mut entry = serde_json::json!({
-            "pr_number": 654,
-            "review_type": "security",
-            "state": "failed",
-            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "terminal_reason": "manual_termination_after_decision",
-        });
-
-        super::annotate_verdict_finalized_status_entry(
-            &mut entry,
-            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-        );
-
-        assert_eq!(entry["state"], serde_json::json!("done"));
-        assert_eq!(
-            entry["terminal_reason"],
-            serde_json::json!("verdict_finalized_agent_stopped")
-        );
-        assert_eq!(entry["action_required"], serde_json::json!(true));
-        assert!(entry["next_action"].as_str().is_some_and(|value| {
-            value.contains("apm2 fac review dispatch --pr 654 --type security --force")
-        }));
-    }
-
-    #[test]
     fn test_allowed_author_association_guard() {
         assert!(is_allowed_author_association("OWNER"));
         assert!(is_allowed_author_association("MEMBER"));
         assert!(is_allowed_author_association("COLLABORATOR"));
         assert!(!is_allowed_author_association("CONTRIBUTOR"));
         assert!(!is_allowed_author_association("NONE"));
-    }
-
-    #[test]
-    fn test_review_wait_terminal_predicates_cover_filters() {
-        let status_done = ProjectionStatus {
-            line: String::new(),
-            sha: "abcd".to_string(),
-            current_head_sha: "abcd".to_string(),
-            security: "done:model/backend:r0:abcd".to_string(),
-            quality: "failed:sequence_unknown".to_string(),
-            recent_events: String::new(),
-            terminal_failure: false,
-            last_seq: 0,
-            errors: Vec::new(),
-        };
-        assert!(review_types_terminal_done(&status_done, Some("security")));
-        assert!(!review_types_terminal_failed(
-            &status_done,
-            Some("security")
-        ));
-        assert!(!review_types_terminal_failed(&status_done, Some("quality")));
-        assert!(!review_types_terminal_done(&status_done, Some("quality")));
-
-        let status_running = ProjectionStatus {
-            security: "alive:model/backend:r0:abcd".to_string(),
-            ..status_done
-        };
-        assert!(!review_types_terminal_done(&status_running, None));
-        assert!(!review_types_terminal_failed(&status_running, None));
-
-        let invalid_filter = review_types_all_terminal(&status_running, Some("invalid"));
-        assert!(invalid_filter.is_err());
-        assert!(invalid_filter.unwrap_err().contains("invalid review type"));
     }
 
     #[test]
