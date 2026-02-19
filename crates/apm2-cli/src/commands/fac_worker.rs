@@ -305,11 +305,8 @@ const MAX_COMPLETED_SCAN_ENTRIES: usize = 4096;
 const MAX_TERMINAL_JOB_METADATA_FILE_SIZE: usize = MAX_JOB_SPEC_SIZE * 4;
 
 #[cfg(test)]
-pub fn env_var_test_lock() -> &'static std::sync::Mutex<()> {
-    use std::sync::{Mutex, OnceLock};
-
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+pub fn env_var_test_lock() -> &'static crate::commands::EnvVarTestLock {
+    crate::commands::env_var_test_lock()
 }
 
 // =============================================================================

@@ -21,6 +21,30 @@ mod exit_codes {
     }
 }
 
+// Test-local compatibility shim for `src/commands/fac_worker.rs`, which
+// references `crate::commands::env_var_test_lock()` in its internal test code.
+// This integration crate does not define the production `commands` module.
+#[allow(missing_docs)]
+pub mod commands {
+    pub struct EnvVarTestLock(std::sync::Mutex<()>);
+
+    impl EnvVarTestLock {
+        pub fn lock(&self) -> Result<std::sync::MutexGuard<'_, ()>, std::convert::Infallible> {
+            Ok(match self.0.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            })
+        }
+    }
+
+    pub fn env_var_test_lock() -> &'static EnvVarTestLock {
+        use std::sync::OnceLock;
+
+        static LOCK: OnceLock<EnvVarTestLock> = OnceLock::new();
+        LOCK.get_or_init(|| EnvVarTestLock(std::sync::Mutex::new(())))
+    }
+}
+
 #[path = "../src/commands/fac_gates_job.rs"]
 pub mod fac_gates_job;
 
