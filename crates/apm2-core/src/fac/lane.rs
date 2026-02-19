@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::execution_backend::{ExecutionBackend, select_backend};
-use super::safe_rmtree::safe_rmtree_v1;
+use super::safe_rmtree::{MAX_LOG_DIR_ENTRIES, safe_rmtree_v1, safe_rmtree_v1_with_entry_limit};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -2680,11 +2680,16 @@ impl LaneManager {
         }
 
         // Execute pruning via safe_rmtree for each marked directory.
+        // Use elevated entry limit (MAX_LOG_DIR_ENTRIES) because job log
+        // directories may legitimately exceed the default MAX_DIR_ENTRIES
+        // (10,000). Without this, oversized log dirs become permanently
+        // unprunable, causing the lane to be marked Corrupt on every
+        // cleanup attempt (MAJOR-4 fix).
         for entry in &job_dirs {
             if !entry.pruned {
                 continue;
             }
-            match safe_rmtree_v1(&entry.path, logs_dir) {
+            match safe_rmtree_v1_with_entry_limit(&entry.path, logs_dir, MAX_LOG_DIR_ENTRIES) {
                 Ok(_) => {},
                 Err(err) => {
                     return Err(LaneCleanupError::LogQuotaFailed {

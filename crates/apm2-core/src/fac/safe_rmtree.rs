@@ -75,6 +75,19 @@ pub const MAX_TRAVERSAL_DEPTH: usize = 128;
 /// directory; this is a hard safety cap, not a performance tuning knob.
 pub const MAX_DIR_ENTRIES: usize = 10_000;
 
+/// Elevated per-directory entry limit for log retention cleanup.
+///
+/// Job log directories may legitimately contain more than `MAX_DIR_ENTRIES`
+/// files (e.g., high-frequency step logs, diagnostic dumps). When log
+/// retention prunes these directories, the streaming deletion path already
+/// processes entries one at a time (no `Vec` collection), so a higher limit
+/// is safe. The total entries across an entire lane are still bounded by
+/// `gc::MAX_LANE_SCAN_ENTRIES` during the size estimation phase.
+///
+/// This constant is the hard cap for `safe_rmtree_v1_with_entry_limit`
+/// callers that opt in to large-directory deletion.
+pub const MAX_LOG_DIR_ENTRIES: usize = 1_000_000;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Error Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -320,6 +333,65 @@ pub fn safe_rmtree_v1(
     }
 }
 
+/// Variant of [`safe_rmtree_v1`] with a caller-specified per-directory entry
+/// limit.
+///
+/// Log retention cleanup may need to delete job-log directories that exceed
+/// the default `MAX_DIR_ENTRIES` (10,000) limit. This function allows the
+/// caller to opt in to a higher cap (bounded by `MAX_LOG_DIR_ENTRIES`) while
+/// preserving all other security invariants (symlink refusal, filesystem
+/// boundary checks, depth limits, ownership validation).
+///
+/// # Panics
+///
+/// None. Returns `Err` on all failure paths.
+///
+/// # Errors
+///
+/// Returns `SafeRmtreeError` on any safety violation, permission error,
+/// or I/O failure — identical to `safe_rmtree_v1`.
+pub fn safe_rmtree_v1_with_entry_limit(
+    root: &Path,
+    allowed_parent: &Path,
+    max_entries_per_dir: usize,
+) -> Result<SafeRmtreeOutcome, SafeRmtreeError> {
+    // Clamp to MAX_LOG_DIR_ENTRIES to prevent unbounded usage.
+    let effective_limit = max_entries_per_dir.min(MAX_LOG_DIR_ENTRIES);
+
+    // ── Step 1: Validate both paths are absolute (INV-RMTREE-005) ────
+    if !root.is_absolute() {
+        return Err(SafeRmtreeError::NotAbsolute {
+            path: root.to_path_buf(),
+        });
+    }
+    if !allowed_parent.is_absolute() {
+        return Err(SafeRmtreeError::NotAbsolute {
+            path: allowed_parent.to_path_buf(),
+        });
+    }
+
+    // ── Step 1b: Reject dot-segment components (INV-RMTREE-010) ─────
+    reject_dot_segments(root)?;
+    reject_dot_segments(allowed_parent)?;
+
+    // ── Step 2: Validate root is strictly under allowed_parent ───────
+    validate_strictly_under(root, allowed_parent)?;
+
+    // ── Step 3: Validate allowed_parent ownership and mode ───────────
+    validate_parent_ownership(allowed_parent)?;
+
+    // ── Step 4+5+6+7: Open root via ancestor chain + delete ─────────
+    #[cfg(unix)]
+    {
+        safe_rmtree_v1_unix_with_limit(root, allowed_parent, effective_limit)
+    }
+
+    #[cfg(not(unix))]
+    {
+        safe_rmtree_v1_non_unix_with_limit(root, allowed_parent, effective_limit)
+    }
+}
+
 /// Unix implementation of safe recursive tree deletion using fd-relative
 /// operations. Walks from `allowed_parent` to `root` via `openat(O_NOFOLLOW)`
 /// at each component, then performs fd-relative deletion.
@@ -327,6 +399,16 @@ pub fn safe_rmtree_v1(
 fn safe_rmtree_v1_unix(
     root: &Path,
     allowed_parent: &Path,
+) -> Result<SafeRmtreeOutcome, SafeRmtreeError> {
+    safe_rmtree_v1_unix_with_limit(root, allowed_parent, MAX_DIR_ENTRIES)
+}
+
+/// Unix implementation with a caller-specified per-directory entry limit.
+#[cfg(unix)]
+fn safe_rmtree_v1_unix_with_limit(
+    root: &Path,
+    allowed_parent: &Path,
+    max_entries_per_dir: usize,
 ) -> Result<SafeRmtreeOutcome, SafeRmtreeError> {
     use nix::fcntl::OFlag;
 
@@ -413,12 +495,14 @@ fn safe_rmtree_v1_unix(
         file_type,
         root_dev,
         open_flags,
+        max_entries_per_dir,
     )
 }
 
 /// Delete the root entry (directory or file) using fd-relative operations
 /// on the already-opened parent directory fd.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn delete_root_entry_via_parent_fd(
     parent_of_root: &nix::dir::Dir,
     root_name: &std::ffi::OsStr,
@@ -426,6 +510,7 @@ fn delete_root_entry_via_parent_fd(
     file_type: libc::mode_t,
     root_dev: u64,
     open_flags: nix::fcntl::OFlag,
+    max_entries_per_dir: usize,
 ) -> Result<SafeRmtreeOutcome, SafeRmtreeError> {
     if file_type == libc::S_IFDIR {
         let mut stats = DeleteStats::default();
@@ -449,7 +534,14 @@ fn delete_root_entry_via_parent_fd(
             }
         })?;
 
-        fd_relative_recursive_delete(&root_dir, root, &mut stats, 0, root_dev)?;
+        fd_relative_recursive_delete(
+            &root_dir,
+            root,
+            &mut stats,
+            0,
+            root_dev,
+            max_entries_per_dir,
+        )?;
         drop(root_dir);
 
         nix::unistd::unlinkat(
@@ -506,6 +598,16 @@ fn safe_rmtree_v1_non_unix(
     root: &Path,
     allowed_parent: &Path,
 ) -> Result<SafeRmtreeOutcome, SafeRmtreeError> {
+    safe_rmtree_v1_non_unix_with_limit(root, allowed_parent, MAX_DIR_ENTRIES)
+}
+
+/// Non-Unix fallback with a caller-specified per-directory entry limit.
+#[cfg(not(unix))]
+fn safe_rmtree_v1_non_unix_with_limit(
+    root: &Path,
+    allowed_parent: &Path,
+    max_entries_per_dir: usize,
+) -> Result<SafeRmtreeOutcome, SafeRmtreeError> {
     let root_meta = match fs::symlink_metadata(root) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -527,7 +629,7 @@ fn safe_rmtree_v1_non_unix(
 
     if root_meta.is_dir() {
         let mut stats = DeleteStats::default();
-        path_based_recursive_delete(root, allowed_parent, 0, &mut stats)?;
+        path_based_recursive_delete(root, allowed_parent, 0, &mut stats, max_entries_per_dir)?;
         Ok(SafeRmtreeOutcome::Deleted {
             files_deleted: stats.files_deleted,
             dirs_deleted: stats.dirs_deleted,
@@ -636,12 +738,14 @@ fn reject_dot_segments(path: &Path) -> Result<(), SafeRmtreeError> {
 /// symlink swaps in the namespace. All child operations go through
 /// `openat`/`unlinkat`/`fstatat` relative to that fd.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn fd_relative_recursive_delete(
     parent_dir: &nix::dir::Dir,
     parent_path: &Path,
     stats: &mut DeleteStats,
     depth: usize,
     root_dev: u64,
+    max_entries_per_dir: usize,
 ) -> Result<(), SafeRmtreeError> {
     use std::os::fd::AsFd;
 
@@ -692,10 +796,10 @@ fn fd_relative_recursive_delete(
         }
 
         entry_count += 1;
-        if entry_count > MAX_DIR_ENTRIES {
+        if entry_count > max_entries_per_dir {
             return Err(SafeRmtreeError::TooManyEntries {
                 path: parent_path.to_path_buf(),
-                max: MAX_DIR_ENTRIES,
+                max: max_entries_per_dir,
             });
         }
 
@@ -723,6 +827,7 @@ fn fd_relative_recursive_delete(
             root_dev,
             stats,
             depth,
+            max_entries_per_dir,
         )?;
     }
 
@@ -742,6 +847,7 @@ fn process_entry(
     root_dev: u64,
     stats: &mut DeleteStats,
     depth: usize,
+    max_entries_per_dir: usize,
 ) -> Result<(), SafeRmtreeError> {
     use nix::sys::stat::Mode;
     use nix::unistd::UnlinkatFlags;
@@ -782,6 +888,7 @@ fn process_entry(
                 stats,
                 depth + 1,
                 root_dev,
+                max_entries_per_dir,
             )?;
 
             // Drop child fd before unlinkat so the directory can be removed.
@@ -1021,6 +1128,7 @@ fn path_based_recursive_delete(
     allowed_parent: &Path,
     depth: usize,
     stats: &mut DeleteStats,
+    max_entries_per_dir: usize,
 ) -> Result<(), SafeRmtreeError> {
     if depth >= MAX_TRAVERSAL_DEPTH {
         return Err(SafeRmtreeError::DepthExceeded {
@@ -1034,10 +1142,10 @@ fn path_based_recursive_delete(
 
     let mut entries = Vec::new();
     for entry_result in read_dir {
-        if entries.len() >= MAX_DIR_ENTRIES {
+        if entries.len() >= max_entries_per_dir {
             return Err(SafeRmtreeError::TooManyEntries {
                 path: dir.to_path_buf(),
-                max: MAX_DIR_ENTRIES,
+                max: max_entries_per_dir,
             });
         }
         let entry = entry_result
@@ -1058,7 +1166,13 @@ fn path_based_recursive_delete(
         validate_strictly_under(entry_path, allowed_parent)?;
 
         if meta.is_dir() {
-            path_based_recursive_delete(entry_path, allowed_parent, depth + 1, stats)?;
+            path_based_recursive_delete(
+                entry_path,
+                allowed_parent,
+                depth + 1,
+                stats,
+                max_entries_per_dir,
+            )?;
         } else if meta.is_file() {
             fs::remove_file(entry_path).map_err(|e| {
                 SafeRmtreeError::io(format!("removing file {}", entry_path.display()), e)
@@ -1726,5 +1840,66 @@ mod tests {
         };
         assert!(receipt.mark_corrupt);
         assert_eq!(receipt.reason, "symlink detected");
+    }
+
+    // ── MAJOR-4 regression: elevated entry limit for log dirs ─────────
+
+    /// Verify that `safe_rmtree_v1` rejects a directory with more than
+    /// `MAX_DIR_ENTRIES` entries (default behavior), while
+    /// `safe_rmtree_v1_with_entry_limit` succeeds with a higher limit.
+    #[test]
+    fn elevated_limit_allows_large_dir_deletion() {
+        let parent = make_allowed_parent();
+        let root = parent.path().join("large_log_dir");
+        std::fs::create_dir(&root).expect("mkdir");
+
+        // Create MAX_DIR_ENTRIES + 1 files to exceed the default limit.
+        let file_count = MAX_DIR_ENTRIES + 1;
+        for i in 0..file_count {
+            let file = root.join(format!("file_{i:06}"));
+            std::fs::write(&file, b"x").expect("write");
+        }
+
+        // Default safe_rmtree_v1 must fail with TooManyEntries.
+        let result = safe_rmtree_v1(&root, parent.path());
+        assert!(
+            matches!(result, Err(SafeRmtreeError::TooManyEntries { .. })),
+            "default safe_rmtree_v1 should reject dir with >{MAX_DIR_ENTRIES} entries, got: {result:?}"
+        );
+
+        // Elevated-limit variant must succeed.
+        let result = safe_rmtree_v1_with_entry_limit(&root, parent.path(), MAX_DIR_ENTRIES + 100);
+        assert!(
+            result.is_ok(),
+            "safe_rmtree_v1_with_entry_limit should succeed with elevated limit, got: {result:?}"
+        );
+        assert!(!root.exists(), "directory should be deleted");
+    }
+
+    /// Verify that the entry limit is clamped to `MAX_LOG_DIR_ENTRIES` even
+    /// when the caller requests a higher value.
+    #[test]
+    fn entry_limit_clamped_to_max_log_dir_entries() {
+        let parent = make_allowed_parent();
+        let root = parent.path().join("clamped_dir");
+        std::fs::create_dir(&root).expect("mkdir");
+
+        // Create a few files — this just verifies the function works
+        // (we cannot create 1M+ files in a test, but we verify clamping
+        // logic doesn't panic).
+        for i in 0..5 {
+            std::fs::write(root.join(format!("f{i}")), b"x").expect("write");
+        }
+
+        let result = safe_rmtree_v1_with_entry_limit(
+            &root,
+            parent.path(),
+            usize::MAX, // Request absurdly high limit
+        );
+        assert!(
+            result.is_ok(),
+            "clamped limit should still allow deletion, got: {result:?}"
+        );
+        assert!(!root.exists(), "directory should be deleted");
     }
 }

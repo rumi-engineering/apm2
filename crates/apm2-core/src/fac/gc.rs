@@ -14,7 +14,8 @@ use crate::fac::job_spec::parse_b3_256_digest;
 use crate::fac::lane::{LaneManager, LaneState, LaneStatusV1};
 use crate::fac::receipt_index::ReceiptIndexV1;
 use crate::fac::safe_rmtree::{
-    MAX_DIR_ENTRIES, SafeRmtreeError, SafeRmtreeOutcome, safe_rmtree_v1,
+    MAX_DIR_ENTRIES, MAX_LOG_DIR_ENTRIES, SafeRmtreeError, SafeRmtreeOutcome, safe_rmtree_v1,
+    safe_rmtree_v1_with_entry_limit,
 };
 
 pub const GATE_CACHE_TTL_SECS: u64 = 2_592_000;
@@ -641,7 +642,7 @@ fn collect_lane_log_retention_targets(
 }
 
 /// Maximum total directory entries scanned per lane during log retention
-/// size estimation. Prevents unbounded recursion/traversal DoS.
+/// size estimation. Prevents unbounded recursion/traversal denial-of-service.
 pub const MAX_LANE_SCAN_ENTRIES: usize = 100_000;
 
 pub(super) fn estimate_job_log_dir_size_recursive(path: &Path, visited_count: &mut usize) -> u64 {
@@ -674,11 +675,8 @@ fn estimate_job_log_dir_size_recursive_inner(
         }
 
         if metadata.is_dir() {
-            let sub = estimate_job_log_dir_size_recursive_inner(
-                &entry.path(),
-                visited_count,
-                depth + 1,
-            );
+            let sub =
+                estimate_job_log_dir_size_recursive_inner(&entry.path(), visited_count, depth + 1);
             if sub == u64::MAX {
                 return u64::MAX;
             }
@@ -1038,7 +1036,19 @@ pub fn execute_gc(plan: &GcPlan) -> GcReceiptV1 {
             None
         };
 
-        let result = safe_rmtree_v1(&target.path, &target.allowed_parent);
+        // MAJOR-4 fix: Use elevated entry limit for LaneLogRetention
+        // targets. Job log directories may legitimately exceed the default
+        // MAX_DIR_ENTRIES (10,000). Without this, oversized log dirs cause
+        // permanent TooManyEntries errors during GC.
+        let result = if target.kind == crate::fac::gc_receipt::GcActionKind::LaneLogRetention {
+            safe_rmtree_v1_with_entry_limit(
+                &target.path,
+                &target.allowed_parent,
+                MAX_LOG_DIR_ENTRIES,
+            )
+        } else {
+            safe_rmtree_v1(&target.path, &target.allowed_parent)
+        };
 
         match result {
             Ok(outcome) => {
@@ -3100,7 +3110,10 @@ mod tests {
         // Metadata for 'nested' dir (usually 4096 on Linux ext4) + file size (1024).
         // Shallow estimator would return only dir metadata (~4096).
         // Recursive should be at least 1024 + dir metadata.
-        assert!(size >= 1024, "recursive estimator must count nested file size");
+        assert!(
+            size >= 1024,
+            "recursive estimator must count nested file size"
+        );
     }
 
     #[test]

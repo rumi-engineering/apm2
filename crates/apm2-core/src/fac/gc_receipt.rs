@@ -98,7 +98,7 @@ pub struct GcAction {
     pub dirs_deleted: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GcActionKind {
     LaneTarget,
