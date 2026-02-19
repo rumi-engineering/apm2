@@ -1794,10 +1794,12 @@ fn run_gates_via_worker(
                 }
             },
             Err(err) => {
+                let failure = QueuePreparationFailure::GateExecutionFailed { message: err };
+                let message = failure.message();
                 return output_worker_typed_error(
                     json_output,
                     "gate_execution_failed",
-                    &err,
+                    &message,
                     GATE_EXECUTION_FAILED_CODE,
                     exit_codes::GENERIC_ERROR,
                 );
