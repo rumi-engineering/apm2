@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00603"
     title: "FAC truth-plane cutover: remove GitHub authority from fac_review core"
-    status: "CLOSED"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

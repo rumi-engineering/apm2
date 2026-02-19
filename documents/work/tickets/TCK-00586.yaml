@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00586"
     title: "Multi-worker fairness & scan efficiency: avoid stampede scanning; optional queue scan lease; deterministic behavior preserved"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

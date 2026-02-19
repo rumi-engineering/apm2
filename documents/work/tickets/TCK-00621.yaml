@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00621"
     title: "Implement two-phase gates contract: PREP (healing) then EXECUTE (isolated, deterministic)"
-    status: "CLOSED"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

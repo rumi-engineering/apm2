@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00553"
     title: "sccache explicit activation (optional): policy-gated enablement + receipt/attestation surfacing + safe defaults"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

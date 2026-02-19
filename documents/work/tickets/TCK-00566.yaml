@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00566"
     title: "Token replay protection: broker-side one-time use (or bounded reuse) ledger + revocation"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

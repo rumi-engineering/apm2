@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00559"
     title: "Security regression tests: fuzz job spec parsing + adversarial queue file tests + safe_rmtree property tests"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

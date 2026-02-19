@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00605"
     title: "FAC agent reliability hardening — auto-verdict, doctor-as-oracle, recovery bypass, auto-merge"
-    status: "CLOSED"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"
