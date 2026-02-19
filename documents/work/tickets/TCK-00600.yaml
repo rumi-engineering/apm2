@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00600"
     title: "Broker/worker health + watchdog integration (ensure daemon is always running)"
-    status: "CLOSED"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

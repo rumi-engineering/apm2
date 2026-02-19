@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00622"
     title: "Enforce network denial during EXECUTE phase; normalize supply failure; fix FAC queue reliability"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

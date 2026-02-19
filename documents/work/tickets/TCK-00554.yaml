@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00554"
     title: "sccache containment protocol: per-unit server lifecycle + refusal to attach to out-of-cgroup servers"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

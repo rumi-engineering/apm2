@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00608"
     title: "Fix daemon ledger_db config/XDG fallback, worker unit template flag, and systemd ReadWritePaths"
-    status: "CLOSED"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

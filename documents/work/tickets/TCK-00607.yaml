@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00607"
     title: "Fix doctor false positive, unify timeouts, add agent activity diagnostics, and auto-nudge incomplete reviewers"
-    status: "CLOSED"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

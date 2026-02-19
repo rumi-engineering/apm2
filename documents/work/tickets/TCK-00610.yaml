@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00610"
     title: "Fix stale-verdict approve bypass, clear verdicts on restart, and repair worktree-less auto-merge"
-    status: "CLOSED"
+    status: "MERGED"
     note: "Stale-verdict bypass and worktree-less auto-merge fixes completed as part of RFC-0019 FAC hardening work."
   binds:
     prd_id: "PRD-PLACEHOLDER"

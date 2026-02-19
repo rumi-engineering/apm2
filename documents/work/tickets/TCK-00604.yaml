@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00604"
     title: "FAC core lifecycle state machine refactor and operational hardening"
-    status: "CLOSED"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00606"
     title: "FAC CLI JSON parity — every fac subcommand outputs JSON by default, long-running commands stream JSONL"
-    status: "CLOSED"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

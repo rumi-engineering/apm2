@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00618"
     title: "Fix: lifecycle stuck at gates_failed after gate retry succeeds; fix duplicate verdict comments on second reviewer completion"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

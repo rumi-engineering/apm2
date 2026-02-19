@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00620"
     title: "Implement daemon-owned readiness controller for zero-touch gates auto-bootstrap"
-    status: "CLOSED"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

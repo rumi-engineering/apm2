@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00589"
     title: "Legacy evidence log deprecation: migrate to per-job logs, keep legacy read-only, and remove clobbering paths"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

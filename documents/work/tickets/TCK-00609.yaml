@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00609"
     title: "Close the doctor command gap: every recommended action must carry an executable command"
-    status: "CLOSED"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"
