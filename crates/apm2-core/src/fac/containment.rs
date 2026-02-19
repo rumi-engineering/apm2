@@ -316,6 +316,10 @@ impl Default for SccacheServerContainment {
 /// Maximum length for the `reason` field in `SccacheServerContainment`.
 const MAX_SERVER_CONTAINMENT_REASON_LENGTH: usize = 512;
 
+/// Maximum number of sccache server PIDs that the set-based discovery
+/// will collect. Exceeding this bound triggers fail-closed auto-disable.
+const MAX_SCCACHE_SERVER_PIDS: usize = 64;
+
 /// Trace for containment checks included in job receipts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1248,19 +1252,25 @@ fn sccache_bounded_reap(child: &mut std::process::Child) -> Option<std::process:
 // Sccache Server Containment Protocol (TCK-00554)
 // =============================================================================
 
-/// Discovers the PID of a running sccache server by scanning `/proc`.
+/// Discovers ALL PIDs of running sccache servers by scanning `/proc`.
 ///
 /// Looks for processes named "sccache" that are NOT children of the
 /// reference PID (i.e., they are standalone daemon processes, typically
-/// listening on a socket). Returns the PID of the first sccache process
-/// found that is not a descendant of `reference_pid`.
+/// listening on a socket). Returns ALL sccache PIDs found that are not
+/// descendants of `reference_pid`, in discovery order.
+///
+/// BLOCKER fix (fix-round-3): Previously returned only the first match.
+/// Set-based enumeration is required so that `verify_started_server` can
+/// fail closed if ANY candidate is outside the unit cgroup — a single-PID
+/// check cannot detect conflicting out-of-cgroup servers that coexist
+/// with a verified in-cgroup server.
 ///
 /// Uses the same bounded scan as `discover_children_from_proc` for
 /// consistency (INV-CONTAIN-003).
-fn discover_sccache_server_pid(
+fn discover_sccache_server_pids(
     reference_pid: u32,
     proc_root: &Path,
-) -> Result<Option<u32>, ContainmentError> {
+) -> Result<Vec<u32>, ContainmentError> {
     // Build the set of descendant PIDs so we can exclude them.
     let descendants = discover_children_from_proc(reference_pid, proc_root)?;
     let descendant_pids: std::collections::BTreeSet<u32> =
@@ -1277,6 +1287,7 @@ fn discover_sccache_server_pid(
         },
     };
 
+    let mut found: Vec<u32> = Vec::new();
     let mut scanned: usize = 0;
     let mut unreadable_count: usize = 0;
     for entry in proc_dir {
@@ -1314,7 +1325,14 @@ fn discover_sccache_server_pid(
         // an escaped sccache server.
         if let Ok(comm) = read_comm(pid, proc_root) {
             if comm.trim() == "sccache" {
-                return Ok(Some(pid));
+                found.push(pid);
+                // Bounded collection: fail-closed if too many sccache PIDs.
+                if found.len() > MAX_SCCACHE_SERVER_PIDS {
+                    return Err(ContainmentError::TooManyChildren {
+                        count: found.len(),
+                        max: MAX_SCCACHE_SERVER_PIDS,
+                    });
+                }
             }
         } else {
             unreadable_count = unreadable_count.saturating_add(1);
@@ -1325,7 +1343,7 @@ fn discover_sccache_server_pid(
         }
     }
 
-    Ok(None)
+    Ok(found)
 }
 
 /// Executes a bounded sccache command (start-server or stop-server).
@@ -1429,9 +1447,9 @@ pub fn execute_sccache_server_containment_protocol_with_proc(
         ..Default::default()
     };
 
-    // Step 1: Detect pre-existing sccache server.
-    let preexisting_pid = match discover_sccache_server_pid(reference_pid, proc_root) {
-        Ok(pid) => pid,
+    // Step 1: Detect pre-existing sccache servers (set-based scan).
+    let preexisting_pids = match discover_sccache_server_pids(reference_pid, proc_root) {
+        Ok(pids) => pids,
         Err(e) => {
             // Fail-closed: cannot scan for servers → auto-disable.
             result.auto_disabled = true;
@@ -1443,11 +1461,21 @@ pub fn execute_sccache_server_containment_protocol_with_proc(
         },
     };
 
-    // Steps 2-3: Handle pre-existing server (verify cgroup, refuse if outside).
-    if let Some(pid) = preexisting_pid {
-        if let Some(early_return) =
-            handle_preexisting_server(&mut result, pid, reference_cgroup, sccache_env, proc_root)
-        {
+    // Steps 2-3: Handle pre-existing servers (verify cgroup, refuse if outside).
+    // Check ALL preexisting PIDs. If ANY is outside the cgroup, attempt to stop
+    // and fail closed if stop fails. Record the first detected PID for
+    // traceability.
+    if !preexisting_pids.is_empty() {
+        result.preexisting_server_detected = true;
+        result.preexisting_server_pid = Some(preexisting_pids[0]);
+
+        if let Some(early_return) = handle_preexisting_servers(
+            &mut result,
+            &preexisting_pids,
+            reference_cgroup,
+            sccache_env,
+            proc_root,
+        ) {
             return early_return;
         }
     }
@@ -1462,66 +1490,81 @@ pub fn execute_sccache_server_containment_protocol_with_proc(
     // Step 5: Verify the new server is inside the cgroup.
     verify_started_server(&mut result, reference_pid, reference_cgroup, proc_root);
 
-    // If we had a pre-existing out-of-cgroup server, mark as auto-disabled
-    // only if we couldn't start a new one.
-    if result.preexisting_server_detected
-        && result.preexisting_server_in_cgroup == Some(false)
-        && !result.server_cgroup_verified
-    {
-        result.auto_disabled = true;
-        if result.reason.is_none() {
-            result.reason = Some(truncate_string(
-                "pre-existing sccache server outside cgroup and replacement failed",
-                MAX_SERVER_CONTAINMENT_REASON_LENGTH,
-            ));
-        }
-    }
-
     result
 }
 
-/// Handles a pre-existing sccache server (Steps 2-3).
+/// Handles ALL pre-existing sccache servers (Steps 2-3).
 ///
-/// Returns `Some(result)` for early return when the server is in-cgroup
-/// (safe to use), or `None` to continue with server start.
-fn handle_preexisting_server(
+/// For each pre-existing PID:
+/// - If in-cgroup: safe to use.
+/// - If outside cgroup: attempt to stop it. Stop failure = containment failure.
+///
+/// Returns `Some(result)` for early return when ALL servers are in-cgroup
+/// (safe to use), or when ANY out-of-cgroup server cannot be stopped
+/// (containment failure). Returns `None` to continue with server start.
+///
+/// BLOCKER fix (fix-round-3): Changed from single-PID to set-based.
+/// Stop failure is now a containment failure (previously ignored).
+fn handle_preexisting_servers(
     result: &mut SccacheServerContainment,
-    pid: u32,
+    pids: &[u32],
     reference_cgroup: &str,
     sccache_env: &[(String, String)],
     proc_root: &Path,
 ) -> Option<SccacheServerContainment> {
-    result.preexisting_server_detected = true;
-    result.preexisting_server_pid = Some(pid);
+    let mut all_in_cgroup = true;
+    let mut any_outside = false;
 
-    // Step 2: Verify cgroup membership of pre-existing server.
-    match read_cgroup_path_from_proc(pid, proc_root) {
-        Ok(server_cgroup) => {
-            let in_cgroup = is_cgroup_contained(&server_cgroup, reference_cgroup);
-            result.preexisting_server_in_cgroup = Some(in_cgroup);
+    for &pid in pids {
+        if let Ok(server_cgroup) = read_cgroup_path_from_proc(pid, proc_root) {
+            if !is_cgroup_contained(&server_cgroup, reference_cgroup) {
+                any_outside = true;
+                all_in_cgroup = false;
+            }
+        } else {
+            // Fail-closed: cannot read server cgroup → treat as outside.
+            any_outside = true;
+            all_in_cgroup = false;
+        }
+    }
 
-            if in_cgroup {
-                // Pre-existing server is inside the cgroup — safe to use.
-                result.server_cgroup_verified = true;
+    if all_in_cgroup {
+        // ALL pre-existing servers are inside the cgroup — safe to use.
+        result.preexisting_server_in_cgroup = Some(true);
+        result.server_cgroup_verified = true;
+        result.reason = Some(truncate_string(
+            &format!(
+                "{} pre-existing sccache server(s) verified in cgroup '{}'",
+                pids.len(),
+                truncate_string(reference_cgroup, 128),
+            ),
+            MAX_SERVER_CONTAINMENT_REASON_LENGTH,
+        ));
+        return Some(result.clone());
+    }
+
+    // At least one server is outside the cgroup.
+    result.preexisting_server_in_cgroup = Some(false);
+
+    if any_outside {
+        // Attempt to stop the out-of-cgroup server(s).
+        // BLOCKER fix (fix-round-3): Stop failure is a containment failure.
+        // Previously the stop result was ignored (`let _ = ...`).
+        match run_sccache_command(&["--stop-server"], sccache_env, SCCACHE_SERVER_STOP_TIMEOUT) {
+            Ok(_) => {
+                // Stop succeeded. Continue to start a fresh server.
+            },
+            Err(e) => {
+                // Stop FAILED. The out-of-cgroup server persists.
+                // This is a containment failure — fail closed.
+                result.auto_disabled = true;
                 result.reason = Some(truncate_string(
-                    &format!(
-                        "pre-existing sccache server PID {pid} verified in cgroup '{}'",
-                        truncate_string(reference_cgroup, 128),
-                    ),
+                    &format!("failed to stop pre-existing out-of-cgroup sccache server: {e}"),
                     MAX_SERVER_CONTAINMENT_REASON_LENGTH,
                 ));
                 return Some(result.clone());
-            }
-
-            // Step 3: Pre-existing server is OUTSIDE the cgroup.
-            // Refuse to attach (INV-CONTAIN-009). Stop it and start fresh.
-            let _ =
-                run_sccache_command(&["--stop-server"], sccache_env, SCCACHE_SERVER_STOP_TIMEOUT);
-        },
-        Err(_) => {
-            // Fail-closed: cannot read server cgroup → treat as outside.
-            result.preexisting_server_in_cgroup = Some(false);
-        },
+            },
+        }
     }
 
     None // Continue with server start.
@@ -1552,69 +1595,27 @@ fn start_sccache_server_in_cgroup(
 /// Verifies that the newly started sccache server is inside the cgroup (Step
 /// 5).
 ///
-/// Re-scans `/proc` for the sccache process to find the newly started server
-/// PID. Note: there is an inherent TOCTOU window between start and this
-/// check, but the server was started by us inside the cgroup, so the only
-/// way it escapes is if systemd moves it — which requires root. We verify
-/// anyway for defense-in-depth.
+/// Re-scans `/proc` for ALL sccache processes and checks every candidate's
+/// cgroup. If ANY candidate is outside the unit cgroup, verification fails
+/// and `auto_disabled` is set (fail-closed). The verified server PID is set
+/// to the candidate confirmed inside the cgroup.
+///
+/// BLOCKER fix (fix-round-3): Previously checked only the first discovered
+/// PID. A single-PID check cannot detect conflicting out-of-cgroup servers
+/// that coexist with a verified in-cgroup server (INV-CONTAIN-009/012).
+///
+/// Note: there is an inherent TOCTOU window between start and this check,
+/// but the server was started by us inside the cgroup, so the only way it
+/// escapes is if systemd moves it — which requires root. We verify anyway
+/// for defense-in-depth.
 fn verify_started_server(
     result: &mut SccacheServerContainment,
     reference_pid: u32,
     reference_cgroup: &str,
     proc_root: &Path,
 ) {
-    match discover_sccache_server_pid(reference_pid, proc_root) {
-        Ok(Some(new_pid)) => {
-            result.started_server_pid = Some(new_pid);
-            match read_cgroup_path_from_proc(new_pid, proc_root) {
-                Ok(new_cgroup) => {
-                    let in_cgroup = is_cgroup_contained(&new_cgroup, reference_cgroup);
-                    result.server_cgroup_verified = in_cgroup;
-                    if in_cgroup {
-                        result.reason = Some(truncate_string(
-                            &format!(
-                                "sccache server PID {new_pid} started and verified in cgroup '{}'",
-                                truncate_string(reference_cgroup, 128),
-                            ),
-                            MAX_SERVER_CONTAINMENT_REASON_LENGTH,
-                        ));
-                    } else {
-                        // Server escaped cgroup after start — auto-disable.
-                        result.auto_disabled = true;
-                        result.reason = Some(truncate_string(
-                            &format!(
-                                "started sccache server PID {new_pid} escaped cgroup: \
-                                 expected='{}', actual='{}'",
-                                truncate_string(reference_cgroup, 128),
-                                truncate_string(&new_cgroup, 128),
-                            ),
-                            MAX_SERVER_CONTAINMENT_REASON_LENGTH,
-                        ));
-                    }
-                },
-                Err(e) => {
-                    // Fail-closed: cannot verify new server cgroup.
-                    result.auto_disabled = true;
-                    result.reason = Some(truncate_string(
-                        &format!("cannot verify started sccache server PID {new_pid} cgroup: {e}"),
-                        MAX_SERVER_CONTAINMENT_REASON_LENGTH,
-                    ));
-                },
-            }
-        },
-        Ok(None) => {
-            // MAJOR-1 fix: Fail-closed when server PID cannot be found.
-            // A positively identified PID plus cgroup match is required
-            // before setting server_cgroup_verified=true. If the server
-            // is not visible in /proc, we cannot verify containment.
-            result.auto_disabled = true;
-            result.server_cgroup_verified = false;
-            result.reason = Some(
-                "sccache server started but not found in /proc — \
-                 cannot verify cgroup containment (fail-closed)"
-                    .to_string(),
-            );
-        },
+    let all_pids = match discover_sccache_server_pids(reference_pid, proc_root) {
+        Ok(pids) => pids,
         Err(e) => {
             // Fail-closed: cannot rescan for server.
             result.auto_disabled = true;
@@ -1622,7 +1623,101 @@ fn verify_started_server(
                 &format!("failed to verify started sccache server: {e}"),
                 MAX_SERVER_CONTAINMENT_REASON_LENGTH,
             ));
+            return;
         },
+    };
+
+    if all_pids.is_empty() {
+        // MAJOR-1 fix: Fail-closed when server PID cannot be found.
+        // A positively identified PID plus cgroup match is required
+        // before setting server_cgroup_verified=true. If the server
+        // is not visible in /proc, we cannot verify containment.
+        result.auto_disabled = true;
+        result.server_cgroup_verified = false;
+        result.reason = Some(
+            "sccache server started but not found in /proc — \
+             cannot verify cgroup containment (fail-closed)"
+                .to_string(),
+        );
+        return;
+    }
+
+    // Set-based verification: check ALL discovered sccache server PIDs.
+    // Track the first in-cgroup PID as our verified server, but fail closed
+    // if ANY candidate is outside the cgroup.
+    let mut verified_pid: Option<u32> = None;
+    let mut outside_cgroup_pids: Vec<u32> = Vec::new();
+    let mut unverifiable_pids: Vec<u32> = Vec::new();
+
+    for &pid in &all_pids {
+        match read_cgroup_path_from_proc(pid, proc_root) {
+            Ok(pid_cgroup) => {
+                if is_cgroup_contained(&pid_cgroup, reference_cgroup) {
+                    if verified_pid.is_none() {
+                        verified_pid = Some(pid);
+                    }
+                } else {
+                    outside_cgroup_pids.push(pid);
+                }
+            },
+            Err(_) => {
+                // Fail-closed: cannot read cgroup → treat as outside.
+                unverifiable_pids.push(pid);
+            },
+        }
+    }
+
+    // Record the started server PID — prefer the verified in-cgroup PID,
+    // fall back to the first discovered PID for traceability.
+    result.started_server_pid = Some(verified_pid.unwrap_or(all_pids[0]));
+
+    // Fail closed if ANY candidate is outside the cgroup or unverifiable.
+    if !outside_cgroup_pids.is_empty() || !unverifiable_pids.is_empty() {
+        result.auto_disabled = true;
+        result.server_cgroup_verified = false;
+        let mut reason_parts: Vec<String> = Vec::new();
+        if !outside_cgroup_pids.is_empty() {
+            reason_parts.push(format!(
+                "sccache server PIDs outside cgroup: {outside_cgroup_pids:?}"
+            ));
+        }
+        if !unverifiable_pids.is_empty() {
+            reason_parts.push(format!(
+                "sccache server PIDs with unreadable cgroup: {unverifiable_pids:?}"
+            ));
+        }
+        reason_parts.push(format!(
+            "expected cgroup='{}'",
+            truncate_string(reference_cgroup, 128),
+        ));
+        result.reason = Some(truncate_string(
+            &reason_parts.join("; "),
+            MAX_SERVER_CONTAINMENT_REASON_LENGTH,
+        ));
+        return;
+    }
+
+    // All candidates are inside the cgroup.
+    if let Some(vpid) = verified_pid {
+        result.server_cgroup_verified = true;
+        result.reason = Some(truncate_string(
+            &format!(
+                "sccache server PID {vpid} started and verified in cgroup '{}' \
+                 ({} candidate(s) checked, all contained)",
+                truncate_string(reference_cgroup, 128),
+                all_pids.len(),
+            ),
+            MAX_SERVER_CONTAINMENT_REASON_LENGTH,
+        ));
+    } else {
+        // All candidates found but none is in-cgroup — this means all are
+        // outside. Already handled above, but guard for completeness.
+        result.auto_disabled = true;
+        result.server_cgroup_verified = false;
+        result.reason = Some(truncate_string(
+            "all discovered sccache servers are outside the unit cgroup",
+            MAX_SERVER_CONTAINMENT_REASON_LENGTH,
+        ));
     }
 }
 
@@ -2853,7 +2948,7 @@ mod tests {
         // MAJOR-1 fix: Both outcomes now result in auto_disabled = true.
         // - If sccache is NOT available: start fails → auto_disabled = true
         // - If sccache IS available: start succeeds but the real server PID is not in
-        //   our mock proc → Ok(None) from discover_sccache_server_pid → fail-closed:
+        //   our mock proc → empty Vec from discover_sccache_server_pids → fail-closed:
         //   auto_disabled = true (no positive PID + cgroup proof)
         assert!(
             result.auto_disabled,
@@ -3084,7 +3179,7 @@ mod tests {
     }
 
     #[test]
-    fn discover_sccache_server_pid_no_sccache_returns_none() {
+    fn discover_sccache_server_pids_no_sccache_returns_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let proc_root = tmp.path().join("proc");
         fs::create_dir_all(&proc_root).unwrap();
@@ -3103,12 +3198,15 @@ mod tests {
         fs::write(other_dir.join("cgroup"), "0::/test\n").unwrap();
         fs::write(other_dir.join("comm"), "rustc\n").unwrap();
 
-        let result = discover_sccache_server_pid(100, &proc_root).unwrap();
-        assert!(result.is_none(), "no sccache process should mean None");
+        let result = discover_sccache_server_pids(100, &proc_root).unwrap();
+        assert!(
+            result.is_empty(),
+            "no sccache process should mean empty Vec"
+        );
     }
 
     #[test]
-    fn discover_sccache_server_pid_finds_sccache() {
+    fn discover_sccache_server_pids_finds_sccache() {
         let tmp = tempfile::tempdir().unwrap();
         let proc_root = tmp.path().join("proc");
         fs::create_dir_all(&proc_root).unwrap();
@@ -3127,12 +3225,50 @@ mod tests {
         fs::write(sccache_dir.join("cgroup"), "0::/other\n").unwrap();
         fs::write(sccache_dir.join("comm"), "sccache\n").unwrap();
 
-        let result = discover_sccache_server_pid(100, &proc_root).unwrap();
-        assert_eq!(result, Some(200));
+        let result = discover_sccache_server_pids(100, &proc_root).unwrap();
+        assert_eq!(result, vec![200]);
     }
 
     #[test]
-    fn discover_sccache_server_pid_skips_child_sccache() {
+    fn discover_sccache_server_pids_finds_all_sccache_servers() {
+        // BLOCKER fix regression test: set-based discovery must return
+        // ALL sccache server PIDs, not just the first one.
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        fs::create_dir_all(&proc_root).unwrap();
+
+        // Reference process (PID 100)
+        let ref_dir = proc_root.join("100");
+        fs::create_dir_all(&ref_dir).unwrap();
+        fs::write(ref_dir.join("status"), "Name:\tcargo\nPPid:\t1\n").unwrap();
+        fs::write(ref_dir.join("cgroup"), "0::/test\n").unwrap();
+        fs::write(ref_dir.join("comm"), "cargo\n").unwrap();
+
+        // sccache process (PID 200) — in cgroup
+        let sccache_dir1 = proc_root.join("200");
+        fs::create_dir_all(&sccache_dir1).unwrap();
+        fs::write(sccache_dir1.join("status"), "Name:\tsccache\nPPid:\t1\n").unwrap();
+        fs::write(sccache_dir1.join("cgroup"), "0::/test\n").unwrap();
+        fs::write(sccache_dir1.join("comm"), "sccache\n").unwrap();
+
+        // sccache process (PID 300) — different cgroup (outside)
+        let sccache_dir2 = proc_root.join("300");
+        fs::create_dir_all(&sccache_dir2).unwrap();
+        fs::write(sccache_dir2.join("status"), "Name:\tsccache\nPPid:\t1\n").unwrap();
+        fs::write(sccache_dir2.join("cgroup"), "0::/other\n").unwrap();
+        fs::write(sccache_dir2.join("comm"), "sccache\n").unwrap();
+
+        let mut result = discover_sccache_server_pids(100, &proc_root).unwrap();
+        result.sort_unstable(); // Discovery order may vary
+        assert_eq!(
+            result,
+            vec![200, 300],
+            "must discover ALL sccache servers, not just the first"
+        );
+    }
+
+    #[test]
+    fn discover_sccache_server_pids_skips_child_sccache() {
         // sccache process that IS a child of the reference PID should be
         // skipped (it's part of the build, not a standalone server).
         let tmp = tempfile::tempdir().unwrap();
@@ -3153,9 +3289,9 @@ mod tests {
         fs::write(sccache_dir.join("cgroup"), "0::/test\n").unwrap();
         fs::write(sccache_dir.join("comm"), "sccache\n").unwrap();
 
-        let result = discover_sccache_server_pid(100, &proc_root).unwrap();
+        let result = discover_sccache_server_pids(100, &proc_root).unwrap();
         assert!(
-            result.is_none(),
+            result.is_empty(),
             "child sccache must be skipped as it's part of the build"
         );
     }
@@ -3166,7 +3302,7 @@ mod tests {
 
     #[test]
     fn verify_started_server_fails_closed_when_pid_not_found() {
-        // When `discover_sccache_server_pid` returns `Ok(None)` (server
+        // When `discover_sccache_server_pids` returns empty Vec (server
         // not visible in /proc), verify_started_server MUST set
         // `auto_disabled = true` and `server_cgroup_verified = false`.
         // Regression: previously treated as success (server_cgroup_verified=true).
@@ -3200,6 +3336,115 @@ mod tests {
         assert!(
             result.reason.as_ref().unwrap().contains("not found"),
             "reason must explain the failure"
+        );
+    }
+
+    // ========================================================================
+    // Regression tests for BLOCKER fix: set-based containment verification
+    // ========================================================================
+
+    #[test]
+    fn verify_started_server_fails_closed_when_any_server_outside_cgroup() {
+        // BLOCKER fix regression test: if the unit cgroup has one sccache
+        // server inside and another sccache server outside, verification
+        // MUST fail closed (auto_disabled = true).
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        fs::create_dir_all(&proc_root).unwrap();
+
+        // Reference process (PID 100)
+        let ref_dir = proc_root.join("100");
+        fs::create_dir_all(&ref_dir).unwrap();
+        fs::write(ref_dir.join("status"), "Name:\tcargo\nPPid:\t1\n").unwrap();
+        fs::write(ref_dir.join("cgroup"), "0::/test/unit\n").unwrap();
+        fs::write(ref_dir.join("comm"), "cargo\n").unwrap();
+
+        // sccache server PID 200 — inside the unit cgroup
+        let sccache_in = proc_root.join("200");
+        fs::create_dir_all(&sccache_in).unwrap();
+        fs::write(sccache_in.join("status"), "Name:\tsccache\nPPid:\t1\n").unwrap();
+        fs::write(sccache_in.join("cgroup"), "0::/test/unit\n").unwrap();
+        fs::write(sccache_in.join("comm"), "sccache\n").unwrap();
+
+        // sccache server PID 300 — OUTSIDE the unit cgroup (escaped)
+        let sccache_out = proc_root.join("300");
+        fs::create_dir_all(&sccache_out).unwrap();
+        fs::write(sccache_out.join("status"), "Name:\tsccache\nPPid:\t1\n").unwrap();
+        fs::write(sccache_out.join("cgroup"), "0::/user.slice/other\n").unwrap();
+        fs::write(sccache_out.join("comm"), "sccache\n").unwrap();
+
+        let mut result = SccacheServerContainment {
+            protocol_executed: true,
+            server_started: true,
+            ..Default::default()
+        };
+
+        verify_started_server(&mut result, 100, "/test/unit", &proc_root);
+
+        assert!(
+            result.auto_disabled,
+            "fail-closed: must auto-disable when ANY sccache server is outside cgroup"
+        );
+        assert!(
+            !result.server_cgroup_verified,
+            "must not verify cgroup when conflicting outside server exists"
+        );
+        assert!(
+            result.reason.as_ref().unwrap().contains("outside cgroup"),
+            "reason must mention the outside-cgroup PIDs: {:?}",
+            result.reason,
+        );
+    }
+
+    #[test]
+    fn verify_started_server_succeeds_when_all_servers_in_cgroup() {
+        // When ALL discovered sccache servers are inside the cgroup,
+        // verification should succeed.
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        fs::create_dir_all(&proc_root).unwrap();
+
+        // Reference process (PID 100)
+        let ref_dir = proc_root.join("100");
+        fs::create_dir_all(&ref_dir).unwrap();
+        fs::write(ref_dir.join("status"), "Name:\tcargo\nPPid:\t1\n").unwrap();
+        fs::write(ref_dir.join("cgroup"), "0::/test/unit\n").unwrap();
+        fs::write(ref_dir.join("comm"), "cargo\n").unwrap();
+
+        // sccache server PID 200 — inside the unit cgroup
+        let sccache1 = proc_root.join("200");
+        fs::create_dir_all(&sccache1).unwrap();
+        fs::write(sccache1.join("status"), "Name:\tsccache\nPPid:\t1\n").unwrap();
+        fs::write(sccache1.join("cgroup"), "0::/test/unit\n").unwrap();
+        fs::write(sccache1.join("comm"), "sccache\n").unwrap();
+
+        // sccache server PID 300 — also inside the unit cgroup
+        let sccache2 = proc_root.join("300");
+        fs::create_dir_all(&sccache2).unwrap();
+        fs::write(sccache2.join("status"), "Name:\tsccache\nPPid:\t1\n").unwrap();
+        fs::write(sccache2.join("cgroup"), "0::/test/unit\n").unwrap();
+        fs::write(sccache2.join("comm"), "sccache\n").unwrap();
+
+        let mut result = SccacheServerContainment {
+            protocol_executed: true,
+            server_started: true,
+            ..Default::default()
+        };
+
+        verify_started_server(&mut result, 100, "/test/unit", &proc_root);
+
+        assert!(
+            !result.auto_disabled,
+            "must not auto-disable when all servers are inside cgroup"
+        );
+        assert!(
+            result.server_cgroup_verified,
+            "must verify cgroup when all servers are contained"
+        );
+        assert!(
+            result.reason.as_ref().unwrap().contains("all contained"),
+            "reason must confirm all candidates were checked: {:?}",
+            result.reason,
         );
     }
 
@@ -3255,5 +3500,216 @@ mod tests {
             !effective_sccache_enabled,
             "effective_sccache_enabled must be false when trace shows auto-disabled"
         );
+    }
+
+    // ========================================================================
+    // BLOCKER fix (fix-round-3): set-based preexisting server handling
+    // ========================================================================
+
+    /// BLOCKER fix (fix-round-3): Two sccache PIDs — one in-cgroup, one
+    /// outside. The protocol must auto-disable because the out-of-cgroup
+    /// server is a threat.
+    #[test]
+    fn sccache_server_containment_two_pids_one_outside_auto_disables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        fs::create_dir_all(&proc_root).unwrap();
+
+        // Reference process (PID 100)
+        let ref_dir = proc_root.join("100");
+        fs::create_dir_all(&ref_dir).unwrap();
+        fs::write(ref_dir.join("status"), "Name:\tcargo\nPPid:\t1\n").unwrap();
+        fs::write(
+            ref_dir.join("cgroup"),
+            "0::/system.slice/apm2-job.service\n",
+        )
+        .unwrap();
+        fs::write(ref_dir.join("comm"), "cargo\n").unwrap();
+
+        // sccache PID 200 — in-cgroup
+        let sc1_dir = proc_root.join("200");
+        fs::create_dir_all(&sc1_dir).unwrap();
+        fs::write(sc1_dir.join("status"), "Name:\tsccache\nPPid:\t1\n").unwrap();
+        fs::write(
+            sc1_dir.join("cgroup"),
+            "0::/system.slice/apm2-job.service\n",
+        )
+        .unwrap();
+        fs::write(sc1_dir.join("comm"), "sccache\n").unwrap();
+
+        // sccache PID 300 — OUTSIDE cgroup
+        let sc2_dir = proc_root.join("300");
+        fs::create_dir_all(&sc2_dir).unwrap();
+        fs::write(sc2_dir.join("status"), "Name:\tsccache\nPPid:\t1\n").unwrap();
+        fs::write(sc2_dir.join("cgroup"), "0::/user.slice/sccache.service\n").unwrap();
+        fs::write(sc2_dir.join("comm"), "sccache\n").unwrap();
+
+        let result = execute_sccache_server_containment_protocol_with_proc(
+            100,
+            "/system.slice/apm2-job.service",
+            &[],
+            &proc_root,
+        );
+
+        assert!(result.protocol_executed);
+        assert!(result.preexisting_server_detected);
+        // Must auto-disable because PID 300 is outside the cgroup.
+        // The stop attempt will fail (no real sccache binary), triggering
+        // fail-closed containment failure.
+        assert!(
+            result.auto_disabled,
+            "must auto-disable when any preexisting server is outside cgroup"
+        );
+    }
+
+    /// BLOCKER fix (fix-round-3): Multiple sccache PIDs all in-cgroup.
+    /// The protocol must succeed — all servers are contained.
+    #[test]
+    fn sccache_server_containment_multiple_pids_all_in_cgroup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        fs::create_dir_all(&proc_root).unwrap();
+
+        // Reference process (PID 100)
+        let ref_dir = proc_root.join("100");
+        fs::create_dir_all(&ref_dir).unwrap();
+        fs::write(ref_dir.join("status"), "Name:\tcargo\nPPid:\t1\n").unwrap();
+        fs::write(
+            ref_dir.join("cgroup"),
+            "0::/system.slice/apm2-job.service\n",
+        )
+        .unwrap();
+        fs::write(ref_dir.join("comm"), "cargo\n").unwrap();
+
+        // sccache PID 200 — in-cgroup
+        let sc1_dir = proc_root.join("200");
+        fs::create_dir_all(&sc1_dir).unwrap();
+        fs::write(sc1_dir.join("status"), "Name:\tsccache\nPPid:\t1\n").unwrap();
+        fs::write(
+            sc1_dir.join("cgroup"),
+            "0::/system.slice/apm2-job.service\n",
+        )
+        .unwrap();
+        fs::write(sc1_dir.join("comm"), "sccache\n").unwrap();
+
+        // sccache PID 300 — also in-cgroup
+        let sc2_dir = proc_root.join("300");
+        fs::create_dir_all(&sc2_dir).unwrap();
+        fs::write(sc2_dir.join("status"), "Name:\tsccache\nPPid:\t1\n").unwrap();
+        fs::write(
+            sc2_dir.join("cgroup"),
+            "0::/system.slice/apm2-job.service\n",
+        )
+        .unwrap();
+        fs::write(sc2_dir.join("comm"), "sccache\n").unwrap();
+
+        let result = execute_sccache_server_containment_protocol_with_proc(
+            100,
+            "/system.slice/apm2-job.service",
+            &[],
+            &proc_root,
+        );
+
+        assert!(result.protocol_executed);
+        assert!(result.preexisting_server_detected);
+        assert_eq!(result.preexisting_server_in_cgroup, Some(true));
+        assert!(
+            result.server_cgroup_verified,
+            "all in-cgroup servers must be verified"
+        );
+        assert!(
+            !result.auto_disabled,
+            "all-in-cgroup servers must not auto-disable"
+        );
+    }
+
+    /// BLOCKER fix (fix-round-3): Stop failure for out-of-cgroup preexisting
+    /// server results in `auto_disabled=true`.
+    #[test]
+    fn sccache_server_containment_stop_failure_auto_disables() {
+        // This test verifies the same scenario as the out-of-cgroup test above,
+        // but focuses on the stop-failure path. With no real sccache binary,
+        // the stop command will fail, and the protocol must auto-disable.
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        fs::create_dir_all(&proc_root).unwrap();
+
+        // Reference process (PID 100)
+        let ref_dir = proc_root.join("100");
+        fs::create_dir_all(&ref_dir).unwrap();
+        fs::write(ref_dir.join("status"), "Name:\tcargo\nPPid:\t1\n").unwrap();
+        fs::write(
+            ref_dir.join("cgroup"),
+            "0::/system.slice/apm2-job.service\n",
+        )
+        .unwrap();
+        fs::write(ref_dir.join("comm"), "cargo\n").unwrap();
+
+        // sccache PID 200 — OUTSIDE cgroup
+        let sccache_dir = proc_root.join("200");
+        fs::create_dir_all(&sccache_dir).unwrap();
+        fs::write(sccache_dir.join("status"), "Name:\tsccache\nPPid:\t1\n").unwrap();
+        fs::write(
+            sccache_dir.join("cgroup"),
+            "0::/user.slice/sccache.service\n",
+        )
+        .unwrap();
+        fs::write(sccache_dir.join("comm"), "sccache\n").unwrap();
+
+        // Override PATH so sccache binary is NOT found — stop must fail.
+        let env = vec![("PATH".to_string(), "/nonexistent-path-for-test".to_string())];
+        let result = execute_sccache_server_containment_protocol_with_proc(
+            100,
+            "/system.slice/apm2-job.service",
+            &env,
+            &proc_root,
+        );
+
+        assert!(result.protocol_executed);
+        assert!(result.preexisting_server_detected);
+        assert_eq!(result.preexisting_server_in_cgroup, Some(false));
+        assert!(
+            result.auto_disabled,
+            "stop failure for out-of-cgroup server must auto-disable"
+        );
+        assert!(
+            result.reason.as_ref().unwrap().contains("failed to stop"),
+            "reason must explain stop failure"
+        );
+    }
+
+    /// BLOCKER fix (fix-round-3): `discover_sccache_server_pids` finds
+    /// multiple sccache processes.
+    #[test]
+    fn discover_sccache_server_pids_finds_multiple() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        fs::create_dir_all(&proc_root).unwrap();
+
+        // Reference process (PID 100)
+        let ref_dir = proc_root.join("100");
+        fs::create_dir_all(&ref_dir).unwrap();
+        fs::write(ref_dir.join("status"), "Name:\tcargo\nPPid:\t1\n").unwrap();
+        fs::write(ref_dir.join("cgroup"), "0::/test\n").unwrap();
+        fs::write(ref_dir.join("comm"), "cargo\n").unwrap();
+
+        // sccache PID 200
+        let sc1_dir = proc_root.join("200");
+        fs::create_dir_all(&sc1_dir).unwrap();
+        fs::write(sc1_dir.join("status"), "Name:\tsccache\nPPid:\t1\n").unwrap();
+        fs::write(sc1_dir.join("cgroup"), "0::/test\n").unwrap();
+        fs::write(sc1_dir.join("comm"), "sccache\n").unwrap();
+
+        // sccache PID 300
+        let sc2_dir = proc_root.join("300");
+        fs::create_dir_all(&sc2_dir).unwrap();
+        fs::write(sc2_dir.join("status"), "Name:\tsccache\nPPid:\t1\n").unwrap();
+        fs::write(sc2_dir.join("cgroup"), "0::/other\n").unwrap();
+        fs::write(sc2_dir.join("comm"), "sccache\n").unwrap();
+
+        let result = discover_sccache_server_pids(100, &proc_root).unwrap();
+        assert_eq!(result.len(), 2, "must find both sccache PIDs");
+        assert!(result.contains(&200));
+        assert!(result.contains(&300));
     }
 }
