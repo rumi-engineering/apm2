@@ -364,10 +364,8 @@ mod job_spec_adversarial {
     fn reject_tilde_expansion_in_repo_id() {
         // Tilde home-directory expansion (~/...) is caught by
         // `reject_filesystem_paths()` which is called from
-        // `validate_job_spec_with_policy()`, not by the builder's structural
-        // validation or the base `validate_job_spec()`.  This verifies that
-        // the policy-driven validation pipeline rejects it (INV-JS-006).
-        use apm2_core::fac::{JobSpecValidationPolicy, validate_job_spec_with_policy};
+        // `validate_job_spec()` at the core layer (INV-JS-006).
+        use apm2_core::fac::validate_job_spec;
 
         let source = JobSource {
             kind: "mirror_commit".to_string(),
@@ -387,11 +385,10 @@ mod job_spec_adversarial {
         .build()
         .expect("builder accepts tilde — structural validation does not cover it");
 
-        let policy = JobSpecValidationPolicy::open();
-        let result = validate_job_spec_with_policy(&spec, &policy);
+        let result = validate_job_spec(&spec);
         assert!(
             matches!(result, Err(JobSpecError::FilesystemPathRejected { .. })),
-            "validate_job_spec_with_policy must reject tilde-expansion repo_id: ~/important-file, got: {result:?}"
+            "validate_job_spec must reject tilde-expansion repo_id: ~/important-file, got: {result:?}"
         );
     }
 
