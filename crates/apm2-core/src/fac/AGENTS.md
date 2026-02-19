@@ -3304,11 +3304,13 @@ new layout.
   exist or is empty, returns a "skipped" receipt (INV-LEM-001).
 - `run_migration_to_completion(fac_root: &Path)`: Production entry point.
   Repeatedly calls `migrate_legacy_evidence` until `is_complete == true`
-  or `MAX_MIGRATION_ITERATIONS` (100) is reached. This handles
-  installations with more than `MAX_LEGACY_FILES` entries. Invoked
-  automatically by `apm2 fac gc` before GC planning.
+  or `MAX_MIGRATION_ITERATIONS` (100) is reached, with early exit on
+  two consecutive zero-progress iterations. This handles installations
+  with more than `MAX_LEGACY_FILES` entries. Invoked automatically by
+  `apm2 fac gc` before GC planning.
 - `migrate_entry(entry, legacy_dir)`: Migrates a single directory entry.
-  Skips symlinks (INV-LEM-005) and uses `move_file()` for the actual move.
+  Skips symlinks (INV-LEM-005) and directories (INV-LEM-007), and uses
+  `move_file()` for regular files.
 - `move_file(src, dst)`: Tries `fs::rename()` first (atomic on same
   filesystem). Falls back to copy-then-remove for cross-device moves
   (EXDEV).
@@ -3334,8 +3336,8 @@ GC (logged as a warning, GC continues).
   the post-migration `legacy/` directory.
 - **fac_job.rs** (apm2-cli): Compatibility reads updated to scan both
   `evidence/` (pre-migration) and `legacy/` (post-migration) directories.
-- **fac_permissions.rs** (apm2-cli): `"private/fac/legacy"` added to
-  `FAC_SUBDIRS`.
+- **fac_permissions.rs** (apm2-cli): `"private/fac/legacy"` and
+  `"private/fac/receipts"` added to `FAC_SUBDIRS`.
 
 ### Security Invariants (TCK-00589)
 
@@ -3351,6 +3353,15 @@ GC (logged as a warning, GC continues).
 - [INV-LEM-005] Symlink entries are skipped (fail-closed). The evidence
   directory itself is validated as a real directory (not a symlink) before
   processing.
-- [INV-LEM-006] `run_migration_to_completion` is bounded by
+- [INV-LEM-006] `is_complete` means "all directory entries have been
+  SEEN", not that all moves succeeded. When `!has_more` (i.e., total
+  entries fit in one batch), `is_complete = true` even if some entries
+  failed (symlinks, directories, permission errors). This prevents
+  `run_migration_to_completion` from looping indefinitely on non-movable
+  entries. `run_migration_to_completion` also terminates early on two
+  consecutive zero-progress iterations as a belt-and-suspenders defense.
+- [INV-LEM-007] Directory entries are skipped (only regular files are
+  migrated). Counted as `files_failed` with an appropriate error message.
+- [INV-LEM-008] `run_migration_to_completion` is bounded by
   `MAX_MIGRATION_ITERATIONS` (100) to prevent unbounded looping if the
   directory is being refilled by an external actor.

@@ -25,6 +25,8 @@
 //!   files have been successfully moved.
 //! - [INV-LEM-004] In-memory collections are bounded by `MAX_LEGACY_FILES`.
 //! - [INV-LEM-005] Symlink entries are skipped (fail-closed).
+//! - [INV-LEM-006] Directory entries are skipped (only regular files are
+//!   migrated).
 
 use std::path::{Path, PathBuf};
 use std::{fs, io};
@@ -134,13 +136,20 @@ fn migrate_entry(entry: &fs::DirEntry, legacy_dir: &Path) -> FileMigrationResult
     let filename = entry.file_name().to_string_lossy().to_string();
     let src_path = entry.path();
 
-    // Skip symlinks (INV-LEM-005).
+    // Skip symlinks (INV-LEM-005) and directories (INV-LEM-006).
     match fs::symlink_metadata(&src_path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             return FileMigrationResult {
                 filename,
                 success: false,
                 error: Some("skipped: symlink entry".to_string()),
+            };
+        },
+        Ok(meta) if meta.is_dir() => {
+            return FileMigrationResult {
+                filename,
+                success: false,
+                error: Some("skipped: directory entries are not migrated".to_string()),
             };
         },
         Err(e) => {
@@ -150,7 +159,7 @@ fn migrate_entry(entry: &fs::DirEntry, legacy_dir: &Path) -> FileMigrationResult
                 error: Some(format!("cannot stat entry: {e}")),
             };
         },
-        Ok(_) => {}, // regular file or directory — proceed
+        Ok(_) => {}, // regular file — proceed
     }
 
     let dst_path = legacy_dir.join(entry.file_name());
@@ -287,6 +296,12 @@ pub fn migrate_legacy_evidence(
     let legacy_dir_removed =
         !has_more && files_failed == 0 && fs::remove_dir(&evidence_dir).is_ok();
 
+    // `is_complete` means all directory entries have been SEEN (processed or
+    // skipped), not that all moves succeeded. When `!has_more` we have
+    // enumerated every entry in the directory, so no further iterations are
+    // needed — even if some entries failed (symlinks, directories, permission
+    // errors). This prevents the caller from looping indefinitely when
+    // non-movable entries are present.
     let receipt = LegacyEvidenceMigrationReceiptV1 {
         schema: MIGRATION_RECEIPT_SCHEMA.to_string(),
         files_moved,
@@ -294,7 +309,7 @@ pub fn migrate_legacy_evidence(
         legacy_dir_removed,
         skipped: false,
         skip_reason: None,
-        is_complete: !has_more && files_failed == 0,
+        is_complete: !has_more,
         total_entries_seen,
         file_results,
     };
@@ -337,8 +352,17 @@ pub fn run_migration_to_completion(
         && !last_receipt.skipped
         && iterations < MAX_MIGRATION_ITERATIONS
     {
+        let prev_moved = last_receipt.files_moved;
         last_receipt = migrate_legacy_evidence(fac_root)?;
         iterations = iterations.saturating_add(1);
+
+        // Early exit: if the last batch made no forward progress (zero files
+        // moved) and there are no more entries beyond the batch cap, further
+        // iterations cannot make progress. This prevents spinning when the
+        // directory contains only non-movable entries.
+        if last_receipt.files_moved == 0 && prev_moved == 0 && !last_receipt.skipped {
+            break;
+        }
     }
 
     Ok(last_receipt)
@@ -482,6 +506,12 @@ mod tests {
             !receipt.legacy_dir_removed,
             "dir should not be removed when failures exist"
         );
+        // All entries were seen even though one failed — is_complete should be
+        // true (we scanned every entry, the symlink is just unmovable).
+        assert!(
+            receipt.is_complete,
+            "migration is complete when all entries have been seen"
+        );
 
         // The real file should be in legacy/.
         let legacy_dir = fac_root.join("legacy");
@@ -489,6 +519,73 @@ mod tests {
 
         // The symlink should still be in evidence/ (not moved).
         assert!(evidence_dir.join("symlink.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_skips_directories() {
+        let (_root, fac_root) = setup_fac_root();
+        let evidence_dir = fac_root.join("evidence");
+        fs::create_dir_all(&evidence_dir).expect("create evidence dir");
+
+        // Create a regular file and a subdirectory.
+        fs::write(evidence_dir.join("real.json"), b"{}").expect("write real file");
+        fs::create_dir(evidence_dir.join("subdir")).expect("create subdir");
+
+        let receipt = migrate_legacy_evidence(&fac_root).expect("migrate");
+        assert_eq!(receipt.files_moved, 1);
+        assert_eq!(receipt.files_failed, 1);
+        assert!(
+            receipt.is_complete,
+            "all entries seen even with skipped directory"
+        );
+
+        // Verify the directory skip is recorded with correct error message.
+        let dir_result = receipt
+            .file_results
+            .iter()
+            .find(|r| r.filename == "subdir")
+            .expect("should have result for subdir");
+        assert!(!dir_result.success);
+        assert!(
+            dir_result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("directory entries are not migrated"),
+            "error message should indicate directory skip"
+        );
+
+        // The real file should be in legacy/.
+        let legacy_dir = fac_root.join("legacy");
+        assert!(legacy_dir.join("real.json").exists());
+
+        // The subdirectory should still be in evidence/ (not moved).
+        assert!(evidence_dir.join("subdir").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_migration_to_completion_does_not_loop_on_unmovable_entries() {
+        use std::os::unix::fs::symlink;
+
+        let (_root, fac_root) = setup_fac_root();
+        let evidence_dir = fac_root.join("evidence");
+        fs::create_dir_all(&evidence_dir).expect("create evidence dir");
+
+        // Create only a symlink (unmovable) — no regular files.
+        let target = fac_root.join("outside_target.json");
+        fs::write(&target, b"{}").expect("write target");
+        symlink(&target, evidence_dir.join("symlink.json")).expect("create symlink");
+
+        // This should complete in 1 iteration, NOT loop 100 times.
+        let receipt = run_migration_to_completion(&fac_root).expect("migrate");
+        assert!(
+            receipt.is_complete,
+            "migration should be complete (all entries seen)"
+        );
+        assert_eq!(receipt.files_moved, 0);
+        assert_eq!(receipt.files_failed, 1);
     }
 
     #[test]
