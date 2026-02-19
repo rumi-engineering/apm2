@@ -86,6 +86,7 @@ const PREP_SUPPLY_FAILURE_CLASS: &str = "supply";
 const PREP_SUPPLY_REMEDIATION: &str = "connect to network and retry to hydrate dependency closure";
 const CLOSURE_DIAGNOSTIC_MAX_BYTES: usize = 2048;
 const V3_CACHE_INDEX_PROBE_MAX_BYTES: u64 = 256 * 1024;
+const MAX_AUTHORITY_REGEN_ATTEMPTS: u8 = 1;
 static GATES_RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,26 +303,86 @@ pub(super) fn run_queued_gates_and_collect(
         );
     }
 
-    let prepared = prepare_queued_gates_job(request, true).map_err(|err| err.message())?;
     let timeout_secs = normalize_wait_timeout(request.wait_timeout_secs);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let wait_mode = if request.require_external_worker {
         WorkerExecutionMode::RequireExternalWorker
     } else {
         WorkerExecutionMode::AllowInlineFallback
     };
-    wait_for_gates_job_receipt_with_mode(
-        &prepared.fac_root,
-        &prepared.job_id,
-        Duration::from_secs(timeout_secs),
-        wait_mode,
-    )?;
-    let receipts_dir = prepared.fac_root.join("receipts");
-    let job_receipt = lookup_job_receipt(&receipts_dir, &prepared.job_id).ok_or_else(|| {
-        format!(
-            "queued gates job {} completed but no FAC job receipt was found",
-            prepared.job_id
-        )
-    })?;
+    let mut authority_regen_attempts = 0_u8;
+    loop {
+        let prepared = prepare_queued_gates_job(request, true).map_err(|err| err.message())?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "queued gates did not reach a terminal receipt within {timeout_secs}s"
+            ));
+        }
+        let job_receipt = wait_for_gates_job_terminal_receipt_with_mode(
+            &prepared.fac_root,
+            &prepared.job_id,
+            remaining,
+            wait_mode,
+        )?;
+        match job_receipt.outcome {
+            apm2_core::fac::FacJobOutcome::Completed => {
+                return materialize_queued_gates_outcome_from_receipt(prepared, &job_receipt);
+            },
+            apm2_core::fac::FacJobOutcome::Denied => {
+                if matches!(
+                    job_receipt.denial_reason,
+                    Some(apm2_core::fac::DenialReasonCode::AlreadyCompleted)
+                ) {
+                    return materialize_queued_gates_outcome_from_receipt(prepared, &job_receipt);
+                }
+                // Security + UX posture:
+                // - Security: consumed authority is never replayed.
+                // - UX: automatically mint one replacement authority/job for idempotent queued
+                //   gates, so callers do not need to recover this replay edge manually.
+                if should_auto_regenerate_on_authority_consumed(&job_receipt)
+                    && authority_regen_attempts < MAX_AUTHORITY_REGEN_ATTEMPTS
+                {
+                    authority_regen_attempts = authority_regen_attempts.saturating_add(1);
+                    continue;
+                }
+                return Err(format!(
+                    "gates job {} denied: {}",
+                    prepared.job_id, job_receipt.reason
+                ));
+            },
+            apm2_core::fac::FacJobOutcome::Quarantined => {
+                return Err(format!(
+                    "gates job {} quarantined: {}",
+                    prepared.job_id, job_receipt.reason
+                ));
+            },
+            apm2_core::fac::FacJobOutcome::Cancelled => {
+                return Err(format!(
+                    "gates job {} cancelled: {}",
+                    prepared.job_id, job_receipt.reason
+                ));
+            },
+            apm2_core::fac::FacJobOutcome::CancellationRequested => {
+                return Err(format!(
+                    "gates job {} cancellation requested: {}",
+                    prepared.job_id, job_receipt.reason
+                ));
+            },
+            _ => {
+                return Err(format!(
+                    "gates job {} returned unsupported outcome: {:?}",
+                    prepared.job_id, job_receipt.outcome
+                ));
+            },
+        }
+    }
+}
+
+fn materialize_queued_gates_outcome_from_receipt(
+    prepared: PreparedQueuedGatesJob,
+    job_receipt: &apm2_core::fac::FacJobReceiptV1,
+) -> Result<QueuedGatesOutcome, String> {
     let job_receipt_id = job_receipt.receipt_id.trim().to_string();
     if job_receipt_id.is_empty() {
         return Err(format!(
@@ -364,6 +425,14 @@ pub(super) fn run_queued_gates_and_collect(
         worker_bootstrapped: prepared.worker_bootstrapped,
         gate_results,
     })
+}
+
+fn should_auto_regenerate_on_authority_consumed(receipt: &apm2_core::fac::FacJobReceiptV1) -> bool {
+    receipt.outcome == apm2_core::fac::FacJobOutcome::Denied
+        && matches!(
+            receipt.denial_reason,
+            Some(apm2_core::fac::DenialReasonCode::AuthorityAlreadyConsumed)
+        )
 }
 
 const fn normalize_wait_timeout(wait_timeout_secs: u64) -> u64 {
@@ -1907,6 +1976,37 @@ fn wait_for_gates_job_receipt_with_mode(
     timeout: Duration,
     mode: WorkerExecutionMode,
 ) -> Result<(), String> {
+    let receipt = wait_for_gates_job_terminal_receipt_with_mode(fac_root, job_id, timeout, mode)?;
+    match receipt.outcome {
+        apm2_core::fac::FacJobOutcome::Completed => Ok(()),
+        apm2_core::fac::FacJobOutcome::Denied => match receipt.denial_reason {
+            Some(apm2_core::fac::DenialReasonCode::AlreadyCompleted) => Ok(()),
+            _ => Err(format!("gates job {job_id} denied: {}", receipt.reason)),
+        },
+        apm2_core::fac::FacJobOutcome::Quarantined => Err(format!(
+            "gates job {job_id} quarantined: {}",
+            receipt.reason
+        )),
+        apm2_core::fac::FacJobOutcome::Cancelled => {
+            Err(format!("gates job {job_id} cancelled: {}", receipt.reason))
+        },
+        apm2_core::fac::FacJobOutcome::CancellationRequested => Err(format!(
+            "gates job {job_id} cancellation requested: {}",
+            receipt.reason
+        )),
+        _ => Err(format!(
+            "gates job {job_id} returned unsupported outcome: {:?}",
+            receipt.outcome
+        )),
+    }
+}
+
+fn wait_for_gates_job_terminal_receipt_with_mode(
+    fac_root: &Path,
+    job_id: &str,
+    timeout: Duration,
+    mode: WorkerExecutionMode,
+) -> Result<apm2_core::fac::FacJobReceiptV1, String> {
     let receipts_dir = fac_root.join("receipts");
     let start = Instant::now();
     loop {
@@ -1917,28 +2017,7 @@ fn wait_for_gates_job_receipt_with_mode(
             ));
         }
         if let Some(receipt) = lookup_job_receipt(&receipts_dir, job_id) {
-            return match receipt.outcome {
-                apm2_core::fac::FacJobOutcome::Completed => Ok(()),
-                apm2_core::fac::FacJobOutcome::Denied => match receipt.denial_reason {
-                    Some(apm2_core::fac::DenialReasonCode::AlreadyCompleted) => Ok(()),
-                    _ => Err(format!("gates job {job_id} denied: {}", receipt.reason)),
-                },
-                apm2_core::fac::FacJobOutcome::Quarantined => Err(format!(
-                    "gates job {job_id} quarantined: {}",
-                    receipt.reason
-                )),
-                apm2_core::fac::FacJobOutcome::Cancelled => {
-                    Err(format!("gates job {job_id} cancelled: {}", receipt.reason))
-                },
-                apm2_core::fac::FacJobOutcome::CancellationRequested => Err(format!(
-                    "gates job {job_id} cancellation requested: {}",
-                    receipt.reason
-                )),
-                _ => Err(format!(
-                    "gates job {job_id} returned unsupported outcome: {:?}",
-                    receipt.outcome
-                )),
-            };
+            return Ok(receipt);
         }
         match detect_queue_processing_mode(fac_root) {
             QueueProcessingMode::ExternalWorker => {
@@ -3869,6 +3948,72 @@ mod tests {
             .expect_err("validation denial must fail");
             assert!(err.contains("denied"));
         });
+    }
+
+    #[test]
+    fn wait_for_gates_job_terminal_receipt_returns_authority_consumed_denial_for_regeneration() {
+        with_test_apm2_home(|apm2_home| {
+            let fac_root = apm2_home.join("private/fac");
+            let receipts_dir = fac_root.join("receipts");
+            fs::create_dir_all(&receipts_dir).expect("create receipts dir");
+            let receipt = apm2_core::fac::FacJobReceiptV1 {
+                schema: "apm2.fac.receipt.v1".to_string(),
+                receipt_id: "receipt-authority-consumed".to_string(),
+                job_id: "job-authority-consumed".to_string(),
+                job_spec_digest: "spec-authority-consumed".to_string(),
+                outcome: apm2_core::fac::FacJobOutcome::Denied,
+                denial_reason: Some(apm2_core::fac::DenialReasonCode::AuthorityAlreadyConsumed),
+                reason: "authority already consumed".to_string(),
+                ..Default::default()
+            };
+            apm2_core::fac::persist_content_addressed_receipt(&receipts_dir, &receipt)
+                .expect("persist receipt");
+            let terminal = wait_for_gates_job_terminal_receipt_with_mode(
+                &fac_root,
+                "job-authority-consumed",
+                Duration::from_secs(1),
+                WorkerExecutionMode::RequireExternalWorker,
+            )
+            .expect("terminal receipt should resolve");
+            assert_eq!(terminal.outcome, apm2_core::fac::FacJobOutcome::Denied);
+            assert_eq!(
+                terminal.denial_reason,
+                Some(apm2_core::fac::DenialReasonCode::AuthorityAlreadyConsumed)
+            );
+            assert!(should_auto_regenerate_on_authority_consumed(&terminal));
+        });
+    }
+
+    #[test]
+    fn should_auto_regenerate_on_authority_consumed_requires_denied_outcome_and_reason() {
+        let authority_consumed = apm2_core::fac::FacJobReceiptV1 {
+            schema: "apm2.fac.receipt.v1".to_string(),
+            receipt_id: "receipt-1".to_string(),
+            job_id: "job-1".to_string(),
+            job_spec_digest: "spec-1".to_string(),
+            outcome: apm2_core::fac::FacJobOutcome::Denied,
+            denial_reason: Some(apm2_core::fac::DenialReasonCode::AuthorityAlreadyConsumed),
+            reason: "authority already consumed".to_string(),
+            ..Default::default()
+        };
+        assert!(should_auto_regenerate_on_authority_consumed(
+            &authority_consumed
+        ));
+
+        let wrong_reason = apm2_core::fac::FacJobReceiptV1 {
+            denial_reason: Some(apm2_core::fac::DenialReasonCode::AlreadyCompleted),
+            ..authority_consumed.clone()
+        };
+        assert!(!should_auto_regenerate_on_authority_consumed(&wrong_reason));
+
+        let wrong_outcome = apm2_core::fac::FacJobReceiptV1 {
+            outcome: apm2_core::fac::FacJobOutcome::Completed,
+            denial_reason: Some(apm2_core::fac::DenialReasonCode::AuthorityAlreadyConsumed),
+            ..authority_consumed
+        };
+        assert!(!should_auto_regenerate_on_authority_consumed(
+            &wrong_outcome
+        ));
     }
 
     fn sample_phase_summary(passed: bool) -> GatesSummary {
