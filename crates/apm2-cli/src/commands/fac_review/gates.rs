@@ -1797,10 +1797,7 @@ fn run_gates_via_worker(
                 return output_worker_typed_error(
                     json_output,
                     "gate_execution_failed",
-                    &QueuePreparationFailure::GateExecutionFailed {
-                        message: err.clone(),
-                    }
-                    .message(),
+                    &err,
                     GATE_EXECUTION_FAILED_CODE,
                     exit_codes::GENERIC_ERROR,
                 );
