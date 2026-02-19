@@ -324,6 +324,33 @@ pub enum FacSubcommand {
     /// configuration, admitted digests, and queue bounds from broker
     /// and filesystem state.
     Config(crate::commands::fac_config::ConfigArgs),
+    /// Receipt-derived metrics: throughput, queue latency, denial/quarantine
+    /// rates, GC freed bytes, and disk preflight failures (TCK-00551).
+    ///
+    /// Scans the receipt index and GC receipt store for the observation
+    /// window and computes aggregate metrics. Supports `--json` for
+    /// automation.
+    Metrics(MetricsArgs),
+}
+
+/// Arguments for `apm2 fac metrics`.
+#[derive(Debug, Args)]
+pub struct MetricsArgs {
+    /// Only include receipts with timestamp >= this epoch (seconds).
+    ///
+    /// When omitted, defaults to 24 hours ago.
+    #[arg(long)]
+    pub since: Option<u64>,
+
+    /// Only include receipts with timestamp <= this epoch (seconds).
+    ///
+    /// When omitted, defaults to now.
+    #[arg(long)]
+    pub until: Option<u64>,
+
+    /// Emit JSON output for this command.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `apm2 fac warm`.
@@ -2304,6 +2331,7 @@ pub fn run_fac(
             | FacSubcommand::Economics(_)
             | FacSubcommand::Bootstrap(_)
             | FacSubcommand::Config(_)
+            | FacSubcommand::Metrics(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -2844,6 +2872,7 @@ pub fn run_fac(
         FacSubcommand::Config(args) => {
             crate::commands::fac_config::run_config_command(args, json_output)
         },
+        FacSubcommand::Metrics(args) => run_metrics(args, json_output),
     }
 }
 
@@ -2977,7 +3006,8 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Policy(_)
         | FacSubcommand::Economics(_)
         | FacSubcommand::Bootstrap(_)
-        | FacSubcommand::Config(_) => true,
+        | FacSubcommand::Config(_)
+        | FacSubcommand::Metrics(_) => true,
     }
 }
 
@@ -3724,7 +3754,8 @@ fn run_receipt_list(args: &ReceiptListArgs, json_output: bool) -> u8 {
     };
 
     let receipts_dir = apm2_home.join("private").join("fac").join("receipts");
-    let mut headers = apm2_core::fac::list_receipt_headers(&receipts_dir);
+    let headers_result = apm2_core::fac::list_receipt_headers(&receipts_dir);
+    let mut headers = headers_result.headers;
 
     // Deterministic ordering: timestamp descending, content_hash ascending
     // for equal timestamps. This ensures stable output across runs.
@@ -6352,6 +6383,244 @@ fn run_bundle_import(args: &BundleImportArgs, json_output: bool) -> u8 {
         "{}",
         serde_json::to_string_pretty(&result).unwrap_or_default()
     );
+    exit_codes::SUCCESS
+}
+
+// =============================================================================
+// Metrics (TCK-00551)
+// =============================================================================
+
+/// Default observation window: 24 hours (in seconds).
+const DEFAULT_METRICS_WINDOW_SECS: u64 = 86_400;
+
+/// Coarse pre-filter margin (seconds) for the metrics observation window.
+///
+/// Headers within +/-1 day of the requested observation window are candidates
+/// for receipt verification. This is a **performance optimization only** to
+/// avoid verifying every receipt in the store.  The authoritative window check
+/// uses the verified receipt's `timestamp_secs` -- this margin is NOT a
+/// security boundary.
+const COARSE_PREFILTER_MARGIN_SECS: u64 = 86_400;
+
+/// Maximum number of job receipts to load for metrics computation.
+///
+/// At 64 KiB per receipt (`MAX_JOB_RECEIPT_SIZE`), 16,384 receipts consumes
+/// at most ~1 GiB. This hard cap prevents unbounded memory growth when
+/// the receipt store contains a very large number of receipts within the
+/// observation window (MINOR-2 fix).
+const MAX_METRICS_RECEIPTS: usize = 16_384;
+
+/// Execute `apm2 fac metrics`.
+fn run_metrics(args: &MetricsArgs, json_output: bool) -> u8 {
+    let Some(apm2_home) = apm2_core::github::resolve_apm2_home() else {
+        return output_error(
+            json_output,
+            "apm2_home_not_found",
+            "Cannot resolve APM2_HOME for receipt store",
+            exit_codes::GENERIC_ERROR,
+        );
+    };
+
+    let receipts_dir = apm2_home.join("private").join("fac").join("receipts");
+
+    // Resolve observation window.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let since_secs = args
+        .since
+        .unwrap_or_else(|| now_secs.saturating_sub(DEFAULT_METRICS_WINDOW_SECS));
+    let until_secs = args.until.unwrap_or(now_secs);
+
+    // Load all receipt headers from the index, with completeness signal.
+    let headers_result = apm2_core::fac::list_receipt_headers(&receipts_dir);
+    let index_may_be_incomplete = headers_result.may_be_incomplete;
+
+    // ---------------------------------------------------------------
+    // Pass 1: Iterate ALL headers, verify each receipt, then apply the
+    // authoritative time-window gate using the VERIFIED receipt's
+    // timestamp_secs — NOT the non-authoritative index header timestamp.
+    //
+    // Security invariant (round 9 fix): The receipt index is attacker-
+    // writable (A2 threat model).  An adversary can modify header
+    // timestamps to move receipts across the observation window boundary
+    // without breaking content-hash verification.  To prevent timestamp
+    // poisoning, we:
+    //   1. Apply a coarse pre-filter using the header timestamp with a generous
+    //      margin (±1 day) as a PERFORMANCE OPTIMIZATION ONLY — this is NOT a
+    //      security boundary.
+    //   2. Verify the receipt via lookup_receipt_by_hash (BLAKE3 integrity).
+    //   3. Gate window inclusion on receipt.timestamp_secs (authoritative).
+    //   4. Detect header-vs-receipt timestamp mismatches as tamper evidence.
+    //
+    // Streaming verification: each receipt is loaded, verified, and
+    // counted one at a time.  Only the receipt loaded for detail
+    // analysis (pass 2) is retained in memory; the verification-only
+    // receipts are dropped immediately after counting.
+    // ---------------------------------------------------------------
+
+    let mut header_counts = apm2_core::fac::HeaderCounts::default();
+    let mut unverified_headers_skipped: u64 = 0;
+    let mut timestamp_mismatches: u64 = 0;
+    // Collect verified headers for pass 2 (detail analysis).
+    // We store (header_ref_index, verified_receipt) pairs so pass 2
+    // can reuse already-loaded receipts without re-reading from disk.
+    let mut verified_window: Vec<(usize, apm2_core::fac::FacJobReceiptV1)> = Vec::new();
+    let mut truncated = false;
+
+    // Coarse window bounds (with margin) for pre-filter.
+    let coarse_since = since_secs.saturating_sub(COARSE_PREFILTER_MARGIN_SECS);
+    let coarse_until = until_secs.saturating_add(COARSE_PREFILTER_MARGIN_SECS);
+
+    for (idx, header) in headers_result.headers.iter().enumerate() {
+        // Coarse pre-filter using the non-authoritative header timestamp.
+        // This is a PERFORMANCE OPTIMIZATION ONLY to avoid verifying every
+        // receipt in the store.  The authoritative window check below uses
+        // the verified receipt's timestamp_secs.
+        if header.timestamp_secs < coarse_since || header.timestamp_secs > coarse_until {
+            continue;
+        }
+
+        // Verify: content_hash must bind to a verified receipt in the store.
+        // lookup_receipt_by_hash validates digest format, loads with bounded
+        // I/O + O_NOFOLLOW, and recomputes the BLAKE3-256 hash for integrity.
+        let Some(receipt) =
+            apm2_core::fac::lookup_receipt_by_hash(&receipts_dir, &header.content_hash)
+        else {
+            // Verification failed: forged/tampered/missing receipt.
+            // Fail-closed: do NOT count this header.
+            unverified_headers_skipped += 1;
+            continue;
+        };
+
+        // Tamper detection: compare the index header's timestamp against the
+        // verified receipt's timestamp.  A mismatch means the index was
+        // modified to move this receipt across observation window boundaries.
+        if header.timestamp_secs != receipt.timestamp_secs {
+            timestamp_mismatches += 1;
+            // Fail-closed: exclude mismatched receipts from ALL metrics.
+            // The receipt's content is valid but the index entry is tampered,
+            // so including it would reward the attacker's manipulation.
+            continue;
+        }
+
+        // Authoritative window gate: use the VERIFIED receipt's timestamp.
+        // This is the security boundary — NOT the header timestamp.
+        if receipt.timestamp_secs < since_secs || receipt.timestamp_secs > until_secs {
+            continue;
+        }
+
+        // Verified and within the authoritative window — count using the
+        // receipt's actual outcome (not the potentially-forged index header
+        // outcome).
+        header_counts.total += 1;
+        match receipt.outcome {
+            apm2_core::fac::FacJobOutcome::Completed => header_counts.completed += 1,
+            apm2_core::fac::FacJobOutcome::Denied => header_counts.denied += 1,
+            apm2_core::fac::FacJobOutcome::Quarantined => {
+                header_counts.quarantined += 1;
+            },
+            apm2_core::fac::FacJobOutcome::Cancelled
+            | apm2_core::fac::FacJobOutcome::CancellationRequested => {
+                header_counts.cancelled += 1;
+            },
+            // Fail-closed: unknown outcome variants are counted in total
+            // but not attributed to any category.
+            _ => {},
+        }
+
+        // Retain for pass 2 if within the detail cap.
+        if verified_window.len() < MAX_METRICS_RECEIPTS {
+            verified_window.push((idx, receipt));
+        } else {
+            truncated = true;
+            // Drop the receipt — only needed for counting, which is
+            // done.
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Pass 2: Extract already-loaded verified receipts for detail
+    // analysis (latency percentiles, denial-reason breakdowns).
+    // These were retained during pass 1, bounded by MAX_METRICS_RECEIPTS.
+    // ---------------------------------------------------------------
+    let job_receipts: Vec<apm2_core::fac::FacJobReceiptV1> =
+        verified_window.into_iter().map(|(_idx, r)| r).collect();
+
+    if truncated {
+        eprintln!(
+            "warning: verified receipt count exceeds MAX_METRICS_RECEIPTS \
+             ({MAX_METRICS_RECEIPTS}); latency and denial-reason details are \
+             computed from the first {MAX_METRICS_RECEIPTS} receipts only \
+             (aggregate counts cover all verified receipts)"
+        );
+    }
+
+    if unverified_headers_skipped > 0 {
+        eprintln!(
+            "warning: {unverified_headers_skipped} receipt index header(s) failed \
+             content-hash verification and were excluded from aggregate counts. \
+             This may indicate index corruption or tampered receipt files."
+        );
+    }
+
+    if timestamp_mismatches > 0 {
+        eprintln!(
+            "warning: {timestamp_mismatches} receipt index header(s) had a \
+             timestamp_secs mismatch versus the verified receipt payload. \
+             These receipts were excluded from metrics. This is a strong tamper \
+             indicator: the receipt index may have been modified to shift \
+             receipts across observation window boundaries."
+        );
+    }
+
+    if index_may_be_incomplete {
+        eprintln!(
+            "warning: receipt index is at capacity and may not contain all \
+             receipts in the store. Aggregate counts may undercount. \
+             Run `apm2 fac reindex` to rebuild."
+        );
+    }
+
+    // Load GC receipts.
+    let gc_result = apm2_core::fac::load_gc_receipts(&receipts_dir, since_secs);
+    let gc_receipts_truncated = gc_result.truncated;
+    // Filter GC receipts by until bound.
+    let gc_receipts: Vec<_> = gc_result
+        .receipts
+        .into_iter()
+        .filter(|r| r.timestamp_secs <= until_secs)
+        .collect();
+
+    let input = apm2_core::fac::MetricsInput {
+        job_receipts: &job_receipts,
+        gc_receipts: &gc_receipts,
+        since_epoch_secs: since_secs,
+        until_epoch_secs: until_secs,
+        header_counts: Some(header_counts),
+    };
+
+    let mut summary = apm2_core::fac::compute_metrics(&input);
+    summary.gc_receipts_truncated = gc_receipts_truncated;
+    summary.job_receipts_truncated = truncated;
+    summary.aggregates_may_be_incomplete = index_may_be_incomplete;
+    summary.unverified_headers_skipped = unverified_headers_skipped;
+    summary.timestamp_mismatches = timestamp_mismatches;
+
+    // TCK-00606 S12: FAC commands are machine-output only.
+    match serde_json::to_string_pretty(&summary) {
+        Ok(json) => println!("{json}"),
+        Err(e) => {
+            return output_error(
+                true,
+                "serialization_error",
+                &format!("Failed to serialize metrics: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    }
+
     exit_codes::SUCCESS
 }
 

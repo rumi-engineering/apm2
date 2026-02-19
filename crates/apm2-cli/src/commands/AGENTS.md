@@ -86,6 +86,7 @@ pub enum FacSubcommand {
     Lane(LaneArgs),
     Bootstrap(BootstrapArgs),
     Economics(EconomicsArgs),
+    Metrics(MetricsArgs),
 }
 ```
 
@@ -540,3 +541,17 @@ Security invariants:
   mismatch, oversized file) denies the job with
   `DenialReasonCode::EconomicsAdmissionDenied`. Previously, all load errors were treated
   as "no root" which allowed admission bypass via root file tampering (INV-EADOPT-004).
+
+## Metrics CLI (TCK-00551)
+
+- **`apm2 fac metrics`** (`fac.rs`): Local-only observability command that computes
+  aggregate metrics from FAC receipts. Accepts `--since <epoch_secs>`,
+  `--until <epoch_secs>`, and `--json` flags. Default window is 24 hours
+  (`DEFAULT_METRICS_WINDOW_SECS = 86_400`). Uses a two-pass approach: (1) iterate
+  ALL receipt headers in the window for accurate aggregate counts and throughput,
+  (2) load full receipts (capped at `MAX_METRICS_RECEIPTS = 16384`) for latency
+  percentiles and denial-reason breakdowns. Passes `HeaderCounts` to
+  `compute_metrics()` so aggregate metrics remain accurate even when full receipt
+  loading is truncated. Sets `job_receipts_truncated` and `gc_receipts_truncated`
+  flags in the output. Emits JSON only (TCK-00606 S12). Excluded from daemon
+  auto-start and listed in `is_local_fac_command()`.

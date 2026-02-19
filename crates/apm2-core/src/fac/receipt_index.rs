@@ -598,14 +598,19 @@ impl ReceiptIndexV1 {
 
 /// Open a file for reading without following symlinks (`O_NOFOLLOW` on Unix).
 ///
+/// On Unix, opens with `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC` to:
+/// - Refuse symlinks atomically (`O_NOFOLLOW`).
+/// - Prevent indefinite blocking on FIFOs/named pipes (`O_NONBLOCK`).
+/// - Prevent fd leaks to child processes (`O_CLOEXEC`).
+///
 /// On non-Unix platforms, falls back to a plain open (no symlink protection).
-fn open_no_follow(path: &Path) -> Result<std::fs::File, std::io::Error> {
+pub(crate) fn open_no_follow(path: &Path) -> Result<std::fs::File, std::io::Error> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)
     }
 
@@ -613,6 +618,19 @@ fn open_no_follow(path: &Path) -> Result<std::fs::File, std::io::Error> {
     {
         std::fs::File::open(path)
     }
+}
+
+/// Check that an already-opened file descriptor refers to a regular file.
+///
+/// Returns `true` if `fstat` reports a regular file, `false` for FIFOs,
+/// device nodes, sockets, directories, etc.  This MUST be called on the fd
+/// returned by [`open_no_follow`] — checking the path via `stat` would be a
+/// TOCTOU race.
+pub(crate) fn is_regular_file(file: &std::fs::File) -> bool {
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    meta.is_file()
 }
 
 // =============================================================================
@@ -656,19 +674,89 @@ pub fn lookup_job_receipt(receipts_dir: &Path, job_id: &str) -> Option<FacJobRec
     scan_receipt_for_job(receipts_dir, job_id)
 }
 
+/// Result of listing receipt headers from the index.
+///
+/// Includes a completeness signal so callers can detect when the index
+/// may not cover all receipts in the store (e.g., because the index
+/// reached capacity during rebuild).
+#[derive(Debug, Clone)]
+pub struct ListReceiptHeadersResult {
+    /// Receipt headers sorted by timestamp descending (most recent first).
+    pub headers: Vec<ReceiptHeaderV1>,
+    /// `true` when the index is at capacity ([`MAX_INDEX_ENTRIES`]) and
+    /// therefore may not contain all receipts in the store.  Callers
+    /// should flag aggregate metrics derived from these headers as
+    /// potentially incomplete.
+    pub may_be_incomplete: bool,
+}
+
 /// List receipt headers from the index without directory scanning.
 ///
-/// Returns an iterator-like vec of headers from the index, sorted by
-/// timestamp descending (most recent first). If the index cannot be loaded,
-/// returns an empty vec.
+/// Returns headers sorted by timestamp descending (most recent first)
+/// together with a completeness signal.  If the index cannot be loaded,
+/// returns an empty result with `may_be_incomplete = true` (fail-closed:
+/// an unavailable index cannot guarantee completeness).
 #[must_use]
-pub fn list_receipt_headers(receipts_dir: &Path) -> Vec<ReceiptHeaderV1> {
+pub fn list_receipt_headers(receipts_dir: &Path) -> ListReceiptHeadersResult {
     let Ok(index) = ReceiptIndexV1::load_or_rebuild(receipts_dir) else {
-        return Vec::new();
+        return ListReceiptHeadersResult {
+            headers: Vec::new(),
+            may_be_incomplete: true,
+        };
     };
+    // The index may be incomplete if it is at capacity — rebuild_from_store
+    // stops inserting when the cap is reached, so receipts beyond the cap
+    // are silently dropped.
+    let may_be_incomplete = index.header_index.len() >= MAX_INDEX_ENTRIES;
     let mut headers: Vec<ReceiptHeaderV1> = index.header_index.into_values().collect();
     headers.sort_by(|a, b| b.timestamp_secs.cmp(&a.timestamp_secs));
-    headers
+    ListReceiptHeadersResult {
+        headers,
+        may_be_incomplete,
+    }
+}
+
+/// Load a `FacJobReceiptV1` from the receipt store by content hash (TCK-00551).
+///
+/// Reads the receipt file at `receipts_dir/{content_hash}.json` with bounded
+/// I/O and `O_NOFOLLOW`. Returns `None` if the file is missing, oversized,
+/// fails to parse, or fails integrity verification.
+///
+/// # Security
+///
+/// The `content_hash` is validated with `is_valid_digest` before path
+/// construction to prevent path traversal attacks. The index is
+/// non-authoritative and attacker-writable — a poisoned entry with
+/// `content_hash` set to `../../../../etc/passwd` must never result in
+/// arbitrary file reads (BLOCKER-1/BLOCKER-2 fix).
+///
+/// After loading, the receipt's content hash is **recomputed** and compared
+/// against the requested `content_hash` using constant-time comparison.
+/// Under the non-authoritative index threat model, tampered receipt files
+/// must never drive metrics without detection (MAJOR-1/MAJOR-2 fix).
+///
+/// This is used by the metrics module to load full receipts when the header
+/// index does not contain all required fields (e.g., `denial_reason`,
+/// `observed_cost`).
+#[must_use]
+pub fn lookup_receipt_by_hash(receipts_dir: &Path, content_hash: &str) -> Option<FacJobReceiptV1> {
+    // Validate content_hash is a well-formed digest before using it in path
+    // construction (path traversal prevention — BLOCKER-1/BLOCKER-2).
+    if !is_valid_digest(content_hash) {
+        return None;
+    }
+    let path = receipts_dir.join(format!("{content_hash}.json"));
+    let receipt = load_receipt_bounded(&path)?;
+
+    // Recompute the BLAKE3-256 hash and compare against the requested digest
+    // using constant-time comparison. Under the non-authoritative index threat
+    // model, the loaded receipt bytes could be tampered — we must never trust
+    // receipt.content_hash as the source of truth (MAJOR-1/MAJOR-2 fix).
+    if !verify_receipt_integrity(&receipt, content_hash) {
+        return None;
+    }
+
+    Some(receipt)
 }
 
 /// Check whether a receipt exists for the given job ID using the index.
@@ -778,9 +866,17 @@ fn verify_receipt_integrity(receipt: &FacJobReceiptV1, expected_digest: &str) ->
     false
 }
 
-/// Load a single receipt file with bounded read and `O_NOFOLLOW`.
+/// Load a single receipt file with bounded read, `O_NOFOLLOW`, and
+/// regular-file verification.
+///
+/// Opens with `O_NOFOLLOW | O_NONBLOCK`, verifies the fd is a regular file
+/// via `fstat` (prevents FIFO blocking), then reads bounded bytes.
 fn load_receipt_bounded(path: &Path) -> Option<FacJobReceiptV1> {
     let file = open_no_follow(path).ok()?;
+    // Verify the fd is a regular file (reject FIFOs, devices, sockets).
+    if !is_regular_file(&file) {
+        return None;
+    }
     let meta = file.metadata().ok()?;
     if meta.len() > MAX_JOB_RECEIPT_SIZE as u64 {
         return None;
@@ -1337,18 +1433,75 @@ mod tests {
         index.persist(receipts_dir).expect("persist");
 
         // List headers — should be sorted by timestamp descending.
-        let headers = list_receipt_headers(receipts_dir);
-        assert_eq!(headers.len(), 3);
-        assert_eq!(headers[0].timestamp_secs, 3000);
-        assert_eq!(headers[1].timestamp_secs, 2000);
-        assert_eq!(headers[2].timestamp_secs, 1000);
+        let result = list_receipt_headers(receipts_dir);
+        assert_eq!(result.headers.len(), 3);
+        assert_eq!(result.headers[0].timestamp_secs, 3000);
+        assert_eq!(result.headers[1].timestamp_secs, 2000);
+        assert_eq!(result.headers[2].timestamp_secs, 1000);
+        // Small index should not be flagged as incomplete.
+        assert!(
+            !result.may_be_incomplete,
+            "index with 3 entries should not be flagged incomplete"
+        );
     }
 
     #[test]
     fn test_list_receipt_headers_empty() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let headers = list_receipt_headers(tmp.path());
-        assert!(headers.is_empty());
+        let result = list_receipt_headers(tmp.path());
+        // Empty directory triggers rebuild which returns empty index.
+        // An empty index from a successful rebuild is not incomplete.
+        assert!(result.headers.is_empty());
+    }
+
+    #[test]
+    fn test_list_receipt_headers_signals_incomplete_at_capacity() {
+        // Regression test for code-quality MAJOR (round 7): when the index
+        // is at MAX_INDEX_ENTRIES capacity, list_receipt_headers must flag
+        // may_be_incomplete = true so callers know aggregate counts may
+        // undercount.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Build an index manually at exactly MAX_INDEX_ENTRIES capacity.
+        let mut index = ReceiptIndexV1::new();
+        for i in 0..MAX_INDEX_ENTRIES {
+            let hash = format!("b3-256:{i:064x}");
+            let header = make_header(&format!("job-cap-{i}"), &hash, 1000 + i as u64);
+            index.upsert(header).expect("upsert within cap");
+        }
+        assert_eq!(index.len(), MAX_INDEX_ENTRIES);
+        index.persist(receipts_dir).expect("persist");
+
+        let result = list_receipt_headers(receipts_dir);
+        assert_eq!(result.headers.len(), MAX_INDEX_ENTRIES);
+        assert!(
+            result.may_be_incomplete,
+            "index at MAX_INDEX_ENTRIES must signal may_be_incomplete"
+        );
+    }
+
+    #[test]
+    fn test_list_receipt_headers_not_incomplete_below_capacity() {
+        // Positive test: an index below capacity should not signal
+        // may_be_incomplete.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let mut index = ReceiptIndexV1::new();
+        for i in 0_u64..10 {
+            let hash = format!("b3-256:{i:064x}");
+            let header = make_header(&format!("job-below-{i}"), &hash, 2000 + i);
+            index.upsert(header).expect("upsert");
+        }
+        index.persist(receipts_dir).expect("persist");
+
+        let result = list_receipt_headers(receipts_dir);
+        assert_eq!(result.headers.len(), 10);
+        assert!(
+            !result.may_be_incomplete,
+            "index below capacity must not signal may_be_incomplete"
+        );
     }
 
     // =========================================================================
@@ -1896,6 +2049,261 @@ mod tests {
         assert!(
             found.is_none(),
             "must reject tampered receipt after index miss"
+        );
+    }
+
+    // =========================================================================
+    // BLOCKER-1/BLOCKER-2 regression: lookup_receipt_by_hash path traversal
+    // =========================================================================
+
+    #[test]
+    fn test_lookup_receipt_by_hash_rejects_path_traversal() {
+        // Regression test for BLOCKER-1/BLOCKER-2: lookup_receipt_by_hash must
+        // reject content_hash values that contain path traversal sequences.
+        // A poisoned index entry with content_hash = "../../../../etc/passwd"
+        // must NOT cause arbitrary file reads.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Attempt traversal patterns — all must return None.
+        assert!(
+            lookup_receipt_by_hash(receipts_dir, "../../../../etc/passwd").is_none(),
+            "must reject path traversal in content_hash"
+        );
+        assert!(
+            lookup_receipt_by_hash(receipts_dir, "../../../etc/shadow").is_none(),
+            "must reject relative path traversal"
+        );
+        assert!(
+            lookup_receipt_by_hash(receipts_dir, "/etc/passwd").is_none(),
+            "must reject absolute path"
+        );
+        assert!(
+            lookup_receipt_by_hash(receipts_dir, "not-hex-at-all!!!").is_none(),
+            "must reject non-hex content_hash"
+        );
+        assert!(
+            lookup_receipt_by_hash(receipts_dir, "").is_none(),
+            "must reject empty content_hash"
+        );
+    }
+
+    #[test]
+    fn test_lookup_receipt_by_hash_accepts_valid_digest() {
+        // Positive test: lookup_receipt_by_hash accepts a valid hex digest
+        // and a valid b3-256:-prefixed digest.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create a receipt with correctly computed content hash.
+        let (_receipt, integrity_hash) =
+            make_and_persist_receipt(receipts_dir, "job-hash-lookup", 5000);
+
+        // lookup_receipt_by_hash with the valid digest should succeed.
+        let found = lookup_receipt_by_hash(receipts_dir, &integrity_hash);
+        assert!(
+            found.is_some(),
+            "must accept well-formed digest in lookup_receipt_by_hash"
+        );
+        assert_eq!(found.unwrap().job_id, "job-hash-lookup");
+    }
+
+    // =========================================================================
+    // MAJOR-1/MAJOR-2 regression: lookup_receipt_by_hash integrity verification
+    // =========================================================================
+
+    #[test]
+    fn test_lookup_receipt_by_hash_rejects_tampered_payload() {
+        // Regression test for MAJOR-1/MAJOR-2: lookup_receipt_by_hash must
+        // recompute the BLAKE3-256 hash and reject receipts whose content
+        // does not match the requested digest. Under the non-authoritative
+        // index threat model, tampered receipt files must never drive metrics.
+        use crate::fac::receipt::compute_job_receipt_content_hash;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create a receipt with a correct content hash.
+        let mut receipt = make_receipt("job-tamper-hash", "placeholder", 11000);
+        let real_hash = compute_job_receipt_content_hash(&receipt);
+        receipt.content_hash = real_hash.clone();
+
+        // Write the receipt with the correct filename.
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{real_hash}.json")), &bytes).expect("write");
+
+        // Tamper the receipt payload: change the reason field so content
+        // no longer matches the filename hash.
+        receipt.reason = "tampered-payload-for-metrics-attack".to_string();
+        let tampered_bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(
+            receipts_dir.join(format!("{real_hash}.json")),
+            &tampered_bytes,
+        )
+        .expect("write tampered");
+
+        // lookup_receipt_by_hash must reject the tampered receipt.
+        let found = lookup_receipt_by_hash(receipts_dir, &real_hash);
+        assert!(
+            found.is_none(),
+            "lookup_receipt_by_hash must reject tampered receipt payload"
+        );
+    }
+
+    #[test]
+    fn test_lookup_receipt_by_hash_accepts_untampered_receipt() {
+        // Positive test: lookup_receipt_by_hash accepts a receipt whose
+        // content matches the requested digest after recomputation.
+        use crate::fac::receipt::compute_job_receipt_content_hash;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let mut receipt = make_receipt("job-untampered-hash", "placeholder", 12000);
+        let hash = compute_job_receipt_content_hash(&receipt);
+        receipt.content_hash = hash.clone();
+
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{hash}.json")), &bytes).expect("write");
+
+        let found = lookup_receipt_by_hash(receipts_dir, &hash);
+        assert!(
+            found.is_some(),
+            "lookup_receipt_by_hash must accept untampered receipt"
+        );
+        assert_eq!(found.unwrap().job_id, "job-untampered-hash");
+    }
+
+    #[test]
+    fn test_lookup_receipt_by_hash_rejects_self_reported_hash_bypass() {
+        // Regression test: an attacker writes a receipt file whose
+        // content_hash field matches the filename but whose actual content
+        // does NOT hash to that value. lookup_receipt_by_hash must reject
+        // it because verify_receipt_integrity recomputes the hash from
+        // canonical content, not the content_hash field.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Use a fake hex digest as the filename (valid format but wrong content).
+        let fake_digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let receipt = FacJobReceiptV1 {
+            content_hash: fake_digest.to_string(),
+            ..make_receipt("job-self-hash-bypass", "placeholder", 13000)
+        };
+        let bytes = serde_json::to_vec_pretty(&receipt).expect("ser");
+        std::fs::write(receipts_dir.join(format!("{fake_digest}.json")), &bytes).expect("write");
+
+        let found = lookup_receipt_by_hash(receipts_dir, fake_digest);
+        assert!(
+            found.is_none(),
+            "must reject receipt whose content_hash field matches filename \
+             but actual content does not hash to that value"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00551 round 9: Timestamp poisoning regression test
+    //
+    // Proves that a poisoned index header with a tampered timestamp_secs
+    // does NOT affect the verified receipt's timestamp returned by
+    // lookup_receipt_by_hash.  The verified receipt's timestamp_secs is
+    // authoritative because it is part of the BLAKE3 content hash preimage.
+    // =========================================================================
+
+    #[test]
+    fn test_poisoned_index_timestamp_does_not_affect_verified_receipt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create and persist a receipt with timestamp 5000.
+        let (receipt, digest) = make_and_persist_receipt(receipts_dir, "job-ts-poison", 5000);
+        assert_eq!(receipt.timestamp_secs, 5000);
+
+        // Build the index normally (header will have timestamp 5000).
+        let mut index = ReceiptIndexV1::rebuild_from_store(receipts_dir).expect("rebuild");
+
+        // Verify the index header has the correct timestamp.
+        let header_before = index.header_for_digest(&digest).expect("header");
+        assert_eq!(header_before.timestamp_secs, 5000);
+
+        // Tamper: overwrite the index header's timestamp to 9999.
+        // This simulates an attacker who modifies the non-authoritative index
+        // to move a receipt across an observation window boundary.
+        let tampered_header = ReceiptHeaderV1 {
+            timestamp_secs: 9999,
+            ..header_before.clone()
+        };
+        // Remove the old header and insert the tampered one.
+        index.header_index.remove(&digest);
+        index.header_index.insert(digest.clone(), tampered_header);
+        index.persist(receipts_dir).expect("persist tampered index");
+
+        // Verify the tampered index now reports timestamp 9999.
+        let reloaded_index =
+            ReceiptIndexV1::load_or_rebuild(receipts_dir).expect("load tampered index");
+        let tampered_hdr = reloaded_index.header_for_digest(&digest).expect("header");
+        assert_eq!(
+            tampered_hdr.timestamp_secs, 9999,
+            "index header should reflect the tampered timestamp"
+        );
+
+        // The verified receipt from lookup_receipt_by_hash must still have
+        // the ORIGINAL timestamp (5000), because the receipt's timestamp_secs
+        // is part of the BLAKE3 content hash preimage and cannot be modified
+        // without invalidating the hash.
+        let verified = lookup_receipt_by_hash(receipts_dir, &digest).expect("receipt must load");
+        assert_eq!(
+            verified.timestamp_secs, 5000,
+            "verified receipt must have the original timestamp (5000), \
+             not the tampered index timestamp (9999)"
+        );
+
+        // Demonstrate the mismatch that the CLI uses for tamper detection:
+        assert_ne!(
+            tampered_hdr.timestamp_secs, verified.timestamp_secs,
+            "header and receipt timestamps must differ (tamper indicator)"
+        );
+    }
+
+    #[test]
+    fn test_list_headers_with_poisoned_timestamp_exposes_mismatch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create two receipts: one normal, one that we will tamper.
+        let (_r1, _d1) = make_and_persist_receipt(receipts_dir, "job-normal", 3000);
+        let (_r2, d2) = make_and_persist_receipt(receipts_dir, "job-tampered", 4000);
+
+        // Build index, then tamper the second receipt's header timestamp.
+        let mut index = ReceiptIndexV1::rebuild_from_store(receipts_dir).expect("rebuild");
+        let original_header = index.header_for_digest(&d2).expect("header").clone();
+        assert_eq!(original_header.timestamp_secs, 4000);
+
+        let tampered = ReceiptHeaderV1 {
+            timestamp_secs: 1000, // Move from 4000 to 1000 (outside a hypothetical window)
+            ..original_header
+        };
+        index.header_index.remove(&d2);
+        index.header_index.insert(d2.clone(), tampered);
+        index.persist(receipts_dir).expect("persist tampered index");
+
+        // List headers and verify: the tampered header will have timestamp 1000,
+        // but the verified receipt will have timestamp 4000.
+        let headers_result = list_receipt_headers(receipts_dir);
+        let tampered_hdr = headers_result
+            .headers
+            .iter()
+            .find(|h| h.content_hash == d2)
+            .expect("tampered header must be in list");
+        assert_eq!(tampered_hdr.timestamp_secs, 1000, "header has tampered ts");
+
+        let verified = lookup_receipt_by_hash(receipts_dir, &d2).expect("receipt loads");
+        assert_eq!(verified.timestamp_secs, 4000, "receipt has original ts");
+
+        // The mismatch is detectable — this is the exact check the CLI performs.
+        assert_ne!(
+            tampered_hdr.timestamp_secs, verified.timestamp_secs,
+            "mismatch between index header and verified receipt is tamper evidence"
         );
     }
 }
