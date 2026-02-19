@@ -465,6 +465,7 @@ mod tests {
             }),
             sandbox_hardening_hash: None,
             network_policy_hash: None,
+            bytes_backend: None,
             htf_time_envelope_ns: None,
             node_fingerprint: None,
             timestamp_secs,
