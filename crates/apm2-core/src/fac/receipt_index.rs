@@ -1006,6 +1006,7 @@ mod tests {
             htf_time_envelope_ns: None,
             node_fingerprint: None,
             toolchain_fingerprint: None,
+            observed_usage: None,
             timestamp_secs: timestamp,
             content_hash: content_hash.to_string(),
         }

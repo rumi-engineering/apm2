@@ -797,6 +797,13 @@ pub struct FacJobReceiptV1 {
     /// changes on the node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolchain_fingerprint: Option<String>,
+    /// Observed cgroup usage stats for economics calibration (TCK-00572).
+    ///
+    /// Best-effort measurement of actual job resource consumption from the
+    /// cgroup v2 hierarchy. Individual fields may be `None` if the
+    /// corresponding stat could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_usage: Option<super::cgroup_stats::ObservedCgroupUsage>,
     /// Epoch timestamp.
     pub timestamp_secs: u64,
     /// BLAKE3 body hash for content-addressed storage.
@@ -1042,6 +1049,24 @@ impl FacJobReceiptV1 {
             bytes.push(10u8);
             bytes.extend_from_slice(&(fp.len() as u32).to_be_bytes());
             bytes.extend_from_slice(fp.as_bytes());
+        }
+
+        // TCK-00572: Observed cgroup usage stats. Uses type-specific marker
+        // `11u8` for injective encoding (10u8 is taken by toolchain_fingerprint).
+        // V1 trailing optional: absence is encoded by omitting bytes entirely
+        // (no marker) for hash stability with historical receipts.
+        if let Some(ref usage) = self.observed_usage {
+            bytes.push(11u8);
+            let mut payload = Vec::with_capacity(48);
+            super::cgroup_stats::append_option_u64(&mut payload, usage.cpu_time_us);
+            super::cgroup_stats::append_option_u64(&mut payload, usage.peak_memory_bytes);
+            super::cgroup_stats::append_option_u64(&mut payload, usage.io_read_bytes);
+            super::cgroup_stats::append_option_u64(&mut payload, usage.io_write_bytes);
+            super::cgroup_stats::append_option_u32(&mut payload, usage.tasks_count);
+            #[allow(clippy::cast_possible_truncation)]
+            // payload is bounded: 5 option fields max 9 bytes each = max 45 bytes
+            bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(&payload);
         }
 
         bytes
@@ -1353,6 +1378,22 @@ impl FacJobReceiptV1 {
             bytes.push(10u8);
             bytes.extend_from_slice(&(fp.len() as u32).to_be_bytes());
             bytes.extend_from_slice(fp.as_bytes());
+        }
+
+        // TCK-00572: Observed cgroup usage stats. Uses type-specific marker
+        // `11u8` for injective encoding (10u8 is taken by toolchain_fingerprint).
+        // Absence is omitted for backwards compatibility with existing V2 receipts.
+        if let Some(ref usage) = self.observed_usage {
+            bytes.push(11u8);
+            let mut payload = Vec::with_capacity(48);
+            super::cgroup_stats::append_option_u64(&mut payload, usage.cpu_time_us);
+            super::cgroup_stats::append_option_u64(&mut payload, usage.peak_memory_bytes);
+            super::cgroup_stats::append_option_u64(&mut payload, usage.io_read_bytes);
+            super::cgroup_stats::append_option_u64(&mut payload, usage.io_write_bytes);
+            super::cgroup_stats::append_option_u32(&mut payload, usage.tasks_count);
+            #[allow(clippy::cast_possible_truncation)]
+            bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(&payload);
         }
 
         bytes
@@ -1673,6 +1714,13 @@ impl FacJobReceiptV1 {
             }
         }
 
+        // TCK-00572: Validate observed_usage bounds (fail-closed).
+        if let Some(ref usage) = self.observed_usage {
+            if let Err(e) = usage.validate() {
+                return Err(FacJobReceiptError::InvalidData(e.to_string()));
+            }
+        }
+
         Ok(())
     }
 }
@@ -1703,6 +1751,7 @@ pub struct FacJobReceiptV1Builder {
     htf_time_envelope_ns: Option<u64>,
     node_fingerprint: Option<String>,
     toolchain_fingerprint: Option<String>,
+    observed_usage: Option<super::cgroup_stats::ObservedCgroupUsage>,
     timestamp_secs: Option<u64>,
 }
 
@@ -1865,6 +1914,13 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub fn toolchain_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
         self.toolchain_fingerprint = Some(fingerprint.into());
+        self
+    }
+
+    /// Sets observed cgroup usage stats (TCK-00572).
+    #[must_use]
+    pub const fn observed_usage(mut self, usage: super::cgroup_stats::ObservedCgroupUsage) -> Self {
+        self.observed_usage = Some(usage);
         self
     }
 
@@ -2129,6 +2185,7 @@ impl FacJobReceiptV1Builder {
             htf_time_envelope_ns: self.htf_time_envelope_ns,
             node_fingerprint: self.node_fingerprint,
             toolchain_fingerprint: self.toolchain_fingerprint,
+            observed_usage: self.observed_usage,
             moved_job_path,
             timestamp_secs,
             content_hash: String::new(),
