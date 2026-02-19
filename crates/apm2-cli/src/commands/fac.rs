@@ -5,8 +5,6 @@
 //!
 //! # Commands
 //!
-//! - `apm2 fac gates` - Run all evidence gates locally with resource-bounded
-//!   test execution; results cached per-SHA for pipeline reuse
 //! - `apm2 fac work status <work_id>` - Show projection-backed work status via
 //!   daemon
 //! - `apm2 fac work list` - List projection-known work items via daemon
@@ -17,12 +15,9 @@
 //! - `apm2 fac receipt show <receipt_hash>` - Show receipt from CAS
 //! - `apm2 fac context rebuild <role> <episode_id>` - Rebuild role-scoped
 //!   context
-//! - `apm2 fac resume <work_id>` - Show crash-only resume helpers from ledger
-//!   anchor
 //! - `apm2 fac review run --pr <N>` - Run FAC review orchestration (parallel,
 //!   multi-model; defaults from local branch mapping when omitted)
-//! - `apm2 fac review dispatch --pr <N>` - Dispatch detached FAC review runs
-//! - `apm2 fac review status` - Show FAC review state and recent events
+//! - `apm2 fac review prepare` - Materialize local review inputs (diff/history)
 //! - `apm2 fac review findings` - Retrieve SHA-bound review findings in a
 //!   structured FAC-native format
 //! - `apm2 fac review verdict` - Show/set SHA-bound approve/deny verdicts per
@@ -31,7 +26,6 @@
 //! - `apm2 fac restart --pr <PR_NUMBER>` - Intelligent pipeline restart from
 //!   optimal point
 //! - `apm2 fac recover --pr <N>` - Repair/reconcile local FAC lifecycle state
-//! - `apm2 fac review project` - Render one projection status line
 //! - `apm2 fac review tail` - Tail FAC review NDJSON telemetry stream
 //!
 //! # Design
@@ -143,6 +137,7 @@ pub enum FacSubcommand {
     /// caller gets maximal host compute (CPU/memory/IO) until completion.
     /// Concurrent callers coalesce/queue rather than splitting compute across
     /// multiple heavyweight test runs.
+    #[command(hide = true)]
     Gates(GatesArgs),
 
     /// Internal: CI preflight checks for credential posture and workflow trust.
@@ -185,12 +180,6 @@ pub enum FacSubcommand {
     /// Reconstructs the context pack for a role+episode combination from
     /// ledger events and CAS artifacts. Useful for debugging and replay.
     Context(ContextArgs),
-
-    /// Show crash-only resume helpers from ledger anchor.
-    ///
-    /// Analyzes ledger to determine restart point for interrupted work.
-    /// Returns the last committed anchor and pending operations.
-    Resume(ResumeArgs),
 
     /// Manage FAC execution lanes.
     ///
@@ -545,7 +534,7 @@ pub struct DoctorArgs {
 
     /// Upgrade credential checks from WARN to ERROR.
     ///
-    /// Use this when running GitHub-facing workflows (push, review dispatch)
+    /// Use this when running GitHub-facing workflows (push, review run)
     /// that require valid credentials. Without this flag, missing credentials
     /// produce WARN; with it, they produce ERROR and cause a non-zero exit.
     #[arg(long, default_value_t = false)]
@@ -891,21 +880,6 @@ pub struct ContextRebuildArgs {
     /// Output directory for rebuilt context.
     #[arg(long)]
     pub output_dir: Option<PathBuf>,
-
-    /// Maximum number of events to scan from the end of the ledger.
-    #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
-    pub limit: u64,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
-
-/// Arguments for `apm2 fac resume`.
-#[derive(Debug, Args)]
-pub struct ResumeArgs {
-    /// Work identifier to analyze for resume point.
-    pub work_id: String,
 
     /// Maximum number of events to scan from the end of the ledger.
     #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
@@ -1376,12 +1350,6 @@ pub struct ReviewArgs {
 pub enum ReviewSubcommand {
     /// Run FAC review orchestration for a pull request URL.
     Run(ReviewRunArgs),
-    /// Dispatch FAC review orchestration in detached mode.
-    Dispatch(ReviewDispatchArgs),
-    /// Block until active FAC review runs for a PR reach terminal state.
-    Wait(ReviewWaitArgs),
-    /// Show FAC review state/events from local operational artifacts.
-    Status(ReviewStatusArgs),
     /// Materialize local review inputs (diff + commit history) under FAC
     /// private storage.
     Prepare(ReviewPrepareArgs),
@@ -1394,19 +1362,10 @@ pub enum ReviewSubcommand {
     Findings(ReviewFindingsArgs),
     /// Show or set explicit verdict state per review dimension.
     Verdict(ReviewVerdictArgs),
-    /// Render one condensed projection line for GitHub log surfaces.
-    Project(ReviewProjectArgs),
     /// Tail FAC review NDJSON event stream.
     Tail(ReviewTailArgs),
     /// Terminate a running reviewer process for a specific PR and type.
     Terminate(ReviewTerminateArgs),
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
-pub enum ReviewFormatArg {
-    #[default]
-    Text,
-    Json,
 }
 
 /// Arguments for `apm2 fac review run`.
@@ -1442,70 +1401,6 @@ pub struct ReviewRunArgs {
     pub json: bool,
 }
 
-/// Arguments for `apm2 fac review wait`.
-#[derive(Debug, Args)]
-pub struct ReviewWaitArgs {
-    /// Pull request number.
-    #[arg(long)]
-    pub pr: u32,
-
-    /// Optional reviewer lane filter (`security` or `quality`).
-    #[arg(long = "type", value_enum)]
-    pub review_type: Option<ReviewStatusTypeArg>,
-
-    /// Maximum wait time in seconds. Omit to wait indefinitely.
-    #[arg(long)]
-    pub timeout_seconds: Option<u64>,
-
-    /// Poll cadence in seconds (min: 1, default: 5).
-    #[arg(long, default_value_t = 5)]
-    pub poll_interval_seconds: u64,
-
-    /// Required head SHA for stale projection protection.
-    #[arg(long = "wait-for-sha")]
-    pub wait_for_sha: Option<String>,
-
-    /// Output format (`text` or `json`).
-    #[arg(long, default_value = "text", value_enum)]
-    pub format: ReviewFormatArg,
-
-    /// Emit JSON output for this command (alias for --format json).
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
-
-/// Arguments for `apm2 fac review dispatch`.
-#[derive(Debug, Args)]
-pub struct ReviewDispatchArgs {
-    /// Pull request number (auto-detected from local branch if omitted).
-    #[arg(long)]
-    pub pr: Option<u32>,
-
-    /// Review selection (`all`, `security`, or `quality`).
-    #[arg(
-        long = "type",
-        alias = "review-type",
-        value_enum,
-        default_value_t = fac_review::ReviewRunType::All
-    )]
-    pub review_type: fac_review::ReviewRunType,
-
-    /// Optional expected head SHA (40 hex) to fail closed on stale dispatch.
-    #[arg(long)]
-    pub expected_head_sha: Option<String>,
-
-    /// Force re-dispatch on the same SHA even when a terminal run already
-    /// exists for this review type.
-    ///
-    /// This does not bypass merge-conflict checks against `main`.
-    #[arg(long, default_value_t = false)]
-    pub force: bool,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
-
 /// Review lane filter for `apm2 fac review status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ReviewStatusTypeArg {
@@ -1520,22 +1415,6 @@ impl ReviewStatusTypeArg {
             Self::Quality => "quality",
         }
     }
-}
-
-/// Arguments for `apm2 fac review status`.
-#[derive(Debug, Args)]
-pub struct ReviewStatusArgs {
-    /// Optional pull request number filter.
-    #[arg(long)]
-    pub pr: Option<u32>,
-
-    /// Optional reviewer lane filter (`security` or `quality`).
-    #[arg(long = "type", value_enum)]
-    pub review_type: Option<ReviewStatusTypeArg>,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac review findings`.
@@ -1735,42 +1614,6 @@ pub struct ReviewVerdictSetArgs {
     pub json: bool,
 }
 
-/// Arguments for `apm2 fac review project`.
-#[derive(Debug, Args)]
-pub struct ReviewProjectArgs {
-    /// Pull request number to project.
-    #[arg(long)]
-    pub pr: u32,
-
-    /// Optional head SHA filter (40 hex).
-    #[arg(long)]
-    pub head_sha: Option<String>,
-
-    /// Optional minimum event timestamp (unix seconds).
-    #[arg(long)]
-    pub since_epoch: Option<u64>,
-
-    /// Emit only errors with seq greater than this value.
-    #[arg(long, default_value_t = 0)]
-    pub after_seq: u64,
-
-    /// Also print ERROR lines in text mode.
-    #[arg(long, default_value_t = false)]
-    pub emit_errors: bool,
-
-    /// Return non-zero when terminal failure is detected.
-    #[arg(long, default_value_t = false)]
-    pub fail_on_terminal: bool,
-
-    /// Output format (`text` or `json`).
-    #[arg(long, default_value = "text", value_enum)]
-    pub format: ReviewFormatArg,
-
-    /// Emit JSON output for this command (alias for --format json).
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
-
 /// Arguments for `apm2 fac review tail`.
 #[derive(Debug, Args)]
 pub struct ReviewTailArgs {
@@ -1910,26 +1753,6 @@ pub struct ContextRebuildResponse {
     pub artifacts_retrieved: u64,
     /// Whether rebuild was deterministic (matched expected hash).
     pub deterministic: bool,
-}
-
-/// Response for resume command.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResumeResponse {
-    /// Work identifier.
-    pub work_id: String,
-    /// Last committed anchor sequence ID.
-    pub last_anchor_seq_id: u64,
-    /// Last committed anchor event type.
-    pub last_anchor_event_type: String,
-    /// Recommended restart action.
-    pub restart_action: String,
-    /// Pending operations (if any).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub pending_operations: Vec<String>,
-    /// Last episode ID (if work was in progress).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_episode_id: Option<String>,
 }
 
 /// Error response for JSON output.
@@ -2538,7 +2361,6 @@ pub fn run_fac(
                 resolve_json(rebuild_args.json),
             ),
         },
-        FacSubcommand::Resume(args) => run_resume(args, &ledger_path, resolve_json(args.json)),
         FacSubcommand::Lane(args) => match &args.subcommand {
             LaneSubcommand::Status(status_args) => {
                 run_lane_status(status_args, resolve_json(status_args.json))
@@ -2636,42 +2458,6 @@ pub fn run_fac(
                     run_args.review_type,
                     run_args.expected_head_sha.as_deref(),
                     run_args.force,
-                    output_json,
-                )
-            },
-            ReviewSubcommand::Wait(wait_args) => {
-                let output_json = resolve_json(
-                    wait_args.json || matches!(wait_args.format, ReviewFormatArg::Json),
-                );
-                fac_review::run_wait(
-                    wait_args.pr,
-                    wait_args.review_type.map(ReviewStatusTypeArg::as_str),
-                    wait_args.wait_for_sha.as_deref(),
-                    wait_args.timeout_seconds,
-                    wait_args.poll_interval_seconds,
-                    output_json,
-                )
-            },
-            ReviewSubcommand::Dispatch(dispatch_args) => {
-                let output_json = resolve_json(dispatch_args.json);
-                let repo = match derive_fac_repo_or_exit(machine_output) {
-                    Ok(value) => value,
-                    Err(code) => return code,
-                };
-                fac_review::run_dispatch(
-                    &repo,
-                    dispatch_args.pr,
-                    dispatch_args.review_type,
-                    dispatch_args.expected_head_sha.as_deref(),
-                    dispatch_args.force,
-                    output_json,
-                )
-            },
-            ReviewSubcommand::Status(status_args) => {
-                let output_json = resolve_json(status_args.json);
-                fac_review::run_status(
-                    status_args.pr,
-                    status_args.review_type.map(ReviewStatusTypeArg::as_str),
                     output_json,
                 )
             },
@@ -2775,21 +2561,6 @@ pub fn run_fac(
                         output_json,
                     )
                 },
-            },
-            ReviewSubcommand::Project(project_args) => {
-                let format_json =
-                    project_args.json || matches!(project_args.format, ReviewFormatArg::Json);
-                let output_json = resolve_json(format_json);
-                fac_review::run_project(
-                    project_args.pr,
-                    project_args.head_sha.as_deref(),
-                    project_args.since_epoch,
-                    project_args.after_seq,
-                    project_args.emit_errors,
-                    project_args.fail_on_terminal,
-                    output_json,
-                    output_json,
-                )
             },
             ReviewSubcommand::Tail(tail_args) => {
                 fac_review::run_tail(tail_args.lines, tail_args.follow)
@@ -2983,7 +2754,6 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Episode(_)
         | FacSubcommand::Receipts(_)
         | FacSubcommand::Context(_)
-        | FacSubcommand::Resume(_)
         | FacSubcommand::Lane(_)
         | FacSubcommand::Push(_)
         | FacSubcommand::Restart(_)
@@ -3193,11 +2963,13 @@ fn fac_work_status_from_daemon(
 }
 
 /// Extracted work information from an event.
+#[cfg(test)]
 struct WorkInfo {
     episode_id: Option<String>,
 }
 
 /// Extracts work-related information from an event if it matches the `work_id`.
+#[cfg(test)]
 fn extract_work_info(event: &EventRecord, work_id: &str) -> Option<WorkInfo> {
     // TCK-00398 Phase 1 compatibility:
     // - Prefer metadata-derived work_id (`session_id`) when present.
@@ -5335,167 +5107,6 @@ fn kill_process_best_effort(pid: u32) -> bool {
 }
 
 // =============================================================================
-// Resume Command
-// =============================================================================
-
-/// Execute the resume command.
-fn run_resume(args: &ResumeArgs, ledger_path: &Path, json_output: bool) -> u8 {
-    // Validate work ID
-    if args.work_id.is_empty() {
-        return output_error(
-            json_output,
-            "invalid_work_id",
-            "Work ID cannot be empty",
-            exit_codes::VALIDATION_ERROR,
-        );
-    }
-
-    // Open ledger
-    let ledger = match open_ledger(ledger_path) {
-        Ok(l) => l,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "ledger_error",
-                &format!("Failed to open ledger: {e}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-
-    // Calculate start cursor based on limit
-    let mut cursor = match calculate_start_cursor(&ledger, args.limit) {
-        Ok(c) => c,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "ledger_error",
-                &format!("Failed to query ledger head: {e}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-
-    // Scan ledger to find last anchor and pending state
-    let mut response = ResumeResponse {
-        work_id: args.work_id.clone(),
-        last_anchor_seq_id: 0,
-        last_anchor_event_type: "none".to_string(),
-        restart_action: "START_FRESH".to_string(),
-        pending_operations: Vec::new(),
-        last_episode_id: None,
-    };
-
-    let mut found_events = false;
-    let mut last_committed_event: Option<(u64, String)> = None;
-    let batch_size = 1000u64;
-    let mut scanned_count = 0u64;
-
-    loop {
-        // Stop if we've scanned more than the limit (plus batch overhead)
-        if scanned_count >= args.limit + batch_size {
-            break;
-        }
-
-        let events = match ledger.read_from(cursor, batch_size) {
-            Ok(events) => events,
-            Err(e) => {
-                return output_error(
-                    json_output,
-                    "ledger_error",
-                    &format!("Failed to read ledger: {e}"),
-                    exit_codes::GENERIC_ERROR,
-                );
-            },
-        };
-
-        if events.is_empty() {
-            break;
-        }
-
-        for event in &events {
-            scanned_count += 1;
-            if let Some(work_info) = extract_work_info(event, &args.work_id) {
-                found_events = true;
-                let seq_id = event.seq_id.unwrap_or(0);
-
-                // Track anchors (committed durable events)
-                match event.event_type.as_str() {
-                    "work_claimed" | "episode_spawned" | "session_terminated" | "gate_receipt"
-                    | "review_receipt" | "merge_receipt" => {
-                        last_committed_event = Some((seq_id, event.event_type.clone()));
-                        if work_info.episode_id.is_some() {
-                            response.last_episode_id = work_info.episode_id;
-                        }
-                    },
-                    _ => {},
-                }
-            }
-        }
-
-        cursor = events.last().map_or(cursor, |e| e.seq_id.unwrap_or(0) + 1);
-    }
-
-    if !found_events {
-        return output_error(
-            json_output,
-            "not_found",
-            &format!("No events found for work_id: {}", args.work_id),
-            exit_codes::NOT_FOUND,
-        );
-    }
-
-    // Determine restart action based on last anchor
-    if let Some((seq_id, event_type)) = last_committed_event {
-        response.last_anchor_seq_id = seq_id;
-        response.last_anchor_event_type.clone_from(&event_type);
-
-        response.restart_action = match event_type.as_str() {
-            "work_claimed" => "SPAWN_EPISODE".to_string(),
-            "episode_spawned" => "RESUME_EPISODE".to_string(),
-            "session_terminated" => {
-                response.pending_operations.push("RUN_GATES".to_string());
-                "RUN_GATES".to_string()
-            },
-            "gate_receipt" => {
-                response.pending_operations.push("AWAIT_REVIEW".to_string());
-                "AWAIT_REVIEW".to_string()
-            },
-            "review_receipt" => {
-                response.pending_operations.push("MERGE".to_string());
-                "MERGE".to_string()
-            },
-            "merge_receipt" => "WORK_COMPLETE".to_string(),
-            _ => "UNKNOWN".to_string(),
-        };
-    }
-
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        println!("Resume Analysis");
-        println!("  Work ID:            {}", response.work_id);
-        println!("  Last Anchor Seq:    {}", response.last_anchor_seq_id);
-        println!("  Last Anchor Type:   {}", response.last_anchor_event_type);
-        println!("  Restart Action:     {}", response.restart_action);
-        if let Some(episode) = &response.last_episode_id {
-            println!("  Last Episode ID:    {episode}");
-        }
-        if !response.pending_operations.is_empty() {
-            println!(
-                "  Pending Operations: {}",
-                response.pending_operations.join(", ")
-            );
-        }
-    }
-
-    exit_codes::SUCCESS
-}
-
-// =============================================================================
 // Helper Functions
 // =============================================================================
 
@@ -6879,22 +6490,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resume_response_serialization() {
-        let response = ResumeResponse {
-            work_id: "work-123".to_string(),
-            last_anchor_seq_id: 100,
-            last_anchor_event_type: "episode_spawned".to_string(),
-            restart_action: "RESUME_EPISODE".to_string(),
-            pending_operations: vec!["RUN_GATES".to_string()],
-            last_episode_id: Some("ep-001".to_string()),
-        };
-
-        let json = serde_json::to_string(&response).unwrap();
-        let restored: ResumeResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.restart_action, "RESUME_EPISODE");
-    }
-
-    #[test]
     fn test_detect_receipt_type_gate() {
         let json = serde_json::json!({
             "schema": "apm2.gate_receipt.v1",
@@ -7352,14 +6947,15 @@ mod tests {
 
     #[test]
     fn test_subcommand_machine_output_detection_for_nested_json() {
-        let review_status = FacSubcommand::Review(ReviewArgs {
-            subcommand: ReviewSubcommand::Status(ReviewStatusArgs {
+        let review_findings = FacSubcommand::Review(ReviewArgs {
+            subcommand: ReviewSubcommand::Findings(ReviewFindingsArgs {
                 pr: Some(615),
-                review_type: None,
+                sha: None,
+                refresh: false,
                 json: true,
             }),
         });
-        assert!(subcommand_requests_machine_output(&review_status));
+        assert!(subcommand_requests_machine_output(&review_findings));
 
         let recover = FacSubcommand::Recover(RecoverArgs {
             pr: Some(615),

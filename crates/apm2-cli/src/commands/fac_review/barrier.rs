@@ -1,38 +1,10 @@
-//! Admission control: event context resolution and trust-boundary enforcement.
-#![allow(dead_code)]
+//! Admission-control helpers used by FAC review tests.
 
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use super::events::emit_review_event;
-use super::types::{
-    FacEventContext, MAX_EVENT_PAYLOAD_BYTES, now_iso8601_millis, split_owner_repo,
-    validate_expected_head_sha,
-};
-
-// ── Event context resolution ────────────────────────────────────────────────
-
-pub fn resolve_fac_event_context(
-    repo: &str,
-    event_path: &Path,
-    event_name: &str,
-) -> Result<FacEventContext, String> {
-    let _ = split_owner_repo(repo)?;
-    let payload_text = read_event_payload_bounded(event_path, MAX_EVENT_PAYLOAD_BYTES)?;
-    let payload: serde_json::Value =
-        serde_json::from_str(&payload_text).map_err(|err| format!("invalid event JSON: {err}"))?;
-
-    match event_name {
-        "pull_request" | "pull_request_target" => {
-            resolve_pull_request_context(repo, event_name, &payload)
-        },
-        "workflow_dispatch" => resolve_workflow_dispatch_context(repo, &payload),
-        other => Err(format!(
-            "unsupported event_name `{other}`; expected pull_request, pull_request_target, or workflow_dispatch"
-        )),
-    }
-}
+use super::types::{FacEventContext, now_iso8601_millis};
 
 pub fn read_event_payload_bounded(path: &Path, max_bytes: u64) -> Result<String, String> {
     let mut file = File::open(path)
@@ -66,73 +38,8 @@ pub fn read_event_payload_bounded(path: &Path, max_bytes: u64) -> Result<String,
         .map_err(|err| format!("event payload {} is not valid UTF-8: {err}", path.display()))
 }
 
-// ── Barrier enforcement ─────────────────────────────────────────────────────
-
-pub fn enforce_barrier(ctx: &FacEventContext) -> Result<(), String> {
-    validate_expected_head_sha(&ctx.head_sha)?;
-    if !is_allowed_author_association(&ctx.author_association) {
-        return Err(format!(
-            "unauthorized PR author identity: {} ({})",
-            ctx.author_login, ctx.author_association
-        ));
-    }
-
-    if ctx.event_name == "workflow_dispatch" {
-        let permission = ctx.actor_permission.as_deref().unwrap_or("none");
-        if !matches!(permission, "admin" | "maintain" | "write") {
-            return Err(format!(
-                "workflow_dispatch actor `{}` lacks repository permission (need write|maintain|admin, got `{permission}`)",
-                ctx.actor_login
-            ));
-        }
-
-        let dispatch_ref = resolve_dispatch_ref_name();
-        if dispatch_ref.is_empty() {
-            return Err(
-                "workflow_dispatch trusted-ref check failed: missing GITHUB_REF_NAME".to_string(),
-            );
-        }
-        if dispatch_ref != ctx.base_ref && dispatch_ref != ctx.default_branch {
-            return Err(format!(
-                "workflow_dispatch ref `{dispatch_ref}` is not trusted for PR base `{}` (default `{}`)",
-                ctx.base_ref, ctx.default_branch
-            ));
-        }
-    }
-
-    Ok(())
-}
-
 pub fn is_allowed_author_association(value: &str) -> bool {
     matches!(value, "OWNER" | "MEMBER" | "COLLABORATOR")
-}
-
-fn resolve_dispatch_ref_name() -> String {
-    if let Ok(ref_name) = std::env::var("GITHUB_REF_NAME") {
-        if !ref_name.is_empty() {
-            return ref_name;
-        }
-    }
-    if let Ok(full_ref) = std::env::var("GITHUB_REF") {
-        if let Some(stripped) = full_ref.strip_prefix("refs/heads/") {
-            return stripped.to_string();
-        }
-    }
-    String::new()
-}
-
-// ── Barrier decision events ─────────────────────────────────────────────────
-
-pub fn emit_barrier_decision_event(
-    source: &str,
-    repo: &str,
-    event_name: &str,
-    ctx: Option<&FacEventContext>,
-    passed: bool,
-    reason: Option<&str>,
-) -> Result<(), String> {
-    let event = build_barrier_decision_event(source, repo, event_name, ctx, passed, reason);
-    emit_review_event(&event)
 }
 
 pub fn build_barrier_decision_event(
@@ -172,174 +79,26 @@ pub fn build_barrier_decision_event(
     if let Some(value) = ctx.and_then(|value| value.actor_permission.as_deref()) {
         envelope.insert("actor_permission".to_string(), serde_json::json!(value));
     }
+    if let Some(value) = ctx {
+        envelope.insert(
+            "pr_url".to_string(),
+            serde_json::json!(value.pr_url.as_str()),
+        );
+        envelope.insert(
+            "base_ref".to_string(),
+            serde_json::json!(value.base_ref.as_str()),
+        );
+        envelope.insert(
+            "default_branch".to_string(),
+            serde_json::json!(value.default_branch.as_str()),
+        );
+        envelope.insert(
+            "author_login".to_string(),
+            serde_json::json!(value.author_login.as_str()),
+        );
+    }
     if let Some(value) = reason {
         envelope.insert("reason".to_string(), serde_json::json!(value));
     }
     serde_json::Value::Object(envelope)
 }
-
-// ── GitHub context resolvers ────────────────────────────────────────────────
-
-fn resolve_pull_request_context(
-    repo: &str,
-    event_name: &str,
-    payload: &serde_json::Value,
-) -> Result<FacEventContext, String> {
-    let event_repo = payload
-        .pointer("/repository/full_name")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "missing repository.full_name in event payload".to_string())?;
-    if event_repo != repo {
-        return Err(format!(
-            "event repository mismatch: expected `{repo}`, got `{event_repo}`"
-        ));
-    }
-
-    let pr_number = payload
-        .pointer("/pull_request/number")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| "missing pull_request.number in event payload".to_string())
-        .and_then(|value| {
-            u32::try_from(value).map_err(|_| format!("invalid pull_request.number: {value}"))
-        })?;
-    let pr_url = payload
-        .pointer("/pull_request/html_url")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "missing pull_request.html_url in event payload".to_string())?
-        .to_string();
-    let head_sha = payload
-        .pointer("/pull_request/head/sha")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "missing pull_request.head.sha in event payload".to_string())?
-        .to_string();
-    let base_ref = payload
-        .pointer("/pull_request/base/ref")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "missing pull_request.base.ref in event payload".to_string())?
-        .to_string();
-    let default_branch = payload
-        .pointer("/repository/default_branch")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "missing repository.default_branch in event payload".to_string())?
-        .to_string();
-    let author_login = payload
-        .pointer("/pull_request/user/login")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "missing pull_request.user.login in event payload".to_string())?
-        .to_string();
-    let author_association = payload
-        .pointer("/pull_request/author_association")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "missing pull_request.author_association in event payload".to_string())?
-        .to_string();
-    let actor_login = resolve_actor_login(payload);
-
-    Ok(FacEventContext {
-        repo: repo.to_string(),
-        event_name: event_name.to_string(),
-        pr_number,
-        pr_url,
-        head_sha,
-        base_ref,
-        default_branch,
-        author_login,
-        author_association,
-        actor_login,
-        actor_permission: None,
-    })
-}
-
-fn resolve_workflow_dispatch_context(
-    repo: &str,
-    payload: &serde_json::Value,
-) -> Result<FacEventContext, String> {
-    let event_repo = payload
-        .pointer("/repository/full_name")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "missing repository.full_name in event payload".to_string())?;
-    if event_repo != repo {
-        return Err(format!(
-            "event repository mismatch: expected `{repo}`, got `{event_repo}`"
-        ));
-    }
-
-    let pr_number_raw = payload
-        .pointer("/inputs/pr_number")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "workflow_dispatch requires inputs.pr_number".to_string())?;
-    let pr_number = pr_number_raw
-        .parse::<u32>()
-        .map_err(|err| format!("invalid inputs.pr_number `{pr_number_raw}`: {err}"))?;
-    if pr_number == 0 {
-        return Err("inputs.pr_number must be greater than zero".to_string());
-    }
-
-    let pr_data = super::github_reads::fetch_pr_data(repo, pr_number)?;
-    let pr_url = pr_data
-        .pointer("/html_url")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "missing html_url from PR API response".to_string())?
-        .to_string();
-    let head_sha = pr_data
-        .pointer("/head/sha")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "missing head.sha from PR API response".to_string())?
-        .to_string();
-    let base_ref = pr_data
-        .pointer("/base/ref")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "missing base.ref from PR API response".to_string())?
-        .to_string();
-    let author_login = pr_data
-        .pointer("/user/login")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "missing user.login from PR API response".to_string())?
-        .to_string();
-    let author_association = pr_data
-        .pointer("/author_association")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "missing author_association from PR API response".to_string())?
-        .to_string();
-
-    let default_branch = payload
-        .pointer("/repository/default_branch")
-        .and_then(serde_json::Value::as_str)
-        .map_or_else(
-            || {
-                super::github_reads::fetch_default_branch(repo)
-                    .unwrap_or_else(|_| "main".to_string())
-            },
-            ToString::to_string,
-        );
-    let actor_login = resolve_actor_login(payload);
-    let actor_permission = super::github_reads::resolve_actor_permission(repo, &actor_login)?;
-
-    Ok(FacEventContext {
-        repo: repo.to_string(),
-        event_name: "workflow_dispatch".to_string(),
-        pr_number,
-        pr_url,
-        head_sha,
-        base_ref,
-        default_branch,
-        author_login,
-        author_association,
-        actor_login,
-        actor_permission: Some(actor_permission),
-    })
-}
-
-fn resolve_actor_login(payload: &serde_json::Value) -> String {
-    std::env::var("GITHUB_ACTOR")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            payload
-                .pointer("/sender/login")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string)
-        })
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-// ── GitHub API helpers ──────────────────────────────────────────────────────

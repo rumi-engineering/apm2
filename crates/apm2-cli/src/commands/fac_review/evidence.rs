@@ -94,7 +94,6 @@ fn compute_gate_env_remove_keys(policy_env: Option<&[(String, String)]>) -> Vec<
 /// to receive these events in real time — enabling JSONL streaming of per-gate
 /// lifecycle events during execution rather than after all gates complete.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Callback consumers are optional; fields remain part of the streaming contract.
 pub enum GateProgressEvent {
     /// Emitted immediately before a gate starts executing.
     Started { gate_name: String },
@@ -109,11 +108,6 @@ pub enum GateProgressEvent {
         gate_name: String,
         passed: bool,
         duration_secs: u64,
-        log_path: Option<String>,
-        bytes_written: Option<u64>,
-        bytes_total: Option<u64>,
-        was_truncated: Option<bool>,
-        log_bundle_hash: Option<String>,
         error_hint: Option<String>,
     },
 }
@@ -156,7 +150,6 @@ pub struct EvidenceGateOptions {
 
 /// Result of a single evidence gate execution.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // Streaming-stats fields are populated for future observability consumers.
 pub struct EvidenceGateResult {
     pub gate_name: String,
     pub passed: bool,
@@ -243,15 +236,6 @@ fn emit_gate_completed_via_cb(cb: &dyn Fn(GateProgressEvent), result: &EvidenceG
         gate_name: result.gate_name.clone(),
         passed: result.passed,
         duration_secs: result.duration_secs,
-        log_path: result
-            .log_path
-            .as_ref()
-            .and_then(|p| p.to_str())
-            .map(str::to_string),
-        bytes_written: result.bytes_written,
-        bytes_total: result.bytes_total,
-        was_truncated: result.was_truncated,
-        log_bundle_hash: result.log_bundle_hash.clone(),
         error_hint,
     });
 }
@@ -453,7 +437,8 @@ fn resolve_cached_payload(
                 log_path: entry.log_path.clone(),
             })
         },
-        CacheSource::V2 | CacheSource::None => {
+        #[cfg(test)]
+        CacheSource::V2 => {
             let v2 = v2_cache?;
             let entry = v2.get(gate_name)?;
             Some(CachedPayload {
@@ -461,6 +446,10 @@ fn resolve_cached_payload(
                 evidence_log_digest: entry.evidence_log_digest.clone(),
                 log_path: entry.log_path.clone(),
             })
+        },
+        CacheSource::None => {
+            let _ = (v2_cache, gate_name);
+            None
         },
     }
 }
@@ -802,7 +791,7 @@ fn run_merge_conflict_gate(
 /// NOTE: Production callers should prefer `run_single_evidence_gate_with_env`
 /// with a policy-filtered environment. This wrapper passes `None` for env
 /// (inheriting ambient) and is retained for test use.
-#[allow(dead_code)] // Used by integration tests in this module.
+#[cfg(test)]
 pub fn run_single_evidence_gate(
     workspace_root: &Path,
     sha: &str,
@@ -826,6 +815,7 @@ pub fn run_single_evidence_gate(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn run_single_evidence_gate_with_env(
     workspace_root: &Path,
     sha: &str,
@@ -1542,7 +1532,6 @@ fn finalize_status_gate_run(
 ///   (`$APM2_HOME/private/fac/receipts`).
 /// * `job_id` - The job ID whose receipt should be looked up.
 /// * `signer` - The signing key for re-signing the cache after flag promotion.
-#[cfg_attr(test, allow(dead_code))]
 pub(super) fn rebind_v3_gate_cache_after_receipt(
     sha: &str,
     policy_hash: &str,
@@ -1672,23 +1661,6 @@ fn compute_log_bundle_hash(logs_dir: &Path) -> Result<String, String> {
 
     let digest = hasher.finalize();
     Ok(format!("b3-256:{}", hex::encode(digest.as_bytes())))
-}
-
-/// Run evidence gates (cargo fmt check, clippy, doc, test, native gate checks).
-/// Returns `Ok((all_passed, per_gate_results))`.
-/// Fail-closed: any error running a gate counts as failure.
-///
-/// When `opts` is provided, `test_command` overrides the default
-/// `cargo nextest run --workspace` invocation (e.g., to use a bounded runner).
-#[allow(dead_code)]
-pub fn run_evidence_gates(
-    workspace_root: &Path,
-    sha: &str,
-    projection_log: Option<&mut File>,
-    opts: Option<&EvidenceGateOptions>,
-) -> Result<(bool, Vec<EvidenceGateResult>), String> {
-    let lane_context = allocate_lane_job_logs_dir()?;
-    run_evidence_gates_with_lane_context(workspace_root, sha, projection_log, opts, lane_context)
 }
 
 pub(super) fn run_evidence_gates_with_lane_context(

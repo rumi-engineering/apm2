@@ -21,7 +21,9 @@ const IDENTITY_SCHEMA: &str = "apm2.fac.projection.identity.v1";
 const BRANCH_HINT_SCHEMA: &str = "apm2.fac.projection.branch_hint.v1";
 const REVIEWER_SCHEMA: &str = "apm2.fac.projection.reviewer.v1";
 const PR_BODY_SCHEMA: &str = "apm2.fac.projection.pr_body.v1";
+const PREPARE_BASE_SNAPSHOT_SCHEMA: &str = "apm2.fac.projection.prepare_base_snapshot.v1";
 const GATES_ADMISSION_SCHEMA: &str = "apm2.fac.projection.gates_admission.v1";
+const VERDICT_PROJECTION_PENDING_SCHEMA: &str = "apm2.fac.projection.verdict_projection_pending.v1";
 const MERGE_PROJECTION_PENDING_SCHEMA: &str = "apm2.fac.projection.merge_projection_pending.v1";
 const SHA256_HEX_LEN: usize = 64;
 
@@ -105,6 +107,18 @@ struct PrBodySnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PrepareBaseSnapshotRecord {
+    schema: String,
+    owner_repo: String,
+    pr_number: u32,
+    head_sha: String,
+    base_sha: String,
+    source: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GatesAdmissionRecord {
     schema: String,
     owner_repo: String,
@@ -114,6 +128,27 @@ struct GatesAdmissionRecord {
     gate_receipt_id: String,
     policy_hash: String,
     gate_evidence_hashes: Vec<String>,
+    source: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerdictProjectionPendingRecord {
+    schema: String,
+    owner_repo: String,
+    pr_number: u32,
+    head_sha: String,
+    dimension: String,
+    decision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_id: Option<String>,
+    last_error: String,
+    attempt_count: u32,
     source: String,
     updated_at: String,
 }
@@ -154,6 +189,16 @@ pub(super) struct GatesAdmissionSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(super) struct PrepareBaseSnapshot {
+    pub owner_repo: String,
+    pub pr_number: u32,
+    pub head_sha: String,
+    pub base_sha: String,
+    pub source: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(super) struct MergeProjectionPendingSnapshot {
     pub owner_repo: String,
     pub pr_number: u32,
@@ -167,6 +212,22 @@ pub(super) struct MergeProjectionPendingSnapshot {
     pub policy_hash: String,
     pub gate_evidence_hashes: Vec<String>,
     pub verdict_hashes: Vec<String>,
+    pub last_error: String,
+    pub attempt_count: u32,
+    pub source: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct VerdictProjectionPendingSnapshot {
+    pub owner_repo: String,
+    pub pr_number: u32,
+    pub head_sha: String,
+    pub dimension: String,
+    pub decision: String,
+    pub reason: Option<String>,
+    pub model_id: Option<String>,
+    pub backend_id: Option<String>,
     pub last_error: String,
     pub attempt_count: u32,
     pub source: String,
@@ -198,6 +259,18 @@ pub(super) struct MergeProjectionPendingSaveRequest<'a> {
     pub source: &'a str,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct VerdictProjectionPendingSaveRequest<'a> {
+    pub dimension: &'a str,
+    pub decision: &'a str,
+    pub reason: Option<&'a str>,
+    pub model_id: Option<&'a str>,
+    pub backend_id: Option<&'a str>,
+    pub last_error: &'a str,
+    pub attempt_count: u32,
+    pub source: &'a str,
+}
+
 impl From<GatesAdmissionRecord> for GatesAdmissionSnapshot {
     fn from(value: GatesAdmissionRecord) -> Self {
         Self {
@@ -208,6 +281,38 @@ impl From<GatesAdmissionRecord> for GatesAdmissionSnapshot {
             gate_receipt_id: value.gate_receipt_id,
             policy_hash: value.policy_hash,
             gate_evidence_hashes: value.gate_evidence_hashes,
+            source: value.source,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+impl From<PrepareBaseSnapshotRecord> for PrepareBaseSnapshot {
+    fn from(value: PrepareBaseSnapshotRecord) -> Self {
+        Self {
+            owner_repo: value.owner_repo,
+            pr_number: value.pr_number,
+            head_sha: value.head_sha,
+            base_sha: value.base_sha,
+            source: value.source,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+impl From<VerdictProjectionPendingRecord> for VerdictProjectionPendingSnapshot {
+    fn from(value: VerdictProjectionPendingRecord) -> Self {
+        Self {
+            owner_repo: value.owner_repo,
+            pr_number: value.pr_number,
+            head_sha: value.head_sha,
+            dimension: value.dimension,
+            decision: value.decision,
+            reason: value.reason,
+            model_id: value.model_id,
+            backend_id: value.backend_id,
+            last_error: value.last_error,
+            attempt_count: value.attempt_count,
             source: value.source,
             updated_at: value.updated_at,
         }
@@ -278,6 +383,14 @@ fn pr_body_path(owner_repo: &str, pr_number: u32) -> Result<PathBuf, String> {
     Ok(pr_dir(owner_repo, pr_number)?.join("pr_body_snapshot.json"))
 }
 
+fn prepare_base_snapshot_path(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<PathBuf, String> {
+    Ok(sha_dir(owner_repo, pr_number, head_sha)?.join("prepare_base_snapshot.json"))
+}
+
 fn gates_admission_path(
     owner_repo: &str,
     pr_number: u32,
@@ -292,6 +405,14 @@ fn merge_projection_pending_path(
     head_sha: &str,
 ) -> Result<PathBuf, String> {
     Ok(sha_dir(owner_repo, pr_number, head_sha)?.join("merge_projection_pending.json"))
+}
+
+fn verdict_projection_pending_path(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<PathBuf, String> {
+    Ok(sha_dir(owner_repo, pr_number, head_sha)?.join("verdict_projection_pending.json"))
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
@@ -548,6 +669,53 @@ pub(super) fn load_pr_body_snapshot(
     Ok(Some(payload.body))
 }
 
+pub(super) fn save_prepare_base_snapshot(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    base_sha: &str,
+    source: &str,
+) -> Result<(), String> {
+    validate_expected_head_sha(head_sha)?;
+    validate_expected_head_sha(base_sha)?;
+    let source = source.trim();
+    if source.is_empty() {
+        return Err("prepare base snapshot requires non-empty source".to_string());
+    }
+
+    let normalized_head = head_sha.to_ascii_lowercase();
+    let normalized_base = base_sha.to_ascii_lowercase();
+    let record = PrepareBaseSnapshotRecord {
+        schema: PREPARE_BASE_SNAPSHOT_SCHEMA.to_string(),
+        owner_repo: owner_repo.to_string(),
+        pr_number,
+        head_sha: normalized_head.clone(),
+        base_sha: normalized_base,
+        source: source.to_string(),
+        updated_at: now_iso8601(),
+    };
+    write_json_atomic(
+        &prepare_base_snapshot_path(owner_repo, pr_number, &normalized_head)?,
+        &record,
+    )
+}
+
+pub(super) fn load_prepare_base_snapshot(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<Option<PrepareBaseSnapshot>, String> {
+    validate_expected_head_sha(head_sha)?;
+    let normalized_head = head_sha.to_ascii_lowercase();
+    let Some(record) = read_json_optional::<PrepareBaseSnapshotRecord>(
+        &prepare_base_snapshot_path(owner_repo, pr_number, &normalized_head)?,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(record.into()))
+}
+
 pub(super) fn save_gates_admission(
     owner_repo: &str,
     pr_number: u32,
@@ -601,6 +769,163 @@ pub(super) fn load_gates_admission(
         return Ok(None);
     };
     Ok(Some(record.into()))
+}
+
+pub(super) fn save_verdict_projection_pending(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    request: &VerdictProjectionPendingSaveRequest<'_>,
+) -> Result<(), String> {
+    validate_expected_head_sha(head_sha)?;
+    let head_sha = head_sha.to_ascii_lowercase();
+
+    let dimension = request.dimension.trim().to_ascii_lowercase();
+    if dimension.is_empty() {
+        return Err("verdict projection pending record requires non-empty dimension".to_string());
+    }
+    let decision = request.decision.trim().to_ascii_lowercase();
+    if !matches!(decision.as_str(), "approve" | "deny") {
+        return Err(format!(
+            "verdict projection pending record requires decision approve|deny (got `{}`)",
+            request.decision
+        ));
+    }
+    let source = request.source.trim();
+    if source.is_empty() {
+        return Err("verdict projection pending record requires non-empty source".to_string());
+    }
+    let last_error = request.last_error.trim();
+    if last_error.is_empty() {
+        return Err("verdict projection pending record requires non-empty last_error".to_string());
+    }
+
+    let normalize_optional = |value: Option<&str>| -> Option<String> {
+        value
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string)
+    };
+    let record = VerdictProjectionPendingRecord {
+        schema: VERDICT_PROJECTION_PENDING_SCHEMA.to_string(),
+        owner_repo: owner_repo.to_string(),
+        pr_number,
+        head_sha: head_sha.clone(),
+        dimension,
+        decision,
+        reason: normalize_optional(request.reason),
+        model_id: normalize_optional(request.model_id),
+        backend_id: normalize_optional(request.backend_id),
+        last_error: last_error.to_string(),
+        attempt_count: request.attempt_count,
+        source: source.to_string(),
+        updated_at: now_iso8601(),
+    };
+    write_json_atomic(
+        &verdict_projection_pending_path(owner_repo, pr_number, &head_sha)?,
+        &record,
+    )
+}
+#[cfg(test)]
+pub(super) fn load_verdict_projection_pending(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<Option<VerdictProjectionPendingSnapshot>, String> {
+    validate_expected_head_sha(head_sha)?;
+    let normalized = head_sha.to_ascii_lowercase();
+    let Some(record) = read_json_optional::<VerdictProjectionPendingRecord>(
+        &verdict_projection_pending_path(owner_repo, pr_number, &normalized)?,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(record.into()))
+}
+
+pub(super) fn clear_verdict_projection_pending(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<(), String> {
+    validate_expected_head_sha(head_sha)?;
+    let path =
+        verdict_projection_pending_path(owner_repo, pr_number, &head_sha.to_ascii_lowercase())?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("failed to remove {}: {err}", path.display())),
+    }
+}
+
+pub(super) fn list_verdict_projection_pending_for_repo(
+    owner_repo: &str,
+    limit: usize,
+) -> Result<Vec<VerdictProjectionPendingSnapshot>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let repo_path = repo_dir(owner_repo)?;
+    let entries = match fs::read_dir(&repo_path) {
+        Ok(value) => value,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(format!(
+                "failed to list projection repo directory {}: {err}",
+                repo_path.display()
+            ));
+        },
+    };
+
+    let mut pending = Vec::new();
+    for pr_entry in entries {
+        let pr_entry = pr_entry
+            .map_err(|err| format!("failed to enumerate PR projection directory: {err}"))?;
+        let pr_type = pr_entry
+            .file_type()
+            .map_err(|err| format!("failed to read projection entry type: {err}"))?;
+        if !pr_type.is_dir() {
+            continue;
+        }
+        let sha_entries = match fs::read_dir(pr_entry.path()) {
+            Ok(value) => value,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(format!(
+                    "failed to list SHA projection directory {}: {err}",
+                    pr_entry.path().display()
+                ));
+            },
+        };
+        for sha_entry in sha_entries {
+            let sha_entry = sha_entry
+                .map_err(|err| format!("failed to enumerate SHA projection directory: {err}"))?;
+            let sha_type = sha_entry
+                .file_type()
+                .map_err(|err| format!("failed to read SHA projection entry type: {err}"))?;
+            if !sha_type.is_dir() {
+                continue;
+            }
+            let path = sha_entry.path().join("verdict_projection_pending.json");
+            let Some(record) = read_json_optional::<VerdictProjectionPendingRecord>(&path)? else {
+                continue;
+            };
+            pending.push(VerdictProjectionPendingSnapshot::from(record));
+            if pending.len() > limit {
+                let Some((oldest_index, _)) = pending
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, lhs), (_, rhs)| lhs.updated_at.cmp(&rhs.updated_at))
+                else {
+                    continue;
+                };
+                pending.swap_remove(oldest_index);
+            }
+        }
+    }
+    pending.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    pending.truncate(limit);
+    Ok(pending)
 }
 
 pub(super) fn save_merge_projection_pending(
@@ -677,8 +1002,7 @@ pub(super) fn save_merge_projection_pending(
         &record,
     )
 }
-
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn load_merge_projection_pending(
     owner_repo: &str,
     pr_number: u32,
@@ -799,9 +1123,12 @@ fn current_branch() -> Result<String, String> {
 mod tests {
     use super::{
         GatesAdmissionSaveRequest, MergeProjectionPendingSaveRequest,
-        clear_merge_projection_pending, list_merge_projection_pending_for_repo,
-        load_gates_admission, load_merge_projection_pending, save_gates_admission,
-        save_merge_projection_pending,
+        VerdictProjectionPendingSaveRequest, clear_merge_projection_pending,
+        clear_verdict_projection_pending, list_merge_projection_pending_for_repo,
+        list_verdict_projection_pending_for_repo, load_gates_admission,
+        load_merge_projection_pending, load_prepare_base_snapshot, load_verdict_projection_pending,
+        save_gates_admission, save_merge_projection_pending, save_prepare_base_snapshot,
+        save_verdict_projection_pending,
     };
 
     fn unique_repo(tag: &str) -> String {
@@ -874,6 +1201,163 @@ mod tests {
         )
         .expect_err("empty gate evidence hashes must fail");
         assert!(err.contains("b3-256 digest"));
+    }
+
+    #[test]
+    fn prepare_base_snapshot_round_trip() {
+        let owner_repo = unique_repo("prepare-base");
+        let pr_number = 61;
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let base_sha = "89abcdef0123456789abcdef0123456789abcdef";
+        save_prepare_base_snapshot(
+            &owner_repo,
+            pr_number,
+            head_sha,
+            base_sha,
+            "push_pr_base_api",
+        )
+        .expect("save prepare base snapshot");
+
+        let loaded = load_prepare_base_snapshot(&owner_repo, pr_number, head_sha)
+            .expect("load prepare base snapshot")
+            .expect("prepare base snapshot exists");
+        assert_eq!(loaded.owner_repo, owner_repo);
+        assert_eq!(loaded.pr_number, pr_number);
+        assert_eq!(loaded.head_sha, head_sha);
+        assert_eq!(loaded.base_sha, base_sha);
+        assert_eq!(loaded.source, "push_pr_base_api");
+    }
+
+    #[test]
+    fn prepare_base_snapshot_rejects_invalid_sha_values() {
+        let owner_repo = unique_repo("prepare-base-invalid");
+        let pr_number = 62;
+        let err = save_prepare_base_snapshot(
+            &owner_repo,
+            pr_number,
+            "not-a-sha",
+            "89abcdef0123456789abcdef0123456789abcdef",
+            "push_pr_base_api",
+        )
+        .expect_err("invalid head sha must fail");
+        assert!(!err.is_empty());
+
+        let err = save_prepare_base_snapshot(
+            &owner_repo,
+            pr_number,
+            "0123456789abcdef0123456789abcdef01234567",
+            "not-a-sha",
+            "push_pr_base_api",
+        )
+        .expect_err("invalid base sha must fail");
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn verdict_projection_pending_round_trip_and_clear() {
+        let owner_repo = unique_repo("verdict-pending");
+        let pr_number = 71;
+        let head_sha = "1111111111111111111111111111111111111111";
+        save_verdict_projection_pending(
+            &owner_repo,
+            pr_number,
+            head_sha,
+            &VerdictProjectionPendingSaveRequest {
+                dimension: "security",
+                decision: "approve",
+                reason: Some("looks good"),
+                model_id: Some("gpt-5"),
+                backend_id: Some("openai"),
+                last_error: "projection deferred",
+                attempt_count: 1,
+                source: "verdict_set",
+            },
+        )
+        .expect("save verdict projection pending");
+
+        let loaded = load_verdict_projection_pending(&owner_repo, pr_number, head_sha)
+            .expect("load verdict projection pending")
+            .expect("verdict projection pending exists");
+        assert_eq!(loaded.dimension, "security");
+        assert_eq!(loaded.decision, "approve");
+        assert_eq!(loaded.reason.as_deref(), Some("looks good"));
+        assert_eq!(loaded.attempt_count, 1);
+
+        clear_verdict_projection_pending(&owner_repo, pr_number, head_sha)
+            .expect("clear verdict projection pending");
+        let reloaded = load_verdict_projection_pending(&owner_repo, pr_number, head_sha)
+            .expect("reload verdict projection pending");
+        assert!(reloaded.is_none());
+    }
+
+    #[test]
+    fn verdict_projection_pending_rejects_invalid_decision() {
+        let owner_repo = unique_repo("verdict-pending-invalid");
+        let pr_number = 72;
+        let head_sha = "2222222222222222222222222222222222222222";
+        let err = save_verdict_projection_pending(
+            &owner_repo,
+            pr_number,
+            head_sha,
+            &VerdictProjectionPendingSaveRequest {
+                dimension: "security",
+                decision: "maybe",
+                reason: None,
+                model_id: None,
+                backend_id: None,
+                last_error: "projection deferred",
+                attempt_count: 1,
+                source: "verdict_set",
+            },
+        )
+        .expect_err("invalid decision must fail");
+        assert!(err.contains("approve|deny"));
+    }
+
+    #[test]
+    fn list_verdict_projection_pending_for_repo_returns_saved_records() {
+        let owner_repo = unique_repo("verdict-pending-list");
+        let first_sha = "3333333333333333333333333333333333333333";
+        let second_sha = "4444444444444444444444444444444444444444";
+
+        save_verdict_projection_pending(
+            &owner_repo,
+            80,
+            first_sha,
+            &VerdictProjectionPendingSaveRequest {
+                dimension: "security",
+                decision: "approve",
+                reason: None,
+                model_id: None,
+                backend_id: None,
+                last_error: "network timeout",
+                attempt_count: 1,
+                source: "verdict_set",
+            },
+        )
+        .expect("save first verdict pending");
+        save_verdict_projection_pending(
+            &owner_repo,
+            81,
+            second_sha,
+            &VerdictProjectionPendingSaveRequest {
+                dimension: "quality",
+                decision: "deny",
+                reason: Some("issue"),
+                model_id: None,
+                backend_id: None,
+                last_error: "network timeout",
+                attempt_count: 2,
+                source: "verdict_set",
+            },
+        )
+        .expect("save second verdict pending");
+
+        let listed = list_verdict_projection_pending_for_repo(&owner_repo, 8)
+            .expect("list verdict projection pending");
+        assert!(listed.len() >= 2);
+        assert!(listed.iter().any(|entry| entry.pr_number == 80));
+        assert!(listed.iter().any(|entry| entry.pr_number == 81));
     }
 
     #[test]

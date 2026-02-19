@@ -73,7 +73,7 @@ impl CiStatus {
     }
 
     /// Set a review gate status with optional token count and model.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn set_review_status(
         &mut self,
         gate: &str,

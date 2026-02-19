@@ -354,17 +354,6 @@ pub fn load_verdict_projection_snapshot(
         updated_at: record.updated_at,
     }))
 }
-
-#[allow(dead_code)]
-pub fn clear_dimension_verdicts_for_sha(
-    owner_repo: &str,
-    pr_number: u32,
-    head_sha: &str,
-) -> Result<(), String> {
-    let _ = clear_dimension_verdicts_for_sha_with_backup(owner_repo, pr_number, head_sha)?;
-    Ok(())
-}
-
 #[derive(Debug, Clone)]
 pub(super) struct ClearedVerdictDimensionsBackup {
     owner_repo: String,
@@ -451,35 +440,6 @@ fn clear_dimension_verdicts_for_home(
     record.decision_signature = signature_for_payload(&payload)?;
     save_decision_projection_for_home(home, &record)?;
     Ok(Some(backup))
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub fn persist_verdict_projection(
-    repo: &str,
-    pr_number: Option<u32>,
-    sha: Option<&str>,
-    dimension: &str,
-    decision: &str,
-    reason: Option<&str>,
-    model_id: Option<&str>,
-    backend_id: Option<&str>,
-    json_output: bool,
-) -> Result<PersistedVerdictProjection, String> {
-    persist_verdict_projection_impl(
-        repo,
-        pr_number,
-        sha,
-        dimension,
-        decision,
-        reason,
-        model_id,
-        backend_id,
-        ProjectionMode::Full,
-        true,
-        json_output,
-        ProjectionLockBehavior::Acquire,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -665,26 +625,22 @@ fn persist_verdict_projection_impl(
 
     let payload = projection_record_to_payload(&record);
     record.decision_signature = signature_for_payload(&payload)?;
-    let all_dimensions_resolved = all_active_dimensions_resolved(&record);
 
     match projection_mode {
         ProjectionMode::Full => {
-            if all_dimensions_resolved {
-                let (projected_comment_id, projected_comment_url) =
-                    project_decision_comment(&owner_repo, resolved_pr, &record, &payload)?;
-                record.decision_comment_id = projected_comment_id;
-                record.decision_comment_url = projected_comment_url;
-            } else {
-                if record.decision_comment_id == 0 {
-                    record.decision_comment_id = allocate_local_comment_id(
-                        resolved_pr,
-                        max_cached_issue_comment_id(&owner_repo, resolved_pr),
-                    );
-                }
-                if record.decision_comment_url.trim().is_empty() {
-                    record.decision_comment_url =
-                        local_comment_url(&owner_repo, resolved_pr, record.decision_comment_id);
-                }
+            let (projected_comment_id, projected_comment_url) =
+                project_decision_comment(&owner_repo, resolved_pr, &record, &payload)?;
+            record.decision_comment_id = projected_comment_id;
+            record.decision_comment_url = projected_comment_url;
+            if record.decision_comment_id == 0 {
+                record.decision_comment_id = allocate_local_comment_id(
+                    resolved_pr,
+                    max_cached_issue_comment_id(&owner_repo, resolved_pr),
+                );
+            }
+            if record.decision_comment_url.trim().is_empty() {
+                record.decision_comment_url =
+                    local_comment_url(&owner_repo, resolved_pr, record.decision_comment_id);
             }
         },
         ProjectionMode::LocalOnly => {
@@ -771,16 +727,6 @@ fn projection_record_to_payload(record: &DecisionProjectionRecord) -> DecisionCo
         updated_at: record.updated_at.clone(),
         dimensions: record.dimensions.clone(),
     }
-}
-
-fn all_active_dimensions_resolved(record: &DecisionProjectionRecord) -> bool {
-    ACTIVE_DIMENSIONS.iter().all(|dimension| {
-        record
-            .dimensions
-            .get(*dimension)
-            .and_then(|entry| normalize_decision_value(&entry.decision))
-            .is_some()
-    })
 }
 
 const GITHUB_COMMENT_URL_PREFIX: &str = "https://github.com/";
@@ -1066,13 +1012,9 @@ where
             }
             Ok((response.id, response.html_url))
         },
-        Err(err) => {
-            eprintln!(
-                "WARNING: failed to project decision comment create to GitHub for PR #{pr_number}: {err}"
-            );
-            comment_url = local_comment_url(owner_repo, pr_number, comment_id);
-            Ok((comment_id, comment_url))
-        },
+        Err(err) => Err(format!(
+            "failed to project decision comment create to GitHub for PR #{pr_number}: {err}"
+        )),
     }
 }
 
@@ -1865,7 +1807,6 @@ pub fn resolve_termination_authority_for_home(
         run_id,
         record.decision_comment_id,
         &trusted_reviewer,
-        &now_iso8601(),
         &signature,
     ))
 }
@@ -2292,60 +2233,6 @@ mod tests {
     }
 
     #[test]
-    fn all_active_dimensions_resolved_requires_security_and_quality() {
-        let head_sha = "0123456789abcdef0123456789abcdef01234567";
-        let mut record = DecisionProjectionRecord {
-            schema: super::PROJECTION_VERDICT_SCHEMA.to_string(),
-            owner_repo: "example/repo".to_string(),
-            pr_number: 442,
-            head_sha: head_sha.to_string(),
-            updated_at: "2026-02-13T00:00:00Z".to_string(),
-            decision_comment_id: 1,
-            decision_comment_url: String::new(),
-            decision_signature: String::new(),
-            dimensions: BTreeMap::new(),
-            integrity_hmac: None,
-        };
-
-        assert!(
-            !super::all_active_dimensions_resolved(&record),
-            "empty projection cannot be resolved"
-        );
-
-        record.dimensions.insert(
-            "security".to_string(),
-            DecisionEntry {
-                decision: "approve".to_string(),
-                reason: String::new(),
-                set_by: "fac-bot".to_string(),
-                set_at: "2026-02-13T00:00:00Z".to_string(),
-                model_id: None,
-                backend_id: None,
-            },
-        );
-        assert!(
-            !super::all_active_dimensions_resolved(&record),
-            "single-dimension projection must remain unresolved"
-        );
-
-        record.dimensions.insert(
-            "code-quality".to_string(),
-            DecisionEntry {
-                decision: "deny".to_string(),
-                reason: String::new(),
-                set_by: "fac-bot".to_string(),
-                set_at: "2026-02-13T00:00:01Z".to_string(),
-                model_id: None,
-                backend_id: None,
-            },
-        );
-        assert!(
-            super::all_active_dimensions_resolved(&record),
-            "both dimensions resolved should unlock projection"
-        );
-    }
-
-    #[test]
     fn project_decision_comment_resolves_remote_comment_before_create() {
         let owner_repo = "example/repo";
         let pr_number = 661;
@@ -2512,6 +2399,57 @@ mod tests {
             comment_url,
             "https://github.com/example/repo/issues/662#issuecomment-120"
         );
+    }
+
+    #[test]
+    fn project_decision_comment_create_failure_propagates_error() {
+        let owner_repo = "example/repo";
+        let pr_number = 667;
+        let head_sha = "89abcdef0123456789abcdef0123456789abcdee";
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: "ok".to_string(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-18T00:00:00Z".to_string(),
+                model_id: None,
+                backend_id: None,
+            },
+        );
+        let payload = DecisionComment {
+            schema: DECISION_SCHEMA.to_string(),
+            pr: pr_number,
+            sha: head_sha.to_string(),
+            updated_at: "2026-02-18T00:00:00Z".to_string(),
+            dimensions: dimensions.clone(),
+        };
+        let record = DecisionProjectionRecord {
+            schema: super::PROJECTION_VERDICT_SCHEMA.to_string(),
+            owner_repo: owner_repo.to_string(),
+            pr_number,
+            head_sha: head_sha.to_string(),
+            updated_at: payload.updated_at.clone(),
+            decision_comment_id: 120,
+            decision_comment_url: super::local_comment_url(owner_repo, pr_number, 120),
+            decision_signature: String::new(),
+            integrity_hmac: None,
+            dimensions,
+        };
+
+        let err = super::project_decision_comment_with(
+            owner_repo,
+            pr_number,
+            &record,
+            &payload,
+            |_, _| Ok(None),
+            |_, _, _| Ok(()),
+            |_, _, _| Err("simulated create failure".to_string()),
+            |_, _| Ok(None),
+        )
+        .expect_err("create failure should surface");
+        assert!(err.contains("failed to project decision comment create"));
     }
 
     #[test]

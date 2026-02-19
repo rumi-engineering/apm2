@@ -75,15 +75,6 @@ impl SpawnCommand {
             .spawn()
             .map_err(|err| format!("failed to spawn {}: {err}", self.program))
     }
-
-    /// Return a display-safe representation of the command (for
-    /// logging/diagnostics only).
-    #[allow(dead_code)]
-    pub fn display_args(&self) -> String {
-        let mut parts = vec![self.program.clone()];
-        parts.extend(self.args.iter().cloned());
-        parts.join(" ")
-    }
 }
 
 // ── Feature detection ───────────────────────────────────────────────────────

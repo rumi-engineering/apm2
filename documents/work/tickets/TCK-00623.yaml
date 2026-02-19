@@ -81,6 +81,191 @@ scope:
         - Test: closure with all entries present + network denied → EXECUTE succeeds.
         - Test: unsigned closure → EXECUTE rejects it.
         - Test: PREP hydrates missing entries when network available.
+    - id: "S6_PREPARE_BASE_SHA"
+      title: "Fix fac review prepare to use pr.base.sha instead of origin/main"
+      detail: |
+        BUG REPORT — observed 2026-02-19.
+
+        `apm2 fac prepare` diffs against the local `origin/main` ref to
+        produce the reviewer's diff and commit history.  However, `apm2 fac
+        push` calls `sync_local_main_with_origin` (fast-forward + push to
+        GitHub) as part of the merge step BEFORE dispatching reviews.  By the
+        time the reviewer calls `prepare`, the local `origin/main` ref has been
+        advanced to the PR tip, so `git diff origin/main...{head_sha}` resolves
+        to an empty diff.  Reviewers then have no diff to read and fall back to
+        expensive file-by-file exploration (86–100 tool calls), inflating review
+        duration from ~1 min to 10–14 min.
+
+        Required fix:
+          In `prepare.rs`, resolve the diff base via `fetch_pr_base_sha` from
+          the GitHub API (`pr.base.sha`) rather than from the local
+          `origin/main` ref.  `pr.base.sha` is stable post-merge — GitHub
+          preserves it on the PR object.  Fall back to `origin/main` when the
+          API is unavailable or the SHA is not reachable locally (e.g. shallow
+          clone).
+
+        Acceptance criteria:
+          - After `apm2 fac push` completes and fast-forwards main, a
+            subsequent `apm2 fac review prepare --json` on the same PR emits
+            non-empty `diff_content` covering all PR commits.
+          - Fallback to `origin/main` when GitHub API is unreachable; no
+            regression in offline environments.
+          - Unit tests: `sha_is_locally_reachable` returns true for the
+            empty-tree object and false for the all-zeros SHA.
+    - id: "S7_REMOVE_OBSOLETE_COMMANDS"
+      title: "Remove five obsolete FAC CLI subcommands"
+      detail: |
+        The following subcommands are superseded by the lifecycle state machine
+        and the `doctor` command and should be removed entirely to reduce
+        surface area and confusion:
+
+          1. `apm2 fac review dispatch`
+             Reason: the lifecycle state machine now dispatches reviews
+             automatically; manual dispatch is no longer needed.
+
+          2. `apm2 fac review wait`
+             Reason: superseded by `apm2 fac doctor --wait-for-recommended-action`,
+             which provides richer status and handles all lifecycle phases.
+
+          3. `apm2 fac review status`
+             Reason: `apm2 fac doctor` is a strict superset — it shows review
+             status alongside gate status, verdict, and recommended action.
+
+          4. `apm2 fac review project`
+             Reason: redundant with `apm2 fac doctor`; no unique functionality
+             that doctor does not already cover.
+
+          5. `apm2 fac resume`
+             Reason: superseded by `apm2 fac restart`, which handles all
+             continuation scenarios including force-restart.
+
+        Acceptance criteria:
+          - All five subcommands are removed from the CLI binary (no parser
+            entry, no handler, no help text).
+          - `cargo clippy --workspace --all-targets --all-features -D warnings`
+            passes with no dead-code warnings from removed handlers.
+          - Any integration tests referencing the removed commands are deleted
+            or updated to use their replacements.
+    - id: "S8_VERDICT_COMMENT_POSTING"
+      title: "Fix verdict comment never posted to GitHub after review completes"
+      detail: |
+        BUG REPORT — observed 2026-02-19.
+
+        After both security and quality reviewers complete and approve a PR,
+        no verdict comment is posted to GitHub.  The `decision_comment_url`
+        in the projection record has the form `local://fac_projection/...`
+        (a synthetic placeholder), not a real GitHub URL.
+
+        Root cause:
+          `verdict_projection.rs` — `persist_verdict_projection_impl` —
+          contains an `all_dimensions_resolved` guard (line ~672) that
+          requires BOTH review dimensions to be present in the local
+          `~/.apm2` record before calling `project_decision_comment`.
+          Because each reviewer runs in an independent process with its own
+          `~/.apm2` home, neither reviewer ever sees both dimensions locally.
+          The guard evaluates to `false` for every reviewer → falls through
+          to the "write local placeholder only" branch → no GitHub API call
+          is ever made.
+
+          The `merge_remote_dimensions_payload` logic already present inside
+          `project_decision_comment_with` (added in TCK-00620) handles
+          exactly this cross-process scenario: it fetches any existing
+          partial comment from GitHub, merges the incoming dimension, and
+          upserts the combined result.  However, this logic is unreachable
+          because the guard above it prevents the call.
+
+        Secondary issue:
+          `create_issue_comment` failure is silently swallowed — the
+          function returns `Ok(local_placeholder)` instead of propagating
+          the error, so posting failures are invisible to the user and not
+          retried.
+
+        Required fix:
+          1. In `verdict_projection.rs`, remove the `all_dimensions_resolved`
+             guard in the `ProjectionMode::Full` arm.  Always call
+             `project_decision_comment`; rely on the existing merge logic in
+             `project_decision_comment_with` to handle partial/cross-process
+             records.
+          2. Propagate `create_issue_comment` / `update_issue_comment`
+             failures as hard errors (return `Err(...)`) rather than
+             silently falling back to a local placeholder URL.
+
+        Acceptance criteria:
+          - After both review dimensions resolve, the projection record
+            contains a real GitHub comment URL (https://github.com/...)
+            and a real comment ID (not in the `PR# × 10^9` placeholder range).
+          - When security resolves first, a partial verdict comment is created
+            on GitHub; when quality resolves, the same comment is updated to
+            include both dimensions.
+          - A `create_issue_comment` failure surfaces as a non-zero exit and
+            is not silently replaced by a local placeholder.
+
+    - id: "S9_DEDUP_CACHE_AND_PUSH"
+      title: "Fix AlreadyCompleted denial blocking push when gates already passed"
+      detail: |
+        BUG REPORT — observed 2026-02-19.
+
+        When `apm2 fac push` is called for a SHA whose gates already completed
+        in a prior run, the worker's SHA-level dedup check (TCK-00622 S8,
+        `fac_worker.rs:2804-2858`) emits a `Denied` receipt with
+        `DenialReasonCode::AlreadyCompleted`.  The push pathway in `gates.rs`
+        treats ALL `Denied` receipts as hard errors (line ~1776-1778):
+
+            FacJobOutcome::Denied =>
+                Err(format!("gates job {job_id} denied: ..."))
+
+        This causes `apm2 fac push` to fail with a non-zero exit even though
+        the gates passed and the results are fully present in the v3 gate
+        cache.  The workaround is to make a trivial commit to force a new SHA.
+
+        Root cause:
+          `AlreadyCompleted` is a "friendly" denial — it means "we already
+          have results for this SHA, nothing to rerun".  It is not a policy
+          rejection.  Treating it as a hard error is incorrect; the intent of
+          the dedup check was to avoid redundant gate execution, not to block
+          the push.
+
+          The denied receipt carries `policy_hash`, `sandbox_hardening_hash`,
+          and `network_policy_hash` (populated at `fac_worker.rs:2847-2850`)
+          so the gate cache lookup path in `run_queued_gates_and_collect`
+          (`gates.rs:345-351`) already has everything it needs to find the
+          cached results.
+
+        Required fix:
+          In `gates.rs` — `wait_for_gates_job_receipt_with_mode` — add a
+          special-case for `DenialReasonCode::AlreadyCompleted`:  return
+          `Ok(())` (treat as pass-through) instead of `Err`.  The existing
+          `load_gate_results_from_cache_for_sha_with_context` path will then
+          resolve the cached v3 gate results using the denied receipt's hash
+          context fields, and the push proceeds normally.
+
+        Acceptance criteria:
+          - `apm2 fac push` succeeds for a SHA whose gates already passed in
+            a prior run (no trivial-commit workaround needed).
+          - A genuine `Denied` receipt (any `denial_reason` other than
+            `AlreadyCompleted`) still surfaces as a hard error.
+          - Gate cache results from the original completed job are used as-is;
+            no gates are re-executed.
+    - id: "S10_HIDE_GATES_COMMAND"
+      title: "Hide `apm2 fac gates` from the public CLI surface"
+      detail: |
+        `apm2 fac gates` is an internal implementation detail invoked by
+        `apm2 fac push` under the hood.  Exposing it as a top-level user
+        command creates confusion (users may invoke it directly, bypassing
+        push-level policy), adds surface area to document and support, and
+        implies it is a stable public API it is not.
+
+        Required change:
+          Mark the `gates` subcommand as hidden in the clap parser (`.hide(true)`)
+          so it does not appear in `apm2 fac --help` output but remains callable
+          internally.  No functional change to the command itself.
+
+        Acceptance criteria:
+          - `apm2 fac --help` does not list `gates` in the subcommand list.
+          - `apm2 fac gates ...` still works when invoked directly (for
+            internal / debugging use), it is just not advertised.
+          - `apm2 fac push` continues to dispatch gates normally.
+
   out_of_scope:
     - "Full supply chain provenance verification (future work)."
     - "Multi-registry or private registry support."

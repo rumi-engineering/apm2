@@ -10,8 +10,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(not(test))]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(not(test))]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use apm2_core::fac::gate_cache_v3::{GateCacheV3, V3CompoundKey};
@@ -68,6 +71,7 @@ const GATES_QUEUE_PENDING_DIR: &str = "pending";
 const GATES_QUEUE_CLAIMED_DIR: &str = "claimed";
 const DIRTY_TREE_STATUS_MAX_LINES: usize = 20;
 const GATES_EVENT_SCHEMA: &str = "apm2.fac.gates_event.v1";
+#[cfg(not(test))]
 const PREP_STEP_SEQUENCE: [&str; 3] = [
     "readiness_controller",
     "singleflight_reap",
@@ -122,6 +126,7 @@ pub(super) struct QueuedGatesOutcome {
 }
 
 /// Local worker execution result used by the FAC worker queue path.
+#[cfg(not(test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LocalGatesRunResult {
     pub(super) exit_code: u8,
@@ -403,6 +408,9 @@ fn prepare_queued_gates_job(
         },
     )
     .map_err(|failure| QueuePreparationFailure::PrepNotReady { failure })?;
+    let readiness_elapsed_ms = readiness.elapsed_ms;
+    let readiness_report_count = readiness.component_reports.len();
+    let _ = (readiness_elapsed_ms, readiness_report_count);
     let worker_bootstrapped = readiness.worker_bootstrapped;
     let apm2_home =
         apm2_core::github::resolve_apm2_home().ok_or_else(|| QueuePreparationFailure::Runtime {
@@ -1210,7 +1218,7 @@ fn materialize_gate_results_from_v3(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(test, allow(dead_code))]
+#[cfg(not(test))]
 pub(super) fn run_gates_local_worker(
     force: bool,
     quick: bool,
@@ -1278,7 +1286,13 @@ pub(super) fn run_gates_local_worker(
                     error_hint.as_deref(),
                 );
             },
-            GateProgressEvent::Progress { .. } => {},
+            GateProgressEvent::Progress {
+                gate_name,
+                elapsed_secs,
+                bytes_streamed,
+            } => {
+                let _ = (gate_name, elapsed_secs, bytes_streamed);
+            },
         });
 
     let summary = match run_gates_inner_detailed(
@@ -1773,8 +1787,9 @@ fn wait_for_gates_job_receipt_with_mode(
         if let Some(receipt) = lookup_job_receipt(&receipts_dir, job_id) {
             return match receipt.outcome {
                 apm2_core::fac::FacJobOutcome::Completed => Ok(()),
-                apm2_core::fac::FacJobOutcome::Denied => {
-                    Err(format!("gates job {job_id} denied: {}", receipt.reason))
+                apm2_core::fac::FacJobOutcome::Denied => match receipt.denial_reason {
+                    Some(apm2_core::fac::DenialReasonCode::AlreadyCompleted) => Ok(()),
+                    _ => Err(format!("gates job {job_id} denied: {}", receipt.reason)),
                 },
                 apm2_core::fac::FacJobOutcome::Quarantined => Err(format!(
                     "gates job {job_id} quarantined: {}",
@@ -2057,8 +2072,8 @@ struct GatesPhaseError {
     details: Box<GatesFailureDetails>,
 }
 
+#[cfg(test)]
 impl GatesPhaseError {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn render(self) -> String {
         format!(
             "run_failed stage={} root_cause={}",
@@ -2220,6 +2235,7 @@ fn next_gates_run_id() -> String {
     )
 }
 
+#[cfg(not(test))]
 fn resolve_workspace_head_sha(workspace_root: &Path) -> Option<String> {
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -2236,6 +2252,7 @@ fn resolve_workspace_head_sha(workspace_root: &Path) -> Option<String> {
     Some(sha)
 }
 
+#[cfg(not(test))]
 fn resolve_execute_network_enforcement_method(quick: bool) -> String {
     if quick {
         return "quick_mode_no_network_isolation".to_string();
@@ -2258,6 +2275,7 @@ fn resolve_execute_network_enforcement_method(quick: bool) -> String {
     "systemd_network_policy_deny".to_string()
 }
 
+#[cfg(not(test))]
 fn prep_started_event(run_id: &str) -> serde_json::Value {
     build_gates_event(
         "prep_started",
@@ -2268,6 +2286,7 @@ fn prep_started_event(run_id: &str) -> serde_json::Value {
     )
 }
 
+#[cfg(not(test))]
 fn emit_prep_started_event(run_id: &str) {
     if let Err(err) = super::jsonl::emit_jsonl(&prep_started_event(run_id)) {
         eprintln!("WARNING: failed to emit gates event `prep_started`: {err}");
@@ -2301,6 +2320,7 @@ fn prep_step_event(run_id: &str, step: &PrepStepResult) -> serde_json::Value {
     build_gates_event("prep_step", serde_json::Value::Object(payload))
 }
 
+#[cfg(not(test))]
 fn emit_prep_step_event(run_id: &str, step: &PrepStepResult) {
     if let Err(err) = super::jsonl::emit_jsonl(&prep_step_event(run_id, step)) {
         eprintln!("WARNING: failed to emit gates event `prep_step`: {err}");
@@ -2317,6 +2337,7 @@ fn execute_started_event(run_id: &str, enforcement_method: &str) -> serde_json::
     )
 }
 
+#[cfg(not(test))]
 fn emit_execute_started_event(run_id: &str, enforcement_method: &str) {
     if let Err(err) = super::jsonl::emit_jsonl(&execute_started_event(run_id, enforcement_method)) {
         eprintln!("WARNING: failed to emit gates event `execute_started`: {err}");
@@ -2342,6 +2363,7 @@ fn gate_started_event(run_id: &str, sha: Option<&str>, gate_name: &str) -> serde
     build_gates_event("gate_started", serde_json::Value::Object(payload))
 }
 
+#[cfg(not(test))]
 fn emit_gate_started_event(run_id: &str, sha: Option<&str>, gate_name: &str) {
     if let Err(err) = super::jsonl::emit_jsonl(&gate_started_event(run_id, sha, gate_name)) {
         eprintln!("WARNING: failed to emit gates event `gate_started`: {err}");
@@ -2393,6 +2415,7 @@ fn gate_finished_event(
     build_gates_event("gate_finished", serde_json::Value::Object(payload))
 }
 
+#[cfg(not(test))]
 fn emit_gate_finished_event(
     run_id: &str,
     sha: Option<&str>,
@@ -2440,6 +2463,7 @@ fn run_summary_event(run_id: &str, summary: &GatesSummary) -> serde_json::Value 
     )
 }
 
+#[cfg(not(test))]
 fn emit_run_summary_event(run_id: &str, summary: &GatesSummary) {
     if let Err(err) = super::jsonl::emit_jsonl(&run_summary_event(run_id, summary)) {
         eprintln!("WARNING: failed to emit gates event `run_summary`: {err}");
@@ -2494,6 +2518,7 @@ fn run_failed_event(run_id: &str, failure: &GatesRunFailure) -> serde_json::Valu
     build_gates_event("run_failed", serde_json::Value::Object(payload))
 }
 
+#[cfg(not(test))]
 fn emit_run_failed_event(run_id: &str, failure: &GatesRunFailure) {
     if let Err(err) = super::jsonl::emit_jsonl(&run_failed_event(run_id, failure)) {
         eprintln!("WARNING: failed to emit gates event `run_failed`: {err}");
@@ -2781,7 +2806,7 @@ fn assert_execute_ambient_mutation_invariant(
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::fn_params_excessive_bools)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn run_gates_inner(
     workspace_root: &Path,
     force: bool,
@@ -2970,11 +2995,6 @@ fn run_execute_phase(
             gate_name: merge_gate.name.clone(),
             passed: merge_gate.status == "PASS",
             duration_secs: merge_gate.duration_secs,
-            log_path: merge_gate.log_path.clone(),
-            bytes_written: merge_gate.bytes_written,
-            bytes_total: merge_gate.bytes_total,
-            was_truncated: merge_gate.was_truncated,
-            log_bundle_hash: merge_gate.log_bundle_hash.clone(),
             error_hint: merge_gate.error_hint.clone(),
         });
     }
@@ -3660,6 +3680,63 @@ mod tests {
     fn write_queue_spec(path: &Path, spec: &FacJobSpecV1) {
         let body = serde_json::to_vec_pretty(spec).expect("serialize spec");
         fs::write(path, body).expect("write spec");
+    }
+
+    #[test]
+    fn wait_for_gates_job_receipt_passes_through_already_completed_denial() {
+        with_test_apm2_home(|apm2_home| {
+            let fac_root = apm2_home.join("private/fac");
+            let receipts_dir = fac_root.join("receipts");
+            fs::create_dir_all(&receipts_dir).expect("create receipts dir");
+            let receipt = apm2_core::fac::FacJobReceiptV1 {
+                schema: "apm2.fac.receipt.v1".to_string(),
+                receipt_id: "receipt-already-completed".to_string(),
+                job_id: "job-already-completed".to_string(),
+                job_spec_digest: "spec-already-completed".to_string(),
+                outcome: apm2_core::fac::FacJobOutcome::Denied,
+                denial_reason: Some(apm2_core::fac::DenialReasonCode::AlreadyCompleted),
+                reason: "already completed".to_string(),
+                ..Default::default()
+            };
+            apm2_core::fac::persist_content_addressed_receipt(&receipts_dir, &receipt)
+                .expect("persist receipt");
+            wait_for_gates_job_receipt_with_mode(
+                &fac_root,
+                "job-already-completed",
+                Duration::from_secs(1),
+                WorkerExecutionMode::RequireExternalWorker,
+            )
+            .expect("already_completed denial should pass through");
+        });
+    }
+
+    #[test]
+    fn wait_for_gates_job_receipt_denied_without_already_completed_is_error() {
+        with_test_apm2_home(|apm2_home| {
+            let fac_root = apm2_home.join("private/fac");
+            let receipts_dir = fac_root.join("receipts");
+            fs::create_dir_all(&receipts_dir).expect("create receipts dir");
+            let receipt = apm2_core::fac::FacJobReceiptV1 {
+                schema: "apm2.fac.receipt.v1".to_string(),
+                receipt_id: "receipt-denied".to_string(),
+                job_id: "job-denied".to_string(),
+                job_spec_digest: "spec-denied".to_string(),
+                outcome: apm2_core::fac::FacJobOutcome::Denied,
+                denial_reason: Some(apm2_core::fac::DenialReasonCode::ValidationFailed),
+                reason: "validation failed".to_string(),
+                ..Default::default()
+            };
+            apm2_core::fac::persist_content_addressed_receipt(&receipts_dir, &receipt)
+                .expect("persist receipt");
+            let err = wait_for_gates_job_receipt_with_mode(
+                &fac_root,
+                "job-denied",
+                Duration::from_secs(1),
+                WorkerExecutionMode::RequireExternalWorker,
+            )
+            .expect_err("validation denial must fail");
+            assert!(err.contains("denied"));
+        });
     }
 
     fn sample_phase_summary(passed: bool) -> GatesSummary {
@@ -5261,12 +5338,15 @@ time.sleep(20)\n",
                     ));
                 },
                 GateProgressEvent::Completed {
-                    gate_name, passed, ..
+                    gate_name,
+                    passed,
+                    duration_secs,
+                    error_hint,
                 } => {
-                    events_clone
-                        .lock()
-                        .unwrap()
-                        .push(format!("completed:{gate_name}:passed={passed}"));
+                    events_clone.lock().unwrap().push(format!(
+                        "completed:{gate_name}:passed={passed}:duration={duration_secs}:hint={}",
+                        error_hint.as_deref().unwrap_or("")
+                    ));
                 },
             });
 
@@ -5296,11 +5376,6 @@ time.sleep(20)\n",
                 gate_name: "test_gate".to_string(),
                 passed: true,
                 duration_secs: 5,
-                log_path: None,
-                bytes_written: None,
-                bytes_total: None,
-                was_truncated: None,
-                log_bundle_hash: None,
                 error_hint: None,
             });
         }
@@ -5309,7 +5384,10 @@ time.sleep(20)\n",
         assert_eq!(recorded.len(), 3);
         assert_eq!(recorded[0], "started:test_gate");
         assert_eq!(recorded[1], "progress:test_gate:elapsed=10:bytes=1024");
-        assert_eq!(recorded[2], "completed:test_gate:passed=true");
+        assert_eq!(
+            recorded[2],
+            "completed:test_gate:passed=true:duration=5:hint="
+        );
     }
 
     /// Regression (MAJOR 2): `check_lane_not_corrupt` must refuse to run

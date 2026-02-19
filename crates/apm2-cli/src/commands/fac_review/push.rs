@@ -22,6 +22,7 @@ use super::gate_cache::GateCache;
 use super::gates::{
     GateThroughputProfile, QueuedGatesOutcome, QueuedGatesRequest, run_queued_gates_and_collect,
 };
+use super::github_reads::fetch_pr_base_sha;
 use super::jsonl::{
     GateCompletedEvent, GateErrorEvent, StageEvent, emit_jsonl, read_log_error_hint, ts_now,
 };
@@ -484,6 +485,20 @@ fn apply_gate_success_lifecycle_events(
     apply_gate_success_lifecycle_events_with(repo, pr_number, sha, |event| {
         lifecycle::apply_event(repo, pr_number, sha, &event).map(|_| ())
     })
+}
+
+fn ensure_projection_success_for_push(successful_targets: &[&str]) -> Result<(), String> {
+    let successful_count = successful_targets
+        .iter()
+        .filter(|target| !target.trim().is_empty())
+        .count();
+    if successful_count == 0 {
+        return Err(
+            "fac push requires at least one successful projection before lifecycle progression"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2045,12 +2060,27 @@ pub fn run_push(
             "url": format!("https://github.com/{repo}/pull/{pr_number}"),
         }),
     );
-
-    if let Err(err) = apply_gate_success_lifecycle_events(repo, pr_number, &sha) {
-        fail_with_attempt!(
-            "fac_push_lifecycle_gates_passed_failed",
-            format!("failed to persist gate-success lifecycle sequence: {err}")
-        );
+    let mut successful_projection_targets = Vec::new();
+    successful_projection_targets.push("pr_metadata");
+    match fetch_pr_base_sha(repo, pr_number) {
+        Ok(base_sha) => {
+            if let Err(err) = projection_store::save_prepare_base_snapshot(
+                repo,
+                pr_number,
+                &sha,
+                &base_sha,
+                "push_pr_base_api",
+            ) {
+                human_log!(
+                    "WARNING: failed to persist prepare base snapshot for PR #{pr_number}: {err}"
+                );
+            }
+        },
+        Err(err) => {
+            human_log!(
+                "WARNING: failed to fetch PR base SHA for PR #{pr_number}; offline prepare may fall back to local main: {err}"
+            );
+        },
     }
 
     let gate_evidence_hashes = gate_outcome
@@ -2096,6 +2126,21 @@ pub fn run_push(
         human_log!("WARNING: failed to sync gate status section in PR body: {err}");
     } else {
         human_log!("fac push: synced gate status section in PR body for PR #{pr_number}");
+        successful_projection_targets.push("gate_status");
+    }
+
+    if let Err(err) = ensure_projection_success_for_push(&successful_projection_targets) {
+        fail_with_attempt!(
+            "fac_push_projection_required_failed",
+            format!("failed projection gate before lifecycle progression: {err}")
+        );
+    }
+
+    if let Err(err) = apply_gate_success_lifecycle_events(repo, pr_number, &sha) {
+        fail_with_attempt!(
+            "fac_push_lifecycle_gates_passed_failed",
+            format!("failed to persist gate-success lifecycle sequence: {err}")
+        );
     }
 
     // Step 4: dispatch reviews.
@@ -2196,6 +2241,24 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn ensure_projection_success_for_push_rejects_empty_set() {
+        let err = ensure_projection_success_for_push(&[]).expect_err("empty set must fail");
+        assert!(err.contains("at least one successful projection"));
+    }
+
+    #[test]
+    fn ensure_projection_success_for_push_accepts_non_empty_set() {
+        ensure_projection_success_for_push(&["pr_metadata"]).expect("non-empty set should pass");
+    }
+
+    #[test]
+    fn ensure_projection_success_for_push_rejects_blank_entries() {
+        let err = ensure_projection_success_for_push(&["", "   "])
+            .expect_err("blank entries must not satisfy projection gate");
+        assert!(err.contains("at least one successful projection"));
+    }
 
     #[allow(unsafe_code)]
     fn with_test_apm2_home<T>(f: impl FnOnce(&Path) -> T) -> T {
