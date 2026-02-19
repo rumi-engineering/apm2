@@ -2862,7 +2862,10 @@ policy bypass from malformed or adversarial job specs.
 - `validate_patch_bytes_backend()`: Rejects unknown or non-string
   `bytes_backend` values in patch descriptors.
 - `reject_filesystem_paths()`: Detects Unix absolute, Windows drive-letter,
-  UNC, tilde-home, and dot-slash relative paths in key fields.
+  UNC, tilde-home, dot-slash relative paths, and embedded NUL bytes in key
+  fields.  Called from both `validate_job_spec()` and
+  `validate_job_spec_control_lane()` at the core layer, and again from the
+  policy-driven wrappers for defense-in-depth.
 
 ### Runtime Wiring
 
@@ -2885,8 +2888,10 @@ policy bypass from malformed or adversarial job specs.
   authority is proven via filesystem capability (queue directory ownership),
   not repo identity.  See `CONTROL_LANE_EXCEPTION_AUDITED`.
 - [INV-JS-006] Filesystem paths (absolute, Windows drive, UNC, tilde, dot-slash)
-  are rejected in `repo_id` and `job_id` to ensure these remain logical
-  identifiers.
+  and embedded NUL bytes are rejected in `repo_id` and `job_id` at the core
+  validation layer (`validate_job_spec` / `validate_job_spec_control_lane`),
+  ensuring all callers are protected regardless of whether policy-driven
+  validation is used.
 - [INV-JS-007] Control-lane `stop_revoke` jobs MUST carry
   `repo_id == CONTROL_LANE_REPO_ID` (`"internal/control"`).  Arbitrary
   repo IDs are rejected fail-closed to prevent audit-trail corruption and
