@@ -3638,3 +3638,59 @@ Integration test file: `crates/apm2-core/tests/tck_00559_security_regression.rs`
 `deserialize_job_spec`, then `validate_job_spec` and `compute_digest` on
 successful parses. Tests INV-JS-003 (fail-closed), RSK-1601 (DoS size cap),
 and RSK-0701 (no panic on untrusted input).
+
+## End-to-End Default Mode Tests (TCK-00588)
+
+Integration test file: `crates/apm2-core/tests/tck_00588_e2e_default_mode.rs`
+
+In-process broker+worker harness that exercises the complete default-mode
+admission pipeline with deterministic inputs. Security domains:
+`DOMAIN_SECURITY`, `DOMAIN_RUNTIME`.
+
+### Coverage Areas
+
+1. **Happy path** (`e2e_happy_path_receipt_contains_rfc0028_and_rfc0029_traces`):
+   Broker issues RFC-0028 channel context token and RFC-0029 time authority
+   envelope, queue admission evaluates all three temporal predicates
+   (TP-EIO29-001/002/003), receipt contains boundary trace, queue admission
+   trace, and budget admission trace.
+
+2. **Missing token denial** (`e2e_missing_token_is_denied`): Spec without
+   channel context token fails `validate_job_spec`, receipt records
+   `DenialReasonCode::MissingChannelToken`.
+
+3. **Expired token denial** (`e2e_expired_token_is_denied`): Token issued at
+   time T decoded at T+1801 (past 1800s expiry) fails decode.
+
+4. **Forged token denial** (`e2e_forged_token_is_denied`): Token signed with
+   attacker's key fails verification against broker's key.
+
+5. **Verifier-None fail-closed** (`e2e_noop_verifier_denies_fail_closed`):
+   Admission with valid broker-issued envelope but `None` verifier denies
+   with `signature_verification_not_configured`, proving the same fail-closed
+   path that cfg-gated `NoOpVerifier` exercises (TCK-00550).
+
+6. **No-envelope denial** (`e2e_queue_admission_without_envelope_denies`):
+   Admission without envelope denies fail-closed with a defect trace.
+
+7. **No-verifier queue denial** (`e2e_queue_admission_with_noop_verifier_denies`):
+   Admission with envelope but `None` verifier denies with TP-001 failure.
+
+8. **Real verifier allow** (`e2e_queue_admission_with_broker_verifier_allows`):
+   `BrokerSignatureVerifier` with broker's Ed25519 key allows admission,
+   all three TPs pass.
+
+9. **Malformed spec quarantine** (`e2e_malformed_spec_is_quarantined`):
+   Invalid JSON fails `deserialize_job_spec`, quarantine receipt with
+   `DenialReasonCode::MalformedSpec`.
+
+10. **Digest mismatch quarantine** (`e2e_digest_mismatch_is_quarantined`):
+    Tampered spec kind triggers `JobSpecError::DigestMismatch`.
+
+11. **Receipt roundtrip** (`e2e_full_pipeline_receipt_roundtrip`):
+    Full pipeline receipt with all three traces survives JSON
+    serialize/deserialize roundtrip.
+
+12. **Multi-lane admission** (`e2e_multiple_lanes_admitted`):
+    Bulk, Consume, and Control lanes all admitted with distinct
+    broker-issued envelopes.
