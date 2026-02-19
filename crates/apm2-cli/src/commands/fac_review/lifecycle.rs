@@ -4880,17 +4880,18 @@ fn run_verdict_set_inner(
             1,
             "verdict_set",
         )?;
-        if let Some(projected_full) = replay_pending_verdict_projection_for_pr_locked(
+        let projected_full = replay_pending_verdict_projection_for_pr_locked(
             &projected.owner_repo,
             projected.pr_number,
-        ) && projected_full.pr_number == projected.pr_number
-            && projected_full
-                .head_sha
-                .eq_ignore_ascii_case(&projected.head_sha)
-        {
-            validate_post_finalize_projection(&projected, &projected_full)?;
-            rewrite_verdict_completion_receipt(&home, &projected_full, &run_id)?;
-        }
+        )
+        .ok_or_else(|| {
+            format!(
+                "verdict projection replay deferred for PR #{} sha {} type={}; pending projection retained for retry",
+                projected.pr_number, projected.head_sha, projected.review_state_type
+            )
+        })?;
+        validate_post_finalize_projection(&projected, &projected_full)?;
+        rewrite_verdict_completion_receipt(&home, &projected_full, &run_id)?;
         Ok(exit_codes::SUCCESS)
     };
 

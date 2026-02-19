@@ -39,6 +39,7 @@ const PROJECTION_INTEGRITY_ROLE: &str = "decision_projection";
 const PROJECTION_SECRET_MAX_FILE_BYTES: u64 = 128;
 const PROJECTION_SECRET_LEN_BYTES: usize = 32;
 const PROJECTION_SECRET_MAX_ENCODED_CHARS: usize = 128;
+const ALWAYS_CREATE_NEW_VERDICT_COMMENT: bool = true;
 type HmacSha256 = Hmac<sha2::Sha256>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -874,7 +875,7 @@ where
 
     let mut orphaned_remote_comment_id: Option<u64> = None;
     let mut known_remote_body = None::<String>;
-    if comment_id > 0 {
+    if !ALWAYS_CREATE_NEW_VERDICT_COMMENT && comment_id > 0 {
         if !is_remote_comment_url(&comment_url) {
             let resolved = fetch_comment(owner_repo, comment_id).map_err(|err| {
                 format!(
@@ -941,6 +942,8 @@ where
                 },
             }
         }
+    } else if comment_id > 0 && is_remote_comment_url(&comment_url) {
+        orphaned_remote_comment_id = Some(comment_id);
     }
 
     let mut superseded_remote_comment_id = orphaned_remote_comment_id;
@@ -962,35 +965,39 @@ where
     if superseded_remote_comment_id.is_none()
         && let Some(latest_remote_comment_id) = latest_known_remote_comment_id
     {
-        match fetch_comment(owner_repo, latest_remote_comment_id) {
-            Ok(Some(found)) => {
-                let latest_body = {
-                    let merged = merge_remote_dimensions_payload(
-                        payload,
-                        &found.body,
-                        pr_number,
-                        &record.head_sha,
-                    );
-                    render_decision_comment_body(owner_repo, pr_number, &record.head_sha, &merged)?
-                };
-                create_body.clone_from(&latest_body);
-                match update_comment(owner_repo, found.id, &latest_body) {
-                    Ok(()) => return Ok((found.id, found.html_url)),
-                    Err(err) => {
-                        eprintln!(
-                            "WARNING: failed to patch latest remote verdict comment {} for PR #{pr_number}; creating replacement: {err}",
-                            found.id
+        if ALWAYS_CREATE_NEW_VERDICT_COMMENT {
+            superseded_remote_comment_id = Some(latest_remote_comment_id);
+        } else {
+            match fetch_comment(owner_repo, latest_remote_comment_id) {
+                Ok(Some(found)) => {
+                    let latest_body = {
+                        let merged = merge_remote_dimensions_payload(
+                            payload,
+                            &found.body,
+                            pr_number,
+                            &record.head_sha,
                         );
-                        superseded_remote_comment_id = Some(found.id);
-                    },
-                }
-            },
-            Ok(None) => {},
-            Err(err) => {
-                eprintln!(
-                    "WARNING: failed to resolve latest remote verdict comment {latest_remote_comment_id} for PR #{pr_number}: {err}"
-                );
-            },
+                        render_decision_comment_body(owner_repo, pr_number, &record.head_sha, &merged)?
+                    };
+                    create_body.clone_from(&latest_body);
+                    match update_comment(owner_repo, found.id, &latest_body) {
+                        Ok(()) => return Ok((found.id, found.html_url)),
+                        Err(err) => {
+                            eprintln!(
+                                "WARNING: failed to patch latest remote verdict comment {} for PR #{pr_number}; creating replacement: {err}",
+                                found.id
+                            );
+                            superseded_remote_comment_id = Some(found.id);
+                        },
+                    }
+                },
+                Ok(None) => {},
+                Err(err) => {
+                    eprintln!(
+                        "WARNING: failed to resolve latest remote verdict comment {latest_remote_comment_id} for PR #{pr_number}: {err}"
+                    );
+                },
+            }
         }
     }
 
@@ -2231,7 +2238,7 @@ mod tests {
     }
 
     #[test]
-    fn project_decision_comment_resolves_remote_comment_before_create() {
+    fn project_decision_comment_creates_new_comment_when_existing_comment_resolves_remotely() {
         let owner_repo = "example/repo";
         let pr_number = 661;
         let head_sha = "0123456789abcdef0123456789abcdef01234567";
@@ -2268,6 +2275,7 @@ mod tests {
         };
 
         let mut fetched = 0usize;
+        let mut update_calls = 0usize;
         let mut created = 0usize;
         let (comment_id, comment_url) = super::project_decision_comment_with(
             owner_repo,
@@ -2286,7 +2294,9 @@ mod tests {
             },
             |_, id, body| {
                 assert_eq!(id, 88);
-                assert!(body.contains("apm2-review-verdict:v1"));
+                update_calls = update_calls.saturating_add(1);
+                assert!(body.contains("apm2-review-verdict:tombstone:v1"));
+                assert!(body.contains("issuecomment-99"));
                 Ok(())
             },
             |_, _, _| {
@@ -2300,14 +2310,15 @@ mod tests {
             },
             |_, _| Ok(None),
         )
-        .expect("resolve+patch existing comment");
+        .expect("existing remote comment should be superseded by a new comment");
 
-        assert_eq!(fetched, 1);
-        assert_eq!(created, 0);
-        assert_eq!(comment_id, 88);
+        assert_eq!(fetched, 0);
+        assert_eq!(update_calls, 0);
+        assert_eq!(created, 1);
+        assert_eq!(comment_id, 99);
         assert_eq!(
             comment_url,
-            "https://github.com/example/repo/issues/661#issuecomment-88"
+            "https://github.com/example/repo/issues/661#issuecomment-99"
         );
     }
 
@@ -2370,11 +2381,7 @@ mod tests {
             |_, id, _| {
                 update_calls = update_calls.saturating_add(1);
                 assert_eq!(id, 120);
-                if update_calls == 1 {
-                    Err("transient patch failure".to_string())
-                } else {
-                    Ok(())
-                }
+                Err("transient patch failure".to_string())
             },
             |_, _, _| {
                 create_calls = create_calls.saturating_add(1);
@@ -2387,15 +2394,15 @@ mod tests {
             },
             |_, _| Ok(None),
         )
-        .expect("revalidation retry should patch existing comment");
+        .expect("new comment should be created and superseded tombstone is best-effort");
 
-        assert_eq!(fetch_calls, 2);
-        assert_eq!(update_calls, 2);
-        assert_eq!(create_calls, 0);
-        assert_eq!(comment_id, 120);
+        assert_eq!(fetch_calls, 0);
+        assert_eq!(update_calls, 1);
+        assert_eq!(create_calls, 1);
+        assert_eq!(comment_id, 999);
         assert_eq!(
             comment_url,
-            "https://github.com/example/repo/issues/662#issuecomment-120"
+            "https://github.com/example/repo/issues/662#issuecomment-999"
         );
     }
 
@@ -2502,13 +2509,9 @@ mod tests {
             |_, id, body| {
                 update_calls = update_calls.saturating_add(1);
                 assert_eq!(id, 77);
-                if update_calls == 1 {
-                    Err("comment no longer patchable".to_string())
-                } else {
-                    tombstone_seen = body.contains("apm2-review-verdict:tombstone:v1")
-                        && body.contains("issuecomment-88");
-                    Ok(())
-                }
+                tombstone_seen = body.contains("apm2-review-verdict:tombstone:v1")
+                    && body.contains("issuecomment-88");
+                Ok(())
             },
             |_, _, _| {
                 Ok(super::github_projection::IssueCommentResponse {
@@ -2527,7 +2530,7 @@ mod tests {
             comment_url,
             "https://github.com/example/repo/issues/663#issuecomment-88"
         );
-        assert_eq!(update_calls, 2);
+        assert_eq!(update_calls, 1);
         assert!(tombstone_seen);
     }
 
@@ -2582,11 +2585,7 @@ mod tests {
             |_, id, _| {
                 update_calls = update_calls.saturating_add(1);
                 assert_eq!(id, 77);
-                if update_calls == 1 {
-                    Err("comment no longer patchable".to_string())
-                } else {
-                    Err("tombstone update denied".to_string())
-                }
+                Err("tombstone update denied".to_string())
             },
             |_, _, _| {
                 Ok(super::github_projection::IssueCommentResponse {
@@ -2605,7 +2604,7 @@ mod tests {
             comment_url,
             "https://github.com/example/repo/issues/665#issuecomment-89"
         );
-        assert_eq!(update_calls, 2);
+        assert_eq!(update_calls, 1);
     }
 
     #[test]
@@ -2646,6 +2645,7 @@ mod tests {
             dimensions,
         };
 
+        let mut fetch_calls = 0usize;
         let mut update_calls = 0usize;
         let mut create_calls = 0usize;
         let mut tombstoned_comment_id = None::<u64>;
@@ -2654,29 +2654,17 @@ mod tests {
             pr_number,
             &record,
             &payload,
-            |_, id| match id {
-                120 => Ok(None),
-                77 => Ok(Some(super::github_projection::IssueCommentResponse {
-                    id: 77,
-                    html_url: "https://github.com/example/repo/issues/666#issuecomment-77"
-                        .to_string(),
-                    body: String::new(),
-                })),
-                other => panic!("unexpected comment lookup id {other}"),
+            |_, _| {
+                fetch_calls = fetch_calls.saturating_add(1);
+                Ok(None)
             },
             |_, id, body| {
                 update_calls = update_calls.saturating_add(1);
-                if update_calls == 1 {
-                    assert_eq!(id, 77);
-                    assert!(body.contains("apm2-review-verdict:v1"));
-                    Err("latest comment patch failed".to_string())
-                } else {
-                    tombstoned_comment_id = Some(id);
-                    assert_eq!(id, 77);
-                    assert!(body.contains("apm2-review-verdict:tombstone:v1"));
-                    assert!(body.contains("issuecomment-88"));
-                    Ok(())
-                }
+                tombstoned_comment_id = Some(id);
+                assert_eq!(id, 77);
+                assert!(body.contains("apm2-review-verdict:tombstone:v1"));
+                assert!(body.contains("issuecomment-88"));
+                Ok(())
             },
             |_, _, _| {
                 create_calls = create_calls.saturating_add(1);
@@ -2696,13 +2684,14 @@ mod tests {
             comment_url,
             "https://github.com/example/repo/issues/666#issuecomment-88"
         );
-        assert_eq!(update_calls, 2);
+        assert_eq!(fetch_calls, 0);
+        assert_eq!(update_calls, 1);
         assert_eq!(create_calls, 1);
         assert_eq!(tombstoned_comment_id, Some(77));
     }
 
     #[test]
-    fn project_decision_comment_updates_latest_known_remote_comment_when_reinitialized() {
+    fn project_decision_comment_creates_new_comment_when_record_reinitialized() {
         let owner_repo = "example/repo";
         let pr_number = 667;
         let head_sha = "0011223344556677889900112233445566778899";
@@ -2738,6 +2727,7 @@ mod tests {
             dimensions,
         };
 
+        let mut fetch_calls = 0usize;
         let mut update_calls = 0usize;
         let mut create_calls = 0usize;
         let (comment_id, comment_url) = super::project_decision_comment_with(
@@ -2745,21 +2735,15 @@ mod tests {
             pr_number,
             &record,
             &payload,
-            |_, id| match id {
-                120 => Ok(None),
-                77 => Ok(Some(super::github_projection::IssueCommentResponse {
-                    id: 77,
-                    html_url: "https://github.com/example/repo/issues/667#issuecomment-77"
-                        .to_string(),
-                    body: String::new(),
-                })),
-                other => panic!("unexpected comment lookup id {other}"),
+            |_, _| {
+                fetch_calls = fetch_calls.saturating_add(1);
+                Ok(None)
             },
             |_, id, body| {
                 update_calls = update_calls.saturating_add(1);
                 assert_eq!(id, 77);
-                assert!(body.contains("apm2-review-verdict:v1"));
-                assert!(!body.contains("apm2-review-verdict:tombstone:v1"));
+                assert!(body.contains("apm2-review-verdict:tombstone:v1"));
+                assert!(body.contains("issuecomment-88"));
                 Ok(())
             },
             |_, _, _| {
@@ -2773,19 +2757,20 @@ mod tests {
             },
             |_, _| Ok(Some(77)),
         )
-        .expect("latest remote verdict comment should be updated in place");
+        .expect("latest remote verdict comment should be superseded by create+tombstone");
 
-        assert_eq!(comment_id, 77);
+        assert_eq!(fetch_calls, 0);
+        assert_eq!(comment_id, 88);
         assert_eq!(
             comment_url,
-            "https://github.com/example/repo/issues/667#issuecomment-77"
+            "https://github.com/example/repo/issues/667#issuecomment-88"
         );
         assert_eq!(update_calls, 1);
-        assert_eq!(create_calls, 0);
+        assert_eq!(create_calls, 1);
     }
 
     #[test]
-    fn project_decision_comment_merges_remote_dimensions_on_reinitialized_update() {
+    fn project_decision_comment_creates_new_comment_without_remote_merge_on_reinitialize() {
         let owner_repo = "example/repo";
         let pr_number = 669;
         let head_sha = "1111222233334444555566667777888899990000";
@@ -2845,32 +2830,29 @@ mod tests {
             dimensions: local_dimensions,
         };
 
+        let mut fetch_calls = 0usize;
+        let mut update_calls = 0usize;
         let mut create_calls = 0usize;
+        let mut created_body = String::new();
         let (comment_id, comment_url) = super::project_decision_comment_with(
             owner_repo,
             pr_number,
             &record,
             &payload,
-            |_, id| match id {
-                120 => Ok(None),
-                77 => Ok(Some(super::github_projection::IssueCommentResponse {
-                    id: 77,
-                    html_url: "https://github.com/example/repo/issues/669#issuecomment-77"
-                        .to_string(),
-                    body: remote_body.clone(),
-                })),
-                other => panic!("unexpected comment lookup id {other}"),
+            |_, _| {
+                fetch_calls = fetch_calls.saturating_add(1);
+                Ok(None)
             },
             |_, id, body| {
+                update_calls = update_calls.saturating_add(1);
                 assert_eq!(id, 77);
-                assert!(body.contains("security:"));
-                assert!(body.contains("code-quality:"));
-                assert!(body.contains("security-ok"));
-                assert!(body.contains("quality-blocker"));
+                assert!(body.contains("apm2-review-verdict:tombstone:v1"));
+                assert!(body.contains("issuecomment-88"));
                 Ok(())
             },
-            |_, _, _| {
+            |_, _, body| {
                 create_calls = create_calls.saturating_add(1);
+                created_body = body.to_string();
                 Ok(super::github_projection::IssueCommentResponse {
                     id: 88,
                     html_url: "https://github.com/example/repo/issues/669#issuecomment-88"
@@ -2880,14 +2862,20 @@ mod tests {
             },
             |_, _| Ok(Some(77)),
         )
-        .expect("latest remote verdict comment should merge remote+local dimensions");
+        .expect("reinitialized projection should create a fresh comment");
 
-        assert_eq!(comment_id, 77);
+        assert_eq!(fetch_calls, 0);
+        assert_eq!(update_calls, 1);
+        assert_eq!(comment_id, 88);
         assert_eq!(
             comment_url,
-            "https://github.com/example/repo/issues/669#issuecomment-77"
+            "https://github.com/example/repo/issues/669#issuecomment-88"
         );
-        assert_eq!(create_calls, 0);
+        assert_eq!(create_calls, 1);
+        assert!(created_body.contains("code-quality:"));
+        assert!(created_body.contains("quality-blocker"));
+        assert!(!created_body.contains("security:"));
+        let _ = remote_body;
     }
 
     #[test]
@@ -3028,16 +3016,18 @@ mod tests {
 
         let guard = comment_store.lock().expect("lock final store");
         assert_eq!(
-            guard.create_calls, 1,
-            "concurrent writers must share one comment"
+            guard.create_calls, 2,
+            "each review set should create a new comment"
         );
         assert_eq!(
             guard.bodies.len(),
-            1,
-            "only one canonical comment body expected"
+            2,
+            "each created review comment should remain addressable"
         );
-        let (&comment_id, body) = guard.bodies.first_key_value().expect("canonical body");
-        assert_eq!(loaded.decision_comment_id, comment_id);
+        let body = guard
+            .bodies
+            .get(&loaded.decision_comment_id)
+            .expect("latest projected comment body");
         assert!(body.contains("security"));
         assert!(body.contains("code-quality"));
     }
