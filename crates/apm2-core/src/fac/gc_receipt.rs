@@ -117,6 +117,9 @@ pub enum GcActionKind {
     CargoCache,
     /// Managed sccache cache directory (TCK-00553).
     SccacheCache,
+    /// Receipt index compaction: prune old index entries and rebuild
+    /// deterministically (TCK-00583).
+    IndexCompaction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

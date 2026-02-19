@@ -140,6 +140,11 @@ pub mod gh_cli;
 /// Git safety hardening for lane workspaces (TCK-00580).
 pub mod git_hardening;
 pub mod harness_sandbox;
+/// Receipt index compaction (TCK-00583).
+///
+/// Prune old time buckets, rebuild deterministically, and emit
+/// `IndexCompactionReceiptV1`.
+pub mod index_compaction;
 pub mod job_spec;
 mod key_policy;
 pub mod lane;
@@ -382,6 +387,12 @@ pub use harness_sandbox::{
     EgressRule, HarnessSandboxError, MAX_EGRESS_RULES, MAX_HOST_LENGTH,
     MAX_STRING_LENGTH as MAX_HARNESS_SANDBOX_STRING_LENGTH, NetworkPolicyProfile,
     NetworkPolicyProfileBuilder, Protocol,
+};
+// Re-export index compaction types (TCK-00583)
+pub use index_compaction::{
+    CompactionError, DEFAULT_INDEX_RETENTION_SECS, INDEX_COMPACTION_RECEIPT_SCHEMA,
+    IndexCompactionReceiptV1, MAX_COMPACTION_RECEIPT_SIZE, MAX_COMPACTION_RECEIPTS, compact_index,
+    persist_compaction_receipt,
 };
 // Re-export job spec types (TCK-00512, TCK-00579)
 pub use job_spec::{

@@ -9,8 +9,10 @@ use crate::fac::GcReceiptV1;
 use crate::fac::blob_store::{BLOB_DIR, BlobStore};
 use crate::fac::cas_reader::CasReader;
 use crate::fac::flock_util::try_acquire_exclusive_nonblocking;
+use crate::fac::index_compaction::{self, DEFAULT_INDEX_RETENTION_SECS};
 use crate::fac::job_spec::parse_b3_256_digest;
 use crate::fac::lane::{LaneManager, LaneState, LaneStatusV1};
+use crate::fac::receipt_index::ReceiptIndexV1;
 use crate::fac::safe_rmtree::{
     MAX_DIR_ENTRIES, SafeRmtreeError, SafeRmtreeOutcome, safe_rmtree_v1,
 };
@@ -255,6 +257,20 @@ pub fn plan_gc(
                 }
             }
         }
+    }
+
+    // TCK-00583: Receipt index compaction as a low-impact GC step.
+    // Only schedule compaction if the index exists and has entries that
+    // would be pruned. This avoids unnecessary I/O for empty/missing indexes.
+    let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
+    if let Some(index_size) = estimate_index_compaction_benefit(&receipts_dir, now_secs) {
+        let index_path = ReceiptIndexV1::index_path(&receipts_dir);
+        targets.push(GcTarget {
+            path: index_path,
+            allowed_parent: receipts_dir,
+            kind: crate::fac::gc_receipt::GcActionKind::IndexCompaction,
+            estimated_bytes: index_size,
+        });
     }
 
     targets.sort_by(|a, b| b.estimated_bytes.cmp(&a.estimated_bytes));
@@ -545,6 +561,40 @@ pub fn execute_gc(plan: &GcPlan) -> GcReceiptV1 {
     let mut errors = Vec::new();
 
     for target in &plan.targets {
+        // TCK-00583: Index compaction is handled separately from file deletion.
+        // The compaction step prunes stale entries in-place and persists the
+        // compacted index; it does not delete the index file.
+        if matches!(
+            target.kind,
+            crate::fac::gc_receipt::GcActionKind::IndexCompaction
+        ) {
+            // The target.allowed_parent is the receipts_dir for compaction.
+            let receipts_dir = &target.allowed_parent;
+            match index_compaction::compact_index(receipts_dir, DEFAULT_INDEX_RETENTION_SECS, now) {
+                Ok(compaction_receipt) => {
+                    actions.push(crate::fac::gc_receipt::GcAction {
+                        target_path: target.path.display().to_string(),
+                        action_kind: target.kind,
+                        bytes_freed: target.estimated_bytes,
+                        files_deleted: 0,
+                        dirs_deleted: 0,
+                    });
+                    // Best-effort: persist the compaction receipt alongside GC receipts.
+                    let _ = index_compaction::persist_compaction_receipt(
+                        receipts_dir,
+                        &compaction_receipt,
+                    );
+                },
+                Err(error) => {
+                    errors.push(crate::fac::gc_receipt::GcError {
+                        target_path: target.path.display().to_string(),
+                        reason: format!("index compaction failed: {error}"),
+                    });
+                },
+            }
+            continue;
+        }
+
         let result = if matches!(
             target.kind,
             crate::fac::gc_receipt::GcActionKind::LaneTarget
@@ -614,6 +664,33 @@ pub fn execute_gc(plan: &GcPlan) -> GcReceiptV1 {
         errors,
         content_hash: String::new(),
     }
+}
+
+/// Estimate the compaction benefit (bytes of stale index entries) without
+/// mutating the index.
+///
+/// Returns `Some(estimated_bytes_freed)` if the index exists and has stale
+/// entries, or `None` if there is nothing to compact.
+fn estimate_index_compaction_benefit(receipts_dir: &Path, now_secs: u64) -> Option<u64> {
+    let index = ReceiptIndexV1::load_or_rebuild(receipts_dir).ok()?;
+    if index.is_empty() {
+        return None;
+    }
+
+    let cutoff = now_secs.saturating_sub(DEFAULT_INDEX_RETENTION_SECS);
+    let stale_count = index
+        .header_index
+        .values()
+        .filter(|h| h.timestamp_secs < cutoff)
+        .count();
+
+    if stale_count == 0 {
+        return None;
+    }
+
+    // Estimate ~200 bytes per entry (JSON overhead).
+    let estimated_bytes = (stale_count as u64).saturating_mul(200);
+    Some(estimated_bytes)
 }
 
 fn safe_rmtree_error_to_string(error: SafeRmtreeError) -> String {

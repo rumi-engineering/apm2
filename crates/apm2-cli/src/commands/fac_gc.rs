@@ -258,6 +258,7 @@ const fn gc_target_kind_to_str(kind: GcActionKind) -> &'static str {
         GcActionKind::CargoCache => "cargo_cache",
         GcActionKind::CasBlobPrune => "cas_blob_prune",
         GcActionKind::SccacheCache => "sccache_cache",
+        GcActionKind::IndexCompaction => "index_compaction",
     }
 }
 

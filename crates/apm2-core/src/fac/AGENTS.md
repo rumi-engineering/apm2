@@ -2090,6 +2090,56 @@ All receipt-touching hot paths consult the index first:
   tampered receipt files must never drive metrics without detection. Returns
   `None` on hash mismatch (MAJOR-1/MAJOR-2 round 3 fix, TCK-00551).
 
+## index_compaction Submodule (TCK-00583)
+
+The `index_compaction` submodule implements bounded retention policies for the
+receipt index. It prunes stale entries, rebuilds deterministically, and emits
+`IndexCompactionReceiptV1` for audit.
+
+### Key Types
+
+- `IndexCompactionReceiptV1`: Receipt documenting an index compaction operation.
+  Includes schema, receipt_id, timestamp, retention window, cutoff timestamp,
+  entry counts (before/after/pruned), job counts (before/after/pruned),
+  rebuild_epoch, and BLAKE3 content hash.
+- `CompactionError`: Error taxonomy covering index load/persist failures,
+  invalid retention parameters, and receipt emission failures.
+
+### Core Capabilities
+
+- `compact_index(receipts_dir, retention_secs, now_secs)`: Load-or-rebuild the
+  index, prune entries with `timestamp_secs < cutoff`, remove orphaned job index
+  entries, persist atomically, and return a compaction receipt.
+- `persist_compaction_receipt(receipts_dir, receipt)`: Content-addressed
+  persistence of the compaction receipt (atomic temp + rename).
+
+### GC Integration
+
+Index compaction is a low-impact step in the `apm2 fac gc` escalation path.
+The GC planner (`plan_gc`) estimates compaction benefit by checking for stale
+index entries. The GC executor (`execute_gc`) handles `IndexCompaction` targets
+by calling `compact_index` rather than `safe_rmtree_v1`.
+
+### Constants
+
+- `INDEX_COMPACTION_RECEIPT_SCHEMA`: `"apm2.fac.index_compaction_receipt.v1"`
+- `DEFAULT_INDEX_RETENTION_SECS`: 30 days (2,592,000 seconds)
+- `MAX_COMPACTION_RECEIPTS`: 1,024
+- `MAX_COMPACTION_RECEIPT_SIZE`: 256 KiB
+
+### Security Invariants (TCK-00583)
+
+- [INV-COMPACT-001] Zero retention is rejected (fail-closed). Compaction never
+  silently preserves everything when misconfigured.
+- [INV-COMPACT-002] The index is non-authoritative. Compaction never touches
+  the authoritative receipt store. Correctness is preserved because the index
+  can always be rebuilt from the store.
+- [INV-COMPACT-003] Compaction receipt content hash uses BLAKE3 with
+  domain-separated prefix. Computed with content_hash field zeroed.
+- [INV-COMPACT-004] Compaction receipt persistence is atomic (temp + rename).
+- [INV-COMPACT-005] Receipt validation enforces structural consistency
+  (schema, timestamp positivity, count arithmetic).
+
 ## sd_notify Submodule (TCK-00600)
 
 The `sd_notify` submodule implements the systemd notification protocol for
