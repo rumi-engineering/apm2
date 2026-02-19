@@ -344,39 +344,57 @@ where
     let cached_base_sha = load_snapshot_base_sha_fn(owner_repo, pr_number, head_sha)?
         .map(|value| value.to_ascii_lowercase());
     if let Some(cached_base_sha) = cached_base_sha {
-        if sha_is_reachable_fn(repo_root, &cached_base_sha) {
-            return Ok(OwnedResolvedBaseRef {
-                base_ref: cached_base_sha,
-                base_source: "local_snapshot",
-            });
+        match validate_expected_head_sha(&cached_base_sha) {
+            Ok(()) => {
+                if sha_is_reachable_fn(repo_root, &cached_base_sha) {
+                    return Ok(OwnedResolvedBaseRef {
+                        base_ref: cached_base_sha,
+                        base_source: "local_snapshot",
+                    });
+                }
+                eprintln!(
+                    "warn: cached prepare base sha for PR #{pr_number} is not locally reachable; trying API/local fallback"
+                );
+            },
+            Err(err) => {
+                eprintln!(
+                    "warn: ignoring invalid cached prepare base sha for PR #{pr_number}; trying API/local fallback: {err}"
+                );
+            },
         }
-        eprintln!(
-            "warn: cached prepare base sha for PR #{pr_number} is not locally reachable; trying API/local fallback"
-        );
     }
 
     if let Ok(base_sha) = fetch_pr_base_sha_fn(owner_repo, pr_number) {
         let normalized_base_sha = base_sha.to_ascii_lowercase();
-        if sha_is_reachable_fn(repo_root, &normalized_base_sha) {
-            if let Err(err) = save_snapshot_base_sha_fn(
-                owner_repo,
-                pr_number,
-                head_sha,
-                &normalized_base_sha,
-                "prepare_pr_base_api",
-            ) {
+        match validate_expected_head_sha(&normalized_base_sha) {
+            Ok(()) => {
+                if sha_is_reachable_fn(repo_root, &normalized_base_sha) {
+                    if let Err(err) = save_snapshot_base_sha_fn(
+                        owner_repo,
+                        pr_number,
+                        head_sha,
+                        &normalized_base_sha,
+                        "prepare_pr_base_api",
+                    ) {
+                        eprintln!(
+                            "warn: unable to persist prepare base snapshot for PR #{pr_number}: {err}"
+                        );
+                    }
+                    return Ok(OwnedResolvedBaseRef {
+                        base_ref: normalized_base_sha,
+                        base_source: "github_pr_base",
+                    });
+                }
                 eprintln!(
-                    "warn: unable to persist prepare base snapshot for PR #{pr_number}: {err}"
+                    "warn: GitHub PR base sha is not locally reachable for PR #{pr_number}; trying local main fallback"
                 );
-            }
-            return Ok(OwnedResolvedBaseRef {
-                base_ref: normalized_base_sha,
-                base_source: "github_pr_base",
-            });
+            },
+            Err(err) => {
+                eprintln!(
+                    "warn: ignoring invalid GitHub PR base sha for PR #{pr_number}; trying local main fallback: {err}"
+                );
+            },
         }
-        eprintln!(
-            "warn: GitHub PR base sha is not locally reachable for PR #{pr_number}; trying local main fallback"
-        );
     }
 
     let fallback = resolve_main_base_ref_fn(repo_root)?;
@@ -686,6 +704,74 @@ mod tests {
             save_calls.get(),
             0,
             "unreachable base must not persist snapshot"
+        );
+    }
+
+    #[test]
+    fn resolve_base_ref_ignores_invalid_local_snapshot_before_reachability() {
+        let save_calls = std::cell::Cell::new(0u32);
+        let reachable_calls = std::cell::Cell::new(0u32);
+        let base = resolve_base_ref_for_pr_with(
+            std::path::Path::new("/tmp"),
+            "example/repo",
+            16,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            |_owner_repo, _pr_number| Ok("5555555555555555555555555555555555555555".to_string()),
+            |_owner_repo, _pr_number, _head_sha| Ok(Some("origin/main".to_string())),
+            |_owner_repo, _pr_number, _head_sha, _base_sha, _source| {
+                save_calls.set(save_calls.get().saturating_add(1));
+                Ok(())
+            },
+            |_repo_root| Ok("main".to_string()),
+            |_repo_root, sha| {
+                reachable_calls.set(reachable_calls.get().saturating_add(1));
+                sha == "5555555555555555555555555555555555555555"
+            },
+        )
+        .expect("resolve base");
+        assert_eq!(base.base_ref, "5555555555555555555555555555555555555555");
+        assert_eq!(base.base_source, "github_pr_base");
+        assert_eq!(
+            save_calls.get(),
+            1,
+            "valid github base should still be persisted once"
+        );
+        assert_eq!(
+            reachable_calls.get(),
+            1,
+            "invalid cached base must be rejected before reachability probes"
+        );
+    }
+
+    #[test]
+    fn resolve_base_ref_rejects_invalid_github_base_and_falls_back_to_local_main() {
+        let save_calls = std::cell::Cell::new(0u32);
+        let reachable_calls = std::cell::Cell::new(0u32);
+        let base = resolve_base_ref_for_pr_with(
+            std::path::Path::new("/tmp"),
+            "example/repo",
+            17,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            |_owner_repo, _pr_number| Ok("origin/main".to_string()),
+            |_owner_repo, _pr_number, _head_sha| Ok(None),
+            |_owner_repo, _pr_number, _head_sha, _base_sha, _source| {
+                save_calls.set(save_calls.get().saturating_add(1));
+                Ok(())
+            },
+            |_repo_root| Ok("origin/main".to_string()),
+            |_repo_root, _sha| {
+                reachable_calls.set(reachable_calls.get().saturating_add(1));
+                true
+            },
+        )
+        .expect("resolve base");
+        assert_eq!(base.base_ref, "origin/main");
+        assert_eq!(base.base_source, "local_main");
+        assert_eq!(save_calls.get(), 0, "invalid github base must not be cached");
+        assert_eq!(
+            reachable_calls.get(),
+            0,
+            "invalid github base must be rejected before reachability checks"
         );
     }
 
