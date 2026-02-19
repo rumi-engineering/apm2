@@ -81,7 +81,10 @@ const DEFAULT_SINGLEFLIGHT_LOCK_TIMEOUT_SECS: u64 = 120;
 const SINGLEFLIGHT_LOCK_TIMEOUT_ENV: &str = "APM2_FAC_GATES_SINGLEFLIGHT_LOCK_TIMEOUT_SECS";
 const SINGLEFLIGHT_LOCK_POLL_INTERVAL_MILLIS: u64 = 200;
 const SINGLEFLIGHT_LOCK_OWNER_FILE_READ_MAX_BYTES: u64 = 1024;
+const PREP_NOT_READY_CODE: &str = "PREP_NOT_READY";
 const PREP_SUPPLY_UNAVAILABLE_CODE: &str = "PREP_SUPPLY_UNAVAILABLE";
+const AUTHORITY_DENIED_CODE: &str = "AUTHORITY_DENIED";
+const GATE_EXECUTION_FAILED_CODE: &str = "GATE_EXECUTION_FAILED";
 const PREP_SUPPLY_FAILURE_CLASS: &str = "supply";
 const PREP_SUPPLY_REMEDIATION: &str = "connect to network and retry to hydrate dependency closure";
 const CLOSURE_DIAGNOSTIC_MAX_BYTES: usize = 2048;
@@ -154,17 +157,36 @@ struct PreparedQueuedGatesJob {
 enum QueuePreparationFailure {
     Validation { message: String },
     PrepNotReady { failure: ReadinessFailure },
+    PrepSupplyUnavailable { failure: ReadinessFailure },
+    AuthorityDenied { message: String },
+    GateExecutionFailed { message: String },
     Runtime { message: String },
 }
 
 impl QueuePreparationFailure {
     fn message(&self) -> String {
         match self {
-            Self::Validation { message } | Self::Runtime { message } => message.clone(),
-            Self::PrepNotReady { failure } => {
+            Self::Validation { message }
+            | Self::AuthorityDenied { message }
+            | Self::GateExecutionFailed { message }
+            | Self::Runtime { message } => message.clone(),
+            Self::PrepNotReady { failure } | Self::PrepSupplyUnavailable { failure } => {
                 format!("{}: {}", failure.component, failure.root_cause)
             },
         }
+    }
+}
+
+fn classify_queue_readiness_failure(failure: ReadinessFailure) -> QueuePreparationFailure {
+    let root_cause = failure.root_cause.to_ascii_lowercase();
+    if failure.component.eq_ignore_ascii_case("cargo_dependencies")
+        || root_cause.contains("supply")
+        || root_cause.contains("network")
+        || root_cause.contains("dependency")
+    {
+        QueuePreparationFailure::PrepSupplyUnavailable { failure }
+    } else {
+        QueuePreparationFailure::PrepNotReady { failure }
     }
 }
 
@@ -478,7 +500,7 @@ fn prepare_queued_gates_job(
             spawn_detached_worker: &spawn_detached_worker_for_queue,
         },
     )
-    .map_err(|failure| QueuePreparationFailure::PrepNotReady { failure })?;
+    .map_err(classify_queue_readiness_failure)?;
     let readiness_elapsed_ms = readiness.elapsed_ms;
     let readiness_report_count = readiness.component_reports.len();
     let _ = (readiness_elapsed_ms, readiness_report_count);
@@ -499,7 +521,7 @@ fn prepare_queued_gates_job(
         })?;
     broker
         .admit_policy_digest(policy_digest)
-        .map_err(|err| QueuePreparationFailure::Runtime {
+        .map_err(|err| QueuePreparationFailure::AuthorityDenied {
             message: format!("cannot admit FAC policy digest: {err}"),
         })?;
 
@@ -569,7 +591,7 @@ fn prepare_queued_gates_job(
         &job_spec_policy,
         fac_policy.allowed_intents.as_deref(),
     )
-    .map_err(|err| QueuePreparationFailure::Runtime {
+    .map_err(|err| QueuePreparationFailure::AuthorityDenied {
         message: format!("cannot build gates job spec: {err}"),
     })?;
     enqueue_job(
@@ -1662,6 +1684,27 @@ fn run_gates_via_worker(
         Err(QueuePreparationFailure::PrepNotReady { failure }) => {
             return output_worker_prep_not_ready(json_output, &failure);
         },
+        Err(QueuePreparationFailure::PrepSupplyUnavailable { failure }) => {
+            return output_worker_prep_supply_unavailable(json_output, &failure);
+        },
+        Err(QueuePreparationFailure::AuthorityDenied { message }) => {
+            return output_worker_typed_error(
+                json_output,
+                "authority_denied",
+                &message,
+                AUTHORITY_DENIED_CODE,
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+        Err(QueuePreparationFailure::GateExecutionFailed { message }) => {
+            return output_worker_typed_error(
+                json_output,
+                "gate_execution_failed",
+                &message,
+                GATE_EXECUTION_FAILED_CODE,
+                exit_codes::GENERIC_ERROR,
+            );
+        },
         Err(QueuePreparationFailure::Runtime { message }) => {
             return output_worker_enqueue_error(json_output, &message, exit_codes::GENERIC_ERROR);
         },
@@ -1751,7 +1794,16 @@ fn run_gates_via_worker(
                 }
             },
             Err(err) => {
-                return output_worker_enqueue_error(json_output, &err, exit_codes::GENERIC_ERROR);
+                return output_worker_typed_error(
+                    json_output,
+                    "gate_execution_failed",
+                    &QueuePreparationFailure::GateExecutionFailed {
+                        message: err.clone(),
+                    }
+                    .message(),
+                    GATE_EXECUTION_FAILED_CODE,
+                    exit_codes::GENERIC_ERROR,
+                );
             },
         }
     }
@@ -1777,11 +1829,55 @@ fn output_worker_enqueue_error(json_output: bool, message: &str, code: u8) -> u8
     code
 }
 
-fn output_worker_prep_not_ready(json_output: bool, failure: &ReadinessFailure) -> u8 {
+fn output_worker_typed_error(
+    json_output: bool,
+    error: &str,
+    message: &str,
+    failure_code: &str,
+    code: u8,
+) -> u8 {
     if json_output {
         let payload = serde_json::json!({
             "status": "error",
-            "error": "prep_not_ready",
+            "error": error,
+            "failure_code": failure_code,
+            "message": message,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+        );
+    } else {
+        eprintln!("ERROR: {failure_code} {message}");
+    }
+    code
+}
+
+fn output_worker_prep_not_ready(json_output: bool, failure: &ReadinessFailure) -> u8 {
+    output_worker_prep_failure(json_output, "prep_not_ready", PREP_NOT_READY_CODE, failure)
+}
+
+fn output_worker_prep_supply_unavailable(json_output: bool, failure: &ReadinessFailure) -> u8 {
+    output_worker_prep_failure(
+        json_output,
+        "prep_supply_unavailable",
+        PREP_SUPPLY_UNAVAILABLE_CODE,
+        failure,
+    )
+}
+
+fn output_worker_prep_failure(
+    json_output: bool,
+    error: &str,
+    failure_code: &str,
+    failure: &ReadinessFailure,
+) -> u8 {
+    if json_output {
+        let payload = serde_json::json!({
+            "status": "error",
+            "error": error,
+            "failure_code": failure_code,
             "component": failure.component,
             "root_cause": failure.root_cause,
             "remediation": failure.remediation,
@@ -1795,8 +1891,9 @@ fn output_worker_prep_not_ready(json_output: bool, failure: &ReadinessFailure) -
         );
     } else {
         eprintln!(
-            "ERROR: PREP_NOT_READY component={} cause={}",
-            failure.component, failure.root_cause
+            "ERROR: {failure_code} component={} cause={}",
+            failure.component,
+            failure.root_cause
         );
         eprintln!("remediation: {}", failure.remediation);
         for diagnostic in &failure.diagnostics {
