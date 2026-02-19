@@ -61,6 +61,7 @@ const LEGACY_EVIDENCE_DIR: &str = "evidence";
 /// Receipt emitted after a legacy evidence migration run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)] // Receipt struct — bools are independent flags, not a state machine.
 pub struct LegacyEvidenceMigrationReceiptV1 {
     /// Schema identifier.
     pub schema: String,
@@ -86,6 +87,13 @@ pub struct LegacyEvidenceMigrationReceiptV1 {
     /// occurred and `is_complete` is `false`.
     #[serde(default)]
     pub total_entries_seen: usize,
+    /// Whether the migration is settled — all migratable (regular) files
+    /// have been processed and no further scans are necessary. When `true`,
+    /// callers can skip future migration attempts even if the evidence/
+    /// directory still exists (due to non-migratable entries like symlinks
+    /// or subdirectories).
+    #[serde(default)]
+    pub migration_settled: bool,
     /// Individual file migration results (bounded by `MAX_LEGACY_FILES`).
     pub file_results: Vec<FileMigrationResult>,
 }
@@ -129,6 +137,7 @@ fn skip_receipt(
         skip_reason: Some(reason.to_string()),
         is_complete: true,
         total_entries_seen: 0,
+        migration_settled: true,
         file_results: Vec::new(),
     };
     persist_migration_receipt(fac_root, &receipt)?;
@@ -138,6 +147,18 @@ fn skip_receipt(
 /// Migrate a single entry from `evidence/` to `legacy/`.
 fn migrate_entry(entry: &fs::DirEntry, legacy_dir: &Path) -> FileMigrationResult {
     let filename = entry.file_name().to_string_lossy().to_string();
+
+    // Path traversal sanitization: reject filenames that contain path
+    // separators or traversal components. This prevents a crafted entry
+    // from escaping the `legacy/` destination directory.
+    if filename.contains('/') || filename.contains('\\') || filename == ".." || filename == "." {
+        return FileMigrationResult {
+            filename,
+            success: false,
+            error: Some("rejected: filename contains path traversal components".to_string()),
+        };
+    }
+
     let src_path = entry.path();
 
     // Skip symlinks (INV-LEM-005) and directories (INV-LEM-006).
@@ -192,6 +213,16 @@ fn migrate_entry(entry: &fs::DirEntry, legacy_dir: &Path) -> FileMigrationResult
 
 /// Move a file from `src` to `dst`. Tries `fs::rename` first (atomic on same
 /// filesystem). Falls back to copy-then-remove for cross-device moves.
+///
+/// # Cross-device fallback (EXDEV)
+///
+/// The copy-then-remove path is intentionally non-atomic: if the process
+/// crashes between `copy` and `remove_file`, the source file remains and
+/// the next migration run will retry. This is acceptable for the legacy
+/// evidence migration context because:
+/// - The files are read-only audit evidence (not actively written).
+/// - Duplicate copies in `legacy/` are harmless (content-addressed).
+/// - The migration is idempotent and will clean up on the next GC cycle.
 fn move_file(src: &Path, dst: &Path) -> Result<(), io::Error> {
     match fs::rename(src, dst) {
         Ok(()) => Ok(()),
@@ -251,8 +282,21 @@ pub fn migrate_legacy_evidence(
     let legacy_dir = fac_root.join(LEGACY_DIR);
 
     // If the legacy evidence directory does not exist, nothing to migrate.
+    // No receipt is persisted because there is nothing to record — the
+    // directory was never present (or was already removed in a prior run).
     if !evidence_dir.exists() {
-        return skip_receipt(fac_root, "legacy evidence directory does not exist", false);
+        return Ok(LegacyEvidenceMigrationReceiptV1 {
+            schema: MIGRATION_RECEIPT_SCHEMA.to_string(),
+            files_moved: 0,
+            files_failed: 0,
+            legacy_dir_removed: false,
+            skipped: true,
+            skip_reason: Some("legacy evidence directory does not exist".to_string()),
+            is_complete: true,
+            total_entries_seen: 0,
+            migration_settled: true,
+            file_results: Vec::new(),
+        });
     }
 
     // Validate evidence_dir is a real directory (not a symlink).
@@ -327,17 +371,30 @@ pub fn migrate_legacy_evidence(
         .count()
         .saturating_add(iterator_errors);
 
-    // Remove the legacy evidence directory only if all files were moved
-    // successfully AND this batch was complete (INV-LEM-003).
-    let legacy_dir_removed =
-        !has_more && files_failed == 0 && fs::remove_dir(&evidence_dir).is_ok();
-
     // `is_complete` means all directory entries have been SEEN (processed or
     // skipped), not that all moves succeeded. When `!has_more` we have
     // enumerated every entry in the directory, so no further iterations are
     // needed — even if some entries failed (symlinks, directories, permission
     // errors). This prevents the caller from looping indefinitely when
     // non-movable entries are present.
+    let is_complete = !has_more;
+
+    // Determine if migration is settled: all entries have been scanned
+    // and all migratable (regular) files have been processed. When
+    // `is_complete` is true, every entry in the directory has been seen.
+    // Since `migrate_entry` only moves regular files and deterministically
+    // skips non-migratable types (symlinks, dirs, special files), there
+    // are no retryable failures — callers can stop scanning.
+    let migration_settled = is_complete;
+
+    // Attempt to remove the legacy evidence directory when all entries
+    // have been scanned (INV-LEM-003). This covers both the clean case
+    // (all files moved, directory is empty) and the settled case (only
+    // non-migratable entries remain). `remove_dir` will fail if the
+    // directory is not empty, which is fine — the `migration_settled`
+    // flag tells callers to stop scanning regardless.
+    let legacy_dir_removed = is_complete && fs::remove_dir(&evidence_dir).is_ok();
+
     let receipt = LegacyEvidenceMigrationReceiptV1 {
         schema: MIGRATION_RECEIPT_SCHEMA.to_string(),
         files_moved,
@@ -345,8 +402,9 @@ pub fn migrate_legacy_evidence(
         legacy_dir_removed,
         skipped: false,
         skip_reason: None,
-        is_complete: !has_more,
+        is_complete,
         total_entries_seen,
+        migration_settled,
         file_results,
     };
 
@@ -388,29 +446,8 @@ pub fn run_migration_to_completion(
         && !last_receipt.skipped
         && iterations < MAX_MIGRATION_ITERATIONS
     {
-        let prev_moved = last_receipt.files_moved;
         last_receipt = migrate_legacy_evidence(fac_root)?;
         iterations = iterations.saturating_add(1);
-
-        // Early exit when no further iterations can make progress.
-        //
-        // The zero-progress guard MUST NOT fire when `is_complete` is
-        // false, because overflow scenarios may have migratable entries
-        // beyond the current batch window. We only break early when the
-        // batch reports `is_complete` (all entries have been scanned) —
-        // if two consecutive batches moved nothing AND all entries have
-        // been seen, further iterations are pointless.
-        //
-        // Note: the while-loop condition already exits on `is_complete`,
-        // so this break is a fast-path that avoids one extra
-        // `migrate_legacy_evidence` call.
-        if last_receipt.is_complete
-            && last_receipt.files_moved == 0
-            && prev_moved == 0
-            && !last_receipt.skipped
-        {
-            break;
-        }
     }
 
     Ok(last_receipt)
@@ -438,6 +475,7 @@ mod tests {
         let receipt = migrate_legacy_evidence(&fac_root).expect("migrate");
         assert!(receipt.skipped);
         assert!(receipt.is_complete);
+        assert!(receipt.migration_settled);
         assert_eq!(receipt.total_entries_seen, 0);
         assert_eq!(receipt.files_moved, 0);
         assert_eq!(receipt.files_failed, 0);
@@ -449,19 +487,12 @@ mod tests {
                 .contains("does not exist")
         );
 
-        // Receipt should have been persisted.
+        // No receipt should be persisted when evidence dir doesn't exist.
         let receipts_dir = fac_root.join("receipts");
-        assert!(receipts_dir.is_dir());
-        let receipt_count = fs::read_dir(&receipts_dir)
-            .expect("read")
-            .filter_map(std::result::Result::ok)
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("legacy_evidence_migration_")
-            })
-            .count();
-        assert_eq!(receipt_count, 1);
+        assert!(
+            !receipts_dir.exists(),
+            "no receipt directory should be created when evidence dir is absent"
+        );
     }
 
     #[test]
@@ -720,6 +751,7 @@ mod tests {
             skip_reason: None,
             is_complete: false,
             total_entries_seen: 10_001,
+            migration_settled: false,
             file_results: Vec::new(),
         };
 

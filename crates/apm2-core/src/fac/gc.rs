@@ -26,9 +26,6 @@ const FAC_CARGO_HOME_DIR: &str = "cargo_home";
 /// Retention for managed sccache directory (TCK-00553).
 const SCCACHE_RETENTION_SECS: u64 = 30 * 24 * 3600;
 const FAC_SCCACHE_DIR: &str = "sccache";
-const FAC_LEGACY_EVIDENCE_DIR: &str = "evidence";
-/// TCK-00589: Post-migration legacy files directory.
-const FAC_LEGACY_MIGRATED_DIR: &str = "legacy";
 const FAC_RECEIPTS_DIR: &str = "receipts";
 const MAX_RECEIPT_SCAN_ENTRIES: usize = 500_000;
 const MAX_RECEIPT_SCAN_FILES: usize = 500_000;
@@ -92,8 +89,6 @@ pub fn plan_gc(
 
     let queue_root = infer_queue_root(fac_root);
     let cargo_home_root = fac_root.join(FAC_CARGO_HOME_DIR);
-    let legacy_evidence_root = fac_root.join(FAC_LEGACY_EVIDENCE_DIR);
-
     if cargo_home_root.exists()
         && is_stale_by_mtime(&cargo_home_root, CARGO_HOME_RETENTION_SECS, now_secs)
     {
@@ -116,25 +111,11 @@ pub fn plan_gc(
         });
     }
 
-    if legacy_evidence_root.exists() {
-        targets.push(GcTarget {
-            path: legacy_evidence_root.clone(),
-            allowed_parent: fac_root.to_path_buf(),
-            kind: crate::fac::gc_receipt::GcActionKind::LaneLog,
-            estimated_bytes: estimate_dir_size(&legacy_evidence_root),
-        });
-    }
-
-    // TCK-00589: Also target the post-migration legacy/ directory for GC.
-    let legacy_migrated_root = fac_root.join(FAC_LEGACY_MIGRATED_DIR);
-    if legacy_migrated_root.exists() {
-        targets.push(GcTarget {
-            path: legacy_migrated_root.clone(),
-            allowed_parent: fac_root.to_path_buf(),
-            kind: crate::fac::gc_receipt::GcActionKind::LaneLog,
-            estimated_bytes: estimate_dir_size(&legacy_migrated_root),
-        });
-    }
+    // TCK-00589 review fix: legacy evidence/ and legacy/ directories are NOT
+    // GC targets. The evidence/ directory is cleaned up by the migration
+    // itself (removed after all files are moved). The legacy/ directory
+    // contains read-only migrated evidence that must be retained
+    // indefinitely for audit purposes.
 
     collect_stale_queue_targets(
         &queue_root,

@@ -62,7 +62,6 @@ const FAC_SUBDIRS: &[&str] = &[
     "receipts",
     "locks",
     "locks/lanes",
-    "evidence",
     "repo_mirror",
     "cargo_home",
     "broker",
@@ -962,7 +961,6 @@ mod tests {
         assert!(FAC_SUBDIRS.contains(&"receipts"));
         assert!(FAC_SUBDIRS.contains(&"locks"));
         assert!(FAC_SUBDIRS.contains(&"locks/lanes"));
-        assert!(FAC_SUBDIRS.contains(&"evidence"));
         assert!(FAC_SUBDIRS.contains(&"repo_mirror"));
         assert!(FAC_SUBDIRS.contains(&"cargo_home"));
         assert!(FAC_SUBDIRS.contains(&"broker"));

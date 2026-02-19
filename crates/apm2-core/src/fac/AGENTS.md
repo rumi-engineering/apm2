@@ -977,7 +977,7 @@ bootstrap and recovery commands exposed via `apm2 fac lane init` and
 - Writes default `LaneProfileV1` for each lane (idempotent: existing profiles
   are left untouched).
 - Derives `node_fingerprint` and `boundary_id` from `$APM2_HOME` identity.
-- Emits a `LaneInitReceiptV1` persisted under `$APM2_HOME/private/fac/evidence/`.
+- Emits a `LaneInitReceiptV1` persisted under `$APM2_HOME/private/fac/receipts/`.
 - Receipt types: `LaneInitReceiptV1`, `LaneInitProfileEntry`.
 
 **Reconcile** (`LaneManager::reconcile_lanes`):
@@ -1000,7 +1000,7 @@ bootstrap and recovery commands exposed via `apm2 fac lane init` and
   `infrastructure_failures` counter. Any non-zero value means the reconcile
   run should be treated as failed.
 - Emits a `LaneReconcileReceiptV1` persisted under
-  `$APM2_HOME/private/fac/evidence/`.
+  `$APM2_HOME/private/fac/receipts/`.
 - Receipt types: `LaneReconcileReceiptV1`, `LaneReconcileAction`,
   `LaneReconcileOutcome`.
 - Decomposed into helper methods (`reconcile_single_lane`, `reconcile_dir`,

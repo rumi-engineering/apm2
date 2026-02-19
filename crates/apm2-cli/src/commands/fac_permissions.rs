@@ -40,7 +40,6 @@ const FAC_SUBDIRS: &[&str] = &[
     "private/fac/gate_cache_v2",
     "private/fac/prepared",
     "private/fac/tickets",
-    "private/fac/evidence",
     "private/fac/legacy",
     "private/fac/receipts",
     "fac_lifecycle",
