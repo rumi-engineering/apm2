@@ -325,8 +325,14 @@ fn gate_attestation_digest(
 /// Returns a BLAKE3 hex digest. Falls back to a hash of "unknown" if rustc
 /// is not available (fail-closed: different key from any real toolchain).
 pub(super) fn compute_toolchain_fingerprint() -> String {
+    // Use CWD="/" to ensure rustup resolves the default toolchain regardless of
+    // where the caller is invoked from.  Without this, rustup picks up the
+    // nearest rust-toolchain.toml (e.g. nightly from the repo root) while the
+    // worker process runs from $HOME and always gets the stable toolchain,
+    // producing a different fingerprint and a V3 gate-cache lookup miss.
     let output = std::process::Command::new("rustc")
         .args(["--version", "--verbose"])
+        .current_dir("/")
         .output();
     let version_bytes = match &output {
         Ok(o) if o.status.success() => &o.stdout[..],
