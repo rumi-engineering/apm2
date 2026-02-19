@@ -767,7 +767,11 @@ mod tests {
         .expect("resolve base");
         assert_eq!(base.base_ref, "origin/main");
         assert_eq!(base.base_source, "local_main");
-        assert_eq!(save_calls.get(), 0, "invalid github base must not be cached");
+        assert_eq!(
+            save_calls.get(),
+            0,
+            "invalid github base must not be cached"
+        );
         assert_eq!(
             reachable_calls.get(),
             0,
