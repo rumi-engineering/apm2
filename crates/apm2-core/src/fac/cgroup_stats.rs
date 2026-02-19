@@ -64,7 +64,7 @@ pub const MAX_TASKS_COUNT: u32 = 1_000_000;
 /// read (e.g., kernel too old, cgroup controller not enabled, permission
 /// denied). This is the best-effort contract: never fail the job because
 /// stats cannot be collected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservedCgroupUsage {
     /// Total CPU time consumed by the cgroup in microseconds.
@@ -107,6 +107,8 @@ pub enum CgroupUsageValidationError {
         max: u64,
     },
 }
+
+impl std::error::Error for CgroupUsageValidationError {}
 
 impl std::fmt::Display for CgroupUsageValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -219,13 +221,7 @@ pub fn collect_cgroup_usage_from_root(
     cgroup_path: &str,
     cgroup_root: &Path,
 ) -> ObservedCgroupUsage {
-    let empty = ObservedCgroupUsage {
-        cpu_time_us: None,
-        peak_memory_bytes: None,
-        io_read_bytes: None,
-        io_write_bytes: None,
-        tasks_count: None,
-    };
+    let empty = ObservedCgroupUsage::default();
 
     // [INV-CGSTAT-005] Validate against path traversal before joining.
     let relative_path = cgroup_path.trim_start_matches('/');

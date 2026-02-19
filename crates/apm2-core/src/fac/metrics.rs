@@ -256,7 +256,12 @@ pub fn compute_metrics(input: &MetricsInput<'_>) -> MetricsSummary {
                     durations.push(cost.duration_ms);
                 }
                 // Aggregate observed resource usage (TCK-00572).
-                if let Some(ref usage) = receipt.observed_usage {
+                // Gate on !is_empty() so that receipts with
+                // observed_usage present but all fields None do not
+                // inflate the sample count without contributing data.
+                if let Some(ref usage) = receipt.observed_usage
+                    && !usage.is_empty()
+                {
                     summary.resource_usage_samples += 1;
                     if let Some(cpu) = usage.cpu_time_us {
                         cpu_time_sum = cpu_time_sum.saturating_add(cpu);
@@ -1882,6 +1887,40 @@ mod tests {
             json_str.contains("max_tasks_count"),
             "max_tasks_count must appear in JSON"
         );
+    }
+
+    #[test]
+    fn observed_usage_all_none_does_not_increment_sample_count() {
+        // A receipt with observed_usage = Some(all fields None) must NOT
+        // increment resource_usage_samples because it contributes no data.
+        let receipts = vec![make_job_receipt_with_usage(
+            1000,
+            ObservedCgroupUsage {
+                cpu_time_us: None,
+                peak_memory_bytes: None,
+                io_read_bytes: None,
+                io_write_bytes: None,
+                tasks_count: None,
+            },
+        )];
+        let input = MetricsInput {
+            job_receipts: &receipts,
+            gc_receipts: &[],
+            since_epoch_secs: 1000,
+            until_epoch_secs: 2000,
+            header_counts: None,
+        };
+        let summary = compute_metrics(&input);
+
+        assert_eq!(
+            summary.resource_usage_samples, 0,
+            "empty observed_usage (all None) must not count as a sample"
+        );
+        assert_eq!(summary.mean_cpu_time_us, None);
+        assert_eq!(summary.mean_peak_memory_bytes, None);
+        assert_eq!(summary.total_io_read_bytes, 0);
+        assert_eq!(summary.total_io_write_bytes, 0);
+        assert_eq!(summary.max_tasks_count, None);
     }
 
     // Compile-time assertion: load cap must not exceed scan cap.

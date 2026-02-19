@@ -2161,6 +2161,15 @@ impl FacJobReceiptV1Builder {
             }
         }
 
+        // TCK-00572: Validate observed_usage bounds on the builder path
+        // (INV-CGSTAT-004 fail-closed). This prevents constructing receipts
+        // with out-of-bounds cgroup usage values via the builder API.
+        if let Some(ref usage) = self.observed_usage {
+            if let Err(e) = usage.validate() {
+                return Err(FacJobReceiptError::InvalidData(e.to_string()));
+            }
+        }
+
         let candidate = FacJobReceiptV1 {
             schema: FAC_JOB_RECEIPT_SCHEMA.to_string(),
             receipt_id,
@@ -5341,5 +5350,145 @@ pub mod tests {
 
         let restored: DenialReasonCode = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored, DenialReasonCode::PatchHardeningDenied);
+    }
+
+    // -------------------------------------------------------------------------
+    // TCK-00572 regression: observed_usage bounds enforced on builder path
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn try_build_rejects_out_of_bounds_cpu_time_in_observed_usage() {
+        use crate::fac::cgroup_stats::{MAX_CPU_TIME_US, ObservedCgroupUsage};
+
+        let result = FacJobReceiptV1Builder::new(
+            "receipt-usage-001",
+            "job-usage-001",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .outcome(FacJobOutcome::Completed)
+        .reason("test")
+        .timestamp_secs(1_700_000_000)
+        .rfc0028_channel_boundary(ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
+        })
+        .eio29_queue_admission(QueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+            cost_estimate_ticks: None,
+        })
+        .observed_usage(ObservedCgroupUsage {
+            cpu_time_us: Some(MAX_CPU_TIME_US + 1),
+            peak_memory_bytes: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            tasks_count: None,
+        })
+        .try_build();
+
+        assert!(
+            result.is_err(),
+            "try_build must reject observed_usage with out-of-bounds cpu_time_us"
+        );
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cpu_time_us"),
+            "error message must mention the offending field: {msg}"
+        );
+    }
+
+    #[test]
+    fn try_build_v2_rejects_out_of_bounds_peak_memory_in_observed_usage() {
+        use crate::fac::cgroup_stats::{MAX_PEAK_MEMORY_BYTES, ObservedCgroupUsage};
+
+        let result = FacJobReceiptV1Builder::new(
+            "receipt-usage-002",
+            "job-usage-002",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .outcome(FacJobOutcome::Completed)
+        .reason("test")
+        .timestamp_secs(1_700_000_000)
+        .rfc0028_channel_boundary(ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
+        })
+        .eio29_queue_admission(QueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+            cost_estimate_ticks: None,
+        })
+        .observed_usage(ObservedCgroupUsage {
+            cpu_time_us: None,
+            peak_memory_bytes: Some(MAX_PEAK_MEMORY_BYTES + 1),
+            io_read_bytes: None,
+            io_write_bytes: None,
+            tasks_count: None,
+        })
+        .try_build_v2();
+
+        assert!(
+            result.is_err(),
+            "try_build_v2 must reject observed_usage with out-of-bounds peak_memory_bytes"
+        );
+    }
+
+    #[test]
+    fn try_build_accepts_valid_observed_usage() {
+        use crate::fac::cgroup_stats::ObservedCgroupUsage;
+
+        let result = FacJobReceiptV1Builder::new(
+            "receipt-usage-003",
+            "job-usage-003",
+            "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .outcome(FacJobOutcome::Completed)
+        .reason("test")
+        .timestamp_secs(1_700_000_000)
+        .rfc0028_channel_boundary(ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
+        })
+        .eio29_queue_admission(QueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "bulk".to_string(),
+            defect_reason: None,
+            cost_estimate_ticks: None,
+        })
+        .observed_usage(ObservedCgroupUsage {
+            cpu_time_us: Some(1_000_000),
+            peak_memory_bytes: Some(1 << 30),
+            io_read_bytes: Some(1024),
+            io_write_bytes: Some(2048),
+            tasks_count: Some(8),
+        })
+        .try_build();
+
+        assert!(
+            result.is_ok(),
+            "try_build must accept valid observed_usage: {:?}",
+            result.unwrap_err()
+        );
     }
 }
