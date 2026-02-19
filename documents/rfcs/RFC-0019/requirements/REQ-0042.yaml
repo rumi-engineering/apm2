@@ -1,0 +1,40 @@
+requirement:
+  schema_version: "2026-02-19"
+  id: "REQ-0042"
+  title: "Verdict projection emits one combined GitHub comment per SHA after full dimension resolution"
+  category: "FUNCTIONAL"
+  priority: "P1"
+  status: "PROPOSED"
+  statement: |
+    Verdict projection for FAC review MUST publish exactly one live verdict comment
+    per PR head SHA only after all active dimensions have terminal decisions.
+
+    Normative behavior:
+      - Projection MUST NOT publish a live verdict comment for a SHA while any
+        active dimension remains unresolved.
+      - Once all active dimensions resolve (`approve` or `deny`), projection
+        MUST emit a single combined comment that includes every resolved
+        dimension and all findings for that SHA.
+      - The comment payload for each dimension MUST include `model_id` for the
+        deciding model; reviewer identity MUST NOT be emitted as `set_by`.
+      - During verdict-set replay, pending projection replay MUST be scoped to
+        the current PR+SHA so stale-SHA pending records cannot be projected
+        during a fresh SHA lifecycle.
+  rationale: |
+    Per-dimension comment fanout and PR-scoped replay can surface stale or
+    incomplete review state on GitHub, reducing reviewer trust and creating
+    false blockers. Emitting a single combined comment per SHA preserves
+    deterministic review truth, improves auditability, and prevents stale
+    projection bleed-through.
+  acceptance_criteria:
+    - "Setting only one dimension verdict does not create a live GitHub verdict comment."
+    - "When both security and code-quality dimensions resolve for a SHA, one combined live verdict comment is created for that SHA."
+    - "The combined verdict comment includes findings across resolved dimensions for that SHA."
+    - "Dimension entries in the projected comment include `model_id` and do not include `set_by`."
+    - "Verdict replay during `verdict set` does not project pending records from a different SHA."
+  evidence_ids:
+    - "EVID-0042"
+  source_refs:
+    - "documents/work/tickets/TCK-00623.yaml"
+    - "crates/apm2-cli/src/commands/fac_review/verdict_projection.rs"
+    - "crates/apm2-cli/src/commands/fac_review/lifecycle.rs"
