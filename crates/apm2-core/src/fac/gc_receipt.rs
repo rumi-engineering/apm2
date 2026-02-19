@@ -115,6 +115,8 @@ pub enum GcActionKind {
     QuarantinePrune,
     DeniedPrune,
     CargoCache,
+    /// Managed sccache cache directory (TCK-00553).
+    SccacheCache,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

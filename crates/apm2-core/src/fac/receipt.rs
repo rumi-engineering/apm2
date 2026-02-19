@@ -925,6 +925,15 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&trace.processes_checked.to_be_bytes());
             bytes.extend_from_slice(&trace.mismatch_count.to_be_bytes());
             bytes.push(u8::from(trace.sccache_auto_disabled));
+            // TCK-00553: sccache explicit activation attestation.
+            bytes.push(u8::from(trace.sccache_enabled));
+            if let Some(ref version) = trace.sccache_version {
+                bytes.push(1u8);
+                bytes.extend_from_slice(&(version.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(version.as_bytes());
+            } else {
+                bytes.push(0u8);
+            }
         }
 
         // TCK-00532: Observed job cost. V1 trailing optionals omit absence
@@ -1154,6 +1163,15 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&trace.processes_checked.to_be_bytes());
             bytes.extend_from_slice(&trace.mismatch_count.to_be_bytes());
             bytes.push(u8::from(trace.sccache_auto_disabled));
+            // TCK-00553: sccache explicit activation attestation.
+            bytes.push(u8::from(trace.sccache_enabled));
+            if let Some(ref version) = trace.sccache_version {
+                bytes.push(1u8);
+                bytes.extend_from_slice(&(version.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(version.as_bytes());
+            } else {
+                bytes.push(0u8);
+            }
         }
 
         // TCK-00532: Observed job cost with a type-specific marker in v2.
@@ -4039,6 +4057,8 @@ pub mod tests {
             processes_checked: 1,
             mismatch_count: 0,
             sccache_auto_disabled: false,
+            sccache_enabled: false,
+            sccache_version: None,
         });
         // Recompute content hash so other validations pass
         let bytes = receipt.canonical_bytes();
@@ -4062,6 +4082,8 @@ pub mod tests {
             processes_checked: 5,
             mismatch_count: 0,
             sccache_auto_disabled: false,
+            sccache_enabled: false,
+            sccache_version: None,
         });
         // Recompute content hash so hash validation passes
         let bytes = receipt.canonical_bytes();
@@ -4082,6 +4104,8 @@ pub mod tests {
             processes_checked: 3,
             mismatch_count: 0,
             sccache_auto_disabled: false,
+            sccache_enabled: false,
+            sccache_version: None,
         });
         let hash_some = r.canonical_bytes();
 
@@ -4100,6 +4124,8 @@ pub mod tests {
             processes_checked: 1,
             mismatch_count: 0,
             sccache_auto_disabled: false,
+            sccache_enabled: false,
+            sccache_version: None,
         });
         let hash_a = r.canonical_bytes();
 
@@ -4109,6 +4135,8 @@ pub mod tests {
             processes_checked: 10,
             mismatch_count: 3,
             sccache_auto_disabled: true,
+            sccache_enabled: false,
+            sccache_version: None,
         });
         let hash_b = r.canonical_bytes();
 
@@ -4147,6 +4175,8 @@ pub mod tests {
             processes_checked: 3,
             mismatch_count: 0,
             sccache_auto_disabled: false,
+            sccache_enabled: false,
+            sccache_version: None,
         });
         let hash_some = r.canonical_bytes_v2();
 
@@ -4305,6 +4335,8 @@ pub mod tests {
                 processes_checked: 0,
                 mismatch_count: 0,
                 sccache_auto_disabled: false,
+                sccache_enabled: false,
+                sccache_version: None,
             })
             .try_build()
             .unwrap();
@@ -4339,6 +4371,8 @@ pub mod tests {
                 processes_checked: 0,
                 mismatch_count: 0,
                 sccache_auto_disabled: false,
+                sccache_enabled: false,
+                sccache_version: None,
             })
             .try_build()
             .unwrap();

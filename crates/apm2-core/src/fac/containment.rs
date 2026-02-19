@@ -238,7 +238,24 @@ pub struct ContainmentTrace {
     pub mismatch_count: u32,
     /// Whether sccache was auto-disabled.
     pub sccache_auto_disabled: bool,
+    /// Whether sccache was explicitly enabled by policy (TCK-00553).
+    ///
+    /// `true` when the policy `sccache_enabled` knob is set AND containment
+    /// passed (sccache is actually active in the job environment).
+    /// `false` when sccache is disabled by default or was auto-disabled.
+    #[serde(default)]
+    pub sccache_enabled: bool,
+    /// sccache version string if detected and sccache is enabled (TCK-00553).
+    ///
+    /// Populated by probing `sccache --version` when the policy enables
+    /// sccache. Included in attestation for auditability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sccache_version: Option<String>,
 }
+
+/// Maximum length for sccache version string to prevent denial-of-service
+/// (TCK-00553).
+pub const MAX_SCCACHE_VERSION_LENGTH: usize = 256;
 
 impl ContainmentTrace {
     /// Creates a trace from a verdict.
@@ -251,6 +268,45 @@ impl ContainmentTrace {
             #[allow(clippy::cast_possible_truncation)]
             mismatch_count: verdict.mismatches.len() as u32,
             sccache_auto_disabled: verdict.sccache_auto_disabled,
+            sccache_enabled: false,
+            sccache_version: None,
+        }
+    }
+
+    /// Creates a trace from a verdict with sccache activation info
+    /// (TCK-00553).
+    ///
+    /// When the policy enables sccache and containment passes, this records
+    /// `sccache_enabled = true` and captures the sccache version for
+    /// attestation.
+    #[must_use]
+    pub fn from_verdict_with_sccache(
+        verdict: &ContainmentVerdict,
+        policy_sccache_enabled: bool,
+        sccache_version: Option<String>,
+    ) -> Self {
+        let effective_enabled =
+            policy_sccache_enabled && verdict.contained && !verdict.sccache_auto_disabled;
+        let bounded_version = sccache_version.map(|v| {
+            if v.len() > MAX_SCCACHE_VERSION_LENGTH {
+                v[..MAX_SCCACHE_VERSION_LENGTH].to_string()
+            } else {
+                v
+            }
+        });
+        Self {
+            verified: verdict.contained,
+            cgroup_path: verdict.reference_cgroup.clone(),
+            processes_checked: verdict.processes_checked,
+            #[allow(clippy::cast_possible_truncation)]
+            mismatch_count: verdict.mismatches.len() as u32,
+            sccache_auto_disabled: verdict.sccache_auto_disabled,
+            sccache_enabled: effective_enabled,
+            sccache_version: if effective_enabled {
+                bounded_version
+            } else {
+                None
+            },
         }
     }
 }
@@ -879,6 +935,38 @@ pub fn check_sccache_containment_with_proc(
     }
 }
 
+/// Probes the sccache version by running `sccache --version` (TCK-00553).
+///
+/// Returns `Some(version_string)` if sccache is installed and responds,
+/// `None` if the probe fails (best-effort, not fail-closed since the
+/// version is informational for attestation only).
+///
+/// Output is bounded to [`MAX_SCCACHE_VERSION_LENGTH`] bytes to prevent
+/// denial-of-service from a malicious sccache binary (INV-CONTAIN-002
+/// analogue).
+#[must_use]
+pub fn probe_sccache_version() -> Option<String> {
+    use std::process::Command;
+
+    let output = Command::new("sccache").arg("--version").output().ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    if version.is_empty() {
+        return None;
+    }
+
+    if version.len() > MAX_SCCACHE_VERSION_LENGTH {
+        Some(version[..MAX_SCCACHE_VERSION_LENGTH].to_string())
+    } else {
+        Some(version)
+    }
+}
+
 // =============================================================================
 // Helpers
 // =============================================================================
@@ -1370,6 +1458,8 @@ mod tests {
             processes_checked: 3,
             mismatch_count: 0,
             sccache_auto_disabled: false,
+            sccache_enabled: false,
+            sccache_version: None,
         };
         let json = serde_json::to_string(&t).unwrap();
         let t2: ContainmentTrace = serde_json::from_str(&json).unwrap();

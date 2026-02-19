@@ -4445,10 +4445,14 @@ fn process_job(
     // the reference because the default-mode worker validates the job
     // spec in-process (no subprocess spawning yet).
     //
-    // sccache detection: check if RUSTC_WRAPPER is set to sccache.
-    let sccache_active = std::env::var("RUSTC_WRAPPER")
-        .ok()
-        .is_some_and(|v| v.contains("sccache"));
+    // TCK-00553: sccache activation is now policy-gated. When
+    // `policy.sccache_enabled` is true, sccache is active (the env
+    // injection happens in `build_job_environment`). When disabled,
+    // we still check ambient RUSTC_WRAPPER for legacy detection.
+    let sccache_active = policy.sccache_enabled
+        || std::env::var("RUSTC_WRAPPER")
+            .ok()
+            .is_some_and(|v| v.contains("sccache"));
     let containment_trace = match apm2_core::fac::containment::verify_containment(
         std::process::id(),
         sccache_active,
@@ -4467,9 +4471,19 @@ fn process_job(
                     verdict.mismatches.len()
                 ));
             }
-            Some(apm2_core::fac::containment::ContainmentTrace::from_verdict(
-                &verdict,
-            ))
+            // TCK-00553: Probe sccache version when policy enables it.
+            let sccache_version = if policy.sccache_enabled {
+                apm2_core::fac::containment::probe_sccache_version()
+            } else {
+                None
+            };
+            Some(
+                apm2_core::fac::containment::ContainmentTrace::from_verdict_with_sccache(
+                    &verdict,
+                    policy.sccache_enabled,
+                    sccache_version,
+                ),
+            )
         },
         Err(err) => {
             eprintln!("worker: ERROR: containment check failed: {err}");
@@ -8244,6 +8258,8 @@ mod tests {
             processes_checked: 5,
             mismatch_count: 0,
             sccache_auto_disabled: false,
+            sccache_enabled: false,
+            sccache_version: None,
         };
 
         let receipt_path = emit_job_receipt(

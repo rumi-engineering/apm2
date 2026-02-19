@@ -23,6 +23,9 @@ const QUARANTINE_DIR: &str = "quarantine";
 const LEGACY_QUARANTINE_DIR: &str = "quarantined";
 const CARGO_HOME_RETENTION_SECS: u64 = 30 * 24 * 3600;
 const FAC_CARGO_HOME_DIR: &str = "cargo_home";
+/// Retention for managed sccache directory (TCK-00553).
+const SCCACHE_RETENTION_SECS: u64 = 30 * 24 * 3600;
+const FAC_SCCACHE_DIR: &str = "sccache";
 const FAC_LEGACY_EVIDENCE_DIR: &str = "evidence";
 const FAC_RECEIPTS_DIR: &str = "receipts";
 const MAX_RECEIPT_SCAN_ENTRIES: usize = 500_000;
@@ -97,6 +100,17 @@ pub fn plan_gc(
             allowed_parent: fac_root.to_path_buf(),
             kind: crate::fac::gc_receipt::GcActionKind::CargoCache,
             estimated_bytes: estimate_dir_size(&cargo_home_root),
+        });
+    }
+
+    // TCK-00553: Managed sccache cache directory GC.
+    let sccache_root = fac_root.join(FAC_SCCACHE_DIR);
+    if sccache_root.exists() && is_stale_by_mtime(&sccache_root, SCCACHE_RETENTION_SECS, now_secs) {
+        targets.push(GcTarget {
+            path: sccache_root.clone(),
+            allowed_parent: fac_root.to_path_buf(),
+            kind: crate::fac::gc_receipt::GcActionKind::SccacheCache,
+            estimated_bytes: estimate_dir_size(&sccache_root),
         });
     }
 

@@ -286,6 +286,29 @@ pub struct FacPolicyV1 {
     /// `QueueBoundsPolicy::default()` via `serde(default)`.
     #[serde(default)]
     pub queue_bounds_policy: super::queue_bounds::QueueBoundsPolicy,
+
+    /// Whether sccache is explicitly enabled for FAC jobs (TCK-00553).
+    ///
+    /// Default is `false` (fail-closed). When `true`, `RUSTC_WRAPPER=sccache`
+    /// and `SCCACHE_DIR` are injected into the job environment, but ONLY if
+    /// containment verification passes. If containment fails, sccache is
+    /// auto-disabled regardless of this setting.
+    ///
+    /// Note: `serde(default)` is safe here because `false` is the MOST
+    /// restrictive option (sccache disabled). Existing persisted policies
+    /// that predate TCK-00553 will correctly default to `false`.
+    #[serde(default)]
+    pub sccache_enabled: bool,
+
+    /// Optional override for the sccache cache directory (TCK-00553).
+    ///
+    /// When `None` (the default), `$APM2_HOME/private/fac/sccache` is used
+    /// as the managed sccache directory. When `Some`, the provided path is
+    /// used instead.
+    ///
+    /// This field is only meaningful when `sccache_enabled` is `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sccache_dir: Option<String>,
 }
 
 impl Default for FacPolicyV1 {
@@ -363,6 +386,8 @@ impl FacPolicyV1 {
             allowed_repo_ids: None,
             allowed_intents: None,
             queue_bounds_policy: super::queue_bounds::QueueBoundsPolicy::default(),
+            sccache_enabled: false,
+            sccache_dir: None,
         }
     }
 
@@ -475,7 +500,26 @@ impl FacPolicyV1 {
                 value: format!("{e}"),
             })?;
 
+        // Validate sccache_dir if present (TCK-00553).
+        validate_string_field_opt("sccache_dir", self.sccache_dir.as_deref())?;
+
         Ok(())
+    }
+
+    /// Resolves the effective `SCCACHE_DIR` path for FAC job execution
+    /// (TCK-00553).
+    ///
+    /// Priority:
+    /// 1. `policy.sccache_dir` (explicit override)
+    /// 2. `$APM2_HOME/private/fac/sccache` (managed default)
+    ///
+    /// Only meaningful when `sccache_enabled` is `true`.
+    #[must_use]
+    pub fn resolve_sccache_dir(&self, apm2_home: &Path) -> PathBuf {
+        if let Some(ref explicit) = self.sccache_dir {
+            return PathBuf::from(explicit);
+        }
+        apm2_home.join("private/fac/sccache")
     }
 
     /// Resolves the effective `CARGO_HOME` path for FAC job execution.
@@ -514,6 +558,10 @@ impl FacPolicyV1 {
 /// 7. If `deny_ambient_cargo_home` is true and `CARGO_HOME` was inherited from
 ///    the ambient environment, replace it with the managed path.
 /// 8. If `cargo_target_dir` is set in policy, force `CARGO_TARGET_DIR`.
+/// 9. If `sccache_enabled` is true in policy, inject `RUSTC_WRAPPER=sccache`
+///    and `SCCACHE_DIR` from the policy-resolved path (TCK-00553). The caller
+///    is responsible for gating on containment verification before actually
+///    using the environment with sccache enabled.
 ///
 /// The result is a deterministic `BTreeMap<String, String>` of environment
 /// variables suitable for passing to `Command::envs()` after clearing the
@@ -583,6 +631,21 @@ pub fn build_job_environment(
     // Step 8: Enforce CARGO_TARGET_DIR from policy.
     if let Some(ref target_dir) = policy.cargo_target_dir {
         env.insert("CARGO_TARGET_DIR".to_string(), target_dir.clone());
+    }
+
+    // Step 9 (TCK-00553): If sccache is explicitly enabled in policy,
+    // inject the wrapper and cache directory variables. This runs AFTER
+    // the hardcoded stripping in Step 6 to re-introduce the variables
+    // only when the policy explicitly opts in. The caller MUST gate on
+    // containment verification before allowing the spawned process to
+    // use sccache — see `check_sccache_containment()`.
+    if policy.sccache_enabled {
+        env.insert("RUSTC_WRAPPER".to_string(), "sccache".to_string());
+        let sccache_dir = policy.resolve_sccache_dir(apm2_home);
+        env.insert(
+            "SCCACHE_DIR".to_string(),
+            sccache_dir.to_string_lossy().to_string(),
+        );
     }
 
     env

@@ -1597,6 +1597,10 @@ directories (`~/.cache`, `~/.cargo`, `~/.config`, etc.).
      re-introduce these variables.
   7. Enforce managed `CARGO_HOME` when `deny_ambient_cargo_home` is true.
   8. Enforce `CARGO_TARGET_DIR` from policy.
+  9. If `sccache_enabled` is true in policy, re-inject `RUSTC_WRAPPER=sccache`
+     and `SCCACHE_DIR` pointing to the resolved sccache cache directory
+     (`resolve_sccache_dir()`). This step runs AFTER Step 6 stripping, so
+     sccache is only active when the policy explicitly enables it (TCK-00553).
   Output is a deterministic `BTreeMap` (sorted keys).
 
   The default policy `env_allowlist_prefixes` use narrow prefixes (`RUSTFLAGS`,
@@ -1608,6 +1612,18 @@ directories (`~/.cache`, `~/.cargo`, `~/.config`, etc.).
 - `FacPolicyV1::resolve_cargo_home(apm2_home) -> Option<PathBuf>`:
   Priority: explicit `cargo_home` > managed path (`$APM2_HOME/private/fac/cargo_home`
   when `deny_ambient_cargo_home` is true) > `None` (ambient allowed).
+- `FacPolicyV1::resolve_sccache_dir(apm2_home) -> PathBuf`:
+  Priority: explicit `sccache_dir` > managed default
+  (`$APM2_HOME/private/fac/sccache`). Only meaningful when `sccache_enabled`
+  is true (TCK-00553).
+- `FacPolicyV1.sccache_enabled` (`bool`, `#[serde(default)]`): Policy knob for
+  explicit sccache activation. Default `false` (fail-closed safe). When `true`,
+  Step 9 of `build_job_environment()` injects `RUSTC_WRAPPER=sccache` and
+  `SCCACHE_DIR` (TCK-00553).
+- `FacPolicyV1.sccache_dir` (`Option<String>`, `#[serde(default)]`): Optional
+  explicit path for the sccache cache directory. Validated by
+  `validate_string_field_opt()` (bounded length). Only meaningful when
+  `sccache_enabled` is true (TCK-00553).
 
 ### Enforcement Sites
 
@@ -2861,7 +2877,7 @@ policy bypass from malformed or adversarial job specs.
 - `DenialReasonCode::PolicyViolation` is emitted for policy-level denials
   (including `InvalidControlLaneRepoId`).
 
-## containment Submodule (TCK-00548)
+## containment Submodule (TCK-00548, TCK-00553)
 
 The `containment` submodule implements cgroup membership verification for
 child processes during FAC job execution. It verifies that child processes
@@ -2875,6 +2891,8 @@ job unit, preventing cache poisoning via escaped sccache daemons.
 - `ContainmentMismatch`: Single escaped process with PID, name, expected and
   actual cgroup paths.
 - `ContainmentTrace`: Lightweight trace for inclusion in `FacJobReceiptV1`.
+  Includes `sccache_enabled` (policy-gated activation status) and
+  `sccache_version` (probed version string for attestation) fields (TCK-00553).
 - `ContainmentError`: Fail-closed error taxonomy for proc read failures,
   parse failures, and resource bounds.
 
@@ -2889,6 +2907,14 @@ job unit, preventing cache poisoning via escaped sccache daemons.
   function returning `Option<String>` reason if sccache should be disabled.
 - `is_cgroup_contained(child_path, reference_path)`: Exact or subtree
   prefix matching with slash separator enforcement.
+- `probe_sccache_version()`: Probes `sccache --version` with bounded output
+  (`MAX_SCCACHE_VERSION_LENGTH` = 256 bytes). Returns `None` on failure
+  (fail-closed). Used by the worker to populate `ContainmentTrace` for
+  attestation visibility (TCK-00553).
+- `ContainmentTrace::from_verdict_with_sccache(verdict, policy_sccache_enabled, sccache_version)`:
+  Constructs a trace that sets `sccache_enabled = true` only when the
+  policy knob is on AND containment is verified AND sccache was not
+  auto-disabled (fail-closed gate chain, TCK-00553).
 
 ### Security Invariants (TCK-00548)
 
