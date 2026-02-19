@@ -935,35 +935,52 @@ impl FacJobReceiptV1 {
                 bytes.push(0u8);
             }
             // TCK-00554: sccache server containment protocol attestation.
-            // V1 trailing optional: absence marker is OMITTED when None to
-            // preserve bit-for-bit compatibility with historical receipts
-            // signed before this field was added (same pattern as
-            // `moved_job_path` and `sandbox_hardening_hash`).
             //
-            // FIX (MAJOR): Hash-bind ALL normative fields with injective
-            // Option encoding. Option<bool> uses 0=None, 1=Some(false),
-            // 2=Some(true) to preserve injectivity between None and
-            // Some(false). Option<u32> uses 0u8/1u8 presence marker.
-            // Option<String> uses 0u8 for None, 1u8+length-prefix for Some.
+            // BLOCKER fix (round 4): The V1 encoding previously used `1u8`
+            // as the presence marker for this sub-field, which collides with
+            // `observed_cost`'s `1u8` marker at the trailing-optional
+            // boundary. Because server-containment payload is variable-length
+            // and not length-delimited, two distinct states can produce
+            // identical byte sequences:
+            //   (A) sccache_server_containment=Some + observed_cost=None
+            //   (B) sccache_server_containment=None + observed_cost=Some
+            //
+            // Fix: use tagged-length encoding `0xFE + len_u32_be + payload`
+            // when present. The `0xFE` marker is distinct from all other
+            // trailing-optional markers (1, 3, 5, 7, 9, 11) and from the
+            // `1u8` used by `observed_cost`, making the boundary injective.
+            // Absence is still encoded by omitting bytes entirely (no marker)
+            // to preserve compatibility with receipts where containment was
+            // present but server_containment was absent.
             if let Some(ref sc) = trace.sccache_server_containment {
-                bytes.push(1u8);
-                bytes.push(u8::from(sc.protocol_executed));
-                bytes.push(u8::from(sc.preexisting_server_detected));
+                // Build the sub-field payload into a temporary buffer so we
+                // can length-prefix it.
+                let mut sc_payload = Vec::with_capacity(64);
+                sc_payload.push(u8::from(sc.protocol_executed));
+                sc_payload.push(u8::from(sc.preexisting_server_detected));
                 // Option<bool>: 0=None, 1=Some(false), 2=Some(true)
-                bytes.push(match sc.preexisting_server_in_cgroup {
+                sc_payload.push(match sc.preexisting_server_in_cgroup {
                     None => 0u8,
                     Some(false) => 1u8,
                     Some(true) => 2u8,
                 });
                 // Option<u32>: preexisting_server_pid
-                Self::append_option_u32(&mut bytes, sc.preexisting_server_pid);
-                bytes.push(u8::from(sc.server_started));
+                Self::append_option_u32(&mut sc_payload, sc.preexisting_server_pid);
+                sc_payload.push(u8::from(sc.server_started));
                 // Option<u32>: started_server_pid
-                Self::append_option_u32(&mut bytes, sc.started_server_pid);
-                bytes.push(u8::from(sc.server_cgroup_verified));
-                bytes.push(u8::from(sc.auto_disabled));
+                Self::append_option_u32(&mut sc_payload, sc.started_server_pid);
+                sc_payload.push(u8::from(sc.server_cgroup_verified));
+                sc_payload.push(u8::from(sc.auto_disabled));
                 // Option<String>: reason (length-prefixed)
-                Self::append_option_string(&mut bytes, sc.reason.as_deref());
+                Self::append_option_string(&mut sc_payload, sc.reason.as_deref());
+
+                // Tagged-length wrapper: 0xFE + len(u32 BE) + payload
+                bytes.push(0xFE_u8);
+                #[allow(clippy::cast_possible_truncation)]
+                // sc_payload is bounded: fixed fields (8 bytes) + 2 option_u32
+                // (max 10 bytes) + 1 option_string (max 5+512 bytes) = max ~535
+                bytes.extend_from_slice(&(sc_payload.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(&sc_payload);
             }
         }
 
@@ -1236,27 +1253,36 @@ impl FacJobReceiptV1 {
                 bytes.push(0u8);
             }
             // TCK-00554: sccache server containment protocol attestation.
-            // V2 trailing optional: same injective encoding as V1 for
-            // consistency. See V1 block for encoding rationale.
+            // V2 uses the same tagged-length encoding (`0xFE + len + payload`)
+            // as V1 for consistency and defense-in-depth. Although V2's outer
+            // containment marker (`2u8`) already differs from observed_cost's
+            // `4u8`, matching V1's fix prevents future non-injectivity if
+            // additional trailing optionals are added inside the containment
+            // block. No V2 receipts exist in production so this change is safe.
             if let Some(ref sc) = trace.sccache_server_containment {
-                bytes.push(1u8);
-                bytes.push(u8::from(sc.protocol_executed));
-                bytes.push(u8::from(sc.preexisting_server_detected));
+                let mut sc_payload = Vec::with_capacity(64);
+                sc_payload.push(u8::from(sc.protocol_executed));
+                sc_payload.push(u8::from(sc.preexisting_server_detected));
                 // Option<bool>: 0=None, 1=Some(false), 2=Some(true)
-                bytes.push(match sc.preexisting_server_in_cgroup {
+                sc_payload.push(match sc.preexisting_server_in_cgroup {
                     None => 0u8,
                     Some(false) => 1u8,
                     Some(true) => 2u8,
                 });
                 // Option<u32>: preexisting_server_pid
-                Self::append_option_u32(&mut bytes, sc.preexisting_server_pid);
-                bytes.push(u8::from(sc.server_started));
+                Self::append_option_u32(&mut sc_payload, sc.preexisting_server_pid);
+                sc_payload.push(u8::from(sc.server_started));
                 // Option<u32>: started_server_pid
-                Self::append_option_u32(&mut bytes, sc.started_server_pid);
-                bytes.push(u8::from(sc.server_cgroup_verified));
-                bytes.push(u8::from(sc.auto_disabled));
+                Self::append_option_u32(&mut sc_payload, sc.started_server_pid);
+                sc_payload.push(u8::from(sc.server_cgroup_verified));
+                sc_payload.push(u8::from(sc.auto_disabled));
                 // Option<String>: reason (length-prefixed)
-                Self::append_option_string(&mut bytes, sc.reason.as_deref());
+                Self::append_option_string(&mut sc_payload, sc.reason.as_deref());
+
+                bytes.push(0xFE_u8);
+                #[allow(clippy::cast_possible_truncation)]
+                bytes.extend_from_slice(&(sc_payload.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(&sc_payload);
             }
         }
 
@@ -4730,6 +4756,167 @@ pub mod tests {
             with_containment.canonical_bytes(),
             with_sandbox.canonical_bytes(),
             "containment and sandbox_hardening_hash must produce distinct canonical bytes"
+        );
+    }
+
+    /// BLOCKER regression: V1 server-containment vs `observed_cost`
+    /// injectivity.
+    ///
+    /// Before fix-round-4, V1 encoded `sccache_server_containment` as
+    /// `1u8 + payload` immediately before trailing `observed_cost` which
+    /// also used `1u8 + 24 bytes`. A crafted server-containment payload
+    /// could collide byte-for-byte with an `observed_cost` encoding.
+    ///
+    /// This test uses the adversarial values from the code-quality finding:
+    /// - Receipt A: `server_containment` with reason="hello-world", no cost
+    /// - Receipt B: no `server_containment`, `observed_cost` with specific
+    ///   values
+    ///
+    /// After the fix, these MUST produce different canonical bytes because
+    /// server-containment now uses `0xFE + len_u32 + payload` framing.
+    #[test]
+    fn canonical_bytes_v1_injective_server_containment_vs_observed_cost() {
+        use crate::economics::cost_model::ObservedJobCost;
+
+        let base = || {
+            FacJobReceiptV1Builder::new(
+                "r-inj",
+                "j-inj",
+                "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .outcome(FacJobOutcome::Denied)
+            .denial_reason(DenialReasonCode::ValidationFailed)
+            .reason("injectivity test")
+            .timestamp_secs(1_700_000_000)
+        };
+
+        // Receipt A: containment with server_containment=Some (reason="hello-world"),
+        // observed_cost=None.
+        let receipt_a = base()
+            .containment(super::super::containment::ContainmentTrace {
+                verified: false,
+                cgroup_path: String::new(),
+                processes_checked: 0,
+                mismatch_count: 0,
+                sccache_auto_disabled: false,
+                sccache_enabled: false,
+                sccache_version: None,
+                sccache_server_containment: Some(
+                    super::super::containment::SccacheServerContainment {
+                        protocol_executed: false,
+                        preexisting_server_detected: false,
+                        preexisting_server_in_cgroup: None,
+                        preexisting_server_pid: Some(0),
+                        server_started: false,
+                        started_server_pid: None,
+                        server_cgroup_verified: false,
+                        auto_disabled: false,
+                        reason: Some("hello-world".to_string()),
+                    },
+                ),
+            })
+            .try_build()
+            .unwrap();
+
+        // Receipt B: containment with server_containment=None,
+        // observed_cost=Some (adversarial values from finding).
+        // The specific cost values were chosen so that under the OLD encoding
+        // (1u8 + payload without length framing), the bytes would collide.
+        let receipt_b = base()
+            .containment(super::super::containment::ContainmentTrace {
+                verified: false,
+                cgroup_path: String::new(),
+                processes_checked: 0,
+                mismatch_count: 0,
+                sccache_auto_disabled: false,
+                sccache_enabled: false,
+                sccache_version: None,
+                sccache_server_containment: None,
+            })
+            .observed_cost(ObservedJobCost {
+                duration_ms: 0,
+                cpu_time_ms: 72_057_594_229_319_020,
+                bytes_written: 7_813_513_869_505_227_876,
+            })
+            .try_build()
+            .unwrap();
+
+        assert_ne!(
+            receipt_a.canonical_bytes(),
+            receipt_b.canonical_bytes(),
+            "V1: server_containment=Some + observed_cost=None MUST differ \
+             from server_containment=None + observed_cost=Some"
+        );
+    }
+
+    /// V2 injectivity: verify server-containment vs `observed_cost` boundary
+    /// is injective in V2 as well (defense-in-depth, same `0xFE` encoding).
+    #[test]
+    fn canonical_bytes_v2_injective_server_containment_vs_observed_cost() {
+        use crate::economics::cost_model::ObservedJobCost;
+
+        let base = || {
+            FacJobReceiptV1Builder::new(
+                "r-v2i",
+                "j-v2i",
+                "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .outcome(FacJobOutcome::Denied)
+            .denial_reason(DenialReasonCode::ValidationFailed)
+            .reason("v2 injectivity test")
+            .timestamp_secs(1_700_000_000)
+        };
+
+        let receipt_a = base()
+            .containment(super::super::containment::ContainmentTrace {
+                verified: false,
+                cgroup_path: String::new(),
+                processes_checked: 0,
+                mismatch_count: 0,
+                sccache_auto_disabled: false,
+                sccache_enabled: false,
+                sccache_version: None,
+                sccache_server_containment: Some(
+                    super::super::containment::SccacheServerContainment {
+                        protocol_executed: false,
+                        preexisting_server_detected: false,
+                        preexisting_server_in_cgroup: None,
+                        preexisting_server_pid: Some(0),
+                        server_started: false,
+                        started_server_pid: None,
+                        server_cgroup_verified: false,
+                        auto_disabled: false,
+                        reason: Some("hello-world".to_string()),
+                    },
+                ),
+            })
+            .try_build()
+            .unwrap();
+
+        let receipt_b = base()
+            .containment(super::super::containment::ContainmentTrace {
+                verified: false,
+                cgroup_path: String::new(),
+                processes_checked: 0,
+                mismatch_count: 0,
+                sccache_auto_disabled: false,
+                sccache_enabled: false,
+                sccache_version: None,
+                sccache_server_containment: None,
+            })
+            .observed_cost(ObservedJobCost {
+                duration_ms: 0,
+                cpu_time_ms: 72_057_594_229_319_020,
+                bytes_written: 7_813_513_869_505_227_876,
+            })
+            .try_build()
+            .unwrap();
+
+        assert_ne!(
+            receipt_a.canonical_bytes_v2(),
+            receipt_b.canonical_bytes_v2(),
+            "V2: server_containment=Some + observed_cost=None MUST differ \
+             from server_containment=None + observed_cost=Some"
         );
     }
 
