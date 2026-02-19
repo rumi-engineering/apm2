@@ -3255,12 +3255,23 @@ no side effects); callers provide loaded receipt data and receive a
   top-level `.json` files (legacy flat layout). Bounded by
   `MAX_GC_RECEIPT_SCAN_FILES` (65536) total directory entries across all shards,
   `MAX_GC_SHARD_DIRS` (512) shard directories, `MAX_GC_RECEIPTS_LOADED` (4096)
-  loaded receipts, and `MAX_GC_RECEIPT_READ_SIZE` (256 KiB) per file. Results
-  sorted newest-first (descending timestamp) so truncation preserves recent data.
+  retained receipts, and `MAX_GC_RECEIPT_READ_SIZE` (256 KiB) per file.
+  Uses a bounded min-heap (`BinaryHeap<Reverse<GcReceiptHeapEntry>>`) during
+  collection to enforce `MAX_GC_RECEIPTS_LOADED` *during* scanning — in-memory
+  receipt count never exceeds the cap regardless of how many files match on disk
+  (worst-case ~1 GiB at 256 KiB x 4096 entries). The heap is keyed by ascending
+  newness (timestamp ASC, content_hash DESC) so the oldest receipt sits at the
+  root and is evicted first when a newer receipt arrives. After scanning, the
+  heap is drained and sorted newest-first (timestamp DESC, content_hash ASC)
+  for deterministic output.
   Shard directory names are validated as exactly 2-character hex to prevent
   traversal. All file opens use `open_no_follow` (`O_NOFOLLOW | O_NONBLOCK`) and
   verify via `fstat` that the fd is a regular file (rejects FIFOs, device nodes,
   sockets). Parse failures silently skipped.
+- `gc_heap_insert(heap, receipt, truncated)`: Helper that inserts a receipt into
+  the bounded min-heap. If below cap, pushes unconditionally. If at cap and
+  the new receipt is newer than the root, evicts the root and pushes. Otherwise
+  discards the new receipt. Sets `truncated = true` on any discard.
 
 ### Bounded Collections
 
