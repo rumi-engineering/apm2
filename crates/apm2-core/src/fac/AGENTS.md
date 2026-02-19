@@ -3523,3 +3523,44 @@ The `apm2 fac metrics` command (in `fac.rs`) uses a single verified pass:
 
 The command emits JSON only (TCK-00606 S12 machine-output invariant), is
 local-only (no daemon IPC), and is excluded from daemon auto-start.
+
+## Security Regression Tests (TCK-00559)
+
+Integration test file: `crates/apm2-core/tests/tck_00559_security_regression.rs`
+
+### Coverage Areas
+
+1. **FacJobSpecV1 adversarial parsing** (`mod job_spec_adversarial`): Oversized
+   input rejection, malformed JSON (empty, null bytes, deep nesting, UTF-8
+   boundary abuse, number overflow), type confusion (array/string/number/
+   boolean/null), field-level adversarial values (empty/wrong schema, null bytes
+   in job\_id, oversized job\_id, priority overflow, invalid kind/source.kind,
+   path traversal in repo\_id, tilde expansion, invalid head\_sha, invalid
+   enqueue\_time), and unknown field rejection in all nested blocks (top-level,
+   actuation, source, constraints, lane\_requirements).
+
+2. **Queue file tampering** (`mod queue_tampering`): Digest mismatch after
+   mutation of kind, repo\_id, head\_sha, priority, queue\_lane, lease\_id,
+   enqueue\_time; forged digest; request\_id mismatch; missing/empty token;
+   control lane rejections (non-stop\_revoke kind, wrong repo\_id, digest
+   tampering); malformed digest format (missing prefix, wrong prefix, short hex,
+   non-hex); invalid request\_id format; cancel\_target\_job\_id on non-control
+   spec and with special characters; digest determinism; token independence.
+
+3. **safe\_rmtree property tests** (`mod safe_rmtree_properties`): Symlink
+   refusal (root, subtree, dangling, ancestor chain), parent boundary
+   enforcement (root == parent, outside parent, relative root/parent),
+   dot-segment rejection (.. in root, . in root, .. in parent), proptest
+   randomized paths (valid tree always deleted, nonexistent root is noop,
+   dot-dot always rejected, relative paths always rejected), TOCTOU smoke
+   tests (symlink swap at root and in tree), permission enforcement (group/
+   world access), unexpected file types (FIFO, socket), successful deletion
+   edge cases (single file, empty dir, nonexistent root, deeply nested tree),
+   and string-prefix attack rejection.
+
+### Fuzz Target
+
+`fuzz/fuzz_targets/job_spec_parse.rs`: Feeds arbitrary bytes through
+`deserialize_job_spec`, then `validate_job_spec` and `compute_digest` on
+successful parses. Tests INV-JS-003 (fail-closed), RSK-1601 (DoS size cap),
+and RSK-0701 (no panic on untrusted input).

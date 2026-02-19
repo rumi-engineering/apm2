@@ -28,3 +28,7 @@ path = "fuzz_targets/public_key_id_parse.rs"
 [[bin]]
 name = "fuzz_keyset_id_parse"
 path = "fuzz_targets/keyset_id_parse.rs"
+
+[[bin]]
+name = "fuzz_job_spec_parse"
+path = "fuzz_targets/job_spec_parse.rs"
