@@ -93,6 +93,13 @@ pub struct MetricsSummary {
     pub gc_freed_bytes: u64,
     /// Number of GC receipts processed.
     pub gc_receipts: u64,
+    /// Whether the GC receipt list was truncated due to the
+    /// [`MAX_GC_RECEIPTS_LOADED`] cap.  When `true`, the GC metrics
+    /// reflect only a deterministic subset (oldest-first by timestamp,
+    /// then content-hash tiebreaker) and operators should investigate
+    /// why the receipt count exceeds the cap.
+    #[serde(default)]
+    pub gc_receipts_truncated: bool,
 }
 
 /// Input parameters for metrics computation.
@@ -270,6 +277,19 @@ pub const MAX_GC_RECEIPTS_LOADED: usize = 4_096;
 /// directory traversal of attacker-created directories.
 const MAX_GC_SHARD_DIRS: usize = 512;
 
+/// Result of loading GC receipts from disk.
+#[derive(Debug, Clone)]
+pub struct LoadGcReceiptsResult {
+    /// The loaded GC receipts, sorted deterministically by
+    /// `(timestamp_secs, content_hash)`.
+    pub receipts: Vec<GcReceiptV1>,
+    /// Whether the result was truncated due to the
+    /// [`MAX_GC_RECEIPTS_LOADED`] cap.  When `true`, only the oldest
+    /// `MAX_GC_RECEIPTS_LOADED` receipts (by timestamp, then
+    /// content-hash tiebreaker) are included.
+    pub truncated: bool,
+}
+
 /// Load GC receipts from the receipts directory, filtering by
 /// `since_epoch_secs`.
 ///
@@ -285,6 +305,14 @@ const MAX_GC_SHARD_DIRS: usize = 512;
 /// skipped (GC receipts share the directory with job receipts; we only
 /// care about files matching the GC schema).
 ///
+/// # Deterministic cap (MAJOR-2 fix)
+///
+/// All matching receipts are collected (up to the scan cap), then sorted
+/// by `(timestamp_secs, content_hash)` to ensure a deterministic ordering
+/// regardless of filesystem enumeration order.  If the sorted list exceeds
+/// [`MAX_GC_RECEIPTS_LOADED`], it is truncated to the oldest entries and
+/// `LoadGcReceiptsResult::truncated` is set to `true`.
+///
 /// # Security
 ///
 /// - File reads use `open_no_follow` (`O_NOFOLLOW | O_NONBLOCK` on Unix) to
@@ -293,10 +321,16 @@ const MAX_GC_SHARD_DIRS: usize = 512;
 ///   to reject FIFOs, device nodes, sockets, and directories (MINOR-2 fix).
 /// - Shard directory validation requires exactly 2-character lowercase hex
 ///   names to prevent path traversal through crafted directory names.
+/// - Shard directory entries are checked via `DirEntry::file_type()` (which
+///   does NOT follow symlinks on Linux) to reject symlinked shard directories
+///   (MAJOR-1 fix).
 /// - Both shard directories visited and total file entries scanned are bounded
 ///   to prevent unbounded traversal.
 #[must_use]
-pub fn load_gc_receipts(receipts_dir: &std::path::Path, since_epoch_secs: u64) -> Vec<GcReceiptV1> {
+pub fn load_gc_receipts(
+    receipts_dir: &std::path::Path,
+    since_epoch_secs: u64,
+) -> LoadGcReceiptsResult {
     let mut results = Vec::new();
     let mut total_scanned: usize = 0;
 
@@ -308,9 +342,6 @@ pub fn load_gc_receipts(receipts_dir: &std::path::Path, since_epoch_secs: u64) -
             // Global scan cap.
             total_scanned = total_scanned.saturating_add(1);
             if total_scanned > MAX_GC_RECEIPT_SCAN_FILES {
-                break;
-            }
-            if results.len() >= MAX_GC_RECEIPTS_LOADED {
                 break;
             }
 
@@ -325,9 +356,17 @@ pub fn load_gc_receipts(receipts_dir: &std::path::Path, since_epoch_secs: u64) -
                 continue;
             };
 
+            // MAJOR-1 fix: Use `DirEntry::file_type()` which on Linux uses
+            // `d_type` from the dirent and does NOT follow symlinks.  This
+            // rejects symlinked shard directories that could redirect
+            // traversal outside the receipts root.  `entry.path().is_dir()`
+            // follows symlinks and is therefore unsafe here.
+            let Ok(entry_type) = top_entry.file_type() else {
+                continue;
+            };
             if dir_name.len() == 2
                 && dir_name.bytes().all(|b| b.is_ascii_hexdigit())
-                && top_path.is_dir()
+                && entry_type.is_dir()
             {
                 // This is a shard directory — scan its contents.
                 shard_dirs_visited = shard_dirs_visited.saturating_add(1);
@@ -342,9 +381,6 @@ pub fn load_gc_receipts(receipts_dir: &std::path::Path, since_epoch_secs: u64) -
                 for shard_entry in shard_entries {
                     total_scanned = total_scanned.saturating_add(1);
                     if total_scanned > MAX_GC_RECEIPT_SCAN_FILES {
-                        break;
-                    }
-                    if results.len() >= MAX_GC_RECEIPTS_LOADED {
                         break;
                     }
 
@@ -366,7 +402,24 @@ pub fn load_gc_receipts(receipts_dir: &std::path::Path, since_epoch_secs: u64) -
         }
     }
 
-    results
+    // MAJOR-2 fix: Sort deterministically by (timestamp_secs, content_hash)
+    // before applying the cap, so the same subset is always selected
+    // regardless of filesystem enumeration order.
+    results.sort_by(|a, b| {
+        a.timestamp_secs
+            .cmp(&b.timestamp_secs)
+            .then_with(|| a.content_hash.cmp(&b.content_hash))
+    });
+
+    let truncated = results.len() > MAX_GC_RECEIPTS_LOADED;
+    if truncated {
+        results.truncate(MAX_GC_RECEIPTS_LOADED);
+    }
+
+    LoadGcReceiptsResult {
+        receipts: results,
+        truncated,
+    }
 }
 
 /// Attempt to load a single GC receipt from a file path.
@@ -758,11 +811,11 @@ mod tests {
 
         // load_gc_receipts must NOT follow the symlink and thus return
         // an empty result (since the only .json file is a symlink).
-        let results = load_gc_receipts(receipts_dir, 0);
+        let result = load_gc_receipts(receipts_dir, 0);
         assert!(
-            results.is_empty(),
+            result.receipts.is_empty(),
             "load_gc_receipts must not follow symlinks (got {} results)",
-            results.len()
+            result.receipts.len()
         );
     }
 
@@ -777,9 +830,9 @@ mod tests {
         let gc_bytes = serde_json::to_vec_pretty(&gc).expect("ser");
         std::fs::write(receipts_dir.join("gc-receipt-1.json"), &gc_bytes).expect("write");
 
-        let results = load_gc_receipts(receipts_dir, 1000);
-        assert_eq!(results.len(), 1, "should load one GC receipt");
-        assert_eq!(results[0].timestamp_secs, 2000);
+        let result = load_gc_receipts(receipts_dir, 1000);
+        assert_eq!(result.receipts.len(), 1, "should load one GC receipt");
+        assert_eq!(result.receipts[0].timestamp_secs, 2000);
     }
 
     // =========================================================================
@@ -810,15 +863,15 @@ mod tests {
         );
 
         // load_gc_receipts MUST find the sharded receipt.
-        let results = load_gc_receipts(receipts_dir, 0);
+        let result = load_gc_receipts(receipts_dir, 0);
         assert_eq!(
-            results.len(),
+            result.receipts.len(),
             1,
             "load_gc_receipts must find receipts in sharded layout \
              (found {} instead of 1)",
-            results.len()
+            result.receipts.len()
         );
-        assert_eq!(results[0].timestamp_secs, 3000);
+        assert_eq!(result.receipts[0].timestamp_secs, 3000);
     }
 
     #[test]
@@ -836,12 +889,12 @@ mod tests {
             persist_gc_receipt(receipts_dir, gc).expect("persist");
         }
 
-        let results = load_gc_receipts(receipts_dir, 4000);
+        let result = load_gc_receipts(receipts_dir, 4000);
         assert_eq!(
-            results.len(),
+            result.receipts.len(),
             5,
             "should find all 5 sharded GC receipts (found {})",
-            results.len()
+            result.receipts.len()
         );
     }
 
@@ -863,12 +916,12 @@ mod tests {
         let flat_bytes = serde_json::to_vec_pretty(&gc_flat).expect("ser");
         std::fs::write(receipts_dir.join("legacy-gc-flat.json"), &flat_bytes).expect("write flat");
 
-        let results = load_gc_receipts(receipts_dir, 5000);
+        let result = load_gc_receipts(receipts_dir, 5000);
         assert_eq!(
-            results.len(),
+            result.receipts.len(),
             2,
             "should find both sharded and flat GC receipts (found {})",
-            results.len()
+            result.receipts.len()
         );
     }
 
@@ -887,13 +940,13 @@ mod tests {
         persist_gc_receipt(receipts_dir, gc_new).expect("persist new");
 
         // Only the receipt at timestamp 3000 should pass the filter.
-        let results = load_gc_receipts(receipts_dir, 2000);
+        let result = load_gc_receipts(receipts_dir, 2000);
         assert_eq!(
-            results.len(),
+            result.receipts.len(),
             1,
             "should filter old receipts from sharded layout"
         );
-        assert_eq!(results[0].timestamp_secs, 3000);
+        assert_eq!(result.receipts[0].timestamp_secs, 3000);
     }
 
     #[test]
@@ -911,9 +964,9 @@ mod tests {
         std::fs::write(bad_dir.join("receipt.json"), &gc_bytes).expect("write");
 
         // "zz" contains non-hex chars, so it should NOT be treated as a shard.
-        let results = load_gc_receipts(receipts_dir, 0);
+        let result = load_gc_receipts(receipts_dir, 0);
         assert!(
-            results.is_empty(),
+            result.receipts.is_empty(),
             "non-hex shard dirs must not be traversed"
         );
     }
@@ -945,17 +998,138 @@ mod tests {
         // load_gc_receipts must NOT block on the FIFO and must return
         // empty results (the only entries are FIFOs).
         let start = std::time::Instant::now();
-        let results = load_gc_receipts(receipts_dir, 0);
+        let result = load_gc_receipts(receipts_dir, 0);
         let elapsed = start.elapsed();
 
         assert!(
-            results.is_empty(),
+            result.receipts.is_empty(),
             "load_gc_receipts must skip FIFOs (got {} results)",
-            results.len()
+            result.receipts.len()
         );
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "load_gc_receipts must not block on FIFO: took {elapsed:?}"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR-1 regression: symlinked shard directory must be rejected
+    // =========================================================================
+
+    #[test]
+    #[cfg(unix)]
+    fn load_gc_receipts_rejects_symlinked_shard_directory() {
+        // Regression test for MAJOR-1 (round 5): a two-character symlinked
+        // directory name (e.g., "ab") that redirects to an external directory
+        // containing a valid GC receipt must be ignored by load_gc_receipts.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Create an external directory with a valid GC receipt.
+        let external_dir = tmp.path().join("external_data");
+        std::fs::create_dir_all(&external_dir).expect("mkdir external");
+        let gc = make_gc_receipt(7000, 999_999);
+        let gc_bytes = serde_json::to_vec_pretty(&gc).expect("ser");
+        std::fs::write(external_dir.join("evil.json"), &gc_bytes).expect("write");
+
+        // Create a symlink "ab" -> external_data in the receipts dir.
+        // "ab" is a valid 2-char hex prefix, so the old code (using
+        // path.is_dir()) would follow this symlink and traverse
+        // external_data.
+        let symlink_shard = receipts_dir.join("ab");
+        std::os::unix::fs::symlink(&external_dir, &symlink_shard).expect("symlink");
+
+        // Verify the symlink exists and IS seen as a directory when following.
+        assert!(
+            symlink_shard.is_dir(),
+            "symlink target should appear as dir when following"
+        );
+
+        // load_gc_receipts must NOT follow the symlinked shard and must
+        // return empty results.
+        let result = load_gc_receipts(receipts_dir, 0);
+        assert!(
+            result.receipts.is_empty(),
+            "load_gc_receipts must not follow symlinked shard directories \
+             (got {} results from external dir)",
+            result.receipts.len()
+        );
+    }
+
+    // =========================================================================
+    // MAJOR-2 regression: deterministic cap + truncation flag
+    // =========================================================================
+
+    #[test]
+    fn load_gc_receipts_result_sorted_deterministically() {
+        // Verify that load_gc_receipts returns receipts sorted by
+        // (timestamp_secs, content_hash) regardless of filesystem order.
+        use crate::fac::gc_receipt::persist_gc_receipt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Write receipts with varying timestamps.
+        let gc_c = make_gc_receipt(9000, 300);
+        let gc_a = make_gc_receipt(7000, 100);
+        let gc_b = make_gc_receipt(8000, 200);
+        persist_gc_receipt(receipts_dir, gc_c).expect("persist");
+        persist_gc_receipt(receipts_dir, gc_a).expect("persist");
+        persist_gc_receipt(receipts_dir, gc_b).expect("persist");
+
+        let result = load_gc_receipts(receipts_dir, 0);
+        assert_eq!(result.receipts.len(), 3);
+        assert!(!result.truncated, "should not be truncated");
+        // Must be sorted by timestamp ascending.
+        assert_eq!(result.receipts[0].timestamp_secs, 7000);
+        assert_eq!(result.receipts[1].timestamp_secs, 8000);
+        assert_eq!(result.receipts[2].timestamp_secs, 9000);
+    }
+
+    #[test]
+    fn gc_receipts_truncated_field_serializes() {
+        // Verify the gc_receipts_truncated field appears in JSON output
+        // when true, and defaults to false when absent.
+        let mut summary = MetricsSummary {
+            schema: METRICS_SUMMARY_SCHEMA.to_string(),
+            gc_receipts_truncated: true,
+            ..MetricsSummary::default()
+        };
+        let json_str = serde_json::to_string_pretty(&summary).expect("serialize");
+        assert!(
+            json_str.contains("\"gc_receipts_truncated\": true"),
+            "gc_receipts_truncated=true must appear in JSON"
+        );
+
+        summary.gc_receipts_truncated = false;
+        let json_str2 = serde_json::to_string_pretty(&summary).expect("serialize");
+        assert!(
+            json_str2.contains("\"gc_receipts_truncated\": false"),
+            "gc_receipts_truncated=false must appear in JSON"
+        );
+
+        // Verify serde(default) allows deserialization of old JSON without
+        // the field.
+        let old_json = r#"{
+            "schema": "apm2.fac.metrics_summary.v1",
+            "since_epoch_secs": 0,
+            "until_epoch_secs": 0,
+            "completed_jobs": 0,
+            "denied_jobs": 0,
+            "quarantined_jobs": 0,
+            "cancelled_jobs": 0,
+            "total_receipts": 0,
+            "throughput_jobs_per_hour": 0.0,
+            "denial_counts_by_reason": {},
+            "disk_preflight_failures": 0,
+            "gc_freed_bytes": 0,
+            "gc_receipts": 0
+        }"#;
+        let deserialized: MetricsSummary =
+            serde_json::from_str(old_json).expect("deserialize old JSON");
+        assert!(
+            !deserialized.gc_receipts_truncated,
+            "gc_receipts_truncated must default to false for old JSON"
         );
     }
 

@@ -6453,9 +6453,11 @@ fn run_metrics(args: &MetricsArgs, json_output: bool) -> u8 {
     }
 
     // Load GC receipts.
-    let gc_receipts = apm2_core::fac::load_gc_receipts(&receipts_dir, since_secs);
+    let gc_result = apm2_core::fac::load_gc_receipts(&receipts_dir, since_secs);
+    let gc_receipts_truncated = gc_result.truncated;
     // Filter GC receipts by until bound.
-    let gc_receipts: Vec<_> = gc_receipts
+    let gc_receipts: Vec<_> = gc_result
+        .receipts
         .into_iter()
         .filter(|r| r.timestamp_secs <= until_secs)
         .collect();
@@ -6467,7 +6469,8 @@ fn run_metrics(args: &MetricsArgs, json_output: bool) -> u8 {
         until_epoch_secs: until_secs,
     };
 
-    let summary = apm2_core::fac::compute_metrics(&input);
+    let mut summary = apm2_core::fac::compute_metrics(&input);
+    summary.gc_receipts_truncated = gc_receipts_truncated;
 
     if json_output || args.json {
         match serde_json::to_string_pretty(&summary) {
@@ -6542,6 +6545,12 @@ fn print_metrics_human(s: &apm2_core::fac::MetricsSummary) {
         format_bytes_simple(s.gc_freed_bytes),
         s.gc_receipts
     );
+    if s.gc_receipts_truncated {
+        println!(
+            "  WARNING: GC receipt list truncated at {} entries",
+            apm2_core::fac::MAX_GC_RECEIPTS_LOADED
+        );
+    }
 }
 
 /// Simple byte formatting for human output.
