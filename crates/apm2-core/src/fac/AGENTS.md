@@ -941,6 +941,12 @@ by another worker).
   by `MAX_DIR_ENTRIES` (10,000, matching INV-RMTREE-009). Exceeding the limit
   returns `Err` with a DoS-prevention reason, preventing directory-flood
   resource exhaustion.
+- [INV-LANE-CLEANUP-004b] Top-level regular files under `logs/` are removed
+  unconditionally by `enforce_log_retention` (fail-closed: only job-log
+  subdirectories are valid entries). Top-level symlinks are also removed
+  unconditionally (symlinks in `logs/` are never valid). The GC planner
+  (`collect_lane_log_retention_targets`) mirrors this behavior by emitting
+  GC targets for stray files and symlinks.
 - [INV-LANE-CLEANUP-005] A RUNNING `LaneLeaseV1` must be persisted before
   job execution and removed on every terminal path.
 - [INV-LANE-CLEANUP-006] Job completion (Completed receipt + move to completed/)

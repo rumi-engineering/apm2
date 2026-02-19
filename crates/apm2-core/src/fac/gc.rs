@@ -525,12 +525,31 @@ fn collect_lane_log_retention_targets(
             let Ok(metadata) = path.symlink_metadata() else {
                 continue;
             };
-            // Skip symlinks (security: no symlink following).
+            // Fail-closed: symlinks under logs/ are never valid.
+            // Emit them as GC targets for unconditional removal so the
+            // GC executor will clean them up, preventing symlink-based
+            // quota bypass.
             if metadata.file_type().is_symlink() {
+                targets.push(GcTarget {
+                    path,
+                    allowed_parent: log_dir.clone(),
+                    kind: crate::fac::gc_receipt::GcActionKind::LaneLogRetention,
+                    estimated_bytes: 0,
+                });
                 continue;
             }
-            // Only consider directories (job log subdirectories).
+            // Regular files under logs/ are invalid (only job-log
+            // subdirectories belong here). Emit them as GC targets so
+            // they are removed during GC, preventing stray files from
+            // bypassing per-lane log-retention controls.
             if !metadata.is_dir() {
+                let file_bytes = metadata.len();
+                targets.push(GcTarget {
+                    path,
+                    allowed_parent: log_dir.clone(),
+                    kind: crate::fac::gc_receipt::GcActionKind::LaneLogRetention,
+                    estimated_bytes: file_bytes,
+                });
                 continue;
             }
             let modified_secs = metadata
@@ -2732,7 +2751,7 @@ mod tests {
     }
 
     #[test]
-    fn log_retention_skips_symlinks_and_files() {
+    fn log_retention_targets_top_level_files_and_symlinks() {
         let dir = tempdir().expect("tmp");
         let fac_root = dir.path().join("fac");
         std::fs::create_dir_all(&fac_root).expect("fac");
@@ -2774,17 +2793,33 @@ mod tests {
             &mut targets,
         );
 
-        // Neither the file nor the symlink should appear as targets.
+        // Regular files must appear as GC targets (fail-closed: stray
+        // files cannot bypass per-lane log-retention controls).
         assert!(
-            !targets.iter().any(|t| t.path == file_path),
-            "regular files in logs dir must not be targeted"
+            targets.iter().any(|t| t.path == file_path),
+            "regular files in logs dir must be targeted for removal"
         );
+        // Verify the file target includes its byte estimate.
+        let file_target = targets.iter().find(|t| t.path == file_path).unwrap();
+        assert_eq!(
+            file_target.estimated_bytes, 100,
+            "file target must report accurate byte estimate"
+        );
+
+        // Symlinks must appear as GC targets (fail-closed: symlinks in
+        // logs/ are never valid and must be removed).
         #[cfg(unix)]
         {
             let symlink_path = logs_dir.join("symlink-job");
             assert!(
-                !targets.iter().any(|t| t.path == symlink_path),
-                "symlinks in logs dir must not be targeted"
+                targets.iter().any(|t| t.path == symlink_path),
+                "symlinks in logs dir must be targeted for removal"
+            );
+            // Symlinks report zero bytes (they have no meaningful size).
+            let symlink_target = targets.iter().find(|t| t.path == symlink_path).unwrap();
+            assert_eq!(
+                symlink_target.estimated_bytes, 0,
+                "symlink target must report zero bytes"
             );
         }
     }

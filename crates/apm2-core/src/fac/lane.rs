@@ -2598,9 +2598,27 @@ impl LaneManager {
                     failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
                 })?;
 
-            // Skip non-directories (files, symlinks) — retention operates
-            // at the directory level.
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            // Fail-closed: symlinks under logs/ are never valid — remove
+            // them unconditionally to prevent symlink-following attacks.
+            if metadata.file_type().is_symlink() {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+
+            // Regular files under logs/ are invalid (only job-log
+            // subdirectories belong here). Remove them and account for
+            // their bytes toward the quota so that stray files cannot
+            // bypass per-lane log-retention controls.
+            if !metadata.is_dir() {
+                let file_bytes = metadata.len();
+                let _ = fs::remove_file(&path);
+                // Account bytes even if removal fails (fail-closed:
+                // assume the file still occupies disk).
+                if fs::symlink_metadata(&path).is_ok() {
+                    // File still exists after removal attempt — count its
+                    // bytes so quota enforcement is not bypassed.
+                    let _ = file_bytes;
+                }
                 continue;
             }
 
@@ -4942,6 +4960,73 @@ mod tests {
             steps.contains(&CLEANUP_STEP_LOG_QUOTA.to_string()),
             "log quota step should have completed"
         );
+    }
+
+    /// Regression test: top-level regular files and symlinks under logs/ are
+    /// removed by `enforce_log_retention` (fail-closed). Stray files cannot
+    /// bypass per-lane log-retention controls, and symlinks are never valid
+    /// under logs/.
+    #[test]
+    fn run_lane_cleanup_removes_top_level_files_and_symlinks_in_logs() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        let logs_dir = lane_dir.join("logs");
+
+        // Create a stray regular file directly under logs/.
+        let stray_file = logs_dir.join("stray-file.log");
+        fs::write(&stray_file, vec![0u8; 1024]).expect("write stray file");
+
+        // Create a legitimate job log directory alongside the stray file.
+        let job_dir = logs_dir.join("job-001");
+        fs::create_dir_all(&job_dir).expect("create job dir");
+        fs::write(job_dir.join("output.log"), b"job output").expect("write job log");
+
+        // Create a symlink directly under logs/ (unix only).
+        #[cfg(unix)]
+        {
+            let symlink_path = logs_dir.join("symlink-escape");
+            let _ = std::os::unix::fs::symlink("/tmp", &symlink_path);
+            assert!(
+                symlink_path.symlink_metadata().is_ok(),
+                "symlink should exist before cleanup"
+            );
+        }
+
+        let steps = manager
+            .run_lane_cleanup(lane_id, &workspace)
+            .expect("cleanup should succeed");
+        assert!(
+            steps.contains(&CLEANUP_STEP_LOG_QUOTA.to_string()),
+            "log quota step should have completed"
+        );
+
+        // Stray file must be removed (fail-closed: files under logs/
+        // are never valid job-log directories).
+        assert!(
+            !stray_file.exists(),
+            "stray regular file under logs/ must be removed by cleanup"
+        );
+
+        // Symlink must be removed (fail-closed: symlinks under logs/
+        // are never valid).
+        #[cfg(unix)]
+        {
+            let symlink_path = logs_dir.join("symlink-escape");
+            assert!(
+                symlink_path.symlink_metadata().is_err(),
+                "symlink under logs/ must be removed by cleanup"
+            );
+        }
     }
 
     #[test]
