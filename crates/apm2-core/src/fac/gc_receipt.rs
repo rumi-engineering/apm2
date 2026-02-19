@@ -120,6 +120,9 @@ pub enum GcActionKind {
     /// Receipt index compaction: prune old index entries and rebuild
     /// deterministically (TCK-00583).
     IndexCompaction,
+    /// Per-lane log retention pruning: removes job log directories that
+    /// exceed TTL, count, or per-lane byte quota (TCK-00571).
+    LaneLogRetention,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

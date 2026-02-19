@@ -3562,6 +3562,54 @@ GC (logged as a warning, GC continues).
   `migrate_legacy_evidence` which processes all entries in a single pass.
   No iteration loop or cap is needed.
 
+## Per-Lane Log Retention (TCK-00571)
+
+The `gc.rs` module includes per-lane log retention pruning, controlled by three
+policy knobs in `FacPolicyV1`:
+
+- `per_lane_log_max_bytes` (default 100 MiB): Maximum total log bytes per lane.
+  Oldest job log directories are pruned first to meet this quota.
+- `per_job_log_ttl_days` (default 7): Per-job log TTL. Job log directories older
+  than this are pruning candidates.
+- `keep_last_n_jobs_per_lane` (default 5): Number of most-recent job log
+  directories to retain regardless of TTL or byte quota.
+
+### Key Types
+
+- `LogRetentionConfig`: Runtime configuration struct derived from policy fields.
+  Decoupled from `FacPolicyV1` serialization format. Contains `per_lane_log_max_bytes`,
+  `per_job_log_ttl_secs`, and `keep_last_n_jobs_per_lane`.
+- `GcActionKind::LaneLogRetention`: New GC action kind for log retention pruning
+  targets in `gc_receipt.rs`.
+
+### Functions
+
+- `plan_gc_with_log_retention(fac_root, lane_manager, quarantine_ttl_secs,
+  denied_ttl_secs, log_retention)`: Extended GC planner that accepts explicit
+  `LogRetentionConfig`. The original `plan_gc()` delegates to this with default
+  config for backwards compatibility.
+- `collect_lane_log_retention_targets(lane_manager, lane_ids, config, now_secs,
+  targets)`: Scans each lane's `logs/` directory for job log subdirectories and
+  applies three-phase pruning: keep-last-N protection, TTL-based pruning, byte
+  quota enforcement. Deterministic ordering: mtime ascending, path tiebreaker.
+
+### CLI Integration
+
+`apm2 fac gc` (`fac_gc.rs`) derives `LogRetentionConfig` from `FacPolicyV1` and
+passes it to `plan_gc_with_log_retention`. The `gc_target_kind_to_str` mapping
+includes `"lane_log_retention"` for the new action kind.
+
+### Security Invariants (TCK-00571)
+
+- [INV-LLR-001] Bounded traversal: `MAX_JOB_LOG_ENTRIES_PER_LANE` (10,000)
+  limits per-lane scan depth (CTR-1303).
+- [INV-LLR-002] No symlink following: `symlink_metadata()` is used and symlinks
+  are skipped.
+- [INV-LLR-003] Deterministic pruning order: mtime ascending with path
+  tiebreaker. Protected entries (keep-last-N) are never pruned.
+- [INV-LLR-004] Policy defaults are conservative: 100 MiB byte quota, 7-day
+  TTL, keep-last-5. All use `#[serde(default)]` for backwards compatibility.
+
 ## metrics Submodule (TCK-00551)
 
 The `metrics` submodule extracts operator-facing observability metrics from FAC
