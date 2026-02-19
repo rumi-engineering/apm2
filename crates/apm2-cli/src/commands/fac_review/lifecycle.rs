@@ -3245,7 +3245,20 @@ fn save_verdict_projection_pending(
 fn replay_pending_verdict_projection_for_pr_locked(
     owner_repo: &str,
     pr_number: u32,
+    expected_head_sha: Option<&str>,
 ) -> Option<verdict_projection::PersistedVerdictProjection> {
+    let normalized_expected_head_sha = match expected_head_sha {
+        Some(value) => match super::types::validate_expected_head_sha(value) {
+            Ok(()) => Some(value.to_ascii_lowercase()),
+            Err(err) => {
+                eprintln!(
+                    "WARNING: invalid expected verdict projection replay SHA for PR #{pr_number}: {err}"
+                );
+                return None;
+            },
+        },
+        None => None,
+    };
     let pending = match projection_store::list_verdict_projection_pending_for_repo(
         owner_repo,
         VERDICT_PROJECTION_REPLAY_SCAN_LIMIT,
@@ -3262,6 +3275,13 @@ fn replay_pending_verdict_projection_for_pr_locked(
     let snapshot = pending
         .into_iter()
         .filter(|entry| entry.pr_number == pr_number)
+        .filter(|entry| {
+            if let Some(expected) = normalized_expected_head_sha.as_deref() {
+                entry.head_sha.eq_ignore_ascii_case(expected)
+            } else {
+                true
+            }
+        })
         .min_by(|lhs, rhs| {
             lhs.attempt_count
                 .cmp(&rhs.attempt_count)
@@ -3870,8 +3890,11 @@ fn finalize_auto_verdict_candidate(
     finalize_projected_verdict(&projected, &dimension, &candidate.run_id, Some("reaper"))?;
     let _projection_lock =
         verdict_projection::acquire_projection_lock(&projected.owner_repo, projected.pr_number)?;
-    let _ =
-        replay_pending_verdict_projection_for_pr_locked(&projected.owner_repo, projected.pr_number);
+    let _ = replay_pending_verdict_projection_for_pr_locked(
+        &projected.owner_repo,
+        projected.pr_number,
+        Some(&projected.head_sha),
+    );
     save_verdict_projection_pending(
         &projected.owner_repo,
         projected.pr_number,
@@ -3885,9 +3908,11 @@ fn finalize_auto_verdict_candidate(
         1,
         "auto_verdict",
     )?;
-    if let Some(projected_full) =
-        replay_pending_verdict_projection_for_pr_locked(&projected.owner_repo, projected.pr_number)
-        && projected_full.pr_number == projected.pr_number
+    if let Some(projected_full) = replay_pending_verdict_projection_for_pr_locked(
+        &projected.owner_repo,
+        projected.pr_number,
+        Some(&projected.head_sha),
+    ) && projected_full.pr_number == projected.pr_number
         && projected_full
             .head_sha
             .eq_ignore_ascii_case(&projected.head_sha)
@@ -4858,11 +4883,13 @@ fn run_verdict_set_inner(
         .and_then(|state| state.pid)
         .is_some_and(|reviewer_pid| is_descendant_of_pid(caller_pid, reviewer_pid));
     let finalize_verdict = || -> Result<u8, String> {
-        // Drain one older pending projection (same PR) before finalizing the
-        // current verdict so fanout remains ordered.
+        // Drain one older pending projection for the same PR+SHA before
+        // finalizing the current verdict so fanout remains ordered without
+        // replaying stale SHA snapshots.
         let _ = replay_pending_verdict_projection_for_pr_locked(
             &projected.owner_repo,
             projected.pr_number,
+            Some(&projected.head_sha),
         );
         finalize_projected_verdict(&projected, dimension, &run_id, None)?;
         // Queue projection intent first; replay is best-effort and may fail
@@ -4883,6 +4910,7 @@ fn run_verdict_set_inner(
         let projected_full = replay_pending_verdict_projection_for_pr_locked(
             &projected.owner_repo,
             projected.pr_number,
+            Some(&projected.head_sha),
         )
         .ok_or_else(|| {
             format!(

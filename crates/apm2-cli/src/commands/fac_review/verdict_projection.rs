@@ -629,17 +629,28 @@ fn persist_verdict_projection_impl(
 
     match projection_mode {
         ProjectionMode::Full => {
-            let (projected_comment_id, projected_comment_url) =
-                project_decision_comment(&owner_repo, resolved_pr, &record, &payload)?;
-            record.decision_comment_id = projected_comment_id;
-            record.decision_comment_url = projected_comment_url;
-            if record.decision_comment_id == 0 {
-                record.decision_comment_id = allocate_local_comment_id(
-                    resolved_pr,
-                    max_cached_issue_comment_id(&owner_repo, resolved_pr),
-                );
-            }
-            if record.decision_comment_url.trim().is_empty() {
+            if all_active_dimensions_have_terminal_verdict(&record) {
+                let (projected_comment_id, projected_comment_url) =
+                    project_decision_comment(&owner_repo, resolved_pr, &record, &payload)?;
+                record.decision_comment_id = projected_comment_id;
+                record.decision_comment_url = projected_comment_url;
+                if record.decision_comment_id == 0 {
+                    record.decision_comment_id = allocate_local_comment_id(
+                        resolved_pr,
+                        max_cached_issue_comment_id(&owner_repo, resolved_pr),
+                    );
+                }
+                if record.decision_comment_url.trim().is_empty() {
+                    record.decision_comment_url =
+                        local_comment_url(&owner_repo, resolved_pr, record.decision_comment_id);
+                }
+            } else {
+                if record.decision_comment_id == 0 {
+                    record.decision_comment_id = allocate_local_comment_id(
+                        resolved_pr,
+                        max_cached_issue_comment_id(&owner_repo, resolved_pr),
+                    );
+                }
                 record.decision_comment_url =
                     local_comment_url(&owner_repo, resolved_pr, record.decision_comment_id);
             }
@@ -1624,6 +1635,20 @@ fn normalize_optional_text(value: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn all_active_dimensions_have_terminal_verdict(record: &DecisionProjectionRecord) -> bool {
+    ACTIVE_DIMENSIONS.iter().all(|dimension| {
+        record
+            .dimensions
+            .get(*dimension)
+            .and_then(|entry| normalize_decision_value(&entry.decision))
+            .is_some()
+    })
+}
+
+fn decision_model_id_for_comment(entry: &DecisionEntry) -> String {
+    normalize_optional_text(entry.model_id.as_deref()).unwrap_or_else(|| "unknown".to_string())
+}
+
 fn aggregate_overall_decision(dimensions: &[DimensionDecisionView]) -> &'static str {
     let decisions = dimensions
         .iter()
@@ -1911,6 +1936,29 @@ struct DecisionCommentProjectionPayload {
     findings: Vec<DecisionCommentFinding>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct DecisionCommentRenderedEntry {
+    decision: String,
+    #[serde(default)]
+    reason: String,
+    model_id: String,
+    #[serde(default)]
+    set_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DecisionCommentRenderedPayload {
+    schema: String,
+    pr: u32,
+    sha: String,
+    updated_at: String,
+    dimensions: BTreeMap<String, DecisionCommentRenderedEntry>,
+    #[serde(default)]
+    findings: Vec<DecisionCommentFinding>,
+}
+
 fn normalize_optional_findings_text(value: Option<&str>) -> Option<String> {
     let raw = value?;
     if raw.trim().is_empty() {
@@ -1968,6 +2016,27 @@ fn collect_projected_findings(
     projected
 }
 
+fn build_rendered_decision_dimensions(
+    payload: &DecisionComment,
+) -> BTreeMap<String, DecisionCommentRenderedEntry> {
+    payload
+        .dimensions
+        .iter()
+        .map(|(dimension, entry)| {
+            (
+                dimension.clone(),
+                DecisionCommentRenderedEntry {
+                    decision: entry.decision.clone(),
+                    reason: entry.reason.clone(),
+                    model_id: decision_model_id_for_comment(entry),
+                    set_at: entry.set_at.clone(),
+                    backend_id: normalize_optional_text(entry.backend_id.as_deref()),
+                },
+            )
+        })
+        .collect()
+}
+
 fn render_decision_comment_body(
     owner_repo: &str,
     pr_number: u32,
@@ -1985,12 +2054,12 @@ fn render_decision_comment_body(
             None
         },
     };
-    let projection_payload = DecisionCommentProjectionPayload {
+    let projection_payload = DecisionCommentRenderedPayload {
         schema: payload.schema.clone(),
         pr: payload.pr,
         sha: payload.sha.clone(),
         updated_at: payload.updated_at.clone(),
-        dimensions: payload.dimensions.clone(),
+        dimensions: build_rendered_decision_dimensions(payload),
         findings: collect_projected_findings(findings_bundle.as_ref(), payload),
     };
     fenced_yaml::render_marked_yaml_comment(DECISION_MARKER, &projection_payload)
@@ -2182,7 +2251,7 @@ mod tests {
                 reason: "all checks passed".to_string(),
                 set_by: "fac-bot".to_string(),
                 set_at: "2026-02-14T00:00:00Z".to_string(),
-                model_id: None,
+                model_id: Some("gpt-5.3-codex".to_string()),
                 backend_id: None,
             },
         );
@@ -2207,6 +2276,9 @@ mod tests {
         assert!(body.contains("findings:"));
         assert!(!body.contains("## FAC Findings"));
         assert!(!body.contains("### security"));
+        assert!(body.contains("model_id:"));
+        assert!(body.contains("gpt-5.3-codex"));
+        assert!(!body.contains("set_by:"));
     }
 
     #[test]
@@ -2240,6 +2312,52 @@ mod tests {
         let report = build_show_report_from_record(head_sha, &record);
         assert_eq!(report.overall_decision, "pending");
         assert!(!report.fail_closed);
+    }
+
+    #[test]
+    fn active_dimension_projection_requires_all_terminal_verdicts() {
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let mut dimensions = BTreeMap::new();
+        dimensions.insert(
+            "security".to_string(),
+            DecisionEntry {
+                decision: "approve".to_string(),
+                reason: String::new(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-13T00:00:00Z".to_string(),
+                model_id: Some("gpt-5.3-codex".to_string()),
+                backend_id: None,
+            },
+        );
+        let mut record = DecisionProjectionRecord {
+            schema: "apm2.fac.projection.verdict.v1".to_string(),
+            owner_repo: "example/repo".to_string(),
+            pr_number: 441,
+            head_sha: head_sha.to_string(),
+            updated_at: "2026-02-13T00:00:00Z".to_string(),
+            decision_comment_id: 88,
+            decision_comment_url: "local://fac_projection/example/repo/pr-441/issue_comments#88"
+                .to_string(),
+            decision_signature: String::new(),
+            dimensions,
+            integrity_hmac: None,
+        };
+
+        assert!(!super::all_active_dimensions_have_terminal_verdict(&record));
+
+        record.dimensions.insert(
+            "code-quality".to_string(),
+            DecisionEntry {
+                decision: "deny".to_string(),
+                reason: "blocker".to_string(),
+                set_by: "fac-bot".to_string(),
+                set_at: "2026-02-13T00:00:01Z".to_string(),
+                model_id: Some("gemini-3-flash-preview".to_string()),
+                backend_id: None,
+            },
+        );
+
+        assert!(super::all_active_dimensions_have_terminal_verdict(&record));
     }
 
     #[test]

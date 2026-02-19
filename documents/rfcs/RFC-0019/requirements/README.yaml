@@ -100,6 +100,9 @@ rfc_requirements_readme:
     - id: "REQ-0041"
       title: "Doctor wait loop must terminate on manual/complete states with reasoned terminal events"
       file: "REQ-0041.yaml"
+    - id: "REQ-0042"
+      title: "Verdict projection emits one combined GitHub comment per SHA after full dimension resolution"
+      file: "REQ-0042.yaml"
   required_conventions:
     - "Root key MUST be requirement (RFC-0019 legacy format; migrate to rfc_requirement when tooling is ready)."
     - "requirement.id MUST match filename."
