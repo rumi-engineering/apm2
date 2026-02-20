@@ -419,6 +419,13 @@ fn enqueue_direct(
 ///   malicious submission cannot bypass queue bounds or spec validation.
 fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result<PathBuf, String> {
     let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+    // Track whether we created directories so we only chmod when we own them.
+    // A non-service-user caller cannot chmod directories owned by the service
+    // user (EPERM), so for pre-existing directories we validate mode instead.
+    let queue_root_existed = queue_root.is_dir();
+    let broker_dir_existed = broker_dir.is_dir();
+
     fs::create_dir_all(&broker_dir).map_err(|err| {
         format!(
             "cannot create broker requests directory {}: {err}. \
@@ -428,24 +435,69 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
         )
     })?;
 
-    // TCK-00577 round 8: Harden queue root to mode 0711 when created via
-    // the broker-mediated path. This prevents world-listing of queue
-    // artifacts when the queue root is first created by a non-service-user
-    // enqueue submission. Fail-closed: if set_permissions fails, the
-    // enqueue is rejected.
+    // TCK-00577 round 9 MAJOR fix: Only chmod directories that this process
+    // just created. For pre-existing directories (owned by the service user),
+    // validate the existing mode is acceptable instead of attempting chmod
+    // (which returns EPERM for non-owner callers). This makes the broker
+    // fallback work for non-service-user processes.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(queue_root, fs::Permissions::from_mode(0o711))
-            .map_err(|err| format!("harden queue root mode to 0711: {err}"))?;
+        if queue_root_existed {
+            // Pre-existing: validate mode is safe. Accept 0700 (strict) or
+            // 0711 (traverse-only). Reject modes with read/write for
+            // group/other.
+            let meta = fs::metadata(queue_root)
+                .map_err(|err| format!("stat queue root {}: {err}", queue_root.display()))?;
+            let mode = meta.permissions().mode() & 0o7777;
+            // Reject group/other read or write bits (0o066) but allow
+            // execute-only (0o011) for traversal.
+            if mode & 0o066 != 0 {
+                return Err(format!(
+                    "queue root {} has unsafe mode {:04o} (expected 0700 or 0711): \
+                     the service user should fix permissions",
+                    queue_root.display(),
+                    mode
+                ));
+            }
+        } else {
+            // We created it — set mode 0711 (traversal-only for group/other).
+            fs::set_permissions(queue_root, fs::Permissions::from_mode(0o711))
+                .map_err(|err| format!("harden queue root mode to 0711: {err}"))?;
+        }
     }
 
-    // Set broker_requests to mode 01733 if we created it.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&broker_dir, fs::Permissions::from_mode(0o1733))
-            .map_err(|err| format!("harden broker_requests mode to 01733: {err}"))?;
+        if broker_dir_existed {
+            // Pre-existing: validate the directory has acceptable mode.
+            // Accept 01733 (sticky + wx for group/other) or 0700 (strict
+            // before worker hardens it).
+            let meta = fs::metadata(&broker_dir)
+                .map_err(|err| format!("stat broker_requests {}: {err}", broker_dir.display()))?;
+            let mode = meta.permissions().mode() & 0o7777;
+            // The expected modes are 01733 (service user provisioned) or
+            // 0700 (strict default). We need write access to create files,
+            // but reading/listing is not required. The actual writability
+            // is tested by the tempfile creation below (fail-closed).
+            // Accept any mode that doesn't have group/other read bits set
+            // (which would expose other users' submissions).
+            let has_other_read = mode & 0o044 != 0;
+            if has_other_read {
+                return Err(format!(
+                    "broker_requests {} has unsafe mode {:04o} (group/other read \
+                     exposes submissions): the service user should fix permissions",
+                    broker_dir.display(),
+                    mode
+                ));
+            }
+        } else {
+            // We created it — set mode 01733 (sticky + write-only for
+            // group/other).
+            fs::set_permissions(&broker_dir, fs::Permissions::from_mode(0o1733))
+                .map_err(|err| format!("harden broker_requests mode to 01733: {err}"))?;
+        }
     }
 
     let json = serde_json::to_string_pretty(spec).map_err(|err| format!("serialize: {err}"))?;
@@ -845,10 +897,12 @@ mod tests {
     #[test]
     fn enqueue_via_broker_requests_writes_to_broker_dir() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
-        let queue_root = dir.path();
+        // Use a subdirectory so queue_root doesn't pre-exist (avoids mode
+        // validation against the tempdir's default 0775).
+        let queue_root = dir.path().join("queue");
         let spec = test_job_spec("test-broker-001");
 
-        let result = enqueue_via_broker_requests(queue_root, &spec);
+        let result = enqueue_via_broker_requests(&queue_root, &spec);
         assert!(result.is_ok(), "broker enqueue should succeed: {result:?}");
 
         let path = result.unwrap();
@@ -867,12 +921,13 @@ mod tests {
     #[test]
     fn enqueue_via_broker_requests_rejects_oversize_spec() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
-        let queue_root = dir.path();
+        // Use a subdirectory so queue_root doesn't pre-exist.
+        let queue_root = dir.path().join("queue");
         let mut spec = test_job_spec("test-broker-oversize");
         // Make the spec exceed MAX_JOB_SPEC_SIZE by stuffing a large field.
         spec.source.repo_id = "x".repeat(MAX_JOB_SPEC_SIZE + 1);
 
-        let result = enqueue_via_broker_requests(queue_root, &spec);
+        let result = enqueue_via_broker_requests(&queue_root, &spec);
         assert!(
             result.is_err(),
             "oversize spec should be rejected: {result:?}"
@@ -1039,6 +1094,103 @@ mod tests {
         assert_eq!(
             br_mode, 0o1733,
             "broker_requests should be mode 01733, got {br_mode:04o}"
+        );
+    }
+
+    // ── Broker fallback with pre-existing directories (TCK-00577 round 9) ──
+
+    /// TCK-00577 round 9 MAJOR fix: Broker-mediated enqueue must succeed when
+    /// queue directories already exist with correct modes. Previously, the
+    /// function unconditionally called chmod, which returns EPERM for non-owner
+    /// callers. Now it only chmods newly-created dirs and validates existing
+    /// ones.
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_via_broker_requests_succeeds_with_preexisting_correct_mode_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path().join("queue");
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        // Simulate service-user-provisioned directories with correct modes.
+        std::fs::create_dir_all(&broker_dir).expect("create broker dir");
+        std::fs::set_permissions(&queue_root, std::fs::Permissions::from_mode(0o711))
+            .expect("set queue root mode");
+        std::fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o1733))
+            .expect("set broker dir mode");
+
+        let spec = test_job_spec("test-preexist-001");
+        let result = enqueue_via_broker_requests(&queue_root, &spec);
+        assert!(
+            result.is_ok(),
+            "broker enqueue with pre-existing correct-mode dirs should succeed: {result:?}"
+        );
+
+        let path = result.unwrap();
+        assert!(path.exists(), "broker request file should exist");
+    }
+
+    /// TCK-00577 round 9 MAJOR fix: Broker-mediated enqueue must reject
+    /// pre-existing directories with unsafe modes (group/other read).
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_via_broker_requests_rejects_preexisting_unsafe_queue_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path().join("queue");
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        // Create directories with unsafe mode (world-readable queue root).
+        std::fs::create_dir_all(&broker_dir).expect("create broker dir");
+        std::fs::set_permissions(&queue_root, std::fs::Permissions::from_mode(0o755))
+            .expect("set unsafe queue root mode");
+        std::fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o1733))
+            .expect("set broker dir mode");
+
+        let spec = test_job_spec("test-unsafe-qroot-001");
+        let result = enqueue_via_broker_requests(&queue_root, &spec);
+        assert!(
+            result.is_err(),
+            "broker enqueue should reject unsafe queue root mode: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unsafe mode"),
+            "error should mention unsafe mode: {err}"
+        );
+    }
+
+    /// TCK-00577 round 9 MAJOR fix: Broker-mediated enqueue must reject
+    /// pre-existing `broker_requests/` with group/other read bits.
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_via_broker_requests_rejects_preexisting_readable_broker_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path().join("queue");
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        // Create directories — queue root is safe but broker_requests has
+        // read bits (mode 0755 instead of 01733).
+        std::fs::create_dir_all(&broker_dir).expect("create broker dir");
+        std::fs::set_permissions(&queue_root, std::fs::Permissions::from_mode(0o711))
+            .expect("set queue root mode");
+        std::fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("set unsafe broker dir mode");
+
+        let spec = test_job_spec("test-unsafe-broker-001");
+        let result = enqueue_via_broker_requests(&queue_root, &spec);
+        assert!(
+            result.is_err(),
+            "broker enqueue should reject broker_requests with read bits: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unsafe mode"),
+            "error should mention unsafe mode: {err}"
         );
     }
 }

@@ -2200,12 +2200,21 @@ pub fn run_fac(
     // TCK-00577 round 6: Bench spawns gate measurements as child processes
     // that need the relaxed permission validation path (same as enqueue-class
     // commands), so include it here.
+    // TCK-00577 round 9 MAJOR fix: Worker and Broker subcommands must also
+    // use relaxed validation. The worker itself sets queue/ to 0711 and
+    // broker_requests/ to 01733 via ensure_queue_dirs(). The strict validator
+    // (0700-only) rejects these intentional modes, causing worker restart to
+    // fail at preflight after mode hardening. The relaxed validator permits
+    // execute-only traversal bits (0o011) while still rejecting read/write
+    // group/other bits.
     let is_enqueue_class = matches!(
         cmd.subcommand,
         FacSubcommand::Push(_)
             | FacSubcommand::Gates(_)
             | FacSubcommand::Warm(_)
             | FacSubcommand::Bench(_)
+            | FacSubcommand::Worker(_)
+            | FacSubcommand::Broker(_)
     );
     let permissions_result = if is_enqueue_class {
         crate::commands::fac_permissions::validate_fac_root_permissions_relaxed_for_enqueue()

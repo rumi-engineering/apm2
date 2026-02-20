@@ -1707,7 +1707,49 @@ fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy)
             None => continue,
         };
 
+        // BLOCKER fix (TCK-00577 round 9): Pre-open file type check to
+        // prevent FIFO poisoning. An attacker with write access to the
+        // world-writable broker_requests/ (mode 01733) can create a FIFO
+        // named *.json. Opening a FIFO without O_NONBLOCK blocks
+        // indefinitely, stalling the worker. Use symlink_metadata (lstat)
+        // to check file type BEFORE opening. Only regular files are
+        // allowed; FIFOs, sockets, devices, and symlinks are quarantined.
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) => {
+                if !meta.file_type().is_file() {
+                    let kind = if meta.file_type().is_symlink() {
+                        "symlink"
+                    } else if meta.file_type().is_dir() {
+                        "directory"
+                    } else {
+                        "non-regular-file (FIFO/socket/device)"
+                    };
+                    tracing::warn!(
+                        path = %path.display(),
+                        file_type = kind,
+                        "TCK-00577: quarantining non-regular-file broker request \
+                         (FIFO poisoning defense)"
+                    );
+                    let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
+                    continue;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "TCK-00577: quarantining broker request with unreadable metadata"
+                );
+                let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
+                continue;
+            },
+        }
+
         // Bounded read (reuse MAX_JOB_SPEC_SIZE from job_spec module).
+        // Defense-in-depth: read_bounded also uses O_NONBLOCK and checks
+        // file type via fstat after open, but the pre-open lstat above
+        // prevents the open(2) call from blocking on a FIFO in the first
+        // place.
         let bytes = match read_bounded(&path, apm2_core::fac::job_spec::MAX_JOB_SPEC_SIZE) {
             Ok(b) => b,
             Err(e) => {
@@ -11718,6 +11760,110 @@ mod tests {
         assert!(
             !broker_dir.join("under-cap-job.json").exists(),
             "broker request must be removed after successful promotion"
+        );
+    }
+
+    /// TCK-00577 round 9 BLOCKER fix: Verify that non-regular files (FIFOs)
+    /// in `broker_requests/` are quarantined without attempting to open them.
+    /// An attacker can create a FIFO in the world-writable `broker_requests/`
+    /// (mode 01733) directory. Without the pre-open file type check, opening
+    /// a FIFO blocks indefinitely (deadlocking the worker).
+    #[test]
+    #[cfg(unix)]
+    fn promote_broker_request_quarantines_fifo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+        let quarantine_dir = queue_root.join(QUARANTINE_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Create a FIFO (named pipe) in broker_requests/ with a .json
+        // extension to simulate the FIFO poisoning attack.
+        let fifo_path = broker_dir.join("malicious-fifo.json");
+        nix::unistd::mkfifo(&fifo_path, nix::sys::stat::Mode::S_IRWXU)
+            .expect("mkfifo must succeed");
+        assert!(fifo_path.exists(), "FIFO must exist");
+
+        // Also create a valid broker request to prove promotion still works
+        // for regular files after quarantining the FIFO.
+        let content = make_valid_broker_request_json("good-after-fifo");
+        fs::write(broker_dir.join("good-after-fifo.json"), &content)
+            .expect("write valid broker request");
+
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The FIFO must NOT be in pending/.
+        assert!(
+            !pending_dir.join("malicious-fifo.json").exists(),
+            "FIFO must not be promoted to pending/"
+        );
+
+        // The FIFO must be quarantined (moved to quarantine/).
+        assert!(
+            quarantine_dir.is_dir(),
+            "quarantine directory must exist after FIFO quarantine"
+        );
+        let quarantine_entries: Vec<_> = fs::read_dir(&quarantine_dir)
+            .expect("read quarantine")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("malicious-fifo"))
+            .collect();
+        assert!(
+            !quarantine_entries.is_empty(),
+            "FIFO must be moved to quarantine directory"
+        );
+
+        // The valid broker request must still be promoted.
+        assert!(
+            pending_dir.join("good-after-fifo.json").exists(),
+            "valid broker request must still be promoted after FIFO quarantine"
+        );
+    }
+
+    /// TCK-00577 round 9 BLOCKER fix: Verify that symlinks in
+    /// `broker_requests/` are quarantined without opening.
+    #[test]
+    #[cfg(unix)]
+    fn promote_broker_request_quarantines_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+        let quarantine_dir = queue_root.join(QUARANTINE_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Create a symlink pointing to /dev/zero (would cause infinite read).
+        let symlink_path = broker_dir.join("evil-symlink.json");
+        std::os::unix::fs::symlink("/dev/zero", &symlink_path).expect("create symlink");
+
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The symlink must NOT be in pending/.
+        assert!(
+            !pending_dir.join("evil-symlink.json").exists(),
+            "symlink must not be promoted to pending/"
+        );
+
+        // The symlink must be quarantined.
+        assert!(
+            quarantine_dir.is_dir(),
+            "quarantine directory must exist after symlink quarantine"
+        );
+        let quarantine_entries: Vec<_> = fs::read_dir(&quarantine_dir)
+            .expect("read quarantine")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("evil-symlink"))
+            .collect();
+        assert!(
+            !quarantine_entries.is_empty(),
+            "symlink must be moved to quarantine directory"
         );
     }
 
