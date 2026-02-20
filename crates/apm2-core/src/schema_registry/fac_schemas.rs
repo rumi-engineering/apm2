@@ -109,6 +109,20 @@ pub const CREDENTIAL_MOUNT_SCHEMA_ID: &str = "apm2.fac.credential_mount.v1";
 /// Schema ID for toolchain fingerprint v1.
 pub const TOOLCHAIN_FINGERPRINT_SCHEMA_ID: &str = "apm2.fac.toolchain_fingerprint.v1";
 
+// -- Work CAS schemas (RFC-0032 Phase 1, TCK-00633) --
+/// Schema ID for work spec v1 (immutable "what is this work?" CAS document).
+pub const WORK_SPEC_V1_SCHEMA_ID: &str = "apm2.work_spec.v1";
+
+/// Schema ID for work context entry v1 (append-only context/notes CAS
+/// document).
+pub const WORK_CONTEXT_ENTRY_V1_SCHEMA_ID: &str = "apm2.work_context_entry.v1";
+
+/// Schema ID for work loop profile v1 (operational knobs CAS document).
+pub const WORK_LOOP_PROFILE_V1_SCHEMA_ID: &str = "apm2.work_loop_profile.v1";
+
+/// Schema ID for work authority bindings v1 (authority pins CAS document).
+pub const WORK_AUTHORITY_BINDINGS_V1_SCHEMA_ID: &str = "apm2.work_authority_bindings.v1";
+
 // ---------------------------------------------------------------------------
 // Central registry list
 // ---------------------------------------------------------------------------
@@ -138,6 +152,11 @@ pub const ALL_FAC_SCHEMA_IDS: &[&str] = &[
     EFFICIENCY_PRIMITIVES_SCHEMA_ID,
     CREDENTIAL_MOUNT_SCHEMA_ID,
     TOOLCHAIN_FINGERPRINT_SCHEMA_ID,
+    // Work CAS schemas (RFC-0032 Phase 1, TCK-00633)
+    WORK_SPEC_V1_SCHEMA_ID,
+    WORK_CONTEXT_ENTRY_V1_SCHEMA_ID,
+    WORK_LOOP_PROFILE_V1_SCHEMA_ID,
+    WORK_AUTHORITY_BINDINGS_V1_SCHEMA_ID,
 ];
 
 // ---------------------------------------------------------------------------
@@ -353,7 +372,7 @@ mod tests {
         // ALL_FAC_SCHEMA_IDS, acting as a change-detection gate.
         assert_eq!(
             ALL_FAC_SCHEMA_IDS.len(),
-            15,
+            19,
             "ALL_FAC_SCHEMA_IDS count changed — update this test after adding new schemas"
         );
     }
@@ -452,6 +471,38 @@ mod tests {
         assert_eq!(
             EFFICIENCY_PRIMITIVES_SCHEMA_ID,
             EFFICIENCY_PRIMITIVES_SCHEMA
+        );
+    }
+
+    // -- Work CAS schema cross-references (TCK-00633, RFC-0032 Phase 1) --
+
+    #[test]
+    fn tck_00633_work_spec_v1_schema_id_matches_module() {
+        use crate::fac::WORK_SPEC_V1_SCHEMA;
+        assert_eq!(WORK_SPEC_V1_SCHEMA_ID, WORK_SPEC_V1_SCHEMA);
+    }
+
+    #[test]
+    fn tck_00633_work_context_entry_v1_schema_id_matches_module() {
+        use crate::fac::WORK_CONTEXT_ENTRY_V1_SCHEMA;
+        assert_eq!(
+            WORK_CONTEXT_ENTRY_V1_SCHEMA_ID,
+            WORK_CONTEXT_ENTRY_V1_SCHEMA
+        );
+    }
+
+    #[test]
+    fn tck_00633_work_loop_profile_v1_schema_id_matches_module() {
+        use crate::fac::WORK_LOOP_PROFILE_V1_SCHEMA;
+        assert_eq!(WORK_LOOP_PROFILE_V1_SCHEMA_ID, WORK_LOOP_PROFILE_V1_SCHEMA);
+    }
+
+    #[test]
+    fn tck_00633_work_authority_bindings_v1_schema_id_matches_module() {
+        use crate::fac::WORK_AUTHORITY_BINDINGS_V1_SCHEMA;
+        assert_eq!(
+            WORK_AUTHORITY_BINDINGS_V1_SCHEMA_ID,
+            WORK_AUTHORITY_BINDINGS_V1_SCHEMA
         );
     }
 

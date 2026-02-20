@@ -612,6 +612,13 @@ pub mod summary_receipt;
 pub mod tool_execution_receipt;
 pub mod tool_log_index;
 pub mod view_commitment;
+/// CAS-backed JSON schemas for work lifecycle artifacts (RFC-0032 Phase 1,
+/// TCK-00633).
+///
+/// Defines `WorkSpecV1`, `WorkContextEntryV1`, `WorkLoopProfileV1`, and
+/// `WorkAuthorityBindingsV1` with bounded decoding, `deny_unknown_fields`,
+/// and per-artifact byte limits.
+pub mod work_cas_schemas;
 // Re-export view commitment types
 // Re-export summary receipt types (TCK-00327)
 // Re-export builtin role types (TCK-00331)
@@ -812,4 +819,16 @@ pub use warm::{
     DEFAULT_WARM_PHASES, MAX_WARM_PHASES, MAX_WARM_RECEIPT_SIZE, MAX_WARM_STRING_LENGTH,
     WARM_RECEIPT_SCHEMA, WarmContainment, WarmError, WarmPhase, WarmPhaseResult, WarmReceiptV1,
     WarmToolVersions, collect_tool_versions, execute_warm, execute_warm_phase,
+};
+// Re-export work CAS schema types (TCK-00633, RFC-0032 Phase 1)
+pub use work_cas_schemas::{
+    MAX_AUTHORITY_BINDINGS_SIZE, MAX_BACKOFF_INTERVALS, MAX_CAPABILITY_HASHES,
+    MAX_CONTEXT_ENTRY_SIZE, MAX_LABELS, MAX_LONG_STRING_LENGTH, MAX_LOOP_PROFILE_SIZE,
+    MAX_MEDIUM_STRING_LENGTH, MAX_REQUIREMENT_IDS, MAX_SHORT_STRING_LENGTH, MAX_TAG_LENGTH,
+    MAX_TAGS, MAX_WORK_ID_LENGTH as MAX_WORK_CAS_WORK_ID_LENGTH, MAX_WORK_SPEC_SIZE, NudgePolicy,
+    RetryConfig, WORK_AUTHORITY_BINDINGS_V1_SCHEMA, WORK_CONTEXT_ENTRY_V1_SCHEMA,
+    WORK_LOOP_PROFILE_V1_SCHEMA, WORK_SPEC_V1_SCHEMA, WorkAuthorityBindingsV1, WorkCasSchemaError,
+    WorkContextEntryV1, WorkLoopProfileV1, WorkSpecRepo, WorkSpecV1, WorkspaceConfig,
+    bounded_decode_authority_bindings, bounded_decode_context_entry, bounded_decode_loop_profile,
+    bounded_decode_work_spec, canonicalize_for_cas,
 };
