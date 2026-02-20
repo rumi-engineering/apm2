@@ -148,7 +148,6 @@ pub enum LedgerError {
     LegacySchemaMismatch { details: String },
     LegacyModeReadOnly,
     MigrationAmbiguousState { frozen_rows: u64, events_rows: u64 },
-    MigrationLegacyRecreated { live_legacy_rows: u64, frozen_rows: u64 },
 }
 ```
 
@@ -234,7 +233,7 @@ RFC-0032 Phase 0: Migrates legacy `ledger_events` rows into the canonical `event
 - [INV-LED-011] Migration is idempotent: running twice does not duplicate rows or change hashes
 - [INV-LED-012] Hash chain is contiguous after migration: no NULL `event_hash` values
 - [INV-LED-013] Fail-closed: ambiguous schema state (both tables have rows) is rejected
-- [INV-LED-014] Fail-closed: if `ledger_events_legacy_frozen` exists AND a live `ledger_events` table also has rows (recreated by a legacy writer), returns `MigrationLegacyRecreated` error
+- [INV-LED-014] Idempotent re-migration: if `ledger_events_legacy_frozen` exists AND a live `ledger_events` table also has rows (written by a legacy writer post-cutover), the migration appends those rows to `events` continuing the hash chain from the current tail, then re-empties `ledger_events`
 - [INV-LED-015] `ledger_events` table is preserved after migration (emptied, not renamed) for legacy writer compatibility
 
 ### `Ledger::open_reader() -> Result<LedgerReader, LedgerError>`
