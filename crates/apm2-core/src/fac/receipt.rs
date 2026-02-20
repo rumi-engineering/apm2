@@ -5491,4 +5491,162 @@ pub mod tests {
             result.unwrap_err()
         );
     }
+
+    // -------------------------------------------------------------------------
+    // TCK-00571: observed_usage bounds enforced on deserialization path
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn deserialize_rejects_out_of_bounds_cpu_time_in_observed_usage() {
+        use crate::fac::cgroup_stats::MAX_CPU_TIME_US;
+
+        // Build a valid receipt, serialize it, then patch observed_usage
+        // with an out-of-range cpu_time_us value to simulate a malformed
+        // receipt arriving via deserialization (not builder).
+        let valid = make_valid_receipt();
+        let mut json: serde_json::Value =
+            serde_json::to_value(&valid).expect("serialize valid receipt");
+        json["observed_usage"] = serde_json::json!({
+            "cpu_time_us": MAX_CPU_TIME_US + 1
+        });
+        let bytes = serde_json::to_vec(&json).expect("re-serialize patched receipt");
+
+        let result = deserialize_job_receipt(&bytes);
+        assert!(
+            result.is_err(),
+            "deserialize_job_receipt must reject out-of-bounds cpu_time_us in observed_usage"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("cpu_time_us"),
+            "error must mention the offending field: {msg}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_out_of_bounds_peak_memory_in_observed_usage() {
+        use crate::fac::cgroup_stats::MAX_PEAK_MEMORY_BYTES;
+
+        let valid = make_valid_receipt();
+        let mut json: serde_json::Value =
+            serde_json::to_value(&valid).expect("serialize valid receipt");
+        json["observed_usage"] = serde_json::json!({
+            "peak_memory_bytes": MAX_PEAK_MEMORY_BYTES + 1
+        });
+        let bytes = serde_json::to_vec(&json).expect("re-serialize patched receipt");
+
+        let result = deserialize_job_receipt(&bytes);
+        assert!(
+            result.is_err(),
+            "deserialize_job_receipt must reject out-of-bounds peak_memory_bytes"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("peak_memory_bytes"),
+            "error must mention the offending field: {msg}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_out_of_bounds_io_read_bytes_in_observed_usage() {
+        use crate::fac::cgroup_stats::MAX_IO_BYTES;
+
+        let valid = make_valid_receipt();
+        let mut json: serde_json::Value =
+            serde_json::to_value(&valid).expect("serialize valid receipt");
+        json["observed_usage"] = serde_json::json!({
+            "io_read_bytes": MAX_IO_BYTES + 1
+        });
+        let bytes = serde_json::to_vec(&json).expect("re-serialize patched receipt");
+
+        let result = deserialize_job_receipt(&bytes);
+        assert!(
+            result.is_err(),
+            "deserialize_job_receipt must reject out-of-bounds io_read_bytes"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("io_read_bytes"),
+            "error must mention the offending field: {msg}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_out_of_bounds_io_write_bytes_in_observed_usage() {
+        use crate::fac::cgroup_stats::MAX_IO_BYTES;
+
+        let valid = make_valid_receipt();
+        let mut json: serde_json::Value =
+            serde_json::to_value(&valid).expect("serialize valid receipt");
+        json["observed_usage"] = serde_json::json!({
+            "io_write_bytes": MAX_IO_BYTES + 1
+        });
+        let bytes = serde_json::to_vec(&json).expect("re-serialize patched receipt");
+
+        let result = deserialize_job_receipt(&bytes);
+        assert!(
+            result.is_err(),
+            "deserialize_job_receipt must reject out-of-bounds io_write_bytes"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("io_write_bytes"),
+            "error must mention the offending field: {msg}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_out_of_bounds_tasks_count_in_observed_usage() {
+        use crate::fac::cgroup_stats::MAX_TASKS_COUNT;
+
+        let valid = make_valid_receipt();
+        let mut json: serde_json::Value =
+            serde_json::to_value(&valid).expect("serialize valid receipt");
+        json["observed_usage"] = serde_json::json!({
+            "tasks_count": MAX_TASKS_COUNT + 1
+        });
+        let bytes = serde_json::to_vec(&json).expect("re-serialize patched receipt");
+
+        let result = deserialize_job_receipt(&bytes);
+        assert!(
+            result.is_err(),
+            "deserialize_job_receipt must reject out-of-bounds tasks_count"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("tasks_count"),
+            "error must mention the offending field: {msg}"
+        );
+    }
+
+    #[test]
+    fn deserialize_accepts_valid_observed_usage() {
+        let valid = make_valid_receipt();
+        let mut json: serde_json::Value =
+            serde_json::to_value(&valid).expect("serialize valid receipt");
+        json["observed_usage"] = serde_json::json!({
+            "cpu_time_us": 1_000_000,
+            "peak_memory_bytes": 1_073_741_824u64,
+            "io_read_bytes": 1024,
+            "io_write_bytes": 2048,
+            "tasks_count": 8
+        });
+        let bytes = serde_json::to_vec(&json).expect("re-serialize patched receipt");
+
+        let result = deserialize_job_receipt(&bytes);
+        assert!(
+            result.is_ok(),
+            "deserialize_job_receipt must accept valid observed_usage: {:?}",
+            result.unwrap_err()
+        );
+        let receipt = result.unwrap();
+        let usage = receipt
+            .observed_usage
+            .expect("observed_usage must be present");
+        assert_eq!(usage.cpu_time_us, Some(1_000_000));
+        assert_eq!(usage.peak_memory_bytes, Some(1_073_741_824));
+        assert_eq!(usage.io_read_bytes, Some(1024));
+        assert_eq!(usage.io_write_bytes, Some(2048));
+        assert_eq!(usage.tasks_count, Some(8));
+    }
 }
