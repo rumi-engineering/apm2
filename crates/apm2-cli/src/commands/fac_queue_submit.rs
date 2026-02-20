@@ -481,13 +481,28 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
             // 0700 (strict default). We need write access to create files,
             // but reading/listing is not required. The actual writability
             // is tested by the tempfile creation below (fail-closed).
-            // Accept any mode that doesn't have group/other read bits set
-            // (which would expose other users' submissions).
+            //
+            // Two checks (fail-closed):
+            // 1. Reject group/other read bits (exposes other users' submissions).
+            // 2. If other-write bit is set, require sticky bit. Without sticky, any local
+            //    user can unlink/overwrite other users' files inside the directory,
+            //    breaking queue isolation (CVE-class: CWE-379).
             let has_other_read = mode & 0o044 != 0;
             if has_other_read {
                 return Err(format!(
                     "broker_requests {} has unsafe mode {:04o} (group/other read \
                      exposes submissions): the service user should fix permissions",
+                    broker_dir.display(),
+                    mode
+                ));
+            }
+            let has_other_write = mode & 0o002 != 0;
+            let has_sticky = mode & 0o1000 != 0;
+            if has_other_write && !has_sticky {
+                return Err(format!(
+                    "broker_requests {} has unsafe mode {:04o} (other-write without \
+                     sticky bit allows local users to unlink/replace peer queue \
+                     entries): the service user should set mode 01733",
                     broker_dir.display(),
                     mode
                 ));
@@ -1191,6 +1206,90 @@ mod tests {
         assert!(
             err.contains("unsafe mode"),
             "error should mention unsafe mode: {err}"
+        );
+    }
+
+    /// MAJOR fix: `broker_requests` with other-write but NO sticky bit (mode
+    /// 0333) allows local users to unlink/replace peer queue entries. Must
+    /// reject.
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_via_broker_requests_rejects_world_writable_no_sticky() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path().join("queue");
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        std::fs::create_dir_all(&broker_dir).expect("create broker dir");
+        std::fs::set_permissions(&queue_root, std::fs::Permissions::from_mode(0o711))
+            .expect("set queue root mode");
+        // Mode 0333: world-writable WITHOUT sticky bit — unsafe.
+        std::fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o333))
+            .expect("set broker dir mode 0333");
+
+        let spec = test_job_spec("test-no-sticky-001");
+        let result = enqueue_via_broker_requests(&queue_root, &spec);
+        assert!(
+            result.is_err(),
+            "broker enqueue should reject world-writable dir without sticky: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("sticky bit"),
+            "error should mention sticky bit: {err}"
+        );
+    }
+
+    /// MAJOR fix: `broker_requests` with other-write AND sticky bit (mode
+    /// 01333) is acceptable — sticky prevents cross-user unlink.
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_via_broker_requests_accepts_sticky_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path().join("queue");
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        std::fs::create_dir_all(&broker_dir).expect("create broker dir");
+        std::fs::set_permissions(&queue_root, std::fs::Permissions::from_mode(0o711))
+            .expect("set queue root mode");
+        // Mode 01333: world-writable WITH sticky bit — safe.
+        std::fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o1333))
+            .expect("set broker dir mode 01333");
+
+        let spec = test_job_spec("test-sticky-001");
+        let result = enqueue_via_broker_requests(&queue_root, &spec);
+        assert!(
+            result.is_ok(),
+            "broker enqueue should accept sticky world-writable dir: {result:?}"
+        );
+    }
+
+    /// Regression: mode 0700 (owner-only) without sticky is acceptable because
+    /// other-write is not set.
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_via_broker_requests_accepts_owner_only_no_sticky() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path().join("queue");
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        std::fs::create_dir_all(&broker_dir).expect("create broker dir");
+        std::fs::set_permissions(&queue_root, std::fs::Permissions::from_mode(0o700))
+            .expect("set queue root mode");
+        // Mode 0700: owner-only, no sticky needed.
+        std::fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("set broker dir mode 0700");
+
+        let spec = test_job_spec("test-owner-only-001");
+        let result = enqueue_via_broker_requests(&queue_root, &spec);
+        assert!(
+            result.is_ok(),
+            "broker enqueue should accept owner-only dir without sticky: {result:?}"
         );
     }
 }
