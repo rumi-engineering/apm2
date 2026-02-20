@@ -112,6 +112,135 @@ enum WorkerExecutionMode {
     RequireExternalWorker,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatesWaitState {
+    EvaluateTimeout,
+    CheckReceipt,
+    EvaluateQueueMode,
+    Sleep,
+    RunInlineWorker,
+    ExitWithReceipt,
+    ExitTimeout,
+}
+
+impl GatesWaitState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::EvaluateTimeout => "evaluate_timeout",
+            Self::CheckReceipt => "check_receipt",
+            Self::EvaluateQueueMode => "evaluate_queue_mode",
+            Self::Sleep => "sleep",
+            Self::RunInlineWorker => "run_inline_worker",
+            Self::ExitWithReceipt => "exit_with_receipt",
+            Self::ExitTimeout => "exit_timeout",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GatesWaitTransitionRule {
+    priority: u8,
+    from: GatesWaitState,
+    to: GatesWaitState,
+    guard: GatesWaitGuard,
+    guard_id: &'static str,
+    guard_predicate: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GatesWaitGuard {
+    TimedOut,
+    ReceiptFound,
+    InlineFallbackAllowed,
+    Always,
+}
+
+impl GatesWaitGuard {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TimedOut => "timed_out",
+            Self::ReceiptFound => "receipt_found",
+            Self::InlineFallbackAllowed => "inline_fallback_allowed",
+            Self::Always => "always",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GatesWaitFacts {
+    timed_out: bool,
+    receipt_found: bool,
+    queue_mode: QueueProcessingMode,
+    allow_inline_fallback: bool,
+}
+
+const GATES_WAIT_TRANSITION_RULES: &[GatesWaitTransitionRule] = &[
+    GatesWaitTransitionRule {
+        priority: 1,
+        from: GatesWaitState::CheckReceipt,
+        to: GatesWaitState::ExitWithReceipt,
+        guard: GatesWaitGuard::ReceiptFound,
+        guard_id: "GW-WAIT-003",
+        guard_predicate: "facts.receipt_found",
+    },
+    GatesWaitTransitionRule {
+        priority: 2,
+        from: GatesWaitState::CheckReceipt,
+        to: GatesWaitState::EvaluateTimeout,
+        guard: GatesWaitGuard::Always,
+        guard_id: "GW-WAIT-004",
+        guard_predicate: "default",
+    },
+    GatesWaitTransitionRule {
+        priority: 3,
+        from: GatesWaitState::EvaluateTimeout,
+        to: GatesWaitState::ExitTimeout,
+        guard: GatesWaitGuard::TimedOut,
+        guard_id: "GW-WAIT-001",
+        guard_predicate: "facts.timed_out",
+    },
+    GatesWaitTransitionRule {
+        priority: 4,
+        from: GatesWaitState::EvaluateTimeout,
+        to: GatesWaitState::EvaluateQueueMode,
+        guard: GatesWaitGuard::Always,
+        guard_id: "GW-WAIT-002",
+        guard_predicate: "default",
+    },
+    GatesWaitTransitionRule {
+        priority: 5,
+        from: GatesWaitState::EvaluateQueueMode,
+        to: GatesWaitState::RunInlineWorker,
+        guard: GatesWaitGuard::InlineFallbackAllowed,
+        guard_id: "GW-WAIT-005",
+        guard_predicate: "facts.queue_mode == inline_single_job && facts.allow_inline_fallback",
+    },
+    GatesWaitTransitionRule {
+        priority: 6,
+        from: GatesWaitState::EvaluateQueueMode,
+        to: GatesWaitState::Sleep,
+        guard: GatesWaitGuard::Always,
+        guard_id: "GW-WAIT-006",
+        guard_predicate: "default",
+    },
+    GatesWaitTransitionRule {
+        priority: 7,
+        from: GatesWaitState::RunInlineWorker,
+        to: GatesWaitState::CheckReceipt,
+        guard: GatesWaitGuard::Always,
+        guard_id: "GW-WAIT-007",
+        guard_predicate: "always",
+    },
+    GatesWaitTransitionRule {
+        priority: 8,
+        from: GatesWaitState::Sleep,
+        to: GatesWaitState::CheckReceipt,
+        guard: GatesWaitGuard::Always,
+        guard_id: "GW-WAIT-008",
+        guard_predicate: "always",
+    },
+];
+
 /// Request payload for queued FAC gates execution.
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -2039,6 +2168,59 @@ fn wait_for_gates_job_receipt(
     )
 }
 
+fn gates_wait_rule_triggered(rule: &GatesWaitTransitionRule, facts: GatesWaitFacts) -> bool {
+    match rule.guard {
+        GatesWaitGuard::TimedOut => facts.timed_out,
+        GatesWaitGuard::ReceiptFound => facts.receipt_found,
+        GatesWaitGuard::InlineFallbackAllowed => {
+            facts.queue_mode == QueueProcessingMode::InlineSingleJob && facts.allow_inline_fallback
+        },
+        GatesWaitGuard::Always => true,
+    }
+}
+
+fn derive_gates_wait_next_state(current: GatesWaitState, facts: GatesWaitFacts) -> GatesWaitState {
+    for rule in GATES_WAIT_TRANSITION_RULES {
+        if rule.from != current {
+            continue;
+        }
+        if gates_wait_rule_triggered(rule, facts) {
+            return rule.to;
+        }
+    }
+    current
+}
+
+pub(super) fn gates_wait_machine_spec_json() -> serde_json::Value {
+    let transitions = GATES_WAIT_TRANSITION_RULES
+        .iter()
+        .map(|rule| {
+            serde_json::json!({
+                "priority": rule.priority,
+                "from": rule.from.as_str(),
+                "to": rule.to.as_str(),
+                "guard_id": rule.guard_id,
+                "guard_kind": rule.guard.as_str(),
+                "guard_predicate": rule.guard_predicate,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schema": "apm2.fac.review.gates_wait_machine.v1",
+        "evaluation": "first_matching_guard_applies",
+        "states": [
+            GatesWaitState::EvaluateTimeout.as_str(),
+            GatesWaitState::CheckReceipt.as_str(),
+            GatesWaitState::EvaluateQueueMode.as_str(),
+            GatesWaitState::Sleep.as_str(),
+            GatesWaitState::RunInlineWorker.as_str(),
+            GatesWaitState::ExitWithReceipt.as_str(),
+            GatesWaitState::ExitTimeout.as_str(),
+        ],
+        "transitions": transitions,
+    })
+}
+
 fn wait_for_gates_job_receipt_with_mode(
     fac_root: &Path,
     job_id: &str,
@@ -2078,25 +2260,61 @@ fn wait_for_gates_job_terminal_receipt_with_mode(
 ) -> Result<apm2_core::fac::FacJobReceiptV1, String> {
     let receipts_dir = fac_root.join("receipts");
     let start = Instant::now();
+    let mut state = GatesWaitState::CheckReceipt;
+    let mut last_receipt: Option<apm2_core::fac::FacJobReceiptV1> = None;
+    let mut queue_mode = QueueProcessingMode::ExternalWorker;
+
     loop {
-        if start.elapsed() >= timeout {
-            return Err(format!(
-                "gates job {job_id} did not reach terminal receipt within {}s",
-                timeout.as_secs()
-            ));
-        }
-        if let Some(receipt) = lookup_job_receipt(&receipts_dir, job_id) {
-            return Ok(receipt);
-        }
-        match detect_queue_processing_mode(fac_root) {
-            QueueProcessingMode::ExternalWorker => {
-                std::thread::sleep(Duration::from_secs(GATES_WAIT_POLL_INTERVAL_SECS));
+        let facts = GatesWaitFacts {
+            timed_out: start.elapsed() >= timeout,
+            receipt_found: last_receipt.is_some(),
+            queue_mode,
+            allow_inline_fallback: mode == WorkerExecutionMode::AllowInlineFallback,
+        };
+        match state {
+            GatesWaitState::CheckReceipt => {
+                last_receipt = lookup_job_receipt(&receipts_dir, job_id);
+                let facts = GatesWaitFacts {
+                    receipt_found: last_receipt.is_some(),
+                    ..facts
+                };
+                state = derive_gates_wait_next_state(state, facts);
             },
-            QueueProcessingMode::InlineSingleJob => match mode {
-                WorkerExecutionMode::AllowInlineFallback => run_inline_worker_cycle()?,
-                WorkerExecutionMode::RequireExternalWorker => {
-                    std::thread::sleep(Duration::from_secs(GATES_WAIT_POLL_INTERVAL_SECS));
-                },
+            GatesWaitState::EvaluateTimeout => {
+                state = derive_gates_wait_next_state(state, facts);
+            },
+            GatesWaitState::EvaluateQueueMode => {
+                queue_mode = detect_queue_processing_mode(fac_root);
+                let facts = GatesWaitFacts {
+                    queue_mode,
+                    ..facts
+                };
+                state = derive_gates_wait_next_state(state, facts);
+            },
+            GatesWaitState::Sleep => {
+                std::thread::sleep(Duration::from_secs(GATES_WAIT_POLL_INTERVAL_SECS));
+                state = derive_gates_wait_next_state(state, facts);
+            },
+            GatesWaitState::RunInlineWorker => {
+                run_inline_worker_cycle()?;
+                state = derive_gates_wait_next_state(state, facts);
+            },
+            GatesWaitState::ExitWithReceipt => {
+                if let Some(receipt) = last_receipt {
+                    return Ok(receipt);
+                }
+                return Err(format!(
+                    "gates job {job_id} wait machine reached receipt terminal state without a receipt",
+                ));
+            },
+            GatesWaitState::ExitTimeout => {
+                if let Some(receipt) = lookup_job_receipt(&receipts_dir, job_id) {
+                    return Ok(receipt);
+                }
+                return Err(format!(
+                    "gates job {job_id} did not reach terminal receipt within {}s",
+                    timeout.as_secs()
+                ));
             },
         }
     }
@@ -4256,6 +4474,34 @@ mod tests {
                 Some(apm2_core::fac::DenialReasonCode::AuthorityAlreadyConsumed)
             );
             assert!(should_auto_regenerate_on_authority_consumed(&terminal));
+        });
+    }
+
+    #[test]
+    fn wait_for_gates_job_terminal_receipt_checks_receipt_before_timeout_guard() {
+        with_test_apm2_home(|apm2_home| {
+            let fac_root = apm2_home.join("private/fac");
+            let receipts_dir = fac_root.join("receipts");
+            fs::create_dir_all(&receipts_dir).expect("create receipts dir");
+            let receipt = apm2_core::fac::FacJobReceiptV1 {
+                schema: "apm2.fac.receipt.v1".to_string(),
+                receipt_id: "receipt-timeout-boundary".to_string(),
+                job_id: "job-timeout-boundary".to_string(),
+                job_spec_digest: "spec-timeout-boundary".to_string(),
+                outcome: apm2_core::fac::FacJobOutcome::Completed,
+                reason: "completed".to_string(),
+                ..Default::default()
+            };
+            apm2_core::fac::persist_content_addressed_receipt(&receipts_dir, &receipt)
+                .expect("persist receipt");
+            let resolved = wait_for_gates_job_terminal_receipt_with_mode(
+                &fac_root,
+                "job-timeout-boundary",
+                Duration::from_secs(0),
+                WorkerExecutionMode::RequireExternalWorker,
+            )
+            .expect("receipt should win even at timeout boundary");
+            assert_eq!(resolved.receipt_id, "receipt-timeout-boundary");
         });
     }
 

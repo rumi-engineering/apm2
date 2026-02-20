@@ -95,6 +95,7 @@ const FAC_REVIEW_MACHINE_PAYLOAD_SCHEMA: &str = "apm2.fac.review.machine_bundle.
 const DOCTOR_DECISION_MACHINE_SCHEMA: &str = "apm2.fac.review.doctor_decision_machine.v1";
 const GATE_PROGRESS_MACHINE_SCHEMA: &str = "apm2.fac.review.gate_progress_machine.v1";
 const DOCTOR_WAIT_MACHINE_SCHEMA: &str = "apm2.fac.review.doctor_wait_machine.v1";
+const GATES_WAIT_MACHINE_SCHEMA: &str = "apm2.fac.review.gates_wait_machine.v1";
 const DOCTOR_COMMAND_PR_NUMBER_PLACEHOLDER: &str = "{pr_number}";
 const DOCTOR_COMMAND_WAIT_TIMEOUT_PLACEHOLDER: &str = "{wait_timeout_seconds}";
 const DOCTOR_STALE_GATE_AGE_SECONDS: i64 = 6 * 60 * 60;
@@ -166,6 +167,8 @@ struct DoctorGateSnapshot {
     status: String,
     completed_at: Option<String>,
     freshness_seconds: Option<i64>,
+    #[serde(skip_serializing)]
+    source: DoctorGateSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +184,28 @@ enum DoctorGateProgressState {
     InFlight,
     TerminalPassed,
     TerminalFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorGateSource {
+    LocalCache,
+    Projection,
+}
+
+impl DoctorGateSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalCache => "local_cache",
+            Self::Projection => "projection",
+        }
+    }
+
+    const fn priority(self) -> u8 {
+        match self {
+            Self::LocalCache => 1,
+            Self::Projection => 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +407,21 @@ struct DoctorPushAttemptSummary {
     error_hint: Option<String>,
 }
 
+#[derive(Debug, Default, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
+struct DoctorRepairSignals {
+    lifecycle_missing: bool,
+    lifecycle_load_failed: bool,
+    lifecycle_stuck_shape: bool,
+    identity_missing: bool,
+    identity_stale: bool,
+    agent_registry_load_failed: bool,
+    agent_registry_capacity_exceeded: bool,
+    dead_active_agent_present: bool,
+    run_state_repair_required: bool,
+    run_state_force_repair_required: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct DoctorPrSummary {
     schema: String,
@@ -402,18 +442,18 @@ struct DoctorPrSummary {
     repairs_applied: Vec<DoctorRepairApplied>,
     #[serde(skip_serializing_if = "Option::is_none")]
     latest_push_attempt: Option<DoctorPushAttemptSummary>,
+    repair_signals: DoctorRepairSignals,
     health: Vec<DoctorHealthItem>,
 }
 
 struct DoctorActionInputs<'a> {
     pr_number: u32,
-    health: &'a [DoctorHealthItem],
+    repair_signals: &'a DoctorRepairSignals,
     lifecycle: Option<&'a DoctorLifecycleSnapshot>,
     gates: &'a [DoctorGateSnapshot],
     agent_activity: DoctorAgentActivitySummary,
     reviews: &'a [DoctorReviewSnapshot],
     review_terminal_reasons: &'a std::collections::BTreeMap<String, Option<String>>,
-    run_state_diagnostics: &'a [DoctorRunStateDiagnostic],
     findings_summary: &'a [DoctorFindingsDimensionSummary],
     merge_readiness: &'a DoctorMergeReadiness,
     latest_push_attempt: Option<&'a DoctorPushAttemptSummary>,
@@ -441,8 +481,11 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
                 "recommended_action": rule.state.recommended_action(),
                 "recommended_priority": recommendation.priority,
                 "guard_id": rule.guard_id,
+                "guard_kind": rule.guard.as_str(),
                 "guard_predicate": rule.guard_predicate,
+                "reason_kind": recommendation.reason_kind.as_str(),
                 "reason_template": recommendation.reason_template,
+                "command_kind": recommendation.command_kind.as_str(),
                 "command_template": recommendation.command_template,
                 "command_notes": recommendation.command_notes,
                 "requirement_refs": rule.requirement_refs,
@@ -456,7 +499,9 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
                 "state": rule.state.as_str(),
                 "action": rule.action,
                 "priority": rule.priority,
+                "reason_kind": rule.reason_kind.as_str(),
                 "reason_template": rule.reason_template,
+                "command_kind": rule.command_kind.as_str(),
                 "command_template": rule.command_template,
                 "command_notes": rule.command_notes,
             })
@@ -469,6 +514,22 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
                 "priority": rule.priority,
                 "state": rule.state.as_str(),
                 "guard_id": rule.guard_id,
+                "guard_kind": rule.guard.as_str(),
+                "guard_predicate": rule.guard_predicate,
+            })
+        })
+        .collect::<Vec<_>>();
+    let gate_reduction_rules = DOCTOR_GATE_REDUCTION_RULES
+        .iter()
+        .map(|rule| {
+            serde_json::json!({
+                "priority": rule.priority,
+                "decision": match rule.decision {
+                    DoctorGateReductionDecision::ReplaceIncoming => "replace_incoming",
+                    DoctorGateReductionDecision::KeepExisting => "keep_existing",
+                },
+                "guard_id": rule.guard_id,
+                "guard_kind": rule.guard.as_str(),
                 "guard_predicate": rule.guard_predicate,
             })
         })
@@ -481,6 +542,7 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
                 "from": rule.from.as_str(),
                 "to": rule.to.as_str(),
                 "guard_id": rule.guard_id,
+                "guard_kind": rule.guard.as_str(),
                 "guard_predicate": rule.guard_predicate,
                 "requirement_refs": rule.requirement_refs,
             })
@@ -504,6 +566,12 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
+    let gates_wait_machine = gates::gates_wait_machine_spec_json();
+    let gates_wait_transitions = gates_wait_machine
+        .get("transitions")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let lifecycle_machine = lifecycle::lifecycle_machine_spec();
     let lifecycle_transitions = lifecycle_machine
         .get("transitions")
@@ -738,6 +806,15 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
     let gate_progress_priorities_strict = DOCTOR_GATE_PROGRESS_RULES
         .windows(2)
         .all(|window| window[0].priority < window[1].priority);
+    let gate_reduction_guard_ids_unique = {
+        let mut seen = std::collections::BTreeSet::new();
+        DOCTOR_GATE_REDUCTION_RULES
+            .iter()
+            .all(|rule| seen.insert(rule.guard_id))
+    };
+    let gate_reduction_priorities_strict = DOCTOR_GATE_REDUCTION_RULES
+        .windows(2)
+        .all(|window| window[0].priority < window[1].priority);
     let wait_guard_ids_unique = {
         let mut seen = std::collections::BTreeSet::new();
         DOCTOR_WAIT_TRANSITION_RULES
@@ -747,6 +824,26 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
     let wait_priorities_strict = DOCTOR_WAIT_TRANSITION_RULES
         .windows(2)
         .all(|window| window[0].priority < window[1].priority);
+    let gates_wait_guard_ids_unique = {
+        let mut seen = std::collections::BTreeSet::new();
+        gates_wait_transitions.iter().all(|transition| {
+            transition
+                .get("guard_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|guard_id| seen.insert(guard_id.to_string()))
+        })
+    };
+    let gates_wait_priorities_strict = gates_wait_transitions.windows(2).all(|window| {
+        let left = window[0]
+            .get("priority")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let right = window[1]
+            .get("priority")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        left < right
+    });
     let lifecycle_transition_ids_unique = {
         let mut seen = std::collections::BTreeSet::<String>::new();
         lifecycle_transitions.iter().all(|transition| {
@@ -771,6 +868,7 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
                 "priority": rule.priority,
                 "state": rule.state.as_str(),
                 "guard_id": rule.guard_id,
+                "guard_kind": rule.guard.as_str(),
                 "guard_predicate": rule.guard_predicate,
                 "action": recommendation.action,
                 "action_priority": recommendation.priority,
@@ -789,6 +887,7 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
                 serde_json::json!({
                     "priority": rule.priority,
                     "state": rule.state.as_str(),
+                    "guard_kind": rule.guard.as_str(),
                     "guard_predicate": rule.guard_predicate,
                     "recommended_action": rule.state.recommended_action(),
                     "requirement_refs": rule.requirement_refs,
@@ -804,6 +903,24 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
                 serde_json::json!({
                     "priority": rule.priority,
                     "state": rule.state.as_str(),
+                    "guard_kind": rule.guard.as_str(),
+                    "guard_predicate": rule.guard_predicate,
+                }),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let gate_reduction_rules_by_guard_id = DOCTOR_GATE_REDUCTION_RULES
+        .iter()
+        .map(|rule| {
+            (
+                rule.guard_id.to_string(),
+                serde_json::json!({
+                    "priority": rule.priority,
+                    "decision": match rule.decision {
+                        DoctorGateReductionDecision::ReplaceIncoming => "replace_incoming",
+                        DoctorGateReductionDecision::KeepExisting => "keep_existing",
+                    },
+                    "guard_kind": rule.guard.as_str(),
                     "guard_predicate": rule.guard_predicate,
                 }),
             )
@@ -818,10 +935,20 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
                     "priority": rule.priority,
                     "from": rule.from.as_str(),
                     "to": rule.to.as_str(),
+                    "guard_kind": rule.guard.as_str(),
                     "guard_predicate": rule.guard_predicate,
                     "requirement_refs": rule.requirement_refs,
                 }),
             )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let gates_wait_transitions_by_guard_id = gates_wait_transitions
+        .iter()
+        .filter_map(|transition| {
+            let guard_id = transition
+                .get("guard_id")
+                .and_then(serde_json::Value::as_str)?;
+            Some((guard_id.to_string(), transition.clone()))
         })
         .collect::<std::collections::BTreeMap<_, _>>();
     let lifecycle_transitions_by_id = lifecycle_transitions
@@ -913,6 +1040,16 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
                 .collect::<Vec<_>>(),
             "rules": gate_rules,
         },
+        "gate_reduction_machine": {
+            "schema": "apm2.fac.review.gate_reduction_machine.v1",
+            "evaluation": "priority_order_first_match",
+            "default_decision": "keep_existing",
+            "sources": [
+                DoctorGateSource::LocalCache.as_str(),
+                DoctorGateSource::Projection.as_str(),
+            ],
+            "rules": gate_reduction_rules,
+        },
         "doctor_wait_machine": {
             "schema": DOCTOR_WAIT_MACHINE_SCHEMA,
             "evaluation": "priority_order_first_match_per_state",
@@ -936,6 +1073,11 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
             "action_policy": wait_action_policy,
             "rules": wait_rules,
         },
+        "gates_wait_machine": {
+            "schema": GATES_WAIT_MACHINE_SCHEMA,
+            "evaluation": "priority_order_first_match_per_state",
+            "machine": gates_wait_machine,
+        },
         "lifecycle_machine": lifecycle_machine,
         "requirements_traceability": requirements_traceability,
         "machine_traceability": {
@@ -944,7 +1086,9 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
             "indexes": {
                 "doctor_decision_rules_by_guard_id": doctor_decision_rules_by_guard_id,
                 "gate_progress_rules_by_guard_id": gate_progress_rules_by_guard_id,
+                "gate_reduction_rules_by_guard_id": gate_reduction_rules_by_guard_id,
                 "doctor_wait_rules_by_guard_id": doctor_wait_rules_by_guard_id,
+                "gates_wait_transitions_by_guard_id": gates_wait_transitions_by_guard_id,
                 "lifecycle_transitions_by_id": lifecycle_transitions_by_id,
                 "doctor_recommendations_by_state": doctor_recommendations_by_state,
             },
@@ -960,8 +1104,12 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
                 "doctor_decision_priorities_strict": doctor_decision_priorities_strict,
                 "gate_progress_guard_ids_unique": gate_progress_guard_ids_unique,
                 "gate_progress_priorities_strict": gate_progress_priorities_strict,
+                "gate_reduction_guard_ids_unique": gate_reduction_guard_ids_unique,
+                "gate_reduction_priorities_strict": gate_reduction_priorities_strict,
                 "wait_guard_ids_unique": wait_guard_ids_unique,
                 "wait_priorities_strict": wait_priorities_strict,
+                "gates_wait_guard_ids_unique": gates_wait_guard_ids_unique,
+                "gates_wait_priorities_strict": gates_wait_priorities_strict,
                 "lifecycle_transition_ids_unique": lifecycle_transition_ids_unique,
                 "recommendation_states_unique": recommendation_states_unique,
             },
@@ -969,8 +1117,10 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
                 "doctor_decision_rules": DOCTOR_DECISION_RULES.len(),
                 "doctor_recommendations": DOCTOR_RECOMMENDATION_RULES.len(),
                 "gate_progress_rules": DOCTOR_GATE_PROGRESS_RULES.len(),
+                "gate_reduction_rules": DOCTOR_GATE_REDUCTION_RULES.len(),
                 "wait_rules": DOCTOR_WAIT_TRANSITION_RULES.len(),
                 "wait_action_policy_actions": DOCTOR_ACTION_POLICIES.len(),
+                "gates_wait_transitions": gates_wait_transitions.len(),
                 "lifecycle_transitions": lifecycle_transitions.len(),
                 "ticket_in_scope_requirements": FAC_REVIEW_MACHINE_REQUIREMENT_IDS.len(),
                 "machine_traceability_requirements": 5,
@@ -1165,15 +1315,11 @@ pub fn run_doctor(
             ) {
                 Ok(summary) => {
                     let mut doctor_repairs = summary.into_doctor_repairs();
-                    let reaped_stale_agents = doctor_repairs
-                        .iter()
-                        .any(|entry| entry.operation == "reap_stale_agents");
                     repairs_applied.append(&mut doctor_repairs);
 
                     let post_repair = run_doctor_inner(repo, pr_number, Vec::new(), true);
-                    if doctor_should_restart_after_repair(&post_repair, reaped_stale_agents) {
-                        let force_restart =
-                            doctor_requires_force_restart_from_summary(&post_repair);
+                    if doctor_recommended_action_requests_restart(&post_repair) {
+                        let force_restart = doctor_recommended_restart_force(&post_repair);
                         match restart::run_restart_for_doctor_fix(
                             repo,
                             pr_number,
@@ -1188,7 +1334,8 @@ pub fn run_doctor(
                                 repairs_applied.push(DoctorRepairApplied {
                                     operation: "restart_reviews".to_string(),
                                     before: Some(format!(
-                                        "force={force_restart} reason=reaped_stale_agents_no_active_reviewers"
+                                        "force={force_restart} reason={}",
+                                        post_repair.recommended_action.reason
                                     )),
                                     after: Some(format!(
                                         "strategy={} evidence_passed={} dispatched_reviews={}",
@@ -1395,21 +1542,15 @@ fn doctor_wait_rule_triggered(
     rule: &DoctorWaitTransitionRule,
     facts: Option<&DoctorWaitFacts<'_>>,
 ) -> bool {
-    match (rule.from, rule.to) {
-        (DoctorWaitState::Evaluate, DoctorWaitState::ExitOnRecommendedAction) => {
+    match rule.guard {
+        DoctorWaitGuard::RecommendedActionInExitSet => {
             facts.is_some_and(|entry| entry.exit_actions.contains(entry.recommended_action))
         },
-        (DoctorWaitState::Evaluate, DoctorWaitState::ExitOnInterrupt) => {
-            facts.is_some_and(|entry| entry.interrupted)
-        },
-        (DoctorWaitState::Evaluate, DoctorWaitState::ExitOnTimeout) => {
+        DoctorWaitGuard::Interrupted => facts.is_some_and(|entry| entry.interrupted),
+        DoctorWaitGuard::TimedOut => {
             facts.is_some_and(|entry| entry.elapsed_seconds >= entry.wait_timeout_seconds)
         },
-        (DoctorWaitState::Evaluate, DoctorWaitState::PollEmit)
-        | (DoctorWaitState::PollEmit, DoctorWaitState::Sleep)
-        | (DoctorWaitState::Sleep, DoctorWaitState::CollectSummary)
-        | (DoctorWaitState::CollectSummary, DoctorWaitState::Evaluate) => true,
-        _ => false,
+        DoctorWaitGuard::Always => true,
     }
 }
 
@@ -1681,6 +1822,7 @@ fn run_doctor_inner(
     lightweight: bool,
 ) -> DoctorPrSummary {
     let mut health = Vec::new();
+    let mut repair_signals = DoctorRepairSignals::default();
     let identity = match projection_store::load_pr_identity_snapshot(owner_repo, pr_number) {
         Ok(value) => value,
         Err(err) => {
@@ -1730,6 +1872,7 @@ fn run_doctor_inner(
         (Some(local), Some(remote)) => !local.eq_ignore_ascii_case(remote),
         _ => false,
     };
+    repair_signals.identity_stale = stale;
 
     if stale {
         health.push(DoctorHealthItem {
@@ -1742,6 +1885,7 @@ fn run_doctor_inner(
             remediation: "fetch latest PR head and rerun the FAC pipeline for this SHA".to_string(),
         });
     } else if local_sha.is_none() {
+        repair_signals.identity_missing = true;
         health.push(DoctorHealthItem {
             severity: "high",
             message: "no local PR identity snapshot found for this PR".to_string(),
@@ -1778,6 +1922,10 @@ fn run_doctor_inner(
                 }),
                 _ => {},
             }
+            repair_signals.lifecycle_stuck_shape = matches!(
+                snapshot.pr_state.as_str(),
+                "stuck" | "recovering" | "quarantined"
+            );
             let lifecycle_view = DoctorLifecycleSnapshot {
                 state: snapshot.pr_state.clone(),
                 time_in_state_seconds: snapshot.time_in_state_seconds,
@@ -1842,6 +1990,7 @@ fn run_doctor_inner(
             Some(lifecycle_view)
         },
         Ok(None) => {
+            repair_signals.lifecycle_missing = true;
             health.push(DoctorHealthItem {
                 severity: "high",
                 message: "no lifecycle record found for this PR".to_string(),
@@ -1850,6 +1999,7 @@ fn run_doctor_inner(
             None
         },
         Err(err) => {
+            repair_signals.lifecycle_load_failed = true;
             health.push(DoctorHealthItem {
                 severity: "high",
                 message: format!("failed to read lifecycle snapshot: {err}"),
@@ -1888,6 +2038,7 @@ fn run_doctor_inner(
                             normalize_doctor_gate_status(&result.status),
                             completed_at,
                             freshness,
+                            DoctorGateSource::LocalCache,
                         );
                         has_any_gate_signal = true;
                     }
@@ -1939,6 +2090,7 @@ fn run_doctor_inner(
                         normalize_doctor_gate_status(&gate.status),
                         Some(projected.timestamp.clone()),
                         projected_freshness,
+                        DoctorGateSource::Projection,
                     );
                     has_any_gate_signal = true;
                 }
@@ -2042,12 +2194,22 @@ fn run_doctor_inner(
     let (run_state_diagnostics, review_terminal_reasons) =
         collect_run_state_diagnostics(pr_number, &mut health);
     apply_terminal_reasons_to_reviews(&mut reviews, &review_terminal_reasons);
+    repair_signals.run_state_repair_required = run_state_diagnostics
+        .iter()
+        .any(|entry| entry.condition.requires_repair());
+    repair_signals.run_state_force_repair_required = run_state_diagnostics.iter().any(|entry| {
+        matches!(
+            entry.condition,
+            DoctorRunStateCondition::Corrupt | DoctorRunStateCondition::Ambiguous
+        )
+    });
 
     let agents = match lifecycle::load_agent_registry_snapshot_for_pr(owner_repo, pr_number) {
         Ok(snapshot) => {
             let max_active = snapshot.max_active_agents_per_pr;
             let active_agents = snapshot.active_agents;
             if active_agents > max_active {
+                repair_signals.agent_registry_capacity_exceeded = true;
                 health.push(DoctorHealthItem {
                     severity: "high",
                     message: format!(
@@ -2064,6 +2226,7 @@ fn run_doctor_inner(
                     && matches!(entry.state.as_str(), "running" | "dispatched")
                     && !entry.pid_alive
                 {
+                    repair_signals.dead_active_agent_present = true;
                     health.push(DoctorHealthItem {
                         severity: "high",
                         message: format!(
@@ -2236,6 +2399,7 @@ fn run_doctor_inner(
             })
         },
         Err(err) => {
+            repair_signals.agent_registry_load_failed = true;
             health.push(DoctorHealthItem {
                 severity: "medium",
                 message: format!("failed to load agent registry snapshot: {err}"),
@@ -2285,13 +2449,12 @@ fn run_doctor_inner(
     let agent_activity = build_doctor_agent_activity_summary(agents.as_ref());
     let recommended_action = build_recommended_action(&DoctorActionInputs {
         pr_number,
-        health: &health,
+        repair_signals: &repair_signals,
         lifecycle: lifecycle.as_ref(),
         gates: &gates,
         agent_activity,
         reviews: &reviews,
         review_terminal_reasons: &review_terminal_reasons,
-        run_state_diagnostics: &run_state_diagnostics,
         findings_summary: &findings_summary,
         merge_readiness: &merge_readiness,
         latest_push_attempt: latest_push_attempt.as_ref(),
@@ -2323,6 +2486,7 @@ fn run_doctor_inner(
         run_state_diagnostics,
         repairs_applied,
         latest_push_attempt,
+        repair_signals,
         health,
     }
 }
@@ -2358,48 +2522,8 @@ impl DoctorRepairPlan {
     }
 }
 
-fn message_signals_registry_issue(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    (message.contains("agent registry") || message.contains("registry snapshot"))
-        && (message.contains("integrity")
-            || message.contains("failed to load")
-            || message.contains("failed to parse")
-            || message.contains("failed to read")
-            || message.contains("unexpected")
-            || message.contains("missing"))
-}
-
 fn derive_doctor_repair_plan(summary: &DoctorPrSummary) -> DoctorRepairPlan {
-    let has_dead_running_agent = summary.agents.as_ref().is_some_and(|agents| {
-        agents.entries.iter().any(|entry| {
-            matches!(entry.state.as_str(), "running" | "dispatched") && !entry.pid_alive
-        })
-    });
-    let exceeds_capacity = summary
-        .agents
-        .as_ref()
-        .is_some_and(|agents| agents.active_agents > agents.max_active_agents_per_pr);
-    let lifecycle_needs_reset = summary.lifecycle.as_ref().is_none_or(|lifecycle| {
-        matches!(
-            lifecycle.state.as_str(),
-            "stuck" | "recovering" | "quarantined"
-        )
-    });
-    let lifecycle_health_signal = summary.health.iter().any(|item| {
-        let message = item.message.to_ascii_lowercase();
-        message.contains("failed to read lifecycle")
-            || message.contains("failed to parse lifecycle")
-            || message.contains("unexpected lifecycle state schema")
-    });
-    let registry_health_signal = summary
-        .health
-        .iter()
-        .any(|item| message_signals_registry_issue(&item.message))
-        || summary
-            .latest_push_attempt
-            .as_ref()
-            .and_then(|attempt| attempt.error_hint.as_deref())
-            .is_some_and(message_signals_registry_issue);
+    let signals = &summary.repair_signals;
     let run_state_review_types = summary
         .run_state_diagnostics
         .iter()
@@ -2410,55 +2534,40 @@ fn derive_doctor_repair_plan(summary: &DoctorPrSummary) -> DoctorRepairPlan {
         .collect::<Vec<_>>();
 
     DoctorRepairPlan {
-        reap_stale_agents: has_dead_running_agent || exceeds_capacity,
-        refresh_identity: summary.identity.stale || summary.identity.local_sha.is_none(),
-        reset_lifecycle: lifecycle_needs_reset || lifecycle_health_signal,
-        repair_registry_integrity: registry_health_signal,
+        reap_stale_agents: signals.dead_active_agent_present
+            || signals.agent_registry_capacity_exceeded,
+        refresh_identity: signals.identity_stale || signals.identity_missing,
+        reset_lifecycle: signals.lifecycle_missing
+            || signals.lifecycle_load_failed
+            || signals.lifecycle_stuck_shape,
+        repair_registry_integrity: signals.agent_registry_load_failed,
         run_state_review_types,
     }
 }
 
-fn doctor_requires_force_repair(summary: &DoctorPrSummary) -> bool {
-    let health_force = summary.health.iter().any(|item| {
-        let message = item.message.to_ascii_lowercase();
-        message.contains("failed to parse lifecycle")
-            || message.contains("failed to read lifecycle")
-            || message.contains("unexpected lifecycle state schema")
-            || message_signals_registry_issue(&message)
-    });
-    let push_attempt_force = summary
-        .latest_push_attempt
-        .as_ref()
-        .and_then(|attempt| attempt.error_hint.as_deref())
-        .is_some_and(message_signals_registry_issue);
-    let run_state_force = summary.run_state_diagnostics.iter().any(|entry| {
-        matches!(
-            entry.condition,
-            DoctorRunStateCondition::Corrupt | DoctorRunStateCondition::Ambiguous
-        )
-    });
-    health_force || push_attempt_force || run_state_force
+const fn doctor_requires_force_repair(summary: &DoctorPrSummary) -> bool {
+    let signals = &summary.repair_signals;
+    signals.lifecycle_load_failed
+        || signals.agent_registry_load_failed
+        || signals.run_state_force_repair_required
 }
 
-fn doctor_requires_force_restart_from_summary(summary: &DoctorPrSummary) -> bool {
-    summary.reviews.iter().any(review_requires_forced_restart)
+fn doctor_recommended_action_requests_restart(summary: &DoctorPrSummary) -> bool {
+    summary
+        .recommended_action
+        .action
+        .eq_ignore_ascii_case("restart_reviews")
 }
 
-fn doctor_should_restart_after_repair(
-    summary: &DoctorPrSummary,
-    reaped_stale_agents: bool,
-) -> bool {
-    if !reaped_stale_agents {
-        return false;
+fn doctor_recommended_restart_force(summary: &DoctorPrSummary) -> bool {
+    if summary.reviews.iter().any(review_requires_forced_restart) {
+        return true;
     }
-    let has_pending_verdict = summary
-        .findings_summary
-        .iter()
-        .any(|entry| entry.formal_verdict.eq_ignore_ascii_case("pending"));
-    if !has_pending_verdict {
-        return false;
-    }
-    build_doctor_agent_activity_summary(summary.agents.as_ref()).active_agents == 0
+    summary
+        .recommended_action
+        .command
+        .as_deref()
+        .is_some_and(|command| command.split_whitespace().any(|token| token == "--force"))
 }
 
 fn build_doctor_agent_activity_summary(
@@ -3618,9 +3727,89 @@ impl DoctorGateProgressState {
 struct DoctorDecisionRule {
     priority: u8,
     state: DoctorDecisionState,
+    guard: DoctorDecisionGuard,
     guard_id: &'static str,
     guard_predicate: &'static str,
     requirement_refs: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DoctorDecisionGuard {
+    HasIntegrityOrCorruption,
+    LifecycleMerged,
+    MergeReady,
+    ShaFreshnessStale,
+    ApproveEligible,
+    MergeConflictsPresent,
+    GateProgressTerminalFailed,
+    ImplementorRemediationResolved,
+    PendingNoActiveWithGateInFlight,
+    AllActiveIdle,
+    PendingNoActive,
+    LifecycleEscalation,
+    Default,
+}
+
+impl DoctorDecisionGuard {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::HasIntegrityOrCorruption => "has_integrity_or_corruption",
+            Self::LifecycleMerged => "lifecycle_merged",
+            Self::MergeReady => "merge_ready",
+            Self::ShaFreshnessStale => "sha_freshness_stale",
+            Self::ApproveEligible => "approve_eligible",
+            Self::MergeConflictsPresent => "merge_conflicts_present",
+            Self::GateProgressTerminalFailed => "gate_progress_terminal_failed",
+            Self::ImplementorRemediationResolved => "implementor_remediation_resolved",
+            Self::PendingNoActiveWithGateInFlight => "pending_no_active_with_gate_in_flight",
+            Self::AllActiveIdle => "all_active_idle",
+            Self::PendingNoActive => "pending_no_active",
+            Self::LifecycleEscalation => "lifecycle_escalation",
+            Self::Default => "default",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DoctorReasonKind {
+    Template,
+    PushFailureHintOrTemplate,
+    FindingsRollupWithPushHint,
+    IdleRestartWithMaxIdle,
+    PendingNoActiveWithPushHint,
+    WaitWithPendingHint,
+}
+
+impl DoctorReasonKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Template => "template",
+            Self::PushFailureHintOrTemplate => "push_failure_hint_or_template",
+            Self::FindingsRollupWithPushHint => "findings_rollup_with_push_hint",
+            Self::IdleRestartWithMaxIdle => "idle_restart_with_max_idle",
+            Self::PendingNoActiveWithPushHint => "pending_no_active_with_push_hint",
+            Self::WaitWithPendingHint => "wait_with_pending_hint",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DoctorCommandKind {
+    RuleTemplate,
+    RestartForce,
+    RestartConditionalForce,
+    None,
+}
+
+impl DoctorCommandKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RuleTemplate => "rule_template",
+            Self::RestartForce => "restart_force",
+            Self::RestartConditionalForce => "restart_conditional_force",
+            Self::None => "none",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3628,7 +3817,9 @@ struct DoctorRecommendationRule {
     state: DoctorDecisionState,
     action: &'static str,
     priority: &'static str,
+    reason_kind: DoctorReasonKind,
     reason_template: &'static str,
+    command_kind: DoctorCommandKind,
     command_template: Option<&'static str>,
     command_notes: Option<&'static str>,
 }
@@ -3646,15 +3837,36 @@ struct DoctorWaitTransitionRule {
     priority: u8,
     from: DoctorWaitState,
     to: DoctorWaitState,
+    guard: DoctorWaitGuard,
     guard_id: &'static str,
     guard_predicate: &'static str,
     requirement_refs: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DoctorWaitGuard {
+    RecommendedActionInExitSet,
+    Interrupted,
+    TimedOut,
+    Always,
+}
+
+impl DoctorWaitGuard {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RecommendedActionInExitSet => "recommended_action_in_exit_set",
+            Self::Interrupted => "interrupted",
+            Self::TimedOut => "timed_out",
+            Self::Always => "always",
+        }
+    }
 }
 
 const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     DoctorDecisionRule {
         priority: 1,
         state: DoctorDecisionState::Fix,
+        guard: DoctorDecisionGuard::HasIntegrityOrCorruption,
         guard_id: "DOC-G-001",
         guard_predicate: "facts.has_integrity_or_corruption",
         requirement_refs: &[],
@@ -3662,6 +3874,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     DoctorDecisionRule {
         priority: 2,
         state: DoctorDecisionState::Done,
+        guard: DoctorDecisionGuard::LifecycleMerged,
         guard_id: "DOC-G-002",
         guard_predicate: "facts.lifecycle_merged",
         requirement_refs: &[],
@@ -3669,6 +3882,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     DoctorDecisionRule {
         priority: 3,
         state: DoctorDecisionState::Merge,
+        guard: DoctorDecisionGuard::MergeReady,
         guard_id: "DOC-G-003",
         guard_predicate: "facts.merge_ready",
         requirement_refs: &["DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY"],
@@ -3676,6 +3890,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     DoctorDecisionRule {
         priority: 4,
         state: DoctorDecisionState::RestartStaleIdentity,
+        guard: DoctorDecisionGuard::ShaFreshnessStale,
         guard_id: "DOC-G-004",
         guard_predicate: "facts.sha_freshness_source == stale",
         requirement_refs: &[],
@@ -3683,6 +3898,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     DoctorDecisionRule {
         priority: 5,
         state: DoctorDecisionState::Approve,
+        guard: DoctorDecisionGuard::ApproveEligible,
         guard_id: "DOC-G-005",
         guard_predicate: "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts",
         requirement_refs: &["DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY"],
@@ -3690,6 +3906,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     DoctorDecisionRule {
         priority: 6,
         state: DoctorDecisionState::DispatchMergeConflicts,
+        guard: DoctorDecisionGuard::MergeConflictsPresent,
         guard_id: "DOC-G-006",
         guard_predicate: "facts.merge_conflict_status == has_conflicts",
         requirement_refs: &["DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"],
@@ -3697,6 +3914,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     DoctorDecisionRule {
         priority: 7,
         state: DoctorDecisionState::DispatchFailedGates,
+        guard: DoctorDecisionGuard::GateProgressTerminalFailed,
         guard_id: "DOC-G-007",
         guard_predicate: "facts.gate_progress_state == terminal_failed",
         requirement_refs: &["DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"],
@@ -3704,6 +3922,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     DoctorDecisionRule {
         priority: 8,
         state: DoctorDecisionState::DispatchImplementor,
+        guard: DoctorDecisionGuard::ImplementorRemediationResolved,
         guard_id: "DOC-G-008",
         guard_predicate: "facts.requires_implementor_remediation && facts.all_verdicts_resolved",
         requirement_refs: &["DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"],
@@ -3711,6 +3930,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     DoctorDecisionRule {
         priority: 9,
         state: DoctorDecisionState::WaitForGates,
+        guard: DoctorDecisionGuard::PendingNoActiveWithGateInFlight,
         guard_id: "DOC-G-009",
         guard_predicate: "facts.has_pending_verdict && facts.active_agents == 0 && facts.gate_progress_state == in_flight",
         requirement_refs: &["DR-002-RUNNING_GATE_SUPPRESSES_RESTART"],
@@ -3718,6 +3938,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     DoctorDecisionRule {
         priority: 10,
         state: DoctorDecisionState::RestartIdleReviewers,
+        guard: DoctorDecisionGuard::AllActiveIdle,
         guard_id: "DOC-G-010",
         guard_predicate: "facts.all_active_idle",
         requirement_refs: &[],
@@ -3725,6 +3946,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     DoctorDecisionRule {
         priority: 11,
         state: DoctorDecisionState::RestartPendingNoActiveReviewers,
+        guard: DoctorDecisionGuard::PendingNoActive,
         guard_id: "DOC-G-011",
         guard_predicate: "facts.active_agents == 0 && facts.has_pending_verdict",
         requirement_refs: &[],
@@ -3732,6 +3954,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     DoctorDecisionRule {
         priority: 12,
         state: DoctorDecisionState::EscalateLifecycleBudget,
+        guard: DoctorDecisionGuard::LifecycleEscalation,
         guard_id: "DOC-G-012",
         guard_predicate: "facts.lifecycle_escalation",
         requirement_refs: &[],
@@ -3739,6 +3962,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     DoctorDecisionRule {
         priority: 13,
         state: DoctorDecisionState::Wait,
+        guard: DoctorDecisionGuard::Default,
         guard_id: "DOC-G-013",
         guard_predicate: "default",
         requirement_refs: &[],
@@ -3750,7 +3974,9 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         state: DoctorDecisionState::Fix,
         action: "fix",
         priority: "high",
+        reason_kind: DoctorReasonKind::Template,
         reason_template: "local FAC state indicates integrity/corruption issues",
+        command_kind: DoctorCommandKind::RuleTemplate,
         command_template: Some("apm2 fac doctor --pr {pr_number} --fix"),
         command_notes: None,
     },
@@ -3758,7 +3984,9 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         state: DoctorDecisionState::Done,
         action: "done",
         priority: "low",
+        reason_kind: DoctorReasonKind::Template,
         reason_template: "PR has been merged to main",
+        command_kind: DoctorCommandKind::None,
         command_template: None,
         command_notes: None,
     },
@@ -3766,7 +3994,9 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         state: DoctorDecisionState::Merge,
         action: "merge",
         priority: "medium",
+        reason_kind: DoctorReasonKind::Template,
         reason_template: "all verdicts approve; gates pass; SHA is fresh; no merge conflicts",
+        command_kind: DoctorCommandKind::None,
         command_template: None,
         command_notes: None,
     },
@@ -3774,7 +4004,9 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         state: DoctorDecisionState::RestartStaleIdentity,
         action: "restart_reviews",
         priority: "high",
+        reason_kind: DoctorReasonKind::Template,
         reason_template: "local verdict/findings snapshot is stale relative to remote PR head",
+        command_kind: DoctorCommandKind::RestartForce,
         command_template: Some("apm2 fac restart --pr {pr_number} --force --refresh-identity"),
         command_notes: None,
     },
@@ -3782,7 +4014,9 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         state: DoctorDecisionState::Approve,
         action: "approve",
         priority: "low",
+        reason_kind: DoctorReasonKind::Template,
         reason_template: "all review dimensions approve; awaiting auto-merge",
+        command_kind: DoctorCommandKind::RuleTemplate,
         command_template: Some(
             "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
         ),
@@ -3792,7 +4026,9 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         state: DoctorDecisionState::DispatchMergeConflicts,
         action: "dispatch_implementor",
         priority: "high",
+        reason_kind: DoctorReasonKind::Template,
         reason_template: "merge conflicts require implementor remediation and a fresh push",
+        command_kind: DoctorCommandKind::RuleTemplate,
         command_template: Some("apm2 fac review findings --pr {pr_number} --json"),
         command_notes: None,
     },
@@ -3800,7 +4036,9 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         state: DoctorDecisionState::DispatchFailedGates,
         action: "dispatch_implementor",
         priority: "high",
+        reason_kind: DoctorReasonKind::PushFailureHintOrTemplate,
         reason_template: "evidence gate failure requires implementor remediation before review can continue",
+        command_kind: DoctorCommandKind::RuleTemplate,
         command_template: Some("apm2 fac review findings --pr {pr_number} --json"),
         command_notes: Some("reason may include latest push failure hint when available"),
     },
@@ -3808,7 +4046,9 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         state: DoctorDecisionState::DispatchImplementor,
         action: "dispatch_implementor",
         priority: "high",
+        reason_kind: DoctorReasonKind::FindingsRollupWithPushHint,
         reason_template: "review findings require implementor remediation",
+        command_kind: DoctorCommandKind::RuleTemplate,
         command_template: Some("apm2 fac review findings --pr {pr_number} --json"),
         command_notes: Some("reason includes findings rollup when available"),
     },
@@ -3816,7 +4056,9 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         state: DoctorDecisionState::WaitForGates,
         action: "wait",
         priority: "medium",
+        reason_kind: DoctorReasonKind::Template,
         reason_template: "FAC gates are still in progress; reviewer restart is deferred",
+        command_kind: DoctorCommandKind::RuleTemplate,
         command_template: Some(
             "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
         ),
@@ -3826,7 +4068,9 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         state: DoctorDecisionState::RestartIdleReviewers,
         action: "restart_reviews",
         priority: "high",
+        reason_kind: DoctorReasonKind::IdleRestartWithMaxIdle,
         reason_template: "all active reviewer agents are idle",
+        command_kind: DoctorCommandKind::RestartForce,
         command_template: Some("apm2 fac restart --pr {pr_number} --force --refresh-identity"),
         command_notes: Some(
             "runtime reason appends max idle age from current agent activity telemetry",
@@ -3836,7 +4080,9 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         state: DoctorDecisionState::RestartPendingNoActiveReviewers,
         action: "restart_reviews",
         priority: "high",
+        reason_kind: DoctorReasonKind::PendingNoActiveWithPushHint,
         reason_template: "no active reviewer agents and verdict remains pending",
+        command_kind: DoctorCommandKind::RestartConditionalForce,
         command_template: Some("apm2 fac restart --pr {pr_number} --refresh-identity"),
         command_notes: Some(
             "runtime appends --force when terminal reason indicates max_restarts_exceeded",
@@ -3846,7 +4092,9 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         state: DoctorDecisionState::EscalateLifecycleBudget,
         action: "escalate",
         priority: "high",
+        reason_kind: DoctorReasonKind::Template,
         reason_template: "lifecycle retry/error budget exhausted",
+        command_kind: DoctorCommandKind::RuleTemplate,
         command_template: Some("apm2 fac doctor --pr {pr_number} --json"),
         command_notes: None,
     },
@@ -3854,7 +4102,9 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         state: DoctorDecisionState::Wait,
         action: "wait",
         priority: "low",
+        reason_kind: DoctorReasonKind::WaitWithPendingHint,
         reason_template: "reviews and findings are still in progress",
+        command_kind: DoctorCommandKind::RuleTemplate,
         command_template: Some(
             "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
         ),
@@ -3918,6 +4168,7 @@ const DOCTOR_WAIT_TRANSITION_RULES: &[DoctorWaitTransitionRule] = &[
         priority: 1,
         from: DoctorWaitState::Evaluate,
         to: DoctorWaitState::ExitOnRecommendedAction,
+        guard: DoctorWaitGuard::RecommendedActionInExitSet,
         guard_id: "WAIT-G-001",
         guard_predicate: "facts.recommended_action in effective_exit_actions",
         requirement_refs: &["DR-005-WAIT_RETURNS_ON_TERMINAL_ACTION"],
@@ -3926,6 +4177,7 @@ const DOCTOR_WAIT_TRANSITION_RULES: &[DoctorWaitTransitionRule] = &[
         priority: 2,
         from: DoctorWaitState::Evaluate,
         to: DoctorWaitState::ExitOnInterrupt,
+        guard: DoctorWaitGuard::Interrupted,
         guard_id: "WAIT-G-002",
         guard_predicate: "facts.interrupted",
         requirement_refs: &[],
@@ -3934,6 +4186,7 @@ const DOCTOR_WAIT_TRANSITION_RULES: &[DoctorWaitTransitionRule] = &[
         priority: 3,
         from: DoctorWaitState::Evaluate,
         to: DoctorWaitState::ExitOnTimeout,
+        guard: DoctorWaitGuard::TimedOut,
         guard_id: "WAIT-G-003",
         guard_predicate: "facts.elapsed_seconds >= facts.wait_timeout_seconds",
         requirement_refs: &[],
@@ -3942,6 +4195,7 @@ const DOCTOR_WAIT_TRANSITION_RULES: &[DoctorWaitTransitionRule] = &[
         priority: 4,
         from: DoctorWaitState::Evaluate,
         to: DoctorWaitState::PollEmit,
+        guard: DoctorWaitGuard::Always,
         guard_id: "WAIT-G-004",
         guard_predicate: "default",
         requirement_refs: &[],
@@ -3950,6 +4204,7 @@ const DOCTOR_WAIT_TRANSITION_RULES: &[DoctorWaitTransitionRule] = &[
         priority: 5,
         from: DoctorWaitState::PollEmit,
         to: DoctorWaitState::Sleep,
+        guard: DoctorWaitGuard::Always,
         guard_id: "WAIT-G-005",
         guard_predicate: "always",
         requirement_refs: &[],
@@ -3958,6 +4213,7 @@ const DOCTOR_WAIT_TRANSITION_RULES: &[DoctorWaitTransitionRule] = &[
         priority: 6,
         from: DoctorWaitState::Sleep,
         to: DoctorWaitState::CollectSummary,
+        guard: DoctorWaitGuard::Always,
         guard_id: "WAIT-G-006",
         guard_predicate: "always",
         requirement_refs: &[],
@@ -3966,6 +4222,7 @@ const DOCTOR_WAIT_TRANSITION_RULES: &[DoctorWaitTransitionRule] = &[
         priority: 7,
         from: DoctorWaitState::CollectSummary,
         to: DoctorWaitState::Evaluate,
+        guard: DoctorWaitGuard::Always,
         guard_id: "WAIT-G-007",
         guard_predicate: "always",
         requirement_refs: &[],
@@ -3978,6 +4235,7 @@ struct DoctorDecisionFacts {
     has_integrity_or_corruption: bool,
     lifecycle_merged: bool,
     merge_ready: bool,
+    all_verdicts_approve: bool,
     sha_freshness_source: DoctorShaFreshnessSource,
     has_actionable_findings: bool,
     merge_conflict_status: DoctorMergeConflictStatus,
@@ -3996,18 +4254,10 @@ struct DoctorDecisionFacts {
 
 impl DoctorDecisionFacts {
     fn from_input(input: &DoctorActionInputs<'_>) -> Self {
-        let has_run_state_repairable = input
-            .run_state_diagnostics
-            .iter()
-            .any(|entry| entry.condition.requires_repair());
-        let has_integrity_or_corruption = has_run_state_repairable
-            || input.health.iter().any(|item| {
-                let message = item.message.to_ascii_lowercase();
-                message.contains("integrity")
-                    || message.contains("failed to read lifecycle snapshot")
-                    || message.contains("failed to parse lifecycle")
-                    || message.contains("failed to load agent registry")
-            });
+        let has_integrity_or_corruption = input.repair_signals.lifecycle_load_failed
+            || input.repair_signals.lifecycle_missing
+            || input.repair_signals.agent_registry_load_failed
+            || input.repair_signals.run_state_repair_required;
 
         let has_actionable_findings = input
             .findings_summary
@@ -4038,6 +4288,7 @@ impl DoctorDecisionFacts {
                 .lifecycle
                 .is_some_and(|entry| entry.state.eq_ignore_ascii_case("merged")),
             merge_ready: input.merge_readiness.merge_ready,
+            all_verdicts_approve: input.merge_readiness.all_verdicts_approve,
             sha_freshness_source: input.merge_readiness.sha_freshness_source,
             has_actionable_findings,
             merge_conflict_status: input.merge_readiness.merge_conflict_status,
@@ -4061,51 +4312,46 @@ impl DoctorDecisionFacts {
     }
 }
 
-impl DoctorDecisionState {
-    fn triggered(self, input: &DoctorActionInputs<'_>, facts: &DoctorDecisionFacts) -> bool {
-        match self {
-            Self::Fix => facts.has_integrity_or_corruption,
-            Self::Done => facts.lifecycle_merged,
-            Self::Merge => facts.merge_ready,
-            Self::RestartStaleIdentity => {
-                facts.sha_freshness_source == DoctorShaFreshnessSource::Stale
-            },
-            Self::Approve => {
-                input.merge_readiness.all_verdicts_approve
-                    && !facts.has_actionable_findings
-                    && facts.sha_freshness_source == DoctorShaFreshnessSource::RemoteMatch
-                    && facts.merge_conflict_status != DoctorMergeConflictStatus::HasConflicts
-            },
-            Self::DispatchMergeConflicts => {
-                facts.merge_conflict_status == DoctorMergeConflictStatus::HasConflicts
-            },
-            Self::DispatchFailedGates => {
-                facts.gate_progress_state == DoctorGateProgressState::TerminalFailed
-            },
-            Self::DispatchImplementor => {
-                facts.requires_implementor_remediation && facts.all_verdicts_resolved
-            },
-            Self::WaitForGates => {
-                facts.has_pending_verdict
-                    && facts.active_agents == 0
-                    && facts.gate_progress_state == DoctorGateProgressState::InFlight
-            },
-            Self::RestartIdleReviewers => facts.all_active_idle,
-            Self::RestartPendingNoActiveReviewers => {
-                facts.active_agents == 0 && facts.has_pending_verdict
-            },
-            Self::EscalateLifecycleBudget => facts.lifecycle_escalation,
-            Self::Wait => true,
-        }
+fn doctor_decision_guard_triggered(rule: &DoctorDecisionRule, facts: &DoctorDecisionFacts) -> bool {
+    match rule.guard {
+        DoctorDecisionGuard::HasIntegrityOrCorruption => facts.has_integrity_or_corruption,
+        DoctorDecisionGuard::LifecycleMerged => facts.lifecycle_merged,
+        DoctorDecisionGuard::MergeReady => facts.merge_ready,
+        DoctorDecisionGuard::ShaFreshnessStale => {
+            facts.sha_freshness_source == DoctorShaFreshnessSource::Stale
+        },
+        DoctorDecisionGuard::ApproveEligible => {
+            facts.all_verdicts_approve
+                && !facts.has_actionable_findings
+                && facts.sha_freshness_source == DoctorShaFreshnessSource::RemoteMatch
+                && facts.merge_conflict_status != DoctorMergeConflictStatus::HasConflicts
+        },
+        DoctorDecisionGuard::MergeConflictsPresent => {
+            facts.merge_conflict_status == DoctorMergeConflictStatus::HasConflicts
+        },
+        DoctorDecisionGuard::GateProgressTerminalFailed => {
+            facts.gate_progress_state == DoctorGateProgressState::TerminalFailed
+        },
+        DoctorDecisionGuard::ImplementorRemediationResolved => {
+            facts.requires_implementor_remediation && facts.all_verdicts_resolved
+        },
+        DoctorDecisionGuard::PendingNoActiveWithGateInFlight => {
+            facts.has_pending_verdict
+                && facts.active_agents == 0
+                && facts.gate_progress_state == DoctorGateProgressState::InFlight
+        },
+        DoctorDecisionGuard::AllActiveIdle => facts.all_active_idle,
+        DoctorDecisionGuard::PendingNoActive => {
+            facts.active_agents == 0 && facts.has_pending_verdict
+        },
+        DoctorDecisionGuard::LifecycleEscalation => facts.lifecycle_escalation,
+        DoctorDecisionGuard::Default => true,
     }
 }
 
-fn derive_doctor_decision_state(
-    input: &DoctorActionInputs<'_>,
-    facts: &DoctorDecisionFacts,
-) -> DoctorDecisionState {
+fn derive_doctor_decision_state(facts: &DoctorDecisionFacts) -> DoctorDecisionState {
     for rule in DOCTOR_DECISION_RULES {
-        if rule.state.triggered(input, facts) {
+        if doctor_decision_guard_triggered(rule, facts) {
             return rule.state;
         }
     }
@@ -4135,25 +4381,6 @@ fn render_doctor_command_template(template: &str, pr_number: u32) -> String {
         )
 }
 
-fn build_doctor_recommended_action_for_state(
-    state: DoctorDecisionState,
-    pr_number: u32,
-    reason: String,
-    command_override: Option<String>,
-) -> DoctorRecommendedAction {
-    let rule = doctor_recommendation_rule_for_state(state);
-    let command = command_override.or_else(|| {
-        rule.command_template
-            .map(|template| render_doctor_command_template(template, pr_number))
-    });
-    DoctorRecommendedAction {
-        action: rule.action.to_string(),
-        reason,
-        priority: rule.priority.to_string(),
-        command,
-    }
-}
-
 fn restart_reviews_command(pr_number: u32, force: bool) -> String {
     if force {
         format!("apm2 fac restart --pr {pr_number} --force --refresh-identity")
@@ -4162,120 +4389,42 @@ fn restart_reviews_command(pr_number: u32, force: bool) -> String {
     }
 }
 
-fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommendedAction {
-    let facts = DoctorDecisionFacts::from_input(input);
-    let state = derive_doctor_decision_state(input, &facts);
-
-    match state {
-        DoctorDecisionState::Fix => build_doctor_recommended_action_for_state(
-            DoctorDecisionState::Fix,
-            input.pr_number,
-            "local FAC state indicates integrity/corruption issues".to_string(),
-            None,
-        ),
-        DoctorDecisionState::Done => build_doctor_recommended_action_for_state(
-            DoctorDecisionState::Done,
-            input.pr_number,
-            "PR has been merged to main".to_string(),
-            None,
-        ),
-        DoctorDecisionState::Merge => build_doctor_recommended_action_for_state(
-            DoctorDecisionState::Merge,
-            input.pr_number,
-            "all verdicts approve; gates pass; SHA is fresh; no merge conflicts".to_string(),
-            None,
-        ),
-        DoctorDecisionState::RestartStaleIdentity => build_doctor_recommended_action_for_state(
-            DoctorDecisionState::RestartStaleIdentity,
-            input.pr_number,
-            "local verdict/findings snapshot is stale relative to remote PR head".to_string(),
-            Some(restart_reviews_command(input.pr_number, true)),
-        ),
-        DoctorDecisionState::Approve => build_doctor_recommended_action_for_state(
-            DoctorDecisionState::Approve,
-            input.pr_number,
-            "all review dimensions approve; awaiting auto-merge".to_string(),
-            None,
-        ),
-        DoctorDecisionState::DispatchMergeConflicts => build_doctor_recommended_action_for_state(
-            DoctorDecisionState::DispatchMergeConflicts,
-            input.pr_number,
-            "merge conflicts require implementor remediation and a fresh push".to_string(),
-            None,
-        ),
-        DoctorDecisionState::DispatchFailedGates => {
-            let reason = facts
-                .push_failure_hint
-                .as_deref()
-                .unwrap_or(
-                    "evidence gate failure requires implementor remediation before review can continue",
-                )
-                .to_string();
-            build_doctor_recommended_action_for_state(
-                DoctorDecisionState::DispatchFailedGates,
-                input.pr_number,
-                reason,
-                None,
-            )
-        },
-        DoctorDecisionState::DispatchImplementor => {
+fn render_doctor_recommendation_reason(
+    rule: &DoctorRecommendationRule,
+    input: &DoctorActionInputs<'_>,
+    facts: &DoctorDecisionFacts,
+) -> String {
+    match rule.reason_kind {
+        DoctorReasonKind::Template => rule.reason_template.to_string(),
+        DoctorReasonKind::PushFailureHintOrTemplate => facts
+            .push_failure_hint
+            .clone()
+            .unwrap_or_else(|| rule.reason_template.to_string()),
+        DoctorReasonKind::FindingsRollupWithPushHint => {
             let push_hint = facts
                 .push_failure_hint
                 .as_deref()
-                .unwrap_or("review findings require implementor remediation");
+                .unwrap_or(rule.reason_template);
             let findings_rollup = format_findings_rollup_for_reason(input.findings_summary);
-            let reason = if findings_rollup.is_empty() {
+            if findings_rollup.is_empty() {
                 push_hint.to_string()
             } else {
                 format!("{findings_rollup}; {push_hint}")
-            };
-            build_doctor_recommended_action_for_state(
-                DoctorDecisionState::DispatchImplementor,
-                input.pr_number,
-                reason,
-                None,
-            )
+            }
         },
-        DoctorDecisionState::WaitForGates => build_doctor_recommended_action_for_state(
-            DoctorDecisionState::WaitForGates,
-            input.pr_number,
-            "FAC gates are still in progress; reviewer restart is deferred".to_string(),
-            None,
-        ),
-        DoctorDecisionState::RestartIdleReviewers => {
+        DoctorReasonKind::IdleRestartWithMaxIdle => {
             let max_idle = facts
                 .max_idle_seconds
                 .unwrap_or(DOCTOR_ACTIVE_AGENT_IDLE_TIMEOUT_SECONDS);
-            build_doctor_recommended_action_for_state(
-                DoctorDecisionState::RestartIdleReviewers,
-                input.pr_number,
-                format!(
-                    "all active reviewer agents are idle (no activity for up to {max_idle}s); recommend restart"
-                ),
-                Some(restart_reviews_command(input.pr_number, true)),
+            format!(
+                "all active reviewer agents are idle (no activity for up to {max_idle}s); recommend restart"
             )
         },
-        DoctorDecisionState::RestartPendingNoActiveReviewers => {
-            let reason = facts.push_failure_hint.clone().unwrap_or_else(|| {
-                "no active reviewer agents and verdict remains pending".to_string()
-            });
-            build_doctor_recommended_action_for_state(
-                DoctorDecisionState::RestartPendingNoActiveReviewers,
-                input.pr_number,
-                reason,
-                Some(restart_reviews_command(
-                    input.pr_number,
-                    facts.has_forced_restart_terminal_reason,
-                )),
-            )
-        },
-        DoctorDecisionState::EscalateLifecycleBudget => build_doctor_recommended_action_for_state(
-            DoctorDecisionState::EscalateLifecycleBudget,
-            input.pr_number,
-            "lifecycle retry/error budget exhausted".to_string(),
-            None,
-        ),
-        DoctorDecisionState::Wait => {
+        DoctorReasonKind::PendingNoActiveWithPushHint => facts
+            .push_failure_hint
+            .clone()
+            .unwrap_or_else(|| rule.reason_template.to_string()),
+        DoctorReasonKind::WaitWithPendingHint => {
             let mut wait_reason =
                 "reviews are in progress or awaiting projection catch-up".to_string();
             if facts
@@ -4289,14 +4438,38 @@ fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommended
                 wait_reason.push_str(&pending_seconds.to_string());
                 wait_reason.push_str("s (may be stuck)");
             }
-
-            build_doctor_recommended_action_for_state(
-                DoctorDecisionState::Wait,
-                input.pr_number,
-                wait_reason,
-                None,
-            )
+            wait_reason
         },
+    }
+}
+
+fn render_doctor_recommendation_command(
+    rule: &DoctorRecommendationRule,
+    input: &DoctorActionInputs<'_>,
+    facts: &DoctorDecisionFacts,
+) -> Option<String> {
+    match rule.command_kind {
+        DoctorCommandKind::None => None,
+        DoctorCommandKind::RuleTemplate => rule
+            .command_template
+            .map(|template| render_doctor_command_template(template, input.pr_number)),
+        DoctorCommandKind::RestartForce => Some(restart_reviews_command(input.pr_number, true)),
+        DoctorCommandKind::RestartConditionalForce => Some(restart_reviews_command(
+            input.pr_number,
+            facts.has_forced_restart_terminal_reason,
+        )),
+    }
+}
+
+fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommendedAction {
+    let facts = DoctorDecisionFacts::from_input(input);
+    let state = derive_doctor_decision_state(&facts);
+    let rule = doctor_recommendation_rule_for_state(state);
+    DoctorRecommendedAction {
+        action: rule.action.to_string(),
+        reason: render_doctor_recommendation_reason(rule, input, &facts),
+        priority: rule.priority.to_string(),
+        command: render_doctor_recommendation_command(rule, input, &facts),
     }
 }
 
@@ -4437,12 +4610,130 @@ fn merge_gate_freshness(existing: Option<i64>, incoming: Option<i64>) -> Option<
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorGateReductionDecision {
+    ReplaceIncoming,
+    KeepExisting,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DoctorGateReductionRule {
+    priority: u8,
+    decision: DoctorGateReductionDecision,
+    guard: DoctorGateReductionGuard,
+    guard_id: &'static str,
+    guard_predicate: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DoctorGateReductionGuard {
+    IncomingSignalHigher,
+    ExistingSignalHigher,
+    SameSignalIncomingSourceHigher,
+    SameSignalIncomingTimestampNewer,
+    Default,
+}
+
+impl DoctorGateReductionGuard {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::IncomingSignalHigher => "incoming_signal_higher",
+            Self::ExistingSignalHigher => "existing_signal_higher",
+            Self::SameSignalIncomingSourceHigher => "same_signal_incoming_source_higher",
+            Self::SameSignalIncomingTimestampNewer => "same_signal_incoming_timestamp_newer",
+            Self::Default => "default",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
+struct DoctorGateReductionFacts {
+    incoming_signal_higher: bool,
+    existing_signal_higher: bool,
+    same_signal: bool,
+    incoming_source_higher: bool,
+    incoming_completed_at_newer: bool,
+}
+
+const DOCTOR_GATE_REDUCTION_RULES: &[DoctorGateReductionRule] = &[
+    DoctorGateReductionRule {
+        priority: 1,
+        decision: DoctorGateReductionDecision::ReplaceIncoming,
+        guard: DoctorGateReductionGuard::IncomingSignalHigher,
+        guard_id: "GATE-R-001",
+        guard_predicate: "incoming.signal_priority > existing.signal_priority",
+    },
+    DoctorGateReductionRule {
+        priority: 2,
+        decision: DoctorGateReductionDecision::KeepExisting,
+        guard: DoctorGateReductionGuard::ExistingSignalHigher,
+        guard_id: "GATE-R-002",
+        guard_predicate: "incoming.signal_priority < existing.signal_priority",
+    },
+    DoctorGateReductionRule {
+        priority: 3,
+        decision: DoctorGateReductionDecision::ReplaceIncoming,
+        guard: DoctorGateReductionGuard::SameSignalIncomingSourceHigher,
+        guard_id: "GATE-R-003",
+        guard_predicate: "incoming.signal_priority == existing.signal_priority && incoming.source_priority > existing.source_priority",
+    },
+    DoctorGateReductionRule {
+        priority: 4,
+        decision: DoctorGateReductionDecision::ReplaceIncoming,
+        guard: DoctorGateReductionGuard::SameSignalIncomingTimestampNewer,
+        guard_id: "GATE-R-004",
+        guard_predicate: "incoming.signal_priority == existing.signal_priority && incoming.completed_at > existing.completed_at",
+    },
+    DoctorGateReductionRule {
+        priority: 5,
+        decision: DoctorGateReductionDecision::KeepExisting,
+        guard: DoctorGateReductionGuard::Default,
+        guard_id: "GATE-R-005",
+        guard_predicate: "default",
+    },
+];
+
+fn gate_timestamp_is_newer(incoming: Option<&str>, existing: Option<&str>) -> bool {
+    match (
+        incoming.and_then(parse_rfc3339_utc),
+        existing.and_then(parse_rfc3339_utc),
+    ) {
+        (Some(incoming_ts), Some(existing_ts)) => incoming_ts > existing_ts,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+fn derive_doctor_gate_reduction_decision(
+    facts: DoctorGateReductionFacts,
+) -> DoctorGateReductionDecision {
+    for rule in DOCTOR_GATE_REDUCTION_RULES {
+        let triggered = match rule.guard {
+            DoctorGateReductionGuard::IncomingSignalHigher => facts.incoming_signal_higher,
+            DoctorGateReductionGuard::ExistingSignalHigher => facts.existing_signal_higher,
+            DoctorGateReductionGuard::SameSignalIncomingSourceHigher => {
+                facts.same_signal && facts.incoming_source_higher
+            },
+            DoctorGateReductionGuard::SameSignalIncomingTimestampNewer => {
+                facts.same_signal && facts.incoming_completed_at_newer
+            },
+            DoctorGateReductionGuard::Default => true,
+        };
+        if triggered {
+            return rule.decision;
+        }
+    }
+    DoctorGateReductionDecision::KeepExisting
+}
+
 fn upsert_doctor_gate_snapshot(
     gates_by_name: &mut std::collections::BTreeMap<String, DoctorGateSnapshot>,
     name: &str,
     status: &'static str,
     completed_at: Option<String>,
     freshness_seconds: Option<i64>,
+    source: DoctorGateSource,
 ) {
     let gate_name = name.trim().to_string();
     if gate_name.is_empty() {
@@ -4455,18 +4746,38 @@ fn upsert_doctor_gate_snapshot(
                 status: status.to_string(),
                 completed_at,
                 freshness_seconds,
+                source,
             });
         },
         std::collections::btree_map::Entry::Occupied(mut entry) => {
             let snapshot = entry.get_mut();
             let existing_signal = doctor_gate_signal_from_status(&snapshot.status);
             let incoming_signal = doctor_gate_signal_from_status(status);
-            if doctor_gate_signal_priority(incoming_signal)
-                > doctor_gate_signal_priority(existing_signal)
+            let facts = DoctorGateReductionFacts {
+                incoming_signal_higher: doctor_gate_signal_priority(incoming_signal)
+                    > doctor_gate_signal_priority(existing_signal),
+                existing_signal_higher: doctor_gate_signal_priority(existing_signal)
+                    > doctor_gate_signal_priority(incoming_signal),
+                same_signal: doctor_gate_signal_priority(existing_signal)
+                    == doctor_gate_signal_priority(incoming_signal),
+                incoming_source_higher: source.priority() > snapshot.source.priority(),
+                incoming_completed_at_newer: gate_timestamp_is_newer(
+                    completed_at.as_deref(),
+                    snapshot.completed_at.as_deref(),
+                ),
+            };
+            if derive_doctor_gate_reduction_decision(facts)
+                == DoctorGateReductionDecision::ReplaceIncoming
             {
                 snapshot.status = doctor_gate_status_for_signal(incoming_signal).to_string();
+                snapshot.source = source;
             }
-            if snapshot.completed_at.is_none() {
+            if snapshot.completed_at.is_none()
+                || gate_timestamp_is_newer(
+                    completed_at.as_deref(),
+                    snapshot.completed_at.as_deref(),
+                )
+            {
                 snapshot.completed_at = completed_at;
             }
             snapshot.freshness_seconds =
@@ -4479,32 +4790,56 @@ fn upsert_doctor_gate_snapshot(
 struct DoctorGateProgressRule {
     priority: u8,
     state: DoctorGateProgressState,
+    guard: DoctorGateProgressGuard,
     guard_id: &'static str,
     guard_predicate: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DoctorGateProgressGuard {
+    LifecycleGatesRunningOrAnyInFlight,
+    AnyFailed,
+    AnyPassed,
+    Default,
+}
+
+impl DoctorGateProgressGuard {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LifecycleGatesRunningOrAnyInFlight => "lifecycle_gates_running_or_any_in_flight",
+            Self::AnyFailed => "any_failed",
+            Self::AnyPassed => "any_passed",
+            Self::Default => "default",
+        }
+    }
 }
 
 const DOCTOR_GATE_PROGRESS_RULES: &[DoctorGateProgressRule] = &[
     DoctorGateProgressRule {
         priority: 1,
         state: DoctorGateProgressState::InFlight,
+        guard: DoctorGateProgressGuard::LifecycleGatesRunningOrAnyInFlight,
         guard_id: "GATE-G-001",
         guard_predicate: "lifecycle.state == gates_running || any(gate.status in {RUNNING,NOT_RUN})",
     },
     DoctorGateProgressRule {
         priority: 2,
         state: DoctorGateProgressState::TerminalFailed,
+        guard: DoctorGateProgressGuard::AnyFailed,
         guard_id: "GATE-G-002",
         guard_predicate: "any(gate.status == FAIL) && no(gate.status in {RUNNING,NOT_RUN})",
     },
     DoctorGateProgressRule {
         priority: 3,
         state: DoctorGateProgressState::TerminalPassed,
+        guard: DoctorGateProgressGuard::AnyPassed,
         guard_id: "GATE-G-003",
         guard_predicate: "any(gate.status == PASS) && no(gate.status in {RUNNING,NOT_RUN,FAIL})",
     },
     DoctorGateProgressRule {
         priority: 4,
         state: DoctorGateProgressState::Unknown,
+        guard: DoctorGateProgressGuard::Default,
         guard_id: "GATE-G-004",
         guard_predicate: "default",
     },
@@ -4550,13 +4885,13 @@ fn derive_doctor_gate_progress_state(
 ) -> DoctorGateProgressState {
     let facts = DoctorGateProgressFacts::from_inputs(gates, lifecycle);
     for rule in DOCTOR_GATE_PROGRESS_RULES {
-        let triggered = match rule.state {
-            DoctorGateProgressState::InFlight => {
+        let triggered = match rule.guard {
+            DoctorGateProgressGuard::LifecycleGatesRunningOrAnyInFlight => {
                 facts.lifecycle_gates_running || facts.has_in_flight_gate
             },
-            DoctorGateProgressState::TerminalFailed => facts.has_failed_gate,
-            DoctorGateProgressState::TerminalPassed => facts.has_passed_gate,
-            DoctorGateProgressState::Unknown => true,
+            DoctorGateProgressGuard::AnyFailed => facts.has_failed_gate,
+            DoctorGateProgressGuard::AnyPassed => facts.has_passed_gate,
+            DoctorGateProgressGuard::Default => true,
         };
         if triggered {
             return rule.state;
@@ -6742,6 +7077,7 @@ mod tests {
             status: status.to_string(),
             completed_at: None,
             freshness_seconds: None,
+            source: super::DoctorGateSource::LocalCache,
         }
     }
 
@@ -6816,6 +7152,7 @@ mod tests {
             run_state_diagnostics: Vec::new(),
             repairs_applied: Vec::new(),
             latest_push_attempt: None,
+            repair_signals: super::DoctorRepairSignals::default(),
             health: Vec::new(),
         }
     }
@@ -6870,6 +7207,7 @@ mod tests {
         merge_readiness: &super::DoctorMergeReadiness,
     ) -> super::DoctorRecommendedAction {
         let mut terminal_reasons = std::collections::BTreeMap::new();
+        let repair_signals = super::DoctorRepairSignals::default();
         for review in reviews {
             terminal_reasons.insert(
                 super::canonical_review_dimension(&review.dimension),
@@ -6878,13 +7216,12 @@ mod tests {
         }
         super::build_recommended_action(&super::DoctorActionInputs {
             pr_number,
-            health: &[],
+            repair_signals: &repair_signals,
             lifecycle,
             gates: &[],
             agent_activity: super::build_doctor_agent_activity_summary(agents),
             reviews,
             review_terminal_reasons: &terminal_reasons,
-            run_state_diagnostics: &[],
             findings_summary,
             merge_readiness,
             latest_push_attempt: None,
@@ -6896,19 +7233,15 @@ mod tests {
         summary.identity.local_sha = Some("0123456789abcdef0123456789abcdef01234567".to_string());
         summary.identity.stale = false;
         summary.lifecycle = Some(doctor_lifecycle_fixture("pushed", 3, 0, 1));
+        summary.repair_signals.identity_missing = false;
+        summary.repair_signals.identity_stale = false;
         summary
     }
 
     #[test]
     fn test_derive_doctor_repair_plan_flags_registry_integrity_repair() {
         let mut summary = doctor_summary_for_repair_plan_tests();
-        summary.health.push(super::DoctorHealthItem {
-            severity: "high",
-            message:
-                "failed to load agent registry snapshot: agent registry integrity check failed"
-                    .to_string(),
-            remediation: "run doctor fix".to_string(),
-        });
+        summary.repair_signals.agent_registry_load_failed = true;
 
         let plan = super::derive_doctor_repair_plan(&summary);
         assert!(plan.repair_registry_integrity);
@@ -6918,14 +7251,7 @@ mod tests {
     #[test]
     fn test_derive_doctor_repair_plan_uses_push_attempt_registry_hint() {
         let mut summary = doctor_summary_for_repair_plan_tests();
-        summary.latest_push_attempt = Some(super::DoctorPushAttemptSummary {
-            ts: "2026-02-17T00:00:00Z".to_string(),
-            sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
-            failed_stage: Some("dispatch".to_string()),
-            exit_code: Some(1),
-            duration_s: Some(5),
-            error_hint: Some("agent registry integrity check failed".to_string()),
-        });
+        summary.repair_signals.agent_registry_load_failed = true;
 
         let plan = super::derive_doctor_repair_plan(&summary);
         assert!(plan.repair_registry_integrity);
@@ -6934,13 +7260,7 @@ mod tests {
     #[test]
     fn test_doctor_requires_force_repair_for_registry_integrity_issue() {
         let mut summary = doctor_summary_for_repair_plan_tests();
-        summary.health.push(super::DoctorHealthItem {
-            severity: "medium",
-            message:
-                "failed to load agent registry snapshot: missing agent registry integrity_hmac"
-                    .to_string(),
-            remediation: "run doctor fix".to_string(),
-        });
+        summary.repair_signals.agent_registry_load_failed = true;
 
         assert!(super::doctor_requires_force_repair(&summary));
     }
@@ -6978,7 +7298,7 @@ mod tests {
         )]);
         let action = super::build_recommended_action(&super::DoctorActionInputs {
             pr_number: 42,
-            health: &[],
+            repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("stuck", 0, 9, 100)),
             gates: &[],
             agent_activity: super::build_doctor_agent_activity_summary(Some(
@@ -6991,7 +7311,6 @@ mod tests {
             )),
             reviews: &[],
             review_terminal_reasons: &terminal_reasons,
-            run_state_diagnostics: &[],
             findings_summary: &findings,
             merge_readiness: &doctor_merge_readiness_fixture(
                 super::DoctorMergeConflictStatus::Unknown,
@@ -7007,15 +7326,9 @@ mod tests {
     fn test_build_recommended_action_terminal_reason_read_warning_does_not_force_fix() {
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::new();
-        let health = vec![super::DoctorHealthItem {
-            severity: "medium",
-            message: "unable to resolve security terminal_reason from run state: corrupt-state"
-                .to_string(),
-            remediation: "restart".to_string(),
-        }];
         let action = super::build_recommended_action(&super::DoctorActionInputs {
             pr_number: 42,
-            health: &health,
+            repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("stuck", 0, 9, 100)),
             gates: &[],
             agent_activity: super::build_doctor_agent_activity_summary(Some(
@@ -7028,7 +7341,6 @@ mod tests {
             )),
             reviews: &[],
             review_terminal_reasons: &terminal_reasons,
-            run_state_diagnostics: &[],
             findings_summary: &findings,
             merge_readiness: &doctor_merge_readiness_fixture(
                 super::DoctorMergeConflictStatus::Unknown,
@@ -7044,16 +7356,13 @@ mod tests {
     fn test_build_recommended_action_recommends_fix_for_run_state_corruption() {
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::new();
-        let diagnostics = vec![super::DoctorRunStateDiagnostic {
-            review_type: "security".to_string(),
-            condition: super::DoctorRunStateCondition::Corrupt,
-            canonical_path: "/tmp/state.json".to_string(),
-            detail: Some("corrupt-state".to_string()),
-            candidates: Vec::new(),
-        }];
+        let repair_signals = super::DoctorRepairSignals {
+            run_state_repair_required: true,
+            ..super::DoctorRepairSignals::default()
+        };
         let action = super::build_recommended_action(&super::DoctorActionInputs {
             pr_number: 42,
-            health: &[],
+            repair_signals: &repair_signals,
             lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 10)),
             gates: &[],
             agent_activity: super::build_doctor_agent_activity_summary(Some(
@@ -7066,7 +7375,6 @@ mod tests {
             )),
             reviews: &[],
             review_terminal_reasons: &terminal_reasons,
-            run_state_diagnostics: &diagnostics,
             findings_summary: &findings,
             merge_readiness: &doctor_merge_readiness_fixture(
                 super::DoctorMergeConflictStatus::Unknown,
@@ -7080,16 +7388,9 @@ mod tests {
     fn test_build_recommended_action_missing_run_state_does_not_force_fix() {
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::new();
-        let diagnostics = vec![super::DoctorRunStateDiagnostic {
-            review_type: "security".to_string(),
-            condition: super::DoctorRunStateCondition::Missing,
-            canonical_path: "/tmp/state.json".to_string(),
-            detail: Some("run-state file missing".to_string()),
-            candidates: Vec::new(),
-        }];
         let action = super::build_recommended_action(&super::DoctorActionInputs {
             pr_number: 42,
-            health: &[],
+            repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 10)),
             gates: &[],
             agent_activity: super::build_doctor_agent_activity_summary(Some(
@@ -7102,7 +7403,6 @@ mod tests {
             )),
             reviews: &[],
             review_terminal_reasons: &terminal_reasons,
-            run_state_diagnostics: &diagnostics,
             findings_summary: &findings,
             merge_readiness: &doctor_merge_readiness_fixture(
                 super::DoctorMergeConflictStatus::Unknown,
@@ -7511,7 +7811,7 @@ mod tests {
         let gates = vec![doctor_gate_snapshot("test", "NOT_RUN")];
         let action = super::build_recommended_action(&super::DoctorActionInputs {
             pr_number: 42,
-            health: &[],
+            repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("gates_running", 1, 0, 12)),
             gates: &gates,
             agent_activity: super::build_doctor_agent_activity_summary(Some(
@@ -7524,7 +7824,6 @@ mod tests {
             )),
             reviews: &reviews,
             review_terminal_reasons: &terminal_reasons,
-            run_state_diagnostics: &[],
             findings_summary: &findings,
             merge_readiness: &doctor_merge_readiness_fixture(
                 super::DoctorMergeConflictStatus::Unknown,
@@ -7545,7 +7844,7 @@ mod tests {
         let gates = vec![doctor_gate_snapshot("test", "PASS")];
         let action = super::build_recommended_action(&super::DoctorActionInputs {
             pr_number: 42,
-            health: &[],
+            repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 12)),
             gates: &gates,
             agent_activity: super::build_doctor_agent_activity_summary(Some(
@@ -7558,7 +7857,6 @@ mod tests {
             )),
             reviews: &reviews,
             review_terminal_reasons: &terminal_reasons,
-            run_state_diagnostics: &[],
             findings_summary: &findings,
             merge_readiness: &doctor_merge_readiness_fixture(
                 super::DoctorMergeConflictStatus::Unknown,
@@ -7576,7 +7874,7 @@ mod tests {
         let gates = vec![doctor_gate_snapshot("test", "RUNNING")];
         let action = super::build_recommended_action(&super::DoctorActionInputs {
             pr_number: 42,
-            health: &[],
+            repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 12)),
             gates: &gates,
             agent_activity: super::build_doctor_agent_activity_summary(Some(
@@ -7589,7 +7887,86 @@ mod tests {
             )),
             reviews: &reviews,
             review_terminal_reasons: &terminal_reasons,
-            run_state_diagnostics: &[],
+            findings_summary: &findings,
+            merge_readiness: &doctor_merge_readiness_fixture(
+                super::DoctorMergeConflictStatus::Unknown,
+            ),
+            latest_push_attempt: None,
+        });
+        assert_eq!(action.action, "wait");
+    }
+
+    #[test]
+    fn test_build_recommended_action_restarts_when_gate_progress_is_unknown_without_active_reviewers()
+     {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = pending_findings_summary();
+        let terminal_reasons = std::collections::BTreeMap::new();
+        let gates = Vec::new();
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            pr_number: 42,
+            repair_signals: &super::DoctorRepairSignals::default(),
+            lifecycle: None,
+            gates: &gates,
+            agent_activity: super::build_doctor_agent_activity_summary(Some(
+                &super::DoctorAgentSection {
+                    max_active_agents_per_pr: 2,
+                    active_agents: 0,
+                    total_agents: 0,
+                    entries: Vec::new(),
+                },
+            )),
+            reviews: &reviews,
+            review_terminal_reasons: &terminal_reasons,
+            findings_summary: &findings,
+            merge_readiness: &doctor_merge_readiness_fixture(
+                super::DoctorMergeConflictStatus::Unknown,
+            ),
+            latest_push_attempt: None,
+        });
+        assert_eq!(action.action, "restart_reviews");
+    }
+
+    #[test]
+    fn test_build_recommended_action_waits_when_projection_running_overrides_cached_pass() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = pending_findings_summary();
+        let terminal_reasons = std::collections::BTreeMap::new();
+
+        let mut gates_by_name = std::collections::BTreeMap::new();
+        super::upsert_doctor_gate_snapshot(
+            &mut gates_by_name,
+            "test",
+            "PASS",
+            Some("2026-02-20T00:00:00Z".to_string()),
+            Some(5),
+            super::DoctorGateSource::LocalCache,
+        );
+        super::upsert_doctor_gate_snapshot(
+            &mut gates_by_name,
+            "test",
+            "RUNNING",
+            Some("2026-02-20T00:00:01Z".to_string()),
+            Some(4),
+            super::DoctorGateSource::Projection,
+        );
+        let gates = gates_by_name.into_values().collect::<Vec<_>>();
+
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            pr_number: 42,
+            repair_signals: &super::DoctorRepairSignals::default(),
+            lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 12)),
+            gates: &gates,
+            agent_activity: super::build_doctor_agent_activity_summary(Some(
+                &super::DoctorAgentSection {
+                    max_active_agents_per_pr: 2,
+                    active_agents: 0,
+                    total_agents: 0,
+                    entries: Vec::new(),
+                },
+            )),
+            reviews: &reviews,
+            review_terminal_reasons: &terminal_reasons,
             findings_summary: &findings,
             merge_readiness: &doctor_merge_readiness_fixture(
                 super::DoctorMergeConflictStatus::Unknown,
@@ -7608,7 +7985,7 @@ mod tests {
         let gates = vec![doctor_gate_snapshot("test", "FAIL")];
         let action = super::build_recommended_action(&super::DoctorActionInputs {
             pr_number: 42,
-            health: &[],
+            repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 12)),
             gates: &gates,
             agent_activity: super::build_doctor_agent_activity_summary(Some(
@@ -7621,7 +7998,6 @@ mod tests {
             )),
             reviews: &reviews,
             review_terminal_reasons: &terminal_reasons,
-            run_state_diagnostics: &[],
             findings_summary: &findings,
             merge_readiness: &doctor_merge_readiness_fixture(
                 super::DoctorMergeConflictStatus::Unknown,
@@ -7766,31 +8142,18 @@ mod tests {
     }
 
     #[test]
-    fn test_doctor_should_restart_after_repair_requires_reap_pending_and_no_active_reviewers() {
-        let pending_summary = pending_findings_summary();
-        let no_agents_summary = doctor_pr_summary_for_restart_tests(pending_summary.clone(), None);
-        assert!(super::doctor_should_restart_after_repair(
-            &no_agents_summary,
-            true
-        ));
-        assert!(!super::doctor_should_restart_after_repair(
-            &no_agents_summary,
-            false
-        ));
+    fn test_doctor_recommended_restart_helpers_follow_recommended_action_contract() {
+        let mut summary = doctor_pr_summary_for_restart_tests(pending_findings_summary(), None);
+        assert!(!super::doctor_recommended_action_requests_restart(&summary));
+        assert!(!super::doctor_recommended_restart_force(&summary));
 
-        let active_agents_summary = doctor_pr_summary_for_restart_tests(
-            pending_summary,
-            Some(super::DoctorAgentSection {
-                max_active_agents_per_pr: 2,
-                active_agents: 1,
-                total_agents: 1,
-                entries: vec![reviewer_agent_snapshot("running", Some(20), Some(2))],
-            }),
-        );
-        assert!(!super::doctor_should_restart_after_repair(
-            &active_agents_summary,
-            true
-        ));
+        summary.recommended_action.action = "restart_reviews".to_string();
+        assert!(super::doctor_recommended_action_requests_restart(&summary));
+        assert!(!super::doctor_recommended_restart_force(&summary));
+
+        summary.recommended_action.command =
+            Some("apm2 fac restart --pr 42 --force --refresh-identity".to_string());
+        assert!(super::doctor_recommended_restart_force(&summary));
     }
 
     #[test]
@@ -7853,6 +8216,7 @@ mod tests {
             status: "PASS".to_string(),
             completed_at: None,
             freshness_seconds: None,
+            source: super::DoctorGateSource::LocalCache,
         }];
         let local_sha = "0123456789abcdef0123456789abcdef01234567".to_string();
         let gate_progress = super::derive_doctor_gate_progress_state(&gates, None);
@@ -8531,6 +8895,7 @@ mod tests {
             "PASS",
             Some("2026-02-20T00:00:00Z".to_string()),
             Some(5),
+            super::DoctorGateSource::LocalCache,
         );
         super::upsert_doctor_gate_snapshot(
             &mut gates,
@@ -8538,6 +8903,7 @@ mod tests {
             "RUNNING",
             Some("2026-02-20T00:00:01Z".to_string()),
             Some(4),
+            super::DoctorGateSource::Projection,
         );
         let merged = gates.get("test").expect("test gate should exist");
         assert_eq!(merged.status, "RUNNING");
@@ -8546,8 +8912,22 @@ mod tests {
     #[test]
     fn upsert_doctor_gate_snapshot_prefers_failed_over_pass() {
         let mut gates = std::collections::BTreeMap::new();
-        super::upsert_doctor_gate_snapshot(&mut gates, "test", "PASS", None, Some(5));
-        super::upsert_doctor_gate_snapshot(&mut gates, "test", "FAIL", None, Some(4));
+        super::upsert_doctor_gate_snapshot(
+            &mut gates,
+            "test",
+            "PASS",
+            None,
+            Some(5),
+            super::DoctorGateSource::LocalCache,
+        );
+        super::upsert_doctor_gate_snapshot(
+            &mut gates,
+            "test",
+            "FAIL",
+            None,
+            Some(4),
+            super::DoctorGateSource::Projection,
+        );
         let merged = gates.get("test").expect("test gate should exist");
         assert_eq!(merged.status, "FAIL");
     }

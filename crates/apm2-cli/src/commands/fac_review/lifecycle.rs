@@ -1629,26 +1629,9 @@ fn apply_event_to_record(
         }
     }
 
-    match event {
-        LifecycleEventKind::VerdictSet {
-            dimension,
-            decision,
-        } => {
-            let dim = normalize_verdict_dimension(dimension)?;
-            let dec = normalize_verdict_decision(decision)?;
-            record.verdicts.insert(dim.to_string(), dec.to_string());
-        },
-        LifecycleEventKind::ReviewsDispatched => {
-            record.verdicts.clear();
-        },
-        LifecycleEventKind::ShaDriftDetected => {
-            record.current_sha.clone_from(&sha);
-        },
-        _ => {},
-    }
-
-    let next_state = next_state_for_event(record, event)?;
-    record.pr_state = next_state;
+    let transition = evaluate_lifecycle_transition(record, event)?;
+    apply_lifecycle_transition_actions(record, &sha, &transition)?;
+    record.pr_state = transition.next_state;
     if record.pr_state == PrLifecycleState::Stuck {
         record.error_budget_used = record.error_budget_used.saturating_add(1);
         if record.error_budget_used >= MAX_ERROR_BUDGET {
@@ -1663,6 +1646,39 @@ fn apply_event_to_record(
         }
     }
     record.append_event(&sha, event.as_str(), event_detail(event));
+    Ok(())
+}
+
+fn apply_lifecycle_transition_actions(
+    record: &mut PrLifecycleRecord,
+    sha: &str,
+    transition: &LifecycleTransitionEvaluation,
+) -> Result<(), String> {
+    match transition.action {
+        LifecycleTransitionAction::ClearVerdicts => {
+            record.verdicts.clear();
+        },
+        LifecycleTransitionAction::UpsertVerdict => {
+            let dimension = transition
+                .facts
+                .normalized_dimension
+                .ok_or_else(|| "missing normalized verdict dimension".to_string())?;
+            let decision = transition
+                .facts
+                .normalized_decision
+                .ok_or_else(|| "missing normalized verdict decision".to_string())?;
+            record
+                .verdicts
+                .insert(dimension.to_string(), decision.to_string());
+        },
+        LifecycleTransitionAction::UpdateCurrentSha => {
+            record.current_sha = sha.to_ascii_lowercase();
+        },
+        LifecycleTransitionAction::ValidateAutoDerivedPayload | LifecycleTransitionAction::None => {
+            // Validation for auto-derived verdict payload already occurred
+            // during transition fact collection.
+        },
+    }
     Ok(())
 }
 
@@ -4095,159 +4111,233 @@ fn normalize_verdict_decision(decision: &str) -> Result<&'static str, String> {
     }
 }
 
-fn next_state_for_event(
+#[derive(Debug, Default, Clone)]
+struct LifecycleEventFacts {
+    normalized_dimension: Option<&'static str>,
+    normalized_decision: Option<&'static str>,
+    has_deny_after_verdict_set: bool,
+    all_required_verdicts_approve_after_set: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LifecycleTransitionGuard {
+    NotQuarantined,
+    VerdictSetDeny,
+    VerdictSetApproveAllRequiredNoDeny,
+    VerdictSetApprovePendingNoDeny,
+    VerdictAutoDerivedPayloadValid,
+    Always,
+}
+
+impl LifecycleTransitionGuard {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotQuarantined => "not_quarantined",
+            Self::VerdictSetDeny => "verdict_set_deny",
+            Self::VerdictSetApproveAllRequiredNoDeny => "verdict_set_approve_all_required_no_deny",
+            Self::VerdictSetApprovePendingNoDeny => "verdict_set_approve_pending_no_deny",
+            Self::VerdictAutoDerivedPayloadValid => "verdict_auto_derived_payload_valid",
+            Self::Always => "always",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LifecycleTransitionAction {
+    None,
+    ClearVerdicts,
+    UpsertVerdict,
+    ValidateAutoDerivedPayload,
+    UpdateCurrentSha,
+}
+
+impl LifecycleTransitionAction {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ClearVerdicts => "clear_verdicts",
+            Self::UpsertVerdict => "upsert_verdict",
+            Self::ValidateAutoDerivedPayload => "validate_auto_derived_payload",
+            Self::UpdateCurrentSha => "update_current_sha",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LifecycleTransitionEvaluation {
+    next_state: PrLifecycleState,
+    action: LifecycleTransitionAction,
+    facts: LifecycleEventFacts,
+}
+
+fn collect_lifecycle_event_facts(
     state: &PrLifecycleRecord,
     event: &LifecycleEventKind,
-) -> Result<PrLifecycleState, String> {
-    use PrLifecycleState as S;
+) -> Result<LifecycleEventFacts, String> {
     match event {
-        LifecycleEventKind::PushObserved => match state.pr_state {
-            S::Untracked
-            | S::Pushed
-            | S::GatesRunning
-            | S::GatesPassed
-            | S::GatesFailed
-            | S::ReviewsDispatched
-            | S::ReviewInProgress
-            | S::VerdictPending
-            | S::VerdictApprove
-            | S::VerdictDeny
-            | S::MergeReady
-            | S::Merged
-            | S::Stuck
-            | S::Stale
-            | S::Recovering => Ok(S::Pushed),
-            S::Quarantined => Err(format!(
-                "illegal transition: {} + push_observed",
-                state.pr_state.as_str()
-            )),
-        },
-        LifecycleEventKind::GatesStarted => match state.pr_state {
-            S::Pushed | S::GatesFailed | S::Recovering => Ok(S::GatesRunning),
-            _ => Err(format!(
-                "illegal transition: {} + gates_started",
-                state.pr_state.as_str()
-            )),
-        },
-        LifecycleEventKind::GatesPassed => match state.pr_state {
-            S::GatesRunning => Ok(S::GatesPassed),
-            _ => Err(format!(
-                "illegal transition: {} + gates_passed",
-                state.pr_state.as_str()
-            )),
-        },
-        LifecycleEventKind::GatesFailed => match state.pr_state {
-            S::GatesRunning => Ok(S::GatesFailed),
-            _ => Err(format!(
-                "illegal transition: {} + gates_failed",
-                state.pr_state.as_str()
-            )),
-        },
-        LifecycleEventKind::ReviewsDispatched => match state.pr_state {
-            S::GatesPassed | S::ReviewsDispatched | S::ReviewInProgress | S::VerdictPending => {
-                Ok(S::ReviewsDispatched)
-            },
-            _ => Err(format!(
-                "illegal transition: {} + reviews_dispatched",
-                state.pr_state.as_str()
-            )),
-        },
-        LifecycleEventKind::ReviewerSpawned { .. } => match state.pr_state {
-            S::ReviewsDispatched | S::ReviewInProgress | S::VerdictPending => {
-                Ok(S::ReviewInProgress)
-            },
-            _ => Err(format!(
-                "illegal transition: {} + reviewer_spawned",
-                state.pr_state.as_str()
-            )),
-        },
         LifecycleEventKind::VerdictSet {
             dimension,
             decision,
         } => {
-            let _ = normalize_verdict_dimension(dimension)?;
+            let normalized_dimension = normalize_verdict_dimension(dimension)?;
             let normalized_decision = normalize_verdict_decision(decision)?;
-            match state.pr_state {
-                S::GatesPassed
-                | S::ReviewsDispatched
-                | S::ReviewInProgress
-                | S::VerdictPending
-                | S::VerdictApprove
-                | S::VerdictDeny
-                | S::MergeReady
-                | S::Stuck => {
-                    if normalized_decision == "deny" {
-                        return Ok(S::VerdictDeny);
-                    }
-                    if state
-                        .verdicts
-                        .values()
-                        .any(|value| value.eq_ignore_ascii_case("deny"))
-                    {
-                        return Ok(S::VerdictDeny);
-                    }
-                    let sec = state
-                        .verdicts
-                        .get("security")
-                        .is_some_and(|value| value.eq_ignore_ascii_case("approve"));
-                    let qual = state
-                        .verdicts
-                        .get("code-quality")
-                        .is_some_and(|value| value.eq_ignore_ascii_case("approve"));
-                    if sec && qual {
-                        Ok(S::MergeReady)
-                    } else {
-                        Ok(S::VerdictPending)
-                    }
-                },
-                _ => Err(format!(
-                    "illegal transition: {} + verdict_set",
-                    state.pr_state.as_str()
-                )),
-            }
+            let mut projected_verdicts = state.verdicts.clone();
+            projected_verdicts.insert(
+                normalized_dimension.to_string(),
+                normalized_decision.to_string(),
+            );
+            let has_deny_after_verdict_set = projected_verdicts
+                .values()
+                .any(|value| value.eq_ignore_ascii_case("deny"));
+            let all_required_verdicts_approve_after_set = projected_verdicts
+                .get("security")
+                .is_some_and(|value| value.eq_ignore_ascii_case("approve"))
+                && projected_verdicts
+                    .get("code-quality")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("approve"));
+            Ok(LifecycleEventFacts {
+                normalized_dimension: Some(normalized_dimension),
+                normalized_decision: Some(normalized_decision),
+                has_deny_after_verdict_set,
+                all_required_verdicts_approve_after_set,
+            })
         },
         LifecycleEventKind::VerdictAutoDerived {
             dimension,
             decision,
             ..
         } => {
-            let _ = normalize_verdict_dimension(dimension)?;
-            let _ = normalize_verdict_decision(decision)?;
-            Ok(state.pr_state)
+            let normalized_dimension = normalize_verdict_dimension(dimension)?;
+            let normalized_decision = normalize_verdict_decision(decision)?;
+            Ok(LifecycleEventFacts {
+                normalized_dimension: Some(normalized_dimension),
+                normalized_decision: Some(normalized_decision),
+                ..LifecycleEventFacts::default()
+            })
         },
-        LifecycleEventKind::MergeFailed { .. } => match state.pr_state {
-            S::MergeReady | S::VerdictApprove | S::VerdictPending | S::Stuck => Ok(S::Stuck),
-            _ => Err(format!(
-                "illegal transition: {} + merge_failed",
-                state.pr_state.as_str()
-            )),
-        },
-        LifecycleEventKind::Merged { .. } => match state.pr_state {
-            S::MergeReady | S::Merged => Ok(S::Merged),
-            _ => Err(format!(
-                "illegal transition: {} + merged",
-                state.pr_state.as_str()
-            )),
-        },
-        LifecycleEventKind::AgentCrashed { .. } => Ok(S::Stuck),
-        LifecycleEventKind::ShaDriftDetected => Ok(S::Stale),
-        LifecycleEventKind::RecoverRequested => match state.pr_state {
-            S::Stale | S::Stuck | S::Quarantined => Ok(S::Recovering),
-            _ => Err(format!(
-                "illegal transition: {} + recover_requested",
-                state.pr_state.as_str()
-            )),
-        },
-        LifecycleEventKind::RecoverCompleted => match state.pr_state {
-            S::Recovering => Ok(S::Pushed),
-            _ => Err(format!(
-                "illegal transition: {} + recover_completed",
-                state.pr_state.as_str()
-            )),
-        },
-        LifecycleEventKind::Quarantined { .. } => Ok(S::Quarantined),
-        LifecycleEventKind::ProjectionFailed { .. } => Ok(state.pr_state),
+        _ => Ok(LifecycleEventFacts::default()),
     }
+}
+
+fn lifecycle_state_from_name(name: &str) -> Option<PrLifecycleState> {
+    match name {
+        "untracked" => Some(PrLifecycleState::Untracked),
+        "pushed" => Some(PrLifecycleState::Pushed),
+        "gates_running" => Some(PrLifecycleState::GatesRunning),
+        "gates_passed" => Some(PrLifecycleState::GatesPassed),
+        "gates_failed" => Some(PrLifecycleState::GatesFailed),
+        "reviews_dispatched" => Some(PrLifecycleState::ReviewsDispatched),
+        "review_in_progress" => Some(PrLifecycleState::ReviewInProgress),
+        "verdict_pending" => Some(PrLifecycleState::VerdictPending),
+        "verdict_approve" => Some(PrLifecycleState::VerdictApprove),
+        "verdict_deny" => Some(PrLifecycleState::VerdictDeny),
+        "merge_ready" => Some(PrLifecycleState::MergeReady),
+        "merged" => Some(PrLifecycleState::Merged),
+        "stuck" => Some(PrLifecycleState::Stuck),
+        "stale" => Some(PrLifecycleState::Stale),
+        "recovering" => Some(PrLifecycleState::Recovering),
+        "quarantined" => Some(PrLifecycleState::Quarantined),
+        _ => None,
+    }
+}
+
+fn lifecycle_rule_matches_from_state(
+    rule: &LifecycleTransitionRule,
+    state: PrLifecycleState,
+) -> bool {
+    rule.from_states.contains(&"*")
+        || rule
+            .from_states
+            .iter()
+            .any(|candidate| *candidate == state.as_str())
+}
+
+fn lifecycle_rule_target_state(
+    rule: &LifecycleTransitionRule,
+    current_state: PrLifecycleState,
+) -> Result<PrLifecycleState, String> {
+    let Some(target_name) = rule.to_states.first().copied() else {
+        return Err(format!(
+            "transition {} has no target state",
+            rule.transition_id
+        ));
+    };
+    if target_name == "self" {
+        return Ok(current_state);
+    }
+    lifecycle_state_from_name(target_name).ok_or_else(|| {
+        format!(
+            "transition {} has unsupported target state `{target_name}`",
+            rule.transition_id
+        )
+    })
+}
+
+fn lifecycle_rule_guard_triggered(
+    rule: &LifecycleTransitionRule,
+    state: &PrLifecycleRecord,
+    facts: &LifecycleEventFacts,
+) -> bool {
+    match rule.guard {
+        LifecycleTransitionGuard::NotQuarantined => state.pr_state != PrLifecycleState::Quarantined,
+        LifecycleTransitionGuard::VerdictSetDeny => {
+            facts.normalized_decision == Some("deny") || facts.has_deny_after_verdict_set
+        },
+        LifecycleTransitionGuard::VerdictSetApproveAllRequiredNoDeny => {
+            facts.normalized_decision == Some("approve")
+                && facts.all_required_verdicts_approve_after_set
+                && !facts.has_deny_after_verdict_set
+        },
+        LifecycleTransitionGuard::VerdictSetApprovePendingNoDeny => {
+            facts.normalized_decision == Some("approve")
+                && !facts.all_required_verdicts_approve_after_set
+                && !facts.has_deny_after_verdict_set
+        },
+        LifecycleTransitionGuard::VerdictAutoDerivedPayloadValid => {
+            facts.normalized_dimension.is_some() && facts.normalized_decision.is_some()
+        },
+        LifecycleTransitionGuard::Always => true,
+    }
+}
+
+fn evaluate_lifecycle_transition(
+    state: &PrLifecycleRecord,
+    event: &LifecycleEventKind,
+) -> Result<LifecycleTransitionEvaluation, String> {
+    let facts = collect_lifecycle_event_facts(state, event)?;
+    let event_name = event.as_str();
+
+    for rule in LIFECYCLE_TRANSITION_RULES
+        .iter()
+        .filter(|rule| rule.event == event_name)
+    {
+        if !lifecycle_rule_matches_from_state(rule, state.pr_state) {
+            continue;
+        }
+        if !lifecycle_rule_guard_triggered(rule, state, &facts) {
+            continue;
+        }
+        let next_state = lifecycle_rule_target_state(rule, state.pr_state)?;
+        return Ok(LifecycleTransitionEvaluation {
+            next_state,
+            action: rule.action,
+            facts,
+        });
+    }
+
+    Err(format!(
+        "illegal transition: {} + {}",
+        state.pr_state.as_str(),
+        event_name
+    ))
+}
+
+#[allow(dead_code)]
+fn next_state_for_event(
+    state: &PrLifecycleRecord,
+    event: &LifecycleEventKind,
+) -> Result<PrLifecycleState, String> {
+    evaluate_lifecycle_transition(state, event).map(|evaluation| evaluation.next_state)
 }
 
 fn event_detail(event: &LifecycleEventKind) -> serde_json::Value {
@@ -4305,6 +4395,8 @@ struct LifecycleTransitionRule {
     event: &'static str,
     from_states: &'static [&'static str],
     to_states: &'static [&'static str],
+    guard: LifecycleTransitionGuard,
+    action: LifecycleTransitionAction,
     guard_predicate: &'static str,
     requirement_refs: &'static [&'static str],
 }
@@ -4331,6 +4423,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
             "recovering",
         ],
         to_states: &["pushed"],
+        guard: LifecycleTransitionGuard::NotQuarantined,
+        action: LifecycleTransitionAction::None,
         guard_predicate: "state.pr_state != quarantined",
         requirement_refs: &[],
     },
@@ -4339,6 +4433,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
         event: "gates_started",
         from_states: &["pushed", "gates_failed", "recovering"],
         to_states: &["gates_running"],
+        guard: LifecycleTransitionGuard::Always,
+        action: LifecycleTransitionAction::None,
         guard_predicate: "state.pr_state in {pushed, gates_failed, recovering}",
         requirement_refs: &[],
     },
@@ -4347,6 +4443,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
         event: "gates_passed",
         from_states: &["gates_running"],
         to_states: &["gates_passed"],
+        guard: LifecycleTransitionGuard::Always,
+        action: LifecycleTransitionAction::None,
         guard_predicate: "state.pr_state == gates_running",
         requirement_refs: &[],
     },
@@ -4355,6 +4453,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
         event: "gates_failed",
         from_states: &["gates_running"],
         to_states: &["gates_failed"],
+        guard: LifecycleTransitionGuard::Always,
+        action: LifecycleTransitionAction::None,
         guard_predicate: "state.pr_state == gates_running",
         requirement_refs: &[],
     },
@@ -4368,6 +4468,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
             "verdict_pending",
         ],
         to_states: &["reviews_dispatched"],
+        guard: LifecycleTransitionGuard::Always,
+        action: LifecycleTransitionAction::ClearVerdicts,
         guard_predicate: "state.pr_state in {gates_passed, reviews_dispatched, review_in_progress, verdict_pending}",
         requirement_refs: &[],
     },
@@ -4380,6 +4482,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
             "verdict_pending",
         ],
         to_states: &["review_in_progress"],
+        guard: LifecycleTransitionGuard::Always,
+        action: LifecycleTransitionAction::None,
         guard_predicate: "state.pr_state in {reviews_dispatched, review_in_progress, verdict_pending}",
         requirement_refs: &[],
     },
@@ -4397,6 +4501,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
             "stuck",
         ],
         to_states: &["verdict_deny"],
+        guard: LifecycleTransitionGuard::VerdictSetDeny,
+        action: LifecycleTransitionAction::UpsertVerdict,
         guard_predicate: "normalized_decision == deny || any(state.verdicts.values == deny)",
         requirement_refs: &[],
     },
@@ -4414,6 +4520,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
             "stuck",
         ],
         to_states: &["merge_ready"],
+        guard: LifecycleTransitionGuard::VerdictSetApproveAllRequiredNoDeny,
+        action: LifecycleTransitionAction::UpsertVerdict,
         guard_predicate: "normalized_decision == approve && state.verdicts.security == approve && state.verdicts.code_quality == approve && no(state.verdicts.values == deny)",
         requirement_refs: &[],
     },
@@ -4431,6 +4539,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
             "stuck",
         ],
         to_states: &["verdict_pending"],
+        guard: LifecycleTransitionGuard::VerdictSetApprovePendingNoDeny,
+        action: LifecycleTransitionAction::UpsertVerdict,
         guard_predicate: "normalized_decision == approve && !all_required_verdicts_approve && no(state.verdicts.values == deny)",
         requirement_refs: &[],
     },
@@ -4439,6 +4549,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
         event: "verdict_auto_derived",
         from_states: &["*"],
         to_states: &["self"],
+        guard: LifecycleTransitionGuard::VerdictAutoDerivedPayloadValid,
+        action: LifecycleTransitionAction::ValidateAutoDerivedPayload,
         guard_predicate: "dimension/decision normalize successfully",
         requirement_refs: &[],
     },
@@ -4447,6 +4559,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
         event: "merge_failed",
         from_states: &["merge_ready", "verdict_approve", "verdict_pending", "stuck"],
         to_states: &["stuck"],
+        guard: LifecycleTransitionGuard::Always,
+        action: LifecycleTransitionAction::None,
         guard_predicate: "state.pr_state in {merge_ready, verdict_approve, verdict_pending, stuck}",
         requirement_refs: &[],
     },
@@ -4455,6 +4569,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
         event: "merged",
         from_states: &["merge_ready", "merged"],
         to_states: &["merged"],
+        guard: LifecycleTransitionGuard::Always,
+        action: LifecycleTransitionAction::None,
         guard_predicate: "state.pr_state in {merge_ready, merged}",
         requirement_refs: &[],
     },
@@ -4463,6 +4579,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
         event: "agent_crashed",
         from_states: &["*"],
         to_states: &["stuck"],
+        guard: LifecycleTransitionGuard::Always,
+        action: LifecycleTransitionAction::None,
         guard_predicate: "always",
         requirement_refs: &[],
     },
@@ -4471,6 +4589,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
         event: "sha_drift_detected",
         from_states: &["*"],
         to_states: &["stale"],
+        guard: LifecycleTransitionGuard::Always,
+        action: LifecycleTransitionAction::UpdateCurrentSha,
         guard_predicate: "always",
         requirement_refs: &[],
     },
@@ -4479,6 +4599,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
         event: "recover_requested",
         from_states: &["stale", "stuck", "quarantined"],
         to_states: &["recovering"],
+        guard: LifecycleTransitionGuard::Always,
+        action: LifecycleTransitionAction::None,
         guard_predicate: "state.pr_state in {stale, stuck, quarantined}",
         requirement_refs: &[],
     },
@@ -4487,6 +4609,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
         event: "recover_completed",
         from_states: &["recovering"],
         to_states: &["pushed"],
+        guard: LifecycleTransitionGuard::Always,
+        action: LifecycleTransitionAction::None,
         guard_predicate: "state.pr_state == recovering",
         requirement_refs: &[],
     },
@@ -4495,6 +4619,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
         event: "quarantined",
         from_states: &["*"],
         to_states: &["quarantined"],
+        guard: LifecycleTransitionGuard::Always,
+        action: LifecycleTransitionAction::None,
         guard_predicate: "always",
         requirement_refs: &[],
     },
@@ -4503,6 +4629,8 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
         event: "projection_failed",
         from_states: &["*"],
         to_states: &["self"],
+        guard: LifecycleTransitionGuard::Always,
+        action: LifecycleTransitionAction::None,
         guard_predicate: "always",
         requirement_refs: &[],
     },
@@ -4527,6 +4655,8 @@ fn lifecycle_machine_transitions() -> Vec<serde_json::Value> {
                 "from_states": rule.from_states,
                 "to": transition_states_text(rule.to_states),
                 "to_states": rule.to_states,
+                "guard_kind": rule.guard.as_str(),
+                "action_kind": rule.action.as_str(),
                 "guard_predicate": rule.guard_predicate,
                 "requirement_refs": rule.requirement_refs,
             })

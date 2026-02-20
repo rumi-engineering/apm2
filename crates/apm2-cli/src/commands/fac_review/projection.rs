@@ -209,6 +209,98 @@ pub fn event_is_terminal_crash(event: &serde_json::Value) -> bool {
 // ── Per-type projection state ───────────────────────────────────────────────
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionStateDecision {
+    Alive,
+    DoneVerdictFailure,
+    Done,
+    CrashFailure,
+    StaleProcessFailure,
+    None,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct ProjectionStateRule {
+    priority: u8,
+    decision: ProjectionStateDecision,
+    guard_id: &'static str,
+    guard_predicate: &'static str,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(clippy::struct_excessive_bools)]
+struct ProjectionStateFacts {
+    has_alive_entry: bool,
+    has_done_event: bool,
+    done_verdict_failed: bool,
+    has_terminal_crash: bool,
+    has_stale_process_state: bool,
+}
+
+#[cfg(test)]
+const PROJECTION_STATE_RULES: &[ProjectionStateRule] = &[
+    ProjectionStateRule {
+        priority: 1,
+        decision: ProjectionStateDecision::Alive,
+        guard_id: "PROJ-S-001",
+        guard_predicate: "facts.has_alive_entry",
+    },
+    ProjectionStateRule {
+        priority: 2,
+        decision: ProjectionStateDecision::DoneVerdictFailure,
+        guard_id: "PROJ-S-002",
+        guard_predicate: "facts.has_done_event && facts.done_verdict_failed",
+    },
+    ProjectionStateRule {
+        priority: 3,
+        decision: ProjectionStateDecision::Done,
+        guard_id: "PROJ-S-003",
+        guard_predicate: "facts.has_done_event",
+    },
+    ProjectionStateRule {
+        priority: 4,
+        decision: ProjectionStateDecision::CrashFailure,
+        guard_id: "PROJ-S-004",
+        guard_predicate: "facts.has_terminal_crash",
+    },
+    ProjectionStateRule {
+        priority: 5,
+        decision: ProjectionStateDecision::StaleProcessFailure,
+        guard_id: "PROJ-S-005",
+        guard_predicate: "facts.has_stale_process_state",
+    },
+    ProjectionStateRule {
+        priority: 6,
+        decision: ProjectionStateDecision::None,
+        guard_id: "PROJ-S-006",
+        guard_predicate: "default",
+    },
+];
+
+#[cfg(test)]
+fn derive_projection_state_decision(facts: ProjectionStateFacts) -> ProjectionStateDecision {
+    for rule in PROJECTION_STATE_RULES {
+        let _ = (rule.priority, rule.guard_id, rule.guard_predicate);
+        let triggered = match rule.decision {
+            ProjectionStateDecision::Alive => facts.has_alive_entry,
+            ProjectionStateDecision::DoneVerdictFailure => {
+                facts.has_done_event && facts.done_verdict_failed
+            },
+            ProjectionStateDecision::Done => facts.has_done_event,
+            ProjectionStateDecision::CrashFailure => facts.has_terminal_crash,
+            ProjectionStateDecision::StaleProcessFailure => facts.has_stale_process_state,
+            ProjectionStateDecision::None => true,
+        };
+        if triggered {
+            return rule.decision;
+        }
+    }
+    ProjectionStateDecision::None
+}
+
+#[cfg(test)]
 pub fn projection_state_for_type(
     state: &ReviewStateFile,
     events: &[serde_json::Value],
@@ -234,15 +326,7 @@ pub fn projection_state_for_type(
         .filter(|entry| head_filter.is_none_or(|head| entry.head_sha.eq_ignore_ascii_case(head)))
         .collect::<Vec<_>>();
     active_entries.sort_by_key(|entry| entry.started_at);
-    if let Some(active) = active_entries.last() {
-        return format!(
-            "alive:{}/{}:r{}:{}",
-            active.model,
-            active.backend.as_str(),
-            active.restart_count,
-            &active.head_sha[..active.head_sha.len().min(7)]
-        );
-    }
+    let active = active_entries.last().copied();
 
     let mut events_for_kind = events
         .iter()
@@ -268,65 +352,92 @@ pub fn projection_state_for_type(
         .rev()
         .find(|event| event_name(event) == "run_crash" && event_is_terminal_crash(event));
 
-    if let Some(done) = done {
-        let verdict = done
+    let has_current_activity = !events_for_kind.is_empty();
+    let has_stale_process_state = latest_entry_for_kind
+        .last()
+        .is_some_and(|stale| has_current_activity && !super::state::is_process_alive(stale.pid));
+    let done_verdict_failed = done.is_some_and(|done_event| {
+        let verdict = done_event
             .get("verdict")
             .and_then(serde_json::Value::as_str)
             .map(|value| value.trim().to_ascii_uppercase())
             .unwrap_or_default();
-        match verdict.as_str() {
-            "FAIL" => return "failed:verdict_fail".to_string(),
-            "UNKNOWN" | "" => return "failed:verdict_unknown".to_string(),
-            _ => {},
-        }
+        matches!(verdict.as_str(), "FAIL" | "UNKNOWN" | "")
+    });
+    let facts = ProjectionStateFacts {
+        has_alive_entry: active.is_some(),
+        has_done_event: done.is_some(),
+        done_verdict_failed,
+        has_terminal_crash: crash.is_some(),
+        has_stale_process_state,
+    };
 
-        let model = start
-            .and_then(|value| value.get("model"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("n/a");
-        let backend = start
-            .and_then(|value| value.get("backend"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("n/a");
-        let restarts = done
-            .get("restart_count")
-            .and_then(serde_json::Value::as_u64)
-            .or_else(|| {
-                start
-                    .and_then(|value| value.get("restart_count"))
-                    .and_then(serde_json::Value::as_u64)
-            })
-            .unwrap_or(0);
-        let sha = done
-            .get("head_sha")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("-");
-        return format!(
-            "done:{}/{backend}:r{}:{}",
-            model,
-            restarts,
-            &sha[..sha.len().min(7)]
-        );
+    match derive_projection_state_decision(facts) {
+        ProjectionStateDecision::Alive => {
+            let active = active.expect("alive decision requires active entry");
+            format!(
+                "alive:{}/{}:r{}:{}",
+                active.model,
+                active.backend.as_str(),
+                active.restart_count,
+                &active.head_sha[..active.head_sha.len().min(7)]
+            )
+        },
+        ProjectionStateDecision::DoneVerdictFailure => {
+            let done = done.expect("done verdict failure decision requires run_complete event");
+            let verdict = done
+                .get("verdict")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value.trim().to_ascii_uppercase())
+                .unwrap_or_default();
+            if verdict == "FAIL" {
+                "failed:verdict_fail".to_string()
+            } else {
+                "failed:verdict_unknown".to_string()
+            }
+        },
+        ProjectionStateDecision::Done => {
+            let done = done.expect("done decision requires run_complete event");
+            let model = start
+                .and_then(|value| value.get("model"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("n/a");
+            let backend = start
+                .and_then(|value| value.get("backend"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("n/a");
+            let restarts = done
+                .get("restart_count")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    start
+                        .and_then(|value| value.get("restart_count"))
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .unwrap_or(0);
+            let sha = done
+                .get("head_sha")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-");
+            format!(
+                "done:{}/{backend}:r{}:{}",
+                model,
+                restarts,
+                &sha[..sha.len().min(7)]
+            )
+        },
+        ProjectionStateDecision::CrashFailure => {
+            let crash = crash.expect("crash failure decision requires terminal crash event");
+            let reason = crash
+                .get("reason")
+                .or_else(|| crash.get("signal"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("run_crash");
+            format!("failed:{reason}")
+        },
+        ProjectionStateDecision::StaleProcessFailure => "failed:stale_process_state".to_string(),
+        ProjectionStateDecision::None => "none".to_string(),
     }
-
-    if let Some(crash) = crash {
-        let reason = crash
-            .get("reason")
-            .or_else(|| crash.get("signal"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("run_crash");
-        return format!("failed:{reason}");
-    }
-
-    let has_current_activity = !events_for_kind.is_empty();
-
-    if let Some(stale) = latest_entry_for_kind.last() {
-        if has_current_activity && !super::state::is_process_alive(stale.pid) {
-            return "failed:stale_process_state".to_string();
-        }
-    }
-
-    "none".to_string()
 }
 
 #[cfg(test)]
