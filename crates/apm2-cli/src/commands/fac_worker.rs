@@ -1804,18 +1804,35 @@ fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy)
             continue;
         }
 
-        // Promote to pending/ via atomic no-replace rename
-        // (move_to_dir_safe uses rename_noreplace internally).
-        // On collision (EEXIST), move_to_dir_safe generates a
-        // timestamped filename — existing pending jobs are never
-        // overwritten.
-        match move_to_dir_safe(&path, &pending_dir, &file_name) {
-            Ok(_moved_path) => {
+        // BLOCKER fix (TCK-00577 round 12): Do NOT rename the attacker-owned
+        // inode into pending/. The original file is owned by the non-service-user
+        // submitter with mode 0644, and rename() preserves ownership+mode across
+        // filesystems. This means the submitter retains write authority over the
+        // file in pending/ and can mutate it after validation (TOCTOU).
+        //
+        // Instead: create a NEW temp file in pending/ owned by the current
+        // process (service user) with mode 0600, write the validated content,
+        // fsync, then rename_noreplace into its final pending/ name. Only then
+        // remove the original broker_requests file.
+        match promote_via_rewrite(&bytes, &pending_dir, &file_name) {
+            Ok(_promoted_path) => {
                 // Lock released after successful promotion.
                 drop(lock_file);
+                // Remove the original attacker-owned broker request file.
+                // Best-effort: if removal fails, the file stays in
+                // broker_requests/ and will be re-read next cycle, but
+                // deserialization will match a pending/ file so it's harmless
+                // (duplicate detection handles this).
+                if let Err(e) = fs::remove_file(&path) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "TCK-00577: could not remove original broker request after promotion"
+                    );
+                }
                 tracing::info!(
                     file = %file_name,
-                    "TCK-00577: promoted broker request to pending/"
+                    "TCK-00577: promoted broker request to pending/ (service-user-owned rewrite)"
                 );
             },
             Err(e) => {
@@ -1823,12 +1840,99 @@ fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy)
                 tracing::warn!(
                     path = %path.display(),
                     error = %e,
-                    "TCK-00577: failed to promote broker request to pending, quarantining"
+                    "TCK-00577: failed to promote broker request to pending via rewrite, quarantining"
                 );
                 let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
             },
         }
         // ---- End enqueue lock critical section ----
+    }
+}
+
+/// Promote validated broker request content into `pending/` by creating a NEW
+/// service-user-owned file (BLOCKER fix, TCK-00577 round 12).
+///
+/// Instead of renaming the attacker-owned inode (which preserves submitter
+/// ownership and mode across `rename()`), this function:
+/// 1. Creates a new temp file in `pending/` owned by the current process (the
+///    service user) with mode 0600.
+/// 2. Writes the already-validated content.
+/// 3. Calls `fsync()` for crash safety.
+/// 4. Uses `rename_noreplace()` to atomically place the file at its final name
+///    in `pending/`.
+///
+/// On filename collision (EEXIST from `rename_noreplace`), a timestamped
+/// suffix is appended to prevent clobbering existing pending jobs.
+///
+/// # Security invariants
+///
+/// - The inode in `pending/` is always owned by the service user with mode
+///   0600. The original submitter has zero write authority over it.
+/// - The validated `bytes` are the single source of truth; the attacker cannot
+///   modify the content between validation and promotion.
+fn promote_via_rewrite(
+    bytes: &[u8],
+    pending_dir: &Path,
+    file_name: &str,
+) -> Result<PathBuf, String> {
+    // Create a temp file in pending/ — this will be owned by the current
+    // process uid (the service user) with permissions set below.
+    let temp = tempfile::NamedTempFile::new_in(pending_dir)
+        .map_err(|e| format!("cannot create temp file in {}: {e}", pending_dir.display()))?;
+
+    {
+        let file = temp.as_file();
+        // Set mode 0600 so only the service user can read/write.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("cannot set mode 0600 on temp file: {e}"))?;
+        }
+        // Write the validated content (already deserialized + bounds-checked).
+        std::io::Write::write_all(&mut &*file, bytes)
+            .map_err(|e| format!("cannot write validated content to temp file: {e}"))?;
+        // fsync for crash safety.
+        file.sync_all()
+            .map_err(|e| format!("cannot fsync promoted file: {e}"))?;
+    }
+
+    // Atomically place the file at its final name in pending/.
+    let dest = pending_dir.join(file_name);
+    match rename_noreplace(temp.path(), &dest) {
+        Ok(()) => {
+            // Disown the NamedTempFile so it doesn't delete the now-renamed file.
+            let _ = temp.into_temp_path();
+            Ok(dest)
+        },
+        Err(e)
+            if e.raw_os_error() == Some(libc::EEXIST)
+                || e.raw_os_error() == Some(libc::ENOTEMPTY)
+                || e.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            // Collision: generate a timestamped fallback name.
+            let ts_nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let stem = file_name.trim_end_matches(".json");
+            let safe_name = format!("{stem}-{ts_nanos}.json");
+            let safe_dest = pending_dir.join(&safe_name);
+            rename_noreplace(temp.path(), &safe_dest).map_err(|e2| {
+                format!(
+                    "rename {} -> {}: {e2}",
+                    temp.path().display(),
+                    safe_dest.display()
+                )
+            })?;
+            let _ = temp.into_temp_path();
+            Ok(safe_dest)
+        },
+        Err(e) => Err(format!(
+            "rename {} -> {}: {e}",
+            temp.path().display(),
+            dest.display()
+        )),
     }
 }
 
@@ -12206,5 +12310,216 @@ mod tests {
         // separately by `enqueue_via_broker_requests`, not by the relaxed
         // preflight validator on queue subdirs, so this is expected. The
         // FAC_SUBDIRS_QUEUE list does NOT include broker_requests/.
+    }
+
+    // =========================================================================
+    // Broker promotion: service-user-owned rewrite (TCK-00577 round 12 BLOCKER)
+    // =========================================================================
+
+    /// TCK-00577 round 12 BLOCKER fix: After broker promotion, the file in
+    /// `pending/` must have mode 0600 (service-user-only). Previously the
+    /// attacker-owned file was renamed directly into `pending/`, preserving
+    /// the submitter's ownership and 0644 mode — allowing post-validation
+    /// modification (TOCTOU).
+    #[cfg(unix)]
+    #[test]
+    fn promoted_broker_request_has_mode_0600_in_pending() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Create a broker request file with mode 0644 (simulating non-service-user
+        // ownership — in production the file would be owned by the submitter).
+        let content = make_valid_broker_request_json("mode-check-job");
+        let broker_file = broker_dir.join("mode-check-job.json");
+        fs::write(&broker_file, &content).expect("write broker request");
+        fs::set_permissions(&broker_file, fs::Permissions::from_mode(0o644))
+            .expect("set mode 0644 on broker request");
+
+        // Verify pre-condition: broker file has mode 0644.
+        let pre_mode = fs::metadata(&broker_file)
+            .expect("broker file metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            pre_mode, 0o644,
+            "pre-condition: broker request must be mode 0644"
+        );
+
+        // Run promotion.
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The promoted file in pending/ must have mode 0600.
+        let promoted_path = pending_dir.join("mode-check-job.json");
+        assert!(
+            promoted_path.exists(),
+            "promoted file must exist in pending/"
+        );
+        let post_mode = fs::metadata(&promoted_path)
+            .expect("promoted file metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            post_mode, 0o600,
+            "promoted file must have mode 0600 (service-user-only), got {post_mode:04o}"
+        );
+    }
+
+    /// TCK-00577 round 12 BLOCKER fix: After promotion, the original broker
+    /// request file must be removed from `broker_requests/`.
+    #[test]
+    fn promoted_broker_request_removes_original_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        let content = make_valid_broker_request_json("remove-original-job");
+        let broker_file = broker_dir.join("remove-original-job.json");
+        fs::write(&broker_file, &content).expect("write broker request");
+
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The promoted file must exist in pending/.
+        assert!(
+            pending_dir.join("remove-original-job.json").exists(),
+            "promoted file must exist in pending/"
+        );
+
+        // The original broker request must be removed.
+        assert!(
+            !broker_file.exists(),
+            "original broker request file must be removed after promotion"
+        );
+    }
+
+    /// TCK-00577 round 12 BLOCKER fix: The inode in `pending/` must be
+    /// DIFFERENT from the original broker inode. This proves the promotion
+    /// used a rewrite (new file) instead of rename (same inode).
+    #[cfg(unix)]
+    #[test]
+    fn promoted_broker_request_is_different_inode_from_original() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        let content = make_valid_broker_request_json("inode-check-job");
+        let broker_file = broker_dir.join("inode-check-job.json");
+        fs::write(&broker_file, &content).expect("write broker request");
+
+        // Capture the original inode number.
+        let original_ino = fs::metadata(&broker_file)
+            .expect("broker file metadata")
+            .ino();
+
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The promoted file must exist in pending/.
+        let promoted_path = pending_dir.join("inode-check-job.json");
+        assert!(
+            promoted_path.exists(),
+            "promoted file must exist in pending/"
+        );
+
+        // The promoted file's inode must differ from the original.
+        let promoted_ino = fs::metadata(&promoted_path)
+            .expect("promoted file metadata")
+            .ino();
+        assert_ne!(
+            original_ino, promoted_ino,
+            "promoted file in pending/ must be a NEW inode (got same inode {original_ino}), \
+             which means rename was used instead of rewrite"
+        );
+    }
+
+    /// TCK-00577 round 12: Verify `promote_via_rewrite` correctly handles
+    /// filename collisions — the existing pending file must not be clobbered.
+    #[test]
+    fn promote_via_rewrite_does_not_clobber_existing_pending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pending_dir = dir.path().join("pending");
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+
+        // Create an existing file in pending/.
+        let existing_content = b"existing pending content";
+        fs::write(pending_dir.join("collision-test.json"), existing_content)
+            .expect("write existing");
+
+        // Attempt to promote new content with the same filename.
+        let new_content = make_valid_broker_request_json("collision-test");
+        let result =
+            promote_via_rewrite(new_content.as_bytes(), &pending_dir, "collision-test.json");
+        assert!(
+            result.is_ok(),
+            "promote_via_rewrite should succeed with collision: {result:?}"
+        );
+
+        // The existing file must be untouched.
+        let existing_after =
+            fs::read(pending_dir.join("collision-test.json")).expect("read existing");
+        assert_eq!(
+            existing_after, existing_content,
+            "existing pending file must not be clobbered"
+        );
+
+        // The promoted file must exist with a timestamped suffix.
+        let promoted_path = result.unwrap();
+        assert!(
+            promoted_path.exists(),
+            "promoted file must exist at collision-safe path"
+        );
+        assert!(
+            promoted_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("collision-test-"),
+            "collision-safe name must have timestamped suffix: {promoted_path:?}"
+        );
+    }
+
+    /// TCK-00577 round 12: Verify promoted file content matches validated input
+    /// bytes.
+    #[test]
+    fn promote_via_rewrite_preserves_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pending_dir = dir.path().join("pending");
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+
+        let content = make_valid_broker_request_json("content-check-job");
+        let result =
+            promote_via_rewrite(content.as_bytes(), &pending_dir, "content-check-job.json");
+        assert!(
+            result.is_ok(),
+            "promote_via_rewrite should succeed: {result:?}"
+        );
+
+        let promoted_path = result.unwrap();
+        let promoted_bytes = fs::read(&promoted_path).expect("read promoted file");
+        assert_eq!(
+            promoted_bytes,
+            content.as_bytes(),
+            "promoted file content must match validated input"
+        );
     }
 }

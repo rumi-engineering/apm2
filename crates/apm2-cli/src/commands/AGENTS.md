@@ -793,6 +793,24 @@ systemd service executables:
   (e.g., 0333 -- world-writable without sticky) are hardened. This prevents
   an attacker from tampering with the directory mode between worker restarts.
 
+### Service-user-owned rewrite on broker promotion (TCK-00577 round 12 BLOCKER fix)
+
+- **No attacker-owned inodes in pending/**: `promote_broker_requests` no
+  longer renames the original broker request file (owned by the non-service-user
+  submitter) into `pending/`. Because `rename()` preserves ownership and mode,
+  the submitter would retain write authority over the promoted file and could
+  mutate it after bounds/deserialization checks (TOCTOU).
+- **Rewrite via `promote_via_rewrite`**: The promotion path now creates a NEW
+  temp file in `pending/` (owned by the service user with mode 0600), writes the
+  already-validated content, calls `fsync()`, and uses `rename_noreplace()` to
+  atomically place it at its final name. The original broker request file is
+  removed only after successful promotion.
+- **Inode isolation**: The file in `pending/` is always a fresh inode created by
+  the service-user worker process. The original submitter has zero write authority
+  over it.
+- **Collision handling**: Filename collisions with existing pending jobs produce
+  a timestamped suffix (same as `move_to_dir_safe`), never clobbering.
+
 ### General invariants
 
 - The `broker_requests/` directory uses mode 01733 (sticky + write-only for
