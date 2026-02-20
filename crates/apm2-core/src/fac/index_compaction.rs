@@ -28,6 +28,7 @@
 //! Deleting receipts from the content-addressed store is forbidden by default
 //! (TCK-00583 out_of_scope).
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::Path;
 
@@ -139,10 +140,26 @@ impl IndexCompactionReceiptV1 {
         if self.retention_secs == 0 {
             return Err("retention_secs must be positive".to_string());
         }
-        if self.entries_pruned != self.entries_before.saturating_sub(self.entries_after) {
+        // Monotonicity: after counts must not exceed before counts.
+        // saturating_sub would mask impossible states (after > before) as zero,
+        // so we reject explicitly before checking pruned deltas.
+        if self.entries_after > self.entries_before {
+            return Err(format!(
+                "entries_after ({}) exceeds entries_before ({}): structurally impossible",
+                self.entries_after, self.entries_before
+            ));
+        }
+        if self.jobs_after > self.jobs_before {
+            return Err(format!(
+                "jobs_after ({}) exceeds jobs_before ({}): structurally impossible",
+                self.jobs_after, self.jobs_before
+            ));
+        }
+        // Now that monotonicity is established, check exact pruned counts.
+        if self.entries_pruned != self.entries_before - self.entries_after {
             return Err("entries_pruned does not match before/after delta".to_string());
         }
-        if self.jobs_pruned != self.jobs_before.saturating_sub(self.jobs_after) {
+        if self.jobs_pruned != self.jobs_before - self.jobs_after {
             return Err("jobs_pruned does not match before/after delta".to_string());
         }
         Ok(())
@@ -171,6 +188,81 @@ impl IndexCompactionReceiptV1 {
 // =============================================================================
 // Compaction Logic
 // =============================================================================
+
+/// Tracks the best candidate digest for a single job during the O(n) rebuild.
+struct JobCandidate {
+    /// Deterministic winner: highest (timestamp, `content_hash`).
+    best_ts: u64,
+    best_digest: String,
+    /// Whether the current `job_index` digest appears at `best_ts`.
+    current_at_max: bool,
+}
+
+/// Rebuild `job_index` in O(n) via a single pass over `header_index`.
+///
+/// For each remaining header, tracks the best candidate per `job_id`.
+/// Deterministic tie-breaking: primary key is `timestamp_secs` (descending),
+/// secondary is `content_hash` (lex-greatest). A stability preference keeps
+/// the current `job_index` digest if it appears at the max timestamp.
+fn rebuild_job_index(index: &mut ReceiptIndexV1) {
+    // Phase 1: single pass -- build best-candidate map.
+    let mut winners: HashMap<String, JobCandidate> = HashMap::new();
+
+    for header in index.header_index.values() {
+        let current_digest_for_job = index.job_index.get(&header.job_id);
+
+        winners
+            .entry(header.job_id.clone())
+            .and_modify(|candidate| {
+                match header.timestamp_secs.cmp(&candidate.best_ts) {
+                    std::cmp::Ordering::Greater => {
+                        candidate.best_ts = header.timestamp_secs;
+                        candidate.best_digest.clone_from(&header.content_hash);
+                        candidate.current_at_max =
+                            current_digest_for_job.is_some_and(|cur| *cur == header.content_hash);
+                    },
+                    std::cmp::Ordering::Equal => {
+                        if header.content_hash > candidate.best_digest {
+                            candidate.best_digest.clone_from(&header.content_hash);
+                        }
+                        if !candidate.current_at_max {
+                            candidate.current_at_max = current_digest_for_job
+                                .is_some_and(|cur| *cur == header.content_hash);
+                        }
+                    },
+                    std::cmp::Ordering::Less => {
+                        // Older than current max -- no update needed.
+                    },
+                }
+            })
+            .or_insert_with(|| {
+                let is_current =
+                    current_digest_for_job.is_some_and(|cur| *cur == header.content_hash);
+                JobCandidate {
+                    best_ts: header.timestamp_secs,
+                    best_digest: header.content_hash.clone(),
+                    current_at_max: is_current,
+                }
+            });
+    }
+
+    // Phase 2: reconcile job_index against the winner map.
+    let jobs_to_check: Vec<String> = index.job_index.keys().cloned().collect();
+    for job_id in &jobs_to_check {
+        match winners.get(job_id) {
+            None => {
+                index.job_index.remove(job_id);
+            },
+            Some(candidate) => {
+                if !candidate.current_at_max {
+                    index
+                        .job_index
+                        .insert(job_id.clone(), candidate.best_digest.clone());
+                }
+            },
+        }
+    }
+}
 
 /// Compact the receipt index by pruning entries older than the retention
 /// window.
@@ -227,62 +319,10 @@ pub fn compact_index(
         index.header_index.remove(hash);
     }
 
-    // Rebuild job_index: for each job, find the latest remaining header.
-    // Remove jobs that have no remaining headers, and update pointers for
-    // jobs whose latest receipt was pruned but older receipts remain.
-    //
-    // Deterministic tie-breaking for equal timestamps:
-    //   1. If the current job_index digest is still present at the max timestamp,
-    //      keep it (stability: compaction does not flip pointers when no stale
-    //      entry for the job was relevant).
-    //   2. Otherwise, break ties by lexicographically greatest content_hash
-    //      (deterministic across HashMap iteration orders and process seeds).
-    let jobs_to_check: Vec<String> = index.job_index.keys().cloned().collect();
-    for job_id in &jobs_to_check {
-        // Collect all remaining headers for this job.
-        let candidates: Vec<&super::receipt_index::ReceiptHeaderV1> = index
-            .header_index
-            .values()
-            .filter(|h| h.job_id == *job_id)
-            .collect();
-
-        // Select the winner using a deterministic comparator:
-        //   Primary key: timestamp_secs (descending — greatest wins).
-        //   Tie-break:   content_hash   (descending — lex-greatest wins).
-        // This is fully deterministic regardless of HashMap iteration order.
-        let deterministic_winner = candidates.iter().max_by(|a, b| {
-            a.timestamp_secs
-                .cmp(&b.timestamp_secs)
-                .then_with(|| a.content_hash.cmp(&b.content_hash))
-        });
-
-        let Some(det_winner) = deterministic_winner else {
-            // No remaining headers for this job — remove from job_index.
-            index.job_index.remove(job_id);
-            continue;
-        };
-
-        // Stability preference: if the current job_index digest is still
-        // present at the max timestamp, keep it instead of the deterministic
-        // winner. This prevents compaction from flipping pointers when the
-        // current receipt is still valid at the max timestamp.
-        let max_ts = det_winner.timestamp_secs;
-        let current_digest = index.job_index.get(job_id).cloned();
-
-        let winner_digest = current_digest
-            .as_ref()
-            .filter(|current| {
-                // Keep current digest only if it is among candidates at
-                // the max timestamp.
-                candidates
-                    .iter()
-                    .any(|h| h.content_hash == **current && h.timestamp_secs == max_ts)
-            })
-            .cloned()
-            .unwrap_or_else(|| det_winner.content_hash.clone());
-
-        index.job_index.insert(job_id.clone(), winner_digest);
-    }
+    // Rebuild job_index in O(n) via a single pass over header_index.
+    // See `rebuild_job_index` for the deterministic tie-breaking and
+    // stability preference logic.
+    rebuild_job_index(&mut index);
 
     let entries_after = index.header_index.len();
     let jobs_after = index.job_index.len();
@@ -752,6 +792,57 @@ mod tests {
             content_hash: String::new(),
         };
         assert!(receipt.validate().is_err());
+    }
+
+    #[test]
+    fn compact_receipt_validate_rejects_entries_after_exceeding_before() {
+        // entries_after > entries_before is structurally impossible.
+        // With saturating_sub this would have silently passed (pruned=0).
+        let receipt = IndexCompactionReceiptV1 {
+            schema: INDEX_COMPACTION_RECEIPT_SCHEMA.to_string(),
+            receipt_id: "test-monotone-entries".to_string(),
+            timestamp_secs: 1000,
+            retention_secs: 500,
+            cutoff_timestamp_secs: 500,
+            entries_before: 2,
+            entries_after: 5, // Impossible: more entries after than before.
+            entries_pruned: 0,
+            jobs_before: 2,
+            jobs_after: 2,
+            jobs_pruned: 0,
+            rebuild_epoch_after: 0,
+            content_hash: String::new(),
+        };
+        let err = receipt.validate().unwrap_err();
+        assert!(
+            err.contains("entries_after") && err.contains("entries_before"),
+            "error must mention the impossible field relationship: {err}"
+        );
+    }
+
+    #[test]
+    fn compact_receipt_validate_rejects_jobs_after_exceeding_before() {
+        // jobs_after > jobs_before is structurally impossible.
+        let receipt = IndexCompactionReceiptV1 {
+            schema: INDEX_COMPACTION_RECEIPT_SCHEMA.to_string(),
+            receipt_id: "test-monotone-jobs".to_string(),
+            timestamp_secs: 1000,
+            retention_secs: 500,
+            cutoff_timestamp_secs: 500,
+            entries_before: 2,
+            entries_after: 2,
+            entries_pruned: 0,
+            jobs_before: 1,
+            jobs_after: 3, // Impossible: more jobs after than before.
+            jobs_pruned: 0,
+            rebuild_epoch_after: 0,
+            content_hash: String::new(),
+        };
+        let err = receipt.validate().unwrap_err();
+        assert!(
+            err.contains("jobs_after") && err.contains("jobs_before"),
+            "error must mention the impossible field relationship: {err}"
+        );
     }
 
     #[test]
