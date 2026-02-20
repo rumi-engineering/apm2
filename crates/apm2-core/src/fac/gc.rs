@@ -648,17 +648,25 @@ fn collect_lane_log_retention_targets(
         //
         // SENTINEL GUARD (MAJOR finding fix): If any entry has
         // `estimated_bytes == u64::MAX`, the recursive size estimator
-        // hit its scan limit (MAX_LANE_SCAN_ENTRIES) and the returned
-        // value is a traversal-failure sentinel, NOT a real byte count.
-        // Using it in arithmetic would cause saturating_add to produce
-        // u64::MAX for total_bytes, making saturating_sub drop the total
-        // below the quota after subtracting pruned entries — effectively
-        // disabling byte-quota enforcement. Fail-closed: skip the
-        // byte-quota phase entirely when any entry's size is unknown,
-        // letting TTL and keep-last-N phases handle retention. The
-        // byte-quota will be retried on the next GC cycle.
+        // encountered a traversal failure (depth overflow, scan-entry
+        // overflow, or unreadable subtree via read_dir failure) and the
+        // returned value is a fail-closed sentinel, NOT a real byte count.
+        //
+        // Fail-closed: skip the ENTIRE lane when any job dir's size is
+        // unknown. Without accurate sizes, TTL-based pruning decisions
+        // may also be unsound (an apparently small directory may actually
+        // be enormous). The lane's log retention will be retried on the
+        // next GC cycle when the obstruction may have been resolved.
         let has_size_overflow = job_logs.iter().any(|e| e.estimated_bytes == u64::MAX);
-        if config.per_lane_log_max_bytes > 0 && !has_size_overflow {
+        if has_size_overflow {
+            // Discard all lane_targets (including symlink/stray-file
+            // targets). The entire lane is in an indeterminate state;
+            // partial GC targeting could leave the lane in a worse
+            // condition than skipping it entirely.
+            continue;
+        }
+
+        if config.per_lane_log_max_bytes > 0 {
             let mut total_bytes: u64 = job_logs
                 .iter()
                 .map(|e| e.estimated_bytes)
@@ -727,8 +735,13 @@ fn estimate_job_log_dir_size_recursive_inner(
     if depth >= MAX_TRAVERSAL_DEPTH {
         return u64::MAX;
     }
+    // CQ-MAJOR fix (read_dir failure): return u64::MAX (same fail-closed
+    // sentinel as depth overflow and scan-entry overflow) when read_dir fails.
+    // Returning 0 would let unreadable subtrees bypass byte-quota pruning by
+    // being undercounted as zero bytes — a job can make a nested log directory
+    // unreadable (mode 000) to evade per-lane byte caps.
     let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
+        return u64::MAX;
     };
     let mut total = 0u64;
     for entry in entries.flatten() {
@@ -3598,12 +3611,13 @@ mod tests {
     }
 
     /// MAJOR regression: when `estimate_job_log_dir_size_recursive` returns
-    /// `u64::MAX` (traversal overflow sentinel) for any job log entry, the
-    /// byte-quota phase in `collect_lane_log_retention_targets` MUST be
-    /// skipped. Using the sentinel in arithmetic would cause `saturating_add`
-    /// to produce `u64::MAX` for `total_bytes`, breaking quota enforcement.
+    /// `u64::MAX` (traversal overflow sentinel) for any job log entry,
+    /// `collect_lane_log_retention_targets` MUST skip the entire lane
+    /// (fail-closed). Without accurate sizes, retention decisions are
+    /// unsound — both TTL and byte-quota pruning could make incorrect
+    /// decisions.
     #[test]
-    fn log_retention_skips_byte_quota_when_estimator_returns_sentinel() {
+    fn log_retention_skips_lane_when_estimator_returns_sentinel() {
         let dir = tempdir().expect("tmp");
         let fac_root = dir.path().join("fac");
         std::fs::create_dir_all(&fac_root).expect("fac");
@@ -3876,6 +3890,140 @@ mod tests {
             "deep tree triggering depth-overflow sentinel must not allow \
              byte-quota bypass — no pruning targets expected, got {} \
              (paths: {:?})",
+            targets.len(),
+            targets.iter().map(|t| &t.path).collect::<Vec<_>>()
+        );
+    }
+
+    // =========================================================================
+    // Regression tests for CQ-MAJOR: unreadable subtree returns u64::MAX
+    // (PR #759 round N+2 finding fix)
+    // =========================================================================
+
+    /// CQ-MAJOR regression: `estimate_job_log_dir_size_recursive_inner` MUST
+    /// return `u64::MAX` (fail-closed sentinel) when `read_dir` fails on a
+    /// nested subdirectory (e.g., mode 000 makes it unreadable). Returning `0`
+    /// would let the unreadable subtree bypass byte-quota pruning by being
+    /// undercounted as zero bytes.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_nested_dir_returns_sentinel_not_zero() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("tmp");
+        let root = dir.path().join("job-log");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+
+        // Create a readable file at the top level.
+        write_file(&root.join("visible.log"), 512);
+
+        // Create a nested subdirectory, put large data inside, then make
+        // the subdirectory unreadable (mode 000).
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+        write_file(&nested.join("large.bin"), 10_000_000);
+
+        // Make nested/ unreadable.
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000 nested dir");
+
+        let mut visited = 0;
+        let size = estimate_job_log_dir_size_recursive(&root, &mut visited);
+
+        // Restore permissions for cleanup (tempdir Drop will fail otherwise).
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 755 nested dir (cleanup)");
+
+        assert_eq!(
+            size,
+            u64::MAX,
+            "unreadable nested directory must return u64::MAX sentinel \
+             (fail-closed), not 0"
+        );
+    }
+
+    /// CQ-MAJOR regression (end-to-end): `collect_lane_log_retention_targets`
+    /// MUST skip the entire lane when a job log directory contains an
+    /// unreadable nested subdirectory that triggers the `u64::MAX` sentinel.
+    /// No GC targets should be emitted for the lane — fail-closed.
+    #[cfg(unix)]
+    #[test]
+    fn gc_planning_skips_lane_with_unreadable_nested_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
+
+        let now = current_wall_clock_secs();
+
+        // Create a normal, small job log (recent).
+        let _job_a = create_job_log_dir(&logs_dir, "job-normal", 100, now.saturating_sub(10));
+
+        // Create a job log with an unreadable nested subdirectory.
+        let job_unreadable = logs_dir.join("job-unreadable");
+        std::fs::create_dir_all(&job_unreadable).expect("mkdir job-unreadable");
+        write_file(&job_unreadable.join("output.log"), 200);
+        let nested = job_unreadable.join("nested-secret");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+        write_file(&nested.join("large.bin"), 50_000_000);
+        // Make nested/ unreadable.
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        set_file_mtime(&job_unreadable, filetime_from_secs(now.saturating_sub(20)))
+            .expect("set mtime");
+
+        // Verify precondition: estimator returns u64::MAX for this job dir.
+        let mut visited = 0;
+        let est = estimate_job_log_dir_size_recursive(&job_unreadable, &mut visited);
+        // Restore permissions before assertion so cleanup can succeed.
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 755 (cleanup)");
+        assert_eq!(
+            est,
+            u64::MAX,
+            "precondition: estimator must return u64::MAX for job with \
+             unreadable nested dir"
+        );
+
+        // Re-apply unreadable permission for the actual test.
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o000))
+            .expect("re-chmod 000");
+
+        // Tight byte quota — if the unreadable dir were counted as 0, the
+        // normal job would be incorrectly pruned.
+        let config = LogRetentionConfig {
+            per_lane_log_max_bytes: 50,
+            per_job_log_ttl_secs: 0,
+            keep_last_n_jobs_per_lane: 0,
+        };
+
+        let mut targets = Vec::new();
+        collect_lane_log_retention_targets(
+            &lane_manager,
+            &lane_ids,
+            &config,
+            now,
+            &HashSet::new(),
+            &mut targets,
+        );
+
+        // Restore permissions for cleanup.
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 755 (final cleanup)");
+
+        // Fail-closed: entire lane is skipped, no targets emitted.
+        assert_eq!(
+            targets.len(),
+            0,
+            "lane with unreadable nested dir must be skipped entirely — \
+             no GC targets expected, got {} (paths: {:?})",
             targets.len(),
             targets.iter().map(|t| &t.path).collect::<Vec<_>>()
         );

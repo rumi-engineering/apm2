@@ -962,14 +962,18 @@ by another worker).
   to an arbitrary directory, which would cause `read_dir`/`remove_file` operations
   to resolve outside the lane root.
 - [INV-LANE-CLEANUP-004d] The `u64::MAX` sentinel returned by
-  `estimate_job_log_dir_size_recursive` when `MAX_LANE_SCAN_ENTRIES` is exceeded
-  OR when `MAX_TRAVERSAL_DEPTH` is reached is never used in byte-quota
-  arithmetic. Both `enforce_log_retention` and
-  `collect_lane_log_retention_targets` check for the sentinel before entering
-  the byte-quota phase; when detected, the byte-quota phase is skipped entirely
-  (safe fallback: TTL and keep-last-N still apply). Depth overflow returns
-  `u64::MAX` (not `0`) so deeply-nested directories cannot bypass quota pruning
-  by being undercounted as zero bytes.
+  `estimate_job_log_dir_size_recursive` when `MAX_LANE_SCAN_ENTRIES` is exceeded,
+  `MAX_TRAVERSAL_DEPTH` is reached, OR `read_dir` fails on any subdirectory
+  (e.g., unreadable subtree with mode 000) is never used in retention arithmetic.
+  Both consumers enforce fail-closed semantics on sentinel detection:
+  - `enforce_log_retention` (cleanup): returns `LogQuotaFailed` error, which
+    causes the caller to mark the lane CORRUPT.
+  - `collect_lane_log_retention_targets` (GC planning): skips the entire lane
+    (no targets emitted for any phase — TTL, keep-last-N, and byte-quota are
+    all suppressed because size information is unreliable).
+  All three failure modes (scan overflow, depth overflow, read_dir failure) return
+  `u64::MAX` (never `0`) so unreadable or deeply-nested directories cannot bypass
+  quota pruning by being undercounted as zero bytes.
 - [INV-LANE-CLEANUP-004e] GC execution (`execute_gc`) handles symlink
   `LaneLogRetention` targets via `std::fs::remove_file` (not `safe_rmtree`,
   which rejects symlink roots by design). The symlink entry is removed from
@@ -3661,15 +3665,18 @@ includes `"lane_log_retention"` for the new action kind.
   If `scan_overflow` is triggered, ALL lane targets (including previously-collected
   symlink and file targets) are discarded. This ensures fail-closed atomicity.
 - [INV-LLR-007] Size estimation sentinel guard: The `u64::MAX` value returned by
-  `estimate_job_log_dir_size_recursive` when the scan exceeds `MAX_LANE_SCAN_ENTRIES`
-  OR when recursion depth reaches `MAX_TRAVERSAL_DEPTH` is a traversal-failure
-  sentinel, not a real byte count. Both `collect_lane_log_retention_targets` and
-  `enforce_log_retention` check for the sentinel before entering the byte-quota
-  phase. When detected, byte-quota enforcement is skipped (safe fallback: TTL and
-  keep-last-N phases still apply). This prevents saturating arithmetic from
-  disabling byte-quota enforcement. Depth overflow returns `u64::MAX` (not `0`)
-  to ensure deeply-nested directories are fail-closed, not silently accepted as
-  zero-byte entries.
+  `estimate_job_log_dir_size_recursive` when the scan exceeds `MAX_LANE_SCAN_ENTRIES`,
+  recursion depth reaches `MAX_TRAVERSAL_DEPTH`, OR `read_dir` fails on any
+  subdirectory (e.g., unreadable subtree) is a traversal-failure sentinel, not a
+  real byte count. Both consumers enforce fail-closed semantics on sentinel
+  detection:
+  - `collect_lane_log_retention_targets`: skips the entire lane (no targets emitted
+    for any retention phase — TTL, keep-last-N, and byte-quota are all suppressed).
+  - `enforce_log_retention`: returns `LogQuotaFailed` error, causing the lane to be
+    marked CORRUPT by the caller.
+  All three failure modes (scan overflow, depth overflow, read_dir failure) return
+  `u64::MAX` (never `0`) to ensure unreadable or deeply-nested directories are
+  fail-closed, not silently accepted as zero-byte entries.
 - [INV-LLR-008] GC symlink execution: `execute_gc` detects `LaneLogRetention`
   targets that are symlinks (via `symlink_metadata`) and uses `remove_file`
   instead of `safe_rmtree_v1_with_entry_limit`. This is necessary because

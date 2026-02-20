@@ -2760,22 +2760,44 @@ impl LaneManager {
             }
         }
 
-        // Phase 2: Byte quota enforcement.
-        //
         // SENTINEL GUARD (MAJOR finding fix): If any entry has
-        // `estimated_bytes == u64::MAX`, the recursive size estimator hit
-        // its scan limit (MAX_LANE_SCAN_ENTRIES) and the returned value is
-        // a traversal-failure sentinel, NOT a real byte count. Using it in
-        // arithmetic would cause saturating_add to produce u64::MAX for
-        // total_bytes, making saturating_sub drop the total below the
-        // quota after subtracting pruned entries — effectively disabling
-        // byte-quota enforcement for the entire lane. Fail-closed: skip
-        // the byte-quota phase entirely when any entry's size is unknown,
-        // letting TTL and keep-last-N phases handle retention. The
-        // byte-quota will be retried on the next cleanup cycle when the
-        // scan may succeed with fewer entries.
+        // `estimated_bytes == u64::MAX`, the recursive size estimator
+        // encountered a traversal failure (depth overflow, scan-entry
+        // overflow, or unreadable subtree via read_dir failure) and the
+        // returned value is a fail-closed sentinel, NOT a real byte count.
+        //
+        // Fail-closed: mark the lane CORRUPT. Without accurate sizes,
+        // retention decisions are unsound — an apparently small directory
+        // may actually be enormous, so both TTL and byte-quota pruning
+        // could make incorrect decisions. The lane must be repaired
+        // (unreadable subtree fixed) before retention can resume.
         let has_size_overflow = job_dirs.iter().any(|e| e.estimated_bytes == u64::MAX);
-        if config.per_lane_log_max_bytes > 0 && !has_size_overflow {
+        if has_size_overflow {
+            // Collect paths of entries that triggered the sentinel for
+            // diagnostic reporting.
+            let sentinel_paths: Vec<String> = job_dirs
+                .iter()
+                .filter(|e| e.estimated_bytes == u64::MAX)
+                .map(|e| e.path.display().to_string())
+                .collect();
+            return Err(LaneCleanupError::LogQuotaFailed {
+                step: CLEANUP_STEP_LOG_QUOTA,
+                reason: format!(
+                    "size estimation returned u64::MAX sentinel for {} job log dir(s) \
+                     under {} — indicates unreadable subtree, depth overflow, or \
+                     scan-entry overflow (fail-closed: lane must be marked CORRUPT \
+                     until obstruction is resolved). Affected paths: {:?}",
+                    sentinel_paths.len(),
+                    logs_dir.display(),
+                    sentinel_paths,
+                ),
+                steps_completed: steps_completed.to_vec(),
+                failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+            });
+        }
+
+        // Phase 2: Byte quota enforcement.
+        if config.per_lane_log_max_bytes > 0 {
             let mut total_bytes: u64 = job_dirs
                 .iter()
                 .map(|e| e.estimated_bytes)
@@ -6909,12 +6931,12 @@ mod tests {
     }
 
     /// MAJOR regression: when `estimate_job_log_dir_size_recursive` returns
-    /// `u64::MAX` (traversal overflow sentinel), the byte-quota phase in
-    /// `enforce_log_retention` MUST be skipped rather than treating the
-    /// sentinel as a real byte count. Using `u64::MAX` in arithmetic would
-    /// break quota enforcement via saturating operations.
+    /// `u64::MAX` (traversal overflow sentinel), `enforce_log_retention` MUST
+    /// return an error (fail-closed) which causes the lane to be marked
+    /// CORRUPT. Silently continuing with zero-byte or sentinel accounting
+    /// would let unreadable/overflow subtrees bypass quota enforcement.
     #[test]
-    fn enforce_log_retention_skips_byte_quota_on_size_overflow_sentinel() {
+    fn enforce_log_retention_marks_corrupt_on_size_overflow_sentinel() {
         let root = tempfile::tempdir().expect("tempdir");
         let fac_root = root.path().join("private").join("fac");
         fs::create_dir_all(&fac_root).expect("create fac root");
@@ -6929,47 +6951,17 @@ mod tests {
 
         let logs_dir = lane_dir.join("logs");
 
-        // Create a job log directory with enough files to trigger the
-        // MAX_LANE_SCAN_ENTRIES limit in the recursive estimator.
-        // We create a single job log dir with many files.
-        let job_dir = logs_dir.join("job-overflow");
-        fs::create_dir_all(&job_dir).expect("create job dir");
-
-        // Create nested directories with files so that the recursive
-        // estimator exceeds MAX_LANE_SCAN_ENTRIES. We create 101 dirs
-        // each with 1000 files to ensure we exceed the 100,000 limit.
-        // However, this would be very slow. Instead, we test the guard
-        // indirectly by creating a scenario that triggers the sentinel
-        // and verifying the behavior.
-        //
-        // Approach: Pre-fill the lane_visited_count close to the limit
-        // by creating enough entries. We use the fact that the sentinel
-        // is checked AFTER all entries are collected. Create 2 job dirs
-        // where one has very many files to trigger the sentinel.
-        //
-        // Alternative (more practical): Create a small scenario and
-        // verify that the byte quota phase is NOT entered when a job
-        // dir has u64::MAX estimated_bytes. We test this by using a
-        // tight byte quota and verifying that no byte-based pruning
-        // occurs despite being over quota.
-        //
-        // Since we can't easily trigger MAX_LANE_SCAN_ENTRIES in a test
-        // without creating 100K+ files, we create enough nested
-        // structure to trigger it via pre-filled visited_count.
-        // The real guard is in enforce_log_retention which uses the
-        // same estimator. We create a scenario with many nested dirs.
-
-        // Clean up and re-create logs_dir for this approach
+        // Clean up and re-create logs_dir.
         fs::remove_dir_all(&logs_dir).expect("remove logs dir");
         fs::create_dir_all(&logs_dir).expect("recreate logs dir");
 
-        // Create two job dirs. First one small, second one with deep
-        // nesting to trigger the recursive estimator limit.
+        // Create two job dirs. First one small, second one with
+        // wide+deep nesting to hit the MAX_LANE_SCAN_ENTRIES limit
+        // in the recursive estimator.
         let job_a = logs_dir.join("job-a-small");
         fs::create_dir_all(&job_a).expect("create job-a");
         fs::write(job_a.join("output.log"), vec![0u8; 100]).expect("write");
 
-        // Create job-b with wide+deep nesting to hit scan limit.
         let job_b = logs_dir.join("job-b-overflow");
         fs::create_dir_all(&job_b).expect("create job-b");
         // Create 200 subdirs, each with 501 files = 100,400 entries
@@ -6983,39 +6975,142 @@ mod tests {
             }
         }
 
-        // Retention config with a very tight byte quota. Without the
-        // sentinel guard, u64::MAX would saturate the total and job-a
-        // would be incorrectly pruned or the accounting would be wrong.
-        // With the guard, the byte-quota phase is skipped entirely, so
-        // neither job dir is byte-pruned (only TTL applies).
         let retention = crate::fac::gc::LogRetentionConfig {
-            per_lane_log_max_bytes: 50, // Very tight — would prune if byte quota ran
-            per_job_log_ttl_secs: 0,    // No TTL pruning (all recent)
+            per_lane_log_max_bytes: 50,
+            per_job_log_ttl_secs: 0,
             keep_last_n_jobs_per_lane: 0,
         };
 
-        // Run cleanup — should succeed because:
-        // 1. The sentinel guard skips byte-quota arithmetic
-        // 2. No TTL pruning (all recent)
-        // 3. No keep-last-N exclusion
-        // Result: no pruning occurs, cleanup succeeds with both dirs intact.
+        // Run cleanup — MUST fail because the sentinel triggers
+        // fail-closed, marking the lane CORRUPT.
         let result = manager.run_lane_cleanup_with_retention(lane_id, &workspace, &retention);
-        assert!(
-            result.is_ok(),
-            "cleanup must succeed when size estimator returns sentinel — \
-             byte-quota phase must be skipped, got: {result:?}"
+        let err = result.expect_err(
+            "cleanup must fail when size estimator returns u64::MAX sentinel \
+             (fail-closed: lane must be marked CORRUPT)",
         );
 
-        // Both job dirs must survive — byte quota was NOT applied.
+        assert!(
+            matches!(err, LaneCleanupError::LogQuotaFailed { .. }),
+            "expected LogQuotaFailed, got: {err:?}"
+        );
+        let reason = match &err {
+            LaneCleanupError::LogQuotaFailed { reason, .. } => reason.clone(),
+            other => panic!("unexpected error variant: {other:?}"),
+        };
+        assert!(
+            reason.contains("u64::MAX sentinel"),
+            "error reason must mention u64::MAX sentinel, got: {reason}"
+        );
+
+        // Both job dirs must survive — cleanup was aborted before pruning.
         assert!(
             job_a.exists(),
-            "job-a must survive: byte-quota must be skipped when \
-             estimator returns u64::MAX sentinel"
+            "job-a must survive: cleanup aborted on sentinel detection"
         );
         assert!(
             job_b.exists(),
-            "job-b must survive: byte-quota must be skipped when \
-             estimator returns u64::MAX sentinel"
+            "job-b must survive: cleanup aborted on sentinel detection"
+        );
+
+        // Verify lane transitioned to Corrupt.
+        let lease = LaneLeaseV1::load(&manager.lane_dir(lane_id))
+            .expect("load lease")
+            .expect("lease exists");
+        assert_eq!(
+            lease.state,
+            LaneState::Corrupt,
+            "lane must be CORRUPT after sentinel-triggered cleanup failure"
+        );
+    }
+
+    /// CQ-MAJOR regression: `enforce_log_retention` MUST return an error
+    /// (causing the lane to be marked CORRUPT) when an unreadable nested
+    /// subdirectory causes `estimate_job_log_dir_size_recursive` to return
+    /// the `u64::MAX` sentinel. Silently continuing with zero-byte
+    /// accounting would let unreadable subtrees bypass quota enforcement.
+    #[cfg(unix)]
+    #[test]
+    fn enforce_log_retention_marks_corrupt_on_unreadable_nested_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        let logs_dir = lane_dir.join("logs");
+
+        // Create a normal job log directory.
+        let job_a = logs_dir.join("job-a-normal");
+        fs::create_dir_all(&job_a).expect("create job-a");
+        fs::write(job_a.join("output.log"), vec![0u8; 100]).expect("write");
+
+        // Create a job log directory with an unreadable nested subdirectory.
+        let job_b = logs_dir.join("job-b-unreadable");
+        fs::create_dir_all(&job_b).expect("create job-b");
+        fs::write(job_b.join("output.log"), vec![0u8; 200]).expect("write");
+        let nested = job_b.join("nested-secret");
+        fs::create_dir_all(&nested).expect("mkdir nested");
+        fs::write(nested.join("large.bin"), vec![0u8; 10_000_000]).expect("write large file");
+        // Make the nested subdirectory unreadable (mode 000).
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o000))
+            .expect("chmod 000 nested dir");
+
+        // Use a retention config with byte quota. The unreadable dir should
+        // trigger the u64::MAX sentinel and fail-closed.
+        let retention = crate::fac::gc::LogRetentionConfig {
+            per_lane_log_max_bytes: 500,
+            per_job_log_ttl_secs: 0,
+            keep_last_n_jobs_per_lane: 0,
+        };
+
+        let result = manager.run_lane_cleanup_with_retention(lane_id, &workspace, &retention);
+
+        // Restore permissions for cleanup (tempdir Drop will fail otherwise).
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o755))
+            .expect("chmod 755 (cleanup)");
+
+        // Cleanup MUST fail — the error propagation marks the lane CORRUPT.
+        let err = result.expect_err(
+            "cleanup must fail when a job log dir has an unreadable nested \
+             subdirectory (fail-closed: u64::MAX sentinel triggers CORRUPT)",
+        );
+
+        // Verify it is a LogQuotaFailed error mentioning the sentinel.
+        assert!(
+            matches!(err, LaneCleanupError::LogQuotaFailed { .. }),
+            "expected LogQuotaFailed, got: {err:?}"
+        );
+        let reason = match &err {
+            LaneCleanupError::LogQuotaFailed { reason, .. } => reason.clone(),
+            other => panic!("unexpected error variant: {other:?}"),
+        };
+        assert!(
+            reason.contains("u64::MAX sentinel"),
+            "error reason must mention u64::MAX sentinel, got: {reason}"
+        );
+        assert!(
+            reason.contains("CORRUPT"),
+            "error reason must mention CORRUPT, got: {reason}"
+        );
+
+        // Verify the lane was transitioned to Corrupt state.
+        let lane_dir_for_lease = manager.lane_dir(lane_id);
+        let lease = LaneLeaseV1::load(&lane_dir_for_lease)
+            .expect("load lease")
+            .expect("lease exists");
+        assert_eq!(
+            lease.state,
+            LaneState::Corrupt,
+            "lane must be in CORRUPT state after unreadable nested dir \
+             triggers u64::MAX sentinel in enforce_log_retention"
         );
     }
 }
