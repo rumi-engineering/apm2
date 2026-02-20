@@ -689,6 +689,30 @@ systemd service executables:
   `broker_requests/` (mode 01733). All other commands continue to use strict
   ownership validation.
 
+### Permission hardening on enqueue paths (TCK-00577 round 8)
+
+- **Queue root mode 0711**: Both `enqueue_direct` and
+  `enqueue_via_broker_requests` explicitly set the queue root directory to
+  mode 0711 after `create_dir_all`. This prevents world-listing of queue
+  artifacts when the queue root is first created by an enqueue submission.
+  Fail-closed: if `set_permissions` fails, the enqueue is rejected.
+- **Pending dir mode 0711**: `enqueue_direct` explicitly sets the pending
+  directory to mode 0711.
+- **Broker requests mode 01733**: `enqueue_via_broker_requests` explicitly
+  sets broker_requests/ to mode 01733 (fail-closed on error).
+
+### ServiceUserNotResolved broker fallback (TCK-00577 round 8)
+
+- **Broker fallback on unresolvable service user**: When
+  `check_queue_write_permission` returns `ServiceUserNotResolved` in
+  `ServiceUserOnly` mode, `enqueue_job` now falls back to broker-mediated
+  enqueue (writes to `broker_requests/`) instead of returning a hard error.
+  This allows `apm2 fac push` to succeed on systems where the service user
+  has not been provisioned (fresh deployment, dev environment, CI). The
+  worker (once provisioned) promotes requests from `broker_requests/` into
+  `pending/`. For local-only workflows, inline gate fallback handles
+  execution without a running worker.
+
 ### General invariants
 
 - The `broker_requests/` directory uses mode 01733 (sticky + write-only for
