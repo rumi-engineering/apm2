@@ -455,12 +455,12 @@ mod tests {
             767,
             "0123456789abcdef0123456789abcdef01234567",
             true,
-            |event| match event {
-                lifecycle::LifecycleEventKind::PushObserved => Ok(()),
-                lifecycle::LifecycleEventKind::GatesStarted => {
+            |event| {
+                if matches!(event, lifecycle::LifecycleEventKind::GatesStarted) {
                     Err("illegal transition: pushed + gates_started".to_string())
-                },
-                _ => Ok(()),
+                } else {
+                    Ok(())
+                }
             },
         )
         .expect_err("transition failure should bubble");
