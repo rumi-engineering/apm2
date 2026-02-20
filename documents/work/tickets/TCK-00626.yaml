@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00626"
     title: "Implement cache reuse explainability: hit/miss with first mismatch dimension"
-    status: "OPEN"
+    status: "IN_PROGRESS"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"
@@ -68,12 +68,26 @@ scope:
     - id: "S4_REGRESSION_TESTS"
       title: "Regression tests for all 11 reason codes"
       detail: |
-        - Test: cache hit → reason_code=cache_hit, first_mismatch_dimension=null.
-        - Test: each of the 10 miss codes → correct reason_code and
+        - Test: cache hit -> reason_code=cache_hit, first_mismatch_dimension=null.
+        - Test: each of the 10 miss codes -> correct reason_code and
           first_mismatch_dimension in gate_finished event.
         - Test: policy_drift miss does NOT also report toolchain_drift
           (first mismatch stops at policy_drift).
         - Test: stdout event stream alone identifies miss cause (no file reads needed).
+    - id: "BF_001_DISPATCH_DIAGNOSTIC"
+      title: "Auto-trigger review dispatch after push: PID liveness check + structured diagnostics"
+      detail: |
+        Push dispatch returns 'joined' for dead PIDs due to stale idempotency.
+        Add PID liveness verification for non-terminal 'joined' results.
+        Emit structured dispatch_failed JSONL events with recovery commands.
+        Improve human-readable error messages with explicit recovery actions.
+    - id: "BF_002_WAIT_MERGED_DETECTION"
+      title: "Wait loop detects externally-merged PRs via periodic GitHub API poll"
+      detail: |
+        The --wait-for-recommended-action loop uses lightweight=true exclusively,
+        which skips GitHub API. PRs merged externally are never detected. Fix by
+        periodically using non-lightweight polls (every 5th tick) and injecting
+        merged lifecycle events when GitHub API confirms merge.
   out_of_scope:
     - "Changing cache eviction or TTL policy."
     - "Adding new reason codes beyond the 11 defined (requires new requirement)."
@@ -84,8 +98,9 @@ plan:
     - id: "STEP_01"
       title: "Define CacheDecision and CacheReasonCode types"
       detail: |
-        In gate_cache.rs or a new fac_cache_decision module. Replace
-        ReuseDecision with CacheDecision. Update all callers.
+        In gate_cache_v3.rs. Add CacheDecision struct and CacheReasonCode
+        enum with 11+1 variants. Add check_reuse_decision() wrapper and
+        map_reason_to_code() helper.
     - id: "STEP_02"
       title: "Refactor check_reuse() to produce CacheDecision with first_mismatch_dimension"
       detail: |
@@ -94,19 +109,33 @@ plan:
     - id: "STEP_03"
       title: "Inline CacheDecision in gate_finished event"
       detail: |
-        Pass CacheDecision to the gate_finished event constructor in TCK-00625
-        EventEmitter. Serialize as cache_decision field in JSON output.
+        Pass CacheDecision to the gate_finished event constructor. Wire
+        through evidence pipeline via reuse_decision_with_v3_fallback return
+        tuple, GateProgressEvent::Completed, and EvidenceGateResult.
     - id: "STEP_04"
       title: "Add regression tests and workspace validation"
       detail: |
         cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings
         cargo doc --workspace --no-deps && cargo test --workspace
+    - id: "STEP_05"
+      title: "BF-001: Push dispatch PID liveness + structured diagnostics"
+      detail: |
+        Verify PID liveness for 'joined' dispatch results. Emit dispatch_failed
+        JSONL events on failure. Improve stderr messages with recovery commands.
+    - id: "STEP_06"
+      title: "BF-002: Wait loop merged state detection"
+      detail: |
+        Add fetch_pr_merged_at to github_reads. Inject merged lifecycle event
+        in run_doctor_inner when GitHub API confirms merge. Periodically use
+        non-lightweight mode in wait loop CollectSummary state.
 
 definition_of_done:
   evidence_ids:
     - "EXEC-TCK00626-CACHE-DECISION"
     - "EXEC-TCK00626-ALL-REASON-CODES"
     - "EXEC-TCK00626-WORKSPACE-VALIDATION"
+    - "EXEC-TCK00626-BF001-DISPATCH"
+    - "EXEC-TCK00626-BF002-MERGED"
   criteria:
     - "CacheDecision struct with all required fields replaces ReuseDecision."
     - "check_reuse() returns first_mismatch_dimension for every miss type."
@@ -115,6 +144,8 @@ definition_of_done:
     - "Cache miss cause is identifiable from stdout event stream without reading gate_cache_v2 files."
     - "Regression tests cover all 11 codes and verify correct first_mismatch_dimension."
     - "Workspace validation completes successfully."
+    - "Push dispatch verifies PID liveness for 'joined' results and emits structured dispatch_failed events."
+    - "Wait loop periodically detects externally-merged PRs via GitHub API and exits with terminal 'done' action."
 
 notes:
   context: |
