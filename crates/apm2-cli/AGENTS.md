@@ -158,7 +158,9 @@ services. This prevents INV-PADOPT-004-class binary drift.
 
 **Security Invariants:**
 - [INV-INSTALL-001] Binary reads for digest computation bounded to `MAX_BINARY_DIGEST_SIZE`.
-- [INV-INSTALL-002] Symlink creation is a **required** success condition.
+- [INV-INSTALL-002] Symlink creation uses atomic create-temp-then-rename(2)
+  so the previous valid link is preserved unless the new link is fully
+  materialized. Symlink creation is a **required** success condition.
   Failure sets `success: false` and returns non-zero exit unless
   `--allow-partial` is set. This is fail-closed: silent partial success
   that leaves the CLI path unaligned is prohibited.

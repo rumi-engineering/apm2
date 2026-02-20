@@ -608,7 +608,7 @@ systemd service executables:
 - `apm2 fac install [--json] [--allow-partial] [--workspace-root <PATH>]` performs:
   1. Resolves workspace root from `--workspace-root` flag or from `current_exe()` path (never cwd)
   2. `cargo install --path crates/apm2-cli --force` from trusted workspace root
-  3. Symlink `~/.local/bin/apm2 -> ~/.cargo/bin/apm2` (atomic replace)
+  3. Symlink `~/.local/bin/apm2 -> ~/.cargo/bin/apm2` (atomic replace via create-temp-then-rename(2))
   4. `systemctl --user restart apm2-daemon.service apm2-worker.service`
   5. Structured output: workspace root, installed path, SHA-256 digest, per-service restart status, restart_failures array
 - Fail-closed restart semantics: required service restart failures cause non-zero exit and `success: false`
