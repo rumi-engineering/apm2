@@ -392,12 +392,16 @@ pub(super) fn cache_v3_root() -> Option<std::path::PathBuf> {
 ///
 /// Defense-in-depth: even if a v2-sourced `GateCacheV3` were passed here,
 /// `check_reuse` would deny via `v2_sourced_no_binding_proof`.
+#[allow(clippy::too_many_arguments)]
 fn reuse_decision_with_v3_fallback(
     v3_cache: Option<&GateCacheV3>,
     _v2_cache: Option<&GateCache>,
     gate_name: &str,
     attestation_digest: Option<&str>,
     verifying_key: Option<&apm2_core::crypto::VerifyingKey>,
+    v3_cache_root: Option<&std::path::Path>,
+    v3_compound_key: Option<&apm2_core::fac::gate_cache_v3::V3CompoundKey>,
+    sha: Option<&str>,
 ) -> (
     ReuseDecision,
     Option<apm2_core::fac::gate_cache_v3::CacheDecision>,
@@ -415,12 +419,21 @@ fn reuse_decision_with_v3_fallback(
             Some(cache_decision),
         );
     }
+    // No v3 cache loaded: diagnose compound-key drift if root and key are
+    // available.
+    if let (Some(root), Some(key), Some(sha_val)) = (v3_cache_root, v3_compound_key, sha) {
+        let decision = apm2_core::fac::gate_cache_v3::diagnose_cache_miss(root, sha_val, key);
+        return (
+            ReuseDecision::miss("v3_miss_v2_fallback_disabled"),
+            Some(decision),
+        );
+    }
     // [INV-GCV3-001] V2 fallback disabled for reuse. V2 entries do not
     // carry RFC-0028/0029 binding proof and cannot satisfy v3 compound-key
     // continuity. Returning miss ensures fail-closed behavior: gates that
     // only have v2 entries will be re-executed under v3 with full bindings.
     //
-    // No v3 cache available: emit ShaMiss since the compound key has no entry.
+    // Fallback: no v3 context available.
     (
         ReuseDecision::miss("v3_miss_v2_fallback_disabled"),
         Some(apm2_core::fac::gate_cache_v3::CacheDecision::cache_miss(
@@ -1771,8 +1784,8 @@ pub(super) fn run_evidence_gates_with_lane_context(
     // Fail-closed: if any v3 context material is unavailable (APM2_HOME,
     // policy load, sandbox/network hash, compound key parse), we simply skip
     // v3 loading and reuse decisions fall back to miss behavior.
-    let v3_cache_loaded = if cache_reuse_active {
-        cache_reuse_policy.as_ref().and_then(|reuse_policy| {
+    let (v3_cache_loaded, v3_compound_key_ns, v3_root_ns) = if cache_reuse_active {
+        let result = cache_reuse_policy.as_ref().and_then(|reuse_policy| {
             let sandbox_hardening_hash = reuse_policy.sandbox_hardening.as_deref()?;
             let network_policy_hash = reuse_policy.network_policy_hash.as_deref()?;
             let apm2_home = apm2_core::github::resolve_apm2_home()?;
@@ -1785,10 +1798,15 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 network_policy_hash,
             )?;
             let root = cache_v3_root()?;
-            GateCacheV3::load_from_dir(&root, sha, &compound_key)
-        })
+            let loaded = GateCacheV3::load_from_dir(&root, sha, &compound_key);
+            Some((loaded, compound_key, root))
+        });
+        match result {
+            Some((loaded, ck, root)) => (loaded, Some(ck), Some(root)),
+            None => (None, None, None),
+        }
     } else {
-        None
+        (None, None, None)
     };
 
     // Fastest-first ordering for expensive cargo gates. Keep cheap checks
@@ -1915,6 +1933,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 gate_name,
                 attestation_digest.as_deref(),
                 fac_verifying_key.as_ref(),
+                v3_root_ns.as_deref(),
+                v3_compound_key_ns.as_ref(),
+                Some(sha),
             );
             if reuse.reusable {
                 if let Some(cached) = resolve_cached_payload(
@@ -2049,6 +2070,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 gate_name,
                 attestation_digest.as_deref(),
                 fac_verifying_key.as_ref(),
+                v3_root_ns.as_deref(),
+                v3_compound_key_ns.as_ref(),
+                Some(sha),
             );
             if reuse.reusable {
                 if let Some(cached) = resolve_cached_payload(
@@ -2182,6 +2206,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 "test",
                 attestation_digest.as_deref(),
                 fac_verifying_key.as_ref(),
+                v3_root_ns.as_deref(),
+                v3_compound_key_ns.as_ref(),
+                Some(sha),
             );
             if reuse.reusable {
                 if let Some(cached) = resolve_cached_payload(
@@ -2300,6 +2327,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
             "workspace_integrity",
             attestation_digest.as_deref(),
             fac_verifying_key.as_ref(),
+            v3_root_ns.as_deref(),
+            v3_compound_key_ns.as_ref(),
+            Some(sha),
         );
         if reuse.reusable {
             if let Some(cached) = resolve_cached_payload(
@@ -2393,6 +2423,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 gate_name,
                 attestation_digest.as_deref(),
                 fac_verifying_key.as_ref(),
+                v3_root_ns.as_deref(),
+                v3_compound_key_ns.as_ref(),
+                Some(sha),
             );
             if reuse.reusable {
                 if let Some(cached) = resolve_cached_payload(
@@ -2744,6 +2777,9 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
+            v3_root.as_deref(),
+            v3_compound_key.as_ref(),
+            Some(sha),
         );
         if reuse.reusable {
             if let Some(cached) =
@@ -2932,6 +2968,9 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
+            v3_root.as_deref(),
+            v3_compound_key.as_ref(),
+            Some(sha),
         );
         if reuse.reusable {
             if let Some(cached) =
@@ -3110,6 +3149,9 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
+            v3_root.as_deref(),
+            v3_compound_key.as_ref(),
+            Some(sha),
         );
         let log_path = logs_dir.join("test.log");
         emit_gate_started_cb(on_gate_progress, gate_name);
@@ -3293,6 +3335,9 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
+            v3_root.as_deref(),
+            v3_compound_key.as_ref(),
+            Some(sha),
         );
         let log_path = logs_dir.join("workspace_integrity.log");
         emit_gate_started_cb(on_gate_progress, gate_name);
@@ -3440,6 +3485,9 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
+            v3_root.as_deref(),
+            v3_compound_key.as_ref(),
+            Some(sha),
         );
         if reuse.reusable {
             if let Some(cached) =
@@ -3994,6 +4042,9 @@ mod tests {
             gate_name,
             Some(attestation_digest),
             Some(&vk),
+            None,
+            None,
+            None,
         );
         assert!(reuse.reusable, "v3-only cache hit must be reusable");
         assert_eq!(
@@ -4099,6 +4150,9 @@ mod tests {
             gate_name,
             Some(attestation_digest),
             Some(&vk),
+            None,
+            None,
+            None,
         );
         assert!(reuse.reusable);
         assert_eq!(reuse.source, CacheSource::V3);
@@ -4180,6 +4234,9 @@ mod tests {
             gate_name,
             Some(attestation_digest),
             Some(&vk),
+            None,
+            None,
+            None,
         );
         assert!(
             !reuse.reusable,

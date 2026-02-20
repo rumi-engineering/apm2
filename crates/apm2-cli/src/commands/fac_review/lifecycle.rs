@@ -885,7 +885,9 @@ fn is_descendant_of_pid(_child_pid: u32, _ancestor_pid: u32) -> bool {
 const fn is_authoritative_sha_event(event: &LifecycleEventKind) -> bool {
     matches!(
         event,
-        LifecycleEventKind::PushObserved | LifecycleEventKind::GatesPassed
+        LifecycleEventKind::PushObserved
+            | LifecycleEventKind::GatesPassed
+            | LifecycleEventKind::Merged { .. }
     )
 }
 
@@ -4608,6 +4610,29 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
         requirement_refs: &[],
     },
     LifecycleTransitionRule {
+        transition_id: "LC-T-012b",
+        event: "merged",
+        from_states: &[
+            "pushed",
+            "gates_running",
+            "gates_passed",
+            "gates_failed",
+            "reviews_dispatched",
+            "review_in_progress",
+            "verdict_pending",
+            "verdict_approve",
+            "verdict_deny",
+            "stuck",
+            "stale",
+            "recovering",
+        ],
+        to_states: &["merged"],
+        guard: LifecycleTransitionGuard::Always,
+        action: LifecycleTransitionAction::None,
+        guard_predicate: "github_api_confirmed_merge",
+        requirement_refs: &["TCK-00626-BF002"],
+    },
+    LifecycleTransitionRule {
         transition_id: "LC-T-013",
         event: "agent_crashed",
         from_states: &["*"],
@@ -7630,5 +7655,31 @@ mod tests {
             .expect("quality alias should map to quality review state");
         super::validate_verdict_set_scope(&projected, "code-quality", Some(&run_state))
             .expect("code-quality alias should map to quality review state");
+    }
+
+    #[test]
+    fn merged_from_verdict_pending_via_github_api() {
+        // LC-T-012b: merged event must be accepted from verdict_pending.
+        let rule = super::LIFECYCLE_TRANSITION_RULES
+            .iter()
+            .find(|r| r.transition_id == "LC-T-012b")
+            .expect("LC-T-012b rule must exist");
+        assert!(
+            rule.from_states.contains(&"verdict_pending"),
+            "LC-T-012b must allow merged from verdict_pending"
+        );
+        assert!(
+            rule.from_states.contains(&"verdict_approve"),
+            "LC-T-012b must allow merged from verdict_approve"
+        );
+        assert!(
+            rule.from_states.contains(&"pushed"),
+            "LC-T-012b must allow merged from pushed"
+        );
+        assert!(
+            rule.from_states.contains(&"stuck"),
+            "LC-T-012b must allow merged from stuck"
+        );
+        assert_eq!(rule.to_states, &["merged"]);
     }
 }

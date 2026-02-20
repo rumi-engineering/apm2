@@ -1916,15 +1916,24 @@ fn run_doctor_inner(
     // the terminal state.
     if !lightweight {
         if let Ok(Some(_merged_at)) = github_reads::fetch_pr_merged_at(owner_repo, pr_number) {
-            let current_sha = local_sha.as_deref().unwrap_or("unknown");
-            let _ = lifecycle::apply_event(
-                owner_repo,
-                pr_number,
-                current_sha,
-                &lifecycle::LifecycleEventKind::Merged {
-                    source: "github_api_detection".to_string(),
-                },
-            );
+            // BF-002 (TCK-00626 round 2): Use remote_head as authoritative SHA
+            // for merge detection. Fall back to local_sha only if remote is
+            // unavailable. Skip merge injection entirely if no valid SHA exists
+            // (cannot verify lifecycle without a valid SHA).
+            let merge_sha = remote_head
+                .as_deref()
+                .or(local_sha.as_deref())
+                .unwrap_or("");
+            if !merge_sha.is_empty() {
+                let _ = lifecycle::apply_event(
+                    owner_repo,
+                    pr_number,
+                    merge_sha,
+                    &lifecycle::LifecycleEventKind::Merged {
+                        source: "github_api_detection".to_string(),
+                    },
+                );
+            }
         }
     }
 

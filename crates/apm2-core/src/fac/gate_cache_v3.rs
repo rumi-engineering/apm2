@@ -819,6 +819,24 @@ impl GateCacheV3 {
         require_full_mode: bool,
         verifying_key: Option<&crate::crypto::VerifyingKey>,
     ) -> CacheDecision {
+        // TTL check: if APM2_FAC_CACHE_TTL_SECS > 0, check entry age.
+        if let Some(cached) = self.get(gate) {
+            let ttl_secs = std::env::var("APM2_FAC_CACHE_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            if ttl_secs > 0 {
+                if let Some(age_secs) = rfc3339_age_secs(&cached.completed_at) {
+                    if age_secs > ttl_secs {
+                        return CacheDecision::cache_miss(
+                            CacheReasonCode::TtlExpired,
+                            Some(&self.sha),
+                        );
+                    }
+                }
+            }
+        }
+
         let v3_decision = self.check_reuse(
             gate,
             expected_attestation_digest,
@@ -1369,6 +1387,93 @@ impl GateCacheV3 {
         atomic_swap_dirs(root, &staging_dir, &final_dir, &index_key)
     }
 
+    /// Diagnose which compound-key dimension drifted by scanning the v3 cache
+    /// root for any entries with a different compound key for this SHA.
+    ///
+    /// Returns the first mismatched dimension as a [`CacheReasonCode`],
+    /// following the ticket's defined check order. Returns `None` if no
+    /// prior cache exists (true gate miss) or if all dimensions match
+    /// (should not happen if `load_from_dir` already returned `None`).
+    ///
+    /// # Bound
+    ///
+    /// Scans at most 64 directories and 4 entries per directory (fail-closed on
+    /// resource).
+    #[must_use]
+    pub fn diagnose_compound_key_drift(
+        root: &std::path::Path,
+        sha: &str,
+        current_key: &V3CompoundKey,
+    ) -> Option<CacheReasonCode> {
+        const MAX_DIRS: usize = 64;
+        const MAX_ENTRIES_PER_DIR: usize = 4;
+
+        let entries = std::fs::read_dir(root).ok()?;
+
+        for (dirs_scanned, dir_entry) in entries.flatten().enumerate() {
+            if dirs_scanned >= MAX_DIRS {
+                break;
+            }
+
+            let dir_path = dir_entry.path();
+            if !dir_path.is_dir() {
+                continue;
+            }
+            // Skip non-index-key dirs (staging, lock files, etc.)
+            let dir_name = match dir_path.file_name().and_then(|n| n.to_str()) {
+                Some(name) if is_valid_v3_index_key(name) => name.to_string(),
+                _ => continue,
+            };
+            // Skip the current key's directory (we already know it didn't load).
+            if dir_name == current_key.compute_index_key() {
+                continue;
+            }
+
+            let Ok(sub_entries) = std::fs::read_dir(&dir_path) else {
+                continue;
+            };
+            for (entries_scanned, file_entry) in sub_entries.flatten().enumerate() {
+                if entries_scanned >= MAX_ENTRIES_PER_DIR {
+                    break;
+                }
+
+                let file_path = file_entry.path();
+                if file_path.extension().and_then(|ext| ext.to_str()) != Some("yaml") {
+                    continue;
+                }
+                let Some(parsed) = Self::read_entry_bounded(&file_path) else {
+                    continue;
+                };
+                if parsed.sha != sha {
+                    continue;
+                }
+                // Found a prior cache entry for this SHA with a different compound key.
+                // Compare dimensions in order and return the first mismatch.
+                let old = &parsed.compound_key;
+                if old.fac_policy_hash != current_key.fac_policy_hash {
+                    return Some(CacheReasonCode::PolicyDrift);
+                }
+                if old.toolchain_fingerprint != current_key.toolchain_fingerprint {
+                    return Some(CacheReasonCode::ToolchainDrift);
+                }
+                if old.attestation_digest != current_key.attestation_digest {
+                    return Some(CacheReasonCode::ClosureDrift);
+                }
+                if old.network_policy_hash != current_key.network_policy_hash {
+                    return Some(CacheReasonCode::NetworkPolicyDrift);
+                }
+                if old.sandbox_policy_hash != current_key.sandbox_policy_hash {
+                    return Some(CacheReasonCode::SandboxDrift);
+                }
+                // All dimensions match but different index key — should not happen,
+                // but fail-closed: return None (true miss).
+                return None;
+            }
+        }
+        // No prior cache entry found for this SHA.
+        None
+    }
+
     /// Read a single v3 cache entry from disk with bounded I/O.
     ///
     /// Post-deserialization validation enforces `MAX_V3_STRING_FIELD_LENGTH`
@@ -1499,6 +1604,58 @@ pub fn sanitize_gate_name(gate: &str) -> String {
             }
         })
         .collect()
+}
+
+// =============================================================================
+// Compound-Key Drift Diagnosis (TCK-00626)
+// =============================================================================
+
+/// Compute the age in seconds of an RFC 3339 timestamp relative to the
+/// current system clock.
+///
+/// Returns `None` if the timestamp cannot be parsed or if the system
+/// clock is unavailable (pre-epoch).
+///
+/// # Wall-Clock Justification
+///
+/// TTL expiry is an intentional wall-clock check: the entry age must be
+/// compared against real elapsed time, not a monotonic counter. A clock
+/// regression simply extends the effective TTL (fail-safe, not fail-open).
+#[allow(clippy::disallowed_methods)] // Intentional wall-clock read for TTL.
+fn rfc3339_age_secs(ts: &str) -> Option<u64> {
+    let completed = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    let completed_epoch = completed.timestamp();
+    if completed_epoch < 0 {
+        return None;
+    }
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    #[allow(clippy::cast_sign_loss)]
+    let completed_u64 = completed_epoch as u64;
+    Some(now_epoch.saturating_sub(completed_u64))
+}
+
+/// Produce a [`CacheDecision`] when no v3 cache loaded for the current compound
+/// key.
+///
+/// Diagnoses compound-key drift to emit specific reason codes instead of
+/// [`CacheReasonCode::ShaMiss`].
+///
+/// Returns `ShaMiss` if no prior cache entry exists (true gate miss),
+/// or the specific drift code if a prior entry was found under a different
+/// compound key.
+#[must_use]
+pub fn diagnose_cache_miss(
+    root: &std::path::Path,
+    sha: &str,
+    current_key: &V3CompoundKey,
+) -> CacheDecision {
+    GateCacheV3::diagnose_compound_key_drift(root, sha, current_key).map_or_else(
+        || CacheDecision::cache_miss(CacheReasonCode::ShaMiss, None),
+        |code| CacheDecision::cache_miss(code, None),
+    )
 }
 
 // =============================================================================
@@ -3021,5 +3178,271 @@ mod tests {
             decision.first_mismatch_dimension,
             Some(CacheReasonCode::SignatureInvalid)
         );
+    }
+
+    // =========================================================================
+    // Compound-Key Drift Diagnosis Tests (TCK-00626)
+    // =========================================================================
+
+    #[test]
+    fn diagnose_policy_drift() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let sha = "abc123";
+
+        let key_a = V3CompoundKey::new("attest", "policy_A", "toolchain", "sandbox", "network")
+            .expect("valid");
+        let mut cache_a = GateCacheV3::new(sha, key_a).expect("new");
+        cache_a
+            .set(
+                "rustfmt",
+                V3GateResult {
+                    status: "PASS".to_string(),
+                    duration_secs: 1,
+                    completed_at: "2026-02-17T00:00:00Z".to_string(),
+                    attestation_digest: None,
+                    evidence_log_digest: None,
+                    quick_mode: None,
+                    log_bundle_hash: None,
+                    log_path: None,
+                    signature_hex: None,
+                    signer_id: None,
+                    rfc0028_receipt_bound: false,
+                    rfc0029_receipt_bound: false,
+                },
+            )
+            .expect("set");
+        cache_a.save_to_dir(root).expect("save");
+
+        let key_b = V3CompoundKey::new("attest", "policy_B", "toolchain", "sandbox", "network")
+            .expect("valid");
+        let result = GateCacheV3::diagnose_compound_key_drift(root, sha, &key_b);
+        assert_eq!(result, Some(CacheReasonCode::PolicyDrift));
+    }
+
+    #[test]
+    fn diagnose_toolchain_drift() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let sha = "abc123";
+
+        let key_a = V3CompoundKey::new("attest", "policy", "toolchain_A", "sandbox", "network")
+            .expect("valid");
+        let mut cache_a = GateCacheV3::new(sha, key_a).expect("new");
+        cache_a
+            .set(
+                "rustfmt",
+                V3GateResult {
+                    status: "PASS".to_string(),
+                    duration_secs: 1,
+                    completed_at: "2026-02-17T00:00:00Z".to_string(),
+                    attestation_digest: None,
+                    evidence_log_digest: None,
+                    quick_mode: None,
+                    log_bundle_hash: None,
+                    log_path: None,
+                    signature_hex: None,
+                    signer_id: None,
+                    rfc0028_receipt_bound: false,
+                    rfc0029_receipt_bound: false,
+                },
+            )
+            .expect("set");
+        cache_a.save_to_dir(root).expect("save");
+
+        let key_b = V3CompoundKey::new("attest", "policy", "toolchain_B", "sandbox", "network")
+            .expect("valid");
+        let result = GateCacheV3::diagnose_compound_key_drift(root, sha, &key_b);
+        assert_eq!(result, Some(CacheReasonCode::ToolchainDrift));
+    }
+
+    #[test]
+    fn diagnose_closure_drift() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let sha = "abc123";
+
+        let key_a = V3CompoundKey::new("attest_A", "policy", "toolchain", "sandbox", "network")
+            .expect("valid");
+        let mut cache_a = GateCacheV3::new(sha, key_a).expect("new");
+        cache_a
+            .set(
+                "rustfmt",
+                V3GateResult {
+                    status: "PASS".to_string(),
+                    duration_secs: 1,
+                    completed_at: "2026-02-17T00:00:00Z".to_string(),
+                    attestation_digest: None,
+                    evidence_log_digest: None,
+                    quick_mode: None,
+                    log_bundle_hash: None,
+                    log_path: None,
+                    signature_hex: None,
+                    signer_id: None,
+                    rfc0028_receipt_bound: false,
+                    rfc0029_receipt_bound: false,
+                },
+            )
+            .expect("set");
+        cache_a.save_to_dir(root).expect("save");
+
+        let key_b = V3CompoundKey::new("attest_B", "policy", "toolchain", "sandbox", "network")
+            .expect("valid");
+        let result = GateCacheV3::diagnose_compound_key_drift(root, sha, &key_b);
+        assert_eq!(result, Some(CacheReasonCode::ClosureDrift));
+    }
+
+    #[test]
+    fn diagnose_network_policy_drift() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let sha = "abc123";
+
+        let key_a = V3CompoundKey::new("attest", "policy", "toolchain", "sandbox", "network_A")
+            .expect("valid");
+        let mut cache_a = GateCacheV3::new(sha, key_a).expect("new");
+        cache_a
+            .set(
+                "rustfmt",
+                V3GateResult {
+                    status: "PASS".to_string(),
+                    duration_secs: 1,
+                    completed_at: "2026-02-17T00:00:00Z".to_string(),
+                    attestation_digest: None,
+                    evidence_log_digest: None,
+                    quick_mode: None,
+                    log_bundle_hash: None,
+                    log_path: None,
+                    signature_hex: None,
+                    signer_id: None,
+                    rfc0028_receipt_bound: false,
+                    rfc0029_receipt_bound: false,
+                },
+            )
+            .expect("set");
+        cache_a.save_to_dir(root).expect("save");
+
+        let key_b = V3CompoundKey::new("attest", "policy", "toolchain", "sandbox", "network_B")
+            .expect("valid");
+        let result = GateCacheV3::diagnose_compound_key_drift(root, sha, &key_b);
+        assert_eq!(result, Some(CacheReasonCode::NetworkPolicyDrift));
+    }
+
+    #[test]
+    fn diagnose_sandbox_drift() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let sha = "abc123";
+
+        let key_a = V3CompoundKey::new("attest", "policy", "toolchain", "sandbox_A", "network")
+            .expect("valid");
+        let mut cache_a = GateCacheV3::new(sha, key_a).expect("new");
+        cache_a
+            .set(
+                "rustfmt",
+                V3GateResult {
+                    status: "PASS".to_string(),
+                    duration_secs: 1,
+                    completed_at: "2026-02-17T00:00:00Z".to_string(),
+                    attestation_digest: None,
+                    evidence_log_digest: None,
+                    quick_mode: None,
+                    log_bundle_hash: None,
+                    log_path: None,
+                    signature_hex: None,
+                    signer_id: None,
+                    rfc0028_receipt_bound: false,
+                    rfc0029_receipt_bound: false,
+                },
+            )
+            .expect("set");
+        cache_a.save_to_dir(root).expect("save");
+
+        let key_b = V3CompoundKey::new("attest", "policy", "toolchain", "sandbox_B", "network")
+            .expect("valid");
+        let result = GateCacheV3::diagnose_compound_key_drift(root, sha, &key_b);
+        assert_eq!(result, Some(CacheReasonCode::SandboxDrift));
+    }
+
+    #[test]
+    fn diagnose_true_gate_miss() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        // No cache entries at all.
+        std::fs::create_dir_all(root).expect("create");
+
+        let key = V3CompoundKey::new("attest", "policy", "toolchain", "sandbox", "network")
+            .expect("valid");
+        let result = GateCacheV3::diagnose_compound_key_drift(root, "no-such-sha", &key);
+        assert_eq!(result, None);
+
+        // diagnose_cache_miss should return ShaMiss
+        let decision = diagnose_cache_miss(root, "no-such-sha", &key);
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::ShaMiss);
+    }
+
+    #[test]
+    fn diagnose_cache_miss_with_drift() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let sha = "abc123";
+
+        let key_a = V3CompoundKey::new("attest", "policy_A", "toolchain", "sandbox", "network")
+            .expect("valid");
+        let mut cache_a = GateCacheV3::new(sha, key_a).expect("new");
+        cache_a
+            .set(
+                "rustfmt",
+                V3GateResult {
+                    status: "PASS".to_string(),
+                    duration_secs: 1,
+                    completed_at: "2026-02-17T00:00:00Z".to_string(),
+                    attestation_digest: None,
+                    evidence_log_digest: None,
+                    quick_mode: None,
+                    log_bundle_hash: None,
+                    log_path: None,
+                    signature_hex: None,
+                    signer_id: None,
+                    rfc0028_receipt_bound: false,
+                    rfc0029_receipt_bound: false,
+                },
+            )
+            .expect("set");
+        cache_a.save_to_dir(root).expect("save");
+
+        let key_b = V3CompoundKey::new("attest", "policy_B", "toolchain", "sandbox", "network")
+            .expect("valid");
+        let decision = diagnose_cache_miss(root, sha, &key_b);
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::PolicyDrift);
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn ttl_expired_check() {
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+        let key = sample_compound_key();
+        let mut cache = GateCacheV3::new("sha123", key).expect("new");
+        let mut result = sample_gate_result();
+        // Set completed_at to a date far in the past.
+        result.completed_at = "2020-01-01T00:00:00Z".to_string();
+        cache.set("rustfmt", result).expect("set");
+        cache.sign_all(&signer);
+
+        // SAFETY: env mutation in test — serialized by test harness.
+        unsafe { std::env::set_var("APM2_FAC_CACHE_TTL_SECS", "1") };
+        let decision = cache.check_reuse_decision(
+            "rustfmt",
+            Some("b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            false,
+            Some(&vk),
+        );
+        unsafe { std::env::remove_var("APM2_FAC_CACHE_TTL_SECS") };
+
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::TtlExpired);
     }
 }
