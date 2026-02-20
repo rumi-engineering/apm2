@@ -431,6 +431,12 @@ pub fn run_fac_worker(
         );
     }
 
+    // FU-003 (TCK-00625): Emit binary identity event at startup for
+    // postmortem correlation. Includes resolved exe path, SHA-256 digest,
+    // PID, and timestamp. This aids diagnosis of INV-PADOPT-004-class
+    // binary drift incidents.
+    emit_binary_identity_event(json_output);
+
     // Resolve queue root directory
     let queue_root = match resolve_queue_root() {
         Ok(root) => root,
@@ -8195,6 +8201,97 @@ fn emit_worker_event(event: &str, extra: serde_json::Value) {
 fn emit_worker_summary(summary: &WorkerSummary) {
     let data = serde_json::to_value(summary).unwrap_or_else(|_| serde_json::json!({}));
     emit_worker_event("worker_summary", data);
+}
+
+/// Maximum binary file size for startup digest computation (256 MiB).
+/// Bounds the read to prevent `DoS` if the binary is unusually large
+/// (CTR-1603).
+const MAX_STARTUP_BINARY_DIGEST_SIZE: u64 = 256 * 1024 * 1024;
+
+/// FU-003 (TCK-00625): Emit binary identity event at worker startup.
+///
+/// Resolves the running binary via `std::env::current_exe()`, computes
+/// its SHA-256 digest, and emits a structured event with the path, digest,
+/// PID, and ISO-8601 timestamp. This enables postmortem correlation for
+/// INV-PADOPT-004-class binary drift incidents.
+///
+/// The event is emitted at INFO level. Failures are non-fatal: if the
+/// binary path or digest cannot be resolved, the event includes the error
+/// but does not abort worker startup.
+fn emit_binary_identity_event(json_output: bool) {
+    use std::io::Read;
+
+    use sha2::{Digest, Sha256};
+
+    let pid = std::process::id();
+    let ts = worker_ts_now();
+
+    let exe_path = match std::env::current_exe() {
+        Ok(p) => p.canonicalize().unwrap_or(p),
+        Err(e) => {
+            if json_output {
+                emit_worker_event(
+                    "binary_identity",
+                    serde_json::json!({
+                        "pid": pid,
+                        "error": format!("cannot resolve current_exe: {e}"),
+                    }),
+                );
+            } else {
+                eprintln!(
+                    "INFO: binary_identity: pid={pid} error=\"cannot resolve current_exe: {e}\""
+                );
+            }
+            return;
+        },
+    };
+
+    let digest = std::fs::File::open(&exe_path).map_or_else(
+        |_| "open_error".to_string(),
+        |file| {
+            let metadata_ok = file
+                .metadata()
+                .is_ok_and(|m| m.len() <= MAX_STARTUP_BINARY_DIGEST_SIZE);
+            if metadata_ok {
+                let mut reader = std::io::BufReader::new(file.take(MAX_STARTUP_BINARY_DIGEST_SIZE));
+                let mut hasher = Sha256::new();
+                let mut buf = [0u8; 8192];
+                let mut ok = true;
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => hasher.update(&buf[..n]),
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        },
+                    }
+                }
+                if ok {
+                    format!("sha256:{:x}", hasher.finalize())
+                } else {
+                    "read_error".to_string()
+                }
+            } else {
+                "oversized_or_unreadable".to_string()
+            }
+        },
+    );
+
+    let exe_display = exe_path.display().to_string();
+
+    if json_output {
+        emit_worker_event(
+            "binary_identity",
+            serde_json::json!({
+                "binary_path": exe_display,
+                "binary_digest": digest,
+                "pid": pid,
+            }),
+        );
+    } else {
+        eprintln!("INFO: binary_identity: path={exe_display} digest={digest} pid={pid} ts={ts}");
+    }
 }
 
 // =============================================================================
