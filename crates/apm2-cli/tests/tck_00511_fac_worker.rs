@@ -804,9 +804,9 @@ fn test_fac_worker_e2e_once_mode_processes_job() {
     let previous_apm2_home = std::env::var_os("APM2_HOME");
     set_env_var_for_test("APM2_HOME", &apm2_home);
 
-    // TCK-00577 round 5: ServiceUserNotResolved is now a hard error
-    // (fail-closed). Set APM2_FAC_SERVICE_USER to the current user so
-    // the ownership gate can resolve the service user in passwd.
+    // TCK-00577: Set APM2_FAC_SERVICE_USER to the current user so the
+    // ownership gate resolves the service user and we go through the
+    // direct enqueue path (not broker-mediated fallback).
     let previous_service_user = std::env::var_os("APM2_FAC_SERVICE_USER");
     let current_user = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))

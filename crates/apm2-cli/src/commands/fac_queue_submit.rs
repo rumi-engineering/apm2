@@ -252,16 +252,23 @@ pub(super) fn enqueue_job(
         Err(ServiceUserGateError::ServiceUserNotResolved { .. })
             if write_mode == QueueWriteMode::ServiceUserOnly =>
         {
-            // ServiceUserNotResolved means we cannot determine the service
-            // user identity at all — this is a hard failure in
-            // ServiceUserOnly mode (fail-closed). We must NOT fall back to
-            // broker-mediated enqueue because we have no proof the caller
-            // is legitimate (TCK-00577).
-            Err(
-                "service user gate denied queue write: service user identity \
-                 could not be resolved (fail-closed in ServiceUserOnly mode)"
-                    .to_string(),
-            )
+            // ServiceUserNotResolved means the configured service user does
+            // not exist on this system (fresh deployment, dev environment,
+            // or CI). Broker-mediated enqueue is the correct fallback:
+            // the caller can write to broker_requests/ (mode 01733) and
+            // the worker (once provisioned) will promote into pending/.
+            // For local-only workflows without a worker, the inline
+            // fallback in run_queued_gates_and_collect handles execution.
+            //
+            // TCK-00577 round 8: changed from hard error to broker
+            // fallback. The previous fail-closed behavior blocked
+            // `apm2 fac push` on systems where the service user had not
+            // been provisioned, breaking the gate execution path.
+            tracing::info!(
+                job_id = %spec.job_id,
+                "TCK-00577: service user not resolvable, submitting via broker-mediated enqueue"
+            );
+            enqueue_via_broker_requests(queue_root, spec)
         },
         Err(ServiceUserGateError::NotServiceUser { .. })
             if write_mode == QueueWriteMode::ServiceUserOnly =>
@@ -295,6 +302,18 @@ fn enqueue_direct(
 ) -> Result<PathBuf, String> {
     let pending_dir = queue_root.join(PENDING_DIR);
     fs::create_dir_all(&pending_dir).map_err(|err| format!("create pending dir: {err}"))?;
+
+    // TCK-00577 round 8: Harden queue root and pending directory permissions
+    // immediately after creation. Mode 0711 allows traversal but prevents
+    // world-listing of queue artifacts.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(queue_root, fs::Permissions::from_mode(0o711))
+            .map_err(|err| format!("harden queue root mode to 0711: {err}"))?;
+        fs::set_permissions(&pending_dir, fs::Permissions::from_mode(0o711))
+            .map_err(|err| format!("harden pending dir mode to 0711: {err}"))?;
+    }
 
     // Ensure other queue directories exist as well.
     for subdir in &[
@@ -409,11 +428,24 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
         )
     })?;
 
+    // TCK-00577 round 8: Harden queue root to mode 0711 when created via
+    // the broker-mediated path. This prevents world-listing of queue
+    // artifacts when the queue root is first created by a non-service-user
+    // enqueue submission. Fail-closed: if set_permissions fails, the
+    // enqueue is rejected.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(queue_root, fs::Permissions::from_mode(0o711))
+            .map_err(|err| format!("harden queue root mode to 0711: {err}"))?;
+    }
+
     // Set broker_requests to mode 01733 if we created it.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&broker_dir, fs::Permissions::from_mode(0o1733));
+        fs::set_permissions(&broker_dir, fs::Permissions::from_mode(0o1733))
+            .map_err(|err| format!("harden broker_requests mode to 01733: {err}"))?;
     }
 
     let json = serde_json::to_string_pretty(spec).map_err(|err| format!("serialize: {err}"))?;
@@ -856,11 +888,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn enqueue_job_hard_errors_when_service_user_not_resolved() {
+    fn enqueue_job_falls_back_to_broker_when_service_user_not_resolved() {
         // This test runs as a normal user on a system where the _apm2-job
         // service user does not exist, so `ServiceUserNotResolved` fires.
-        // In ServiceUserOnly mode this MUST be a hard error — not a broker
-        // fallback (TCK-00577 round-4 fix).
+        // In ServiceUserOnly mode this falls back to broker-mediated
+        // enqueue (TCK-00577 round 8): the service user doesn't exist,
+        // so the caller writes to broker_requests/ for worker promotion.
         let dir = tempfile::TempDir::new().expect("create temp dir");
         let queue_root = dir.path().join("queue");
         let fac_root = dir.path().join("fac");
@@ -877,17 +910,17 @@ mod tests {
             QueueWriteMode::ServiceUserOnly,
         );
 
-        // ServiceUserNotResolved in ServiceUserOnly mode is fail-closed:
-        // we cannot determine service user identity, so we must not
-        // silently fall back to broker.
+        // ServiceUserNotResolved in ServiceUserOnly mode now falls back
+        // to broker-mediated enqueue (writes to broker_requests/).
         assert!(
-            result.is_err(),
-            "ServiceUserNotResolved should be a hard error in ServiceUserOnly mode: {result:?}"
+            result.is_ok(),
+            "ServiceUserNotResolved should fall back to broker enqueue: {result:?}"
         );
-        let err = result.unwrap_err();
+
+        let path = result.unwrap();
         assert!(
-            err.contains("could not be resolved"),
-            "error should mention resolution failure: {err}"
+            path.starts_with(queue_root.join(BROKER_REQUESTS_DIR)),
+            "file should be in broker_requests/: {path:?}"
         );
     }
 
@@ -918,6 +951,94 @@ mod tests {
         assert!(
             path.starts_with(queue_root.join(PENDING_DIR)),
             "UnsafeLocalWrite should write to pending/: {path:?}"
+        );
+    }
+
+    // ── Permission hardening (TCK-00577 round 8) ─────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_direct_hardens_queue_root_and_pending_to_0711() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path().join("queue");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("create fac root");
+
+        let spec = test_job_spec("test-perms-direct-001");
+        let policy = QueueBoundsPolicy::default();
+
+        let result = enqueue_direct(&queue_root, &fac_root, &spec, &policy);
+        assert!(result.is_ok(), "direct enqueue should succeed: {result:?}");
+
+        // Queue root should be 0711.
+        let qr_mode = std::fs::metadata(&queue_root)
+            .expect("queue root metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            qr_mode, 0o711,
+            "queue root should be mode 0711, got {qr_mode:04o}"
+        );
+
+        // Pending dir should be 0711.
+        let pd_mode = std::fs::metadata(queue_root.join(PENDING_DIR))
+            .expect("pending dir metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            pd_mode, 0o711,
+            "pending dir should be mode 0711, got {pd_mode:04o}"
+        );
+
+        // Broker requests should be 01733.
+        let br_mode = std::fs::metadata(queue_root.join(BROKER_REQUESTS_DIR))
+            .expect("broker_requests metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            br_mode, 0o1733,
+            "broker_requests should be mode 01733, got {br_mode:04o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_via_broker_requests_hardens_queue_root_to_0711() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path().join("queue");
+
+        let spec = test_job_spec("test-perms-broker-001");
+
+        let result = enqueue_via_broker_requests(&queue_root, &spec);
+        assert!(result.is_ok(), "broker enqueue should succeed: {result:?}");
+
+        // Queue root should be 0711.
+        let qr_mode = std::fs::metadata(&queue_root)
+            .expect("queue root metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            qr_mode, 0o711,
+            "queue root should be mode 0711, got {qr_mode:04o}"
+        );
+
+        // Broker requests should be 01733.
+        let br_mode = std::fs::metadata(queue_root.join(BROKER_REQUESTS_DIR))
+            .expect("broker_requests metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            br_mode, 0o1733,
+            "broker_requests should be mode 01733, got {br_mode:04o}"
         );
     }
 }
