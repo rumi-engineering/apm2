@@ -109,6 +109,11 @@ pub enum GateProgressEvent {
         passed: bool,
         duration_secs: u64,
         error_hint: Option<String>,
+        /// Structured cache reuse decision (TCK-00626, REQ-0037).
+        /// Present when a cache lookup was performed for this gate.
+        /// Used by the gates.rs callback handler in non-test builds.
+        #[cfg_attr(test, allow(dead_code))]
+        cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision>,
     },
 }
 
@@ -159,6 +164,9 @@ pub struct EvidenceGateResult {
     pub bytes_total: Option<u64>,
     pub was_truncated: Option<bool>,
     pub log_bundle_hash: Option<String>,
+    /// Structured cache reuse decision (TCK-00626, REQ-0037).
+    /// Present when a cache lookup was performed for this gate.
+    pub cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -237,6 +245,7 @@ fn emit_gate_completed_via_cb(cb: &dyn Fn(GateProgressEvent), result: &EvidenceG
         passed: result.passed,
         duration_secs: result.duration_secs,
         error_hint,
+        cache_decision: result.cache_decision.clone(),
     });
 }
 
@@ -383,25 +392,59 @@ pub(super) fn cache_v3_root() -> Option<std::path::PathBuf> {
 ///
 /// Defense-in-depth: even if a v2-sourced `GateCacheV3` were passed here,
 /// `check_reuse` would deny via `v2_sourced_no_binding_proof`.
+#[allow(clippy::too_many_arguments)]
 fn reuse_decision_with_v3_fallback(
     v3_cache: Option<&GateCacheV3>,
     _v2_cache: Option<&GateCache>,
     gate_name: &str,
     attestation_digest: Option<&str>,
     verifying_key: Option<&apm2_core::crypto::VerifyingKey>,
-) -> ReuseDecision {
+    v3_cache_root: Option<&std::path::Path>,
+    v3_compound_key: Option<&apm2_core::fac::gate_cache_v3::V3CompoundKey>,
+    sha: Option<&str>,
+) -> (
+    ReuseDecision,
+    Option<apm2_core::fac::gate_cache_v3::CacheDecision>,
+) {
     // Try v3 first.
+    //
+    // TCK-00626 round 5: check_reuse now returns CacheDecision directly
+    // (the old check_reuse_decision wrapper was eliminated). The single
+    // check_reuse method performs all checks in the correct TCK-00626 S2
+    // order (gate_miss -> signature -> receipt_binding -> drift -> TTL)
+    // and returns a structured CacheDecision with first_mismatch_dimension.
     if let Some(v3) = v3_cache {
-        let v3_decision = v3.check_reuse(gate_name, attestation_digest, true, verifying_key);
-        if v3_decision.reusable {
-            return ReuseDecision::hit_v3();
+        let cache_decision = v3.check_reuse(gate_name, attestation_digest, true, verifying_key);
+        if cache_decision.hit {
+            return (ReuseDecision::hit_v3(), Some(cache_decision));
         }
+        return (
+            ReuseDecision::miss("v3_miss_v2_fallback_disabled"),
+            Some(cache_decision),
+        );
+    }
+    // No v3 cache loaded: diagnose compound-key drift if root and key are
+    // available.
+    if let (Some(root), Some(key), Some(sha_val)) = (v3_cache_root, v3_compound_key, sha) {
+        let decision = apm2_core::fac::gate_cache_v3::diagnose_cache_miss(root, sha_val, key);
+        return (
+            ReuseDecision::miss("v3_miss_v2_fallback_disabled"),
+            Some(decision),
+        );
     }
     // [INV-GCV3-001] V2 fallback disabled for reuse. V2 entries do not
     // carry RFC-0028/0029 binding proof and cannot satisfy v3 compound-key
     // continuity. Returning miss ensures fail-closed behavior: gates that
     // only have v2 entries will be re-executed under v3 with full bindings.
-    ReuseDecision::miss("v3_miss_v2_fallback_disabled")
+    //
+    // Fallback: no v3 context available.
+    (
+        ReuseDecision::miss("v3_miss_v2_fallback_disabled"),
+        Some(apm2_core::fac::gate_cache_v3::CacheDecision::cache_miss(
+            apm2_core::fac::gate_cache_v3::CacheReasonCode::ShaMiss,
+            None,
+        )),
+    )
 }
 
 /// Unified cached payload fields extracted from either v2 or v3.
@@ -1383,6 +1426,24 @@ fn build_evidence_gate_result(
     log_path: Option<&Path>,
     stream_stats: Option<&StreamStats>,
 ) -> EvidenceGateResult {
+    build_evidence_gate_result_with_cache_decision(
+        gate_name,
+        passed,
+        duration_secs,
+        log_path,
+        stream_stats,
+        None,
+    )
+}
+
+fn build_evidence_gate_result_with_cache_decision(
+    gate_name: &str,
+    passed: bool,
+    duration_secs: u64,
+    log_path: Option<&Path>,
+    stream_stats: Option<&StreamStats>,
+    cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision>,
+) -> EvidenceGateResult {
     EvidenceGateResult {
         gate_name: gate_name.to_string(),
         passed,
@@ -1392,6 +1453,7 @@ fn build_evidence_gate_result(
         bytes_total: stream_stats.map(|stats| stats.bytes_total),
         was_truncated: stream_stats.map(|stats| stats.was_truncated),
         log_bundle_hash: None,
+        cache_decision,
     }
 }
 
@@ -1726,8 +1788,8 @@ pub(super) fn run_evidence_gates_with_lane_context(
     // Fail-closed: if any v3 context material is unavailable (APM2_HOME,
     // policy load, sandbox/network hash, compound key parse), we simply skip
     // v3 loading and reuse decisions fall back to miss behavior.
-    let v3_cache_loaded = if cache_reuse_active {
-        cache_reuse_policy.as_ref().and_then(|reuse_policy| {
+    let (v3_cache_loaded, v3_compound_key_ns, v3_root_ns) = if cache_reuse_active {
+        let result = cache_reuse_policy.as_ref().and_then(|reuse_policy| {
             let sandbox_hardening_hash = reuse_policy.sandbox_hardening.as_deref()?;
             let network_policy_hash = reuse_policy.network_policy_hash.as_deref()?;
             let apm2_home = apm2_core::github::resolve_apm2_home()?;
@@ -1740,10 +1802,15 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 network_policy_hash,
             )?;
             let root = cache_v3_root()?;
-            GateCacheV3::load_from_dir(&root, sha, &compound_key)
-        })
+            let loaded = GateCacheV3::load_from_dir(&root, sha, &compound_key);
+            Some((loaded, compound_key, root))
+        });
+        match result {
+            Some((loaded, ck, root)) => (loaded, Some(ck), Some(root)),
+            None => (None, None, None),
+        }
     } else {
-        None
+        (None, None, None)
     };
 
     // Fastest-first ordering for expensive cargo gates. Keep cheap checks
@@ -1855,6 +1922,10 @@ pub(super) fn run_evidence_gates_with_lane_context(
     for (idx, &(gate_name, cmd_args)) in gates.iter().enumerate() {
         let log_path = logs_dir.join(format!("{gate_name}.log"));
 
+        // TCK-00626 round 4: Hoist cache_decision so it is available on both
+        // hit and miss paths — gate_finished must always carry the decision.
+        let mut gate_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
+
         // TCK-00540 fix round 3: Check gate cache for reuse before execution.
         if cache_reuse_active {
             // SAFETY: `cache_reuse_policy` is guaranteed `Some` here because
@@ -1864,13 +1935,19 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 .expect("guarded by cache_reuse_active");
             let attestation_digest =
                 gate_attestation_digest(workspace_root, sha, gate_name, None, reuse_grp);
-            let reuse = reuse_decision_with_v3_fallback(
+            let (reuse, cache_decision_local) = reuse_decision_with_v3_fallback(
                 v3_cache_loaded.as_ref(),
                 cached_gate_cache.as_ref(),
                 gate_name,
                 attestation_digest.as_deref(),
                 fac_verifying_key.as_ref(),
+                v3_root_ns.as_deref(),
+                v3_compound_key_ns.as_ref(),
+                Some(sha),
             );
+            // TCK-00626 round 4: propagate cache decision to outer scope so
+            // both hit and miss paths include it in gate_finished.
+            gate_cache_decision.clone_from(&cache_decision_local);
             if reuse.reusable {
                 if let Some(cached) = resolve_cached_payload(
                     &reuse,
@@ -1885,12 +1962,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
                         reuse.reason,
                         attestation_digest.as_deref(),
                     );
-                    let cached_result = build_evidence_gate_result(
+                    let cached_result = build_evidence_gate_result_with_cache_decision(
                         gate_name,
                         true,
                         cached.duration_secs,
                         Some(&log_path),
                         Some(&stream_stats),
+                        cache_decision_local,
                     );
                     emit_gate_completed(opts, &cached_result);
                     gate_results.push(cached_result);
@@ -1960,12 +2038,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
         };
 
         let duration = started.elapsed().as_secs();
-        let result = build_evidence_gate_result(
+        let result = build_evidence_gate_result_with_cache_decision(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
+            gate_cache_decision.take(),
         );
         emit_gate_completed(opts, &result);
         gate_results.push(result);
@@ -1990,6 +2069,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
     for gate_name in pre_test_native_gates {
         let log_path = logs_dir.join(format!("{gate_name}.log"));
 
+        // TCK-00626 round 4: Hoist cache_decision for miss path.
+        let mut gate_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
+
         // TCK-00540 fix round 3: Cache reuse for pre-test native gates.
         if cache_reuse_active {
             let reuse_grp = cache_reuse_policy
@@ -1997,13 +2079,19 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 .expect("guarded by cache_reuse_active");
             let attestation_digest =
                 gate_attestation_digest(workspace_root, sha, gate_name, None, reuse_grp);
-            let reuse = reuse_decision_with_v3_fallback(
+            let (reuse, cache_decision_local) = reuse_decision_with_v3_fallback(
                 v3_cache_loaded.as_ref(),
                 cached_gate_cache.as_ref(),
                 gate_name,
                 attestation_digest.as_deref(),
                 fac_verifying_key.as_ref(),
+                v3_root_ns.as_deref(),
+                v3_compound_key_ns.as_ref(),
+                Some(sha),
             );
+            // TCK-00626 round 4: propagate cache decision to outer scope so
+            // both hit and miss paths include it in gate_finished.
+            gate_cache_decision.clone_from(&cache_decision_local);
             if reuse.reusable {
                 if let Some(cached) = resolve_cached_payload(
                     &reuse,
@@ -2018,12 +2106,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
                         reuse.reason,
                         attestation_digest.as_deref(),
                     );
-                    let cached_result = build_evidence_gate_result(
+                    let cached_result = build_evidence_gate_result_with_cache_decision(
                         gate_name,
                         true,
                         cached.duration_secs,
                         Some(&log_path),
                         Some(&stream_stats),
+                        cache_decision_local,
                     );
                     emit_gate_completed(opts, &cached_result);
                     gate_results.push(cached_result);
@@ -2056,12 +2145,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
         let (passed, stream_stats) =
             run_native_evidence_gate(workspace_root, sha, gate_name, &log_path, emit_human_logs);
         let duration = started.elapsed().as_secs();
-        let result = build_evidence_gate_result(
+        let result = build_evidence_gate_result_with_cache_decision(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
+            gate_cache_decision.take(),
         );
         emit_gate_completed(opts, &result);
         gate_results.push(result);
@@ -2118,6 +2208,8 @@ pub(super) fn run_evidence_gates_with_lane_context(
         let test_command_override =
             resolve_evidence_test_command_override(opts.and_then(|o| o.test_command.as_deref()));
         let mut test_cache_hit = false;
+        // TCK-00626 round 4: Hoist cache_decision for miss path.
+        let mut test_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
         if cache_reuse_active {
             let reuse_grp = cache_reuse_policy
                 .as_ref()
@@ -2129,13 +2221,18 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 Some(&test_command_override),
                 reuse_grp,
             );
-            let reuse = reuse_decision_with_v3_fallback(
+            let (reuse, cache_decision_local) = reuse_decision_with_v3_fallback(
                 v3_cache_loaded.as_ref(),
                 cached_gate_cache.as_ref(),
                 "test",
                 attestation_digest.as_deref(),
                 fac_verifying_key.as_ref(),
+                v3_root_ns.as_deref(),
+                v3_compound_key_ns.as_ref(),
+                Some(sha),
             );
+            // TCK-00626 round 4: propagate cache decision to outer scope.
+            test_cache_decision.clone_from(&cache_decision_local);
             if reuse.reusable {
                 if let Some(cached) = resolve_cached_payload(
                     &reuse,
@@ -2150,12 +2247,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
                         reuse.reason,
                         attestation_digest.as_deref(),
                     );
-                    let cached_result = build_evidence_gate_result(
+                    let cached_result = build_evidence_gate_result_with_cache_decision(
                         "test",
                         true,
                         cached.duration_secs,
                         Some(&test_log),
                         Some(&stream_stats),
+                        cache_decision_local,
                     );
                     emit_gate_completed(opts, &cached_result);
                     gate_results.push(cached_result);
@@ -2211,12 +2309,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 on_gate_progress,
             );
             let test_duration = test_started.elapsed().as_secs();
-            let test_result = build_evidence_gate_result(
+            let test_result = build_evidence_gate_result_with_cache_decision(
                 "test",
                 passed,
                 test_duration,
                 Some(&test_log),
                 Some(&stream_stats),
+                test_cache_decision.take(),
             );
             emit_gate_completed(opts, &test_result);
             gate_results.push(test_result);
@@ -2240,19 +2339,26 @@ pub(super) fn run_evidence_gates_with_lane_context(
 
     let wi_log_path = logs_dir.join("workspace_integrity.log");
     let mut wi_cache_hit = false;
+    // TCK-00626 round 4: Hoist cache_decision for miss path.
+    let mut wi_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
     if cache_reuse_active {
         let reuse_grp = cache_reuse_policy
             .as_ref()
             .expect("guarded by cache_reuse_active");
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, "workspace_integrity", None, reuse_grp);
-        let reuse = reuse_decision_with_v3_fallback(
+        let (reuse, cache_decision_local) = reuse_decision_with_v3_fallback(
             v3_cache_loaded.as_ref(),
             cached_gate_cache.as_ref(),
             "workspace_integrity",
             attestation_digest.as_deref(),
             fac_verifying_key.as_ref(),
+            v3_root_ns.as_deref(),
+            v3_compound_key_ns.as_ref(),
+            Some(sha),
         );
+        // TCK-00626 round 4: propagate cache decision to outer scope.
+        wi_cache_decision.clone_from(&cache_decision_local);
         if reuse.reusable {
             if let Some(cached) = resolve_cached_payload(
                 &reuse,
@@ -2267,12 +2373,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
                     reuse.reason,
                     attestation_digest.as_deref(),
                 );
-                let cached_result = build_evidence_gate_result(
+                let cached_result = build_evidence_gate_result_with_cache_decision(
                     "workspace_integrity",
                     true,
                     cached.duration_secs,
                     Some(&wi_log_path),
                     Some(&stream_stats),
+                    cache_decision_local,
                 );
                 emit_gate_completed(opts, &cached_result);
                 gate_results.push(cached_result);
@@ -2306,12 +2413,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
         let (wi_passed, wi_line, wi_stream_stats) =
             verify_workspace_integrity_gate(workspace_root, sha, &wi_log_path, emit_human_logs);
         let wi_duration = wi_started.elapsed().as_secs();
-        let wi_result = build_evidence_gate_result(
+        let wi_result = build_evidence_gate_result_with_cache_decision(
             "workspace_integrity",
             wi_passed,
             wi_duration,
             Some(&wi_log_path),
             Some(&wi_stream_stats),
+            wi_cache_decision.take(),
         );
         emit_gate_completed(opts, &wi_result);
         gate_results.push(wi_result);
@@ -2331,6 +2439,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
     for gate_name in post_test_native_gates {
         let log_path = logs_dir.join(format!("{gate_name}.log"));
 
+        // TCK-00626 round 4: Hoist cache_decision for miss path.
+        let mut gate_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
+
         // TCK-00540 fix round 3: Cache reuse for post-test native gates.
         if cache_reuse_active {
             let reuse_grp = cache_reuse_policy
@@ -2338,13 +2449,19 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 .expect("guarded by cache_reuse_active");
             let attestation_digest =
                 gate_attestation_digest(workspace_root, sha, gate_name, None, reuse_grp);
-            let reuse = reuse_decision_with_v3_fallback(
+            let (reuse, cache_decision_local) = reuse_decision_with_v3_fallback(
                 v3_cache_loaded.as_ref(),
                 cached_gate_cache.as_ref(),
                 gate_name,
                 attestation_digest.as_deref(),
                 fac_verifying_key.as_ref(),
+                v3_root_ns.as_deref(),
+                v3_compound_key_ns.as_ref(),
+                Some(sha),
             );
+            // TCK-00626 round 4: propagate cache decision to outer scope so
+            // both hit and miss paths include it in gate_finished.
+            gate_cache_decision.clone_from(&cache_decision_local);
             if reuse.reusable {
                 if let Some(cached) = resolve_cached_payload(
                     &reuse,
@@ -2359,12 +2476,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
                         reuse.reason,
                         attestation_digest.as_deref(),
                     );
-                    let cached_result = build_evidence_gate_result(
+                    let cached_result = build_evidence_gate_result_with_cache_decision(
                         gate_name,
                         true,
                         cached.duration_secs,
                         Some(&log_path),
                         Some(&stream_stats),
+                        cache_decision_local,
                     );
                     emit_gate_completed(opts, &cached_result);
                     gate_results.push(cached_result);
@@ -2397,12 +2515,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
         let (passed, stream_stats) =
             run_native_evidence_gate(workspace_root, sha, gate_name, &log_path, emit_human_logs);
         let duration = started.elapsed().as_secs();
-        let result = build_evidence_gate_result(
+        let result = build_evidence_gate_result_with_cache_decision(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
+            gate_cache_decision.take(),
         );
         emit_gate_completed(opts, &result);
         gate_results.push(result);
@@ -2688,12 +2807,15 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
         let log_path = logs_dir.join(format!("{gate_name}.log"));
-        let reuse = reuse_decision_with_v3_fallback(
+        let (reuse, cache_decision_local) = reuse_decision_with_v3_fallback(
             v3_cache_loaded.as_ref(),
             cache.as_ref(),
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
+            v3_root.as_deref(),
+            v3_compound_key.as_ref(),
+            Some(sha),
         );
         if reuse.reusable {
             if let Some(cached) =
@@ -2710,12 +2832,13 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 );
                 status.set_result(gate_name, true, cached.duration_secs);
                 updater.update(&status);
-                let cached_result = build_evidence_gate_result(
+                let cached_result = build_evidence_gate_result_with_cache_decision(
                     gate_name,
                     true,
                     cached.duration_secs,
                     Some(&log_path),
                     Some(&stream_stats),
+                    cache_decision_local,
                 );
                 emit_gate_completed_cb(on_gate_progress, &cached_result);
                 gate_results.push(cached_result);
@@ -2745,7 +2868,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             updater.update(&status);
             status.set_result(gate_name, false, 0);
             updater.update(&status);
-            let fail_result = build_evidence_gate_result(
+            let fail_result = build_evidence_gate_result_with_cache_decision(
                 gate_name,
                 false,
                 0,
@@ -2755,6 +2878,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     bytes_total: 0,
                     was_truncated: false,
                 }),
+                cache_decision_local,
             );
             emit_gate_completed_cb(on_gate_progress, &fail_result);
             gate_results.push(fail_result);
@@ -2826,12 +2950,13 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
 
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
-        let exec_result = build_evidence_gate_result(
+        let exec_result = build_evidence_gate_result_with_cache_decision(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
+            cache_decision_local.clone(),
         );
         emit_gate_completed_cb(on_gate_progress, &exec_result);
         gate_results.push(exec_result);
@@ -2875,12 +3000,15 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         let log_path = logs_dir.join(format!("{gate_name}.log"));
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
-        let reuse = reuse_decision_with_v3_fallback(
+        let (reuse, cache_decision_local) = reuse_decision_with_v3_fallback(
             v3_cache_loaded.as_ref(),
             cache.as_ref(),
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
+            v3_root.as_deref(),
+            v3_compound_key.as_ref(),
+            Some(sha),
         );
         if reuse.reusable {
             if let Some(cached) =
@@ -2897,12 +3025,13 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 );
                 status.set_result(gate_name, true, cached.duration_secs);
                 updater.update(&status);
-                let cached_result = build_evidence_gate_result(
+                let cached_result = build_evidence_gate_result_with_cache_decision(
                     gate_name,
                     true,
                     cached.duration_secs,
                     Some(&log_path),
                     Some(&stream_stats),
+                    cache_decision_local,
                 );
                 emit_gate_completed_cb(on_gate_progress, &cached_result);
                 gate_results.push(cached_result);
@@ -2932,7 +3061,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             updater.update(&status);
             status.set_result(gate_name, false, 0);
             updater.update(&status);
-            let fail_result = build_evidence_gate_result(
+            let fail_result = build_evidence_gate_result_with_cache_decision(
                 gate_name,
                 false,
                 0,
@@ -2942,6 +3071,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     bytes_total: 0,
                     was_truncated: false,
                 }),
+                cache_decision_local,
             );
             emit_gate_completed_cb(on_gate_progress, &fail_result);
             gate_results.push(fail_result);
@@ -2996,12 +3126,13 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
 
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
-        let exec_result = build_evidence_gate_result(
+        let exec_result = build_evidence_gate_result_with_cache_decision(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
+            cache_decision_local.clone(),
         );
         emit_gate_completed_cb(on_gate_progress, &exec_result);
         gate_results.push(exec_result);
@@ -3052,12 +3183,15 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             Some(pipeline_test_command.command.as_slice()),
             &policy,
         );
-        let reuse = reuse_decision_with_v3_fallback(
+        let (reuse, cache_decision_local) = reuse_decision_with_v3_fallback(
             v3_cache_loaded.as_ref(),
             cache.as_ref(),
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
+            v3_root.as_deref(),
+            v3_compound_key.as_ref(),
+            Some(sha),
         );
         let log_path = logs_dir.join("test.log");
         emit_gate_started_cb(on_gate_progress, gate_name);
@@ -3075,12 +3209,13 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 );
                 status.set_result(gate_name, true, cached.duration_secs);
                 updater.update(&status);
-                let cached_result = build_evidence_gate_result(
+                let cached_result = build_evidence_gate_result_with_cache_decision(
                     gate_name,
                     true,
                     cached.duration_secs,
                     Some(&log_path),
                     Some(&stream_stats),
+                    cache_decision_local,
                 );
                 emit_gate_completed_cb(on_gate_progress, &cached_result);
                 gate_results.push(cached_result);
@@ -3106,7 +3241,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             } else {
                 status.set_result(gate_name, false, 0);
                 updater.update(&status);
-                let fail_result = build_evidence_gate_result(
+                let fail_result = build_evidence_gate_result_with_cache_decision(
                     gate_name,
                     false,
                     0,
@@ -3116,6 +3251,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                         bytes_total: 0,
                         was_truncated: false,
                     }),
+                    cache_decision_local,
                 );
                 emit_gate_completed_cb(on_gate_progress, &fail_result);
                 gate_results.push(fail_result);
@@ -3185,12 +3321,13 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             let duration = started.elapsed().as_secs();
             status.set_result(gate_name, passed, duration);
             updater.update(&status);
-            let test_result = build_evidence_gate_result(
+            let test_result = build_evidence_gate_result_with_cache_decision(
                 gate_name,
                 passed,
                 duration,
                 Some(&log_path),
                 Some(&stream_stats),
+                cache_decision_local,
             );
             emit_gate_completed_cb(on_gate_progress, &test_result);
             gate_results.push(test_result);
@@ -3234,12 +3371,15 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         let gate_name = "workspace_integrity";
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
-        let reuse = reuse_decision_with_v3_fallback(
+        let (reuse, cache_decision_local) = reuse_decision_with_v3_fallback(
             v3_cache_loaded.as_ref(),
             cache.as_ref(),
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
+            v3_root.as_deref(),
+            v3_compound_key.as_ref(),
+            Some(sha),
         );
         let log_path = logs_dir.join("workspace_integrity.log");
         emit_gate_started_cb(on_gate_progress, gate_name);
@@ -3257,12 +3397,13 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 );
                 status.set_result(gate_name, true, cached.duration_secs);
                 updater.update(&status);
-                let cached_result = build_evidence_gate_result(
+                let cached_result = build_evidence_gate_result_with_cache_decision(
                     gate_name,
                     true,
                     cached.duration_secs,
                     Some(&log_path),
                     Some(&stream_stats),
+                    cache_decision_local,
                 );
                 emit_gate_completed_cb(on_gate_progress, &cached_result);
                 gate_results.push(cached_result);
@@ -3288,7 +3429,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             } else {
                 status.set_result(gate_name, false, 0);
                 updater.update(&status);
-                let fail_result = build_evidence_gate_result(
+                let fail_result = build_evidence_gate_result_with_cache_decision(
                     gate_name,
                     false,
                     0,
@@ -3298,6 +3439,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                         bytes_total: 0,
                         was_truncated: false,
                     }),
+                    cache_decision_local,
                 );
                 emit_gate_completed_cb(on_gate_progress, &fail_result);
                 gate_results.push(fail_result);
@@ -3336,12 +3478,13 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             let duration = started.elapsed().as_secs();
             status.set_result(gate_name, passed, duration);
             updater.update(&status);
-            let wi_result = build_evidence_gate_result(
+            let wi_result = build_evidence_gate_result_with_cache_decision(
                 gate_name,
                 passed,
                 duration,
                 Some(&log_path),
                 Some(&stream_stats),
+                cache_decision_local,
             );
             emit_gate_completed_cb(on_gate_progress, &wi_result);
             gate_results.push(wi_result);
@@ -3380,12 +3523,15 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         let log_path = logs_dir.join(format!("{gate_name}.log"));
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
-        let reuse = reuse_decision_with_v3_fallback(
+        let (reuse, cache_decision_local) = reuse_decision_with_v3_fallback(
             v3_cache_loaded.as_ref(),
             cache.as_ref(),
             gate_name,
             attestation_digest.as_deref(),
             Some(&fac_verifying_key),
+            v3_root.as_deref(),
+            v3_compound_key.as_ref(),
+            Some(sha),
         );
         if reuse.reusable {
             if let Some(cached) =
@@ -3402,12 +3548,13 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 );
                 status.set_result(gate_name, true, cached.duration_secs);
                 updater.update(&status);
-                let cached_result = build_evidence_gate_result(
+                let cached_result = build_evidence_gate_result_with_cache_decision(
                     gate_name,
                     true,
                     cached.duration_secs,
                     Some(&log_path),
                     Some(&stream_stats),
+                    cache_decision_local,
                 );
                 emit_gate_completed_cb(on_gate_progress, &cached_result);
                 gate_results.push(cached_result);
@@ -3437,7 +3584,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             updater.update(&status);
             status.set_result(gate_name, false, 0);
             updater.update(&status);
-            let fail_result = build_evidence_gate_result(
+            let fail_result = build_evidence_gate_result_with_cache_decision(
                 gate_name,
                 false,
                 0,
@@ -3447,6 +3594,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     bytes_total: 0,
                     was_truncated: false,
                 }),
+                cache_decision_local,
             );
             emit_gate_completed_cb(on_gate_progress, &fail_result);
             gate_results.push(fail_result);
@@ -3500,12 +3648,13 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         let duration = started.elapsed().as_secs();
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
-        let exec_result = build_evidence_gate_result(
+        let exec_result = build_evidence_gate_result_with_cache_decision(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
+            cache_decision_local.clone(),
         );
         emit_gate_completed_cb(on_gate_progress, &exec_result);
         gate_results.push(exec_result);
@@ -3933,12 +4082,15 @@ mod tests {
             "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
         // Step 1: v3 exists, v2 is None — reuse decision must be a v3 hit.
-        let reuse = reuse_decision_with_v3_fallback(
+        let (reuse, _cache_decision_local) = reuse_decision_with_v3_fallback(
             Some(&v3_cache),
             None, // v2 is absent
             gate_name,
             Some(attestation_digest),
             Some(&vk),
+            None,
+            None,
+            None,
         );
         assert!(reuse.reusable, "v3-only cache hit must be reusable");
         assert_eq!(
@@ -4038,12 +4190,15 @@ mod tests {
             "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
         // Reuse decision should prefer v3.
-        let reuse = reuse_decision_with_v3_fallback(
+        let (reuse, _cache_decision_local) = reuse_decision_with_v3_fallback(
             Some(&v3_cache),
             Some(&v2_cache),
             gate_name,
             Some(attestation_digest),
             Some(&vk),
+            None,
+            None,
+            None,
         );
         assert!(reuse.reusable);
         assert_eq!(reuse.source, CacheSource::V3);
@@ -4119,12 +4274,15 @@ mod tests {
 
         // [INV-GCV3-001] v3 cache exists but has no "doc" entry. V2 fallback
         // MUST be denied — v2 entries lack binding continuity proof.
-        let reuse = reuse_decision_with_v3_fallback(
+        let (reuse, _cache_decision_local) = reuse_decision_with_v3_fallback(
             Some(&v3_cache),
             Some(&v2_cache),
             gate_name,
             Some(attestation_digest),
             Some(&vk),
+            None,
+            None,
+            None,
         );
         assert!(
             !reuse.reusable,
@@ -4419,8 +4577,11 @@ mod tests {
 
         let pre = GateCacheV3::load_from_dir(&v3_root, sha, &compound_key).expect("load pre");
         let pre_decision = pre.check_reuse("rustfmt", Some(attestation_digest), true, Some(&vk));
-        assert!(!pre_decision.reusable, "must deny before receipt rebind");
-        assert_eq!(pre_decision.reason, "receipt_binding_missing");
+        assert!(!pre_decision.hit, "must deny before receipt rebind");
+        assert_eq!(
+            pre_decision.reason_code,
+            apm2_core::fac::gate_cache_v3::CacheReasonCode::ReceiptBindingMissing
+        );
 
         let job_id = "job-wrapper-rebind";
         let receipt = FacJobReceiptV1 {
@@ -4473,9 +4634,12 @@ mod tests {
         let post_decision =
             rebound.check_reuse("rustfmt", Some(attestation_digest), true, Some(&vk));
         assert!(
-            post_decision.reusable,
+            post_decision.hit,
             "entry must be reusable after wrapper rebind"
         );
-        assert_eq!(post_decision.reason, "v3_compound_key_match");
+        assert_eq!(
+            post_decision.reason_code,
+            apm2_core::fac::gate_cache_v3::CacheReasonCode::CacheHit
+        );
     }
 }

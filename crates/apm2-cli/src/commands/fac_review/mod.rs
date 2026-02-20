@@ -1537,7 +1537,12 @@ pub fn run_doctor(
                 wait_state = derive_doctor_wait_next_state(wait_state, None);
             },
             DoctorWaitState::CollectSummary => {
-                summary = run_doctor_inner(repo, pr_number, Vec::new(), true);
+                // BF-002 (TCK-00626): Every 5th tick, use non-lightweight
+                // mode to detect externally-merged PRs via GitHub API. This
+                // ensures the wait loop can terminate when a PR is merged
+                // outside the local lifecycle projection.
+                let use_lightweight = tick % 5 != 0;
+                summary = run_doctor_inner(repo, pr_number, Vec::new(), use_lightweight);
                 wait_state = derive_doctor_wait_next_state(wait_state, None);
             },
         }
@@ -1905,6 +1910,43 @@ fn run_doctor_inner(
             },
         }
     }
+    // BF-002 (TCK-00626): When running in non-lightweight mode, check if
+    // the PR was merged on GitHub. If the local lifecycle projection hasn't
+    // observed the merge, inject a merged event so the wait loop can detect
+    // the terminal state.
+    if !lightweight {
+        if let Ok(Some(_merged_at)) = github_reads::fetch_pr_merged_at(owner_repo, pr_number) {
+            // BF-002 (TCK-00626 round 2): Use remote_head as authoritative SHA
+            // for merge detection. Fall back to local_sha only if remote is
+            // unavailable. Skip merge injection entirely if no valid SHA exists
+            // (cannot verify lifecycle without a valid SHA).
+            let merge_sha = remote_head
+                .as_deref()
+                .or(local_sha.as_deref())
+                .unwrap_or("");
+            if !merge_sha.is_empty() {
+                if let Err(err) = lifecycle::apply_event(
+                    owner_repo,
+                    pr_number,
+                    merge_sha,
+                    &lifecycle::LifecycleEventKind::Merged {
+                        source: "github_api_detection".to_string(),
+                    },
+                ) {
+                    // BF-002 (TCK-00626 round 3): Propagate merge event
+                    // application errors instead of silently dropping them.
+                    // This surfaces SHA mismatches and state transition
+                    // failures that could leave the lifecycle projection
+                    // inconsistent with the actual GitHub merge state.
+                    eprintln!(
+                        "WARNING: failed to apply merged lifecycle event for PR #{pr_number} \
+                         (sha={merge_sha}): {err}",
+                    );
+                }
+            }
+        }
+    }
+
     let stale = match (&local_sha, remote_head.as_deref()) {
         (Some(local), Some(remote)) => !local.eq_ignore_ascii_case(remote),
         _ => false,

@@ -373,8 +373,8 @@ pub use flake_class::FlakeRouting;
 // Re-export gate cache v3 types (TCK-00541)
 pub use gate_cache_v3::{
     GATE_CACHE_V3_SCHEMA, GateCacheV3, GateCacheV3Error, MAX_V3_ENTRY_SIZE, MAX_V3_GATES_PER_INDEX,
-    MAX_V3_STRING_FIELD_LENGTH, V3CacheEntry, V3CompoundKey, V3GateResult, V3ReuseDecision,
-    is_valid_v3_index_key, sanitize_gate_name,
+    MAX_V3_STRING_FIELD_LENGTH, V3CacheEntry, V3CompoundKey, V3GateResult, is_valid_v3_index_key,
+    sanitize_gate_name,
 };
 pub use gc::{
     GcPlan, GcPlanError, GcTarget, LogRetentionConfig, execute_gc, plan_gc,

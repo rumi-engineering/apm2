@@ -998,6 +998,35 @@
         },
         {
           "action_kind": "none",
+          "event": "merged",
+          "from": "pushed|gates_running|gates_passed|gates_failed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|stuck|stale|recovering",
+          "from_states": [
+            "pushed",
+            "gates_running",
+            "gates_passed",
+            "gates_failed",
+            "reviews_dispatched",
+            "review_in_progress",
+            "verdict_pending",
+            "verdict_approve",
+            "verdict_deny",
+            "stuck",
+            "stale",
+            "recovering"
+          ],
+          "guard_kind": "always",
+          "guard_predicate": "github_api_confirmed_merge",
+          "requirement_refs": [
+            "TCK-00626-BF002"
+          ],
+          "to": "merged",
+          "to_states": [
+            "merged"
+          ],
+          "transition_id": "LC-T-012b"
+        },
+        {
+          "action_kind": "none",
           "event": "agent_crashed",
           "from": "*",
           "from_states": [
@@ -1105,7 +1134,7 @@
         "gate_progress_rules": 4,
         "gate_reduction_rules": 5,
         "gates_wait_transitions": 8,
-        "lifecycle_transitions": 18,
+        "lifecycle_transitions": 19,
         "machine_traceability_requirements": 5,
         "reviewer_missing_verdict_rules": 3,
         "ticket_in_scope_requirements": 8,
@@ -1738,6 +1767,15 @@
             "requirement_refs": [],
             "to": "merged"
           },
+          "LC-T-012b": {
+            "event": "merged",
+            "from": "pushed|gates_running|gates_passed|gates_failed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|stuck|stale|recovering",
+            "guard_predicate": "github_api_confirmed_merge",
+            "requirement_refs": [
+              "TCK-00626-BF002"
+            ],
+            "to": "merged"
+          },
           "LC-T-013": {
             "event": "agent_crashed",
             "from": "*",
@@ -1948,6 +1986,19 @@
           "regression_tests": [],
           "requirement_id": "DR-008-MACHINE_VERIFIABLE_ARTIFACTS",
           "rule_links": []
+        },
+        {
+          "artifact_evidence_refs": [],
+          "coverage_mode": "rule_linked",
+          "covered": false,
+          "implemented_by": [],
+          "in_machine_traceability": false,
+          "in_ticket_scope": false,
+          "regression_tests": [],
+          "requirement_id": "TCK-00626-BF002",
+          "rule_links": [
+            "lifecycle_transitions:LC-T-012b"
+          ]
         }
       ],
       "schema": "apm2.fac.review.machine_traceability.v1",
