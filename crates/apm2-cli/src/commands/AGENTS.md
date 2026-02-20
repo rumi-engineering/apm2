@@ -29,6 +29,7 @@ All command functions return a `u8` exit code or `anyhow::Result<()>`, using val
 | `fac_review/` | `apm2 fac review *` | Review orchestration (security + quality reviews) |
 | `fac_queue.rs` | `apm2 fac queue *` | Queue introspection (status with counts, reason stats) |
 | `fac_job.rs` | `apm2 fac job *` | Job introspection (show, cancel) with bounded I/O |
+| `fac_caches.rs` | `apm2 fac caches *` | Explicit cache purge (nuke) with hard confirmations and receipts (TCK-00592) |
 | `fac_config.rs` | `apm2 fac config *` | FAC configuration introspection (pure read-only; no state mutation) |
 | `fac_utils.rs` | _(shared)_ | Shared utilities: queue/fac root resolution, bounded job spec I/O |
 | `factory/` | `apm2 factory *` | Factory pipeline (CCP, Impact Map, RFC, Tickets) |
@@ -557,3 +558,16 @@ Security invariants:
   loading is truncated. Sets `job_receipts_truncated` and `gc_receipts_truncated`
   flags in the output. Emits JSON only (TCK-00606 S12). Excluded from daemon
   auto-start and listed in `is_local_fac_command()`.
+
+## Caches Nuke CLI (TCK-00592)
+
+- **`apm2 fac caches nuke`** (`fac_caches.rs`): Explicit operator-only command to
+  delete bulky FAC caches (lane targets, lane env dirs, cargo_home, sccache) with
+  hard confirmations and audit receipts. Requires `--i-know-what-im-doing` flag
+  (long form only) or interactive "yes" confirmation on a TTY. Fail-closed: denies
+  on non-TTY without the flag. Supports `--dry-run` mode (JSON output of what would
+  be deleted). Emits a `NukeReceiptV1` to `$APM2_HOME/private/fac/receipts/`.
+  Uses `safe_rmtree_v1` for all deletions (INV-NUKE-004). NEVER deletes receipts/
+  or broker keys (INV-NUKE-001, INV-NUKE-002). All deletion paths validated against
+  an explicit allow-list with protected directory exclusion (INV-NUKE-003).
+  Excluded from daemon auto-start.
