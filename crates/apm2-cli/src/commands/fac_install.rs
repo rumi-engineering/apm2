@@ -22,6 +22,11 @@
 //! - [INV-INSTALL-002] Symlink creation uses atomic replacement (remove then
 //!   create) with explicit path validation.
 //! - [INV-INSTALL-003] Service restarts use `systemctl --user restart`.
+//! - [INV-INSTALL-004] Restart failures of required services cause command
+//!   failure (non-zero exit) unless `--allow-partial` is set.
+//! - [INV-INSTALL-005] Workspace root is derived from `current_exe()` path, not
+//!   from untrusted `current_dir()`. An explicit `--workspace-root` flag
+//!   overrides exe-based discovery.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -40,7 +45,8 @@ const INSTALL_SERVICE_UNITS: [&str; 2] = ["apm2-daemon.service", "apm2-worker.se
 /// Structured output for the install command.
 #[derive(Debug, Serialize)]
 struct InstallResult {
-    /// Whether the install succeeded.
+    /// Whether the install fully succeeded (false if any required restart
+    /// failed, even when `--allow-partial` suppresses the exit code).
     success: bool,
     /// Installed binary path (canonical).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -48,8 +54,13 @@ struct InstallResult {
     /// SHA-256 digest of the installed binary.
     #[serde(skip_serializing_if = "Option::is_none")]
     sha256: Option<String>,
+    /// Resolved workspace root used for install source (audit trail).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_root: Option<String>,
     /// Per-service restart results.
     service_restarts: Vec<ServiceRestartResult>,
+    /// Units that failed to restart (subset of `service_restarts`).
+    restart_failures: Vec<RestartFailureEntry>,
     /// Symlink path and target.
     #[serde(skip_serializing_if = "Option::is_none")]
     symlink: Option<SymlinkResult>,
@@ -65,6 +76,13 @@ struct ServiceRestartResult {
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+/// A single restart failure for the `restart_failures` array in JSON output.
+#[derive(Debug, Serialize)]
+struct RestartFailureEntry {
+    unit: String,
+    reason: String,
 }
 
 /// Result of symlink creation.
@@ -119,11 +137,9 @@ fn local_bin_path() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".local/bin/apm2"))
 }
 
-/// Run `cargo install --path crates/apm2-cli --force`.
-fn run_cargo_install() -> Result<(), String> {
-    // Find the workspace root: walk up from the current exe or cwd looking
-    // for Cargo.toml with [workspace].
-    let workspace_root = find_workspace_root()?;
+/// Run `cargo install --path crates/apm2-cli --force` using the given
+/// workspace root.
+fn run_cargo_install(workspace_root: &Path) -> Result<(), String> {
     let cli_crate_path = workspace_root.join("crates/apm2-cli");
     if !cli_crate_path.join("Cargo.toml").exists() {
         return Err(format!(
@@ -148,16 +164,56 @@ fn run_cargo_install() -> Result<(), String> {
     Ok(())
 }
 
-/// Find the workspace root by walking up from the current directory.
-fn find_workspace_root() -> Result<PathBuf, String> {
-    let mut dir =
-        std::env::current_dir().map_err(|e| format!("cannot determine current directory: {e}"))?;
+/// Resolve the workspace root from a trusted source.
+///
+/// # Security (INV-INSTALL-005)
+///
+/// We NEVER use `std::env::current_dir()` because the working directory is
+/// set by the caller and cannot be trusted. An attacker could run the command
+/// from a malicious workspace containing trojanized build scripts.
+///
+/// Resolution order:
+/// 1. If `explicit_root` is `Some`, use it directly after validation.
+/// 2. Otherwise, derive from `std::env::current_exe()` by walking up from the
+///    executable's real path to find a `Cargo.toml` with `[workspace]`.
+///
+/// Returns an error if neither method succeeds.
+fn resolve_workspace_root(explicit_root: Option<&Path>) -> Result<PathBuf, String> {
+    if let Some(root) = explicit_root {
+        // Validate the explicit root is actually a cargo workspace.
+        let cargo_toml = root.join("Cargo.toml");
+        if !cargo_toml.exists() {
+            return Err(format!(
+                "explicit --workspace-root {} does not contain Cargo.toml",
+                root.display()
+            ));
+        }
+        let contents = std::fs::read_to_string(&cargo_toml)
+            .map_err(|e| format!("cannot read {}: {e}", cargo_toml.display()))?;
+        if !contents.contains("[workspace]") {
+            return Err(format!(
+                "explicit --workspace-root {} has Cargo.toml but no [workspace] section",
+                root.display()
+            ));
+        }
+        return Ok(root.to_path_buf());
+    }
 
-    // Walk up to 16 levels to prevent unbounded traversal
+    // Derive from current executable location (trusted).
+    let exe_path = std::env::current_exe()
+        .map_err(|e| format!("cannot determine current executable path: {e}"))?;
+    let exe_canonical = std::fs::canonicalize(&exe_path)
+        .map_err(|e| format!("cannot canonicalize exe path {}: {e}", exe_path.display()))?;
+
+    let mut dir = exe_canonical
+        .parent()
+        .ok_or_else(|| "current executable has no parent directory".to_string())?
+        .to_path_buf();
+
+    // Walk up to 16 levels to prevent unbounded traversal.
     for _ in 0..16 {
         let cargo_toml = dir.join("Cargo.toml");
         if cargo_toml.exists() {
-            // Check if it contains [workspace]
             if let Ok(contents) = std::fs::read_to_string(&cargo_toml) {
                 if contents.contains("[workspace]") {
                     return Ok(dir);
@@ -168,7 +224,12 @@ fn find_workspace_root() -> Result<PathBuf, String> {
             break;
         }
     }
-    Err("cannot find workspace root (no Cargo.toml with [workspace] found)".to_string())
+
+    Err(
+        "cannot find workspace root: no Cargo.toml with [workspace] found \
+         walking up from current executable. Use --workspace-root to specify explicitly"
+            .to_string(),
+    )
 }
 
 /// Ensure the symlink at `link_path` points to `target`.
@@ -238,22 +299,43 @@ fn restart_service(unit: &str) -> ServiceRestartResult {
 
 /// Execute `apm2 fac install`.
 ///
-/// Returns a process exit code.
-pub fn run_install(json_output: bool) -> u8 {
+/// Returns a process exit code. Restart failure of required services causes
+/// non-zero exit unless `allow_partial` is true.
+pub fn run_install(
+    json_output: bool,
+    allow_partial: bool,
+    explicit_workspace_root: Option<&Path>,
+) -> u8 {
     let mut result = InstallResult {
         success: false,
         installed_binary_path: None,
         sha256: None,
+        workspace_root: None,
         service_restarts: Vec::with_capacity(INSTALL_SERVICE_UNITS.len()),
+        restart_failures: Vec::new(),
         symlink: None,
         error: None,
     };
 
+    // Step 0: Resolve trusted workspace root (INV-INSTALL-005).
+    let workspace_root = match resolve_workspace_root(explicit_workspace_root) {
+        Ok(root) => root,
+        Err(e) => {
+            result.error = Some(format!("workspace root resolution failed: {e}"));
+            emit_result(&result, json_output);
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+    result.workspace_root = Some(workspace_root.display().to_string());
+
     // Step 1: cargo install
     if !json_output {
-        eprintln!("Installing apm2 via cargo install...");
+        eprintln!(
+            "Installing apm2 via cargo install (workspace: {})...",
+            workspace_root.display()
+        );
     }
-    if let Err(e) = run_cargo_install() {
+    if let Err(e) = run_cargo_install(&workspace_root) {
         result.error = Some(format!("cargo install failed: {e}"));
         emit_result(&result, json_output);
         return exit_codes::GENERIC_ERROR;
@@ -313,7 +395,7 @@ pub fn run_install(json_output: bool) -> u8 {
         },
     }
 
-    // Step 4: Restart services
+    // Step 4: Restart services and collect failures (INV-INSTALL-004).
     for unit in &INSTALL_SERVICE_UNITS {
         let restart_result = restart_service(unit);
         if !json_output {
@@ -322,11 +404,31 @@ pub fn run_install(json_output: bool) -> u8 {
                 None => eprintln!("  {unit}: restarted"),
             }
         }
+        // Track failures for the restart_failures array.
+        if restart_result.status == "failed" {
+            let reason = restart_result
+                .error
+                .clone()
+                .unwrap_or_else(|| "unknown error".to_string());
+            result.restart_failures.push(RestartFailureEntry {
+                unit: unit.to_string(),
+                reason,
+            });
+        }
         result.service_restarts.push(restart_result);
     }
 
-    result.success = true;
+    // Determine overall success: true only if no restart failures.
+    let has_restart_failures = !result.restart_failures.is_empty();
+    result.success = !has_restart_failures;
+
     emit_result(&result, json_output);
+
+    // Fail-closed: non-zero exit when restarts failed unless --allow-partial.
+    if has_restart_failures && !allow_partial {
+        return exit_codes::GENERIC_ERROR;
+    }
+
     exit_codes::SUCCESS
 }
 
@@ -338,6 +440,9 @@ fn emit_result(result: &InstallResult, json_output: bool) {
         }
     } else if result.success {
         println!("Install complete.");
+        if let Some(ref root) = result.workspace_root {
+            println!("  Workspace root: {root}");
+        }
         if let Some(ref path) = result.installed_binary_path {
             println!("  Binary: {path}");
         }
@@ -356,8 +461,30 @@ fn emit_result(result: &InstallResult, json_output: bool) {
                 None => println!("  Service {}: {}", svc.unit, svc.status),
             }
         }
-    } else if let Some(ref err) = result.error {
-        eprintln!("ERROR: {err}");
+    } else {
+        // Partial failure or full failure — emit diagnostics.
+        if let Some(ref err) = result.error {
+            eprintln!("ERROR: {err}");
+        }
+        if !result.restart_failures.is_empty() {
+            eprintln!(
+                "ERROR: {} service restart(s) failed:",
+                result.restart_failures.len()
+            );
+            for f in &result.restart_failures {
+                eprintln!("  {}: {}", f.unit, f.reason);
+            }
+        }
+        // Still print install info if available.
+        if let Some(ref root) = result.workspace_root {
+            eprintln!("  Workspace root: {root}");
+        }
+        if let Some(ref path) = result.installed_binary_path {
+            eprintln!("  Binary: {path}");
+        }
+        if let Some(ref digest) = result.sha256 {
+            eprintln!("  SHA-256: {digest}");
+        }
     }
 }
 
@@ -386,10 +513,41 @@ mod tests {
     }
 
     #[test]
-    fn find_workspace_root_bounded_traversal() {
-        // Ensure the function terminates even in deep directories
-        // We just verify it doesn't hang (bounded by 16 iterations)
-        let _ = find_workspace_root();
+    fn resolve_workspace_root_bounded_traversal() {
+        // Ensure the function terminates even when exe is far from workspace.
+        // We just verify it doesn't hang (bounded by 16 iterations).
+        let _ = resolve_workspace_root(None);
+    }
+
+    #[test]
+    fn resolve_workspace_root_rejects_nonexistent_explicit() {
+        let result = resolve_workspace_root(Some(Path::new("/nonexistent/workspace")));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("does not contain Cargo.toml"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_root_rejects_non_workspace_explicit() {
+        // Create a temp dir with a Cargo.toml that has no [workspace].
+        let tmp = std::env::temp_dir().join("fac_install_test_non_ws");
+        let _ = std::fs::create_dir_all(&tmp);
+        let cargo_toml = tmp.join("Cargo.toml");
+        std::fs::write(&cargo_toml, "[package]\nname = \"fake\"\n").unwrap();
+
+        let result = resolve_workspace_root(Some(&tmp));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("no [workspace] section"),
+            "unexpected error: {err}"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -399,15 +557,27 @@ mod tests {
     }
 
     #[test]
-    fn install_result_serializes_to_json() {
+    fn install_result_serializes_to_json_with_restart_failures() {
         let result = InstallResult {
-            success: true,
+            success: false,
             installed_binary_path: Some("/usr/bin/apm2".to_string()),
             sha256: Some("abcdef1234567890".to_string()),
-            service_restarts: vec![ServiceRestartResult {
-                unit: "apm2-daemon.service".to_string(),
-                status: "restarted".to_string(),
-                error: None,
+            workspace_root: Some("/home/user/Projects/apm2".to_string()),
+            service_restarts: vec![
+                ServiceRestartResult {
+                    unit: "apm2-daemon.service".to_string(),
+                    status: "restarted".to_string(),
+                    error: None,
+                },
+                ServiceRestartResult {
+                    unit: "apm2-worker.service".to_string(),
+                    status: "failed".to_string(),
+                    error: Some("exit code 1".to_string()),
+                },
+            ],
+            restart_failures: vec![RestartFailureEntry {
+                unit: "apm2-worker.service".to_string(),
+                reason: "exit code 1".to_string(),
             }],
             symlink: Some(SymlinkResult {
                 link_path: "/home/user/.local/bin/apm2".to_string(),
@@ -419,7 +589,50 @@ mod tests {
         let json = serde_json::to_string(&result);
         assert!(json.is_ok());
         let json_str = json.unwrap();
-        assert!(json_str.contains("\"success\":true"));
-        assert!(json_str.contains("\"sha256\":\"abcdef1234567890\""));
+        assert!(
+            json_str.contains("\"success\":false"),
+            "expected success false when restart failures present"
+        );
+        assert!(
+            json_str.contains("\"restart_failures\""),
+            "expected restart_failures in output"
+        );
+        assert!(
+            json_str.contains("apm2-worker.service"),
+            "expected failed unit in output"
+        );
+        assert!(
+            json_str.contains("\"workspace_root\""),
+            "expected workspace_root in audit output"
+        );
+    }
+
+    #[test]
+    fn install_result_serializes_success_with_no_failures() {
+        let result = InstallResult {
+            success: true,
+            installed_binary_path: Some("/usr/bin/apm2".to_string()),
+            sha256: Some("abcdef1234567890".to_string()),
+            workspace_root: Some("/home/user/Projects/apm2".to_string()),
+            service_restarts: vec![ServiceRestartResult {
+                unit: "apm2-daemon.service".to_string(),
+                status: "restarted".to_string(),
+                error: None,
+            }],
+            restart_failures: vec![],
+            symlink: None,
+            error: None,
+        };
+        let json = serde_json::to_string(&result);
+        assert!(json.is_ok());
+        let json_str = json.unwrap();
+        assert!(
+            json_str.contains("\"success\":true"),
+            "expected success true when no restart failures"
+        );
+        assert!(
+            json_str.contains("\"restart_failures\":[]"),
+            "expected empty restart_failures"
+        );
     }
 }
