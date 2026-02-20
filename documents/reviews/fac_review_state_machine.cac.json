@@ -211,7 +211,7 @@
           "command_template": "apm2 fac restart --pr {pr_number} --force --refresh-identity",
           "guard_id": "DOC-G-004",
           "guard_kind": "sha_freshness_stale",
-          "guard_predicate": "facts.sha_freshness_source == stale",
+          "guard_predicate": "facts.sha_freshness_source == stale && !facts.has_gate_failure_signal",
           "priority": 4,
           "reason_kind": "template",
           "reason_template": "local verdict/findings snapshot is stale relative to remote PR head",
@@ -226,7 +226,7 @@
           "command_template": "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
           "guard_id": "DOC-G-005",
           "guard_kind": "approve_eligible",
-          "guard_predicate": "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts",
+          "guard_predicate": "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts && !facts.has_gate_failure_signal",
           "priority": 5,
           "reason_kind": "template",
           "reason_template": "all review dimensions approve; awaiting auto-merge",
@@ -259,8 +259,8 @@
           "command_notes": "reason may include latest push failure hint when available",
           "command_template": "apm2 fac review findings --pr {pr_number} --json",
           "guard_id": "DOC-G-007",
-          "guard_kind": "gate_progress_terminal_failed",
-          "guard_predicate": "facts.gate_progress_state == terminal_failed",
+          "guard_kind": "gate_failure_signal",
+          "guard_predicate": "facts.has_gate_failure_signal",
           "priority": 7,
           "reason_kind": "push_failure_hint_or_template",
           "reason_template": "evidence gate failure requires implementor remediation before review can continue",
@@ -293,8 +293,8 @@
           "command_notes": null,
           "command_template": "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
           "guard_id": "DOC-G-009",
-          "guard_kind": "pending_no_active_with_gate_in_flight",
-          "guard_predicate": "facts.has_pending_verdict && facts.active_agents == 0 && facts.gate_progress_state == in_flight",
+          "guard_kind": "pending_verdict_with_gate_in_flight",
+          "guard_predicate": "facts.has_pending_verdict && facts.gate_progress_state == in_flight",
           "priority": 9,
           "reason_kind": "template",
           "reason_template": "FAC gates are still in progress; reviewer restart is deferred",
@@ -543,22 +543,22 @@
       "rules": [
         {
           "guard_id": "GATE-G-001",
-          "guard_kind": "lifecycle_gates_running_or_any_in_flight",
-          "guard_predicate": "lifecycle.state == gates_running || any(gate.status in {RUNNING,NOT_RUN})",
+          "guard_kind": "any_failed",
+          "guard_predicate": "lifecycle.state == gates_failed || any(gate.status == FAIL)",
           "priority": 1,
-          "state": "in_flight"
+          "state": "terminal_failed"
         },
         {
           "guard_id": "GATE-G-002",
-          "guard_kind": "any_failed",
-          "guard_predicate": "any(gate.status == FAIL) && no(gate.status in {RUNNING,NOT_RUN})",
+          "guard_kind": "lifecycle_gates_running_or_any_in_flight",
+          "guard_predicate": "lifecycle.state == gates_running || any(gate.status in {RUNNING,NOT_RUN})",
           "priority": 2,
-          "state": "terminal_failed"
+          "state": "in_flight"
         },
         {
           "guard_id": "GATE-G-003",
           "guard_kind": "any_passed",
-          "guard_predicate": "any(gate.status == PASS) && no(gate.status in {RUNNING,NOT_RUN,FAIL})",
+          "guard_predicate": "any(gate.status == PASS)",
           "priority": 3,
           "state": "terminal_passed"
         },
@@ -572,8 +572,8 @@
       ],
       "schema": "apm2.fac.review.gate_progress_machine.v1",
       "states": [
-        "in_flight",
         "terminal_failed",
+        "in_flight",
         "terminal_passed",
         "unknown"
       ]
@@ -1158,7 +1158,7 @@
           "command_template": "apm2 fac restart --pr {pr_number} --force --refresh-identity",
           "guard_id": "DOC-G-004",
           "guard_kind": "sha_freshness_stale",
-          "guard_predicate": "facts.sha_freshness_source == stale",
+          "guard_predicate": "facts.sha_freshness_source == stale && !facts.has_gate_failure_signal",
           "priority": 4,
           "reason_template": "local verdict/findings snapshot is stale relative to remote PR head",
           "requirement_refs": [],
@@ -1170,7 +1170,7 @@
           "command_template": "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
           "guard_id": "DOC-G-005",
           "guard_kind": "approve_eligible",
-          "guard_predicate": "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts",
+          "guard_predicate": "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts && !facts.has_gate_failure_signal",
           "priority": 5,
           "reason_template": "all review dimensions approve; awaiting auto-merge",
           "requirement_refs": [
@@ -1197,8 +1197,8 @@
           "action_priority": "high",
           "command_template": "apm2 fac review findings --pr {pr_number} --json",
           "guard_id": "DOC-G-007",
-          "guard_kind": "gate_progress_terminal_failed",
-          "guard_predicate": "facts.gate_progress_state == terminal_failed",
+          "guard_kind": "gate_failure_signal",
+          "guard_predicate": "facts.has_gate_failure_signal",
           "priority": 7,
           "reason_template": "evidence gate failure requires implementor remediation before review can continue",
           "requirement_refs": [
@@ -1225,8 +1225,8 @@
           "action_priority": "medium",
           "command_template": "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
           "guard_id": "DOC-G-009",
-          "guard_kind": "pending_no_active_with_gate_in_flight",
-          "guard_predicate": "facts.has_pending_verdict && facts.active_agents == 0 && facts.gate_progress_state == in_flight",
+          "guard_kind": "pending_verdict_with_gate_in_flight",
+          "guard_predicate": "facts.has_pending_verdict && facts.gate_progress_state == in_flight",
           "priority": 9,
           "reason_template": "FAC gates are still in progress; reviewer restart is deferred",
           "requirement_refs": [
@@ -1313,7 +1313,7 @@
           },
           "DOC-G-004": {
             "guard_kind": "sha_freshness_stale",
-            "guard_predicate": "facts.sha_freshness_source == stale",
+            "guard_predicate": "facts.sha_freshness_source == stale && !facts.has_gate_failure_signal",
             "priority": 4,
             "recommended_action": "restart_reviews",
             "requirement_refs": [],
@@ -1321,7 +1321,7 @@
           },
           "DOC-G-005": {
             "guard_kind": "approve_eligible",
-            "guard_predicate": "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts",
+            "guard_predicate": "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts && !facts.has_gate_failure_signal",
             "priority": 5,
             "recommended_action": "approve",
             "requirement_refs": [
@@ -1340,8 +1340,8 @@
             "state": "dispatch_merge_conflicts"
           },
           "DOC-G-007": {
-            "guard_kind": "gate_progress_terminal_failed",
-            "guard_predicate": "facts.gate_progress_state == terminal_failed",
+            "guard_kind": "gate_failure_signal",
+            "guard_predicate": "facts.has_gate_failure_signal",
             "priority": 7,
             "recommended_action": "dispatch_implementor",
             "requirement_refs": [
@@ -1360,8 +1360,8 @@
             "state": "dispatch_implementor"
           },
           "DOC-G-009": {
-            "guard_kind": "pending_no_active_with_gate_in_flight",
-            "guard_predicate": "facts.has_pending_verdict && facts.active_agents == 0 && facts.gate_progress_state == in_flight",
+            "guard_kind": "pending_verdict_with_gate_in_flight",
+            "guard_predicate": "facts.has_pending_verdict && facts.gate_progress_state == in_flight",
             "priority": 9,
             "recommended_action": "wait",
             "requirement_refs": [
@@ -1531,20 +1531,20 @@
         },
         "gate_progress_rules_by_guard_id": {
           "GATE-G-001": {
-            "guard_kind": "lifecycle_gates_running_or_any_in_flight",
-            "guard_predicate": "lifecycle.state == gates_running || any(gate.status in {RUNNING,NOT_RUN})",
+            "guard_kind": "any_failed",
+            "guard_predicate": "lifecycle.state == gates_failed || any(gate.status == FAIL)",
             "priority": 1,
-            "state": "in_flight"
+            "state": "terminal_failed"
           },
           "GATE-G-002": {
-            "guard_kind": "any_failed",
-            "guard_predicate": "any(gate.status == FAIL) && no(gate.status in {RUNNING,NOT_RUN})",
+            "guard_kind": "lifecycle_gates_running_or_any_in_flight",
+            "guard_predicate": "lifecycle.state == gates_running || any(gate.status in {RUNNING,NOT_RUN})",
             "priority": 2,
-            "state": "terminal_failed"
+            "state": "in_flight"
           },
           "GATE-G-003": {
             "guard_kind": "any_passed",
-            "guard_predicate": "any(gate.status == PASS) && no(gate.status in {RUNNING,NOT_RUN,FAIL})",
+            "guard_predicate": "any(gate.status == PASS)",
             "priority": 3,
             "state": "terminal_passed"
           },
@@ -1812,6 +1812,11 @@
           "in_ticket_scope": true,
           "regression_tests": [
             "test_build_recommended_action_dispatches_implementor_on_failed_gates_with_pending_verdicts",
+            "test_build_recommended_action_dispatches_implementor_when_lifecycle_reports_gates_failed",
+            "test_build_recommended_action_dispatches_implementor_when_push_attempt_failed_gate_stage",
+            "test_build_recommended_action_gate_failure_overrides_stale_identity_restart",
+            "upsert_doctor_gate_snapshot_prefers_failed_over_inflight",
+            "derive_doctor_gate_progress_state_treats_lifecycle_gates_failed_as_terminal_failed",
             "test_build_recommended_action_dispatch_implementor_has_command"
           ],
           "requirement_id": "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR",
@@ -1833,6 +1838,7 @@
           "in_ticket_scope": true,
           "regression_tests": [
             "test_build_recommended_action_waits_when_gate_status_is_running_without_active_reviewers",
+            "test_build_recommended_action_waits_when_gate_status_is_running_with_idle_reviewers",
             "parse_pr_body_gate_status_for_sha_extracts_current_sha_snapshot"
           ],
           "requirement_id": "DR-002-RUNNING_GATE_SUPPRESSES_RESTART",
@@ -2027,6 +2033,11 @@
         ],
         "regression_tests": [
           "test_build_recommended_action_dispatches_implementor_on_failed_gates_with_pending_verdicts",
+          "test_build_recommended_action_dispatches_implementor_when_lifecycle_reports_gates_failed",
+          "test_build_recommended_action_dispatches_implementor_when_push_attempt_failed_gate_stage",
+          "test_build_recommended_action_gate_failure_overrides_stale_identity_restart",
+          "upsert_doctor_gate_snapshot_prefers_failed_over_inflight",
+          "derive_doctor_gate_progress_state_treats_lifecycle_gates_failed_as_terminal_failed",
           "test_build_recommended_action_dispatch_implementor_has_command"
         ],
         "requirement_id": "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"
@@ -2038,6 +2049,7 @@
         ],
         "regression_tests": [
           "test_build_recommended_action_waits_when_gate_status_is_running_without_active_reviewers",
+          "test_build_recommended_action_waits_when_gate_status_is_running_with_idle_reviewers",
           "parse_pr_body_gate_status_for_sha_extracts_current_sha_snapshot"
         ],
         "requirement_id": "DR-002-RUNNING_GATE_SUPPRESSES_RESTART"

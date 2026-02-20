@@ -594,6 +594,11 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
             ],
             "regression_tests": [
                 "test_build_recommended_action_dispatches_implementor_on_failed_gates_with_pending_verdicts",
+                "test_build_recommended_action_dispatches_implementor_when_lifecycle_reports_gates_failed",
+                "test_build_recommended_action_dispatches_implementor_when_push_attempt_failed_gate_stage",
+                "test_build_recommended_action_gate_failure_overrides_stale_identity_restart",
+                "upsert_doctor_gate_snapshot_prefers_failed_over_inflight",
+                "derive_doctor_gate_progress_state_treats_lifecycle_gates_failed_as_terminal_failed",
                 "test_build_recommended_action_dispatch_implementor_has_command"
             ]
         }),
@@ -605,6 +610,7 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
             ],
             "regression_tests": [
                 "test_build_recommended_action_waits_when_gate_status_is_running_without_active_reviewers",
+                "test_build_recommended_action_waits_when_gate_status_is_running_with_idle_reviewers",
                 "parse_pr_body_gate_status_for_sha_extracts_current_sha_snapshot"
             ]
         }),
@@ -3771,9 +3777,9 @@ enum DoctorDecisionGuard {
     ShaFreshnessStale,
     ApproveEligible,
     MergeConflictsPresent,
-    GateProgressTerminalFailed,
+    GateFailureSignal,
     ImplementorRemediationResolved,
-    PendingNoActiveWithGateInFlight,
+    PendingVerdictWithGateInFlight,
     AllActiveIdle,
     PendingNoActive,
     LifecycleEscalation,
@@ -3789,9 +3795,9 @@ impl DoctorDecisionGuard {
             Self::ShaFreshnessStale => "sha_freshness_stale",
             Self::ApproveEligible => "approve_eligible",
             Self::MergeConflictsPresent => "merge_conflicts_present",
-            Self::GateProgressTerminalFailed => "gate_progress_terminal_failed",
+            Self::GateFailureSignal => "gate_failure_signal",
             Self::ImplementorRemediationResolved => "implementor_remediation_resolved",
-            Self::PendingNoActiveWithGateInFlight => "pending_no_active_with_gate_in_flight",
+            Self::PendingVerdictWithGateInFlight => "pending_verdict_with_gate_in_flight",
             Self::AllActiveIdle => "all_active_idle",
             Self::PendingNoActive => "pending_no_active",
             Self::LifecycleEscalation => "lifecycle_escalation",
@@ -3922,7 +3928,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
         state: DoctorDecisionState::RestartStaleIdentity,
         guard: DoctorDecisionGuard::ShaFreshnessStale,
         guard_id: "DOC-G-004",
-        guard_predicate: "facts.sha_freshness_source == stale",
+        guard_predicate: "facts.sha_freshness_source == stale && !facts.has_gate_failure_signal",
         requirement_refs: &[],
     },
     DoctorDecisionRule {
@@ -3930,7 +3936,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
         state: DoctorDecisionState::Approve,
         guard: DoctorDecisionGuard::ApproveEligible,
         guard_id: "DOC-G-005",
-        guard_predicate: "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts",
+        guard_predicate: "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts && !facts.has_gate_failure_signal",
         requirement_refs: &["DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY"],
     },
     DoctorDecisionRule {
@@ -3944,9 +3950,9 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     DoctorDecisionRule {
         priority: 7,
         state: DoctorDecisionState::DispatchFailedGates,
-        guard: DoctorDecisionGuard::GateProgressTerminalFailed,
+        guard: DoctorDecisionGuard::GateFailureSignal,
         guard_id: "DOC-G-007",
-        guard_predicate: "facts.gate_progress_state == terminal_failed",
+        guard_predicate: "facts.has_gate_failure_signal",
         requirement_refs: &["DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"],
     },
     DoctorDecisionRule {
@@ -3960,9 +3966,9 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     DoctorDecisionRule {
         priority: 9,
         state: DoctorDecisionState::WaitForGates,
-        guard: DoctorDecisionGuard::PendingNoActiveWithGateInFlight,
+        guard: DoctorDecisionGuard::PendingVerdictWithGateInFlight,
         guard_id: "DOC-G-009",
-        guard_predicate: "facts.has_pending_verdict && facts.active_agents == 0 && facts.gate_progress_state == in_flight",
+        guard_predicate: "facts.has_pending_verdict && facts.gate_progress_state == in_flight",
         requirement_refs: &["DR-002-RUNNING_GATE_SUPPRESSES_RESTART"],
     },
     DoctorDecisionRule {
@@ -4269,6 +4275,7 @@ struct DoctorDecisionFacts {
     sha_freshness_source: DoctorShaFreshnessSource,
     has_actionable_findings: bool,
     merge_conflict_status: DoctorMergeConflictStatus,
+    has_gate_failure_signal: bool,
     requires_implementor_remediation: bool,
     all_verdicts_resolved: bool,
     has_pending_verdict: bool,
@@ -4308,6 +4315,17 @@ impl DoctorDecisionFacts {
             .any(|entry| entry.formal_verdict.eq_ignore_ascii_case("pending"));
 
         let gate_progress_state = derive_doctor_gate_progress_state(input.gates, input.lifecycle);
+        let lifecycle_gate_failure = input
+            .lifecycle
+            .is_some_and(|entry| entry.state.eq_ignore_ascii_case("gates_failed"));
+        let push_attempt_gate_failure = input
+            .latest_push_attempt
+            .and_then(|attempt| attempt.failed_stage.as_deref())
+            .is_some_and(push_attempt_stage_is_gate_failure);
+        let has_gate_failure_signal = gate_progress_state
+            == DoctorGateProgressState::TerminalFailed
+            || lifecycle_gate_failure
+            || push_attempt_gate_failure;
         let lifecycle_escalation = input.lifecycle.is_some_and(|entry| {
             entry.error_budget_used >= 8 || lifecycle_retry_budget_exhausted(entry)
         });
@@ -4322,6 +4340,7 @@ impl DoctorDecisionFacts {
             sha_freshness_source: input.merge_readiness.sha_freshness_source,
             has_actionable_findings,
             merge_conflict_status: input.merge_readiness.merge_conflict_status,
+            has_gate_failure_signal,
             requires_implementor_remediation,
             all_verdicts_resolved,
             has_pending_verdict,
@@ -4349,25 +4368,24 @@ fn doctor_decision_guard_triggered(rule: &DoctorDecisionRule, facts: &DoctorDeci
         DoctorDecisionGuard::MergeReady => facts.merge_ready,
         DoctorDecisionGuard::ShaFreshnessStale => {
             facts.sha_freshness_source == DoctorShaFreshnessSource::Stale
+                && !facts.has_gate_failure_signal
         },
         DoctorDecisionGuard::ApproveEligible => {
             facts.all_verdicts_approve
                 && !facts.has_actionable_findings
                 && facts.sha_freshness_source == DoctorShaFreshnessSource::RemoteMatch
                 && facts.merge_conflict_status != DoctorMergeConflictStatus::HasConflicts
+                && !facts.has_gate_failure_signal
         },
         DoctorDecisionGuard::MergeConflictsPresent => {
             facts.merge_conflict_status == DoctorMergeConflictStatus::HasConflicts
         },
-        DoctorDecisionGuard::GateProgressTerminalFailed => {
-            facts.gate_progress_state == DoctorGateProgressState::TerminalFailed
-        },
+        DoctorDecisionGuard::GateFailureSignal => facts.has_gate_failure_signal,
         DoctorDecisionGuard::ImplementorRemediationResolved => {
             facts.requires_implementor_remediation && facts.all_verdicts_resolved
         },
-        DoctorDecisionGuard::PendingNoActiveWithGateInFlight => {
+        DoctorDecisionGuard::PendingVerdictWithGateInFlight => {
             facts.has_pending_verdict
-                && facts.active_agents == 0
                 && facts.gate_progress_state == DoctorGateProgressState::InFlight
         },
         DoctorDecisionGuard::AllActiveIdle => facts.all_active_idle,
@@ -4538,6 +4556,11 @@ fn format_push_attempt_failure_hint(attempt: &DoctorPushAttemptSummary) -> Optio
     ))
 }
 
+fn push_attempt_stage_is_gate_failure(stage: &str) -> bool {
+    let normalized = stage.trim().to_ascii_lowercase();
+    normalized.starts_with("gate_") || normalized == "gates"
+}
+
 fn collect_default_review_dimension_snapshots(local_sha: &str) -> Vec<DoctorReviewSnapshot> {
     vec![
         DoctorReviewSnapshot {
@@ -4617,8 +4640,8 @@ fn doctor_gate_signal_from_status(status: &str) -> DoctorGateSignal {
 
 const fn doctor_gate_signal_priority(signal: DoctorGateSignal) -> u8 {
     match signal {
-        DoctorGateSignal::InFlight => 3,
-        DoctorGateSignal::Fail => 2,
+        DoctorGateSignal::Fail => 3,
+        DoctorGateSignal::InFlight => 2,
         DoctorGateSignal::Pass => 1,
     }
 }
@@ -4847,24 +4870,24 @@ impl DoctorGateProgressGuard {
 const DOCTOR_GATE_PROGRESS_RULES: &[DoctorGateProgressRule] = &[
     DoctorGateProgressRule {
         priority: 1,
-        state: DoctorGateProgressState::InFlight,
-        guard: DoctorGateProgressGuard::LifecycleGatesRunningOrAnyInFlight,
+        state: DoctorGateProgressState::TerminalFailed,
+        guard: DoctorGateProgressGuard::AnyFailed,
         guard_id: "GATE-G-001",
-        guard_predicate: "lifecycle.state == gates_running || any(gate.status in {RUNNING,NOT_RUN})",
+        guard_predicate: "lifecycle.state == gates_failed || any(gate.status == FAIL)",
     },
     DoctorGateProgressRule {
         priority: 2,
-        state: DoctorGateProgressState::TerminalFailed,
-        guard: DoctorGateProgressGuard::AnyFailed,
+        state: DoctorGateProgressState::InFlight,
+        guard: DoctorGateProgressGuard::LifecycleGatesRunningOrAnyInFlight,
         guard_id: "GATE-G-002",
-        guard_predicate: "any(gate.status == FAIL) && no(gate.status in {RUNNING,NOT_RUN})",
+        guard_predicate: "lifecycle.state == gates_running || any(gate.status in {RUNNING,NOT_RUN})",
     },
     DoctorGateProgressRule {
         priority: 3,
         state: DoctorGateProgressState::TerminalPassed,
         guard: DoctorGateProgressGuard::AnyPassed,
         guard_id: "GATE-G-003",
-        guard_predicate: "any(gate.status == PASS) && no(gate.status in {RUNNING,NOT_RUN,FAIL})",
+        guard_predicate: "any(gate.status == PASS)",
     },
     DoctorGateProgressRule {
         priority: 4,
@@ -4890,7 +4913,9 @@ impl DoctorGateProgressFacts {
         lifecycle: Option<&DoctorLifecycleSnapshot>,
     ) -> Self {
         let mut has_in_flight_gate = false;
-        let mut has_failed_gate = false;
+        let lifecycle_gates_failed =
+            lifecycle.is_some_and(|entry| entry.state.eq_ignore_ascii_case("gates_failed"));
+        let mut has_failed_gate = lifecycle_gates_failed;
         let mut has_passed_gate = false;
         for gate in gates {
             match doctor_gate_signal_from_status(&gate.status) {
@@ -7111,6 +7136,20 @@ mod tests {
         }
     }
 
+    fn doctor_push_attempt_summary(
+        failed_stage: Option<&str>,
+        error_hint: Option<&str>,
+    ) -> super::DoctorPushAttemptSummary {
+        super::DoctorPushAttemptSummary {
+            ts: "fixture-ts".to_string(),
+            sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            failed_stage: failed_stage.map(str::to_string),
+            exit_code: Some(1),
+            duration_s: Some(30),
+            error_hint: error_hint.map(str::to_string),
+        }
+    }
+
     fn reviewer_agent_snapshot(
         state: &str,
         elapsed_seconds: Option<i64>,
@@ -7924,6 +7963,139 @@ mod tests {
             latest_push_attempt: None,
         });
         assert_eq!(action.action, "wait");
+    }
+
+    #[test]
+    fn test_build_recommended_action_waits_when_gate_status_is_running_with_idle_reviewers() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = pending_findings_summary();
+        let terminal_reasons = std::collections::BTreeMap::new();
+        let gates = vec![doctor_gate_snapshot("test", "RUNNING")];
+        let idle_agents = super::DoctorAgentSection {
+            max_active_agents_per_pr: 2,
+            active_agents: 1,
+            total_agents: 1,
+            entries: vec![reviewer_agent_snapshot(
+                "running",
+                Some(super::DOCTOR_ACTIVE_AGENT_IDLE_TIMEOUT_SECONDS + 20),
+                Some(super::DOCTOR_ACTIVE_AGENT_IDLE_TIMEOUT_SECONDS + 20),
+            )],
+        };
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            pr_number: 42,
+            repair_signals: &super::DoctorRepairSignals::default(),
+            lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 12)),
+            gates: &gates,
+            agent_activity: super::build_doctor_agent_activity_summary(Some(&idle_agents)),
+            reviews: &reviews,
+            review_terminal_reasons: &terminal_reasons,
+            findings_summary: &findings,
+            merge_readiness: &doctor_merge_readiness_fixture(
+                super::DoctorMergeConflictStatus::Unknown,
+            ),
+            latest_push_attempt: None,
+        });
+        assert_eq!(action.action, "wait");
+        assert!(action.reason.contains("gates are still in progress"));
+    }
+
+    #[test]
+    fn test_build_recommended_action_dispatches_implementor_when_lifecycle_reports_gates_failed() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = pending_findings_summary();
+        let terminal_reasons = std::collections::BTreeMap::new();
+        let gates = Vec::new();
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            pr_number: 42,
+            repair_signals: &super::DoctorRepairSignals::default(),
+            lifecycle: Some(&doctor_lifecycle_fixture("gates_failed", 1, 0, 12)),
+            gates: &gates,
+            agent_activity: super::build_doctor_agent_activity_summary(Some(
+                &super::DoctorAgentSection {
+                    max_active_agents_per_pr: 2,
+                    active_agents: 0,
+                    total_agents: 0,
+                    entries: Vec::new(),
+                },
+            )),
+            reviews: &reviews,
+            review_terminal_reasons: &terminal_reasons,
+            findings_summary: &findings,
+            merge_readiness: &doctor_merge_readiness_fixture(
+                super::DoctorMergeConflictStatus::Unknown,
+            ),
+            latest_push_attempt: None,
+        });
+        assert_eq!(action.action, "dispatch_implementor");
+    }
+
+    #[test]
+    fn test_build_recommended_action_dispatches_implementor_when_push_attempt_failed_gate_stage() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = pending_findings_summary();
+        let terminal_reasons = std::collections::BTreeMap::new();
+        let gates = vec![doctor_gate_snapshot("test", "RUNNING")];
+        let push_attempt = doctor_push_attempt_summary(Some("gate_test"), Some("gate timeout"));
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            pr_number: 42,
+            repair_signals: &super::DoctorRepairSignals::default(),
+            lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 12)),
+            gates: &gates,
+            agent_activity: super::build_doctor_agent_activity_summary(Some(
+                &super::DoctorAgentSection {
+                    max_active_agents_per_pr: 2,
+                    active_agents: 0,
+                    total_agents: 0,
+                    entries: Vec::new(),
+                },
+            )),
+            reviews: &reviews,
+            review_terminal_reasons: &terminal_reasons,
+            findings_summary: &findings,
+            merge_readiness: &doctor_merge_readiness_fixture(
+                super::DoctorMergeConflictStatus::Unknown,
+            ),
+            latest_push_attempt: Some(&push_attempt),
+        });
+        assert_eq!(action.action, "dispatch_implementor");
+        assert!(action.reason.contains("last push: gate_test FAIL"));
+    }
+
+    #[test]
+    fn test_build_recommended_action_gate_failure_overrides_stale_identity_restart() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = pending_findings_summary();
+        let terminal_reasons = std::collections::BTreeMap::new();
+        let gates = vec![doctor_gate_snapshot("test", "FAIL")];
+        let stale_readiness = super::DoctorMergeReadiness {
+            merge_ready: false,
+            all_verdicts_approve: false,
+            gates_pass: false,
+            sha_fresh: false,
+            sha_freshness_source: super::DoctorShaFreshnessSource::Stale,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            pr_number: 42,
+            repair_signals: &super::DoctorRepairSignals::default(),
+            lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 12)),
+            gates: &gates,
+            agent_activity: super::build_doctor_agent_activity_summary(Some(
+                &super::DoctorAgentSection {
+                    max_active_agents_per_pr: 2,
+                    active_agents: 0,
+                    total_agents: 0,
+                    entries: Vec::new(),
+                },
+            )),
+            reviews: &reviews,
+            review_terminal_reasons: &terminal_reasons,
+            findings_summary: &findings,
+            merge_readiness: &stale_readiness,
+            latest_push_attempt: None,
+        });
+        assert_eq!(action.action, "dispatch_implementor");
     }
 
     #[test]
@@ -8960,6 +9132,59 @@ mod tests {
         );
         let merged = gates.get("test").expect("test gate should exist");
         assert_eq!(merged.status, "FAIL");
+    }
+
+    #[test]
+    fn upsert_doctor_gate_snapshot_prefers_failed_over_inflight() {
+        let mut gates = std::collections::BTreeMap::new();
+        super::upsert_doctor_gate_snapshot(
+            &mut gates,
+            "test",
+            "RUNNING",
+            None,
+            Some(5),
+            super::DoctorGateSource::LocalCache,
+        );
+        super::upsert_doctor_gate_snapshot(
+            &mut gates,
+            "test",
+            "FAIL",
+            None,
+            Some(4),
+            super::DoctorGateSource::Projection,
+        );
+        let merged = gates.get("test").expect("test gate should exist");
+        assert_eq!(merged.status, "FAIL");
+
+        super::upsert_doctor_gate_snapshot(
+            &mut gates,
+            "test",
+            "RUNNING",
+            None,
+            Some(3),
+            super::DoctorGateSource::Projection,
+        );
+        let merged = gates.get("test").expect("test gate should exist");
+        assert_eq!(merged.status, "FAIL");
+    }
+
+    #[test]
+    fn derive_doctor_gate_progress_state_treats_lifecycle_gates_failed_as_terminal_failed() {
+        let state = super::derive_doctor_gate_progress_state(
+            &[],
+            Some(&doctor_lifecycle_fixture("gates_failed", 2, 0, 9)),
+        );
+        assert_eq!(state, super::DoctorGateProgressState::TerminalFailed);
+    }
+
+    #[test]
+    fn derive_doctor_gate_progress_state_prefers_failed_when_running_and_failed_present() {
+        let gates = vec![
+            doctor_gate_snapshot("test", "RUNNING"),
+            doctor_gate_snapshot("test2", "FAIL"),
+        ];
+        let state = super::derive_doctor_gate_progress_state(&gates, None);
+        assert_eq!(state, super::DoctorGateProgressState::TerminalFailed);
     }
 
     #[test]
