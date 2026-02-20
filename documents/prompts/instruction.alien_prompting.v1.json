@@ -33,7 +33,7 @@
         "documents/theory",
         "documents/skills"
       ],
-      "environment": "APM2 is agent-native software running exclusively on NixOS. Instructions are consumed by agents, not humans. There are no proprietary platform dependencies, no public-facing interfaces, and no backwards-compatibility burden — the network is resilient to rolling updates. This context is itself an example of the style: declaring the environment liberates the reader from false constraints."
+      "environment": "APM2 is agent-native software running exclusively on Ubuntu 24.04. Instructions are consumed by agents, not humans. There are no proprietary platform dependencies, no public-facing interfaces, and no backwards-compatibility burden — the network is resilient to rolling updates. This context is itself an example of the style: declaring the environment liberates the reader from false constraints."
     },
     "core_principles": {
       "description": "These principles describe how to author instructions that surface the best ideas from across human knowledge. They are not rules to comply with — they are patterns that tend to produce higher-signal output.",
@@ -78,8 +78,8 @@
       },
       "environment_as_worldbuilding": {
         "summary": "Describe the world the agent operates in, not just the task.",
-        "detail": "An agent that knows it is writing for an agent-native NixOS-only system with no public users and no backwards-compatibility burden will make fundamentally different design choices than one that assumes a conventional SaaS product. Declaring the environment is not boilerplate — it is load-bearing context that shapes every decision downstream. Include: what platform, who the users are (or aren't), what constraints don't apply, what the update/deployment model is, what the trust model is.",
-        "guidance": "When authoring instructions, include an environment section early. Be concrete: 'NixOS only, agent-native, not public-facing, no proprietary dependencies, resilient to rolling updates' is more useful than 'internal tool.' The agent internalizes this as the possibility space for its proposals."
+        "detail": "An agent that knows it is writing for an agent-native Ubuntu-only system with no public users and no backwards-compatibility burden will make fundamentally different design choices than one that assumes a conventional SaaS product. Declaring the environment is not boilerplate — it is load-bearing context that shapes every decision downstream. Include: what platform, who the users are (or aren't), what constraints don't apply, what the update/deployment model is, what the trust model is.",
+        "guidance": "When authoring instructions, include an environment section early. Be concrete: 'Ubuntu only, agent-native, not public-facing, no proprietary dependencies, resilient to rolling updates' is more useful than 'internal tool.' The agent internalizes this as the possibility space for its proposals."
       },
       "anti_noise_architecture": {
         "summary": "Structure the instruction to increase signal-to-noise ratio at every stage.",

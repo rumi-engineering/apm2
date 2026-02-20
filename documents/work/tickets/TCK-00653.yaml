@@ -1,0 +1,47 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: TCK-00653
+    title: 'RFC-0032: pulse plane correctness (decode by event_type+payload; multi-topic derivation; typed/dotted parity mapping tests)'
+    status: OPEN
+  binds:
+    prd_id: PRD-PLACEHOLDER
+    rfc_id: RFC-0032
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_PROTOCOL
+    - DOMAIN_OBSERVABILITY
+    - DOMAIN_DAEMON
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00642
+      reason: WorkGraph topics require multi-topic derivation
+    - ticket_id: TCK-00631
+      reason: Canonical ledger append path influences commit notifications
+  scope:
+    in_scope:
+    - Update PulsePublisher to operate on (event_type, namespace, payload_bytes) from commit notifications without assuming a KernelEvent envelope
+    - Implement multi-topic derivation returning Vec<String> (edges touch two work ids; receipts may touch work+PR indices)
+    - Ensure topic derivation works for both dotted reducer event types (`work.opened`) and typed discriminants (`WorkOpened`) used by existing tests/RFC-0018 taxonomy
+    - Add/extend tests in `crates/apm2-daemon/src/protocol/topic_derivation.rs` to cover new canonical events and typed/dotted parity mapping
+    out_of_scope:
+    - Reworking the entire pulse transport protocol (focus is topic correctness + decoding assumptions)
+  plan:
+    steps:
+    - Audit current `pulse_outbox.rs` decode path; remove hard dependency on KernelEvent envelope
+    - Implement minimal decoding per event_type to extract routing keys (work_id, session_id, etc.) with bounded decode
+    - Add a mapping layer (reuse concepts from `apm2_core::work::parity.rs`) that maps typed discriminants to dotted event types for topic derivation
+    - 'Add tests: same semantic event routed to identical topics regardless of naming form'
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+    - PulsePublisher can route legacy JSON events, reducer protobuf events, and typed kernel events during bridge.
+    - Topic derivation returns correct topic sets for work, session, and graph events and is covered by tests.
+    - No polling is required for `--wait` flows once CLI integration lands.
+  notes:
+    security: Topic derivation is part of admission-critical waits; decoding must be bounded and fail-closed on malformed payloads.

@@ -4,6 +4,7 @@
 //! pipeline can skip already-validated gates.
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -85,8 +86,15 @@ const PREP_NOT_READY_CODE: &str = "PREP_NOT_READY";
 const PREP_SUPPLY_UNAVAILABLE_CODE: &str = "PREP_SUPPLY_UNAVAILABLE";
 const AUTHORITY_DENIED_CODE: &str = "AUTHORITY_DENIED";
 const GATE_EXECUTION_FAILED_CODE: &str = "GATE_EXECUTION_FAILED";
-const PREP_SUPPLY_FAILURE_CLASS: &str = "supply";
+const FAILURE_CLASS_PREP: &str = "prep";
+const FAILURE_CLASS_AUTHORITY: &str = "authority";
+const FAILURE_CLASS_EXECUTION: &str = "execution";
+const PREP_NOT_READY_REMEDIATION: &str =
+    "resolve readiness prerequisites and retry `apm2 fac gates`";
 const PREP_SUPPLY_REMEDIATION: &str = "connect to network and retry to hydrate dependency closure";
+const AUTHORITY_DENIED_REMEDIATION: &str =
+    "refresh policy/token admission inputs, then retry `apm2 fac gates`";
+const GATE_EXECUTION_REMEDIATION: &str = "dispatch implementor";
 const CLOSURE_DIAGNOSTIC_MAX_BYTES: usize = 2048;
 const V3_CACHE_INDEX_PROBE_MAX_BYTES: u64 = 256 * 1024;
 const MAX_AUTHORITY_REGEN_ATTEMPTS: u8 = 1;
@@ -103,6 +111,135 @@ enum WorkerExecutionMode {
     AllowInlineFallback,
     RequireExternalWorker,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatesWaitState {
+    EvaluateTimeout,
+    CheckReceipt,
+    EvaluateQueueMode,
+    Sleep,
+    RunInlineWorker,
+    ExitWithReceipt,
+    ExitTimeout,
+}
+
+impl GatesWaitState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::EvaluateTimeout => "evaluate_timeout",
+            Self::CheckReceipt => "check_receipt",
+            Self::EvaluateQueueMode => "evaluate_queue_mode",
+            Self::Sleep => "sleep",
+            Self::RunInlineWorker => "run_inline_worker",
+            Self::ExitWithReceipt => "exit_with_receipt",
+            Self::ExitTimeout => "exit_timeout",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GatesWaitTransitionRule {
+    priority: u8,
+    from: GatesWaitState,
+    to: GatesWaitState,
+    guard: GatesWaitGuard,
+    guard_id: &'static str,
+    guard_predicate: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GatesWaitGuard {
+    TimedOut,
+    ReceiptFound,
+    InlineFallbackAllowed,
+    Always,
+}
+
+impl GatesWaitGuard {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TimedOut => "timed_out",
+            Self::ReceiptFound => "receipt_found",
+            Self::InlineFallbackAllowed => "inline_fallback_allowed",
+            Self::Always => "always",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GatesWaitFacts {
+    timed_out: bool,
+    receipt_found: bool,
+    queue_mode: QueueProcessingMode,
+    allow_inline_fallback: bool,
+}
+
+const GATES_WAIT_TRANSITION_RULES: &[GatesWaitTransitionRule] = &[
+    GatesWaitTransitionRule {
+        priority: 1,
+        from: GatesWaitState::CheckReceipt,
+        to: GatesWaitState::ExitWithReceipt,
+        guard: GatesWaitGuard::ReceiptFound,
+        guard_id: "GW-WAIT-003",
+        guard_predicate: "facts.receipt_found",
+    },
+    GatesWaitTransitionRule {
+        priority: 2,
+        from: GatesWaitState::CheckReceipt,
+        to: GatesWaitState::EvaluateTimeout,
+        guard: GatesWaitGuard::Always,
+        guard_id: "GW-WAIT-004",
+        guard_predicate: "default",
+    },
+    GatesWaitTransitionRule {
+        priority: 3,
+        from: GatesWaitState::EvaluateTimeout,
+        to: GatesWaitState::ExitTimeout,
+        guard: GatesWaitGuard::TimedOut,
+        guard_id: "GW-WAIT-001",
+        guard_predicate: "facts.timed_out",
+    },
+    GatesWaitTransitionRule {
+        priority: 4,
+        from: GatesWaitState::EvaluateTimeout,
+        to: GatesWaitState::EvaluateQueueMode,
+        guard: GatesWaitGuard::Always,
+        guard_id: "GW-WAIT-002",
+        guard_predicate: "default",
+    },
+    GatesWaitTransitionRule {
+        priority: 5,
+        from: GatesWaitState::EvaluateQueueMode,
+        to: GatesWaitState::RunInlineWorker,
+        guard: GatesWaitGuard::InlineFallbackAllowed,
+        guard_id: "GW-WAIT-005",
+        guard_predicate: "facts.queue_mode == inline_single_job && facts.allow_inline_fallback",
+    },
+    GatesWaitTransitionRule {
+        priority: 6,
+        from: GatesWaitState::EvaluateQueueMode,
+        to: GatesWaitState::Sleep,
+        guard: GatesWaitGuard::Always,
+        guard_id: "GW-WAIT-006",
+        guard_predicate: "default",
+    },
+    GatesWaitTransitionRule {
+        priority: 7,
+        from: GatesWaitState::RunInlineWorker,
+        to: GatesWaitState::CheckReceipt,
+        guard: GatesWaitGuard::Always,
+        guard_id: "GW-WAIT-007",
+        guard_predicate: "always",
+    },
+    GatesWaitTransitionRule {
+        priority: 8,
+        from: GatesWaitState::Sleep,
+        to: GatesWaitState::CheckReceipt,
+        guard: GatesWaitGuard::Always,
+        guard_id: "GW-WAIT-008",
+        guard_predicate: "always",
+    },
+];
 
 /// Request payload for queued FAC gates execution.
 #[derive(Debug, Clone)]
@@ -175,6 +312,49 @@ impl QueuePreparationFailure {
             },
         }
     }
+
+    fn to_structured_failure(&self) -> StructuredFailure {
+        match self {
+            Self::Validation { message } => StructuredFailure::prep_not_ready(
+                "invalid gates request parameters",
+                "fix CLI flags and retry `apm2 fac gates`",
+                vec![message.clone()],
+            ),
+            Self::PrepNotReady { failure } => StructuredFailure::prep_not_ready(
+                failure.root_cause.clone(),
+                failure.remediation.to_string(),
+                readiness_failure_diagnostics(failure),
+            ),
+            Self::PrepSupplyUnavailable { failure } => StructuredFailure::prep_supply_unavailable(
+                failure.root_cause.clone(),
+                readiness_failure_diagnostics(failure),
+            ),
+            Self::AuthorityDenied { message } => StructuredFailure::authority_denied(
+                "policy, token, or admission check rejected during PREP",
+                vec![message.clone()],
+            ),
+            Self::GateExecutionFailed { message } => StructuredFailure::gate_execution_failed(
+                "one or more gates failed during EXECUTE",
+                vec![message.clone()],
+            ),
+            Self::Runtime { message } => StructuredFailure::prep_not_ready(
+                "runtime prerequisites were not ready during PREP",
+                PREP_NOT_READY_REMEDIATION,
+                vec![message.clone()],
+            ),
+        }
+    }
+}
+
+fn readiness_failure_diagnostics(failure: &ReadinessFailure) -> Vec<String> {
+    let mut diagnostics = failure.diagnostics.clone();
+    diagnostics.extend(failure.component_reports.iter().filter_map(|report| {
+        report
+            .detail
+            .as_deref()
+            .map(|detail| format!("component_report:{}:{}", report.component, detail))
+    }));
+    diagnostics
 }
 
 fn classify_queue_readiness_failure(failure: ReadinessFailure) -> QueuePreparationFailure {
@@ -1586,9 +1766,24 @@ pub(super) fn run_gates_local_worker(
         } else {
             GatesRunPhase::Execute
         };
+        let structured = match phase {
+            GatesRunPhase::Prep => StructuredFailure::prep_not_ready(
+                "gates preparation failed during PREP",
+                PREP_NOT_READY_REMEDIATION,
+                vec![failure_summary.clone()],
+            ),
+            GatesRunPhase::Execute => StructuredFailure::gate_execution_failed(
+                "one or more gates failed during EXECUTE",
+                vec![failure_summary.clone()],
+            ),
+        };
         emit_run_failed_event(
             &run_id,
-            &GatesRunFailure::simple(phase, failure_summary.clone()),
+            &GatesRunFailure {
+                phase,
+                message: structured.root_cause.clone(),
+                details: Box::new(GatesFailureDetails::from_structured_failure(&structured)),
+            },
         );
         LocalGatesRunResult {
             exit_code: exit_codes::GENERIC_ERROR,
@@ -1674,39 +1869,17 @@ fn run_gates_via_worker(
     };
     let prepared = match prepare_queued_gates_job(&request, wait) {
         Ok(prepared) => prepared,
-        Err(QueuePreparationFailure::Validation { message }) => {
-            return output_worker_enqueue_error(
+        Err(failure) => {
+            let exit_code = if matches!(failure, QueuePreparationFailure::Validation { .. }) {
+                exit_codes::VALIDATION_ERROR
+            } else {
+                exit_codes::GENERIC_ERROR
+            };
+            return output_worker_structured_failure(
                 json_output,
-                &message,
-                exit_codes::VALIDATION_ERROR,
+                &failure.to_structured_failure(),
+                exit_code,
             );
-        },
-        Err(QueuePreparationFailure::PrepNotReady { failure }) => {
-            return output_worker_prep_not_ready(json_output, &failure);
-        },
-        Err(QueuePreparationFailure::PrepSupplyUnavailable { failure }) => {
-            return output_worker_prep_supply_unavailable(json_output, &failure);
-        },
-        Err(QueuePreparationFailure::AuthorityDenied { message }) => {
-            return output_worker_typed_error(
-                json_output,
-                "authority_denied",
-                &message,
-                AUTHORITY_DENIED_CODE,
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-        Err(QueuePreparationFailure::GateExecutionFailed { message }) => {
-            return output_worker_typed_error(
-                json_output,
-                "gate_execution_failed",
-                &message,
-                GATE_EXECUTION_FAILED_CODE,
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-        Err(QueuePreparationFailure::Runtime { message }) => {
-            return output_worker_enqueue_error(json_output, &message, exit_codes::GENERIC_ERROR);
         },
     };
 
@@ -1795,12 +1968,9 @@ fn run_gates_via_worker(
             },
             Err(err) => {
                 let failure = QueuePreparationFailure::GateExecutionFailed { message: err };
-                let message = failure.message();
-                return output_worker_typed_error(
+                return output_worker_structured_failure(
                     json_output,
-                    "gate_execution_failed",
-                    &message,
-                    GATE_EXECUTION_FAILED_CODE,
+                    &failure.to_structured_failure(),
                     exit_codes::GENERIC_ERROR,
                 );
             },
@@ -1810,95 +1980,28 @@ fn run_gates_via_worker(
     exit_codes::SUCCESS
 }
 
-fn output_worker_enqueue_error(json_output: bool, message: &str, code: u8) -> u8 {
-    if json_output {
-        let payload = serde_json::json!({
-            "status": "error",
-            "error": "fac_gates_worker_enqueue_failed",
-            "message": message,
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload)
-                .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-        );
-    } else {
-        eprintln!("ERROR: {message}");
-    }
-    code
-}
-
-fn output_worker_typed_error(
+fn output_worker_structured_failure(
     json_output: bool,
-    error: &str,
-    message: &str,
-    failure_code: &str,
+    failure: &StructuredFailure,
     code: u8,
 ) -> u8 {
     if json_output {
-        let payload = serde_json::json!({
-            "status": "error",
-            "error": error,
-            "failure_code": failure_code,
-            "message": message,
+        let payload = serde_json::to_string(failure).unwrap_or_else(|_| {
+            serde_json::json!({
+                "failure_code": PREP_NOT_READY_CODE,
+                "failure_class": FAILURE_CLASS_PREP,
+                "stage": GatesRunPhase::Prep.as_str(),
+                "root_cause": "failed to serialize structured gate failure",
+                "remediation": PREP_NOT_READY_REMEDIATION,
+                "diagnostics": ["structured failure serialization failed"],
+            })
+            .to_string()
         });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload)
-                .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-        );
+        println!("{payload}");
     } else {
-        eprintln!("ERROR: {failure_code} {message}");
+        println!("{failure}");
     }
     code
-}
-
-fn output_worker_prep_not_ready(json_output: bool, failure: &ReadinessFailure) -> u8 {
-    output_worker_prep_failure(json_output, "prep_not_ready", PREP_NOT_READY_CODE, failure)
-}
-
-fn output_worker_prep_supply_unavailable(json_output: bool, failure: &ReadinessFailure) -> u8 {
-    output_worker_prep_failure(
-        json_output,
-        "prep_supply_unavailable",
-        PREP_SUPPLY_UNAVAILABLE_CODE,
-        failure,
-    )
-}
-
-fn output_worker_prep_failure(
-    json_output: bool,
-    error: &str,
-    failure_code: &str,
-    failure: &ReadinessFailure,
-) -> u8 {
-    if json_output {
-        let payload = serde_json::json!({
-            "status": "error",
-            "error": error,
-            "failure_code": failure_code,
-            "component": failure.component,
-            "root_cause": failure.root_cause,
-            "remediation": failure.remediation,
-            "diagnostics": failure.diagnostics,
-            "component_reports": failure.component_reports,
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload)
-                .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-        );
-    } else {
-        eprintln!(
-            "ERROR: {failure_code} component={} cause={}",
-            failure.component, failure.root_cause
-        );
-        eprintln!("remediation: {}", failure.remediation);
-        for diagnostic in &failure.diagnostics {
-            eprintln!("diagnostic: {diagnostic}");
-        }
-    }
-    exit_codes::GENERIC_ERROR
 }
 
 fn collect_gates_queue_snapshot(
@@ -2065,6 +2168,59 @@ fn wait_for_gates_job_receipt(
     )
 }
 
+fn gates_wait_rule_triggered(rule: &GatesWaitTransitionRule, facts: GatesWaitFacts) -> bool {
+    match rule.guard {
+        GatesWaitGuard::TimedOut => facts.timed_out,
+        GatesWaitGuard::ReceiptFound => facts.receipt_found,
+        GatesWaitGuard::InlineFallbackAllowed => {
+            facts.queue_mode == QueueProcessingMode::InlineSingleJob && facts.allow_inline_fallback
+        },
+        GatesWaitGuard::Always => true,
+    }
+}
+
+fn derive_gates_wait_next_state(current: GatesWaitState, facts: GatesWaitFacts) -> GatesWaitState {
+    for rule in GATES_WAIT_TRANSITION_RULES {
+        if rule.from != current {
+            continue;
+        }
+        if gates_wait_rule_triggered(rule, facts) {
+            return rule.to;
+        }
+    }
+    current
+}
+
+pub(super) fn gates_wait_machine_spec_json() -> serde_json::Value {
+    let transitions = GATES_WAIT_TRANSITION_RULES
+        .iter()
+        .map(|rule| {
+            serde_json::json!({
+                "priority": rule.priority,
+                "from": rule.from.as_str(),
+                "to": rule.to.as_str(),
+                "guard_id": rule.guard_id,
+                "guard_kind": rule.guard.as_str(),
+                "guard_predicate": rule.guard_predicate,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schema": "apm2.fac.review.gates_wait_machine.v1",
+        "evaluation": "first_matching_guard_applies",
+        "states": [
+            GatesWaitState::EvaluateTimeout.as_str(),
+            GatesWaitState::CheckReceipt.as_str(),
+            GatesWaitState::EvaluateQueueMode.as_str(),
+            GatesWaitState::Sleep.as_str(),
+            GatesWaitState::RunInlineWorker.as_str(),
+            GatesWaitState::ExitWithReceipt.as_str(),
+            GatesWaitState::ExitTimeout.as_str(),
+        ],
+        "transitions": transitions,
+    })
+}
+
 fn wait_for_gates_job_receipt_with_mode(
     fac_root: &Path,
     job_id: &str,
@@ -2104,25 +2260,61 @@ fn wait_for_gates_job_terminal_receipt_with_mode(
 ) -> Result<apm2_core::fac::FacJobReceiptV1, String> {
     let receipts_dir = fac_root.join("receipts");
     let start = Instant::now();
+    let mut state = GatesWaitState::CheckReceipt;
+    let mut last_receipt: Option<apm2_core::fac::FacJobReceiptV1> = None;
+    let mut queue_mode = QueueProcessingMode::ExternalWorker;
+
     loop {
-        if start.elapsed() >= timeout {
-            return Err(format!(
-                "gates job {job_id} did not reach terminal receipt within {}s",
-                timeout.as_secs()
-            ));
-        }
-        if let Some(receipt) = lookup_job_receipt(&receipts_dir, job_id) {
-            return Ok(receipt);
-        }
-        match detect_queue_processing_mode(fac_root) {
-            QueueProcessingMode::ExternalWorker => {
-                std::thread::sleep(Duration::from_secs(GATES_WAIT_POLL_INTERVAL_SECS));
+        let facts = GatesWaitFacts {
+            timed_out: start.elapsed() >= timeout,
+            receipt_found: last_receipt.is_some(),
+            queue_mode,
+            allow_inline_fallback: mode == WorkerExecutionMode::AllowInlineFallback,
+        };
+        match state {
+            GatesWaitState::CheckReceipt => {
+                last_receipt = lookup_job_receipt(&receipts_dir, job_id);
+                let facts = GatesWaitFacts {
+                    receipt_found: last_receipt.is_some(),
+                    ..facts
+                };
+                state = derive_gates_wait_next_state(state, facts);
             },
-            QueueProcessingMode::InlineSingleJob => match mode {
-                WorkerExecutionMode::AllowInlineFallback => run_inline_worker_cycle()?,
-                WorkerExecutionMode::RequireExternalWorker => {
-                    std::thread::sleep(Duration::from_secs(GATES_WAIT_POLL_INTERVAL_SECS));
-                },
+            GatesWaitState::EvaluateTimeout => {
+                state = derive_gates_wait_next_state(state, facts);
+            },
+            GatesWaitState::EvaluateQueueMode => {
+                queue_mode = detect_queue_processing_mode(fac_root);
+                let facts = GatesWaitFacts {
+                    queue_mode,
+                    ..facts
+                };
+                state = derive_gates_wait_next_state(state, facts);
+            },
+            GatesWaitState::Sleep => {
+                std::thread::sleep(Duration::from_secs(GATES_WAIT_POLL_INTERVAL_SECS));
+                state = derive_gates_wait_next_state(state, facts);
+            },
+            GatesWaitState::RunInlineWorker => {
+                run_inline_worker_cycle()?;
+                state = derive_gates_wait_next_state(state, facts);
+            },
+            GatesWaitState::ExitWithReceipt => {
+                if let Some(receipt) = last_receipt {
+                    return Ok(receipt);
+                }
+                return Err(format!(
+                    "gates job {job_id} wait machine reached receipt terminal state without a receipt",
+                ));
+            },
+            GatesWaitState::ExitTimeout => {
+                if let Some(receipt) = lookup_job_receipt(&receipts_dir, job_id) {
+                    return Ok(receipt);
+                }
+                return Err(format!(
+                    "gates job {job_id} did not reach terminal receipt within {}s",
+                    timeout.as_secs()
+                ));
             },
         }
     }
@@ -2319,10 +2511,131 @@ struct PrepStepTelemetry {
     reaped_locks: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 enum GatesRunPhase {
     Prep,
     Execute,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum FailureCode {
+    PrepNotReady,
+    PrepSupplyUnavailable,
+    AuthorityDenied,
+    GateExecutionFailed,
+}
+
+impl FailureCode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PrepNotReady => PREP_NOT_READY_CODE,
+            Self::PrepSupplyUnavailable => PREP_SUPPLY_UNAVAILABLE_CODE,
+            Self::AuthorityDenied => AUTHORITY_DENIED_CODE,
+            Self::GateExecutionFailed => GATE_EXECUTION_FAILED_CODE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FailureClass {
+    Prep,
+    Authority,
+    Execution,
+}
+
+impl FailureClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prep => FAILURE_CLASS_PREP,
+            Self::Authority => FAILURE_CLASS_AUTHORITY,
+            Self::Execution => FAILURE_CLASS_EXECUTION,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct StructuredFailure {
+    failure_code: FailureCode,
+    failure_class: FailureClass,
+    stage: GatesRunPhase,
+    root_cause: String,
+    remediation: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    diagnostics: Vec<String>,
+}
+
+impl StructuredFailure {
+    fn prep_not_ready(
+        root_cause: impl Into<String>,
+        remediation: impl Into<String>,
+        diagnostics: Vec<String>,
+    ) -> Self {
+        Self {
+            failure_code: FailureCode::PrepNotReady,
+            failure_class: FailureClass::Prep,
+            stage: GatesRunPhase::Prep,
+            root_cause: root_cause.into(),
+            remediation: remediation.into(),
+            diagnostics,
+        }
+    }
+
+    fn prep_supply_unavailable(root_cause: impl Into<String>, diagnostics: Vec<String>) -> Self {
+        Self {
+            failure_code: FailureCode::PrepSupplyUnavailable,
+            failure_class: FailureClass::Prep,
+            stage: GatesRunPhase::Prep,
+            root_cause: root_cause.into(),
+            remediation: PREP_SUPPLY_REMEDIATION.to_string(),
+            diagnostics,
+        }
+    }
+
+    fn authority_denied(root_cause: impl Into<String>, diagnostics: Vec<String>) -> Self {
+        Self {
+            failure_code: FailureCode::AuthorityDenied,
+            failure_class: FailureClass::Authority,
+            stage: GatesRunPhase::Prep,
+            root_cause: root_cause.into(),
+            remediation: AUTHORITY_DENIED_REMEDIATION.to_string(),
+            diagnostics,
+        }
+    }
+
+    fn gate_execution_failed(root_cause: impl Into<String>, diagnostics: Vec<String>) -> Self {
+        Self {
+            failure_code: FailureCode::GateExecutionFailed,
+            failure_class: FailureClass::Execution,
+            stage: GatesRunPhase::Execute,
+            root_cause: root_cause.into(),
+            remediation: GATE_EXECUTION_REMEDIATION.to_string(),
+            diagnostics,
+        }
+    }
+}
+
+impl fmt::Display for StructuredFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "failure_code={} failure_class={} stage={} root_cause={} remediation={}",
+            self.failure_code.as_str(),
+            self.failure_class.as_str(),
+            self.stage.as_str(),
+            self.root_cause,
+            self.remediation
+        )?;
+        if !self.diagnostics.is_empty() {
+            write!(f, "\ndiagnostics:")?;
+            for diagnostic in &self.diagnostics {
+                write!(f, "\n- {diagnostic}")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2331,6 +2644,97 @@ struct GatesFailureDetails {
     failure_class: Option<String>,
     remediation: Option<String>,
     diagnostics: Vec<String>,
+}
+
+impl GatesFailureDetails {
+    fn from_structured_failure(failure: &StructuredFailure) -> Self {
+        Self {
+            failure_code: Some(failure.failure_code.as_str().to_string()),
+            failure_class: Some(failure.failure_class.as_str().to_string()),
+            remediation: Some(failure.remediation.clone()),
+            diagnostics: failure.diagnostics.clone(),
+        }
+    }
+}
+
+fn compact_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+const MAX_RENDERED_FAILURE_REASON_CHARS: usize = 420;
+const MAX_RENDERED_FAILURE_REMEDIATION_CHARS: usize = 96;
+const MAX_RENDERED_FAILURE_DIAGNOSTIC_CHARS: usize = 120;
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut chars = input.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        if max_chars > 3 {
+            let mut shortened = truncated.chars().take(max_chars - 3).collect::<String>();
+            shortened.push_str("...");
+            shortened
+        } else {
+            ".".repeat(max_chars)
+        }
+    } else {
+        truncated
+    }
+}
+
+fn append_render_field(rendered: &mut String, key: &str, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    rendered.push(' ');
+    rendered.push_str(key);
+    rendered.push('=');
+    rendered.push_str(value);
+}
+
+fn render_run_failure(
+    phase: GatesRunPhase,
+    message: &str,
+    details: &GatesFailureDetails,
+) -> String {
+    let mut rendered = format!(
+        "run_failed stage={} root_cause={}",
+        phase.as_str(),
+        compact_whitespace(message)
+    );
+    if let Some(code) = details.failure_code.as_deref() {
+        append_render_field(&mut rendered, "failure_code", code);
+    }
+    if let Some(class) = details.failure_class.as_deref() {
+        append_render_field(&mut rendered, "failure_class", class);
+    }
+    if let Some(remediation) = details.remediation.as_deref() {
+        let compact = truncate_chars(
+            &compact_whitespace(remediation),
+            MAX_RENDERED_FAILURE_REMEDIATION_CHARS,
+        );
+        append_render_field(&mut rendered, "remediation", &compact);
+    }
+    if !details.diagnostics.is_empty() {
+        let diagnostics = details
+            .diagnostics
+            .iter()
+            .map(|entry| {
+                truncate_chars(
+                    &compact_whitespace(entry),
+                    MAX_RENDERED_FAILURE_DIAGNOSTIC_CHARS,
+                )
+            })
+            .filter(|entry| !entry.is_empty())
+            .take(2)
+            .collect::<Vec<_>>();
+        if !diagnostics.is_empty() {
+            append_render_field(&mut rendered, "diagnostics", &diagnostics.join(" | "));
+        }
+    }
+    truncate_chars(&rendered, MAX_RENDERED_FAILURE_REASON_CHARS)
 }
 
 #[derive(Debug, Clone)]
@@ -2348,14 +2752,10 @@ impl GatesStepError {
     }
 
     fn prep_supply_unavailable(root_cause: String, diagnostics: Vec<String>) -> Self {
+        let structured = StructuredFailure::prep_supply_unavailable(root_cause, diagnostics);
         Self {
-            message: root_cause,
-            details: Box::new(GatesFailureDetails {
-                failure_code: Some(PREP_SUPPLY_UNAVAILABLE_CODE.to_string()),
-                failure_class: Some(PREP_SUPPLY_FAILURE_CLASS.to_string()),
-                remediation: Some(PREP_SUPPLY_REMEDIATION.to_string()),
-                diagnostics,
-            }),
+            message: structured.root_cause.clone(),
+            details: Box::new(GatesFailureDetails::from_structured_failure(&structured)),
         }
     }
 }
@@ -2381,11 +2781,7 @@ struct GatesPhaseError {
 #[cfg(test)]
 impl GatesPhaseError {
     fn render(self) -> String {
-        format!(
-            "run_failed stage={} root_cause={}",
-            self.phase.as_str(),
-            self.message
-        )
+        render_run_failure(self.phase, &self.message, &self.details)
     }
 }
 
@@ -2397,6 +2793,7 @@ struct GatesRunFailure {
 }
 
 impl GatesRunFailure {
+    #[cfg(test)]
     fn simple(phase: GatesRunPhase, message: impl Into<String>) -> Self {
         Self {
             phase,
@@ -2406,11 +2803,7 @@ impl GatesRunFailure {
     }
 
     fn render(self) -> String {
-        format!(
-            "run_failed stage={} root_cause={}",
-            self.phase.as_str(),
-            self.message
-        )
+        render_run_failure(self.phase, &self.message, &self.details)
     }
 }
 
@@ -2866,18 +3259,6 @@ where
     Ok(())
 }
 
-fn format_readiness_failure(failure: &ReadinessFailure) -> String {
-    let diagnostics = if failure.diagnostics.is_empty() {
-        String::new()
-    } else {
-        format!(" diagnostics={}", failure.diagnostics.join(" | "))
-    };
-    format!(
-        "component={} root_cause={} remediation={}{}",
-        failure.component, failure.root_cause, failure.remediation, diagnostics
-    )
-}
-
 fn summarize_diagnostic(kind: &str, raw: &str) -> String {
     let mut trimmed = raw.trim().replace('\n', " | ");
     if trimmed.len() > CLOSURE_DIAGNOSTIC_MAX_BYTES {
@@ -3023,7 +3404,17 @@ fn run_prep_phase(
             },
         )
         .map(|_| PrepStepTelemetry::default())
-        .map_err(|failure| GatesStepError::simple(format_readiness_failure(&failure)))
+        .map_err(|failure| {
+            let structured = StructuredFailure::prep_not_ready(
+                failure.root_cause.clone(),
+                failure.remediation.to_string(),
+                readiness_failure_diagnostics(&failure),
+            );
+            GatesStepError {
+                message: structured.root_cause.clone(),
+                details: Box::new(GatesFailureDetails::from_structured_failure(&structured)),
+            }
+        })
     })?;
     run_prep_step(prep_steps, "singleflight_reap", on_step, || {
         run_singleflight_lock_liveness_reap()
@@ -3159,24 +3550,44 @@ fn run_gates_inner_detailed(
     on_prep_step: Option<PrepStepCallback<'_>>,
     on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
 ) -> Result<GatesSummary, GatesRunFailure> {
-    validate_timeout_seconds(timeout_seconds).map_err(|message| GatesRunFailure {
-        phase: GatesRunPhase::Prep,
-        message,
-        details: Box::new(GatesFailureDetails::default()),
+    validate_timeout_seconds(timeout_seconds).map_err(|message| {
+        let structured = StructuredFailure::prep_not_ready(
+            "invalid timeout configuration for PREP",
+            "set `--timeout-seconds` to a valid value and retry `apm2 fac gates`",
+            vec![message],
+        );
+        GatesRunFailure {
+            phase: GatesRunPhase::Prep,
+            message: structured.root_cause.clone(),
+            details: Box::new(GatesFailureDetails::from_structured_failure(&structured)),
+        }
     })?;
-    let memory_max_bytes = parse_memory_limit(memory_max).map_err(|message| GatesRunFailure {
-        phase: GatesRunPhase::Prep,
-        message,
-        details: Box::new(GatesFailureDetails::default()),
+    let memory_max_bytes = parse_memory_limit(memory_max).map_err(|message| {
+        let structured = StructuredFailure::prep_not_ready(
+            "invalid memory limit configuration for PREP",
+            "set `--memory-max` to a valid bounded value and retry `apm2 fac gates`",
+            vec![message],
+        );
+        GatesRunFailure {
+            phase: GatesRunPhase::Prep,
+            message: structured.root_cause.clone(),
+            details: Box::new(GatesFailureDetails::from_structured_failure(&structured)),
+        }
     })?;
     if memory_max_bytes > max_memory_bytes() {
+        let detail = format!(
+            "--memory-max {memory_max} exceeds FAC test memory cap of {max_bytes}",
+            max_bytes = max_memory_bytes()
+        );
+        let structured = StructuredFailure::prep_not_ready(
+            "memory limit exceeds the admitted FAC cap",
+            "reduce `--memory-max` and retry `apm2 fac gates`",
+            vec![detail],
+        );
         return Err(GatesRunFailure {
             phase: GatesRunPhase::Prep,
-            message: format!(
-                "--memory-max {memory_max} exceeds FAC test memory cap of {max_bytes}",
-                max_bytes = max_memory_bytes()
-            ),
-            details: Box::new(GatesFailureDetails::default()),
+            message: structured.root_cause.clone(),
+            details: Box::new(GatesFailureDetails::from_structured_failure(&structured)),
         });
     }
 
@@ -3197,7 +3608,16 @@ fn run_gates_inner_detailed(
                 emit_human_logs,
                 on_gate_progress,
             )
-            .map_err(GatesStepError::simple)
+            .map_err(|message| {
+                let structured = StructuredFailure::gate_execution_failed(
+                    "gates execute phase failed before completion",
+                    vec![message],
+                );
+                GatesStepError {
+                    message: structured.root_cause.clone(),
+                    details: Box::new(GatesFailureDetails::from_structured_failure(&structured)),
+                }
+            })
         },
     );
 
@@ -3422,7 +3842,7 @@ fn run_execute_phase(
 
     // 5. Run evidence gates.
     let started = Instant::now();
-    let (passed, gate_results) = run_evidence_gates_with_lane_context(
+    let (mut passed, gate_results) = run_evidence_gates_with_lane_context(
         workspace_root,
         &sha,
         None,
@@ -3431,6 +3851,16 @@ fn run_execute_phase(
     )?;
     bind_merge_gate_log_bundle_hash(&mut merge_gate, &gate_results)?;
     let total_secs = started.elapsed().as_secs();
+
+    // TCK-00624 S8: close the merge-conflict TOCTOU window. The early
+    // merge gate above is a fast-fail; this post-evidence recheck catches
+    // conflicts introduced while long-running evidence gates were executing.
+    passed = apply_merge_conflict_bookend_guard(
+        passed,
+        &mut merge_gate,
+        || evaluate_merge_conflict_gate(workspace_root, &sha, emit_human_logs),
+        emit_human_logs,
+    )?;
 
     // 6. Write attested results to gate cache for full runs only.
     if !quick {
@@ -3675,6 +4105,14 @@ fn evaluate_merge_conflict_gate(
     if emit_human_logs && !passed {
         eprintln!("{}", render_merge_conflict_summary(&report));
     }
+    let error_hint = if passed {
+        None
+    } else {
+        Some(format!(
+            "merge conflict against main detected (conflicts={})",
+            report.conflict_count()
+        ))
+    };
     Ok(GateResult {
         name: "merge_conflict_main".to_string(),
         status: if passed { "PASS" } else { "FAIL" }.to_string(),
@@ -3684,8 +4122,40 @@ fn evaluate_merge_conflict_gate(
         bytes_total: None,
         was_truncated: None,
         log_bundle_hash: None,
-        error_hint: None,
+        error_hint,
     })
+}
+
+fn apply_merge_conflict_bookend_guard<F>(
+    passed: bool,
+    merge_gate: &mut GateResult,
+    mut late_merge_check: F,
+    emit_human_logs: bool,
+) -> Result<bool, String>
+where
+    F: FnMut() -> Result<GateResult, String>,
+{
+    if !passed {
+        return Ok(false);
+    }
+
+    let late_merge_gate = late_merge_check()?;
+    if late_merge_gate.status == "FAIL" {
+        merge_gate.status = "FAIL".to_string();
+        merge_gate.duration_secs = merge_gate
+            .duration_secs
+            .saturating_add(late_merge_gate.duration_secs);
+        merge_gate.error_hint = Some(format!(
+            "merge conflict detected after evidence gates passed; remediation={GATE_EXECUTION_REMEDIATION}"
+        ));
+        if emit_human_logs {
+            eprintln!(
+                "merge_conflict_main: FAIL post-evidence recheck; remediation: {GATE_EXECUTION_REMEDIATION}"
+            );
+        }
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn normalize_quick_test_gate(gates: &mut Vec<GateResult>) {
@@ -4080,6 +4550,34 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_gates_job_terminal_receipt_checks_receipt_before_timeout_guard() {
+        with_test_apm2_home(|apm2_home| {
+            let fac_root = apm2_home.join("private/fac");
+            let receipts_dir = fac_root.join("receipts");
+            fs::create_dir_all(&receipts_dir).expect("create receipts dir");
+            let receipt = apm2_core::fac::FacJobReceiptV1 {
+                schema: "apm2.fac.receipt.v1".to_string(),
+                receipt_id: "receipt-timeout-boundary".to_string(),
+                job_id: "job-timeout-boundary".to_string(),
+                job_spec_digest: "spec-timeout-boundary".to_string(),
+                outcome: apm2_core::fac::FacJobOutcome::Completed,
+                reason: "completed".to_string(),
+                ..Default::default()
+            };
+            apm2_core::fac::persist_content_addressed_receipt(&receipts_dir, &receipt)
+                .expect("persist receipt");
+            let resolved = wait_for_gates_job_terminal_receipt_with_mode(
+                &fac_root,
+                "job-timeout-boundary",
+                Duration::from_secs(0),
+                WorkerExecutionMode::RequireExternalWorker,
+            )
+            .expect("receipt should win even at timeout boundary");
+            assert_eq!(resolved.receipt_id, "receipt-timeout-boundary");
+        });
+    }
+
+    #[test]
     fn should_auto_regenerate_on_authority_consumed_requires_denied_outcome_and_reason() {
         let authority_consumed = apm2_core::fac::FacJobReceiptV1 {
             schema: "apm2.fac.receipt.v1".to_string(),
@@ -4128,6 +4626,25 @@ mod tests {
             prep_steps: Vec::new(),
             cache_status: "write-through".to_string(),
             gates: Vec::new(),
+        }
+    }
+
+    fn sample_readiness_failure(
+        component: &'static str,
+        root_cause: &str,
+        remediation: &'static str,
+        diagnostic: &str,
+    ) -> ReadinessFailure {
+        ReadinessFailure {
+            component,
+            root_cause: root_cause.to_string(),
+            remediation,
+            diagnostics: vec![diagnostic.to_string()],
+            component_reports: vec![super::readiness::ComponentReport {
+                component,
+                status: "failed",
+                detail: Some("simulated readiness component detail".to_string()),
+            }],
         }
     }
 
@@ -4193,7 +4710,7 @@ mod tests {
                 .to_string(),
             details: Box::new(GatesFailureDetails {
                 failure_code: Some(PREP_SUPPLY_UNAVAILABLE_CODE.to_string()),
-                failure_class: Some(PREP_SUPPLY_FAILURE_CLASS.to_string()),
+                failure_class: Some(FAILURE_CLASS_PREP.to_string()),
                 remediation: Some(PREP_SUPPLY_REMEDIATION.to_string()),
                 diagnostics: vec!["offline_probe=cargo registry unavailable".to_string()],
             }),
@@ -4209,7 +4726,7 @@ mod tests {
             payload
                 .get("failure_class")
                 .and_then(serde_json::Value::as_str),
-            Some(PREP_SUPPLY_FAILURE_CLASS)
+            Some(FAILURE_CLASS_PREP)
         );
         assert_eq!(
             payload
@@ -4223,6 +4740,201 @@ mod tests {
                 .and_then(serde_json::Value::as_array)
                 .map(std::vec::Vec::len),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn gates_run_failure_render_includes_structured_metadata() {
+        let rendered = GatesRunFailure {
+            phase: GatesRunPhase::Execute,
+            message: "gates execute phase failed before completion".to_string(),
+            details: Box::new(GatesFailureDetails {
+                failure_code: Some(GATE_EXECUTION_FAILED_CODE.to_string()),
+                failure_class: Some(FAILURE_CLASS_EXECUTION.to_string()),
+                remediation: Some("inspect gate logs and rerun `apm2 fac gates`".to_string()),
+                diagnostics: vec![
+                    "failed_gates=clippy".to_string(),
+                    "first_failure=clippy: lint errors".to_string(),
+                ],
+            }),
+        }
+        .render();
+
+        assert!(rendered.contains("stage=execute"));
+        assert!(rendered.contains(&format!("failure_code={GATE_EXECUTION_FAILED_CODE}")));
+        assert!(rendered.contains(&format!("failure_class={FAILURE_CLASS_EXECUTION}")));
+        assert!(
+            rendered
+                .contains("diagnostics=failed_gates=clippy | first_failure=clippy: lint errors")
+        );
+    }
+
+    #[test]
+    fn gates_run_failure_render_is_bounded_for_receipt_reason_limits() {
+        let rendered = GatesRunFailure {
+            phase: GatesRunPhase::Execute,
+            message: "gates execute phase failed before completion".to_string(),
+            details: Box::new(GatesFailureDetails {
+                failure_code: Some(GATE_EXECUTION_FAILED_CODE.to_string()),
+                failure_class: Some(FAILURE_CLASS_EXECUTION.to_string()),
+                remediation: Some("dispatch implementor ".repeat(32)),
+                diagnostics: vec!["DIRTY TREE ".repeat(128)],
+            }),
+        }
+        .render();
+
+        assert!(
+            rendered.len() <= MAX_RENDERED_FAILURE_REASON_CHARS,
+            "rendered reason must be bounded for job receipt persistence"
+        );
+        assert!(rendered.contains("diagnostics="));
+    }
+
+    #[test]
+    fn queue_failure_taxonomy_covers_all_four_required_codes() {
+        let prep_not_ready = QueuePreparationFailure::PrepNotReady {
+            failure: sample_readiness_failure(
+                "worker_broker",
+                "worker heartbeat missing after readiness retries",
+                "start worker and retry",
+                "dial unix:///tmp/apm2.sock: connection refused",
+            ),
+        }
+        .to_structured_failure();
+        assert_eq!(prep_not_ready.failure_code.as_str(), PREP_NOT_READY_CODE);
+        assert_eq!(prep_not_ready.failure_class.as_str(), FAILURE_CLASS_PREP);
+        assert_eq!(prep_not_ready.stage, GatesRunPhase::Prep);
+        assert!(!prep_not_ready.root_cause.trim().is_empty());
+        assert!(!prep_not_ready.remediation.trim().is_empty());
+
+        let prep_supply = QueuePreparationFailure::PrepSupplyUnavailable {
+            failure: sample_readiness_failure(
+                "cargo_dependencies",
+                "dependency closure incomplete and network unavailable during PREP hydration",
+                PREP_SUPPLY_REMEDIATION,
+                "failed to fetch registry index: network is unreachable",
+            ),
+        }
+        .to_structured_failure();
+        assert_eq!(
+            prep_supply.failure_code.as_str(),
+            PREP_SUPPLY_UNAVAILABLE_CODE
+        );
+        assert_eq!(prep_supply.failure_class.as_str(), FAILURE_CLASS_PREP);
+        assert_eq!(prep_supply.stage, GatesRunPhase::Prep);
+        assert!(prep_supply.remediation.contains("connect"));
+
+        let authority_denied = QueuePreparationFailure::AuthorityDenied {
+            message: "token verification failed: signature mismatch".to_string(),
+        }
+        .to_structured_failure();
+        assert_eq!(
+            authority_denied.failure_code.as_str(),
+            AUTHORITY_DENIED_CODE
+        );
+        assert_eq!(
+            authority_denied.failure_class.as_str(),
+            FAILURE_CLASS_AUTHORITY
+        );
+        assert_eq!(authority_denied.stage, GatesRunPhase::Prep);
+
+        let gate_execution_failed = QueuePreparationFailure::GateExecutionFailed {
+            message: "failed_gates=clippy; first_failure=clippy: lint errors".to_string(),
+        }
+        .to_structured_failure();
+        assert_eq!(
+            gate_execution_failed.failure_code.as_str(),
+            GATE_EXECUTION_FAILED_CODE
+        );
+        assert_eq!(
+            gate_execution_failed.failure_class.as_str(),
+            FAILURE_CLASS_EXECUTION
+        );
+        assert_eq!(gate_execution_failed.stage, GatesRunPhase::Execute);
+        assert_eq!(
+            gate_execution_failed.remediation.as_str(),
+            GATE_EXECUTION_REMEDIATION
+        );
+    }
+
+    #[test]
+    fn structured_failure_demotes_raw_internal_errors_to_diagnostics() {
+        let structured = QueuePreparationFailure::AuthorityDenied {
+            message: "open /tmp/fac/token-ledger.wal: permission denied".to_string(),
+        }
+        .to_structured_failure();
+
+        assert_eq!(
+            structured.root_cause,
+            "policy, token, or admission check rejected during PREP"
+        );
+        assert!(
+            structured
+                .diagnostics
+                .iter()
+                .any(|entry| entry.contains("permission denied")),
+            "raw internal error should be preserved only under diagnostics"
+        );
+    }
+
+    #[test]
+    fn structured_failure_json_shape_contains_required_fields_only() {
+        let structured = QueuePreparationFailure::GateExecutionFailed {
+            message: "cargo test exited with status 101".to_string(),
+        }
+        .to_structured_failure();
+        let payload = serde_json::to_value(&structured).expect("serialize structured failure");
+
+        for field in [
+            "failure_code",
+            "failure_class",
+            "stage",
+            "root_cause",
+            "remediation",
+        ] {
+            assert!(
+                payload.get(field).is_some(),
+                "structured failure payload must include `{field}`"
+            );
+        }
+        assert!(
+            payload.get("message").is_none(),
+            "legacy raw top-level message field must not be emitted"
+        );
+        assert!(
+            payload.get("diagnostics").is_some(),
+            "raw details must be nested under diagnostics"
+        );
+    }
+
+    #[test]
+    fn prep_failure_remediations_are_actionable_without_logs() {
+        let prep_not_ready = QueuePreparationFailure::PrepNotReady {
+            failure: sample_readiness_failure(
+                "worker_broker",
+                "worker heartbeat missing after readiness retries",
+                "start worker and retry",
+                "worker heartbeat stale",
+            ),
+        }
+        .to_structured_failure();
+        let prep_supply = QueuePreparationFailure::PrepSupplyUnavailable {
+            failure: sample_readiness_failure(
+                "cargo_dependencies",
+                "dependency closure incomplete and network unavailable during PREP hydration",
+                PREP_SUPPLY_REMEDIATION,
+                "dns resolution failed",
+            ),
+        }
+        .to_structured_failure();
+
+        assert!(
+            !prep_not_ready.remediation.trim().is_empty()
+                && prep_not_ready.remediation.contains("retry")
+        );
+        assert!(
+            !prep_supply.remediation.trim().is_empty()
+                && prep_supply.remediation.contains("connect")
         );
     }
 
@@ -4386,7 +5098,7 @@ mod tests {
         );
         assert_eq!(
             err.details.failure_class.as_deref(),
-            Some(PREP_SUPPLY_FAILURE_CLASS)
+            Some(FAILURE_CLASS_PREP)
         );
         assert_eq!(
             err.details.remediation.as_deref(),
@@ -5828,6 +6540,88 @@ time.sleep(20)\n",
         let err = bind_merge_gate_log_bundle_hash(&mut merge_gate, &evidence)
             .expect_err("inconsistent evidence hashes must fail closed");
         assert!(err.contains("inconsistent log bundle hashes"));
+    }
+
+    #[test]
+    fn merge_conflict_bookend_guard_overrides_pass_and_sets_dispatch_remediation() {
+        let mut merge_gate = GateResult {
+            name: "merge_conflict_main".to_string(),
+            status: "PASS".to_string(),
+            duration_secs: 2,
+            log_path: None,
+            bytes_written: None,
+            bytes_total: None,
+            was_truncated: None,
+            log_bundle_hash: None,
+            error_hint: None,
+        };
+        let passed = apply_merge_conflict_bookend_guard(
+            true,
+            &mut merge_gate,
+            || {
+                Ok(GateResult {
+                    name: "merge_conflict_main".to_string(),
+                    status: "FAIL".to_string(),
+                    duration_secs: 5,
+                    log_path: None,
+                    bytes_written: None,
+                    bytes_total: None,
+                    was_truncated: None,
+                    log_bundle_hash: None,
+                    error_hint: Some("late conflict".to_string()),
+                })
+            },
+            false,
+        )
+        .expect("bookend guard should complete");
+
+        assert!(!passed, "late conflict must override execute phase to FAIL");
+        assert_eq!(merge_gate.status, "FAIL");
+        assert!(merge_gate.duration_secs >= 7);
+        assert!(
+            merge_gate
+                .error_hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains(GATE_EXECUTION_REMEDIATION))
+        );
+    }
+
+    #[test]
+    fn merge_conflict_bookend_guard_preserves_pass_when_recheck_is_clean() {
+        let mut merge_gate = GateResult {
+            name: "merge_conflict_main".to_string(),
+            status: "PASS".to_string(),
+            duration_secs: 1,
+            log_path: None,
+            bytes_written: None,
+            bytes_total: None,
+            was_truncated: None,
+            log_bundle_hash: None,
+            error_hint: None,
+        };
+        let passed = apply_merge_conflict_bookend_guard(
+            true,
+            &mut merge_gate,
+            || {
+                Ok(GateResult {
+                    name: "merge_conflict_main".to_string(),
+                    status: "PASS".to_string(),
+                    duration_secs: 2,
+                    log_path: None,
+                    bytes_written: None,
+                    bytes_total: None,
+                    was_truncated: None,
+                    log_bundle_hash: None,
+                    error_hint: None,
+                })
+            },
+            false,
+        )
+        .expect("bookend guard should preserve pass");
+
+        assert!(passed);
+        assert_eq!(merge_gate.status, "PASS");
+        assert!(merge_gate.error_hint.is_none());
     }
 
     /// Verify that the `on_gate_progress` callback in [`EvidenceGateOptions`]

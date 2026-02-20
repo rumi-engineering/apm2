@@ -40,7 +40,7 @@
         "documents/theory",
         "documents/rfcs/RFC-0021"
       ],
-      "environment": "APM2 is agent-native software running exclusively on NixOS. It is not public-facing, not designed for human end-users, and has no proprietary platform dependencies. The entire network is resilient to rolling updates, so there is no backwards-compatibility burden. Strategy can assume full infrastructure sovereignty and agent-native distribution — no need to plan for app stores, browser compatibility, or conventional SaaS delivery.",
+      "environment": "APM2 is agent-native software running exclusively on Ubuntu. It is not public-facing, not designed for human end-users, and has no proprietary platform dependencies. The entire network is resilient to rolling updates, so there is no backwards-compatibility burden. Strategy can assume full infrastructure sovereignty and agent-native distribution — no need to plan for app stores, browser compatibility, or conventional SaaS delivery.",
       "creative_process": "When analyzing strategic questions, generate multiple parallel framings from genuinely different angles before converging. Let each framing develop its own logic fully, then recombine the strongest elements. The goal is to escape local minima that conventional strategy frameworks create. Draw freely on physics, biology, economics, game theory, cognitive science, and any field whose invariants illuminate the problem."
     },
     "lex": {

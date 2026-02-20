@@ -1,0 +1,50 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: TCK-00643
+    title: 'RFC-0032 Phase 3: implement work graph RPCs (Add/Remove/Waive) + `work_edges` projection + cycle detection'
+    status: OPEN
+  binds:
+    prd_id: PRD-PLACEHOLDER
+    rfc_id: RFC-0032
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_DAEMON
+    - DOMAIN_PROTOCOL
+    - DOMAIN_PROJECTION
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00642
+      reason: Requires WorkGraphEvent proto + topic derivation
+    - ticket_id: TCK-00637
+      reason: Claims/leases exist for authorization
+  scope:
+    in_scope:
+    - Add runtime proto messages for AddWorkEdge/RemoveWorkEdge/WaiveWorkEdge requests including lease_id for authorization
+    - Emit canonical `work_graph.edge.*` events with WorkGraphEvent protobuf payloads
+    - 'Enforce idempotency: AddWorkEdge is idempotent on (from_work_id,to_work_id,edge_type,dedupe_key); derive edge_id deterministically when not supplied'
+    - 'Enforce authorization: edge mutations require COORDINATOR lease for to_work_id or daemon-internal system actor'
+    - Implement bounded cycle detection for active BLOCKS edges and reject edges that create cycles (fail-closed on bounds exceed)
+    - Add `work_edges` projection table that is replayable from ledger events
+    out_of_scope:
+    - Claimability enforcement (separate ticket)
+  plan:
+    steps:
+    - Extend runtime proto; implement dispatch handlers with CAS-free ledger append (graph events are protobuf payloads stored directly in ledger)
+    - Implement deterministic edge_id derivation helper (EDGE- prefix) and enforce non-empty dedupe_key when edge_id absent
+    - 'Add projection worker support: maintain active edge set + waivers + removals'
+    - Implement cycle detection using projection state (bounded DFS/BFS); reject on cycle or bound exceed
+    - 'Add tests: idempotent add no duplicates; cycles rejected; waiver expiry honored'
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+    - Graph edge mutations are replayable from ledger alone and are fully projection-derived (no WorkRegistry state).
+    - Cycle detection is bounded and fail-closed.
+    - Authorization is enforced via lease role; implementers cannot mutate graph without coordinator/system authority.
+  notes:
+    security: Treat graph mutation as admission-critical; failures must be CAPABILITY_DENIED/CAPABILITY_REQUEST_REJECTED, not best-effort.

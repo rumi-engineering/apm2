@@ -573,6 +573,10 @@ pub struct DoctorArgs {
     /// Exit only when doctor returns one of these actions (comma-separated).
     #[arg(long, value_delimiter = ',', value_enum)]
     pub exit_on: Vec<DoctorExitActionArg>,
+
+    /// Print FAC review/lifecycle machine contracts as JSON and exit.
+    #[arg(long, default_value_t = false)]
+    pub machine_spec: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -2202,6 +2206,22 @@ pub fn run_fac(
         },
         FacSubcommand::Doctor(args) => {
             let output_json = resolve_json(args.json);
+            if args.machine_spec {
+                match fac_review::fac_review_machine_spec_json_string(output_json) {
+                    Ok(rendered) => {
+                        println!("{rendered}");
+                        return exit_codes::SUCCESS;
+                    },
+                    Err(err) => {
+                        return output_error(
+                            output_json,
+                            "fac_doctor_machine_spec_serialize_failed",
+                            &err,
+                            exit_codes::GENERIC_ERROR,
+                        );
+                    },
+                }
+            }
             if args.wait_for_recommended_action && args.pr.is_none() {
                 return output_error(
                     output_json,
@@ -7050,6 +7070,20 @@ mod tests {
     }
 
     #[test]
+    fn test_doctor_machine_spec_flag_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "doctor", "--machine-spec"])
+            .expect("doctor --machine-spec should parse");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert!(args.machine_spec);
+                assert!(args.pr.is_none());
+                assert!(args.repo.is_none());
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_doctor_wait_flags_parse() {
         let parsed = FacLogsCliHarness::try_parse_from([
             "fac",
@@ -7285,6 +7319,25 @@ mod tests {
             },
             other => panic!("expected doctor subcommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_doctor_exit_action_enum_matches_fac_review_supported_actions() {
+        let mut enum_actions = vec![
+            DoctorExitActionArg::Fix.as_str(),
+            DoctorExitActionArg::Escalate.as_str(),
+            DoctorExitActionArg::Merge.as_str(),
+            DoctorExitActionArg::Done.as_str(),
+            DoctorExitActionArg::Approve.as_str(),
+            DoctorExitActionArg::DispatchImplementor.as_str(),
+            DoctorExitActionArg::RestartReviews.as_str(),
+        ];
+        enum_actions.sort_unstable();
+
+        let mut review_actions = super::fac_review::doctor_wait_supported_exit_actions();
+        review_actions.sort_unstable();
+
+        assert_eq!(enum_actions, review_actions);
     }
 
     #[test]

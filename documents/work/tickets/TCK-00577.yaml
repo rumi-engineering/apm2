@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00577"
     title: "Receipt store permissions model: dedicated service user ownership + CLI writes only via broker APIs (minimize attacker write access)"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

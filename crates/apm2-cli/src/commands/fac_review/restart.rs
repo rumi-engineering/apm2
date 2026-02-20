@@ -7,10 +7,10 @@ use serde::Serialize;
 use super::dispatch::resolve_worktree_for_sha;
 use super::evidence::run_evidence_gates_with_status;
 use super::projection::fetch_pr_head_sha_authoritative;
-use super::projection_store;
 use super::state::load_review_run_completion_receipt;
 use super::target::resolve_pr_target;
 use super::types::{DispatchReviewResult, validate_expected_head_sha};
+use super::{lifecycle, projection_store};
 use crate::exit_codes::codes as exit_codes;
 
 // ── Strategy ────────────────────────────────────────────────────────────────
@@ -148,6 +148,53 @@ fn determine_restart_strategy(
     Ok(RestartStrategy::EvidenceRestart)
 }
 
+fn apply_restart_gate_lifecycle_events_with<F>(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    passed: bool,
+    mut apply_event_fn: F,
+) -> Result<(), String>
+where
+    F: FnMut(lifecycle::LifecycleEventKind) -> Result<(), String>,
+{
+    let final_event = if passed {
+        lifecycle::LifecycleEventKind::GatesPassed
+    } else {
+        lifecycle::LifecycleEventKind::GatesFailed
+    };
+    for (event_name, event) in [
+        ("push_observed", lifecycle::LifecycleEventKind::PushObserved),
+        ("gates_started", lifecycle::LifecycleEventKind::GatesStarted),
+        (
+            if passed {
+                "gates_passed"
+            } else {
+                "gates_failed"
+            },
+            final_event,
+        ),
+    ] {
+        apply_event_fn(event).map_err(|err| {
+            format!(
+                "failed to record restart lifecycle event {event_name} for PR #{pr_number} SHA {head_sha} repo {owner_repo}: {err}"
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn apply_restart_gate_lifecycle_events(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    passed: bool,
+) -> Result<(), String> {
+    apply_restart_gate_lifecycle_events_with(owner_repo, pr_number, head_sha, passed, |event| {
+        lifecycle::apply_event(owner_repo, pr_number, head_sha, &event).map(|_| ())
+    })
+}
+
 // ── Execution ───────────────────────────────────────────────────────────────
 
 fn execute_strategy(
@@ -169,6 +216,13 @@ fn execute_strategy(
                 None,
                 emit_human_logs,
                 None,
+            )?;
+
+            apply_restart_gate_lifecycle_events(
+                &ctx.owner_repo,
+                ctx.pr_number,
+                &ctx.head_sha,
+                passed,
             )?;
 
             if passed {
@@ -346,5 +400,71 @@ mod tests {
         ));
 
         assert!(!receipt_approves_head(Some(&approve), "other/repo", head));
+    }
+
+    #[test]
+    fn restart_lifecycle_events_success_sequence() {
+        let mut seen = Vec::new();
+        apply_restart_gate_lifecycle_events_with(
+            "guardian-intelligence/apm2",
+            767,
+            "0123456789abcdef0123456789abcdef01234567",
+            true,
+            |event| {
+                let name = match event {
+                    lifecycle::LifecycleEventKind::PushObserved => "push_observed",
+                    lifecycle::LifecycleEventKind::GatesStarted => "gates_started",
+                    lifecycle::LifecycleEventKind::GatesPassed => "gates_passed",
+                    _ => "unexpected",
+                };
+                seen.push(name.to_string());
+                Ok(())
+            },
+        )
+        .expect("restart lifecycle success sequence should apply");
+        assert_eq!(seen, vec!["push_observed", "gates_started", "gates_passed"]);
+    }
+
+    #[test]
+    fn restart_lifecycle_events_failure_sequence() {
+        let mut seen = Vec::new();
+        apply_restart_gate_lifecycle_events_with(
+            "guardian-intelligence/apm2",
+            767,
+            "0123456789abcdef0123456789abcdef01234567",
+            false,
+            |event| {
+                let name = match event {
+                    lifecycle::LifecycleEventKind::PushObserved => "push_observed",
+                    lifecycle::LifecycleEventKind::GatesStarted => "gates_started",
+                    lifecycle::LifecycleEventKind::GatesFailed => "gates_failed",
+                    _ => "unexpected",
+                };
+                seen.push(name.to_string());
+                Ok(())
+            },
+        )
+        .expect("restart lifecycle failure sequence should apply");
+        assert_eq!(seen, vec!["push_observed", "gates_started", "gates_failed"]);
+    }
+
+    #[test]
+    fn restart_lifecycle_events_propagate_transition_errors() {
+        let err = apply_restart_gate_lifecycle_events_with(
+            "guardian-intelligence/apm2",
+            767,
+            "0123456789abcdef0123456789abcdef01234567",
+            true,
+            |event| {
+                if matches!(event, lifecycle::LifecycleEventKind::GatesStarted) {
+                    Err("illegal transition: pushed + gates_started".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("transition failure should bubble");
+        assert!(err.contains("gates_started"));
+        assert!(err.contains("illegal transition"));
     }
 }

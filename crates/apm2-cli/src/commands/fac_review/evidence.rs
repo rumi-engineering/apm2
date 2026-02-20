@@ -247,10 +247,10 @@ fn emit_gate_completed_via_cb(cb: &dyn Fn(GateProgressEvent), result: &EvidenceG
 pub const LANE_EVIDENCE_GATES: &[&str] = &[
     "merge_conflict_main",
     "rustfmt",
-    "clippy",
     "doc",
-    "test",
+    "clippy",
     "test_safety_guard",
+    "test",
     "workspace_integrity",
     "review_artifact_lint",
 ];
@@ -1746,8 +1746,11 @@ pub(super) fn run_evidence_gates_with_lane_context(
         None
     };
 
+    // Fastest-first ordering for expensive cargo gates. Keep cheap checks
+    // ahead of heavier analysis to minimize wasted compute on early failure.
     let gates: &[(&str, &[&str])] = &[
         ("rustfmt", &["cargo", "fmt", "--all", "--check"]),
+        ("doc", &["cargo", "doc", "--workspace", "--no-deps"]),
         (
             "clippy",
             &[
@@ -1761,7 +1764,6 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 "warnings",
             ],
         ),
-        ("doc", &["cargo", "doc", "--workspace", "--no-deps"]),
     ];
 
     // Native gates that run BEFORE tests (no ordering dependency on test).
@@ -1801,7 +1803,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
         }
     }
 
-    // Phase 1: cargo fmt/clippy/doc — all receive the policy-filtered env
+    // Phase 1: cargo fmt/doc/clippy — all receive the policy-filtered env
     // and wrapper-stripping keys (TCK-00526: defense-in-depth for all gates).
     //
     // TCK-00574 BLOCKER fix: In full (non-quick) mode, wrap non-test gates
@@ -2564,8 +2566,11 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         );
     }
 
+    // Fastest-first ordering for expensive cargo gates. Keep cheap checks
+    // ahead of heavier analysis to minimize wasted compute on early failure.
     let gates: &[(&str, &[&str])] = &[
         ("rustfmt", &["cargo", "fmt", "--all", "--check"]),
+        ("doc", &["cargo", "doc", "--workspace", "--no-deps"]),
         (
             "clippy",
             &[
@@ -2579,7 +2584,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                 "warnings",
             ],
         ),
-        ("doc", &["cargo", "doc", "--workspace", "--no-deps"]),
     ];
 
     let pre_test_native_gates: &[&str] = &["test_safety_guard"];
@@ -2679,7 +2683,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         specs
     };
 
-    // Phase 1: cargo fmt/clippy/doc.
+    // Phase 1: cargo fmt/doc/clippy.
     for (idx, &(gate_name, _cmd_args)) in gates.iter().enumerate() {
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);

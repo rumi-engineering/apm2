@@ -40,7 +40,7 @@
         "crates/apm2-core/src"
       ],
       "focus_note": "Treat holonic architecture as a pressure-test environment for security primitives that hold at exabyte-scale evidence and globally distributed trust boundaries.",
-      "environment": "APM2 is agent-native software running exclusively on NixOS. It is not public-facing, not designed for human end-users, and has no proprietary platform dependencies. The entire network is resilient to rolling updates, so there is no backwards-compatibility burden. This is liberating: you can propose clean-slate primitives without worrying about migration paths, human ergonomics, or platform portability. Design for agents talking to agents, on infrastructure we fully control."
+      "environment": "APM2 is agent-native software running exclusively on Ubuntu. It is not public-facing, not designed for human end-users, and has no proprietary platform dependencies. The entire network is resilient to rolling updates, so there is no backwards-compatibility burden. This is liberating: you can propose clean-slate primitives without worrying about migration paths, human ergonomics, or platform portability. Design for agents talking to agents, on infrastructure we fully control."
     },
     "ambition_scope_alignment": [
       "Treat APM2 theory, code, and invariants as primary discovery inputs — but treat the entire frontier of human knowledge (distributed systems, formal methods, capability security, information theory, biological immune systems, economic mechanism design, category theory, fault-tolerant avionics, cryptographic protocol design) as the search space for transferable invariants.",

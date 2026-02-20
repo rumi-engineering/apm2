@@ -1,0 +1,49 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: TCK-00635
+    title: 'RFC-0032 Phase 1: implement OpenWork RPC (WorkSpec -> CAS + `work.opened`) and CLI `apm2 work open --from-ticket`'
+    status: OPEN
+  binds:
+    prd_id: PRD-PLACEHOLDER
+    rfc_id: RFC-0032
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_DAEMON
+    - DOMAIN_PROTOCOL
+    - DOMAIN_CLI
+    - DOMAIN_CORE
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00631
+      reason: Requires canonical ledger append path in daemon
+    - ticket_id: TCK-00633
+      reason: Requires WorkSpec schema + bounded decode
+  scope:
+    in_scope:
+    - Add `OpenWorkRequest`/`OpenWorkResponse` to `proto/apm2d_runtime_v1.proto` and implement handler in `crates/apm2-daemon/src/protocol/dispatch.rs`
+    - Canonicalize + validate WorkSpec JSON (schema allowlist + bounds), store canonical bytes to CAS, and emit canonical `work.opened` (`WorkEvent{opened=...}`)
+    - Implement CLI command `apm2 work open --from-ticket <path>` that imports existing ticket YAML into WorkSpec and calls OpenWork
+    - Enforce OpenWork idempotency on `work_id` (same spec hash -> no-op; different hash -> ALREADY_EXISTS)
+    out_of_scope:
+    - Claiming/lease issuance (ClaimWorkV2 ticket)
+    - Work graph edges beyond optional `parent_work_ids` legacy field
+  plan:
+    steps:
+    - Extend runtime proto with OpenWork messages; regenerate code
+    - 'Implement handler: bounded decode + canonicalize JSON -> CAS -> append `work.opened`'
+    - 'Implement CLI importer: parse ticket YAML, map to WorkSpec fields, canonicalize JSON, call daemon RPC'
+    - 'Add unit test: OpenWork idempotency behavior and mismatch returns ALREADY_EXISTS'
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+    - '`OpenWork` persists WorkSpec to CAS and appends exactly one `work.opened` event in the canonical ledger.'
+    - Retrying the same OpenWork request is idempotent (no duplicate events).
+    - CLI importer produces a valid WorkSpec that passes schema allowlist + bounds.
+  notes:
+    security: OpenWork must not accept client-supplied `actor_id` as authoritative; derive from peer credentials if WorkOpened includes actor attribution.

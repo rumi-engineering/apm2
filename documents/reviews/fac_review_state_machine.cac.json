@@ -1,0 +1,2134 @@
+{
+  "kind": "fac.review.machine_bundle",
+  "meta": {
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "classification": "INTERNAL",
+    "last_aligned_rfc": "RFC-0019",
+    "provenance": {
+      "actor_id": "HOLON-PLATFORM-GOVERNANCE",
+      "source_receipts": [],
+      "work_id": "FAC-REVIEW-STATE-MACHINE-CAC-INIT-20260220"
+    },
+    "source_of_truth_refs": [
+      "documents/reviews/fac_review_state_machine.cac.json",
+      "documents/reviews/fac_review_requirements.cac.json",
+      "documents/rfcs/RFC-0019/"
+    ],
+    "stable_id": "dcp://apm2.fac/machine/fac-review@v1",
+    "status": "ACTIVE"
+  },
+  "payload": {
+    "doctor_decision_machine": {
+      "default_state": "wait",
+      "evaluation": "priority_order_first_match",
+      "recommendations": [
+        {
+          "action": "fix",
+          "command_kind": "rule_template",
+          "command_notes": null,
+          "command_template": "apm2 fac doctor --pr {pr_number} --fix",
+          "priority": "high",
+          "reason_kind": "template",
+          "reason_template": "local FAC state indicates integrity/corruption issues",
+          "state": "fix"
+        },
+        {
+          "action": "done",
+          "command_kind": "none",
+          "command_notes": null,
+          "command_template": null,
+          "priority": "low",
+          "reason_kind": "template",
+          "reason_template": "PR has been merged to main",
+          "state": "done"
+        },
+        {
+          "action": "merge",
+          "command_kind": "none",
+          "command_notes": null,
+          "command_template": null,
+          "priority": "medium",
+          "reason_kind": "template",
+          "reason_template": "all verdicts approve; gates pass; SHA is fresh; no merge conflicts",
+          "state": "merge"
+        },
+        {
+          "action": "restart_reviews",
+          "command_kind": "restart_force",
+          "command_notes": null,
+          "command_template": "apm2 fac restart --pr {pr_number} --force --refresh-identity",
+          "priority": "high",
+          "reason_kind": "template",
+          "reason_template": "local verdict/findings snapshot is stale relative to remote PR head",
+          "state": "restart_stale_identity"
+        },
+        {
+          "action": "approve",
+          "command_kind": "rule_template",
+          "command_notes": null,
+          "command_template": "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+          "priority": "low",
+          "reason_kind": "template",
+          "reason_template": "all review dimensions approve; awaiting auto-merge",
+          "state": "approve"
+        },
+        {
+          "action": "dispatch_implementor",
+          "command_kind": "rule_template",
+          "command_notes": null,
+          "command_template": "apm2 fac review findings --pr {pr_number} --json",
+          "priority": "high",
+          "reason_kind": "template",
+          "reason_template": "merge conflicts require implementor remediation and a fresh push",
+          "state": "dispatch_merge_conflicts"
+        },
+        {
+          "action": "dispatch_implementor",
+          "command_kind": "rule_template",
+          "command_notes": "reason may include latest push failure hint when available",
+          "command_template": "apm2 fac review findings --pr {pr_number} --json",
+          "priority": "high",
+          "reason_kind": "push_failure_hint_or_template",
+          "reason_template": "evidence gate failure requires implementor remediation before review can continue",
+          "state": "dispatch_failed_gates"
+        },
+        {
+          "action": "dispatch_implementor",
+          "command_kind": "rule_template",
+          "command_notes": "reason includes findings rollup when available",
+          "command_template": "apm2 fac review findings --pr {pr_number} --json",
+          "priority": "high",
+          "reason_kind": "findings_rollup_with_push_hint",
+          "reason_template": "review findings require implementor remediation",
+          "state": "dispatch_implementor"
+        },
+        {
+          "action": "wait",
+          "command_kind": "rule_template",
+          "command_notes": null,
+          "command_template": "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+          "priority": "medium",
+          "reason_kind": "template",
+          "reason_template": "FAC gates are still in progress; reviewer restart is deferred",
+          "state": "wait_for_gates"
+        },
+        {
+          "action": "restart_reviews",
+          "command_kind": "restart_force",
+          "command_notes": "runtime reason appends max idle age from current agent activity telemetry",
+          "command_template": "apm2 fac restart --pr {pr_number} --force --refresh-identity",
+          "priority": "high",
+          "reason_kind": "idle_restart_with_max_idle",
+          "reason_template": "all active reviewer agents are idle",
+          "state": "restart_idle_reviewers"
+        },
+        {
+          "action": "restart_reviews",
+          "command_kind": "restart_conditional_force",
+          "command_notes": "runtime appends --force when terminal reason indicates max_restarts_exceeded",
+          "command_template": "apm2 fac restart --pr {pr_number} --refresh-identity",
+          "priority": "high",
+          "reason_kind": "pending_no_active_with_push_hint",
+          "reason_template": "no active reviewer agents and verdict remains pending",
+          "state": "restart_pending_no_active_reviewers"
+        },
+        {
+          "action": "escalate",
+          "command_kind": "rule_template",
+          "command_notes": null,
+          "command_template": "apm2 fac doctor --pr {pr_number} --json",
+          "priority": "high",
+          "reason_kind": "template",
+          "reason_template": "lifecycle retry/error budget exhausted",
+          "state": "escalate_lifecycle_budget"
+        },
+        {
+          "action": "wait",
+          "command_kind": "rule_template",
+          "command_notes": null,
+          "command_template": "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+          "priority": "low",
+          "reason_kind": "wait_with_pending_hint",
+          "reason_template": "reviews and findings are still in progress",
+          "state": "wait"
+        }
+      ],
+      "rules": [
+        {
+          "command_kind": "rule_template",
+          "command_notes": null,
+          "command_template": "apm2 fac doctor --pr {pr_number} --fix",
+          "guard_id": "DOC-G-001",
+          "guard_kind": "has_integrity_or_corruption",
+          "guard_predicate": "facts.has_integrity_or_corruption",
+          "priority": 1,
+          "reason_kind": "template",
+          "reason_template": "local FAC state indicates integrity/corruption issues",
+          "recommended_action": "fix",
+          "recommended_priority": "high",
+          "requirement_refs": [],
+          "state": "fix"
+        },
+        {
+          "command_kind": "none",
+          "command_notes": null,
+          "command_template": null,
+          "guard_id": "DOC-G-002",
+          "guard_kind": "lifecycle_merged",
+          "guard_predicate": "facts.lifecycle_merged",
+          "priority": 2,
+          "reason_kind": "template",
+          "reason_template": "PR has been merged to main",
+          "recommended_action": "done",
+          "recommended_priority": "low",
+          "requirement_refs": [],
+          "state": "done"
+        },
+        {
+          "command_kind": "none",
+          "command_notes": null,
+          "command_template": null,
+          "guard_id": "DOC-G-003",
+          "guard_kind": "merge_ready",
+          "guard_predicate": "facts.merge_ready",
+          "priority": 3,
+          "reason_kind": "template",
+          "reason_template": "all verdicts approve; gates pass; SHA is fresh; no merge conflicts",
+          "recommended_action": "merge",
+          "recommended_priority": "medium",
+          "requirement_refs": [
+            "DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY"
+          ],
+          "state": "merge"
+        },
+        {
+          "command_kind": "restart_force",
+          "command_notes": null,
+          "command_template": "apm2 fac restart --pr {pr_number} --force --refresh-identity",
+          "guard_id": "DOC-G-004",
+          "guard_kind": "sha_freshness_stale",
+          "guard_predicate": "facts.sha_freshness_source == stale && !facts.has_gate_failure_signal",
+          "priority": 4,
+          "reason_kind": "template",
+          "reason_template": "local verdict/findings snapshot is stale relative to remote PR head",
+          "recommended_action": "restart_reviews",
+          "recommended_priority": "high",
+          "requirement_refs": [],
+          "state": "restart_stale_identity"
+        },
+        {
+          "command_kind": "rule_template",
+          "command_notes": null,
+          "command_template": "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+          "guard_id": "DOC-G-005",
+          "guard_kind": "approve_eligible",
+          "guard_predicate": "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts && !facts.has_gate_failure_signal",
+          "priority": 5,
+          "reason_kind": "template",
+          "reason_template": "all review dimensions approve; awaiting auto-merge",
+          "recommended_action": "approve",
+          "recommended_priority": "low",
+          "requirement_refs": [
+            "DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY"
+          ],
+          "state": "approve"
+        },
+        {
+          "command_kind": "rule_template",
+          "command_notes": null,
+          "command_template": "apm2 fac review findings --pr {pr_number} --json",
+          "guard_id": "DOC-G-006",
+          "guard_kind": "merge_conflicts_present",
+          "guard_predicate": "facts.merge_conflict_status == has_conflicts",
+          "priority": 6,
+          "reason_kind": "template",
+          "reason_template": "merge conflicts require implementor remediation and a fresh push",
+          "recommended_action": "dispatch_implementor",
+          "recommended_priority": "high",
+          "requirement_refs": [
+            "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"
+          ],
+          "state": "dispatch_merge_conflicts"
+        },
+        {
+          "command_kind": "rule_template",
+          "command_notes": "reason may include latest push failure hint when available",
+          "command_template": "apm2 fac review findings --pr {pr_number} --json",
+          "guard_id": "DOC-G-007",
+          "guard_kind": "gate_failure_signal",
+          "guard_predicate": "facts.has_gate_failure_signal",
+          "priority": 7,
+          "reason_kind": "push_failure_hint_or_template",
+          "reason_template": "evidence gate failure requires implementor remediation before review can continue",
+          "recommended_action": "dispatch_implementor",
+          "recommended_priority": "high",
+          "requirement_refs": [
+            "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"
+          ],
+          "state": "dispatch_failed_gates"
+        },
+        {
+          "command_kind": "rule_template",
+          "command_notes": "reason includes findings rollup when available",
+          "command_template": "apm2 fac review findings --pr {pr_number} --json",
+          "guard_id": "DOC-G-008",
+          "guard_kind": "implementor_remediation_resolved",
+          "guard_predicate": "facts.requires_implementor_remediation && facts.all_verdicts_resolved",
+          "priority": 8,
+          "reason_kind": "findings_rollup_with_push_hint",
+          "reason_template": "review findings require implementor remediation",
+          "recommended_action": "dispatch_implementor",
+          "recommended_priority": "high",
+          "requirement_refs": [
+            "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"
+          ],
+          "state": "dispatch_implementor"
+        },
+        {
+          "command_kind": "rule_template",
+          "command_notes": null,
+          "command_template": "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+          "guard_id": "DOC-G-009",
+          "guard_kind": "pending_verdict_with_gate_in_flight",
+          "guard_predicate": "facts.has_pending_verdict && facts.gate_progress_state == in_flight",
+          "priority": 9,
+          "reason_kind": "template",
+          "reason_template": "FAC gates are still in progress; reviewer restart is deferred",
+          "recommended_action": "wait",
+          "recommended_priority": "medium",
+          "requirement_refs": [
+            "DR-002-RUNNING_GATE_SUPPRESSES_RESTART"
+          ],
+          "state": "wait_for_gates"
+        },
+        {
+          "command_kind": "restart_force",
+          "command_notes": "runtime reason appends max idle age from current agent activity telemetry",
+          "command_template": "apm2 fac restart --pr {pr_number} --force --refresh-identity",
+          "guard_id": "DOC-G-010",
+          "guard_kind": "all_active_idle",
+          "guard_predicate": "facts.all_active_idle",
+          "priority": 10,
+          "reason_kind": "idle_restart_with_max_idle",
+          "reason_template": "all active reviewer agents are idle",
+          "recommended_action": "restart_reviews",
+          "recommended_priority": "high",
+          "requirement_refs": [],
+          "state": "restart_idle_reviewers"
+        },
+        {
+          "command_kind": "restart_conditional_force",
+          "command_notes": "runtime appends --force when terminal reason indicates max_restarts_exceeded",
+          "command_template": "apm2 fac restart --pr {pr_number} --refresh-identity",
+          "guard_id": "DOC-G-011",
+          "guard_kind": "pending_no_active",
+          "guard_predicate": "facts.active_agents == 0 && facts.has_pending_verdict",
+          "priority": 11,
+          "reason_kind": "pending_no_active_with_push_hint",
+          "reason_template": "no active reviewer agents and verdict remains pending",
+          "recommended_action": "restart_reviews",
+          "recommended_priority": "high",
+          "requirement_refs": [],
+          "state": "restart_pending_no_active_reviewers"
+        },
+        {
+          "command_kind": "rule_template",
+          "command_notes": null,
+          "command_template": "apm2 fac doctor --pr {pr_number} --json",
+          "guard_id": "DOC-G-012",
+          "guard_kind": "lifecycle_escalation",
+          "guard_predicate": "facts.lifecycle_escalation",
+          "priority": 12,
+          "reason_kind": "template",
+          "reason_template": "lifecycle retry/error budget exhausted",
+          "recommended_action": "escalate",
+          "recommended_priority": "high",
+          "requirement_refs": [],
+          "state": "escalate_lifecycle_budget"
+        },
+        {
+          "command_kind": "rule_template",
+          "command_notes": null,
+          "command_template": "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+          "guard_id": "DOC-G-013",
+          "guard_kind": "default",
+          "guard_predicate": "default",
+          "priority": 13,
+          "reason_kind": "wait_with_pending_hint",
+          "reason_template": "reviews and findings are still in progress",
+          "recommended_action": "wait",
+          "recommended_priority": "low",
+          "requirement_refs": [],
+          "state": "wait"
+        }
+      ],
+      "schema": "apm2.fac.review.doctor_decision_machine.v1",
+      "states": [
+        "fix",
+        "done",
+        "merge",
+        "restart_stale_identity",
+        "approve",
+        "dispatch_merge_conflicts",
+        "dispatch_failed_gates",
+        "dispatch_implementor",
+        "wait_for_gates",
+        "restart_idle_reviewers",
+        "restart_pending_no_active_reviewers",
+        "escalate_lifecycle_budget",
+        "wait"
+      ]
+    },
+    "doctor_wait_machine": {
+      "action_policy": [
+        {
+          "action": "fix",
+          "allow_exit_on_flag": true,
+          "default_wait_exit": true,
+          "wait_terminal_reason": "fix"
+        },
+        {
+          "action": "escalate",
+          "allow_exit_on_flag": true,
+          "default_wait_exit": true,
+          "wait_terminal_reason": "escalate"
+        },
+        {
+          "action": "merge",
+          "allow_exit_on_flag": true,
+          "default_wait_exit": true,
+          "wait_terminal_reason": "merge_ready"
+        },
+        {
+          "action": "dispatch_implementor",
+          "allow_exit_on_flag": true,
+          "default_wait_exit": true,
+          "wait_terminal_reason": "dispatch_implementor"
+        },
+        {
+          "action": "restart_reviews",
+          "allow_exit_on_flag": true,
+          "default_wait_exit": true,
+          "wait_terminal_reason": "restart_reviews"
+        },
+        {
+          "action": "done",
+          "allow_exit_on_flag": true,
+          "default_wait_exit": true,
+          "wait_terminal_reason": "done"
+        },
+        {
+          "action": "approve",
+          "allow_exit_on_flag": true,
+          "default_wait_exit": true,
+          "wait_terminal_reason": "merge_ready"
+        },
+        {
+          "action": "wait",
+          "allow_exit_on_flag": false,
+          "default_wait_exit": false,
+          "wait_terminal_reason": "non_terminal_wait"
+        }
+      ],
+      "default_exit_actions": [
+        "approve",
+        "dispatch_implementor",
+        "done",
+        "escalate",
+        "fix",
+        "merge",
+        "restart_reviews"
+      ],
+      "evaluation": "priority_order_first_match_per_state",
+      "rules": [
+        {
+          "from": "evaluate",
+          "guard_id": "WAIT-G-001",
+          "guard_kind": "recommended_action_in_exit_set",
+          "guard_predicate": "facts.recommended_action in effective_exit_actions",
+          "priority": 1,
+          "requirement_refs": [
+            "DR-005-WAIT_RETURNS_ON_TERMINAL_ACTION"
+          ],
+          "to": "exit_on_recommended_action"
+        },
+        {
+          "from": "evaluate",
+          "guard_id": "WAIT-G-002",
+          "guard_kind": "interrupted",
+          "guard_predicate": "facts.interrupted",
+          "priority": 2,
+          "requirement_refs": [],
+          "to": "exit_on_interrupt"
+        },
+        {
+          "from": "evaluate",
+          "guard_id": "WAIT-G-003",
+          "guard_kind": "timed_out",
+          "guard_predicate": "facts.elapsed_seconds >= facts.wait_timeout_seconds",
+          "priority": 3,
+          "requirement_refs": [],
+          "to": "exit_on_timeout"
+        },
+        {
+          "from": "evaluate",
+          "guard_id": "WAIT-G-004",
+          "guard_kind": "always",
+          "guard_predicate": "default",
+          "priority": 4,
+          "requirement_refs": [],
+          "to": "poll_emit"
+        },
+        {
+          "from": "poll_emit",
+          "guard_id": "WAIT-G-005",
+          "guard_kind": "always",
+          "guard_predicate": "always",
+          "priority": 5,
+          "requirement_refs": [],
+          "to": "sleep"
+        },
+        {
+          "from": "sleep",
+          "guard_id": "WAIT-G-006",
+          "guard_kind": "always",
+          "guard_predicate": "always",
+          "priority": 6,
+          "requirement_refs": [],
+          "to": "collect_summary"
+        },
+        {
+          "from": "collect_summary",
+          "guard_id": "WAIT-G-007",
+          "guard_kind": "always",
+          "guard_predicate": "always",
+          "priority": 7,
+          "requirement_refs": [],
+          "to": "evaluate"
+        }
+      ],
+      "schema": "apm2.fac.review.doctor_wait_machine.v1",
+      "start_state": "evaluate",
+      "states": [
+        "evaluate",
+        "exit_on_recommended_action",
+        "exit_on_interrupt",
+        "exit_on_timeout",
+        "poll_emit",
+        "sleep",
+        "collect_summary"
+      ],
+      "supported_exit_actions": [
+        "fix",
+        "escalate",
+        "merge",
+        "dispatch_implementor",
+        "restart_reviews",
+        "done",
+        "approve"
+      ],
+      "terminal_states": [
+        "exit_on_recommended_action",
+        "exit_on_interrupt",
+        "exit_on_timeout"
+      ]
+    },
+    "gate_progress_machine": {
+      "default_state": "unknown",
+      "evaluation": "priority_order_first_match",
+      "rules": [
+        {
+          "guard_id": "GATE-G-001",
+          "guard_kind": "any_failed",
+          "guard_predicate": "lifecycle.state == gates_failed || any(gate.status == FAIL)",
+          "priority": 1,
+          "state": "terminal_failed"
+        },
+        {
+          "guard_id": "GATE-G-002",
+          "guard_kind": "lifecycle_gates_running_or_any_in_flight",
+          "guard_predicate": "lifecycle.state == gates_running || any(gate.status in {RUNNING,NOT_RUN})",
+          "priority": 2,
+          "state": "in_flight"
+        },
+        {
+          "guard_id": "GATE-G-003",
+          "guard_kind": "any_passed",
+          "guard_predicate": "any(gate.status == PASS)",
+          "priority": 3,
+          "state": "terminal_passed"
+        },
+        {
+          "guard_id": "GATE-G-004",
+          "guard_kind": "default",
+          "guard_predicate": "default",
+          "priority": 4,
+          "state": "unknown"
+        }
+      ],
+      "schema": "apm2.fac.review.gate_progress_machine.v1",
+      "states": [
+        "terminal_failed",
+        "in_flight",
+        "terminal_passed",
+        "unknown"
+      ]
+    },
+    "gate_reduction_machine": {
+      "default_decision": "keep_existing",
+      "evaluation": "priority_order_first_match",
+      "rules": [
+        {
+          "decision": "replace_incoming",
+          "guard_id": "GATE-R-001",
+          "guard_kind": "incoming_signal_higher",
+          "guard_predicate": "incoming.signal_priority > existing.signal_priority",
+          "priority": 1
+        },
+        {
+          "decision": "keep_existing",
+          "guard_id": "GATE-R-002",
+          "guard_kind": "existing_signal_higher",
+          "guard_predicate": "incoming.signal_priority < existing.signal_priority",
+          "priority": 2
+        },
+        {
+          "decision": "replace_incoming",
+          "guard_id": "GATE-R-003",
+          "guard_kind": "same_signal_incoming_source_higher",
+          "guard_predicate": "incoming.signal_priority == existing.signal_priority && incoming.source_priority > existing.source_priority",
+          "priority": 3
+        },
+        {
+          "decision": "replace_incoming",
+          "guard_id": "GATE-R-004",
+          "guard_kind": "same_signal_incoming_timestamp_newer",
+          "guard_predicate": "incoming.signal_priority == existing.signal_priority && incoming.completed_at > existing.completed_at",
+          "priority": 4
+        },
+        {
+          "decision": "keep_existing",
+          "guard_id": "GATE-R-005",
+          "guard_kind": "default",
+          "guard_predicate": "default",
+          "priority": 5
+        }
+      ],
+      "schema": "apm2.fac.review.gate_reduction_machine.v1",
+      "sources": [
+        "local_cache",
+        "projection"
+      ]
+    },
+    "gates_wait_machine": {
+      "evaluation": "priority_order_first_match_per_state",
+      "machine": {
+        "evaluation": "first_matching_guard_applies",
+        "schema": "apm2.fac.review.gates_wait_machine.v1",
+        "states": [
+          "evaluate_timeout",
+          "check_receipt",
+          "evaluate_queue_mode",
+          "sleep",
+          "run_inline_worker",
+          "exit_with_receipt",
+          "exit_timeout"
+        ],
+        "transitions": [
+          {
+            "from": "check_receipt",
+            "guard_id": "GW-WAIT-003",
+            "guard_kind": "receipt_found",
+            "guard_predicate": "facts.receipt_found",
+            "priority": 1,
+            "to": "exit_with_receipt"
+          },
+          {
+            "from": "check_receipt",
+            "guard_id": "GW-WAIT-004",
+            "guard_kind": "always",
+            "guard_predicate": "default",
+            "priority": 2,
+            "to": "evaluate_timeout"
+          },
+          {
+            "from": "evaluate_timeout",
+            "guard_id": "GW-WAIT-001",
+            "guard_kind": "timed_out",
+            "guard_predicate": "facts.timed_out",
+            "priority": 3,
+            "to": "exit_timeout"
+          },
+          {
+            "from": "evaluate_timeout",
+            "guard_id": "GW-WAIT-002",
+            "guard_kind": "always",
+            "guard_predicate": "default",
+            "priority": 4,
+            "to": "evaluate_queue_mode"
+          },
+          {
+            "from": "evaluate_queue_mode",
+            "guard_id": "GW-WAIT-005",
+            "guard_kind": "inline_fallback_allowed",
+            "guard_predicate": "facts.queue_mode == inline_single_job && facts.allow_inline_fallback",
+            "priority": 5,
+            "to": "run_inline_worker"
+          },
+          {
+            "from": "evaluate_queue_mode",
+            "guard_id": "GW-WAIT-006",
+            "guard_kind": "always",
+            "guard_predicate": "default",
+            "priority": 6,
+            "to": "sleep"
+          },
+          {
+            "from": "run_inline_worker",
+            "guard_id": "GW-WAIT-007",
+            "guard_kind": "always",
+            "guard_predicate": "always",
+            "priority": 7,
+            "to": "check_receipt"
+          },
+          {
+            "from": "sleep",
+            "guard_id": "GW-WAIT-008",
+            "guard_kind": "always",
+            "guard_predicate": "always",
+            "priority": 8,
+            "to": "check_receipt"
+          }
+        ]
+      },
+      "schema": "apm2.fac.review.gates_wait_machine.v1"
+    },
+    "lifecycle_machine": {
+      "evaluation": "first_matching_guard_applies",
+      "events": [
+        "agent_crashed",
+        "gates_failed",
+        "gates_passed",
+        "gates_started",
+        "merge_failed",
+        "merged",
+        "projection_failed",
+        "push_observed",
+        "quarantined",
+        "recover_completed",
+        "recover_requested",
+        "reviewer_spawned",
+        "reviews_dispatched",
+        "sha_drift_detected",
+        "verdict_auto_derived",
+        "verdict_set"
+      ],
+      "illegal_transition_policy": "fail_closed",
+      "schema": "apm2.fac.lifecycle_machine.v1",
+      "states": {
+        "agent_lifecycle": [
+          "dispatched",
+          "running",
+          "completed",
+          "crashed",
+          "reaped",
+          "stuck"
+        ],
+        "pr_lifecycle": [
+          "untracked",
+          "pushed",
+          "gates_running",
+          "gates_passed",
+          "gates_failed",
+          "reviews_dispatched",
+          "review_in_progress",
+          "verdict_pending",
+          "verdict_approve",
+          "verdict_deny",
+          "merge_ready",
+          "merged",
+          "stuck",
+          "stale",
+          "recovering",
+          "quarantined"
+        ]
+      },
+      "transitions": [
+        {
+          "action_kind": "none",
+          "event": "push_observed",
+          "from": "untracked|pushed|gates_running|gates_passed|gates_failed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|merge_ready|merged|stuck|stale|recovering",
+          "from_states": [
+            "untracked",
+            "pushed",
+            "gates_running",
+            "gates_passed",
+            "gates_failed",
+            "reviews_dispatched",
+            "review_in_progress",
+            "verdict_pending",
+            "verdict_approve",
+            "verdict_deny",
+            "merge_ready",
+            "merged",
+            "stuck",
+            "stale",
+            "recovering"
+          ],
+          "guard_kind": "not_quarantined",
+          "guard_predicate": "state.pr_state != quarantined",
+          "requirement_refs": [],
+          "to": "pushed",
+          "to_states": [
+            "pushed"
+          ],
+          "transition_id": "LC-T-001"
+        },
+        {
+          "action_kind": "none",
+          "event": "gates_started",
+          "from": "pushed|gates_failed|recovering",
+          "from_states": [
+            "pushed",
+            "gates_failed",
+            "recovering"
+          ],
+          "guard_kind": "always",
+          "guard_predicate": "state.pr_state in {pushed, gates_failed, recovering}",
+          "requirement_refs": [],
+          "to": "gates_running",
+          "to_states": [
+            "gates_running"
+          ],
+          "transition_id": "LC-T-002"
+        },
+        {
+          "action_kind": "none",
+          "event": "gates_passed",
+          "from": "gates_running",
+          "from_states": [
+            "gates_running"
+          ],
+          "guard_kind": "always",
+          "guard_predicate": "state.pr_state == gates_running",
+          "requirement_refs": [],
+          "to": "gates_passed",
+          "to_states": [
+            "gates_passed"
+          ],
+          "transition_id": "LC-T-003"
+        },
+        {
+          "action_kind": "none",
+          "event": "gates_failed",
+          "from": "gates_running",
+          "from_states": [
+            "gates_running"
+          ],
+          "guard_kind": "always",
+          "guard_predicate": "state.pr_state == gates_running",
+          "requirement_refs": [],
+          "to": "gates_failed",
+          "to_states": [
+            "gates_failed"
+          ],
+          "transition_id": "LC-T-004"
+        },
+        {
+          "action_kind": "clear_verdicts",
+          "event": "reviews_dispatched",
+          "from": "gates_passed|reviews_dispatched|review_in_progress|verdict_pending",
+          "from_states": [
+            "gates_passed",
+            "reviews_dispatched",
+            "review_in_progress",
+            "verdict_pending"
+          ],
+          "guard_kind": "always",
+          "guard_predicate": "state.pr_state in {gates_passed, reviews_dispatched, review_in_progress, verdict_pending}",
+          "requirement_refs": [],
+          "to": "reviews_dispatched",
+          "to_states": [
+            "reviews_dispatched"
+          ],
+          "transition_id": "LC-T-005"
+        },
+        {
+          "action_kind": "none",
+          "event": "reviewer_spawned",
+          "from": "reviews_dispatched|review_in_progress|verdict_pending",
+          "from_states": [
+            "reviews_dispatched",
+            "review_in_progress",
+            "verdict_pending"
+          ],
+          "guard_kind": "always",
+          "guard_predicate": "state.pr_state in {reviews_dispatched, review_in_progress, verdict_pending}",
+          "requirement_refs": [],
+          "to": "review_in_progress",
+          "to_states": [
+            "review_in_progress"
+          ],
+          "transition_id": "LC-T-006"
+        },
+        {
+          "action_kind": "upsert_verdict",
+          "event": "verdict_set",
+          "from": "gates_passed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|merge_ready|stuck",
+          "from_states": [
+            "gates_passed",
+            "reviews_dispatched",
+            "review_in_progress",
+            "verdict_pending",
+            "verdict_approve",
+            "verdict_deny",
+            "merge_ready",
+            "stuck"
+          ],
+          "guard_kind": "verdict_set_deny",
+          "guard_predicate": "normalized_decision == deny || any(state.verdicts.values == deny)",
+          "requirement_refs": [],
+          "to": "verdict_deny",
+          "to_states": [
+            "verdict_deny"
+          ],
+          "transition_id": "LC-T-007"
+        },
+        {
+          "action_kind": "upsert_verdict",
+          "event": "verdict_set",
+          "from": "gates_passed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|merge_ready|stuck",
+          "from_states": [
+            "gates_passed",
+            "reviews_dispatched",
+            "review_in_progress",
+            "verdict_pending",
+            "verdict_approve",
+            "verdict_deny",
+            "merge_ready",
+            "stuck"
+          ],
+          "guard_kind": "verdict_set_approve_all_required_no_deny",
+          "guard_predicate": "normalized_decision == approve && state.verdicts.security == approve && state.verdicts.code_quality == approve && no(state.verdicts.values == deny)",
+          "requirement_refs": [],
+          "to": "merge_ready",
+          "to_states": [
+            "merge_ready"
+          ],
+          "transition_id": "LC-T-008"
+        },
+        {
+          "action_kind": "upsert_verdict",
+          "event": "verdict_set",
+          "from": "gates_passed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|merge_ready|stuck",
+          "from_states": [
+            "gates_passed",
+            "reviews_dispatched",
+            "review_in_progress",
+            "verdict_pending",
+            "verdict_approve",
+            "verdict_deny",
+            "merge_ready",
+            "stuck"
+          ],
+          "guard_kind": "verdict_set_approve_pending_no_deny",
+          "guard_predicate": "normalized_decision == approve && !all_required_verdicts_approve && no(state.verdicts.values == deny)",
+          "requirement_refs": [],
+          "to": "verdict_pending",
+          "to_states": [
+            "verdict_pending"
+          ],
+          "transition_id": "LC-T-009"
+        },
+        {
+          "action_kind": "validate_auto_derived_payload",
+          "event": "verdict_auto_derived",
+          "from": "*",
+          "from_states": [
+            "*"
+          ],
+          "guard_kind": "verdict_auto_derived_payload_valid",
+          "guard_predicate": "dimension/decision normalize successfully",
+          "requirement_refs": [],
+          "to": "self",
+          "to_states": [
+            "self"
+          ],
+          "transition_id": "LC-T-010"
+        },
+        {
+          "action_kind": "none",
+          "event": "merge_failed",
+          "from": "merge_ready|verdict_approve|verdict_pending|stuck",
+          "from_states": [
+            "merge_ready",
+            "verdict_approve",
+            "verdict_pending",
+            "stuck"
+          ],
+          "guard_kind": "always",
+          "guard_predicate": "state.pr_state in {merge_ready, verdict_approve, verdict_pending, stuck}",
+          "requirement_refs": [],
+          "to": "stuck",
+          "to_states": [
+            "stuck"
+          ],
+          "transition_id": "LC-T-011"
+        },
+        {
+          "action_kind": "none",
+          "event": "merged",
+          "from": "merge_ready|merged",
+          "from_states": [
+            "merge_ready",
+            "merged"
+          ],
+          "guard_kind": "always",
+          "guard_predicate": "state.pr_state in {merge_ready, merged}",
+          "requirement_refs": [],
+          "to": "merged",
+          "to_states": [
+            "merged"
+          ],
+          "transition_id": "LC-T-012"
+        },
+        {
+          "action_kind": "none",
+          "event": "agent_crashed",
+          "from": "*",
+          "from_states": [
+            "*"
+          ],
+          "guard_kind": "always",
+          "guard_predicate": "always",
+          "requirement_refs": [],
+          "to": "stuck",
+          "to_states": [
+            "stuck"
+          ],
+          "transition_id": "LC-T-013"
+        },
+        {
+          "action_kind": "update_current_sha",
+          "event": "sha_drift_detected",
+          "from": "*",
+          "from_states": [
+            "*"
+          ],
+          "guard_kind": "always",
+          "guard_predicate": "always",
+          "requirement_refs": [],
+          "to": "stale",
+          "to_states": [
+            "stale"
+          ],
+          "transition_id": "LC-T-014"
+        },
+        {
+          "action_kind": "none",
+          "event": "recover_requested",
+          "from": "stale|stuck|quarantined",
+          "from_states": [
+            "stale",
+            "stuck",
+            "quarantined"
+          ],
+          "guard_kind": "always",
+          "guard_predicate": "state.pr_state in {stale, stuck, quarantined}",
+          "requirement_refs": [],
+          "to": "recovering",
+          "to_states": [
+            "recovering"
+          ],
+          "transition_id": "LC-T-015"
+        },
+        {
+          "action_kind": "none",
+          "event": "recover_completed",
+          "from": "recovering",
+          "from_states": [
+            "recovering"
+          ],
+          "guard_kind": "always",
+          "guard_predicate": "state.pr_state == recovering",
+          "requirement_refs": [],
+          "to": "pushed",
+          "to_states": [
+            "pushed"
+          ],
+          "transition_id": "LC-T-016"
+        },
+        {
+          "action_kind": "none",
+          "event": "quarantined",
+          "from": "*",
+          "from_states": [
+            "*"
+          ],
+          "guard_kind": "always",
+          "guard_predicate": "always",
+          "requirement_refs": [],
+          "to": "quarantined",
+          "to_states": [
+            "quarantined"
+          ],
+          "transition_id": "LC-T-017"
+        },
+        {
+          "action_kind": "none",
+          "event": "projection_failed",
+          "from": "*",
+          "from_states": [
+            "*"
+          ],
+          "guard_kind": "always",
+          "guard_predicate": "always",
+          "requirement_refs": [],
+          "to": "self",
+          "to_states": [
+            "self"
+          ],
+          "transition_id": "LC-T-018"
+        }
+      ]
+    },
+    "machine_traceability": {
+      "counts": {
+        "artifact_level_total": 3,
+        "covered_total": 8,
+        "doctor_decision_rules": 13,
+        "doctor_recommendations": 13,
+        "gate_progress_rules": 4,
+        "gate_reduction_rules": 5,
+        "gates_wait_transitions": 8,
+        "lifecycle_transitions": 18,
+        "machine_traceability_requirements": 5,
+        "reviewer_missing_verdict_rules": 3,
+        "ticket_in_scope_requirements": 8,
+        "traceability_entry_only_total": 1,
+        "wait_action_policy_actions": 8,
+        "wait_rules": 7
+      },
+      "decision_recommendation_matrix": [
+        {
+          "action": "fix",
+          "action_priority": "high",
+          "command_template": "apm2 fac doctor --pr {pr_number} --fix",
+          "guard_id": "DOC-G-001",
+          "guard_kind": "has_integrity_or_corruption",
+          "guard_predicate": "facts.has_integrity_or_corruption",
+          "priority": 1,
+          "reason_template": "local FAC state indicates integrity/corruption issues",
+          "requirement_refs": [],
+          "state": "fix"
+        },
+        {
+          "action": "done",
+          "action_priority": "low",
+          "command_template": null,
+          "guard_id": "DOC-G-002",
+          "guard_kind": "lifecycle_merged",
+          "guard_predicate": "facts.lifecycle_merged",
+          "priority": 2,
+          "reason_template": "PR has been merged to main",
+          "requirement_refs": [],
+          "state": "done"
+        },
+        {
+          "action": "merge",
+          "action_priority": "medium",
+          "command_template": null,
+          "guard_id": "DOC-G-003",
+          "guard_kind": "merge_ready",
+          "guard_predicate": "facts.merge_ready",
+          "priority": 3,
+          "reason_template": "all verdicts approve; gates pass; SHA is fresh; no merge conflicts",
+          "requirement_refs": [
+            "DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY"
+          ],
+          "state": "merge"
+        },
+        {
+          "action": "restart_reviews",
+          "action_priority": "high",
+          "command_template": "apm2 fac restart --pr {pr_number} --force --refresh-identity",
+          "guard_id": "DOC-G-004",
+          "guard_kind": "sha_freshness_stale",
+          "guard_predicate": "facts.sha_freshness_source == stale && !facts.has_gate_failure_signal",
+          "priority": 4,
+          "reason_template": "local verdict/findings snapshot is stale relative to remote PR head",
+          "requirement_refs": [],
+          "state": "restart_stale_identity"
+        },
+        {
+          "action": "approve",
+          "action_priority": "low",
+          "command_template": "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+          "guard_id": "DOC-G-005",
+          "guard_kind": "approve_eligible",
+          "guard_predicate": "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts && !facts.has_gate_failure_signal",
+          "priority": 5,
+          "reason_template": "all review dimensions approve; awaiting auto-merge",
+          "requirement_refs": [
+            "DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY"
+          ],
+          "state": "approve"
+        },
+        {
+          "action": "dispatch_implementor",
+          "action_priority": "high",
+          "command_template": "apm2 fac review findings --pr {pr_number} --json",
+          "guard_id": "DOC-G-006",
+          "guard_kind": "merge_conflicts_present",
+          "guard_predicate": "facts.merge_conflict_status == has_conflicts",
+          "priority": 6,
+          "reason_template": "merge conflicts require implementor remediation and a fresh push",
+          "requirement_refs": [
+            "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"
+          ],
+          "state": "dispatch_merge_conflicts"
+        },
+        {
+          "action": "dispatch_implementor",
+          "action_priority": "high",
+          "command_template": "apm2 fac review findings --pr {pr_number} --json",
+          "guard_id": "DOC-G-007",
+          "guard_kind": "gate_failure_signal",
+          "guard_predicate": "facts.has_gate_failure_signal",
+          "priority": 7,
+          "reason_template": "evidence gate failure requires implementor remediation before review can continue",
+          "requirement_refs": [
+            "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"
+          ],
+          "state": "dispatch_failed_gates"
+        },
+        {
+          "action": "dispatch_implementor",
+          "action_priority": "high",
+          "command_template": "apm2 fac review findings --pr {pr_number} --json",
+          "guard_id": "DOC-G-008",
+          "guard_kind": "implementor_remediation_resolved",
+          "guard_predicate": "facts.requires_implementor_remediation && facts.all_verdicts_resolved",
+          "priority": 8,
+          "reason_template": "review findings require implementor remediation",
+          "requirement_refs": [
+            "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"
+          ],
+          "state": "dispatch_implementor"
+        },
+        {
+          "action": "wait",
+          "action_priority": "medium",
+          "command_template": "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+          "guard_id": "DOC-G-009",
+          "guard_kind": "pending_verdict_with_gate_in_flight",
+          "guard_predicate": "facts.has_pending_verdict && facts.gate_progress_state == in_flight",
+          "priority": 9,
+          "reason_template": "FAC gates are still in progress; reviewer restart is deferred",
+          "requirement_refs": [
+            "DR-002-RUNNING_GATE_SUPPRESSES_RESTART"
+          ],
+          "state": "wait_for_gates"
+        },
+        {
+          "action": "restart_reviews",
+          "action_priority": "high",
+          "command_template": "apm2 fac restart --pr {pr_number} --force --refresh-identity",
+          "guard_id": "DOC-G-010",
+          "guard_kind": "all_active_idle",
+          "guard_predicate": "facts.all_active_idle",
+          "priority": 10,
+          "reason_template": "all active reviewer agents are idle",
+          "requirement_refs": [],
+          "state": "restart_idle_reviewers"
+        },
+        {
+          "action": "restart_reviews",
+          "action_priority": "high",
+          "command_template": "apm2 fac restart --pr {pr_number} --refresh-identity",
+          "guard_id": "DOC-G-011",
+          "guard_kind": "pending_no_active",
+          "guard_predicate": "facts.active_agents == 0 && facts.has_pending_verdict",
+          "priority": 11,
+          "reason_template": "no active reviewer agents and verdict remains pending",
+          "requirement_refs": [],
+          "state": "restart_pending_no_active_reviewers"
+        },
+        {
+          "action": "escalate",
+          "action_priority": "high",
+          "command_template": "apm2 fac doctor --pr {pr_number} --json",
+          "guard_id": "DOC-G-012",
+          "guard_kind": "lifecycle_escalation",
+          "guard_predicate": "facts.lifecycle_escalation",
+          "priority": 12,
+          "reason_template": "lifecycle retry/error budget exhausted",
+          "requirement_refs": [],
+          "state": "escalate_lifecycle_budget"
+        },
+        {
+          "action": "wait",
+          "action_priority": "low",
+          "command_template": "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+          "guard_id": "DOC-G-013",
+          "guard_kind": "default",
+          "guard_predicate": "default",
+          "priority": 13,
+          "reason_template": "reviews and findings are still in progress",
+          "requirement_refs": [],
+          "state": "wait"
+        }
+      ],
+      "indexes": {
+        "doctor_decision_rules_by_guard_id": {
+          "DOC-G-001": {
+            "guard_kind": "has_integrity_or_corruption",
+            "guard_predicate": "facts.has_integrity_or_corruption",
+            "priority": 1,
+            "recommended_action": "fix",
+            "requirement_refs": [],
+            "state": "fix"
+          },
+          "DOC-G-002": {
+            "guard_kind": "lifecycle_merged",
+            "guard_predicate": "facts.lifecycle_merged",
+            "priority": 2,
+            "recommended_action": "done",
+            "requirement_refs": [],
+            "state": "done"
+          },
+          "DOC-G-003": {
+            "guard_kind": "merge_ready",
+            "guard_predicate": "facts.merge_ready",
+            "priority": 3,
+            "recommended_action": "merge",
+            "requirement_refs": [
+              "DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY"
+            ],
+            "state": "merge"
+          },
+          "DOC-G-004": {
+            "guard_kind": "sha_freshness_stale",
+            "guard_predicate": "facts.sha_freshness_source == stale && !facts.has_gate_failure_signal",
+            "priority": 4,
+            "recommended_action": "restart_reviews",
+            "requirement_refs": [],
+            "state": "restart_stale_identity"
+          },
+          "DOC-G-005": {
+            "guard_kind": "approve_eligible",
+            "guard_predicate": "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts && !facts.has_gate_failure_signal",
+            "priority": 5,
+            "recommended_action": "approve",
+            "requirement_refs": [
+              "DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY"
+            ],
+            "state": "approve"
+          },
+          "DOC-G-006": {
+            "guard_kind": "merge_conflicts_present",
+            "guard_predicate": "facts.merge_conflict_status == has_conflicts",
+            "priority": 6,
+            "recommended_action": "dispatch_implementor",
+            "requirement_refs": [
+              "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"
+            ],
+            "state": "dispatch_merge_conflicts"
+          },
+          "DOC-G-007": {
+            "guard_kind": "gate_failure_signal",
+            "guard_predicate": "facts.has_gate_failure_signal",
+            "priority": 7,
+            "recommended_action": "dispatch_implementor",
+            "requirement_refs": [
+              "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"
+            ],
+            "state": "dispatch_failed_gates"
+          },
+          "DOC-G-008": {
+            "guard_kind": "implementor_remediation_resolved",
+            "guard_predicate": "facts.requires_implementor_remediation && facts.all_verdicts_resolved",
+            "priority": 8,
+            "recommended_action": "dispatch_implementor",
+            "requirement_refs": [
+              "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"
+            ],
+            "state": "dispatch_implementor"
+          },
+          "DOC-G-009": {
+            "guard_kind": "pending_verdict_with_gate_in_flight",
+            "guard_predicate": "facts.has_pending_verdict && facts.gate_progress_state == in_flight",
+            "priority": 9,
+            "recommended_action": "wait",
+            "requirement_refs": [
+              "DR-002-RUNNING_GATE_SUPPRESSES_RESTART"
+            ],
+            "state": "wait_for_gates"
+          },
+          "DOC-G-010": {
+            "guard_kind": "all_active_idle",
+            "guard_predicate": "facts.all_active_idle",
+            "priority": 10,
+            "recommended_action": "restart_reviews",
+            "requirement_refs": [],
+            "state": "restart_idle_reviewers"
+          },
+          "DOC-G-011": {
+            "guard_kind": "pending_no_active",
+            "guard_predicate": "facts.active_agents == 0 && facts.has_pending_verdict",
+            "priority": 11,
+            "recommended_action": "restart_reviews",
+            "requirement_refs": [],
+            "state": "restart_pending_no_active_reviewers"
+          },
+          "DOC-G-012": {
+            "guard_kind": "lifecycle_escalation",
+            "guard_predicate": "facts.lifecycle_escalation",
+            "priority": 12,
+            "recommended_action": "escalate",
+            "requirement_refs": [],
+            "state": "escalate_lifecycle_budget"
+          },
+          "DOC-G-013": {
+            "guard_kind": "default",
+            "guard_predicate": "default",
+            "priority": 13,
+            "recommended_action": "wait",
+            "requirement_refs": [],
+            "state": "wait"
+          }
+        },
+        "doctor_recommendations_by_state": {
+          "approve": {
+            "action": "approve",
+            "command_template": "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+            "priority": "low"
+          },
+          "dispatch_failed_gates": {
+            "action": "dispatch_implementor",
+            "command_template": "apm2 fac review findings --pr {pr_number} --json",
+            "priority": "high"
+          },
+          "dispatch_implementor": {
+            "action": "dispatch_implementor",
+            "command_template": "apm2 fac review findings --pr {pr_number} --json",
+            "priority": "high"
+          },
+          "dispatch_merge_conflicts": {
+            "action": "dispatch_implementor",
+            "command_template": "apm2 fac review findings --pr {pr_number} --json",
+            "priority": "high"
+          },
+          "done": {
+            "action": "done",
+            "command_template": null,
+            "priority": "low"
+          },
+          "escalate_lifecycle_budget": {
+            "action": "escalate",
+            "command_template": "apm2 fac doctor --pr {pr_number} --json",
+            "priority": "high"
+          },
+          "fix": {
+            "action": "fix",
+            "command_template": "apm2 fac doctor --pr {pr_number} --fix",
+            "priority": "high"
+          },
+          "merge": {
+            "action": "merge",
+            "command_template": null,
+            "priority": "medium"
+          },
+          "restart_idle_reviewers": {
+            "action": "restart_reviews",
+            "command_template": "apm2 fac restart --pr {pr_number} --force --refresh-identity",
+            "priority": "high"
+          },
+          "restart_pending_no_active_reviewers": {
+            "action": "restart_reviews",
+            "command_template": "apm2 fac restart --pr {pr_number} --refresh-identity",
+            "priority": "high"
+          },
+          "restart_stale_identity": {
+            "action": "restart_reviews",
+            "command_template": "apm2 fac restart --pr {pr_number} --force --refresh-identity",
+            "priority": "high"
+          },
+          "wait": {
+            "action": "wait",
+            "command_template": "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+            "priority": "low"
+          },
+          "wait_for_gates": {
+            "action": "wait",
+            "command_template": "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+            "priority": "medium"
+          }
+        },
+        "doctor_wait_rules_by_guard_id": {
+          "WAIT-G-001": {
+            "from": "evaluate",
+            "guard_kind": "recommended_action_in_exit_set",
+            "guard_predicate": "facts.recommended_action in effective_exit_actions",
+            "priority": 1,
+            "requirement_refs": [
+              "DR-005-WAIT_RETURNS_ON_TERMINAL_ACTION"
+            ],
+            "to": "exit_on_recommended_action"
+          },
+          "WAIT-G-002": {
+            "from": "evaluate",
+            "guard_kind": "interrupted",
+            "guard_predicate": "facts.interrupted",
+            "priority": 2,
+            "requirement_refs": [],
+            "to": "exit_on_interrupt"
+          },
+          "WAIT-G-003": {
+            "from": "evaluate",
+            "guard_kind": "timed_out",
+            "guard_predicate": "facts.elapsed_seconds >= facts.wait_timeout_seconds",
+            "priority": 3,
+            "requirement_refs": [],
+            "to": "exit_on_timeout"
+          },
+          "WAIT-G-004": {
+            "from": "evaluate",
+            "guard_kind": "always",
+            "guard_predicate": "default",
+            "priority": 4,
+            "requirement_refs": [],
+            "to": "poll_emit"
+          },
+          "WAIT-G-005": {
+            "from": "poll_emit",
+            "guard_kind": "always",
+            "guard_predicate": "always",
+            "priority": 5,
+            "requirement_refs": [],
+            "to": "sleep"
+          },
+          "WAIT-G-006": {
+            "from": "sleep",
+            "guard_kind": "always",
+            "guard_predicate": "always",
+            "priority": 6,
+            "requirement_refs": [],
+            "to": "collect_summary"
+          },
+          "WAIT-G-007": {
+            "from": "collect_summary",
+            "guard_kind": "always",
+            "guard_predicate": "always",
+            "priority": 7,
+            "requirement_refs": [],
+            "to": "evaluate"
+          }
+        },
+        "gate_progress_rules_by_guard_id": {
+          "GATE-G-001": {
+            "guard_kind": "any_failed",
+            "guard_predicate": "lifecycle.state == gates_failed || any(gate.status == FAIL)",
+            "priority": 1,
+            "state": "terminal_failed"
+          },
+          "GATE-G-002": {
+            "guard_kind": "lifecycle_gates_running_or_any_in_flight",
+            "guard_predicate": "lifecycle.state == gates_running || any(gate.status in {RUNNING,NOT_RUN})",
+            "priority": 2,
+            "state": "in_flight"
+          },
+          "GATE-G-003": {
+            "guard_kind": "any_passed",
+            "guard_predicate": "any(gate.status == PASS)",
+            "priority": 3,
+            "state": "terminal_passed"
+          },
+          "GATE-G-004": {
+            "guard_kind": "default",
+            "guard_predicate": "default",
+            "priority": 4,
+            "state": "unknown"
+          }
+        },
+        "gate_reduction_rules_by_guard_id": {
+          "GATE-R-001": {
+            "decision": "replace_incoming",
+            "guard_kind": "incoming_signal_higher",
+            "guard_predicate": "incoming.signal_priority > existing.signal_priority",
+            "priority": 1
+          },
+          "GATE-R-002": {
+            "decision": "keep_existing",
+            "guard_kind": "existing_signal_higher",
+            "guard_predicate": "incoming.signal_priority < existing.signal_priority",
+            "priority": 2
+          },
+          "GATE-R-003": {
+            "decision": "replace_incoming",
+            "guard_kind": "same_signal_incoming_source_higher",
+            "guard_predicate": "incoming.signal_priority == existing.signal_priority && incoming.source_priority > existing.source_priority",
+            "priority": 3
+          },
+          "GATE-R-004": {
+            "decision": "replace_incoming",
+            "guard_kind": "same_signal_incoming_timestamp_newer",
+            "guard_predicate": "incoming.signal_priority == existing.signal_priority && incoming.completed_at > existing.completed_at",
+            "priority": 4
+          },
+          "GATE-R-005": {
+            "decision": "keep_existing",
+            "guard_kind": "default",
+            "guard_predicate": "default",
+            "priority": 5
+          }
+        },
+        "gates_wait_transitions_by_guard_id": {
+          "GW-WAIT-001": {
+            "from": "evaluate_timeout",
+            "guard_id": "GW-WAIT-001",
+            "guard_kind": "timed_out",
+            "guard_predicate": "facts.timed_out",
+            "priority": 3,
+            "to": "exit_timeout"
+          },
+          "GW-WAIT-002": {
+            "from": "evaluate_timeout",
+            "guard_id": "GW-WAIT-002",
+            "guard_kind": "always",
+            "guard_predicate": "default",
+            "priority": 4,
+            "to": "evaluate_queue_mode"
+          },
+          "GW-WAIT-003": {
+            "from": "check_receipt",
+            "guard_id": "GW-WAIT-003",
+            "guard_kind": "receipt_found",
+            "guard_predicate": "facts.receipt_found",
+            "priority": 1,
+            "to": "exit_with_receipt"
+          },
+          "GW-WAIT-004": {
+            "from": "check_receipt",
+            "guard_id": "GW-WAIT-004",
+            "guard_kind": "always",
+            "guard_predicate": "default",
+            "priority": 2,
+            "to": "evaluate_timeout"
+          },
+          "GW-WAIT-005": {
+            "from": "evaluate_queue_mode",
+            "guard_id": "GW-WAIT-005",
+            "guard_kind": "inline_fallback_allowed",
+            "guard_predicate": "facts.queue_mode == inline_single_job && facts.allow_inline_fallback",
+            "priority": 5,
+            "to": "run_inline_worker"
+          },
+          "GW-WAIT-006": {
+            "from": "evaluate_queue_mode",
+            "guard_id": "GW-WAIT-006",
+            "guard_kind": "always",
+            "guard_predicate": "default",
+            "priority": 6,
+            "to": "sleep"
+          },
+          "GW-WAIT-007": {
+            "from": "run_inline_worker",
+            "guard_id": "GW-WAIT-007",
+            "guard_kind": "always",
+            "guard_predicate": "always",
+            "priority": 7,
+            "to": "check_receipt"
+          },
+          "GW-WAIT-008": {
+            "from": "sleep",
+            "guard_id": "GW-WAIT-008",
+            "guard_kind": "always",
+            "guard_predicate": "always",
+            "priority": 8,
+            "to": "check_receipt"
+          }
+        },
+        "lifecycle_transitions_by_id": {
+          "LC-T-001": {
+            "event": "push_observed",
+            "from": "untracked|pushed|gates_running|gates_passed|gates_failed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|merge_ready|merged|stuck|stale|recovering",
+            "guard_predicate": "state.pr_state != quarantined",
+            "requirement_refs": [],
+            "to": "pushed"
+          },
+          "LC-T-002": {
+            "event": "gates_started",
+            "from": "pushed|gates_failed|recovering",
+            "guard_predicate": "state.pr_state in {pushed, gates_failed, recovering}",
+            "requirement_refs": [],
+            "to": "gates_running"
+          },
+          "LC-T-003": {
+            "event": "gates_passed",
+            "from": "gates_running",
+            "guard_predicate": "state.pr_state == gates_running",
+            "requirement_refs": [],
+            "to": "gates_passed"
+          },
+          "LC-T-004": {
+            "event": "gates_failed",
+            "from": "gates_running",
+            "guard_predicate": "state.pr_state == gates_running",
+            "requirement_refs": [],
+            "to": "gates_failed"
+          },
+          "LC-T-005": {
+            "event": "reviews_dispatched",
+            "from": "gates_passed|reviews_dispatched|review_in_progress|verdict_pending",
+            "guard_predicate": "state.pr_state in {gates_passed, reviews_dispatched, review_in_progress, verdict_pending}",
+            "requirement_refs": [],
+            "to": "reviews_dispatched"
+          },
+          "LC-T-006": {
+            "event": "reviewer_spawned",
+            "from": "reviews_dispatched|review_in_progress|verdict_pending",
+            "guard_predicate": "state.pr_state in {reviews_dispatched, review_in_progress, verdict_pending}",
+            "requirement_refs": [],
+            "to": "review_in_progress"
+          },
+          "LC-T-007": {
+            "event": "verdict_set",
+            "from": "gates_passed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|merge_ready|stuck",
+            "guard_predicate": "normalized_decision == deny || any(state.verdicts.values == deny)",
+            "requirement_refs": [],
+            "to": "verdict_deny"
+          },
+          "LC-T-008": {
+            "event": "verdict_set",
+            "from": "gates_passed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|merge_ready|stuck",
+            "guard_predicate": "normalized_decision == approve && state.verdicts.security == approve && state.verdicts.code_quality == approve && no(state.verdicts.values == deny)",
+            "requirement_refs": [],
+            "to": "merge_ready"
+          },
+          "LC-T-009": {
+            "event": "verdict_set",
+            "from": "gates_passed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|merge_ready|stuck",
+            "guard_predicate": "normalized_decision == approve && !all_required_verdicts_approve && no(state.verdicts.values == deny)",
+            "requirement_refs": [],
+            "to": "verdict_pending"
+          },
+          "LC-T-010": {
+            "event": "verdict_auto_derived",
+            "from": "*",
+            "guard_predicate": "dimension/decision normalize successfully",
+            "requirement_refs": [],
+            "to": "self"
+          },
+          "LC-T-011": {
+            "event": "merge_failed",
+            "from": "merge_ready|verdict_approve|verdict_pending|stuck",
+            "guard_predicate": "state.pr_state in {merge_ready, verdict_approve, verdict_pending, stuck}",
+            "requirement_refs": [],
+            "to": "stuck"
+          },
+          "LC-T-012": {
+            "event": "merged",
+            "from": "merge_ready|merged",
+            "guard_predicate": "state.pr_state in {merge_ready, merged}",
+            "requirement_refs": [],
+            "to": "merged"
+          },
+          "LC-T-013": {
+            "event": "agent_crashed",
+            "from": "*",
+            "guard_predicate": "always",
+            "requirement_refs": [],
+            "to": "stuck"
+          },
+          "LC-T-014": {
+            "event": "sha_drift_detected",
+            "from": "*",
+            "guard_predicate": "always",
+            "requirement_refs": [],
+            "to": "stale"
+          },
+          "LC-T-015": {
+            "event": "recover_requested",
+            "from": "stale|stuck|quarantined",
+            "guard_predicate": "state.pr_state in {stale, stuck, quarantined}",
+            "requirement_refs": [],
+            "to": "recovering"
+          },
+          "LC-T-016": {
+            "event": "recover_completed",
+            "from": "recovering",
+            "guard_predicate": "state.pr_state == recovering",
+            "requirement_refs": [],
+            "to": "pushed"
+          },
+          "LC-T-017": {
+            "event": "quarantined",
+            "from": "*",
+            "guard_predicate": "always",
+            "requirement_refs": [],
+            "to": "quarantined"
+          },
+          "LC-T-018": {
+            "event": "projection_failed",
+            "from": "*",
+            "guard_predicate": "always",
+            "requirement_refs": [],
+            "to": "self"
+          }
+        }
+      },
+      "integrity_checks": {
+        "doctor_decision_guard_ids_unique": true,
+        "doctor_decision_priorities_strict": true,
+        "gate_progress_guard_ids_unique": true,
+        "gate_progress_priorities_strict": true,
+        "gate_reduction_guard_ids_unique": true,
+        "gate_reduction_priorities_strict": true,
+        "gates_wait_guard_ids_unique": true,
+        "gates_wait_priorities_strict": true,
+        "lifecycle_transition_ids_unique": true,
+        "recommendation_states_unique": true,
+        "reviewer_missing_verdict_guard_ids_unique": true,
+        "reviewer_missing_verdict_priorities_strict": true,
+        "wait_guard_ids_unique": true,
+        "wait_priorities_strict": true
+      },
+      "requirement_coverage": [
+        {
+          "artifact_evidence_refs": [],
+          "coverage_mode": "rule_linked",
+          "covered": true,
+          "implemented_by": [
+            "DoctorDecisionState::DispatchMergeConflicts",
+            "DoctorDecisionState::DispatchFailedGates",
+            "DoctorDecisionState::DispatchImplementor"
+          ],
+          "in_machine_traceability": true,
+          "in_ticket_scope": true,
+          "regression_tests": [
+            "test_build_recommended_action_dispatches_implementor_on_failed_gates_with_pending_verdicts",
+            "test_build_recommended_action_dispatches_implementor_when_lifecycle_reports_gates_failed",
+            "test_build_recommended_action_dispatches_implementor_when_push_attempt_failed_gate_stage",
+            "test_build_recommended_action_gate_failure_overrides_stale_identity_restart",
+            "upsert_doctor_gate_snapshot_prefers_failed_over_inflight",
+            "derive_doctor_gate_progress_state_treats_lifecycle_gates_failed_as_terminal_failed",
+            "test_build_recommended_action_dispatch_implementor_has_command"
+          ],
+          "requirement_id": "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR",
+          "rule_links": [
+            "doctor_decision_rules:DOC-G-006",
+            "doctor_decision_rules:DOC-G-007",
+            "doctor_decision_rules:DOC-G-008"
+          ]
+        },
+        {
+          "artifact_evidence_refs": [],
+          "coverage_mode": "rule_linked",
+          "covered": true,
+          "implemented_by": [
+            "derive_doctor_gate_progress_state",
+            "DoctorDecisionState::WaitForGates"
+          ],
+          "in_machine_traceability": true,
+          "in_ticket_scope": true,
+          "regression_tests": [
+            "test_build_recommended_action_waits_when_gate_status_is_running_without_active_reviewers",
+            "test_build_recommended_action_waits_when_gate_status_is_running_with_idle_reviewers",
+            "parse_pr_body_gate_status_for_sha_extracts_current_sha_snapshot"
+          ],
+          "requirement_id": "DR-002-RUNNING_GATE_SUPPRESSES_RESTART",
+          "rule_links": [
+            "doctor_decision_rules:DOC-G-009"
+          ]
+        },
+        {
+          "artifact_evidence_refs": [],
+          "coverage_mode": "rule_linked",
+          "covered": true,
+          "implemented_by": [
+            "build_doctor_merge_readiness",
+            "DoctorDecisionState::Merge",
+            "DoctorDecisionState::Approve"
+          ],
+          "in_machine_traceability": true,
+          "in_ticket_scope": true,
+          "regression_tests": [
+            "test_build_doctor_merge_readiness_requires_terminal_passed_gates"
+          ],
+          "requirement_id": "DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY",
+          "rule_links": [
+            "doctor_decision_rules:DOC-G-003",
+            "doctor_decision_rules:DOC-G-005"
+          ]
+        },
+        {
+          "artifact_evidence_refs": [],
+          "coverage_mode": "traceability_entry_only",
+          "covered": true,
+          "implemented_by": [
+            "DOCTOR_DECISION_RULES",
+            "DOCTOR_GATE_PROGRESS_RULES",
+            "DOCTOR_RECOMMENDATION_RULES"
+          ],
+          "in_machine_traceability": true,
+          "in_ticket_scope": true,
+          "regression_tests": [
+            "doctor_decision_rules_are_unique_and_strictly_ordered",
+            "doctor_gate_progress_rules_are_unique_and_strictly_ordered",
+            "doctor_recommendation_rules_cover_all_decision_states"
+          ],
+          "requirement_id": "DR-004-DOCTOR_RULE_ORDER_IS_STRICT",
+          "rule_links": []
+        },
+        {
+          "artifact_evidence_refs": [],
+          "coverage_mode": "rule_linked",
+          "covered": true,
+          "implemented_by": [
+            "DOCTOR_WAIT_TRANSITION_RULES",
+            "DOCTOR_ACTION_POLICIES",
+            "derive_doctor_wait_next_state"
+          ],
+          "in_machine_traceability": true,
+          "in_ticket_scope": true,
+          "regression_tests": [
+            "doctor_wait_transition_rules_are_unique_and_strictly_ordered",
+            "doctor_wait_machine_exits_immediately_on_dispatch_implementor",
+            "doctor_wait_machine_prioritizes_terminal_action_over_interrupt",
+            "doctor_wait_machine_exits_on_interrupt_when_action_is_not_terminal",
+            "doctor_wait_machine_exits_on_timeout_when_not_interrupted"
+          ],
+          "requirement_id": "DR-005-WAIT_RETURNS_ON_TERMINAL_ACTION",
+          "rule_links": [
+            "doctor_wait_rules:WAIT-G-001"
+          ]
+        },
+        {
+          "artifact_evidence_refs": [
+            "documents/reviews/fac_review_state_machine.cac.json",
+            "crates/apm2-cli/src/commands/fac_review/mod.rs"
+          ],
+          "coverage_mode": "artifact_level",
+          "covered": true,
+          "implemented_by": [],
+          "in_machine_traceability": false,
+          "in_ticket_scope": true,
+          "regression_tests": [],
+          "requirement_id": "DR-006-EVERGREEN_CAC_STATE_MACHINE_SOURCE",
+          "rule_links": []
+        },
+        {
+          "artifact_evidence_refs": [
+            "crates/apm2-cli/src/commands/fac_review/mod.rs",
+            "crates/apm2-cli/src/commands/fac.rs"
+          ],
+          "coverage_mode": "artifact_level",
+          "covered": true,
+          "implemented_by": [],
+          "in_machine_traceability": false,
+          "in_ticket_scope": true,
+          "regression_tests": [],
+          "requirement_id": "DR-007-CLI_EXIT_ON_ACTION_SET_IS_CANONICAL",
+          "rule_links": []
+        },
+        {
+          "artifact_evidence_refs": [
+            "documents/reviews/fac_review_state_machine.cac.json"
+          ],
+          "coverage_mode": "artifact_level",
+          "covered": true,
+          "implemented_by": [],
+          "in_machine_traceability": false,
+          "in_ticket_scope": true,
+          "regression_tests": [],
+          "requirement_id": "DR-008-MACHINE_VERIFIABLE_ARTIFACTS",
+          "rule_links": []
+        }
+      ],
+      "schema": "apm2.fac.review.machine_traceability.v1",
+      "ticket_requirement_ids": [
+        "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR",
+        "DR-002-RUNNING_GATE_SUPPRESSES_RESTART",
+        "DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY",
+        "DR-004-DOCTOR_RULE_ORDER_IS_STRICT",
+        "DR-005-WAIT_RETURNS_ON_TERMINAL_ACTION",
+        "DR-006-EVERGREEN_CAC_STATE_MACHINE_SOURCE",
+        "DR-007-CLI_EXIT_ON_ACTION_SET_IS_CANONICAL",
+        "DR-008-MACHINE_VERIFIABLE_ARTIFACTS"
+      ],
+      "wait_action_policy": {
+        "by_action": {
+          "approve": {
+            "allow_exit_on_flag": true,
+            "default_wait_exit": true,
+            "wait_terminal_reason": "merge_ready"
+          },
+          "dispatch_implementor": {
+            "allow_exit_on_flag": true,
+            "default_wait_exit": true,
+            "wait_terminal_reason": "dispatch_implementor"
+          },
+          "done": {
+            "allow_exit_on_flag": true,
+            "default_wait_exit": true,
+            "wait_terminal_reason": "done"
+          },
+          "escalate": {
+            "allow_exit_on_flag": true,
+            "default_wait_exit": true,
+            "wait_terminal_reason": "escalate"
+          },
+          "fix": {
+            "allow_exit_on_flag": true,
+            "default_wait_exit": true,
+            "wait_terminal_reason": "fix"
+          },
+          "merge": {
+            "allow_exit_on_flag": true,
+            "default_wait_exit": true,
+            "wait_terminal_reason": "merge_ready"
+          },
+          "restart_reviews": {
+            "allow_exit_on_flag": true,
+            "default_wait_exit": true,
+            "wait_terminal_reason": "restart_reviews"
+          },
+          "wait": {
+            "allow_exit_on_flag": false,
+            "default_wait_exit": false,
+            "wait_terminal_reason": "non_terminal_wait"
+          }
+        },
+        "default_exit_actions": [
+          "approve",
+          "dispatch_implementor",
+          "done",
+          "escalate",
+          "fix",
+          "merge",
+          "restart_reviews"
+        ],
+        "supported_exit_actions": [
+          "fix",
+          "escalate",
+          "merge",
+          "dispatch_implementor",
+          "restart_reviews",
+          "done",
+          "approve"
+        ]
+      }
+    },
+    "requirements_traceability": [
+      {
+        "implemented_by": [
+          "DoctorDecisionState::DispatchMergeConflicts",
+          "DoctorDecisionState::DispatchFailedGates",
+          "DoctorDecisionState::DispatchImplementor"
+        ],
+        "regression_tests": [
+          "test_build_recommended_action_dispatches_implementor_on_failed_gates_with_pending_verdicts",
+          "test_build_recommended_action_dispatches_implementor_when_lifecycle_reports_gates_failed",
+          "test_build_recommended_action_dispatches_implementor_when_push_attempt_failed_gate_stage",
+          "test_build_recommended_action_gate_failure_overrides_stale_identity_restart",
+          "upsert_doctor_gate_snapshot_prefers_failed_over_inflight",
+          "derive_doctor_gate_progress_state_treats_lifecycle_gates_failed_as_terminal_failed",
+          "test_build_recommended_action_dispatch_implementor_has_command"
+        ],
+        "requirement_id": "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"
+      },
+      {
+        "implemented_by": [
+          "derive_doctor_gate_progress_state",
+          "DoctorDecisionState::WaitForGates"
+        ],
+        "regression_tests": [
+          "test_build_recommended_action_waits_when_gate_status_is_running_without_active_reviewers",
+          "test_build_recommended_action_waits_when_gate_status_is_running_with_idle_reviewers",
+          "parse_pr_body_gate_status_for_sha_extracts_current_sha_snapshot"
+        ],
+        "requirement_id": "DR-002-RUNNING_GATE_SUPPRESSES_RESTART"
+      },
+      {
+        "implemented_by": [
+          "build_doctor_merge_readiness",
+          "DoctorDecisionState::Merge",
+          "DoctorDecisionState::Approve"
+        ],
+        "regression_tests": [
+          "test_build_doctor_merge_readiness_requires_terminal_passed_gates"
+        ],
+        "requirement_id": "DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY"
+      },
+      {
+        "implemented_by": [
+          "DOCTOR_DECISION_RULES",
+          "DOCTOR_GATE_PROGRESS_RULES",
+          "DOCTOR_RECOMMENDATION_RULES"
+        ],
+        "regression_tests": [
+          "doctor_decision_rules_are_unique_and_strictly_ordered",
+          "doctor_gate_progress_rules_are_unique_and_strictly_ordered",
+          "doctor_recommendation_rules_cover_all_decision_states"
+        ],
+        "requirement_id": "DR-004-DOCTOR_RULE_ORDER_IS_STRICT"
+      },
+      {
+        "implemented_by": [
+          "DOCTOR_WAIT_TRANSITION_RULES",
+          "DOCTOR_ACTION_POLICIES",
+          "derive_doctor_wait_next_state"
+        ],
+        "regression_tests": [
+          "doctor_wait_transition_rules_are_unique_and_strictly_ordered",
+          "doctor_wait_machine_exits_immediately_on_dispatch_implementor",
+          "doctor_wait_machine_prioritizes_terminal_action_over_interrupt",
+          "doctor_wait_machine_exits_on_interrupt_when_action_is_not_terminal",
+          "doctor_wait_machine_exits_on_timeout_when_not_interrupted"
+        ],
+        "requirement_id": "DR-005-WAIT_RETURNS_ON_TERMINAL_ACTION"
+      }
+    ],
+    "reviewer_missing_verdict_machine": {
+      "default_state": "retry_invalid_completion",
+      "evaluation": "priority_order_first_match",
+      "rules": [
+        {
+          "guard_id": "RVMV-G-001",
+          "guard_kind": "nudge_eligible",
+          "guard_predicate": "facts.nudge_count < max_missing_verdict_nudges && facts.restart_count < max_restart_attempts && !facts.nudge_disabled",
+          "priority": 1,
+          "state": "nudge_resume"
+        },
+        {
+          "guard_id": "RVMV-G-002",
+          "guard_kind": "comment_permission_denied",
+          "guard_predicate": "facts.comment_permission_denied",
+          "priority": 2,
+          "state": "crash_permission_denied"
+        },
+        {
+          "guard_id": "RVMV-G-003",
+          "guard_kind": "default",
+          "guard_predicate": "default",
+          "priority": 3,
+          "state": "retry_invalid_completion"
+        }
+      ],
+      "schema": "apm2.fac.review.reviewer_missing_verdict_machine.v1",
+      "states": [
+        "nudge_resume",
+        "crash_permission_denied",
+        "retry_invalid_completion"
+      ]
+    },
+    "schema": "apm2.fac.review.machine_bundle.v1"
+  },
+  "schema": "apm2.fac.review.machine_bundle.cac.v1",
+  "schema_version": "1.0.0"
+}

@@ -1,0 +1,43 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: TCK-00654
+    title: 'RFC-0032: CLI `--wait` integration using pulse subscriptions (SubscribePulse/WaitForPulse) for work doctor flows'
+    status: OPEN
+  binds:
+    prd_id: PRD-PLACEHOLDER
+    rfc_id: RFC-0032
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_CLI
+    - DOMAIN_PROTOCOL
+    - DOMAIN_OBSERVABILITY
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00653
+      reason: Requires pulse publisher correctness
+    - ticket_id: TCK-00644
+      reason: Doctor outputs must update on relevant events
+  scope:
+    in_scope:
+    - Add operator client support for SubscribePulse and WaitForPulse (or the existing equivalent) in CLI
+    - Update `apm2 fac doctor` and/or `apm2 work doctor` so `--wait` subscribes to `work.<work_id>.>` topics and reruns evaluation on pulse arrival
+    - Remove polling as default wait mechanism in doctor flows (pulse-driven waits become default when available)
+    out_of_scope:
+    - Designing new UI/TTY interactions beyond basic wait semantics
+  plan:
+    steps:
+    - 'Audit existing runtime proto: SubscribePulse exists; add WaitForPulse if missing or wire existing wait message'
+    - 'Implement CLI subscription lifecycle: subscribe, await pulses, handle reconnect/backoff'
+    - 'Integrate with doctor evaluation loop: on pulse, re-run doctor and print structured output'
+    - 'Add tests: simulated pulse triggers doctor reevaluation without polling'
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+    - '`--wait` uses pulses as the primary mechanism and does not rely on polling when pulse is available.'
+    - CLI subscription code handles disconnect/reconnect without duplicating work or leaking subscribers.
