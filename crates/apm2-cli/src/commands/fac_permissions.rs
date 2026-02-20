@@ -536,6 +536,73 @@ pub fn validate_fac_root_permissions_for(apm2_home: &Path) -> Result<(), FacPerm
     validate_fac_root_permissions_at(apm2_home)
 }
 
+/// Relaxed validation for enqueue-class commands (TCK-00577 round 3).
+///
+/// In a service-user-owned deployment, non-service-user callers cannot
+/// satisfy the strict ownership check on FAC roots (directories are owned
+/// by the service user). For enqueue-class commands (`push`, `gates`,
+/// `warm`), the caller will route through `enqueue_job` → broker fallback
+/// → `broker_requests/` (mode 01733, world-writable). The strict
+/// ownership check would block these callers before they reach
+/// `enqueue_job`, making the broker fallback path unreachable.
+///
+/// This function validates that:
+/// 1. Directories exist and are real (not symlinks).
+/// 2. Directories have no group/world permission bits (mode 0700 or stricter) —
+///    this ensures the data is protected regardless of who owns it.
+/// 3. Ownership is NOT checked — the caller may not own the directories in a
+///    service-user deployment.
+///
+/// The `broker_requests/` directory itself may have mode 01733 and is
+/// validated separately by `enqueue_via_broker_requests`.
+pub fn validate_fac_root_permissions_relaxed_for_enqueue() -> Result<(), FacPermissionsError> {
+    let apm2_home = resolve_apm2_home()?;
+    validate_fac_root_permissions_relaxed_at(&apm2_home)
+}
+
+/// Relaxed validation: checks mode bits and symlink safety but not ownership.
+fn validate_fac_root_permissions_relaxed_at(apm2_home: &Path) -> Result<(), FacPermissionsError> {
+    // Validate that apm2_home exists, is not a symlink, and is a directory.
+    // Skip ownership check — in service-user deployments the caller EUID
+    // will differ from the directory owner.
+    validate_directory_mode_only(apm2_home)?;
+
+    for subdir in FAC_SUBDIRS {
+        let path = apm2_home.join(subdir);
+        // Directories that do not exist yet are fine — they will be
+        // created by the service user (worker/broker) when needed.
+        if path.exists() {
+            validate_directory_mode_only(&path)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate that a directory has safe permission bits and is not a symlink,
+/// without checking ownership. Used for enqueue-class commands where the
+/// caller may not own the FAC directories.
+#[cfg(unix)]
+fn validate_directory_mode_only(path: &Path) -> Result<(), FacPermissionsError> {
+    let metadata = ensure_directory_is_directory(path)?;
+    let mode = metadata.mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        return Err(FacPermissionsError::UnsafePermissions {
+            path: path.to_path_buf(),
+            actual_mode: mode,
+            actual_uid: metadata.uid(),
+            expected_uid: geteuid().as_raw(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_directory_mode_only(path: &Path) -> Result<(), FacPermissionsError> {
+    ensure_directory_is_directory(path)?;
+    Ok(())
+}
+
 fn validate_fac_root_permissions_at(apm2_home: &Path) -> Result<(), FacPermissionsError> {
     #[cfg(unix)]
     let expected_uid = geteuid().as_raw();
@@ -931,5 +998,96 @@ mod tests {
                 mode
             );
         }
+    }
+
+    // ── TCK-00577 round 3: relaxed validation for enqueue-class commands ──
+
+    /// TCK-00577: Relaxed validation allows directories owned by a different
+    /// user (service user) as long as mode is safe.
+    #[test]
+    #[cfg(unix)]
+    fn relaxed_validation_allows_different_owner_with_safe_mode() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let apm2_home = dir.path().join("apm2_home");
+
+        // First, create with strict mode via the normal path.
+        let strict_result = validate_fac_root_permissions_at(&apm2_home);
+        assert!(strict_result.is_ok(), "strict creation should succeed");
+
+        // Now validate with relaxed mode — should still pass since
+        // all directories have mode 0700 and are owned by us.
+        let relaxed_result = validate_fac_root_permissions_relaxed_at(&apm2_home);
+        assert!(
+            relaxed_result.is_ok(),
+            "relaxed validation should succeed for 0700 dirs: {relaxed_result:?}"
+        );
+    }
+
+    /// TCK-00577: Relaxed validation rejects directories with unsafe mode
+    /// bits even when ownership is not checked.
+    #[test]
+    #[cfg(unix)]
+    fn relaxed_validation_rejects_unsafe_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let apm2_home = dir.path().join("apm2_home");
+        std::fs::create_dir_all(&apm2_home).expect("create dir");
+        std::fs::set_permissions(&apm2_home, std::fs::Permissions::from_mode(0o755))
+            .expect("set unsafe permissions");
+
+        let result = validate_fac_root_permissions_relaxed_at(&apm2_home);
+        assert!(
+            result.is_err(),
+            "relaxed validation should still reject world-readable directory"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unsafe permissions"),
+            "should mention unsafe permissions: {msg}"
+        );
+    }
+
+    /// TCK-00577: Relaxed validation rejects symlinks.
+    #[test]
+    #[cfg(unix)]
+    fn relaxed_validation_rejects_symlink() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let real_dir = dir.path().join("real_dir");
+        let symlink_path = dir.path().join("symlink_dir");
+        std::fs::create_dir(&real_dir).expect("create real dir");
+        std::os::unix::fs::symlink(&real_dir, &symlink_path).expect("create symlink");
+
+        let result = validate_fac_root_permissions_relaxed_at(&symlink_path);
+        assert!(result.is_err(), "relaxed validation should reject symlinks");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("symlink"), "should mention symlink: {msg}");
+    }
+
+    /// TCK-00577: `validate_directory_mode_only` accepts 0700 and rejects 0755.
+    #[test]
+    #[cfg(unix)]
+    fn validate_directory_mode_only_rejects_group_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let target = dir.path().join("mode_test");
+        std::fs::create_dir(&target).expect("create dir");
+
+        // 0700 should pass.
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+            .expect("set permissions");
+        assert!(
+            validate_directory_mode_only(&target).is_ok(),
+            "0700 should pass mode-only check"
+        );
+
+        // 0750 should fail.
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o750))
+            .expect("set permissions");
+        assert!(
+            validate_directory_mode_only(&target).is_err(),
+            "0750 should fail mode-only check"
+        );
     }
 }

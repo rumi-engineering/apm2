@@ -490,6 +490,77 @@ pub fn run_fac_worker(
         return exit_codes::GENERIC_ERROR;
     }
 
+    // TCK-00577 round 3: Validate that queue and receipt directories are
+    // owned by the configured FAC service user (not just the caller EUID).
+    // This wires the service-user ownership validator into the command
+    // execution path.
+    //
+    // Behavior:
+    // - ServiceUserNotResolved: the configured service user does not exist in
+    //   passwd. This means the deployment is not using the service-user model
+    //   (dev/test environment). Emit a warning and continue — the standard
+    //   EUID-based ownership check from validate_fac_root_permissions already
+    //   validated ownership.
+    // - OwnershipMismatch: the service user EXISTS but the directory is owned by
+    //   someone else. This is a hard failure (fail-closed).
+    // - Other errors (metadata, env, etc.): fail-closed.
+    {
+        use apm2_core::fac::service_user_gate::{
+            ServiceUserGateError, validate_directory_service_user_ownership,
+        };
+
+        // Directories that MUST be owned by the service user in production.
+        let service_user_dirs = [
+            queue_root.join(PENDING_DIR),
+            queue_root.join("claimed"),
+            queue_root.join("completed"),
+            queue_root.join("denied"),
+            queue_root.join("cancelled"),
+            queue_root.join(QUARANTINE_DIR),
+        ];
+        // Also validate the receipt store if it exists.
+        let receipt_dir = fac_root.join("receipts");
+
+        for dir in service_user_dirs
+            .iter()
+            .chain(std::iter::once(&receipt_dir))
+        {
+            if !dir.exists() {
+                continue;
+            }
+            match validate_directory_service_user_ownership(dir) {
+                Ok(()) => {},
+                Err(ServiceUserGateError::ServiceUserNotResolved {
+                    ref service_user,
+                    ref reason,
+                }) => {
+                    // Service user does not exist in passwd — not a
+                    // service-user deployment. Warn and continue.
+                    tracing::warn!(
+                        service_user = %service_user,
+                        reason = %reason,
+                        dir = %dir.display(),
+                        "TCK-00577: service user not resolvable, skipping ownership check \
+                         (standard EUID-based check already passed)"
+                    );
+                },
+                Err(e) => {
+                    // OwnershipMismatch or other hard errors: fail-closed.
+                    output_worker_error(
+                        json_output,
+                        &format!(
+                            "service user ownership check failed for {}: {e} \
+                             (fail-closed: worker will not start with incorrect \
+                              directory ownership)",
+                            dir.display()
+                        ),
+                    );
+                    return exit_codes::GENERIC_ERROR;
+                },
+            }
+        }
+    }
+
     // Load persistent signing key for stable broker identity and receipts across
     // restarts.
     let persistent_signer = match load_or_generate_persistent_signer() {
@@ -1032,8 +1103,10 @@ pub fn run_fac_worker(
         };
 
         // TCK-00577: Promote broker requests from non-service-user
-        // callers into pending/ before scanning.
-        promote_broker_requests(&queue_root);
+        // callers into pending/ before scanning. The loaded FAC policy's
+        // queue_bounds_policy is threaded through to ensure broker
+        // promotion enforces the same configured limits as enqueue_direct.
+        promote_broker_requests(&queue_root, &policy.queue_bounds_policy);
 
         // Scan pending directory (quarantines malformed files inline).
         let candidates = match scan_pending(
@@ -1564,6 +1637,13 @@ fn acquire_enqueue_lock(queue_root: &Path) -> Result<fs::File, String> {
 /// are quarantined with denial evidence. Files that collide with existing
 /// pending entries are quarantined (collision-safe, never overwrites).
 ///
+/// # Arguments
+///
+/// * `bounds_policy` - The queue bounds policy loaded from the FAC
+///   configuration (`FacPolicyV1::queue_bounds_policy`). Must be the same
+///   policy used by `enqueue_direct` to ensure broker-mediated promotion
+///   enforces identical queue capacity limits.
+///
 /// # Lock discipline
 ///
 /// Each promotion acquires the same process-level lockfile
@@ -1583,7 +1663,7 @@ fn acquire_enqueue_lock(queue_root: &Path) -> Result<fs::File, String> {
 /// - Happens-before: `lock_exclusive()` → scan pending + move → drop lockfile
 ///   (implicit `flock(LOCK_UN)`).
 /// - Async suspension: not applicable (synchronous path).
-fn promote_broker_requests(queue_root: &Path) {
+fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy) {
     let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
     if !broker_dir.is_dir() {
         return;
@@ -1599,9 +1679,9 @@ fn promote_broker_requests(queue_root: &Path) {
     let quarantine_dir = queue_root.join(QUARANTINE_DIR);
     let _ = fs::create_dir_all(&quarantine_dir);
 
-    // Load queue bounds policy (default if not configured).
-    // The same policy is used by `enqueue_direct`.
-    let bounds_policy = QueueBoundsPolicy::default();
+    // Queue bounds policy is threaded from the loaded FAC policy by
+    // the caller (run_fac_worker). This ensures broker-mediated
+    // promotion enforces the same configured limits as enqueue_direct.
 
     for (idx, entry) in entries.enumerate() {
         if idx >= MAX_BROKER_REQUESTS_PROMOTE {
@@ -1666,7 +1746,7 @@ fn promote_broker_requests(queue_root: &Path) {
 
         // Check queue bounds with proposed file size before promoting.
         let proposed_bytes = bytes.len() as u64;
-        if let Err(bounds_err) = check_queue_bounds(&pending_dir, proposed_bytes, &bounds_policy) {
+        if let Err(bounds_err) = check_queue_bounds(&pending_dir, proposed_bytes, bounds_policy) {
             // Queue is at capacity: quarantine the broker request with
             // denial evidence instead of promoting.
             tracing::warn!(
@@ -11295,8 +11375,9 @@ mod tests {
         )
         .expect("write broker request");
 
-        // Run promotion.
-        promote_broker_requests(&queue_root);
+        // Run promotion with default policy (max_pending_jobs = 10_000).
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
 
         // The broker request must NOT be in pending/ (queue at capacity).
         assert!(
@@ -11348,8 +11429,9 @@ mod tests {
         fs::write(broker_dir.join("collision-job.json"), &new_content)
             .expect("write broker request");
 
-        // Run promotion.
-        promote_broker_requests(&queue_root);
+        // Run promotion with default policy.
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
 
         // The original pending job must be untouched.
         let existing_after = fs::read_to_string(pending_dir.join("collision-job.json"))
@@ -11390,8 +11472,9 @@ mod tests {
         let content = make_valid_broker_request_json("good-job");
         fs::write(broker_dir.join("good-job.json"), &content).expect("write broker request");
 
-        // Run promotion.
-        promote_broker_requests(&queue_root);
+        // Run promotion with default policy.
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
 
         // The job must appear in pending/.
         assert!(
@@ -11429,8 +11512,9 @@ mod tests {
         let content = make_valid_broker_request_json("lock-test-job");
         fs::write(broker_dir.join("lock-test-job.json"), &content).expect("write broker request");
 
-        // Run promotion.
-        promote_broker_requests(&queue_root);
+        // Run promotion with default policy.
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
 
         // The lockfile must have been created (created by acquire_enqueue_lock).
         assert!(
@@ -11442,6 +11526,104 @@ mod tests {
         assert!(
             pending_dir.join("lock-test-job.json").exists(),
             "job must be promoted"
+        );
+    }
+
+    /// TCK-00577 round 3: Regression test proving broker promotion respects
+    /// non-default configured queue bounds policy. Uses `max_pending_jobs=1`
+    /// so that with 1 existing pending job, broker promotion denies.
+    #[test]
+    fn promote_broker_request_denied_by_configured_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+        let quarantine_dir = queue_root.join(QUARANTINE_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Fill pending with 1 job to hit the configured cap.
+        fs::write(pending_dir.join("existing-job.json"), "{}").expect("write pending job");
+
+        // Submit a broker request.
+        let broker_file = broker_dir.join("policy-denied.json");
+        fs::write(
+            &broker_file,
+            make_valid_broker_request_json("policy-denied"),
+        )
+        .expect("write broker request");
+
+        // Use a tight configured policy: max_pending_jobs = 1.
+        let tight_policy = QueueBoundsPolicy {
+            max_pending_jobs: 1,
+            // Use a large byte limit so only job count triggers denial.
+            max_pending_bytes: 1024 * 1024 * 1024,
+            per_lane_max_pending_jobs: None,
+        };
+        promote_broker_requests(&queue_root, &tight_policy);
+
+        // The broker request must NOT be in pending/ (configured cap exceeded).
+        assert!(
+            !pending_dir.join("policy-denied.json").exists(),
+            "broker request must not be promoted when configured policy cap is exceeded"
+        );
+
+        // The broker request must be quarantined.
+        assert!(
+            quarantine_dir.is_dir(),
+            "quarantine directory must exist after policy denial"
+        );
+        let quarantine_entries: Vec<_> = fs::read_dir(&quarantine_dir)
+            .expect("read quarantine")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("policy-denied"))
+            .collect();
+        assert!(
+            !quarantine_entries.is_empty(),
+            "policy-denied broker request must be quarantined"
+        );
+
+        // Original broker request must be gone from broker_requests/.
+        assert!(
+            !broker_file.exists(),
+            "original broker request file must be removed after quarantine"
+        );
+    }
+
+    /// TCK-00577 round 3: Confirm that with the same tight policy,
+    /// promotion succeeds when pending count is below the configured cap.
+    #[test]
+    fn promote_broker_request_allowed_by_configured_policy_under_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // No existing pending jobs — under cap of 1.
+        let content = make_valid_broker_request_json("under-cap-job");
+        fs::write(broker_dir.join("under-cap-job.json"), &content).expect("write broker request");
+
+        let tight_policy = QueueBoundsPolicy {
+            max_pending_jobs: 1,
+            max_pending_bytes: 1024 * 1024 * 1024,
+            per_lane_max_pending_jobs: None,
+        };
+        promote_broker_requests(&queue_root, &tight_policy);
+
+        // Job must be promoted since queue is under cap.
+        assert!(
+            pending_dir.join("under-cap-job.json").exists(),
+            "broker request must be promoted when under configured policy cap"
+        );
+
+        // Original broker request must be gone.
+        assert!(
+            !broker_dir.join("under-cap-job.json").exists(),
+            "broker request must be removed after successful promotion"
         );
     }
 }

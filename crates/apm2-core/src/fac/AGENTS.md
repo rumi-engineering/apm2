@@ -684,6 +684,10 @@ enqueue attempts that would exceed configured caps.
   FAC private directory (`$APM2_HOME/private/fac/audit/denial_events.jsonl`)
   outside the writable queue directories, ensuring audit evidence resilience
   even if the `queue/denied/` directory is tampered with.
+- `promote_broker_requests()` in `fac_worker.rs` now receives the loaded
+  `FacPolicyV1::queue_bounds_policy` from `run_fac_worker` instead of using
+  `QueueBoundsPolicy::default()`. This ensures broker-mediated promotions
+  enforce the same configured limits as direct enqueue (TCK-00577 round 3).
 - `FacPolicyV1` includes a `queue_bounds_policy` field (`serde(default)` for
   backward compatibility with pre-TCK-00578 policies).
 - Control-lane `stop_revoke` jobs bypass queue bounds (consistent with the

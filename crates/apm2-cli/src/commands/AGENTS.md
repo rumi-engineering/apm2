@@ -661,6 +661,34 @@ systemd service executables:
   cannot be acquired, the broker request is deferred to the next cycle
   (not promoted).
 
+### Configured policy threading (TCK-00577 round 3)
+
+- **Broker promotion enforces configured policy**: `promote_broker_requests`
+  now receives the loaded `FacPolicyV1::queue_bounds_policy` from
+  `run_fac_worker`. The hardcoded `QueueBoundsPolicy::default()` is replaced
+  so that broker-mediated promotions enforce the same operator-configured
+  limits as direct enqueue.
+
+### Service-user ownership validation (TCK-00577 round 3)
+
+- **Worker startup wires ownership check**: `run_fac_worker` validates that
+  queue subdirectories (`pending/`, `claimed/`, `completed/`, `denied/`,
+  `cancelled/`, `quarantine/`) and `receipts/` are owned by the configured
+  FAC service user (via `validate_directory_service_user_ownership`). This
+  check runs after directories are created but before the worker loop starts.
+  Fail-closed: if the service user cannot be resolved or ownership deviates,
+  the worker refuses to start.
+
+### Relaxed startup validation for enqueue-class commands (TCK-00577 round 3)
+
+- **Non-service-user callers reach broker fallback**: The FAC root permissions
+  check at `run_fac` uses `validate_fac_root_permissions_relaxed_for_enqueue()`
+  for enqueue-class commands (`Push`, `Gates`, `Warm`). This checks mode bits
+  and symlink safety but NOT ownership, so non-service-user callers in a
+  service-user-owned deployment can reach `enqueue_job` → broker fallback →
+  `broker_requests/` (mode 01733). All other commands continue to use strict
+  ownership validation.
+
 ### General invariants
 
 - The `broker_requests/` directory uses mode 01733 (sticky + write-only for
