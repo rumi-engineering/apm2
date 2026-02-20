@@ -562,12 +562,25 @@ Security invariants:
 ## Caches Nuke CLI (TCK-00592)
 
 - **`apm2 fac caches nuke`** (`fac_caches.rs`): Explicit operator-only command to
-  delete bulky FAC caches (lane targets, lane env dirs, cargo_home, sccache) with
-  hard confirmations and audit receipts. Requires `--i-know-what-im-doing` flag
-  (long form only) or interactive "yes" confirmation on a TTY. Fail-closed: denies
-  on non-TTY without the flag. Supports `--dry-run` mode (JSON output of what would
-  be deleted). Emits a `NukeReceiptV1` to `$APM2_HOME/private/fac/receipts/`.
-  Uses `safe_rmtree_v1` for all deletions (INV-NUKE-004). NEVER deletes receipts/
-  or broker keys (INV-NUKE-001, INV-NUKE-002). All deletion paths validated against
-  an explicit allow-list with protected directory exclusion (INV-NUKE-003).
-  Excluded from daemon auto-start.
+  delete bulky FAC caches (lane targets, lane env dirs, cargo_home, sccache,
+  gate_cache, gate_cache_v2, gate_cache_v3) with hard confirmations and audit
+  receipts. Requires `--i-know-what-im-doing` flag (long form only) or interactive
+  "yes" confirmation on a TTY. Fail-closed: denies on non-TTY without the flag.
+  Supports `--dry-run` mode (JSON output of what would be deleted). Emits a
+  `NukeReceiptV1` to `$APM2_HOME/private/fac/receipts/`. Uses `safe_rmtree_v1`
+  for all deletions (INV-NUKE-004). NEVER deletes receipts/ or broker keys
+  (INV-NUKE-001, INV-NUKE-002). All deletion paths validated against an explicit
+  allow-list with protected directory exclusion (INV-NUKE-003). Excluded from
+  daemon auto-start.
+- **Receipt persistence is a hard success condition** (INV-NUKE-006): If
+  `persist_nuke_receipt` fails, the command returns non-zero exit code and reports
+  status as "failure" regardless of deletion outcomes. Destructive work without a
+  durable audit trail is never reported as success.
+- **No silent truncation of nuke targets**: The plan collects ALL deletion targets
+  without truncation. If the plan exceeds `MAX_NUKE_TARGETS` (8192), the command
+  fails closed with an explicit error. Per-directory scans are unbounded within the
+  overall safety limit.
+- **Gate cache coverage**: `FAC_GATE_CACHE_DIRS` constant lists `gate_cache`,
+  `gate_cache_v2`, `gate_cache_v3`. These are added to the nuke plan when present
+  under the FAC root, using the same allow-list validation and `safe_rmtree_v1`
+  deletion as other cache targets.

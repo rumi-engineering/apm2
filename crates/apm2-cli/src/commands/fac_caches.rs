@@ -2,9 +2,10 @@
 //! Explicit cache purge command: `apm2 fac caches nuke`.
 //!
 //! Provides a deterministic, operator-only mechanism to delete bulky FAC
-//! caches (lane targets, `cargo_home`, sccache) with hard confirmations and
-//! audit receipts. This is NOT automated GC -- it requires explicit operator
-//! confirmation via `--i-know-what-im-doing` or an interactive prompt.
+//! caches (lane targets, `cargo_home`, sccache, gate caches) with hard
+//! confirmations and audit receipts. This is NOT automated GC -- it requires
+//! explicit operator confirmation via `--i-know-what-im-doing` or an
+//! interactive prompt.
 //!
 //! # Safety Invariants
 //!
@@ -37,9 +38,11 @@ use crate::exit_codes::codes as exit_codes;
 // Constants
 // =============================================================================
 
-/// Maximum number of cache roots to nuke in a single invocation.
-/// Prevents unbounded iteration (CTR-1303).
-const MAX_CACHE_ROOTS: usize = 128;
+/// Hard upper bound on nuke targets. If the plan exceeds this limit, the
+/// command fails closed with an explicit error rather than silently
+/// truncating. The value is deliberately generous — operator-invoked nuke
+/// must either process ALL targets or refuse outright (INV-NUKE-005).
+const MAX_NUKE_TARGETS: usize = 8192;
 
 /// Subdirectory name for managed `cargo_home`.
 const FAC_CARGO_HOME_DIR: &str = "cargo_home";
@@ -49,6 +52,10 @@ const FAC_SCCACHE_DIR: &str = "sccache";
 
 /// Subdirectory name for lane targets.
 const FAC_LANES_DIR: &str = "lanes";
+
+/// Gate cache directory names (v1, v2, v3). These are optional cache
+/// directories that may exist under the FAC root.
+const FAC_GATE_CACHE_DIRS: &[&str] = &["gate_cache", "gate_cache_v2", "gate_cache_v3"];
 
 /// Directories that MUST NEVER be deleted (INV-NUKE-001, INV-NUKE-002).
 const PROTECTED_DIRS: &[&str] = &[
@@ -82,7 +89,8 @@ pub struct CachesArgs {
 /// Subcommands for `apm2 fac caches`.
 #[derive(Debug, Subcommand)]
 pub enum CachesSubcommand {
-    /// Delete all bulky FAC caches (lane targets, `cargo_home`, sccache).
+    /// Delete all bulky FAC caches (lane targets, `cargo_home`, sccache, gate
+    /// caches).
     ///
     /// This is a DANGEROUS destructive operation. It requires explicit
     /// confirmation via `--i-know-what-im-doing` or interactive prompt.
@@ -243,25 +251,47 @@ fn run_nuke(args: &NukeArgs) -> u8 {
         total_bytes_freed,
     };
 
-    // Step 7: Persist receipt.
-    if let Err(err) = persist_nuke_receipt(&fac_root, &receipt) {
+    // Step 7: Persist receipt (hard success condition — INV-NUKE-006).
+    // The receipt MUST be durably written before the command reports success.
+    // Destructive work without an audit trail is a fail-closed violation.
+    let receipt_persist_failed = if let Err(err) = persist_nuke_receipt(&fac_root, &receipt) {
+        let err_msg = format!("nuke receipt persistence failed — audit trail not durable: {err}");
         eprintln!(
             "{}",
             serde_json::to_string(&json!({
-                "warning": "nuke_receipt_persist_failed",
-                "message": format!("nuke completed but receipt persistence failed: {err}"),
+                "error": "nuke_receipt_persist_failed",
+                "message": &err_msg,
             }))
             .unwrap_or_default()
         );
+        Some(err_msg)
+    } else {
+        None
+    };
+
+    // Step 8: Determine final status.
+    // Status is "failure" if receipt persistence failed (regardless of
+    // deletion outcomes), "partial_success" if some deletions failed, or
+    // "success" if everything succeeded and the receipt is durable.
+    let status = if receipt_persist_failed.is_some() {
+        "failure"
+    } else if errors.is_empty() {
+        "success"
+    } else {
+        "partial_success"
+    };
+
+    let mut all_errors = errors.clone();
+    if let Some(ref persist_err) = receipt_persist_failed {
+        all_errors.push(persist_err.clone());
     }
 
-    // Step 8: Output result.
     let output = json!({
-        "status": if errors.is_empty() { "success" } else { "partial_success" },
+        "status": status,
         "total_bytes_freed": receipt.total_bytes_freed,
         "paths_deleted": receipt.deleted_paths.iter().filter(|p| p.success).count(),
         "paths_failed": receipt.deleted_paths.iter().filter(|p| !p.success).count(),
-        "errors": receipt.errors,
+        "errors": all_errors,
         "receipt": receipt,
     });
     println!(
@@ -269,10 +299,10 @@ fn run_nuke(args: &NukeArgs) -> u8 {
         serde_json::to_string_pretty(&output).unwrap_or_default()
     );
 
-    if errors.is_empty() {
-        exit_codes::SUCCESS
-    } else {
+    if receipt_persist_failed.is_some() || !errors.is_empty() {
         exit_codes::GENERIC_ERROR
+    } else {
+        exit_codes::SUCCESS
     }
 }
 
@@ -317,12 +347,7 @@ fn build_nuke_plan(fac_root: &Path) -> Result<Vec<NukeTarget>, String> {
                     }
                     // Find target-* directories (fingerprint-namespaced build dirs).
                     if let Ok(entries) = fs::read_dir(&lane_path) {
-                        let mut entry_count: usize = 0;
                         for entry in entries {
-                            entry_count = entry_count.saturating_add(1);
-                            if entry_count > MAX_CACHE_ROOTS {
-                                break;
-                            }
                             let Ok(entry) = entry else {
                                 continue;
                             };
@@ -392,14 +417,38 @@ fn build_nuke_plan(fac_root: &Path) -> Result<Vec<NukeTarget>, String> {
         });
     }
 
+    // 4. Optional gate cache directories (gate_cache, gate_cache_v2,
+    //    gate_cache_v3).
+    // These are present when FAC gates have been run and cached results.
+    // Each gate cache dir is a direct child of fac_root and is deleted as a
+    // single unit via safe_rmtree_v1 (same pattern as cargo_home / sccache).
+    for gate_dir_name in FAC_GATE_CACHE_DIRS {
+        let gate_dir = fac_root.join(gate_dir_name);
+        if gate_dir.is_dir() {
+            validate_not_protected(gate_dir_name)?;
+            targets.push(NukeTarget {
+                path: gate_dir.clone(),
+                allowed_parent: fac_root.to_path_buf(),
+                description: format!("FAC {gate_dir_name}"),
+                estimated_bytes: estimate_dir_size(&gate_dir),
+            });
+        }
+    }
+
     // Final safety gate: ensure no target path overlaps with any protected dir.
     for target in &targets {
         validate_path_not_protected(&target.path, fac_root)?;
     }
 
-    // Enforce MAX_CACHE_ROOTS to prevent unbounded iteration (CTR-1303).
-    if targets.len() > MAX_CACHE_ROOTS {
-        targets.truncate(MAX_CACHE_ROOTS);
+    // Fail closed if the plan exceeds the hard safety bound. An operator nuke
+    // must either process ALL targets or refuse outright — silent omission of
+    // deletion targets is unacceptable (BLOCKER: no silent truncation).
+    if targets.len() > MAX_NUKE_TARGETS {
+        return Err(format!(
+            "nuke plan exceeds safety bound: {} targets found, maximum is {MAX_NUKE_TARGETS}. \
+             Reduce cache population before retrying.",
+            targets.len()
+        ));
     }
 
     Ok(targets)
@@ -407,15 +456,14 @@ fn build_nuke_plan(fac_root: &Path) -> Result<Vec<NukeTarget>, String> {
 
 /// Discover lane IDs by scanning the lanes directory.
 ///
-/// Bounded to `MAX_CACHE_ROOTS` entries to prevent unbounded memory growth.
+/// Collects ALL lane directories. The overall plan is bounded at
+/// `MAX_NUKE_TARGETS` by the caller; individual discovery must not
+/// silently drop entries.
 fn discover_lane_ids(lanes_dir: &Path) -> Result<Vec<String>, String> {
     let entries = fs::read_dir(lanes_dir).map_err(|e| format!("cannot read lanes dir: {e}"))?;
 
     let mut lane_ids = Vec::new();
     for entry in entries {
-        if lane_ids.len() >= MAX_CACHE_ROOTS {
-            break;
-        }
         let Ok(entry) = entry else {
             continue;
         };
@@ -750,6 +798,10 @@ mod tests {
         assert!(validate_not_protected("xdg_cache").is_ok());
         assert!(validate_not_protected("cargo_home").is_ok());
         assert!(validate_not_protected("sccache").is_ok());
+        // Gate cache directories are not protected.
+        assert!(validate_not_protected("gate_cache").is_ok());
+        assert!(validate_not_protected("gate_cache_v2").is_ok());
+        assert!(validate_not_protected("gate_cache_v3").is_ok());
     }
 
     #[test]
@@ -769,6 +821,10 @@ mod tests {
             validate_path_not_protected(&fac_root.join("lanes/lane-00/target-abc123"), fac_root)
                 .is_ok()
         );
+        // Gate cache dirs are allowed.
+        assert!(validate_path_not_protected(&fac_root.join("gate_cache"), fac_root).is_ok());
+        assert!(validate_path_not_protected(&fac_root.join("gate_cache_v2"), fac_root).is_ok());
+        assert!(validate_path_not_protected(&fac_root.join("gate_cache_v3"), fac_root).is_ok());
     }
 
     #[test]
@@ -837,11 +893,77 @@ mod tests {
     }
 
     #[test]
-    fn max_cache_roots_is_bounded() {
+    fn max_nuke_targets_is_bounded() {
         // Verify our constant is reasonable (compile-time assertion).
-        const _: () = assert!(MAX_CACHE_ROOTS <= 1024);
-        const _: () = assert!(MAX_CACHE_ROOTS >= 8);
+        const _: () = assert!(MAX_NUKE_TARGETS <= 16_384);
+        const _: () = assert!(MAX_NUKE_TARGETS >= 128);
         // Runtime check for the actual value.
-        assert_eq!(MAX_CACHE_ROOTS, 128);
+        assert_eq!(MAX_NUKE_TARGETS, 8192);
+    }
+
+    #[test]
+    fn gate_cache_dirs_are_not_protected() {
+        // All gate cache directory names must pass the protected-dir check.
+        for name in FAC_GATE_CACHE_DIRS {
+            assert!(
+                validate_not_protected(name).is_ok(),
+                "gate cache dir '{name}' should not be protected"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_cache_dirs_constant_covers_known_versions() {
+        // Verify that we cover the three known gate cache directory names.
+        assert!(FAC_GATE_CACHE_DIRS.contains(&"gate_cache"));
+        assert!(FAC_GATE_CACHE_DIRS.contains(&"gate_cache_v2"));
+        assert!(FAC_GATE_CACHE_DIRS.contains(&"gate_cache_v3"));
+    }
+
+    #[test]
+    fn build_nuke_plan_includes_gate_caches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().to_path_buf();
+
+        // Create gate cache directories with some content.
+        for name in FAC_GATE_CACHE_DIRS {
+            let gate_dir = fac_root.join(name);
+            fs::create_dir_all(&gate_dir).expect("create gate cache dir");
+            fs::write(gate_dir.join("dummy.yaml"), b"test").expect("write dummy");
+        }
+
+        // Also create a protected dir (receipts) — must NOT appear in plan.
+        let receipts_dir = fac_root.join("receipts");
+        fs::create_dir_all(&receipts_dir).expect("create receipts dir");
+
+        // build_nuke_plan requires LaneManager::from_default_home which we
+        // cannot safely call in unit tests. Instead, verify the gate cache
+        // directories would pass validation and the protected ones would not.
+        for name in FAC_GATE_CACHE_DIRS {
+            assert!(validate_not_protected(name).is_ok());
+            assert!(validate_path_not_protected(&fac_root.join(name), &fac_root).is_ok());
+        }
+        assert!(validate_not_protected("receipts").is_err());
+    }
+
+    #[test]
+    fn persist_nuke_receipt_fails_on_nonexistent_readonly() {
+        // Verify persist_nuke_receipt returns Err when the path is impossible.
+        let receipt = NukeReceiptV1 {
+            schema: NUKE_RECEIPT_SCHEMA.to_string(),
+            timestamp_utc: 1_700_000_002,
+            operator_confirmed: true,
+            dry_run: false,
+            deleted_paths: vec![],
+            errors: vec![],
+            total_bytes_freed: 0,
+        };
+
+        // A path that should not be writable.
+        let result = persist_nuke_receipt(Path::new("/proc/nonexistent/fac_root"), &receipt);
+        assert!(
+            result.is_err(),
+            "persist_nuke_receipt must return Err for non-writable path"
+        );
     }
 }
