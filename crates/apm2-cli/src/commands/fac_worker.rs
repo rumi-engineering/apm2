@@ -1587,10 +1587,23 @@ fn compute_canonicalizer_tuple_digest() -> String {
 // Queue scanning
 // =============================================================================
 
-/// Maximum number of broker request entries to promote per cycle.
+/// Maximum number of **candidate** broker request entries to promote per cycle.
 ///
 /// Prevents unbounded I/O from a `broker_requests` directory with many files.
+/// Only valid candidates (regular files with `.json` extension that pass
+/// filename validation) count toward this cap. Non-candidate entries (wrong
+/// extension, FIFOs, symlinks, etc.) are drained/quarantined separately without
+/// consuming the promotion budget.
 const MAX_BROKER_REQUESTS_PROMOTE: usize = 256;
+
+/// Maximum number of non-candidate (junk) entries to drain per cycle.
+///
+/// Non-candidate entries in `broker_requests/` (wrong extension, non-regular
+/// files, unreadable metadata) are quarantined without counting toward
+/// `MAX_BROKER_REQUESTS_PROMOTE`. This cap prevents unbounded quarantine I/O
+/// from an attacker flooding the directory with junk. Remaining junk entries
+/// are deferred to the next cycle.
+const MAX_JUNK_DRAIN_PER_CYCLE: usize = 1024;
 
 /// Acquire the process-level enqueue lockfile under `queue_root`.
 ///
@@ -1690,11 +1703,27 @@ fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy)
     // the caller (run_fac_worker). This ensures broker-mediated
     // promotion enforces the same configured limits as enqueue_direct.
 
-    for (idx, entry) in entries.enumerate() {
-        if idx >= MAX_BROKER_REQUESTS_PROMOTE {
+    // MAJOR fix (TCK-00577 round 16): Separate candidate counting from junk
+    // draining. Only CANDIDATE entries (regular files with .json extension that
+    // pass filename validation) count toward MAX_BROKER_REQUESTS_PROMOTE.
+    // Non-candidate entries (wrong extension, non-regular files, unreadable
+    // metadata) are quarantined without consuming the promotion budget, up to
+    // MAX_JUNK_DRAIN_PER_CYCLE. This prevents an attacker from filling
+    // broker_requests/ with junk filenames to exhaust the scan budget and
+    // starve valid .json requests.
+    let mut candidates_processed: usize = 0;
+    let mut junk_drained: usize = 0;
+
+    for entry in entries {
+        // Both caps reached: stop scanning entirely.
+        if candidates_processed >= MAX_BROKER_REQUESTS_PROMOTE
+            && junk_drained >= MAX_JUNK_DRAIN_PER_CYCLE
+        {
             tracing::warn!(
-                "TCK-00577: broker_requests promotion cap reached ({MAX_BROKER_REQUESTS_PROMOTE}), \
-                 remaining files deferred to next cycle"
+                candidates = candidates_processed,
+                junk = junk_drained,
+                "TCK-00577: both promotion and junk drain caps reached, \
+                 remaining entries deferred to next cycle"
             );
             break;
         }
@@ -1702,52 +1731,95 @@ fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy)
         let Ok(entry) = entry else { continue };
         let path = entry.path();
 
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        // ── Classify: is this a candidate (.json extension + valid UTF-8 name)? ──
+        let is_json = path.extension().and_then(|e| e.to_str()) == Some("json");
+        let file_name = path.file_name().and_then(|n| n.to_str()).map(String::from);
+
+        if !is_json || file_name.is_none() {
+            // Non-candidate: quarantine without counting toward promotion cap.
+            if junk_drained < MAX_JUNK_DRAIN_PER_CYCLE {
+                if let Some(ref name) = file_name {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "TCK-00577: draining non-.json entry from broker_requests/"
+                    );
+                    let _ = move_to_dir_safe(&path, &quarantine_dir, name);
+                } else {
+                    // Non-UTF-8 filename: try to remove directly (can't safely
+                    // construct a quarantine name).
+                    tracing::debug!(
+                        path = %path.display(),
+                        "TCK-00577: removing non-UTF-8 entry from broker_requests/"
+                    );
+                    let _ = fs::remove_file(&path);
+                }
+                junk_drained += 1;
+            }
             continue;
         }
 
-        let file_name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
+        let file_name = file_name.unwrap();
 
-        // BLOCKER fix (TCK-00577 round 9): Pre-open file type check to
-        // prevent FIFO poisoning. An attacker with write access to the
-        // world-writable broker_requests/ (mode 01733) can create a FIFO
-        // named *.json. Opening a FIFO without O_NONBLOCK blocks
-        // indefinitely, stalling the worker. Use symlink_metadata (lstat)
-        // to check file type BEFORE opening. Only regular files are
-        // allowed; FIFOs, sockets, devices, and symlinks are quarantined.
+        // ── Pre-open file type check (lstat) ──
+        // BLOCKER fix (TCK-00577 round 9): Prevent FIFO poisoning.
+        // An attacker with write access to broker_requests/ (mode 01733)
+        // can create a FIFO named *.json. Opening a FIFO without O_NONBLOCK
+        // blocks indefinitely. Use symlink_metadata (lstat) to check file
+        // type BEFORE opening. Only regular files proceed; FIFOs, sockets,
+        // devices, and symlinks are quarantined as junk.
         match std::fs::symlink_metadata(&path) {
             Ok(meta) => {
                 if !meta.file_type().is_file() {
-                    let kind = if meta.file_type().is_symlink() {
-                        "symlink"
-                    } else if meta.file_type().is_dir() {
-                        "directory"
-                    } else {
-                        "non-regular-file (FIFO/socket/device)"
-                    };
-                    tracing::warn!(
-                        path = %path.display(),
-                        file_type = kind,
-                        "TCK-00577: quarantining non-regular-file broker request \
-                         (FIFO poisoning defense)"
-                    );
-                    let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
+                    // .json extension but not a regular file — this is junk.
+                    if junk_drained < MAX_JUNK_DRAIN_PER_CYCLE {
+                        let kind = if meta.file_type().is_symlink() {
+                            "symlink"
+                        } else if meta.file_type().is_dir() {
+                            "directory"
+                        } else {
+                            "non-regular-file (FIFO/socket/device)"
+                        };
+                        tracing::warn!(
+                            path = %path.display(),
+                            file_type = kind,
+                            "TCK-00577: quarantining non-regular-file broker request \
+                             (FIFO poisoning defense)"
+                        );
+                        let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
+                        junk_drained += 1;
+                    }
                     continue;
                 }
             },
             Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "TCK-00577: quarantining broker request with unreadable metadata"
-                );
-                let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
+                // Unreadable metadata: treat as junk.
+                if junk_drained < MAX_JUNK_DRAIN_PER_CYCLE {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "TCK-00577: quarantining broker request with unreadable metadata"
+                    );
+                    let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
+                    junk_drained += 1;
+                }
                 continue;
             },
         }
+
+        // ── This is a valid candidate: count toward promotion cap ──
+        if candidates_processed >= MAX_BROKER_REQUESTS_PROMOTE {
+            tracing::warn!(
+                "TCK-00577: broker_requests promotion cap reached \
+                 ({MAX_BROKER_REQUESTS_PROMOTE}), remaining candidates \
+                 deferred to next cycle"
+            );
+            // Continue draining junk if junk cap not yet reached.
+            if junk_drained >= MAX_JUNK_DRAIN_PER_CYCLE {
+                break;
+            }
+            continue;
+        }
+        candidates_processed += 1;
 
         // Bounded read (reuse MAX_JOB_SPEC_SIZE from job_spec module).
         // Defense-in-depth: read_bounded also uses O_NONBLOCK and checks
@@ -1757,14 +1829,15 @@ fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy)
         let bytes = match read_bounded(&path, apm2_core::fac::job_spec::MAX_JOB_SPEC_SIZE) {
             Ok(b) => b,
             Err(e) => {
-                // TCK-00577 round 14: Broker request files are now
-                // written with mode 0600 (owner-only) to prevent
-                // world-readable job specs. In cross-user deployments
-                // (submitter UID != worker UID), the worker may get
-                // EACCES. This is fail-closed: unreadable files are
-                // quarantined, not promoted. The operator must
-                // configure a shared group or POSIX ACL for cross-user
-                // access.
+                // TCK-00577 round 16: Broker request files are now
+                // written with mode 0640 + fchown(gid=service_user)
+                // when the service user is resolvable, or mode 0644 as
+                // fallback in dev environments. In cross-user
+                // deployments where fchown succeeded, the worker can
+                // read via group membership. EACCES here indicates a
+                // misconfiguration (service user not in file's group
+                // and fchown failed). This is fail-closed: unreadable
+                // files are quarantined, not promoted.
                 if e.contains("Permission denied") {
                     tracing::warn!(
                         path = %path.display(),
@@ -12544,6 +12617,193 @@ mod tests {
             promoted_bytes,
             content.as_bytes(),
             "promoted file content must match validated input"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR fix regression: junk entries must NOT starve valid broker requests
+    // (TCK-00577 round 16)
+    // =========================================================================
+
+    /// MAJOR fix (TCK-00577 round 16): Filling `broker_requests/` with N junk
+    /// entries (non-.json) plus 1 valid entry must still promote the valid
+    /// entry. Junk entries drain separately from the candidate cap.
+    #[test]
+    fn promote_broker_request_not_starved_by_junk_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+        let quarantine_dir = queue_root.join(QUARANTINE_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Create 300 junk entries (non-.json files) in broker_requests/.
+        // This exceeds MAX_BROKER_REQUESTS_PROMOTE (256) but should NOT
+        // consume the candidate budget because they are non-candidates.
+        let junk_count = 300;
+        for i in 0..junk_count {
+            let junk_path = broker_dir.join(format!("junk-entry-{i:04}.txt"));
+            fs::write(&junk_path, "not a json file").expect("write junk entry");
+        }
+
+        // Create 1 valid .json broker request.
+        let valid_content = make_valid_broker_request_json("valid-among-junk");
+        fs::write(broker_dir.join("valid-among-junk.json"), &valid_content)
+            .expect("write valid broker request");
+
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The valid entry MUST be promoted to pending/ (not starved).
+        assert!(
+            pending_dir.join("valid-among-junk.json").exists(),
+            "valid .json broker request must be promoted even when surrounded \
+             by {junk_count} junk entries (junk must not consume the candidate budget)",
+        );
+
+        // Junk entries must be moved to quarantine (up to
+        // MAX_JUNK_DRAIN_PER_CYCLE).
+        let quarantine_entries: Vec<_> = fs::read_dir(&quarantine_dir)
+            .expect("read quarantine dir")
+            .flatten()
+            .collect();
+        assert!(
+            !quarantine_entries.is_empty(),
+            "junk entries must be drained to quarantine"
+        );
+
+        // The original valid broker request file must be removed.
+        assert!(
+            !broker_dir.join("valid-among-junk.json").exists(),
+            "original valid broker request file must be removed after promotion"
+        );
+    }
+
+    /// MAJOR fix (TCK-00577 round 16): Verify that both promotion cap and
+    /// junk drain cap are enforced independently. With candidates at cap
+    /// and junk at cap, the loop terminates cleanly.
+    #[test]
+    fn promote_broker_request_respects_independent_caps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Create MAX_BROKER_REQUESTS_PROMOTE + 5 valid .json entries.
+        // Only MAX_BROKER_REQUESTS_PROMOTE should be promoted.
+        let total_candidates = MAX_BROKER_REQUESTS_PROMOTE + 5;
+        for i in 0..total_candidates {
+            let content = make_valid_broker_request_json(&format!("cap-test-{i:04}"));
+            fs::write(broker_dir.join(format!("cap-test-{i:04}.json")), &content)
+                .expect("write candidate entry");
+        }
+
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // Count promoted files in pending/.
+        let promoted: Vec<_> = fs::read_dir(&pending_dir)
+            .expect("read pending")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("cap-test-"))
+            .collect();
+        assert_eq!(
+            promoted.len(),
+            MAX_BROKER_REQUESTS_PROMOTE,
+            "exactly MAX_BROKER_REQUESTS_PROMOTE ({MAX_BROKER_REQUESTS_PROMOTE}) \
+             candidates should be promoted, got {}",
+            promoted.len()
+        );
+
+        // Remaining candidates should still be in broker_requests/.
+        let remaining: Vec<_> = fs::read_dir(&broker_dir)
+            .expect("read broker dir")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+            .collect();
+        assert_eq!(
+            remaining.len(),
+            5,
+            "5 excess candidates should remain in broker_requests/ for next cycle"
+        );
+    }
+
+    // =========================================================================
+    // BLOCKER fix: broker file readability by service-user worker
+    // (TCK-00577 round 16)
+    // =========================================================================
+
+    /// BLOCKER fix (TCK-00577 round 16): Verify that `promote_broker_requests`
+    /// successfully reads and promotes a file created with mode 0640 (the new
+    /// broker file mode for cross-user deployments). In same-user tests (test
+    /// process == broker file owner), the file is always readable. This test
+    /// verifies the promotion path works end-to-end with the new mode.
+    #[cfg(unix)]
+    #[test]
+    fn promote_broker_request_reads_mode_0640_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Write a valid broker request with mode 0640 (new default for
+        // cross-user deployments).
+        let content = make_valid_broker_request_json("mode-0640-test");
+        let broker_file = broker_dir.join("mode-0640-test.json");
+        fs::write(&broker_file, &content).expect("write broker request");
+        fs::set_permissions(&broker_file, fs::Permissions::from_mode(0o640))
+            .expect("set mode 0640");
+
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The file must be promoted (not quarantined due to EACCES).
+        assert!(
+            pending_dir.join("mode-0640-test.json").exists(),
+            "broker request with mode 0640 must be promoted to pending/ \
+             (not quarantined)"
+        );
+    }
+
+    /// BLOCKER fix (TCK-00577 round 16): Verify that
+    /// `promote_broker_requests` also works with mode 0644 files (fallback
+    /// mode when service user is not resolvable in dev environments).
+    #[cfg(unix)]
+    #[test]
+    fn promote_broker_request_reads_mode_0644_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Write with mode 0644 (dev fallback mode).
+        let content = make_valid_broker_request_json("mode-0644-test");
+        let broker_file = broker_dir.join("mode-0644-test.json");
+        fs::write(&broker_file, &content).expect("write broker request");
+        fs::set_permissions(&broker_file, fs::Permissions::from_mode(0o644))
+            .expect("set mode 0644");
+
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        assert!(
+            pending_dir.join("mode-0644-test.json").exists(),
+            "broker request with mode 0644 must be promoted to pending/"
         );
     }
 }
