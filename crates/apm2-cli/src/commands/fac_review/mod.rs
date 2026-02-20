@@ -60,6 +60,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use apm2_core::fac::service_user_gate::QueueWriteMode;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 // Re-export public API for use by `fac.rs`
 use dispatch::dispatch_single_review_with_force;
@@ -5513,6 +5514,7 @@ pub fn run_gates(
     json_output: bool,
     wait: bool,
     wait_timeout_secs: u64,
+    write_mode: QueueWriteMode,
 ) -> u8 {
     gates::run_gates(
         force,
@@ -5525,6 +5527,7 @@ pub fn run_gates(
         json_output,
         wait,
         wait_timeout_secs,
+        write_mode,
     )
 }
 

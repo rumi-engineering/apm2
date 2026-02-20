@@ -12,6 +12,7 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use apm2_core::fac::service_user_gate::QueueWriteMode;
 use apm2_core::fac::{parse_b3_256_digest, parse_policy_hash};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -373,6 +374,10 @@ fn run_blocking_evidence_gates(sha: &str) -> Result<QueuedGatesOutcome, String> 
         // Prefer worker execution when available, but do not hard-require it:
         // push must remain single-command operable for callers.
         require_external_worker: false,
+        // Push always uses UnsafeLocalWrite for backward compatibility:
+        // the push command orchestrates the full pipeline and needs to
+        // enqueue regardless of service user identity.
+        write_mode: QueueWriteMode::UnsafeLocalWrite,
     };
     let outcome = run_queued_gates_and_collect(&request)?;
     validate_queued_gates_outcome_for_push(sha, outcome)

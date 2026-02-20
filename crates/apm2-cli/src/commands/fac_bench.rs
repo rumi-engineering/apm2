@@ -28,6 +28,7 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 use std::{env, fs};
 
+use apm2_core::fac::service_user_gate::QueueWriteMode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -842,7 +843,16 @@ fn find_repo_root_from_cwd() -> Option<PathBuf> {
 ///
 /// Returns `true` if warm succeeded.
 fn run_warm_phase(timeout_seconds: u64, json_output: bool) -> bool {
-    let status = run_fac_warm(&None, &None, true, timeout_seconds, json_output);
+    // Bench command uses UnsafeLocalWrite: it is a development/testing tool
+    // that operates outside the production service-user model.
+    let status = run_fac_warm(
+        &None,
+        &None,
+        true,
+        timeout_seconds,
+        json_output,
+        QueueWriteMode::UnsafeLocalWrite,
+    );
     status == exit_codes::SUCCESS
 }
 

@@ -14,6 +14,7 @@ use apm2_core::fac::job_spec::{FacJobSpecV1, MAX_JOB_SPEC_SIZE};
 use apm2_core::fac::queue_bounds::{
     QueueBoundsDenialReceipt, QueueBoundsError, QueueBoundsPolicy, check_queue_bounds,
 };
+use apm2_core::fac::service_user_gate::{QueueWriteMode, check_queue_write_permission};
 use apm2_core::fac::{
     FacPolicyV1, MAX_POLICY_SIZE, compute_policy_hash, deserialize_policy, parse_policy_hash,
     persist_policy,
@@ -187,12 +188,17 @@ pub(super) fn load_or_init_policy(
 
 /// Enqueue a validated job spec into `queue/pending`.
 ///
-/// Enforces queue bounds (TCK-00578) before writing: the pending queue
-/// must not exceed `max_pending_jobs` or `max_pending_bytes` as
-/// configured by the provided [`QueueBoundsPolicy`]. Excess enqueue
-/// attempts are denied with structured denial receipts persisted to
-/// the `denied/` directory and a structured denial event emitted to
-/// the trusted audit log under the FAC private directory.
+/// Enforces two gates before writing:
+///
+/// 1. **Service user gate (TCK-00577)**: The current process must be running as
+///    the FAC service user, or `--unsafe-local-write` must be active.
+///    Non-service-user processes are denied with actionable error messages
+///    pointing to broker-mediated enqueue.
+///
+/// 2. **Queue bounds (TCK-00578)**: The pending queue must not exceed
+///    `max_pending_jobs` or `max_pending_bytes` as configured by the provided
+///    [`QueueBoundsPolicy`]. Excess enqueue attempts are denied with structured
+///    denial receipts.
 ///
 /// A process-level lockfile (`queue/.enqueue.lock`) is held for the
 /// full check-write critical section to prevent concurrent `apm2 fac`
@@ -206,12 +212,19 @@ pub(super) fn load_or_init_policy(
 /// * `spec` - The job spec to enqueue.
 /// * `queue_bounds_policy` - The queue bounds policy loaded from FAC
 ///   configuration. Must be pre-validated via `QueueBoundsPolicy::validate()`.
+/// * `write_mode` - Controls whether the service user ownership gate is
+///   enforced or bypassed (TCK-00577).
 pub(super) fn enqueue_job(
     queue_root: &Path,
     fac_root: &Path,
     spec: &FacJobSpecV1,
     queue_bounds_policy: &QueueBoundsPolicy,
+    write_mode: QueueWriteMode,
 ) -> Result<PathBuf, String> {
+    // TCK-00577: Gate 1 — service user write permission check.
+    // Non-service-user processes are denied unless --unsafe-local-write.
+    check_queue_write_permission(write_mode)
+        .map_err(|err| format!("service user gate denied queue write: {err}"))?;
     let pending_dir = queue_root.join(PENDING_DIR);
     fs::create_dir_all(&pending_dir).map_err(|err| format!("create pending dir: {err}"))?;
 
