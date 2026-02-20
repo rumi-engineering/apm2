@@ -775,9 +775,23 @@ systemd service executables:
   with `fac_root_permissions_failed` when `queue/` has the intentional
   hardened mode 0711.
 - **Relaxed validator checks both sets**: The relaxed validator
-  (`validate_fac_root_permissions_relaxed_at`) iterates both
+  (`validate_fac_root_permissions_relaxed_for_enqueue_at`) iterates both
   `FAC_SUBDIRS_STRICT` and `FAC_SUBDIRS_QUEUE`, using `validate_directory_mode_only`
   which permits execute-only traversal bits (`o+x` without `o+r`/`o+w`).
+
+### Deterministic queue subdir permissions (TCK-00577 round 11 BLOCKER fix)
+
+- **All queue subdirs get mode 0711**: `ensure_queue_dirs` now explicitly
+  calls `set_permissions(0o711)` on every queue subdir (`pending/`,
+  `claimed/`, `completed/`, `denied/`, `quarantine/`, `cancelled/`,
+  `authority_consumed/`) after `create_dir_all`. Previously these subdirs
+  inherited the process umask (e.g., 0775 with umask 0o002), which caused
+  `validate_directory_mode_only` to reject them during relaxed preflight.
+- **Unconditional `broker_requests/` hardening**: `ensure_queue_dirs` now
+  sets `broker_requests/` to mode 01733 unconditionally at every startup,
+  not just when newly created. Pre-existing directories with unsafe modes
+  (e.g., 0333 -- world-writable without sticky) are hardened. This prevents
+  an attacker from tampering with the directory mode between worker restarts.
 
 ### General invariants
 

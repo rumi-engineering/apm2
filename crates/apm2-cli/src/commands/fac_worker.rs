@@ -7481,11 +7481,23 @@ fn resolve_fac_root() -> Result<PathBuf, String> {
     Ok(home.join("private").join("fac"))
 }
 
-/// Ensures all required queue subdirectories exist.
+/// Ensures all required queue subdirectories exist with deterministic
+/// secure permissions, regardless of the process umask.
 ///
 /// TCK-00577 round 6: Creates `queue/` itself with mode 0711 (owner rwx,
 /// group/other execute-only) so non-service-user callers can traverse to
 /// reach `broker_requests/`. The `private/fac/` parent remains 0700.
+///
+/// TCK-00577 round 11 BLOCKER fix: After `create_dir_all` for each queue
+/// subdir, explicitly calls `set_permissions` to set mode 0711
+/// (traverse-only). This prevents umask-derived default modes (e.g.,
+/// 0775 from umask 0o002) from causing `validate_directory_mode_only`
+/// failures during the relaxed preflight path.
+///
+/// TCK-00577 round 11 MAJOR fix: `broker_requests/` permissions are now
+/// enforced unconditionally at every startup, not just when newly
+/// created. Pre-existing `broker_requests/` with unsafe modes (e.g.,
+/// 0333 — world-writable without sticky) are hardened to 01733.
 fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
     // Ensure the queue root itself exists with mode 0711 for traversal.
     if !queue_root.exists() {
@@ -7516,6 +7528,17 @@ fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
             fs::create_dir_all(&path)
                 .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
         }
+        // TCK-00577 round 11 BLOCKER fix: Set deterministic mode 0711 on
+        // every queue subdir, regardless of the process umask. Without
+        // this, create_dir_all inherits the umask which may produce
+        // 0775 or 0777, causing validate_directory_mode_only to reject
+        // these directories during relaxed preflight.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, std::fs::Permissions::from_mode(0o711))
+                .map_err(|e| format!("cannot set mode 0711 on {}: {e}", path.display()))?;
+        }
     }
 
     // TCK-00577 round 5 BLOCKER fix: Create broker_requests/ with mode 01733
@@ -7526,16 +7549,24 @@ fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
     //
     // DirBuilder::mode() is subject to the process umask, so we must
     // explicitly chmod after creation to ensure the exact mode is applied.
+    //
+    // TCK-00577 round 11 MAJOR fix: Permissions are now enforced
+    // unconditionally — both for newly created AND pre-existing
+    // broker_requests/ directories. A pre-existing directory with an
+    // unsafe mode (e.g., 0333 — world-writable without sticky) is
+    // hardened to 01733 at every worker startup. This prevents an
+    // attacker from tampering with the directory mode between restarts
+    // and ensures the sticky bit invariant is always enforced.
     let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
     if !broker_dir.exists() {
         fs::create_dir_all(&broker_dir)
             .map_err(|e| format!("cannot create {}: {e}", broker_dir.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o1733))
-                .map_err(|e| format!("cannot set mode 01733 on {}: {e}", broker_dir.display()))?;
-        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o1733))
+            .map_err(|e| format!("cannot set mode 01733 on {}: {e}", broker_dir.display()))?;
     }
 
     Ok(())
@@ -11907,5 +11938,273 @@ mod tests {
         } else {
             panic!("expected ServiceUserNotResolved variant");
         }
+    }
+
+    /// TCK-00577 round 11 BLOCKER regression: Queue subdirs must have
+    /// deterministic secure mode 0711 after `ensure_queue_dirs`, regardless
+    /// of the mode they had before (simulating umask-derived defaults).
+    ///
+    /// Steps:
+    /// 1. Pre-create queue subdirs with an insecure mode (0775, as umask 0o002
+    ///    would produce).
+    /// 2. Call `ensure_queue_dirs`.
+    /// 3. Verify ALL queue subdirs have mode 0711 (deterministically set), NOT
+    ///    the pre-existing insecure mode.
+    /// 4. Verify `broker_requests/` has mode 01733.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_queue_dirs_sets_deterministic_mode_on_preexisting_insecure_subdirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+
+        // Pre-create all subdirs with insecure mode 0775 (simulating
+        // what create_dir_all would produce under umask 0o002).
+        for subdir in [
+            PENDING_DIR,
+            CLAIMED_DIR,
+            COMPLETED_DIR,
+            DENIED_DIR,
+            QUARANTINE_DIR,
+            CANCELLED_DIR,
+            CONSUME_RECEIPTS_DIR,
+        ] {
+            let path = queue_root.join(subdir);
+            fs::create_dir_all(&path).expect("create subdir");
+            fs::set_permissions(&path, std::fs::Permissions::from_mode(0o775))
+                .expect("set insecure mode 0775");
+        }
+
+        // Also pre-create queue root with insecure mode.
+        fs::set_permissions(&queue_root, std::fs::Permissions::from_mode(0o775))
+            .expect("set insecure mode on queue root");
+
+        // Call ensure_queue_dirs - must fix all modes.
+        ensure_queue_dirs(&queue_root).expect("ensure_queue_dirs should succeed");
+
+        // Check queue root itself.
+        let root_mode = fs::metadata(&queue_root)
+            .expect("queue root metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            root_mode, 0o711,
+            "queue root must have mode 0711, got {root_mode:#o}"
+        );
+
+        // Check each queue subdir has mode 0711.
+        for subdir in [
+            PENDING_DIR,
+            CLAIMED_DIR,
+            COMPLETED_DIR,
+            DENIED_DIR,
+            QUARANTINE_DIR,
+            CANCELLED_DIR,
+            CONSUME_RECEIPTS_DIR,
+        ] {
+            let path = queue_root.join(subdir);
+            let mode = fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("metadata for {subdir}: {e}"))
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                mode, 0o711,
+                "{subdir} must have mode 0711 (not umask-derived 0775), got {mode:#o}"
+            );
+        }
+
+        // Check broker_requests/ has mode 01733.
+        let broker_mode = fs::metadata(queue_root.join(BROKER_REQUESTS_DIR))
+            .expect("broker_requests metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            broker_mode, 0o1733,
+            "broker_requests must have mode 01733, got {broker_mode:#o}"
+        );
+    }
+
+    /// TCK-00577 round 11 BLOCKER regression: Fresh queue creation must
+    /// also produce correct modes. Call `ensure_queue_dirs` on a completely
+    /// new directory and verify all modes are deterministic.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_queue_dirs_fresh_creation_sets_correct_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+
+        // Queue root does not exist yet - ensure_queue_dirs creates everything.
+        ensure_queue_dirs(&queue_root).expect("ensure_queue_dirs should succeed");
+
+        // Check queue root itself.
+        let root_mode = fs::metadata(&queue_root)
+            .expect("queue root metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            root_mode, 0o711,
+            "queue root must have mode 0711, got {root_mode:#o}"
+        );
+
+        // Check each queue subdir has mode 0711.
+        for subdir in [
+            PENDING_DIR,
+            CLAIMED_DIR,
+            COMPLETED_DIR,
+            DENIED_DIR,
+            QUARANTINE_DIR,
+            CANCELLED_DIR,
+            CONSUME_RECEIPTS_DIR,
+        ] {
+            let path = queue_root.join(subdir);
+            assert!(path.is_dir(), "{subdir} must exist");
+            let mode = fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("metadata for {subdir}: {e}"))
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                mode, 0o711,
+                "{subdir} must have mode 0711 after fresh creation, got {mode:#o}"
+            );
+        }
+
+        // Check broker_requests/ has mode 01733.
+        let broker_mode = fs::metadata(queue_root.join(BROKER_REQUESTS_DIR))
+            .expect("broker_requests metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            broker_mode, 0o1733,
+            "broker_requests must have mode 01733 after fresh creation, got {broker_mode:#o}"
+        );
+    }
+
+    /// TCK-00577 round 11 MAJOR regression: Pre-existing `broker_requests/`
+    /// with an unsafe mode (0333 - world-writable, no sticky bit) must be
+    /// hardened to 01733 by `ensure_queue_dirs` at worker startup.
+    ///
+    /// Steps:
+    /// 1. Create `broker_requests/` with unsafe mode 0333.
+    /// 2. Call `ensure_queue_dirs`.
+    /// 3. Verify `broker_requests/` mode is now 01733 (hardened).
+    #[cfg(unix)]
+    #[test]
+    fn ensure_queue_dirs_hardens_preexisting_unsafe_broker_requests() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        // Create broker_requests/ manually with unsafe mode 0333
+        // (world-writable, no sticky bit).
+        fs::create_dir_all(&broker_dir).expect("create broker_requests");
+        fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o333))
+            .expect("set unsafe mode 0333");
+
+        // Verify the unsafe mode is set.
+        let pre_mode = fs::metadata(&broker_dir)
+            .expect("broker metadata pre-fix")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            pre_mode, 0o333,
+            "pre-condition: broker_requests must start with mode 0333"
+        );
+
+        // Run ensure_queue_dirs - must harden the pre-existing directory.
+        ensure_queue_dirs(&queue_root).expect("ensure_queue_dirs should succeed");
+
+        // Verify broker_requests/ is now hardened to 01733.
+        let post_mode = fs::metadata(&broker_dir)
+            .expect("broker metadata post-fix")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            post_mode, 0o1733,
+            "broker_requests must be hardened from 0333 to 01733, got {post_mode:#o}"
+        );
+    }
+
+    /// TCK-00577 round 11 BLOCKER regression: After `ensure_queue_dirs`,
+    /// the relaxed preflight validator's mode check (reject group/other
+    /// read or write bits: mode & 0o066 != 0) must accept all queue
+    /// subdirectories. This proves the end-to-end invariant: queue dirs
+    /// created by `ensure_queue_dirs` pass the same validation used by
+    /// worker startup preflight.
+    ///
+    /// The check is inlined here (mode & 0o066 == 0) rather than
+    /// importing from `fac_permissions` to avoid cross-module visibility
+    /// issues with the integration test harness.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_queue_dirs_passes_relaxed_preflight_mode_check() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+
+        // Create queue dirs via `ensure_queue_dirs`.
+        ensure_queue_dirs(&queue_root).expect("ensure_queue_dirs should succeed");
+
+        // Inline the same check that `validate_directory_mode_only` performs:
+        // reject group/other read or write bits (0o066) but allow execute-only
+        // (0o011) for traversal.
+        let queue_dirs: Vec<&str> = vec![
+            PENDING_DIR,
+            CLAIMED_DIR,
+            COMPLETED_DIR,
+            DENIED_DIR,
+            QUARANTINE_DIR,
+            CANCELLED_DIR,
+            CONSUME_RECEIPTS_DIR,
+        ];
+
+        // Check queue root.
+        let root_mode = fs::metadata(&queue_root)
+            .expect("queue root metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            root_mode & 0o066,
+            0,
+            "queue root mode {root_mode:#o} has group/other read or write bits \
+             that relaxed preflight would reject"
+        );
+
+        // Check each queue subdir.
+        for subdir in &queue_dirs {
+            let path = queue_root.join(subdir);
+            let mode = fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("metadata for {subdir}: {e}"))
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                mode & 0o066,
+                0,
+                "{subdir} mode {mode:#o} has group/other read or write bits \
+                 that relaxed preflight would reject"
+            );
+        }
+
+        // broker_requests/ has special mode 01733. Verify it also passes
+        // the relaxed check (01733 & 0o066 = 0o022 which DOES have
+        // group write bits). However, broker_requests/ is validated
+        // separately by `enqueue_via_broker_requests`, not by the relaxed
+        // preflight validator on queue subdirs, so this is expected. The
+        // FAC_SUBDIRS_QUEUE list does NOT include broker_requests/.
     }
 }

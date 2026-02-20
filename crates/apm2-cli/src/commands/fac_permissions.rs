@@ -40,9 +40,10 @@ const fn fac_file_open_flags() -> i32 {
 /// the strict 0700 check, breaking non-enqueue commands like `fac lane status`.
 ///
 /// Queue directories are checked separately:
-/// - The **relaxed** validator (`validate_fac_root_permissions_relaxed_at`)
-///   iterates both `FAC_SUBDIRS_STRICT` and `FAC_SUBDIRS_QUEUE`, and permits
-///   execute-only traversal bits (`o+x` without `o+r`/`o+w`).
+/// - The **relaxed** validator
+///   (`validate_fac_root_permissions_relaxed_for_enqueue_at`) iterates both
+///   `FAC_SUBDIRS_STRICT` and `FAC_SUBDIRS_QUEUE`, and permits execute-only
+///   traversal bits (`o+x` without `o+r`/`o+w`).
 /// - The **strict** validator uses only this list (`FAC_SUBDIRS_STRICT`).
 const FAC_SUBDIRS_STRICT: &[&str] = &[
     "private",
@@ -575,11 +576,16 @@ pub fn validate_fac_root_permissions_for(apm2_home: &Path) -> Result<(), FacPerm
 /// validated separately by `enqueue_via_broker_requests`.
 pub fn validate_fac_root_permissions_relaxed_for_enqueue() -> Result<(), FacPermissionsError> {
     let apm2_home = resolve_apm2_home()?;
-    validate_fac_root_permissions_relaxed_at(&apm2_home)
+    validate_fac_root_permissions_relaxed_for_enqueue_at(&apm2_home)
 }
 
 /// Relaxed validation: checks mode bits and symlink safety but not ownership.
-fn validate_fac_root_permissions_relaxed_at(apm2_home: &Path) -> Result<(), FacPermissionsError> {
+///
+/// Public for testability (e.g., verifying that `ensure_queue_dirs` output
+/// satisfies relaxed preflight requirements).
+pub fn validate_fac_root_permissions_relaxed_for_enqueue_at(
+    apm2_home: &Path,
+) -> Result<(), FacPermissionsError> {
     // Validate that apm2_home exists, is not a symlink, and is a directory.
     // Skip ownership check — in service-user deployments the caller EUID
     // will differ from the directory owner.
@@ -1125,7 +1131,7 @@ mod tests {
 
         // Now validate with relaxed mode — should still pass since
         // all directories have mode 0700 and are owned by us.
-        let relaxed_result = validate_fac_root_permissions_relaxed_at(&apm2_home);
+        let relaxed_result = validate_fac_root_permissions_relaxed_for_enqueue_at(&apm2_home);
         assert!(
             relaxed_result.is_ok(),
             "relaxed validation should succeed for 0700 dirs: {relaxed_result:?}"
@@ -1158,7 +1164,7 @@ mod tests {
             .expect("set queue to 0711");
 
         // Relaxed validation should accept 0711 on queue/.
-        let relaxed_result = validate_fac_root_permissions_relaxed_at(&apm2_home);
+        let relaxed_result = validate_fac_root_permissions_relaxed_for_enqueue_at(&apm2_home);
         assert!(
             relaxed_result.is_ok(),
             "relaxed validation should accept 0711 on queue/: {relaxed_result:?}"
@@ -1178,7 +1184,7 @@ mod tests {
         std::fs::set_permissions(&apm2_home, std::fs::Permissions::from_mode(0o755))
             .expect("set unsafe permissions");
 
-        let result = validate_fac_root_permissions_relaxed_at(&apm2_home);
+        let result = validate_fac_root_permissions_relaxed_for_enqueue_at(&apm2_home);
         assert!(
             result.is_err(),
             "relaxed validation should still reject world-readable directory"
@@ -1200,7 +1206,7 @@ mod tests {
         std::fs::create_dir(&real_dir).expect("create real dir");
         std::os::unix::fs::symlink(&real_dir, &symlink_path).expect("create symlink");
 
-        let result = validate_fac_root_permissions_relaxed_at(&symlink_path);
+        let result = validate_fac_root_permissions_relaxed_for_enqueue_at(&symlink_path);
         assert!(result.is_err(), "relaxed validation should reject symlinks");
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("symlink"), "should mention symlink: {msg}");
