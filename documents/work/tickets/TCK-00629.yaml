@@ -1,0 +1,51 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: TCK-00629
+    title: 'RFC-0032: Kernel-Native FAC vNext cutover (epic tracker)'
+    status: OPEN
+  binds:
+    prd_id: PRD-PLACEHOLDER
+    rfc_id: RFC-0032
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_PRODUCT
+    - DOMAIN_KERNEL
+    - DOMAIN_DAEMON
+    - DOMAIN_PROTOCOL
+    - DOMAIN_CLI
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00630
+      reason: Core-ledger migration must land first (Phase 0 prerequisite)
+    - ticket_id: TCK-00655
+      reason: System acceptance tests must be green before promotion
+  scope:
+    in_scope:
+    - Track RFC-0032 implementation phases (0-6) as discrete mergeable tickets
+    - 'Maintain cross-ticket invariants: ledger+CAS reconstructibility, bounded decoding, topic derivation tests, parity gates fail-closed'
+    - Ensure acceptance tests AT-0..AT-5 exist and are promotion-blocking in production mode
+    - Coordinate deprecation/removal sequencing for WorkRegistry authority and legacy ledger writers
+    out_of_scope:
+    - Implement code changes directly (handled by dependent tickets)
+    - Redesign actor identity / cryptographic model beyond vNext (explicitly deferred by RFC-0032)
+  plan:
+    steps:
+    - Keep dependency graph current; update this ticket when child tickets are added/merged
+    - Maintain a 'Phase checklist' section in RFC-0032 tracking migration readiness signals (metrics/tests/gates)
+    - Run AT-0..AT-5 on every promotion candidate; treat failures as promotion-blocking
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+    - All Phase 0-6 tickets required for vNext are MERGED.
+    - All drift-control guardrails are implemented with tests (schema registry allowlist, topic derivation coverage, parity gates).
+    - AT-0..AT-5 pass in CI and can be executed locally against a seeded legacy DB.
+    - No daemon codepath can append to legacy `ledger_events` in production mode.
+  notes:
+    security: Fail-closed by default; do not weaken existing promotion-blocking gates (alias reconciliation, parity/merge gates).
+    verification: Track and publish a reproducible end-to-end demo script exercising AT-0..AT-5.

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00588"
     title: "End-to-end default-mode harness: spin up broker+worker, enqueue gates, verify RFC-0028/0029 receipts, and test denial paths"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

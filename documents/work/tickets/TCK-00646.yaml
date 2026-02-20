@@ -1,0 +1,45 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: TCK-00646
+    title: 'RFC-0032 Phase 4: daemon WorktreeManager (deterministic workspace paths; config + WorkLoopProfile overrides)'
+    status: OPEN
+  binds:
+    prd_id: PRD-PLACEHOLDER
+    rfc_id: RFC-0032
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_DAEMON
+    - DOMAIN_RUNTIME
+    - DOMAIN_TOOLING
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00645
+      reason: Needs active WorkLoopProfile projection
+    - ticket_id: TCK-00636
+      reason: Needs WorkSpec repo identity for repo_slug
+  scope:
+    in_scope:
+    - Implement daemon-owned workspace allocation so callers no longer supply workspace_root directly for SpawnEpisode-style flows
+    - 'Deterministic workspace path: <root>/<repo_slug>/<work_id>/ where repo_slug = owner_repo from WorkSpec'
+    - 'Support strategies: git_worktree (default) and git_clone_shared (fallback)'
+    - Support policies from WorkLoopProfile.workspace and daemon config defaults (reuse_per_work, cleanup_on_complete)
+    out_of_scope:
+    - Changing git operations semantics in fac_review beyond workspace root determination
+  plan:
+    steps:
+    - Add WorktreeManager component/module under `crates/apm2-daemon/src/work/`
+    - Read workspace defaults from daemon config; override with active WorkLoopProfile when present
+    - Implement deterministic path computation using WorkSpec.repo owner/name join
+    - Add cleanup hook triggered on `work.completed` when cleanup_on_complete is true
+    - 'Add tests: deterministic path stable across nudges; cleanup occurs only on completion'
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+    - Workspace allocation is deterministic and daemon-owned; clients/CLI are not authority for workspace_root.
+    - WorkLoopProfile overrides are honored without allowing privilege escalation.

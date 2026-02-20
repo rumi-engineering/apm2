@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00592"
     title: "Explicit cache purge command: `apm2 fac caches nuke` (dangerous) with hard confirmations and receipts"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

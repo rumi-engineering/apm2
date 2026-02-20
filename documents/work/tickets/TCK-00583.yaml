@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00583"
     title: "Receipt/index compaction + GC: prune old index buckets, rebuild deterministically, and emit compaction receipts"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00572"
     title: "Cgroup usage accounting: record cpu/mem/IO stats per job and store in receipts (feeds economics calibration)"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

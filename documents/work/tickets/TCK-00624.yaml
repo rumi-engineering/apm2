@@ -87,10 +87,73 @@ scope:
           - edge-case regressions green.
         This sequencing is mandatory to avoid mixing stabilization and test
         harness refactors in one unresolved change window.
+    - id: "S7_MERGE_FLOW_FANOUT_FIRST_THEN_LOCAL_RESET"
+      title: "Redesign merge sequencing: fanout-first, then stash+fetch+reset-hard on local main"
+      detail: |
+        Current flow (incorrect):
+          sync_local_main_with_origin → try_fast_forward_main (local ref update)
+          → persist_signed_merge_receipt → push_local_main_to_origin
+          → project_merge_to_all_sinks (GitHub API merge, idempotent at this point)
+
+        Required flow:
+          1. project_merge_to_all_sinks — call GitHub API (fanout) to merge the PR first.
+          2. On first successful projection result:
+             a. git stash --include-untracked on ~/Projects/apm2 (main worktree),
+                covering ALL local state (tracked, untracked, staged).
+             b. git fetch origin refs/heads/main.
+             c. git reset --hard to the merged SHA returned by the successful
+                projection (GitHub for now).
+             d. Assert the working tree is completely clean (no tracked changes,
+                no untracked files, no ignored artifacts that belong to the build).
+          3. Persist the signed merge receipt only after the local main is confirmed
+             clean and consistent with the projection result.
+
+        The key invariant: local main must never be fast-forwarded locally before
+        the projection succeeds. If the projection (GitHub API merge) fails, local
+        main stays on its pre-merge state. The stash-before-reset ensures no local
+        work is silently discarded without a recovery path.
+    - id: "S8_MERGE_CONFLICT_TOCTOU_GUARD"
+      title: "Bugfix: re-check merge conflicts after evidence gates pass to close TOCTOU window"
+      detail: |
+        The merge_conflict_main gate currently runs once at the start of the execute
+        phase (step 3 in run_execute_phase). Evidence gates take 2-3 minutes.
+        During that window, a concurrent push to main can introduce a new conflict
+        on the branch under review, leaving gates recorded as PASS even though the
+        branch now has a merge conflict.
+
+        Fix: run a second merge_conflict_main check immediately after all evidence
+        gates pass and before recording the overall GatesSummary as passed. If the
+        second check finds a conflict, override the result to FAIL with
+        failure_code = GateExecutionFailed and remediation = "dispatch implementor".
+        The first check (fast-fail early) is kept for speed; the second check
+        (bookend guard) closes the race window.
+    - id: "S9_GATE_ORDERING_FASTEST_FIRST"
+      title: "Re-order evidence gates fastest-first to minimize wasted compute on failure"
+      detail: |
+        Within the evidence gate pipeline, gates should be ordered by expected
+        duration ascending so that the cheapest checks eliminate failing branches
+        before expensive checks run. Current known ordering issue: rustfmt, clippy,
+        and cargo test may not be sequenced by duration.
+
+        Required ordering principle: a gate that is expected to complete in T seconds
+        should not be scheduled after a gate expected to take 10T seconds. Apply this
+        principle to the evidence gate list produced by run_evidence_gates_with_lane_context.
+        Document the rationale for the chosen order in a code comment so future gate
+        additions can be slotted correctly.
+    - id: "S6_DISPATCH_IMPLEMENTOR_ON_GATE_FAILURE"
+      title: "Bugfix: recommended action on evidence gate failure must be dispatch-implementor"
+      detail: |
+        When an evidence gate fails (e.g. rustfmt check, clippy, cargo test),
+        the remediation field emitted by StructuredFailure — and any
+        human-readable output — must recommend "dispatch implementor" as the
+        next action. Recommending "request-reviews" on a gate failure is
+        incorrect: review cannot proceed until the gate passes, so dispatching
+        the implementor to fix the underlying issue is the only valid path.
+        Apply consistently across all GateExecutionFailed remediation strings.
   out_of_scope:
     - "Adding new top-level failure codes beyond the four defined."
     - "JSONL full event schema (TCK-00625 owns the broader stdout contract)."
-    - "Failure taxonomy for commands other than apm2 fac gates."
+    - "Failure taxonomy for commands other than the gates phase of apm2 fac push."
 
 plan:
   steps:

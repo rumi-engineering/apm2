@@ -1,0 +1,47 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: TCK-00631
+    title: 'RFC-0032 Phase 0: daemon startup wiring + freeze legacy ledger writers'
+    status: OPEN
+  binds:
+    prd_id: PRD-PLACEHOLDER
+    rfc_id: RFC-0032
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_DAEMON
+    - DOMAIN_KERNEL
+    - DOMAIN_PROTOCOL
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00630
+      reason: Requires core migration implementation to run at daemon startup
+  scope:
+    in_scope:
+    - Invoke Phase 0 migration during daemon startup before any projections or writes
+    - Ensure all new ledger appends go to core `events` (not legacy `ledger_events`), even for legacy-signed JSON event types during bridge
+    - Hard-fail any codepath attempting to write `ledger_events` once migration has frozen the table
+    - Update/introduce an event append helper that always sets `prev_hash`/`event_hash` (and attaches signatures when available)
+    - Add runtime logging/metrics that clearly indicate ledger mode and whether legacy tables are frozen
+    out_of_scope:
+    - Removing legacy JSON event emission semantics (handled in later phases; this ticket is storage-plane only)
+  plan:
+    steps:
+    - Locate daemon startup path where `LedgerStorage` is opened; call the Phase 0 migration if `events` is empty and legacy table exists
+    - Replace or wrap any usage of `SqliteLedgerEventEmitter` (legacy) so it appends into core `events` (with chain) or refuses in production mode
+    - 'Add an invariant check: after startup, `LedgerReadMode` must not be `LegacyLedgerEvents` in production mode'
+    - Add a small redteam test to ensure legacy writer attempts are rejected (fail-closed) after migration
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+    - Daemon can start against a legacy DB, run migration, and then append at least one new event to `events` successfully.
+    - Any attempt to append to `ledger_events` after startup fails with a clear error and does not mutate state.
+    - 'Metrics/logs expose: whether migration ran, number of migrated rows, and final ledger mode.'
+  notes:
+    security: Do not allow a dual-writer period; once migration runs, treat legacy table as frozen and reject writes.
+    verification: 'Exercise daemon startup with three DB states: (a) legacy-only, (b) canonical-only, (c) ambiguous (expect fail-fast).'

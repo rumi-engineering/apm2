@@ -1,0 +1,48 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: TCK-00651
+    title: 'RFC-0032 Phase 6: eliminate WorkRegistry as authority source (SpawnEpisode reads authority bindings from ledger+CAS projections)'
+    status: OPEN
+  binds:
+    prd_id: PRD-PLACEHOLDER
+    rfc_id: RFC-0032
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_DAEMON
+    - DOMAIN_EVIDENCE
+    - DOMAIN_SECURITY
+    - DOMAIN_PROJECTION
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00637
+      reason: ClaimWorkV2 publishes WorkAuthorityBindings
+    - ticket_id: TCK-00638
+      reason: Evidence pipeline for CAS anchors
+  scope:
+    in_scope:
+    - Stop using WorkRegistry as an authority source for SpawnEpisode and privileged operations
+    - Ensure authority-relevant pins (policy resolution hashes, capability manifest hash, context pack hashes, stop-condition hash, typed budgets, permeability receipt hash) are stored in `apm2.work_authority_bindings.v1` and anchored via `evidence.published`
+    - Update `handle_spawn_episode` to fetch authority bindings via projections + CAS (bounded decode) and validate against requested action
+    - Treat missing/incomplete bindings as fail-closed (no best-effort fallback to SQLite-only authority)
+    out_of_scope:
+    - Deleting WorkRegistry tables immediately (may remain as derived cache temporarily)
+  plan:
+    steps:
+    - Add projection table `work_authority_bindings` keyed by (work_id, role) derived from evidence.published category WORK_AUTHORITY_BINDINGS
+    - Update spawn_episode path to require bindings existence for the lease/role and validate boundary pins
+    - Remove or gate any remaining reads from WorkRegistry that influence authorization decisions
+    - 'Add tests: SpawnEpisode fails when bindings missing; succeeds when present; mismatched pins fail-closed'
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+    - SpawnEpisode and privileged validations do not depend on WorkRegistry-only state.
+    - Authority decisions are replayable from ledger+CAS alone.
+    - Missing pins are recorded as defects and block promotion-capable actions (fail-closed).
+  notes:
+    security: 'This is a hard requirement: no SQLite-only authority for ''what happens next''.'
