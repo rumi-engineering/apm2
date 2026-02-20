@@ -1251,16 +1251,27 @@ fn resolve_service_binary(unit_name: &str) -> Result<PathBuf, String> {
 /// FU-001 (TCK-00625): Check binary alignment between interactive CLI
 /// (`which apm2`) and systemd service `ExecStart` binaries.
 ///
-/// Computes SHA-256 digests of all resolved binary paths and emits WARN
-/// if any digest mismatches. This prevents recurrence of INV-PADOPT-004
-/// where binary drift caused non-deterministic behavior.
+/// Computes SHA-256 digests of all resolved binary paths and enforces
+/// fail-closed semantics: any mismatch or unverifiable state is ERROR.
+/// This prevents recurrence of INV-PADOPT-004 where binary drift caused
+/// non-deterministic behavior.
+///
+/// # Status semantics
+///
+/// - `OK`: ALL required service binaries resolved AND all digests match.
+/// - `WARN`: Partial resolution — at least one unit resolved and matched but
+///   other units failed to resolve. This is a degraded but non-fatal state
+///   (e.g., only daemon is installed, worker unit is absent).
+/// - `ERROR`: Digest mismatch detected, no service binaries resolvable, or CLI
+///   binary itself cannot be resolved/digested. Fail-closed.
 fn check_binary_alignment() -> DaemonDoctorCheck {
     let cli_path = match resolve_which_apm2() {
         Ok(p) => p,
         Err(e) => {
+            // CLI binary itself cannot be resolved — ERROR (fail-closed).
             return DaemonDoctorCheck {
                 name: "binary_alignment".to_string(),
-                status: "WARN",
+                status: "ERROR",
                 message: format!(
                     "cannot resolve CLI binary path: {e}. \
                      Remediation: ensure apm2 is on PATH"
@@ -1272,46 +1283,100 @@ fn check_binary_alignment() -> DaemonDoctorCheck {
     let cli_digest = match sha256_file_digest(&cli_path) {
         Ok(d) => d,
         Err(e) => {
+            // Cannot compute CLI digest — ERROR (fail-closed).
             return DaemonDoctorCheck {
                 name: "binary_alignment".to_string(),
-                status: "WARN",
+                status: "ERROR",
                 message: format!("cannot compute CLI binary digest: {e}"),
             };
         },
     };
 
+    // Resolve each service unit's binary and compute its digest.
+    let unit_results: Vec<(&str, Result<String, String>)> = BINARY_ALIGNMENT_UNIT_NAMES
+        .iter()
+        .map(|unit| {
+            let digest_result =
+                resolve_service_binary(unit).and_then(|svc_path| sha256_file_digest(&svc_path));
+            (*unit, digest_result)
+        })
+        .collect();
+
+    // Convert to borrowed slices for the shared inner function.
+    let borrowed: Vec<(&str, Result<&str, &str>)> = unit_results
+        .iter()
+        .map(|(unit, res)| {
+            (
+                *unit,
+                res.as_ref().map(String::as_str).map_err(String::as_str),
+            )
+        })
+        .collect();
+
+    check_binary_alignment_inner(
+        &cli_path.display().to_string(),
+        &cli_digest,
+        &borrowed,
+        BINARY_ALIGNMENT_UNIT_NAMES.len(),
+    )
+}
+
+/// Testable inner logic for binary alignment checking.
+///
+/// Accepts pre-resolved CLI binary info and per-unit resolution results,
+/// avoiding external shell-outs (`which`, `systemctl`) in tests.
+///
+/// Each entry in `unit_results` is `(unit_name, Result<digest, error_msg>)`:
+/// - `Ok(digest)` means the unit's binary was resolved and its SHA-256
+///   computed.
+/// - `Err(msg)` means resolution or digest computation failed.
+fn check_binary_alignment_inner(
+    cli_display: &str,
+    cli_digest: &str,
+    unit_results: &[(&str, Result<&str, &str>)],
+    total_units: usize,
+) -> DaemonDoctorCheck {
     let mut mismatches: Vec<String> = Vec::new();
     let mut resolve_failures: Vec<String> = Vec::new();
     let mut resolved_ok_count: usize = 0;
 
-    for unit in &BINARY_ALIGNMENT_UNIT_NAMES {
-        match resolve_service_binary(unit) {
-            Ok(svc_path) => match sha256_file_digest(&svc_path) {
-                Ok(svc_digest) => {
-                    if svc_digest == cli_digest {
-                        resolved_ok_count += 1;
-                    } else {
-                        mismatches.push(format!(
-                            "{unit}: path={} sha256={svc_digest} \
-                             (CLI: path={} sha256={cli_digest})",
-                            svc_path.display(),
-                            cli_path.display()
-                        ));
-                    }
-                },
-                Err(e) => {
-                    resolve_failures.push(format!("{unit}: cannot compute digest: {e}"));
-                },
+    for &(unit, ref result) in unit_results {
+        match result {
+            Ok(svc_digest) => {
+                if *svc_digest == cli_digest {
+                    resolved_ok_count += 1;
+                } else {
+                    mismatches.push(format!(
+                        "{unit}: sha256={svc_digest} (CLI: {cli_display} sha256={cli_digest})"
+                    ));
+                }
             },
             Err(e) => {
-                resolve_failures.push(format!("{unit}: cannot resolve service binary: {e}"));
+                resolve_failures.push(format!("{unit}: {e}"));
             },
         }
     }
 
-    // Fail-closed: if we could not resolve ANY service binary, never report OK.
-    if resolved_ok_count == 0 && mismatches.is_empty() {
-        // No service binary was successfully resolved and verified.
+    // Fail-closed: digest mismatch is always ERROR.
+    if !mismatches.is_empty() {
+        let mut parts = Vec::with_capacity(mismatches.len() + resolve_failures.len());
+        parts.extend(mismatches);
+        if !resolve_failures.is_empty() {
+            parts.extend(resolve_failures);
+        }
+        return DaemonDoctorCheck {
+            name: "binary_alignment".to_string(),
+            status: "ERROR",
+            message: format!(
+                "binary digest mismatch detected (INV-PADOPT-004 risk): {}. \
+                 Remediation: run `apm2 fac install` to realign binaries",
+                parts.join("; ")
+            ),
+        };
+    }
+
+    // Fail-closed: no service binary verified at all.
+    if resolved_ok_count == 0 {
         let detail = if resolve_failures.is_empty() {
             "no service units configured for alignment check".to_string()
         } else {
@@ -1319,7 +1384,7 @@ fn check_binary_alignment() -> DaemonDoctorCheck {
         };
         return DaemonDoctorCheck {
             name: "binary_alignment".to_string(),
-            status: "WARN",
+            status: "ERROR",
             message: format!(
                 "no service binary could be verified ({detail}). \
                  Remediation: ensure apm2-daemon.service and \
@@ -1328,45 +1393,28 @@ fn check_binary_alignment() -> DaemonDoctorCheck {
         };
     }
 
-    // Some units resolved but others failed — partial verification.
+    // Partial: some matched, some failed to resolve — WARN.
     if !resolve_failures.is_empty() {
-        let mut parts = Vec::with_capacity(mismatches.len() + resolve_failures.len());
-        parts.extend(mismatches);
-        parts.extend(resolve_failures);
         return DaemonDoctorCheck {
             name: "binary_alignment".to_string(),
             status: "WARN",
             message: format!(
-                "partial binary verification ({resolved_ok_count}/{} units ok): {}. \
+                "partial binary verification ({resolved_ok_count}/{total_units} units ok): {}. \
                  Remediation: run `apm2 fac install` to realign binaries",
-                BINARY_ALIGNMENT_UNIT_NAMES.len(),
-                parts.join("; ")
+                resolve_failures.join("; ")
             ),
         };
     }
 
-    if mismatches.is_empty() {
-        // All units resolved and all digests matched.
-        DaemonDoctorCheck {
-            name: "binary_alignment".to_string(),
-            status: "OK",
-            message: format!(
-                "CLI binary ({}) and all {resolved_ok_count} service binaries \
-                 have matching SHA-256 digest ({})",
-                cli_path.display(),
-                &cli_digest[..16]
-            ),
-        }
-    } else {
-        DaemonDoctorCheck {
-            name: "binary_alignment".to_string(),
-            status: "WARN",
-            message: format!(
-                "binary digest mismatch detected (INV-PADOPT-004 risk): {}. \
-                 Remediation: run `apm2 fac install` to realign binaries",
-                mismatches.join("; ")
-            ),
-        }
+    // All resolved and matched — OK.
+    DaemonDoctorCheck {
+        name: "binary_alignment".to_string(),
+        status: "OK",
+        message: format!(
+            "CLI binary ({cli_display}) and all {resolved_ok_count} service binaries \
+             have matching SHA-256 digest ({})",
+            &cli_digest[..cli_digest.len().min(16)]
+        ),
     }
 }
 
@@ -2165,5 +2213,158 @@ mod tests {
             assert_eq!(result.status, "ERROR", "symlink must always be detected");
             assert!(result.message.contains("symlink"));
         }
+    }
+
+    // ── Binary alignment doctor check tests (TCK-00625 MAJOR-2) ────────
+
+    /// TCK-00625 MAJOR-2: Digest mismatch must produce ERROR status
+    /// (fail-closed), not WARN.
+    #[test]
+    fn binary_alignment_digest_mismatch_is_error() {
+        let cli_digest = "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666";
+        let svc_digest = "9999888877776666555544443333222211110000ffffeeee";
+        let result = check_binary_alignment_inner(
+            "/usr/bin/apm2",
+            cli_digest,
+            &[
+                ("apm2-daemon.service", Ok(svc_digest)),
+                ("apm2-worker.service", Ok(cli_digest)),
+            ],
+            2,
+        );
+        assert_eq!(
+            result.status, "ERROR",
+            "digest mismatch must be ERROR, got: {} — {}",
+            result.status, result.message
+        );
+        assert!(
+            result.message.contains("mismatch"),
+            "message must mention mismatch: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("INV-PADOPT-004"),
+            "message must cite INV-PADOPT-004: {}",
+            result.message
+        );
+    }
+
+    /// TCK-00625 MAJOR-2: No service binaries resolvable must produce
+    /// ERROR status (fail-closed), not WARN.
+    #[test]
+    fn binary_alignment_no_service_resolvable_is_error() {
+        let cli_digest = "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666";
+        let result = check_binary_alignment_inner(
+            "/usr/bin/apm2",
+            cli_digest,
+            &[
+                (
+                    "apm2-daemon.service",
+                    Err("cannot resolve service binary: unit not found"),
+                ),
+                (
+                    "apm2-worker.service",
+                    Err("cannot resolve service binary: unit not found"),
+                ),
+            ],
+            2,
+        );
+        assert_eq!(
+            result.status, "ERROR",
+            "no resolvable service binaries must be ERROR, got: {} — {}",
+            result.status, result.message
+        );
+        assert!(
+            result
+                .message
+                .contains("no service binary could be verified"),
+            "message must indicate no verification: {}",
+            result.message
+        );
+    }
+
+    /// TCK-00625 MAJOR-2: Partial resolution (at least one matched, others
+    /// failed to resolve) produces WARN — degraded but not fatal.
+    #[test]
+    fn binary_alignment_partial_resolution_is_warn() {
+        let cli_digest = "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666";
+        let result = check_binary_alignment_inner(
+            "/usr/bin/apm2",
+            cli_digest,
+            &[
+                ("apm2-daemon.service", Ok(cli_digest)),
+                (
+                    "apm2-worker.service",
+                    Err("cannot resolve service binary: unit not found"),
+                ),
+            ],
+            2,
+        );
+        assert_eq!(
+            result.status, "WARN",
+            "partial resolution must be WARN, got: {} — {}",
+            result.status, result.message
+        );
+        assert!(
+            result.message.contains("partial binary verification"),
+            "message must indicate partial verification: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("1/2 units ok"),
+            "message must show count: {}",
+            result.message
+        );
+    }
+
+    /// TCK-00625 MAJOR-2: All service binaries resolved and all digests
+    /// match produces OK status.
+    #[test]
+    fn binary_alignment_all_match_is_ok() {
+        let cli_digest = "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666";
+        let result = check_binary_alignment_inner(
+            "/usr/bin/apm2",
+            cli_digest,
+            &[
+                ("apm2-daemon.service", Ok(cli_digest)),
+                ("apm2-worker.service", Ok(cli_digest)),
+            ],
+            2,
+        );
+        assert_eq!(
+            result.status, "OK",
+            "all matching digests must be OK, got: {} — {}",
+            result.status, result.message
+        );
+        assert!(
+            result.message.contains("matching SHA-256 digest"),
+            "message must confirm matching digest: {}",
+            result.message
+        );
+    }
+
+    /// TCK-00625 MAJOR-2: Mismatch + resolve failure is still ERROR
+    /// (mismatch takes precedence over partial resolution).
+    #[test]
+    fn binary_alignment_mismatch_plus_resolve_failure_is_error() {
+        let cli_digest = "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666";
+        let bad_digest = "9999888877776666555544443333222211110000ffffeeee";
+        let result = check_binary_alignment_inner(
+            "/usr/bin/apm2",
+            cli_digest,
+            &[
+                ("apm2-daemon.service", Ok(bad_digest)),
+                (
+                    "apm2-worker.service",
+                    Err("cannot resolve service binary: unit not found"),
+                ),
+            ],
+            2,
+        );
+        assert_eq!(
+            result.status, "ERROR",
+            "mismatch must dominate over resolve failure: {} — {}",
+            result.status, result.message
+        );
     }
 }

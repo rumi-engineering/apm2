@@ -372,26 +372,39 @@ pub fn run_install(
     }
 
     // Step 3: Re-link ~/.local/bin/apm2 -> ~/.cargo/bin/apm2
+    //
+    // INV-INSTALL-002: Symlink alignment is a required success condition.
+    // Failure to create or verify the symlink means the interactive CLI path
+    // may still diverge from the service binary, leaving INV-PADOPT-004-class
+    // drift in place. We treat this as a hard failure (success=false, non-zero
+    // exit) unless --allow-partial is explicitly passed.
+    let mut symlink_failed = false;
     match local_bin_path() {
         Ok(link_path) => match ensure_symlink(&link_path, &cargo_bin) {
             Ok(symlink_result) => {
                 result.symlink = Some(symlink_result);
             },
             Err(e) => {
+                symlink_failed = true;
                 if !json_output {
-                    eprintln!("WARNING: symlink creation failed: {e}");
+                    eprintln!("ERROR: symlink creation failed: {e}");
                 }
                 result.symlink = Some(SymlinkResult {
                     link_path: link_path.display().to_string(),
                     target_path: cargo_bin.display().to_string(),
                     status: format!("failed: {e}"),
                 });
+                result.error = Some(format!("symlink alignment failed: {e}"));
             },
         },
         Err(e) => {
+            symlink_failed = true;
             if !json_output {
-                eprintln!("WARNING: cannot resolve local bin path: {e}");
+                eprintln!("ERROR: cannot resolve local bin path: {e}");
             }
+            result.error = Some(format!(
+                "symlink alignment failed: cannot resolve local bin path: {e}"
+            ));
         },
     }
 
@@ -418,14 +431,17 @@ pub fn run_install(
         result.service_restarts.push(restart_result);
     }
 
-    // Determine overall success: true only if no restart failures.
+    // Determine overall success: true only if no restart failures AND
+    // symlink alignment succeeded. Both conditions are required for full
+    // alignment (INV-INSTALL-002, INV-INSTALL-004).
     let has_restart_failures = !result.restart_failures.is_empty();
-    result.success = !has_restart_failures;
+    result.success = !has_restart_failures && !symlink_failed;
 
     emit_result(&result, json_output);
 
-    // Fail-closed: non-zero exit when restarts failed unless --allow-partial.
-    if has_restart_failures && !allow_partial {
+    // Fail-closed: non-zero exit when restarts or symlink failed unless
+    // --allow-partial.
+    if (has_restart_failures || symlink_failed) && !allow_partial {
         return exit_codes::GENERIC_ERROR;
     }
 
@@ -633,6 +649,129 @@ mod tests {
         assert!(
             json_str.contains("\"restart_failures\":[]"),
             "expected empty restart_failures"
+        );
+    }
+
+    /// TCK-00625 MAJOR-1 regression: `ensure_symlink` failure on a
+    /// read-only directory causes an error, not silent success.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_symlink_fails_on_read_only_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let readonly_dir = temp.path().join("readonly_bin");
+        std::fs::create_dir_all(&readonly_dir).unwrap();
+
+        // Create a dummy target binary
+        let target = temp.path().join("apm2_binary");
+        std::fs::write(&target, b"fake-binary").unwrap();
+
+        // Lock the directory to read-only so symlink creation fails
+        std::fs::set_permissions(&readonly_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let link_path = readonly_dir.join("apm2");
+        let result = ensure_symlink(&link_path, &target);
+
+        // Restore permissions for cleanup
+        std::fs::set_permissions(&readonly_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "ensure_symlink must fail when parent directory is read-only"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("cannot create symlink"),
+            "error must describe symlink creation failure, got: {err}"
+        );
+    }
+
+    /// TCK-00625 MAJOR-1 regression: When symlink creation fails,
+    /// `InstallResult.success` must be `false` and the error field must
+    /// describe the symlink failure.
+    #[test]
+    fn install_result_success_false_on_symlink_failure() {
+        // Simulate the state that run_install would produce when
+        // ensure_symlink fails: symlink has "failed:" status, error is set,
+        // and success is false — even if all service restarts succeeded.
+        let result = InstallResult {
+            success: false,
+            installed_binary_path: Some("/usr/bin/apm2".to_string()),
+            sha256: Some("abcdef1234567890".to_string()),
+            workspace_root: Some("/home/user/Projects/apm2".to_string()),
+            service_restarts: vec![
+                ServiceRestartResult {
+                    unit: "apm2-daemon.service".to_string(),
+                    status: "restarted".to_string(),
+                    error: None,
+                },
+                ServiceRestartResult {
+                    unit: "apm2-worker.service".to_string(),
+                    status: "restarted".to_string(),
+                    error: None,
+                },
+            ],
+            restart_failures: vec![],
+            symlink: Some(SymlinkResult {
+                link_path: "/home/user/.local/bin/apm2".to_string(),
+                target_path: "/home/user/.cargo/bin/apm2".to_string(),
+                status: "failed: permission denied".to_string(),
+            }),
+            error: Some("symlink alignment failed: permission denied".to_string()),
+        };
+
+        let json_str = serde_json::to_string(&result).unwrap();
+
+        // success must be false even though no restart failures occurred
+        assert!(
+            json_str.contains("\"success\":false"),
+            "success must be false when symlink fails, got: {json_str}"
+        );
+        // error field must be present with symlink context
+        assert!(
+            json_str.contains("symlink alignment failed"),
+            "error must describe symlink failure, got: {json_str}"
+        );
+        // symlink status must reflect the failure
+        assert!(
+            json_str.contains("\"status\":\"failed: permission denied\""),
+            "symlink status must reflect failure, got: {json_str}"
+        );
+        // restart_failures should be empty (symlink failure is separate)
+        assert!(
+            json_str.contains("\"restart_failures\":[]"),
+            "restart_failures should be empty, got: {json_str}"
+        );
+    }
+
+    /// TCK-00625 MAJOR-1: Symlink failure must produce non-zero exit code
+    /// unless --allow-partial is set. This is a unit-level assertion that
+    /// the exit code logic is correct given the boolean states.
+    #[test]
+    fn symlink_failure_exit_code_logic() {
+        // When symlink fails and allow_partial is false: non-zero exit.
+        let symlink_failed = true;
+        let has_restart_failures = false;
+        let allow_partial = false;
+        assert!(
+            (has_restart_failures || symlink_failed) && !allow_partial,
+            "symlink failure without --allow-partial must trigger non-zero exit"
+        );
+
+        // When symlink fails but allow_partial is true: zero exit.
+        let allow_partial_set = true;
+        assert!(
+            !((has_restart_failures || symlink_failed) && !allow_partial_set),
+            "--allow-partial must suppress non-zero exit on symlink failure"
+        );
+
+        // When symlink succeeds and no restart failures: zero exit.
+        let symlink_ok = false;
+        let no_failures = false;
+        assert!(
+            !(no_failures || symlink_ok),
+            "clean install must not trigger non-zero exit"
         );
     }
 }

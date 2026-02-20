@@ -143,6 +143,38 @@ Credential management subcommands.
 | `apm2 fac lane reset <lane_id> --force` | Force-reset RUNNING lane (kills process first) |
 | `apm2 fac services status` | Check daemon/worker service status with health verdicts |
 
+### FAC Install and Binary Alignment (TCK-00625)
+
+| Command | Description |
+|---------|-------------|
+| `apm2 fac install` | Install current worktree binary, re-link symlink, restart services |
+| `apm2 fac install --json` | Same, with JSON receipt output |
+| `apm2 fac install --allow-partial` | Allow non-zero exit suppression for partial failures |
+
+**Overview:** The `fac install` subcommand enforces a single canonical
+runtime binary path by (1) running `cargo install`, (2) re-linking
+`~/.local/bin/apm2 -> ~/.cargo/bin/apm2`, and (3) restarting systemd
+services. This prevents INV-PADOPT-004-class binary drift.
+
+**Security Invariants:**
+- [INV-INSTALL-001] Binary reads for digest computation bounded to `MAX_BINARY_DIGEST_SIZE`.
+- [INV-INSTALL-002] Symlink creation is a **required** success condition.
+  Failure sets `success: false` and returns non-zero exit unless
+  `--allow-partial` is set. This is fail-closed: silent partial success
+  that leaves the CLI path unaligned is prohibited.
+- [INV-INSTALL-004] Service restart failures cause non-zero exit unless
+  `--allow-partial` is set.
+- [INV-INSTALL-005] Workspace root is derived from `current_exe()`, never
+  from untrusted `current_dir()`.
+
+**Doctor Binary Alignment Check (INV-PADOPT-004 prevention):**
+- The `apm2 daemon doctor` command includes a `binary_alignment` check.
+- Status semantics are fail-closed:
+  - `OK`: ALL required service binaries resolved AND all digests match.
+  - `WARN`: Partial resolution (at least one unit matched, others unresolvable).
+  - `ERROR`: Digest mismatch, no service binaries resolvable, or CLI binary
+    itself cannot be resolved/digested. Sets `has_error=true` to fail doctor.
+
 ### FAC Configuration Introspection (TCK-00590)
 
 | Command | Description |
