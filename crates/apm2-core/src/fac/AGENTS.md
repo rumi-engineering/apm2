@@ -3622,6 +3622,16 @@ includes `"lane_log_retention"` for the new action kind.
   tiebreaker. Protected entries (keep-last-N) are never pruned.
 - [INV-LLR-004] Policy defaults are conservative: 100 MiB byte quota, 7-day
   TTL, keep-last-5. All use `#[serde(default)]` for backwards compatibility.
+- [INV-LLR-005] Idle lane policy enforcement: `collect_idle_lane_targets` does
+  NOT emit `LaneLog` targets. Idle lane logs are always processed through
+  `collect_lane_log_retention_targets` with full policy enforcement
+  (`per_lane_log_max_bytes`, `per_job_log_ttl_days`, `keep_last_n_jobs_per_lane`).
+  This prevents unconditional full log deletion that would bypass retention policy.
+- [INV-LLR-006] Overflow target atomicity: `collect_lane_log_retention_targets`
+  collects all targets for each lane into a local vector. Only after the full
+  scan completes without overflow are targets committed to the shared vector.
+  If `scan_overflow` is triggered, ALL lane targets (including previously-collected
+  symlink and file targets) are discarded. This ensures fail-closed atomicity.
 
 ## metrics Submodule (TCK-00551)
 

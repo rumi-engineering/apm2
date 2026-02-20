@@ -351,10 +351,11 @@ pub fn plan_gc_with_log_retention(
     // CQ-MAJOR-1/3 fix: Only scan IDLE lanes for log retention pruning.
     // Active/running lanes must never have their logs pruned.
     //
-    // CQ-MAJOR-2 fix: Build a set of lane IDs whose logs/ directory is
-    // already scheduled for full removal (LaneLog target). Suppress
-    // LaneLogRetention child targets for these lanes to prevent
-    // overlapping parent/child deletion and double-counting bytes_freed.
+    // CQ-BLOCKER-1/2 fix: collect_idle_lane_targets no longer emits
+    // LaneLog targets, so idle lane logs are always processed through
+    // collect_lane_log_retention_targets with full policy enforcement.
+    // The lanes_with_full_log_gc set is retained as a defensive guard
+    // in case any future code path adds LaneLog targets to the plan.
     let idle_lane_ids: Vec<String> = statuses
         .iter()
         .filter(|s| s.state == LaneState::Idle)
@@ -403,14 +404,13 @@ fn collect_idle_lane_targets(
     lane_manager: &LaneManager,
     statuses: &[LaneStatusV1],
 ) -> Vec<GcTarget> {
-    let mut targets = Vec::with_capacity(statuses.len().saturating_mul(2));
+    let mut targets = Vec::with_capacity(statuses.len());
     for status in statuses {
         if status.state != LaneState::Idle {
             continue;
         }
         let lane_dir = lane_manager.lane_dir(&status.lane_id);
         let target_dir = lane_dir.join("target");
-        let log_dir = lane_dir.join("logs");
 
         if target_dir.exists() {
             targets.push(GcTarget {
@@ -420,14 +420,13 @@ fn collect_idle_lane_targets(
                 estimated_bytes: estimate_dir_size(&target_dir),
             });
         }
-        if log_dir.exists() {
-            targets.push(GcTarget {
-                path: log_dir.clone(),
-                allowed_parent: lane_dir.clone(),
-                kind: crate::fac::gc_receipt::GcActionKind::LaneLog,
-                estimated_bytes: estimate_dir_size(&log_dir),
-            });
-        }
+        // CQ-BLOCKER-1/2 fix: Do NOT emit LaneLog targets for idle lanes.
+        // Idle lane logs are processed by collect_lane_log_retention_targets
+        // which enforces per_lane_log_max_bytes, per_job_log_ttl_days, and
+        // keep_last_n_jobs_per_lane. Emitting a blanket LaneLog target here
+        // caused plan_gc_with_log_retention to skip retention policy for
+        // idle lanes (they were added to lanes_with_full_log_gc, which
+        // suppressed collect_lane_log_retention_targets for those lanes).
     }
     targets
 }
@@ -507,6 +506,12 @@ fn collect_lane_log_retention_targets(
             continue;
         };
 
+        // CQ-MAJOR-1/2 fix (overflow atomicity): Collect all targets for
+        // this lane into a local vector. Only append to the shared `targets`
+        // vector after the full scan completes without overflow. This ensures
+        // atomicity: either ALL targets for a lane are included, or NONE.
+        let mut lane_targets: Vec<GcTarget> = Vec::new();
+
         // Collect job log subdirectories with their metadata.
         let mut job_logs: Vec<JobLogEntry> = Vec::new();
         let mut scan_count = 0usize;
@@ -530,7 +535,7 @@ fn collect_lane_log_retention_targets(
             // GC executor will clean them up, preventing symlink-based
             // quota bypass.
             if metadata.file_type().is_symlink() {
-                targets.push(GcTarget {
+                lane_targets.push(GcTarget {
                     path,
                     allowed_parent: log_dir.clone(),
                     kind: crate::fac::gc_receipt::GcActionKind::LaneLogRetention,
@@ -544,7 +549,7 @@ fn collect_lane_log_retention_targets(
             // bypassing per-lane log-retention controls.
             if !metadata.is_dir() {
                 let file_bytes = metadata.len();
-                targets.push(GcTarget {
+                lane_targets.push(GcTarget {
                     path,
                     allowed_parent: log_dir.clone(),
                     kind: crate::fac::gc_receipt::GcActionKind::LaneLogRetention,
@@ -574,11 +579,19 @@ fn collect_lane_log_retention_targets(
         // after some entries have been organically pruned or manually
         // cleaned. This is fail-closed: we do NOT proceed with a partial
         // set that could be manipulated by decoy flooding.
+        //
+        // CQ-MAJOR-1/2 fix: Discard ALL lane_targets (including symlink
+        // and file targets already collected) when overflow is detected.
+        // This ensures atomicity — either all targets for a lane are
+        // included or none.
         if scan_overflow {
             continue;
         }
 
         if job_logs.is_empty() {
+            // Atomically commit any non-directory targets (symlinks, stray
+            // files) even when there are no job log subdirectories.
+            targets.extend(lane_targets);
             continue;
         }
 
@@ -649,7 +662,7 @@ fn collect_lane_log_retention_targets(
         // Emit GC targets for all prune candidates.
         for entry in &job_logs {
             if entry.pruned {
-                targets.push(GcTarget {
+                lane_targets.push(GcTarget {
                     path: entry.path.clone(),
                     allowed_parent: log_dir.clone(),
                     kind: crate::fac::gc_receipt::GcActionKind::LaneLogRetention,
@@ -657,6 +670,9 @@ fn collect_lane_log_retention_targets(
                 });
             }
         }
+
+        // Atomically commit all lane targets to the shared vector.
+        targets.extend(lane_targets);
     }
 }
 
@@ -1758,10 +1774,18 @@ mod tests {
                 .iter()
                 .filter(|target| target.path.starts_with(&idle_lane_dir))
                 .collect();
+            // CQ-BLOCKER-1/2 fix: collect_idle_lane_targets no longer emits
+            // LaneLog targets. Idle lanes contribute only the target/ directory.
+            // Logs are processed by collect_lane_log_retention_targets with
+            // retention policy enforcement.
             assert_eq!(
                 idle_targets.len(),
-                2,
-                "idle lane must contribute exactly target and logs directories, got {idle_targets:?}"
+                1,
+                "idle lane must contribute exactly the target directory (logs handled by retention), got {idle_targets:?}"
+            );
+            assert!(
+                idle_targets[0].path.ends_with("target"),
+                "idle lane target must be the target/ directory"
             );
         }
     }
@@ -2826,11 +2850,10 @@ mod tests {
 
     #[test]
     fn log_retention_integrated_with_plan_gc() {
-        // Verify that plan_gc_with_log_retention includes log-related targets
-        // for idle lanes. Idle lanes always receive a full LaneLog target
-        // (via collect_idle_lane_targets), which supersedes per-job
-        // LaneLogRetention targets (CQ-MAJOR-2 dedup). The plan should
-        // therefore contain LaneLog for idle lanes with stale logs.
+        // CQ-BLOCKER-1/2 fix: Verify that plan_gc_with_log_retention applies
+        // retention policy (LaneLogRetention) to idle lanes instead of
+        // unconditional full removal (LaneLog). The plan should contain
+        // LaneLogRetention for the stale job log directory.
         let dir = tempdir().expect("tmp");
         let fac_root = dir.path().join("fac");
         std::fs::create_dir_all(&fac_root).expect("fac");
@@ -2842,7 +2865,7 @@ mod tests {
         let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
 
         let now = current_wall_clock_secs();
-        let _stale_job = create_job_log_dir(
+        let stale_job = create_job_log_dir(
             &logs_dir,
             "job-stale",
             200,
@@ -2864,27 +2887,8 @@ mod tests {
         )
         .expect("plan");
 
-        // Idle lanes get LaneLog (full removal) which supersedes per-job
-        // LaneLogRetention. Verify that the plan includes coverage for
-        // the lane's log directory via either target type.
-        let has_log_coverage = plan.targets.iter().any(|t| {
-            matches!(
-                t.kind,
-                crate::fac::gc_receipt::GcActionKind::LaneLog
-                    | crate::fac::gc_receipt::GcActionKind::LaneLogRetention
-            )
-        });
-        assert!(
-            has_log_coverage,
-            "plan must include log cleanup targets (LaneLog or LaneLogRetention) for idle lane"
-        );
-
-        // CQ-MAJOR-2 regression check: LaneLogRetention must NOT appear
-        // alongside LaneLog for the same lane (dedup).
-        let has_full_log = plan
-            .targets
-            .iter()
-            .any(|t| matches!(t.kind, crate::fac::gc_receipt::GcActionKind::LaneLog));
+        // CQ-BLOCKER-1/2: Idle lanes must use LaneLogRetention (policy-based
+        // pruning), not LaneLog (unconditional full removal).
         let has_retention = plan.targets.iter().any(|t| {
             matches!(
                 t.kind,
@@ -2892,8 +2896,25 @@ mod tests {
             )
         });
         assert!(
-            !(has_full_log && has_retention),
-            "LaneLog and LaneLogRetention must not coexist for the same lane (CQ-MAJOR-2)"
+            has_retention,
+            "plan must include LaneLogRetention targets for idle lane (policy-based pruning)"
+        );
+
+        // The stale job directory must be individually targeted.
+        assert!(
+            plan.targets.iter().any(|t| t.path == stale_job),
+            "stale job log directory must be targeted for retention-based pruning"
+        );
+
+        // LaneLog must NOT appear — idle lanes should not get blanket
+        // log directory removal.
+        let has_full_log = plan
+            .targets
+            .iter()
+            .any(|t| matches!(t.kind, crate::fac::gc_receipt::GcActionKind::LaneLog));
+        assert!(
+            !has_full_log,
+            "LaneLog must not appear for idle lanes — retention policy must be applied instead"
         );
     }
 
@@ -3123,6 +3144,173 @@ mod tests {
             targets.len(),
             0,
             "scan overflow must cause lane to be skipped entirely (fail-closed), \
+             got {} targets",
+            targets.len()
+        );
+    }
+
+    // =========================================================================
+    // CQ-BLOCKER-1/2 regression: keep-last-N enforced for idle lanes through
+    // the full plan_gc_with_log_retention path
+    // =========================================================================
+
+    #[test]
+    fn idle_lane_keep_last_n_enforced_via_plan_gc() {
+        // CQ-BLOCKER-1/2 regression: idle lanes with >N jobs in logs must
+        // have keep-last-N enforced. Before the fix, collect_idle_lane_targets
+        // emitted a blanket LaneLog target for the entire logs/ directory,
+        // which caused plan_gc_with_log_retention to skip retention policy
+        // for idle lanes.
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
+
+        let now = current_wall_clock_secs();
+        let ttl_secs: u64 = 60;
+
+        // Create 5 stale job logs.
+        let dir_a = create_job_log_dir(&logs_dir, "job-a", 100, now.saturating_sub(ttl_secs + 500));
+        let dir_b = create_job_log_dir(&logs_dir, "job-b", 100, now.saturating_sub(ttl_secs + 400));
+        let dir_c = create_job_log_dir(&logs_dir, "job-c", 100, now.saturating_sub(ttl_secs + 300));
+        let dir_d = create_job_log_dir(&logs_dir, "job-d", 100, now.saturating_sub(ttl_secs + 200));
+        let dir_e = create_job_log_dir(&logs_dir, "job-e", 100, now.saturating_sub(ttl_secs + 100));
+
+        // Keep last 2 — only the 3 oldest should be pruned.
+        let config = LogRetentionConfig {
+            per_lane_log_max_bytes: 0,
+            per_job_log_ttl_secs: ttl_secs,
+            keep_last_n_jobs_per_lane: 2,
+        };
+
+        let plan = plan_gc_with_log_retention(
+            lane_manager.fac_root(),
+            &lane_manager,
+            QUARANTINE_RETENTION_SECS,
+            DENIED_RETENTION_SECS,
+            &config,
+        )
+        .expect("plan");
+
+        // The 3 oldest (a, b, c) should be pruned via LaneLogRetention.
+        let retention_targets: Vec<_> = plan
+            .targets
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.kind,
+                    crate::fac::gc_receipt::GcActionKind::LaneLogRetention
+                )
+            })
+            .collect();
+        assert_eq!(
+            retention_targets.len(),
+            3,
+            "exactly 3 stale job log dirs (outside keep-last-2) should be pruned via LaneLogRetention, got {}",
+            retention_targets.len()
+        );
+        assert!(
+            retention_targets.iter().any(|t| t.path == dir_a),
+            "oldest job (a) must be pruned"
+        );
+        assert!(
+            retention_targets.iter().any(|t| t.path == dir_b),
+            "second oldest job (b) must be pruned"
+        );
+        assert!(
+            retention_targets.iter().any(|t| t.path == dir_c),
+            "third oldest job (c) must be pruned"
+        );
+
+        // The 2 newest (d, e) must NOT be pruned — protected by keep-last-N.
+        assert!(
+            !plan.targets.iter().any(|t| t.path == dir_d),
+            "protected job (d) must not be pruned"
+        );
+        assert!(
+            !plan.targets.iter().any(|t| t.path == dir_e),
+            "protected job (e) must not be pruned"
+        );
+
+        // No LaneLog target should exist — retention policy is applied instead.
+        assert!(
+            !plan
+                .targets
+                .iter()
+                .any(|t| matches!(t.kind, crate::fac::gc_receipt::GcActionKind::LaneLog)),
+            "LaneLog must not appear for idle lanes — retention policy must be applied"
+        );
+    }
+
+    // =========================================================================
+    // CQ-MAJOR-1/2 regression: overflow discards ALL lane targets atomically
+    // =========================================================================
+
+    #[test]
+    fn log_retention_overflow_discards_symlink_and_file_targets() {
+        // CQ-MAJOR-1/2 regression: When scan_overflow is triggered,
+        // previously-appended symlink and regular-file targets for the
+        // same lane must also be discarded (atomicity).
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
+
+        let now = current_wall_clock_secs();
+
+        // Create a stray file and a symlink in the logs directory.
+        let stray_file = logs_dir.join("stray-file.log");
+        write_file(&stray_file, 50);
+
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink("/tmp", logs_dir.join("symlink-entry"));
+        }
+
+        // Create MAX_JOB_LOG_ENTRIES_PER_LANE + 1 directories to trigger overflow.
+        // The stray file and symlink count toward scan_count too, so we need
+        // enough total entries to exceed the cap.
+        let entries_to_create = MAX_JOB_LOG_ENTRIES_PER_LANE;
+        for i in 0..entries_to_create {
+            let name = format!("job-{i:06}");
+            let job_dir = logs_dir.join(&name);
+            std::fs::create_dir_all(&job_dir).expect("create job dir");
+            set_file_mtime(&job_dir, filetime_from_secs(now.saturating_sub(86400 * 30)))
+                .expect("set mtime");
+        }
+
+        let config = LogRetentionConfig {
+            per_lane_log_max_bytes: 0,
+            per_job_log_ttl_secs: 3600,
+            keep_last_n_jobs_per_lane: 0,
+        };
+
+        let mut targets = Vec::new();
+        collect_lane_log_retention_targets(
+            &lane_manager,
+            &lane_ids,
+            &config,
+            now,
+            &HashSet::new(),
+            &mut targets,
+        );
+
+        // ALL targets for the overflowed lane must be discarded — including
+        // symlink and file targets that were collected before the overflow.
+        assert_eq!(
+            targets.len(),
+            0,
+            "overflow must discard ALL lane targets atomically (including symlinks/files), \
              got {} targets",
             targets.len()
         );
