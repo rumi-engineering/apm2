@@ -1,0 +1,42 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: TCK-00636
+    title: 'RFC-0032 Phase 1: WorkSpec projection plumbing + ticket-alias reconciliation integration'
+    status: OPEN
+  binds:
+    prd_id: PRD-PLACEHOLDER
+    rfc_id: RFC-0032
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_DAEMON
+    - DOMAIN_PROJECTION
+    - DOMAIN_KERNEL
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00635
+      reason: Requires OpenWork producing WorkOpened.spec_snapshot_hash
+  scope:
+    in_scope:
+    - Add/extend daemon projections to index `work_id -> spec_snapshot_hash` and allow joining WorkSpec fields (repo owner/name, ticket_alias, etc.)
+    - Wire ticket alias reconciliation gate so ticket ids remain aliases (do not force `work_id == TCK-*`)
+    - Expose doctor/CLI query surfaces to resolve `--ticket-alias` -> `work_id` via projections
+    out_of_scope:
+    - Final cryptographic identity model for alias reconciliation (deferred)
+  plan:
+    steps:
+    - Add a projection table mapping work_id to spec_snapshot_hash (derived from `work.opened`)
+    - Add CAS fetch helper with bounded decode for WorkSpec reads used by projections/indexing
+    - Integrate alias reconciliation checks in existing gate path (`crates/apm2-daemon/src/work/authority.rs` stubs)
+    - 'Add tests covering: alias resolution returns stable work_id; alias gate remains promotion-blocking on mismatch'
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+    - WorkSpec is queryable via projections without requiring WorkRegistry state.
+    - Ticket alias resolution is deterministic and replayable from ledger+CAS.
+    - Alias reconciliation remains fail-closed and promotion-blocking (no weakening).

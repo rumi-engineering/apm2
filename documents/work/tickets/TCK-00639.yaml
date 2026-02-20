@@ -1,0 +1,46 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: TCK-00639
+    title: 'RFC-0032 Phase 2: implement RecordWorkPrAssociation (canonical `work.pr_associated` + optional LINKOUT context entry)'
+    status: OPEN
+  binds:
+    prd_id: PRD-PLACEHOLDER
+    rfc_id: RFC-0032
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_DAEMON
+    - DOMAIN_PROTOCOL
+    - DOMAIN_PROJECTION
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00635
+      reason: Requires work.opened exists
+    - ticket_id: TCK-00638
+      reason: Optional linkout uses PublishWorkContextEntry machinery
+  scope:
+    in_scope:
+    - Add `RecordWorkPrAssociationRequest` to runtime proto and implement handler
+    - Validate commit_sha format (40-hex) and PR number > 0
+    - Emit canonical `work.pr_associated` WorkEvent with (work_id, pr_number, commit_sha) only
+    - If pr_url is provided, publish a WORK_CONTEXT_ENTRY of kind LINKOUT with the PR URL (do not bloat WorkEvent)
+    - Idempotency on (work_id, pr_number, commit_sha) and avoid PR flapping
+    out_of_scope:
+    - GitHub API integration in daemon (CLI supplies PR info per RFC)
+  plan:
+    steps:
+    - Extend runtime proto messages; regenerate code
+    - 'Implement handler: validate inputs, check existing association projection, append WorkEvent if not already present'
+    - Add projection mapping keyed by (repo_owner, repo_name, pr_number) using WorkSpec join to avoid repo collisions
+    - Add unit tests for idempotency and invalid sha rejection
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+    - PR association can be replayed deterministically from ledger+CAS (repo identity comes from WorkSpec).
+    - Duplicate RecordWorkPrAssociation requests do not create duplicate events.
+    - Projection keys are collision-free for multi-repo scenarios.

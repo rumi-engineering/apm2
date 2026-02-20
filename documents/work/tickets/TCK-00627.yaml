@@ -22,12 +22,12 @@ ticket_meta:
 
 root_cause_analysis:
   summary: |
-    Repeated identical `apm2 fac gates` runs do not have a defined performance
-    contract. There is no measurement of warm-path vs. cold-path duration, no
-    SLO threshold, and no CI signal that detects regressions in cache reuse
-    efficiency. Implementors running gates repeatedly in fast iteration loops
-    have no visibility into whether the second run is benefiting from caching
-    or re-executing gates from scratch.
+    Repeated identical `apm2 fac push` invocations (gates phase) do not have
+    a defined performance contract. There is no measurement of warm-path vs.
+    cold-path duration, no SLO threshold, and no CI signal that detects
+    regressions in cache reuse efficiency. Implementors running push repeatedly
+    in fast iteration loops have no visibility into whether the second run is
+    benefiting from caching or re-executing gates from scratch.
 
 scope:
   in_scope:
@@ -55,8 +55,8 @@ scope:
       title: "Add CI benchmark test verifying warm-path SLO"
       detail: |
         Add a benchmark/integration test that:
-          1. Runs `apm2 fac gates` (run1) and captures run_summary.
-          2. Runs `apm2 fac gates` again (run2, same SHA) and captures run_summary.
+          1. Runs `apm2 fac push` (run1) and captures the gates run_summary.
+          2. Runs `apm2 fac push` again (run2, same SHA) and captures run_summary.
           3. Asserts run2.cache_hit_count == run1 gate count.
           4. Asserts run2.total_duration_ms <= run1.total_duration_ms * 0.20.
           5. Asserts run2.prep_duration_ms <= 500.

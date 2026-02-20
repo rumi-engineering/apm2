@@ -1,0 +1,53 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: TCK-00638
+    title: 'RFC-0032 Phase 2: implement PublishWorkContextEntry (CAS + `evidence.published` anchor) + `work_context` projection'
+    status: OPEN
+  binds:
+    prd_id: PRD-PLACEHOLDER
+    rfc_id: RFC-0032
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_DAEMON
+    - DOMAIN_PROTOCOL
+    - DOMAIN_PROJECTION
+    - DOMAIN_EVIDENCE
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00633
+      reason: ContextEntry schema
+    - ticket_id: TCK-00634
+      reason: EvidenceCategory extensions
+    - ticket_id: TCK-00631
+      reason: Canonical ledger append path
+  scope:
+    in_scope:
+    - Add `PublishWorkContextEntryRequest` to runtime proto and implement handler in `dispatch.rs`
+    - Enforce schema allowlist + bounded decode (WorkContextEntry <= 256KiB, deny_unknown_fields)
+    - 'Daemon overwrites daemon-authoritative fields: entry_id, actor_id, created_at_ns; reject empty dedupe_key'
+    - Deterministically derive entry_id/evidence_id from (work_id, kind, dedupe_key) with CTX- prefix; enforce evidence_id == entry_id
+    - Store canonical JSON bytes in CAS, then append `evidence.published` with category WORK_CONTEXT_ENTRY (atomic CAS->ledger order)
+    - Add projection table `work_context` keyed by (work_id, entry_id) and uniqueness on (work_id, kind, dedupe_key)
+    out_of_scope:
+    - Implementer/reviewer nudge loops (handled by WorkLoopManager ticket)
+  plan:
+    steps:
+    - Extend runtime proto; regenerate bindings
+    - Implement deterministic id derivation helper (BLAKE3 over canonical UTF-8 components)
+    - Implement handler with CAS-first then ledger append (orphan CAS objects allowed on append failure)
+    - Extend projection worker to index WORK_CONTEXT_ENTRY evidence events into `work_context` table
+    - 'Add tests: idempotent retry yields no duplicate evidence events; deny_unknown_fields enforced'
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+    - PublishWorkContextEntry is idempotent on (work_id, kind, dedupe_key) and enforces deterministic ids.
+    - Daemon is authoritative for actor_id and created_at_ns; client cannot spoof.
+    - Projection uniqueness guarantees prevent duplicates under retries.
+  notes:
+    security: Fail-closed on mismatched kind/dedupe_key between request fields and decoded entry_json; do not accept empty dedupe_key.

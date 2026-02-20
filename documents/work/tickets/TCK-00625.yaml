@@ -22,12 +22,12 @@ ticket_meta:
 
 root_cause_analysis:
   summary: |
-    `apm2 fac gates` currently emits unstructured human-readable output that
-    orchestrators and CI systems cannot reliably parse. Progress, timing,
-    cache decisions, and failure attribution are not available in a stable
-    machine-readable format. Consumers resort to scraping text output, which
-    breaks on every binary change and cannot support structured failure
-    routing or performance tracking.
+    The gates phase of `apm2 fac push` currently emits unstructured
+    human-readable output that orchestrators and CI systems cannot reliably
+    parse. Progress, timing, cache decisions, and failure attribution are not
+    available in a stable machine-readable format. Consumers resort to
+    scraping text output, which breaks on every binary change and cannot
+    support structured failure routing or performance tracking.
 
 scope:
   in_scope:
@@ -56,8 +56,11 @@ scope:
           run_summary    — on successful completion
           run_failed     — on any failure (uses StructuredFailure from TCK-00624)
     - id: "S3_JSON_MODE"
-      title: "Gate all event emission on --json flag"
+      title: "Gate all event emission on --json flag passed through apm2 fac push"
       detail: |
+        Gates is no longer a directly callable subcommand; it is invoked as a
+        phase of `apm2 fac push`. The --json flag on `apm2 fac push` controls
+        event emission mode for the gates phase:
         Without --json: emit a concise human-friendly progress/summary.
         With --json: emit full JSONL event stream; suppress human-friendly text.
         EventEmitter selects mode at startup based on the flag; all downstream

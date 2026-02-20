@@ -1,0 +1,45 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: TCK-00641
+    title: 'RFC-0032 Phase 2: daemon CI processor emits CI transitions from changeset publication (InProgress->CiPending->ReadyForReview/Blocked)'
+    status: OPEN
+  binds:
+    prd_id: PRD-PLACEHOLDER
+    rfc_id: RFC-0032
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_DAEMON
+    - DOMAIN_CI
+    - DOMAIN_ORCHESTRATION
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00640
+      reason: Requires changeset_published bound to work_id and fac push terminal markers
+    - ticket_id: TCK-00631
+      reason: Canonical ledger append
+  scope:
+    in_scope:
+    - Implement/extend a daemon-side CI processor that observes changeset publication events and emits `work.transitioned` CI-authorized transitions as `system:ci-processor`
+    - Maintain `work_latest_changeset` projection (work_id -> latest changeset digest) and ensure transitions only apply to latest digest
+    - Emit `work.transitioned(InProgress -> CiPending)` when a new latest changeset is observed
+    - Emit `work.transitioned(CiPending -> ReadyForReview)` or `Blocked` based on gate/receipt outcomes (existing gate orchestrator integration)
+    out_of_scope:
+    - Making CI actor id configurable (explicitly deferred; reducer hard-codes `system:ci-processor` today)
+  plan:
+    steps:
+    - Identify existing daemon component responsible for CI/gate observation (if any) and extend it to key off changeset_published bound to work_id
+    - Add/extend `work_latest_changeset` projection maintained from changeset publication events
+    - Gate transitions based on latest digest; reject stale receipts
+    - 'Add tests: stale receipt does not transition work; latest receipt does'
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+    - CI processor emits transitions with actor_id exactly `system:ci-processor` to satisfy current WorkReducer checks.
+    - Transitions are only emitted for the latest changeset digest per work (no stale transitions).
+    - Projections and reducers remain replayable from ledger+CAS (no hidden SQLite authority).

@@ -46,7 +46,7 @@ scope:
           - Create a temp dir as APM2_HOME (empty)
           - Provide a valid FAC config pointing to a test repo
           - Network available
-        Test action: run `apm2 fac gates --json` (or test equivalent)
+        Test action: run `apm2 fac push --json` (gates executes as a phase)
         Assertions:
           - exit code 0
           - prep_autofix events emitted (ReadinessController auto-healed)
@@ -58,7 +58,7 @@ scope:
         Test setup:
           - Pre-populated APM2_HOME with valid substrate and signed closure
           - Network denied for EXECUTE (via test fixture)
-        Test action: run `apm2 fac gates --json`
+        Test action: run `apm2 fac push --json` (gates phase runs within push)
         Assertions:
           - exit code 0
           - execute_started event includes network_policy confirming denial
@@ -70,7 +70,7 @@ scope:
         Test setup:
           - Pre-populated APM2_HOME substrate but no closure artifact
           - Network denied (both PREP and EXECUTE)
-        Test action: run `apm2 fac gates --json`
+        Test action: run `apm2 fac push --json` (gates phase runs within push)
         Assertions:
           - exit code non-zero
           - run_failed event emitted with failure_code=PREP_SUPPLY_UNAVAILABLE
@@ -81,7 +81,7 @@ scope:
       detail: |
         Test setup:
           - run1: completed successfully, cache populated
-        Test action: run `apm2 fac gates --json` again (same SHA, same closure)
+        Test action: run `apm2 fac push --json` again (same SHA, same closure)
         Assertions:
           - exit code 0
           - run_summary.is_warm_run = true

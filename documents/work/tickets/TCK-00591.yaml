@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00591"
     title: "Backup/restore tooling (minimal set): export/import FAC control-plane state (receipts, policy, horizons) without bulky caches"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

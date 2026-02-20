@@ -1,0 +1,49 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: TCK-00640
+    title: 'RFC-0032 Phase 2: extend `apm2 fac push` to bind work_id + emit terminal contract markers'
+    status: OPEN
+  binds:
+    prd_id: PRD-PLACEHOLDER
+    rfc_id: RFC-0032
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_CLI
+    - DOMAIN_PROTOCOL
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00638
+      reason: Needs PublishWorkContextEntry
+    - ticket_id: TCK-00639
+      reason: Needs RecordWorkPrAssociation
+    - ticket_id: TCK-00636
+      reason: Needs ticket-alias -> work_id resolution
+  scope:
+    in_scope:
+    - Add `--work-id <W-...>` to `apm2 fac push` (and/or `--ticket-alias` resolution) and ensure work_id is bound through PublishChangeSet
+    - 'After push/PR update: call daemon RPCs in order: PublishChangeSet(work_id), RecordWorkPrAssociation, PublishWorkContextEntry(HANDOFF_NOTE), PublishWorkContextEntry(IMPLEMENTER_TERMINAL)'
+    - 'Enforce hard terminal contract: HANDOFF_NOTE and IMPLEMENTER_TERMINAL must exist per session attempt'
+    - Do not emit any `work.transitioned` events from CLI; CLI only publishes changeset + context markers
+    out_of_scope:
+    - Daemon-side CI processor transitions (separate ticket)
+  plan:
+    steps:
+    - Update CLI args in `crates/apm2-cli/src/commands/fac_review/push.rs` to accept work-id / ticket-alias
+    - Thread resolved work_id into existing PublishChangeSet request path
+    - Call RecordWorkPrAssociation and PublishWorkContextEntry RPCs; ensure retries are safe (idempotent dedupe keys)
+    - 'Add CLI-level validation: require handoff note text and ensure dedupe_key=session_id is used'
+    - 'Add integration test: run fac push twice and verify no duplicate context entries/evidence events'
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+    - '`apm2 fac push` binds changeset publication to a specific work_id and records required terminal markers.'
+    - The terminal contract is enforceable from ledger+CAS alone (no local files required for truth).
+    - CLI does not emit work transitions; CI/system actors remain the only sources of CI transitions.
+  notes:
+    verification: Add a smoke test script that runs fac push on a dummy repo and confirms evidence markers exist via doctor/projection query.
