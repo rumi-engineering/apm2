@@ -3905,3 +3905,15 @@ broker-mediated enqueue or explicit `--unsafe-local-write`.
 - [INV-SU-006] `ServiceUserNotResolved` error variant covers unresolvable
   service user (missing or lookup failure). Callers must use
   `UnsafeLocalWrite` or broker-mediated path to bypass.
+- [INV-SU-007] `resolve_service_user_identity()` returns
+  `ServiceUserIdentity { name, uid, gid }` — the full passwd entry. Used
+  by broker-mediated enqueue to `fchown` broker files to the service user's
+  primary GID, enabling cross-user readability (mode 0640).
+
+### Public API
+
+- `check_queue_write_permission(QueueWriteMode)`: Gate check for direct writes.
+- `validate_directory_service_user_ownership(Path)`: Ownership validation.
+- `resolve_service_user_identity()`: Full identity resolution (name+UID+GID).
+  Returns `ServiceUserIdentity` on success, `ServiceUserGateError` on failure.
+  Used by `enqueue_via_broker_requests` for group-based file handoff.

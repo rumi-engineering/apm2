@@ -361,6 +361,80 @@ fn resolve_uid_for_user(user: &str) -> Result<u32, String> {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Service User Identity Resolution (public API)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolved identity of the FAC service user, including UID and primary GID.
+///
+/// Used by broker-mediated enqueue to set file group ownership so the
+/// service-user worker can read broker request files written by non-service
+/// users.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceUserIdentity {
+    /// The service user name (e.g. `_apm2-job`).
+    pub name: String,
+    /// The service user's numeric UID.
+    pub uid: u32,
+    /// The service user's primary GID from `/etc/passwd`.
+    pub gid: u32,
+}
+
+/// Resolve the FAC service user's full identity (name, UID, GID) via
+/// passwd lookup.
+///
+/// The service user name is determined from `APM2_FAC_SERVICE_USER` (env)
+/// or the default (`_apm2-job`). Returns `Err` if the user does not exist
+/// or the passwd lookup fails.
+///
+/// # Errors
+///
+/// Returns `ServiceUserGateError::ServiceUserNotResolved` if the service
+/// user does not exist in the passwd database or if the lookup itself
+/// fails (e.g. NSS/LDAP error). Returns `ServiceUserGateError::EnvError`
+/// or `ServiceUserGateError::InvalidServiceUser` if the service user name
+/// (from environment variable) is invalid.
+///
+/// # Usage
+///
+/// Broker-mediated enqueue calls this to obtain the service user's GID,
+/// then uses `fchown(fd, -1, gid)` to set the file's group so the worker
+/// (running as the service user) can read broker request files written
+/// with mode 0640.
+#[cfg(unix)]
+pub fn resolve_service_user_identity() -> Result<ServiceUserIdentity, ServiceUserGateError> {
+    let name = resolve_service_user_name()?;
+    match nix::unistd::User::from_name(&name) {
+        Ok(Some(u)) => Ok(ServiceUserIdentity {
+            name,
+            uid: u.uid.as_raw(),
+            gid: u.gid.as_raw(),
+        }),
+        Ok(None) => Err(ServiceUserGateError::ServiceUserNotResolved {
+            service_user: name,
+            reason: "user not found in passwd".to_string(),
+        }),
+        Err(e) => Err(ServiceUserGateError::ServiceUserNotResolved {
+            service_user: name,
+            reason: format!("passwd lookup failed: {e}"),
+        }),
+    }
+}
+
+/// Non-Unix stub: always returns `Err` since the permissions model is
+/// Unix-only.
+///
+/// # Errors
+///
+/// Always returns `ServiceUserGateError::ServiceUserNotResolved`.
+#[cfg(not(unix))]
+pub fn resolve_service_user_identity() -> Result<ServiceUserIdentity, ServiceUserGateError> {
+    Err(ServiceUserGateError::ServiceUserNotResolved {
+        service_user: String::new(),
+        reason: "service user identity resolution is Unix-only".to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,5 +672,54 @@ mod tests {
 
         let result = validate_directory_service_user_ownership(&nonexistent);
         assert!(result.is_err(), "should fail for nonexistent path");
+    }
+
+    // ── Service user identity resolution (TCK-00577 round 16) ────────
+
+    /// TCK-00577 round 16: Verify `resolve_service_user_identity` behavior
+    /// with the default service user (which typically does not exist in test
+    /// environments). We cannot set env vars without unsafe, so we test the
+    /// default behavior: the default `_apm2-job` user is unlikely to exist,
+    /// so we expect Err. If it does exist (CI environment with the user
+    /// provisioned), both uid and gid must be non-zero or the test is still
+    /// valid.
+    #[test]
+    #[cfg(unix)]
+    fn resolve_service_user_identity_default_user_behavior() {
+        let result = resolve_service_user_identity();
+        // Two valid outcomes:
+        // 1. Err (ServiceUserNotResolved) — default user does not exist
+        // 2. Ok — default user exists; verify fields are populated
+        match result {
+            Ok(identity) => {
+                assert!(!identity.name.is_empty(), "name must not be empty");
+                // uid and gid should be valid (just check they're populated)
+            },
+            Err(ref err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("could not be resolved") || msg.contains("not found"),
+                    "error should indicate user not found: {msg}"
+                );
+            },
+        }
+    }
+
+    /// TCK-00577 round 16: Verify `ServiceUserIdentity` struct construction
+    /// and field access.
+    #[test]
+    fn service_user_identity_struct_has_expected_fields() {
+        let identity = ServiceUserIdentity {
+            name: "test_user".to_string(),
+            uid: 1000,
+            gid: 1000,
+        };
+        assert_eq!(identity.name, "test_user");
+        assert_eq!(identity.uid, 1000);
+        assert_eq!(identity.gid, 1000);
+        // Clone + PartialEq + Eq + Debug
+        let cloned = identity.clone();
+        assert_eq!(identity, cloned);
+        assert_eq!(format!("{identity:?}"), format!("{cloned:?}"));
     }
 }

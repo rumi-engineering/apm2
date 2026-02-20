@@ -812,12 +812,17 @@ systemd service executables:
 - **Collision handling**: Filename collisions with existing pending jobs produce
   a timestamped suffix (same as `move_to_dir_safe`), never clobbering.
 
-### Broker request file permissions (TCK-00577 round 14 MAJOR fix)
+### Broker request file permissions (TCK-00577 round 14+16 fix)
 
-- **Mode 0600 (owner-only)**: `enqueue_via_broker_requests` creates broker
-  request temp files with mode 0600, not the previous 0644 (world-readable).
-  This prevents local attackers from reading job-spec JSON (repo IDs,
-  commits, patch metadata) submitted by other users.
+- **Mode 0640 + fchown (cross-user)**: `enqueue_via_broker_requests` resolves
+  the service user's primary GID via `resolve_service_user_identity()`, then
+  creates broker request temp files with mode 0640 and `fchown(fd, -1, gid)`.
+  The service-user worker can read via group membership. If `fchown` fails
+  (caller not in the group and lacks CAP_CHOWN), falls back to mode 0644.
+- **Mode 0644 (dev fallback)**: When the service user is not resolvable (dev
+  environment without `_apm2-job`), the file is created with mode 0644. The
+  `broker_requests/` directory's mode 01733 prevents enumeration, so UUID
+  filenames are effectively opaque to other users.
 - **Same-user deployments**: Mode 0600 works transparently — the submitter
   and worker are the same UID.
 - **Cross-user deployments**: The worker may get EACCES when reading
@@ -829,6 +834,16 @@ systemd service executables:
   permission-denied errors from other read failures and emits an
   actionable warning directing operators to configure shared group
   access or ACLs.
+
+### Junk entry drain (TCK-00577 round 16 MAJOR fix)
+
+- **Independent caps**: `promote_broker_requests` uses two separate counters:
+  `candidates_processed` (up to `MAX_BROKER_REQUESTS_PROMOTE = 256`) for valid
+  `.json` regular files, and `junk_drained` (up to `MAX_JUNK_DRAIN_PER_CYCLE =
+  1024`) for non-candidate entries (wrong extension, non-regular files, unreadable
+  metadata). Non-candidate entries are quarantined without consuming the promotion
+  budget, preventing an attacker from filling `broker_requests/` with junk
+  filenames to exhaust the scan budget and starve valid requests.
 
 ### General invariants
 
