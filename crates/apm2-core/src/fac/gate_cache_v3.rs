@@ -1390,28 +1390,45 @@ impl GateCacheV3 {
     /// Diagnose which compound-key dimension drifted by scanning the v3 cache
     /// root for any entries with a different compound key for this SHA.
     ///
-    /// Returns the first mismatched dimension as a [`CacheReasonCode`],
-    /// following the ticket's defined check order. Returns `None` if no
-    /// prior cache exists (true gate miss) or if all dimensions match
-    /// (should not happen if `load_from_dir` already returned `None`).
+    /// Returns a tuple of `(drift_code, scan_exhaustive)`:
+    /// - `drift_code`: the first mismatched dimension as a [`CacheReasonCode`],
+    ///   following the ticket's defined check order. `None` if no prior cache
+    ///   entry was found for this SHA, or if all dimensions match (should not
+    ///   happen if `load_from_dir` already returned `None`).
+    /// - `scan_exhaustive`: `true` if the entire cache root was scanned within
+    ///   bounds, `false` if a scan limit was reached. When `false` and
+    ///   `drift_code` is `None`, the result is inconclusive: a matching prior
+    ///   entry may exist beyond the scan window. Callers should use this flag
+    ///   to distinguish a true cache miss from a scan-bounded inconclusive
+    ///   result.
     ///
     /// # Bound
     ///
     /// Scans at most 64 directories and 4 entries per directory (fail-closed on
-    /// resource).
+    /// resource). This bound is deliberately conservative to prevent I/O
+    /// amplification on large cache roots. In practice, v3 cache roots rarely
+    /// exceed a few dozen directories since each index key maps to one
+    /// directory. When the bound is reached, `scan_exhaustive` is `false` to
+    /// signal that the scan may have missed matching entries.
     #[must_use]
     pub fn diagnose_compound_key_drift(
         root: &std::path::Path,
         sha: &str,
         current_key: &V3CompoundKey,
-    ) -> Option<CacheReasonCode> {
+    ) -> (Option<CacheReasonCode>, bool) {
         const MAX_DIRS: usize = 64;
         const MAX_ENTRIES_PER_DIR: usize = 4;
 
-        let entries = std::fs::read_dir(root).ok()?;
+        let Some(entries) = std::fs::read_dir(root).ok() else {
+            return (None, true);
+        };
+
+        let mut dir_bound_reached = false;
+        let mut any_entry_bound_reached = false;
 
         for (dirs_scanned, dir_entry) in entries.flatten().enumerate() {
             if dirs_scanned >= MAX_DIRS {
+                dir_bound_reached = true;
                 break;
             }
 
@@ -1434,6 +1451,7 @@ impl GateCacheV3 {
             };
             for (entries_scanned, file_entry) in sub_entries.flatten().enumerate() {
                 if entries_scanned >= MAX_ENTRIES_PER_DIR {
+                    any_entry_bound_reached = true;
                     break;
                 }
 
@@ -1451,27 +1469,29 @@ impl GateCacheV3 {
                 // Compare dimensions in order and return the first mismatch.
                 let old = &parsed.compound_key;
                 if old.fac_policy_hash != current_key.fac_policy_hash {
-                    return Some(CacheReasonCode::PolicyDrift);
+                    return (Some(CacheReasonCode::PolicyDrift), true);
                 }
                 if old.toolchain_fingerprint != current_key.toolchain_fingerprint {
-                    return Some(CacheReasonCode::ToolchainDrift);
+                    return (Some(CacheReasonCode::ToolchainDrift), true);
                 }
                 if old.attestation_digest != current_key.attestation_digest {
-                    return Some(CacheReasonCode::ClosureDrift);
+                    return (Some(CacheReasonCode::ClosureDrift), true);
                 }
                 if old.network_policy_hash != current_key.network_policy_hash {
-                    return Some(CacheReasonCode::NetworkPolicyDrift);
+                    return (Some(CacheReasonCode::NetworkPolicyDrift), true);
                 }
                 if old.sandbox_policy_hash != current_key.sandbox_policy_hash {
-                    return Some(CacheReasonCode::SandboxDrift);
+                    return (Some(CacheReasonCode::SandboxDrift), true);
                 }
                 // All dimensions match but different index key — should not happen,
                 // but fail-closed: return None (true miss).
-                return None;
+                return (None, true);
             }
         }
-        // No prior cache entry found for this SHA.
-        None
+
+        // No prior cache entry found for this SHA within the scan bounds.
+        let exhaustive = !dir_bound_reached && !any_entry_bound_reached;
+        (None, exhaustive)
     }
 
     /// Read a single v3 cache entry from disk with bounded I/O.
@@ -1643,16 +1663,25 @@ fn rfc3339_age_secs(ts: &str) -> Option<u64> {
 /// Diagnoses compound-key drift to emit specific reason codes instead of
 /// [`CacheReasonCode::ShaMiss`].
 ///
-/// Returns `ShaMiss` if no prior cache entry exists (true gate miss),
-/// or the specific drift code if a prior entry was found under a different
-/// compound key.
+/// Returns `ShaMiss` if no prior cache entry exists (true gate miss) or if
+/// the scan bound was reached without finding a match (inconclusive; see
+/// `diagnose_compound_key_drift` for bound documentation). Returns the
+/// specific drift code if a prior entry was found under a different compound
+/// key.
+///
+/// When the scan bound is reached without a match, `ShaMiss` is returned
+/// as a fail-closed default. This is conservative: it may misclassify a
+/// drift as a cache miss in very large cache roots (>64 directories or >4
+/// entries per directory), but it never misclassifies a miss as a drift.
 #[must_use]
 pub fn diagnose_cache_miss(
     root: &std::path::Path,
     sha: &str,
     current_key: &V3CompoundKey,
 ) -> CacheDecision {
-    GateCacheV3::diagnose_compound_key_drift(root, sha, current_key).map_or_else(
+    let (drift_code, _scan_exhaustive) =
+        GateCacheV3::diagnose_compound_key_drift(root, sha, current_key);
+    drift_code.map_or_else(
         || CacheDecision::cache_miss(CacheReasonCode::ShaMiss, None),
         |code| CacheDecision::cache_miss(code, None),
     )
@@ -3216,8 +3245,9 @@ mod tests {
 
         let key_b = V3CompoundKey::new("attest", "policy_B", "toolchain", "sandbox", "network")
             .expect("valid");
-        let result = GateCacheV3::diagnose_compound_key_drift(root, sha, &key_b);
+        let (result, exhaustive) = GateCacheV3::diagnose_compound_key_drift(root, sha, &key_b);
         assert_eq!(result, Some(CacheReasonCode::PolicyDrift));
+        assert!(exhaustive);
     }
 
     #[test]
@@ -3252,8 +3282,9 @@ mod tests {
 
         let key_b = V3CompoundKey::new("attest", "policy", "toolchain_B", "sandbox", "network")
             .expect("valid");
-        let result = GateCacheV3::diagnose_compound_key_drift(root, sha, &key_b);
+        let (result, exhaustive) = GateCacheV3::diagnose_compound_key_drift(root, sha, &key_b);
         assert_eq!(result, Some(CacheReasonCode::ToolchainDrift));
+        assert!(exhaustive);
     }
 
     #[test]
@@ -3288,8 +3319,9 @@ mod tests {
 
         let key_b = V3CompoundKey::new("attest_B", "policy", "toolchain", "sandbox", "network")
             .expect("valid");
-        let result = GateCacheV3::diagnose_compound_key_drift(root, sha, &key_b);
+        let (result, exhaustive) = GateCacheV3::diagnose_compound_key_drift(root, sha, &key_b);
         assert_eq!(result, Some(CacheReasonCode::ClosureDrift));
+        assert!(exhaustive);
     }
 
     #[test]
@@ -3324,8 +3356,9 @@ mod tests {
 
         let key_b = V3CompoundKey::new("attest", "policy", "toolchain", "sandbox", "network_B")
             .expect("valid");
-        let result = GateCacheV3::diagnose_compound_key_drift(root, sha, &key_b);
+        let (result, exhaustive) = GateCacheV3::diagnose_compound_key_drift(root, sha, &key_b);
         assert_eq!(result, Some(CacheReasonCode::NetworkPolicyDrift));
+        assert!(exhaustive);
     }
 
     #[test]
@@ -3360,8 +3393,9 @@ mod tests {
 
         let key_b = V3CompoundKey::new("attest", "policy", "toolchain", "sandbox_B", "network")
             .expect("valid");
-        let result = GateCacheV3::diagnose_compound_key_drift(root, sha, &key_b);
+        let (result, exhaustive) = GateCacheV3::diagnose_compound_key_drift(root, sha, &key_b);
         assert_eq!(result, Some(CacheReasonCode::SandboxDrift));
+        assert!(exhaustive);
     }
 
     #[test]
@@ -3373,8 +3407,10 @@ mod tests {
 
         let key = V3CompoundKey::new("attest", "policy", "toolchain", "sandbox", "network")
             .expect("valid");
-        let result = GateCacheV3::diagnose_compound_key_drift(root, "no-such-sha", &key);
+        let (result, exhaustive) =
+            GateCacheV3::diagnose_compound_key_drift(root, "no-such-sha", &key);
         assert_eq!(result, None);
+        assert!(exhaustive);
 
         // diagnose_cache_miss should return ShaMiss
         let decision = diagnose_cache_miss(root, "no-such-sha", &key);

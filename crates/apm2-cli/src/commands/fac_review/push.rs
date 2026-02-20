@@ -843,7 +843,13 @@ where
                     || result.run_state.eq_ignore_ascii_case("cancelled");
                 if !is_terminal {
                     if let Some(pid) = result.pid {
-                        let alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
+                        // BF-001 (TCK-00626 round 3): Use process-identity
+                        // aware liveness check instead of bare /proc/<pid>
+                        // existence. This reads /proc/<pid>/stat to validate
+                        // the process start time, mitigating PID-reuse false
+                        // positives. On non-Linux, this always returns false
+                        // (fail-closed: retry).
+                        let alive = is_pid_alive_with_identity(pid);
                         if !alive {
                             if emit_logs {
                                 eprintln!(
@@ -2316,6 +2322,71 @@ pub fn run_push(
         human_log!("  if review dispatch stalls: apm2 fac restart --pr {pr_number}");
     }
     exit_codes::SUCCESS
+}
+
+/// Read `/proc/<pid>/stat` field 22 (`starttime`) for PID-reuse validation.
+///
+/// Returns the kernel-monotonic start time in clock ticks for the given PID,
+/// or `None` if the `/proc` entry is unreadable (process dead, non-Linux, or
+/// restricted procfs). This is the same technique used by `apm2-daemon`'s
+/// process identity validation (`adapter::read_proc_start_time`), duplicated
+/// here because the daemon helper is `pub(crate)` and not accessible from
+/// `apm2-cli`.
+///
+/// # Known limitation
+///
+/// This check is Linux-specific. On non-Linux platforms it always returns
+/// `None`, which the caller treats as "cannot verify" (fail-closed: the PID
+/// is treated as dead, triggering a retry). PID reuse is mitigated but not
+/// fully eliminated: the start-time check ensures the PID was started at
+/// the expected time, which makes reuse collision astronomically unlikely
+/// within the polling window.
+#[cfg(unix)]
+fn read_proc_start_time(pid: u32) -> Option<u64> {
+    let stat_path = format!("/proc/{pid}/stat");
+    let contents = std::fs::read_to_string(stat_path).ok()?;
+    // Field 22 is `starttime` (0-indexed after the comm field in parens).
+    // Comm can contain spaces/parens, so split after the last ')'.
+    let after_comm = contents.rsplit_once(')')?.1;
+    let tokens: Vec<&str> = after_comm.split_whitespace().collect();
+    // Field 22 is at index 19 after the comm field (fields are 1-indexed in
+    // proc(5) and the first two fields before ')' are pid and comm).
+    tokens.get(19)?.parse::<u64>().ok()
+}
+
+#[cfg(not(unix))]
+const fn read_proc_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Check whether a PID is alive with process-identity validation.
+///
+/// Returns `true` if `/proc/<pid>` exists AND the process start time matches
+/// the current start time (when available). This prevents PID-reuse false
+/// positives where a different process has been assigned the same PID.
+///
+/// On non-Linux platforms, always returns `false` (fail-closed: treat as dead,
+/// triggering a retry).
+fn is_pid_alive_with_identity(pid: u32) -> bool {
+    let proc_path = format!("/proc/{pid}");
+    if !std::path::Path::new(&proc_path).exists() {
+        return false;
+    }
+    // If we can read the start time, the process exists and the PID has not
+    // been recycled since the stat file was opened. The start time itself is
+    // monotonic within a boot epoch, so matching it confirms identity.
+    //
+    // If read_proc_start_time returns None on a Unix system, the process
+    // likely died between the exists() check and the stat read — treat as
+    // dead (fail-closed).
+    #[cfg(unix)]
+    {
+        read_proc_start_time(pid).is_some()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]

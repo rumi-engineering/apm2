@@ -407,11 +407,22 @@ fn reuse_decision_with_v3_fallback(
     Option<apm2_core::fac::gate_cache_v3::CacheDecision>,
 ) {
     // Try v3 first.
+    //
+    // TCK-00626 round 3: Use check_reuse_decision as the single source of
+    // truth for both the CacheDecision and the reuse verdict. The previous
+    // code called check_reuse_decision (which includes TTL enforcement) and
+    // then independently called check_reuse (which lacks TTL enforcement),
+    // using check_reuse's result for the hit/miss decision. This allowed
+    // TTL-expired entries to be accepted as hits, bypassing the TTL policy.
+    //
+    // Now: check_reuse_decision alone drives the verdict. Its internal
+    // logic already delegates to check_reuse for non-TTL checks, so the
+    // full validation chain (signature, receipt binding, attestation) is
+    // preserved without duplication.
     if let Some(v3) = v3_cache {
         let cache_decision =
             v3.check_reuse_decision(gate_name, attestation_digest, true, verifying_key);
-        let v3_decision = v3.check_reuse(gate_name, attestation_digest, true, verifying_key);
-        if v3_decision.reusable {
+        if cache_decision.hit {
             return (ReuseDecision::hit_v3(), Some(cache_decision));
         }
         return (

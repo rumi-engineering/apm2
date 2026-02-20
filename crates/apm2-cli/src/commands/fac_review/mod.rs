@@ -1925,14 +1925,24 @@ fn run_doctor_inner(
                 .or(local_sha.as_deref())
                 .unwrap_or("");
             if !merge_sha.is_empty() {
-                let _ = lifecycle::apply_event(
+                if let Err(err) = lifecycle::apply_event(
                     owner_repo,
                     pr_number,
                     merge_sha,
                     &lifecycle::LifecycleEventKind::Merged {
                         source: "github_api_detection".to_string(),
                     },
-                );
+                ) {
+                    // BF-002 (TCK-00626 round 3): Propagate merge event
+                    // application errors instead of silently dropping them.
+                    // This surfaces SHA mismatches and state transition
+                    // failures that could leave the lifecycle projection
+                    // inconsistent with the actual GitHub merge state.
+                    eprintln!(
+                        "WARNING: failed to apply merged lifecycle event for PR #{pr_number} \
+                         (sha={merge_sha}): {err}",
+                    );
+                }
             }
         }
     }
