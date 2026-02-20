@@ -840,6 +840,16 @@ pub fn collect_doctor_checks(
         has_error = true;
     }
 
+    // ── Binary Alignment (INV-PADOPT-004 prevention) ──────────────────
+    // FU-001: Compare digest of `which apm2` against ExecStart binaries
+    // for apm2-daemon.service and apm2-worker.service. Mismatches indicate
+    // binary drift that caused the INV-PADOPT-004 incident.
+    let alignment_check = check_binary_alignment();
+    if alignment_check.status == "ERROR" {
+        has_error = true;
+    }
+    checks.push(alignment_check);
+
     Ok((checks, has_error))
 }
 
@@ -1122,6 +1132,198 @@ fn check_binary_available(binary: &str, args: &[&str]) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+/// Maximum binary file size to read for digest computation (256 MiB).
+/// Prevents unbounded memory allocation if the binary is unusually large.
+const MAX_BINARY_DIGEST_SIZE: u64 = 256 * 1024 * 1024;
+
+/// Systemd user service units to check for binary alignment.
+const BINARY_ALIGNMENT_UNIT_NAMES: [&str; 2] = ["apm2-daemon.service", "apm2-worker.service"];
+
+/// Compute SHA-256 digest of a file at the given path.
+///
+/// Returns the hex-encoded digest or an error message. Reads are bounded
+/// to `MAX_BINARY_DIGEST_SIZE` to prevent memory exhaustion (CTR-1603).
+fn sha256_file_digest(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+
+    use sha2::{Digest, Sha256};
+
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+    if metadata.len() > MAX_BINARY_DIGEST_SIZE {
+        return Err(format!(
+            "{} is too large ({} bytes, max {MAX_BINARY_DIGEST_SIZE})",
+            path.display(),
+            metadata.len()
+        ));
+    }
+
+    let mut reader = std::io::BufReader::new(file.take(MAX_BINARY_DIGEST_SIZE));
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("read error on {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Resolve the binary path from `which apm2`.
+fn resolve_which_apm2() -> Result<PathBuf, String> {
+    let output = Command::new("which")
+        .arg("apm2")
+        .output()
+        .map_err(|e| format!("failed to run `which apm2`: {e}"))?;
+    if !output.status.success() {
+        return Err("apm2 not found on PATH".to_string());
+    }
+    let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path_str.is_empty() {
+        return Err("which apm2 returned empty output".to_string());
+    }
+    // Resolve symlinks to get the canonical path
+    std::fs::canonicalize(&path_str).map_err(|e| format!("cannot canonicalize {path_str}: {e}"))
+}
+
+/// Parse the binary path from a systemd `ExecStart` property value.
+///
+/// `systemctl show --property ExecStart` returns something like:
+/// `ExecStart={ path=/home/user/.cargo/bin/apm2 ;
+/// argv[]=/home/user/.cargo/bin/apm2 ... }` or in simpler form:
+/// `/home/user/.cargo/bin/apm2 daemon --no-daemon`
+fn parse_execstart_binary(exec_start_value: &str) -> Result<PathBuf, String> {
+    let trimmed = exec_start_value.trim();
+    if trimmed.is_empty() || trimmed == "ExecStart=" {
+        return Err("ExecStart is empty or unset".to_string());
+    }
+
+    // Strip "ExecStart=" prefix if present
+    let value = trimmed.strip_prefix("ExecStart=").unwrap_or(trimmed);
+
+    // Handle structured format: { path=/path/to/bin ; ... }
+    if let Some(rest) = value.strip_prefix("{ path=") {
+        if let Some(path_end) = rest.find([' ', ';']) {
+            let path_str = &rest[..path_end];
+            return std::fs::canonicalize(path_str)
+                .map_err(|e| format!("cannot canonicalize {path_str}: {e}"));
+        }
+        // Try the whole rest as a path
+        let path_str = rest.trim_end_matches([' ', ';', '}']);
+        return std::fs::canonicalize(path_str)
+            .map_err(|e| format!("cannot canonicalize {path_str}: {e}"));
+    }
+
+    // Handle simple format: /path/to/bin arg1 arg2
+    let first_token = value.split_whitespace().next().unwrap_or("");
+    if first_token.is_empty() {
+        return Err("cannot parse ExecStart binary path".to_string());
+    }
+    std::fs::canonicalize(first_token)
+        .map_err(|e| format!("cannot canonicalize {first_token}: {e}"))
+}
+
+/// Resolve `ExecStart` binary path for a systemd user unit.
+fn resolve_service_binary(unit_name: &str) -> Result<PathBuf, String> {
+    let output = Command::new("systemctl")
+        .args(["--user", "show", unit_name, "--property", "ExecStart"])
+        .output()
+        .map_err(|e| format!("failed to query {unit_name}: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "systemctl show {unit_name} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_execstart_binary(&stdout)
+}
+
+/// FU-001 (TCK-00625): Check binary alignment between interactive CLI
+/// (`which apm2`) and systemd service `ExecStart` binaries.
+///
+/// Computes SHA-256 digests of all resolved binary paths and emits WARN
+/// if any digest mismatches. This prevents recurrence of INV-PADOPT-004
+/// where binary drift caused non-deterministic behavior.
+fn check_binary_alignment() -> DaemonDoctorCheck {
+    let cli_path = match resolve_which_apm2() {
+        Ok(p) => p,
+        Err(e) => {
+            return DaemonDoctorCheck {
+                name: "binary_alignment".to_string(),
+                status: "WARN",
+                message: format!(
+                    "cannot resolve CLI binary path: {e}. \
+                     Remediation: ensure apm2 is on PATH"
+                ),
+            };
+        },
+    };
+
+    let cli_digest = match sha256_file_digest(&cli_path) {
+        Ok(d) => d,
+        Err(e) => {
+            return DaemonDoctorCheck {
+                name: "binary_alignment".to_string(),
+                status: "WARN",
+                message: format!("cannot compute CLI binary digest: {e}"),
+            };
+        },
+    };
+
+    let mut mismatches: Vec<String> = Vec::new();
+
+    for unit in &BINARY_ALIGNMENT_UNIT_NAMES {
+        if let Ok(svc_path) = resolve_service_binary(unit) {
+            match sha256_file_digest(&svc_path) {
+                Ok(svc_digest) => {
+                    if svc_digest != cli_digest {
+                        mismatches.push(format!(
+                            "{unit}: path={} sha256={svc_digest} \
+                             (CLI: path={} sha256={cli_digest})",
+                            svc_path.display(),
+                            cli_path.display()
+                        ));
+                    }
+                },
+                Err(e) => {
+                    mismatches.push(format!("{unit}: cannot compute digest: {e}"));
+                },
+            }
+        }
+        // Service may not be installed — not a mismatch, just skip
+    }
+
+    if mismatches.is_empty() {
+        DaemonDoctorCheck {
+            name: "binary_alignment".to_string(),
+            status: "OK",
+            message: format!(
+                "CLI binary ({}) and service binaries have matching SHA-256 digest ({})",
+                cli_path.display(),
+                &cli_digest[..16]
+            ),
+        }
+    } else {
+        DaemonDoctorCheck {
+            name: "binary_alignment".to_string(),
+            status: "WARN",
+            message: format!(
+                "binary digest mismatch detected (INV-PADOPT-004 risk): {}. \
+                 Remediation: run `apm2 fac install` to realign binaries",
+                mismatches.join("; ")
+            ),
+        }
+    }
 }
 
 /// Maximum number of lane directories to scan for symlink safety.
