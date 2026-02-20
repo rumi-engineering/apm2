@@ -1605,6 +1605,21 @@ const MAX_BROKER_REQUESTS_PROMOTE: usize = 256;
 /// are deferred to the next cycle.
 const MAX_JUNK_DRAIN_PER_CYCLE: usize = 1024;
 
+/// Hard total per-cycle entry budget for broker request scanning.
+///
+/// Bounds the total number of directory entries iterated per promotion cycle,
+/// regardless of whether they are candidates, junk, or skipped entries.
+/// This prevents adversarial directory flooding from causing unbounded
+/// `readdir` iteration even after both `MAX_BROKER_REQUESTS_PROMOTE` and
+/// `MAX_JUNK_DRAIN_PER_CYCLE` are reached (the loop previously kept
+/// iterating entries past both caps). After the budget is exhausted, one
+/// aggregate warning is emitted and the loop terminates.
+///
+/// Formula: `MAX_BROKER_REQUESTS_PROMOTE * 4 + MAX_JUNK_DRAIN_PER_CYCLE`
+/// — a generous window that accommodates interleaved candidates and junk
+/// while still bounding work under adversarial flood.
+const MAX_BROKER_SCAN_BUDGET: usize = MAX_BROKER_REQUESTS_PROMOTE * 4 + MAX_JUNK_DRAIN_PER_CYCLE;
+
 /// Acquire the process-level enqueue lockfile under `queue_root`.
 ///
 /// Returns the open `File` handle whose lifetime controls the lock.
@@ -1713,18 +1728,25 @@ fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy)
     // starve valid .json requests.
     let mut candidates_processed: usize = 0;
     let mut junk_drained: usize = 0;
+    let mut entries_scanned: usize = 0;
+    // Track skipped entries for aggregate warning (replaces per-entry spam).
+    let mut candidates_skipped: usize = 0;
+    let mut junk_skipped: usize = 0;
 
     for entry in entries {
-        // Both caps reached: stop scanning entirely.
+        // CODE-QUALITY fix (TCK-00577 round 17): Hard total per-cycle
+        // entry budget. Stop iterating directory entries once the budget
+        // is exhausted, regardless of individual cap states. This bounds
+        // work under adversarial directory flood.
+        if entries_scanned >= MAX_BROKER_SCAN_BUDGET {
+            break;
+        }
+        entries_scanned += 1;
+
+        // Both individual caps reached: stop scanning.
         if candidates_processed >= MAX_BROKER_REQUESTS_PROMOTE
             && junk_drained >= MAX_JUNK_DRAIN_PER_CYCLE
         {
-            tracing::warn!(
-                candidates = candidates_processed,
-                junk = junk_drained,
-                "TCK-00577: both promotion and junk drain caps reached, \
-                 remaining entries deferred to next cycle"
-            );
             break;
         }
 
@@ -1754,6 +1776,8 @@ fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy)
                     let _ = fs::remove_file(&path);
                 }
                 junk_drained += 1;
+            } else {
+                junk_skipped += 1;
             }
             continue;
         }
@@ -1787,6 +1811,8 @@ fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy)
                         );
                         let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
                         junk_drained += 1;
+                    } else {
+                        junk_skipped += 1;
                     }
                     continue;
                 }
@@ -1801,6 +1827,8 @@ fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy)
                     );
                     let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
                     junk_drained += 1;
+                } else {
+                    junk_skipped += 1;
                 }
                 continue;
             },
@@ -1808,11 +1836,10 @@ fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy)
 
         // ── This is a valid candidate: count toward promotion cap ──
         if candidates_processed >= MAX_BROKER_REQUESTS_PROMOTE {
-            tracing::warn!(
-                "TCK-00577: broker_requests promotion cap reached \
-                 ({MAX_BROKER_REQUESTS_PROMOTE}), remaining candidates \
-                 deferred to next cycle"
-            );
+            // CODE-QUALITY fix (TCK-00577 round 17): Track skipped
+            // candidates for ONE aggregate warning after the loop,
+            // instead of emitting a warning per skipped entry.
+            candidates_skipped += 1;
             // Continue draining junk if junk cap not yet reached.
             if junk_drained >= MAX_JUNK_DRAIN_PER_CYCLE {
                 break;
@@ -1829,15 +1856,15 @@ fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy)
         let bytes = match read_bounded(&path, apm2_core::fac::job_spec::MAX_JOB_SPEC_SIZE) {
             Ok(b) => b,
             Err(e) => {
-                // TCK-00577 round 16: Broker request files are now
-                // written with mode 0640 + fchown(gid=service_user)
-                // when the service user is resolvable, or mode 0644 as
-                // fallback in dev environments. In cross-user
-                // deployments where fchown succeeded, the worker can
-                // read via group membership. EACCES here indicates a
-                // misconfiguration (service user not in file's group
-                // and fchown failed). This is fail-closed: unreadable
-                // files are quarantined, not promoted.
+                // TCK-00577 round 17: Broker request files are now
+                // written with mode 0640 + fchown(gid=service_user).
+                // The submitter MUST resolve the service user and
+                // fchown must succeed (fail-closed, no 0644 fallback).
+                // In cross-user deployments, the worker can read via
+                // group membership. EACCES here indicates a
+                // misconfiguration (shared group not configured).
+                // This is fail-closed: unreadable files are
+                // quarantined, not promoted.
                 if e.contains("Permission denied") {
                     tracing::warn!(
                         path = %path.display(),
@@ -1942,6 +1969,24 @@ fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy)
             },
         }
         // ---- End enqueue lock critical section ----
+    }
+
+    // CODE-QUALITY fix (TCK-00577 round 17): Emit ONE aggregate warning
+    // per cycle instead of per-entry warnings. This bounds log output
+    // under adversarial flood.
+    let total_skipped = candidates_skipped + junk_skipped;
+    if total_skipped > 0 || entries_scanned >= MAX_BROKER_SCAN_BUDGET {
+        tracing::warn!(
+            entries_scanned = entries_scanned,
+            scan_budget = MAX_BROKER_SCAN_BUDGET,
+            candidates_promoted = candidates_processed,
+            candidates_skipped = candidates_skipped,
+            junk_drained = junk_drained,
+            junk_skipped = junk_skipped,
+            budget_exhausted = entries_scanned >= MAX_BROKER_SCAN_BUDGET,
+            "TCK-00577: broker promotion cycle summary — \
+             {total_skipped} entries deferred to next cycle"
+        );
     }
 }
 

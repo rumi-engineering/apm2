@@ -319,25 +319,44 @@ fn enqueue_direct(
             .map_err(|err| format!("harden pending dir mode to 0711: {err}"))?;
     }
 
-    // Ensure other queue directories exist as well.
+    // CODE-QUALITY fix (TCK-00577 round 17): Ensure all queue subdirectories
+    // exist with deterministic, hardened permissions. Propagate create/chmod
+    // failures (fail-closed) instead of silently ignoring them. Each subdir
+    // gets mode 0711 (traversal-only for group/other), and broker_requests
+    // gets mode 01733 (sticky + write-only for group/other).
     for subdir in &[
         "claimed",
         "completed",
         "denied",
         "cancelled",
         "quarantine",
-        BROKER_REQUESTS_DIR,
+        "authority_consumed",
     ] {
-        let _ = fs::create_dir_all(queue_root.join(subdir));
+        let subdir_path = queue_root.join(subdir);
+        fs::create_dir_all(&subdir_path)
+            .map_err(|err| format!("create queue subdir {subdir}: {err}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&subdir_path, fs::Permissions::from_mode(0o711))
+                .map_err(|err| format!("harden queue subdir {subdir} mode to 0711: {err}"))?;
+        }
     }
 
-    // Set broker_requests to mode 01733 (sticky + group/other write-only)
+    // broker_requests gets mode 01733 (sticky + group/other write-only)
     // so non-service-user callers can submit but not read/delete others.
-    #[cfg(unix)]
+    // Fail-closed: if the directory cannot be created or mode cannot be
+    // set, return an error.
     {
-        use std::os::unix::fs::PermissionsExt;
         let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
-        let _ = fs::set_permissions(&broker_dir, fs::Permissions::from_mode(0o1733));
+        fs::create_dir_all(&broker_dir)
+            .map_err(|err| format!("create broker_requests dir: {err}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&broker_dir, fs::Permissions::from_mode(0o1733))
+                .map_err(|err| format!("harden broker_requests mode to 01733: {err}"))?;
+        }
     }
 
     let json = serde_json::to_string_pretty(spec).map_err(|err| format!("serialize: {err}"))?;
@@ -534,26 +553,27 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
     let filename = format!("{}.json", spec.job_id);
     let target = broker_dir.join(&filename);
 
-    // BLOCKER fix (TCK-00577 round 16): Resolve service user GID so we can
+    // SECURITY fix (TCK-00577 round 17): Resolve service user GID so we can
     // set the file's group to the service user, enabling the worker to read
-    // broker files in cross-user deployments. If the service user is
-    // resolvable, use mode 0640 + fchown(gid). If not resolvable (dev
-    // environment without a service user), fall back to mode 0644 with a
-    // warning (same-user deployment; world-read is acceptable since the
-    // broker_requests/ directory has mode 01733 and cannot be listed by
-    // other users, making UUID filenames effectively opaque).
+    // broker files in cross-user deployments. Fail-closed: if the service
+    // user is not resolvable, return an error instead of falling back to
+    // world-readable mode 0644. The 0644 fallback was fail-open because job
+    // names are not opaque random UUIDs and can be guessed/brute-forced,
+    // converting a controlled handoff failure into a confidentiality leak.
+    //
+    // If fchown succeeds: mode 0640 (group-read for service user).
+    // If fchown fails or GID unavailable: hard error (fail-closed).
     #[cfg(unix)]
-    let service_user_gid: Option<u32> = match resolve_service_user_identity() {
-        Ok(identity) => Some(identity.gid),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
+    let service_user_gid: u32 = resolve_service_user_identity()
+        .map(|identity| identity.gid)
+        .map_err(|e| {
+            format!(
                 "TCK-00577: service user not resolvable for group-based broker \
-                 file handoff; falling back to mode 0644 (dev/same-user deployment)"
-            );
-            None
-        },
-    };
+                 file handoff (fail-closed, no 0644 fallback): {e}. \
+                 Configure a valid FAC service user, or use --unsafe-local-write \
+                 for development environments."
+            )
+        })?;
 
     let temp = tempfile::NamedTempFile::new_in(&broker_dir).map_err(|err| {
         format!(
@@ -566,51 +586,40 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
         let mut file = temp.as_file();
         #[cfg(unix)]
         {
+            // SECURITY fix (TCK-00577 round 17): Cross-user deployment with
+            // fail-closed handoff. Set group to service user's primary GID
+            // and mode 0640 (owner read+write, group read). The service-user
+            // worker is in this group and can read the file.
+            //
+            // fchown(fd, -1, gid): change group only, preserve owner.
+            // This works because we own the file (just created it) and
+            // either (a) the target gid is our primary/supplementary
+            // group, or (b) we have CAP_CHOWN. If fchown fails (e.g.
+            // the calling user is not in the service user's group and
+            // lacks CAP_CHOWN), return a hard error — do NOT fall back
+            // to world-readable 0644.
+            use std::os::fd::AsFd;
             use std::os::unix::fs::PermissionsExt;
-            if let Some(gid) = service_user_gid {
-                // Cross-user deployment: set group to service user's primary
-                // GID and mode 0640 (owner read+write, group read). The
-                // service-user worker is in this group and can read the file.
-                //
-                // fchown(fd, -1, gid): change group only, preserve owner.
-                // This works because we own the file (just created it) and
-                // either (a) the target gid is our primary/supplementary
-                // group, or (b) we have CAP_CHOWN. If fchown fails (e.g.
-                // the calling user is not in the service user's group and
-                // lacks CAP_CHOWN), fall back to 0644 with a warning.
-                use std::os::fd::AsFd;
-                match nix::unistd::fchown(file.as_fd(), None, Some(nix::unistd::Gid::from_raw(gid)))
-                {
-                    Ok(()) => {
-                        let _ = file.set_permissions(fs::Permissions::from_mode(0o640));
-                        tracing::debug!(
-                            gid = gid,
-                            mode = "0640",
-                            "TCK-00577: broker request file group set to service user GID"
-                        );
-                    },
-                    Err(e) => {
-                        // fchown failed (not in group, no CAP_CHOWN). Fall
-                        // back to 0644 — the broker_requests/ directory's
-                        // mode 01733 prevents enumeration, and UUID filenames
-                        // are effectively opaque.
-                        tracing::warn!(
-                            gid = gid,
-                            error = %e,
-                            "TCK-00577: fchown to service user GID failed; \
-                             falling back to mode 0644 (defense-in-depth: \
-                             broker_requests/ mode 01733 prevents enumeration)"
-                        );
-                        let _ = file.set_permissions(fs::Permissions::from_mode(0o644));
-                    },
-                }
-            } else {
-                // Dev/same-user deployment: service user not resolvable.
-                // Use mode 0644 — world-readable, but broker_requests/ has
-                // mode 01733 (no list permission) so other users cannot
-                // discover filenames.
-                let _ = file.set_permissions(fs::Permissions::from_mode(0o644));
-            }
+            nix::unistd::fchown(
+                file.as_fd(),
+                None,
+                Some(nix::unistd::Gid::from_raw(service_user_gid)),
+            )
+            .map_err(|e| {
+                format!(
+                    "TCK-00577: fchown to service user GID {service_user_gid} \
+                     failed (fail-closed, no 0644 fallback): {e}. \
+                     Ensure the submitting user is in the service user's \
+                     group, or grant CAP_CHOWN."
+                )
+            })?;
+            file.set_permissions(fs::Permissions::from_mode(0o640))
+                .map_err(|err| format!("set broker request file mode to 0640: {err}"))?;
+            tracing::debug!(
+                gid = service_user_gid,
+                mode = "0640",
+                "TCK-00577: broker request file group set to service user GID"
+            );
         }
         file.write_all(json.as_bytes())
             .map_err(|err| format!("write: {err}"))?;
@@ -985,9 +994,20 @@ mod tests {
         let spec = test_job_spec("test-broker-001");
 
         let result = enqueue_via_broker_requests(&queue_root, &spec);
-        assert!(result.is_ok(), "broker enqueue should succeed: {result:?}");
 
-        let path = result.unwrap();
+        // TCK-00577 round 17: broker enqueue now fails closed when the
+        // service user is not resolvable. In test environments without
+        // `_apm2-job`, this returns an error.
+        let path = match result {
+            Err(err) => {
+                assert!(
+                    err.contains("fail-closed") || err.contains("service user"),
+                    "error must mention fail-closed semantics: {err}"
+                );
+                return;
+            },
+            Ok(p) => p,
+        };
         assert!(path.exists(), "broker request file should exist");
         assert!(
             path.starts_with(queue_root.join(BROKER_REQUESTS_DIR)),
@@ -1000,52 +1020,55 @@ mod tests {
         assert_eq!(parsed.job_id, "test-broker-001");
     }
 
-    /// TCK-00577 round 16 regression test: Broker request files are created
-    /// with mode 0640 (when service user is resolvable and fchown succeeds)
-    /// or mode 0644 (fallback when service user not resolvable or fchown
-    /// fails). In test environments, the default service user `_apm2-job`
-    /// typically does not exist, so the fallback path (0644) is expected.
+    /// SECURITY fix (TCK-00577 round 17): Broker enqueue now fails closed
+    /// when the service user is not resolvable. In test environments where
+    /// `_apm2-job` does not exist, `enqueue_via_broker_requests` returns an
+    /// error instead of falling back to world-readable mode 0644.
     ///
-    /// The key security invariant: the file MUST NOT have mode 0600 (which
-    /// would make it unreadable by the service-user worker in cross-user
-    /// deployments — the BLOCKER finding that motivated this fix).
+    /// The previous 0644 fallback was fail-open: job filenames are not
+    /// opaque random UUIDs and can be guessed, so world-readable files in
+    /// `broker_requests/` constituted a confidentiality leak.
+    ///
+    /// In production, the service user MUST exist and fchown MUST succeed
+    /// for broker-mediated enqueue to work. Dev environments should use
+    /// `--unsafe-local-write` which routes through `enqueue_direct` and
+    /// bypasses the broker path entirely.
     #[cfg(unix)]
     #[test]
-    fn enqueue_via_broker_requests_creates_file_with_cross_user_readable_mode() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn enqueue_via_broker_requests_fails_closed_when_service_user_not_resolvable() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
         let queue_root = dir.path().join("queue");
         let spec = test_job_spec("test-broker-mode-001");
 
         let result = enqueue_via_broker_requests(&queue_root, &spec);
-        assert!(result.is_ok(), "broker enqueue should succeed: {result:?}");
 
-        let path = result.unwrap();
-        let mode = std::fs::metadata(&path)
-            .expect("broker request file metadata")
-            .permissions()
-            .mode()
-            & 0o7777;
-
-        // Acceptable modes:
-        // - 0640: service user resolvable, fchown succeeded (cross-user)
-        // - 0644: fallback (dev/same-user deployment, or fchown failed)
-        // NOT acceptable: 0600 (would break cross-user readability)
-        assert!(
-            mode == 0o640 || mode == 0o644,
-            "broker request file must have mode 0640 (group-read for service \
-             user) or 0644 (dev fallback), got {mode:04o}. Mode 0600 is a \
-             BLOCKER — it breaks cross-user broker-mediated enqueue."
-        );
-
-        // In test environments, the default service user `_apm2-job` usually
-        // does not exist, so we expect mode 0644 (the fallback).
-        if mode == 0o644 {
-            // Expected in dev/test environments.
-        } else {
-            // mode == 0640 means the test environment has a service user.
-            // Both are acceptable.
+        // In test environments, the default service user `_apm2-job`
+        // typically does not exist. The function must return an error
+        // (fail-closed) instead of falling back to 0644.
+        match result {
+            Err(err) => {
+                assert!(
+                    err.contains("fail-closed") || err.contains("service user"),
+                    "error must mention fail-closed semantics or service user: {err}"
+                );
+            },
+            Ok(path) => {
+                // If the test environment happens to have a valid service user
+                // (e.g., CI with _apm2-job configured), the file MUST have
+                // mode 0640 (group-read, no world-read).
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path)
+                    .expect("broker request file metadata")
+                    .permissions()
+                    .mode()
+                    & 0o7777;
+                assert_eq!(
+                    mode, 0o640,
+                    "broker request file must have mode 0640 (group-read for \
+                     service user), got {mode:04o}. Mode 0644 is no longer \
+                     acceptable (fail-open removed in round 17)."
+                );
+            },
         }
     }
 
@@ -1212,7 +1235,27 @@ mod tests {
         let spec = test_job_spec("test-perms-broker-001");
 
         let result = enqueue_via_broker_requests(&queue_root, &spec);
-        assert!(result.is_ok(), "broker enqueue should succeed: {result:?}");
+
+        // TCK-00577 round 17: In test environments without a service user,
+        // broker enqueue now fails closed. The directory hardening still
+        // runs (it happens before service user resolution), so we can
+        // verify modes even on error.
+        if result.is_err() {
+            // Directories were created and hardened before the service
+            // user check. Verify modes are correct despite the error.
+            if queue_root.exists() {
+                let qr_mode = std::fs::metadata(&queue_root)
+                    .expect("queue root metadata")
+                    .permissions()
+                    .mode()
+                    & 0o7777;
+                assert_eq!(
+                    qr_mode, 0o711,
+                    "queue root should be mode 0711 even on error, got {qr_mode:04o}"
+                );
+            }
+            return;
+        }
 
         // Queue root should be 0711.
         let qr_mode = std::fs::metadata(&queue_root)
@@ -1262,12 +1305,21 @@ mod tests {
 
         let spec = test_job_spec("test-preexist-001");
         let result = enqueue_via_broker_requests(&queue_root, &spec);
-        assert!(
-            result.is_ok(),
-            "broker enqueue with pre-existing correct-mode dirs should succeed: {result:?}"
-        );
 
-        let path = result.unwrap();
+        // TCK-00577 round 17: In test environments without a service user,
+        // broker enqueue fails closed after directory validation passes.
+        // This test validates directory mode acceptance, not file creation.
+        let path = match result {
+            Err(err) => {
+                // Must fail at service user resolution, NOT at directory mode.
+                assert!(
+                    err.contains("service user") || err.contains("fail-closed"),
+                    "error should be about service user, not directory mode: {err}"
+                );
+                return;
+            },
+            Ok(p) => p,
+        };
         assert!(path.exists(), "broker request file should exist");
     }
 
@@ -1386,10 +1438,17 @@ mod tests {
 
         let spec = test_job_spec("test-sticky-001");
         let result = enqueue_via_broker_requests(&queue_root, &spec);
-        assert!(
-            result.is_ok(),
-            "broker enqueue should accept sticky world-writable dir: {result:?}"
-        );
+
+        // TCK-00577 round 17: In test environments without a service user,
+        // broker enqueue fails closed after directory validation passes.
+        // The key assertion: error is NOT about directory mode (the mode
+        // 01333 was accepted).
+        if let Err(err) = result {
+            assert!(
+                !err.contains("sticky bit") && !err.contains("unsafe mode"),
+                "error should not be about directory mode (01333 is valid): {err}"
+            );
+        }
     }
 
     /// Regression: mode 0700 (owner-only) without sticky is acceptable because
@@ -1412,10 +1471,16 @@ mod tests {
 
         let spec = test_job_spec("test-owner-only-001");
         let result = enqueue_via_broker_requests(&queue_root, &spec);
-        assert!(
-            result.is_ok(),
-            "broker enqueue should accept owner-only dir without sticky: {result:?}"
-        );
+
+        // TCK-00577 round 17: In test environments without a service user,
+        // broker enqueue fails closed after directory validation passes.
+        // The key assertion: error is NOT about directory mode.
+        if let Err(err) = result {
+            assert!(
+                !err.contains("sticky bit") && !err.contains("unsafe mode"),
+                "error should not be about directory mode (0700 is valid): {err}"
+            );
+        }
     }
 
     /// MAJOR fix: `broker_requests` with group-write but NO sticky bit (mode
@@ -1470,9 +1535,15 @@ mod tests {
 
         let spec = test_job_spec("test-grp-sticky-001");
         let result = enqueue_via_broker_requests(&queue_root, &spec);
-        assert!(
-            result.is_ok(),
-            "broker enqueue should accept group-writable dir with sticky: {result:?}"
-        );
+
+        // TCK-00577 round 17: In test environments without a service user,
+        // broker enqueue fails closed after directory validation passes.
+        // The key assertion: error is NOT about directory mode.
+        if let Err(err) = result {
+            assert!(
+                !err.contains("sticky bit") && !err.contains("unsafe mode"),
+                "error should not be about directory mode (01730 is valid): {err}"
+            );
+        }
     }
 }

@@ -812,19 +812,19 @@ systemd service executables:
 - **Collision handling**: Filename collisions with existing pending jobs produce
   a timestamped suffix (same as `move_to_dir_safe`), never clobbering.
 
-### Broker request file permissions (TCK-00577 round 14+16 fix)
+### Broker request file permissions (TCK-00577 round 14+16+17 fix)
 
-- **Mode 0640 + fchown (cross-user)**: `enqueue_via_broker_requests` resolves
-  the service user's primary GID via `resolve_service_user_identity()`, then
-  creates broker request temp files with mode 0640 and `fchown(fd, -1, gid)`.
-  The service-user worker can read via group membership. If `fchown` fails
-  (caller not in the group and lacks CAP_CHOWN), falls back to mode 0644.
-- **Mode 0644 (dev fallback)**: When the service user is not resolvable (dev
-  environment without `_apm2-job`), the file is created with mode 0644. The
-  `broker_requests/` directory's mode 01733 prevents enumeration, so UUID
-  filenames are effectively opaque to other users.
-- **Same-user deployments**: Mode 0600 works transparently — the submitter
-  and worker are the same UID.
+- **Mode 0640 + fchown (cross-user, fail-closed)**: `enqueue_via_broker_requests`
+  resolves the service user's primary GID via `resolve_service_user_identity()`,
+  then creates broker request temp files with mode 0640 and `fchown(fd, -1, gid)`.
+  The service-user worker can read via group membership. **Fail-closed**: if the
+  service user is not resolvable OR fchown fails, the function returns an error.
+  The previous 0644 fallback was removed in round 17 (it was fail-open because
+  job filenames are not opaque UUIDs and can be guessed).
+- **No 0644 fallback**: Dev environments without a service user MUST use
+  `--unsafe-local-write` (which routes through `enqueue_direct`, bypassing the
+  broker path entirely). This is the explicit opt-in for "I know there's no
+  service user."
 - **Cross-user deployments**: The worker may get EACCES when reading
   broker files owned by a different UID. The worker handles this
   fail-closed: unreadable files are quarantined with a logged warning
@@ -835,7 +835,15 @@ systemd service executables:
   actionable warning directing operators to configure shared group
   access or ACLs.
 
-### Junk entry drain (TCK-00577 round 16 MAJOR fix)
+### Direct enqueue subdir hardening (TCK-00577 round 17 fix)
+
+- **Deterministic modes on all subdirs**: `enqueue_direct` now creates all queue
+  subdirectories (`claimed`, `completed`, `denied`, `cancelled`, `quarantine`,
+  `authority_consumed`) with mode 0711 and `broker_requests` with mode 01733.
+  Create and chmod failures are propagated (fail-closed) instead of being
+  silently ignored with `let _ =`.
+
+### Junk entry drain and scan budget (TCK-00577 round 16+17 fix)
 
 - **Independent caps**: `promote_broker_requests` uses two separate counters:
   `candidates_processed` (up to `MAX_BROKER_REQUESTS_PROMOTE = 256`) for valid
@@ -844,6 +852,13 @@ systemd service executables:
   metadata). Non-candidate entries are quarantined without consuming the promotion
   budget, preventing an attacker from filling `broker_requests/` with junk
   filenames to exhaust the scan budget and starve valid requests.
+- **Hard scan budget**: `MAX_BROKER_SCAN_BUDGET` (= `MAX_BROKER_REQUESTS_PROMOTE
+  * 4 + MAX_JUNK_DRAIN_PER_CYCLE`) bounds the total directory entries iterated per
+  cycle. Once exhausted, the loop terminates immediately. This prevents adversarial
+  directory flooding from causing unbounded `readdir` iteration.
+- **Aggregate warnings**: After the loop, ONE aggregate warning is emitted with
+  cycle summary (entries scanned, candidates promoted/skipped, junk drained/skipped,
+  budget exhaustion status). Per-entry warning spam was removed.
 
 ### General invariants
 
