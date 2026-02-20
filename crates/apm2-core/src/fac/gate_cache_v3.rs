@@ -527,39 +527,6 @@ impl CacheDecision {
 }
 
 // =============================================================================
-// V3 Reuse Decision
-// =============================================================================
-
-/// Decision on whether a v3 cache entry can be reused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct V3ReuseDecision {
-    /// Whether the entry is reusable.
-    pub reusable: bool,
-    /// Human-readable reason for the decision.
-    pub reason: &'static str,
-}
-
-impl V3ReuseDecision {
-    /// Cache hit: entry is valid and reusable.
-    #[must_use]
-    pub const fn hit() -> Self {
-        Self {
-            reusable: true,
-            reason: "v3_compound_key_match",
-        }
-    }
-
-    /// Cache miss: entry is not reusable, with reason.
-    #[must_use]
-    pub const fn miss(reason: &'static str) -> Self {
-        Self {
-            reusable: false,
-            reason,
-        }
-    }
-}
-
-// =============================================================================
 // V3 Gate Cache (in-memory index)
 // =============================================================================
 
@@ -662,7 +629,25 @@ impl GateCacheV3 {
         Ok(())
     }
 
-    /// Evaluate whether a v3 cache entry is safe to reuse.
+    /// Evaluate whether a v3 cache entry is safe to reuse, returning a
+    /// structured [`CacheDecision`] with first-mismatch attribution
+    /// (TCK-00626 S2).
+    ///
+    /// This is the sole API for cache reuse decisions. It returns a
+    /// [`CacheDecision`] directly with the correct [`CacheReasonCode`] and
+    /// `first_mismatch_dimension`, following the ordered check sequence
+    /// defined in TCK-00626 S2:
+    ///
+    /// 1. `sha_miss` / `gate_miss` -- no cache entry found
+    /// 2. `signature_invalid` -- entry exists but signature fails
+    /// 3. `receipt_binding_missing` -- RFC-0028/0029 flags not set
+    /// 4. `policy_drift` (detected at compound-key level by caller)
+    /// 5. `toolchain_drift` (detected at compound-key level by caller)
+    /// 6. `closure_drift` (detected at compound-key level by caller)
+    /// 7. `input_drift` -- attestation/evidence mismatch
+    /// 8. `network_policy_drift` (detected at compound-key level by caller)
+    /// 9. `sandbox_drift` (detected at compound-key level by caller)
+    /// 10. `ttl_expired` -- LAST check; only runs if all earlier checks pass
     ///
     /// A v3 cache hit requires:
     /// 0. Cache is NOT v2-sourced ([INV-GCV3-001]).
@@ -672,6 +657,7 @@ impl GateCacheV3 {
     /// 4. Evidence log digest is present and non-empty.
     /// 5. Signature is valid against the expected verifying key.
     /// 6. RFC-0028/0029 receipt bindings are present (fail-closed).
+    /// 7. Entry has not exceeded TTL (if TTL is configured).
     ///
     /// The compound key match is implicit: the caller looked up this cache
     /// by compound key, so if the entry exists, the compound key matched.
@@ -690,197 +676,129 @@ impl GateCacheV3 {
         expected_attestation_digest: Option<&str>,
         require_full_mode: bool,
         verifying_key: Option<&crate::crypto::VerifyingKey>,
-    ) -> V3ReuseDecision {
+    ) -> CacheDecision {
         // [INV-GCV3-001] Fail-closed: v2-sourced entries never satisfy reuse.
         // V2 entries lack RFC-0028/0029 binding proof; the compound key was
         // assigned by the loader, not cryptographically bound at production time.
         if self.v2_sourced {
-            return V3ReuseDecision::miss("v2_sourced_no_binding_proof");
+            return CacheDecision::cache_miss(CacheReasonCode::SignatureInvalid, Some(&self.sha));
         }
 
+        // 1. Gate miss: no entry or non-PASS status.
         let Some(cached) = self.get(gate) else {
-            return V3ReuseDecision::miss("no_record");
+            return CacheDecision::cache_miss(CacheReasonCode::GateMiss, Some(&self.sha));
         };
         if cached.status != "PASS" {
-            return V3ReuseDecision::miss("status_not_pass");
+            return CacheDecision::cache_miss(CacheReasonCode::GateMiss, Some(&self.sha));
         }
+
+        // Input validation checks that map to InputDrift.
         if require_full_mode && cached.quick_mode.unwrap_or(false) {
-            return V3ReuseDecision::miss("quick_receipt_not_reusable");
+            return CacheDecision::cache_miss(CacheReasonCode::InputDrift, Some(&self.sha));
         }
         let Some(expected_digest) = expected_attestation_digest else {
-            return V3ReuseDecision::miss("attestation_missing_current");
+            return CacheDecision::cache_miss(CacheReasonCode::InputDrift, Some(&self.sha));
         };
         if cached.attestation_digest.as_deref() != Some(expected_digest) {
-            return V3ReuseDecision::miss("attestation_mismatch");
+            return CacheDecision::cache_miss(CacheReasonCode::InputDrift, Some(&self.sha));
         }
         if cached
             .evidence_log_digest
             .as_deref()
             .is_none_or(|v| v.trim().is_empty())
         {
-            return V3ReuseDecision::miss("evidence_digest_missing");
+            return CacheDecision::cache_miss(CacheReasonCode::InputDrift, Some(&self.sha));
         }
 
-        // Signature verification gate (fail-closed).
-        if let Some(key) = verifying_key {
-            let canonical = self.canonical_bytes_for_gate(gate, cached);
-            let sig_hex = match cached.signature_hex.as_deref() {
-                Some(s) if !s.is_empty() => s,
-                _ => return V3ReuseDecision::miss("signature_missing"),
-            };
-            let signer_hex = match cached.signer_id.as_deref() {
-                Some(s) if !s.is_empty() => s,
-                _ => return V3ReuseDecision::miss("signer_id_missing"),
-            };
-            if sig_hex.len() > 256 || signer_hex.len() > 256 {
-                return V3ReuseDecision::miss("signature_field_too_long");
-            }
-            // Verify signer matches expected key.
-            let Ok(signer_bytes) = hex::decode(signer_hex) else {
-                return V3ReuseDecision::miss("signer_id_invalid_hex");
-            };
-            let expected_bytes = key.to_bytes();
-            if signer_bytes.len() != expected_bytes.len() {
-                return V3ReuseDecision::miss("signer_id_length_mismatch");
-            }
-            let eq: bool =
-                subtle::ConstantTimeEq::ct_eq(signer_bytes.as_slice(), expected_bytes.as_slice())
-                    .into();
-            if !eq {
-                return V3ReuseDecision::miss("signer_id_mismatch");
-            }
-            // Verify signature.
-            let Ok(sig_bytes) = hex::decode(sig_hex) else {
-                return V3ReuseDecision::miss("signature_invalid_hex");
-            };
-            let Ok(signature) = crate::crypto::parse_signature(&sig_bytes) else {
-                return V3ReuseDecision::miss("signature_malformed");
-            };
-            if super::verify_with_domain(
-                key,
-                super::GATE_CACHE_RECEIPT_PREFIX,
-                &canonical,
-                &signature,
-            )
-            .is_err()
-            {
-                return V3ReuseDecision::miss("signature_invalid");
-            }
-        } else {
-            // No verifying key provided: fail-closed in all cases.
-            // If a signature is present but we cannot verify it, deny
-            // (prevents forged-signature bypass). If no signature at all,
-            // also deny (unsigned entry).
-            if cached.signature_hex.is_some() {
-                return V3ReuseDecision::miss("signature_unverifiable_no_key");
-            }
-            return V3ReuseDecision::miss("signature_missing");
+        // 2. Signature verification gate (fail-closed).
+        if !self.verify_signature(gate, cached, verifying_key) {
+            return CacheDecision::cache_miss(CacheReasonCode::SignatureInvalid, Some(&self.sha));
         }
 
-        // TCK-00541: RFC-0028/0029 receipt binding gate (fail-closed).
+        // 3. RFC-0028/0029 receipt binding gate (fail-closed).
         // Cache hits are only valid when the gate result carries evidence of
         // both RFC-0028 channel authorization and RFC-0029 queue admission.
         // These flags are promoted after a durable receipt lookup; entries
         // that were never rebound remain false and are denied here.
         if !cached.rfc0028_receipt_bound || !cached.rfc0029_receipt_bound {
-            return V3ReuseDecision::miss("receipt_binding_missing");
+            return CacheDecision::cache_miss(
+                CacheReasonCode::ReceiptBindingMissing,
+                Some(&self.sha),
+            );
         }
 
-        V3ReuseDecision::hit()
-    }
-
-    /// Evaluate cache reuse and return a structured [`CacheDecision`]
-    /// (TCK-00626).
-    ///
-    /// This is the primary API for cache explainability. It wraps the
-    /// existing `check_reuse` logic and maps each miss reason to a
-    /// [`CacheReasonCode`] with structured first-mismatch attribution.
-    ///
-    /// The ordered check sequence matches `check_reuse`:
-    ///
-    /// 1. `sha_miss` / `gate_miss` -- no cache entry found
-    /// 2. `signature_invalid` -- entry exists but signature fails
-    /// 3. `receipt_binding_missing` -- RFC-0028/0029 flags not set
-    /// 4. Dimension-specific drift codes (`policy`, `toolchain`, etc.)
-    ///
-    /// Note: dimension drifts (4+) are detected at the compound-key
-    /// level by the caller -- if the compound key does not match, no cache
-    /// is loaded. The `check_reuse` method only sees entries that already
-    /// match on compound key. Therefore drifts like `policy`, `toolchain`,
-    /// `network_policy`, `sandbox` are signaled by the caller via
-    /// `sha_miss` / `gate_miss` when no v3 cache loads for the current
-    /// compound key. The remaining detailed miss reasons from
-    /// `check_reuse` are mapped to their closest reason code.
-    #[must_use]
-    pub fn check_reuse_decision(
-        &self,
-        gate: &str,
-        expected_attestation_digest: Option<&str>,
-        require_full_mode: bool,
-        verifying_key: Option<&crate::crypto::VerifyingKey>,
-    ) -> CacheDecision {
-        // TTL check: if APM2_FAC_CACHE_TTL_SECS > 0, check entry age.
-        if let Some(cached) = self.get(gate) {
-            let ttl_secs = std::env::var("APM2_FAC_CACHE_TTL_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0);
-            if ttl_secs > 0 {
-                if let Some(age_secs) = rfc3339_age_secs(&cached.completed_at) {
-                    if age_secs > ttl_secs {
-                        return CacheDecision::cache_miss(
-                            CacheReasonCode::TtlExpired,
-                            Some(&self.sha),
-                        );
-                    }
+        // 10. TTL check: LAST in the ordered evaluation.
+        // Only runs if all earlier dimension checks pass. This ensures that
+        // integrity failures (signature, receipt binding) are surfaced before
+        // timing-based reasons, per TCK-00626 S2 check order.
+        let ttl_secs = std::env::var("APM2_FAC_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        if ttl_secs > 0 {
+            if let Some(age_secs) = rfc3339_age_secs(&cached.completed_at) {
+                if age_secs > ttl_secs {
+                    return CacheDecision::cache_miss(CacheReasonCode::TtlExpired, Some(&self.sha));
                 }
             }
         }
 
-        let v3_decision = self.check_reuse(
-            gate,
-            expected_attestation_digest,
-            require_full_mode,
-            verifying_key,
-        );
-        if v3_decision.reusable {
-            return CacheDecision::cache_hit(&self.sha);
-        }
-        // Map the V3ReuseDecision reason string to a CacheReasonCode.
-        let reason_code = Self::map_reason_to_code(v3_decision.reason);
-        CacheDecision::cache_miss(reason_code, Some(&self.sha))
+        CacheDecision::cache_hit(&self.sha)
     }
 
-    /// Map a legacy `V3ReuseDecision` reason string to a [`CacheReasonCode`].
+    /// Verify the signature of a cached gate entry against the expected key.
     ///
-    /// Reasons that indicate "no entry found" map to `GateMiss`.
-    /// Signature-related failures map to `SignatureInvalid`.
-    /// Receipt-binding failures map to `ReceiptBindingMissing`.
-    /// V2-sourced denials map to `SignatureInvalid` (v2 lacks binding proof).
-    /// All other reasons default to `InputDrift` (attestation mismatch = input
-    /// content changed).
-    #[must_use]
-    fn map_reason_to_code(reason: &str) -> CacheReasonCode {
-        match reason {
-            "no_record" | "status_not_pass" => CacheReasonCode::GateMiss,
-            "v2_sourced_no_binding_proof"
-            | "signature_missing"
-            | "signer_id_missing"
-            | "signature_field_too_long"
-            | "signer_id_invalid_hex"
-            | "signer_id_length_mismatch"
-            | "signer_id_mismatch"
-            | "signature_invalid_hex"
-            | "signature_malformed"
-            | "signature_invalid"
-            | "signature_unverifiable_no_key" => CacheReasonCode::SignatureInvalid,
-            "receipt_binding_missing" => CacheReasonCode::ReceiptBindingMissing,
-            // All remaining reasons (attestation/evidence mismatches, quick-mode
-            // denial, and unknown reasons) default to InputDrift as a fail-closed
-            // catch-all. Individual reason strings are intentionally NOT listed
-            // separately to avoid clippy::match_same_arms.
-            _ => CacheReasonCode::InputDrift,
+    /// Returns `true` if the signature is valid, `false` otherwise.
+    /// Fail-closed: returns `false` if no verifying key is provided, or if
+    /// any signature field is missing/malformed/invalid.
+    fn verify_signature(
+        &self,
+        gate: &str,
+        cached: &V3GateResult,
+        verifying_key: Option<&crate::crypto::VerifyingKey>,
+    ) -> bool {
+        let Some(key) = verifying_key else {
+            // No verifying key provided: fail-closed in all cases.
+            return false;
+        };
+        let canonical = self.canonical_bytes_for_gate(gate, cached);
+        let sig_hex = match cached.signature_hex.as_deref() {
+            Some(s) if !s.is_empty() => s,
+            _ => return false,
+        };
+        let signer_hex = match cached.signer_id.as_deref() {
+            Some(s) if !s.is_empty() => s,
+            _ => return false,
+        };
+        if sig_hex.len() > 256 || signer_hex.len() > 256 {
+            return false;
         }
+        let Ok(signer_bytes) = hex::decode(signer_hex) else {
+            return false;
+        };
+        let expected_bytes = key.to_bytes();
+        if signer_bytes.len() != expected_bytes.len() {
+            return false;
+        }
+        let eq: bool =
+            subtle::ConstantTimeEq::ct_eq(signer_bytes.as_slice(), expected_bytes.as_slice())
+                .into();
+        if !eq {
+            return false;
+        }
+        let Ok(sig_bytes) = hex::decode(sig_hex) else {
+            return false;
+        };
+        let Ok(signature) = crate::crypto::parse_signature(&sig_bytes) else {
+            return false;
+        };
+        super::verify_with_domain(
+            key,
+            super::GATE_CACHE_RECEIPT_PREFIX,
+            &canonical,
+            &signature,
+        )
+        .is_ok()
     }
 
     /// Explicitly bind RFC-0028/0029 receipt evidence to a cache entry.
@@ -1707,11 +1625,14 @@ mod tests {
         .expect("valid compound key")
     }
 
+    #[allow(clippy::disallowed_methods)] // Wall-clock OK in test fixture.
     fn sample_gate_result() -> V3GateResult {
         V3GateResult {
             status: "PASS".to_string(),
             duration_secs: 5,
-            completed_at: "2026-02-17T00:00:00Z".to_string(),
+            // Use current time so TTL checks never expire sample entries
+            // when run concurrently with the ttl_expired_check test.
+            completed_at: chrono::Utc::now().to_rfc3339(),
             attestation_digest: Some(
                 "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_string(),
@@ -1862,8 +1783,8 @@ mod tests {
         let vk = signer.verifying_key();
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(decision.reusable);
-        assert_eq!(decision.reason, "v3_compound_key_match");
+        assert!(decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::CacheHit);
     }
 
     #[test]
@@ -1872,8 +1793,8 @@ mod tests {
         let cache = make_signed_v3(&signer);
         let vk = signer.verifying_key();
         let decision = cache.check_reuse("nonexistent", Some("x"), true, Some(&vk));
-        assert!(!decision.reusable);
-        assert_eq!(decision.reason, "no_record");
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::GateMiss);
     }
 
     #[test]
@@ -1888,8 +1809,8 @@ mod tests {
 
         let vk = signer.verifying_key();
         let decision = cache.check_reuse("rustfmt", Some("x"), true, Some(&vk));
-        assert!(!decision.reusable);
-        assert_eq!(decision.reason, "status_not_pass");
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::GateMiss);
     }
 
     #[test]
@@ -1898,8 +1819,8 @@ mod tests {
         let cache = make_signed_v3(&signer);
         let vk = signer.verifying_key();
         let decision = cache.check_reuse("rustfmt", Some("wrong-digest"), true, Some(&vk));
-        assert!(!decision.reusable);
-        assert_eq!(decision.reason, "attestation_mismatch");
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::InputDrift);
     }
 
     #[test]
@@ -1915,8 +1836,8 @@ mod tests {
         let vk = signer.verifying_key();
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(!decision.reusable);
-        assert_eq!(decision.reason, "quick_receipt_not_reusable");
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::InputDrift);
     }
 
     #[test]
@@ -1929,8 +1850,8 @@ mod tests {
         let vk = signer.verifying_key();
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(!decision.reusable);
-        assert_eq!(decision.reason, "signature_missing");
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::SignatureInvalid);
     }
 
     #[test]
@@ -1941,8 +1862,8 @@ mod tests {
         let vk_b = signer_b.verifying_key();
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk_b));
-        assert!(!decision.reusable);
-        assert_eq!(decision.reason, "signer_id_mismatch");
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::SignatureInvalid);
     }
 
     #[test]
@@ -1958,8 +1879,8 @@ mod tests {
         let vk = signer.verifying_key();
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(!decision.reusable);
-        assert_eq!(decision.reason, "evidence_digest_missing");
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::InputDrift);
     }
 
     #[test]
@@ -1969,8 +1890,8 @@ mod tests {
         cache.set("rustfmt", sample_gate_result()).expect("set");
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, None);
-        assert!(!decision.reusable);
-        assert_eq!(decision.reason, "signature_missing");
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::SignatureInvalid);
     }
 
     /// Fail-closed: signed entry with no verifying key -> miss.
@@ -1982,8 +1903,8 @@ mod tests {
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         // No verifying key but entry IS signed -> must deny.
         let decision = cache.check_reuse("rustfmt", Some(digest), true, None);
-        assert!(!decision.reusable);
-        assert_eq!(decision.reason, "signature_unverifiable_no_key");
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::SignatureInvalid);
     }
 
     // =========================================================================
@@ -2005,8 +1926,8 @@ mod tests {
         let vk = signer.verifying_key();
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(!decision.reusable);
-        assert_eq!(decision.reason, "receipt_binding_missing");
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::ReceiptBindingMissing);
     }
 
     /// `check_reuse` denies entries missing RFC-0029 receipt binding.
@@ -2024,8 +1945,8 @@ mod tests {
         let vk = signer.verifying_key();
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(!decision.reusable);
-        assert_eq!(decision.reason, "receipt_binding_missing");
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::ReceiptBindingMissing);
     }
 
     /// `check_reuse` denies entries where both receipt bindings are false.
@@ -2043,8 +1964,8 @@ mod tests {
         let vk = signer.verifying_key();
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(!decision.reusable);
-        assert_eq!(decision.reason, "receipt_binding_missing");
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::ReceiptBindingMissing);
     }
 
     /// `bind_receipt_evidence` promotes flags; signed entries then pass reuse.
@@ -2063,7 +1984,7 @@ mod tests {
         let vk = signer.verifying_key();
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(decision.reusable, "receipt-bound entry should be reusable");
+        assert!(decision.hit, "receipt-bound entry should be reusable");
     }
 
     /// Post-deserialization validation rejects oversized fields.
@@ -2094,7 +2015,7 @@ mod tests {
         let vk = signer.verifying_key();
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(decision.reusable);
+        assert!(decision.hit);
     }
 
     #[test]
@@ -2108,8 +2029,8 @@ mod tests {
         let vk = signer.verifying_key();
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(!decision.reusable);
-        assert_eq!(decision.reason, "signature_invalid");
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::SignatureInvalid);
     }
 
     // =========================================================================
@@ -2277,10 +2198,7 @@ mod tests {
         let vk = signer.verifying_key();
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = loaded.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(
-            decision.reusable,
-            "signature must survive save/load roundtrip"
-        );
+        assert!(decision.hit, "signature must survive save/load roundtrip");
     }
 
     // =========================================================================
@@ -2461,7 +2379,7 @@ mod tests {
         // Verify it WOULD pass reuse if v2_sourced were false.
         let vk = signer.verifying_key();
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(decision.reusable, "native v3 entry should be reusable");
+        assert!(decision.hit, "native v3 entry should be reusable");
         assert!(!cache.is_v2_sourced());
 
         // Now simulate v2 sourcing by loading from v2 directory.
@@ -2478,11 +2396,12 @@ mod tests {
         assert!(v2_loaded.is_v2_sourced());
         let v2_decision = v2_loaded.check_reuse("rustfmt", Some(digest), false, None);
         assert!(
-            !v2_decision.reusable,
+            !v2_decision.hit,
             "v2-sourced entries must never satisfy reuse"
         );
         assert_eq!(
-            v2_decision.reason, "v2_sourced_no_binding_proof",
+            v2_decision.reason_code,
+            CacheReasonCode::SignatureInvalid,
             "denial reason must cite missing binding proof"
         );
     }
@@ -2528,10 +2447,10 @@ mod tests {
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = loaded.check_reuse("rustfmt", Some(digest), false, None);
         assert!(
-            !decision.reusable,
+            !decision.hit,
             "v2-sourced entry under drifted authority context must be denied"
         );
-        assert_eq!(decision.reason, "v2_sourced_no_binding_proof");
+        assert_eq!(decision.reason_code, CacheReasonCode::SignatureInvalid);
     }
 
     /// [INV-GCV3-001] Native v3 entries (not v2-sourced) are still reusable.
@@ -2546,11 +2465,8 @@ mod tests {
         let vk = signer.verifying_key();
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(
-            decision.reusable,
-            "native v3 signed entry must remain reusable"
-        );
-        assert_eq!(decision.reason, "v3_compound_key_match");
+        assert!(decision.hit, "native v3 signed entry must remain reusable");
+        assert_eq!(decision.reason_code, CacheReasonCode::CacheHit);
     }
 
     /// [INV-GCV3-001] V3 cache loaded from disk (save/load roundtrip) is
@@ -2575,10 +2491,7 @@ mod tests {
         let vk = signer.verifying_key();
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let decision = loaded.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(
-            decision.reusable,
-            "v3 disk roundtrip entry must be reusable"
-        );
+        assert!(decision.hit, "v3 disk roundtrip entry must be reusable");
     }
 
     /// [INV-GCV3-001] Newly constructed caches are NOT v2-sourced.
@@ -2698,8 +2611,11 @@ mod tests {
 
         // Confirm check_reuse denies before rebind (receipt_binding_missing).
         let pre_decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(!pre_decision.reusable, "must deny before rebind");
-        assert_eq!(pre_decision.reason, "receipt_binding_missing");
+        assert!(!pre_decision.hit, "must deny before rebind");
+        assert_eq!(
+            pre_decision.reason_code,
+            CacheReasonCode::ReceiptBindingMissing
+        );
 
         // Step 2: Persist to disk.
         let root = tempfile::tempdir().expect("tmpdir");
@@ -2759,8 +2675,8 @@ mod tests {
         let final_cache =
             GateCacheV3::load_from_dir(root.path(), "abc123", &key).expect("final load");
         let post_decision = final_cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(post_decision.reusable, "must hit after rebind round-trip");
-        assert_eq!(post_decision.reason, "v3_compound_key_match");
+        assert!(post_decision.hit, "must hit after rebind round-trip");
+        assert_eq!(post_decision.reason_code, CacheReasonCode::CacheHit);
     }
 
     /// Verify that `try_bind_receipt_from_store` does NOT promote flags when
@@ -2831,8 +2747,8 @@ mod tests {
 
         // check_reuse must still deny.
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
-        assert!(!decision.reusable, "must deny with failed 0028");
-        assert_eq!(decision.reason, "receipt_binding_missing");
+        assert!(!decision.hit, "must deny with failed 0028");
+        assert_eq!(decision.reason_code, CacheReasonCode::ReceiptBindingMissing);
     }
 
     // =========================================================================
@@ -3063,68 +2979,12 @@ mod tests {
     }
 
     #[test]
-    fn map_reason_to_code_covers_all_known_reasons() {
-        let cases = [
-            ("no_record", CacheReasonCode::GateMiss),
-            ("status_not_pass", CacheReasonCode::GateMiss),
-            (
-                "v2_sourced_no_binding_proof",
-                CacheReasonCode::SignatureInvalid,
-            ),
-            ("signature_missing", CacheReasonCode::SignatureInvalid),
-            ("signer_id_missing", CacheReasonCode::SignatureInvalid),
-            (
-                "signature_field_too_long",
-                CacheReasonCode::SignatureInvalid,
-            ),
-            ("signer_id_invalid_hex", CacheReasonCode::SignatureInvalid),
-            (
-                "signer_id_length_mismatch",
-                CacheReasonCode::SignatureInvalid,
-            ),
-            ("signer_id_mismatch", CacheReasonCode::SignatureInvalid),
-            ("signature_invalid_hex", CacheReasonCode::SignatureInvalid),
-            ("signature_malformed", CacheReasonCode::SignatureInvalid),
-            ("signature_invalid", CacheReasonCode::SignatureInvalid),
-            (
-                "signature_unverifiable_no_key",
-                CacheReasonCode::SignatureInvalid,
-            ),
-            (
-                "receipt_binding_missing",
-                CacheReasonCode::ReceiptBindingMissing,
-            ),
-            ("attestation_mismatch", CacheReasonCode::InputDrift),
-            ("attestation_missing_current", CacheReasonCode::InputDrift),
-            ("evidence_digest_missing", CacheReasonCode::InputDrift),
-            ("quick_receipt_not_reusable", CacheReasonCode::InputDrift),
-        ];
-        for (reason, expected_code) in &cases {
-            let code = GateCacheV3::map_reason_to_code(reason);
-            assert_eq!(
-                code, *expected_code,
-                "map_reason_to_code({reason:?}) should be {expected_code:?}, got {code:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn map_reason_to_code_unknown_defaults_to_input_drift() {
-        let code = GateCacheV3::map_reason_to_code("completely_unknown_reason");
-        assert_eq!(
-            code,
-            CacheReasonCode::InputDrift,
-            "unknown reason must default to InputDrift (fail-closed)"
-        );
-    }
-
-    #[test]
-    fn check_reuse_decision_hit_returns_cache_hit() {
+    fn check_reuse_hit_returns_cache_hit() {
         let signer = Signer::generate();
         let vk = signer.verifying_key();
         let cache = make_signed_v3(&signer);
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let decision = cache.check_reuse_decision("rustfmt", Some(digest), true, Some(&vk));
+        let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
         assert!(decision.hit, "signed cache should produce hit");
         assert_eq!(decision.reason_code, CacheReasonCode::CacheHit);
         assert!(decision.first_mismatch_dimension.is_none());
@@ -3132,13 +2992,12 @@ mod tests {
     }
 
     #[test]
-    fn check_reuse_decision_gate_miss_for_absent_gate() {
+    fn check_reuse_gate_miss_for_absent_gate() {
         let signer = Signer::generate();
         let vk = signer.verifying_key();
         let cache = make_signed_v3(&signer);
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let decision =
-            cache.check_reuse_decision("nonexistent_gate", Some(digest), true, Some(&vk));
+        let decision = cache.check_reuse("nonexistent_gate", Some(digest), true, Some(&vk));
         assert!(!decision.hit, "absent gate should produce miss");
         assert_eq!(decision.reason_code, CacheReasonCode::GateMiss);
         assert_eq!(
@@ -3148,14 +3007,14 @@ mod tests {
     }
 
     #[test]
-    fn check_reuse_decision_input_drift_for_attestation_mismatch() {
+    fn check_reuse_input_drift_for_attestation_mismatch() {
         let signer = Signer::generate();
         let vk = signer.verifying_key();
         let cache = make_signed_v3(&signer);
         // Use a different digest than the one in the cache entry.
         let wrong_digest =
             "b3-256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-        let decision = cache.check_reuse_decision("rustfmt", Some(wrong_digest), true, Some(&vk));
+        let decision = cache.check_reuse("rustfmt", Some(wrong_digest), true, Some(&vk));
         assert!(!decision.hit, "attestation mismatch should produce miss");
         assert_eq!(
             decision.reason_code,
@@ -3169,7 +3028,7 @@ mod tests {
     }
 
     #[test]
-    fn check_reuse_decision_receipt_binding_missing_for_unbound_entry() {
+    fn check_reuse_receipt_binding_missing_for_unbound_entry() {
         let signer = Signer::generate();
         let vk = signer.verifying_key();
         let key = sample_compound_key();
@@ -3181,7 +3040,7 @@ mod tests {
         cache.sign_all(&signer);
 
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let decision = cache.check_reuse_decision("rustfmt", Some(digest), true, Some(&vk));
+        let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
         assert!(!decision.hit);
         assert_eq!(decision.reason_code, CacheReasonCode::ReceiptBindingMissing);
         assert_eq!(
@@ -3191,7 +3050,7 @@ mod tests {
     }
 
     #[test]
-    fn check_reuse_decision_signature_invalid_for_unsigned_entry() {
+    fn check_reuse_signature_invalid_for_unsigned_entry() {
         let signer = Signer::generate();
         let vk = signer.verifying_key();
         let key = sample_compound_key();
@@ -3200,7 +3059,7 @@ mod tests {
         // Do NOT sign — signature will be missing.
 
         let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let decision = cache.check_reuse_decision("rustfmt", Some(digest), true, Some(&vk));
+        let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
         assert!(!decision.hit);
         assert_eq!(decision.reason_code, CacheReasonCode::SignatureInvalid);
         assert_eq!(
@@ -3470,7 +3329,7 @@ mod tests {
 
         // SAFETY: env mutation in test — serialized by test harness.
         unsafe { std::env::set_var("APM2_FAC_CACHE_TTL_SECS", "1") };
-        let decision = cache.check_reuse_decision(
+        let decision = cache.check_reuse(
             "rustfmt",
             Some("b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             false,

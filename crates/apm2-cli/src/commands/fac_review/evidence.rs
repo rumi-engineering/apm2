@@ -408,20 +408,13 @@ fn reuse_decision_with_v3_fallback(
 ) {
     // Try v3 first.
     //
-    // TCK-00626 round 3: Use check_reuse_decision as the single source of
-    // truth for both the CacheDecision and the reuse verdict. The previous
-    // code called check_reuse_decision (which includes TTL enforcement) and
-    // then independently called check_reuse (which lacks TTL enforcement),
-    // using check_reuse's result for the hit/miss decision. This allowed
-    // TTL-expired entries to be accepted as hits, bypassing the TTL policy.
-    //
-    // Now: check_reuse_decision alone drives the verdict. Its internal
-    // logic already delegates to check_reuse for non-TTL checks, so the
-    // full validation chain (signature, receipt binding, attestation) is
-    // preserved without duplication.
+    // TCK-00626 round 5: check_reuse now returns CacheDecision directly
+    // (the old check_reuse_decision wrapper was eliminated). The single
+    // check_reuse method performs all checks in the correct TCK-00626 S2
+    // order (gate_miss -> signature -> receipt_binding -> drift -> TTL)
+    // and returns a structured CacheDecision with first_mismatch_dimension.
     if let Some(v3) = v3_cache {
-        let cache_decision =
-            v3.check_reuse_decision(gate_name, attestation_digest, true, verifying_key);
+        let cache_decision = v3.check_reuse(gate_name, attestation_digest, true, verifying_key);
         if cache_decision.hit {
             return (ReuseDecision::hit_v3(), Some(cache_decision));
         }
@@ -4584,8 +4577,11 @@ mod tests {
 
         let pre = GateCacheV3::load_from_dir(&v3_root, sha, &compound_key).expect("load pre");
         let pre_decision = pre.check_reuse("rustfmt", Some(attestation_digest), true, Some(&vk));
-        assert!(!pre_decision.reusable, "must deny before receipt rebind");
-        assert_eq!(pre_decision.reason, "receipt_binding_missing");
+        assert!(!pre_decision.hit, "must deny before receipt rebind");
+        assert_eq!(
+            pre_decision.reason_code,
+            apm2_core::fac::gate_cache_v3::CacheReasonCode::ReceiptBindingMissing
+        );
 
         let job_id = "job-wrapper-rebind";
         let receipt = FacJobReceiptV1 {
@@ -4638,9 +4634,12 @@ mod tests {
         let post_decision =
             rebound.check_reuse("rustfmt", Some(attestation_digest), true, Some(&vk));
         assert!(
-            post_decision.reusable,
+            post_decision.hit,
             "entry must be reusable after wrapper rebind"
         );
-        assert_eq!(post_decision.reason, "v3_compound_key_match");
+        assert_eq!(
+            post_decision.reason_code,
+            apm2_core::fac::gate_cache_v3::CacheReasonCode::CacheHit
+        );
     }
 }

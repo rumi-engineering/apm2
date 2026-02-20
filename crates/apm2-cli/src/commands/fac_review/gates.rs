@@ -5092,6 +5092,124 @@ mod tests {
         );
     }
 
+    /// Table-driven regression test for all 11 miss reason codes + hit in
+    /// `gate_finished` event serialization (TCK-00626 S4).
+    ///
+    /// Each entry verifies that `gate_finished_event` correctly serializes
+    /// the `cache_decision` field with the expected `reason_code` and
+    /// `first_mismatch_dimension` for every [`CacheReasonCode`] variant.
+    #[test]
+    fn gate_finished_event_all_reason_codes_table_driven() {
+        use apm2_core::fac::gate_cache_v3::{CacheDecision, CacheReasonCode};
+
+        // Table: (reason_code, expected_str, is_hit, expected_mismatch_str)
+        // For hit: first_mismatch_dimension is None (absent in JSON).
+        // For miss: first_mismatch_dimension equals reason_code.
+        let miss_cases: &[(CacheReasonCode, &str)] = &[
+            (CacheReasonCode::ShaMiss, "sha_miss"),
+            (CacheReasonCode::GateMiss, "gate_miss"),
+            (CacheReasonCode::SignatureInvalid, "signature_invalid"),
+            (
+                CacheReasonCode::ReceiptBindingMissing,
+                "receipt_binding_missing",
+            ),
+            (CacheReasonCode::PolicyDrift, "policy_drift"),
+            (CacheReasonCode::ToolchainDrift, "toolchain_drift"),
+            (CacheReasonCode::ClosureDrift, "closure_drift"),
+            (CacheReasonCode::InputDrift, "input_drift"),
+            (CacheReasonCode::NetworkPolicyDrift, "network_policy_drift"),
+            (CacheReasonCode::SandboxDrift, "sandbox_drift"),
+            (CacheReasonCode::TtlExpired, "ttl_expired"),
+        ];
+
+        // Verify all 10 miss codes.
+        for (i, &(reason_code, expected_str)) in miss_cases.iter().enumerate() {
+            let decision = CacheDecision::cache_miss(reason_code, Some("cached-sha"));
+            let payload = gate_finished_event(
+                &format!("run-miss-{i}"),
+                Some("head-sha"),
+                "test_gate",
+                false,
+                1,
+                "FAIL",
+                None,
+                Some(&decision),
+            );
+            let cd = payload.get("cache_decision").unwrap_or_else(|| {
+                panic!("cache_decision must be present for miss code {expected_str}")
+            });
+
+            assert_eq!(
+                cd.get("hit").and_then(serde_json::Value::as_bool),
+                Some(false),
+                "miss code {expected_str}: hit must be false"
+            );
+            assert_eq!(
+                cd.get("reason_code").and_then(serde_json::Value::as_str),
+                Some(expected_str),
+                "miss code {expected_str}: reason_code mismatch"
+            );
+            assert_eq!(
+                cd.get("first_mismatch_dimension")
+                    .and_then(serde_json::Value::as_str),
+                Some(expected_str),
+                "miss code {expected_str}: first_mismatch_dimension mismatch"
+            );
+            assert_eq!(
+                cd.get("cached_sha").and_then(serde_json::Value::as_str),
+                Some("cached-sha"),
+                "miss code {expected_str}: cached_sha mismatch"
+            );
+        }
+
+        // Verify cache hit (reason_code = cache_hit, first_mismatch_dimension = None).
+        let hit_decision = CacheDecision::cache_hit("hit-sha");
+        let hit_payload = gate_finished_event(
+            "run-hit",
+            Some("head-sha"),
+            "test_gate",
+            true,
+            0,
+            "PASS",
+            None,
+            Some(&hit_decision),
+        );
+        let hit_cd = hit_payload
+            .get("cache_decision")
+            .expect("cache_decision must be present for hit");
+
+        assert_eq!(
+            hit_cd.get("hit").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "hit: hit must be true"
+        );
+        assert_eq!(
+            hit_cd
+                .get("reason_code")
+                .and_then(serde_json::Value::as_str),
+            Some("cache_hit"),
+            "hit: reason_code must be cache_hit"
+        );
+        // first_mismatch_dimension should be absent (skip_serializing_if = None).
+        assert!(
+            hit_cd.get("first_mismatch_dimension").is_none()
+                || hit_cd.get("first_mismatch_dimension") == Some(&serde_json::Value::Null),
+            "hit: first_mismatch_dimension must be null/absent"
+        );
+        assert_eq!(
+            hit_cd.get("cached_sha").and_then(serde_json::Value::as_str),
+            Some("hit-sha"),
+            "hit: cached_sha mismatch"
+        );
+
+        // Verify total coverage: 11 miss codes + 1 hit = 12 reason codes.
+        assert_eq!(
+            miss_cases.len(),
+            11,
+            "must test all 11 miss reason codes (10 miss + ttl_expired)"
+        );
+    }
+
     #[test]
     fn execute_started_event_includes_network_enforcement_method() {
         let payload = execute_started_event("run-1", "systemd_private_network_ipaddressdeny_any");
