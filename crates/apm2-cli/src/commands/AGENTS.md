@@ -643,7 +643,25 @@ systemd service executables:
    user) promotes valid requests into `pending/` via `promote_broker_requests()`
    in `fac_worker.rs`.
 
-### Invariants
+### Broker promotion invariants (TCK-00577 round 2)
+
+- **Queue bounds enforcement**: `promote_broker_requests` calls
+  `check_queue_bounds` from `apm2_core::fac::queue_bounds` before each
+  promotion. When the pending queue is at capacity, the broker request is
+  quarantined with a denial log entry instead of promoted.
+- **Enqueue lock discipline**: Each promotion acquires the same
+  process-level lockfile (`queue/.enqueue.lock`) used by `enqueue_direct`
+  to serialize the check-then-rename sequence. This prevents TOCTOU races
+  between concurrent enqueue and promotion operations.
+- **No-replace rename**: Promotion uses `move_to_dir_safe` (which
+  internally uses `rename_noreplace`) instead of `fs::rename`. Filename
+  collisions with existing pending jobs result in a collision-safe
+  timestamped filename — existing pending jobs are never overwritten.
+- **Fail-closed on lock acquisition failure**: If the enqueue lockfile
+  cannot be acquired, the broker request is deferred to the next cycle
+  (not promoted).
+
+### General invariants
 
 - The `broker_requests/` directory uses mode 01733 (sticky + write-only for
   group/other) so non-service-user callers can submit but cannot enumerate

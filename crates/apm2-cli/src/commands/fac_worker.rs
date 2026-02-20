@@ -89,6 +89,7 @@ use apm2_core::fac::job_spec::{
     parse_b3_256_digest, validate_job_spec_control_lane_with_policy, validate_job_spec_with_policy,
 };
 use apm2_core::fac::lane::{LaneLeaseV1, LaneLockGuard, LaneManager, LaneState};
+use apm2_core::fac::queue_bounds::{QueueBoundsPolicy, check_queue_bounds};
 use apm2_core::fac::scan_lock::{ScanLockResult, check_stuck_scan_lock, try_acquire_scan_lock};
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
 use apm2_core::fac::{
@@ -110,6 +111,7 @@ use apm2_core::github::{parse_github_remote_url, resolve_apm2_home};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use chrono::{SecondsFormat, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
@@ -276,6 +278,22 @@ const MAX_POLL_INTERVAL_SECS: u64 = 3600;
 /// Max number of boundary defect classes retained in a trace.
 const MAX_BOUNDARY_DEFECT_CLASSES: usize = 32;
 const SCHEDULER_RECOVERY_SCHEMA: &str = "apm2.scheduler_recovery.v1";
+
+/// Lockfile name for the enqueue critical section.
+///
+/// Shared with `fac_queue_submit::ENQUEUE_LOCKFILE` (same string value).
+/// The worker must use the same lockfile as `enqueue_direct` to serialize
+/// broker promotions with direct enqueue processes.
+///
+/// Synchronization protocol:
+/// - Protected data: set of files in `queue/pending/` and the snapshot-derived
+///   bounds decision.
+/// - Who can mutate: only the holder of the exclusive flock.
+/// - Lock ordering: single lock, no nesting required.
+/// - Happens-before: `lock_exclusive()` → scan pending dir + move → drop
+///   lockfile (implicit `flock(LOCK_UN)` on `File::drop`).
+/// - Async suspension: not applicable (synchronous path).
+const ENQUEUE_LOCKFILE: &str = ".enqueue.lock";
 
 /// FAC receipt directory under `$APM2_HOME/private/fac`.
 const FAC_RECEIPTS_DIR: &str = "receipts";
@@ -1494,14 +1512,77 @@ fn compute_canonicalizer_tuple_digest() -> String {
 /// Prevents unbounded I/O from a `broker_requests` directory with many files.
 const MAX_BROKER_REQUESTS_PROMOTE: usize = 256;
 
+/// Acquire the process-level enqueue lockfile under `queue_root`.
+///
+/// Returns the open `File` handle whose lifetime controls the lock.
+/// The lock is released when the file handle is dropped (implicit
+/// `flock(LOCK_UN)` on `File::drop`).
+///
+/// This is the same lock used by `enqueue_direct` in `fac_queue_submit`.
+/// Both code paths must use the same lockfile name (`ENQUEUE_LOCKFILE`)
+/// to serialize check-then-act sequences against the pending directory.
+///
+/// # Errors
+///
+/// Returns `Err` if the lockfile cannot be created or locked.
+fn acquire_enqueue_lock(queue_root: &Path) -> Result<fs::File, String> {
+    let lock_path = queue_root.join(ENQUEUE_LOCKFILE);
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| {
+            format!(
+                "cannot open enqueue lockfile {}: {err}",
+                lock_path.display()
+            )
+        })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = lock_file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
+
+    lock_file
+        .lock_exclusive()
+        .map_err(|err| format!("cannot acquire enqueue lock {}: {err}", lock_path.display()))?;
+
+    Ok(lock_file)
+}
+
 /// Promote valid job specs from `queue/broker_requests/` into `queue/pending/`
 /// (TCK-00577).
 ///
 /// Called by the worker (running as service user) before scanning pending.
 /// Each `.json` file in `broker_requests/` is validated (bounded read +
-/// deserialize) and moved to `pending/` via atomic rename. Malformed files
-/// are quarantined. This provides the "broker-mediated enqueue" path for
-/// non-service-user CLI callers.
+/// deserialize), checked against queue bounds under the enqueue lock, and
+/// moved to `pending/` via atomic no-replace rename (`move_to_dir_safe`).
+/// Malformed files are quarantined. Files that would exceed queue bounds
+/// are quarantined with denial evidence. Files that collide with existing
+/// pending entries are quarantined (collision-safe, never overwrites).
+///
+/// # Lock discipline
+///
+/// Each promotion acquires the same process-level lockfile
+/// (`queue/.enqueue.lock`) used by `enqueue_direct` in `fac_queue_submit`,
+/// ensuring the check-then-rename sequence is atomic with respect to
+/// concurrent enqueue processes. The lock is held for the shortest
+/// possible duration: acquire → `check_queue_bounds` → `move_to_dir_safe`
+/// → release.
+///
+/// # Synchronization protocol
+///
+/// - Protected data: set of files in `queue/pending/` and the snapshot-derived
+///   bounds decision.
+/// - Who can mutate: only the holder of the exclusive flock on
+///   `ENQUEUE_LOCKFILE`.
+/// - Lock ordering: single lock, no nesting required.
+/// - Happens-before: `lock_exclusive()` → scan pending + move → drop lockfile
+///   (implicit `flock(LOCK_UN)`).
+/// - Async suspension: not applicable (synchronous path).
 fn promote_broker_requests(queue_root: &Path) {
     let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
     if !broker_dir.is_dir() {
@@ -1516,6 +1597,11 @@ fn promote_broker_requests(queue_root: &Path) {
     let _ = fs::create_dir_all(&pending_dir);
 
     let quarantine_dir = queue_root.join(QUARANTINE_DIR);
+    let _ = fs::create_dir_all(&quarantine_dir);
+
+    // Load queue bounds policy (default if not configured).
+    // The same policy is used by `enqueue_direct`.
+    let bounds_policy = QueueBoundsPolicy::default();
 
     for (idx, entry) in entries.enumerate() {
         if idx >= MAX_BROKER_REQUESTS_PROMOTE {
@@ -1562,23 +1648,62 @@ fn promote_broker_requests(queue_root: &Path) {
             continue;
         }
 
-        // Promote to pending/ via rename (same filesystem).
-        let target = pending_dir.join(&file_name);
-        if let Err(e) = fs::rename(&path, &target) {
+        // ---- Begin enqueue lock critical section ----
+        // Acquire the same process-level lockfile used by enqueue_direct
+        // to prevent TOCTOU races between bounds check and rename.
+        let lock_file = match acquire_enqueue_lock(queue_root) {
+            Ok(lf) => lf,
+            Err(e) => {
+                // Fail-closed: cannot acquire lock → do not promote.
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "TCK-00577: cannot acquire enqueue lock, deferring broker request promotion"
+                );
+                continue;
+            },
+        };
+
+        // Check queue bounds with proposed file size before promoting.
+        let proposed_bytes = bytes.len() as u64;
+        if let Err(bounds_err) = check_queue_bounds(&pending_dir, proposed_bytes, &bounds_policy) {
+            // Queue is at capacity: quarantine the broker request with
+            // denial evidence instead of promoting.
             tracing::warn!(
                 path = %path.display(),
-                target = %target.display(),
-                error = %e,
-                "TCK-00577: failed to promote broker request to pending"
+                error = %bounds_err,
+                "TCK-00577: queue bounds exceeded, quarantining broker request"
             );
-            // Don't quarantine on rename failure; retry next cycle.
+            drop(lock_file);
+            let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
             continue;
         }
 
-        tracing::info!(
-            file = %file_name,
-            "TCK-00577: promoted broker request to pending/"
-        );
+        // Promote to pending/ via atomic no-replace rename
+        // (move_to_dir_safe uses rename_noreplace internally).
+        // On collision (EEXIST), move_to_dir_safe generates a
+        // timestamped filename — existing pending jobs are never
+        // overwritten.
+        match move_to_dir_safe(&path, &pending_dir, &file_name) {
+            Ok(_moved_path) => {
+                // Lock released after successful promotion.
+                drop(lock_file);
+                tracing::info!(
+                    file = %file_name,
+                    "TCK-00577: promoted broker request to pending/"
+                );
+            },
+            Err(e) => {
+                drop(lock_file);
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "TCK-00577: failed to promote broker request to pending, quarantining"
+                );
+                let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
+            },
+        }
+        // ---- End enqueue lock critical section ----
     }
 }
 
@@ -11081,6 +11206,242 @@ mod tests {
         assert!(
             owns_sccache_server(Some(&trace)),
             "preexisting in-cgroup server must own"
+        );
+    }
+
+    // =========================================================================
+    // Broker promotion: queue bounds enforcement (TCK-00577 round 2 fixes)
+    // =========================================================================
+
+    /// Helper: creates a minimal valid JSON job spec for broker request tests.
+    fn make_valid_broker_request_json(job_id: &str) -> String {
+        use apm2_core::fac::job_spec::{FacJobSpecV1Builder, JobSource};
+
+        let source = JobSource {
+            kind: "mirror_commit".to_string(),
+            repo_id: "test/repo".to_string(),
+            head_sha: "a".repeat(40),
+            patch: None,
+        };
+        let spec = FacJobSpecV1Builder::new(
+            job_id,
+            "gates",
+            "bulk",
+            "2026-02-19T00:00:00Z",
+            "lease-test",
+            source,
+        )
+        .priority(50)
+        .build()
+        .expect("valid spec");
+        serde_json::to_string_pretty(&spec).expect("serialize broker request JSON")
+    }
+
+    #[test]
+    fn promote_broker_request_denied_when_queue_at_capacity() {
+        // Verify that broker promotion respects queue bounds: when
+        // pending/ is at capacity, broker requests are quarantined
+        // instead of promoted.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+        let quarantine_dir = queue_root.join(QUARANTINE_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Fill pending to the default capacity (10_000 jobs).
+        // Use a tight capacity to keep the test fast: override by
+        // filling to the default limit.
+        // Instead, we can just fill enough to trigger denial with a
+        // small number of files — but check_queue_bounds uses the
+        // default policy (10_000 jobs, 1 GiB). That's too many files.
+        //
+        // Instead, create a tight scenario: fill pending with
+        // DEFAULT_MAX_PENDING_JOBS files. That's impractical. Instead,
+        // test at the check_queue_bounds level first, and test
+        // promote_broker_requests with the real function.
+        //
+        // We can test this by creating enough pending files to exceed the
+        // default byte limit. With default max_pending_bytes = 1 GiB,
+        // that's also impractical.
+        //
+        // The practical approach: verify the function uses
+        // move_to_dir_safe (no-replace) and the lock by testing the
+        // actual promote function behavior. For bounds, we need a
+        // targeted test.
+        //
+        // Actually, the simplest test: create 10_000 small files in
+        // pending to hit the job cap, then verify broker request is
+        // quarantined. But creating 10k files is expensive.
+        //
+        // A better test: verify the function behavior by testing the
+        // integration point. We will create a moderate number of files
+        // and use the fact that the default policy has max_pending_jobs
+        // = 10_000. If we want to actually test the denial, we must
+        // create enough files. Let's keep it practical with 10_000
+        // tiny files (should be fast on tmpfs).
+        for i in 0..10_000 {
+            let f = pending_dir.join(format!("job-{i}.json"));
+            fs::write(&f, "{}").expect("write pending job");
+        }
+
+        // Now submit a broker request.
+        let broker_file = broker_dir.join("broker-overflow.json");
+        fs::write(
+            &broker_file,
+            make_valid_broker_request_json("broker-overflow"),
+        )
+        .expect("write broker request");
+
+        // Run promotion.
+        promote_broker_requests(&queue_root);
+
+        // The broker request must NOT be in pending/ (queue at capacity).
+        assert!(
+            !pending_dir.join("broker-overflow.json").exists(),
+            "broker request must not be promoted when queue is at capacity"
+        );
+
+        // The broker request must be quarantined.
+        assert!(
+            quarantine_dir.is_dir(),
+            "quarantine directory must exist after denial"
+        );
+        let quarantine_entries: Vec<_> = fs::read_dir(&quarantine_dir)
+            .expect("read quarantine")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("broker-overflow"))
+            .collect();
+        assert!(
+            !quarantine_entries.is_empty(),
+            "denied broker request must be moved to quarantine"
+        );
+
+        // The original broker request must be gone.
+        assert!(
+            !broker_file.exists(),
+            "original broker request file must be removed after quarantine"
+        );
+    }
+
+    #[test]
+    fn promote_broker_request_collision_does_not_overwrite_pending() {
+        // Verify that when a broker request has the same filename as an
+        // existing pending job, the existing job is never overwritten.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Create an existing pending job.
+        let existing_content = make_valid_broker_request_json("collision-job");
+        fs::write(pending_dir.join("collision-job.json"), &existing_content)
+            .expect("write existing pending job");
+
+        // Create a broker request with the same job ID.
+        let new_content = make_valid_broker_request_json("collision-job");
+        fs::write(broker_dir.join("collision-job.json"), &new_content)
+            .expect("write broker request");
+
+        // Run promotion.
+        promote_broker_requests(&queue_root);
+
+        // The original pending job must be untouched.
+        let existing_after = fs::read_to_string(pending_dir.join("collision-job.json"))
+            .expect("read existing pending job");
+        assert_eq!(
+            existing_after, existing_content,
+            "existing pending job must not be overwritten by broker promotion"
+        );
+
+        // The broker request should have been promoted with a
+        // collision-safe name (timestamped suffix) by move_to_dir_safe.
+        // Or it should still exist in broker_dir if move failed.
+        // Either way, the original pending job is intact.
+        let pending_entries: Vec<_> = fs::read_dir(&pending_dir)
+            .expect("read pending")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("collision-job"))
+            .collect();
+        assert!(
+            !pending_entries.is_empty(),
+            "at least the original pending job must remain"
+        );
+    }
+
+    #[test]
+    fn promote_broker_request_success_under_capacity() {
+        // Verify that a valid broker request is promoted to pending/
+        // when queue is under capacity, using no-replace rename.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Create a valid broker request.
+        let content = make_valid_broker_request_json("good-job");
+        fs::write(broker_dir.join("good-job.json"), &content).expect("write broker request");
+
+        // Run promotion.
+        promote_broker_requests(&queue_root);
+
+        // The job must appear in pending/.
+        assert!(
+            pending_dir.join("good-job.json").exists(),
+            "valid broker request must be promoted to pending/"
+        );
+
+        // The original broker request must be gone.
+        assert!(
+            !broker_dir.join("good-job.json").exists(),
+            "broker request must be removed after successful promotion"
+        );
+    }
+
+    #[test]
+    fn promote_broker_request_uses_enqueue_lock() {
+        // Verify that the enqueue lockfile is created during promotion,
+        // demonstrating that the lock mechanism is engaged.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Lockfile should not exist yet.
+        let lock_path = queue_root.join(ENQUEUE_LOCKFILE);
+        assert!(
+            !lock_path.exists(),
+            "lockfile must not exist before promotion"
+        );
+
+        // Create a valid broker request to trigger promotion.
+        let content = make_valid_broker_request_json("lock-test-job");
+        fs::write(broker_dir.join("lock-test-job.json"), &content).expect("write broker request");
+
+        // Run promotion.
+        promote_broker_requests(&queue_root);
+
+        // The lockfile must have been created (created by acquire_enqueue_lock).
+        assert!(
+            lock_path.exists(),
+            "enqueue lockfile must be created during broker promotion"
+        );
+
+        // Job must have been promoted.
+        assert!(
+            pending_dir.join("lock-test-job.json").exists(),
+            "job must be promoted"
         );
     }
 }
