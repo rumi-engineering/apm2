@@ -1472,7 +1472,7 @@ pub struct ReviewRunArgs {
     pub json: bool,
 }
 
-/// Review lane filter for `apm2 fac review status`.
+/// Review lane filter for `apm2 fac review terminate`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ReviewStatusTypeArg {
     Security,
