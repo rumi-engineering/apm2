@@ -2139,6 +2139,12 @@ by calling `compact_index` rather than `safe_rmtree_v1`.
 - [INV-COMPACT-004] Compaction receipt persistence is atomic (temp + rename).
 - [INV-COMPACT-005] Receipt validation enforces structural consistency
   (schema, timestamp positivity, count arithmetic).
+- [INV-COMPACT-006] Compaction job_index rebuild uses deterministic
+  tie-breaking on equal timestamps: (1) if the current job_index digest is
+  still present at the max timestamp, it is preserved (stability); (2)
+  otherwise, the lexicographically greatest content_hash wins (determinism).
+  This prevents compaction from nondeterministically flipping job_index
+  pointers due to HashMap iteration order.
 
 ## sd_notify Submodule (TCK-00600)
 

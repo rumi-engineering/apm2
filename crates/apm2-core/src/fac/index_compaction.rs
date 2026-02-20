@@ -230,27 +230,58 @@ pub fn compact_index(
     // Rebuild job_index: for each job, find the latest remaining header.
     // Remove jobs that have no remaining headers, and update pointers for
     // jobs whose latest receipt was pruned but older receipts remain.
+    //
+    // Deterministic tie-breaking for equal timestamps:
+    //   1. If the current job_index digest is still present at the max timestamp,
+    //      keep it (stability: compaction does not flip pointers when no stale
+    //      entry for the job was relevant).
+    //   2. Otherwise, break ties by lexicographically greatest content_hash
+    //      (deterministic across HashMap iteration orders and process seeds).
     let jobs_to_check: Vec<String> = index.job_index.keys().cloned().collect();
     for job_id in &jobs_to_check {
-        // Find the latest remaining header for this job.
-        let latest = index
+        // Collect all remaining headers for this job.
+        let candidates: Vec<&super::receipt_index::ReceiptHeaderV1> = index
             .header_index
             .values()
             .filter(|h| h.job_id == *job_id)
-            .max_by_key(|h| h.timestamp_secs);
+            .collect();
 
-        match latest {
-            Some(header) => {
-                // Update job_index to point to the latest remaining header.
-                index
-                    .job_index
-                    .insert(job_id.clone(), header.content_hash.clone());
-            },
-            None => {
-                // No remaining headers for this job — remove from job_index.
-                index.job_index.remove(job_id);
-            },
-        }
+        // Select the winner using a deterministic comparator:
+        //   Primary key: timestamp_secs (descending — greatest wins).
+        //   Tie-break:   content_hash   (descending — lex-greatest wins).
+        // This is fully deterministic regardless of HashMap iteration order.
+        let deterministic_winner = candidates.iter().max_by(|a, b| {
+            a.timestamp_secs
+                .cmp(&b.timestamp_secs)
+                .then_with(|| a.content_hash.cmp(&b.content_hash))
+        });
+
+        let Some(det_winner) = deterministic_winner else {
+            // No remaining headers for this job — remove from job_index.
+            index.job_index.remove(job_id);
+            continue;
+        };
+
+        // Stability preference: if the current job_index digest is still
+        // present at the max timestamp, keep it instead of the deterministic
+        // winner. This prevents compaction from flipping pointers when the
+        // current receipt is still valid at the max timestamp.
+        let max_ts = det_winner.timestamp_secs;
+        let current_digest = index.job_index.get(job_id).cloned();
+
+        let winner_digest = current_digest
+            .as_ref()
+            .filter(|current| {
+                // Keep current digest only if it is among candidates at
+                // the max timestamp.
+                candidates
+                    .iter()
+                    .any(|h| h.content_hash == **current && h.timestamp_secs == max_ts)
+            })
+            .cloned()
+            .unwrap_or_else(|| det_winner.content_hash.clone());
+
+        index.job_index.insert(job_id.clone(), winner_digest);
     }
 
     let entries_after = index.header_index.len();
@@ -810,6 +841,180 @@ mod tests {
         assert!(
             reloaded.header_for_digest("hash-old").is_none(),
             "entry below cutoff must be pruned"
+        );
+    }
+
+    // =========================================================================
+    // Regression: compaction must not flip job_index on equal-timestamp ties
+    // (MAJOR finding — nondeterministic HashMap iteration order).
+    // =========================================================================
+
+    #[test]
+    fn compact_does_not_flip_latest_digest_on_equal_timestamp_ties() {
+        // Two receipts for the same job with identical timestamps but
+        // different content hashes. Compaction must produce a stable,
+        // deterministic result regardless of HashMap iteration order.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        // Insert two same-timestamp receipts for the same job.
+        let mut index = ReceiptIndexV1::new();
+        index
+            .upsert(make_header("job-tie", "aaaa_digest_first", 800))
+            .expect("upsert a");
+        index
+            .upsert(make_header("job-tie", "zzzz_digest_second", 800))
+            .expect("upsert b");
+        index.persist(receipts_dir).expect("persist");
+
+        // Record what job_index points to before compaction.
+        let pre_compaction_digest = index
+            .latest_digest_for_job("job-tie")
+            .expect("pre-compaction digest")
+            .to_string();
+
+        // Run compaction multiple times; the result must be stable.
+        // now=2000, retention=5000 => cutoff=-3000 (clamped to 0) => nothing pruned.
+        let mut observed_digests = std::collections::HashSet::new();
+        for _ in 0..20 {
+            // Re-setup the index each time to exercise different HashMap seeds.
+            let mut fresh_index = ReceiptIndexV1::new();
+            fresh_index
+                .upsert(make_header("job-tie", "aaaa_digest_first", 800))
+                .expect("upsert a");
+            fresh_index
+                .upsert(make_header("job-tie", "zzzz_digest_second", 800))
+                .expect("upsert b");
+            fresh_index.persist(receipts_dir).expect("persist");
+
+            let receipt = compact_index(receipts_dir, 5000, 2000).expect("compact");
+            assert_eq!(receipt.entries_pruned, 0, "no entries should be pruned");
+
+            let reloaded = ReceiptIndexV1::load(receipts_dir)
+                .expect("load")
+                .expect("some");
+            let digest = reloaded
+                .latest_digest_for_job("job-tie")
+                .expect("digest after compaction")
+                .to_string();
+            observed_digests.insert(digest);
+        }
+
+        // The compaction must always pick the same digest (stability).
+        assert_eq!(
+            observed_digests.len(),
+            1,
+            "compaction must produce a stable job_index pointer across runs, \
+             but observed {} distinct digests: {:?}",
+            observed_digests.len(),
+            observed_digests
+        );
+
+        // Additionally: the stable digest should be the pre-compaction one
+        // (since both receipts are retained, the current pointer is stable).
+        let stable_digest = observed_digests.into_iter().next().unwrap();
+        assert_eq!(
+            stable_digest, pre_compaction_digest,
+            "compaction must preserve the pre-compaction job_index pointer \
+             when both tied receipts are retained"
+        );
+    }
+
+    #[test]
+    fn compact_deterministic_tiebreak_when_current_digest_pruned() {
+        // When the current job_index digest is pruned and two remaining
+        // receipts tie on timestamp, compaction must pick the
+        // lexicographically greatest content_hash (deterministic).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let mut index = ReceiptIndexV1::new();
+        // Old receipt (will be pruned): this is currently the "latest" via upsert.
+        index
+            .upsert(make_header("job-tie2", "cccc_old_pruned", 100))
+            .expect("upsert old");
+        // Two newer receipts with same timestamp (both retained).
+        index
+            .upsert(make_header("job-tie2", "aaaa_newer_low", 800))
+            .expect("upsert a");
+        index
+            .upsert(make_header("job-tie2", "zzzz_newer_high", 800))
+            .expect("upsert b");
+        index.persist(receipts_dir).expect("persist");
+
+        // now=1000, retention=500 => cutoff=500
+        // cccc_old_pruned (ts=100) is pruned; both aaaa and zzzz (ts=800)
+        // remain. The current digest after upsert is "zzzz_newer_high"
+        // (last-writer-wins in upsert). After pruning, both aaaa and zzzz
+        // are at max ts=800. The current digest ("zzzz_newer_high") is
+        // still present, so it should be kept.
+        let receipt = compact_index(receipts_dir, 500, 1000).expect("compact");
+        assert_eq!(receipt.entries_pruned, 1);
+
+        let reloaded = ReceiptIndexV1::load(receipts_dir)
+            .expect("load")
+            .expect("some");
+        let digest = reloaded
+            .latest_digest_for_job("job-tie2")
+            .expect("digest after compaction");
+
+        // Current digest "zzzz_newer_high" is at max timestamp, so it is kept.
+        assert_eq!(
+            digest, "zzzz_newer_high",
+            "must keep current digest when it is at max timestamp"
+        );
+    }
+
+    #[test]
+    fn compact_lex_greatest_tiebreak_when_current_not_at_max() {
+        // Verify the lexicographic tiebreak when the current pointer is
+        // NOT at the max timestamp.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let mut index = ReceiptIndexV1::new();
+        // Current "latest" points to this one (ts=600, within retention).
+        index
+            .upsert(make_header("job-lex", "mmmm_current", 600))
+            .expect("upsert current");
+        // Two newer receipts with same timestamp > current.
+        index
+            .upsert(make_header("job-lex", "aaaa_newer_low", 900))
+            .expect("upsert a");
+        index
+            .upsert(make_header("job-lex", "zzzz_newer_high", 900))
+            .expect("upsert b");
+        index.persist(receipts_dir).expect("persist");
+
+        // After upsert, current digest is "zzzz_newer_high" (last-writer
+        // wins on equal-or-greater timestamp). Both aaaa and zzzz are at
+        // max ts=900. Since current digest "zzzz_newer_high" IS at max
+        // timestamp, it should be kept (stability preference).
+        //
+        // But let's force the current pointer to "mmmm_current" (ts=600)
+        // to test the lex tiebreak path.
+        index
+            .job_index
+            .insert("job-lex".to_string(), "mmmm_current".to_string());
+        index.persist(receipts_dir).expect("persist forced");
+
+        // now=2000, retention=5000 => cutoff=0 => nothing pruned.
+        let _receipt = compact_index(receipts_dir, 5000, 2000).expect("compact");
+
+        let reloaded = ReceiptIndexV1::load(receipts_dir)
+            .expect("load")
+            .expect("some");
+        let digest = reloaded
+            .latest_digest_for_job("job-lex")
+            .expect("digest after compaction");
+
+        // mmmm_current is at ts=600, not at max (900). So the tiebreak
+        // between aaaa_newer_low and zzzz_newer_high uses lexicographic
+        // greatest => "zzzz_newer_high".
+        assert_eq!(
+            digest, "zzzz_newer_high",
+            "when current digest is not at max timestamp, \
+             lex-greatest content_hash must win the tie"
         );
     }
 
