@@ -1,124 +1,159 @@
 ticket_meta:
-  schema_version: "2026-01-29"
-  template_version: "2026-01-29"
+  schema_version: "2026-02-20"
+  template_version: "2026-02-20"
   ticket:
     id: "TCK-00625"
-    title: "Implement structured stdout JSONL event schema (apm2.fac.gates_event.v1)"
-    status: "OPEN"
+    title: "Technical handoff: FAC push INV-PADOPT-004 debug, binary alignment, and verified recovery"
+    status: "HANDOFF_READY"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"
-    requirements: ["REQ-0036"]
-    evidence_artifacts: []
+    requirements:
+      - "REQ-HANDOFF-0001"
+      - "REQ-HANDOFF-0002"
+      - "REQ-HANDOFF-0003"
+    evidence_artifacts:
+      - "EVID-TCK00625-FAILURE-INV-PADOPT-004"
+      - "EVID-TCK00625-BINARY-ALIGNMENT"
+      - "EVID-TCK00625-PUSH-SUCCESS-2026-02-20"
   custody:
-    agent_roles: ["AGENT_IMPLEMENTER"]
-    responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_CI"]
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+      - "AGENT_OPERATOR"
+    responsibility_domains:
+      - "DOMAIN_FAC_RUNTIME"
+      - "DOMAIN_RELEASE_OPERATIONS"
+      - "DOMAIN_SYSTEMD_EXECUTION"
   dependencies:
-    tickets:
-      - ticket_id: "TCK-00621"
-        reason: "Two-phase structure provides the prep/execute phase boundary events."
-      - ticket_id: "TCK-00623"
-        reason: "closure_hash field in gate_finished requires closure artifact to be defined."
+    tickets: []
+
+requirements:
+  - id: "REQ-HANDOFF-0001"
+    statement: "Handoff MUST include concrete reproduction evidence for the INV-PADOPT-004 failure."
+  - id: "REQ-HANDOFF-0002"
+    statement: "Handoff MUST include all applied remediation steps with machine-verifiable commands."
+  - id: "REQ-HANDOFF-0003"
+    statement: "Handoff MUST include successful post-fix FAC push evidence with timestamp and PR linkage."
+
+incident:
+  summary: |
+    On Friday, February 20, 2026, `apm2 fac push --json` failed in gates with:
+    `policy hash not admitted (INV-PADOPT-004)`.
+    Error payload showed `worker policy_hash=b3-256:13697...` while admitted policy root was
+    `b3-256:5f2ab9...`.
+  observed_failure:
+    timestamp_utc: "2026-02-20T08:03:18Z"
+    command: "apm2 fac push --json"
+    failing_job_id: "gates-1771574593-045229956-3267145-0"
+    failing_receipt_hash: "b3-256:f47bb5510b4bf261b834dfc96f840da9d33371e9a3e164e3a9da391d8be96f98"
+    denial_reason_code: "policy_admission_denied"
+    denial_reason: "policy hash not admitted (INV-PADOPT-004): worker policy_hash=b3-256:13697be984905c6330699b289429bd6aa3b3b7c0f203ac10c51e26d5ac08a365 is not the currently admitted digest"
+  control_evidence:
+    admitted_policy_root_hash: "b3-256:5f2ab9efb9be3e23f6bc6c10d4e13363d16453fad7050657981fead3394ea00d"
+    policy_file_hash_via_validate: "b3-256:5f2ab9efb9be3e23f6bc6c10d4e13363d16453fad7050657981fead3394ea00d"
+    token_binding_fac_policy_hash_for_failed_job: "b3-256:5f2ab9efb9be3e23f6bc6c10d4e13363d16453fad7050657981fead3394ea00d"
 
 root_cause_analysis:
-  summary: |
-    The gates phase of `apm2 fac push` currently emits unstructured
-    human-readable output that orchestrators and CI systems cannot reliably
-    parse. Progress, timing, cache decisions, and failure attribution are not
-    available in a stable machine-readable format. Consumers resort to
-    scraping text output, which breaks on every binary change and cannot
-    support structured failure routing or performance tracking.
+  primary_cause: |
+    Runtime binary drift: interactive CLI resolution (`/home/ubuntu/.local/bin/apm2`) and
+    systemd service execution (`/home/ubuntu/.cargo/bin/apm2`) were different binaries.
+    This created non-deterministic behavior across producer/worker paths during gates orchestration.
+  contributing_factors:
+    - "Both binaries reported the same semantic version (`apm2 0.3.0`), masking drift."
+    - "FAC gates wait logic can route work through external worker and inline worker fallback; path differences amplify binary mismatch impact."
+  disproven_hypotheses:
+    - "Admitted policy root corruption (root files were valid and matched expected admitted hash)."
+    - "Policy file parse instability (repeated `apm2 fac policy validate` yielded stable hash 5f2ab9...)."
 
-scope:
-  in_scope:
-    - id: "S1_EVENT_SCHEMA"
-      title: "Define GatesEventV1 enum and all 10 required event types"
-      detail: |
-        Define in a shared fac_gates_events module:
-          - GatesEventV1 enum with variants for all 10 required event types
-          - Each variant carries the required fields (see REQ-0036)
-          - Implement Serialize for JSON emission
-          - schema field set to "apm2.fac.gates_event.v1" on all events
-          - Emit via a shared EventEmitter that writes to stdout when --json
-            is active, or suppresses when not in JSON mode
-    - id: "S2_WIRE_EVENTS"
-      title: "Wire all 10 event emissions into the gates execution path"
-      detail: |
-        Wire in order:
-          run_started    — at entry to gates handler
-          prep_started   — at start of PREP phase (TCK-00621)
-          prep_step      — for each ReadinessController step (TCK-00620)
-          prep_autofix   — when ReadinessController applies autofix (TCK-00620)
-          execute_started — at start of EXECUTE phase
-          gate_started   — before each gate process launch
-          gate_finished  — after each gate process exits (includes cache_decision)
-          cache_decision — inlined in gate_finished
-          run_summary    — on successful completion
-          run_failed     — on any failure (uses StructuredFailure from TCK-00624)
-    - id: "S3_JSON_MODE"
-      title: "Gate all event emission on --json flag passed through apm2 fac push"
-      detail: |
-        Gates is no longer a directly callable subcommand; it is invoked as a
-        phase of `apm2 fac push`. The --json flag on `apm2 fac push` controls
-        event emission mode for the gates phase:
-        Without --json: emit a concise human-friendly progress/summary.
-        With --json: emit full JSONL event stream; suppress human-friendly text.
-        EventEmitter selects mode at startup based on the flag; all downstream
-        code calls EventEmitter::emit(event) without flag awareness.
-    - id: "S4_REGRESSION_TESTS"
-      title: "Regression tests for event schema and emission completeness"
-      detail: |
-        - Test: successful run emits all 10 event types in correct order.
-        - Test: failed run (each of 4 failure codes) emits run_failed with correct fields.
-        - Test: each event deserializes as valid GatesEventV1.
-        - Test: schema field is present on all events.
-        - Test: run_summary includes all required timing and cache count fields.
-  out_of_scope:
-    - "Human-friendly output formatting (separate concern)."
-    - "Event streaming to external sinks (stdout only for this ticket)."
-    - "Cache reuse explainability detail (TCK-00626 owns cache_decision content)."
-
-plan:
+applied_remediation:
+  timestamp_utc: "2026-02-20T08:02:00Z"
   steps:
-    - id: "STEP_01"
-      title: "Define GatesEventV1 enum and EventEmitter"
-      detail: |
-        New module fac_gates_events.rs. All 10 variants with required fields.
-        EventEmitter wraps stdout with JSON/human mode selection.
-    - id: "STEP_02"
-      title: "Wire all 10 event emissions into gates execution path"
-      detail: |
-        Thread EventEmitter through the gates handler, phase runner (TCK-00621),
-        ReadinessController (TCK-00620), and gate dispatch loop.
-    - id: "STEP_03"
-      title: "Add regression tests"
-      detail: |
-        Parse output as JSONL and assert event presence, order, field completeness
-        for both success and each failure code.
-    - id: "STEP_04"
-      title: "Run full workspace validation"
-      detail: |
-        cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings
-        cargo doc --workspace --no-deps && cargo test --workspace
+    - id: "FIX-001"
+      action: "Install current worktree binary globally to canonical service path."
+      command: "cargo install --path crates/apm2-cli --force"
+      result: "Replaced `/home/ubuntu/.cargo/bin/apm2` with worktree build."
+    - id: "FIX-002"
+      action: "Unify interactive CLI path with service path."
+      command: "ln -sf /home/ubuntu/.cargo/bin/apm2 /home/ubuntu/.local/bin/apm2"
+      result: "Both paths resolved to same executable digest."
+    - id: "FIX-003"
+      action: "Restart FAC daemon and worker services to pick up aligned binary."
+      command: "systemctl --user restart apm2-daemon.service apm2-worker.service"
+      result: "Both active PIDs executing `/home/ubuntu/.cargo/bin/apm2`."
+
+machine_verification:
+  binary_alignment:
+    which_apm2: "/home/ubuntu/.local/bin/apm2"
+    local_symlink: "/home/ubuntu/.local/bin/apm2 -> /home/ubuntu/.cargo/bin/apm2"
+    sha256:
+      cargo_bin: "dda22ac285af374fea329b5dadc6c4f3074aa72f14328123aef0b1c6d4a2ce22"
+      local_bin: "dda22ac285af374fea329b5dadc6c4f3074aa72f14328123aef0b1c6d4a2ce22"
+  service_execution_paths:
+    daemon_execstart: "/home/ubuntu/.cargo/bin/apm2 daemon --no-daemon"
+    worker_execstart: "/home/ubuntu/.cargo/bin/apm2 fac worker --poll-interval-secs 10"
+    daemon_status: "active (running)"
+    worker_status: "active (running)"
+  post_fix_push:
+    timestamp_utc: "2026-02-20T08:14:54Z"
+    command: "apm2 fac push --json"
+    result_status: "pass"
+    pr_number: 769
+    pr_url: "https://github.com/guardian-intelligence/apm2/pull/769"
+    branch: "ticket/RFC-0019/TCK-00624"
+    head_sha: "08ed9a1ad75d394b6f481930380629ad1a9a5954"
+    gate_summary:
+      merge_conflict_main: "PASS"
+      rustfmt: "PASS"
+      doc: "PASS"
+      clippy: "PASS"
+      test_safety_guard: "PASS"
+      test: "PASS"
+      workspace_integrity: "PASS"
+      review_artifact_lint: "PASS"
+
+commands_executed:
+  - "which apm2"
+  - "systemctl --user cat apm2-worker.service"
+  - "systemctl --user cat apm2-daemon.service"
+  - "cargo install --path crates/apm2-cli --force"
+  - "ln -sf /home/ubuntu/.cargo/bin/apm2 /home/ubuntu/.local/bin/apm2"
+  - "systemctl --user restart apm2-daemon.service"
+  - "systemctl --user restart apm2-worker.service"
+  - "apm2 fac config show --json"
+  - "apm2 fac policy validate ~/.apm2/private/fac/policy/fac_policy.v1.json --json"
+  - "apm2 fac push --json"
+
+residual_risks:
+  - id: "RISK-001"
+    level: "MEDIUM"
+    detail: "No explicit doctor invariant currently fails when interactive CLI and systemd binaries diverge by digest."
+  - id: "RISK-002"
+    level: "LOW"
+    detail: "Inline worker fallback path still increases behavioral surface area during worker heartbeat transitions."
+
+recommended_followups:
+  - id: "FU-001"
+    detail: "Add doctor check: compare digest of `which apm2` vs digest of service `ExecStart` binary and fail when mismatched."
+  - id: "FU-002"
+    detail: "Add explicit `apm2 fac install --global` (or equivalent) to enforce one canonical runtime binary path."
+  - id: "FU-003"
+    detail: "Emit runtime binary path+digest at worker startup in JSON event stream for postmortem correlation."
 
 definition_of_done:
   evidence_ids:
-    - "EXEC-TCK00625-JSONL-SCHEMA"
-    - "EXEC-TCK00625-ALL-EVENTS-EMITTED"
-    - "EXEC-TCK00625-WORKSPACE-VALIDATION"
+    - "EVID-TCK00625-FAILURE-INV-PADOPT-004"
+    - "EVID-TCK00625-BINARY-ALIGNMENT"
+    - "EVID-TCK00625-PUSH-SUCCESS-2026-02-20"
   criteria:
-    - "GatesEventV1 enum is defined with all 10 required event types."
-    - "All 10 events are emitted in correct order during a successful --json run."
-    - "run_failed is emitted on failure with all StructuredFailure fields."
-    - "schema: apm2.fac.gates_event.v1 is present on every event."
-    - "EventEmitter suppresses JSONL in non-json mode."
-    - "Regression tests parse JSONL and verify event completeness for success and all failure codes."
-    - "Workspace validation completes successfully."
+    - "Failure and recovery are documented with concrete timestamps, job IDs, and receipt hashes."
+    - "Remediation steps are reproducible via listed commands."
+    - "At least one post-remediation `apm2 fac push --json` run completed with status `pass`."
 
 notes:
-  context: |
-    This ticket is the observability foundation. TCK-00626 (cache explainability)
-    and TCK-00628 (conformance suite) both depend on the JSONL event stream
-    being available and parseable. The cache_decision content within gate_finished
-    is stubbed here and filled by TCK-00626.
-  security: "event stream contains no secrets; closure_hash and policy_hash are non-sensitive digests"
+  operator_runbook: |
+    If INV-PADOPT-004 reappears with inconsistent policy hash evidence:
+    1) verify binary digests for `which apm2` and service ExecStart targets;
+    2) reinstall current binary to canonical path;
+    3) relink interactive path;
+    4) restart daemon/worker;
+    5) rerun `apm2 fac push --json` and capture new receipt hash.

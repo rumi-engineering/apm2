@@ -13,7 +13,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::types::{
-    apm2_home_dir, ensure_parent_dir, now_iso8601, sanitize_for_path, validate_expected_head_sha,
+    apm2_home_dir, ensure_parent_dir, now_iso8601, now_iso8601_millis, sanitize_for_path,
+    validate_expected_head_sha,
 };
 
 const PROJECTION_ROOT_DIR: &str = "fac_projection";
@@ -407,12 +408,28 @@ fn merge_projection_pending_path(
     Ok(sha_dir(owner_repo, pr_number, head_sha)?.join("merge_projection_pending.json"))
 }
 
-fn verdict_projection_pending_path(
+fn legacy_verdict_projection_pending_path(
     owner_repo: &str,
     pr_number: u32,
     head_sha: &str,
 ) -> Result<PathBuf, String> {
     Ok(sha_dir(owner_repo, pr_number, head_sha)?.join("verdict_projection_pending.json"))
+}
+
+fn verdict_projection_pending_path(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    dimension: &str,
+) -> Result<PathBuf, String> {
+    let normalized = dimension.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err("verdict projection pending path requires non-empty dimension".to_string());
+    }
+    Ok(sha_dir(owner_repo, pr_number, head_sha)?.join(format!(
+        "verdict_projection_pending.{}.json",
+        sanitize_for_path(&normalized)
+    )))
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
@@ -806,40 +823,65 @@ pub(super) fn save_verdict_projection_pending(
             .filter(|v| !v.is_empty())
             .map(ToString::to_string)
     };
+    let path = verdict_projection_pending_path(owner_repo, pr_number, &head_sha, &dimension)?;
+    let existing_attempt = read_json_optional::<VerdictProjectionPendingRecord>(&path)?
+        .map_or(0, |record| record.attempt_count);
+    let requested_attempt = request.attempt_count.max(1);
+    let attempt_count = if requested_attempt <= existing_attempt {
+        existing_attempt.saturating_add(1)
+    } else {
+        requested_attempt
+    };
+
     let record = VerdictProjectionPendingRecord {
         schema: VERDICT_PROJECTION_PENDING_SCHEMA.to_string(),
         owner_repo: owner_repo.to_string(),
         pr_number,
-        head_sha: head_sha.clone(),
+        head_sha,
         dimension,
         decision,
         reason: normalize_optional(request.reason),
         model_id: normalize_optional(request.model_id),
         backend_id: normalize_optional(request.backend_id),
         last_error: last_error.to_string(),
-        attempt_count: request.attempt_count,
+        attempt_count,
         source: source.to_string(),
-        updated_at: now_iso8601(),
+        updated_at: now_iso8601_millis(),
     };
-    write_json_atomic(
-        &verdict_projection_pending_path(owner_repo, pr_number, &head_sha)?,
-        &record,
-    )
+    write_json_atomic(&path, &record)
 }
 #[cfg(test)]
 pub(super) fn load_verdict_projection_pending(
     owner_repo: &str,
     pr_number: u32,
     head_sha: &str,
+    dimension: &str,
 ) -> Result<Option<VerdictProjectionPendingSnapshot>, String> {
     validate_expected_head_sha(head_sha)?;
+    let normalized_dimension = dimension.trim().to_ascii_lowercase();
+    if normalized_dimension.is_empty() {
+        return Err("load verdict projection pending requires non-empty dimension".to_string());
+    }
     let normalized = head_sha.to_ascii_lowercase();
+    if let Some(record) =
+        read_json_optional::<VerdictProjectionPendingRecord>(&verdict_projection_pending_path(
+            owner_repo,
+            pr_number,
+            &normalized,
+            &normalized_dimension,
+        )?)?
+    {
+        return Ok(Some(record.into()));
+    }
     let Some(record) = read_json_optional::<VerdictProjectionPendingRecord>(
-        &verdict_projection_pending_path(owner_repo, pr_number, &normalized)?,
+        &legacy_verdict_projection_pending_path(owner_repo, pr_number, &normalized)?,
     )?
     else {
         return Ok(None);
     };
+    if !record.dimension.eq_ignore_ascii_case(&normalized_dimension) {
+        return Ok(None);
+    }
     Ok(Some(record.into()))
 }
 
@@ -847,14 +889,48 @@ pub(super) fn clear_verdict_projection_pending(
     owner_repo: &str,
     pr_number: u32,
     head_sha: &str,
+    dimension: &str,
 ) -> Result<(), String> {
     validate_expected_head_sha(head_sha)?;
-    let path =
-        verdict_projection_pending_path(owner_repo, pr_number, &head_sha.to_ascii_lowercase())?;
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(format!("failed to remove {}: {err}", path.display())),
+    let normalized_sha = head_sha.to_ascii_lowercase();
+    let normalized_dimension = dimension.trim().to_ascii_lowercase();
+    if normalized_dimension.is_empty() {
+        return Err("clear verdict projection pending requires non-empty dimension".to_string());
+    }
+
+    let mut failures = Vec::new();
+    let current_path = verdict_projection_pending_path(
+        owner_repo,
+        pr_number,
+        &normalized_sha,
+        &normalized_dimension,
+    )?;
+    match fs::remove_file(&current_path) {
+        Ok(()) => {},
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+        Err(err) => failures.push(format!(
+            "failed to remove {}: {err}",
+            current_path.display()
+        )),
+    }
+
+    // Clean up legacy pending path if it matches this dimension.
+    let legacy_path =
+        legacy_verdict_projection_pending_path(owner_repo, pr_number, &normalized_sha)?;
+    if let Some(record) = read_json_optional::<VerdictProjectionPendingRecord>(&legacy_path)?
+        && record.dimension.eq_ignore_ascii_case(&normalized_dimension)
+    {
+        match fs::remove_file(&legacy_path) {
+            Ok(()) => {},
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+            Err(err) => failures.push(format!("failed to remove {}: {err}", legacy_path.display())),
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
 }
 
@@ -906,20 +982,39 @@ pub(super) fn list_verdict_projection_pending_for_repo(
             if !sha_type.is_dir() {
                 continue;
             }
-            let path = sha_entry.path().join("verdict_projection_pending.json");
-            let Some(record) = read_json_optional::<VerdictProjectionPendingRecord>(&path)? else {
-                continue;
+            let files = match fs::read_dir(sha_entry.path()) {
+                Ok(value) => value,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(format!(
+                        "failed to list pending projection files in {}: {err}",
+                        sha_entry.path().display()
+                    ));
+                },
             };
-            pending.push(VerdictProjectionPendingSnapshot::from(record));
-            if pending.len() > limit {
-                let Some((oldest_index, _)) = pending
-                    .iter()
-                    .enumerate()
-                    .min_by(|(_, lhs), (_, rhs)| lhs.updated_at.cmp(&rhs.updated_at))
+            for pending_file in files {
+                let pending_file = pending_file.map_err(|err| {
+                    format!("failed to enumerate pending projection file entry: {err}")
+                })?;
+                let file_type = pending_file
+                    .file_type()
+                    .map_err(|err| format!("failed to read pending projection file type: {err}"))?;
+                if !file_type.is_file() {
+                    continue;
+                }
+                let file_name = pending_file.file_name();
+                let file_name = file_name.to_string_lossy();
+                if !file_name.starts_with("verdict_projection_pending")
+                    || !file_name.ends_with(".json")
+                {
+                    continue;
+                }
+                let path = pending_file.path();
+                let Some(record) = read_json_optional::<VerdictProjectionPendingRecord>(&path)?
                 else {
                     continue;
                 };
-                pending.swap_remove(oldest_index);
+                pending.push(VerdictProjectionPendingSnapshot::from(record));
             }
         }
     }
@@ -995,7 +1090,7 @@ pub(super) fn save_merge_projection_pending(
         last_error: last_error.to_string(),
         attempt_count: request.attempt_count,
         source: source.to_string(),
-        updated_at: now_iso8601(),
+        updated_at: now_iso8601_millis(),
     };
     write_json_atomic(
         &merge_projection_pending_path(owner_repo, pr_number, &head_sha)?,
@@ -1087,16 +1182,6 @@ pub(super) fn list_merge_projection_pending_for_repo(
                 continue;
             };
             pending.push(MergeProjectionPendingSnapshot::from(record));
-            if pending.len() > limit {
-                let Some((oldest_index, _)) = pending
-                    .iter()
-                    .enumerate()
-                    .min_by(|(_, lhs), (_, rhs)| lhs.updated_at.cmp(&rhs.updated_at))
-                else {
-                    continue;
-                };
-                pending.swap_remove(oldest_index);
-            }
         }
     }
     pending.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -1275,7 +1360,7 @@ mod tests {
         )
         .expect("save verdict projection pending");
 
-        let loaded = load_verdict_projection_pending(&owner_repo, pr_number, head_sha)
+        let loaded = load_verdict_projection_pending(&owner_repo, pr_number, head_sha, "security")
             .expect("load verdict projection pending")
             .expect("verdict projection pending exists");
         assert_eq!(loaded.dimension, "security");
@@ -1283,10 +1368,11 @@ mod tests {
         assert_eq!(loaded.reason.as_deref(), Some("looks good"));
         assert_eq!(loaded.attempt_count, 1);
 
-        clear_verdict_projection_pending(&owner_repo, pr_number, head_sha)
+        clear_verdict_projection_pending(&owner_repo, pr_number, head_sha, "security")
             .expect("clear verdict projection pending");
-        let reloaded = load_verdict_projection_pending(&owner_repo, pr_number, head_sha)
-            .expect("reload verdict projection pending");
+        let reloaded =
+            load_verdict_projection_pending(&owner_repo, pr_number, head_sha, "security")
+                .expect("reload verdict projection pending");
         assert!(reloaded.is_none());
     }
 

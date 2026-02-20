@@ -3406,7 +3406,7 @@ fn replay_pending_verdict_projection_for_pr_locked(
         },
     };
 
-    let snapshot = pending
+    let mut snapshots = pending
         .into_iter()
         .filter(|entry| entry.pr_number == pr_number)
         .filter(|entry| {
@@ -3414,29 +3414,92 @@ fn replay_pending_verdict_projection_for_pr_locked(
                 .as_deref()
                 .is_none_or(|expected| entry.head_sha.eq_ignore_ascii_case(expected))
         })
-        .min_by(|lhs, rhs| {
-            lhs.attempt_count
-                .cmp(&rhs.attempt_count)
-                .then_with(|| lhs.updated_at.cmp(&rhs.updated_at))
-        })?;
+        .collect::<Vec<_>>();
+    if snapshots.is_empty() {
+        return None;
+    }
+    snapshots.sort_by(|lhs, rhs| {
+        lhs.attempt_count
+            .cmp(&rhs.attempt_count)
+            .then_with(|| lhs.updated_at.cmp(&rhs.updated_at))
+    });
 
-    match verdict_projection::persist_verdict_projection_locked(
-        &snapshot.owner_repo,
-        Some(snapshot.pr_number),
-        Some(&snapshot.head_sha),
-        &snapshot.dimension,
-        &snapshot.decision,
-        snapshot.reason.as_deref(),
-        snapshot.model_id.as_deref(),
-        snapshot.backend_id.as_deref(),
-        false,
-    ) {
-        Ok(projected) => {
-            if let Err(err) = project_fac_required_status_with_fallback(
-                &projected.owner_repo,
-                projected.pr_number,
-                &projected.head_sha,
-            ) {
+    let mut latest_success = None;
+    let mut replay_failed = false;
+    for snapshot in snapshots {
+        match verdict_projection::persist_verdict_projection_locked(
+            &snapshot.owner_repo,
+            Some(snapshot.pr_number),
+            Some(&snapshot.head_sha),
+            &snapshot.dimension,
+            &snapshot.decision,
+            snapshot.reason.as_deref(),
+            snapshot.model_id.as_deref(),
+            snapshot.backend_id.as_deref(),
+            false,
+        ) {
+            Ok(projected) => {
+                if let Err(err) = project_fac_required_status_with_fallback(
+                    &projected.owner_repo,
+                    projected.pr_number,
+                    &projected.head_sha,
+                ) {
+                    replay_failed = true;
+                    let next_attempt = snapshot.attempt_count.saturating_add(1);
+                    if let Err(persist_err) = save_verdict_projection_pending(
+                        &snapshot.owner_repo,
+                        snapshot.pr_number,
+                        &snapshot.head_sha,
+                        &snapshot.dimension,
+                        &snapshot.decision,
+                        snapshot.reason.as_deref(),
+                        snapshot.model_id.as_deref(),
+                        snapshot.backend_id.as_deref(),
+                        &err,
+                        next_attempt,
+                        "projection_replay",
+                    ) {
+                        eprintln!(
+                            "WARNING: failed to update pending verdict projection record for PR #{} after required-status projection failure: {persist_err}",
+                            snapshot.pr_number
+                        );
+                    }
+                    continue;
+                }
+                if let Err(err) = projection_store::clear_verdict_projection_pending(
+                    &snapshot.owner_repo,
+                    snapshot.pr_number,
+                    &snapshot.head_sha,
+                    &snapshot.dimension,
+                ) {
+                    replay_failed = true;
+                    let next_attempt = snapshot.attempt_count.saturating_add(1);
+                    if let Err(persist_err) = save_verdict_projection_pending(
+                        &snapshot.owner_repo,
+                        snapshot.pr_number,
+                        &snapshot.head_sha,
+                        &snapshot.dimension,
+                        &snapshot.decision,
+                        snapshot.reason.as_deref(),
+                        snapshot.model_id.as_deref(),
+                        snapshot.backend_id.as_deref(),
+                        &format!(
+                            "replayed pending verdict projection but failed to clear pending record: {err}"
+                        ),
+                        next_attempt,
+                        "projection_replay",
+                    ) {
+                        eprintln!(
+                            "WARNING: failed to update pending verdict projection record for PR #{} after clear failure: {persist_err}",
+                            snapshot.pr_number
+                        );
+                    }
+                    continue;
+                }
+                latest_success = Some(projected);
+            },
+            Err(err) => {
+                replay_failed = true;
                 let next_attempt = snapshot.attempt_count.saturating_add(1);
                 if let Err(persist_err) = save_verdict_projection_pending(
                     &snapshot.owner_repo,
@@ -3452,47 +3515,15 @@ fn replay_pending_verdict_projection_for_pr_locked(
                     "projection_replay",
                 ) {
                     eprintln!(
-                        "WARNING: failed to update pending verdict projection record for PR #{} after required-status projection failure: {persist_err}",
+                        "WARNING: failed to update pending verdict projection record for PR #{} after replay failure: {persist_err}",
                         snapshot.pr_number
                     );
                 }
-                return None;
-            }
-            if let Err(err) = projection_store::clear_verdict_projection_pending(
-                &snapshot.owner_repo,
-                snapshot.pr_number,
-                &snapshot.head_sha,
-            ) {
-                eprintln!(
-                    "WARNING: replayed pending verdict projection for PR #{} but failed to clear pending record: {err}",
-                    snapshot.pr_number
-                );
-            }
-            Some(projected)
-        },
-        Err(err) => {
-            let next_attempt = snapshot.attempt_count.saturating_add(1);
-            if let Err(persist_err) = save_verdict_projection_pending(
-                &snapshot.owner_repo,
-                snapshot.pr_number,
-                &snapshot.head_sha,
-                &snapshot.dimension,
-                &snapshot.decision,
-                snapshot.reason.as_deref(),
-                snapshot.model_id.as_deref(),
-                snapshot.backend_id.as_deref(),
-                &err,
-                next_attempt,
-                "projection_replay",
-            ) {
-                eprintln!(
-                    "WARNING: failed to update pending verdict projection record for PR #{} after replay failure: {persist_err}",
-                    snapshot.pr_number
-                );
-            }
-            None
-        },
+            },
+        }
     }
+
+    if replay_failed { None } else { latest_success }
 }
 
 /// Run auto-merge synchronously when the PR reaches `MergeReady`. Earlier
@@ -3914,7 +3945,7 @@ fn project_fac_required_status_with_fallback(
 fn finalize_projected_verdict(
     projected: &verdict_projection::PersistedVerdictProjection,
     fallback_dimension: &str,
-    run_id: &str,
+    _run_id: &str,
     auto_source: Option<&str>,
 ) -> Result<(), String> {
     replay_pending_merge_projection_for_repo(&projected.owner_repo);
@@ -3943,22 +3974,7 @@ fn finalize_projected_verdict(
         )?;
     }
 
-    let auto_merge_result =
-        maybe_auto_merge_if_ready(&reduced, auto_source.unwrap_or("explicit_verdict_set"));
-
-    let authority = TerminationAuthority::new(
-        &projected.owner_repo,
-        projected.pr_number,
-        &projected.review_state_type,
-        &projected.head_sha,
-        run_id,
-        projected.decision_comment_id,
-        &projected.decision_author,
-        &projected.decision_signature,
-    );
-    let home = apm2_home_dir()?;
-    dispatch::write_completion_receipt_for_verdict(&home, &authority, &projected.decision)?;
-    auto_merge_result
+    maybe_auto_merge_if_ready(&reduced, auto_source.unwrap_or("explicit_verdict_set"))
 }
 
 fn finalize_auto_verdict_candidate(
@@ -4040,9 +4056,10 @@ fn finalize_auto_verdict_candidate(
         validate_post_finalize_projection(&projected, &projected_full)?;
         let home = apm2_home_dir()?;
         rewrite_verdict_completion_receipt(&home, &projected_full, &candidate.run_id)?;
+        return Ok(AutoVerdictFinalizeResult::Applied);
     }
 
-    Ok(AutoVerdictFinalizeResult::Applied)
+    Ok(AutoVerdictFinalizeResult::Pending)
 }
 
 fn finalize_auto_verdict_candidates(candidates: Vec<AutoVerdictCandidate>) -> AutoVerdictOutcome {
@@ -7384,7 +7401,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_verdict_finalization_persists_local_verdict_and_completion_receipt() {
+    fn auto_verdict_finalization_marks_pending_when_replay_not_confirmed() {
         let pr = next_pr();
         let repo = next_repo("auto-verdict-finalize", pr);
         let sha = "ffffffffffffffffffffffffffffffffffffffff";
@@ -7429,23 +7446,30 @@ mod tests {
             pr_number: pr,
             head_sha: sha.to_string(),
             review_type: "security".to_string(),
-            run_id: run_id.clone(),
+            run_id,
         })
         .expect("auto finalize");
-        assert!(matches!(result, AutoVerdictFinalizeResult::Applied));
+        assert!(matches!(result, AutoVerdictFinalizeResult::Pending));
 
         let verdict = resolve_verdict_for_dimension(&repo, pr, sha, "security")
             .expect("resolve verdict")
             .expect("verdict present");
         assert_eq!(verdict, "FAIL");
 
-        let receipt = load_review_run_completion_receipt(pr, "security")
-            .expect("load completion receipt")
-            .expect("completion receipt exists");
-        assert_eq!(receipt.repo, repo);
-        assert_eq!(receipt.head_sha, sha);
-        assert_eq!(receipt.run_id, run_id);
-        assert_eq!(receipt.decision, "deny");
+        let pending =
+            super::projection_store::load_verdict_projection_pending(&repo, pr, sha, "security")
+                .expect("load pending verdict snapshot");
+        assert!(
+            pending.is_some(),
+            "pending verdict snapshot should be retained"
+        );
+
+        let receipt =
+            load_review_run_completion_receipt(pr, "security").expect("load completion receipt");
+        assert!(
+            receipt.is_none(),
+            "completion receipt should not be written while pending"
+        );
     }
 
     #[test]

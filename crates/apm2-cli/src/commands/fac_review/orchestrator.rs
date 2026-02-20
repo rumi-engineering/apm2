@@ -494,6 +494,9 @@ fn load_completion_signal(
         else {
             return Ok(None);
         };
+        if signal.decision_comment_id == 0 || signal.decision_summary.trim().is_empty() {
+            return Ok(None);
+        }
         let receipt = ReviewRunCompletionReceipt {
             schema: COMPLETION_RECEIPT_SCHEMA.to_string(),
             emitted_at: now_iso8601(),
@@ -525,7 +528,7 @@ fn load_completion_signal(
     {
         return Ok(None);
     }
-    if receipt.decision_summary.trim().is_empty() {
+    if receipt.decision_comment_id == 0 || receipt.decision_summary.trim().is_empty() {
         return Ok(None);
     }
     let Some(verdict) = decision_to_verdict(&receipt.decision) else {

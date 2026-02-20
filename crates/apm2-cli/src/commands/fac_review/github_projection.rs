@@ -267,14 +267,20 @@ pub(super) fn update_issue_comment(
     Ok(())
 }
 
+fn live_verdict_comment_id_jq(expected_sha: &str) -> Result<String, String> {
+    let normalized_sha = parse_commit_sha(expected_sha)?;
+    Ok(format!(
+        ".[] | select((.body // \"\") | contains(\"{VERDICT_MARKER}\")) | select(((.body // \"\") | contains(\"{VERDICT_TOMBSTONE_MARKER}\")) | not) | select(((.body // \"\") | ascii_downcase | contains(\"sha: {normalized_sha}\"))) | .id"
+    ))
+}
+
 pub(super) fn fetch_latest_live_verdict_comment_id(
     owner_repo: &str,
     pr_number: u32,
+    expected_sha: &str,
 ) -> Result<Option<u64>, String> {
     let endpoint = format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100");
-    let jq = format!(
-        ".[] | select((.body // \"\") | contains(\"{VERDICT_MARKER}\")) | select(((.body // \"\") | contains(\"{VERDICT_TOMBSTONE_MARKER}\")) | not) | .id"
-    );
+    let jq = live_verdict_comment_id_jq(expected_sha)?;
     let output = gh_command()
         .args(["api", "--paginate", &endpoint, "--jq", &jq])
         .output()
@@ -514,8 +520,8 @@ pub(super) fn merge_pr_on_github(repo: &str, pr_number: u32, sha: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_COMMIT_STATUS_DESCRIPTION_CHARS, clamp_commit_status_description, parse_commit_sha,
-        validate_commit_status_state,
+        MAX_COMMIT_STATUS_DESCRIPTION_CHARS, clamp_commit_status_description,
+        live_verdict_comment_id_jq, parse_commit_sha, validate_commit_status_state,
     };
 
     #[test]
@@ -536,5 +542,13 @@ mod tests {
     fn merge_sha_parser_rejects_invalid_values() {
         let err = parse_commit_sha("not-a-sha").expect_err("invalid sha should be rejected");
         assert!(err.contains("40-char hex sha"));
+    }
+
+    #[test]
+    fn live_verdict_comment_jq_filters_by_sha() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let jq = live_verdict_comment_id_jq(sha).expect("valid sha");
+        assert!(jq.contains("apm2-review-verdict:v1"));
+        assert!(jq.contains("sha: 0123456789abcdef0123456789abcdef01234567"));
     }
 }

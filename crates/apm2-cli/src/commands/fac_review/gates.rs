@@ -2657,6 +2657,86 @@ impl GatesFailureDetails {
     }
 }
 
+fn compact_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+const MAX_RENDERED_FAILURE_REASON_CHARS: usize = 420;
+const MAX_RENDERED_FAILURE_REMEDIATION_CHARS: usize = 96;
+const MAX_RENDERED_FAILURE_DIAGNOSTIC_CHARS: usize = 120;
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut chars = input.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        if max_chars > 3 {
+            let mut shortened = truncated.chars().take(max_chars - 3).collect::<String>();
+            shortened.push_str("...");
+            shortened
+        } else {
+            ".".repeat(max_chars)
+        }
+    } else {
+        truncated
+    }
+}
+
+fn append_render_field(rendered: &mut String, key: &str, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    rendered.push(' ');
+    rendered.push_str(key);
+    rendered.push('=');
+    rendered.push_str(value);
+}
+
+fn render_run_failure(
+    phase: GatesRunPhase,
+    message: &str,
+    details: &GatesFailureDetails,
+) -> String {
+    let mut rendered = format!(
+        "run_failed stage={} root_cause={}",
+        phase.as_str(),
+        compact_whitespace(message)
+    );
+    if let Some(code) = details.failure_code.as_deref() {
+        append_render_field(&mut rendered, "failure_code", code);
+    }
+    if let Some(class) = details.failure_class.as_deref() {
+        append_render_field(&mut rendered, "failure_class", class);
+    }
+    if let Some(remediation) = details.remediation.as_deref() {
+        let compact = truncate_chars(
+            &compact_whitespace(remediation),
+            MAX_RENDERED_FAILURE_REMEDIATION_CHARS,
+        );
+        append_render_field(&mut rendered, "remediation", &compact);
+    }
+    if !details.diagnostics.is_empty() {
+        let diagnostics = details
+            .diagnostics
+            .iter()
+            .map(|entry| {
+                truncate_chars(
+                    &compact_whitespace(entry),
+                    MAX_RENDERED_FAILURE_DIAGNOSTIC_CHARS,
+                )
+            })
+            .filter(|entry| !entry.is_empty())
+            .take(2)
+            .collect::<Vec<_>>();
+        if !diagnostics.is_empty() {
+            append_render_field(&mut rendered, "diagnostics", &diagnostics.join(" | "));
+        }
+    }
+    truncate_chars(&rendered, MAX_RENDERED_FAILURE_REASON_CHARS)
+}
+
 #[derive(Debug, Clone)]
 struct GatesStepError {
     message: String,
@@ -2701,11 +2781,7 @@ struct GatesPhaseError {
 #[cfg(test)]
 impl GatesPhaseError {
     fn render(self) -> String {
-        format!(
-            "run_failed stage={} root_cause={}",
-            self.phase.as_str(),
-            self.message
-        )
+        render_run_failure(self.phase, &self.message, &self.details)
     }
 }
 
@@ -2727,11 +2803,7 @@ impl GatesRunFailure {
     }
 
     fn render(self) -> String {
-        format!(
-            "run_failed stage={} root_cause={}",
-            self.phase.as_str(),
-            self.message
-        )
+        render_run_failure(self.phase, &self.message, &self.details)
     }
 }
 
@@ -4669,6 +4741,53 @@ mod tests {
                 .map(std::vec::Vec::len),
             Some(1)
         );
+    }
+
+    #[test]
+    fn gates_run_failure_render_includes_structured_metadata() {
+        let rendered = GatesRunFailure {
+            phase: GatesRunPhase::Execute,
+            message: "gates execute phase failed before completion".to_string(),
+            details: Box::new(GatesFailureDetails {
+                failure_code: Some(GATE_EXECUTION_FAILED_CODE.to_string()),
+                failure_class: Some(FAILURE_CLASS_EXECUTION.to_string()),
+                remediation: Some("inspect gate logs and rerun `apm2 fac gates`".to_string()),
+                diagnostics: vec![
+                    "failed_gates=clippy".to_string(),
+                    "first_failure=clippy: lint errors".to_string(),
+                ],
+            }),
+        }
+        .render();
+
+        assert!(rendered.contains("stage=execute"));
+        assert!(rendered.contains(&format!("failure_code={GATE_EXECUTION_FAILED_CODE}")));
+        assert!(rendered.contains(&format!("failure_class={FAILURE_CLASS_EXECUTION}")));
+        assert!(
+            rendered
+                .contains("diagnostics=failed_gates=clippy | first_failure=clippy: lint errors")
+        );
+    }
+
+    #[test]
+    fn gates_run_failure_render_is_bounded_for_receipt_reason_limits() {
+        let rendered = GatesRunFailure {
+            phase: GatesRunPhase::Execute,
+            message: "gates execute phase failed before completion".to_string(),
+            details: Box::new(GatesFailureDetails {
+                failure_code: Some(GATE_EXECUTION_FAILED_CODE.to_string()),
+                failure_class: Some(FAILURE_CLASS_EXECUTION.to_string()),
+                remediation: Some("dispatch implementor ".repeat(32)),
+                diagnostics: vec!["DIRTY TREE ".repeat(128)],
+            }),
+        }
+        .render();
+
+        assert!(
+            rendered.len() <= MAX_RENDERED_FAILURE_REASON_CHARS,
+            "rendered reason must be bounded for job receipt persistence"
+        );
+        assert!(rendered.contains("diagnostics="));
     }
 
     #[test]
