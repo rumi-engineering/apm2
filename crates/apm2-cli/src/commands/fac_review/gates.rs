@@ -1559,6 +1559,7 @@ fn materialize_gate_results_from_v2(
             bytes_total: cached.bytes_total,
             was_truncated: cached.was_truncated,
             log_bundle_hash: cached.log_bundle_hash.clone(),
+            cache_decision: None,
         });
     }
     Ok(results)
@@ -1622,6 +1623,7 @@ fn materialize_gate_results_from_v3(
             bytes_total: None,
             was_truncated: None,
             log_bundle_hash: cached.log_bundle_hash.clone(),
+            cache_decision: None,
         });
     }
     Ok(results)
@@ -1680,7 +1682,7 @@ pub(super) fn run_gates_local_worker(
                 passed,
                 duration_secs,
                 error_hint,
-                ..
+                cache_decision,
             } => {
                 if let Ok(mut emitted) = emitted_gate_finishes_for_progress.lock() {
                     emitted.insert(gate_name.clone());
@@ -1694,6 +1696,7 @@ pub(super) fn run_gates_local_worker(
                     duration_secs,
                     status,
                     error_hint.as_deref(),
+                    cache_decision.as_ref(),
                 );
             },
             GateProgressEvent::Progress {
@@ -1752,6 +1755,7 @@ pub(super) fn run_gates_local_worker(
             gate.duration_secs,
             gate.status.as_str(),
             gate.error_hint.as_deref(),
+            None,
         );
     }
 
@@ -3078,6 +3082,7 @@ fn emit_gate_started_event(run_id: &str, sha: Option<&str>, gate_name: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gate_finished_event(
     run_id: &str,
     sha: Option<&str>,
@@ -3086,6 +3091,7 @@ fn gate_finished_event(
     duration_secs: u64,
     status: &str,
     error_hint: Option<&str>,
+    cache_decision: Option<&apm2_core::fac::gate_cache_v3::CacheDecision>,
 ) -> serde_json::Value {
     let mut payload = serde_json::Map::new();
     payload.insert(
@@ -3120,10 +3126,16 @@ fn gate_finished_event(
             serde_json::Value::String(error_hint.to_string()),
         );
     }
+    if let Some(cd) = cache_decision {
+        if let Ok(cd_value) = serde_json::to_value(cd) {
+            payload.insert("cache_decision".to_string(), cd_value);
+        }
+    }
     build_gates_event("gate_finished", serde_json::Value::Object(payload))
 }
 
 #[cfg(not(test))]
+#[allow(clippy::too_many_arguments)]
 fn emit_gate_finished_event(
     run_id: &str,
     sha: Option<&str>,
@@ -3132,6 +3144,7 @@ fn emit_gate_finished_event(
     duration_secs: u64,
     status: &str,
     error_hint: Option<&str>,
+    cache_decision: Option<&apm2_core::fac::gate_cache_v3::CacheDecision>,
 ) {
     if let Err(err) = super::jsonl::emit_jsonl(&gate_finished_event(
         run_id,
@@ -3141,6 +3154,7 @@ fn emit_gate_finished_event(
         duration_secs,
         status,
         error_hint,
+        cache_decision,
     )) {
         eprintln!("WARNING: failed to emit gates event `gate_finished`: {err}");
     }
@@ -3731,6 +3745,7 @@ fn run_execute_phase(
             passed: merge_gate.status == "PASS",
             duration_secs: merge_gate.duration_secs,
             error_hint: merge_gate.error_hint.clone(),
+            cache_decision: None,
         });
     }
     if merge_gate.status == "FAIL" {
@@ -4986,7 +5001,7 @@ mod tests {
 
     #[test]
     fn gate_finished_event_keeps_status_and_optional_sha() {
-        let payload = gate_finished_event("run-1", None, "test", true, 0, "SKIP", None);
+        let payload = gate_finished_event("run-1", None, "test", true, 0, "SKIP", None, None);
         assert_eq!(
             payload.get("status").and_then(serde_json::Value::as_str),
             Some("SKIP")
@@ -4996,6 +5011,85 @@ mod tests {
             Some("pass")
         );
         assert!(payload.get("sha").is_none());
+    }
+
+    #[test]
+    fn gate_finished_event_includes_cache_decision_when_present() {
+        let decision = apm2_core::fac::gate_cache_v3::CacheDecision::cache_miss(
+            apm2_core::fac::gate_cache_v3::CacheReasonCode::PolicyDrift,
+            Some("deadbeef"),
+        );
+        let payload = gate_finished_event(
+            "run-1",
+            Some("abc123"),
+            "rustfmt",
+            false,
+            5,
+            "FAIL",
+            Some("policy drift detected"),
+            Some(&decision),
+        );
+        let cd = payload
+            .get("cache_decision")
+            .expect("cache_decision must be present");
+        assert_eq!(
+            cd.get("hit").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            cd.get("reason_code").and_then(serde_json::Value::as_str),
+            Some("policy_drift")
+        );
+        assert_eq!(
+            cd.get("first_mismatch_dimension")
+                .and_then(serde_json::Value::as_str),
+            Some("policy_drift")
+        );
+        assert_eq!(
+            cd.get("cached_sha").and_then(serde_json::Value::as_str),
+            Some("deadbeef")
+        );
+    }
+
+    #[test]
+    fn gate_finished_event_omits_cache_decision_when_none() {
+        let payload = gate_finished_event("run-1", None, "test", true, 0, "PASS", None, None);
+        assert!(
+            payload.get("cache_decision").is_none(),
+            "cache_decision must be absent when None"
+        );
+    }
+
+    #[test]
+    fn gate_finished_event_cache_hit_has_null_mismatch_dimension() {
+        let decision = apm2_core::fac::gate_cache_v3::CacheDecision::cache_hit("abc123");
+        let payload = gate_finished_event(
+            "run-1",
+            Some("abc123"),
+            "rustfmt",
+            true,
+            5,
+            "PASS",
+            None,
+            Some(&decision),
+        );
+        let cd = payload
+            .get("cache_decision")
+            .expect("cache_decision must be present");
+        assert_eq!(
+            cd.get("hit").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            cd.get("reason_code").and_then(serde_json::Value::as_str),
+            Some("cache_hit")
+        );
+        // first_mismatch_dimension should be absent (skip_serializing_if = None).
+        assert!(
+            cd.get("first_mismatch_dimension").is_none()
+                || cd.get("first_mismatch_dimension") == Some(&serde_json::Value::Null),
+            "hit must have null first_mismatch_dimension"
+        );
     }
 
     #[test]
@@ -6451,6 +6545,7 @@ time.sleep(20)\n",
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: Some(shared.clone()),
+                cache_decision: None,
             },
             EvidenceGateResult {
                 gate_name: "clippy".to_string(),
@@ -6461,6 +6556,7 @@ time.sleep(20)\n",
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: Some(shared.clone()),
+                cache_decision: None,
             },
         ];
 
@@ -6492,6 +6588,7 @@ time.sleep(20)\n",
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: None,
+                cache_decision: None,
             },
             EvidenceGateResult {
                 gate_name: "clippy".to_string(),
@@ -6502,6 +6599,7 @@ time.sleep(20)\n",
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: Some("b3-256:nothex".to_string()),
+                cache_decision: None,
             },
         ];
 
@@ -6534,6 +6632,7 @@ time.sleep(20)\n",
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: Some(format!("b3-256:{}", "b".repeat(64))),
+                cache_decision: None,
             },
             EvidenceGateResult {
                 gate_name: "clippy".to_string(),
@@ -6544,6 +6643,7 @@ time.sleep(20)\n",
                 bytes_total: None,
                 was_truncated: None,
                 log_bundle_hash: Some(format!("b3-256:{}", "c".repeat(64))),
+                cache_decision: None,
             },
         ];
 
@@ -6673,6 +6773,7 @@ time.sleep(20)\n",
                     passed,
                     duration_secs,
                     error_hint,
+                    ..
                 } => {
                     events_clone.lock().unwrap().push(format!(
                         "completed:{gate_name}:passed={passed}:duration={duration_secs}:hint={}",
@@ -6708,6 +6809,7 @@ time.sleep(20)\n",
                 passed: true,
                 duration_secs: 5,
                 error_hint: None,
+                cache_decision: None,
             });
         }
 

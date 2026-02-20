@@ -400,6 +400,133 @@ impl V3CacheEntry {
 }
 
 // =============================================================================
+// Cache Reason Code (TCK-00626)
+// =============================================================================
+
+/// Stable reason code for cache reuse decisions (REQ-0037).
+///
+/// Each variant corresponds to a specific dimension check in the ordered
+/// evaluation sequence. On a miss, the first failing dimension determines
+/// the `reason_code` and `first_mismatch_dimension` in [`CacheDecision`].
+///
+/// The check order is:
+/// 1. `ShaMiss` / `GateMiss`
+/// 2. `SignatureInvalid`
+/// 3. `ReceiptBindingMissing`
+/// 4. `PolicyDrift`
+/// 5. `ToolchainDrift`
+/// 6. `ClosureDrift`
+/// 7. `InputDrift`
+/// 8. `NetworkPolicyDrift`
+/// 9. `SandboxDrift`
+/// 10. `TtlExpired`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheReasonCode {
+    /// Cache hit: entry found and all dimensions match.
+    CacheHit,
+    /// No entry for this commit SHA (compound key miss).
+    ShaMiss,
+    /// No entry for this gate name.
+    GateMiss,
+    /// Entry signature verification failed.
+    SignatureInvalid,
+    /// Entry lacks RFC-0028/0029 receipt bindings.
+    ReceiptBindingMissing,
+    /// Policy hash changed since cache entry was produced.
+    PolicyDrift,
+    /// Toolchain version/target changed.
+    ToolchainDrift,
+    /// Closure hash changed (per REQ-0034).
+    ClosureDrift,
+    /// Gate input files changed.
+    InputDrift,
+    /// Network isolation policy hash changed.
+    NetworkPolicyDrift,
+    /// Sandbox/cgroup profile changed.
+    SandboxDrift,
+    /// Entry exceeded TTL.
+    TtlExpired,
+}
+
+impl CacheReasonCode {
+    /// Returns the stable string representation of this reason code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CacheHit => "cache_hit",
+            Self::ShaMiss => "sha_miss",
+            Self::GateMiss => "gate_miss",
+            Self::SignatureInvalid => "signature_invalid",
+            Self::ReceiptBindingMissing => "receipt_binding_missing",
+            Self::PolicyDrift => "policy_drift",
+            Self::ToolchainDrift => "toolchain_drift",
+            Self::ClosureDrift => "closure_drift",
+            Self::InputDrift => "input_drift",
+            Self::NetworkPolicyDrift => "network_policy_drift",
+            Self::SandboxDrift => "sandbox_drift",
+            Self::TtlExpired => "ttl_expired",
+        }
+    }
+}
+
+impl fmt::Display for CacheReasonCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// =============================================================================
+// Cache Decision (TCK-00626)
+// =============================================================================
+
+/// Structured cache reuse decision record (REQ-0037).
+///
+/// Emitted as part of the `gate_finished` event, enabling operators and
+/// orchestrators to diagnose cache miss causes from the stdout event stream
+/// alone without reading internal cache files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheDecision {
+    /// Whether the cache entry was reused (hit = true, miss = false).
+    pub hit: bool,
+    /// Stable reason code explaining the decision.
+    pub reason_code: CacheReasonCode,
+    /// The first dimension that caused a miss (null on hit).
+    ///
+    /// Enables O(1) triage: the operator can immediately see which
+    /// dimension drifted without enumerating all checks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_mismatch_dimension: Option<CacheReasonCode>,
+    /// The SHA of the cached entry (null on miss where no entry exists).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_sha: Option<String>,
+}
+
+impl CacheDecision {
+    /// Construct a cache hit decision.
+    #[must_use]
+    pub fn cache_hit(cached_sha: &str) -> Self {
+        Self {
+            hit: true,
+            reason_code: CacheReasonCode::CacheHit,
+            first_mismatch_dimension: None,
+            cached_sha: Some(cached_sha.to_string()),
+        }
+    }
+
+    /// Construct a cache miss decision.
+    #[must_use]
+    pub fn cache_miss(reason_code: CacheReasonCode, cached_sha: Option<&str>) -> Self {
+        Self {
+            hit: false,
+            reason_code,
+            first_mismatch_dimension: Some(reason_code),
+            cached_sha: cached_sha.map(str::to_string),
+        }
+    }
+}
+
+// =============================================================================
 // V3 Reuse Decision
 // =============================================================================
 
@@ -660,6 +787,82 @@ impl GateCacheV3 {
         }
 
         V3ReuseDecision::hit()
+    }
+
+    /// Evaluate cache reuse and return a structured [`CacheDecision`]
+    /// (TCK-00626).
+    ///
+    /// This is the primary API for cache explainability. It wraps the
+    /// existing `check_reuse` logic and maps each miss reason to a
+    /// [`CacheReasonCode`] with structured first-mismatch attribution.
+    ///
+    /// The ordered check sequence matches `check_reuse`:
+    ///
+    /// 1. `sha_miss` / `gate_miss` -- no cache entry found
+    /// 2. `signature_invalid` -- entry exists but signature fails
+    /// 3. `receipt_binding_missing` -- RFC-0028/0029 flags not set
+    /// 4. Dimension-specific drift codes (`policy`, `toolchain`, etc.)
+    ///
+    /// Note: dimension drifts (4+) are detected at the compound-key
+    /// level by the caller -- if the compound key does not match, no cache
+    /// is loaded. The `check_reuse` method only sees entries that already
+    /// match on compound key. Therefore drifts like `policy`, `toolchain`,
+    /// `network_policy`, `sandbox` are signaled by the caller via
+    /// `sha_miss` / `gate_miss` when no v3 cache loads for the current
+    /// compound key. The remaining detailed miss reasons from
+    /// `check_reuse` are mapped to their closest reason code.
+    #[must_use]
+    pub fn check_reuse_decision(
+        &self,
+        gate: &str,
+        expected_attestation_digest: Option<&str>,
+        require_full_mode: bool,
+        verifying_key: Option<&crate::crypto::VerifyingKey>,
+    ) -> CacheDecision {
+        let v3_decision = self.check_reuse(
+            gate,
+            expected_attestation_digest,
+            require_full_mode,
+            verifying_key,
+        );
+        if v3_decision.reusable {
+            return CacheDecision::cache_hit(&self.sha);
+        }
+        // Map the V3ReuseDecision reason string to a CacheReasonCode.
+        let reason_code = Self::map_reason_to_code(v3_decision.reason);
+        CacheDecision::cache_miss(reason_code, Some(&self.sha))
+    }
+
+    /// Map a legacy `V3ReuseDecision` reason string to a [`CacheReasonCode`].
+    ///
+    /// Reasons that indicate "no entry found" map to `GateMiss`.
+    /// Signature-related failures map to `SignatureInvalid`.
+    /// Receipt-binding failures map to `ReceiptBindingMissing`.
+    /// V2-sourced denials map to `SignatureInvalid` (v2 lacks binding proof).
+    /// All other reasons default to `InputDrift` (attestation mismatch = input
+    /// content changed).
+    #[must_use]
+    fn map_reason_to_code(reason: &str) -> CacheReasonCode {
+        match reason {
+            "no_record" | "status_not_pass" => CacheReasonCode::GateMiss,
+            "v2_sourced_no_binding_proof"
+            | "signature_missing"
+            | "signer_id_missing"
+            | "signature_field_too_long"
+            | "signer_id_invalid_hex"
+            | "signer_id_length_mismatch"
+            | "signer_id_mismatch"
+            | "signature_invalid_hex"
+            | "signature_malformed"
+            | "signature_invalid"
+            | "signature_unverifiable_no_key" => CacheReasonCode::SignatureInvalid,
+            "receipt_binding_missing" => CacheReasonCode::ReceiptBindingMissing,
+            // All remaining reasons (attestation/evidence mismatches, quick-mode
+            // denial, and unknown reasons) default to InputDrift as a fail-closed
+            // catch-all. Individual reason strings are intentionally NOT listed
+            // separately to avoid clippy::match_same_arms.
+            _ => CacheReasonCode::InputDrift,
+        }
     }
 
     /// Explicitly bind RFC-0028/0029 receipt evidence to a cache entry.
@@ -2444,5 +2647,379 @@ mod tests {
         let decision = cache.check_reuse("rustfmt", Some(digest), true, Some(&vk));
         assert!(!decision.reusable, "must deny with failed 0028");
         assert_eq!(decision.reason, "receipt_binding_missing");
+    }
+
+    // =========================================================================
+    // CacheDecision and CacheReasonCode Tests (TCK-00626, S4)
+    // =========================================================================
+
+    #[test]
+    fn cache_reason_code_as_str_roundtrips_all_variants() {
+        let codes = [
+            (CacheReasonCode::CacheHit, "cache_hit"),
+            (CacheReasonCode::ShaMiss, "sha_miss"),
+            (CacheReasonCode::GateMiss, "gate_miss"),
+            (CacheReasonCode::SignatureInvalid, "signature_invalid"),
+            (
+                CacheReasonCode::ReceiptBindingMissing,
+                "receipt_binding_missing",
+            ),
+            (CacheReasonCode::PolicyDrift, "policy_drift"),
+            (CacheReasonCode::ToolchainDrift, "toolchain_drift"),
+            (CacheReasonCode::ClosureDrift, "closure_drift"),
+            (CacheReasonCode::InputDrift, "input_drift"),
+            (CacheReasonCode::NetworkPolicyDrift, "network_policy_drift"),
+            (CacheReasonCode::SandboxDrift, "sandbox_drift"),
+            (CacheReasonCode::TtlExpired, "ttl_expired"),
+        ];
+        for (code, expected_str) in &codes {
+            assert_eq!(code.as_str(), *expected_str, "as_str mismatch for {code:?}");
+            assert_eq!(
+                code.to_string(),
+                *expected_str,
+                "Display mismatch for {code:?}"
+            );
+        }
+        // Verify all 12 variants (11 miss + 1 hit) are covered.
+        assert_eq!(codes.len(), 12);
+    }
+
+    #[test]
+    fn cache_decision_hit_has_correct_structure() {
+        let decision = CacheDecision::cache_hit("abc123");
+        assert!(decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::CacheHit);
+        assert!(
+            decision.first_mismatch_dimension.is_none(),
+            "hit must have null first_mismatch_dimension"
+        );
+        assert_eq!(
+            decision.cached_sha.as_deref(),
+            Some("abc123"),
+            "hit must carry cached SHA"
+        );
+    }
+
+    #[test]
+    fn cache_decision_miss_sha_miss() {
+        let decision = CacheDecision::cache_miss(CacheReasonCode::ShaMiss, None);
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::ShaMiss);
+        assert_eq!(
+            decision.first_mismatch_dimension,
+            Some(CacheReasonCode::ShaMiss)
+        );
+        assert!(
+            decision.cached_sha.is_none(),
+            "sha_miss with no cached entry must have null cached_sha"
+        );
+    }
+
+    #[test]
+    fn cache_decision_miss_gate_miss() {
+        let decision = CacheDecision::cache_miss(CacheReasonCode::GateMiss, Some("abc123"));
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::GateMiss);
+        assert_eq!(
+            decision.first_mismatch_dimension,
+            Some(CacheReasonCode::GateMiss)
+        );
+        assert_eq!(decision.cached_sha.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn cache_decision_miss_signature_invalid() {
+        let decision = CacheDecision::cache_miss(CacheReasonCode::SignatureInvalid, Some("sha1"));
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::SignatureInvalid);
+        assert_eq!(
+            decision.first_mismatch_dimension,
+            Some(CacheReasonCode::SignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn cache_decision_miss_receipt_binding_missing() {
+        let decision =
+            CacheDecision::cache_miss(CacheReasonCode::ReceiptBindingMissing, Some("sha1"));
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::ReceiptBindingMissing);
+        assert_eq!(
+            decision.first_mismatch_dimension,
+            Some(CacheReasonCode::ReceiptBindingMissing)
+        );
+    }
+
+    #[test]
+    fn cache_decision_miss_policy_drift() {
+        let decision = CacheDecision::cache_miss(CacheReasonCode::PolicyDrift, None);
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::PolicyDrift);
+        assert_eq!(
+            decision.first_mismatch_dimension,
+            Some(CacheReasonCode::PolicyDrift)
+        );
+    }
+
+    #[test]
+    fn cache_decision_miss_toolchain_drift() {
+        let decision = CacheDecision::cache_miss(CacheReasonCode::ToolchainDrift, None);
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::ToolchainDrift);
+        assert_eq!(
+            decision.first_mismatch_dimension,
+            Some(CacheReasonCode::ToolchainDrift)
+        );
+    }
+
+    #[test]
+    fn cache_decision_miss_closure_drift() {
+        let decision = CacheDecision::cache_miss(CacheReasonCode::ClosureDrift, None);
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::ClosureDrift);
+        assert_eq!(
+            decision.first_mismatch_dimension,
+            Some(CacheReasonCode::ClosureDrift)
+        );
+    }
+
+    #[test]
+    fn cache_decision_miss_input_drift() {
+        let decision = CacheDecision::cache_miss(CacheReasonCode::InputDrift, Some("sha1"));
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::InputDrift);
+        assert_eq!(
+            decision.first_mismatch_dimension,
+            Some(CacheReasonCode::InputDrift)
+        );
+    }
+
+    #[test]
+    fn cache_decision_miss_network_policy_drift() {
+        let decision = CacheDecision::cache_miss(CacheReasonCode::NetworkPolicyDrift, None);
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::NetworkPolicyDrift);
+        assert_eq!(
+            decision.first_mismatch_dimension,
+            Some(CacheReasonCode::NetworkPolicyDrift)
+        );
+    }
+
+    #[test]
+    fn cache_decision_miss_sandbox_drift() {
+        let decision = CacheDecision::cache_miss(CacheReasonCode::SandboxDrift, None);
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::SandboxDrift);
+        assert_eq!(
+            decision.first_mismatch_dimension,
+            Some(CacheReasonCode::SandboxDrift)
+        );
+    }
+
+    #[test]
+    fn cache_decision_miss_ttl_expired() {
+        let decision = CacheDecision::cache_miss(CacheReasonCode::TtlExpired, Some("sha1"));
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::TtlExpired);
+        assert_eq!(
+            decision.first_mismatch_dimension,
+            Some(CacheReasonCode::TtlExpired)
+        );
+    }
+
+    #[test]
+    fn cache_decision_serialization_roundtrip() {
+        let hit = CacheDecision::cache_hit("abc123");
+        let json = serde_json::to_string(&hit).expect("serialize hit");
+        let parsed: CacheDecision = serde_json::from_str(&json).expect("deserialize hit");
+        assert_eq!(parsed.hit, hit.hit);
+        assert_eq!(parsed.reason_code, hit.reason_code);
+        assert_eq!(
+            parsed.first_mismatch_dimension,
+            hit.first_mismatch_dimension
+        );
+        assert_eq!(parsed.cached_sha, hit.cached_sha);
+
+        let miss = CacheDecision::cache_miss(CacheReasonCode::PolicyDrift, Some("def456"));
+        let json = serde_json::to_string(&miss).expect("serialize miss");
+        let parsed: CacheDecision = serde_json::from_str(&json).expect("deserialize miss");
+        assert_eq!(parsed.hit, miss.hit);
+        assert_eq!(parsed.reason_code, miss.reason_code);
+        assert_eq!(
+            parsed.first_mismatch_dimension,
+            miss.first_mismatch_dimension
+        );
+        assert_eq!(parsed.cached_sha, miss.cached_sha);
+    }
+
+    #[test]
+    fn cache_decision_json_skip_serializing_none_fields() {
+        let hit = CacheDecision::cache_hit("abc123");
+        let json = serde_json::to_string(&hit).expect("serialize");
+        // first_mismatch_dimension is None on hit — should not appear in JSON.
+        assert!(
+            !json.contains("first_mismatch_dimension"),
+            "hit should skip null first_mismatch_dimension: {json}"
+        );
+
+        let miss = CacheDecision::cache_miss(CacheReasonCode::ShaMiss, None);
+        let json = serde_json::to_string(&miss).expect("serialize");
+        // cached_sha is None on sha_miss — should not appear in JSON.
+        assert!(
+            !json.contains("cached_sha"),
+            "sha_miss with no cached_sha should skip null cached_sha: {json}"
+        );
+        // first_mismatch_dimension IS present on miss.
+        assert!(
+            json.contains("first_mismatch_dimension"),
+            "miss should include first_mismatch_dimension: {json}"
+        );
+    }
+
+    #[test]
+    fn map_reason_to_code_covers_all_known_reasons() {
+        let cases = [
+            ("no_record", CacheReasonCode::GateMiss),
+            ("status_not_pass", CacheReasonCode::GateMiss),
+            (
+                "v2_sourced_no_binding_proof",
+                CacheReasonCode::SignatureInvalid,
+            ),
+            ("signature_missing", CacheReasonCode::SignatureInvalid),
+            ("signer_id_missing", CacheReasonCode::SignatureInvalid),
+            (
+                "signature_field_too_long",
+                CacheReasonCode::SignatureInvalid,
+            ),
+            ("signer_id_invalid_hex", CacheReasonCode::SignatureInvalid),
+            (
+                "signer_id_length_mismatch",
+                CacheReasonCode::SignatureInvalid,
+            ),
+            ("signer_id_mismatch", CacheReasonCode::SignatureInvalid),
+            ("signature_invalid_hex", CacheReasonCode::SignatureInvalid),
+            ("signature_malformed", CacheReasonCode::SignatureInvalid),
+            ("signature_invalid", CacheReasonCode::SignatureInvalid),
+            (
+                "signature_unverifiable_no_key",
+                CacheReasonCode::SignatureInvalid,
+            ),
+            (
+                "receipt_binding_missing",
+                CacheReasonCode::ReceiptBindingMissing,
+            ),
+            ("attestation_mismatch", CacheReasonCode::InputDrift),
+            ("attestation_missing_current", CacheReasonCode::InputDrift),
+            ("evidence_digest_missing", CacheReasonCode::InputDrift),
+            ("quick_receipt_not_reusable", CacheReasonCode::InputDrift),
+        ];
+        for (reason, expected_code) in &cases {
+            let code = GateCacheV3::map_reason_to_code(reason);
+            assert_eq!(
+                code, *expected_code,
+                "map_reason_to_code({reason:?}) should be {expected_code:?}, got {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_reason_to_code_unknown_defaults_to_input_drift() {
+        let code = GateCacheV3::map_reason_to_code("completely_unknown_reason");
+        assert_eq!(
+            code,
+            CacheReasonCode::InputDrift,
+            "unknown reason must default to InputDrift (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn check_reuse_decision_hit_returns_cache_hit() {
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+        let cache = make_signed_v3(&signer);
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let decision = cache.check_reuse_decision("rustfmt", Some(digest), true, Some(&vk));
+        assert!(decision.hit, "signed cache should produce hit");
+        assert_eq!(decision.reason_code, CacheReasonCode::CacheHit);
+        assert!(decision.first_mismatch_dimension.is_none());
+        assert_eq!(decision.cached_sha.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn check_reuse_decision_gate_miss_for_absent_gate() {
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+        let cache = make_signed_v3(&signer);
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let decision =
+            cache.check_reuse_decision("nonexistent_gate", Some(digest), true, Some(&vk));
+        assert!(!decision.hit, "absent gate should produce miss");
+        assert_eq!(decision.reason_code, CacheReasonCode::GateMiss);
+        assert_eq!(
+            decision.first_mismatch_dimension,
+            Some(CacheReasonCode::GateMiss)
+        );
+    }
+
+    #[test]
+    fn check_reuse_decision_input_drift_for_attestation_mismatch() {
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+        let cache = make_signed_v3(&signer);
+        // Use a different digest than the one in the cache entry.
+        let wrong_digest =
+            "b3-256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let decision = cache.check_reuse_decision("rustfmt", Some(wrong_digest), true, Some(&vk));
+        assert!(!decision.hit, "attestation mismatch should produce miss");
+        assert_eq!(
+            decision.reason_code,
+            CacheReasonCode::InputDrift,
+            "attestation mismatch maps to InputDrift"
+        );
+        assert_eq!(
+            decision.first_mismatch_dimension,
+            Some(CacheReasonCode::InputDrift)
+        );
+    }
+
+    #[test]
+    fn check_reuse_decision_receipt_binding_missing_for_unbound_entry() {
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+        let key = sample_compound_key();
+        let mut cache = GateCacheV3::new("abc123", key).expect("new");
+        let mut result = sample_gate_result();
+        result.rfc0028_receipt_bound = false;
+        result.rfc0029_receipt_bound = false;
+        cache.set("rustfmt", result).expect("set");
+        cache.sign_all(&signer);
+
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let decision = cache.check_reuse_decision("rustfmt", Some(digest), true, Some(&vk));
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::ReceiptBindingMissing);
+        assert_eq!(
+            decision.first_mismatch_dimension,
+            Some(CacheReasonCode::ReceiptBindingMissing)
+        );
+    }
+
+    #[test]
+    fn check_reuse_decision_signature_invalid_for_unsigned_entry() {
+        let signer = Signer::generate();
+        let vk = signer.verifying_key();
+        let key = sample_compound_key();
+        let mut cache = GateCacheV3::new("abc123", key).expect("new");
+        cache.set("rustfmt", sample_gate_result()).expect("set");
+        // Do NOT sign — signature will be missing.
+
+        let digest = "b3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let decision = cache.check_reuse_decision("rustfmt", Some(digest), true, Some(&vk));
+        assert!(!decision.hit);
+        assert_eq!(decision.reason_code, CacheReasonCode::SignatureInvalid);
+        assert_eq!(
+            decision.first_mismatch_dimension,
+            Some(CacheReasonCode::SignatureInvalid)
+        );
     }
 }

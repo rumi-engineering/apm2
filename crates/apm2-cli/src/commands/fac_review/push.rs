@@ -835,6 +835,40 @@ where
             }
 
             if result.mode.eq_ignore_ascii_case("joined") {
+                // BF-001 (TCK-00626): For non-terminal "joined" results,
+                // verify the PID is still alive. A stale run-state with a
+                // dead PID should be treated as a dispatch that needs retry.
+                let is_terminal = result.run_state.eq_ignore_ascii_case("completed")
+                    || result.run_state.eq_ignore_ascii_case("failed")
+                    || result.run_state.eq_ignore_ascii_case("cancelled");
+                if !is_terminal {
+                    if let Some(pid) = result.pid {
+                        let alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
+                        if !alive {
+                            if emit_logs {
+                                eprintln!(
+                                    "fac push: {review_type} dispatch returned 'joined' with dead PID {pid}; \
+                                     retrying dispatch",
+                                );
+                            }
+                            let err = format!(
+                                "{review_type} joined dispatch has dead PID {pid} (run_state={})",
+                                result.run_state
+                            );
+                            let delay = retry_delay_or_fail(
+                                &mut retry_counts,
+                                retry_budget,
+                                review_type,
+                                "dispatch_dead_pid",
+                                PushRetryClass::DispatchTransient,
+                                &err,
+                                emit_logs,
+                            )?;
+                            thread::sleep(delay);
+                            continue;
+                        }
+                    }
+                }
                 break result;
             }
 
@@ -2192,7 +2226,24 @@ pub fn run_push(
             normalize_error_hint(&e),
         );
         human_log!("WARNING: review dispatch failed: {e}");
-        human_log!("  Use `apm2 fac restart --pr {pr_number}` to retry.");
+        human_log!("  Reviewers are NOT running. Use one of:");
+        human_log!("    apm2 fac review dispatch <PR_URL> --type all");
+        human_log!("    apm2 fac restart --pr {pr_number}");
+        // BF-001 (TCK-00626): Emit structured dispatch_failed event so
+        // the event stream captures the failure for automated recovery.
+        if json_output {
+            let _ = emit_jsonl(&serde_json::json!({
+                "event": "dispatch_failed",
+                "ts": ts_now(),
+                "pr_number": pr_number,
+                "sha": sha,
+                "error": e,
+                "recovery_commands": [
+                    format!("apm2 fac review dispatch <PR_URL> --type all"),
+                    format!("apm2 fac restart --pr {pr_number}"),
+                ],
+            }));
+        }
         Some(e)
     } else {
         attempt.set_stage_pass("dispatch", dispatch_started.elapsed().as_secs());
