@@ -963,10 +963,19 @@ by another worker).
   to resolve outside the lane root.
 - [INV-LANE-CLEANUP-004d] The `u64::MAX` sentinel returned by
   `estimate_job_log_dir_size_recursive` when `MAX_LANE_SCAN_ENTRIES` is exceeded
-  is never used in byte-quota arithmetic. Both `enforce_log_retention` and
+  OR when `MAX_TRAVERSAL_DEPTH` is reached is never used in byte-quota
+  arithmetic. Both `enforce_log_retention` and
   `collect_lane_log_retention_targets` check for the sentinel before entering
   the byte-quota phase; when detected, the byte-quota phase is skipped entirely
-  (safe fallback: TTL and keep-last-N still apply).
+  (safe fallback: TTL and keep-last-N still apply). Depth overflow returns
+  `u64::MAX` (not `0`) so deeply-nested directories cannot bypass quota pruning
+  by being undercounted as zero bytes.
+- [INV-LANE-CLEANUP-004e] GC execution (`execute_gc`) handles symlink
+  `LaneLogRetention` targets via `std::fs::remove_file` (not `safe_rmtree`,
+  which rejects symlink roots by design). The symlink entry is removed from
+  the parent directory without following it. Parent-boundary checks ensure the
+  symlink path is a child of `allowed_parent`. `NotFound` errors are treated
+  as benign (already absent).
 - [INV-LANE-CLEANUP-005] A RUNNING `LaneLeaseV1` must be persisted before
   job execution and removed on every terminal path.
 - [INV-LANE-CLEANUP-006] Job completion (Completed receipt + move to completed/)
@@ -3649,11 +3658,20 @@ includes `"lane_log_retention"` for the new action kind.
   symlink and file targets) are discarded. This ensures fail-closed atomicity.
 - [INV-LLR-007] Size estimation sentinel guard: The `u64::MAX` value returned by
   `estimate_job_log_dir_size_recursive` when the scan exceeds `MAX_LANE_SCAN_ENTRIES`
-  is a traversal-failure sentinel, not a real byte count. Both
-  `collect_lane_log_retention_targets` and `enforce_log_retention` check for the
-  sentinel before entering the byte-quota phase. When detected, byte-quota
-  enforcement is skipped (safe fallback: TTL and keep-last-N phases still apply).
-  This prevents saturating arithmetic from disabling byte-quota enforcement.
+  OR when recursion depth reaches `MAX_TRAVERSAL_DEPTH` is a traversal-failure
+  sentinel, not a real byte count. Both `collect_lane_log_retention_targets` and
+  `enforce_log_retention` check for the sentinel before entering the byte-quota
+  phase. When detected, byte-quota enforcement is skipped (safe fallback: TTL and
+  keep-last-N phases still apply). This prevents saturating arithmetic from
+  disabling byte-quota enforcement. Depth overflow returns `u64::MAX` (not `0`)
+  to ensure deeply-nested directories are fail-closed, not silently accepted as
+  zero-byte entries.
+- [INV-LLR-008] GC symlink execution: `execute_gc` detects `LaneLogRetention`
+  targets that are symlinks (via `symlink_metadata`) and uses `remove_file`
+  instead of `safe_rmtree_v1_with_entry_limit`. This is necessary because
+  `safe_rmtree` rejects symlink roots by design (`SymlinkDetected` error),
+  which would cause symlink GC targets to fail indefinitely. Parent-boundary
+  checks prevent removal of symlinks outside `allowed_parent`.
 
 ## metrics Submodule (TCK-00551)
 

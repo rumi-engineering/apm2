@@ -720,8 +720,12 @@ fn estimate_job_log_dir_size_recursive_inner(
     visited_count: &mut usize,
     depth: usize,
 ) -> u64 {
+    // CQ-MAJOR-2 fix (round N+1): Depth overflow must return u64::MAX
+    // (same fail-closed sentinel as MAX_LANE_SCAN_ENTRIES overflow) so
+    // callers treat it as unknown size. Returning 0 would let deeply-
+    // nested directories bypass byte-quota pruning by being undercounted.
     if depth >= MAX_TRAVERSAL_DEPTH {
-        return 0;
+        return u64::MAX;
     }
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
@@ -1101,6 +1105,86 @@ pub fn execute_gc(plan: &GcPlan) -> GcReceiptV1 {
         } else {
             None
         };
+
+        // CQ-MAJOR-1 fix (round N+1): LaneLogRetention targets that are
+        // symlinks cannot be removed by `safe_rmtree` (which rejects symlink
+        // roots by design). Detect symlinks via `symlink_metadata` and use
+        // `std::fs::remove_file` instead — symlinks are files in the
+        // directory namespace, so `remove_file` is the correct syscall.
+        // Parent-boundary check: verify the target lives under its
+        // allowed_parent before deletion.
+        if target.kind == crate::fac::gc_receipt::GcActionKind::LaneLogRetention {
+            match std::fs::symlink_metadata(&target.path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    // Parent-boundary check: target must be a child of
+                    // allowed_parent. Use canonical comparison on the
+                    // target's parent (NOT the symlink target itself).
+                    let is_child = target
+                        .path
+                        .parent()
+                        .is_some_and(|p| p.starts_with(&target.allowed_parent));
+                    if !is_child {
+                        errors.push(crate::fac::gc_receipt::GcError {
+                            target_path: target.path.display().to_string(),
+                            reason: format!(
+                                "symlink target outside allowed parent: {}",
+                                target.allowed_parent.display()
+                            ),
+                        });
+                        continue;
+                    }
+                    match std::fs::remove_file(&target.path) {
+                        Ok(()) => {
+                            actions.push(crate::fac::gc_receipt::GcAction {
+                                target_path: target.path.display().to_string(),
+                                action_kind: target.kind,
+                                bytes_freed: 0,
+                                files_deleted: 1,
+                                dirs_deleted: 0,
+                            });
+                        },
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            // Already absent — benign race.
+                            actions.push(crate::fac::gc_receipt::GcAction {
+                                target_path: target.path.display().to_string(),
+                                action_kind: target.kind,
+                                bytes_freed: 0,
+                                files_deleted: 0,
+                                dirs_deleted: 0,
+                            });
+                        },
+                        Err(e) => {
+                            errors.push(crate::fac::gc_receipt::GcError {
+                                target_path: target.path.display().to_string(),
+                                reason: format!("symlink removal failed: {e}"),
+                            });
+                        },
+                    }
+                    continue;
+                },
+                Ok(_) => {
+                    // Not a symlink — fall through to normal rmtree path.
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Already absent — report as successful no-op.
+                    actions.push(crate::fac::gc_receipt::GcAction {
+                        target_path: target.path.display().to_string(),
+                        action_kind: target.kind,
+                        bytes_freed: 0,
+                        files_deleted: 0,
+                        dirs_deleted: 0,
+                    });
+                    continue;
+                },
+                Err(e) => {
+                    errors.push(crate::fac::gc_receipt::GcError {
+                        target_path: target.path.display().to_string(),
+                        reason: format!("symlink_metadata failed: {e}"),
+                    });
+                    continue;
+                },
+            }
+        }
 
         // MAJOR-4 fix: Use elevated entry limit for LaneLogRetention
         // targets. Job log directories may legitimately exceed the default
@@ -3547,6 +3631,202 @@ mod tests {
         assert!(
             job_a.exists(),
             "job-a must survive: byte-quota must be skipped when sentinel detected"
+        );
+    }
+
+    // =========================================================================
+    // Regression tests for round-N+1 review findings (CQ-MAJOR-1, CQ-MAJOR-2)
+    // =========================================================================
+
+    /// CQ-MAJOR-1 regression: symlink GC targets emitted by
+    /// `collect_lane_log_retention_targets` must be successfully removed by
+    /// `execute_gc` using `remove_file`, NOT `safe_rmtree` (which rejects
+    /// symlink roots by design with `SymlinkDetected`).
+    #[cfg(unix)]
+    #[test]
+    fn execute_gc_removes_symlink_lane_log_retention_targets() {
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root.clone()).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
+
+        // Create the lane lock file so execute_gc can acquire the lock.
+        // ensure_directories() creates locks/lanes/ but not the .lock files.
+        let lock_dir = fac_root.join("locks").join("lanes");
+        std::fs::create_dir_all(&lock_dir).expect("create lock dir");
+        std::fs::write(lock_dir.join(format!("{lane_id}.lock")), b"")
+            .expect("create lane lock file");
+
+        // Create a real target outside the lane for the symlink to point to.
+        let outside_target = dir.path().join("outside-target");
+        std::fs::create_dir_all(&outside_target).expect("create outside target");
+        let canary = outside_target.join("canary.txt");
+        std::fs::write(&canary, b"must survive").expect("write canary");
+
+        // Create a symlink entry under logs/ (invalid — only directories
+        // should exist here).
+        let symlink_path = logs_dir.join("evil-symlink-job");
+        std::os::unix::fs::symlink(&outside_target, &symlink_path)
+            .expect("create symlink under logs/");
+        assert!(
+            symlink_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "precondition: must be a symlink"
+        );
+
+        // Construct a GcPlan with the symlink as a LaneLogRetention target
+        // (exactly as collect_lane_log_retention_targets would emit).
+        let plan = GcPlan {
+            targets: vec![GcTarget {
+                path: symlink_path.clone(),
+                allowed_parent: logs_dir,
+                kind: crate::fac::gc_receipt::GcActionKind::LaneLogRetention,
+                estimated_bytes: 0,
+            }],
+        };
+
+        let receipt = execute_gc(&plan);
+
+        // The symlink must have been removed — no errors.
+        assert_eq!(
+            receipt.errors.len(),
+            0,
+            "symlink LaneLogRetention target must not produce errors, got: {:?}",
+            receipt.errors
+        );
+        assert_eq!(
+            receipt.actions.len(),
+            1,
+            "exactly one action expected for the symlink target"
+        );
+        assert!(
+            symlink_path.symlink_metadata().is_err(),
+            "symlink must have been removed by execute_gc"
+        );
+
+        // Canary file must survive — the symlink was removed, not followed.
+        assert!(
+            canary.exists(),
+            "canary file outside lane root must not be affected — \
+             only the symlink entry was removed, not its target"
+        );
+    }
+
+    /// CQ-MAJOR-2 regression: depth overflow in
+    /// `estimate_job_log_dir_size_recursive_inner` MUST return `u64::MAX`
+    /// (fail-closed sentinel), NOT `0`. Returning `0` would allow deeply-
+    /// nested directories to bypass byte-quota pruning by being
+    /// undercounted as zero bytes.
+    #[test]
+    fn depth_overflow_returns_sentinel_not_zero() {
+        let dir = tempdir().expect("tmp");
+        let root = dir.path().join("deep");
+
+        // Build a directory tree deeper than MAX_TRAVERSAL_DEPTH.
+        // Each level has one file to produce a non-zero "real" size if
+        // the estimator were not depth-capped.
+        let mut current = root.clone();
+        for level in 0..=MAX_TRAVERSAL_DEPTH + 2 {
+            std::fs::create_dir_all(&current).expect("mkdir deep level");
+            write_file(&current.join(format!("file_{level}.dat")), 1024);
+            current = current.join(format!("d{level}"));
+        }
+
+        let mut visited = 0;
+        let size = estimate_job_log_dir_size_recursive(&root, &mut visited);
+
+        // The estimator MUST return u64::MAX because it hits depth >=
+        // MAX_TRAVERSAL_DEPTH in the recursive descent. Returning 0
+        // would be the old (broken) behavior.
+        assert_eq!(
+            size,
+            u64::MAX,
+            "depth overflow must return u64::MAX sentinel (fail-closed), not 0"
+        );
+    }
+
+    /// CQ-MAJOR-2 regression (end-to-end): a lane log directory whose
+    /// recursive size estimation hits the depth limit must not allow
+    /// byte-quota bypass. The sentinel value must trigger the fail-closed
+    /// path that skips byte-quota enforcement entirely.
+    #[test]
+    fn deep_tree_cannot_bypass_quota_via_zero_size() {
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
+
+        let now = current_wall_clock_secs();
+
+        // Create a "normal" small job log (recent, 100 bytes).
+        let _job_a = create_job_log_dir(&logs_dir, "job-normal", 100, now.saturating_sub(10));
+
+        // Create a deep-nested job log that will trigger depth overflow.
+        let deep_job = logs_dir.join("job-deep");
+        std::fs::create_dir_all(&deep_job).expect("mkdir deep job");
+        let mut current = deep_job.clone();
+        for level in 0..=MAX_TRAVERSAL_DEPTH + 2 {
+            std::fs::create_dir_all(&current).expect("mkdir level");
+            write_file(&current.join(format!("data_{level}.bin")), 2048);
+            current = current.join(format!("sub{level}"));
+        }
+        set_file_mtime(&deep_job, filetime_from_secs(now.saturating_sub(20)))
+            .expect("set deep job mtime");
+
+        // Verify precondition: estimator returns u64::MAX for the deep job.
+        let mut visited = 0;
+        let est = estimate_job_log_dir_size_recursive(&deep_job, &mut visited);
+        assert_eq!(
+            est,
+            u64::MAX,
+            "precondition: estimator must return u64::MAX for deep job"
+        );
+
+        // Use a very tight byte quota. If depth overflow returned 0 (old bug):
+        // - deep job counted as 0 bytes
+        // - total_bytes = 100 (only job-normal)
+        // - 100 > 50 → job-normal pruned (WRONG — deep job is the oversized one)
+        // With the fix (u64::MAX sentinel):
+        // - has_size_overflow = true → byte-quota phase skipped entirely
+        let config = LogRetentionConfig {
+            per_lane_log_max_bytes: 50, // Very tight quota
+            per_job_log_ttl_secs: 0,    // No TTL pruning (use default 7 days)
+            keep_last_n_jobs_per_lane: 0,
+        };
+
+        let mut targets = Vec::new();
+        collect_lane_log_retention_targets(
+            &lane_manager,
+            &lane_ids,
+            &config,
+            now,
+            &HashSet::new(),
+            &mut targets,
+        );
+
+        // With fail-closed sentinel: byte-quota is skipped, no TTL pruning
+        // (all recent). No targets should be emitted.
+        assert_eq!(
+            targets.len(),
+            0,
+            "deep tree triggering depth-overflow sentinel must not allow \
+             byte-quota bypass — no pruning targets expected, got {} \
+             (paths: {:?})",
+            targets.len(),
+            targets.iter().map(|t| &t.path).collect::<Vec<_>>()
         );
     }
 }
