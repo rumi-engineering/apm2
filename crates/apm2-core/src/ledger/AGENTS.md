@@ -221,7 +221,13 @@ Initializes the canonical `events` table schema on a raw SQLite connection. Requ
 
 ### `migrate_legacy_ledger_events(conn) -> Result<MigrationStats, LedgerError>`
 
-RFC-0032 Phase 0: Migrates legacy `ledger_events` rows into the canonical `events` table with a real hash chain. Callable from daemon startup before opening a `Ledger`. Runs atomically under an EXCLUSIVE SQLite transaction. Idempotent: safe to call on every startup. After migration, `determine_read_mode()` returns `CanonicalEvents` and write operations succeed. The original `ledger_events` table is renamed to `ledger_events_legacy_frozen` for audit.
+RFC-0032 Phase 0: Migrates legacy `ledger_events` rows into the canonical `events` table with a real hash chain. Callable from daemon startup before opening a `Ledger`. Runs atomically under an EXCLUSIVE SQLite transaction. Idempotent: safe to call on every startup. After migration, `determine_read_mode()` returns `CanonicalEvents` and write operations succeed. The `ledger_events` table is preserved (emptied, not renamed) so legacy daemon writers can still INSERT into it without crashing. An immutable audit copy is stored as `ledger_events_legacy_frozen`.
+
+**Migration decision matrix:**
+- `events > 0, legacy > 0` -> `AmbiguousSchemaState` error (fail-closed)
+- `events > 0, legacy == 0` -> no-op (`already_migrated: true`)
+- `events == 0, legacy > 0` -> migrate rows from `ledger_events` to `events`
+- `events == 0, legacy == 0` -> no-op (`already_migrated: false`, empty table cleanup)
 
 **Invariants:**
 - [INV-LED-010] Migration is atomic: on failure the database is unchanged
@@ -229,6 +235,7 @@ RFC-0032 Phase 0: Migrates legacy `ledger_events` rows into the canonical `event
 - [INV-LED-012] Hash chain is contiguous after migration: no NULL `event_hash` values
 - [INV-LED-013] Fail-closed: ambiguous schema state (both tables have rows) is rejected
 - [INV-LED-014] Fail-closed: if `ledger_events_legacy_frozen` exists AND a live `ledger_events` table also has rows (recreated by a legacy writer), returns `MigrationLegacyRecreated` error
+- [INV-LED-015] `ledger_events` table is preserved after migration (emptied, not renamed) for legacy writer compatibility
 
 ### `Ledger::open_reader() -> Result<LedgerReader, LedgerError>`
 

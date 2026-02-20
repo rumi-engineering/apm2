@@ -226,9 +226,12 @@ pub fn init_canonical_schema(conn: &Connection) -> Result<(), LedgerError> {
 ///
 /// This function implements RFC-0032 Phase 0: unification of the daemon's
 /// `ledger_events` table into the kernel's `events` table. After migration,
-/// `determine_read_mode()` returns `CanonicalEvents` because the
-/// `ledger_events` table no longer exists (it is renamed to
-/// `ledger_events_legacy_frozen` for audit).
+/// `determine_read_mode()` returns `CanonicalEvents` because `events` has
+/// rows and `ledger_events` has zero rows.
+///
+/// The original `ledger_events` table is preserved (emptied, not renamed)
+/// so that legacy daemon writers can still INSERT into it without crashing.
+/// An immutable audit copy is stored as `ledger_events_legacy_frozen`.
 ///
 /// # Atomicity
 ///
@@ -246,7 +249,9 @@ pub fn init_canonical_schema(conn: &Connection) -> Result<(), LedgerError> {
 /// - If `ledger_events_legacy_frozen` exists AND `ledger_events` also has rows,
 ///   fails with [`LedgerError::MigrationLegacyRecreated`] (fail-closed: a
 ///   legacy writer recreated the table after migration).
-/// - If `events` already has rows and `ledger_events` still exists, fails with
+/// - If `events` has rows and `ledger_events` has zero rows, returns `Ok` with
+///   `already_migrated = true` (canonical DB with empty legacy table).
+/// - If both `events` and `ledger_events` have rows, fails with
 ///   `AmbiguousSchemaState`.
 ///
 /// # Hash Chain
@@ -332,32 +337,43 @@ pub fn migrate_legacy_ledger_events(conn: &Connection) -> Result<MigrationStats,
 
 /// Inner migration logic, called within an exclusive transaction.
 fn migrate_legacy_inner(conn: &Connection) -> Result<MigrationStats, LedgerError> {
-    // Check `events` row count. If > 0 and `ledger_events` exists, fail-closed.
+    // Check `events` row count against `ledger_events` for migration decision.
     let events_rows: u64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| {
         row.get::<_, i64>(0).map(|v| v as u64)
     })?;
 
-    if events_rows > 0 {
-        let legacy_rows: u64 = conn.query_row("SELECT COUNT(*) FROM ledger_events", [], |row| {
-            row.get::<_, i64>(0).map(|v| v as u64)
-        })?;
+    let legacy_rows: u64 = conn.query_row("SELECT COUNT(*) FROM ledger_events", [], |row| {
+        row.get::<_, i64>(0).map(|v| v as u64)
+    })?;
+
+    if events_rows > 0 && legacy_rows > 0 {
+        // Both tables have rows — truly ambiguous, fail-closed.
         return Err(LedgerError::AmbiguousSchemaState {
             events_rows,
             legacy_rows,
         });
     }
 
-    // Count legacy rows and enforce safety bound.
-    let legacy_count: u64 = conn.query_row("SELECT COUNT(*) FROM ledger_events", [], |row| {
-        row.get::<_, i64>(0).map(|v| v as u64)
-    })?;
+    if events_rows > 0 && legacy_rows == 0 {
+        // Canonical events already present, legacy table is empty.
+        // This is the idempotent case: e.g., `init_schema_with_signing_key`
+        // created an empty `ledger_events` on a pre-canonicalized DB.
+        // Migration is a no-op.
+        return Ok(MigrationStats {
+            rows_migrated: 0,
+            already_migrated: true,
+        });
+    }
 
-    if legacy_count == 0 {
-        // No rows to migrate — rename the empty table and return.
-        conn.execute_batch("ALTER TABLE ledger_events RENAME TO ledger_events_legacy_frozen")?;
-
-        // Drop the compatibility view if it exists (it references the now-renamed
-        // table).
+    // `legacy_rows` was already counted above.
+    if legacy_rows == 0 {
+        // No rows to migrate — create a frozen backup (empty) and clear
+        // the compatibility view, but preserve `ledger_events` as a
+        // write-compatible sink for legacy runtime writers (BLOCKER 2 fix).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ledger_events_legacy_frozen AS \
+             SELECT * FROM ledger_events WHERE 0",
+        )?;
         conn.execute_batch(&format!("DROP VIEW IF EXISTS {LEGACY_EVENTS_COMPAT_VIEW}"))?;
 
         return Ok(MigrationStats {
@@ -366,10 +382,10 @@ fn migrate_legacy_inner(conn: &Connection) -> Result<MigrationStats, LedgerError
         });
     }
 
-    if legacy_count > MAX_LEGACY_MIGRATION_ROWS {
+    if legacy_rows > MAX_LEGACY_MIGRATION_ROWS {
         return Err(LedgerError::LegacySchemaMismatch {
             details: format!(
-                "ledger_events has {legacy_count} rows, exceeding safety limit of \
+                "ledger_events has {legacy_rows} rows, exceeding safety limit of \
                  {MAX_LEGACY_MIGRATION_ROWS}; manual migration required"
             ),
         });
@@ -422,12 +438,20 @@ fn migrate_legacy_inner(conn: &Connection) -> Result<MigrationStats, LedgerError
         rows_migrated += 1;
     }
 
-    // Drop the compatibility view before renaming the table (the view references
-    // `ledger_events` which we are about to rename).
+    // Drop the compatibility view (it is no longer needed after migration).
     conn.execute_batch(&format!("DROP VIEW IF EXISTS {LEGACY_EVENTS_COMPAT_VIEW}"))?;
 
-    // Rename `ledger_events` to `ledger_events_legacy_frozen` for audit.
-    conn.execute_batch("ALTER TABLE ledger_events RENAME TO ledger_events_legacy_frozen")?;
+    // BLOCKER 2 fix: Preserve `ledger_events` as a write-compatible sink for
+    // legacy runtime writers.  Instead of renaming it (which breaks daemon
+    // code that still INSERTs into `ledger_events`), create an immutable
+    // audit copy and clear the original table.
+    //
+    // 1. `ledger_events_legacy_frozen` = immutable audit record of migrated rows.
+    // 2. `ledger_events` = emptied but still exists for legacy writer compat.
+    // 3. `determine_read_mode` sees events > 0, legacy == 0 → CanonicalEvents.
+    // 4. Next startup: migration sees events > 0, legacy == 0 → no-op (BLOCKER 1).
+    conn.execute_batch("CREATE TABLE ledger_events_legacy_frozen AS SELECT * FROM ledger_events")?;
+    conn.execute_batch("DELETE FROM ledger_events")?;
 
     Ok(MigrationStats {
         rows_migrated,
