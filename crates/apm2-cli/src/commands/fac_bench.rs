@@ -168,6 +168,7 @@ pub fn run_fac_bench(
     pids_max: u64,
     cpu_quota: &str,
     json_output: bool,
+    write_mode: QueueWriteMode,
 ) -> u8 {
     let overall_start = Instant::now();
 
@@ -251,7 +252,7 @@ pub fn run_fac_bench(
             &serde_json::json!({"phase": "warm"}),
         );
         let warm_start = Instant::now();
-        let warm_ok = run_warm_phase(timeout_seconds, json_output);
+        let warm_ok = run_warm_phase(timeout_seconds, json_output, write_mode);
         let warm_dur = millis_from_elapsed(&warm_start);
         emit_event(
             json_output,
@@ -842,17 +843,11 @@ fn find_repo_root_from_cwd() -> Option<PathBuf> {
 /// Run the warm phase to pre-populate build caches.
 ///
 /// Returns `true` if warm succeeded.
-fn run_warm_phase(timeout_seconds: u64, json_output: bool) -> bool {
-    // Bench command uses UnsafeLocalWrite: it is a development/testing tool
-    // that operates outside the production service-user model.
-    let status = run_fac_warm(
-        &None,
-        &None,
-        true,
-        timeout_seconds,
-        json_output,
-        QueueWriteMode::UnsafeLocalWrite,
-    );
+fn run_warm_phase(timeout_seconds: u64, json_output: bool, write_mode: QueueWriteMode) -> bool {
+    // Thread caller-provided write mode through to warm phase.
+    // ServiceUserOnly is the default; UnsafeLocalWrite requires explicit
+    // --unsafe-local-write flag (TCK-00577).
+    let status = run_fac_warm(&None, &None, true, timeout_seconds, json_output, write_mode);
     status == exit_codes::SUCCESS
 }
 

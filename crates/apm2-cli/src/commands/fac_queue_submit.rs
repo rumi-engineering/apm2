@@ -249,13 +249,26 @@ pub(super) fn enqueue_job(
             // proceed with direct write to pending/.
             enqueue_direct(queue_root, fac_root, spec, queue_bounds_policy)
         },
-        Err(
-            ServiceUserGateError::NotServiceUser { .. }
-            | ServiceUserGateError::ServiceUserNotResolved { .. },
-        ) if write_mode == QueueWriteMode::ServiceUserOnly => {
-            // Non-service-user caller in normal mode — use broker-mediated
-            // enqueue path (TCK-00577 DoD: "CLI still works via
-            // broker-mediated enqueue").
+        Err(ServiceUserGateError::ServiceUserNotResolved { .. })
+            if write_mode == QueueWriteMode::ServiceUserOnly =>
+        {
+            // ServiceUserNotResolved means we cannot determine the service
+            // user identity at all — this is a hard failure in
+            // ServiceUserOnly mode (fail-closed). We must NOT fall back to
+            // broker-mediated enqueue because we have no proof the caller
+            // is legitimate (TCK-00577).
+            Err(
+                "service user gate denied queue write: service user identity \
+                 could not be resolved (fail-closed in ServiceUserOnly mode)"
+                    .to_string(),
+            )
+        },
+        Err(ServiceUserGateError::NotServiceUser { .. })
+            if write_mode == QueueWriteMode::ServiceUserOnly =>
+        {
+            // NotServiceUser means "I know who you are, you're just not
+            // the service user" — broker-mediated enqueue is the correct
+            // fallback (TCK-00577 DoD: "CLI still works via broker").
             tracing::info!(
                 job_id = %spec.job_id,
                 "TCK-00577: non-service-user caller, submitting via broker-mediated enqueue"
@@ -839,10 +852,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn enqueue_job_falls_back_to_broker_when_not_service_user() {
-        // This test runs as a normal user (not _apm2-job), so the
-        // service user gate will deny. enqueue_job should fall back
-        // to broker_requests/.
+    fn enqueue_job_hard_errors_when_service_user_not_resolved() {
+        // This test runs as a normal user on a system where the _apm2-job
+        // service user does not exist, so `ServiceUserNotResolved` fires.
+        // In ServiceUserOnly mode this MUST be a hard error — not a broker
+        // fallback (TCK-00577 round-4 fix).
         let dir = tempfile::TempDir::new().expect("create temp dir");
         let queue_root = dir.path().join("queue");
         let fac_root = dir.path().join("fac");
@@ -859,17 +873,17 @@ mod tests {
             QueueWriteMode::ServiceUserOnly,
         );
 
-        // Should succeed via broker-mediated path (either NotServiceUser
-        // or ServiceUserNotResolved triggers fallback).
+        // ServiceUserNotResolved in ServiceUserOnly mode is fail-closed:
+        // we cannot determine service user identity, so we must not
+        // silently fall back to broker.
         assert!(
-            result.is_ok(),
-            "enqueue_job should fall back to broker: {result:?}"
+            result.is_err(),
+            "ServiceUserNotResolved should be a hard error in ServiceUserOnly mode: {result:?}"
         );
-
-        let path = result.unwrap();
+        let err = result.unwrap_err();
         assert!(
-            path.starts_with(queue_root.join(BROKER_REQUESTS_DIR)),
-            "should be in broker_requests/: {path:?}"
+            err.contains("could not be resolved"),
+            "error should mention resolution failure: {err}"
         );
     }
 

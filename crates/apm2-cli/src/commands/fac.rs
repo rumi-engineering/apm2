@@ -2738,6 +2738,7 @@ pub fn run_fac(
             args.pids_max,
             &args.cpu_quota,
             resolve_json(args.json),
+            cmd.queue_write_mode(),
         ),
         FacSubcommand::Bundle(args) => match &args.subcommand {
             BundleSubcommand::Export(export_args) => {
