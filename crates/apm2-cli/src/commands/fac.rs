@@ -320,6 +320,12 @@ pub enum FacSubcommand {
     /// window and computes aggregate metrics. Supports `--json` for
     /// automation.
     Metrics(MetricsArgs),
+    /// Manage FAC caches: nuke (destructive purge with receipts).
+    ///
+    /// Provides explicit operator-only cache deletion with hard
+    /// confirmations, safety exclusions (receipts and broker keys are
+    /// NEVER deleted), and audit receipts.
+    Caches(crate::commands::fac_caches::CachesArgs),
 }
 
 /// Arguments for `apm2 fac metrics`.
@@ -2155,6 +2161,7 @@ pub fn run_fac(
             | FacSubcommand::Bootstrap(_)
             | FacSubcommand::Config(_)
             | FacSubcommand::Metrics(_)
+            | FacSubcommand::Caches(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
@@ -2644,6 +2651,9 @@ pub fn run_fac(
             crate::commands::fac_config::run_config_command(args, json_output)
         },
         FacSubcommand::Metrics(args) => run_metrics(args, json_output),
+        FacSubcommand::Caches(args) => {
+            crate::commands::fac_caches::run_caches_command(args, json_output)
+        },
     }
 }
 
@@ -2777,7 +2787,8 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Economics(_)
         | FacSubcommand::Bootstrap(_)
         | FacSubcommand::Config(_)
-        | FacSubcommand::Metrics(_) => true,
+        | FacSubcommand::Metrics(_)
+        | FacSubcommand::Caches(_) => true,
     }
 }
 
