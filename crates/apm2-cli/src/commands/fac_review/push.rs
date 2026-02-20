@@ -12,6 +12,7 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use apm2_core::fac::service_user_gate::QueueWriteMode;
 use apm2_core::fac::{parse_b3_256_digest, parse_policy_hash};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -360,7 +361,10 @@ fn update_pr(repo: &str, pr_number: u32, title: &str, body: &str) -> Result<(), 
     github_projection::update_pr(repo, pr_number, title, body)
 }
 
-fn run_blocking_evidence_gates(sha: &str) -> Result<QueuedGatesOutcome, String> {
+fn run_blocking_evidence_gates(
+    sha: &str,
+    write_mode: QueueWriteMode,
+) -> Result<QueuedGatesOutcome, String> {
     let request = QueuedGatesRequest {
         force: false,
         quick: false,
@@ -373,6 +377,10 @@ fn run_blocking_evidence_gates(sha: &str) -> Result<QueuedGatesOutcome, String> 
         // Prefer worker execution when available, but do not hard-require it:
         // push must remain single-command operable for callers.
         require_external_worker: false,
+        // TCK-00577: Use the caller-provided write mode. Default is
+        // ServiceUserOnly; only bypass when --unsafe-local-write is
+        // explicitly passed at the top-level FacCommand.
+        write_mode,
     };
     let outcome = run_queued_gates_and_collect(&request)?;
     validate_queued_gates_outcome_for_push(sha, outcome)
@@ -1381,6 +1389,7 @@ pub fn run_push(
     branch: Option<&str>,
     ticket: Option<&Path>,
     json_output: bool,
+    write_mode: QueueWriteMode,
 ) -> u8 {
     macro_rules! emit_machine_error {
         ($error:expr, $message:expr) => {{
@@ -1635,7 +1644,7 @@ pub fn run_push(
             );
             emit_stage("gates_started", serde_json::json!({}));
             let gates_started = Instant::now();
-            let gate_outcome = match run_blocking_evidence_gates(&sha) {
+            let gate_outcome = match run_blocking_evidence_gates(&sha, write_mode) {
                 Ok(outcome) => {
                     for gate in &outcome.gate_results {
                         let stage = stage_from_gate_name(&gate.gate_name);

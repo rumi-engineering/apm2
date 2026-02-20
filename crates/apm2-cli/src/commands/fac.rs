@@ -49,6 +49,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use apm2_core::fac::service_user_gate::QueueWriteMode;
 use apm2_core::fac::{
     LANE_ENV_DIRS, LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1, LaneManager,
     LaneReconcileReceiptV1, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
@@ -120,8 +121,34 @@ pub struct FacCommand {
     #[arg(long)]
     pub cas_path: Option<PathBuf>,
 
+    /// Bypass the service-user ownership gate for direct queue/receipt writes.
+    ///
+    /// By default, non-service-user processes are denied direct filesystem
+    /// writes to FAC queue and receipt directories (TCK-00577). This flag
+    /// disables that check for backward compatibility and development.
+    ///
+    /// **NOT recommended for production deployments.** Use broker-mediated
+    /// enqueue instead.
+    #[arg(long, default_value_t = false)]
+    pub unsafe_local_write: bool,
+
     #[command(subcommand)]
     pub subcommand: FacSubcommand,
+}
+
+impl FacCommand {
+    /// Derive the queue write mode from the `--unsafe-local-write` flag.
+    ///
+    /// Returns `QueueWriteMode::UnsafeLocalWrite` if the flag is set,
+    /// otherwise `QueueWriteMode::ServiceUserOnly` (the secure default).
+    #[must_use]
+    pub const fn queue_write_mode(&self) -> QueueWriteMode {
+        if self.unsafe_local_write {
+            QueueWriteMode::UnsafeLocalWrite
+        } else {
+            QueueWriteMode::ServiceUserOnly
+        }
+    }
 }
 
 /// FAC subcommands.
@@ -2163,7 +2190,38 @@ pub fn run_fac(
     let json_output = machine_output;
     let resolve_json = |_subcommand_json: bool| -> bool { machine_output };
 
-    if let Err(err) = crate::commands::fac_permissions::validate_fac_root_permissions() {
+    // TCK-00577 round 3: Enqueue-class commands (push, gates, warm) may be
+    // invoked by non-service-user callers in a service-user-owned deployment.
+    // These callers cannot satisfy the strict ownership check on FAC roots
+    // (directories are owned by the service user). Use a relaxed validation
+    // that checks mode bits and symlink safety but NOT ownership, so the
+    // caller can reach enqueue_job → broker fallback → broker_requests/.
+    // All other commands require strict ownership validation.
+    // TCK-00577 round 6: Bench spawns gate measurements as child processes
+    // that need the relaxed permission validation path (same as enqueue-class
+    // commands), so include it here.
+    // TCK-00577 round 9 MAJOR fix: Worker and Broker subcommands must also
+    // use relaxed validation. The worker itself sets queue/ to 0711 and
+    // broker_requests/ to 01733 via ensure_queue_dirs(). The strict validator
+    // (0700-only) rejects these intentional modes, causing worker restart to
+    // fail at preflight after mode hardening. The relaxed validator permits
+    // execute-only traversal bits (0o011) while still rejecting read/write
+    // group/other bits.
+    let is_enqueue_class = matches!(
+        cmd.subcommand,
+        FacSubcommand::Push(_)
+            | FacSubcommand::Gates(_)
+            | FacSubcommand::Warm(_)
+            | FacSubcommand::Bench(_)
+            | FacSubcommand::Worker(_)
+            | FacSubcommand::Broker(_)
+    );
+    let permissions_result = if is_enqueue_class {
+        crate::commands::fac_permissions::validate_fac_root_permissions_relaxed_for_enqueue()
+    } else {
+        crate::commands::fac_permissions::validate_fac_root_permissions()
+    };
+    if let Err(err) = permissions_result {
         return output_error(
             machine_output,
             "fac_root_permissions_failed",
@@ -2220,6 +2278,7 @@ pub fn run_fac(
             resolve_json(args.json),
             args.wait && !args.no_wait,
             args.wait_timeout_secs,
+            cmd.queue_write_mode(),
         ),
         FacSubcommand::Preflight(args) => match &args.subcommand {
             PreflightSubcommand::Credential(credential_args) => fac_preflight::run_credential(
@@ -2457,6 +2516,7 @@ pub fn run_fac(
                 args.branch.as_deref(),
                 args.ticket.as_deref(),
                 output_json,
+                cmd.queue_write_mode(),
             )
         },
         FacSubcommand::Restart(args) => {
@@ -2683,6 +2743,7 @@ pub fn run_fac(
             args.wait,
             args.wait_timeout_secs,
             resolve_json(args.json),
+            cmd.queue_write_mode(),
         ),
         FacSubcommand::Bench(args) => crate::commands::fac_bench::run_fac_bench(
             args.concurrency,
@@ -2692,6 +2753,7 @@ pub fn run_fac(
             args.pids_max,
             &args.cpu_quota,
             resolve_json(args.json),
+            cmd.queue_write_mode(),
         ),
         FacSubcommand::Bundle(args) => match &args.subcommand {
             BundleSubcommand::Export(export_args) => {

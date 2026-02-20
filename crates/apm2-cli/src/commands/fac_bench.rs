@@ -28,6 +28,7 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 use std::{env, fs};
 
+use apm2_core::fac::service_user_gate::QueueWriteMode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -167,6 +168,7 @@ pub fn run_fac_bench(
     pids_max: u64,
     cpu_quota: &str,
     json_output: bool,
+    write_mode: QueueWriteMode,
 ) -> u8 {
     let overall_start = Instant::now();
 
@@ -228,6 +230,7 @@ pub fn run_fac_bench(
         pids_max,
         cpu_quota,
         json_output,
+        write_mode,
     );
     emit_event(
         json_output,
@@ -250,7 +253,7 @@ pub fn run_fac_bench(
             &serde_json::json!({"phase": "warm"}),
         );
         let warm_start = Instant::now();
-        let warm_ok = run_warm_phase(timeout_seconds, json_output);
+        let warm_ok = run_warm_phase(timeout_seconds, json_output, write_mode);
         let warm_dur = millis_from_elapsed(&warm_start);
         emit_event(
             json_output,
@@ -286,6 +289,7 @@ pub fn run_fac_bench(
         pids_max,
         cpu_quota,
         json_output,
+        write_mode,
     );
     emit_event(
         json_output,
@@ -317,6 +321,7 @@ pub fn run_fac_bench(
             memory_max,
             pids_max,
             cpu_quota,
+            write_mode,
         );
         let concurrent_dur = millis_from_elapsed(&concurrent_start);
         let concurrent_passed = concurrent_runs.iter().filter(|r| r.all_passed).count();
@@ -490,6 +495,10 @@ pub fn run_fac_bench(
 // ---------------------------------------------------------------------------
 
 /// Run gates and capture timing, returning a `GateRunMeasurement`.
+///
+/// TCK-00577 round 6: `write_mode` is threaded through so the spawned
+/// `fac gates` child process receives `--unsafe-local-write` when the
+/// caller specified it.
 fn run_gate_measurement(
     label: &str,
     timeout_seconds: u64,
@@ -497,6 +506,7 @@ fn run_gate_measurement(
     pids_max: u64,
     cpu_quota: &str,
     json_output: bool,
+    write_mode: QueueWriteMode,
 ) -> GateRunMeasurement {
     let overall = Instant::now();
 
@@ -517,8 +527,14 @@ fn run_gate_measurement(
     // Run gates via the active CLI binary to get an isolated measurement.
     // We parse the JSON output to extract per-phase timings.
     let mut cmd = Command::new(exe);
+    cmd.arg("fac");
+    // TCK-00577 round 6: Forward --unsafe-local-write when active so the
+    // spawned gate process uses relaxed permission validation and can reach
+    // the broker-mediated enqueue path.
+    if write_mode == QueueWriteMode::UnsafeLocalWrite {
+        cmd.arg("--unsafe-local-write");
+    }
     cmd.args([
-        "fac",
         "--json",
         "gates",
         "--quick",
@@ -841,8 +857,11 @@ fn find_repo_root_from_cwd() -> Option<PathBuf> {
 /// Run the warm phase to pre-populate build caches.
 ///
 /// Returns `true` if warm succeeded.
-fn run_warm_phase(timeout_seconds: u64, json_output: bool) -> bool {
-    let status = run_fac_warm(&None, &None, true, timeout_seconds, json_output);
+fn run_warm_phase(timeout_seconds: u64, json_output: bool, write_mode: QueueWriteMode) -> bool {
+    // Thread caller-provided write mode through to warm phase.
+    // ServiceUserOnly is the default; UnsafeLocalWrite requires explicit
+    // --unsafe-local-write flag (TCK-00577).
+    let status = run_fac_warm(&None, &None, true, timeout_seconds, json_output, write_mode);
     status == exit_codes::SUCCESS
 }
 
@@ -853,12 +872,16 @@ fn run_warm_phase(timeout_seconds: u64, json_output: bool) -> bool {
 /// Run multiple gate runs concurrently and return their measurements.
 ///
 /// Bounded by `MAX_CONCURRENCY` (INV-BENCH-003).
+///
+/// TCK-00577 round 6: `write_mode` is forwarded to each spawned gate
+/// measurement so `--unsafe-local-write` propagates to child processes.
 fn run_concurrent_gates(
     concurrency: u8,
     timeout_seconds: u64,
     memory_max: &str,
     pids_max: u64,
     cpu_quota: &str,
+    write_mode: QueueWriteMode,
 ) -> Vec<GateRunMeasurement> {
     use std::thread;
 
@@ -871,8 +894,9 @@ fn run_concurrent_gates(
         let pids = pids_max;
         let cpu = cpu_quota.to_string();
 
-        let handle =
-            thread::spawn(move || run_gate_measurement(&label, timeout, &mem, pids, &cpu, false));
+        let handle = thread::spawn(move || {
+            run_gate_measurement(&label, timeout, &mem, pids, &cpu, false, write_mode)
+        });
         handles.push(handle);
     }
 

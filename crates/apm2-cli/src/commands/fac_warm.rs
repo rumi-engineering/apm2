@@ -36,6 +36,7 @@ use apm2_core::fac::job_spec::{
     Actuation, FacJobSpecV1, JobConstraints, JobSource, JobSpecValidationPolicy, LaneRequirements,
     MAX_QUEUE_LANE_LENGTH, validate_job_spec_with_policy,
 };
+use apm2_core::fac::service_user_gate::QueueWriteMode;
 use apm2_core::fac::warm::{DEFAULT_WARM_PHASES, MAX_WARM_PHASES, WarmPhase};
 use apm2_core::fac::{check_disk_space, load_or_default_boundary_id, lookup_job_receipt};
 
@@ -77,6 +78,7 @@ pub fn run_fac_warm(
     wait: bool,
     wait_timeout_secs: u64,
     json_output: bool,
+    write_mode: QueueWriteMode,
 ) -> u8 {
     // Resolve FAC root.
     let fac_root = match resolve_fac_root() {
@@ -237,6 +239,7 @@ pub fn run_fac_warm(
         &fac_root,
         &spec,
         &fac_policy.queue_bounds_policy,
+        write_mode,
     ) {
         return output_error(
             json_output,

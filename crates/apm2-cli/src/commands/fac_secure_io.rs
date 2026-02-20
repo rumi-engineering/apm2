@@ -10,14 +10,17 @@ use std::path::Path;
 ///
 /// Security properties:
 /// - Refuses symlinks on Unix (`O_NOFOLLOW`).
-/// - Refuses non-regular files.
+/// - Refuses non-regular files (FIFOs, sockets, devices).
+/// - Opens with `O_NONBLOCK` to prevent indefinite blocking on FIFOs
+///   (defense-in-depth; primary guard is the `symlink_metadata` pre-check in
+///   callers such as `promote_broker_requests`).
 /// - Enforces `max_size` with `Read::take(max_size + 1)` (fail-closed).
 pub fn read_bounded(path: &Path, max_size: usize) -> Result<Vec<u8>, String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
 
     let file = options

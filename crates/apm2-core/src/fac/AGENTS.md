@@ -684,6 +684,10 @@ enqueue attempts that would exceed configured caps.
   FAC private directory (`$APM2_HOME/private/fac/audit/denial_events.jsonl`)
   outside the writable queue directories, ensuring audit evidence resilience
   even if the `queue/denied/` directory is tampered with.
+- `promote_broker_requests()` in `fac_worker.rs` now receives the loaded
+  `FacPolicyV1::queue_bounds_policy` from `run_fac_worker` instead of using
+  `QueueBoundsPolicy::default()`. This ensures broker-mediated promotions
+  enforce the same configured limits as direct enqueue (TCK-00577 round 3).
 - `FacPolicyV1` includes a `queue_bounds_policy` field (`serde(default)` for
   backward compatibility with pre-TCK-00578 policies).
 - Control-lane `stop_revoke` jobs bypass queue bounds (consistent with the
@@ -3880,3 +3884,36 @@ admission pipeline with deterministic inputs. Security domains:
 12. **Multi-lane admission** (`e2e_multiple_lanes_admitted`):
     Bulk, Consume, and Control lanes all admitted with distinct
     broker-issued envelopes.
+
+## `service_user_gate.rs` — Service User Ownership Gate (TCK-00577)
+
+Enforces the receipt store permissions model: a dedicated FAC service user
+owns queue and receipt directories. Non-service-user processes must use
+broker-mediated enqueue or explicit `--unsafe-local-write`.
+
+### Key invariants
+
+- [INV-SU-001] Direct queue/receipt writes denied for non-service-user
+  processes unless `--unsafe-local-write` is active. **Fail-closed.**
+- [INV-SU-002] Service user identity resolved from effective uid at
+  decision time, not cached.
+- [INV-SU-003] `--unsafe-local-write` is per-invocation, does not persist.
+- [INV-SU-004] Ownership validation uses `lstat` (symlink_metadata).
+- [INV-SU-005] `resolve_uid_for_user` returns `Result<u32, String>` (not
+  `Option`). Both "user missing" and "lookup error" map to hard denial in
+  `ServiceUserOnly` mode — never implicit allow.
+- [INV-SU-006] `ServiceUserNotResolved` error variant covers unresolvable
+  service user (missing or lookup failure). Callers must use
+  `UnsafeLocalWrite` or broker-mediated path to bypass.
+- [INV-SU-007] `resolve_service_user_identity()` returns
+  `ServiceUserIdentity { name, uid, gid }` — the full passwd entry. Used
+  by broker-mediated enqueue to `fchown` broker files to the service user's
+  primary GID, enabling cross-user readability (mode 0640).
+
+### Public API
+
+- `check_queue_write_permission(QueueWriteMode)`: Gate check for direct writes.
+- `validate_directory_service_user_ownership(Path)`: Ownership validation.
+- `resolve_service_user_identity()`: Full identity resolution (name+UID+GID).
+  Returns `ServiceUserIdentity` on success, `ServiceUserGateError` on failure.
+  Used by `enqueue_via_broker_requests` for group-based file handoff.

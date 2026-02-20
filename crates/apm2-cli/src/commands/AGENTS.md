@@ -626,3 +626,247 @@ systemd service executables:
 - In JSON mode: emitted as NDJSON worker event
 - In text mode: emitted as structured key=value to stderr at INFO level
 - Non-fatal: digest failures produce error markers, not worker abort
+
+## `fac_queue_submit.rs` — Queue Submission with Service User Gate (TCK-00577)
+
+### Broker-mediated enqueue (TCK-00577)
+
+`enqueue_job` now has two write paths:
+
+1. **Direct path** (`enqueue_direct`): Used when the caller IS the service
+   user or `--unsafe-local-write` is active. Writes directly to
+   `queue/pending/` with full queue-bounds enforcement.
+
+2. **Broker-mediated path** (`enqueue_via_broker_requests`): Used when the
+   service user gate denies (caller is NOT the service user). Writes to
+   `queue/broker_requests/` instead. The FAC worker (running as service
+   user) promotes valid requests into `pending/` via `promote_broker_requests()`
+   in `fac_worker.rs`.
+
+### Broker promotion invariants (TCK-00577 round 2)
+
+- **Queue bounds enforcement**: `promote_broker_requests` calls
+  `check_queue_bounds` from `apm2_core::fac::queue_bounds` before each
+  promotion. When the pending queue is at capacity, the broker request is
+  quarantined with a denial log entry instead of promoted.
+- **Enqueue lock discipline**: Each promotion acquires the same
+  process-level lockfile (`queue/.enqueue.lock`) used by `enqueue_direct`
+  to serialize the check-then-rename sequence. This prevents TOCTOU races
+  between concurrent enqueue and promotion operations.
+- **No-replace rename**: Promotion uses `move_to_dir_safe` (which
+  internally uses `rename_noreplace`) instead of `fs::rename`. Filename
+  collisions with existing pending jobs result in a collision-safe
+  timestamped filename — existing pending jobs are never overwritten.
+- **Fail-closed on lock acquisition failure**: If the enqueue lockfile
+  cannot be acquired, the broker request is deferred to the next cycle
+  (not promoted).
+
+### Configured policy threading (TCK-00577 round 3)
+
+- **Broker promotion enforces configured policy**: `promote_broker_requests`
+  now receives the loaded `FacPolicyV1::queue_bounds_policy` from
+  `run_fac_worker`. The hardcoded `QueueBoundsPolicy::default()` is replaced
+  so that broker-mediated promotions enforce the same operator-configured
+  limits as direct enqueue.
+
+### Service-user ownership validation (TCK-00577 round 3)
+
+- **Worker startup wires ownership check**: `run_fac_worker` validates that
+  queue subdirectories (`pending/`, `claimed/`, `completed/`, `denied/`,
+  `cancelled/`, `quarantine/`) and `receipts/` are owned by the configured
+  FAC service user (via `validate_directory_service_user_ownership`). This
+  check runs after directories are created but before the worker loop starts.
+  Fail-closed: if the service user cannot be resolved or ownership deviates,
+  the worker refuses to start.
+
+### Relaxed startup validation for enqueue-class commands (TCK-00577 round 3)
+
+- **Non-service-user callers reach broker fallback**: The FAC root permissions
+  check at `run_fac` uses `validate_fac_root_permissions_relaxed_for_enqueue()`
+  for enqueue-class commands (`Push`, `Gates`, `Warm`). This checks mode bits
+  and symlink safety but NOT ownership, so non-service-user callers in a
+  service-user-owned deployment can reach `enqueue_job` → broker fallback →
+  `broker_requests/` (mode 01733). All other commands continue to use strict
+  ownership validation.
+
+### Permission hardening on enqueue paths (TCK-00577 round 8)
+
+- **Queue root mode 0711**: Both `enqueue_direct` and
+  `enqueue_via_broker_requests` explicitly set the queue root directory to
+  mode 0711 after `create_dir_all`. This prevents world-listing of queue
+  artifacts when the queue root is first created by an enqueue submission.
+  Fail-closed: if `set_permissions` fails, the enqueue is rejected.
+- **Pending dir mode 0711**: `enqueue_direct` explicitly sets the pending
+  directory to mode 0711.
+- **Broker requests mode 01733**: `enqueue_via_broker_requests` explicitly
+  sets broker_requests/ to mode 01733 (fail-closed on error).
+
+### ServiceUserNotResolved is a hard denial (TCK-00577 round 10 security fix)
+
+- **Fail-closed on unresolvable service user**: When
+  `check_queue_write_permission` returns `ServiceUserNotResolved` in
+  `ServiceUserOnly` mode, `enqueue_job` returns a hard error. The service
+  user identity cannot be confirmed, so no write path (including broker
+  fallback) is permitted. This prevents a local user from bypassing the
+  service user gate by misconfiguring or removing the service user account.
+- **Dev environment escape hatch**: Callers in dev environments MUST use
+  `--unsafe-local-write` to bypass the service user check. This is the
+  explicit opt-in that tells the system "I know there's no service user."
+- **NotServiceUser still falls back to broker**: Only `ServiceUserNotResolved`
+  is a hard error. `NotServiceUser` (identity IS resolved, caller is not
+  that user) correctly routes to broker-mediated enqueue.
+
+### FIFO poisoning defense (TCK-00577 round 9)
+
+- **Pre-open file type check**: `promote_broker_requests` calls
+  `symlink_metadata()` (lstat) on each entry BEFORE calling `read_bounded`.
+  Non-regular files (FIFOs, sockets, devices, symlinks) are quarantined
+  without ever being opened. This prevents a local attacker with write
+  access to the world-writable `broker_requests/` (mode 01733) from
+  creating a FIFO named `*.json` that would block the worker indefinitely
+  when opened without `O_NONBLOCK`.
+- **Defense-in-depth O_NONBLOCK**: `fac_secure_io::read_bounded` now opens
+  files with `O_NONBLOCK` in addition to `O_NOFOLLOW | O_CLOEXEC`. Even if
+  the pre-open check were bypassed (TOCTOU between lstat and open), the
+  `O_NONBLOCK` flag prevents the `open(2)` syscall from blocking on a FIFO.
+
+### Worker/Broker preflight validation (TCK-00577 round 9)
+
+- **Relaxed validation for Worker and Broker**: `run_fac` now routes
+  `FacSubcommand::Worker` and `FacSubcommand::Broker` through the relaxed
+  permission validator (`validate_fac_root_permissions_relaxed_for_enqueue`)
+  instead of the strict validator. The worker itself sets queue directories
+  to mode 0711 and `broker_requests/` to mode 01733 via `ensure_queue_dirs`.
+  The strict validator (0700-only) rejects these intentional modes, causing
+  worker restart to fail at preflight. The relaxed validator permits
+  execute-only traversal bits while still rejecting read/write group/other.
+
+### Non-service-user chmod avoidance (TCK-00577 round 9)
+
+- **Create-only chmod**: `enqueue_via_broker_requests` now tracks whether
+  directories existed before the call. For newly-created directories, it
+  sets the intended mode (0711 for queue root, 01733 for `broker_requests/`).
+  For pre-existing directories (owned by the service user), it validates the
+  existing mode is acceptable instead of calling `chmod` (which returns
+  EPERM for non-owner callers). This makes the broker fallback work for
+  non-service-user processes in service-user deployments.
+- **Fail-closed on unsafe pre-existing mode**: Pre-existing directories
+  with group/other read bits are rejected with an actionable error message.
+
+### Sticky-bit enforcement on pre-existing broker_requests (TCK-00577 round 10, hardened round 13)
+
+- **Sticky-bit required for non-owner-writable broker_requests**: When a
+  pre-existing `broker_requests/` directory has the group-write (0o020)
+  OR other-write (0o002) bit set (checked via `mode & 0o022`), the
+  sticky bit (mode & 0o1000) MUST also be set. Without the sticky bit,
+  any non-owner principal with group or other write access can unlink or
+  overwrite peer files inside the directory, breaking queue isolation
+  (CWE-379). Modes like `0333` and `0730` (writable without sticky) are
+  rejected. Modes like `01333`, `01733`, and `01730` (sticky set) are
+  accepted. Owner-only modes (e.g., `0700`) do not require the sticky
+  bit since neither group-write nor other-write is set.
+
+### Queue-aware strict validator (TCK-00577 round 10 code-quality fix)
+
+- **Strict validator excludes queue directories**: `FAC_SUBDIRS` was split
+  into `FAC_SUBDIRS_STRICT` (private/fac dirs, fac_lifecycle, fac_projection)
+  and `FAC_SUBDIRS_QUEUE` (queue, queue/pending, etc.). The strict validator
+  (`validate_fac_root_permissions_at`) only iterates `FAC_SUBDIRS_STRICT`.
+  This prevents non-enqueue commands like `fac lane status` from failing
+  with `fac_root_permissions_failed` when `queue/` has the intentional
+  hardened mode 0711.
+- **Relaxed validator checks both sets**: The relaxed validator
+  (`validate_fac_root_permissions_relaxed_for_enqueue_at`) iterates both
+  `FAC_SUBDIRS_STRICT` and `FAC_SUBDIRS_QUEUE`, using `validate_directory_mode_only`
+  which permits execute-only traversal bits (`o+x` without `o+r`/`o+w`).
+
+### Deterministic queue subdir permissions (TCK-00577 round 11 BLOCKER fix)
+
+- **All queue subdirs get mode 0711**: `ensure_queue_dirs` now explicitly
+  calls `set_permissions(0o711)` on every queue subdir (`pending/`,
+  `claimed/`, `completed/`, `denied/`, `quarantine/`, `cancelled/`,
+  `authority_consumed/`) after `create_dir_all`. Previously these subdirs
+  inherited the process umask (e.g., 0775 with umask 0o002), which caused
+  `validate_directory_mode_only` to reject them during relaxed preflight.
+- **Unconditional `broker_requests/` hardening**: `ensure_queue_dirs` now
+  sets `broker_requests/` to mode 01733 unconditionally at every startup,
+  not just when newly created. Pre-existing directories with unsafe modes
+  (e.g., 0333 -- world-writable without sticky) are hardened. This prevents
+  an attacker from tampering with the directory mode between worker restarts.
+
+### Service-user-owned rewrite on broker promotion (TCK-00577 round 12 BLOCKER fix)
+
+- **No attacker-owned inodes in pending/**: `promote_broker_requests` no
+  longer renames the original broker request file (owned by the non-service-user
+  submitter) into `pending/`. Because `rename()` preserves ownership and mode,
+  the submitter would retain write authority over the promoted file and could
+  mutate it after bounds/deserialization checks (TOCTOU).
+- **Rewrite via `promote_via_rewrite`**: The promotion path now creates a NEW
+  temp file in `pending/` (owned by the service user with mode 0600), writes the
+  already-validated content, calls `fsync()`, and uses `rename_noreplace()` to
+  atomically place it at its final name. The original broker request file is
+  removed only after successful promotion.
+- **Inode isolation**: The file in `pending/` is always a fresh inode created by
+  the service-user worker process. The original submitter has zero write authority
+  over it.
+- **Collision handling**: Filename collisions with existing pending jobs produce
+  a timestamped suffix (same as `move_to_dir_safe`), never clobbering.
+
+### Broker request file permissions (TCK-00577 round 14+16+17 fix)
+
+- **Mode 0640 + fchown (cross-user, fail-closed)**: `enqueue_via_broker_requests`
+  resolves the service user's primary GID via `resolve_service_user_identity()`,
+  then creates broker request temp files with mode 0640 and `fchown(fd, -1, gid)`.
+  The service-user worker can read via group membership. **Fail-closed**: if the
+  service user is not resolvable OR fchown fails, the function returns an error.
+  The previous 0644 fallback was removed in round 17 (it was fail-open because
+  job filenames are not opaque UUIDs and can be guessed).
+- **No 0644 fallback**: Dev environments without a service user MUST use
+  `--unsafe-local-write` (which routes through `enqueue_direct`, bypassing the
+  broker path entirely). This is the explicit opt-in for "I know there's no
+  service user."
+- **Cross-user deployments**: The worker may get EACCES when reading
+  broker files owned by a different UID. The worker handles this
+  fail-closed: unreadable files are quarantined with a logged warning
+  (including remediation guidance). The operator must configure a shared
+  group between submitter and service user, or use POSIX ACLs.
+- **Worker EACCES handling**: `promote_broker_requests` distinguishes
+  permission-denied errors from other read failures and emits an
+  actionable warning directing operators to configure shared group
+  access or ACLs.
+
+### Direct enqueue subdir hardening (TCK-00577 round 17 fix)
+
+- **Deterministic modes on all subdirs**: `enqueue_direct` now creates all queue
+  subdirectories (`claimed`, `completed`, `denied`, `cancelled`, `quarantine`,
+  `authority_consumed`) with mode 0711 and `broker_requests` with mode 01733.
+  Create and chmod failures are propagated (fail-closed) instead of being
+  silently ignored with `let _ =`.
+
+### Junk entry drain and scan budget (TCK-00577 round 16+17 fix)
+
+- **Independent caps**: `promote_broker_requests` uses two separate counters:
+  `candidates_processed` (up to `MAX_BROKER_REQUESTS_PROMOTE = 256`) for valid
+  `.json` regular files, and `junk_drained` (up to `MAX_JUNK_DRAIN_PER_CYCLE =
+  1024`) for non-candidate entries (wrong extension, non-regular files, unreadable
+  metadata). Non-candidate entries are quarantined without consuming the promotion
+  budget, preventing an attacker from filling `broker_requests/` with junk
+  filenames to exhaust the scan budget and starve valid requests.
+- **Hard scan budget**: `MAX_BROKER_SCAN_BUDGET` (= `MAX_BROKER_REQUESTS_PROMOTE
+  * 4 + MAX_JUNK_DRAIN_PER_CYCLE`) bounds the total directory entries iterated per
+  cycle. Once exhausted, the loop terminates immediately. This prevents adversarial
+  directory flooding from causing unbounded `readdir` iteration.
+- **Aggregate warnings**: After the loop, ONE aggregate warning is emitted with
+  cycle summary (entries scanned, candidates promoted/skipped, junk drained/skipped,
+  budget exhaustion status). Per-entry warning spam was removed.
+
+### General invariants
+
+- The `broker_requests/` directory uses mode 01733 (sticky + write-only for
+  group/other) so non-service-user callers can submit but cannot enumerate
+  or tamper with other users' requests.
+- Hard gate errors (invalid service user name, env var errors) are NOT
+  recoverable via broker fallback and return immediate error.
+- `run_push` and `run_blocking_evidence_gates` use the caller-provided
+  `write_mode` (from `FacCommand::queue_write_mode()`), NOT a hardcoded
+  `UnsafeLocalWrite`.

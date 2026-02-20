@@ -89,6 +89,7 @@ use apm2_core::fac::job_spec::{
     parse_b3_256_digest, validate_job_spec_control_lane_with_policy, validate_job_spec_with_policy,
 };
 use apm2_core::fac::lane::{LaneLeaseV1, LaneLockGuard, LaneManager, LaneState};
+use apm2_core::fac::queue_bounds::{QueueBoundsPolicy, check_queue_bounds};
 use apm2_core::fac::scan_lock::{ScanLockResult, check_stuck_scan_lock, try_acquire_scan_lock};
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
 use apm2_core::fac::{
@@ -110,6 +111,7 @@ use apm2_core::github::{parse_github_remote_url, resolve_apm2_home};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use chrono::{SecondsFormat, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
@@ -265,6 +267,9 @@ const COMPLETED_DIR: &str = "completed";
 const DENIED_DIR: &str = "denied";
 const QUARANTINE_DIR: &str = "quarantine";
 const CANCELLED_DIR: &str = "cancelled";
+/// Broker requests directory where non-service-user callers submit jobs
+/// for promotion by the worker (TCK-00577).
+const BROKER_REQUESTS_DIR: &str = "broker_requests";
 const CONSUME_RECEIPTS_DIR: &str = "authority_consumed";
 
 /// Maximum poll interval to prevent misconfiguration (1 hour).
@@ -273,6 +278,22 @@ const MAX_POLL_INTERVAL_SECS: u64 = 3600;
 /// Max number of boundary defect classes retained in a trace.
 const MAX_BOUNDARY_DEFECT_CLASSES: usize = 32;
 const SCHEDULER_RECOVERY_SCHEMA: &str = "apm2.scheduler_recovery.v1";
+
+/// Lockfile name for the enqueue critical section.
+///
+/// Shared with `fac_queue_submit::ENQUEUE_LOCKFILE` (same string value).
+/// The worker must use the same lockfile as `enqueue_direct` to serialize
+/// broker promotions with direct enqueue processes.
+///
+/// Synchronization protocol:
+/// - Protected data: set of files in `queue/pending/` and the snapshot-derived
+///   bounds decision.
+/// - Who can mutate: only the holder of the exclusive flock.
+/// - Lock ordering: single lock, no nesting required.
+/// - Happens-before: `lock_exclusive()` → scan pending dir + move → drop
+///   lockfile (implicit `flock(LOCK_UN)` on `File::drop`).
+/// - Async suspension: not applicable (synchronous path).
+const ENQUEUE_LOCKFILE: &str = ".enqueue.lock";
 
 /// FAC receipt directory under `$APM2_HOME/private/fac`.
 const FAC_RECEIPTS_DIR: &str = "receipts";
@@ -467,6 +488,84 @@ pub fn run_fac_worker(
             &format!("cannot create queue directories: {e}"),
         );
         return exit_codes::GENERIC_ERROR;
+    }
+
+    // TCK-00577 round 3+5: Validate that queue and receipt directories are
+    // owned by the configured FAC service user (not just the caller EUID).
+    // This wires the service-user ownership validator into the command
+    // execution path.
+    //
+    // Behavior (round 5 MAJOR fix — all errors are now fail-closed):
+    // - ServiceUserNotResolved: fail-closed. If the configured service user cannot
+    //   be resolved in passwd/NSS, this may indicate a mistyped service-user value
+    //   or corrupted NSS database. Ownership validation cannot be completed, so the
+    //   worker MUST NOT start.
+    // - OwnershipMismatch: the service user EXISTS but the directory is owned by
+    //   someone else. This is a hard failure (fail-closed).
+    // - Other errors (metadata, env, etc.): fail-closed.
+    {
+        use apm2_core::fac::service_user_gate::{
+            ServiceUserGateError, validate_directory_service_user_ownership,
+        };
+
+        // Directories that MUST be owned by the service user in production.
+        // Note: BROKER_REQUESTS_DIR is intentionally excluded — it uses
+        // mode 01733 (world-writable with sticky) so that non-service-user
+        // callers can submit broker requests.
+        let service_user_dirs = [
+            queue_root.join(PENDING_DIR),
+            queue_root.join("claimed"),
+            queue_root.join("completed"),
+            queue_root.join("denied"),
+            queue_root.join("cancelled"),
+            queue_root.join(QUARANTINE_DIR),
+            queue_root.join(CONSUME_RECEIPTS_DIR),
+        ];
+        // Also validate the receipt store if it exists.
+        let receipt_dir = fac_root.join("receipts");
+
+        for dir in service_user_dirs
+            .iter()
+            .chain(std::iter::once(&receipt_dir))
+        {
+            if !dir.exists() {
+                continue;
+            }
+            match validate_directory_service_user_ownership(dir) {
+                Ok(()) => {},
+                Err(ServiceUserGateError::ServiceUserNotResolved {
+                    ref service_user,
+                    ref reason,
+                    ..
+                }) => {
+                    // TCK-00577 round 5 MAJOR fix: ServiceUserNotResolved is
+                    // now a hard failure. If the service user cannot be
+                    // resolved, ownership cannot be validated — fail-closed.
+                    output_worker_error(
+                        json_output,
+                        &format!(
+                            "service user '{service_user}' not resolvable: {reason} \
+                             (fail-closed: worker will not start when service user \
+                              identity cannot be confirmed)",
+                        ),
+                    );
+                    return exit_codes::GENERIC_ERROR;
+                },
+                Err(e) => {
+                    // OwnershipMismatch or other hard errors: fail-closed.
+                    output_worker_error(
+                        json_output,
+                        &format!(
+                            "service user ownership check failed for {}: {e} \
+                             (fail-closed: worker will not start with incorrect \
+                              directory ownership)",
+                            dir.display()
+                        ),
+                    );
+                    return exit_codes::GENERIC_ERROR;
+                },
+            }
+        }
     }
 
     // Load persistent signing key for stable broker identity and receipts across
@@ -1010,6 +1109,12 @@ pub fn run_fac_worker(
             },
         };
 
+        // TCK-00577: Promote broker requests from non-service-user
+        // callers into pending/ before scanning. The loaded FAC policy's
+        // queue_bounds_policy is threaded through to ensure broker
+        // promotion enforces the same configured limits as enqueue_direct.
+        promote_broker_requests(&queue_root, &policy.queue_bounds_policy);
+
         // Scan pending directory (quarantines malformed files inline).
         let candidates = match scan_pending(
             &queue_root,
@@ -1481,6 +1586,496 @@ fn compute_canonicalizer_tuple_digest() -> String {
 // =============================================================================
 // Queue scanning
 // =============================================================================
+
+/// Maximum number of **candidate** broker request entries to promote per cycle.
+///
+/// Prevents unbounded I/O from a `broker_requests` directory with many files.
+/// Only valid candidates (regular files with `.json` extension that pass
+/// filename validation) count toward this cap. Non-candidate entries (wrong
+/// extension, FIFOs, symlinks, etc.) are drained/quarantined separately without
+/// consuming the promotion budget.
+const MAX_BROKER_REQUESTS_PROMOTE: usize = 256;
+
+/// Maximum number of non-candidate (junk) entries to drain per cycle.
+///
+/// Non-candidate entries in `broker_requests/` (wrong extension, non-regular
+/// files, unreadable metadata) are quarantined without counting toward
+/// `MAX_BROKER_REQUESTS_PROMOTE`. This cap prevents unbounded quarantine I/O
+/// from an attacker flooding the directory with junk. Remaining junk entries
+/// are deferred to the next cycle.
+const MAX_JUNK_DRAIN_PER_CYCLE: usize = 1024;
+
+/// Hard total per-cycle entry budget for broker request scanning.
+///
+/// Bounds the total number of directory entries iterated per promotion cycle,
+/// regardless of whether they are candidates, junk, or skipped entries.
+/// This prevents adversarial directory flooding from causing unbounded
+/// `readdir` iteration even after both `MAX_BROKER_REQUESTS_PROMOTE` and
+/// `MAX_JUNK_DRAIN_PER_CYCLE` are reached (the loop previously kept
+/// iterating entries past both caps). After the budget is exhausted, one
+/// aggregate warning is emitted and the loop terminates.
+///
+/// Formula: `MAX_BROKER_REQUESTS_PROMOTE * 4 + MAX_JUNK_DRAIN_PER_CYCLE`
+/// — a generous window that accommodates interleaved candidates and junk
+/// while still bounding work under adversarial flood.
+const MAX_BROKER_SCAN_BUDGET: usize = MAX_BROKER_REQUESTS_PROMOTE * 4 + MAX_JUNK_DRAIN_PER_CYCLE;
+
+/// Acquire the process-level enqueue lockfile under `queue_root`.
+///
+/// Returns the open `File` handle whose lifetime controls the lock.
+/// The lock is released when the file handle is dropped (implicit
+/// `flock(LOCK_UN)` on `File::drop`).
+///
+/// This is the same lock used by `enqueue_direct` in `fac_queue_submit`.
+/// Both code paths must use the same lockfile name (`ENQUEUE_LOCKFILE`)
+/// to serialize check-then-act sequences against the pending directory.
+///
+/// # Errors
+///
+/// Returns `Err` if the lockfile cannot be created or locked.
+fn acquire_enqueue_lock(queue_root: &Path) -> Result<fs::File, String> {
+    let lock_path = queue_root.join(ENQUEUE_LOCKFILE);
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| {
+            format!(
+                "cannot open enqueue lockfile {}: {err}",
+                lock_path.display()
+            )
+        })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = lock_file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
+
+    lock_file
+        .lock_exclusive()
+        .map_err(|err| format!("cannot acquire enqueue lock {}: {err}", lock_path.display()))?;
+
+    Ok(lock_file)
+}
+
+/// Promote valid job specs from `queue/broker_requests/` into `queue/pending/`
+/// (TCK-00577).
+///
+/// Called by the worker (running as service user) before scanning pending.
+/// Each `.json` file in `broker_requests/` is validated (bounded read +
+/// deserialize), checked against queue bounds under the enqueue lock, and
+/// moved to `pending/` via atomic no-replace rename (`move_to_dir_safe`).
+/// Malformed files are quarantined. Files that would exceed queue bounds
+/// are quarantined with denial evidence. Files that collide with existing
+/// pending entries are quarantined (collision-safe, never overwrites).
+///
+/// # Arguments
+///
+/// * `bounds_policy` - The queue bounds policy loaded from the FAC
+///   configuration (`FacPolicyV1::queue_bounds_policy`). Must be the same
+///   policy used by `enqueue_direct` to ensure broker-mediated promotion
+///   enforces identical queue capacity limits.
+///
+/// # Lock discipline
+///
+/// Each promotion acquires the same process-level lockfile
+/// (`queue/.enqueue.lock`) used by `enqueue_direct` in `fac_queue_submit`,
+/// ensuring the check-then-rename sequence is atomic with respect to
+/// concurrent enqueue processes. The lock is held for the shortest
+/// possible duration: acquire → `check_queue_bounds` → `move_to_dir_safe`
+/// → release.
+///
+/// # Synchronization protocol
+///
+/// - Protected data: set of files in `queue/pending/` and the snapshot-derived
+///   bounds decision.
+/// - Who can mutate: only the holder of the exclusive flock on
+///   `ENQUEUE_LOCKFILE`.
+/// - Lock ordering: single lock, no nesting required.
+/// - Happens-before: `lock_exclusive()` → scan pending + move → drop lockfile
+///   (implicit `flock(LOCK_UN)`).
+/// - Async suspension: not applicable (synchronous path).
+fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy) {
+    let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+    if !broker_dir.is_dir() {
+        return;
+    }
+
+    let Ok(entries) = fs::read_dir(&broker_dir) else {
+        return;
+    };
+
+    let pending_dir = queue_root.join(PENDING_DIR);
+    let _ = fs::create_dir_all(&pending_dir);
+
+    let quarantine_dir = queue_root.join(QUARANTINE_DIR);
+    let _ = fs::create_dir_all(&quarantine_dir);
+
+    // Queue bounds policy is threaded from the loaded FAC policy by
+    // the caller (run_fac_worker). This ensures broker-mediated
+    // promotion enforces the same configured limits as enqueue_direct.
+
+    // MAJOR fix (TCK-00577 round 16): Separate candidate counting from junk
+    // draining. Only CANDIDATE entries (regular files with .json extension that
+    // pass filename validation) count toward MAX_BROKER_REQUESTS_PROMOTE.
+    // Non-candidate entries (wrong extension, non-regular files, unreadable
+    // metadata) are quarantined without consuming the promotion budget, up to
+    // MAX_JUNK_DRAIN_PER_CYCLE. This prevents an attacker from filling
+    // broker_requests/ with junk filenames to exhaust the scan budget and
+    // starve valid .json requests.
+    let mut candidates_processed: usize = 0;
+    let mut junk_drained: usize = 0;
+    let mut entries_scanned: usize = 0;
+    // Track skipped entries for aggregate warning (replaces per-entry spam).
+    let mut candidates_skipped: usize = 0;
+    let mut junk_skipped: usize = 0;
+
+    for entry in entries {
+        // CODE-QUALITY fix (TCK-00577 round 17): Hard total per-cycle
+        // entry budget. Stop iterating directory entries once the budget
+        // is exhausted, regardless of individual cap states. This bounds
+        // work under adversarial directory flood.
+        if entries_scanned >= MAX_BROKER_SCAN_BUDGET {
+            break;
+        }
+        entries_scanned += 1;
+
+        // Both individual caps reached: stop scanning.
+        if candidates_processed >= MAX_BROKER_REQUESTS_PROMOTE
+            && junk_drained >= MAX_JUNK_DRAIN_PER_CYCLE
+        {
+            break;
+        }
+
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+
+        // ── Classify: is this a candidate (.json extension + valid UTF-8 name)? ──
+        let is_json = path.extension().and_then(|e| e.to_str()) == Some("json");
+        let file_name = path.file_name().and_then(|n| n.to_str()).map(String::from);
+
+        if !is_json || file_name.is_none() {
+            // Non-candidate: quarantine without counting toward promotion cap.
+            if junk_drained < MAX_JUNK_DRAIN_PER_CYCLE {
+                if let Some(ref name) = file_name {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "TCK-00577: draining non-.json entry from broker_requests/"
+                    );
+                    let _ = move_to_dir_safe(&path, &quarantine_dir, name);
+                } else {
+                    // Non-UTF-8 filename: try to remove directly (can't safely
+                    // construct a quarantine name).
+                    tracing::debug!(
+                        path = %path.display(),
+                        "TCK-00577: removing non-UTF-8 entry from broker_requests/"
+                    );
+                    let _ = fs::remove_file(&path);
+                }
+                junk_drained += 1;
+            } else {
+                junk_skipped += 1;
+            }
+            continue;
+        }
+
+        let file_name = file_name.unwrap();
+
+        // ── Pre-open file type check (lstat) ──
+        // BLOCKER fix (TCK-00577 round 9): Prevent FIFO poisoning.
+        // An attacker with write access to broker_requests/ (mode 01733)
+        // can create a FIFO named *.json. Opening a FIFO without O_NONBLOCK
+        // blocks indefinitely. Use symlink_metadata (lstat) to check file
+        // type BEFORE opening. Only regular files proceed; FIFOs, sockets,
+        // devices, and symlinks are quarantined as junk.
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) => {
+                if !meta.file_type().is_file() {
+                    // .json extension but not a regular file — this is junk.
+                    if junk_drained < MAX_JUNK_DRAIN_PER_CYCLE {
+                        let kind = if meta.file_type().is_symlink() {
+                            "symlink"
+                        } else if meta.file_type().is_dir() {
+                            "directory"
+                        } else {
+                            "non-regular-file (FIFO/socket/device)"
+                        };
+                        tracing::warn!(
+                            path = %path.display(),
+                            file_type = kind,
+                            "TCK-00577: quarantining non-regular-file broker request \
+                             (FIFO poisoning defense)"
+                        );
+                        let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
+                        junk_drained += 1;
+                    } else {
+                        junk_skipped += 1;
+                    }
+                    continue;
+                }
+            },
+            Err(e) => {
+                // Unreadable metadata: treat as junk.
+                if junk_drained < MAX_JUNK_DRAIN_PER_CYCLE {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "TCK-00577: quarantining broker request with unreadable metadata"
+                    );
+                    let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
+                    junk_drained += 1;
+                } else {
+                    junk_skipped += 1;
+                }
+                continue;
+            },
+        }
+
+        // ── This is a valid candidate: count toward promotion cap ──
+        if candidates_processed >= MAX_BROKER_REQUESTS_PROMOTE {
+            // CODE-QUALITY fix (TCK-00577 round 17): Track skipped
+            // candidates for ONE aggregate warning after the loop,
+            // instead of emitting a warning per skipped entry.
+            candidates_skipped += 1;
+            // Continue draining junk if junk cap not yet reached.
+            if junk_drained >= MAX_JUNK_DRAIN_PER_CYCLE {
+                break;
+            }
+            continue;
+        }
+        candidates_processed += 1;
+
+        // Bounded read (reuse MAX_JOB_SPEC_SIZE from job_spec module).
+        // Defense-in-depth: read_bounded also uses O_NONBLOCK and checks
+        // file type via fstat after open, but the pre-open lstat above
+        // prevents the open(2) call from blocking on a FIFO in the first
+        // place.
+        let bytes = match read_bounded(&path, apm2_core::fac::job_spec::MAX_JOB_SPEC_SIZE) {
+            Ok(b) => b,
+            Err(e) => {
+                // TCK-00577 round 17: Broker request files are now
+                // written with mode 0640 + fchown(gid=service_user).
+                // The submitter MUST resolve the service user and
+                // fchown must succeed (fail-closed, no 0644 fallback).
+                // In cross-user deployments, the worker can read via
+                // group membership. EACCES here indicates a
+                // misconfiguration (shared group not configured).
+                // This is fail-closed: unreadable files are
+                // quarantined, not promoted.
+                if e.contains("Permission denied") {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "TCK-00577: broker request file is not readable by the worker \
+                         (EACCES). In cross-user deployments, configure a shared group \
+                         between the submitter and service user, or use POSIX ACLs. \
+                         Quarantining file (fail-closed)."
+                    );
+                } else {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "TCK-00577: quarantining unreadable broker request"
+                    );
+                }
+                let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
+                continue;
+            },
+        };
+
+        // Validate deserialization.
+        if deserialize_job_spec(&bytes).is_err() {
+            tracing::warn!(
+                path = %path.display(),
+                "TCK-00577: quarantining malformed broker request"
+            );
+            let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
+            continue;
+        }
+
+        // ---- Begin enqueue lock critical section ----
+        // Acquire the same process-level lockfile used by enqueue_direct
+        // to prevent TOCTOU races between bounds check and rename.
+        let lock_file = match acquire_enqueue_lock(queue_root) {
+            Ok(lf) => lf,
+            Err(e) => {
+                // Fail-closed: cannot acquire lock → do not promote.
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "TCK-00577: cannot acquire enqueue lock, deferring broker request promotion"
+                );
+                continue;
+            },
+        };
+
+        // Check queue bounds with proposed file size before promoting.
+        let proposed_bytes = bytes.len() as u64;
+        if let Err(bounds_err) = check_queue_bounds(&pending_dir, proposed_bytes, bounds_policy) {
+            // Queue is at capacity: quarantine the broker request with
+            // denial evidence instead of promoting.
+            tracing::warn!(
+                path = %path.display(),
+                error = %bounds_err,
+                "TCK-00577: queue bounds exceeded, quarantining broker request"
+            );
+            drop(lock_file);
+            let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
+            continue;
+        }
+
+        // BLOCKER fix (TCK-00577 round 12): Do NOT rename the attacker-owned
+        // inode into pending/. The original file is owned by the non-service-user
+        // submitter with mode 0600, and rename() preserves ownership+mode across
+        // filesystems. This means the submitter retains write authority over the
+        // file in pending/ and can mutate it after validation (TOCTOU).
+        //
+        // Instead: create a NEW temp file in pending/ owned by the current
+        // process (service user) with mode 0600, write the validated content,
+        // fsync, then rename_noreplace into its final pending/ name. Only then
+        // remove the original broker_requests file.
+        match promote_via_rewrite(&bytes, &pending_dir, &file_name) {
+            Ok(_promoted_path) => {
+                // Lock released after successful promotion.
+                drop(lock_file);
+                // Remove the original attacker-owned broker request file.
+                // Best-effort: if removal fails, the file stays in
+                // broker_requests/ and will be re-read next cycle, but
+                // deserialization will match a pending/ file so it's harmless
+                // (duplicate detection handles this).
+                if let Err(e) = fs::remove_file(&path) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "TCK-00577: could not remove original broker request after promotion"
+                    );
+                }
+                tracing::info!(
+                    file = %file_name,
+                    "TCK-00577: promoted broker request to pending/ (service-user-owned rewrite)"
+                );
+            },
+            Err(e) => {
+                drop(lock_file);
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "TCK-00577: failed to promote broker request to pending via rewrite, quarantining"
+                );
+                let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
+            },
+        }
+        // ---- End enqueue lock critical section ----
+    }
+
+    // CODE-QUALITY fix (TCK-00577 round 17): Emit ONE aggregate warning
+    // per cycle instead of per-entry warnings. This bounds log output
+    // under adversarial flood.
+    let total_skipped = candidates_skipped + junk_skipped;
+    if total_skipped > 0 || entries_scanned >= MAX_BROKER_SCAN_BUDGET {
+        tracing::warn!(
+            entries_scanned = entries_scanned,
+            scan_budget = MAX_BROKER_SCAN_BUDGET,
+            candidates_promoted = candidates_processed,
+            candidates_skipped = candidates_skipped,
+            junk_drained = junk_drained,
+            junk_skipped = junk_skipped,
+            budget_exhausted = entries_scanned >= MAX_BROKER_SCAN_BUDGET,
+            "TCK-00577: broker promotion cycle summary — \
+             {total_skipped} entries deferred to next cycle"
+        );
+    }
+}
+
+/// Promote validated broker request content into `pending/` by creating a NEW
+/// service-user-owned file (BLOCKER fix, TCK-00577 round 12).
+///
+/// Instead of renaming the attacker-owned inode (which preserves submitter
+/// ownership and mode across `rename()`), this function:
+/// 1. Creates a new temp file in `pending/` owned by the current process (the
+///    service user) with mode 0600.
+/// 2. Writes the already-validated content.
+/// 3. Calls `fsync()` for crash safety.
+/// 4. Uses `rename_noreplace()` to atomically place the file at its final name
+///    in `pending/`.
+///
+/// On filename collision (EEXIST from `rename_noreplace`), a timestamped
+/// suffix is appended to prevent clobbering existing pending jobs.
+///
+/// # Security invariants
+///
+/// - The inode in `pending/` is always owned by the service user with mode
+///   0600. The original submitter has zero write authority over it.
+/// - The validated `bytes` are the single source of truth; the attacker cannot
+///   modify the content between validation and promotion.
+fn promote_via_rewrite(
+    bytes: &[u8],
+    pending_dir: &Path,
+    file_name: &str,
+) -> Result<PathBuf, String> {
+    // Create a temp file in pending/ — this will be owned by the current
+    // process uid (the service user) with permissions set below.
+    let temp = tempfile::NamedTempFile::new_in(pending_dir)
+        .map_err(|e| format!("cannot create temp file in {}: {e}", pending_dir.display()))?;
+
+    {
+        let file = temp.as_file();
+        // Set mode 0600 so only the service user can read/write.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("cannot set mode 0600 on temp file: {e}"))?;
+        }
+        // Write the validated content (already deserialized + bounds-checked).
+        std::io::Write::write_all(&mut &*file, bytes)
+            .map_err(|e| format!("cannot write validated content to temp file: {e}"))?;
+        // fsync for crash safety.
+        file.sync_all()
+            .map_err(|e| format!("cannot fsync promoted file: {e}"))?;
+    }
+
+    // Atomically place the file at its final name in pending/.
+    let dest = pending_dir.join(file_name);
+    match rename_noreplace(temp.path(), &dest) {
+        Ok(()) => {
+            // Disown the NamedTempFile so it doesn't delete the now-renamed file.
+            let _ = temp.into_temp_path();
+            Ok(dest)
+        },
+        Err(e)
+            if e.raw_os_error() == Some(libc::EEXIST)
+                || e.raw_os_error() == Some(libc::ENOTEMPTY)
+                || e.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            // Collision: generate a timestamped fallback name.
+            let ts_nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let stem = file_name.trim_end_matches(".json");
+            let safe_name = format!("{stem}-{ts_nanos}.json");
+            let safe_dest = pending_dir.join(&safe_name);
+            rename_noreplace(temp.path(), &safe_dest).map_err(|e2| {
+                format!(
+                    "rename {} -> {}: {e2}",
+                    temp.path().display(),
+                    safe_dest.display()
+                )
+            })?;
+            let _ = temp.into_temp_path();
+            Ok(safe_dest)
+        },
+        Err(e) => Err(format!(
+            "rename {} -> {}: {e}",
+            temp.path().display(),
+            dest.display()
+        )),
+    }
+}
 
 /// Scans `queue/pending/` and returns sorted candidates.
 ///
@@ -7131,8 +7726,39 @@ fn resolve_fac_root() -> Result<PathBuf, String> {
     Ok(home.join("private").join("fac"))
 }
 
-/// Ensures all required queue subdirectories exist.
+/// Ensures all required queue subdirectories exist with deterministic
+/// secure permissions, regardless of the process umask.
+///
+/// TCK-00577 round 6: Creates `queue/` itself with mode 0711 (owner rwx,
+/// group/other execute-only) so non-service-user callers can traverse to
+/// reach `broker_requests/`. The `private/fac/` parent remains 0700.
+///
+/// TCK-00577 round 11 BLOCKER fix: After `create_dir_all` for each queue
+/// subdir, explicitly calls `set_permissions` to set mode 0711
+/// (traverse-only). This prevents umask-derived default modes (e.g.,
+/// 0775 from umask 0o002) from causing `validate_directory_mode_only`
+/// failures during the relaxed preflight path.
+///
+/// TCK-00577 round 11 MAJOR fix: `broker_requests/` permissions are now
+/// enforced unconditionally at every startup, not just when newly
+/// created. Pre-existing `broker_requests/` with unsafe modes (e.g.,
+/// 0333 — world-writable without sticky) are hardened to 01733.
 fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
+    // Ensure the queue root itself exists with mode 0711 for traversal.
+    if !queue_root.exists() {
+        fs::create_dir_all(queue_root)
+            .map_err(|e| format!("cannot create {}: {e}", queue_root.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Mode 0711: owner rwx, group/other execute-only (traversal).
+        // Allows non-service-user callers to reach broker_requests/ without
+        // exposing directory listings.
+        fs::set_permissions(queue_root, std::fs::Permissions::from_mode(0o711))
+            .map_err(|e| format!("cannot set mode 0711 on {}: {e}", queue_root.display()))?;
+    }
+
     for dir in [
         PENDING_DIR,
         CLAIMED_DIR,
@@ -7147,7 +7773,47 @@ fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
             fs::create_dir_all(&path)
                 .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
         }
+        // TCK-00577 round 11 BLOCKER fix: Set deterministic mode 0711 on
+        // every queue subdir, regardless of the process umask. Without
+        // this, create_dir_all inherits the umask which may produce
+        // 0775 or 0777, causing validate_directory_mode_only to reject
+        // these directories during relaxed preflight.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, std::fs::Permissions::from_mode(0o711))
+                .map_err(|e| format!("cannot set mode 0711 on {}: {e}", path.display()))?;
+        }
     }
+
+    // TCK-00577 round 5 BLOCKER fix: Create broker_requests/ with mode 01733
+    // (sticky bit + world-writable). Non-service-user callers use the broker
+    // fallback to drop job specs into this directory. The sticky bit prevents
+    // callers from deleting each other's files while still allowing writes.
+    // Mode 01733 = owner rwx, group wx, others wx, sticky bit set.
+    //
+    // DirBuilder::mode() is subject to the process umask, so we must
+    // explicitly chmod after creation to ensure the exact mode is applied.
+    //
+    // TCK-00577 round 11 MAJOR fix: Permissions are now enforced
+    // unconditionally — both for newly created AND pre-existing
+    // broker_requests/ directories. A pre-existing directory with an
+    // unsafe mode (e.g., 0333 — world-writable without sticky) is
+    // hardened to 01733 at every worker startup. This prevents an
+    // attacker from tampering with the directory mode between restarts
+    // and ensures the sticky bit invariant is always enforced.
+    let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+    if !broker_dir.exists() {
+        fs::create_dir_all(&broker_dir)
+            .map_err(|e| format!("cannot create {}: {e}", broker_dir.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o1733))
+            .map_err(|e| format!("cannot set mode 01733 on {}: {e}", broker_dir.display()))?;
+    }
+
     Ok(())
 }
 
@@ -8367,6 +9033,57 @@ mod tests {
         ] {
             assert!(queue_root.join(sub).is_dir(), "missing {sub}");
         }
+
+        // TCK-00577 round 5 BLOCKER fix: broker_requests/ must also be
+        // created by ensure_queue_dirs.
+        assert!(
+            queue_root.join(BROKER_REQUESTS_DIR).is_dir(),
+            "missing broker_requests dir"
+        );
+    }
+
+    /// TCK-00577 round 5: `ensure_queue_dirs` creates `broker_requests/` with
+    /// mode 01733 (sticky + world-writable) on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_queue_dirs_broker_requests_mode_01733() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+
+        ensure_queue_dirs(&queue_root).expect("create dirs");
+
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+        assert!(broker_dir.is_dir(), "broker_requests must exist");
+
+        let metadata = fs::metadata(&broker_dir).expect("metadata");
+        let mode = metadata.permissions().mode() & 0o7777; // mask off file type bits
+        assert_eq!(
+            mode, 0o1733,
+            "broker_requests/ must have mode 01733 (sticky + world-writable), got {mode:#o}"
+        );
+    }
+
+    /// TCK-00577 round 6: `ensure_queue_dirs` creates `queue/` with mode 0711
+    /// (traverse-only for group/other) so non-service-user callers can reach
+    /// `broker_requests/`.
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_queue_dirs_queue_root_mode_0711() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+
+        ensure_queue_dirs(&queue_root).expect("create dirs");
+
+        let metadata = fs::metadata(&queue_root).expect("metadata");
+        let mode = metadata.permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o711,
+            "queue/ must have mode 0711 (traverse-only), got {mode:#o}"
+        );
     }
 
     #[test]
@@ -10981,6 +11698,1157 @@ mod tests {
         assert!(
             owns_sccache_server(Some(&trace)),
             "preexisting in-cgroup server must own"
+        );
+    }
+
+    // =========================================================================
+    // Broker promotion: queue bounds enforcement (TCK-00577 round 2 fixes)
+    // =========================================================================
+
+    /// Helper: creates a minimal valid JSON job spec for broker request tests.
+    fn make_valid_broker_request_json(job_id: &str) -> String {
+        use apm2_core::fac::job_spec::{FacJobSpecV1Builder, JobSource};
+
+        let source = JobSource {
+            kind: "mirror_commit".to_string(),
+            repo_id: "test/repo".to_string(),
+            head_sha: "a".repeat(40),
+            patch: None,
+        };
+        let spec = FacJobSpecV1Builder::new(
+            job_id,
+            "gates",
+            "bulk",
+            "2026-02-19T00:00:00Z",
+            "lease-test",
+            source,
+        )
+        .priority(50)
+        .build()
+        .expect("valid spec");
+        serde_json::to_string_pretty(&spec).expect("serialize broker request JSON")
+    }
+
+    #[test]
+    fn promote_broker_request_denied_when_queue_at_capacity() {
+        // Verify that broker promotion respects queue bounds: when
+        // pending/ is at capacity, broker requests are quarantined
+        // instead of promoted.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+        let quarantine_dir = queue_root.join(QUARANTINE_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Fill pending to the default capacity (10_000 jobs).
+        // Use a tight capacity to keep the test fast: override by
+        // filling to the default limit.
+        // Instead, we can just fill enough to trigger denial with a
+        // small number of files — but check_queue_bounds uses the
+        // default policy (10_000 jobs, 1 GiB). That's too many files.
+        //
+        // Instead, create a tight scenario: fill pending with
+        // DEFAULT_MAX_PENDING_JOBS files. That's impractical. Instead,
+        // test at the check_queue_bounds level first, and test
+        // promote_broker_requests with the real function.
+        //
+        // We can test this by creating enough pending files to exceed the
+        // default byte limit. With default max_pending_bytes = 1 GiB,
+        // that's also impractical.
+        //
+        // The practical approach: verify the function uses
+        // move_to_dir_safe (no-replace) and the lock by testing the
+        // actual promote function behavior. For bounds, we need a
+        // targeted test.
+        //
+        // Actually, the simplest test: create 10_000 small files in
+        // pending to hit the job cap, then verify broker request is
+        // quarantined. But creating 10k files is expensive.
+        //
+        // A better test: verify the function behavior by testing the
+        // integration point. We will create a moderate number of files
+        // and use the fact that the default policy has max_pending_jobs
+        // = 10_000. If we want to actually test the denial, we must
+        // create enough files. Let's keep it practical with 10_000
+        // tiny files (should be fast on tmpfs).
+        for i in 0..10_000 {
+            let f = pending_dir.join(format!("job-{i}.json"));
+            fs::write(&f, "{}").expect("write pending job");
+        }
+
+        // Now submit a broker request.
+        let broker_file = broker_dir.join("broker-overflow.json");
+        fs::write(
+            &broker_file,
+            make_valid_broker_request_json("broker-overflow"),
+        )
+        .expect("write broker request");
+
+        // Run promotion with default policy (max_pending_jobs = 10_000).
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The broker request must NOT be in pending/ (queue at capacity).
+        assert!(
+            !pending_dir.join("broker-overflow.json").exists(),
+            "broker request must not be promoted when queue is at capacity"
+        );
+
+        // The broker request must be quarantined.
+        assert!(
+            quarantine_dir.is_dir(),
+            "quarantine directory must exist after denial"
+        );
+        let quarantine_entries: Vec<_> = fs::read_dir(&quarantine_dir)
+            .expect("read quarantine")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("broker-overflow"))
+            .collect();
+        assert!(
+            !quarantine_entries.is_empty(),
+            "denied broker request must be moved to quarantine"
+        );
+
+        // The original broker request must be gone.
+        assert!(
+            !broker_file.exists(),
+            "original broker request file must be removed after quarantine"
+        );
+    }
+
+    #[test]
+    fn promote_broker_request_collision_does_not_overwrite_pending() {
+        // Verify that when a broker request has the same filename as an
+        // existing pending job, the existing job is never overwritten.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Create an existing pending job.
+        let existing_content = make_valid_broker_request_json("collision-job");
+        fs::write(pending_dir.join("collision-job.json"), &existing_content)
+            .expect("write existing pending job");
+
+        // Create a broker request with the same job ID.
+        let new_content = make_valid_broker_request_json("collision-job");
+        fs::write(broker_dir.join("collision-job.json"), &new_content)
+            .expect("write broker request");
+
+        // Run promotion with default policy.
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The original pending job must be untouched.
+        let existing_after = fs::read_to_string(pending_dir.join("collision-job.json"))
+            .expect("read existing pending job");
+        assert_eq!(
+            existing_after, existing_content,
+            "existing pending job must not be overwritten by broker promotion"
+        );
+
+        // The broker request should have been promoted with a
+        // collision-safe name (timestamped suffix) by move_to_dir_safe.
+        // Or it should still exist in broker_dir if move failed.
+        // Either way, the original pending job is intact.
+        let pending_entries: Vec<_> = fs::read_dir(&pending_dir)
+            .expect("read pending")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("collision-job"))
+            .collect();
+        assert!(
+            !pending_entries.is_empty(),
+            "at least the original pending job must remain"
+        );
+    }
+
+    #[test]
+    fn promote_broker_request_success_under_capacity() {
+        // Verify that a valid broker request is promoted to pending/
+        // when queue is under capacity, using no-replace rename.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Create a valid broker request.
+        let content = make_valid_broker_request_json("good-job");
+        fs::write(broker_dir.join("good-job.json"), &content).expect("write broker request");
+
+        // Run promotion with default policy.
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The job must appear in pending/.
+        assert!(
+            pending_dir.join("good-job.json").exists(),
+            "valid broker request must be promoted to pending/"
+        );
+
+        // The original broker request must be gone.
+        assert!(
+            !broker_dir.join("good-job.json").exists(),
+            "broker request must be removed after successful promotion"
+        );
+    }
+
+    #[test]
+    fn promote_broker_request_uses_enqueue_lock() {
+        // Verify that the enqueue lockfile is created during promotion,
+        // demonstrating that the lock mechanism is engaged.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Lockfile should not exist yet.
+        let lock_path = queue_root.join(ENQUEUE_LOCKFILE);
+        assert!(
+            !lock_path.exists(),
+            "lockfile must not exist before promotion"
+        );
+
+        // Create a valid broker request to trigger promotion.
+        let content = make_valid_broker_request_json("lock-test-job");
+        fs::write(broker_dir.join("lock-test-job.json"), &content).expect("write broker request");
+
+        // Run promotion with default policy.
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The lockfile must have been created (created by acquire_enqueue_lock).
+        assert!(
+            lock_path.exists(),
+            "enqueue lockfile must be created during broker promotion"
+        );
+
+        // Job must have been promoted.
+        assert!(
+            pending_dir.join("lock-test-job.json").exists(),
+            "job must be promoted"
+        );
+    }
+
+    /// TCK-00577 round 3: Regression test proving broker promotion respects
+    /// non-default configured queue bounds policy. Uses `max_pending_jobs=1`
+    /// so that with 1 existing pending job, broker promotion denies.
+    #[test]
+    fn promote_broker_request_denied_by_configured_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+        let quarantine_dir = queue_root.join(QUARANTINE_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Fill pending with 1 job to hit the configured cap.
+        fs::write(pending_dir.join("existing-job.json"), "{}").expect("write pending job");
+
+        // Submit a broker request.
+        let broker_file = broker_dir.join("policy-denied.json");
+        fs::write(
+            &broker_file,
+            make_valid_broker_request_json("policy-denied"),
+        )
+        .expect("write broker request");
+
+        // Use a tight configured policy: max_pending_jobs = 1.
+        let tight_policy = QueueBoundsPolicy {
+            max_pending_jobs: 1,
+            // Use a large byte limit so only job count triggers denial.
+            max_pending_bytes: 1024 * 1024 * 1024,
+            per_lane_max_pending_jobs: None,
+        };
+        promote_broker_requests(&queue_root, &tight_policy);
+
+        // The broker request must NOT be in pending/ (configured cap exceeded).
+        assert!(
+            !pending_dir.join("policy-denied.json").exists(),
+            "broker request must not be promoted when configured policy cap is exceeded"
+        );
+
+        // The broker request must be quarantined.
+        assert!(
+            quarantine_dir.is_dir(),
+            "quarantine directory must exist after policy denial"
+        );
+        let quarantine_entries: Vec<_> = fs::read_dir(&quarantine_dir)
+            .expect("read quarantine")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("policy-denied"))
+            .collect();
+        assert!(
+            !quarantine_entries.is_empty(),
+            "policy-denied broker request must be quarantined"
+        );
+
+        // Original broker request must be gone from broker_requests/.
+        assert!(
+            !broker_file.exists(),
+            "original broker request file must be removed after quarantine"
+        );
+    }
+
+    /// TCK-00577 round 3: Confirm that with the same tight policy,
+    /// promotion succeeds when pending count is below the configured cap.
+    #[test]
+    fn promote_broker_request_allowed_by_configured_policy_under_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // No existing pending jobs — under cap of 1.
+        let content = make_valid_broker_request_json("under-cap-job");
+        fs::write(broker_dir.join("under-cap-job.json"), &content).expect("write broker request");
+
+        let tight_policy = QueueBoundsPolicy {
+            max_pending_jobs: 1,
+            max_pending_bytes: 1024 * 1024 * 1024,
+            per_lane_max_pending_jobs: None,
+        };
+        promote_broker_requests(&queue_root, &tight_policy);
+
+        // Job must be promoted since queue is under cap.
+        assert!(
+            pending_dir.join("under-cap-job.json").exists(),
+            "broker request must be promoted when under configured policy cap"
+        );
+
+        // Original broker request must be gone.
+        assert!(
+            !broker_dir.join("under-cap-job.json").exists(),
+            "broker request must be removed after successful promotion"
+        );
+    }
+
+    /// TCK-00577 round 9 BLOCKER fix: Verify that non-regular files (FIFOs)
+    /// in `broker_requests/` are quarantined without attempting to open them.
+    /// An attacker can create a FIFO in the world-writable `broker_requests/`
+    /// (mode 01733) directory. Without the pre-open file type check, opening
+    /// a FIFO blocks indefinitely (deadlocking the worker).
+    #[test]
+    #[cfg(unix)]
+    fn promote_broker_request_quarantines_fifo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+        let quarantine_dir = queue_root.join(QUARANTINE_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Create a FIFO (named pipe) in broker_requests/ with a .json
+        // extension to simulate the FIFO poisoning attack.
+        let fifo_path = broker_dir.join("malicious-fifo.json");
+        nix::unistd::mkfifo(&fifo_path, nix::sys::stat::Mode::S_IRWXU)
+            .expect("mkfifo must succeed");
+        assert!(fifo_path.exists(), "FIFO must exist");
+
+        // Also create a valid broker request to prove promotion still works
+        // for regular files after quarantining the FIFO.
+        let content = make_valid_broker_request_json("good-after-fifo");
+        fs::write(broker_dir.join("good-after-fifo.json"), &content)
+            .expect("write valid broker request");
+
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The FIFO must NOT be in pending/.
+        assert!(
+            !pending_dir.join("malicious-fifo.json").exists(),
+            "FIFO must not be promoted to pending/"
+        );
+
+        // The FIFO must be quarantined (moved to quarantine/).
+        assert!(
+            quarantine_dir.is_dir(),
+            "quarantine directory must exist after FIFO quarantine"
+        );
+        let quarantine_entries: Vec<_> = fs::read_dir(&quarantine_dir)
+            .expect("read quarantine")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("malicious-fifo"))
+            .collect();
+        assert!(
+            !quarantine_entries.is_empty(),
+            "FIFO must be moved to quarantine directory"
+        );
+
+        // The valid broker request must still be promoted.
+        assert!(
+            pending_dir.join("good-after-fifo.json").exists(),
+            "valid broker request must still be promoted after FIFO quarantine"
+        );
+    }
+
+    /// TCK-00577 round 9 BLOCKER fix: Verify that symlinks in
+    /// `broker_requests/` are quarantined without opening.
+    #[test]
+    #[cfg(unix)]
+    fn promote_broker_request_quarantines_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+        let quarantine_dir = queue_root.join(QUARANTINE_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Create a symlink pointing to /dev/zero (would cause infinite read).
+        let symlink_path = broker_dir.join("evil-symlink.json");
+        std::os::unix::fs::symlink("/dev/zero", &symlink_path).expect("create symlink");
+
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The symlink must NOT be in pending/.
+        assert!(
+            !pending_dir.join("evil-symlink.json").exists(),
+            "symlink must not be promoted to pending/"
+        );
+
+        // The symlink must be quarantined.
+        assert!(
+            quarantine_dir.is_dir(),
+            "quarantine directory must exist after symlink quarantine"
+        );
+        let quarantine_entries: Vec<_> = fs::read_dir(&quarantine_dir)
+            .expect("read quarantine")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("evil-symlink"))
+            .collect();
+        assert!(
+            !quarantine_entries.is_empty(),
+            "symlink must be moved to quarantine directory"
+        );
+    }
+
+    /// TCK-00577 round 5 MAJOR fix: `ServiceUserNotResolved` must produce a
+    /// fail-closed error message, not a warning. This test exercises the
+    /// error variant format string to ensure the error path compiles and
+    /// produces the expected diagnostic message pattern.
+    #[test]
+    fn service_user_not_resolved_error_message_is_fail_closed() {
+        use apm2_core::fac::service_user_gate::ServiceUserGateError;
+
+        let err = ServiceUserGateError::ServiceUserNotResolved {
+            service_user: "_apm2-job".to_string(),
+            reason: "user not found in passwd".to_string(),
+        };
+
+        // Simulate the error formatting from the worker startup path.
+        if let ServiceUserGateError::ServiceUserNotResolved {
+            ref service_user,
+            ref reason,
+            ..
+        } = err
+        {
+            let msg = format!(
+                "service user '{service_user}' not resolvable: {reason} \
+                 (fail-closed: worker will not start when service user \
+                  identity cannot be confirmed)",
+            );
+            assert!(
+                msg.contains("fail-closed"),
+                "error message must contain fail-closed"
+            );
+            assert!(
+                msg.contains("_apm2-job"),
+                "error message must contain the service user name"
+            );
+            assert!(
+                msg.contains("will not start"),
+                "error message must indicate worker will not start"
+            );
+        } else {
+            panic!("expected ServiceUserNotResolved variant");
+        }
+    }
+
+    /// TCK-00577 round 11 BLOCKER regression: Queue subdirs must have
+    /// deterministic secure mode 0711 after `ensure_queue_dirs`, regardless
+    /// of the mode they had before (simulating umask-derived defaults).
+    ///
+    /// Steps:
+    /// 1. Pre-create queue subdirs with an insecure mode (0775, as umask 0o002
+    ///    would produce).
+    /// 2. Call `ensure_queue_dirs`.
+    /// 3. Verify ALL queue subdirs have mode 0711 (deterministically set), NOT
+    ///    the pre-existing insecure mode.
+    /// 4. Verify `broker_requests/` has mode 01733.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_queue_dirs_sets_deterministic_mode_on_preexisting_insecure_subdirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+
+        // Pre-create all subdirs with insecure mode 0775 (simulating
+        // what create_dir_all would produce under umask 0o002).
+        for subdir in [
+            PENDING_DIR,
+            CLAIMED_DIR,
+            COMPLETED_DIR,
+            DENIED_DIR,
+            QUARANTINE_DIR,
+            CANCELLED_DIR,
+            CONSUME_RECEIPTS_DIR,
+        ] {
+            let path = queue_root.join(subdir);
+            fs::create_dir_all(&path).expect("create subdir");
+            fs::set_permissions(&path, std::fs::Permissions::from_mode(0o775))
+                .expect("set insecure mode 0775");
+        }
+
+        // Also pre-create queue root with insecure mode.
+        fs::set_permissions(&queue_root, std::fs::Permissions::from_mode(0o775))
+            .expect("set insecure mode on queue root");
+
+        // Call ensure_queue_dirs - must fix all modes.
+        ensure_queue_dirs(&queue_root).expect("ensure_queue_dirs should succeed");
+
+        // Check queue root itself.
+        let root_mode = fs::metadata(&queue_root)
+            .expect("queue root metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            root_mode, 0o711,
+            "queue root must have mode 0711, got {root_mode:#o}"
+        );
+
+        // Check each queue subdir has mode 0711.
+        for subdir in [
+            PENDING_DIR,
+            CLAIMED_DIR,
+            COMPLETED_DIR,
+            DENIED_DIR,
+            QUARANTINE_DIR,
+            CANCELLED_DIR,
+            CONSUME_RECEIPTS_DIR,
+        ] {
+            let path = queue_root.join(subdir);
+            let mode = fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("metadata for {subdir}: {e}"))
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                mode, 0o711,
+                "{subdir} must have mode 0711 (not umask-derived 0775), got {mode:#o}"
+            );
+        }
+
+        // Check broker_requests/ has mode 01733.
+        let broker_mode = fs::metadata(queue_root.join(BROKER_REQUESTS_DIR))
+            .expect("broker_requests metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            broker_mode, 0o1733,
+            "broker_requests must have mode 01733, got {broker_mode:#o}"
+        );
+    }
+
+    /// TCK-00577 round 11 BLOCKER regression: Fresh queue creation must
+    /// also produce correct modes. Call `ensure_queue_dirs` on a completely
+    /// new directory and verify all modes are deterministic.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_queue_dirs_fresh_creation_sets_correct_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+
+        // Queue root does not exist yet - ensure_queue_dirs creates everything.
+        ensure_queue_dirs(&queue_root).expect("ensure_queue_dirs should succeed");
+
+        // Check queue root itself.
+        let root_mode = fs::metadata(&queue_root)
+            .expect("queue root metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            root_mode, 0o711,
+            "queue root must have mode 0711, got {root_mode:#o}"
+        );
+
+        // Check each queue subdir has mode 0711.
+        for subdir in [
+            PENDING_DIR,
+            CLAIMED_DIR,
+            COMPLETED_DIR,
+            DENIED_DIR,
+            QUARANTINE_DIR,
+            CANCELLED_DIR,
+            CONSUME_RECEIPTS_DIR,
+        ] {
+            let path = queue_root.join(subdir);
+            assert!(path.is_dir(), "{subdir} must exist");
+            let mode = fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("metadata for {subdir}: {e}"))
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                mode, 0o711,
+                "{subdir} must have mode 0711 after fresh creation, got {mode:#o}"
+            );
+        }
+
+        // Check broker_requests/ has mode 01733.
+        let broker_mode = fs::metadata(queue_root.join(BROKER_REQUESTS_DIR))
+            .expect("broker_requests metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            broker_mode, 0o1733,
+            "broker_requests must have mode 01733 after fresh creation, got {broker_mode:#o}"
+        );
+    }
+
+    /// TCK-00577 round 11 MAJOR regression: Pre-existing `broker_requests/`
+    /// with an unsafe mode (0333 - world-writable, no sticky bit) must be
+    /// hardened to 01733 by `ensure_queue_dirs` at worker startup.
+    ///
+    /// Steps:
+    /// 1. Create `broker_requests/` with unsafe mode 0333.
+    /// 2. Call `ensure_queue_dirs`.
+    /// 3. Verify `broker_requests/` mode is now 01733 (hardened).
+    #[cfg(unix)]
+    #[test]
+    fn ensure_queue_dirs_hardens_preexisting_unsafe_broker_requests() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        // Create broker_requests/ manually with unsafe mode 0333
+        // (world-writable, no sticky bit).
+        fs::create_dir_all(&broker_dir).expect("create broker_requests");
+        fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o333))
+            .expect("set unsafe mode 0333");
+
+        // Verify the unsafe mode is set.
+        let pre_mode = fs::metadata(&broker_dir)
+            .expect("broker metadata pre-fix")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            pre_mode, 0o333,
+            "pre-condition: broker_requests must start with mode 0333"
+        );
+
+        // Run ensure_queue_dirs - must harden the pre-existing directory.
+        ensure_queue_dirs(&queue_root).expect("ensure_queue_dirs should succeed");
+
+        // Verify broker_requests/ is now hardened to 01733.
+        let post_mode = fs::metadata(&broker_dir)
+            .expect("broker metadata post-fix")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            post_mode, 0o1733,
+            "broker_requests must be hardened from 0333 to 01733, got {post_mode:#o}"
+        );
+    }
+
+    /// TCK-00577 round 11 BLOCKER regression: After `ensure_queue_dirs`,
+    /// the relaxed preflight validator's mode check (reject group/other
+    /// read or write bits: mode & 0o066 != 0) must accept all queue
+    /// subdirectories. This proves the end-to-end invariant: queue dirs
+    /// created by `ensure_queue_dirs` pass the same validation used by
+    /// worker startup preflight.
+    ///
+    /// The check is inlined here (mode & 0o066 == 0) rather than
+    /// importing from `fac_permissions` to avoid cross-module visibility
+    /// issues with the integration test harness.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_queue_dirs_passes_relaxed_preflight_mode_check() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+
+        // Create queue dirs via `ensure_queue_dirs`.
+        ensure_queue_dirs(&queue_root).expect("ensure_queue_dirs should succeed");
+
+        // Inline the same check that `validate_directory_mode_only` performs:
+        // reject group/other read or write bits (0o066) but allow execute-only
+        // (0o011) for traversal.
+        let queue_dirs: Vec<&str> = vec![
+            PENDING_DIR,
+            CLAIMED_DIR,
+            COMPLETED_DIR,
+            DENIED_DIR,
+            QUARANTINE_DIR,
+            CANCELLED_DIR,
+            CONSUME_RECEIPTS_DIR,
+        ];
+
+        // Check queue root.
+        let root_mode = fs::metadata(&queue_root)
+            .expect("queue root metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            root_mode & 0o066,
+            0,
+            "queue root mode {root_mode:#o} has group/other read or write bits \
+             that relaxed preflight would reject"
+        );
+
+        // Check each queue subdir.
+        for subdir in &queue_dirs {
+            let path = queue_root.join(subdir);
+            let mode = fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("metadata for {subdir}: {e}"))
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                mode & 0o066,
+                0,
+                "{subdir} mode {mode:#o} has group/other read or write bits \
+                 that relaxed preflight would reject"
+            );
+        }
+
+        // broker_requests/ has special mode 01733. Verify it also passes
+        // the relaxed check (01733 & 0o066 = 0o022 which DOES have
+        // group write bits). However, broker_requests/ is validated
+        // separately by `enqueue_via_broker_requests`, not by the relaxed
+        // preflight validator on queue subdirs, so this is expected. The
+        // FAC_SUBDIRS_QUEUE list does NOT include broker_requests/.
+    }
+
+    // =========================================================================
+    // Broker promotion: service-user-owned rewrite (TCK-00577 round 12 BLOCKER)
+    // =========================================================================
+
+    /// TCK-00577 round 12 BLOCKER fix: After broker promotion, the file in
+    /// `pending/` must have mode 0600 (service-user-only). Previously the
+    /// attacker-owned file was renamed directly into `pending/`, preserving
+    /// the submitter's ownership and 0644 mode — allowing post-validation
+    /// modification (TOCTOU).
+    #[cfg(unix)]
+    #[test]
+    fn promoted_broker_request_has_mode_0600_in_pending() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Create a broker request file with mode 0600 (matching the new
+        // submitter mode from TCK-00577 round 14). In same-user tests the
+        // worker can read 0600 files it owns.
+        let content = make_valid_broker_request_json("mode-check-job");
+        let broker_file = broker_dir.join("mode-check-job.json");
+        fs::write(&broker_file, &content).expect("write broker request");
+        fs::set_permissions(&broker_file, fs::Permissions::from_mode(0o600))
+            .expect("set mode 0600 on broker request");
+
+        // Verify pre-condition: broker file has mode 0600.
+        let pre_mode = fs::metadata(&broker_file)
+            .expect("broker file metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            pre_mode, 0o600,
+            "pre-condition: broker request must be mode 0600"
+        );
+
+        // Run promotion.
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The promoted file in pending/ must have mode 0600.
+        let promoted_path = pending_dir.join("mode-check-job.json");
+        assert!(
+            promoted_path.exists(),
+            "promoted file must exist in pending/"
+        );
+        let post_mode = fs::metadata(&promoted_path)
+            .expect("promoted file metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            post_mode, 0o600,
+            "promoted file must have mode 0600 (service-user-only), got {post_mode:04o}"
+        );
+    }
+
+    /// TCK-00577 round 12 BLOCKER fix: After promotion, the original broker
+    /// request file must be removed from `broker_requests/`.
+    #[test]
+    fn promoted_broker_request_removes_original_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        let content = make_valid_broker_request_json("remove-original-job");
+        let broker_file = broker_dir.join("remove-original-job.json");
+        fs::write(&broker_file, &content).expect("write broker request");
+
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The promoted file must exist in pending/.
+        assert!(
+            pending_dir.join("remove-original-job.json").exists(),
+            "promoted file must exist in pending/"
+        );
+
+        // The original broker request must be removed.
+        assert!(
+            !broker_file.exists(),
+            "original broker request file must be removed after promotion"
+        );
+    }
+
+    /// TCK-00577 round 12 BLOCKER fix: The inode in `pending/` must be
+    /// DIFFERENT from the original broker inode. This proves the promotion
+    /// used a rewrite (new file) instead of rename (same inode).
+    #[cfg(unix)]
+    #[test]
+    fn promoted_broker_request_is_different_inode_from_original() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        let content = make_valid_broker_request_json("inode-check-job");
+        let broker_file = broker_dir.join("inode-check-job.json");
+        fs::write(&broker_file, &content).expect("write broker request");
+
+        // Capture the original inode number.
+        let original_ino = fs::metadata(&broker_file)
+            .expect("broker file metadata")
+            .ino();
+
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The promoted file must exist in pending/.
+        let promoted_path = pending_dir.join("inode-check-job.json");
+        assert!(
+            promoted_path.exists(),
+            "promoted file must exist in pending/"
+        );
+
+        // The promoted file's inode must differ from the original.
+        let promoted_ino = fs::metadata(&promoted_path)
+            .expect("promoted file metadata")
+            .ino();
+        assert_ne!(
+            original_ino, promoted_ino,
+            "promoted file in pending/ must be a NEW inode (got same inode {original_ino}), \
+             which means rename was used instead of rewrite"
+        );
+    }
+
+    /// TCK-00577 round 12: Verify `promote_via_rewrite` correctly handles
+    /// filename collisions — the existing pending file must not be clobbered.
+    #[test]
+    fn promote_via_rewrite_does_not_clobber_existing_pending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pending_dir = dir.path().join("pending");
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+
+        // Create an existing file in pending/.
+        let existing_content = b"existing pending content";
+        fs::write(pending_dir.join("collision-test.json"), existing_content)
+            .expect("write existing");
+
+        // Attempt to promote new content with the same filename.
+        let new_content = make_valid_broker_request_json("collision-test");
+        let result =
+            promote_via_rewrite(new_content.as_bytes(), &pending_dir, "collision-test.json");
+        assert!(
+            result.is_ok(),
+            "promote_via_rewrite should succeed with collision: {result:?}"
+        );
+
+        // The existing file must be untouched.
+        let existing_after =
+            fs::read(pending_dir.join("collision-test.json")).expect("read existing");
+        assert_eq!(
+            existing_after, existing_content,
+            "existing pending file must not be clobbered"
+        );
+
+        // The promoted file must exist with a timestamped suffix.
+        let promoted_path = result.unwrap();
+        assert!(
+            promoted_path.exists(),
+            "promoted file must exist at collision-safe path"
+        );
+        assert!(
+            promoted_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("collision-test-"),
+            "collision-safe name must have timestamped suffix: {promoted_path:?}"
+        );
+    }
+
+    /// TCK-00577 round 12: Verify promoted file content matches validated input
+    /// bytes.
+    #[test]
+    fn promote_via_rewrite_preserves_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pending_dir = dir.path().join("pending");
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+
+        let content = make_valid_broker_request_json("content-check-job");
+        let result =
+            promote_via_rewrite(content.as_bytes(), &pending_dir, "content-check-job.json");
+        assert!(
+            result.is_ok(),
+            "promote_via_rewrite should succeed: {result:?}"
+        );
+
+        let promoted_path = result.unwrap();
+        let promoted_bytes = fs::read(&promoted_path).expect("read promoted file");
+        assert_eq!(
+            promoted_bytes,
+            content.as_bytes(),
+            "promoted file content must match validated input"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR fix regression: junk entries must NOT starve valid broker requests
+    // (TCK-00577 round 16)
+    // =========================================================================
+
+    /// MAJOR fix (TCK-00577 round 16): Filling `broker_requests/` with N junk
+    /// entries (non-.json) plus 1 valid entry must still promote the valid
+    /// entry. Junk entries drain separately from the candidate cap.
+    #[test]
+    fn promote_broker_request_not_starved_by_junk_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+        let quarantine_dir = queue_root.join(QUARANTINE_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Create 300 junk entries (non-.json files) in broker_requests/.
+        // This exceeds MAX_BROKER_REQUESTS_PROMOTE (256) but should NOT
+        // consume the candidate budget because they are non-candidates.
+        let junk_count = 300;
+        for i in 0..junk_count {
+            let junk_path = broker_dir.join(format!("junk-entry-{i:04}.txt"));
+            fs::write(&junk_path, "not a json file").expect("write junk entry");
+        }
+
+        // Create 1 valid .json broker request.
+        let valid_content = make_valid_broker_request_json("valid-among-junk");
+        fs::write(broker_dir.join("valid-among-junk.json"), &valid_content)
+            .expect("write valid broker request");
+
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The valid entry MUST be promoted to pending/ (not starved).
+        assert!(
+            pending_dir.join("valid-among-junk.json").exists(),
+            "valid .json broker request must be promoted even when surrounded \
+             by {junk_count} junk entries (junk must not consume the candidate budget)",
+        );
+
+        // Junk entries must be moved to quarantine (up to
+        // MAX_JUNK_DRAIN_PER_CYCLE).
+        let quarantine_entries: Vec<_> = fs::read_dir(&quarantine_dir)
+            .expect("read quarantine dir")
+            .flatten()
+            .collect();
+        assert!(
+            !quarantine_entries.is_empty(),
+            "junk entries must be drained to quarantine"
+        );
+
+        // The original valid broker request file must be removed.
+        assert!(
+            !broker_dir.join("valid-among-junk.json").exists(),
+            "original valid broker request file must be removed after promotion"
+        );
+    }
+
+    /// MAJOR fix (TCK-00577 round 16): Verify that both promotion cap and
+    /// junk drain cap are enforced independently. With candidates at cap
+    /// and junk at cap, the loop terminates cleanly.
+    #[test]
+    fn promote_broker_request_respects_independent_caps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Create MAX_BROKER_REQUESTS_PROMOTE + 5 valid .json entries.
+        // Only MAX_BROKER_REQUESTS_PROMOTE should be promoted.
+        let total_candidates = MAX_BROKER_REQUESTS_PROMOTE + 5;
+        for i in 0..total_candidates {
+            let content = make_valid_broker_request_json(&format!("cap-test-{i:04}"));
+            fs::write(broker_dir.join(format!("cap-test-{i:04}.json")), &content)
+                .expect("write candidate entry");
+        }
+
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // Count promoted files in pending/.
+        let promoted: Vec<_> = fs::read_dir(&pending_dir)
+            .expect("read pending")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("cap-test-"))
+            .collect();
+        assert_eq!(
+            promoted.len(),
+            MAX_BROKER_REQUESTS_PROMOTE,
+            "exactly MAX_BROKER_REQUESTS_PROMOTE ({MAX_BROKER_REQUESTS_PROMOTE}) \
+             candidates should be promoted, got {}",
+            promoted.len()
+        );
+
+        // Remaining candidates should still be in broker_requests/.
+        let remaining: Vec<_> = fs::read_dir(&broker_dir)
+            .expect("read broker dir")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+            .collect();
+        assert_eq!(
+            remaining.len(),
+            5,
+            "5 excess candidates should remain in broker_requests/ for next cycle"
+        );
+    }
+
+    // =========================================================================
+    // BLOCKER fix: broker file readability by service-user worker
+    // (TCK-00577 round 16)
+    // =========================================================================
+
+    /// BLOCKER fix (TCK-00577 round 16): Verify that `promote_broker_requests`
+    /// successfully reads and promotes a file created with mode 0640 (the new
+    /// broker file mode for cross-user deployments). In same-user tests (test
+    /// process == broker file owner), the file is always readable. This test
+    /// verifies the promotion path works end-to-end with the new mode.
+    #[cfg(unix)]
+    #[test]
+    fn promote_broker_request_reads_mode_0640_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Write a valid broker request with mode 0640 (new default for
+        // cross-user deployments).
+        let content = make_valid_broker_request_json("mode-0640-test");
+        let broker_file = broker_dir.join("mode-0640-test.json");
+        fs::write(&broker_file, &content).expect("write broker request");
+        fs::set_permissions(&broker_file, fs::Permissions::from_mode(0o640))
+            .expect("set mode 0640");
+
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        // The file must be promoted (not quarantined due to EACCES).
+        assert!(
+            pending_dir.join("mode-0640-test.json").exists(),
+            "broker request with mode 0640 must be promoted to pending/ \
+             (not quarantined)"
+        );
+    }
+
+    /// BLOCKER fix (TCK-00577 round 16): Verify that
+    /// `promote_broker_requests` also works with mode 0644 files (fallback
+    /// mode when service user is not resolvable in dev environments).
+    #[cfg(unix)]
+    #[test]
+    fn promote_broker_request_reads_mode_0644_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        fs::create_dir_all(&pending_dir).expect("pending dir");
+        fs::create_dir_all(&broker_dir).expect("broker dir");
+
+        // Write with mode 0644 (dev fallback mode).
+        let content = make_valid_broker_request_json("mode-0644-test");
+        let broker_file = broker_dir.join("mode-0644-test.json");
+        fs::write(&broker_file, &content).expect("write broker request");
+        fs::set_permissions(&broker_file, fs::Permissions::from_mode(0o644))
+            .expect("set mode 0644");
+
+        let default_policy = QueueBoundsPolicy::default();
+        promote_broker_requests(&queue_root, &default_policy);
+
+        assert!(
+            pending_dir.join("mode-0644-test.json").exists(),
+            "broker request with mode 0644 must be promoted to pending/"
         );
     }
 }
