@@ -701,17 +701,20 @@ systemd service executables:
 - **Broker requests mode 01733**: `enqueue_via_broker_requests` explicitly
   sets broker_requests/ to mode 01733 (fail-closed on error).
 
-### ServiceUserNotResolved broker fallback (TCK-00577 round 8)
+### ServiceUserNotResolved is a hard denial (TCK-00577 round 10 security fix)
 
-- **Broker fallback on unresolvable service user**: When
+- **Fail-closed on unresolvable service user**: When
   `check_queue_write_permission` returns `ServiceUserNotResolved` in
-  `ServiceUserOnly` mode, `enqueue_job` now falls back to broker-mediated
-  enqueue (writes to `broker_requests/`) instead of returning a hard error.
-  This allows `apm2 fac push` to succeed on systems where the service user
-  has not been provisioned (fresh deployment, dev environment, CI). The
-  worker (once provisioned) promotes requests from `broker_requests/` into
-  `pending/`. For local-only workflows, inline gate fallback handles
-  execution without a running worker.
+  `ServiceUserOnly` mode, `enqueue_job` returns a hard error. The service
+  user identity cannot be confirmed, so no write path (including broker
+  fallback) is permitted. This prevents a local user from bypassing the
+  service user gate by misconfiguring or removing the service user account.
+- **Dev environment escape hatch**: Callers in dev environments MUST use
+  `--unsafe-local-write` to bypass the service user check. This is the
+  explicit opt-in that tells the system "I know there's no service user."
+- **NotServiceUser still falls back to broker**: Only `ServiceUserNotResolved`
+  is a hard error. `NotServiceUser` (identity IS resolved, caller is not
+  that user) correctly routes to broker-mediated enqueue.
 
 ### FIFO poisoning defense (TCK-00577 round 9)
 
@@ -761,6 +764,20 @@ systemd service executables:
   Modes like `01333` or `01733` (sticky set) are accepted. Owner-only
   modes (e.g., `0700`) do not require the sticky bit since other-write
   is not set.
+
+### Queue-aware strict validator (TCK-00577 round 10 code-quality fix)
+
+- **Strict validator excludes queue directories**: `FAC_SUBDIRS` was split
+  into `FAC_SUBDIRS_STRICT` (private/fac dirs, fac_lifecycle, fac_projection)
+  and `FAC_SUBDIRS_QUEUE` (queue, queue/pending, etc.). The strict validator
+  (`validate_fac_root_permissions_at`) only iterates `FAC_SUBDIRS_STRICT`.
+  This prevents non-enqueue commands like `fac lane status` from failing
+  with `fac_root_permissions_failed` when `queue/` has the intentional
+  hardened mode 0711.
+- **Relaxed validator checks both sets**: The relaxed validator
+  (`validate_fac_root_permissions_relaxed_at`) iterates both
+  `FAC_SUBDIRS_STRICT` and `FAC_SUBDIRS_QUEUE`, using `validate_directory_mode_only`
+  which permits execute-only traversal bits (`o+x` without `o+r`/`o+w`).
 
 ### General invariants
 

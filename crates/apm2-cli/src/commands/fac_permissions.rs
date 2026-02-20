@@ -31,9 +31,20 @@ const fn fac_file_open_flags() -> i32 {
     libc::O_NOFOLLOW | libc::O_CLOEXEC
 }
 
-/// Subdirectories under `$APM2_HOME` that must satisfy the permissions
-/// invariant.
-const FAC_SUBDIRS: &[&str] = &[
+/// Subdirectories under `$APM2_HOME` that must satisfy the **strict**
+/// permissions invariant (mode 0700, owner-only).
+///
+/// Queue directories are intentionally excluded from this list because the
+/// queue hardening (TCK-00577) sets `queue/` to 0711 and
+/// `queue/broker_requests/` to 01733. These intentional modes would fail
+/// the strict 0700 check, breaking non-enqueue commands like `fac lane status`.
+///
+/// Queue directories are checked separately:
+/// - The **relaxed** validator (`validate_fac_root_permissions_relaxed_at`)
+///   iterates both `FAC_SUBDIRS_STRICT` and `FAC_SUBDIRS_QUEUE`, and permits
+///   execute-only traversal bits (`o+x` without `o+r`/`o+w`).
+/// - The **strict** validator uses only this list (`FAC_SUBDIRS_STRICT`).
+const FAC_SUBDIRS_STRICT: &[&str] = &[
     "private",
     "private/fac",
     "private/fac/gate_cache",
@@ -42,8 +53,17 @@ const FAC_SUBDIRS: &[&str] = &[
     "private/fac/tickets",
     "private/fac/legacy",
     "private/fac/receipts",
-    // TCK-00577: Queue directories are part of the sensitive FAC state.
-    // Service user ownership enforces that only the broker/worker can write.
+    "fac_lifecycle",
+    "fac_projection",
+];
+
+/// Queue subdirectories under `$APM2_HOME` that use intentionally relaxed
+/// permission modes (TCK-00577 round 10 fix).
+///
+/// These are checked by the **relaxed** validator only (which permits
+/// execute-only traversal bits). The strict validator skips them because
+/// `queue/` is hardened to 0711 (not 0700) by design.
+const FAC_SUBDIRS_QUEUE: &[&str] = &[
     "queue",
     "queue/pending",
     "queue/claimed",
@@ -51,8 +71,6 @@ const FAC_SUBDIRS: &[&str] = &[
     "queue/denied",
     "queue/cancelled",
     "queue/quarantine",
-    "fac_lifecycle",
-    "fac_projection",
 ];
 
 /// Errors from FAC root permissions validation.
@@ -567,7 +585,9 @@ fn validate_fac_root_permissions_relaxed_at(apm2_home: &Path) -> Result<(), FacP
     // will differ from the directory owner.
     validate_directory_mode_only(apm2_home)?;
 
-    for subdir in FAC_SUBDIRS {
+    // Check both strict subdirs and queue subdirs with the relaxed
+    // validator (permits execute-only traversal bits like 0711).
+    for subdir in FAC_SUBDIRS_STRICT.iter().chain(FAC_SUBDIRS_QUEUE.iter()) {
         let path = apm2_home.join(subdir);
         // Directories that do not exist yet are fine — they will be
         // created by the service user (worker/broker) when needed.
@@ -620,8 +640,15 @@ fn validate_fac_root_permissions_at(apm2_home: &Path) -> Result<(), FacPermissio
     // Validate the APM2 home directory itself.
     validate_directory(apm2_home, expected_uid)?;
 
-    // Validate each critical subdirectory.
-    for subdir in FAC_SUBDIRS {
+    // TCK-00577 round 10: Only validate strict subdirectories here.
+    // Queue directories are intentionally set to 0711 (not 0700) after
+    // queue hardening, so they would fail this strict check. Queue
+    // directories are validated by the relaxed validator (for enqueue-class
+    // commands) and by queue-specific code (enqueue_direct,
+    // enqueue_via_broker_requests). Non-enqueue commands like
+    // `fac lane status` use this strict validator and must not fail
+    // on intentional queue modes.
+    for subdir in FAC_SUBDIRS_STRICT {
         let path = apm2_home.join(subdir);
         validate_directory(&path, expected_uid)?;
     }
@@ -976,6 +1003,10 @@ mod tests {
 
     /// TCK-00536: End-to-end test of `validate_fac_root_permissions` with a
     /// temporary `$APM2_HOME`.
+    ///
+    /// TCK-00577 round 10: The strict validator only creates/validates
+    /// `FAC_SUBDIRS_STRICT` (not queue dirs). Queue dirs are intentionally
+    /// excluded because they use 0711 mode after hardening.
     #[test]
     #[cfg(unix)]
     fn validate_fac_root_creates_all_dirs_with_0700() {
@@ -990,9 +1021,9 @@ mod tests {
             "should succeed with fresh temp dir: {result:?}"
         );
 
-        // Verify all directories were created with correct permissions.
-        let dirs_to_check =
-            std::iter::once(apm2_home.clone()).chain(FAC_SUBDIRS.iter().map(|s| apm2_home.join(s)));
+        // Verify all strict directories were created with correct permissions.
+        let dirs_to_check = std::iter::once(apm2_home.clone())
+            .chain(FAC_SUBDIRS_STRICT.iter().map(|s| apm2_home.join(s)));
 
         for path in dirs_to_check {
             assert!(path.exists(), "directory should exist: {}", path.display());
@@ -1006,6 +1037,76 @@ mod tests {
                 mode
             );
         }
+
+        // Queue directories should NOT be created by the strict validator.
+        for subdir in FAC_SUBDIRS_QUEUE {
+            let path = apm2_home.join(subdir);
+            assert!(
+                !path.exists(),
+                "queue directory {} should NOT be created by strict validator",
+                path.display()
+            );
+        }
+    }
+
+    /// TCK-00577 round 10 MAJOR fix: The strict validator must succeed when
+    /// queue directories exist with mode 0711 (the intentional hardened mode).
+    /// Previously, queue dirs were in `FAC_SUBDIRS` and the strict validator
+    /// rejected 0711, breaking non-enqueue commands like `fac lane status`.
+    #[test]
+    #[cfg(unix)]
+    fn strict_validation_succeeds_when_queue_dirs_have_mode_0711() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let apm2_home = dir.path().join("apm2_home");
+
+        // Create strict dirs via the normal path.
+        let result = validate_fac_root_permissions_at(&apm2_home);
+        assert!(result.is_ok(), "initial strict validation should succeed");
+
+        // Now create queue directories with the intentional hardened modes.
+        let queue_root = apm2_home.join("queue");
+        std::fs::create_dir_all(queue_root.join("pending")).expect("create queue/pending");
+        std::fs::create_dir_all(queue_root.join("claimed")).expect("create queue/claimed");
+        std::fs::create_dir_all(queue_root.join("completed")).expect("create queue/completed");
+        std::fs::create_dir_all(queue_root.join("denied")).expect("create queue/denied");
+        std::fs::create_dir_all(queue_root.join("cancelled")).expect("create queue/cancelled");
+        std::fs::create_dir_all(queue_root.join("quarantine")).expect("create queue/quarantine");
+        std::fs::create_dir_all(queue_root.join("broker_requests"))
+            .expect("create broker_requests");
+
+        // Set queue dirs to 0711 (traverse-only for group/other).
+        std::fs::set_permissions(&queue_root, std::fs::Permissions::from_mode(0o711))
+            .expect("set queue root to 0711");
+        for subdir in &[
+            "pending",
+            "claimed",
+            "completed",
+            "denied",
+            "cancelled",
+            "quarantine",
+        ] {
+            std::fs::set_permissions(
+                queue_root.join(subdir),
+                std::fs::Permissions::from_mode(0o711),
+            )
+            .expect("set queue subdir to 0711");
+        }
+        // Set broker_requests to 01733.
+        std::fs::set_permissions(
+            queue_root.join("broker_requests"),
+            std::fs::Permissions::from_mode(0o1733),
+        )
+        .expect("set broker_requests to 01733");
+
+        // The strict validator must STILL succeed — it should not check
+        // queue directories at all.
+        let result = validate_fac_root_permissions_at(&apm2_home);
+        assert!(
+            result.is_ok(),
+            "strict validation should succeed when queue dirs have mode 0711: {result:?}"
+        );
     }
 
     // ── TCK-00577 round 3: relaxed validation for enqueue-class commands ──
@@ -1033,6 +1134,9 @@ mod tests {
 
     /// TCK-00577 round 6: Relaxed validation accepts 0711 on `queue/` (needed
     /// for non-service-user traversal to `broker_requests/`).
+    ///
+    /// TCK-00577 round 10: The strict validator no longer creates queue dirs,
+    /// so this test creates them manually before setting mode 0711.
     #[test]
     #[cfg(unix)]
     fn relaxed_validation_accepts_0711_queue_dir() {
@@ -1041,12 +1145,15 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("create temp dir");
         let apm2_home = dir.path().join("apm2_home");
 
-        // Create all dirs via strict path first.
+        // Create strict dirs via the normal path first.
         let strict_result = validate_fac_root_permissions_at(&apm2_home);
         assert!(strict_result.is_ok(), "strict creation should succeed");
 
-        // Set queue/ to 0711 (traverse-only for group/other).
+        // Manually create queue dir (strict validator no longer creates it).
         let queue_dir = apm2_home.join("queue");
+        std::fs::create_dir_all(&queue_dir).expect("create queue dir");
+
+        // Set queue/ to 0711 (traverse-only for group/other).
         std::fs::set_permissions(&queue_dir, std::fs::Permissions::from_mode(0o711))
             .expect("set queue to 0711");
 

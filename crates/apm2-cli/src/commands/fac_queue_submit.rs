@@ -249,26 +249,29 @@ pub(super) fn enqueue_job(
             // proceed with direct write to pending/.
             enqueue_direct(queue_root, fac_root, spec, queue_bounds_policy)
         },
-        Err(ServiceUserGateError::ServiceUserNotResolved { .. })
-            if write_mode == QueueWriteMode::ServiceUserOnly =>
-        {
-            // ServiceUserNotResolved means the configured service user does
-            // not exist on this system (fresh deployment, dev environment,
-            // or CI). Broker-mediated enqueue is the correct fallback:
-            // the caller can write to broker_requests/ (mode 01733) and
-            // the worker (once provisioned) will promote into pending/.
-            // For local-only workflows without a worker, the inline
-            // fallback in run_queued_gates_and_collect handles execution.
+        Err(ServiceUserGateError::ServiceUserNotResolved {
+            ref service_user,
+            ref reason,
+        }) if write_mode == QueueWriteMode::ServiceUserOnly => {
+            // TCK-00577 round 10 MAJOR fix (security review): ServiceUserNotResolved
+            // in ServiceUserOnly mode is a HARD error, not a broker fallback.
+            // The service user identity cannot be confirmed, so we must fail-closed.
             //
-            // TCK-00577 round 8: changed from hard error to broker
-            // fallback. The previous fail-closed behavior blocked
-            // `apm2 fac push` on systems where the service user had not
-            // been provisioned, breaking the gate execution path.
-            tracing::info!(
-                job_id = %spec.job_id,
-                "TCK-00577: service user not resolvable, submitting via broker-mediated enqueue"
-            );
-            enqueue_via_broker_requests(queue_root, spec)
+            // Rationale: ServiceUserNotResolved means "I cannot determine who
+            // the service user is" — this is an unresolvable trust question.
+            // Allowing broker fallback here would let any local user bypass
+            // the service user gate simply by misconfiguring or removing the
+            // service user account.
+            //
+            // For dev environments without a service user, callers MUST use
+            // `--unsafe-local-write` explicitly (which returns Ok(()) from
+            // check_queue_write_permission before resolution is attempted).
+            Err(format!(
+                "service user gate denied queue write (fail-closed): \
+                 service user '{service_user}' not resolvable ({reason}). \
+                 In ServiceUserOnly mode, an unresolvable service user is a hard denial. \
+                 Use --unsafe-local-write to bypass in development environments."
+            ))
         },
         Err(ServiceUserGateError::NotServiceUser { .. })
             if write_mode == QueueWriteMode::ServiceUserOnly =>
@@ -958,18 +961,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn enqueue_job_falls_back_to_broker_when_service_user_not_resolved() {
-        // This test runs as a normal user on a system where the _apm2-job
-        // service user does not exist, so `ServiceUserNotResolved` fires.
-        // In ServiceUserOnly mode this falls back to broker-mediated
-        // enqueue (TCK-00577 round 8): the service user doesn't exist,
-        // so the caller writes to broker_requests/ for worker promotion.
+    fn enqueue_job_hard_denies_when_service_user_not_resolved_in_service_user_only_mode() {
+        // TCK-00577 round 10 MAJOR fix: ServiceUserNotResolved in
+        // ServiceUserOnly mode is a HARD error (fail-closed). The service
+        // user identity cannot be confirmed, so we must not allow any
+        // write path (not even broker fallback). Callers in dev
+        // environments MUST use --unsafe-local-write explicitly.
         let dir = tempfile::TempDir::new().expect("create temp dir");
         let queue_root = dir.path().join("queue");
         let fac_root = dir.path().join("fac");
         std::fs::create_dir_all(&fac_root).expect("create fac root");
 
-        let spec = test_job_spec("test-fallback-001");
+        let spec = test_job_spec("test-hard-deny-001");
         let policy = QueueBoundsPolicy::default();
 
         let result = enqueue_job(
@@ -980,17 +983,26 @@ mod tests {
             QueueWriteMode::ServiceUserOnly,
         );
 
-        // ServiceUserNotResolved in ServiceUserOnly mode now falls back
-        // to broker-mediated enqueue (writes to broker_requests/).
+        // ServiceUserNotResolved + ServiceUserOnly = hard error.
         assert!(
-            result.is_ok(),
-            "ServiceUserNotResolved should fall back to broker enqueue: {result:?}"
+            result.is_err(),
+            "ServiceUserNotResolved in ServiceUserOnly mode must be a hard error: {result:?}"
         );
 
-        let path = result.unwrap();
+        let err = result.unwrap_err();
         assert!(
-            path.starts_with(queue_root.join(BROKER_REQUESTS_DIR)),
-            "file should be in broker_requests/: {path:?}"
+            err.contains("fail-closed") && err.contains("not resolvable"),
+            "error should mention fail-closed and not resolvable: {err}"
+        );
+
+        // Verify no file was written to broker_requests/ either.
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+        assert!(
+            !broker_dir.exists()
+                || std::fs::read_dir(&broker_dir)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true),
+            "no files should be written to broker_requests/ on hard denial"
         );
     }
 
