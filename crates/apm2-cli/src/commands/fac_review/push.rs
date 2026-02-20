@@ -2252,7 +2252,7 @@ pub fn run_push(
         );
         human_log!("WARNING: review dispatch failed: {e}");
         human_log!("  Reviewers are NOT running. Use one of:");
-        human_log!("    apm2 fac review dispatch <PR_URL> --type all");
+        human_log!("    apm2 fac review run --pr {pr_number} --type all");
         human_log!("    apm2 fac restart --pr {pr_number}");
         // BF-001 (TCK-00626): Emit structured dispatch_failed event so
         // the event stream captures the failure for automated recovery.
@@ -2264,7 +2264,7 @@ pub fn run_push(
                 "sha": sha,
                 "error": e,
                 "recovery_commands": [
-                    format!("apm2 fac review dispatch <PR_URL> --type all"),
+                    format!("apm2 fac review run --pr {pr_number} --type all"),
                     format!("apm2 fac restart --pr {pr_number}"),
                 ],
             }));
