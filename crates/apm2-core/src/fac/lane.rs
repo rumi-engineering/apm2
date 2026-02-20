@@ -2533,8 +2533,54 @@ impl LaneManager {
         config: &super::gc::LogRetentionConfig,
         steps_completed: &[String],
     ) -> Result<(), LaneCleanupError> {
-        if !logs_dir.exists() {
-            return Ok(());
+        // SECURITY: Validate that logs_dir itself is not a symlink before any
+        // read_dir/remove operations. A symlinked logs/ directory would cause
+        // all subsequent path operations to resolve outside the lane root,
+        // enabling arbitrary-file-deletion attacks (BLOCKER finding).
+        // Use symlink_metadata (lstat) to inspect without following.
+        match fs::symlink_metadata(logs_dir) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(LaneCleanupError::LogQuotaFailed {
+                        step: CLEANUP_STEP_LOG_QUOTA,
+                        reason: format!(
+                            "logs directory {} is a symlink — refusing to follow \
+                             (fail-closed: symlinked logs/ enables arbitrary-file-deletion \
+                             attacks outside the lane root)",
+                            logs_dir.display()
+                        ),
+                        steps_completed: steps_completed.to_vec(),
+                        failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+                    });
+                }
+                if !meta.is_dir() {
+                    return Err(LaneCleanupError::LogQuotaFailed {
+                        step: CLEANUP_STEP_LOG_QUOTA,
+                        reason: format!(
+                            "logs path {} exists but is not a directory \
+                             (fail-closed: unexpected file type at logs path)",
+                            logs_dir.display()
+                        ),
+                        steps_completed: steps_completed.to_vec(),
+                        failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+                    });
+                }
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok(());
+            },
+            Err(e) => {
+                return Err(LaneCleanupError::LogQuotaFailed {
+                    step: CLEANUP_STEP_LOG_QUOTA,
+                    reason: format!(
+                        "cannot stat logs directory {}: {e} \
+                         (fail-closed: unreadable logs path)",
+                        logs_dir.display()
+                    ),
+                    steps_completed: steps_completed.to_vec(),
+                    failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+                });
+            },
         }
 
         let effective_ttl = config.effective_ttl_secs();
@@ -2715,7 +2761,21 @@ impl LaneManager {
         }
 
         // Phase 2: Byte quota enforcement.
-        if config.per_lane_log_max_bytes > 0 {
+        //
+        // SENTINEL GUARD (MAJOR finding fix): If any entry has
+        // `estimated_bytes == u64::MAX`, the recursive size estimator hit
+        // its scan limit (MAX_LANE_SCAN_ENTRIES) and the returned value is
+        // a traversal-failure sentinel, NOT a real byte count. Using it in
+        // arithmetic would cause saturating_add to produce u64::MAX for
+        // total_bytes, making saturating_sub drop the total below the
+        // quota after subtracting pruned entries — effectively disabling
+        // byte-quota enforcement for the entire lane. Fail-closed: skip
+        // the byte-quota phase entirely when any entry's size is unknown,
+        // letting TTL and keep-last-N phases handle retention. The
+        // byte-quota will be retried on the next cleanup cycle when the
+        // scan may succeed with fewer entries.
+        let has_size_overflow = job_dirs.iter().any(|e| e.estimated_bytes == u64::MAX);
+        if config.per_lane_log_max_bytes > 0 && !has_size_overflow {
             let mut total_bytes: u64 = job_dirs
                 .iter()
                 .map(|e| e.estimated_bytes)
@@ -6769,5 +6829,193 @@ mod tests {
         }"#;
         let receipt: LaneReconcileReceiptV1 = serde_json::from_str(json).expect("deserialize");
         assert_eq!(receipt.infrastructure_failures, 0);
+    }
+
+    // =========================================================================
+    // Regression tests for round-N review findings (PR #759)
+    // =========================================================================
+
+    /// BLOCKER regression: `enforce_log_retention` MUST reject a symlinked
+    /// `logs/` directory at entry and MUST NOT follow the symlink or delete
+    /// files outside the lane root. This prevents an attacker-controlled job
+    /// from replacing `lanes/{lane_id}/logs` with a symlink to an arbitrary
+    /// directory, which would cause `read_dir`/`remove_file` operations to
+    /// resolve outside FAC boundaries.
+    #[cfg(unix)]
+    #[test]
+    fn enforce_log_retention_rejects_symlinked_logs_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        // Create a directory that a symlink will point to.
+        // Place a canary file inside to verify it is NOT deleted.
+        let target_dir = root.path().join("attacker-controlled");
+        fs::create_dir_all(&target_dir).expect("create target dir");
+        let canary = target_dir.join("canary.txt");
+        fs::write(&canary, b"must survive").expect("write canary");
+
+        // Remove the real logs/ directory and replace it with a symlink
+        // to the attacker-controlled directory.
+        let logs_dir = lane_dir.join("logs");
+        if logs_dir.exists() {
+            fs::remove_dir_all(&logs_dir).expect("remove real logs dir");
+        }
+        std::os::unix::fs::symlink(&target_dir, &logs_dir).expect("create symlink at logs/");
+
+        // Verify the symlink exists.
+        let meta = fs::symlink_metadata(&logs_dir).expect("symlink metadata");
+        assert!(
+            meta.file_type().is_symlink(),
+            "logs/ must be a symlink for this test"
+        );
+
+        // Run cleanup — must fail at log retention entry due to symlink.
+        let result = manager.run_lane_cleanup(lane_id, &workspace);
+        let err = result.expect_err(
+            "cleanup must fail when logs/ is a symlink (fail-closed: \
+             symlinked logs/ enables arbitrary-file-deletion attacks)",
+        );
+
+        // Verify it is a LogQuotaFailed error mentioning the symlink.
+        assert!(
+            matches!(err, LaneCleanupError::LogQuotaFailed { .. }),
+            "expected LogQuotaFailed, got: {err:?}"
+        );
+        let reason = match &err {
+            LaneCleanupError::LogQuotaFailed { reason, .. } => reason.clone(),
+            other => panic!("unexpected error variant: {other:?}"),
+        };
+        assert!(
+            reason.contains("symlink"),
+            "error reason must mention symlink, got: {reason}"
+        );
+
+        // Canary file outside the lane MUST survive — the symlink was
+        // never followed.
+        assert!(
+            canary.exists(),
+            "canary file outside lane root must not be deleted — \
+             symlink following was correctly prevented"
+        );
+    }
+
+    /// MAJOR regression: when `estimate_job_log_dir_size_recursive` returns
+    /// `u64::MAX` (traversal overflow sentinel), the byte-quota phase in
+    /// `enforce_log_retention` MUST be skipped rather than treating the
+    /// sentinel as a real byte count. Using `u64::MAX` in arithmetic would
+    /// break quota enforcement via saturating operations.
+    #[test]
+    fn enforce_log_retention_skips_byte_quota_on_size_overflow_sentinel() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        let logs_dir = lane_dir.join("logs");
+
+        // Create a job log directory with enough files to trigger the
+        // MAX_LANE_SCAN_ENTRIES limit in the recursive estimator.
+        // We create a single job log dir with many files.
+        let job_dir = logs_dir.join("job-overflow");
+        fs::create_dir_all(&job_dir).expect("create job dir");
+
+        // Create nested directories with files so that the recursive
+        // estimator exceeds MAX_LANE_SCAN_ENTRIES. We create 101 dirs
+        // each with 1000 files to ensure we exceed the 100,000 limit.
+        // However, this would be very slow. Instead, we test the guard
+        // indirectly by creating a scenario that triggers the sentinel
+        // and verifying the behavior.
+        //
+        // Approach: Pre-fill the lane_visited_count close to the limit
+        // by creating enough entries. We use the fact that the sentinel
+        // is checked AFTER all entries are collected. Create 2 job dirs
+        // where one has very many files to trigger the sentinel.
+        //
+        // Alternative (more practical): Create a small scenario and
+        // verify that the byte quota phase is NOT entered when a job
+        // dir has u64::MAX estimated_bytes. We test this by using a
+        // tight byte quota and verifying that no byte-based pruning
+        // occurs despite being over quota.
+        //
+        // Since we can't easily trigger MAX_LANE_SCAN_ENTRIES in a test
+        // without creating 100K+ files, we create enough nested
+        // structure to trigger it via pre-filled visited_count.
+        // The real guard is in enforce_log_retention which uses the
+        // same estimator. We create a scenario with many nested dirs.
+
+        // Clean up and re-create logs_dir for this approach
+        fs::remove_dir_all(&logs_dir).expect("remove logs dir");
+        fs::create_dir_all(&logs_dir).expect("recreate logs dir");
+
+        // Create two job dirs. First one small, second one with deep
+        // nesting to trigger the recursive estimator limit.
+        let job_a = logs_dir.join("job-a-small");
+        fs::create_dir_all(&job_a).expect("create job-a");
+        fs::write(job_a.join("output.log"), vec![0u8; 100]).expect("write");
+
+        // Create job-b with wide+deep nesting to hit scan limit.
+        let job_b = logs_dir.join("job-b-overflow");
+        fs::create_dir_all(&job_b).expect("create job-b");
+        // Create 200 subdirs, each with 501 files = 100,400 entries
+        // which exceeds MAX_LANE_SCAN_ENTRIES (100,000).
+        for dir_idx in 0..200 {
+            let subdir = job_b.join(format!("d{dir_idx:04}"));
+            fs::create_dir_all(&subdir).expect("create subdir");
+            for file_idx in 0..501 {
+                fs::write(subdir.join(format!("f{file_idx:04}.log")), vec![0u8; 10])
+                    .expect("write nested file");
+            }
+        }
+
+        // Retention config with a very tight byte quota. Without the
+        // sentinel guard, u64::MAX would saturate the total and job-a
+        // would be incorrectly pruned or the accounting would be wrong.
+        // With the guard, the byte-quota phase is skipped entirely, so
+        // neither job dir is byte-pruned (only TTL applies).
+        let retention = crate::fac::gc::LogRetentionConfig {
+            per_lane_log_max_bytes: 50, // Very tight — would prune if byte quota ran
+            per_job_log_ttl_secs: 0,    // No TTL pruning (all recent)
+            keep_last_n_jobs_per_lane: 0,
+        };
+
+        // Run cleanup — should succeed because:
+        // 1. The sentinel guard skips byte-quota arithmetic
+        // 2. No TTL pruning (all recent)
+        // 3. No keep-last-N exclusion
+        // Result: no pruning occurs, cleanup succeeds with both dirs intact.
+        let result = manager.run_lane_cleanup_with_retention(lane_id, &workspace, &retention);
+        assert!(
+            result.is_ok(),
+            "cleanup must succeed when size estimator returns sentinel — \
+             byte-quota phase must be skipped, got: {result:?}"
+        );
+
+        // Both job dirs must survive — byte quota was NOT applied.
+        assert!(
+            job_a.exists(),
+            "job-a must survive: byte-quota must be skipped when \
+             estimator returns u64::MAX sentinel"
+        );
+        assert!(
+            job_b.exists(),
+            "job-b must survive: byte-quota must be skipped when \
+             estimator returns u64::MAX sentinel"
+        );
     }
 }

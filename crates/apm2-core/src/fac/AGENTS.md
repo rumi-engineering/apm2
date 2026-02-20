@@ -954,6 +954,19 @@ by another worker).
   an error to prevent silent accumulation. The GC planner
   (`collect_lane_log_retention_targets`) mirrors this behavior by emitting
   GC targets for stray files and symlinks.
+- [INV-LANE-CLEANUP-004c] The `logs/` directory itself is validated via
+  `symlink_metadata()` at function entry in both `enforce_log_retention` and
+  `collect_lane_log_retention_targets`. If `logs/` is a symlink or non-directory,
+  the function fails closed (returns error in cleanup, skips lane in GC).
+  This prevents an attacker-controlled job from replacing `logs/` with a symlink
+  to an arbitrary directory, which would cause `read_dir`/`remove_file` operations
+  to resolve outside the lane root.
+- [INV-LANE-CLEANUP-004d] The `u64::MAX` sentinel returned by
+  `estimate_job_log_dir_size_recursive` when `MAX_LANE_SCAN_ENTRIES` is exceeded
+  is never used in byte-quota arithmetic. Both `enforce_log_retention` and
+  `collect_lane_log_retention_targets` check for the sentinel before entering
+  the byte-quota phase; when detected, the byte-quota phase is skipped entirely
+  (safe fallback: TTL and keep-last-N still apply).
 - [INV-LANE-CLEANUP-005] A RUNNING `LaneLeaseV1` must be persisted before
   job execution and removed on every terminal path.
 - [INV-LANE-CLEANUP-006] Job completion (Completed receipt + move to completed/)
@@ -3617,7 +3630,9 @@ includes `"lane_log_retention"` for the new action kind.
 - [INV-LLR-001] Bounded traversal: `MAX_JOB_LOG_ENTRIES_PER_LANE` (10,000)
   limits per-lane scan depth (CTR-1303).
 - [INV-LLR-002] No symlink following: `symlink_metadata()` is used and symlinks
-  are skipped.
+  are skipped. The `logs/` directory itself is validated at function entry via
+  `symlink_metadata()` — if it is a symlink or non-directory, the lane is
+  skipped entirely (fail-closed).
 - [INV-LLR-003] Deterministic pruning order: mtime ascending with path
   tiebreaker. Protected entries (keep-last-N) are never pruned.
 - [INV-LLR-004] Policy defaults are conservative: 100 MiB byte quota, 7-day
@@ -3632,6 +3647,13 @@ includes `"lane_log_retention"` for the new action kind.
   scan completes without overflow are targets committed to the shared vector.
   If `scan_overflow` is triggered, ALL lane targets (including previously-collected
   symlink and file targets) are discarded. This ensures fail-closed atomicity.
+- [INV-LLR-007] Size estimation sentinel guard: The `u64::MAX` value returned by
+  `estimate_job_log_dir_size_recursive` when the scan exceeds `MAX_LANE_SCAN_ENTRIES`
+  is a traversal-failure sentinel, not a real byte count. Both
+  `collect_lane_log_retention_targets` and `enforce_log_retention` check for the
+  sentinel before entering the byte-quota phase. When detected, byte-quota
+  enforcement is skipped (safe fallback: TTL and keep-last-N phases still apply).
+  This prevents saturating arithmetic from disabling byte-quota enforcement.
 
 ## metrics Submodule (TCK-00551)
 

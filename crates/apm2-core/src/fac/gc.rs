@@ -494,8 +494,26 @@ fn collect_lane_log_retention_targets(
 
         let lane_dir = lane_manager.lane_dir(lane_id);
         let log_dir = lane_dir.join("logs");
-        if !log_dir.exists() {
-            continue;
+
+        // SECURITY (BLOCKER finding fix): Validate that log_dir is not a
+        // symlink before any read_dir/path operations. A symlinked logs/
+        // directory would cause all subsequent operations to resolve
+        // outside the lane root, enabling arbitrary-file-deletion attacks.
+        // Use symlink_metadata (lstat) so symlinks are detected without
+        // being followed.
+        match std::fs::symlink_metadata(&log_dir) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    // Fail-closed: symlink or non-directory at logs/ path
+                    // is never valid. Skip lane entirely so the anomaly
+                    // is retried/repaired on the next GC cycle.
+                    continue;
+                }
+            },
+            Err(_) => {
+                // Path doesn't exist or cannot be stat'd — skip lane.
+                continue;
+            },
         }
 
         // S-MAJOR-1/2 fix: Fail-closed on read_dir error — skip lane
@@ -627,7 +645,20 @@ fn collect_lane_log_retention_targets(
         // keep-last-N) until within quota.
         // S-NIT-1 / S-MAJOR-3 fix: Use boolean `pruned` flag on
         // JobLogEntry for O(1) lookup instead of Vec::contains() O(N).
-        if config.per_lane_log_max_bytes > 0 {
+        //
+        // SENTINEL GUARD (MAJOR finding fix): If any entry has
+        // `estimated_bytes == u64::MAX`, the recursive size estimator
+        // hit its scan limit (MAX_LANE_SCAN_ENTRIES) and the returned
+        // value is a traversal-failure sentinel, NOT a real byte count.
+        // Using it in arithmetic would cause saturating_add to produce
+        // u64::MAX for total_bytes, making saturating_sub drop the total
+        // below the quota after subtracting pruned entries — effectively
+        // disabling byte-quota enforcement. Fail-closed: skip the
+        // byte-quota phase entirely when any entry's size is unknown,
+        // letting TTL and keep-last-N phases handle retention. The
+        // byte-quota will be retried on the next GC cycle.
+        let has_size_overflow = job_logs.iter().any(|e| e.estimated_bytes == u64::MAX);
+        if config.per_lane_log_max_bytes > 0 && !has_size_overflow {
             let mut total_bytes: u64 = job_logs
                 .iter()
                 .map(|e| e.estimated_bytes)
@@ -3359,6 +3390,163 @@ mod tests {
             size,
             u64::MAX,
             "must return u64::MAX (fail-closed) when scan limit is exceeded"
+        );
+    }
+
+    // =========================================================================
+    // Regression tests for round-N review findings (PR #759)
+    // =========================================================================
+
+    /// BLOCKER regression: `collect_lane_log_retention_targets` MUST skip a
+    /// lane whose `logs/` directory is a symlink. If `logs/` is a symlink,
+    /// all subsequent `read_dir`/path operations would resolve outside the
+    /// lane root, enabling arbitrary-file-deletion attacks via GC targets.
+    #[cfg(unix)]
+    #[test]
+    fn log_retention_skips_lane_with_symlinked_logs_directory() {
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let lane_dir = lane_manager.lane_dir(lane_id);
+        let logs_dir = lane_dir.join("logs");
+
+        // Create a target directory outside the lane with a canary file.
+        let target_dir = dir.path().join("attacker-target");
+        std::fs::create_dir_all(&target_dir).expect("create target");
+        let canary = target_dir.join("canary.txt");
+        std::fs::write(&canary, b"must survive").expect("write canary");
+
+        // Replace logs/ with a symlink to the attacker-controlled directory.
+        if logs_dir.exists() {
+            std::fs::remove_dir_all(&logs_dir).expect("remove real logs");
+        }
+        std::os::unix::fs::symlink(&target_dir, &logs_dir).expect("create symlink at logs/");
+
+        let now = current_wall_clock_secs();
+        let config = LogRetentionConfig {
+            per_lane_log_max_bytes: 0,
+            per_job_log_ttl_secs: 1, // Very short TTL
+            keep_last_n_jobs_per_lane: 0,
+        };
+
+        let mut targets = Vec::new();
+        collect_lane_log_retention_targets(
+            &lane_manager,
+            &lane_ids,
+            &config,
+            now,
+            &HashSet::new(),
+            &mut targets,
+        );
+
+        // No targets should be emitted for this lane — the symlinked
+        // logs/ directory must be rejected at entry (fail-closed).
+        assert_eq!(
+            targets.len(),
+            0,
+            "symlinked logs/ directory must be skipped entirely — \
+             no GC targets should be emitted, got {} targets",
+            targets.len()
+        );
+
+        // Canary file must survive — symlink was not followed.
+        assert!(
+            canary.exists(),
+            "canary file outside lane root must not be affected — \
+             symlink following was correctly prevented"
+        );
+    }
+
+    /// MAJOR regression: when `estimate_job_log_dir_size_recursive` returns
+    /// `u64::MAX` (traversal overflow sentinel) for any job log entry, the
+    /// byte-quota phase in `collect_lane_log_retention_targets` MUST be
+    /// skipped. Using the sentinel in arithmetic would cause `saturating_add`
+    /// to produce `u64::MAX` for `total_bytes`, breaking quota enforcement.
+    #[test]
+    fn log_retention_skips_byte_quota_when_estimator_returns_sentinel() {
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let logs_dir = lane_manager.lane_dir(lane_id).join("logs");
+
+        let now = current_wall_clock_secs();
+
+        // Create a small job log (100 bytes, recent).
+        let job_a = create_job_log_dir(&logs_dir, "job-a", 100, now.saturating_sub(10));
+
+        // Create a job log with deep nesting that will trigger the
+        // MAX_LANE_SCAN_ENTRIES limit in the recursive estimator.
+        // We pre-fill the nesting with enough entries to exceed the
+        // limit. Use wide nesting: 200 subdirs x 501 files = 100,200.
+        let job_b_dir = logs_dir.join("job-b-overflow");
+        std::fs::create_dir_all(&job_b_dir).expect("create job-b");
+        for dir_idx in 0..200 {
+            let subdir = job_b_dir.join(format!("d{dir_idx:04}"));
+            std::fs::create_dir_all(&subdir).expect("subdir");
+            for file_idx in 0..501 {
+                write_file(&subdir.join(format!("f{file_idx:04}")), 10);
+            }
+        }
+        set_file_mtime(&job_b_dir, filetime_from_secs(now.saturating_sub(20)))
+            .expect("set job-b mtime");
+
+        // Verify that the estimator actually returns u64::MAX for job-b.
+        let mut visited = 0;
+        let est = estimate_job_log_dir_size_recursive(&job_b_dir, &mut visited);
+        assert_eq!(
+            est,
+            u64::MAX,
+            "precondition: estimator must return u64::MAX for job-b-overflow"
+        );
+
+        // Use a very tight byte quota. Without the sentinel guard:
+        // - total_bytes would be u64::MAX (saturating_add with sentinel)
+        // - After subtracting job-b (u64::MAX), total_bytes would be ~100
+        // - 100 < 50 is false, so job-a would be incorrectly pruned
+        // OR the arithmetic would be unpredictable.
+        // With the sentinel guard: byte-quota phase is skipped entirely.
+        let config = LogRetentionConfig {
+            per_lane_log_max_bytes: 50, // Tight quota
+            per_job_log_ttl_secs: 0,    // No TTL pruning
+            keep_last_n_jobs_per_lane: 0,
+        };
+
+        let mut targets = Vec::new();
+        collect_lane_log_retention_targets(
+            &lane_manager,
+            &lane_ids,
+            &config,
+            now,
+            &HashSet::new(),
+            &mut targets,
+        );
+
+        // With the sentinel guard, byte-quota is skipped. No TTL pruning
+        // (all recent). So no targets should be emitted.
+        assert_eq!(
+            targets.len(),
+            0,
+            "byte-quota phase must be skipped when estimator returns u64::MAX \
+             sentinel — no targets should be emitted, got {} targets \
+             (paths: {:?})",
+            targets.len(),
+            targets.iter().map(|t| &t.path).collect::<Vec<_>>()
+        );
+
+        // Both job dirs must survive — byte quota was not applied.
+        assert!(
+            job_a.exists(),
+            "job-a must survive: byte-quota must be skipped when sentinel detected"
         );
     }
 }
