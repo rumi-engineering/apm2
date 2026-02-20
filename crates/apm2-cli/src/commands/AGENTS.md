@@ -25,6 +25,7 @@ All command functions return a `u8` exit code or `anyhow::Result<()>`, using val
 | `fac.rs` | `apm2 fac *` | FAC (Factory Automation Cycle) top-level dispatcher |
 | `fac_bootstrap.rs` | `apm2 fac bootstrap` | One-shot compute-host provisioning for FESv1 |
 | `fac_economics.rs` | `apm2 fac economics *` | Economics profile adoption, rollback, and inspection (TCK-00584) |
+| `fac_install.rs` | `apm2 fac install` | Binary install and alignment (INV-PADOPT-004 prevention, TCK-00625) |
 | `fac_pr/` | `apm2 fac pr *` | GitHub App credential management for PR operations |
 | `fac_review/` | `apm2 fac review *` | Review orchestration (security + quality reviews) |
 | `fac_queue.rs` | `apm2 fac queue *` | Queue introspection (status with counts, reason stats) |
@@ -584,3 +585,44 @@ Security invariants:
   `gate_cache_v2`, `gate_cache_v3`. These are added to the nuke plan when present
   under the FAC root, using the same allow-list validation and `safe_rmtree_v1`
   deletion as other cache targets.
+
+## Binary Alignment Controls (TCK-00625, INV-PADOPT-004 followup)
+
+Three engineering controls to prevent binary drift between interactive CLI and
+systemd service executables:
+
+### FU-001: Doctor binary_alignment check (`daemon.rs`)
+
+- `collect_doctor_checks` now includes a `binary_alignment` check that:
+  - Resolves `which apm2` to canonical path
+  - Resolves `ExecStart` binary path for each systemd user unit via `systemctl --user show`
+  - Computes SHA-256 digests of all resolved binary paths (bounded to 256 MiB, CTR-1603)
+  - Emits `WARN` if any digest mismatches with remediation pointing to `apm2 fac install`
+  - Emits `WARN` (never `OK`) if no service binary could be resolved (fail-closed)
+  - Emits `WARN` for partial verification (some units resolved, others failed)
+  - Emits `OK` only when at least one service binary was successfully resolved AND matched
+  - Tracks per-unit resolution errors and digest failures separately
+
+### FU-002: `apm2 fac install` subcommand (`fac_install.rs`)
+
+- `apm2 fac install [--json] [--allow-partial] [--workspace-root <PATH>]` performs:
+  1. Resolves workspace root from `--workspace-root` flag or from `current_exe()` path (never cwd)
+  2. `cargo install --path crates/apm2-cli --force` from trusted workspace root
+  3. Symlink `~/.local/bin/apm2 -> ~/.cargo/bin/apm2` (atomic replace via create-temp-then-rename(2))
+  4. `systemctl --user restart apm2-daemon.service apm2-worker.service`
+  5. Structured output: workspace root, installed path, SHA-256 digest, per-service restart status, restart_failures array
+- Fail-closed restart semantics: required service restart failures cause non-zero exit and `success: false`
+- `--allow-partial` flag: exits 0 even when restarts fail, but `success` remains false and `restart_failures` populated
+- Workspace root discovery: derived from `std::env::current_exe()` (trusted) with 16-level bounded traversal; cwd never used
+- Exempt from daemon auto-start (local command)
+
+### FU-003: Worker binary identity event (`fac_worker.rs`)
+
+- `run_fac_worker` emits a `binary_identity` event at startup before the poll loop:
+  - `binary_path`: resolved via `std::env::current_exe()` + `canonicalize()`
+  - `binary_digest`: `sha256:<hex>` of the running binary (bounded read, CTR-1603)
+  - `pid`: current process ID
+  - `ts`: ISO-8601 timestamp
+- In JSON mode: emitted as NDJSON worker event
+- In text mode: emitted as structured key=value to stderr at INFO level
+- Non-fatal: digest failures produce error markers, not worker abort

@@ -55,6 +55,7 @@ pub mod fac_config;
 pub mod fac_economics;
 mod fac_gates_job;
 pub mod fac_gc;
+pub mod fac_install;
 pub mod fac_job;
 pub mod fac_key_material;
 pub mod fac_permissions;
