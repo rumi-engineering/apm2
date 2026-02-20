@@ -36,6 +36,35 @@ pub(super) fn fetch_pr_head_sha(owner_repo: &str, pr_number: u32) -> Result<Stri
     Ok(sha)
 }
 
+/// Check whether a pull request has been merged on GitHub.
+///
+/// Returns `Ok(Some(merged_at))` when the PR is merged, `Ok(None)` when it
+/// is still open/closed-without-merge, or `Err` on API failure.
+///
+/// BF-002 (TCK-00626): Used by the doctor wait loop to detect externally-
+/// merged PRs that the local lifecycle projection has not yet observed.
+pub(super) fn fetch_pr_merged_at(
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<Option<String>, String> {
+    let endpoint = format!("/repos/{owner_repo}/pulls/{pr_number}");
+    let output = gh_command()
+        .args(["api", &endpoint, "--jq", ".merged_at"])
+        .output()
+        .map_err(|err| format!("failed to execute gh api for PR merged_at: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh api failed resolving PR merged_at: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() || value == "null" {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
 /// Fetch the base branch SHA for a pull request from the GitHub API.
 ///
 /// Returns `pr.base.sha` — the tip of the base branch at the time the PR was

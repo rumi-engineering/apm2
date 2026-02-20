@@ -3365,7 +3365,8 @@ length-prefix framing and domain separation
 - `GateCacheV3`: In-memory index with `load_from_dir()`, `save_to_dir()`,
   `check_reuse()`, `sign_all()`, `bind_receipt_evidence()`, and
   `try_bind_receipt_from_store()`.
-- `V3ReuseDecision`: Hit/miss decision with human-readable reason.
+- `CacheDecision`: Structured hit/miss decision with `reason_code` (`CacheReasonCode`) and `first_mismatch_dimension` (TCK-00626). `check_reuse()` returns this directly.
+- `CacheReasonCode`: Enum with 12 variants (1 hit + 11 miss codes) following the ordered check sequence defined in TCK-00626 S2.
 
 ### Compound Key Index
 

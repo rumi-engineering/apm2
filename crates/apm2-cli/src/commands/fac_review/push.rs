@@ -835,6 +835,65 @@ where
             }
 
             if result.mode.eq_ignore_ascii_case("joined") {
+                // BF-001 (TCK-00626): For non-terminal "joined" results,
+                // verify the PID is still alive. A stale run-state with a
+                // dead PID should be treated as a dispatch that needs retry.
+                let is_terminal = result.run_state.eq_ignore_ascii_case("completed")
+                    || result.run_state.eq_ignore_ascii_case("failed")
+                    || result.run_state.eq_ignore_ascii_case("cancelled");
+                if !is_terminal {
+                    if let Some(pid) = result.pid {
+                        // BF-001 (TCK-00626 round 3): Use process-identity
+                        // aware liveness check that compares the recorded
+                        // proc_start_time against the current value in
+                        // /proc/<pid>/stat. This prevents PID-reuse false
+                        // positives. If proc_start_time was never recorded
+                        // (legacy path), fail closed (treat as dead).
+                        // On non-Linux, always returns false (fail-closed).
+                        let alive = is_pid_alive_with_identity(pid, result.proc_start_time);
+                        if !alive {
+                            if emit_logs {
+                                eprintln!(
+                                    "fac push: {review_type} dispatch returned 'joined' with dead PID {pid}; \
+                                     retrying dispatch",
+                                );
+                            }
+                            let err = format!(
+                                "{review_type} joined dispatch has dead PID {pid} (run_state={})",
+                                result.run_state
+                            );
+                            let delay = retry_delay_or_fail(
+                                &mut retry_counts,
+                                retry_budget,
+                                review_type,
+                                "dispatch_dead_pid",
+                                PushRetryClass::DispatchTransient,
+                                &err,
+                                emit_logs,
+                            )?;
+                            thread::sleep(delay);
+                            continue;
+                        }
+                    } else {
+                        // BF-001 (TCK-00626 round 4): Non-terminal joined
+                        // with no PID — assume unit-based supervision is
+                        // keeping the dispatch alive. In the systemd detached
+                        // path, dispatches are created with unit-based
+                        // supervision and no PID recorded, so pid=None is the
+                        // normal steady-state for healthy unit-supervised
+                        // reviews. Treating these as dead would cause
+                        // spurious retry loops and duplicate dispatches.
+                        // Only apply PID identity checks when a PID IS
+                        // present (the branch above).
+                        if emit_logs {
+                            eprintln!(
+                                "fac push: {review_type} dispatch returned 'joined' with no PID in non-terminal \
+                                 state '{}'; assuming unit-supervised liveness",
+                                result.run_state,
+                            );
+                        }
+                    }
+                }
                 break result;
             }
 
@@ -2192,7 +2251,24 @@ pub fn run_push(
             normalize_error_hint(&e),
         );
         human_log!("WARNING: review dispatch failed: {e}");
-        human_log!("  Use `apm2 fac restart --pr {pr_number}` to retry.");
+        human_log!("  Reviewers are NOT running. Use one of:");
+        human_log!("    apm2 fac review dispatch <PR_URL> --type all");
+        human_log!("    apm2 fac restart --pr {pr_number}");
+        // BF-001 (TCK-00626): Emit structured dispatch_failed event so
+        // the event stream captures the failure for automated recovery.
+        if json_output {
+            let _ = emit_jsonl(&serde_json::json!({
+                "event": "dispatch_failed",
+                "ts": ts_now(),
+                "pr_number": pr_number,
+                "sha": sha,
+                "error": e,
+                "recovery_commands": [
+                    format!("apm2 fac review dispatch <PR_URL> --type all"),
+                    format!("apm2 fac restart --pr {pr_number}"),
+                ],
+            }));
+        }
         Some(e)
     } else {
         attempt.set_stage_pass("dispatch", dispatch_started.elapsed().as_secs());
@@ -2242,6 +2318,81 @@ pub fn run_push(
     exit_codes::SUCCESS
 }
 
+/// Read `/proc/<pid>/stat` field 22 (`starttime`) for PID-reuse validation.
+///
+/// Returns the kernel-monotonic start time in clock ticks for the given PID,
+/// or `None` if the `/proc` entry is unreadable (process dead, non-Linux, or
+/// restricted procfs). This is the same technique used by `apm2-daemon`'s
+/// process identity validation (`adapter::read_proc_start_time`), duplicated
+/// here because the daemon helper is `pub(crate)` and not accessible from
+/// `apm2-cli`.
+///
+/// # Known limitation
+///
+/// This check is Linux-specific. On non-Linux platforms it always returns
+/// `None`, which the caller treats as "cannot verify" (fail-closed: the PID
+/// is treated as dead, triggering a retry). PID reuse is mitigated but not
+/// fully eliminated: the start-time check ensures the PID was started at
+/// the expected time, which makes reuse collision astronomically unlikely
+/// within the polling window.
+#[cfg(unix)]
+fn read_proc_start_time(pid: u32) -> Option<u64> {
+    let stat_path = format!("/proc/{pid}/stat");
+    let contents = std::fs::read_to_string(stat_path).ok()?;
+    // Field 22 is `starttime` (0-indexed after the comm field in parens).
+    // Comm can contain spaces/parens, so split after the last ')'.
+    let after_comm = contents.rsplit_once(')')?.1;
+    let tokens: Vec<&str> = after_comm.split_whitespace().collect();
+    // Field 22 is at index 19 after the comm field (fields are 1-indexed in
+    // proc(5) and the first two fields before ')' are pid and comm).
+    tokens.get(19)?.parse::<u64>().ok()
+}
+
+#[cfg(not(unix))]
+const fn read_proc_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Check whether a PID is alive with process-identity validation.
+///
+/// Returns `true` only if ALL of the following hold:
+/// 1. `/proc/<pid>` exists (process slot is occupied),
+/// 2. The current `proc_start_time` can be read from `/proc/<pid>/stat`,
+/// 3. `recorded_start_time` was provided (not `None`), and
+/// 4. The current start time matches the recorded start time.
+///
+/// If `recorded_start_time` is `None` (legacy path where start time was never
+/// captured), the function returns `false` (fail-closed: treat the process as
+/// dead, triggering a retry).  This prevents PID-reuse false positives where
+/// a different process has been assigned the same PID after the original
+/// terminated.
+///
+/// On non-Linux platforms, always returns `false` (fail-closed: treat as dead,
+/// triggering a retry).
+fn is_pid_alive_with_identity(pid: u32, recorded_start_time: Option<u64>) -> bool {
+    let proc_path = format!("/proc/{pid}");
+    if !std::path::Path::new(&proc_path).exists() {
+        return false;
+    }
+    // Fail-closed: if no recorded start time was captured at dispatch time,
+    // we cannot distinguish the original process from a PID-reuse impostor.
+    let Some(recorded) = recorded_start_time else {
+        return false;
+    };
+    // The start time (field 22 in /proc/<pid>/stat) is monotonic within a
+    // boot epoch. Matching it against the recorded value confirms that the
+    // running process is the same one we originally dispatched.
+    #[cfg(unix)]
+    {
+        read_proc_start_time(pid).is_some_and(|current| current == recorded)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = recorded;
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -2267,6 +2418,60 @@ mod tests {
         let err = ensure_projection_success_for_push(&["", "   "])
             .expect_err("blank entries must not satisfy projection gate");
         assert!(err.contains("at least one successful projection"));
+    }
+
+    #[test]
+    fn is_pid_alive_with_identity_rejects_none_recorded_start_time() {
+        // Fail-closed: if no recorded start time was captured (legacy path),
+        // the function must return false even for a live PID. This prevents
+        // PID-reuse false positives on legacy dispatch payloads.
+        let current_pid = std::process::id();
+        assert!(
+            !is_pid_alive_with_identity(current_pid, None),
+            "expected false when recorded_start_time is None (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn is_pid_alive_with_identity_rejects_mismatched_start_time() {
+        // A different process with the same PID will have a different start
+        // time.  Simulate this by passing a deliberately wrong start time for
+        // the current process.
+        let current_pid = std::process::id();
+        let wrong_start_time: u64 = 1; // any value that won't match the real start time
+        assert!(
+            !is_pid_alive_with_identity(current_pid, Some(wrong_start_time)),
+            "expected false when recorded start time does not match current process"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_pid_alive_with_identity_accepts_matching_start_time() {
+        // When the recorded start time matches the current process, the
+        // function should return true.
+        let current_pid = std::process::id();
+        let real_start_time = read_proc_start_time(current_pid)
+            .expect("should be able to read start time for own process");
+        assert!(
+            is_pid_alive_with_identity(current_pid, Some(real_start_time)),
+            "expected true when recorded start time matches current process"
+        );
+    }
+
+    #[test]
+    fn is_pid_alive_with_identity_rejects_dead_pid() {
+        // A PID that does not exist should return false regardless of the
+        // recorded start time.
+        let dead_pid = 4_000_000_000_u32; // unlikely to be a real PID
+        assert!(
+            !is_pid_alive_with_identity(dead_pid, Some(12345)),
+            "expected false for non-existent PID"
+        );
+        assert!(
+            !is_pid_alive_with_identity(dead_pid, None),
+            "expected false for non-existent PID with None start time"
+        );
     }
 
     #[allow(unsafe_code)]
@@ -3111,6 +3316,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: None,
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
@@ -3151,6 +3357,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: None,
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
@@ -3184,6 +3391,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: None,
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
@@ -3213,6 +3421,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: None,
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
@@ -3261,6 +3470,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: None,
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
@@ -3296,6 +3506,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: None,
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
@@ -3340,6 +3551,7 @@ mod tests {
                             sequence_number: None,
                             terminal_reason: None,
                             pid: None,
+                            proc_start_time: None,
                             unit: None,
                             log_file: None,
                         });
@@ -3353,6 +3565,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: None,
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
