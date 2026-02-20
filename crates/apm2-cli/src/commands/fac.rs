@@ -2190,7 +2190,23 @@ pub fn run_fac(
     let json_output = machine_output;
     let resolve_json = |_subcommand_json: bool| -> bool { machine_output };
 
-    if let Err(err) = crate::commands::fac_permissions::validate_fac_root_permissions() {
+    // TCK-00577 round 3: Enqueue-class commands (push, gates, warm) may be
+    // invoked by non-service-user callers in a service-user-owned deployment.
+    // These callers cannot satisfy the strict ownership check on FAC roots
+    // (directories are owned by the service user). Use a relaxed validation
+    // that checks mode bits and symlink safety but NOT ownership, so the
+    // caller can reach enqueue_job → broker fallback → broker_requests/.
+    // All other commands require strict ownership validation.
+    let is_enqueue_class = matches!(
+        cmd.subcommand,
+        FacSubcommand::Push(_) | FacSubcommand::Gates(_) | FacSubcommand::Warm(_)
+    );
+    let permissions_result = if is_enqueue_class {
+        crate::commands::fac_permissions::validate_fac_root_permissions_relaxed_for_enqueue()
+    } else {
+        crate::commands::fac_permissions::validate_fac_root_permissions()
+    };
+    if let Err(err) = permissions_result {
         return output_error(
             machine_output,
             "fac_root_permissions_failed",
