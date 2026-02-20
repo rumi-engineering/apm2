@@ -943,8 +943,15 @@ by another worker).
   resource exhaustion.
 - [INV-LANE-CLEANUP-004b] Top-level regular files under `logs/` are removed
   unconditionally by `enforce_log_retention` (fail-closed: only job-log
-  subdirectories are valid entries). Top-level symlinks are also removed
-  unconditionally (symlinks in `logs/` are never valid). The GC planner
+  subdirectories are valid entries). If deletion fails (non-`NotFound`),
+  the file's byte count is added to `stray_surviving_bytes` so it counts
+  against the per-lane byte quota (fail-closed accounting). Top-level
+  symlinks are also removed unconditionally (symlinks in `logs/` are never
+  valid); if symlink deletion fails, cleanup returns
+  `LaneCleanupError::LogQuotaFailed` immediately (fail-closed: surviving
+  symlinks are a symlink-following attack vector). When
+  `stray_surviving_bytes > 0` and no job directories exist, cleanup returns
+  an error to prevent silent accumulation. The GC planner
   (`collect_lane_log_retention_targets`) mirrors this behavior by emitting
   GC targets for stray files and symlinks.
 - [INV-LANE-CLEANUP-005] A RUNNING `LaneLeaseV1` must be persisted before

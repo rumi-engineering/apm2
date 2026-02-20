@@ -2567,6 +2567,12 @@ impl LaneManager {
         let mut job_dirs: Vec<JobLogDirEntry> = Vec::new();
         let mut scan_count = 0usize;
         let mut lane_visited_count = 0usize;
+        // Accumulator for bytes consumed by invalid top-level entries
+        // (non-directory files) that survived deletion attempts.  These
+        // bytes MUST be included in quota calculations so that undeletable
+        // stray files cannot bypass per-lane retention limits (fail-closed
+        // accounting, security finding f-759-security-*-0).
+        let mut stray_surviving_bytes: u64 = 0;
         for entry_result in entries {
             scan_count += 1;
             if scan_count > MAX_LOG_ENTRIES {
@@ -2600,8 +2606,26 @@ impl LaneManager {
 
             // Fail-closed: symlinks under logs/ are never valid — remove
             // them unconditionally to prevent symlink-following attacks.
+            // If removal fails, propagate the error (fail-closed): a
+            // surviving symlink is a security risk that must not be
+            // silently ignored.
             if metadata.file_type().is_symlink() {
-                let _ = fs::remove_file(&path);
+                if let Err(e) = fs::remove_file(&path) {
+                    // NotFound is benign (concurrent deletion race).
+                    if e.kind() != io::ErrorKind::NotFound {
+                        return Err(LaneCleanupError::LogQuotaFailed {
+                            step: CLEANUP_STEP_LOG_QUOTA,
+                            reason: format!(
+                                "cannot remove invalid symlink {}: {e} \
+                                 (fail-closed: surviving symlinks under logs/ \
+                                 are a symlink-following attack vector)",
+                                path.display()
+                            ),
+                            steps_completed: steps_completed.to_vec(),
+                            failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+                        });
+                    }
+                }
                 continue;
             }
 
@@ -2611,13 +2635,20 @@ impl LaneManager {
             // bypass per-lane log-retention controls.
             if !metadata.is_dir() {
                 let file_bytes = metadata.len();
-                let _ = fs::remove_file(&path);
-                // Account bytes even if removal fails (fail-closed:
-                // assume the file still occupies disk).
-                if fs::symlink_metadata(&path).is_ok() {
-                    // File still exists after removal attempt — count its
-                    // bytes so quota enforcement is not bypassed.
-                    let _ = file_bytes;
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        // Successfully removed — no byte accounting needed.
+                    },
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        // Benign race: file was concurrently deleted.
+                    },
+                    Err(_) => {
+                        // Deletion failed and file still exists — include
+                        // its bytes in quota accounting so the surviving
+                        // entry cannot bypass retention limits (fail-closed
+                        // accounting, security finding f-759-security-*-0).
+                        stray_surviving_bytes = stray_surviving_bytes.saturating_add(file_bytes);
+                    },
                 }
                 continue;
             }
@@ -2642,6 +2673,23 @@ impl LaneManager {
         }
 
         if job_dirs.is_empty() {
+            // If invalid top-level files survived deletion and there are no
+            // job directories to evict, report failure so the lane is marked
+            // Corrupt rather than silently accumulating undeletable entries.
+            if stray_surviving_bytes > 0 {
+                return Err(LaneCleanupError::LogQuotaFailed {
+                    step: CLEANUP_STEP_LOG_QUOTA,
+                    reason: format!(
+                        "cannot delete {stray_surviving_bytes} bytes of invalid \
+                         top-level files under {} and no job directories exist \
+                         to evict (fail-closed: undeletable stray entries \
+                         must not silently accumulate)",
+                        logs_dir.display()
+                    ),
+                    steps_completed: steps_completed.to_vec(),
+                    failure_step: Some(CLEANUP_STEP_LOG_QUOTA.to_string()),
+                });
+            }
             return Ok(());
         }
 
@@ -2672,6 +2720,11 @@ impl LaneManager {
                 .iter()
                 .map(|e| e.estimated_bytes)
                 .fold(0u64, u64::saturating_add);
+
+            // Include bytes from invalid top-level files that survived
+            // deletion so they count against the per-lane quota
+            // (fail-closed: undeletable stray files are not invisible).
+            total_bytes = total_bytes.saturating_add(stray_surviving_bytes);
 
             // Subtract bytes already marked for TTL pruning.
             for entry in &job_dirs {
@@ -5027,6 +5080,200 @@ mod tests {
                 "symlink under logs/ must be removed by cleanup"
             );
         }
+    }
+
+    /// Regression (security finding f-759-security-*-0): when a symlink under
+    /// logs/ cannot be deleted (e.g., parent directory made read-only), cleanup
+    /// MUST return an error rather than silently ignoring the surviving
+    /// symlink.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_errors_on_undeletable_symlink_in_logs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        let logs_dir = lane_dir.join("logs");
+
+        // Create a symlink directly under logs/.
+        let symlink_path = logs_dir.join("symlink-escape");
+        std::os::unix::fs::symlink("/tmp", &symlink_path).expect("create symlink");
+        assert!(
+            symlink_path.symlink_metadata().is_ok(),
+            "symlink should exist before cleanup"
+        );
+
+        // Make the logs directory read-only so remove_file will fail
+        // with PermissionDenied.
+        let original_perms = fs::metadata(&logs_dir).expect("metadata").permissions();
+        let mut readonly = original_perms.clone();
+        readonly.set_mode(0o555);
+        fs::set_permissions(&logs_dir, readonly).expect("set readonly");
+
+        // Cleanup must fail because the symlink cannot be deleted.
+        let result = manager.run_lane_cleanup(lane_id, &workspace);
+
+        // Restore permissions before assertions so tempdir cleanup works.
+        fs::set_permissions(&logs_dir, original_perms).expect("restore perms");
+
+        let err = result.expect_err(
+            "cleanup must fail when symlink under logs/ cannot be deleted (fail-closed)",
+        );
+        assert!(
+            matches!(err, LaneCleanupError::LogQuotaFailed { .. }),
+            "expected LogQuotaFailed, got: {err:?}"
+        );
+        let reason = match &err {
+            LaneCleanupError::LogQuotaFailed { reason, .. } => reason.clone(),
+            other => panic!("unexpected error variant: {other:?}"),
+        };
+        assert!(
+            reason.contains("symlink"),
+            "error reason should mention symlink, got: {reason}"
+        );
+    }
+
+    /// Regression (security finding f-759-security-*-0): when an invalid
+    /// top-level file under logs/ cannot be deleted (e.g., parent directory
+    /// made read-only), the file's bytes MUST be included in quota
+    /// calculations so the surviving entry counts against the lane's byte
+    /// limit.  When stray surviving bytes push total usage above the quota,
+    /// the function attempts to prune job directories; if pruning also fails
+    /// (read-only directory), the function returns an error rather than
+    /// silently accepting the over-quota state.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_accounts_bytes_for_undeletable_stray_file_in_logs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        let logs_dir = lane_dir.join("logs");
+
+        // Create a large stray file (50 KiB) directly under logs/.
+        let stray_file = logs_dir.join("stray-undeletable.bin");
+        fs::write(&stray_file, vec![0u8; 50 * 1024]).expect("write stray file");
+
+        // Create a legitimate job log directory (~1 KiB).
+        let job_dir = logs_dir.join("job-001");
+        fs::create_dir_all(&job_dir).expect("create job dir");
+        fs::write(job_dir.join("output.log"), vec![0u8; 1024]).expect("write job log");
+
+        // Use a byte quota small enough that stray_surviving_bytes (50 KiB)
+        // alone exceeds it. Without fail-closed byte accounting, total would
+        // be ~1 KiB (job dir only) which is under quota. WITH stray byte
+        // accounting, total is ~51 KiB which exceeds the 10 KiB quota,
+        // triggering eviction of the job dir. Since logs/ is read-only,
+        // the eviction via safe_rmtree fails, producing an error.
+        let retention = crate::fac::gc::LogRetentionConfig {
+            per_lane_log_max_bytes: 10 * 1024, // 10 KiB — less than the stray file
+            per_job_log_ttl_secs: 0,
+            keep_last_n_jobs_per_lane: 0,
+        };
+
+        // Make the logs directory read-only so that:
+        // 1. remove_file on the stray file fails → bytes go to stray_surviving_bytes
+        // 2. safe_rmtree on job-001 also fails → error returned
+        let original_perms = fs::metadata(&logs_dir).expect("metadata").permissions();
+        let mut readonly = original_perms.clone();
+        readonly.set_mode(0o555);
+        fs::set_permissions(&logs_dir, readonly).expect("set readonly on logs");
+
+        // Run cleanup with retention config.
+        let result = manager.run_lane_cleanup_with_retention(lane_id, &workspace, &retention);
+
+        // Restore permissions before assertions so tempdir cleanup works.
+        fs::set_permissions(&logs_dir, original_perms).expect("restore perms");
+
+        // The cleanup must fail: stray bytes push total over quota, job dir
+        // pruning is attempted but fails on the read-only directory.
+        let err = result.expect_err(
+            "cleanup must fail when stray surviving bytes push usage above quota \
+             and subsequent pruning cannot proceed (fail-closed byte accounting)",
+        );
+        assert!(
+            matches!(err, LaneCleanupError::LogQuotaFailed { .. }),
+            "expected LogQuotaFailed, got: {err:?}"
+        );
+    }
+
+    /// Regression (security finding f-759-security-*-0): when an invalid
+    /// top-level file under logs/ cannot be deleted and no job directories
+    /// exist, the function MUST return an error rather than Ok(()).
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_errors_on_undeletable_stray_file_with_no_job_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        let logs_dir = lane_dir.join("logs");
+
+        // Create only a stray file (no job directories).
+        let stray_file = logs_dir.join("stray-orphan.bin");
+        fs::write(&stray_file, vec![0u8; 4096]).expect("write stray file");
+
+        // Make logs/ unwritable so remove_file will fail.
+        let original_perms = fs::metadata(&logs_dir).expect("metadata").permissions();
+        let mut readonly = original_perms.clone();
+        readonly.set_mode(0o555);
+        fs::set_permissions(&logs_dir, readonly).expect("set readonly on logs");
+
+        let result = manager.run_lane_cleanup_with_retention(
+            lane_id,
+            &workspace,
+            &crate::fac::gc::LogRetentionConfig::default(),
+        );
+
+        // Restore permissions for tempdir cleanup.
+        fs::set_permissions(&logs_dir, original_perms).expect("restore perms");
+
+        let err = result.expect_err(
+            "cleanup must fail when undeletable stray files exist and no job \
+             directories are present (fail-closed: no silent accumulation)",
+        );
+        assert!(
+            matches!(err, LaneCleanupError::LogQuotaFailed { .. }),
+            "expected LogQuotaFailed, got: {err:?}"
+        );
+        let reason = match &err {
+            LaneCleanupError::LogQuotaFailed { reason, .. } => reason.clone(),
+            other => panic!("unexpected error variant: {other:?}"),
+        };
+        assert!(
+            reason.contains("undeletable") || reason.contains("cannot delete"),
+            "error reason should mention undeletable stray entries, got: {reason}"
+        );
     }
 
     #[test]
