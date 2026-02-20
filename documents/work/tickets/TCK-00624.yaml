@@ -3,201 +3,155 @@ ticket_meta:
   template_version: "2026-01-29"
   ticket:
     id: "TCK-00624"
-    title: "Implement bounded failure taxonomy with machine-readable remediation for apm2 fac gates"
+    title: "FAC doctor/review state machine unification with machine-verifiable CAC contract"
     status: "OPEN"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"
     requirements: ["REQ-0035"]
-    evidence_artifacts: []
+    evidence_artifacts:
+      - "documents/reviews/fac_review_state_machine.cac.json"
   custody:
     agent_roles: ["AGENT_IMPLEMENTER"]
     responsibility_domains: ["DOMAIN_RUNTIME", "DOMAIN_CI"]
   dependencies:
-    tickets:
-      - ticket_id: "TCK-00621"
-        reason: "Two-phase structure provides the stage field required by the failure taxonomy."
+    tickets: []
 
 root_cause_analysis:
   summary: |
-    Gates failures currently surface as heterogeneous error messages drawn from
-    raw system errors, cargo output, git errors, and internal panics. No stable
-    taxonomy exists, so orchestrators and agents cannot make deterministic
-    branching decisions on failure type. Remediation is either absent or buried
-    in log files that agents are not expected to read. The closed failure
-    taxonomy and machine-readable remediation contract fix both problems.
+    FAC doctor recommendation logic and wait-loop behavior accumulated into
+    scattered conditional branches, which made correctness hard to prove and
+    regressions easy to introduce. The resulting bugs included recommending
+    reviewer restarts while evidence gates were still running, and delayed
+    wait-loop exits for terminal recommended actions.
+
+    This ticket reframes the entire flow as explicit state machines with ordered
+    transition tables, guard predicates, and machine-readable requirement
+    traceability so behavior is deterministic, auditable, and easy to evolve.
 
 scope:
   in_scope:
-    - id: "S1_FAILURE_TYPES"
-      title: "Define StructuredFailure type and the four failure codes"
+    - id: "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"
+      title: "Blocking review conditions recommend dispatch_implementor"
       detail: |
-        Define in a shared module:
-          struct StructuredFailure {
-            failure_code: FailureCode,   // enum
-            failure_class: FailureClass, // enum: prep | authority | execution
-            stage: GatesRunPhase,        // prep | execute
-            root_cause: String,          // human-readable one-liner
-            remediation: String,         // actionable instruction
-            diagnostics: Vec<String>,    // raw internal errors (never top-level)
-          }
-          enum FailureCode {
-            PrepNotReady,
-            PrepSupplyUnavailable,
-            AuthorityDenied,
-            GateExecutionFailed,
-          }
-    - id: "S2_EMIT_ON_STDOUT"
-      title: "Emit StructuredFailure as JSON on stdout for all failure paths"
-      detail: |
-        All four failure codes must be reachable from existing code paths.
-        Wire StructuredFailure emission at:
-          - ReadinessController failure → PrepNotReady
-          - Closure hydration failure with no network → PrepSupplyUnavailable
-          - Policy/token/admission rejection → AuthorityDenied
-          - Gate process exit != 0 → GateExecutionFailed
-        Emit as a JSON line on stdout (not stderr) with --json flag.
-        Without --json, emit a human-friendly formatted version of the
-        same structured data.
-    - id: "S3_SUPPRESS_RAW_ERRORS"
-      title: "Demote all raw internal errors to diagnostics[]"
-      detail: |
-        Audit all existing error propagation paths in fac gates. Any raw
-        system error, cargo output line, or internal string error that
-        currently reaches top-level stdout must be moved into diagnostics[]
-        within the enclosing StructuredFailure.
-    - id: "S4_REGRESSION_TESTS"
-      title: "Regression tests enumerating all four failure codes"
-      detail: |
-        - Test: each of the four FailureCode variants is reachable and produces
-          correct failure_code, failure_class, stage, root_cause, remediation.
-        - Test: diagnostics[] is populated with raw errors; top-level output
-          contains only structured fields.
-        - Test: remediation field alone is sufficient for recovery without logs
-          (assert non-empty and action-oriented for PREP_NOT_READY and
-          PREP_SUPPLY_UNAVAILABLE).
-    - id: "S5_SHARED_DST_MODULE_POST_PUSH_CLOSURE"
-      title: "Create shared DST test module after fac push closure-complete"
-      detail: |
-        Shared deterministic simulated testing helpers (env mutation
-        serialization + panic-safe restoration) are in-scope for this ticket
-        only after closure-complete validation of `apm2 fac push` is done:
-          - bounded completion (no stuck caller path),
-          - local CLI dogfood pass,
-          - edge-case regressions green.
-        This sequencing is mandatory to avoid mixing stabilization and test
-        harness refactors in one unresolved change window.
-    - id: "S7_MERGE_FLOW_FANOUT_FIRST_THEN_LOCAL_RESET"
-      title: "Redesign merge sequencing: fanout-first, then stash+fetch+reset-hard on local main"
-      detail: |
-        Current flow (incorrect):
-          sync_local_main_with_origin → try_fast_forward_main (local ref update)
-          → persist_signed_merge_receipt → push_local_main_to_origin
-          → project_merge_to_all_sinks (GitHub API merge, idempotent at this point)
+        Doctor decision states that represent blocking remediation must resolve
+        to `dispatch_implementor`:
+          - merge conflicts,
+          - terminal evidence gate failures,
+          - actionable findings requiring implementor remediation.
+        Recommendation command templates must direct to findings context.
 
-        Required flow:
-          1. project_merge_to_all_sinks — call GitHub API (fanout) to merge the PR first.
-          2. On first successful projection result:
-             a. git stash --include-untracked on ~/Projects/apm2 (main worktree),
-                covering ALL local state (tracked, untracked, staged).
-             b. git fetch origin refs/heads/main.
-             c. git reset --hard to the merged SHA returned by the successful
-                projection (GitHub for now).
-             d. Assert the working tree is completely clean (no tracked changes,
-                no untracked files, no ignored artifacts that belong to the build).
-          3. Persist the signed merge receipt only after the local main is confirmed
-             clean and consistent with the projection result.
-
-        The key invariant: local main must never be fast-forwarded locally before
-        the projection succeeds. If the projection (GitHub API merge) fails, local
-        main stays on its pre-merge state. The stash-before-reset ensures no local
-        work is silently discarded without a recovery path.
-    - id: "S8_MERGE_CONFLICT_TOCTOU_GUARD"
-      title: "Bugfix: re-check merge conflicts after evidence gates pass to close TOCTOU window"
+    - id: "DR-002-RUNNING_GATE_SUPPRESSES_RESTART"
+      title: "In-flight gate progress suppresses reviewer restarts"
       detail: |
-        The merge_conflict_main gate currently runs once at the start of the execute
-        phase (step 3 in run_execute_phase). Evidence gates take 2-3 minutes.
-        During that window, a concurrent push to main can introduce a new conflict
-        on the branch under review, leaving gates recorded as PASS even though the
-        branch now has a merge conflict.
+        Gate progress derivation must classify RUNNING / NOT_RUN gates as
+        `in_flight`, and doctor recommendation must return `wait` (not
+        `restart_reviews`) when verdicts are pending and gate progress remains
+        in-flight.
 
-        Fix: run a second merge_conflict_main check immediately after all evidence
-        gates pass and before recording the overall GatesSummary as passed. If the
-        second check finds a conflict, override the result to FAIL with
-        failure_code = GateExecutionFailed and remediation = "dispatch implementor".
-        The first check (fast-fail early) is kept for speed; the second check
-        (bookend guard) closes the race window.
-    - id: "S9_GATE_ORDERING_FASTEST_FIRST"
-      title: "Re-order evidence gates fastest-first to minimize wasted compute on failure"
+    - id: "DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY"
+      title: "Merge readiness requires terminal passed gates"
       detail: |
-        Within the evidence gate pipeline, gates should be ordered by expected
-        duration ascending so that the cheapest checks eliminate failing branches
-        before expensive checks run. Current known ordering issue: rustfmt, clippy,
-        and cargo test may not be sequenced by duration.
+        Merge and approve outcomes must only be reachable when merge-readiness
+        facts are satisfied, including terminal passed gate progress and no
+        merge conflicts.
 
-        Required ordering principle: a gate that is expected to complete in T seconds
-        should not be scheduled after a gate expected to take 10T seconds. Apply this
-        principle to the evidence gate list produced by run_evidence_gates_with_lane_context.
-        Document the rationale for the chosen order in a code comment so future gate
-        additions can be slotted correctly.
-    - id: "S6_DISPATCH_IMPLEMENTOR_ON_GATE_FAILURE"
-      title: "Bugfix: recommended action on evidence gate failure must be dispatch-implementor"
+    - id: "DR-004-DOCTOR_RULE_ORDER_IS_STRICT"
+      title: "Decision/gate/recommendation rules are table-driven and ordered"
       detail: |
-        When an evidence gate fails (e.g. rustfmt check, clippy, cargo test),
-        the remediation field emitted by StructuredFailure — and any
-        human-readable output — must recommend "dispatch implementor" as the
-        next action. Recommending "request-reviews" on a gate failure is
-        incorrect: review cannot proceed until the gate passes, so dispatching
-        the implementor to fix the underlying issue is the only valid path.
-        Apply consistently across all GateExecutionFailed remediation strings.
+        Doctor decision, gate progress, and recommendation logic must be derived
+        from explicit rule tables with unique IDs and strictly increasing
+        priority. Evaluation semantics are first-match in priority order.
+
+    - id: "DR-005-WAIT_RETURNS_ON_TERMINAL_ACTION"
+      title: "Wait loop is an explicit state machine with terminal action exit"
+      detail: |
+        `--wait-for-recommended-action` must evaluate transitions through a
+        dedicated wait-state machine. Terminal recommended actions (including
+        `dispatch_implementor`) must exit immediately by priority, ahead of
+        interrupt/timeout fallback checks.
+
+    - id: "DR-006-EVERGREEN_CAC_STATE_MACHINE_SOURCE"
+      title: "Single evergreen CAC machine-spec artifact"
+      detail: |
+        FAC review machine spec must be published as a canonical evergreen CAC
+        document at `documents/reviews/fac_review_state_machine.cac.json` and
+        referenced in code as the snapshot/source contract for machine-spec
+        output verification.
+
+    - id: "DR-007-CLI_EXIT_ON_ACTION_SET_IS_CANONICAL"
+      title: "--exit-on actions derive from action policy table"
+      detail: |
+        Supported/default `--exit-on` actions must derive from a single
+        `DoctorActionPolicy` table. CLI enum choices and fac_review-supported
+        actions must remain aligned via regression test.
+
+    - id: "DR-008-MACHINE_VERIFIABLE_ARTIFACTS"
+      title: "Emit reviewer-grade transition and traceability artifacts"
+      detail: |
+        Produce machine-verifiable outputs that enumerate states, transitions,
+        guards, action policy, and requirement-to-test mapping:
+          - canonical CAC machine spec JSON,
+          - embedded machine_traceability section with indexes, coverage, and
+            integrity checks.
+
   out_of_scope:
-    - "Adding new top-level failure codes beyond the four defined."
-    - "JSONL full event schema (TCK-00625 owns the broader stdout contract)."
-    - "Failure taxonomy for commands other than the gates phase of apm2 fac push."
+    - "Legacy ad-hoc branching paths outside FAC doctor/review scope."
+    - "Non-FAC command state-machine redesign."
+    - "Backwards-compatibility shims for superseded machine-spec file paths."
 
 plan:
   steps:
     - id: "STEP_01"
-      title: "Define StructuredFailure, FailureCode, FailureClass types"
+      title: "Model FAC doctor, gate progress, wait loop, and lifecycle as explicit machines"
       detail: |
-        In fac_review/ or a shared fac_error module. Derive Serialize for
-        JSON emission. Implement Display for human-friendly format.
+        Encode states, guards, priorities, and transitions as static rule tables.
+
     - id: "STEP_02"
-      title: "Wire StructuredFailure into all failure paths"
+      title: "Unify recommendation semantics under rule + action-policy tables"
       detail: |
-        Replace ad-hoc error strings in gates entry point with StructuredFailure
-        construction. Capture raw errors in diagnostics[]. Emit on stdout.
+        Ensure recommendation action, priority, reason, and command templates are
+        derived from a single table; derive wait `--exit-on` behavior from action policy.
+
     - id: "STEP_03"
-      title: "Audit and demote raw error propagation"
+      title: "Publish CAC machine spec and migrate snapshot checks"
       detail: |
-        Search all error! / eprintln! / return Err(...) paths in the gates
-        pipeline. Move raw content into diagnostics[]. Verify no raw errors
-        reach top-level stdout.
+        Wrap machine bundle in CAC envelope, publish evergreen JSON, and point
+        code snapshot validation to the canonical file.
+
     - id: "STEP_04"
-      title: "Add regression tests and workspace validation"
+      title: "Populate machine-traceability section inside CAC spec"
       detail: |
-        cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings
-        cargo doc --workspace --no-deps && cargo test --workspace
+        Embed compact indexes, requirement coverage, decision/recommendation
+        matrix, and integrity checks directly in the canonical CAC JSON.
+
+    - id: "STEP_05"
+      title: "Regression and workspace validation"
+      detail: |
+        cargo fmt --all
+        cargo clippy --workspace --all-targets --all-features -- -D warnings
+        cargo doc --workspace --no-deps
+        cargo test --workspace
 
 definition_of_done:
   evidence_ids:
-    - "EXEC-TCK00624-FAILURE-TAXONOMY"
-    - "EXEC-TCK00624-ALL-FOUR-CODES"
+    - "EXEC-TCK00624-STATE-MACHINE-CUTOVER"
+    - "EXEC-TCK00624-EVERGREEN-CAC-SPEC"
     - "EXEC-TCK00624-WORKSPACE-VALIDATION"
   criteria:
-    - "StructuredFailure type is defined with all required fields."
-    - "All four FailureCode values are reachable from gates execution paths."
-    - "Every failure emits failure_code, failure_class, stage, root_cause, and remediation."
-    - "No raw system errors appear at the top level of stdout output."
-    - "remediation field for PREP_NOT_READY and PREP_SUPPLY_UNAVAILABLE is actionable without log access."
-    - "Regression tests enumerate all four codes and verify output shape."
+    - "Doctor, gate progress, wait loop, and lifecycle transitions are represented as explicit rule/state tables."
+    - "Running gates no longer permit restart recommendation; doctor returns wait in the in-flight case."
+    - "Blocking conditions (merge conflict/gate failure/actionable findings) recommend dispatch_implementor."
+    - "--wait-for-recommended-action exits immediately on terminal recommended actions, including dispatch_implementor."
+    - "Supported/default --exit-on actions derive from DoctorActionPolicy and are CLI-aligned via test."
+    - "Machine spec is published as a single evergreen CAC JSON document with no TCK path coupling."
+    - "CAC machine_traceability section enumerates guards, states, transitions, and requirement/test links."
     - "Workspace validation completes successfully."
 
 notes:
   context: |
-    This ticket defines the shared StructuredFailure type that all other
-    gates tickets reference. TCK-00622 uses PREP_SUPPLY_UNAVAILABLE;
-    TCK-00620 uses PREP_NOT_READY; TCK-00623 uses AUTHORITY_DENIED for
-    closure signature rejection. The taxonomy is explicitly closed: no
-    new top-level codes may be added without a new requirement.
-  security: "fail-closed; raw errors are demoted to diagnostics, never top-level"
+    This ticket supersedes the prior if-branch-centric framing for FAC doctor
+    behavior with state-machine-first semantics. The implementation is designed
+    so recommendation logic remains evolvable by table edits rather than control
+    flow rewrites.
+  security: "fail-closed transition semantics; undefined paths resolve through explicit default guards"

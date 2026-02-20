@@ -512,6 +512,13 @@ struct GateMarkerSpan {
     end_line_end: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProjectedGateStatusSnapshot {
+    pub(super) sha: String,
+    pub(super) timestamp: String,
+    pub(super) gates: Vec<GateResult>,
+}
+
 fn fetch_pr_body_for_projection(owner_repo: &str, pr_number: u32) -> Result<String, String> {
     match github_projection::fetch_pr_body(owner_repo, pr_number) {
         Ok(body) if !body.trim().is_empty() => Ok(body),
@@ -790,6 +797,40 @@ fn parse_pr_body(body: &str) -> ParsedPrBody {
     }
 }
 
+fn gate_status_for_sha(statuses: &[ShaGateStatus], sha: &str) -> Option<ShaGateStatus> {
+    statuses
+        .iter()
+        .find(|status| status.sha.eq_ignore_ascii_case(sha))
+        .cloned()
+}
+
+pub(super) fn parse_pr_body_gate_status_for_sha(
+    body: &str,
+    sha: &str,
+) -> Option<ProjectedGateStatusSnapshot> {
+    if validate_expected_head_sha(sha).is_err() {
+        return None;
+    }
+    let normalized_sha = sha.to_ascii_lowercase();
+    let parsed = parse_pr_body(body);
+    let status = gate_status_for_sha(&parsed.existing_gate_statuses, &normalized_sha)?;
+    Some(ProjectedGateStatusSnapshot {
+        sha: status.sha,
+        timestamp: status.timestamp,
+        gates: status.gates,
+    })
+}
+
+pub(super) fn load_pr_body_gate_status_for_sha(
+    owner_repo: &str,
+    pr_number: u32,
+    sha: &str,
+) -> Result<Option<ProjectedGateStatusSnapshot>, String> {
+    validate_expected_head_sha(sha)?;
+    let existing_body = fetch_pr_body_for_projection(owner_repo, pr_number)?;
+    Ok(parse_pr_body_gate_status_for_sha(&existing_body, sha))
+}
+
 fn yaml_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -960,7 +1001,8 @@ mod tests {
 
     use super::{
         GATE_STATUS_END, GATE_STATUS_START, GateResult, ShaGateStatus, build_updated_pr_body,
-        parse_pr_body, render_gate_status_section, render_state_code_from_run_state,
+        parse_pr_body, parse_pr_body_gate_status_for_sha, render_gate_status_section,
+        render_state_code_from_run_state,
     };
     use crate::commands::fac_review::state::ReviewRunStateLoad;
     use crate::commands::fac_review::types::{ReviewRunState, ReviewRunStatus};
@@ -1198,5 +1240,20 @@ mod tests {
         assert!(updated.contains("## FAC Gate Status"));
         assert_eq!(updated.matches(GATE_STATUS_START).count(), 2);
         assert_eq!(updated.matches(GATE_STATUS_END).count(), 2);
+    }
+
+    #[test]
+    fn parse_pr_body_gate_status_for_sha_extracts_current_sha_snapshot() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let existing = format!(
+            "intro\n\n{GATE_STATUS_START}\n## FAC Gate Status\n\n```yaml\n# apm2-gate-status:v2\nsha: {sha}\nshort_sha: 01234567\ntimestamp: '2026-02-12T00:00:00Z'\nall_passed: false\ngates:\n  - name: 'test'\n    status: RUNNING\n```\n\n<details>\n<summary>Previous SHAs (1)</summary>\n\n```yaml\nprevious_shas:\n  - sha: 89abcdef0123456789abcdef0123456789abcdef\n    timestamp: '2026-02-11T00:00:00Z'\n    all_passed: true\n    gates: ['test': PASS]\n```\n\n</details>\n{GATE_STATUS_END}\n"
+        );
+        let snapshot =
+            parse_pr_body_gate_status_for_sha(&existing, sha).expect("snapshot should exist");
+        assert_eq!(snapshot.sha, sha);
+        assert_eq!(snapshot.timestamp, "2026-02-12T00:00:00Z");
+        assert_eq!(snapshot.gates.len(), 1);
+        assert_eq!(snapshot.gates[0].name, "test");
+        assert_eq!(snapshot.gates[0].status, "RUNNING");
     }
 }

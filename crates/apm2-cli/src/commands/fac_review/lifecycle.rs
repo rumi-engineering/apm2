@@ -2065,6 +2065,7 @@ fn git_run_checked_with_git_dir(git_dir: &Path, args: &[&str]) -> Result<(), Str
     ))
 }
 
+#[cfg(test)]
 fn git_commit_sha_if_exists(current_dir: &Path, reference: &str) -> Result<Option<String>, String> {
     let output = Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", reference])
@@ -2096,6 +2097,7 @@ fn git_commit_sha_if_exists(current_dir: &Path, reference: &str) -> Result<Optio
     }
 }
 
+#[cfg(test)]
 fn git_update_ref_if_missing(
     current_dir: &Path,
     reference: &str,
@@ -2138,6 +2140,7 @@ fn git_update_ref_if_missing(
     ))
 }
 
+#[cfg(test)]
 fn git_worktree_has_tracked_changes(current_dir: &Path) -> Result<bool, String> {
     let output = Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=no"])
@@ -2202,6 +2205,7 @@ fn find_main_worktree(reference_dir: &Path) -> Result<Option<PathBuf>, String> {
     Ok(None)
 }
 
+#[cfg(test)]
 fn git_merge_base_is_ancestor(
     current_dir: &Path,
     ancestor_ref: &str,
@@ -2231,6 +2235,7 @@ fn git_merge_base_is_ancestor(
     }
 }
 
+#[cfg(test)]
 fn sync_main_worktree_if_present(reference_dir: &Path) {
     let Ok(Some(main_worktree)) = find_main_worktree(reference_dir) else {
         return;
@@ -2267,6 +2272,7 @@ fn sync_main_worktree_if_present(reference_dir: &Path) {
     }
 }
 
+#[cfg(test)]
 fn sync_local_main_with_origin(current_dir: &Path) -> Result<(), String> {
     git_run_checked(
         current_dir,
@@ -2312,26 +2318,7 @@ fn sync_local_main_with_origin(current_dir: &Path) -> Result<(), String> {
     Err("local main diverged from origin/main; manual rebase/repair required".to_string())
 }
 
-fn push_local_main_to_origin(current_dir: &Path, expected_main_sha: &str) -> Result<(), String> {
-    validate_expected_head_sha(expected_main_sha)?;
-    let local_main = git_stdout_checked(
-        current_dir,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            "refs/heads/main^{commit}",
-        ],
-    )?;
-    if !local_main.eq_ignore_ascii_case(expected_main_sha) {
-        return Err(format!(
-            "auto-merge push aborted: local main {local_main} no longer matches expected merged SHA {expected_main_sha}"
-        ));
-    }
-    let push_refspec = format!("{expected_main_sha}:refs/heads/main");
-    git_run_checked(current_dir, &["push", "origin", &push_refspec])
-}
-
+#[cfg(test)]
 fn try_fast_forward_main(
     current_dir: &Path,
     branch: &str,
@@ -2372,6 +2359,101 @@ fn try_fast_forward_main(
     )?;
     sync_main_worktree_if_present(current_dir);
     Ok(())
+}
+
+fn resolve_primary_main_worktree(reference_dir: &Path) -> Result<PathBuf, String> {
+    if let Some(path) = find_main_worktree(reference_dir)? {
+        return Ok(path);
+    }
+
+    let fallback = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Projects").join("apm2"))
+        .filter(|path| path.is_dir());
+    if let Some(path) = fallback {
+        return Ok(path);
+    }
+
+    Err(
+        "cannot resolve main worktree path for local reset (expected an attached main worktree or ~/Projects/apm2)"
+            .to_string(),
+    )
+}
+
+fn assert_main_worktree_clean(main_worktree: &Path) -> Result<(), String> {
+    let status = git_stdout_checked(
+        main_worktree,
+        &[
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+    )?;
+    if status.trim().is_empty() {
+        return Ok(());
+    }
+    let summary = status
+        .lines()
+        .take(20)
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Err(format!(
+        "main worktree is not clean after merge reset (tracked/untracked/ignored): {summary}"
+    ))
+}
+
+fn reset_local_main_after_projection(reference_dir: &Path, merged_sha: &str) -> Result<(), String> {
+    validate_expected_head_sha(merged_sha)?;
+    let main_worktree = resolve_primary_main_worktree(reference_dir)?;
+    let active_branch = git_stdout_checked(&main_worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if active_branch != "main" {
+        return Err(format!(
+            "resolved main worktree {} is on branch `{active_branch}`, expected `main`",
+            main_worktree.display()
+        ));
+    }
+
+    let stash_message = format!("apm2-auto-merge-pre-reset-{merged_sha}");
+    git_run_checked(
+        &main_worktree,
+        &[
+            "stash",
+            "push",
+            "--include-untracked",
+            "--message",
+            &stash_message,
+        ],
+    )?;
+    git_run_checked(&main_worktree, &["fetch", "origin", "refs/heads/main"])?;
+    git_run_checked(&main_worktree, &["reset", "--hard", merged_sha])?;
+
+    let head_sha = git_stdout_checked(
+        &main_worktree,
+        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+    )?;
+    if !head_sha.eq_ignore_ascii_case(merged_sha) {
+        return Err(format!(
+            "main worktree HEAD {head_sha} does not match projected merge SHA {merged_sha}"
+        ));
+    }
+    let main_ref_sha = git_stdout_checked(
+        &main_worktree,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/main^{commit}",
+        ],
+    )?;
+    if !main_ref_sha.eq_ignore_ascii_case(merged_sha) {
+        return Err(format!(
+            "local refs/heads/main {main_ref_sha} does not match projected merge SHA {merged_sha}"
+        ));
+    }
+
+    assert_main_worktree_clean(&main_worktree)
 }
 
 fn maybe_cleanup_worktree_target(worktree: Option<&str>) {
@@ -2556,6 +2638,12 @@ impl MergeProjectionSink {
 
 fn configured_merge_projection_sinks() -> Vec<MergeProjectionSink> {
     vec![MergeProjectionSink::Github]
+}
+
+#[derive(Debug, Clone)]
+struct MergeProjectionFanoutResult {
+    sink: MergeProjectionSink,
+    merge_sha: String,
 }
 
 fn fac_root_dir() -> Result<PathBuf, String> {
@@ -2842,26 +2930,6 @@ fn persist_signed_merge_receipt(
     })
 }
 
-fn rollback_local_main_after_receipt_failure(
-    current_dir: &Path,
-    previous_main_sha: &str,
-    merged_sha: &str,
-) -> Result<(), String> {
-    validate_expected_head_sha(previous_main_sha)?;
-    validate_expected_head_sha(merged_sha)?;
-    git_run_checked(
-        current_dir,
-        &[
-            "update-ref",
-            "refs/heads/main",
-            previous_main_sha,
-            merged_sha,
-        ],
-    )?;
-    sync_main_worktree_if_present(current_dir);
-    Ok(())
-}
-
 fn delete_remote_branch_projection(current_dir: &Path, branch: &str) -> Result<(), String> {
     let branch = branch.trim();
     if branch.is_empty() {
@@ -3019,7 +3087,7 @@ fn project_merge_evidence_to_pr_body(context: &MergeProjectionContext) -> Result
 fn project_merge_to_github(
     merge_dir: &Path,
     context: &MergeProjectionContext,
-) -> Result<(), String> {
+) -> Result<String, String> {
     project_merge_to_github_with(
         merge_dir,
         context,
@@ -3039,17 +3107,22 @@ fn project_merge_to_github_with<FMerge, FDelete, FStatus, FBody>(
     mut delete_remote_branch_fn: FDelete,
     mut project_status_fn: FStatus,
     mut project_pr_body_fn: FBody,
-) -> Result<(), String>
+) -> Result<String, String>
 where
-    FMerge: FnMut(&str, u32, &str) -> Result<(), String>,
+    FMerge: FnMut(&str, u32, &str) -> Result<String, String>,
     FDelete: FnMut(&Path, &str) -> Result<(), String>,
     FStatus: FnMut(&str, u32, &str, &str) -> Result<(), String>,
     FBody: FnMut(&MergeProjectionContext) -> Result<(), String>,
 {
     let mut errors = Vec::new();
-    if let Err(err) = merge_pr_fn(&context.owner_repo, context.pr_number, &context.merge_sha) {
-        errors.push(format!("merge_pr: {err}"));
+    let mut projected_merge_sha = None::<String>;
+    match merge_pr_fn(&context.owner_repo, context.pr_number, &context.merge_sha) {
+        Ok(merge_sha) => projected_merge_sha = Some(merge_sha),
+        Err(err) => errors.push(format!("merge_pr: {err}")),
     }
+    let status_sha = projected_merge_sha
+        .as_deref()
+        .unwrap_or(context.merge_sha.as_str());
     if let Err(err) = delete_remote_branch_fn(merge_dir, &context.source_branch) {
         errors.push(format!(
             "delete_remote_branch `{}`: {err}",
@@ -3059,7 +3132,7 @@ where
     if let Err(err) = project_status_fn(
         &context.owner_repo,
         context.pr_number,
-        &context.merge_sha,
+        status_sha,
         "approve",
     ) {
         errors.push(format!("commit_status: {err}"));
@@ -3068,7 +3141,8 @@ where
         errors.push(format!("pr_body: {err}"));
     }
     if errors.is_empty() {
-        Ok(())
+        projected_merge_sha
+            .ok_or_else(|| "merge projection succeeded without a merged commit SHA".to_string())
     } else {
         Err(errors.join("; "))
     }
@@ -3081,7 +3155,7 @@ fn project_merge_to_all_sinks(
     let mut errors = Vec::new();
     for sink in configured_merge_projection_sinks() {
         let sink_result = match sink {
-            MergeProjectionSink::Github => project_merge_to_github(merge_dir, context),
+            MergeProjectionSink::Github => project_merge_to_github(merge_dir, context).map(|_| ()),
         };
         if let Err(err) = sink_result {
             errors.push(format!("{}: {err}", sink.as_str()));
@@ -3092,6 +3166,50 @@ fn project_merge_to_all_sinks(
     } else {
         Err(errors.join("; "))
     }
+}
+
+fn project_merge_on_any_sink(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<MergeProjectionFanoutResult, String> {
+    let mut errors = Vec::new();
+    for sink in configured_merge_projection_sinks() {
+        let sink_result = match sink {
+            MergeProjectionSink::Github => {
+                github_projection::merge_pr_on_github(owner_repo, pr_number, head_sha)
+            },
+        };
+        match sink_result {
+            Ok(merge_sha) => {
+                return Ok(MergeProjectionFanoutResult { sink, merge_sha });
+            },
+            Err(err) => errors.push(format!("{}: {err}", sink.as_str())),
+        }
+    }
+    Err(errors.join("; "))
+}
+
+fn project_merge_on_any_sink_with_retry(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    max_attempts: u32,
+) -> Result<MergeProjectionFanoutResult, String> {
+    let attempts = max_attempts.max(1);
+    let mut last_error = String::new();
+    for attempt in 1..=attempts {
+        match project_merge_on_any_sink(owner_repo, pr_number, head_sha) {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                last_error = err;
+                if attempt < attempts {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            },
+        }
+    }
+    Err(last_error)
 }
 
 fn save_merge_projection_pending(
@@ -3429,45 +3547,33 @@ fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) -> 
     };
 
     let merge_result = (|| -> Result<MergeProjectionContext, String> {
-        sync_local_main_with_origin(&merge_dir)?;
-        let pre_merge_main = git_stdout_checked(
-            &merge_dir,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                "refs/heads/main^{commit}",
-            ],
-        )?;
-        try_fast_forward_main(&merge_dir, branch, &record.current_sha)?;
-        let persisted_receipt = match persist_signed_merge_receipt(
+        let projected = project_merge_on_any_sink_with_retry(
             &record.owner_repo,
             record.pr_number,
             &record.current_sha,
+            3,
+        )?;
+        eprintln!(
+            "INFO: auto-merge fanout succeeded via sink={} merged_sha={}",
+            projected.sink.as_str(),
+            projected.merge_sha
+        );
+
+        // TCK-00624 S7: projection-first merge flow. Local main is reset only
+        // after an external projection has produced an authoritative merged SHA.
+        reset_local_main_after_projection(&merge_dir, &projected.merge_sha)?;
+
+        let persisted_receipt = persist_signed_merge_receipt(
+            &record.owner_repo,
+            record.pr_number,
             &record.current_sha,
+            &projected.merge_sha,
             &merge_evidence,
-        ) {
-            Ok(value) => value,
-            Err(err) => {
-                if let Err(rollback_err) = rollback_local_main_after_receipt_failure(
-                    &merge_dir,
-                    &pre_merge_main,
-                    &record.current_sha,
-                ) {
-                    return Err(format!(
-                        "failed to emit signed merge receipt: {err}; additionally failed to roll back local main: {rollback_err}"
-                    ));
-                }
-                return Err(format!(
-                    "failed to emit signed merge receipt: {err}; local main rolled back to pre-merge commit"
-                ));
-            },
-        };
-        push_local_main_to_origin(&merge_dir, &record.current_sha)?;
+        )?;
         Ok(MergeProjectionContext {
             owner_repo: record.owner_repo.clone(),
             pr_number: record.pr_number,
-            merge_sha: record.current_sha.clone(),
+            merge_sha: projected.merge_sha,
             source_branch: branch.to_string(),
             merge_receipt_hash: persisted_receipt.content_hash,
             merged_at_iso: persisted_receipt.merged_at_iso,
@@ -4185,25 +4291,260 @@ pub fn ensure_machine_artifact() -> Result<PathBuf, String> {
     if path.exists() {
         return Ok(path);
     }
-    let transitions = vec![
-        serde_json::json!({"from":"untracked|pushed|gates_running|gates_passed|gates_failed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|merge_ready|merged|stuck|stale|recovering","event":"push_observed","to":"pushed"}),
-        serde_json::json!({"from":"pushed|gates_failed|recovering","event":"gates_started","to":"gates_running"}),
-        serde_json::json!({"from":"gates_running","event":"gates_passed","to":"gates_passed"}),
-        serde_json::json!({"from":"gates_running","event":"gates_failed","to":"gates_failed"}),
-        serde_json::json!({"from":"gates_passed|reviews_dispatched|review_in_progress|verdict_pending","event":"reviews_dispatched","to":"reviews_dispatched"}),
-        serde_json::json!({"from":"reviews_dispatched|review_in_progress|verdict_pending","event":"reviewer_spawned","to":"review_in_progress"}),
-        serde_json::json!({"from":"gates_passed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|merge_ready","event":"verdict_set","to":"verdict_pending|verdict_deny|merge_ready"}),
-        serde_json::json!({"from":"*","event":"verdict_auto_derived","to":"self"}),
-        serde_json::json!({"from":"merge_ready|verdict_approve|verdict_pending|stuck","event":"merge_failed","to":"stuck"}),
-        serde_json::json!({"from":"merge_ready|merged","event":"merged","to":"merged"}),
-        serde_json::json!({"from":"*","event":"sha_drift_detected","to":"stale"}),
-        serde_json::json!({"from":"stale|stuck|quarantined","event":"recover_requested","to":"recovering"}),
-        serde_json::json!({"from":"recovering","event":"recover_completed","to":"pushed"}),
-    ];
-    let machine = serde_json::json!({
+    let mut machine = lifecycle_machine_spec();
+    if let Some(object) = machine.as_object_mut() {
+        object.insert("generated_at".to_string(), serde_json::json!(now_iso8601()));
+    }
+    atomic_write_json(&path, &machine)?;
+    Ok(path)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LifecycleTransitionRule {
+    transition_id: &'static str,
+    event: &'static str,
+    from_states: &'static [&'static str],
+    to_states: &'static [&'static str],
+    guard_predicate: &'static str,
+    requirement_refs: &'static [&'static str],
+}
+
+const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
+    LifecycleTransitionRule {
+        transition_id: "LC-T-001",
+        event: "push_observed",
+        from_states: &[
+            "untracked",
+            "pushed",
+            "gates_running",
+            "gates_passed",
+            "gates_failed",
+            "reviews_dispatched",
+            "review_in_progress",
+            "verdict_pending",
+            "verdict_approve",
+            "verdict_deny",
+            "merge_ready",
+            "merged",
+            "stuck",
+            "stale",
+            "recovering",
+        ],
+        to_states: &["pushed"],
+        guard_predicate: "state.pr_state != quarantined",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-002",
+        event: "gates_started",
+        from_states: &["pushed", "gates_failed", "recovering"],
+        to_states: &["gates_running"],
+        guard_predicate: "state.pr_state in {pushed, gates_failed, recovering}",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-003",
+        event: "gates_passed",
+        from_states: &["gates_running"],
+        to_states: &["gates_passed"],
+        guard_predicate: "state.pr_state == gates_running",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-004",
+        event: "gates_failed",
+        from_states: &["gates_running"],
+        to_states: &["gates_failed"],
+        guard_predicate: "state.pr_state == gates_running",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-005",
+        event: "reviews_dispatched",
+        from_states: &[
+            "gates_passed",
+            "reviews_dispatched",
+            "review_in_progress",
+            "verdict_pending",
+        ],
+        to_states: &["reviews_dispatched"],
+        guard_predicate: "state.pr_state in {gates_passed, reviews_dispatched, review_in_progress, verdict_pending}",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-006",
+        event: "reviewer_spawned",
+        from_states: &[
+            "reviews_dispatched",
+            "review_in_progress",
+            "verdict_pending",
+        ],
+        to_states: &["review_in_progress"],
+        guard_predicate: "state.pr_state in {reviews_dispatched, review_in_progress, verdict_pending}",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-007",
+        event: "verdict_set",
+        from_states: &[
+            "gates_passed",
+            "reviews_dispatched",
+            "review_in_progress",
+            "verdict_pending",
+            "verdict_approve",
+            "verdict_deny",
+            "merge_ready",
+            "stuck",
+        ],
+        to_states: &["verdict_deny"],
+        guard_predicate: "normalized_decision == deny || any(state.verdicts.values == deny)",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-008",
+        event: "verdict_set",
+        from_states: &[
+            "gates_passed",
+            "reviews_dispatched",
+            "review_in_progress",
+            "verdict_pending",
+            "verdict_approve",
+            "verdict_deny",
+            "merge_ready",
+            "stuck",
+        ],
+        to_states: &["merge_ready"],
+        guard_predicate: "normalized_decision == approve && state.verdicts.security == approve && state.verdicts.code_quality == approve && no(state.verdicts.values == deny)",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-009",
+        event: "verdict_set",
+        from_states: &[
+            "gates_passed",
+            "reviews_dispatched",
+            "review_in_progress",
+            "verdict_pending",
+            "verdict_approve",
+            "verdict_deny",
+            "merge_ready",
+            "stuck",
+        ],
+        to_states: &["verdict_pending"],
+        guard_predicate: "normalized_decision == approve && !all_required_verdicts_approve && no(state.verdicts.values == deny)",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-010",
+        event: "verdict_auto_derived",
+        from_states: &["*"],
+        to_states: &["self"],
+        guard_predicate: "dimension/decision normalize successfully",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-011",
+        event: "merge_failed",
+        from_states: &["merge_ready", "verdict_approve", "verdict_pending", "stuck"],
+        to_states: &["stuck"],
+        guard_predicate: "state.pr_state in {merge_ready, verdict_approve, verdict_pending, stuck}",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-012",
+        event: "merged",
+        from_states: &["merge_ready", "merged"],
+        to_states: &["merged"],
+        guard_predicate: "state.pr_state in {merge_ready, merged}",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-013",
+        event: "agent_crashed",
+        from_states: &["*"],
+        to_states: &["stuck"],
+        guard_predicate: "always",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-014",
+        event: "sha_drift_detected",
+        from_states: &["*"],
+        to_states: &["stale"],
+        guard_predicate: "always",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-015",
+        event: "recover_requested",
+        from_states: &["stale", "stuck", "quarantined"],
+        to_states: &["recovering"],
+        guard_predicate: "state.pr_state in {stale, stuck, quarantined}",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-016",
+        event: "recover_completed",
+        from_states: &["recovering"],
+        to_states: &["pushed"],
+        guard_predicate: "state.pr_state == recovering",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-017",
+        event: "quarantined",
+        from_states: &["*"],
+        to_states: &["quarantined"],
+        guard_predicate: "always",
+        requirement_refs: &[],
+    },
+    LifecycleTransitionRule {
+        transition_id: "LC-T-018",
+        event: "projection_failed",
+        from_states: &["*"],
+        to_states: &["self"],
+        guard_predicate: "always",
+        requirement_refs: &[],
+    },
+];
+
+fn transition_states_text(states: &[&str]) -> String {
+    if states.len() == 1 {
+        states[0].to_string()
+    } else {
+        states.join("|")
+    }
+}
+
+fn lifecycle_machine_transitions() -> Vec<serde_json::Value> {
+    LIFECYCLE_TRANSITION_RULES
+        .iter()
+        .map(|rule| {
+            serde_json::json!({
+                "transition_id": rule.transition_id,
+                "event": rule.event,
+                "from": transition_states_text(rule.from_states),
+                "from_states": rule.from_states,
+                "to": transition_states_text(rule.to_states),
+                "to_states": rule.to_states,
+                "guard_predicate": rule.guard_predicate,
+                "requirement_refs": rule.requirement_refs,
+            })
+        })
+        .collect()
+}
+
+pub(super) fn lifecycle_machine_spec() -> serde_json::Value {
+    let mut events = LIFECYCLE_TRANSITION_RULES
+        .iter()
+        .map(|rule| rule.event)
+        .collect::<Vec<_>>();
+    events.sort_unstable();
+    events.dedup();
+    serde_json::json!({
         "schema": MACHINE_SCHEMA,
-        "generated_at": now_iso8601(),
         "illegal_transition_policy": "fail_closed",
+        "evaluation": "first_matching_guard_applies",
         "states": {
             "pr_lifecycle": [
                 "untracked","pushed","gates_running","gates_passed","gates_failed",
@@ -4215,10 +4556,9 @@ pub fn ensure_machine_artifact() -> Result<PathBuf, String> {
                 "dispatched","running","completed","crashed","reaped","stuck"
             ]
         },
-        "transitions": transitions
-    });
-    atomic_write_json(&path, &machine)?;
-    Ok(path)
+        "events": events,
+        "transitions": lifecycle_machine_transitions(),
+    })
 }
 
 pub fn apply_event(
@@ -5140,8 +5480,8 @@ mod tests {
         normalize_hash_list, normalize_sha256_hex_digest, persist_merge_receipt_binding_record,
         project_fac_required_status_to_contexts_with, project_fac_required_status_with,
         project_merge_to_github_with, register_agent_spawn, register_reviewer_dispatch,
-        save_registry, sync_local_main_with_origin, token_hash, try_fast_forward_main,
-        upsert_marker_section,
+        reset_local_main_after_projection, save_registry, sync_local_main_with_origin, token_hash,
+        try_fast_forward_main, upsert_marker_section,
     };
     use crate::commands::fac_review::lifecycle::tracked_agent_id;
     use crate::commands::fac_review::state::{
@@ -5883,6 +6223,60 @@ mod tests {
     }
 
     #[test]
+    fn reset_local_main_after_projection_stashes_and_resets_main_worktree() {
+        let temp = init_git_repo_for_merge_tests();
+        let dir = temp.path();
+        let origin_path = dir.join("origin.git");
+        let origin_str = origin_path.to_string_lossy().to_string();
+
+        git_checked(dir, &["clone", "--bare", ".", &origin_str]);
+        git_checked(dir, &["remote", "add", "origin", &origin_str]);
+        git_checked(dir, &["push", "origin", "main"]);
+
+        git_checked(dir, &["checkout", "-b", "ticket/reset-local-main"]);
+        let main_worktree = dir.join("main-worktree");
+        let main_worktree_str = main_worktree.to_string_lossy().to_string();
+        git_checked(dir, &["worktree", "add", &main_worktree_str, "main"]);
+
+        fs::write(main_worktree.join("README.md"), "merged-from-projection\n")
+            .expect("write merged commit");
+        git_checked(&main_worktree, &["add", "README.md"]);
+        git_checked(&main_worktree, &["commit", "-m", "merged commit"]);
+        let merged_sha = git_stdout(&main_worktree, &["rev-parse", "HEAD"]);
+        git_checked(&main_worktree, &["push", "origin", "main"]);
+
+        fs::write(main_worktree.join("README.md"), "dirty staged main\n")
+            .expect("write dirty tracked file");
+        git_checked(&main_worktree, &["add", "README.md"]);
+        fs::write(main_worktree.join("scratch.txt"), "dirty untracked\n")
+            .expect("write dirty untracked file");
+
+        reset_local_main_after_projection(dir, &merged_sha)
+            .expect("projection reset should stash and hard-reset main worktree");
+
+        let head_after = git_stdout(&main_worktree, &["rev-parse", "HEAD"]);
+        assert_eq!(head_after, merged_sha.to_ascii_lowercase());
+        let status_after = git_stdout(
+            &main_worktree,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ],
+        );
+        assert!(
+            status_after.trim().is_empty(),
+            "main worktree must be fully clean after projection reset"
+        );
+        let stash_entries = git_stdout(&main_worktree, &["stash", "list"]);
+        assert!(
+            stash_entries.contains("apm2-auto-merge-pre-reset"),
+            "stash entry should preserve pre-reset local state"
+        );
+    }
+
+    #[test]
     fn delete_remote_branch_projection_is_idempotent_when_branch_missing() {
         let temp = init_git_repo_for_merge_tests();
         let dir = temp.path();
@@ -6032,7 +6426,7 @@ mod tests {
                 calls
                     .borrow_mut()
                     .push(format!("merge_pr:{owner_repo}:{pr_number}:{sha}"));
-                Ok(())
+                Ok(sha.to_string())
             },
             |dir, branch| {
                 calls
@@ -6092,7 +6486,7 @@ mod tests {
             &context,
             |_, _, _| {
                 calls.borrow_mut().push("merge");
-                Err("merge failed".to_string())
+                Err::<String, String>("merge failed".to_string())
             },
             |_, _| {
                 calls.borrow_mut().push("delete");
@@ -6922,6 +7316,33 @@ mod tests {
         assert_eq!(receipt.head_sha, sha);
         assert_eq!(receipt.run_id, run_id);
         assert_eq!(receipt.decision, "deny");
+    }
+
+    #[test]
+    fn lifecycle_transition_rules_have_unique_ids_and_non_empty_state_sets() {
+        let mut seen_ids = std::collections::BTreeSet::new();
+        for rule in super::LIFECYCLE_TRANSITION_RULES {
+            assert!(seen_ids.insert(rule.transition_id));
+            assert!(!rule.event.trim().is_empty());
+            assert!(!rule.from_states.is_empty());
+            assert!(!rule.to_states.is_empty());
+        }
+    }
+
+    #[test]
+    fn lifecycle_machine_spec_emits_guard_predicates_for_every_transition() {
+        let machine = super::lifecycle_machine_spec();
+        let transitions = machine
+            .get("transitions")
+            .and_then(|value| value.as_array())
+            .expect("transitions array");
+        assert_eq!(transitions.len(), super::LIFECYCLE_TRANSITION_RULES.len());
+        for entry in transitions {
+            assert!(entry.get("transition_id").is_some());
+            assert!(entry.get("guard_predicate").is_some());
+            assert!(entry.get("from_states").is_some());
+            assert!(entry.get("to_states").is_some());
+        }
     }
 
     #[test]
