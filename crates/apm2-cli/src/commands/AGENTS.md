@@ -750,6 +750,18 @@ systemd service executables:
 - **Fail-closed on unsafe pre-existing mode**: Pre-existing directories
   with group/other read bits are rejected with an actionable error message.
 
+### Sticky-bit enforcement on pre-existing broker_requests (TCK-00577 round 10)
+
+- **Sticky-bit required for world-writable broker_requests**: When a
+  pre-existing `broker_requests/` directory has the other-write bit set
+  (mode & 0o002), the sticky bit (mode & 0o1000) MUST also be set.
+  Without the sticky bit, any local user can unlink or overwrite other
+  users' submission files inside the directory, breaking queue isolation
+  (CWE-379). Modes like `0333` (write-only, no sticky) are rejected.
+  Modes like `01333` or `01733` (sticky set) are accepted. Owner-only
+  modes (e.g., `0700`) do not require the sticky bit since other-write
+  is not set.
+
 ### General invariants
 
 - The `broker_requests/` directory uses mode 01733 (sticky + write-only for
