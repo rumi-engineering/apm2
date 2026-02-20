@@ -566,6 +566,12 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
+    let reviewer_missing_verdict_machine = orchestrator::missing_verdict_machine_spec_json();
+    let reviewer_missing_verdict_rules = reviewer_missing_verdict_machine
+        .get("rules")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let gates_wait_machine = gates::gates_wait_machine_spec_json();
     let gates_wait_transitions = gates_wait_machine
         .get("transitions")
@@ -844,6 +850,26 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
             .unwrap_or(0);
         left < right
     });
+    let reviewer_missing_verdict_guard_ids_unique = {
+        let mut seen = std::collections::BTreeSet::<String>::new();
+        reviewer_missing_verdict_rules.iter().all(|rule| {
+            rule.get("guard_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|guard_id| seen.insert(guard_id.to_string()))
+        })
+    };
+    let reviewer_missing_verdict_priorities_strict =
+        reviewer_missing_verdict_rules.windows(2).all(|window| {
+            let left = window[0]
+                .get("priority")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let right = window[1]
+                .get("priority")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            left < right
+        });
     let lifecycle_transition_ids_unique = {
         let mut seen = std::collections::BTreeSet::<String>::new();
         lifecycle_transitions.iter().all(|transition| {
@@ -1073,6 +1099,7 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
             "action_policy": wait_action_policy,
             "rules": wait_rules,
         },
+        "reviewer_missing_verdict_machine": reviewer_missing_verdict_machine,
         "gates_wait_machine": {
             "schema": GATES_WAIT_MACHINE_SCHEMA,
             "evaluation": "priority_order_first_match_per_state",
@@ -1110,6 +1137,8 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
                 "wait_priorities_strict": wait_priorities_strict,
                 "gates_wait_guard_ids_unique": gates_wait_guard_ids_unique,
                 "gates_wait_priorities_strict": gates_wait_priorities_strict,
+                "reviewer_missing_verdict_guard_ids_unique": reviewer_missing_verdict_guard_ids_unique,
+                "reviewer_missing_verdict_priorities_strict": reviewer_missing_verdict_priorities_strict,
                 "lifecycle_transition_ids_unique": lifecycle_transition_ids_unique,
                 "recommendation_states_unique": recommendation_states_unique,
             },
@@ -1120,6 +1149,7 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
                 "gate_reduction_rules": DOCTOR_GATE_REDUCTION_RULES.len(),
                 "wait_rules": DOCTOR_WAIT_TRANSITION_RULES.len(),
                 "wait_action_policy_actions": DOCTOR_ACTION_POLICIES.len(),
+                "reviewer_missing_verdict_rules": reviewer_missing_verdict_rules.len(),
                 "gates_wait_transitions": gates_wait_transitions.len(),
                 "lifecycle_transitions": lifecycle_transitions.len(),
                 "ticket_in_scope_requirements": FAC_REVIEW_MACHINE_REQUIREMENT_IDS.len(),

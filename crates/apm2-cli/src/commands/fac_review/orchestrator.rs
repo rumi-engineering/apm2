@@ -70,6 +70,133 @@ fn missing_verdict_nudge_disabled() -> bool {
     bool_env_enabled(MISSING_VERDICT_NUDGE_DISABLE_ENV)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingVerdictDecisionState {
+    NudgeResume,
+    CrashPermissionDenied,
+    RetryInvalidCompletion,
+}
+
+impl MissingVerdictDecisionState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NudgeResume => "nudge_resume",
+            Self::CrashPermissionDenied => "crash_permission_denied",
+            Self::RetryInvalidCompletion => "retry_invalid_completion",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MissingVerdictDecisionGuard {
+    NudgeEligible,
+    CommentPermissionDenied,
+    Default,
+}
+
+impl MissingVerdictDecisionGuard {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NudgeEligible => "nudge_eligible",
+            Self::CommentPermissionDenied => "comment_permission_denied",
+            Self::Default => "default",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MissingVerdictDecisionRule {
+    priority: u8,
+    state: MissingVerdictDecisionState,
+    guard: MissingVerdictDecisionGuard,
+    guard_id: &'static str,
+    guard_predicate: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MissingVerdictDecisionFacts {
+    nudge_count: u32,
+    restart_count: u32,
+    nudge_disabled: bool,
+    comment_permission_denied: bool,
+}
+
+const MISSING_VERDICT_DECISION_RULES: &[MissingVerdictDecisionRule] = &[
+    MissingVerdictDecisionRule {
+        priority: 1,
+        state: MissingVerdictDecisionState::NudgeResume,
+        guard: MissingVerdictDecisionGuard::NudgeEligible,
+        guard_id: "RVMV-G-001",
+        guard_predicate: "facts.nudge_count < max_missing_verdict_nudges && facts.restart_count < max_restart_attempts && !facts.nudge_disabled",
+    },
+    MissingVerdictDecisionRule {
+        priority: 2,
+        state: MissingVerdictDecisionState::CrashPermissionDenied,
+        guard: MissingVerdictDecisionGuard::CommentPermissionDenied,
+        guard_id: "RVMV-G-002",
+        guard_predicate: "facts.comment_permission_denied",
+    },
+    MissingVerdictDecisionRule {
+        priority: 3,
+        state: MissingVerdictDecisionState::RetryInvalidCompletion,
+        guard: MissingVerdictDecisionGuard::Default,
+        guard_id: "RVMV-G-003",
+        guard_predicate: "default",
+    },
+];
+
+const fn missing_verdict_guard_triggered(
+    rule: &MissingVerdictDecisionRule,
+    facts: &MissingVerdictDecisionFacts,
+) -> bool {
+    match rule.guard {
+        MissingVerdictDecisionGuard::NudgeEligible => {
+            facts.nudge_count < MAX_MISSING_VERDICT_NUDGES
+                && facts.restart_count < MAX_RESTART_ATTEMPTS
+                && !facts.nudge_disabled
+        },
+        MissingVerdictDecisionGuard::CommentPermissionDenied => facts.comment_permission_denied,
+        MissingVerdictDecisionGuard::Default => true,
+    }
+}
+
+fn derive_missing_verdict_decision_state(
+    facts: &MissingVerdictDecisionFacts,
+) -> MissingVerdictDecisionState {
+    for rule in MISSING_VERDICT_DECISION_RULES {
+        if missing_verdict_guard_triggered(rule, facts) {
+            return rule.state;
+        }
+    }
+    MissingVerdictDecisionState::RetryInvalidCompletion
+}
+
+pub(super) fn missing_verdict_machine_spec_json() -> serde_json::Value {
+    let rules = MISSING_VERDICT_DECISION_RULES
+        .iter()
+        .map(|rule| {
+            serde_json::json!({
+                "priority": rule.priority,
+                "state": rule.state.as_str(),
+                "guard_id": rule.guard_id,
+                "guard_kind": rule.guard.as_str(),
+                "guard_predicate": rule.guard_predicate,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schema": "apm2.fac.review.reviewer_missing_verdict_machine.v1",
+        "evaluation": "priority_order_first_match",
+        "default_state": MissingVerdictDecisionState::RetryInvalidCompletion.as_str(),
+        "states": [
+            MissingVerdictDecisionState::NudgeResume.as_str(),
+            MissingVerdictDecisionState::CrashPermissionDenied.as_str(),
+            MissingVerdictDecisionState::RetryInvalidCompletion.as_str(),
+        ],
+        "rules": rules,
+    })
+}
+
 const fn verdict_dimension_for_kind(review_kind: ReviewKind) -> &'static str {
     match review_kind {
         ReviewKind::Security => "security",
@@ -1365,79 +1492,96 @@ fn run_single_review(
                         });
                     }
 
-                    if run_state.nudge_count < MAX_MISSING_VERDICT_NUDGES
-                        && restart_count < MAX_RESTART_ATTEMPTS
-                        && !missing_verdict_nudge_disabled()
-                    {
-                        let nudge_message =
-                            build_missing_verdict_nudge_message(review_kind, &prompt_path);
-                        let required_command = required_verdict_command(review_kind);
-                        run_state.nudge_count = run_state.nudge_count.saturating_add(1);
-                        emit_run_event(
-                            "nudge_resume",
-                            &current_head_sha,
-                            serde_json::json!({
-                                "nudge_count": run_state.nudge_count,
-                                "required_command": required_command,
-                                "reason": "clean_exit_without_verdict",
-                            }),
-                        )?;
-                        persist_review_run_state(
-                            &mut run_state,
-                            ReviewRunStatus::Pending,
-                            Some("nudge_resume".to_string()),
-                            &current_head_sha,
-                            &current_model,
-                            restart_count,
-                            None,
-                        )?;
-                        spawn_mode = SpawnMode::Resume {
-                            message: nudge_message,
-                        };
-                        continue 'restart_loop;
-                    }
-
-                    let comment_permission_denied = detect_comment_permission_denied(&log_path);
-                    emit_run_event(
-                        "run_crash",
-                        &current_head_sha,
-                        serde_json::json!({
-                            "exit_code": exit_code.unwrap_or(0),
-                            "signal": if comment_permission_denied { "auth_permission_denied" } else { "invalid_completion" },
-                            "duration_secs": run_started.elapsed().as_secs(),
-                            "restart_count": restart_count,
-                            "completion_issue": "decision_receipt_missing",
-                            "reason": if comment_permission_denied { "comment_post_permission_denied" } else { "invalid_completion" },
-                        }),
-                    )?;
-                    if comment_permission_denied {
-                        remove_review_state_entry(&run_key)?;
-                        persist_review_run_state(
-                            &mut run_state,
-                            ReviewRunStatus::Crashed,
-                            Some("comment_post_permission_denied".to_string()),
-                            &current_head_sha,
-                            &current_model,
-                            restart_count,
-                            None,
-                        )?;
-                        return Ok(SingleReviewResult {
-                            summary: build_single_review_summary(
-                                &run_id,
-                                sequence_number,
-                                ReviewRunStatus::Crashed,
-                                review_type,
-                                false,
-                                "UNKNOWN".to_string(),
-                                Some("comment_post_permission_denied".to_string()),
-                                &current_model.model,
-                                current_model.backend.as_str(),
-                                review_started.elapsed().as_secs(),
+                    let missing_verdict_facts = MissingVerdictDecisionFacts {
+                        nudge_count: run_state.nudge_count,
+                        restart_count,
+                        nudge_disabled: missing_verdict_nudge_disabled(),
+                        comment_permission_denied: detect_comment_permission_denied(&log_path),
+                    };
+                    match derive_missing_verdict_decision_state(&missing_verdict_facts) {
+                        MissingVerdictDecisionState::NudgeResume => {
+                            let nudge_message =
+                                build_missing_verdict_nudge_message(review_kind, &prompt_path);
+                            let required_command = required_verdict_command(review_kind);
+                            run_state.nudge_count = run_state.nudge_count.saturating_add(1);
+                            emit_run_event(
+                                "nudge_resume",
+                                &current_head_sha,
+                                serde_json::json!({
+                                    "nudge_count": run_state.nudge_count,
+                                    "required_command": required_command,
+                                    "reason": "clean_exit_without_verdict",
+                                }),
+                            )?;
+                            persist_review_run_state(
+                                &mut run_state,
+                                ReviewRunStatus::Pending,
+                                Some("nudge_resume".to_string()),
+                                &current_head_sha,
+                                &current_model,
                                 restart_count,
-                                extract_token_usage(&log_path),
-                            ),
-                            final_head_sha: current_head_sha,
-                        });
+                                None,
+                            )?;
+                            spawn_mode = SpawnMode::Resume {
+                                message: nudge_message,
+                            };
+                            continue 'restart_loop;
+                        },
+                        MissingVerdictDecisionState::CrashPermissionDenied => {
+                            emit_run_event(
+                                "run_crash",
+                                &current_head_sha,
+                                serde_json::json!({
+                                    "exit_code": exit_code.unwrap_or(0),
+                                    "signal": "auth_permission_denied",
+                                    "duration_secs": run_started.elapsed().as_secs(),
+                                    "restart_count": restart_count,
+                                    "completion_issue": "decision_receipt_missing",
+                                    "reason": "comment_post_permission_denied",
+                                }),
+                            )?;
+                            remove_review_state_entry(&run_key)?;
+                            persist_review_run_state(
+                                &mut run_state,
+                                ReviewRunStatus::Crashed,
+                                Some("comment_post_permission_denied".to_string()),
+                                &current_head_sha,
+                                &current_model,
+                                restart_count,
+                                None,
+                            )?;
+                            return Ok(SingleReviewResult {
+                                summary: build_single_review_summary(
+                                    &run_id,
+                                    sequence_number,
+                                    ReviewRunStatus::Crashed,
+                                    review_type,
+                                    false,
+                                    "UNKNOWN".to_string(),
+                                    Some("comment_post_permission_denied".to_string()),
+                                    &current_model.model,
+                                    current_model.backend.as_str(),
+                                    review_started.elapsed().as_secs(),
+                                    restart_count,
+                                    extract_token_usage(&log_path),
+                                ),
+                                final_head_sha: current_head_sha,
+                            });
+                        },
+                        MissingVerdictDecisionState::RetryInvalidCompletion => {
+                            emit_run_event(
+                                "run_crash",
+                                &current_head_sha,
+                                serde_json::json!({
+                                    "exit_code": exit_code.unwrap_or(0),
+                                    "signal": "invalid_completion",
+                                    "duration_secs": run_started.elapsed().as_secs(),
+                                    "restart_count": restart_count,
+                                    "completion_issue": "decision_receipt_missing",
+                                    "reason": "invalid_completion",
+                                }),
+                            )?;
+                        },
                     }
                 } else {
                     let reason_is_http = detect_http_400_or_rate_limit(&log_path);
@@ -1814,7 +1958,9 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        MISSING_VERDICT_NUDGE_PROMPT_MAX_CHARS, ReviewKind, build_missing_verdict_nudge_message,
+        MISSING_VERDICT_DECISION_RULES, MISSING_VERDICT_NUDGE_PROMPT_MAX_CHARS,
+        MissingVerdictDecisionFacts, MissingVerdictDecisionState, ReviewKind,
+        build_missing_verdict_nudge_message, derive_missing_verdict_decision_state,
         required_verdict_command, seeded_pending_run_identity, should_dedupe_on_lease_contention,
     };
     use crate::commands::fac_review::types::{
@@ -1897,6 +2043,53 @@ mod tests {
         assert!(message.contains("cargo run -p apm2-cli -- fac review verdict set"));
         assert!(message.contains("--dimension security"));
         assert!(message.contains("...[truncated]"));
+    }
+
+    #[test]
+    fn missing_verdict_decision_rules_are_unique_and_strictly_ordered() {
+        let mut last_priority = 0_u8;
+        let mut seen_guard_ids = std::collections::BTreeSet::new();
+        for rule in MISSING_VERDICT_DECISION_RULES {
+            assert!(rule.priority > last_priority);
+            last_priority = rule.priority;
+            assert!(seen_guard_ids.insert(rule.guard_id));
+        }
+    }
+
+    #[test]
+    fn missing_verdict_decision_prefers_nudge_when_eligible() {
+        let facts = MissingVerdictDecisionFacts {
+            nudge_count: 0,
+            restart_count: 0,
+            nudge_disabled: false,
+            comment_permission_denied: true,
+        };
+        let state = derive_missing_verdict_decision_state(&facts);
+        assert_eq!(state, MissingVerdictDecisionState::NudgeResume);
+    }
+
+    #[test]
+    fn missing_verdict_decision_crashes_on_permission_denied_when_nudge_not_eligible() {
+        let facts = MissingVerdictDecisionFacts {
+            nudge_count: 1,
+            restart_count: 0,
+            nudge_disabled: false,
+            comment_permission_denied: true,
+        };
+        let state = derive_missing_verdict_decision_state(&facts);
+        assert_eq!(state, MissingVerdictDecisionState::CrashPermissionDenied);
+    }
+
+    #[test]
+    fn missing_verdict_decision_defaults_to_retry_invalid_completion() {
+        let facts = MissingVerdictDecisionFacts {
+            nudge_count: 1,
+            restart_count: 3,
+            nudge_disabled: true,
+            comment_permission_denied: false,
+        };
+        let state = derive_missing_verdict_decision_state(&facts);
+        assert_eq!(state, MissingVerdictDecisionState::RetryInvalidCompletion);
     }
 
     #[test]

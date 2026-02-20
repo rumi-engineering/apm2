@@ -1107,6 +1107,7 @@
         "gates_wait_transitions": 8,
         "lifecycle_transitions": 18,
         "machine_traceability_requirements": 5,
+        "reviewer_missing_verdict_rules": 3,
         "ticket_in_scope_requirements": 8,
         "traceability_entry_only_total": 1,
         "wait_action_policy_actions": 8,
@@ -1792,6 +1793,8 @@
         "gates_wait_priorities_strict": true,
         "lifecycle_transition_ids_unique": true,
         "recommendation_states_unique": true,
+        "reviewer_missing_verdict_guard_ids_unique": true,
+        "reviewer_missing_verdict_priorities_strict": true,
         "wait_guard_ids_unique": true,
         "wait_priorities_strict": true
       },
@@ -2079,6 +2082,39 @@
         "requirement_id": "DR-005-WAIT_RETURNS_ON_TERMINAL_ACTION"
       }
     ],
+    "reviewer_missing_verdict_machine": {
+      "default_state": "retry_invalid_completion",
+      "evaluation": "priority_order_first_match",
+      "rules": [
+        {
+          "guard_id": "RVMV-G-001",
+          "guard_kind": "nudge_eligible",
+          "guard_predicate": "facts.nudge_count < max_missing_verdict_nudges && facts.restart_count < max_restart_attempts && !facts.nudge_disabled",
+          "priority": 1,
+          "state": "nudge_resume"
+        },
+        {
+          "guard_id": "RVMV-G-002",
+          "guard_kind": "comment_permission_denied",
+          "guard_predicate": "facts.comment_permission_denied",
+          "priority": 2,
+          "state": "crash_permission_denied"
+        },
+        {
+          "guard_id": "RVMV-G-003",
+          "guard_kind": "default",
+          "guard_predicate": "default",
+          "priority": 3,
+          "state": "retry_invalid_completion"
+        }
+      ],
+      "schema": "apm2.fac.review.reviewer_missing_verdict_machine.v1",
+      "states": [
+        "nudge_resume",
+        "crash_permission_denied",
+        "retry_invalid_completion"
+      ]
+    },
     "schema": "apm2.fac.review.machine_bundle.v1"
   },
   "schema": "apm2.fac.review.machine_bundle.cac.v1",
