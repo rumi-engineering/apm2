@@ -592,6 +592,25 @@ pub struct InstallArgs {
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
     pub json: bool,
+
+    /// Allow partial success when some service restarts fail.
+    ///
+    /// By default, `apm2 fac install` treats restart failure of any
+    /// required service (apm2-daemon.service, apm2-worker.service) as
+    /// a command failure (non-zero exit). This flag overrides that
+    /// behavior: the command exits 0 even when some restarts fail,
+    /// though `success` in the JSON output remains `false` when any
+    /// restart failed.
+    #[arg(long, default_value_t = false)]
+    pub allow_partial: bool,
+
+    /// Explicit workspace root path for the cargo install source.
+    ///
+    /// When set, uses this path as the trusted workspace root instead
+    /// of discovering it from the running executable. Refuses ambiguous
+    /// cwd-based discovery.
+    #[arg(long)]
+    pub workspace_root: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -2220,9 +2239,11 @@ pub fn run_fac(
                 run_work_list(list_args, operator_socket, resolve_json(list_args.json))
             },
         },
-        FacSubcommand::Install(args) => {
-            crate::commands::fac_install::run_install(resolve_json(args.json))
-        },
+        FacSubcommand::Install(args) => crate::commands::fac_install::run_install(
+            resolve_json(args.json),
+            args.allow_partial,
+            args.workspace_root.as_deref(),
+        ),
         FacSubcommand::Doctor(args) => {
             let output_json = resolve_json(args.json);
             if args.machine_spec {

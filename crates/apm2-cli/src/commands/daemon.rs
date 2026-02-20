@@ -1281,12 +1281,16 @@ fn check_binary_alignment() -> DaemonDoctorCheck {
     };
 
     let mut mismatches: Vec<String> = Vec::new();
+    let mut resolve_failures: Vec<String> = Vec::new();
+    let mut resolved_ok_count: usize = 0;
 
     for unit in &BINARY_ALIGNMENT_UNIT_NAMES {
-        if let Ok(svc_path) = resolve_service_binary(unit) {
-            match sha256_file_digest(&svc_path) {
+        match resolve_service_binary(unit) {
+            Ok(svc_path) => match sha256_file_digest(&svc_path) {
                 Ok(svc_digest) => {
-                    if svc_digest != cli_digest {
+                    if svc_digest == cli_digest {
+                        resolved_ok_count += 1;
+                    } else {
                         mismatches.push(format!(
                             "{unit}: path={} sha256={svc_digest} \
                              (CLI: path={} sha256={cli_digest})",
@@ -1296,19 +1300,59 @@ fn check_binary_alignment() -> DaemonDoctorCheck {
                     }
                 },
                 Err(e) => {
-                    mismatches.push(format!("{unit}: cannot compute digest: {e}"));
+                    resolve_failures.push(format!("{unit}: cannot compute digest: {e}"));
                 },
-            }
+            },
+            Err(e) => {
+                resolve_failures.push(format!("{unit}: cannot resolve service binary: {e}"));
+            },
         }
-        // Service may not be installed — not a mismatch, just skip
+    }
+
+    // Fail-closed: if we could not resolve ANY service binary, never report OK.
+    if resolved_ok_count == 0 && mismatches.is_empty() {
+        // No service binary was successfully resolved and verified.
+        let detail = if resolve_failures.is_empty() {
+            "no service units configured for alignment check".to_string()
+        } else {
+            resolve_failures.join("; ")
+        };
+        return DaemonDoctorCheck {
+            name: "binary_alignment".to_string(),
+            status: "WARN",
+            message: format!(
+                "no service binary could be verified ({detail}). \
+                 Remediation: ensure apm2-daemon.service and \
+                 apm2-worker.service are installed and active"
+            ),
+        };
+    }
+
+    // Some units resolved but others failed — partial verification.
+    if !resolve_failures.is_empty() {
+        let mut parts = Vec::with_capacity(mismatches.len() + resolve_failures.len());
+        parts.extend(mismatches);
+        parts.extend(resolve_failures);
+        return DaemonDoctorCheck {
+            name: "binary_alignment".to_string(),
+            status: "WARN",
+            message: format!(
+                "partial binary verification ({resolved_ok_count}/{} units ok): {}. \
+                 Remediation: run `apm2 fac install` to realign binaries",
+                BINARY_ALIGNMENT_UNIT_NAMES.len(),
+                parts.join("; ")
+            ),
+        };
     }
 
     if mismatches.is_empty() {
+        // All units resolved and all digests matched.
         DaemonDoctorCheck {
             name: "binary_alignment".to_string(),
             status: "OK",
             message: format!(
-                "CLI binary ({}) and service binaries have matching SHA-256 digest ({})",
+                "CLI binary ({}) and all {resolved_ok_count} service binaries \
+                 have matching SHA-256 digest ({})",
                 cli_path.display(),
                 &cli_digest[..16]
             ),
