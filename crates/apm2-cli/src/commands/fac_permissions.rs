@@ -42,6 +42,15 @@ const FAC_SUBDIRS: &[&str] = &[
     "private/fac/tickets",
     "private/fac/legacy",
     "private/fac/receipts",
+    // TCK-00577: Queue directories are part of the sensitive FAC state.
+    // Service user ownership enforces that only the broker/worker can write.
+    "queue",
+    "queue/pending",
+    "queue/claimed",
+    "queue/completed",
+    "queue/denied",
+    "queue/cancelled",
+    "queue/quarantine",
     "fac_lifecycle",
     "fac_projection",
 ];

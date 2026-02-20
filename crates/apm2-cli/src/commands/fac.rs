@@ -49,6 +49,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use apm2_core::fac::service_user_gate::QueueWriteMode;
 use apm2_core::fac::{
     LANE_ENV_DIRS, LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1, LaneManager,
     LaneReconcileReceiptV1, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
@@ -120,8 +121,34 @@ pub struct FacCommand {
     #[arg(long)]
     pub cas_path: Option<PathBuf>,
 
+    /// Bypass the service-user ownership gate for direct queue/receipt writes.
+    ///
+    /// By default, non-service-user processes are denied direct filesystem
+    /// writes to FAC queue and receipt directories (TCK-00577). This flag
+    /// disables that check for backward compatibility and development.
+    ///
+    /// **NOT recommended for production deployments.** Use broker-mediated
+    /// enqueue instead.
+    #[arg(long, default_value_t = false)]
+    pub unsafe_local_write: bool,
+
     #[command(subcommand)]
     pub subcommand: FacSubcommand,
+}
+
+impl FacCommand {
+    /// Derive the queue write mode from the `--unsafe-local-write` flag.
+    ///
+    /// Returns `QueueWriteMode::UnsafeLocalWrite` if the flag is set,
+    /// otherwise `QueueWriteMode::ServiceUserOnly` (the secure default).
+    #[must_use]
+    pub const fn queue_write_mode(&self) -> QueueWriteMode {
+        if self.unsafe_local_write {
+            QueueWriteMode::UnsafeLocalWrite
+        } else {
+            QueueWriteMode::ServiceUserOnly
+        }
+    }
 }
 
 /// FAC subcommands.
@@ -2220,6 +2247,7 @@ pub fn run_fac(
             resolve_json(args.json),
             args.wait && !args.no_wait,
             args.wait_timeout_secs,
+            cmd.queue_write_mode(),
         ),
         FacSubcommand::Preflight(args) => match &args.subcommand {
             PreflightSubcommand::Credential(credential_args) => fac_preflight::run_credential(
@@ -2683,6 +2711,7 @@ pub fn run_fac(
             args.wait,
             args.wait_timeout_secs,
             resolve_json(args.json),
+            cmd.queue_write_mode(),
         ),
         FacSubcommand::Bench(args) => crate::commands::fac_bench::run_fac_bench(
             args.concurrency,

@@ -202,6 +202,12 @@ pub mod scheduler_state;
 pub mod sd_notify;
 pub mod selection_policy;
 pub mod serde_helpers;
+/// Service user ownership gate for receipt and queue directories (TCK-00577).
+///
+/// Enforces that only the FAC service user can directly write to queue and
+/// receipt directories. Non-service-user CLI processes must use broker-mediated
+/// enqueue or pass `--unsafe-local-write`.
+pub mod service_user_gate;
 pub mod signed_receipt;
 mod systemd_properties;
 pub mod taint;

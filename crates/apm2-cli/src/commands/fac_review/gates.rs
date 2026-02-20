@@ -23,6 +23,7 @@ use apm2_core::fac::job_spec::{
     Actuation, FacJobSpecV1, JobConstraints, JobSource, JobSpecValidationPolicy, LaneRequirements,
     MAX_QUEUE_LANE_LENGTH, validate_job_spec_with_policy,
 };
+use apm2_core::fac::service_user_gate::QueueWriteMode;
 use apm2_core::fac::{
     FacPolicyV1, LaneLockGuard, LaneManager, LaneState, apply_lane_env_overrides,
     build_job_environment, compute_test_env_for_parallelism, ensure_lane_env_dirs,
@@ -254,6 +255,9 @@ pub(super) struct QueuedGatesRequest {
     pub(super) gate_profile: GateThroughputProfile,
     pub(super) wait_timeout_secs: u64,
     pub(super) require_external_worker: bool,
+    /// TCK-00577: Controls whether the service user ownership gate is
+    /// enforced or bypassed for direct queue writes.
+    pub(super) write_mode: QueueWriteMode,
 }
 
 /// Queue-backed FAC gates outcome with materialized per-gate rows.
@@ -479,6 +483,7 @@ pub fn run_gates(
     json_output: bool,
     wait: bool,
     wait_timeout_secs: u64,
+    write_mode: QueueWriteMode,
 ) -> u8 {
     run_gates_via_worker(
         force,
@@ -491,6 +496,7 @@ pub fn run_gates(
         wait,
         wait_timeout_secs,
         json_output,
+        write_mode,
     )
 }
 
@@ -779,6 +785,7 @@ fn prepare_queued_gates_job(
         &fac_root,
         &spec,
         &fac_policy.queue_bounds_policy,
+        request.write_mode,
     )
     .map_err(|err| QueuePreparationFailure::Runtime {
         message: format!("failed to enqueue gates job: {err}"),
@@ -1855,6 +1862,7 @@ fn run_gates_via_worker(
     wait: bool,
     wait_timeout_secs: u64,
     json_output: bool,
+    write_mode: QueueWriteMode,
 ) -> u8 {
     let request = QueuedGatesRequest {
         force,
@@ -1866,6 +1874,7 @@ fn run_gates_via_worker(
         gate_profile,
         wait_timeout_secs,
         require_external_worker: false,
+        write_mode,
     };
     let prepared = match prepare_queued_gates_job(&request, wait) {
         Ok(prepared) => prepared,
@@ -4397,6 +4406,7 @@ mod tests {
             gate_profile: GateThroughputProfile::Conservative,
             wait_timeout_secs: 60,
             require_external_worker,
+            write_mode: QueueWriteMode::UnsafeLocalWrite,
         }
     }
 
