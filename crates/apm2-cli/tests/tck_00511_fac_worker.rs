@@ -804,6 +804,15 @@ fn test_fac_worker_e2e_once_mode_processes_job() {
     let previous_apm2_home = std::env::var_os("APM2_HOME");
     set_env_var_for_test("APM2_HOME", &apm2_home);
 
+    // TCK-00577 round 5: ServiceUserNotResolved is now a hard error
+    // (fail-closed). Set APM2_FAC_SERVICE_USER to the current user so
+    // the ownership gate can resolve the service user in passwd.
+    let previous_service_user = std::env::var_os("APM2_FAC_SERVICE_USER");
+    let current_user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "root".to_string());
+    set_env_var_for_test("APM2_FAC_SERVICE_USER", &current_user);
+
     let signer = Signer::generate();
     let fac_root = apm2_home.join("private").join("fac");
     fs::create_dir_all(&fac_root).expect("create fac root");
@@ -838,6 +847,10 @@ fn test_fac_worker_e2e_once_mode_processes_job() {
     match previous_apm2_home {
         Some(value) => set_env_var_for_test("APM2_HOME", value),
         None => remove_env_var_for_test("APM2_HOME"),
+    }
+    match previous_service_user {
+        Some(value) => set_env_var_for_test("APM2_FAC_SERVICE_USER", value),
+        None => remove_env_var_for_test("APM2_FAC_SERVICE_USER"),
     }
 }
 

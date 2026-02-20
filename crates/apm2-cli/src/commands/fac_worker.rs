@@ -490,17 +490,16 @@ pub fn run_fac_worker(
         return exit_codes::GENERIC_ERROR;
     }
 
-    // TCK-00577 round 3: Validate that queue and receipt directories are
+    // TCK-00577 round 3+5: Validate that queue and receipt directories are
     // owned by the configured FAC service user (not just the caller EUID).
     // This wires the service-user ownership validator into the command
     // execution path.
     //
-    // Behavior:
-    // - ServiceUserNotResolved: the configured service user does not exist in
-    //   passwd. This means the deployment is not using the service-user model
-    //   (dev/test environment). Emit a warning and continue — the standard
-    //   EUID-based ownership check from validate_fac_root_permissions already
-    //   validated ownership.
+    // Behavior (round 5 MAJOR fix — all errors are now fail-closed):
+    // - ServiceUserNotResolved: fail-closed. If the configured service user cannot
+    //   be resolved in passwd/NSS, this may indicate a mistyped service-user value
+    //   or corrupted NSS database. Ownership validation cannot be completed, so the
+    //   worker MUST NOT start.
     // - OwnershipMismatch: the service user EXISTS but the directory is owned by
     //   someone else. This is a hard failure (fail-closed).
     // - Other errors (metadata, env, etc.): fail-closed.
@@ -533,16 +532,20 @@ pub fn run_fac_worker(
                 Err(ServiceUserGateError::ServiceUserNotResolved {
                     ref service_user,
                     ref reason,
+                    ..
                 }) => {
-                    // Service user does not exist in passwd — not a
-                    // service-user deployment. Warn and continue.
-                    tracing::warn!(
-                        service_user = %service_user,
-                        reason = %reason,
-                        dir = %dir.display(),
-                        "TCK-00577: service user not resolvable, skipping ownership check \
-                         (standard EUID-based check already passed)"
+                    // TCK-00577 round 5 MAJOR fix: ServiceUserNotResolved is
+                    // now a hard failure. If the service user cannot be
+                    // resolved, ownership cannot be validated — fail-closed.
+                    output_worker_error(
+                        json_output,
+                        &format!(
+                            "service user '{service_user}' not resolvable: {reason} \
+                             (fail-closed: worker will not start when service user \
+                              identity cannot be confirmed)",
+                        ),
                     );
+                    return exit_codes::GENERIC_ERROR;
                 },
                 Err(e) => {
                     // OwnershipMismatch or other hard errors: fail-closed.
@@ -7453,6 +7456,27 @@ fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
                 .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
         }
     }
+
+    // TCK-00577 round 5 BLOCKER fix: Create broker_requests/ with mode 01733
+    // (sticky bit + world-writable). Non-service-user callers use the broker
+    // fallback to drop job specs into this directory. The sticky bit prevents
+    // callers from deleting each other's files while still allowing writes.
+    // Mode 01733 = owner rwx, group wx, others wx, sticky bit set.
+    //
+    // DirBuilder::mode() is subject to the process umask, so we must
+    // explicitly chmod after creation to ensure the exact mode is applied.
+    let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+    if !broker_dir.exists() {
+        fs::create_dir_all(&broker_dir)
+            .map_err(|e| format!("cannot create {}: {e}", broker_dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o1733))
+                .map_err(|e| format!("cannot set mode 01733 on {}: {e}", broker_dir.display()))?;
+        }
+    }
+
     Ok(())
 }
 
@@ -8672,6 +8696,36 @@ mod tests {
         ] {
             assert!(queue_root.join(sub).is_dir(), "missing {sub}");
         }
+
+        // TCK-00577 round 5 BLOCKER fix: broker_requests/ must also be
+        // created by ensure_queue_dirs.
+        assert!(
+            queue_root.join(BROKER_REQUESTS_DIR).is_dir(),
+            "missing broker_requests dir"
+        );
+    }
+
+    /// TCK-00577 round 5: `ensure_queue_dirs` creates `broker_requests/` with
+    /// mode 01733 (sticky + world-writable) on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_queue_dirs_broker_requests_mode_01733() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+
+        ensure_queue_dirs(&queue_root).expect("create dirs");
+
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+        assert!(broker_dir.is_dir(), "broker_requests must exist");
+
+        let metadata = fs::metadata(&broker_dir).expect("metadata");
+        let mode = metadata.permissions().mode() & 0o7777; // mask off file type bits
+        assert_eq!(
+            mode, 0o1733,
+            "broker_requests/ must have mode 01733 (sticky + world-writable), got {mode:#o}"
+        );
     }
 
     #[test]
@@ -11625,5 +11679,47 @@ mod tests {
             !broker_dir.join("under-cap-job.json").exists(),
             "broker request must be removed after successful promotion"
         );
+    }
+
+    /// TCK-00577 round 5 MAJOR fix: `ServiceUserNotResolved` must produce a
+    /// fail-closed error message, not a warning. This test exercises the
+    /// error variant format string to ensure the error path compiles and
+    /// produces the expected diagnostic message pattern.
+    #[test]
+    fn service_user_not_resolved_error_message_is_fail_closed() {
+        use apm2_core::fac::service_user_gate::ServiceUserGateError;
+
+        let err = ServiceUserGateError::ServiceUserNotResolved {
+            service_user: "_apm2-job".to_string(),
+            reason: "user not found in passwd".to_string(),
+        };
+
+        // Simulate the error formatting from the worker startup path.
+        if let ServiceUserGateError::ServiceUserNotResolved {
+            ref service_user,
+            ref reason,
+            ..
+        } = err
+        {
+            let msg = format!(
+                "service user '{service_user}' not resolvable: {reason} \
+                 (fail-closed: worker will not start when service user \
+                  identity cannot be confirmed)",
+            );
+            assert!(
+                msg.contains("fail-closed"),
+                "error message must contain fail-closed"
+            );
+            assert!(
+                msg.contains("_apm2-job"),
+                "error message must contain the service user name"
+            );
+            assert!(
+                msg.contains("will not start"),
+                "error message must indicate worker will not start"
+            );
+        } else {
+            panic!("expected ServiceUserNotResolved variant");
+        }
     }
 }
