@@ -554,6 +554,7 @@ const fn effective_retention_seconds(value: u64, fallback: u64) -> u64 {
 /// This function records all per-target failures into `errors` and does not
 /// abort early.
 #[must_use]
+#[allow(clippy::too_many_lines)] // TCK-00583: receipt persistence error handling adds required branching for fail-closed audit evidence.
 pub fn execute_gc(plan: &GcPlan) -> GcReceiptV1 {
     let now = current_wall_clock_secs();
 
@@ -572,18 +573,30 @@ pub fn execute_gc(plan: &GcPlan) -> GcReceiptV1 {
             let receipts_dir = &target.allowed_parent;
             match index_compaction::compact_index(receipts_dir, DEFAULT_INDEX_RETENTION_SECS, now) {
                 Ok(compaction_receipt) => {
-                    actions.push(crate::fac::gc_receipt::GcAction {
-                        target_path: target.path.display().to_string(),
-                        action_kind: target.kind,
-                        bytes_freed: target.estimated_bytes,
-                        files_deleted: 0,
-                        dirs_deleted: 0,
-                    });
-                    // Best-effort: persist the compaction receipt alongside GC receipts.
-                    let _ = index_compaction::persist_compaction_receipt(
+                    // Receipt persistence failure is a GC error — audit evidence
+                    // loss must be explicit (never silently swallowed).
+                    match index_compaction::persist_compaction_receipt(
                         receipts_dir,
                         &compaction_receipt,
-                    );
+                    ) {
+                        Ok(_) => {
+                            actions.push(crate::fac::gc_receipt::GcAction {
+                                target_path: target.path.display().to_string(),
+                                action_kind: target.kind,
+                                bytes_freed: target.estimated_bytes,
+                                files_deleted: 0,
+                                dirs_deleted: 0,
+                            });
+                        },
+                        Err(persist_err) => {
+                            errors.push(crate::fac::gc_receipt::GcError {
+                                target_path: target.path.display().to_string(),
+                                reason: format!(
+                                    "index compaction succeeded but receipt persistence failed: {persist_err}"
+                                ),
+                            });
+                        },
+                    }
                 },
                 Err(error) => {
                     errors.push(crate::fac::gc_receipt::GcError {
