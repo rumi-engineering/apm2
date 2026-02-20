@@ -1929,6 +1929,10 @@ pub(super) fn run_evidence_gates_with_lane_context(
     for (idx, &(gate_name, cmd_args)) in gates.iter().enumerate() {
         let log_path = logs_dir.join(format!("{gate_name}.log"));
 
+        // TCK-00626 round 4: Hoist cache_decision so it is available on both
+        // hit and miss paths — gate_finished must always carry the decision.
+        let mut gate_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
+
         // TCK-00540 fix round 3: Check gate cache for reuse before execution.
         if cache_reuse_active {
             // SAFETY: `cache_reuse_policy` is guaranteed `Some` here because
@@ -1948,6 +1952,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 v3_compound_key_ns.as_ref(),
                 Some(sha),
             );
+            // TCK-00626 round 4: propagate cache decision to outer scope so
+            // both hit and miss paths include it in gate_finished.
+            gate_cache_decision.clone_from(&cache_decision_local);
             if reuse.reusable {
                 if let Some(cached) = resolve_cached_payload(
                     &reuse,
@@ -2038,12 +2045,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
         };
 
         let duration = started.elapsed().as_secs();
-        let result = build_evidence_gate_result(
+        let result = build_evidence_gate_result_with_cache_decision(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
+            gate_cache_decision.take(),
         );
         emit_gate_completed(opts, &result);
         gate_results.push(result);
@@ -2068,6 +2076,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
     for gate_name in pre_test_native_gates {
         let log_path = logs_dir.join(format!("{gate_name}.log"));
 
+        // TCK-00626 round 4: Hoist cache_decision for miss path.
+        let mut gate_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
+
         // TCK-00540 fix round 3: Cache reuse for pre-test native gates.
         if cache_reuse_active {
             let reuse_grp = cache_reuse_policy
@@ -2085,6 +2096,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 v3_compound_key_ns.as_ref(),
                 Some(sha),
             );
+            // TCK-00626 round 4: propagate cache decision to outer scope so
+            // both hit and miss paths include it in gate_finished.
+            gate_cache_decision.clone_from(&cache_decision_local);
             if reuse.reusable {
                 if let Some(cached) = resolve_cached_payload(
                     &reuse,
@@ -2138,12 +2152,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
         let (passed, stream_stats) =
             run_native_evidence_gate(workspace_root, sha, gate_name, &log_path, emit_human_logs);
         let duration = started.elapsed().as_secs();
-        let result = build_evidence_gate_result(
+        let result = build_evidence_gate_result_with_cache_decision(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
+            gate_cache_decision.take(),
         );
         emit_gate_completed(opts, &result);
         gate_results.push(result);
@@ -2200,6 +2215,8 @@ pub(super) fn run_evidence_gates_with_lane_context(
         let test_command_override =
             resolve_evidence_test_command_override(opts.and_then(|o| o.test_command.as_deref()));
         let mut test_cache_hit = false;
+        // TCK-00626 round 4: Hoist cache_decision for miss path.
+        let mut test_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
         if cache_reuse_active {
             let reuse_grp = cache_reuse_policy
                 .as_ref()
@@ -2221,6 +2238,8 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 v3_compound_key_ns.as_ref(),
                 Some(sha),
             );
+            // TCK-00626 round 4: propagate cache decision to outer scope.
+            test_cache_decision.clone_from(&cache_decision_local);
             if reuse.reusable {
                 if let Some(cached) = resolve_cached_payload(
                     &reuse,
@@ -2297,12 +2316,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 on_gate_progress,
             );
             let test_duration = test_started.elapsed().as_secs();
-            let test_result = build_evidence_gate_result(
+            let test_result = build_evidence_gate_result_with_cache_decision(
                 "test",
                 passed,
                 test_duration,
                 Some(&test_log),
                 Some(&stream_stats),
+                test_cache_decision.take(),
             );
             emit_gate_completed(opts, &test_result);
             gate_results.push(test_result);
@@ -2326,6 +2346,8 @@ pub(super) fn run_evidence_gates_with_lane_context(
 
     let wi_log_path = logs_dir.join("workspace_integrity.log");
     let mut wi_cache_hit = false;
+    // TCK-00626 round 4: Hoist cache_decision for miss path.
+    let mut wi_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
     if cache_reuse_active {
         let reuse_grp = cache_reuse_policy
             .as_ref()
@@ -2342,6 +2364,8 @@ pub(super) fn run_evidence_gates_with_lane_context(
             v3_compound_key_ns.as_ref(),
             Some(sha),
         );
+        // TCK-00626 round 4: propagate cache decision to outer scope.
+        wi_cache_decision.clone_from(&cache_decision_local);
         if reuse.reusable {
             if let Some(cached) = resolve_cached_payload(
                 &reuse,
@@ -2396,12 +2420,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
         let (wi_passed, wi_line, wi_stream_stats) =
             verify_workspace_integrity_gate(workspace_root, sha, &wi_log_path, emit_human_logs);
         let wi_duration = wi_started.elapsed().as_secs();
-        let wi_result = build_evidence_gate_result(
+        let wi_result = build_evidence_gate_result_with_cache_decision(
             "workspace_integrity",
             wi_passed,
             wi_duration,
             Some(&wi_log_path),
             Some(&wi_stream_stats),
+            wi_cache_decision.take(),
         );
         emit_gate_completed(opts, &wi_result);
         gate_results.push(wi_result);
@@ -2421,6 +2446,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
     for gate_name in post_test_native_gates {
         let log_path = logs_dir.join(format!("{gate_name}.log"));
 
+        // TCK-00626 round 4: Hoist cache_decision for miss path.
+        let mut gate_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
+
         // TCK-00540 fix round 3: Cache reuse for post-test native gates.
         if cache_reuse_active {
             let reuse_grp = cache_reuse_policy
@@ -2438,6 +2466,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 v3_compound_key_ns.as_ref(),
                 Some(sha),
             );
+            // TCK-00626 round 4: propagate cache decision to outer scope so
+            // both hit and miss paths include it in gate_finished.
+            gate_cache_decision.clone_from(&cache_decision_local);
             if reuse.reusable {
                 if let Some(cached) = resolve_cached_payload(
                     &reuse,
@@ -2491,12 +2522,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
         let (passed, stream_stats) =
             run_native_evidence_gate(workspace_root, sha, gate_name, &log_path, emit_human_logs);
         let duration = started.elapsed().as_secs();
-        let result = build_evidence_gate_result(
+        let result = build_evidence_gate_result_with_cache_decision(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
+            gate_cache_decision.take(),
         );
         emit_gate_completed(opts, &result);
         gate_results.push(result);
@@ -2843,7 +2875,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             updater.update(&status);
             status.set_result(gate_name, false, 0);
             updater.update(&status);
-            let fail_result = build_evidence_gate_result(
+            let fail_result = build_evidence_gate_result_with_cache_decision(
                 gate_name,
                 false,
                 0,
@@ -2853,6 +2885,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     bytes_total: 0,
                     was_truncated: false,
                 }),
+                cache_decision_local,
             );
             emit_gate_completed_cb(on_gate_progress, &fail_result);
             gate_results.push(fail_result);
@@ -2924,12 +2957,13 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
 
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
-        let exec_result = build_evidence_gate_result(
+        let exec_result = build_evidence_gate_result_with_cache_decision(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
+            cache_decision_local.clone(),
         );
         emit_gate_completed_cb(on_gate_progress, &exec_result);
         gate_results.push(exec_result);
@@ -3034,7 +3068,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             updater.update(&status);
             status.set_result(gate_name, false, 0);
             updater.update(&status);
-            let fail_result = build_evidence_gate_result(
+            let fail_result = build_evidence_gate_result_with_cache_decision(
                 gate_name,
                 false,
                 0,
@@ -3044,6 +3078,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     bytes_total: 0,
                     was_truncated: false,
                 }),
+                cache_decision_local,
             );
             emit_gate_completed_cb(on_gate_progress, &fail_result);
             gate_results.push(fail_result);
@@ -3098,12 +3133,13 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
 
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
-        let exec_result = build_evidence_gate_result(
+        let exec_result = build_evidence_gate_result_with_cache_decision(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
+            cache_decision_local.clone(),
         );
         emit_gate_completed_cb(on_gate_progress, &exec_result);
         gate_results.push(exec_result);
@@ -3212,7 +3248,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             } else {
                 status.set_result(gate_name, false, 0);
                 updater.update(&status);
-                let fail_result = build_evidence_gate_result(
+                let fail_result = build_evidence_gate_result_with_cache_decision(
                     gate_name,
                     false,
                     0,
@@ -3222,6 +3258,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                         bytes_total: 0,
                         was_truncated: false,
                     }),
+                    cache_decision_local,
                 );
                 emit_gate_completed_cb(on_gate_progress, &fail_result);
                 gate_results.push(fail_result);
@@ -3291,12 +3328,13 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             let duration = started.elapsed().as_secs();
             status.set_result(gate_name, passed, duration);
             updater.update(&status);
-            let test_result = build_evidence_gate_result(
+            let test_result = build_evidence_gate_result_with_cache_decision(
                 gate_name,
                 passed,
                 duration,
                 Some(&log_path),
                 Some(&stream_stats),
+                cache_decision_local,
             );
             emit_gate_completed_cb(on_gate_progress, &test_result);
             gate_results.push(test_result);
@@ -3398,7 +3436,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             } else {
                 status.set_result(gate_name, false, 0);
                 updater.update(&status);
-                let fail_result = build_evidence_gate_result(
+                let fail_result = build_evidence_gate_result_with_cache_decision(
                     gate_name,
                     false,
                     0,
@@ -3408,6 +3446,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                         bytes_total: 0,
                         was_truncated: false,
                     }),
+                    cache_decision_local,
                 );
                 emit_gate_completed_cb(on_gate_progress, &fail_result);
                 gate_results.push(fail_result);
@@ -3446,12 +3485,13 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             let duration = started.elapsed().as_secs();
             status.set_result(gate_name, passed, duration);
             updater.update(&status);
-            let wi_result = build_evidence_gate_result(
+            let wi_result = build_evidence_gate_result_with_cache_decision(
                 gate_name,
                 passed,
                 duration,
                 Some(&log_path),
                 Some(&stream_stats),
+                cache_decision_local,
             );
             emit_gate_completed_cb(on_gate_progress, &wi_result);
             gate_results.push(wi_result);
@@ -3551,7 +3591,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             updater.update(&status);
             status.set_result(gate_name, false, 0);
             updater.update(&status);
-            let fail_result = build_evidence_gate_result(
+            let fail_result = build_evidence_gate_result_with_cache_decision(
                 gate_name,
                 false,
                 0,
@@ -3561,6 +3601,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     bytes_total: 0,
                     was_truncated: false,
                 }),
+                cache_decision_local,
             );
             emit_gate_completed_cb(on_gate_progress, &fail_result);
             gate_results.push(fail_result);
@@ -3614,12 +3655,13 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         let duration = started.elapsed().as_secs();
         status.set_result(gate_name, passed, duration);
         updater.update(&status);
-        let exec_result = build_evidence_gate_result(
+        let exec_result = build_evidence_gate_result_with_cache_decision(
             gate_name,
             passed,
             duration,
             Some(&log_path),
             Some(&stream_stats),
+            cache_decision_local.clone(),
         );
         emit_gate_completed_cb(on_gate_progress, &exec_result);
         gate_results.push(exec_result);

@@ -430,6 +430,12 @@ pub struct DispatchReviewResult {
     pub terminal_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// Process start time (clock ticks since boot) recorded when the PID was
+    /// first observed.  Used by `is_pid_alive_with_identity` to detect PID
+    /// reuse — a different process assigned the same PID after the original
+    /// terminated will have a different start time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proc_start_time: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

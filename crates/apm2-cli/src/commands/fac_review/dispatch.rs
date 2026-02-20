@@ -939,6 +939,7 @@ where
             sequence_number: None,
             terminal_reason: None,
             pid: started.pid,
+            proc_start_time: started.pid.and_then(get_process_start_time),
             unit: started.unit,
             log_file: started.log_file,
         },
@@ -1043,6 +1044,7 @@ where
                         sequence_number: Some(state.sequence_number),
                         terminal_reason: state.terminal_reason,
                         pid: state.pid,
+                        proc_start_time: state.proc_start_time,
                         unit: None,
                         log_file: None,
                     });
@@ -1065,6 +1067,7 @@ where
                         sequence_number: Some(state.sequence_number),
                         terminal_reason: state.terminal_reason,
                         pid: state.pid,
+                        proc_start_time: state.proc_start_time,
                         unit: None,
                         log_file: None,
                     });
@@ -1082,6 +1085,7 @@ where
                                 sequence_number: None,
                                 terminal_reason: None,
                                 pid: pending.pid,
+                                proc_start_time: pending.proc_start_time,
                                 unit: pending.unit,
                                 log_file: pending.log_file,
                             },
@@ -1214,15 +1218,16 @@ where
         Ok(None) => {
             // Lease held — enrich the response with current run state so callers
             // can see which run_id/pid they joined.
-            let (run_state_str, run_id, seq, pid) =
+            let (run_state_str, run_id, seq, pid, pst) =
                 match load_review_run_state_for_home(home, key.pr_number, &key.review_type) {
                     Ok(ReviewRunStateLoad::Present(state)) => (
                         state.status.as_str().to_string(),
                         Some(state.run_id),
                         Some(state.sequence_number),
                         state.pid,
+                        state.proc_start_time,
                     ),
-                    _ => ("unknown".to_string(), None, None, None),
+                    _ => ("unknown".to_string(), None, None, None, None),
                 };
             return Ok(DispatchReviewResult {
                 review_type: key.review_type.clone(),
@@ -1232,6 +1237,7 @@ where
                 sequence_number: seq,
                 terminal_reason: None,
                 pid,
+                proc_start_time: pst,
                 unit: None,
                 log_file: None,
             });
@@ -1262,6 +1268,7 @@ where
                 sequence_number: None,
                 terminal_reason: None,
                 pid: pending.pid,
+                proc_start_time: pending.proc_start_time,
                 unit: pending.unit,
                 log_file: pending.log_file,
             },
@@ -1567,6 +1574,7 @@ fn spawn_detached_review(
             sequence_number: None,
             terminal_reason: None,
             pid: None,
+            proc_start_time: None,
             unit: Some(unit),
             log_file: None,
         });
@@ -1608,6 +1616,7 @@ fn spawn_detached_review(
         .spawn()
         .map_err(|err| format!("failed to spawn detached review process: {err}"))?;
 
+    let child_pid = child.id();
     Ok(DispatchReviewResult {
         review_type: review_kind.as_str().to_string(),
         mode: "started".to_string(),
@@ -1615,7 +1624,8 @@ fn spawn_detached_review(
         run_id: None,
         sequence_number: None,
         terminal_reason: None,
-        pid: Some(child.id()),
+        pid: Some(child_pid),
+        proc_start_time: get_process_start_time(child_pid),
         unit: None,
         log_file: Some(log_path.display().to_string()),
     })
@@ -1807,6 +1817,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: Some(pid),
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
@@ -1848,6 +1859,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: Some(dead_pid_for_test()),
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
@@ -1921,6 +1933,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: Some(dead_pid_for_test()),
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
@@ -1966,6 +1979,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: Some(dead_pid_for_test()),
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
@@ -2148,6 +2162,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: Some(dead_pid_for_test()),
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
@@ -2197,6 +2212,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: Some(pid),
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
@@ -2264,6 +2280,7 @@ mod tests {
                 sequence_number: None,
                 terminal_reason: None,
                 pid: Some(stale_pid),
+                proc_start_time: None,
                 unit: None,
                 log_file: None,
             },
@@ -2284,6 +2301,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: Some(pid),
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
@@ -2395,6 +2413,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: Some(dead_pid_for_test()),
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
@@ -2456,6 +2475,7 @@ mod tests {
                         sequence_number: None,
                         terminal_reason: None,
                         pid: Some(pid),
+                        proc_start_time: None,
                         unit: None,
                         log_file: None,
                     })
@@ -2501,6 +2521,7 @@ mod tests {
                         sequence_number: None,
                         terminal_reason: None,
                         pid: Some(pid),
+                        proc_start_time: None,
                         unit: None,
                         log_file: None,
                     })
@@ -2638,6 +2659,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: Some(dead_pid_for_test()),
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
@@ -2696,6 +2718,7 @@ mod tests {
                     sequence_number: None,
                     terminal_reason: None,
                     pid: Some(dead_pid_for_test()),
+                    proc_start_time: None,
                     unit: None,
                     log_file: None,
                 })
