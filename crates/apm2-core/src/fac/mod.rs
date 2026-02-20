@@ -828,7 +828,7 @@ pub use work_cas_schemas::{
     MAX_TAGS, MAX_WORK_ID_LENGTH as MAX_WORK_CAS_WORK_ID_LENGTH, MAX_WORK_SPEC_SIZE, NudgePolicy,
     RetryConfig, WORK_AUTHORITY_BINDINGS_V1_SCHEMA, WORK_CONTEXT_ENTRY_V1_SCHEMA,
     WORK_LOOP_PROFILE_V1_SCHEMA, WORK_SPEC_V1_SCHEMA, WorkAuthorityBindingsV1, WorkCasSchemaError,
-    WorkContextEntryV1, WorkLoopProfileV1, WorkSpecRepo, WorkSpecV1, WorkspaceConfig,
-    bounded_decode_authority_bindings, bounded_decode_context_entry, bounded_decode_loop_profile,
-    bounded_decode_work_spec, canonicalize_for_cas,
+    WorkContextEntryV1, WorkContextKind, WorkLoopProfileV1, WorkSpecRepo, WorkSpecType, WorkSpecV1,
+    WorkspaceConfig, bounded_decode_authority_bindings, bounded_decode_context_entry,
+    bounded_decode_loop_profile, bounded_decode_work_spec, canonicalize_for_cas,
 };

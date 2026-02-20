@@ -3917,3 +3917,24 @@ broker-mediated enqueue or explicit `--unsafe-local-write`.
 - `resolve_service_user_identity()`: Full identity resolution (name+UID+GID).
   Returns `ServiceUserIdentity` on success, `ServiceUserGateError` on failure.
   Used by `enqueue_via_broker_requests` for group-based file handoff.
+
+## work_cas_schemas Submodule (TCK-00633)
+
+CAS-backed JSON schemas for work lifecycle artifacts (RFC-0032 Phase 1).
+
+### Key Types
+
+- `WorkSpecV1`: Immutable "what is this work?" CAS document.
+- `WorkSpecType`: Closed enum allowlist for `work_type` (`TICKET`, `PRD_REFINEMENT`, `RFC_REFINEMENT`, `REVIEW`). Rejects unknown variants at serde decode time.
+- `WorkContextEntryV1`: Append-only context/notes entry anchored in the ledger.
+- `WorkContextKind`: Closed enum allowlist for context entry `kind` (`HANDOFF_NOTE`, `IMPLEMENTER_TERMINAL`, `DIAGNOSIS`, `REVIEW_FINDING`, `REVIEW_VERDICT`, `GATE_NOTE`, `LINKOUT`). Rejects unknown variants at serde decode time.
+- `WorkLoopProfileV1`: Operational knobs for implementer retry/nudge/backoff.
+- `WorkAuthorityBindingsV1`: Authority pins eliminating `WorkRegistry` as authority source.
+
+### Security Invariants (TCK-00633)
+
+- **Closed allowlists**: `WorkSpecType` and `WorkContextKind` are serde-enforced enums that reject unknown variants at decode time (fail-closed).
+- **Mandatory boundary pins**: `WorkAuthorityBindingsV1::validate()` enforces presence and non-emptiness of RFC-0032 §2.5 / RFC-0018 §6.3 mandatory pins: `permeability_receipt_hash`, `capability_manifest_hash`, `context_pack_hash`, `stop_condition_hash`.
+- **Bounded decoding**: Per-artifact byte limits enforced before JSON parsing.
+- **`deny_unknown_fields`**: All structs reject payloads with unexpected fields.
+- **Fail-closed**: Unknown or mismatched schema IDs cause rejection.

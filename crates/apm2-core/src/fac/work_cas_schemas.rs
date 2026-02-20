@@ -152,6 +152,37 @@ pub enum WorkCasSchemaError {
         /// Maximum allowed count.
         max: usize,
     },
+
+    /// Field value is not in the allowed set.
+    #[error("field '{field}' has invalid value '{value}': not in allowed set")]
+    InvalidValue {
+        /// Field name.
+        field: &'static str,
+        /// The invalid value.
+        value: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// WorkSpecType (closed allowlist for work_type)
+// ---------------------------------------------------------------------------
+
+/// Closed allowlist of valid `work_type` values for [`WorkSpecV1`].
+///
+/// Aligned with `apm2_core::work::WorkType`. Unknown variants are rejected
+/// at serde decode time (fail-closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
+pub enum WorkSpecType {
+    /// Implementation of a specific ticket.
+    Ticket,
+    /// PRD refinement task.
+    PrdRefinement,
+    /// RFC refinement task.
+    RfcRefinement,
+    /// Code or artifact review.
+    Review,
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +201,8 @@ pub enum WorkCasSchemaError {
 /// - **`deny_unknown_fields`**: extra JSON fields are rejected.
 /// - **Bounded decode**: payloads exceeding [`MAX_WORK_SPEC_SIZE`] are rejected
 ///   before parsing.
+/// - **Closed `work_type` allowlist**: only [`WorkSpecType`] variants are
+///   accepted; unknown values are rejected at decode time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkSpecV1 {
@@ -190,9 +223,9 @@ pub struct WorkSpecV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
 
-    /// Work type discriminant (e.g., `TICKET`, `REVIEW`, `PRD_REFINEMENT`,
-    /// `RFC_REFINEMENT`). Must align with `apm2_core::work::WorkType`.
-    pub work_type: String,
+    /// Work type discriminant. Only canonical values from [`WorkSpecType`]
+    /// are accepted; unknown variants are rejected at decode time.
+    pub work_type: WorkSpecType,
 
     /// Repository identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -258,7 +291,8 @@ impl WorkSpecV1 {
         }
         validate_field_length("work_id", &self.work_id, MAX_WORK_ID_LENGTH)?;
         validate_field_length("title", &self.title, MAX_MEDIUM_STRING_LENGTH)?;
-        validate_field_length("work_type", &self.work_type, MAX_SHORT_STRING_LENGTH)?;
+        // work_type is validated at decode time via WorkSpecType enum — no
+        // further string validation needed.
 
         if let Some(ref alias) = self.ticket_alias {
             validate_field_length("ticket_alias", alias, MAX_SHORT_STRING_LENGTH)?;
@@ -305,6 +339,34 @@ impl WorkSpecV1 {
 }
 
 // ---------------------------------------------------------------------------
+// WorkContextKind (closed allowlist for context entry kind)
+// ---------------------------------------------------------------------------
+
+/// Closed allowlist of valid `kind` values for [`WorkContextEntryV1`].
+///
+/// RFC-0032 mandates a closed set of context entry kinds. Unknown variants
+/// are rejected at serde decode time (fail-closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
+pub enum WorkContextKind {
+    /// Handoff notes for implementer transitions.
+    HandoffNote,
+    /// Implementer terminal output / session summary.
+    ImplementerTerminal,
+    /// Diagnostic analysis or root-cause notes.
+    Diagnosis,
+    /// Individual review finding (BLOCKER/MAJOR/MINOR/NIT).
+    ReviewFinding,
+    /// Aggregate review verdict (APPROVE/DENY).
+    ReviewVerdict,
+    /// Gate lifecycle note (push/CI/merge-gate).
+    GateNote,
+    /// External link reference.
+    Linkout,
+}
+
+// ---------------------------------------------------------------------------
 // WorkContextEntryV1
 // ---------------------------------------------------------------------------
 
@@ -320,6 +382,8 @@ impl WorkSpecV1 {
 /// - **Deduplication**: entries are deduplicated by `(work_id, kind,
 ///   dedupe_key)`.
 /// - **`deny_unknown_fields`**: extra JSON fields are rejected.
+/// - **Closed kind allowlist**: only [`WorkContextKind`] variants are accepted;
+///   unknown values are rejected at decode time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkContextEntryV1 {
@@ -332,9 +396,10 @@ pub struct WorkContextEntryV1 {
     /// Unique entry identifier (e.g., `CTX-<blake3>`).
     pub entry_id: String,
 
-    /// Entry kind discriminant (e.g., `HANDOFF_NOTE`, `REVIEWER_FINDING`,
-    /// `DIAGNOSIS`, `GATE_NOTE`, `LINKOUT`).
-    pub kind: String,
+    /// Entry kind discriminant. Only canonical values from
+    /// [`WorkContextKind`] are accepted; unknown variants are rejected at
+    /// decode time.
+    pub kind: WorkContextKind,
 
     /// Deduplication key for idempotent publishing.
     pub dedupe_key: String,
@@ -388,10 +453,8 @@ impl WorkContextEntryV1 {
         }
         validate_field_length("entry_id", &self.entry_id, MAX_SHORT_STRING_LENGTH)?;
 
-        if self.kind.is_empty() {
-            return Err(WorkCasSchemaError::MissingField("kind"));
-        }
-        validate_field_length("kind", &self.kind, MAX_SHORT_STRING_LENGTH)?;
+        // kind is validated at decode time via WorkContextKind enum — no
+        // further string validation needed.
 
         if self.dedupe_key.is_empty() {
             return Err(WorkCasSchemaError::MissingField("dedupe_key"));
@@ -655,7 +718,24 @@ impl WorkAuthorityBindingsV1 {
         }
         validate_field_length("actor_id", &self.actor_id, MAX_SHORT_STRING_LENGTH)?;
 
-        // Validate optional hash fields (should be hex-encoded if present)
+        // RFC-0032 §2.5 / RFC-0018 §6.3 mandatory boundary pins.
+        // Fail-closed: every required pin must be present and non-empty.
+        for (name, field) in [
+            ("permeability_receipt_hash", &self.permeability_receipt_hash),
+            ("capability_manifest_hash", &self.capability_manifest_hash),
+            ("context_pack_hash", &self.context_pack_hash),
+            ("stop_condition_hash", &self.stop_condition_hash),
+        ] {
+            match field {
+                None => return Err(WorkCasSchemaError::MissingField(name)),
+                Some(v) if v.is_empty() => {
+                    return Err(WorkCasSchemaError::MissingField(name));
+                },
+                _ => {},
+            }
+        }
+
+        // Validate all hash fields (mandatory + optional) for length.
         for (name, field) in [
             ("adapter_profile_hash", &self.adapter_profile_hash),
             ("policy_resolution_hash", &self.policy_resolution_hash),
@@ -836,7 +916,7 @@ mod tests {
         assert_eq!(spec.schema, WORK_SPEC_V1_SCHEMA);
         assert_eq!(spec.work_id, "W-550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(spec.title, "RFC-0032 Phase 1: CAS schemas");
-        assert_eq!(spec.work_type, "TICKET");
+        assert_eq!(spec.work_type, WorkSpecType::Ticket);
         assert_eq!(spec.ticket_alias.as_deref(), Some("TCK-00633"));
         assert_eq!(spec.labels.len(), 2);
     }
@@ -951,7 +1031,7 @@ mod tests {
         let entry = bounded_decode_context_entry(&data).expect("decode should succeed");
         assert_eq!(entry.schema, WORK_CONTEXT_ENTRY_V1_SCHEMA);
         assert_eq!(entry.work_id, "W-001");
-        assert_eq!(entry.kind, "HANDOFF_NOTE");
+        assert_eq!(entry.kind, WorkContextKind::HandoffNote);
         assert_eq!(entry.dedupe_key, "session:S-001");
     }
 
@@ -1092,7 +1172,10 @@ mod tests {
             "claimed_at_ns": 1_704_067_200_000_000_000_u64,
             "adapter_profile_hash": "a".repeat(64),
             "policy_resolution_hash": "b".repeat(64),
-            "capability_manifest_hash": "c".repeat(64)
+            "capability_manifest_hash": "c".repeat(64),
+            "context_pack_hash": "d".repeat(64),
+            "stop_condition_hash": "e".repeat(64),
+            "permeability_receipt_hash": "f".repeat(64)
         }))
         .expect("valid json")
     }
@@ -1133,6 +1216,10 @@ mod tests {
             "role": "IMPLEMENTER",
             "lease_id": "L-001",
             "actor_id": "actor:test",
+            "permeability_receipt_hash": "f".repeat(64),
+            "capability_manifest_hash": "c".repeat(64),
+            "context_pack_hash": "d".repeat(64),
+            "stop_condition_hash": "e".repeat(64),
             "backdoor_field": "should_be_rejected"
         }))
         .expect("valid json");
@@ -1147,7 +1234,11 @@ mod tests {
             "work_id": "W-001",
             "role": "",
             "lease_id": "L-001",
-            "actor_id": "actor:test"
+            "actor_id": "actor:test",
+            "permeability_receipt_hash": "f".repeat(64),
+            "capability_manifest_hash": "c".repeat(64),
+            "context_pack_hash": "d".repeat(64),
+            "stop_condition_hash": "e".repeat(64)
         }))
         .expect("valid json");
         let result = bounded_decode_authority_bindings(&data);
@@ -1407,19 +1498,150 @@ mod tests {
     }
 
     #[test]
-    fn tck_00633_authority_bindings_minimal_valid() {
+    fn tck_00633_authority_bindings_rejects_missing_mandatory_pins() {
+        // RFC-0032 §2.5 / RFC-0018 §6.3: mandatory boundary pins must be
+        // present. Omitting any one must fail-closed.
+        let mandatory_pins: &[&str] = &[
+            "permeability_receipt_hash",
+            "capability_manifest_hash",
+            "context_pack_hash",
+            "stop_condition_hash",
+        ];
+        for omitted_pin in mandatory_pins {
+            let mut obj = serde_json::json!({
+                "schema": WORK_AUTHORITY_BINDINGS_V1_SCHEMA,
+                "work_id": "W-001",
+                "role": "IMPLEMENTER",
+                "lease_id": "L-001",
+                "actor_id": "actor:test",
+                "permeability_receipt_hash": "f".repeat(64),
+                "capability_manifest_hash": "c".repeat(64),
+                "context_pack_hash": "d".repeat(64),
+                "stop_condition_hash": "e".repeat(64),
+            });
+            obj.as_object_mut().unwrap().remove(*omitted_pin);
+            let data = serde_json::to_vec(&obj).expect("valid json");
+            let result = bounded_decode_authority_bindings(&data);
+            assert!(
+                matches!(
+                    result,
+                    Err(WorkCasSchemaError::MissingField(f)) if f == *omitted_pin
+                ),
+                "missing '{omitted_pin}' must be rejected, got: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tck_00633_authority_bindings_rejects_empty_mandatory_pin() {
+        // An empty string for a mandatory pin must also fail-closed.
         let data = serde_json::to_vec(&serde_json::json!({
             "schema": WORK_AUTHORITY_BINDINGS_V1_SCHEMA,
             "work_id": "W-001",
             "role": "IMPLEMENTER",
             "lease_id": "L-001",
-            "actor_id": "actor:test"
+            "actor_id": "actor:test",
+            "permeability_receipt_hash": "",
+            "capability_manifest_hash": "c".repeat(64),
+            "context_pack_hash": "d".repeat(64),
+            "stop_condition_hash": "e".repeat(64),
         }))
         .expect("valid json");
-        let bindings =
-            bounded_decode_authority_bindings(&data).expect("minimal bindings should decode");
-        assert_eq!(bindings.work_id, "W-001");
-        assert!(bindings.adapter_profile_hash.is_none());
-        assert!(bindings.policy_resolution_hash.is_none());
+        let result = bounded_decode_authority_bindings(&data);
+        assert!(
+            matches!(
+                result,
+                Err(WorkCasSchemaError::MissingField(
+                    "permeability_receipt_hash"
+                ))
+            ),
+            "empty mandatory pin should be rejected, got: {result:?}"
+        );
+    }
+
+    // ===================================================================
+    // WorkSpecType closed allowlist tests
+    // ===================================================================
+
+    #[test]
+    fn tck_00633_work_spec_rejects_invalid_work_type() {
+        let data = serde_json::to_vec(&serde_json::json!({
+            "schema": WORK_SPEC_V1_SCHEMA,
+            "work_id": "W-001",
+            "title": "Test",
+            "work_type": "NOT_A_WORK_TYPE"
+        }))
+        .expect("valid json");
+        let result = bounded_decode_work_spec(&data);
+        assert!(
+            result.is_err(),
+            "unrecognized work_type 'NOT_A_WORK_TYPE' must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn tck_00633_work_spec_accepts_all_canonical_work_types() {
+        for wt in ["TICKET", "PRD_REFINEMENT", "RFC_REFINEMENT", "REVIEW"] {
+            let data = serde_json::to_vec(&serde_json::json!({
+                "schema": WORK_SPEC_V1_SCHEMA,
+                "work_id": "W-001",
+                "title": "Test",
+                "work_type": wt
+            }))
+            .expect("valid json");
+            let result = bounded_decode_work_spec(&data);
+            assert!(
+                result.is_ok(),
+                "canonical work_type '{wt}' must be accepted, got: {result:?}"
+            );
+        }
+    }
+
+    // ===================================================================
+    // WorkContextKind closed allowlist tests
+    // ===================================================================
+
+    #[test]
+    fn tck_00633_context_entry_rejects_unscoped_kind() {
+        let data = serde_json::to_vec(&serde_json::json!({
+            "schema": WORK_CONTEXT_ENTRY_V1_SCHEMA,
+            "work_id": "W-001",
+            "entry_id": "CTX-001",
+            "kind": "UNSCOPED_KIND",
+            "dedupe_key": "test"
+        }))
+        .expect("valid json");
+        let result = bounded_decode_context_entry(&data);
+        assert!(
+            result.is_err(),
+            "unrecognized kind 'UNSCOPED_KIND' must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn tck_00633_context_entry_accepts_all_canonical_kinds() {
+        for kind in [
+            "HANDOFF_NOTE",
+            "IMPLEMENTER_TERMINAL",
+            "DIAGNOSIS",
+            "REVIEW_FINDING",
+            "REVIEW_VERDICT",
+            "GATE_NOTE",
+            "LINKOUT",
+        ] {
+            let data = serde_json::to_vec(&serde_json::json!({
+                "schema": WORK_CONTEXT_ENTRY_V1_SCHEMA,
+                "work_id": "W-001",
+                "entry_id": "CTX-001",
+                "kind": kind,
+                "dedupe_key": "test"
+            }))
+            .expect("valid json");
+            let result = bounded_decode_context_entry(&data);
+            assert!(
+                result.is_ok(),
+                "canonical kind '{kind}' must be accepted, got: {result:?}"
+            );
+        }
     }
 }
