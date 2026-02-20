@@ -440,7 +440,11 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+            // TCK-00577 round 6: Mode 0644 (world-readable) so the service-user
+            // worker can read files owned by non-service-user callers. The
+            // broker_requests/ directory already has sticky bit (01733)
+            // preventing callers from deleting each other's files.
+            let _ = file.set_permissions(fs::Permissions::from_mode(0o644));
         }
         file.write_all(json.as_bytes())
             .map_err(|err| format!("write: {err}"))?;

@@ -2197,9 +2197,15 @@ pub fn run_fac(
     // that checks mode bits and symlink safety but NOT ownership, so the
     // caller can reach enqueue_job → broker fallback → broker_requests/.
     // All other commands require strict ownership validation.
+    // TCK-00577 round 6: Bench spawns gate measurements as child processes
+    // that need the relaxed permission validation path (same as enqueue-class
+    // commands), so include it here.
     let is_enqueue_class = matches!(
         cmd.subcommand,
-        FacSubcommand::Push(_) | FacSubcommand::Gates(_) | FacSubcommand::Warm(_)
+        FacSubcommand::Push(_)
+            | FacSubcommand::Gates(_)
+            | FacSubcommand::Warm(_)
+            | FacSubcommand::Bench(_)
     );
     let permissions_result = if is_enqueue_class {
         crate::commands::fac_permissions::validate_fac_root_permissions_relaxed_for_enqueue()

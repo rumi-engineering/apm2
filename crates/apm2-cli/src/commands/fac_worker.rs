@@ -7440,7 +7440,26 @@ fn resolve_fac_root() -> Result<PathBuf, String> {
 }
 
 /// Ensures all required queue subdirectories exist.
+///
+/// TCK-00577 round 6: Creates `queue/` itself with mode 0711 (owner rwx,
+/// group/other execute-only) so non-service-user callers can traverse to
+/// reach `broker_requests/`. The `private/fac/` parent remains 0700.
 fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
+    // Ensure the queue root itself exists with mode 0711 for traversal.
+    if !queue_root.exists() {
+        fs::create_dir_all(queue_root)
+            .map_err(|e| format!("cannot create {}: {e}", queue_root.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Mode 0711: owner rwx, group/other execute-only (traversal).
+        // Allows non-service-user callers to reach broker_requests/ without
+        // exposing directory listings.
+        fs::set_permissions(queue_root, std::fs::Permissions::from_mode(0o711))
+            .map_err(|e| format!("cannot set mode 0711 on {}: {e}", queue_root.display()))?;
+    }
+
     for dir in [
         PENDING_DIR,
         CLAIMED_DIR,
@@ -8725,6 +8744,27 @@ mod tests {
         assert_eq!(
             mode, 0o1733,
             "broker_requests/ must have mode 01733 (sticky + world-writable), got {mode:#o}"
+        );
+    }
+
+    /// TCK-00577 round 6: `ensure_queue_dirs` creates `queue/` with mode 0711
+    /// (traverse-only for group/other) so non-service-user callers can reach
+    /// `broker_requests/`.
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_queue_dirs_queue_root_mode_0711() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_root = dir.path().join("queue");
+
+        ensure_queue_dirs(&queue_root).expect("create dirs");
+
+        let metadata = fs::metadata(&queue_root).expect("metadata");
+        let mode = metadata.permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o711,
+            "queue/ must have mode 0711 (traverse-only), got {mode:#o}"
         );
     }
 

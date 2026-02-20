@@ -230,6 +230,7 @@ pub fn run_fac_bench(
         pids_max,
         cpu_quota,
         json_output,
+        write_mode,
     );
     emit_event(
         json_output,
@@ -288,6 +289,7 @@ pub fn run_fac_bench(
         pids_max,
         cpu_quota,
         json_output,
+        write_mode,
     );
     emit_event(
         json_output,
@@ -319,6 +321,7 @@ pub fn run_fac_bench(
             memory_max,
             pids_max,
             cpu_quota,
+            write_mode,
         );
         let concurrent_dur = millis_from_elapsed(&concurrent_start);
         let concurrent_passed = concurrent_runs.iter().filter(|r| r.all_passed).count();
@@ -492,6 +495,10 @@ pub fn run_fac_bench(
 // ---------------------------------------------------------------------------
 
 /// Run gates and capture timing, returning a `GateRunMeasurement`.
+///
+/// TCK-00577 round 6: `write_mode` is threaded through so the spawned
+/// `fac gates` child process receives `--unsafe-local-write` when the
+/// caller specified it.
 fn run_gate_measurement(
     label: &str,
     timeout_seconds: u64,
@@ -499,6 +506,7 @@ fn run_gate_measurement(
     pids_max: u64,
     cpu_quota: &str,
     json_output: bool,
+    write_mode: QueueWriteMode,
 ) -> GateRunMeasurement {
     let overall = Instant::now();
 
@@ -519,8 +527,14 @@ fn run_gate_measurement(
     // Run gates via the active CLI binary to get an isolated measurement.
     // We parse the JSON output to extract per-phase timings.
     let mut cmd = Command::new(exe);
+    cmd.arg("fac");
+    // TCK-00577 round 6: Forward --unsafe-local-write when active so the
+    // spawned gate process uses relaxed permission validation and can reach
+    // the broker-mediated enqueue path.
+    if write_mode == QueueWriteMode::UnsafeLocalWrite {
+        cmd.arg("--unsafe-local-write");
+    }
     cmd.args([
-        "fac",
         "--json",
         "gates",
         "--quick",
@@ -858,12 +872,16 @@ fn run_warm_phase(timeout_seconds: u64, json_output: bool, write_mode: QueueWrit
 /// Run multiple gate runs concurrently and return their measurements.
 ///
 /// Bounded by `MAX_CONCURRENCY` (INV-BENCH-003).
+///
+/// TCK-00577 round 6: `write_mode` is forwarded to each spawned gate
+/// measurement so `--unsafe-local-write` propagates to child processes.
 fn run_concurrent_gates(
     concurrency: u8,
     timeout_seconds: u64,
     memory_max: &str,
     pids_max: u64,
     cpu_quota: &str,
+    write_mode: QueueWriteMode,
 ) -> Vec<GateRunMeasurement> {
     use std::thread;
 
@@ -876,8 +894,9 @@ fn run_concurrent_gates(
         let pids = pids_max;
         let cpu = cpu_quota.to_string();
 
-        let handle =
-            thread::spawn(move || run_gate_measurement(&label, timeout, &mem, pids, &cpu, false));
+        let handle = thread::spawn(move || {
+            run_gate_measurement(&label, timeout, &mem, pids, &cpu, false, write_mode)
+        });
         handles.push(handle);
     }
 

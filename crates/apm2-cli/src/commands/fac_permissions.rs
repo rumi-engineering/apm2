@@ -582,11 +582,19 @@ fn validate_fac_root_permissions_relaxed_at(apm2_home: &Path) -> Result<(), FacP
 /// Validate that a directory has safe permission bits and is not a symlink,
 /// without checking ownership. Used for enqueue-class commands where the
 /// caller may not own the FAC directories.
+///
+/// TCK-00577 round 6: Permits group/other execute (`o+x`, `g+x`) bits for
+/// directory traversal. Non-service-user callers need execute permission on
+/// `queue/` (mode 0711) to reach `broker_requests/` (mode 01733). Read and
+/// write bits for group/other are still rejected.
 #[cfg(unix)]
 fn validate_directory_mode_only(path: &Path) -> Result<(), FacPermissionsError> {
     let metadata = ensure_directory_is_directory(path)?;
     let mode = metadata.mode() & 0o7777;
-    if mode & 0o077 != 0 {
+    // Reject group/other read or write bits (0o066) but allow execute-only
+    // (0o011) for traversal. This permits mode 0711 on queue/ while still
+    // blocking 0755, 0750, 0770, etc.
+    if mode & 0o066 != 0 {
         return Err(FacPermissionsError::UnsafePermissions {
             path: path.to_path_buf(),
             actual_mode: mode,
@@ -1023,6 +1031,33 @@ mod tests {
         );
     }
 
+    /// TCK-00577 round 6: Relaxed validation accepts 0711 on `queue/` (needed
+    /// for non-service-user traversal to `broker_requests/`).
+    #[test]
+    #[cfg(unix)]
+    fn relaxed_validation_accepts_0711_queue_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let apm2_home = dir.path().join("apm2_home");
+
+        // Create all dirs via strict path first.
+        let strict_result = validate_fac_root_permissions_at(&apm2_home);
+        assert!(strict_result.is_ok(), "strict creation should succeed");
+
+        // Set queue/ to 0711 (traverse-only for group/other).
+        let queue_dir = apm2_home.join("queue");
+        std::fs::set_permissions(&queue_dir, std::fs::Permissions::from_mode(0o711))
+            .expect("set queue to 0711");
+
+        // Relaxed validation should accept 0711 on queue/.
+        let relaxed_result = validate_fac_root_permissions_relaxed_at(&apm2_home);
+        assert!(
+            relaxed_result.is_ok(),
+            "relaxed validation should accept 0711 on queue/: {relaxed_result:?}"
+        );
+    }
+
     /// TCK-00577: Relaxed validation rejects directories with unsafe mode
     /// bits even when ownership is not checked.
     #[test]
@@ -1082,12 +1117,48 @@ mod tests {
             "0700 should pass mode-only check"
         );
 
-        // 0750 should fail.
+        // 0750 should fail (group read).
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o750))
             .expect("set permissions");
         assert!(
             validate_directory_mode_only(&target).is_err(),
             "0750 should fail mode-only check"
+        );
+    }
+
+    /// TCK-00577 round 6: `validate_directory_mode_only` accepts 0711
+    /// (traverse-only for group/other) and rejects 0755 (group/other read).
+    #[test]
+    #[cfg(unix)]
+    fn validate_directory_mode_only_accepts_0711_traverse() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let target = dir.path().join("traverse_test");
+        std::fs::create_dir(&target).expect("create dir");
+
+        // 0711 should pass: execute-only for group/other allows traversal.
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o711))
+            .expect("set permissions");
+        assert!(
+            validate_directory_mode_only(&target).is_ok(),
+            "0711 should pass mode-only check (traverse-only)"
+        );
+
+        // 0755 should fail: group/other read exposes directory listings.
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("set permissions");
+        assert!(
+            validate_directory_mode_only(&target).is_err(),
+            "0755 should fail mode-only check (group/other read)"
+        );
+
+        // 0733 should fail: group/other write is unsafe.
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o733))
+            .expect("set permissions");
+        assert!(
+            validate_directory_mode_only(&target).is_err(),
+            "0733 should fail mode-only check (group/other write)"
         );
     }
 }
