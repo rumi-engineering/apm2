@@ -102,6 +102,75 @@
                 ]
             }
         },
+        "ledger_projection_grounding": {
+            "thesis": "The step function is a fold over the append-only ledger. State is the projection that fold produces. Effects are primarily acts of evidence creation — their operational consequence (API call, process spawn, lease issuance) is the side effect, not the substance.",
+            "event_first_design": {
+                "instruction": "Before designing State or the Input enum, design the ledger event vocabulary. Ask: if this machine ran to completion, what named events would appear in the ledger, and what would each contain? The events define the information domain; State is only what you must carry between events to fold the next one correctly.",
+                "test": "Can you reconstruct the full machine history from ledger events alone, with no in-memory state? If not, a ledger event is missing."
+            },
+            "step_is_the_reducer": {
+                "instruction": "The step function IS the reduce/fold. Input enum variants correspond to ledger event types (observed by the driver) plus driver-boundary observations (time readings, process signals, API outcomes). Determinism is not a testing nicety — it is the requirement that derives from the ledger being ground truth: if step is non-deterministic, the machine's projection diverges across restarts.",
+                "state_field_test": "For every State field ask: 'Do I need this to correctly fold the next event?' If the answer is no, it is a cache and belongs in a witnessed cache or derived view, not in canonical State."
+            },
+            "closure_properties": {
+                "instruction": "The step function must satisfy the three properties of the Cl_P closure operator. These are the algebraic requirements that make the ledger the single source of truth — not guidelines.",
+                "extensive": {
+                    "definition": "Missing evidence yields fail/pending/quarantine, never a spurious pass.",
+                    "machine_check": "Invariant test: step called with an Input carrying no evidence for a required gate must produce a non-Pass terminal or a waiting state. A Completed/Pass state with empty evidence refs is a defect."
+                },
+                "monotone": {
+                    "definition": "Additional evidence can only advance state, never retract it. A passing gate cannot be un-passed by a subsequent event.",
+                    "machine_check": "Property test: fold(A) then fold(A ++ B) — final state from A+B is at least as advanced as from A alone."
+                },
+                "idempotent": {
+                    "definition": "Same event sequence, same output. This is why replay-from-genesis equals replay-from-checkpoint, and why replaying a deduplicated event stream is safe.",
+                    "machine_check": "Already covered in verification_suite.property_tests. Extend with: fold(dedupe(events ++ events)) == fold(events)."
+                }
+            },
+            "effects_as_evidence_creation": {
+                "instruction": "For every Effect, identify its primary evidence artifact first: what named ledger event or CAS digest does it produce? The API call or process op is the mechanism; the ledger/CAS write is the substance. This ordering is what makes replay safe.",
+                "sequencing_rule": "Emit the evidence-anchoring ledger event BEFORE the irreversible operational effect (already stated in effect_emission.ordering). The reason: on restart, the driver checks the ledger first and skips re-execution if the result event already exists.",
+                "canonical_pattern_external_write": {
+                    "description": "Idempotent write to a 3rd-party authority (GitHub PR creation, issue comment, external API mutation).",
+                    "steps": [
+                        "1. Step emits Effect::RecordIntent { idempotency_key, action_id, action } — driver writes intent event to ledger.",
+                        "2. Step emits Effect::CallExternalApi { action_id, params } — driver checks ledger for an existing result event for action_id FIRST; if found, synthesizes the Input from the ledger record and skips the call.",
+                        "3. Call returns; driver converts outcome to Input::ApiResult { action_id, outcome }.",
+                        "4. Step processes ApiResult, emits Effect::RecordOutcome { action_id, outcome } — driver writes result event to ledger.",
+                        "5. On any subsequent replay: step 2 finds the result event; no call is made; Input::ApiResult is synthesized from the ledger record."
+                    ],
+                    "anti_pattern": "Executing the external call as a bare driver side-effect without a prior intent event. A crash between the call and the result record leaves the system unable to determine whether the call succeeded. The next restart re-executes, producing a duplicate action."
+                }
+            }
+        },
+        "cursor_and_activation": {
+            "goal": "Give every machine an explicit, durable position in the event stream so that cross-machine coordination is exactly-once by construction, not by memory.",
+            "ledger_cursor_in_state": {
+                "instruction": "Include a ledger cursor field in State representing the position up to which the machine has durably processed events. Justification as sufficient statistic: it is the minimal information needed to resume folding from the correct position after a crash.",
+                "invariant": "Events before the cursor are provably already processed — not because the machine remembers processing them, but because the cursor is structurally past them. No in-memory seen-set can provide this guarantee across restarts."
+            },
+            "cursor_advancement_ordering": {
+                "instruction": "Advance the cursor only AFTER the result effects that justify the advancement have been durably written to the ledger. If you advance the cursor in State before your result events are flushed, a crash between those two operations produces a checkpoint that claims progress the ledger does not contain.",
+                "ordering": [
+                    "1. Read events from ledger starting at state.ledger_cursor.",
+                    "2. Feed each event into step as an Input variant; collect (NextState, Effects).",
+                    "3. Execute Effects: write result events to ledger (durable).",
+                    "4. Only then checkpoint NextState (which contains the advanced cursor).",
+                    "5. On crash-restart: load checkpoint, read ledger from checkpoint.cursor — events before cursor are skipped structurally."
+                ]
+            },
+            "at_most_once_activation": {
+                "instruction": "When a machine activates in response to a cross-machine ledger event (e.g., session_terminated triggering gate orchestration), the activation itself must be a ledger event whose idempotency key is derived from the triggering event's stable position or id. The driver checks the ledger for an existing activation record before processing — no in-memory lock required as the primary guarantee.",
+                "pattern": [
+                    "Triggering event arrives at cursor position P.",
+                    "Driver checks ledger: does an activation record exist for trigger_event_id=P?",
+                    "If yes: advance cursor past P, no further action (already processed).",
+                    "If no: emit Effect::RecordActivation { trigger_event_id: P, action_id } to ledger, then proceed with activation effects.",
+                    "Crash at any point: restart reads the ledger, finds (or doesn't find) the activation record, and branches correctly."
+                ],
+                "benefit": "Double-activation becomes structurally impossible without relying on in-memory deduplication state that does not survive crashes."
+            }
+        },
         "derived_state_discipline": {
             "core_axiom": "State is a sufficient statistic for future decisions under the modeled Inputs; every other datum is a derived view or an external observation.",
             "fact_ownership_map": {
@@ -228,7 +297,7 @@
                 ]
             },
             "context_snapshot": {
-                "instruction": "Provide the transition core with a Snapshot object holding bounded, validated observations.",
+                "instruction": "Provide the transition core with a Snapshot object holding bounded, validated observations. Snapshot is a trust boundary: the step function branches on its values without further validation, so the driver owns all validation.",
                 "snapshot_fields": [
                     "monotonic_elapsed_ms",
                     "budget_remaining",
@@ -236,7 +305,11 @@
                     "authoritative_head_sha / changeset_digest",
                     "active_leases set for dedupe (bounded view)"
                 ],
-                "property": "Snapshot values come from boundary reads performed by the driver, then normalized and bounded."
+                "trust_boundary": {
+                    "property": "The step function fully trusts every Snapshot field. An elapsed time that goes backwards, a budget that exceeds its initial value, or an active_leases set with unbounded entries will cause step to produce wrong state — which gets checkpointed and replayed indefinitely.",
+                    "validation_rule": "All Snapshot fields must be validated and clamped at the driver boundary before step is called. Validation failures must not be silently truncated and passed to step.",
+                    "on_invalid_snapshot": "Emit Input::SnapshotRejected { field, reason } rather than passing a corrupted Snapshot to step. The machine handles this as a structured event (typically: pause, emit escalation ledger event, await corrected observation). Rejection becomes observable in the ledger, not a silent divergence."
+                }
             }
         },
         "universal_addressing": {
