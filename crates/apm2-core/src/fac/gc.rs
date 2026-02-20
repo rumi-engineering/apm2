@@ -1113,7 +1113,58 @@ pub fn execute_gc(plan: &GcPlan) -> GcReceiptV1 {
         // directory namespace, so `remove_file` is the correct syscall.
         // Parent-boundary check: verify the target lives under its
         // allowed_parent before deletion.
+        //
+        // SEC-MAJOR fix: Inode-stable parent re-validation at execution time.
+        // The parent directory (`allowed_parent`, typically `logs/`) is
+        // re-validated via `symlink_metadata` immediately before any delete
+        // to ensure it has not been swapped to a symlink between plan and
+        // execution. A lexical `starts_with` check alone is insufficient:
+        // if `logs/` is replaced with a symlink after planning, path-based
+        // deletion would resolve outside the lane boundary. The re-validation
+        // confirms the parent is a real directory (not a symlink) at the
+        // point of use, closing the TOCTOU window.
         if target.kind == crate::fac::gc_receipt::GcActionKind::LaneLogRetention {
+            // --- Inode-stable parent re-validation (SEC-MAJOR) ---
+            // Re-validate allowed_parent at execution time: it must still be
+            // a real directory (not a symlink). This prevents a symlink-swap
+            // race where an attacker replaces the parent directory with a
+            // symlink between plan construction and execution.
+            match std::fs::symlink_metadata(&target.allowed_parent) {
+                Ok(parent_meta) => {
+                    if parent_meta.file_type().is_symlink() {
+                        errors.push(crate::fac::gc_receipt::GcError {
+                            target_path: target.path.display().to_string(),
+                            reason: format!(
+                                "allowed_parent is a symlink at execution time \
+                                 (parent symlink-swap detected): {}",
+                                target.allowed_parent.display()
+                            ),
+                        });
+                        continue;
+                    }
+                    if !parent_meta.is_dir() {
+                        errors.push(crate::fac::gc_receipt::GcError {
+                            target_path: target.path.display().to_string(),
+                            reason: format!(
+                                "allowed_parent is not a directory at execution time: {}",
+                                target.allowed_parent.display()
+                            ),
+                        });
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    errors.push(crate::fac::gc_receipt::GcError {
+                        target_path: target.path.display().to_string(),
+                        reason: format!(
+                            "allowed_parent re-validation failed: {e} ({})",
+                            target.allowed_parent.display()
+                        ),
+                    });
+                    continue;
+                },
+            }
+
             match std::fs::symlink_metadata(&target.path) {
                 Ok(meta) if meta.file_type().is_symlink() => {
                     // Parent-boundary check: target must be a child of
@@ -3827,6 +3878,213 @@ mod tests {
              (paths: {:?})",
             targets.len(),
             targets.iter().map(|t| &t.path).collect::<Vec<_>>()
+        );
+    }
+
+    // =========================================================================
+    // Regression test for SEC-MAJOR: parent symlink-swap race (PR #759)
+    // =========================================================================
+
+    /// SEC-MAJOR regression: If `logs/` (the `allowed_parent`) is swapped to a
+    /// symlink between plan construction and execution, `execute_gc` MUST
+    /// detect the swap and abort deletion rather than following the symlink.
+    ///
+    /// Attack scenario:
+    /// 1. Plan phase: `logs/` is a real directory, symlink target is planned
+    /// 2. Between plan and execute: attacker replaces `logs/` with a symlink
+    ///    pointing to an external directory
+    /// 3. Execute phase: lexical parent check (`starts_with`) still passes
+    ///    because the path string hasn't changed, but `remove_file` would
+    ///    resolve through the symlink, deleting files outside the lane
+    ///
+    /// The fix re-validates `allowed_parent` at execution time using
+    /// `symlink_metadata` to confirm it is still a real directory.
+    #[cfg(unix)]
+    #[test]
+    fn execute_gc_aborts_when_logs_dir_swapped_to_symlink() {
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root.clone()).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let lane_dir = lane_manager.lane_dir(lane_id);
+        let logs_dir = lane_dir.join("logs");
+
+        // Create the lane lock file so execute_gc can acquire the lock.
+        let lock_dir = fac_root.join("locks").join("lanes");
+        std::fs::create_dir_all(&lock_dir).expect("create lock dir");
+        std::fs::write(lock_dir.join(format!("{lane_id}.lock")), b"")
+            .expect("create lane lock file");
+
+        // Create a real symlink target inside logs/ during "plan phase".
+        let symlink_entry = logs_dir.join("job-symlink");
+        let real_target = dir.path().join("real-symlink-target");
+        std::fs::create_dir_all(&real_target).expect("create real target");
+        std::os::unix::fs::symlink(&real_target, &symlink_entry)
+            .expect("create symlink entry under logs/");
+
+        // Construct a GcPlan as if it was built when logs/ was still real.
+        // The plan captures `allowed_parent = logs_dir` (a real directory
+        // at plan time).
+        let plan = GcPlan {
+            targets: vec![GcTarget {
+                path: symlink_entry,
+                allowed_parent: logs_dir.clone(),
+                kind: crate::fac::gc_receipt::GcActionKind::LaneLogRetention,
+                estimated_bytes: 0,
+            }],
+        };
+
+        // --- Simulate the attack: swap logs/ to a symlink ---
+        // Remove the real logs/ directory and replace it with a symlink
+        // pointing to an attacker-controlled location.
+        let attacker_dir = dir.path().join("attacker-controlled");
+        std::fs::create_dir_all(&attacker_dir).expect("create attacker dir");
+        let canary = attacker_dir.join("canary.txt");
+        std::fs::write(&canary, b"must survive").expect("write canary");
+
+        // Put a symlink entry inside attacker_dir with the same basename
+        // so that path resolution through the swapped parent would find it.
+        let attacker_entry = attacker_dir.join("job-symlink");
+        std::fs::write(&attacker_entry, b"attacker file").expect("write attacker entry");
+
+        // Swap: remove real logs/, replace with symlink to attacker dir.
+        std::fs::remove_dir_all(&logs_dir).expect("remove real logs dir");
+        std::os::unix::fs::symlink(&attacker_dir, &logs_dir)
+            .expect("create symlink at logs/ (attack)");
+
+        // Verify precondition: logs_dir is now a symlink.
+        assert!(
+            logs_dir
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "precondition: logs/ must be a symlink after swap"
+        );
+
+        // Execute GC — this MUST detect the swap and abort.
+        let receipt = execute_gc(&plan);
+
+        // Deletion must have been aborted with an error.
+        assert!(
+            !receipt.errors.is_empty(),
+            "execute_gc must detect parent symlink-swap and produce an error, \
+             but got no errors (actions: {:?})",
+            receipt.actions
+        );
+        assert!(
+            receipt.errors[0].reason.contains("symlink"),
+            "error reason must mention symlink detection, got: {}",
+            receipt.errors[0].reason
+        );
+        assert_eq!(
+            receipt.actions.len(),
+            0,
+            "no actions should be recorded when parent is a symlink"
+        );
+
+        // Canary and attacker entry must survive — deletion was aborted.
+        assert!(
+            canary.exists(),
+            "canary file in attacker-controlled directory must survive"
+        );
+        assert!(
+            attacker_entry.exists(),
+            "attacker entry must survive — deletion was blocked by \
+             parent symlink-swap detection"
+        );
+    }
+
+    /// SEC-MAJOR regression: parent re-validation must also block the
+    /// non-symlink (normal rmtree) path for `LaneLogRetention` targets
+    /// when `allowed_parent` has been swapped to a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn execute_gc_aborts_rmtree_path_when_logs_dir_swapped_to_symlink() {
+        let dir = tempdir().expect("tmp");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("fac");
+        let lane_manager = LaneManager::new(fac_root.clone()).expect("manager");
+        lane_manager.ensure_directories().expect("dirs");
+
+        let lane_ids = LaneManager::default_lane_ids();
+        let lane_id = lane_ids.first().expect("at least one lane");
+        let lane_dir = lane_manager.lane_dir(lane_id);
+        let logs_dir = lane_dir.join("logs");
+
+        // Create lane lock file.
+        let lock_dir = fac_root.join("locks").join("lanes");
+        std::fs::create_dir_all(&lock_dir).expect("create lock dir");
+        std::fs::write(lock_dir.join(format!("{lane_id}.lock")), b"")
+            .expect("create lane lock file");
+
+        // Create a real directory target inside logs/ during "plan phase".
+        let job_dir = logs_dir.join("job-real-dir");
+        std::fs::create_dir_all(&job_dir).expect("create job dir");
+        std::fs::write(job_dir.join("output.log"), b"some log data").expect("write log file");
+
+        // Construct plan when logs/ is still a real directory.
+        let plan = GcPlan {
+            targets: vec![GcTarget {
+                path: job_dir,
+                allowed_parent: logs_dir.clone(),
+                kind: crate::fac::gc_receipt::GcActionKind::LaneLogRetention,
+                estimated_bytes: 100,
+            }],
+        };
+
+        // --- Simulate attack: swap logs/ to a symlink ---
+        let attacker_dir = dir.path().join("attacker-controlled-2");
+        std::fs::create_dir_all(&attacker_dir).expect("create attacker dir");
+        let canary = attacker_dir.join("canary-2.txt");
+        std::fs::write(&canary, b"must survive").expect("write canary");
+
+        // Put a directory with same basename in attacker dir.
+        let attacker_job = attacker_dir.join("job-real-dir");
+        std::fs::create_dir_all(&attacker_job).expect("create attacker job");
+        std::fs::write(attacker_job.join("secret.txt"), b"secret data").expect("write secret");
+
+        // Swap: remove real logs/, replace with symlink.
+        std::fs::remove_dir_all(&logs_dir).expect("remove real logs dir");
+        std::os::unix::fs::symlink(&attacker_dir, &logs_dir)
+            .expect("create symlink at logs/ (attack)");
+
+        assert!(
+            logs_dir
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "precondition: logs/ must be a symlink"
+        );
+
+        let receipt = execute_gc(&plan);
+
+        // Must detect swap and abort — no successful actions.
+        assert!(
+            !receipt.errors.is_empty(),
+            "execute_gc must detect parent symlink-swap for directory targets too"
+        );
+        assert!(
+            receipt.errors[0].reason.contains("symlink"),
+            "error must mention symlink detection, got: {}",
+            receipt.errors[0].reason
+        );
+        assert_eq!(
+            receipt.actions.len(),
+            0,
+            "no actions should be recorded when parent is swapped"
+        );
+
+        // Attacker files must survive.
+        assert!(canary.exists(), "canary in attacker dir must survive");
+        assert!(
+            attacker_job.join("secret.txt").exists(),
+            "attacker secret must survive — rmtree was blocked"
         );
     }
 }

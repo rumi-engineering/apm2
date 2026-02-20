@@ -975,7 +975,11 @@ by another worker).
   which rejects symlink roots by design). The symlink entry is removed from
   the parent directory without following it. Parent-boundary checks ensure the
   symlink path is a child of `allowed_parent`. `NotFound` errors are treated
-  as benign (already absent).
+  as benign (already absent). **Inode-stable parent re-validation**: before
+  any deletion (symlink or directory), `allowed_parent` is re-validated via
+  `symlink_metadata` at execution time to confirm it is still a real directory
+  (not a symlink). This prevents parent symlink-swap TOCTOU attacks where an
+  attacker replaces `logs/` with a symlink between plan and execution phases.
 - [INV-LANE-CLEANUP-005] A RUNNING `LaneLeaseV1` must be persisted before
   job execution and removed on every terminal path.
 - [INV-LANE-CLEANUP-006] Job completion (Completed receipt + move to completed/)
@@ -3672,6 +3676,14 @@ includes `"lane_log_retention"` for the new action kind.
   `safe_rmtree` rejects symlink roots by design (`SymlinkDetected` error),
   which would cause symlink GC targets to fail indefinitely. Parent-boundary
   checks prevent removal of symlinks outside `allowed_parent`.
+- [INV-LLR-008a] Parent symlink-swap mitigation: before any `LaneLogRetention`
+  deletion (symlink entry removal or directory rmtree), `execute_gc`
+  re-validates `allowed_parent` at execution time via `symlink_metadata` to
+  confirm it is a real directory (not a symlink or non-directory). If the parent
+  has been swapped to a symlink between plan construction and execution, deletion
+  is aborted with an error (fail-closed). This closes the TOCTOU window where an
+  attacker could replace `logs/` with a symlink after planning to redirect
+  path-based deletion outside the lane boundary.
 
 ## metrics Submodule (TCK-00551)
 
