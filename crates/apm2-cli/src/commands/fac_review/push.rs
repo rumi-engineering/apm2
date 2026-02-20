@@ -875,30 +875,23 @@ where
                             continue;
                         }
                     } else {
-                        // BF-001 (TCK-00626 round 2): Non-terminal joined with no PID:
-                        // cannot verify liveness. Treat as transient failure (fail-closed).
+                        // BF-001 (TCK-00626 round 4): Non-terminal joined
+                        // with no PID — assume unit-based supervision is
+                        // keeping the dispatch alive. In the systemd detached
+                        // path, dispatches are created with unit-based
+                        // supervision and no PID recorded, so pid=None is the
+                        // normal steady-state for healthy unit-supervised
+                        // reviews. Treating these as dead would cause
+                        // spurious retry loops and duplicate dispatches.
+                        // Only apply PID identity checks when a PID IS
+                        // present (the branch above).
                         if emit_logs {
                             eprintln!(
                                 "fac push: {review_type} dispatch returned 'joined' with no PID in non-terminal \
-                                 state '{}'; treating as transient failure",
+                                 state '{}'; assuming unit-supervised liveness",
                                 result.run_state,
                             );
                         }
-                        let err = format!(
-                            "{review_type} joined dispatch has no PID (run_state={})",
-                            result.run_state
-                        );
-                        let delay = retry_delay_or_fail(
-                            &mut retry_counts,
-                            retry_budget,
-                            review_type,
-                            "dispatch_no_pid",
-                            PushRetryClass::DispatchTransient,
-                            &err,
-                            emit_logs,
-                        )?;
-                        thread::sleep(delay);
-                        continue;
                     }
                 }
                 break result;
