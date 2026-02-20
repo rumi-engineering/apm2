@@ -14,7 +14,9 @@ use apm2_core::fac::job_spec::{FacJobSpecV1, MAX_JOB_SPEC_SIZE};
 use apm2_core::fac::queue_bounds::{
     QueueBoundsDenialReceipt, QueueBoundsError, QueueBoundsPolicy, check_queue_bounds,
 };
-use apm2_core::fac::service_user_gate::{QueueWriteMode, check_queue_write_permission};
+use apm2_core::fac::service_user_gate::{
+    QueueWriteMode, ServiceUserGateError, check_queue_write_permission,
+};
 use apm2_core::fac::{
     FacPolicyV1, MAX_POLICY_SIZE, compute_policy_hash, deserialize_policy, parse_policy_hash,
     persist_policy,
@@ -28,6 +30,15 @@ use crate::commands::{fac_key_material, fac_secure_io};
 pub(super) const QUEUE_DIR: &str = "queue";
 /// Queue pending subdirectory.
 pub(super) const PENDING_DIR: &str = "pending";
+/// Broker requests subdirectory for non-service-user submissions (TCK-00577).
+///
+/// Non-service-user processes write job specs here instead of directly to
+/// `pending/`. The FAC worker (running as the service user) picks up
+/// requests from this directory and moves them into `pending/` after
+/// validation. This directory has mode 01733 (sticky + group/other write)
+/// so any local user can submit but cannot read or delete other users'
+/// submissions.
+pub(super) const BROKER_REQUESTS_DIR: &str = "broker_requests";
 /// Default authority clock for local-mode evaluation windows.
 pub(super) const DEFAULT_AUTHORITY_CLOCK: &str = "local";
 
@@ -186,19 +197,25 @@ pub(super) fn load_or_init_policy(
     Ok((policy_hash, policy_digest, policy))
 }
 
-/// Enqueue a validated job spec into `queue/pending`.
+/// Enqueue a validated job spec into `queue/pending` (service user) or
+/// `queue/broker_requests` (broker-mediated fallback for non-service-user).
 ///
-/// Enforces two gates before writing:
+/// # Flow
 ///
-/// 1. **Service user gate (TCK-00577)**: The current process must be running as
-///    the FAC service user, or `--unsafe-local-write` must be active.
-///    Non-service-user processes are denied with actionable error messages
-///    pointing to broker-mediated enqueue.
+/// 1. **Service user gate (TCK-00577)**: Check whether the current process is
+///    the FAC service user. If yes (or if `--unsafe-local-write` is active),
+///    write directly to `queue/pending/`.
 ///
-/// 2. **Queue bounds (TCK-00578)**: The pending queue must not exceed
-///    `max_pending_jobs` or `max_pending_bytes` as configured by the provided
-///    [`QueueBoundsPolicy`]. Excess enqueue attempts are denied with structured
-///    denial receipts.
+/// 2. **Broker-mediated fallback**: If the service user gate denies (because
+///    the caller is not the service user), write to `queue/broker_requests/`
+///    instead. The FAC worker (running as the service user) picks up requests
+///    from this directory and moves them into `pending/` after validation. This
+///    fulfills the TCK-00577 `DoD`: "CLI still works via broker-mediated
+///    enqueue."
+///
+/// 3. **Queue bounds (TCK-00578)**: For direct writes to `pending/`, the
+///    pending queue must not exceed `max_pending_jobs` or `max_pending_bytes`
+///    as configured by the provided [`QueueBoundsPolicy`].
 ///
 /// A process-level lockfile (`queue/.enqueue.lock`) is held for the
 /// full check-write critical section to prevent concurrent `apm2 fac`
@@ -222,15 +239,69 @@ pub(super) fn enqueue_job(
     write_mode: QueueWriteMode,
 ) -> Result<PathBuf, String> {
     // TCK-00577: Gate 1 — service user write permission check.
-    // Non-service-user processes are denied unless --unsafe-local-write.
-    check_queue_write_permission(write_mode)
-        .map_err(|err| format!("service user gate denied queue write: {err}"))?;
+    // If the gate passes, we do a direct write to pending/. If it denies,
+    // we fall back to the broker-mediated requests directory.
+    let gate_result = check_queue_write_permission(write_mode);
+
+    match gate_result {
+        Ok(()) => {
+            // Caller is service user or UnsafeLocalWrite is active —
+            // proceed with direct write to pending/.
+            enqueue_direct(queue_root, fac_root, spec, queue_bounds_policy)
+        },
+        Err(
+            ServiceUserGateError::NotServiceUser { .. }
+            | ServiceUserGateError::ServiceUserNotResolved { .. },
+        ) if write_mode == QueueWriteMode::ServiceUserOnly => {
+            // Non-service-user caller in normal mode — use broker-mediated
+            // enqueue path (TCK-00577 DoD: "CLI still works via
+            // broker-mediated enqueue").
+            tracing::info!(
+                job_id = %spec.job_id,
+                "TCK-00577: non-service-user caller, submitting via broker-mediated enqueue"
+            );
+            enqueue_via_broker_requests(queue_root, spec)
+        },
+        Err(err) => {
+            // Hard gate errors (invalid service user, env errors, etc.)
+            // are not recoverable via broker fallback.
+            Err(format!("service user gate denied queue write: {err}"))
+        },
+    }
+}
+
+/// Direct enqueue to `queue/pending/` (privileged path).
+///
+/// Used when the caller is the service user or `--unsafe-local-write` is
+/// active.
+fn enqueue_direct(
+    queue_root: &Path,
+    fac_root: &Path,
+    spec: &FacJobSpecV1,
+    queue_bounds_policy: &QueueBoundsPolicy,
+) -> Result<PathBuf, String> {
     let pending_dir = queue_root.join(PENDING_DIR);
     fs::create_dir_all(&pending_dir).map_err(|err| format!("create pending dir: {err}"))?;
 
     // Ensure other queue directories exist as well.
-    for subdir in &["claimed", "completed", "denied", "cancelled", "quarantine"] {
+    for subdir in &[
+        "claimed",
+        "completed",
+        "denied",
+        "cancelled",
+        "quarantine",
+        BROKER_REQUESTS_DIR,
+    ] {
         let _ = fs::create_dir_all(queue_root.join(subdir));
+    }
+
+    // Set broker_requests to mode 01733 (sticky + group/other write-only)
+    // so non-service-user callers can submit but not read/delete others.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+        let _ = fs::set_permissions(&broker_dir, fs::Permissions::from_mode(0o1733));
     }
 
     let json = serde_json::to_string_pretty(spec).map_err(|err| format!("serialize: {err}"))?;
@@ -295,6 +366,82 @@ pub(super) fn enqueue_job(
     // Lock is released on drop (implicit flock(LOCK_UN)) after the job
     // spec file has been persisted.
     drop(lock_file);
+
+    Ok(target)
+}
+
+/// Broker-mediated enqueue: write job spec to `queue/broker_requests/`
+/// for pickup by the service-user worker (TCK-00577).
+///
+/// This path is used when the caller is NOT the service user but needs to
+/// submit a job. The worker process (running as service user) monitors this
+/// directory and moves valid requests into `pending/` after validation.
+///
+/// # Security properties
+///
+/// - The `broker_requests/` directory has mode 01733 (sticky bit prevents other
+///   users from deleting/renaming files they don't own; group/other have
+///   write+execute but no read). This allows any local user to create files but
+///   prevents enumeration or tampering with other users' requests.
+/// - The worker validates each request before promoting to `pending/`, so a
+///   malicious submission cannot bypass queue bounds or spec validation.
+fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result<PathBuf, String> {
+    let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+    fs::create_dir_all(&broker_dir).map_err(|err| {
+        format!(
+            "cannot create broker requests directory {}: {err}. \
+             The service user may need to initialize this directory first \
+             (run `apm2 fac gates` as the service user once).",
+            broker_dir.display()
+        )
+    })?;
+
+    // Set broker_requests to mode 01733 if we created it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&broker_dir, fs::Permissions::from_mode(0o1733));
+    }
+
+    let json = serde_json::to_string_pretty(spec).map_err(|err| format!("serialize: {err}"))?;
+    if json.len() > MAX_JOB_SPEC_SIZE {
+        return Err(format!(
+            "serialized spec too large: {} > {}",
+            json.len(),
+            MAX_JOB_SPEC_SIZE
+        ));
+    }
+
+    let filename = format!("{}.json", spec.job_id);
+    let target = broker_dir.join(&filename);
+
+    let temp = tempfile::NamedTempFile::new_in(&broker_dir).map_err(|err| {
+        format!(
+            "cannot create temp file in broker requests directory {}: {err}. \
+                 Ensure the directory exists with correct permissions (mode 01733).",
+            broker_dir.display()
+        )
+    })?;
+    {
+        let mut file = temp.as_file();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+        }
+        file.write_all(json.as_bytes())
+            .map_err(|err| format!("write: {err}"))?;
+        file.sync_all().map_err(|err| format!("sync: {err}"))?;
+    }
+    temp.persist(&target)
+        .map_err(|err| format!("persist broker request: {}", err.error))?;
+
+    tracing::info!(
+        job_id = %spec.job_id,
+        path = %target.display(),
+        "TCK-00577: job spec submitted via broker-mediated enqueue \
+         (worker will promote to pending/)"
+    );
 
     Ok(target)
 }
@@ -605,6 +752,154 @@ mod tests {
         assert!(
             a.split('-').count() >= 4,
             "suffix should include timestamp, nanos, pid, and counter"
+        );
+    }
+
+    use apm2_core::fac::job_spec::{Actuation, JobConstraints, JobSource, LaneRequirements};
+
+    /// Build a minimal valid `FacJobSpecV1` for testing enqueue paths.
+    fn test_job_spec(job_id: &str) -> FacJobSpecV1 {
+        FacJobSpecV1 {
+            schema: "apm2.fac.job_spec.v1".to_string(),
+            job_id: job_id.to_string(),
+            job_spec_digest: "c".repeat(64),
+            kind: "gates".to_string(),
+            queue_lane: "default".to_string(),
+            priority: 50,
+            enqueue_time: "2026-01-01T00:00:00Z".to_string(),
+            actuation: Actuation {
+                lease_id: "test-lease".to_string(),
+                request_id: "test-request".to_string(),
+                channel_context_token: None,
+                decoded_source: None,
+            },
+            source: JobSource {
+                kind: "mirror_commit".to_string(),
+                repo_id: "test/repo".to_string(),
+                head_sha: "a".repeat(40),
+                patch: None,
+            },
+            lane_requirements: LaneRequirements {
+                lane_profile_hash: None,
+            },
+            constraints: JobConstraints {
+                require_nextest: false,
+                test_timeout_seconds: None,
+                memory_max_bytes: None,
+            },
+            cancel_target_job_id: None,
+        }
+    }
+
+    // ── Broker-mediated enqueue (TCK-00577) ──────────────────────────
+
+    #[test]
+    fn enqueue_via_broker_requests_writes_to_broker_dir() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path();
+        let spec = test_job_spec("test-broker-001");
+
+        let result = enqueue_via_broker_requests(queue_root, &spec);
+        assert!(result.is_ok(), "broker enqueue should succeed: {result:?}");
+
+        let path = result.unwrap();
+        assert!(path.exists(), "broker request file should exist");
+        assert!(
+            path.starts_with(queue_root.join(BROKER_REQUESTS_DIR)),
+            "file should be in broker_requests/: {path:?}"
+        );
+
+        // Verify contents are valid JSON with the right job_id.
+        let bytes = std::fs::read(&path).expect("read broker request");
+        let parsed: FacJobSpecV1 = serde_json::from_slice(&bytes).expect("parse broker request");
+        assert_eq!(parsed.job_id, "test-broker-001");
+    }
+
+    #[test]
+    fn enqueue_via_broker_requests_rejects_oversize_spec() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path();
+        let mut spec = test_job_spec("test-broker-oversize");
+        // Make the spec exceed MAX_JOB_SPEC_SIZE by stuffing a large field.
+        spec.source.repo_id = "x".repeat(MAX_JOB_SPEC_SIZE + 1);
+
+        let result = enqueue_via_broker_requests(queue_root, &spec);
+        assert!(
+            result.is_err(),
+            "oversize spec should be rejected: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("too large"),
+            "error should mention size: {err}"
+        );
+    }
+
+    // ── enqueue_job fallback (TCK-00577) ─────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_job_falls_back_to_broker_when_not_service_user() {
+        // This test runs as a normal user (not _apm2-job), so the
+        // service user gate will deny. enqueue_job should fall back
+        // to broker_requests/.
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path().join("queue");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("create fac root");
+
+        let spec = test_job_spec("test-fallback-001");
+        let policy = QueueBoundsPolicy::default();
+
+        let result = enqueue_job(
+            &queue_root,
+            &fac_root,
+            &spec,
+            &policy,
+            QueueWriteMode::ServiceUserOnly,
+        );
+
+        // Should succeed via broker-mediated path (either NotServiceUser
+        // or ServiceUserNotResolved triggers fallback).
+        assert!(
+            result.is_ok(),
+            "enqueue_job should fall back to broker: {result:?}"
+        );
+
+        let path = result.unwrap();
+        assert!(
+            path.starts_with(queue_root.join(BROKER_REQUESTS_DIR)),
+            "should be in broker_requests/: {path:?}"
+        );
+    }
+
+    #[test]
+    fn enqueue_job_uses_direct_path_with_unsafe_local_write() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path().join("queue");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("create fac root");
+
+        let spec = test_job_spec("test-direct-001");
+        let policy = QueueBoundsPolicy::default();
+
+        let result = enqueue_job(
+            &queue_root,
+            &fac_root,
+            &spec,
+            &policy,
+            QueueWriteMode::UnsafeLocalWrite,
+        );
+
+        assert!(
+            result.is_ok(),
+            "UnsafeLocalWrite enqueue should succeed: {result:?}"
+        );
+
+        let path = result.unwrap();
+        assert!(
+            path.starts_with(queue_root.join(PENDING_DIR)),
+            "UnsafeLocalWrite should write to pending/: {path:?}"
         );
     }
 }

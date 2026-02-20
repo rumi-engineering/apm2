@@ -5473,8 +5473,9 @@ pub fn run_push(
     branch: Option<&str>,
     ticket: Option<&Path>,
     json_output: bool,
+    write_mode: QueueWriteMode,
 ) -> u8 {
-    push::run_push(repo, remote, branch, ticket, json_output)
+    push::run_push(repo, remote, branch, ticket, json_output, write_mode)
 }
 
 pub fn run_restart(

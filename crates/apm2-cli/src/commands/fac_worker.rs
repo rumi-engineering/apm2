@@ -265,6 +265,9 @@ const COMPLETED_DIR: &str = "completed";
 const DENIED_DIR: &str = "denied";
 const QUARANTINE_DIR: &str = "quarantine";
 const CANCELLED_DIR: &str = "cancelled";
+/// Broker requests directory where non-service-user callers submit jobs
+/// for promotion by the worker (TCK-00577).
+const BROKER_REQUESTS_DIR: &str = "broker_requests";
 const CONSUME_RECEIPTS_DIR: &str = "authority_consumed";
 
 /// Maximum poll interval to prevent misconfiguration (1 hour).
@@ -1010,6 +1013,10 @@ pub fn run_fac_worker(
             },
         };
 
+        // TCK-00577: Promote broker requests from non-service-user
+        // callers into pending/ before scanning.
+        promote_broker_requests(&queue_root);
+
         // Scan pending directory (quarantines malformed files inline).
         let candidates = match scan_pending(
             &queue_root,
@@ -1481,6 +1488,99 @@ fn compute_canonicalizer_tuple_digest() -> String {
 // =============================================================================
 // Queue scanning
 // =============================================================================
+
+/// Maximum number of broker request entries to promote per cycle.
+///
+/// Prevents unbounded I/O from a `broker_requests` directory with many files.
+const MAX_BROKER_REQUESTS_PROMOTE: usize = 256;
+
+/// Promote valid job specs from `queue/broker_requests/` into `queue/pending/`
+/// (TCK-00577).
+///
+/// Called by the worker (running as service user) before scanning pending.
+/// Each `.json` file in `broker_requests/` is validated (bounded read +
+/// deserialize) and moved to `pending/` via atomic rename. Malformed files
+/// are quarantined. This provides the "broker-mediated enqueue" path for
+/// non-service-user CLI callers.
+fn promote_broker_requests(queue_root: &Path) {
+    let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+    if !broker_dir.is_dir() {
+        return;
+    }
+
+    let Ok(entries) = fs::read_dir(&broker_dir) else {
+        return;
+    };
+
+    let pending_dir = queue_root.join(PENDING_DIR);
+    let _ = fs::create_dir_all(&pending_dir);
+
+    let quarantine_dir = queue_root.join(QUARANTINE_DIR);
+
+    for (idx, entry) in entries.enumerate() {
+        if idx >= MAX_BROKER_REQUESTS_PROMOTE {
+            tracing::warn!(
+                "TCK-00577: broker_requests promotion cap reached ({MAX_BROKER_REQUESTS_PROMOTE}), \
+                 remaining files deferred to next cycle"
+            );
+            break;
+        }
+
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+
+        let file_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        // Bounded read (reuse MAX_JOB_SPEC_SIZE from job_spec module).
+        let bytes = match read_bounded(&path, apm2_core::fac::job_spec::MAX_JOB_SPEC_SIZE) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "TCK-00577: quarantining unreadable broker request"
+                );
+                let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
+                continue;
+            },
+        };
+
+        // Validate deserialization.
+        if deserialize_job_spec(&bytes).is_err() {
+            tracing::warn!(
+                path = %path.display(),
+                "TCK-00577: quarantining malformed broker request"
+            );
+            let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
+            continue;
+        }
+
+        // Promote to pending/ via rename (same filesystem).
+        let target = pending_dir.join(&file_name);
+        if let Err(e) = fs::rename(&path, &target) {
+            tracing::warn!(
+                path = %path.display(),
+                target = %target.display(),
+                error = %e,
+                "TCK-00577: failed to promote broker request to pending"
+            );
+            // Don't quarantine on rename failure; retry next cycle.
+            continue;
+        }
+
+        tracing::info!(
+            file = %file_name,
+            "TCK-00577: promoted broker request to pending/"
+        );
+    }
+}
 
 /// Scans `queue/pending/` and returns sorted candidates.
 ///

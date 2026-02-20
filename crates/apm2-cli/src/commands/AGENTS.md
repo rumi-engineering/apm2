@@ -626,3 +626,30 @@ systemd service executables:
 - In JSON mode: emitted as NDJSON worker event
 - In text mode: emitted as structured key=value to stderr at INFO level
 - Non-fatal: digest failures produce error markers, not worker abort
+
+## `fac_queue_submit.rs` — Queue Submission with Service User Gate (TCK-00577)
+
+### Broker-mediated enqueue (TCK-00577)
+
+`enqueue_job` now has two write paths:
+
+1. **Direct path** (`enqueue_direct`): Used when the caller IS the service
+   user or `--unsafe-local-write` is active. Writes directly to
+   `queue/pending/` with full queue-bounds enforcement.
+
+2. **Broker-mediated path** (`enqueue_via_broker_requests`): Used when the
+   service user gate denies (caller is NOT the service user). Writes to
+   `queue/broker_requests/` instead. The FAC worker (running as service
+   user) promotes valid requests into `pending/` via `promote_broker_requests()`
+   in `fac_worker.rs`.
+
+### Invariants
+
+- The `broker_requests/` directory uses mode 01733 (sticky + write-only for
+  group/other) so non-service-user callers can submit but cannot enumerate
+  or tamper with other users' requests.
+- Hard gate errors (invalid service user name, env var errors) are NOT
+  recoverable via broker fallback and return immediate error.
+- `run_push` and `run_blocking_evidence_gates` use the caller-provided
+  `write_mode` (from `FacCommand::queue_write_mode()`), NOT a hardcoded
+  `UnsafeLocalWrite`.

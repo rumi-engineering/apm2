@@ -108,6 +108,25 @@ pub enum ServiceUserGateError {
         /// What went wrong.
         reason: String,
     },
+
+    /// The FAC service user could not be resolved to a uid (fail-closed).
+    ///
+    /// This covers both "user does not exist in passwd" and "passwd lookup
+    /// failed with an I/O or system error". In `ServiceUserOnly` mode, an
+    /// unresolvable service user is a hard denial — writes are never
+    /// permitted when the service user identity cannot be confirmed.
+    #[error(
+        "service user '{service_user}' could not be resolved to a uid \
+         (fail-closed: denying write). Reason: {reason}. \
+         Ensure the service user exists or pass --unsafe-local-write to bypass"
+    )]
+    ServiceUserNotResolved {
+        /// The service user name that could not be resolved.
+        service_user: String,
+        /// Why resolution failed (e.g. "user not found in passwd" or the
+        /// underlying system error).
+        reason: String,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -169,37 +188,36 @@ pub fn check_queue_write_permission(
     let service_user = resolve_service_user_name()?;
     let current_uid = nix::unistd::geteuid().as_raw();
 
-    // Resolve the service user uid. If the user does not exist in passwd,
-    // we fall back to comparing names against the current user's passwd
-    // entry.
-    let service_uid = resolve_uid_for_user(&service_user);
+    // Resolve the service user uid. Fail-closed: if the user does not
+    // exist or lookup errors out, deny writes in ServiceUserOnly mode.
+    let service_uid = match resolve_uid_for_user(&service_user) {
+        Ok(uid) => uid,
+        Err(reason) => {
+            // [INV-SU-001] Fail-closed: unresolvable service user
+            // is a hard denial. The caller must use UnsafeLocalWrite
+            // or broker-mediated enqueue.
+            tracing::warn!(
+                service_user = %service_user,
+                current_uid = current_uid,
+                reason = %reason,
+                "TCK-00577: service user not resolvable — denying write (fail-closed)"
+            );
+            return Err(ServiceUserGateError::ServiceUserNotResolved {
+                service_user,
+                reason,
+            });
+        },
+    };
 
-    // If the service user resolves to a uid, check direct match.
-    if let Some(uid) = service_uid {
-        if current_uid == uid {
-            return Ok(());
-        }
-        return Err(ServiceUserGateError::NotServiceUser {
-            current_uid,
-            service_user,
-            service_uid: uid,
-        });
+    if current_uid == service_uid {
+        return Ok(());
     }
 
-    // Service user does not exist in passwd yet. Check if we are the
-    // owner of the FAC home directory as a fallback heuristic. If the
-    // service user is not yet created, the current user is likely the
-    // owner and we permit writes in this bootstrap scenario.
-    //
-    // This handles the case where the system is not yet provisioned
-    // with a dedicated service user but the directories are already
-    // owned by the current user (user-mode deployment).
-    tracing::debug!(
-        service_user = %service_user,
-        current_uid = current_uid,
-        "FAC service user not found in passwd, permitting write for owner-mode bootstrap"
-    );
-    Ok(())
+    Err(ServiceUserGateError::NotServiceUser {
+        current_uid,
+        service_user,
+        service_uid,
+    })
 }
 
 /// Non-Unix stub: always permits writes (permissions model is Unix-only).
@@ -224,7 +242,12 @@ pub fn validate_directory_service_user_ownership(path: &Path) -> Result<(), Serv
     use std::os::unix::fs::MetadataExt;
 
     let service_user = resolve_service_user_name()?;
-    let service_uid = resolve_uid_for_user(&service_user);
+    let expected_uid = resolve_uid_for_user(&service_user).map_err(|reason| {
+        ServiceUserGateError::ServiceUserNotResolved {
+            service_user: service_user.clone(),
+            reason,
+        }
+    })?;
 
     let metadata =
         std::fs::symlink_metadata(path).map_err(|err| ServiceUserGateError::MetadataError {
@@ -241,19 +264,14 @@ pub fn validate_directory_service_user_ownership(path: &Path) -> Result<(), Serv
 
     let actual_uid = metadata.uid();
 
-    // If the service user resolves to a uid, check ownership.
-    if let Some(expected_uid) = service_uid {
-        if actual_uid != expected_uid {
-            return Err(ServiceUserGateError::OwnershipMismatch {
-                path: path.display().to_string(),
-                actual_uid,
-                expected_uid,
-                service_user,
-            });
-        }
+    if actual_uid != expected_uid {
+        return Err(ServiceUserGateError::OwnershipMismatch {
+            path: path.display().to_string(),
+            actual_uid,
+            expected_uid,
+            service_user,
+        });
     }
-    // If the service user does not exist, ownership validation is
-    // deferred to provisioning time.
 
     Ok(())
 }
@@ -328,14 +346,19 @@ fn validate_service_user_syntax(user: &str) -> Result<(), ServiceUserGateError> 
     Ok(())
 }
 
-/// Resolve a username to a uid via passwd lookup. Returns `None` if
-/// the user does not exist.
+/// Resolve a username to a uid via passwd lookup.
+///
+/// Returns `Ok(uid)` if the user exists, `Err(reason)` if the user does
+/// not exist or if the lookup itself failed (e.g. NSS/LDAP error). The
+/// caller MUST treat `Err` as a hard denial in `ServiceUserOnly` mode
+/// to maintain fail-closed semantics.
 #[cfg(unix)]
-fn resolve_uid_for_user(user: &str) -> Option<u32> {
-    nix::unistd::User::from_name(user)
-        .ok()
-        .flatten()
-        .map(|u| u.uid.as_raw())
+fn resolve_uid_for_user(user: &str) -> Result<u32, String> {
+    match nix::unistd::User::from_name(user) {
+        Ok(Some(u)) => Ok(u.uid.as_raw()),
+        Ok(None) => Err(format!("user '{user}' not found in passwd")),
+        Err(e) => Err(format!("passwd lookup failed for '{user}': {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -423,6 +446,68 @@ mod tests {
         );
     }
 
+    // ── Fail-closed: service user not resolvable ──────────────────────
+
+    #[test]
+    #[cfg(unix)]
+    fn check_queue_write_service_user_only_denies_when_user_not_found() {
+        // The default service user `_apm2-job` almost certainly does not
+        // exist in test environments. ServiceUserOnly mode must deny.
+        let result = check_queue_write_permission(QueueWriteMode::ServiceUserOnly);
+        // Two valid outcomes:
+        // - Err(ServiceUserNotResolved) if the user does not exist
+        // - Err(NotServiceUser) if the user exists but is different
+        // - Ok(()) if we happen to be running as the service user (unlikely)
+        //
+        // We just assert that the default service user `_apm2-job` does
+        // not silently permit writes for a non-service-user process.
+        // The test user is extremely unlikely to be `_apm2-job`.
+        match result {
+            Ok(()) => {
+                // We must be running as the service user — that is valid.
+                let current_uid = nix::unistd::geteuid().as_raw();
+                let service_uid = resolve_uid_for_user(DEFAULT_SERVICE_USER);
+                assert_eq!(
+                    service_uid,
+                    Ok(current_uid),
+                    "Ok result should only happen when running as service user"
+                );
+            },
+            Err(ref err) => {
+                let msg = err.to_string();
+                // Must be either NotServiceUser or ServiceUserNotResolved
+                assert!(
+                    msg.contains("could not be resolved")
+                        || msg.contains("direct queue/receipt write denied"),
+                    "denial should have a clear reason: {msg}"
+                );
+            },
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_uid_for_nonexistent_user_returns_err() {
+        let result = resolve_uid_for_user("__nonexistent_user_tck00577__");
+        assert!(
+            result.is_err(),
+            "nonexistent user should return Err, got: {result:?}"
+        );
+        let reason = result.unwrap_err();
+        assert!(
+            reason.contains("not found"),
+            "error should mention 'not found': {reason}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_uid_for_root_returns_zero() {
+        // `root` exists on all Unix systems with uid 0.
+        let result = resolve_uid_for_user("root");
+        assert_eq!(result, Ok(0), "root should resolve to uid 0");
+    }
+
     // ── Error display ─────────────────────────────────────────────────
 
     #[test]
@@ -446,6 +531,28 @@ mod tests {
     }
 
     #[test]
+    fn service_user_not_resolved_error_has_remediation() {
+        let err = ServiceUserGateError::ServiceUserNotResolved {
+            service_user: "_apm2-job".to_string(),
+            reason: "user not found in passwd".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("could not be resolved"),
+            "should explain resolution failure: {msg}"
+        );
+        assert!(
+            msg.contains("fail-closed"),
+            "should indicate fail-closed: {msg}"
+        );
+        assert!(
+            msg.contains("--unsafe-local-write"),
+            "should mention bypass flag: {msg}"
+        );
+        assert!(msg.contains("_apm2-job"), "should show service user: {msg}");
+    }
+
+    #[test]
     fn ownership_mismatch_error_has_remediation() {
         let err = ServiceUserGateError::OwnershipMismatch {
             path: "/home/apm2/queue".to_string(),
@@ -462,25 +569,30 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn validate_directory_service_user_ownership_rejects_symlink() {
+    fn validate_directory_service_user_ownership_denies_when_service_user_not_found() {
+        // The default service user `_apm2-job` does not exist in test
+        // environments. validate_directory_service_user_ownership should
+        // fail-closed with ServiceUserNotResolved before even reading
+        // directory metadata.
         let dir = tempfile::TempDir::new().expect("create temp dir");
         let real_dir = dir.path().join("real");
-        let symlink_dir = dir.path().join("link");
         std::fs::create_dir(&real_dir).expect("create real dir");
-        std::os::unix::fs::symlink(&real_dir, &symlink_dir).expect("create symlink");
 
-        let result = validate_directory_service_user_ownership(&symlink_dir);
-        assert!(result.is_err(), "should reject symlink");
+        let result = validate_directory_service_user_ownership(&real_dir);
+        assert!(result.is_err(), "should deny when service user not found");
         let err = result.unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("symlink"),
-            "should mention symlink: {err}"
+            msg.contains("could not be resolved") || msg.contains("not found"),
+            "should indicate service user not resolved: {msg}"
         );
     }
 
     #[test]
     #[cfg(unix)]
     fn validate_directory_service_user_ownership_handles_nonexistent_path() {
+        // Even for a nonexistent path, the service user resolution
+        // fails-closed first (before metadata read).
         let dir = tempfile::TempDir::new().expect("create temp dir");
         let nonexistent = dir.path().join("nonexistent");
 

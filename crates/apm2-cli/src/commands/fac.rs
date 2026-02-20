@@ -2485,6 +2485,7 @@ pub fn run_fac(
                 args.branch.as_deref(),
                 args.ticket.as_deref(),
                 output_json,
+                cmd.queue_write_mode(),
             )
         },
         FacSubcommand::Restart(args) => {

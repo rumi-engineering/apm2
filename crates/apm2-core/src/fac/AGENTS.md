@@ -3880,3 +3880,24 @@ admission pipeline with deterministic inputs. Security domains:
 12. **Multi-lane admission** (`e2e_multiple_lanes_admitted`):
     Bulk, Consume, and Control lanes all admitted with distinct
     broker-issued envelopes.
+
+## `service_user_gate.rs` — Service User Ownership Gate (TCK-00577)
+
+Enforces the receipt store permissions model: a dedicated FAC service user
+owns queue and receipt directories. Non-service-user processes must use
+broker-mediated enqueue or explicit `--unsafe-local-write`.
+
+### Key invariants
+
+- [INV-SU-001] Direct queue/receipt writes denied for non-service-user
+  processes unless `--unsafe-local-write` is active. **Fail-closed.**
+- [INV-SU-002] Service user identity resolved from effective uid at
+  decision time, not cached.
+- [INV-SU-003] `--unsafe-local-write` is per-invocation, does not persist.
+- [INV-SU-004] Ownership validation uses `lstat` (symlink_metadata).
+- [INV-SU-005] `resolve_uid_for_user` returns `Result<u32, String>` (not
+  `Option`). Both "user missing" and "lookup error" map to hard denial in
+  `ServiceUserOnly` mode — never implicit allow.
+- [INV-SU-006] `ServiceUserNotResolved` error variant covers unresolvable
+  service user (missing or lookup failure). Callers must use
+  `UnsafeLocalWrite` or broker-mediated path to bypass.
