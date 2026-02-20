@@ -753,17 +753,18 @@ systemd service executables:
 - **Fail-closed on unsafe pre-existing mode**: Pre-existing directories
   with group/other read bits are rejected with an actionable error message.
 
-### Sticky-bit enforcement on pre-existing broker_requests (TCK-00577 round 10)
+### Sticky-bit enforcement on pre-existing broker_requests (TCK-00577 round 10, hardened round 13)
 
-- **Sticky-bit required for world-writable broker_requests**: When a
-  pre-existing `broker_requests/` directory has the other-write bit set
-  (mode & 0o002), the sticky bit (mode & 0o1000) MUST also be set.
-  Without the sticky bit, any local user can unlink or overwrite other
-  users' submission files inside the directory, breaking queue isolation
-  (CWE-379). Modes like `0333` (write-only, no sticky) are rejected.
-  Modes like `01333` or `01733` (sticky set) are accepted. Owner-only
-  modes (e.g., `0700`) do not require the sticky bit since other-write
-  is not set.
+- **Sticky-bit required for non-owner-writable broker_requests**: When a
+  pre-existing `broker_requests/` directory has the group-write (0o020)
+  OR other-write (0o002) bit set (checked via `mode & 0o022`), the
+  sticky bit (mode & 0o1000) MUST also be set. Without the sticky bit,
+  any non-owner principal with group or other write access can unlink or
+  overwrite peer files inside the directory, breaking queue isolation
+  (CWE-379). Modes like `0333` and `0730` (writable without sticky) are
+  rejected. Modes like `01333`, `01733`, and `01730` (sticky set) are
+  accepted. Owner-only modes (e.g., `0700`) do not require the sticky
+  bit since neither group-write nor other-write is set.
 
 ### Queue-aware strict validator (TCK-00577 round 10 code-quality fix)
 

@@ -485,11 +485,12 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
             // but reading/listing is not required. The actual writability
             // is tested by the tempfile creation below (fail-closed).
             //
-            // Two checks (fail-closed):
+            // Three checks (fail-closed):
             // 1. Reject group/other read bits (exposes other users' submissions).
-            // 2. If other-write bit is set, require sticky bit. Without sticky, any local
-            //    user can unlink/overwrite other users' files inside the directory,
-            //    breaking queue isolation (CVE-class: CWE-379).
+            // 2. If group-write OR other-write bit is set, require sticky bit. Without
+            //    sticky, any non-owner principal with group or other write access can
+            //    unlink/overwrite peer files inside the directory, breaking queue isolation
+            //    (CVE-class: CWE-379).
             let has_other_read = mode & 0o044 != 0;
             if has_other_read {
                 return Err(format!(
@@ -499,13 +500,15 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
                     mode
                 ));
             }
-            let has_other_write = mode & 0o002 != 0;
+            // 0o022 = group-write (0o020) | other-write (0o002).
+            let writable_by_non_owner = (mode & 0o022) != 0;
             let has_sticky = mode & 0o1000 != 0;
-            if has_other_write && !has_sticky {
+            if writable_by_non_owner && !has_sticky {
                 return Err(format!(
-                    "broker_requests {} has unsafe mode {:04o} (other-write without \
-                     sticky bit allows local users to unlink/replace peer queue \
-                     entries): the service user should set mode 01733",
+                    "broker_requests {} has unsafe mode {:04o} (group/other write \
+                     without sticky bit allows non-owner principals to \
+                     unlink/replace peer queue entries): the service user \
+                     should set mode 01733",
                     broker_dir.display(),
                     mode
                 ));
@@ -1302,6 +1305,64 @@ mod tests {
         assert!(
             result.is_ok(),
             "broker enqueue should accept owner-only dir without sticky: {result:?}"
+        );
+    }
+
+    /// MAJOR fix: `broker_requests` with group-write but NO sticky bit (mode
+    /// 0730) allows group members to unlink/replace peer queue entries. Must
+    /// reject.
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_via_broker_requests_rejects_group_writable_no_sticky() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path().join("queue");
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        std::fs::create_dir_all(&broker_dir).expect("create broker dir");
+        std::fs::set_permissions(&queue_root, std::fs::Permissions::from_mode(0o711))
+            .expect("set queue root mode");
+        // Mode 0730: group-writable WITHOUT sticky bit — unsafe.
+        std::fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o730))
+            .expect("set broker dir mode 0730");
+
+        let spec = test_job_spec("test-grp-no-sticky-001");
+        let result = enqueue_via_broker_requests(&queue_root, &spec);
+        assert!(
+            result.is_err(),
+            "broker enqueue should reject group-writable dir without sticky: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("sticky bit"),
+            "error should mention sticky bit: {err}"
+        );
+    }
+
+    /// MAJOR fix: `broker_requests` with group-write AND sticky bit (mode
+    /// 01730) is acceptable — sticky prevents cross-user unlink.
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_via_broker_requests_accepts_group_writable_with_sticky() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path().join("queue");
+        let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+        std::fs::create_dir_all(&broker_dir).expect("create broker dir");
+        std::fs::set_permissions(&queue_root, std::fs::Permissions::from_mode(0o711))
+            .expect("set queue root mode");
+        // Mode 01730: group-writable WITH sticky bit — safe.
+        std::fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o1730))
+            .expect("set broker dir mode 01730");
+
+        let spec = test_job_spec("test-grp-sticky-001");
+        let result = enqueue_via_broker_requests(&queue_root, &spec);
+        assert!(
+            result.is_ok(),
+            "broker enqueue should accept group-writable dir with sticky: {result:?}"
         );
     }
 }
