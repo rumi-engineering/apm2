@@ -3540,6 +3540,13 @@ fn maybe_auto_merge_if_ready(record: &PrLifecycleRecord, source: &str) -> Result
     maybe_auto_merge_if_ready_inner(record, source)
 }
 
+fn should_defer_auto_merge_until_projection_replay(err: &str) -> bool {
+    let normalized = err.to_ascii_lowercase();
+    normalized.contains("decision projection for pr #")
+        && (normalized.contains("missing remote comment id")
+            || normalized.contains("invalid remote comment url `local://fac_projection/"))
+}
+
 fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) -> Result<(), String> {
     let persist_merge_failed = |reason: String| -> Result<(), String> {
         if let Err(event_err) = apply_event(
@@ -3589,6 +3596,13 @@ fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) -> 
     ) {
         Ok(value) => value,
         Err(err) => {
+            if should_defer_auto_merge_until_projection_replay(&err) {
+                eprintln!(
+                    "INFO: deferring auto-merge for PR #{} until verdict projection replay materializes remote completion signal: {err}",
+                    record.pr_number
+                );
+                return Ok(());
+            }
             return persist_merge_failed(err);
         },
     };
@@ -3947,7 +3961,7 @@ fn finalize_projected_verdict(
     fallback_dimension: &str,
     _run_id: &str,
     auto_source: Option<&str>,
-) -> Result<(), String> {
+) -> Result<PrLifecycleRecord, String> {
     replay_pending_merge_projection_for_repo(&projected.owner_repo);
 
     let lifecycle_dimension =
@@ -3974,7 +3988,7 @@ fn finalize_projected_verdict(
         )?;
     }
 
-    maybe_auto_merge_if_ready(&reduced, auto_source.unwrap_or("explicit_verdict_set"))
+    Ok(reduced)
 }
 
 fn finalize_auto_verdict_candidate(
@@ -4023,7 +4037,8 @@ fn finalize_auto_verdict_candidate(
         model_id.as_deref(),
         backend_id.as_deref(),
     )?;
-    finalize_projected_verdict(&projected, &dimension, &candidate.run_id, Some("reaper"))?;
+    let reduced =
+        finalize_projected_verdict(&projected, &dimension, &candidate.run_id, Some("reaper"))?;
     let _projection_lock =
         verdict_projection::acquire_projection_lock(&projected.owner_repo, projected.pr_number)?;
     let _ = replay_pending_verdict_projection_for_pr_locked(
@@ -4056,6 +4071,7 @@ fn finalize_auto_verdict_candidate(
         validate_post_finalize_projection(&projected, &projected_full)?;
         let home = apm2_home_dir()?;
         rewrite_verdict_completion_receipt(&home, &projected_full, &candidate.run_id)?;
+        maybe_auto_merge_if_ready(&reduced, "reaper")?;
         return Ok(AutoVerdictFinalizeResult::Applied);
     }
 
@@ -5405,6 +5421,11 @@ fn run_verdict_set_inner(
         })?;
         validate_post_finalize_projection(&projected, &projected_full)?;
         rewrite_verdict_completion_receipt(&home, &projected_full, &run_id)?;
+        if let Some(latest_lifecycle) =
+            load_pr_state_for_readonly(&projected.owner_repo, projected.pr_number)?
+        {
+            maybe_auto_merge_if_ready(&latest_lifecycle, "explicit_verdict_set_post_projection")?;
+        }
         Ok(exit_codes::SUCCESS)
     };
 
@@ -5889,6 +5910,60 @@ mod tests {
     }
 
     #[test]
+    fn finalize_projected_verdict_defers_merge_attempt_until_post_projection_phase() {
+        let pr = next_pr();
+        let repo = next_repo("finalize-projection-order", pr);
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::PushObserved).expect("push");
+        let _ =
+            apply_event(&repo, pr, sha, &LifecycleEventKind::GatesStarted).expect("gates start");
+        let _ = apply_event(&repo, pr, sha, &LifecycleEventKind::GatesPassed).expect("gates pass");
+        let _ =
+            apply_event(&repo, pr, sha, &LifecycleEventKind::ReviewsDispatched).expect("dispatch");
+
+        let security_projection = super::verdict_projection::PersistedVerdictProjection {
+            owner_repo: repo.clone(),
+            pr_number: pr,
+            head_sha: sha.to_string(),
+            review_state_type: "security".to_string(),
+            decision: "approve".to_string(),
+            decision_comment_id: 1,
+            decision_author: "ubuntu".to_string(),
+            decision_signature: "deadbeef".to_string(),
+        };
+        super::finalize_projected_verdict(&security_projection, "security", "", None)
+            .expect("security verdict event");
+
+        let quality_projection = super::verdict_projection::PersistedVerdictProjection {
+            owner_repo: repo.clone(),
+            pr_number: pr,
+            head_sha: sha.to_string(),
+            review_state_type: "quality".to_string(),
+            decision: "approve".to_string(),
+            decision_comment_id: 2,
+            decision_author: "ubuntu".to_string(),
+            decision_signature: "deadbeef".to_string(),
+        };
+        let reduced =
+            super::finalize_projected_verdict(&quality_projection, "code-quality", "", None)
+                .expect("quality verdict event");
+        assert_eq!(reduced.pr_state, PrLifecycleState::MergeReady);
+
+        let record = super::load_pr_state_for_readonly(&repo, pr)
+            .expect("load record")
+            .expect("record present");
+        assert_eq!(record.pr_state, PrLifecycleState::MergeReady);
+        assert!(
+            !record
+                .events
+                .iter()
+                .map(|event| event.event.as_str())
+                .any(|event| event == "merge_failed"),
+            "merge must not be attempted during verdict-finalize pre-projection phase"
+        );
+    }
+
+    #[test]
     fn apply_gate_result_events_for_repo_sha_recovers_from_gates_failed() {
         let pr = next_pr();
         let repo = next_repo("gate-retry", pr);
@@ -6214,6 +6289,24 @@ mod tests {
         )
         .expect("merge_failed");
         assert_eq!(stuck.pr_state, PrLifecycleState::Stuck);
+    }
+
+    #[test]
+    fn auto_merge_defers_when_completion_signal_url_is_local_projection_url() {
+        let err = "decision projection for PR #769 sha 32c77765db97329386a1a74801c8a07a877df3ba has invalid remote comment url `local://fac_projection/guardian-intelligence/apm2/pr-769/issue_comments#3932348386`";
+        assert!(super::should_defer_auto_merge_until_projection_replay(err));
+    }
+
+    #[test]
+    fn auto_merge_defers_when_completion_signal_comment_id_is_unresolved() {
+        let err = "decision projection for PR #769 sha 32c77765db97329386a1a74801c8a07a877df3ba is missing remote comment id";
+        assert!(super::should_defer_auto_merge_until_projection_replay(err));
+    }
+
+    #[test]
+    fn auto_merge_does_not_defer_unrelated_merge_binding_errors() {
+        let err = "missing authoritative gates admission snapshot for PR #769 SHA 32c77765db97329386a1a74801c8a07a877df3ba";
+        assert!(!super::should_defer_auto_merge_until_projection_replay(err));
     }
 
     #[test]
