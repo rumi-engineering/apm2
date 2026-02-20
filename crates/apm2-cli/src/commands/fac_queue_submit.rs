@@ -545,11 +545,18 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // TCK-00577 round 6: Mode 0644 (world-readable) so the service-user
-            // worker can read files owned by non-service-user callers. The
-            // broker_requests/ directory already has sticky bit (01733)
-            // preventing callers from deleting each other's files.
-            let _ = file.set_permissions(fs::Permissions::from_mode(0o644));
+            // TCK-00577 round 14: Mode 0600 (owner-only). Writing
+            // world-readable (0644) was a MAJOR finding — any local
+            // principal could read job-spec JSON from broker_requests/
+            // before worker promotion.
+            //
+            // For same-user deployments (submitter == worker), 0600
+            // is sufficient. For cross-user deployments the operator
+            // must configure a shared group or POSIX ACL so the
+            // service-user worker can read. The worker handles EACCES
+            // gracefully: unreadable broker files are quarantined with
+            // a logged warning (fail-closed, not crash).
+            let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
         }
         file.write_all(json.as_bytes())
             .map_err(|err| format!("write: {err}"))?;
@@ -937,6 +944,35 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read broker request");
         let parsed: FacJobSpecV1 = serde_json::from_slice(&bytes).expect("parse broker request");
         assert_eq!(parsed.job_id, "test-broker-001");
+    }
+
+    /// TCK-00577 round 14 regression test: Broker request files MUST be
+    /// created with mode 0600 (owner-only), not 0644 (world-readable).
+    /// This prevents local attackers from reading job-spec JSON
+    /// submitted by other users via the `broker_requests/` directory.
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_via_broker_requests_creates_file_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path().join("queue");
+        let spec = test_job_spec("test-broker-mode-001");
+
+        let result = enqueue_via_broker_requests(&queue_root, &spec);
+        assert!(result.is_ok(), "broker enqueue should succeed: {result:?}");
+
+        let path = result.unwrap();
+        let mode = std::fs::metadata(&path)
+            .expect("broker request file metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode, 0o600,
+            "broker request file must have mode 0600 (owner-only), got {mode:04o}. \
+             Mode 0644 (world-readable) was a MAJOR finding — see TCK-00577 round 14."
+        );
     }
 
     #[test]

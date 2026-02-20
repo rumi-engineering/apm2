@@ -1753,11 +1753,30 @@ fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy)
         let bytes = match read_bounded(&path, apm2_core::fac::job_spec::MAX_JOB_SPEC_SIZE) {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "TCK-00577: quarantining unreadable broker request"
-                );
+                // TCK-00577 round 14: Broker request files are now
+                // written with mode 0600 (owner-only) to prevent
+                // world-readable job specs. In cross-user deployments
+                // (submitter UID != worker UID), the worker may get
+                // EACCES. This is fail-closed: unreadable files are
+                // quarantined, not promoted. The operator must
+                // configure a shared group or POSIX ACL for cross-user
+                // access.
+                if e.contains("Permission denied") {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "TCK-00577: broker request file is not readable by the worker \
+                         (EACCES). In cross-user deployments, configure a shared group \
+                         between the submitter and service user, or use POSIX ACLs. \
+                         Quarantining file (fail-closed)."
+                    );
+                } else {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "TCK-00577: quarantining unreadable broker request"
+                    );
+                }
                 let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
                 continue;
             },
@@ -1806,7 +1825,7 @@ fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBoundsPolicy)
 
         // BLOCKER fix (TCK-00577 round 12): Do NOT rename the attacker-owned
         // inode into pending/. The original file is owned by the non-service-user
-        // submitter with mode 0644, and rename() preserves ownership+mode across
+        // submitter with mode 0600, and rename() preserves ownership+mode across
         // filesystems. This means the submitter retains write authority over the
         // file in pending/ and can mutate it after validation (TOCTOU).
         //
@@ -12334,23 +12353,24 @@ mod tests {
         fs::create_dir_all(&pending_dir).expect("pending dir");
         fs::create_dir_all(&broker_dir).expect("broker dir");
 
-        // Create a broker request file with mode 0644 (simulating non-service-user
-        // ownership — in production the file would be owned by the submitter).
+        // Create a broker request file with mode 0600 (matching the new
+        // submitter mode from TCK-00577 round 14). In same-user tests the
+        // worker can read 0600 files it owns.
         let content = make_valid_broker_request_json("mode-check-job");
         let broker_file = broker_dir.join("mode-check-job.json");
         fs::write(&broker_file, &content).expect("write broker request");
-        fs::set_permissions(&broker_file, fs::Permissions::from_mode(0o644))
-            .expect("set mode 0644 on broker request");
+        fs::set_permissions(&broker_file, fs::Permissions::from_mode(0o600))
+            .expect("set mode 0600 on broker request");
 
-        // Verify pre-condition: broker file has mode 0644.
+        // Verify pre-condition: broker file has mode 0600.
         let pre_mode = fs::metadata(&broker_file)
             .expect("broker file metadata")
             .permissions()
             .mode()
             & 0o7777;
         assert_eq!(
-            pre_mode, 0o644,
-            "pre-condition: broker request must be mode 0644"
+            pre_mode, 0o600,
+            "pre-condition: broker request must be mode 0600"
         );
 
         // Run promotion.

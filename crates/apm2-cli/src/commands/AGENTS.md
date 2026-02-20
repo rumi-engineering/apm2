@@ -812,6 +812,24 @@ systemd service executables:
 - **Collision handling**: Filename collisions with existing pending jobs produce
   a timestamped suffix (same as `move_to_dir_safe`), never clobbering.
 
+### Broker request file permissions (TCK-00577 round 14 MAJOR fix)
+
+- **Mode 0600 (owner-only)**: `enqueue_via_broker_requests` creates broker
+  request temp files with mode 0600, not the previous 0644 (world-readable).
+  This prevents local attackers from reading job-spec JSON (repo IDs,
+  commits, patch metadata) submitted by other users.
+- **Same-user deployments**: Mode 0600 works transparently — the submitter
+  and worker are the same UID.
+- **Cross-user deployments**: The worker may get EACCES when reading
+  broker files owned by a different UID. The worker handles this
+  fail-closed: unreadable files are quarantined with a logged warning
+  (including remediation guidance). The operator must configure a shared
+  group between submitter and service user, or use POSIX ACLs.
+- **Worker EACCES handling**: `promote_broker_requests` distinguishes
+  permission-denied errors from other read failures and emits an
+  actionable warning directing operators to configure shared group
+  access or ACLs.
+
 ### General invariants
 
 - The `broker_requests/` directory uses mode 01733 (sticky + write-only for
