@@ -509,6 +509,9 @@ pub fn run_fac_worker(
         };
 
         // Directories that MUST be owned by the service user in production.
+        // Note: BROKER_REQUESTS_DIR is intentionally excluded — it uses
+        // mode 01733 (world-writable with sticky) so that non-service-user
+        // callers can submit broker requests.
         let service_user_dirs = [
             queue_root.join(PENDING_DIR),
             queue_root.join("claimed"),
@@ -516,6 +519,7 @@ pub fn run_fac_worker(
             queue_root.join("denied"),
             queue_root.join("cancelled"),
             queue_root.join(QUARANTINE_DIR),
+            queue_root.join(CONSUME_RECEIPTS_DIR),
         ];
         // Also validate the receipt store if it exists.
         let receipt_dir = fac_root.join("receipts");
