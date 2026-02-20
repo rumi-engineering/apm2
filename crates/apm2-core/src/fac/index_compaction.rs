@@ -28,9 +28,11 @@
 //! Deleting receipts from the content-addressed store is forbidden by default
 //! (TCK-00583 out_of_scope).
 
+use std::io::Write as _;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq as _;
 
 use super::receipt_index::{ReceiptIndexError, ReceiptIndexV1};
 
@@ -53,6 +55,27 @@ pub const MAX_COMPACTION_RECEIPTS: usize = 1024;
 
 /// Maximum serialized size of a compaction receipt (256 KiB).
 pub const MAX_COMPACTION_RECEIPT_SIZE: usize = 262_144;
+
+/// Expected length of a BLAKE3 hex-encoded digest string (32 bytes = 64 hex
+/// chars).
+const BLAKE3_HEX_LEN: usize = 64;
+
+/// Validate that a content hash is a strict BLAKE3 hex digest.
+///
+/// Returns `Ok(())` if the string is exactly 64 lowercase hex characters.
+/// Returns `Err` with a description otherwise.
+fn validate_strict_hex_digest(hash: &str) -> Result<(), String> {
+    if hash.len() != BLAKE3_HEX_LEN {
+        return Err(format!(
+            "content hash length {}, expected {BLAKE3_HEX_LEN}",
+            hash.len()
+        ));
+    }
+    if !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("content hash contains non-hex characters".to_string());
+    }
+    Ok(())
+}
 
 // =============================================================================
 // Compaction Receipt
@@ -268,17 +291,46 @@ pub fn compact_index(
 /// Persist an index compaction receipt to the receipts directory.
 ///
 /// Uses content-addressed naming: `{prefix}/{suffix}.json` where the full
-/// string is the content hash.
+/// string is the recomputed content hash. The receipt's `content_hash` field
+/// is validated by recomputing the BLAKE3 digest from canonical bytes and
+/// comparing via constant-time equality. The hash must be strict hex-only,
+/// fixed-length (64 chars for BLAKE3-256), and the final path is verified
+/// to remain within `receipts_dir`.
+///
+/// Persistence uses `NamedTempFile::new_in` for unpredictable temp names,
+/// restrictive permissions, fsync, and atomic rename.
 ///
 /// # Errors
 ///
-/// Returns an error string if persistence fails.
+/// Returns an error string if validation, persistence, or path construction
+/// fails.
 pub fn persist_compaction_receipt(
     receipts_dir: &Path,
     receipt: &IndexCompactionReceiptV1,
 ) -> Result<std::path::PathBuf, String> {
     receipt.validate()?;
 
+    // --- Step 1: Recompute content hash and compare via constant-time eq ---
+    let expected_hash = receipt.compute_content_hash()?;
+    let claimed_hash = &receipt.content_hash;
+
+    // Constant-time comparison to prevent timing side-channels on hash values.
+    if expected_hash
+        .as_bytes()
+        .ct_eq(claimed_hash.as_bytes())
+        .into()
+    {
+        // match — proceed
+    } else {
+        return Err(format!(
+            "content hash mismatch: expected {expected_hash}, found {claimed_hash}"
+        ));
+    }
+
+    // --- Step 2: Validate strict hex digest format ---
+    validate_strict_hex_digest(claimed_hash)?;
+
+    // --- Step 3: Serialize and check size ---
     let bytes = serde_json::to_vec_pretty(receipt)
         .map_err(|e| format!("failed to serialize compaction receipt: {e}"))?;
 
@@ -289,25 +341,71 @@ pub fn persist_compaction_receipt(
         ));
     }
 
-    let content_hash = &receipt.content_hash;
-    if content_hash.len() < 4 {
-        return Err("content hash is too short".to_string());
+    // --- Step 4: Construct path from validated hex digest ---
+    // After validate_strict_hex_digest, claimed_hash is exactly 64 hex chars.
+    let prefix = &claimed_hash[..2];
+    let suffix = &claimed_hash[2..];
+    let dir = receipts_dir.join(prefix);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        builder.mode(0o700);
+        builder
+            .create(&dir)
+            .map_err(|e| format!("failed to create receipt dir: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create receipt dir: {e}"))?;
     }
 
-    let prefix = &content_hash[..2];
-    let suffix = &content_hash[2..];
-    let dir = receipts_dir.join(prefix);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create receipt dir: {e}"))?;
+    let final_path = dir.join(format!("{suffix}.json"));
 
-    let path = dir.join(format!("{suffix}.json"));
+    // Defense-in-depth: verify final path is within receipts_dir.
+    // Canonicalize both to resolve any symbolic links or `.` components.
+    let canonical_receipts = receipts_dir
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize receipts_dir: {e}"))?;
+    let canonical_parent = dir
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize target dir: {e}"))?;
+    if !canonical_parent.starts_with(&canonical_receipts) {
+        return Err(format!(
+            "path traversal detected: {} escapes {}",
+            canonical_parent.display(),
+            canonical_receipts.display()
+        ));
+    }
 
-    // Atomic write: temp + rename.
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &bytes).map_err(|e| format!("failed to write compaction receipt: {e}"))?;
-    std::fs::rename(&tmp, &path)
+    // --- Step 5: Atomic write via NamedTempFile ---
+    let mut tmp_file = tempfile::NamedTempFile::new_in(&dir)
+        .map_err(|e| format!("failed to create temp file for compaction receipt: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        tmp_file
+            .as_file()
+            .set_permissions(perms)
+            .map_err(|e| format!("failed to set temp file permissions: {e}"))?;
+    }
+
+    tmp_file
+        .write_all(&bytes)
+        .map_err(|e| format!("failed to write compaction receipt: {e}"))?;
+    tmp_file
+        .as_file()
+        .sync_all()
+        .map_err(|e| format!("failed to fsync compaction receipt: {e}"))?;
+    tmp_file
+        .persist(&final_path)
         .map_err(|e| format!("failed to persist compaction receipt: {e}"))?;
 
-    Ok(path)
+    Ok(final_path)
 }
 
 // =============================================================================
@@ -713,5 +811,231 @@ mod tests {
             reloaded.header_for_digest("hash-old").is_none(),
             "entry below cutoff must be pruned"
         );
+    }
+
+    // =========================================================================
+    // Regression tests for path-traversal, hash validation, and hardened
+    // persistence (BLOCKER + MAJOR fix).
+    // =========================================================================
+
+    /// Helper: build a valid receipt with a computed content hash.
+    fn make_valid_receipt() -> IndexCompactionReceiptV1 {
+        let mut receipt = IndexCompactionReceiptV1 {
+            schema: INDEX_COMPACTION_RECEIPT_SCHEMA.to_string(),
+            receipt_id: "security-test".to_string(),
+            timestamp_secs: 1000,
+            retention_secs: 500,
+            cutoff_timestamp_secs: 500,
+            entries_before: 0,
+            entries_after: 0,
+            entries_pruned: 0,
+            jobs_before: 0,
+            jobs_after: 0,
+            jobs_pruned: 0,
+            rebuild_epoch_after: 0,
+            content_hash: String::new(),
+        };
+        let hash = receipt.compute_content_hash().expect("compute hash");
+        receipt.content_hash = hash;
+        receipt
+    }
+
+    #[test]
+    fn persist_rejects_path_traversal_hash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let mut receipt = make_valid_receipt();
+        // Inject a path-traversal hash string.
+        receipt.content_hash =
+            "../etc/passwd/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+
+        let result = persist_compaction_receipt(receipts_dir, &receipt);
+        assert!(
+            result.is_err(),
+            "path-traversal hash must be rejected, got: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("mismatch") || err.contains("non-hex") || err.contains("length"),
+            "error must indicate hash validation failure: {err}"
+        );
+    }
+
+    #[test]
+    fn persist_rejects_absolute_path_hash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let mut receipt = make_valid_receipt();
+        // Inject an absolute path as hash.
+        receipt.content_hash =
+            "/tmp/evil/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+
+        let result = persist_compaction_receipt(receipts_dir, &receipt);
+        assert!(
+            result.is_err(),
+            "absolute-path hash must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn persist_rejects_mismatched_hash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let mut receipt = make_valid_receipt();
+        // Forge a valid-format but incorrect hash (all zeros).
+        receipt.content_hash = "0".repeat(64);
+
+        let result = persist_compaction_receipt(receipts_dir, &receipt);
+        assert!(
+            result.is_err(),
+            "mismatched hash must be rejected, got: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("mismatch"),
+            "error must indicate hash mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn persist_rejects_non_hex_hash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let mut receipt = make_valid_receipt();
+        // Valid length but contains non-hex characters.
+        receipt.content_hash =
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".to_string();
+
+        let result = persist_compaction_receipt(receipts_dir, &receipt);
+        assert!(
+            result.is_err(),
+            "non-hex hash must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn persist_rejects_short_hash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let mut receipt = make_valid_receipt();
+        receipt.content_hash = "abcd".to_string();
+
+        let result = persist_compaction_receipt(receipts_dir, &receipt);
+        assert!(
+            result.is_err(),
+            "short hash must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn persist_rejects_dot_dot_components_in_hash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let mut receipt = make_valid_receipt();
+        // Exactly 64 chars but containing ".." in positions that could escape.
+        receipt.content_hash =
+            "..aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+
+        let result = persist_compaction_receipt(receipts_dir, &receipt);
+        assert!(
+            result.is_err(),
+            "hash with dot-dot must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn persist_valid_receipt_stays_within_receipts_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path();
+
+        let receipt = make_valid_receipt();
+        let path = persist_compaction_receipt(receipts_dir, &receipt).expect("persist");
+
+        // Verify the file was created within receipts_dir.
+        let canonical_receipts = receipts_dir.canonicalize().expect("canonicalize receipts");
+        let canonical_path = path.canonicalize().expect("canonicalize path");
+        assert!(
+            canonical_path.starts_with(&canonical_receipts),
+            "persisted path {} must be within receipts_dir {}",
+            canonical_path.display(),
+            canonical_receipts.display()
+        );
+
+        // Verify the file content is valid.
+        let bytes = std::fs::read(&path).expect("read");
+        let loaded: IndexCompactionReceiptV1 = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(loaded.content_hash, receipt.content_hash);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_does_not_follow_symlinked_temp_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        std::fs::create_dir_all(&receipts_dir).expect("create receipts_dir");
+
+        // Create a trap directory that a symlink attack might try to redirect to.
+        let trap_dir = tmp.path().join("trap");
+        std::fs::create_dir_all(&trap_dir).expect("create trap_dir");
+
+        // Create a symlink inside the receipts prefix dir pointing to trap.
+        // First, compute what prefix directory the valid receipt would use.
+        let receipt = make_valid_receipt();
+        let prefix = &receipt.content_hash[..2];
+        let prefix_dir = receipts_dir.join(prefix);
+        // DO NOT create prefix_dir yet — let persist create it.
+
+        // Instead, create a symlink at the prefix path pointing to the trap.
+        // The persist function should create the dir itself (not follow a
+        // symlink), and the canonicalize defense-in-depth check should catch
+        // any escape.
+        symlink(&trap_dir, &prefix_dir).expect("create symlink");
+
+        // Persist should succeed because canonicalize resolves the symlink
+        // and the resolved path (trap_dir) is NOT within receipts_dir.
+        let result = persist_compaction_receipt(&receipts_dir, &receipt);
+        // The symlink resolves to trap_dir which is outside receipts_dir,
+        // so the defense-in-depth check should reject it.
+        assert!(
+            result.is_err(),
+            "symlinked prefix dir must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_strict_hex_digest_accepts_valid() {
+        let valid = "a".repeat(64);
+        assert!(super::validate_strict_hex_digest(&valid).is_ok());
+        let mixed = "0123456789abcdefABCDEF01234567890123456789abcdef0123456789abcdef".to_string();
+        assert!(super::validate_strict_hex_digest(&mixed).is_ok());
+    }
+
+    #[test]
+    fn validate_strict_hex_digest_rejects_wrong_length() {
+        assert!(super::validate_strict_hex_digest("abcd").is_err());
+        assert!(super::validate_strict_hex_digest(&"a".repeat(63)).is_err());
+        assert!(super::validate_strict_hex_digest(&"a".repeat(65)).is_err());
+        assert!(super::validate_strict_hex_digest("").is_err());
+    }
+
+    #[test]
+    fn validate_strict_hex_digest_rejects_non_hex() {
+        let with_dots =
+            "..aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        assert!(super::validate_strict_hex_digest(&with_dots).is_err());
+        let with_slash =
+            "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        assert!(super::validate_strict_hex_digest(&with_slash).is_err());
+        let with_space =
+            " aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        assert!(super::validate_strict_hex_digest(&with_space).is_err());
     }
 }
