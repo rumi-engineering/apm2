@@ -3202,3 +3202,103 @@ fn tck_00630_frozen_exists_events_empty_frozen_empty_noop() {
         assert_eq!(stats.rows_migrated, 0);
     }
 }
+
+/// Regression (TCK-00630 R5): frozen snapshot has rows, canonical `events` is
+/// empty, but `ledger_events` has live rows (simulating truncation + rogue
+/// write).  The old code checked `live_legacy_rows` BEFORE `events_rows`
+/// inside the `frozen_exists` branch, allowing re-migration to bypass the
+/// fail-closed `MigrationPartialState` guard.  After the fix, `events_rows`
+/// is checked FIRST — this scenario must always fail closed.
+#[test]
+fn tck_00630_frozen_nonempty_events_empty_live_legacy_nonzero_fails_closed() {
+    let dir = TempDir::new().unwrap();
+    let path = dir
+        .path()
+        .join("frozen_nonempty_events_empty_live_nonzero.db");
+
+    // Step 1: Perform a normal migration of 3 legacy rows.
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 3);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 3);
+        assert!(!stats.already_migrated);
+    }
+
+    // Step 2: Simulate data loss — delete all rows from `events`.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DELETE FROM events").unwrap();
+
+        // Verify preconditions: frozen has rows, events is empty.
+        let frozen_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ledger_events_legacy_frozen",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(frozen_count, 3, "frozen snapshot must have 3 rows");
+        let events_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events_count, 0, "events must be empty after truncation");
+    }
+
+    // Step 3: Simulate rogue write — insert a new row into `ledger_events`.
+    // This is the key differentiator from the existing test: live_legacy > 0.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO ledger_events \
+             (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "EVT-ROGUE-TRUNC",
+                "work_claimed",
+                "work-rogue",
+                "actor-rogue",
+                br#"{"rogue_after_truncation":true}"#,
+                vec![0xCC_u8, 0x01],
+                200_000_000_000_i64,
+            ],
+        )
+        .unwrap();
+
+        // Verify: live legacy has 1 row.
+        let live_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            live_count, 1,
+            "ledger_events must have 1 rogue row for this test"
+        );
+    }
+
+    // Step 4: Migration must fail closed — NOT re-migrate the rogue row.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let result = migrate_legacy_ledger_events(&conn);
+        assert!(
+            matches!(result, Err(LedgerError::MigrationPartialState { .. })),
+            "expected MigrationPartialState for frozen-nonempty + events-empty + \
+             live-legacy-nonzero, got: {result:?}"
+        );
+        // Verify the error message includes diagnostic context.
+        if let Err(LedgerError::MigrationPartialState { message }) = result {
+            assert!(
+                message.contains("data loss"),
+                "error message should mention data loss: {message}"
+            );
+            assert!(
+                message.contains("events_rows=0"),
+                "error message should include events_rows=0 diagnostic: {message}"
+            );
+        }
+    }
+}
