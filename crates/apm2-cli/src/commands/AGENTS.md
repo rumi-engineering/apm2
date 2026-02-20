@@ -713,6 +713,43 @@ systemd service executables:
   `pending/`. For local-only workflows, inline gate fallback handles
   execution without a running worker.
 
+### FIFO poisoning defense (TCK-00577 round 9)
+
+- **Pre-open file type check**: `promote_broker_requests` calls
+  `symlink_metadata()` (lstat) on each entry BEFORE calling `read_bounded`.
+  Non-regular files (FIFOs, sockets, devices, symlinks) are quarantined
+  without ever being opened. This prevents a local attacker with write
+  access to the world-writable `broker_requests/` (mode 01733) from
+  creating a FIFO named `*.json` that would block the worker indefinitely
+  when opened without `O_NONBLOCK`.
+- **Defense-in-depth O_NONBLOCK**: `fac_secure_io::read_bounded` now opens
+  files with `O_NONBLOCK` in addition to `O_NOFOLLOW | O_CLOEXEC`. Even if
+  the pre-open check were bypassed (TOCTOU between lstat and open), the
+  `O_NONBLOCK` flag prevents the `open(2)` syscall from blocking on a FIFO.
+
+### Worker/Broker preflight validation (TCK-00577 round 9)
+
+- **Relaxed validation for Worker and Broker**: `run_fac` now routes
+  `FacSubcommand::Worker` and `FacSubcommand::Broker` through the relaxed
+  permission validator (`validate_fac_root_permissions_relaxed_for_enqueue`)
+  instead of the strict validator. The worker itself sets queue directories
+  to mode 0711 and `broker_requests/` to mode 01733 via `ensure_queue_dirs`.
+  The strict validator (0700-only) rejects these intentional modes, causing
+  worker restart to fail at preflight. The relaxed validator permits
+  execute-only traversal bits while still rejecting read/write group/other.
+
+### Non-service-user chmod avoidance (TCK-00577 round 9)
+
+- **Create-only chmod**: `enqueue_via_broker_requests` now tracks whether
+  directories existed before the call. For newly-created directories, it
+  sets the intended mode (0711 for queue root, 01733 for `broker_requests/`).
+  For pre-existing directories (owned by the service user), it validates the
+  existing mode is acceptable instead of calling `chmod` (which returns
+  EPERM for non-owner callers). This makes the broker fallback work for
+  non-service-user processes in service-user deployments.
+- **Fail-closed on unsafe pre-existing mode**: Pre-existing directories
+  with group/other read bits are rejected with an actionable error message.
+
 ### General invariants
 
 - The `broker_requests/` directory uses mode 01733 (sticky + write-only for
