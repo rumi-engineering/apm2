@@ -1862,6 +1862,9 @@ message OpenWorkRequest {
   // Canonical JSON-encoded WorkSpec (schema: apm2.work_spec.v1).
   // Must pass bounded decode + schema validation before acceptance.
   bytes work_spec_json = 1;
+  // Governing lease ID for PCAC lifecycle enforcement.
+  // Required when PCAC lifecycle gate is wired (fail-closed if empty).
+  string lease_id = 2;
 }
 
 message OpenWorkResponse {

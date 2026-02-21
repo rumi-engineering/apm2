@@ -1228,9 +1228,11 @@ impl OperatorClient {
     pub async fn open_work(
         &mut self,
         work_spec_json: &[u8],
+        lease_id: &str,
     ) -> Result<OpenWorkResponse, ProtocolClientError> {
         let request = OpenWorkRequest {
             work_spec_json: work_spec_json.to_vec(),
+            lease_id: lease_id.to_string(),
         };
         let request_bytes = encode_open_work_request(&request);
 
