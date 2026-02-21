@@ -3907,12 +3907,16 @@ admission pipeline with deterministic inputs. Security domains:
 
 Enforces the receipt store permissions model: a dedicated FAC service user
 owns queue and receipt directories. Non-service-user processes must use
-broker-mediated enqueue or explicit `--unsafe-local-write`.
+broker-mediated enqueue or explicit `--unsafe-local-write` in system-mode.
+In user-mode, the gate is bypassed automatically.
 
 ### Key invariants
 
-- [INV-SU-001] Direct queue/receipt writes denied for non-service-user
-  processes unless `--unsafe-local-write` is active. **Fail-closed.**
+- [INV-SU-001] In `SystemMode`, direct queue/receipt writes are denied for
+  non-service-user processes unless `--unsafe-local-write` is active.
+  **Fail-closed.**
+- [INV-SU-001A] In `UserMode`, `check_queue_write_permission` bypasses
+  service-user resolution and permits direct enqueue semantics.
 - [INV-SU-002] Service user identity resolved from effective uid at
   decision time, not cached.
 - [INV-SU-003] `--unsafe-local-write` is per-invocation, does not persist.

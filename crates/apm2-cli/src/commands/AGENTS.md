@@ -225,12 +225,13 @@ until cleared via `apm2 fac lane reset`.
 |------------|----------|-------------|
 | `apm2 fac bootstrap` | `run_bootstrap()` | One-shot compute-host provisioning for FESv1 |
 
-Five-phase provisioning sequence:
-1. **Directories**: creates `$APM2_HOME/private/fac/**` tree via `create_dir_restricted` (0o700 user-mode, 0o770 system-mode) (CTR-2611)
-2. **Policy**: writes default `FacPolicyV1` (safe no-secrets posture) via `persist_policy()`
-3. **Lanes**: initializes lane pool via `LaneManager::init_lanes()`
-4. **Services** (optional): installs systemd templates from `contrib/systemd/` (`--user` or `--system`)
-5. **Doctor**: runs `collect_doctor_checks()` and gates exit code on result
+Six-phase provisioning sequence:
+1. **Directories**: creates `$APM2_HOME/private/fac/**` and `$APM2_HOME/queue/**` trees via `create_dir_restricted` (CTR-2611)
+2. **System identity** (`--system` only): provisions service-user identity and ownership (`useradd` if needed, queue mode normalization, recursive `chown`, caller group membership via `usermod -aG`)
+3. **Policy**: writes default `FacPolicyV1` (safe no-secrets posture) via `persist_policy()`
+4. **Lanes**: initializes lane pool via `LaneManager::init_lanes()`
+5. **Services** (optional): installs systemd templates from `contrib/systemd/` (`--user` or `--system`)
+6. **Doctor**: runs `collect_doctor_checks()` and gates exit code on result
 
 Flags: `--dry-run` (show planned actions), `--user`/`--system` (systemd install mode), `--json`.
 
@@ -239,8 +240,10 @@ Security invariants:
 - [INV-BOOT-002] Policy files written with 0o600 permissions
 - [INV-BOOT-003] Existing state never destroyed (additive-only)
 - [INV-BOOT-004] Doctor checks gate the exit code (fail-closed)
-- [INV-BOOT-005] Phase 4 (service installation) degrades gracefully when not in a git repository (e.g. binary releases). Missing templates are skipped with a warning, not fatal.
+- [INV-BOOT-005] Phase 5 (service installation) degrades gracefully when not in a git repository (e.g. binary releases). Missing templates are skipped with a warning, not fatal.
 - [INV-BOOT-006] Installs `apm2-worker@.service` template unit alongside non-templated units for parallel lane-specific workers.
+- [INV-BOOT-007] `--system` provisioning is root-only and fails closed when service-user identity or ownership updates cannot be verified.
+- [INV-BOOT-008] Queue runtime modes are normalized during `--system` provisioning (`queue/**` 0711, `broker_requests/` 01733).
 
 ### Work (work.rs)
 
@@ -715,9 +718,12 @@ systemd service executables:
   user identity cannot be confirmed, so no write path (including broker
   fallback) is permitted. This prevents a local user from bypassing the
   service user gate by misconfiguring or removing the service user account.
-- **Dev environment escape hatch**: Callers in dev environments MUST use
-  `--unsafe-local-write` to bypass the service user check. This is the
-  explicit opt-in that tells the system "I know there's no service user."
+- **User-mode automatic bypass (TCK-00657)**: When execution backend resolves
+  to `UserMode`, `check_queue_write_permission` bypasses service-user
+  resolution and permits direct enqueue semantics. This restores local-dev
+  single-principal behavior without requiring `_apm2-job`.
+- **System-mode escape hatch**: In `SystemMode`, callers can still use
+  `--unsafe-local-write` as an explicit opt-in bypass.
 - **NotServiceUser still falls back to broker**: Only `ServiceUserNotResolved`
   is a hard error. `NotServiceUser` (identity IS resolved, caller is not
   that user) correctly routes to broker-mediated enqueue.
@@ -827,10 +833,9 @@ systemd service executables:
   service user is not resolvable OR fchown fails, the function returns an error.
   The previous 0644 fallback was removed in round 17 (it was fail-open because
   job filenames are not opaque UUIDs and can be guessed).
-- **No 0644 fallback**: Dev environments without a service user MUST use
-  `--unsafe-local-write` (which routes through `enqueue_direct`, bypassing the
-  broker path entirely). This is the explicit opt-in for "I know there's no
-  service user."
+- **No 0644 fallback**: In `SystemMode`, environments without a resolvable
+  service user must use `--unsafe-local-write` (routes through `enqueue_direct`)
+  or provision the system user via `apm2 fac bootstrap --system`.
 - **Cross-user deployments**: The worker may get EACCES when reading
   broker files owned by a different UID. The worker handles this
   fail-closed: unreadable files are quarantined with a logged warning

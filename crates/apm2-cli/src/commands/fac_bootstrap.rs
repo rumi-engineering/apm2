@@ -36,7 +36,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use apm2_core::fac::policy::FacPolicyV1;
-use apm2_core::fac::{LaneManager, create_dir_restricted, persist_policy};
+#[cfg(unix)]
+use apm2_core::fac::service_user_gate::resolve_service_user_identity;
+use apm2_core::fac::{LaneManager, SystemModeConfig, create_dir_restricted, persist_policy};
+#[cfg(unix)]
+use nix::fcntl::AtFlags;
+#[cfg(unix)]
+use nix::unistd::{self, Gid, Uid};
 use serde::Serialize;
 
 use crate::exit_codes::codes as exit_codes;
@@ -70,6 +76,18 @@ const FAC_SUBDIRS: &[&str] = &[
     "scheduler",
     "policy",
     "blobs",
+];
+
+/// Queue subdirectories under `$APM2_HOME/queue/`.
+const QUEUE_SUBDIRS: &[&str] = &[
+    "pending",
+    "claimed",
+    "completed",
+    "cancelled",
+    "denied",
+    "quarantine",
+    "authority_consumed",
+    "broker_requests",
 ];
 
 /// Subdirectories under `$APM2_HOME/private/` (above fac).
@@ -163,6 +181,9 @@ pub fn run_bootstrap(args: &BootstrapArgs, operator_socket: &Path, config_path: 
     if args.dry_run {
         // Dry-run: collect planned actions without mutation.
         plan_directories(&apm2_home, &private_dir, &fac_root, &mut actions);
+        if args.system {
+            plan_system_mode_provisioning(&apm2_home, &fac_root, &mut actions);
+        }
         plan_policy(&fac_root, &mut actions);
         plan_lanes(&mut actions);
         if args.user || args.system {
@@ -204,7 +225,14 @@ pub fn run_bootstrap(args: &BootstrapArgs, operator_socket: &Path, config_path: 
         },
     }
 
-    // ── Phase 2: Write default policy ───────────────────────────────────
+    // ── Phase 2: Provision system-mode service user (optional) ──────────
+    if args.system {
+        if let Err(msg) = provision_system_mode_identity(&apm2_home, &fac_root, &mut actions) {
+            return output_error(json_output, "bootstrap_system_identity_error", &msg);
+        }
+    }
+
+    // ── Phase 3: Write default policy ───────────────────────────────────
     let policy_written = match write_default_policy(&fac_root, &mut actions) {
         Ok(written) => written,
         Err(msg) => {
@@ -212,7 +240,7 @@ pub fn run_bootstrap(args: &BootstrapArgs, operator_socket: &Path, config_path: 
         },
     };
 
-    // ── Phase 3: Initialize lanes ───────────────────────────────────────
+    // ── Phase 4: Initialize lanes ───────────────────────────────────────
     let lanes_initialized = match initialize_lanes(&mut actions) {
         Ok(init) => init,
         Err(msg) => {
@@ -220,7 +248,7 @@ pub fn run_bootstrap(args: &BootstrapArgs, operator_socket: &Path, config_path: 
         },
     };
 
-    // ── Phase 4: Install services (optional) ────────────────────────────
+    // ── Phase 5: Install services (optional) ────────────────────────────
     let services_installed = if args.user || args.system {
         match install_services(args.user, &mut actions) {
             Ok(installed) => installed,
@@ -232,7 +260,7 @@ pub fn run_bootstrap(args: &BootstrapArgs, operator_socket: &Path, config_path: 
         false
     };
 
-    // ── Phase 5: Run doctor checks ──────────────────────────────────────
+    // ── Phase 6: Run doctor checks ──────────────────────────────────────
     let (doctor_passed, doctor_checks) =
         run_doctor_checks(operator_socket, config_path, &mut actions);
 
@@ -286,6 +314,24 @@ fn create_directory_tree(
 
     // Create $APM2_HOME/private/fac
     create_dir_idempotent(fac_root, actions, dirs_created, dirs_existing)?;
+
+    // Create $APM2_HOME/queue and standard queue subdirectories.
+    let queue_root = apm2_home.join("queue");
+    create_dir_idempotent(&queue_root, actions, dirs_created, dirs_existing)?;
+    for subdir in QUEUE_SUBDIRS {
+        if actions.len() >= MAX_PLANNED_ACTIONS {
+            return Err(format!(
+                "exceeded maximum planned actions ({MAX_PLANNED_ACTIONS}); \
+                 possible configuration error"
+            ));
+        }
+        create_dir_idempotent(
+            &queue_root.join(subdir),
+            actions,
+            dirs_created,
+            dirs_existing,
+        )?;
+    }
 
     // Create all FAC subdirectories
     for subdir in FAC_SUBDIRS {
@@ -663,6 +709,327 @@ fn install_services(user_mode: bool, actions: &mut Vec<BootstrapAction>) -> Resu
 }
 
 // =============================================================================
+// System-Mode Identity Provisioning
+// =============================================================================
+
+fn plan_system_mode_provisioning(
+    apm2_home: &Path,
+    fac_root: &Path,
+    actions: &mut Vec<BootstrapAction>,
+) {
+    let queue_root = apm2_home.join("queue");
+    actions.push(BootstrapAction {
+        kind: "system_identity",
+        description: "[plan] ensure system service user exists (useradd -r -s nologin -U)"
+            .to_string(),
+        skipped: false,
+    });
+    actions.push(BootstrapAction {
+        kind: "system_identity",
+        description: format!(
+            "[plan] set queue directory modes for system-mode: {} (0711), {}/broker_requests (01733)",
+            queue_root.display(),
+            queue_root.display()
+        ),
+        skipped: false,
+    });
+    actions.push(BootstrapAction {
+        kind: "system_identity",
+        description: format!(
+            "[plan] chown/chgrp FAC runtime roots to service user: {}, {}",
+            fac_root.display(),
+            queue_root.display()
+        ),
+        skipped: false,
+    });
+    actions.push(BootstrapAction {
+        kind: "system_identity",
+        description:
+            "[plan] add invoking user to service group (usermod -aG <service_user> <caller>)"
+                .to_string(),
+        skipped: false,
+    });
+}
+
+#[cfg(unix)]
+fn provision_system_mode_identity(
+    apm2_home: &Path,
+    fac_root: &Path,
+    actions: &mut Vec<BootstrapAction>,
+) -> Result<(), String> {
+    let current_uid = unistd::geteuid().as_raw();
+    if current_uid != 0 {
+        return Err(
+            "system bootstrap requires root privileges. Run with sudo for --system provisioning."
+                .to_string(),
+        );
+    }
+
+    let system_config = SystemModeConfig::from_env()
+        .map_err(|err| format!("invalid system-mode service user configuration: {err}"))?;
+    let service_user = system_config.service_user;
+
+    let created = ensure_system_service_user_exists(&service_user)?;
+    actions.push(BootstrapAction {
+        kind: "system_identity",
+        description: if created {
+            format!("created system service user '{service_user}'")
+        } else {
+            format!("system service user '{service_user}' already exists")
+        },
+        skipped: !created,
+    });
+
+    let queue_root = apm2_home.join("queue");
+    apply_system_queue_modes(&queue_root)?;
+    actions.push(BootstrapAction {
+        kind: "system_identity",
+        description: format!(
+            "applied system-mode queue permissions: {} (0711), {}/broker_requests (01733)",
+            queue_root.display(),
+            queue_root.display()
+        ),
+        skipped: false,
+    });
+
+    let identity = resolve_service_user_identity()
+        .map_err(|err| format!("cannot resolve provisioned service user identity: {err}"))?;
+    let owner_uid = Uid::from_raw(identity.uid);
+    let owner_group = Gid::from_raw(identity.gid);
+
+    chown_tree_no_symlink(fac_root, owner_uid, owner_group)?;
+    actions.push(BootstrapAction {
+        kind: "system_identity",
+        description: format!(
+            "applied recursive ownership {}:{} to {}",
+            identity.name,
+            identity.name,
+            fac_root.display()
+        ),
+        skipped: false,
+    });
+
+    chown_tree_no_symlink(&queue_root, owner_uid, owner_group)?;
+    actions.push(BootstrapAction {
+        kind: "system_identity",
+        description: format!(
+            "applied recursive ownership {}:{} to {}",
+            identity.name,
+            identity.name,
+            queue_root.display()
+        ),
+        skipped: false,
+    });
+
+    match resolve_bootstrap_caller_user() {
+        Some(caller_user) => {
+            let added = ensure_user_in_service_group(&caller_user, &identity.name, owner_group)?;
+            actions.push(BootstrapAction {
+                kind: "system_identity",
+                description: if added {
+                    format!(
+                        "added user '{caller_user}' to group '{}'; re-login may be required",
+                        identity.name
+                    )
+                } else {
+                    format!(
+                        "user '{caller_user}' is already a member of group '{}'",
+                        identity.name
+                    )
+                },
+                skipped: !added,
+            });
+        },
+        None => {
+            actions.push(BootstrapAction {
+                kind: "system_identity",
+                description: "no non-root caller user detected (SUDO_USER/USER); skipped group membership update".to_string(),
+                skipped: true,
+            });
+        },
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn provision_system_mode_identity(
+    _apm2_home: &Path,
+    _fac_root: &Path,
+    _actions: &mut Vec<BootstrapAction>,
+) -> Result<(), String> {
+    Err("system bootstrap provisioning is only supported on Unix hosts".to_string())
+}
+
+#[cfg(unix)]
+fn ensure_system_service_user_exists(service_user: &str) -> Result<bool, String> {
+    if unistd::User::from_name(service_user)
+        .map_err(|err| format!("cannot resolve service user '{service_user}': {err}"))?
+        .is_some()
+    {
+        return Ok(false);
+    }
+
+    let nologin_shell = if Path::new("/usr/sbin/nologin").exists() {
+        "/usr/sbin/nologin"
+    } else {
+        "/usr/bin/nologin"
+    };
+
+    let output = Command::new("useradd")
+        .args(["-r", "-s", nologin_shell, "-U", service_user])
+        .output()
+        .map_err(|err| format!("failed to execute useradd: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "useradd failed for '{service_user}': {}",
+            stderr.trim()
+        ));
+    }
+
+    let created = unistd::User::from_name(service_user)
+        .map_err(|err| format!("cannot verify service user '{service_user}': {err}"))?;
+    if created.is_none() {
+        return Err(format!(
+            "service user '{service_user}' still unresolved after useradd"
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn apply_system_queue_modes(queue_root: &Path) -> Result<(), String> {
+    ensure_directory_with_mode(queue_root, 0o711)?;
+    for subdir in QUEUE_SUBDIRS {
+        let mode = if *subdir == "broker_requests" {
+            0o1733
+        } else {
+            0o711
+        };
+        ensure_directory_with_mode(&queue_root.join(subdir), mode)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_directory_with_mode(path: &Path, mode: u32) -> Result<(), String> {
+    if !path.exists() {
+        fs::create_dir_all(path)
+            .map_err(|err| format!("cannot create directory {}: {err}", path.display()))?;
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("cannot read metadata for {}: {err}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to operate on symlink directory path: {}",
+            path.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!(
+            "path exists but is not a directory: {}",
+            path.display()
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|err| format!("cannot set mode {:04o} on {}: {err}", mode, path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn chown_tree_no_symlink(path: &Path, uid: Uid, gid: Gid) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let cwd_fd = fs::File::open(".")
+        .map_err(|err| format!("cannot open current directory for fchownat: {err}"))?;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|err| format!("cannot stat {}: {err}", current.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "refusing recursive ownership update on symlink path: {}",
+                current.display()
+            ));
+        }
+        unistd::fchownat(
+            &cwd_fd,
+            current.as_path(),
+            Some(uid),
+            Some(gid),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .map_err(|err| format!("fchownat failed for {}: {err}", current.display()))?;
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&current)
+                .map_err(|err| format!("cannot read directory {}: {err}", current.display()))?
+            {
+                let entry = entry.map_err(|err| {
+                    format!(
+                        "cannot read directory entry under {}: {err}",
+                        current.display()
+                    )
+                })?;
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn resolve_bootstrap_caller_user() -> Option<String> {
+    for var in ["SUDO_USER", "USER"] {
+        let Ok(value) = std::env::var(var) else {
+            continue;
+        };
+        let trimmed = value.trim();
+        if trimmed.is_empty() || trimmed == "root" {
+            continue;
+        }
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+#[cfg(unix)]
+fn ensure_user_in_service_group(
+    caller_user: &str,
+    service_group: &str,
+    service_gid: Gid,
+) -> Result<bool, String> {
+    let caller = unistd::User::from_name(caller_user)
+        .map_err(|err| format!("cannot resolve caller user '{caller_user}': {err}"))?
+        .ok_or_else(|| format!("caller user '{caller_user}' not found"))?;
+
+    let group = unistd::Group::from_name(service_group)
+        .map_err(|err| format!("cannot resolve service group '{service_group}': {err}"))?
+        .ok_or_else(|| format!("service group '{service_group}' not found"))?;
+
+    let already_member =
+        caller.gid == service_gid || group.mem.iter().any(|member| member == caller_user);
+    if already_member {
+        return Ok(false);
+    }
+
+    let output = Command::new("usermod")
+        .args(["-aG", service_group, caller_user])
+        .output()
+        .map_err(|err| format!("failed to execute usermod: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "usermod failed while adding '{caller_user}' to '{service_group}': {}",
+            stderr.trim()
+        ));
+    }
+
+    Ok(true)
+}
+
+// =============================================================================
 // Doctor Integration
 // =============================================================================
 
@@ -741,6 +1108,10 @@ fn plan_directories(
 
     plan_dir(apm2_home, actions);
     plan_dir(private_dir, actions);
+    plan_dir(&apm2_home.join("queue"), actions);
+    for subdir in QUEUE_SUBDIRS {
+        plan_dir(&apm2_home.join("queue").join(subdir), actions);
+    }
 
     for subdir in PRIVATE_SUBDIRS {
         plan_dir(&private_dir.join(subdir), actions);
@@ -970,9 +1341,22 @@ mod tests {
     }
 
     #[test]
+    fn test_queue_subdirs_has_required_entries() {
+        assert!(QUEUE_SUBDIRS.contains(&"pending"));
+        assert!(QUEUE_SUBDIRS.contains(&"claimed"));
+        assert!(QUEUE_SUBDIRS.contains(&"completed"));
+        assert!(QUEUE_SUBDIRS.contains(&"cancelled"));
+        assert!(QUEUE_SUBDIRS.contains(&"denied"));
+        assert!(QUEUE_SUBDIRS.contains(&"quarantine"));
+        assert!(QUEUE_SUBDIRS.contains(&"authority_consumed"));
+        assert!(QUEUE_SUBDIRS.contains(&"broker_requests"));
+    }
+
+    #[test]
     fn test_max_planned_actions_is_reasonable() {
-        // FAC_SUBDIRS + PRIVATE_SUBDIRS + fixed dirs + policy + lanes + doctor < MAX.
-        let total = FAC_SUBDIRS.len() + PRIVATE_SUBDIRS.len() + 10; // apm2_home, private, fac, etc.
+        // FAC_SUBDIRS + QUEUE_SUBDIRS + PRIVATE_SUBDIRS + fixed dirs + policy + lanes +
+        // doctor < MAX.
+        let total = FAC_SUBDIRS.len() + QUEUE_SUBDIRS.len() + PRIVATE_SUBDIRS.len() + 12; // apm2_home, private, queue root, fac, etc.
         assert!(
             total < MAX_PLANNED_ACTIONS,
             "total planned directories ({total}) must be less than MAX_PLANNED_ACTIONS ({MAX_PLANNED_ACTIONS})"
