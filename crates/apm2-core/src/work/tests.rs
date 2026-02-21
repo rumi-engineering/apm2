@@ -707,19 +707,21 @@ fn test_work_completed_rejects_bare_string_in_merge_receipt_id() {
 }
 
 #[test]
-fn test_work_completed_rejects_case_variant_merge_receipt_prefix() {
+fn test_work_completed_accepts_case_variant_merge_receipt_prefix() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
     setup_review_work(&mut reducer, &ctx, "work-1");
 
-    // Case-variant prefix (MERGE-RECEIPT-) must be rejected — prefix is
-    // case-sensitive.
+    // Case-variant prefix (MERGE-RECEIPT-) is accepted — the domain
+    // separation check normalizes to ASCII lowercase before the
+    // starts_with comparison, so all case variants of "merge-receipt-"
+    // are valid merge receipt identifiers.
     let complete_payload = helpers::work_completed_payload(
         "work-1",
         vec![10, 20, 30],
         vec!["EVID-001".to_string()],
-        "",
+        "gate-receipt-quality-001",
         "MERGE-RECEIPT-abc123",
     );
     let result = reducer.apply(
@@ -727,40 +729,70 @@ fn test_work_completed_rejects_case_variant_merge_receipt_prefix() {
         &ctx,
     );
     assert!(
-        matches!(result, Err(WorkError::InvalidMergeReceiptId { .. })),
-        "expected InvalidMergeReceiptId for case-variant prefix, got: {result:?}"
+        result.is_ok(),
+        "expected case-variant MERGE-RECEIPT- prefix to be accepted, got: {result:?}"
     );
 }
 
 #[test]
 fn test_work_completed_rejects_case_variant_gate_receipt_cross_injection() {
-    let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    setup_review_work(&mut reducer, &ctx, "work-1");
+    // Part A: Case-variant merge receipt prefix in gate_receipt_id field
+    // must be rejected — the domain separation check normalizes to ASCII
+    // lowercase so "MERGE-RECEIPT-", "Merge-Receipt-", etc. are all caught.
+    let case_variants_gate = [
+        "MERGE-RECEIPT-abc123",
+        "Merge-Receipt-abc123",
+        "MERGE-receipt-abc123",
+        "Merge-RECEIPT-abc123",
+    ];
+    for variant in &case_variants_gate {
+        let mut reducer = WorkReducer::new();
+        setup_review_work(&mut reducer, &ctx, "work-1");
+        let payload = helpers::work_completed_payload(
+            "work-1",
+            vec![10, 20, 30],
+            vec!["EVID-001".to_string()],
+            variant, // case-variant in gate_receipt_id
+            "",
+        );
+        let result = reducer.apply(&create_event("work.completed", "session-1", payload), &ctx);
+        assert!(
+            matches!(
+                result,
+                Err(WorkError::MergeReceiptInGateReceiptField { .. })
+            ),
+            "expected MergeReceiptInGateReceiptField for gate_receipt_id \
+             case-variant '{variant}', got: {result:?}"
+        );
+    }
 
-    // Case-variant merge receipt in gate_receipt_id (MERGE-receipt-) would
-    // bypass a naive starts_with check.  The current check is lowercase
-    // "merge-receipt-" and this variant does NOT match, so it would pass
-    // the gate_receipt_id check.  However, it also should NOT be accepted
-    // in merge_receipt_id because it doesn't have the exact prefix.
-    //
-    // This test verifies that BOTH fields reject mismatched case.
-    let complete_payload = helpers::work_completed_payload(
-        "work-1",
-        vec![10, 20, 30],
-        vec!["EVID-001".to_string()],
-        "",
-        "Merge-Receipt-abc123", // wrong case
-    );
-    let result = reducer.apply(
-        &create_event("work.completed", "session-1", complete_payload),
-        &ctx,
-    );
-    assert!(
-        matches!(result, Err(WorkError::InvalidMergeReceiptId { .. })),
-        "expected InvalidMergeReceiptId for mixed-case prefix, got: {result:?}"
-    );
+    // Part B: Case-variant merge receipt prefix in merge_receipt_id field
+    // is now accepted because the check normalizes to lowercase — all
+    // case variants of "merge-receipt-" are valid merge receipt prefixes.
+    let case_variants_merge = [
+        "MERGE-RECEIPT-abc123",
+        "Merge-Receipt-abc123",
+        "Merge-RECEIPT-abc123",
+    ];
+    for variant in &case_variants_merge {
+        let mut reducer = WorkReducer::new();
+        setup_review_work(&mut reducer, &ctx, "work-1");
+        let payload = helpers::work_completed_payload(
+            "work-1",
+            vec![10, 20, 30],
+            vec!["EVID-001".to_string()],
+            "gate-receipt-quality-001",
+            variant, // case-variant in merge_receipt_id — should pass now
+        );
+        let result = reducer.apply(&create_event("work.completed", "session-1", payload), &ctx);
+        assert!(
+            result.is_ok(),
+            "expected case-insensitive merge_receipt_id '{variant}' to be \
+             accepted, got: {result:?}"
+        );
+    }
 }
 
 #[test]

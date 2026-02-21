@@ -347,17 +347,24 @@ impl WorkReducer {
         // --- Domain separation: gate_receipt_id vs merge_receipt_id ---
         //
         // INV-0113 (fail-closed): gate_receipt_id MUST NOT contain a merge
-        // receipt identifier.  Any value starting with "merge-receipt-" is
-        // rejected.
+        // receipt identifier.  Any value whose ASCII-lowercase form starts
+        // with "merge-receipt-" is rejected.  Case-insensitive comparison
+        // prevents bypass via case-variant prefixes (e.g. "MERGE-RECEIPT-",
+        // "Merge-Receipt-").
         //
         // INV-0114 (positive allowlist): merge_receipt_id, when non-empty,
-        // MUST start with "merge-receipt-".  This prevents gate receipt
-        // identifiers from being injected into the merge field.
+        // MUST start with "merge-receipt-" (case-insensitive).  This
+        // prevents gate receipt identifiers from being injected into the
+        // merge field.
         //
         // Together these two checks enforce bidirectional domain separation
         // at the reducer boundary.
 
-        if event.gate_receipt_id.starts_with("merge-receipt-") {
+        if event
+            .gate_receipt_id
+            .to_ascii_lowercase()
+            .starts_with("merge-receipt-")
+        {
             return Err(WorkError::MergeReceiptInGateReceiptField {
                 work_id: work_id.clone(),
                 value: event.gate_receipt_id,
@@ -365,7 +372,10 @@ impl WorkReducer {
         }
 
         if !event.merge_receipt_id.is_empty()
-            && !event.merge_receipt_id.starts_with("merge-receipt-")
+            && !event
+                .merge_receipt_id
+                .to_ascii_lowercase()
+                .starts_with("merge-receipt-")
         {
             return Err(WorkError::InvalidMergeReceiptId {
                 work_id: work_id.clone(),
