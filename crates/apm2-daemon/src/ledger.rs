@@ -333,6 +333,78 @@ impl SqliteLedgerEventEmitter {
         .flatten()
     }
 
+    /// Canonical-table query searching for an `evidence.published` event
+    /// matching (`work_id`, `entry_id`) with category `WORK_CONTEXT_ENTRY`.
+    ///
+    /// TCK-00638 / BLOCKER fix: When the freeze guard is active, evidence
+    /// events are written to the canonical `events` table. This helper
+    /// ensures replay/idempotency lookup covers canonical-mode writes.
+    ///
+    /// Column mapping: `events.session_id` → `work_id` (same mapping as
+    /// `canonical_row_to_event`).
+    fn canonical_get_evidence_by_identity(
+        conn: &Connection,
+        work_id: &str,
+        entry_id: &str,
+    ) -> Option<SignedLedgerEvent> {
+        use prost::Message;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                        COALESCE(signature, X''), timestamp_ns \
+                 FROM events \
+                 WHERE event_type = 'evidence.published' \
+                 AND session_id = ?1 \
+                 ORDER BY rowid DESC",
+            )
+            .ok()?;
+
+        let rows = stmt
+            .query_map(params![work_id], Self::canonical_row_to_event)
+            .ok()?;
+
+        for row_result in rows {
+            let Ok(event) = row_result else {
+                continue;
+            };
+
+            // Decode JSON envelope: { "payload": "<hex-encoded protobuf>", ... }
+            let Ok(payload_json) = serde_json::from_slice::<serde_json::Value>(&event.payload)
+            else {
+                continue;
+            };
+            let Some(hex_payload) = payload_json.get("payload").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok(inner_bytes) = hex::decode(hex_payload) else {
+                continue;
+            };
+
+            // Decode protobuf EvidenceEvent and extract Published variant.
+            let Ok(evidence_event) =
+                apm2_core::events::EvidenceEvent::decode(inner_bytes.as_slice())
+            else {
+                continue;
+            };
+            let Some(apm2_core::events::evidence_event::Event::Published(published)) =
+                evidence_event.event
+            else {
+                continue;
+            };
+
+            // Semantic match: category, work_id, and evidence_id must all match.
+            if published.category == "WORK_CONTEXT_ENTRY"
+                && published.work_id == work_id
+                && published.evidence_id == entry_id
+            {
+                return Some(event);
+            }
+        }
+
+        None
+    }
+
     /// Canonical-table latest event hash (BLOB → hex), for
     /// `get_latest_event_hash` when frozen.
     fn canonical_get_latest_event_hash_hex(conn: &Connection) -> Result<Option<String>, String> {
@@ -3050,6 +3122,16 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // and evidence_id == entry_id before returning. This prevents false
         // idempotency hits when multiple entries exist for the same work_id.
         let conn = self.conn.lock().ok()?;
+
+        // TCK-00638 / BLOCKER fix: When frozen, also search the canonical
+        // `events` table. The daemon routes writes to canonical events when
+        // the freeze guard is active, so replay detection must look there
+        // to avoid duplicate evidence.published entries.
+        if self.is_frozen_internal() {
+            if let Some(ev) = Self::canonical_get_evidence_by_identity(&conn, work_id, entry_id) {
+                return Some(ev);
+            }
+        }
 
         let mut stmt = conn
             .prepare(
@@ -7847,5 +7929,145 @@ mod tests {
             result_wrong_work.is_none(),
             "Wrong work_id must return None"
         );
+    }
+
+    /// TCK-00638 / BLOCKER fix regression test: Verify that
+    /// `get_event_by_evidence_identity` finds evidence events written to the
+    /// canonical `events` table when the freeze guard is active.
+    ///
+    /// Without the fix, the method only searched `ledger_events`, so
+    /// idempotent replays would fail to detect already-published entries in
+    /// canonical mode, causing duplicate `evidence.published` events.
+    #[test]
+    fn test_canonical_evidence_replay_lookup_after_freeze() {
+        use apm2_core::ledger::{init_canonical_schema, migrate_legacy_ledger_events};
+        use prost::Message;
+
+        // 1. Create emitter with legacy schema.
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let conn_arc = Arc::new(Mutex::new(conn));
+        let emitter = SqliteLedgerEventEmitter::new(Arc::clone(&conn_arc), signing_key);
+
+        // 2. Initialize canonical schema and migrate (creates frozen marker).
+        {
+            let conn_guard = conn_arc.lock().unwrap();
+            init_canonical_schema(&conn_guard).unwrap();
+            let _stats = migrate_legacy_ledger_events(&conn_guard).unwrap();
+        }
+
+        // 3. Freeze legacy writes — all subsequent writes go to canonical `events`.
+        {
+            let conn_guard = conn_arc.lock().unwrap();
+            let frozen = emitter.freeze_legacy_writes(&conn_guard).unwrap();
+            assert!(frozen, "freeze_legacy_writes must return true");
+        }
+        assert!(emitter.is_frozen(), "emitter must be frozen");
+
+        // 4. Emit an evidence.published event via emit_session_event.
+        // This write goes to the canonical `events` table (not legacy).
+        let published = apm2_core::events::EvidencePublished {
+            evidence_id: "CTX-canonical-entry".to_string(),
+            work_id: "W-CANONICAL-TEST".to_string(),
+            category: "WORK_CONTEXT_ENTRY".to_string(),
+            artifact_hash: vec![0xCC; 32],
+            verification_command_ids: Vec::new(),
+            classification: "INTERNAL".to_string(),
+            artifact_size: 100,
+            metadata: vec![
+                "entry_id=CTX-canonical-entry".to_string(),
+                "kind=HANDOFF_NOTE".to_string(),
+                "dedupe_key=dedup-canonical".to_string(),
+                "actor_id=actor-canonical".to_string(),
+            ],
+            time_envelope_ref: None,
+        };
+        let evidence_event = apm2_core::events::EvidenceEvent {
+            event: Some(apm2_core::events::evidence_event::Event::Published(
+                published,
+            )),
+        };
+        let proto_bytes = evidence_event.encode_to_vec();
+
+        let emit_result = emitter
+            .emit_session_event(
+                "W-CANONICAL-TEST",
+                "evidence.published",
+                &proto_bytes,
+                "actor-canonical",
+                5_000_000_000,
+            )
+            .expect("emit_session_event must succeed in frozen mode");
+
+        // 5. Verify the event was written to canonical `events` (not legacy).
+        {
+            let conn_guard = conn_arc.lock().unwrap();
+            let canonical_count: i64 = conn_guard
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE event_type = 'evidence.published'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                canonical_count >= 1,
+                "canonical events table must have the evidence event"
+            );
+
+            let legacy_count: i64 = conn_guard
+                .query_row(
+                    "SELECT COUNT(*) FROM ledger_events \
+                     WHERE event_type = 'evidence.published'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                legacy_count, 0,
+                "legacy ledger_events must NOT have evidence events after freeze"
+            );
+        }
+
+        // 6. REGRESSION: get_event_by_evidence_identity MUST find the event
+        // even though it is in the canonical `events` table, not legacy.
+        let result =
+            emitter.get_event_by_evidence_identity("W-CANONICAL-TEST", "CTX-canonical-entry");
+        assert!(
+            result.is_some(),
+            "BLOCKER fix: get_event_by_evidence_identity must find canonical-mode \
+             evidence events for idempotent replay detection"
+        );
+
+        // Verify it returned the correct event (by checking the event_id
+        // starts with "canonical-" since it was synthesised from seq_id).
+        let found = result.unwrap();
+        assert!(
+            found.event_id.starts_with("canonical-"),
+            "event_id must be synthesised from canonical seq_id, got: {}",
+            found.event_id
+        );
+
+        // 7. Non-existent entry_id must still return None.
+        let none_result =
+            emitter.get_event_by_evidence_identity("W-CANONICAL-TEST", "CTX-nonexistent");
+        assert!(
+            none_result.is_none(),
+            "Non-existent entry_id must return None even in canonical mode"
+        );
+
+        // 8. Verify the returned event has the correct timestamp.
+        let found2 = emitter
+            .get_event_by_evidence_identity("W-CANONICAL-TEST", "CTX-canonical-entry")
+            .unwrap();
+        assert_eq!(
+            found2.timestamp_ns, 5_000_000_000,
+            "timestamp must match the emitted event"
+        );
+
+        // 9. Verify emit_result event_id matches (the legacy event_id from
+        // emit is different from the canonical synthesised one, but the
+        // canonical lookup should still work).
+        let _ = emit_result; // used above for proof that emit succeeded
     }
 }

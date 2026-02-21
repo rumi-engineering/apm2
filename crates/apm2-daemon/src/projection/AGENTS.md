@@ -197,7 +197,15 @@ Maps `changeset_digest` to `work_id` to PR metadata for projection routing. Also
 
 ### `LedgerTailer`
 
-Ledger event tailer that drives projection decisions.
+Ledger event tailer that drives projection decisions. Uses a composite cursor `(timestamp_ns, event_id)` for deterministic ordering and at-least-once delivery semantics.
+
+**Freeze-aware canonical reads (TCK-00638):** When the canonical `events` table exists (freeze mode active), `poll_events` and `poll_events_async` merge results from both `ledger_events` (legacy) and `events` (canonical) tables, sorted by `(timestamp_ns, event_id)` and truncated to the batch limit. Canonical events use synthesised `event_id` = `"canonical-{seq_id}"` and map `session_id` to `work_id`. Canonical mode is lazily detected via `sqlite_master` probe and cached in an `AtomicU8` (0=unknown, 1=legacy-only, 2=canonical-active).
+
+**Invariants:**
+
+- [INV-LT01] Canonical mode detection is cached after first probe -- no repeated `sqlite_master` queries per poll cycle.
+- [INV-LT02] Merged results are always sorted by `(timestamp_ns, event_id)` for deterministic cursor advancement.
+- [INV-LT03] When no canonical `events` table exists, the tailer operates in legacy-only mode with no error.
 
 ### `IntentBuffer` (TCK-00504)
 

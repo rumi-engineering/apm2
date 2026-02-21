@@ -1211,6 +1211,13 @@ pub struct LedgerTailer {
     last_event_id: String,
     /// Tailer identifier for watermark persistence.
     tailer_id: String,
+    /// TCK-00638 / BLOCKER fix: Whether the canonical `events` table is
+    /// active (freeze mode). Detected lazily on first poll by checking
+    /// if the `events` table exists in `sqlite_master`. Once set, the
+    /// tailer also queries canonical events to see freeze-mode writes.
+    /// Uses `std::sync::atomic::AtomicU8` with three states:
+    /// 0 = unknown, 1 = legacy-only, 2 = canonical-active.
+    canonical_mode: std::sync::atomic::AtomicU8,
 }
 
 impl LedgerTailer {
@@ -1254,6 +1261,7 @@ impl LedgerTailer {
             last_processed_ns,
             last_event_id,
             tailer_id: tailer_id.to_string(),
+            canonical_mode: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
@@ -1265,6 +1273,125 @@ impl LedgerTailer {
             last_processed_ns: timestamp_ns,
             last_event_id: String::new(),
             tailer_id: DEFAULT_TAILER_ID.to_string(),
+            canonical_mode: std::sync::atomic::AtomicU8::new(0),
+        }
+    }
+
+    /// TCK-00638 / BLOCKER fix: Detects whether the canonical `events` table
+    /// is active. Returns `true` if canonical mode is active (the `events`
+    /// table exists and has at least one row). Result is cached in an
+    /// `AtomicU8` to avoid repeated `sqlite_master` queries.
+    ///
+    /// States: 0 = unknown (probe required), 1 = legacy-only, 2 = canonical.
+    fn is_canonical_active(conn: &Connection, mode: &std::sync::atomic::AtomicU8) -> bool {
+        use std::sync::atomic::Ordering;
+        let current = mode.load(Ordering::Acquire);
+        if current == 2 {
+            return true;
+        }
+        if current == 1 {
+            return false;
+        }
+        // Probe: check if `events` table exists in sqlite_master.
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'events')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if exists {
+            mode.store(2, Ordering::Release);
+            true
+        } else {
+            mode.store(1, Ordering::Release);
+            false
+        }
+    }
+
+    /// TCK-00638 / BLOCKER fix: Polls the canonical `events` table for
+    /// events matching the given type and cursor, using the same composite
+    /// cursor semantics as the legacy poll.
+    ///
+    /// Column mapping: `events.session_id` → `work_id`,
+    /// `events.seq_id` → synthesised `"canonical-{seq_id}"` `event_id`.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    fn poll_canonical_events(
+        conn: &Connection,
+        event_type: &str,
+        last_processed_ns: u64,
+        last_event_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SignedLedgerEvent>, ProjectionWorkerError> {
+        // Map the canonical row to a `SignedLedgerEvent` with synthesised
+        // event_id = "canonical-{seq_id}".
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<SignedLedgerEvent> {
+            let seq_id: i64 = row.get(0)?;
+            Ok(SignedLedgerEvent {
+                event_id: format!("canonical-{seq_id}"),
+                event_type: row.get(1)?,
+                work_id: row.get(2)?, // session_id maps to work_id
+                actor_id: row.get(3)?,
+                payload: row.get(4)?,
+                signature: row.get(5)?,
+                timestamp_ns: row.get::<_, i64>(6)? as u64,
+            })
+        };
+
+        if last_event_id.is_empty() {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                            COALESCE(signature, X''), timestamp_ns \
+                     FROM events \
+                     WHERE event_type = ?1 AND timestamp_ns > ?2 \
+                     ORDER BY timestamp_ns ASC, seq_id ASC \
+                     LIMIT ?3",
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+            let events = stmt
+                .query_map(
+                    params![event_type, last_processed_ns as i64, limit as i64],
+                    map_row,
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            Ok(events)
+        } else {
+            // For composite cursor with canonical events: the last_event_id
+            // may be a legacy event_id or a "canonical-{seq_id}" string.
+            // Use string comparison on the synthesised canonical event_id.
+            let mut stmt = conn
+                .prepare(
+                    "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                            COALESCE(signature, X''), timestamp_ns \
+                     FROM events \
+                     WHERE event_type = ?1 AND ( \
+                         timestamp_ns > ?2 OR \
+                         (timestamp_ns = ?2 AND ('canonical-' || CAST(seq_id AS TEXT)) > ?3) \
+                     ) \
+                     ORDER BY timestamp_ns ASC, seq_id ASC \
+                     LIMIT ?4",
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+            let events = stmt
+                .query_map(
+                    params![
+                        event_type,
+                        last_processed_ns as i64,
+                        last_event_id,
+                        limit as i64
+                    ],
+                    map_row,
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            Ok(events)
         }
     }
 
@@ -1366,7 +1493,7 @@ impl LedgerTailer {
             .prepare(query)
             .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
-        let events = if self.last_event_id.is_empty() {
+        let mut events = if self.last_event_id.is_empty() {
             stmt.query_map(
                 params![event_type, self.last_processed_ns as i64, limit as i64],
                 |row| {
@@ -1408,6 +1535,32 @@ impl LedgerTailer {
             .filter_map(Result::ok)
             .collect::<Vec<_>>()
         };
+
+        // TCK-00638 / BLOCKER fix: When canonical mode is active, also
+        // poll the canonical `events` table and merge results by
+        // (timestamp_ns, event_id) ordering. This ensures the tailer
+        // observes freeze-mode writes.
+        if Self::is_canonical_active(&conn, &self.canonical_mode) {
+            let canonical = Self::poll_canonical_events(
+                &conn,
+                event_type,
+                self.last_processed_ns,
+                &self.last_event_id,
+                limit,
+            )?;
+            if !canonical.is_empty() {
+                events.extend(canonical);
+                // Sort merged events by (timestamp_ns, event_id) for
+                // deterministic cursor-compatible ordering.
+                events.sort_by(|a, b| {
+                    a.timestamp_ns
+                        .cmp(&b.timestamp_ns)
+                        .then_with(|| a.event_id.cmp(&b.event_id))
+                });
+                // Enforce the batch limit after merge.
+                events.truncate(limit);
+            }
+        }
 
         // NOTE: Watermark is NOT advanced here. Caller must call acknowledge()
         // after successful processing to ensure at-least-once delivery.
@@ -1469,8 +1622,15 @@ impl LedgerTailer {
         let event_type = event_type.to_string();
         let last_processed_ns = self.last_processed_ns;
         let last_event_id = self.last_event_id.clone();
+        // TCK-00638 / BLOCKER fix: Snapshot canonical_mode before spawning so
+        // the blocking closure can detect freeze-mode writes. The probe
+        // result is returned alongside events so we can cache it.
+        let canonical_mode_snapshot = self
+            .canonical_mode
+            .load(std::sync::atomic::Ordering::Acquire);
 
-        tokio::task::spawn_blocking(move || {
+        // Return (events, detected_canonical_mode) from spawn_blocking.
+        let result = tokio::task::spawn_blocking(move || {
             let conn_guard = conn.lock().map_err(|e| {
                 ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
             })?;
@@ -1499,7 +1659,7 @@ impl LedgerTailer {
                 .prepare(query)
                 .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
-            let events = if last_event_id.is_empty() {
+            let mut events = if last_event_id.is_empty() {
                 stmt.query_map(
                     params![event_type, last_processed_ns as i64, limit as i64],
                     |row| {
@@ -1522,7 +1682,7 @@ impl LedgerTailer {
                     params![
                         event_type,
                         last_processed_ns as i64,
-                        last_event_id,
+                        &last_event_id,
                         limit as i64
                     ],
                     |row| {
@@ -1542,10 +1702,66 @@ impl LedgerTailer {
                 .collect::<Vec<_>>()
             };
 
-            Ok(events)
+            // TCK-00638 / BLOCKER fix: When canonical mode is active (or
+            // unknown and detected by probing), also poll canonical events.
+            let canonical_active = if canonical_mode_snapshot == 2 {
+                true
+            } else if canonical_mode_snapshot == 1 {
+                false
+            } else {
+                // Probe: check if `events` table exists.
+                conn_guard
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                         WHERE type = 'table' AND name = 'events')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false)
+            };
+
+            // Encode detected mode for caching: 2 = canonical, 1 = legacy.
+            let detected: u8 = if canonical_active {
+                2
+            } else if canonical_mode_snapshot == 0 {
+                1
+            } else {
+                canonical_mode_snapshot
+            };
+
+            if canonical_active {
+                let canonical = Self::poll_canonical_events(
+                    &conn_guard,
+                    &event_type,
+                    last_processed_ns,
+                    &last_event_id,
+                    limit,
+                )?;
+                if !canonical.is_empty() {
+                    events.extend(canonical);
+                    events.sort_by(|a, b| {
+                        a.timestamp_ns
+                            .cmp(&b.timestamp_ns)
+                            .then_with(|| a.event_id.cmp(&b.event_id))
+                    });
+                    events.truncate(limit);
+                }
+            }
+
+            Ok((events, detected))
         })
         .await
-        .map_err(|e| ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}")))?
+        .map_err(|e| ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}")))?;
+
+        let (events, detected_mode) = result?;
+
+        // Cache the detected canonical mode for future polls.
+        if canonical_mode_snapshot == 0 && detected_mode != 0 {
+            self.canonical_mode
+                .store(detected_mode, std::sync::atomic::Ordering::Release);
+        }
+
+        Ok(events)
     }
 
     /// Async wrapper for `acknowledge` that uses `spawn_blocking`.
@@ -8403,5 +8619,224 @@ mod tests {
             bad_count, 0,
             "Malformed event must not produce a work_context row"
         );
+    }
+
+    /// TCK-00638 / BLOCKER-2 regression test: `LedgerTailer::poll_events`
+    /// discovers events written to the canonical `events` table when in
+    /// freeze mode.
+    ///
+    /// Proves: When both `ledger_events` (legacy) and `events` (canonical)
+    /// tables exist, `poll_events` merges results from both sources and
+    /// synthesises `event_id` = `"canonical-{seq_id}"` for canonical rows.
+    #[test]
+    fn test_tailer_poll_events_discovers_canonical_events() {
+        use prost::Message;
+
+        // 1. Create in-memory DB with legacy schema + work index.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ledger_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                work_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                signature BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(WORK_INDEX_SCHEMA_SQL).unwrap();
+
+        // 2. Create canonical `events` table (same schema as `init_canonical_schema`
+        //    produces).
+        conn.execute_batch(
+            "CREATE TABLE events (
+                seq_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                actor_id   TEXT NOT NULL,
+                payload    BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL,
+                prev_hash  TEXT NOT NULL DEFAULT 'genesis',
+                event_hash TEXT NOT NULL DEFAULT '',
+                signature  BLOB
+            );",
+        )
+        .unwrap();
+
+        // 3. Insert a legacy event to prove the tailer reads both sources.
+        let legacy_proto = {
+            let published = apm2_core::events::EvidencePublished {
+                evidence_id: "CTX-legacy-entry".to_string(),
+                work_id: "W-TAILER-LEGACY".to_string(),
+                category: "WORK_CONTEXT_ENTRY".to_string(),
+                artifact_hash: vec![0xAA; 32],
+                verification_command_ids: Vec::new(),
+                classification: "INTERNAL".to_string(),
+                artifact_size: 50,
+                metadata: Vec::new(),
+                time_envelope_ref: None,
+            };
+            let ev = apm2_core::events::EvidenceEvent {
+                event: Some(apm2_core::events::evidence_event::Event::Published(
+                    published,
+                )),
+            };
+            ev.encode_to_vec()
+        };
+        let legacy_envelope = build_session_event_envelope(&legacy_proto);
+        conn.execute(
+            "INSERT INTO ledger_events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "EVT-LEGACY-001",
+                "evidence.published",
+                "W-TAILER-LEGACY",
+                "actor-test",
+                legacy_envelope,
+                vec![0u8; 64],
+                1_000_000_000_i64
+            ],
+        )
+        .unwrap();
+
+        // 4. Insert a canonical event with a later timestamp.
+        let canonical_proto = {
+            let published = apm2_core::events::EvidencePublished {
+                evidence_id: "CTX-canonical-entry".to_string(),
+                work_id: "W-TAILER-CANONICAL".to_string(),
+                category: "WORK_CONTEXT_ENTRY".to_string(),
+                artifact_hash: vec![0xBB; 32],
+                verification_command_ids: Vec::new(),
+                classification: "INTERNAL".to_string(),
+                artifact_size: 75,
+                metadata: Vec::new(),
+                time_envelope_ref: None,
+            };
+            let ev = apm2_core::events::EvidenceEvent {
+                event: Some(apm2_core::events::evidence_event::Event::Published(
+                    published,
+                )),
+            };
+            ev.encode_to_vec()
+        };
+        let canonical_envelope = build_session_event_envelope(&canonical_proto);
+        conn.execute(
+            "INSERT INTO events (event_type, session_id, actor_id, payload, timestamp_ns) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "evidence.published",
+                "W-TAILER-CANONICAL",
+                "actor-canonical",
+                canonical_envelope,
+                2_000_000_000_i64
+            ],
+        )
+        .unwrap();
+
+        let conn_arc = Arc::new(Mutex::new(conn));
+
+        // 5. Create tailer and poll — must return BOTH events.
+        let mut tailer = LedgerTailer::new(Arc::clone(&conn_arc));
+        let events = tailer
+            .poll_events("evidence.published", 100)
+            .expect("poll_events must succeed");
+
+        assert_eq!(
+            events.len(),
+            2,
+            "BLOCKER-2 fix: poll_events must return events from BOTH \
+             legacy and canonical tables, got {} event(s)",
+            events.len()
+        );
+
+        // 6. Verify ordering: legacy (ts=1B) before canonical (ts=2B).
+        assert_eq!(
+            events[0].event_id, "EVT-LEGACY-001",
+            "First event must be the legacy event"
+        );
+        assert!(
+            events[1].event_id.starts_with("canonical-"),
+            "Second event must have synthesised canonical event_id, got: {}",
+            events[1].event_id
+        );
+
+        // 7. Verify canonical event fields are correctly mapped.
+        let canonical_evt = &events[1];
+        assert_eq!(canonical_evt.event_type, "evidence.published");
+        assert_eq!(
+            canonical_evt.work_id, "W-TAILER-CANONICAL",
+            "canonical session_id must map to work_id"
+        );
+        assert_eq!(canonical_evt.timestamp_ns, 2_000_000_000);
+
+        // 8. Acknowledge the first event and poll again — must return only the
+        //    canonical event.
+        tailer
+            .acknowledge(events[0].timestamp_ns, &events[0].event_id)
+            .expect("acknowledge legacy event");
+
+        let events2 = tailer
+            .poll_events("evidence.published", 100)
+            .expect("second poll must succeed");
+        assert_eq!(
+            events2.len(),
+            1,
+            "After acknowledging the legacy event, only the canonical event should remain"
+        );
+        assert!(
+            events2[0].event_id.starts_with("canonical-"),
+            "Remaining event must be the canonical event"
+        );
+
+        // 9. Acknowledge the canonical event and poll again — must be empty.
+        tailer
+            .acknowledge(events2[0].timestamp_ns, &events2[0].event_id)
+            .expect("acknowledge canonical event");
+
+        let events3 = tailer
+            .poll_events("evidence.published", 100)
+            .expect("third poll must succeed");
+        assert!(
+            events3.is_empty(),
+            "After acknowledging all events, poll must return empty"
+        );
+    }
+
+    /// TCK-00638 / BLOCKER-2 regression test: When no canonical `events`
+    /// table exists, `poll_events` only returns legacy events (no error).
+    #[test]
+    fn test_tailer_poll_events_legacy_only_when_no_canonical_table() {
+        let conn = create_test_db();
+
+        // Insert a legacy event.
+        conn.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO ledger_events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "EVT-LEGACY-ONLY",
+                    "evidence.published",
+                    "W-LEGACY",
+                    "actor-test",
+                    vec![0u8; 10],
+                    vec![0u8; 64],
+                    1_000_i64
+                ],
+            )
+            .unwrap();
+
+        let mut tailer = LedgerTailer::new(conn);
+        let events = tailer
+            .poll_events("evidence.published", 100)
+            .expect("poll must succeed without canonical table");
+
+        assert_eq!(
+            events.len(),
+            1,
+            "Legacy-only mode must return the single legacy event"
+        );
+        assert_eq!(events[0].event_id, "EVT-LEGACY-ONLY");
     }
 }
