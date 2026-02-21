@@ -2401,7 +2401,25 @@ impl ProjectionWorker {
                         .acknowledge_async(event.timestamp_ns, &event.event_id)
                         .await?;
                 },
+                Err(ProjectionWorkerError::InvalidPayload(ref msg)) => {
+                    // InvalidPayload is permanently unrecoverable: the event
+                    // payload is structurally malformed and will never succeed
+                    // on retry. Acknowledge (skip) the event to prevent
+                    // head-of-line blocking that would pin the tailer and
+                    // block all subsequent evidence.published events.
+                    warn!(
+                        event_id = %event.event_id,
+                        error = %msg,
+                        "Defect: permanently malformed evidence.published event \
+                         - acknowledging to prevent head-of-line blocking"
+                    );
+                    self.evidence_published_tailer
+                        .acknowledge_async(event.timestamp_ns, &event.event_id)
+                        .await?;
+                },
                 Err(e) => {
+                    // Transient errors (database, lock contention) may
+                    // succeed on retry. Break and re-poll on next cycle.
                     warn!(
                         event_id = %event.event_id,
                         error = %e,
@@ -8261,6 +8279,129 @@ mod tests {
         assert!(
             result.is_err(),
             "Raw protobuf payload (without JSON envelope) must be rejected"
+        );
+    }
+
+    /// Security regression: a permanently malformed evidence.published event
+    /// must NOT cause head-of-line blocking. The tailer must acknowledge
+    /// (skip) the defective event and continue processing subsequent valid
+    /// events.
+    ///
+    /// Scenario: insert a malformed event (raw protobuf, no JSON envelope),
+    /// followed by a valid `WORK_CONTEXT_ENTRY` event. After one poll cycle,
+    /// the malformed event is acknowledged and the valid event is indexed.
+    #[test]
+    fn test_process_evidence_published_skips_malformed_no_head_of_line_block() {
+        use prost::Message;
+
+        let conn = create_test_db();
+        let mut worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
+
+        // Event 1: malformed — raw protobuf without JSON envelope wrapper.
+        let published_bad = apm2_core::events::EvidencePublished {
+            evidence_id: "CTX-bad".to_string(),
+            work_id: "W-HOL-TEST".to_string(),
+            category: "WORK_CONTEXT_ENTRY".to_string(),
+            artifact_hash: vec![0xFF; 32],
+            verification_command_ids: Vec::new(),
+            classification: "INTERNAL".to_string(),
+            artifact_size: 42,
+            metadata: vec![
+                "entry_id=CTX-bad".to_string(),
+                "kind=HANDOFF_NOTE".to_string(),
+                "dedupe_key=bad-key".to_string(),
+                "actor_id=actor-bad".to_string(),
+            ],
+            time_envelope_ref: None,
+        };
+        let bad_event = apm2_core::events::EvidenceEvent {
+            event: Some(apm2_core::events::evidence_event::Event::Published(
+                published_bad,
+            )),
+        };
+        // Insert as raw protobuf (NOT wrapped in JSON envelope) — this is
+        // permanently malformed and will cause InvalidPayload on decode.
+        let raw_protobuf = bad_event.encode_to_vec();
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO ledger_events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "EVT-BAD-001",
+                    "evidence.published",
+                    "W-HOL-TEST",
+                    "actor-bad",
+                    raw_protobuf,
+                    vec![0u8; 64],
+                    11_000_000_000i64
+                ],
+            )
+            .expect("insert malformed event");
+
+        // Event 2: valid WORK_CONTEXT_ENTRY with correct JSON envelope.
+        let published_good = apm2_core::events::EvidencePublished {
+            evidence_id: "CTX-good".to_string(),
+            work_id: "W-HOL-TEST".to_string(),
+            category: "WORK_CONTEXT_ENTRY".to_string(),
+            artifact_hash: vec![0xAA; 32],
+            verification_command_ids: Vec::new(),
+            classification: "INTERNAL".to_string(),
+            artifact_size: 99,
+            metadata: vec![
+                "entry_id=CTX-good".to_string(),
+                "kind=DIAGNOSIS".to_string(),
+                "dedupe_key=good-key".to_string(),
+                "actor_id=actor-good".to_string(),
+            ],
+            time_envelope_ref: None,
+        };
+        let good_event = apm2_core::events::EvidenceEvent {
+            event: Some(apm2_core::events::evidence_event::Event::Published(
+                published_good,
+            )),
+        };
+        insert_evidence_published_event(
+            &conn,
+            "EVT-GOOD-001",
+            "W-HOL-TEST",
+            &good_event.encode_to_vec(),
+            12_000_000_000,
+        );
+
+        // Poll cycle 1: should acknowledge the malformed event (skip) and
+        // process the valid event. No head-of-line blocking.
+        run_evidence_published_poll_once(&mut worker)
+            .expect("process_evidence_published should not fail on malformed payload");
+
+        // If there was head-of-line blocking, we might need a second poll.
+        // Run a second poll to prove forward progress completes.
+        run_evidence_published_poll_once(&mut worker).expect("second poll should also succeed");
+
+        // Verify: the valid event was indexed.
+        let guard = conn.lock().unwrap();
+        let (stored_kind, stored_dedupe): (String, String) = guard
+            .query_row(
+                "SELECT kind, dedupe_key FROM work_context \
+                 WHERE work_id = ?1 AND entry_id = ?2",
+                params!["W-HOL-TEST", "CTX-good"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("valid WORK_CONTEXT_ENTRY must be indexed despite preceding malformed event");
+        assert_eq!(stored_kind, "DIAGNOSIS");
+        assert_eq!(stored_dedupe, "good-key");
+
+        // Verify: the malformed event did NOT produce a projection row.
+        let bad_count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM work_context WHERE entry_id = ?1",
+                params!["CTX-bad"],
+                |row| row.get(0),
+            )
+            .expect("count query should succeed");
+        assert_eq!(
+            bad_count, 0,
+            "Malformed event must not produce a work_context row"
         );
     }
 }

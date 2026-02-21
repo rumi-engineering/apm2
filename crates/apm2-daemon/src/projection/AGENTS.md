@@ -56,6 +56,7 @@ Long-running worker that tails ledger and projects review results to GitHub.
 - [INV-PJ12] Events without economics selectors are DENIED with `missing_economics_selectors` subcategory — no bypass path exists (TCK-00505).
 - [INV-PJ13] Already-projected intents (same `work_id + changeset_digest`) result in DENY via IntentBuffer uniqueness -- idempotent-insert replay prevention (TCK-00505).
 - [INV-PJ14] No projection side effect executes unless lifecycle gate `join -> revalidate -> consume` succeeds (TCK-00505).
+- [INV-PJ15] Permanently malformed `evidence.published` events (InvalidPayload) are acknowledged and skipped to prevent head-of-line blocking; transient errors retry on next poll cycle (TCK-00638 R4 fix).
 
 **Contracts:**
 
