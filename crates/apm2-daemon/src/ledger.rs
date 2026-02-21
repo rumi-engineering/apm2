@@ -625,6 +625,29 @@ impl SqliteLedgerEventEmitter {
              WHERE event_type = 'changeset_published'",
             [],
         )?;
+        // SECURITY (TCK-00635 — OpenWork Idempotency Constraint):
+        //
+        // Enforce at-most-once semantics for `work.opened` events at the
+        // database level. The `handle_open_work` handler uses a
+        // check-then-act pattern: `get_first_event_by_work_id_and_type`
+        // queries for an existing `work.opened` event before emitting.
+        // Under concurrent dispatch (`&self`, not `&mut self`), two racing
+        // requests can both observe no existing event and both commit,
+        // creating duplicate `work.opened` events for the same `work_id`.
+        //
+        // This partial unique index converts the pattern into
+        // defense-in-depth: the application-level check provides the
+        // idempotent fast-path, while the database constraint provides
+        // the authoritative uniqueness guarantee that cannot be bypassed
+        // by race conditions. The handler catches UNIQUE violations and
+        // re-reads the persisted event to return idempotent success (same
+        // hash) or WORK_ALREADY_EXISTS (different hash).
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_opened_unique \
+             ON ledger_events(work_id) \
+             WHERE event_type = 'work.opened'",
+            [],
+        )?;
         if migration_changes_applied {
             warn!(
                 "ledger startup migrations mutated rows; rebuilding hash-chain links and invalidating stored checkpoint metadata before full verification"

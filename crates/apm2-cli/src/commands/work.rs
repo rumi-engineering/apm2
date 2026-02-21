@@ -427,7 +427,19 @@ fn run_open(args: &OpenArgs, socket_path: &Path, json_output: bool) -> u8 {
     // so that a replaced-after-stat file or special file (/dev/zero) cannot
     // bypass the size limit.
     let ticket_path = Path::new(&args.from_ticket);
-    let file = match std::fs::File::open(ticket_path) {
+    // Defense-in-depth: open with O_NOFOLLOW to atomically refuse symlinks
+    // at the kernel level, preventing TOCTOU symlink-swap attacks.
+    let open_result = {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        options.open(ticket_path)
+    };
+    let file = match open_result {
         Ok(f) => f,
         Err(e) => {
             let (code, msg) = if e.kind() == std::io::ErrorKind::NotFound {
