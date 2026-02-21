@@ -193,13 +193,13 @@ Maps `changeset_digest` to `work_id` to PR metadata for projection routing. Also
 **Tables:**
 
 - `changeset_map`, `pr_metadata` -- projection routing tables
-- `work_context` -- work context entries projected from `evidence.published` events (TCK-00638). Primary key `(work_id, entry_id)`, unique constraint on `(work_id, kind, dedupe_key)`, indexed by `work_id` and `created_at_ns`.
+- `work_context` -- work context entries projected from `evidence.published` events (TCK-00638). Primary key `(work_id, entry_id)`, unique constraint on `(work_id, kind, dedupe_key)`, indexed by `work_id` and `created_at_ns`. Included in `evict_expired` / `evict_expired_async` TTL-based eviction using `created_at_ns` (nanoseconds) with seconds-to-nanoseconds conversion (BLOCKER fix: unbounded state growth).
 
 ### `LedgerTailer`
 
 Ledger event tailer that drives projection decisions. Uses a composite cursor `(timestamp_ns, event_id)` for deterministic ordering and at-least-once delivery semantics.
 
-**Freeze-aware canonical reads (TCK-00638):** When the canonical `events` table exists (freeze mode active), `poll_events` and `poll_events_async` merge results from both `ledger_events` (legacy) and `events` (canonical) tables, sorted by `(timestamp_ns, event_id)` and truncated to the batch limit. Canonical events use synthesised `event_id` = `"canonical-{seq_id}"` and map `session_id` to `work_id`. Canonical mode is lazily detected via `sqlite_master` probe and cached in an `AtomicU8` (0=unknown, 1=legacy-only, 2=canonical-active).
+**Freeze-aware canonical reads (TCK-00638):** When the canonical `events` table exists (freeze mode active), `poll_events` and `poll_events_async` merge results from both `ledger_events` (legacy) and `events` (canonical) tables, sorted by `(timestamp_ns, event_id)` and truncated to the batch limit. Canonical events use synthesised `event_id` = `"canonical-{seq_id:020}"` (20-digit zero-padded) and map `session_id` to `work_id`. Canonical mode is lazily detected via `sqlite_master` probe and cached in an `AtomicU8` (0=unknown, 1=legacy-only, 2=canonical-active). The zero-padded format ensures lexicographic ordering matches numeric `seq_id` ordering, preventing cursor skip when >9 canonical events share the same timestamp (MAJOR fix: timestamp collision cursor skip).
 
 **Invariants:**
 

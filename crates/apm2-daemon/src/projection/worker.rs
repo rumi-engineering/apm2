@@ -1014,6 +1014,18 @@ impl WorkIndex {
             )
             .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
+        // BLOCKER FIX: Evict expired work_context entries.
+        // The `created_at_ns` column uses nanoseconds, so convert the
+        // seconds-based cutoff to nanoseconds before comparison.
+        #[allow(clippy::cast_possible_wrap)]
+        let cutoff_ns = (now.saturating_sub(ttl_secs) as i64).saturating_mul(1_000_000_000);
+        total_deleted += conn
+            .execute(
+                "DELETE FROM work_context WHERE created_at_ns < ?1",
+                params![cutoff_ns],
+            )
+            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
         if total_deleted > 0 {
             info!(
                 deleted = total_deleted,
@@ -1080,6 +1092,18 @@ impl WorkIndex {
                 .execute(
                     "DELETE FROM work_pr_index WHERE created_at < ?1",
                     params![cutoff],
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+            // BLOCKER FIX: Evict expired work_context entries.
+            // The `created_at_ns` column uses nanoseconds, so convert the
+            // seconds-based cutoff to nanoseconds before comparison.
+            #[allow(clippy::cast_possible_wrap)]
+            let cutoff_ns = cutoff.saturating_mul(1_000_000_000);
+            total_deleted += conn_guard
+                .execute(
+                    "DELETE FROM work_context WHERE created_at_ns < ?1",
+                    params![cutoff_ns],
                 )
                 .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
@@ -1315,7 +1339,17 @@ impl LedgerTailer {
     /// cursor semantics as the legacy poll.
     ///
     /// Column mapping: `events.session_id` → `work_id`,
-    /// `events.seq_id` → synthesised `"canonical-{seq_id}"` `event_id`.
+    /// `events.seq_id` → synthesised `"canonical-{seq_id:020}"` `event_id`.
+    ///
+    /// ## Cursor correctness (MAJOR fix: timestamp collision cursor skip)
+    ///
+    /// The synthesised `event_id` uses a **20-digit zero-padded** `seq_id`
+    /// (e.g. `canonical-00000000000000000042`) so that lexicographic ordering
+    /// matches the underlying numeric `seq_id ASC` ordering. Without zero-
+    /// padding, `"canonical-10"` would sort **before** `"canonical-9"` in
+    /// string comparison, causing the cursor to skip rows with `seq_id >= 10`
+    /// when a same-timestamp batch page boundary falls between single-digit
+    /// and multi-digit `seq_id` values.
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     fn poll_canonical_events(
         conn: &Connection,
@@ -1325,11 +1359,12 @@ impl LedgerTailer {
         limit: usize,
     ) -> Result<Vec<SignedLedgerEvent>, ProjectionWorkerError> {
         // Map the canonical row to a `SignedLedgerEvent` with synthesised
-        // event_id = "canonical-{seq_id}".
+        // event_id = "canonical-{seq_id:020}" (zero-padded for
+        // lexicographic == numeric ordering).
         let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<SignedLedgerEvent> {
             let seq_id: i64 = row.get(0)?;
             Ok(SignedLedgerEvent {
-                event_id: format!("canonical-{seq_id}"),
+                event_id: format!("canonical-{seq_id:020}"),
                 event_type: row.get(1)?,
                 work_id: row.get(2)?, // session_id maps to work_id
                 actor_id: row.get(3)?,
@@ -1362,8 +1397,14 @@ impl LedgerTailer {
             Ok(events)
         } else {
             // For composite cursor with canonical events: the last_event_id
-            // may be a legacy event_id or a "canonical-{seq_id}" string.
-            // Use string comparison on the synthesised canonical event_id.
+            // may be a legacy event_id or a "canonical-{seq_id:020}" string.
+            //
+            // MAJOR FIX (cursor skip under timestamp collision):
+            // Use zero-padded synthesised canonical event_id in SQL so
+            // string `>` comparison matches numeric `seq_id ASC` ordering.
+            // The SQL pads `seq_id` with `SUBSTR('00000000000000000000', 1,
+            // 20 - LENGTH(CAST(seq_id AS TEXT)))` to produce a 20-char
+            // zero-padded number, then prefixes `'canonical-'`.
             let mut stmt = conn
                 .prepare(
                     "SELECT seq_id, event_type, session_id, actor_id, payload, \
@@ -1371,7 +1412,9 @@ impl LedgerTailer {
                      FROM events \
                      WHERE event_type = ?1 AND ( \
                          timestamp_ns > ?2 OR \
-                         (timestamp_ns = ?2 AND ('canonical-' || CAST(seq_id AS TEXT)) > ?3) \
+                         (timestamp_ns = ?2 AND \
+                          ('canonical-' || SUBSTR('00000000000000000000', 1, \
+                              20 - LENGTH(CAST(seq_id AS TEXT))) || CAST(seq_id AS TEXT)) > ?3) \
                      ) \
                      ORDER BY timestamp_ns ASC, seq_id ASC \
                      LIMIT ?4",
@@ -8838,5 +8881,229 @@ mod tests {
             "Legacy-only mode must return the single legacy event"
         );
         assert_eq!(events[0].event_id, "EVT-LEGACY-ONLY");
+    }
+
+    // =========================================================================
+    // TCK-00638 fix regression tests:
+    //   1. Canonical cursor skip under timestamp collisions (>9 events)
+    //   2. work_context eviction in evict_expired / evict_expired_async
+    // =========================================================================
+
+    /// MAJOR [Security] regression test: canonical tailer cursor must not
+    /// skip events when >9 canonical rows share the same timestamp and a
+    /// batch limit forces pagination.
+    ///
+    /// Before the fix, `"canonical-10"` sorted lexicographically BEFORE
+    /// `"canonical-9"`, causing the cursor to advance past unprocessed rows
+    /// with `seq_id >= 10`. The zero-padded `event_id` format
+    /// (`"canonical-{seq_id:020}"`) eliminates the ordering mismatch.
+    #[test]
+    fn test_canonical_cursor_no_skip_above_9_events_same_timestamp() {
+        // Setup: in-memory DB with both legacy + canonical tables.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ledger_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                work_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                signature BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(WORK_INDEX_SCHEMA_SQL).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (
+                seq_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                actor_id   TEXT NOT NULL,
+                payload    BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL,
+                prev_hash  TEXT NOT NULL DEFAULT 'genesis',
+                event_hash TEXT NOT NULL DEFAULT '',
+                signature  BLOB
+            );",
+        )
+        .unwrap();
+
+        // Insert 15 canonical events ALL sharing the same timestamp.
+        let same_ts: i64 = 5_000_000_000;
+        for i in 1..=15 {
+            conn.execute(
+                "INSERT INTO events (event_type, session_id, actor_id, payload, timestamp_ns) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "evidence.published",
+                    format!("W-CURSOR-{i}"),
+                    "actor-test",
+                    vec![0u8; 10],
+                    same_ts
+                ],
+            )
+            .unwrap();
+        }
+
+        let conn_arc = Arc::new(Mutex::new(conn));
+        let mut tailer = LedgerTailer::new(Arc::clone(&conn_arc));
+
+        // Poll with batch_size = 5 (forces 3 pagination rounds).
+        let batch1 = tailer
+            .poll_events("evidence.published", 5)
+            .expect("first poll must succeed");
+        assert_eq!(batch1.len(), 5, "First batch must return exactly 5 events");
+
+        // Acknowledge all events in batch 1.
+        for ev in &batch1 {
+            tailer
+                .acknowledge(ev.timestamp_ns, &ev.event_id)
+                .expect("acknowledge must succeed");
+        }
+
+        // Poll again — should return the NEXT 5 events (seq_id 6..10).
+        let batch2 = tailer
+            .poll_events("evidence.published", 5)
+            .expect("second poll must succeed");
+        assert_eq!(
+            batch2.len(),
+            5,
+            "Second batch must return exactly 5 events (seq_id 6..10), \
+             got {}: cursor must not skip events with seq_id >= 10",
+            batch2.len()
+        );
+
+        // Acknowledge batch 2.
+        for ev in &batch2 {
+            tailer
+                .acknowledge(ev.timestamp_ns, &ev.event_id)
+                .expect("acknowledge must succeed");
+        }
+
+        // Poll again — should return remaining 5 events (seq_id 11..15).
+        let batch3 = tailer
+            .poll_events("evidence.published", 5)
+            .expect("third poll must succeed");
+        assert_eq!(
+            batch3.len(),
+            5,
+            "Third batch must return exactly 5 events (seq_id 11..15), \
+             got {}: zero-padded cursor must not skip high seq_ids",
+            batch3.len()
+        );
+
+        // Acknowledge batch 3.
+        for ev in &batch3 {
+            tailer
+                .acknowledge(ev.timestamp_ns, &ev.event_id)
+                .expect("acknowledge must succeed");
+        }
+
+        // Final poll — must be empty (all 15 events consumed).
+        let batch4 = tailer
+            .poll_events("evidence.published", 5)
+            .expect("fourth poll must succeed");
+        assert_eq!(
+            batch4.len(),
+            0,
+            "All 15 events must have been consumed; remaining = {}",
+            batch4.len()
+        );
+
+        // Verify the zero-padded event_id format is consistent.
+        assert!(
+            batch1[0]
+                .event_id
+                .starts_with("canonical-0000000000000000000"),
+            "event_id must be zero-padded, got: {}",
+            batch1[0].event_id
+        );
+    }
+
+    /// BLOCKER [Code-quality] regression test: `evict_expired` must
+    /// delete expired rows from the `work_context` table using the
+    /// nanosecond `created_at_ns` column.
+    #[test]
+    fn test_evict_expired_includes_work_context_table() {
+        let conn = create_test_db();
+        let index = WorkIndex::new(Arc::clone(&conn)).unwrap();
+
+        // Insert an old work_context entry (created_at_ns = 0, i.e. epoch).
+        index
+            .register_work_context_entry(
+                "W-OLD",
+                "CTX-old-entry",
+                "DIAGNOSIS",
+                "dedup-old",
+                "actor-old",
+                "hash-old",
+                "CTX-old-entry",
+                0, // nanoseconds: epoch => very old
+            )
+            .expect("register old entry");
+
+        // Insert a fresh work_context entry with a recent timestamp.
+        // Use a timestamp well in the future (year ~2040 in ns).
+        let recent_ns: u64 = 2_200_000_000_000_000_000;
+        index
+            .register_work_context_entry(
+                "W-NEW",
+                "CTX-new-entry",
+                "DIAGNOSIS",
+                "dedup-new",
+                "actor-new",
+                "hash-new",
+                "CTX-new-entry",
+                recent_ns,
+            )
+            .expect("register new entry");
+
+        // Verify both rows exist before eviction.
+        {
+            let guard = conn.lock().unwrap();
+            let count: i64 = guard
+                .query_row("SELECT COUNT(*) FROM work_context", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 2, "Both entries must exist before eviction");
+        }
+
+        // Evict with 1-second TTL — the old entry (created_at_ns = 0)
+        // should be deleted, the recent entry should survive.
+        let deleted = index.evict_expired(1).unwrap();
+        assert!(
+            deleted >= 1,
+            "evict_expired must delete at least 1 entry (the old work_context row)"
+        );
+
+        // Verify: old entry is gone.
+        {
+            let guard = conn.lock().unwrap();
+            let old_count: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM work_context WHERE entry_id = ?1",
+                    params!["CTX-old-entry"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(old_count, 0, "Old work_context entry must be evicted");
+        }
+
+        // Verify: new entry survives.
+        {
+            let guard = conn.lock().unwrap();
+            let new_count: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM work_context WHERE entry_id = ?1",
+                    params!["CTX-new-entry"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                new_count, 1,
+                "Recent work_context entry must survive eviction"
+            );
+        }
     }
 }
