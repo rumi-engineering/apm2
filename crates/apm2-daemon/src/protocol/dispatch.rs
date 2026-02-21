@@ -29952,12 +29952,12 @@ mod tests {
             }
         }
 
-        /// MAJOR regression: `effect_intent_digest` must bind to canonical bytes
-        /// (post daemon-authoritative field overwrite), NOT to the raw client
-        /// `entry_json`. Validates RFC-0027 Law 2 (Intent Equality) by verifying
-        /// the PCAC intent digest in the emitted evidence metadata matches the
-        /// expected value computed from the canonical (daemon-overwritten)
-        /// entry.
+        /// MAJOR regression: `effect_intent_digest` must bind to canonical
+        /// bytes (post daemon-authoritative field overwrite), NOT to
+        /// the raw client `entry_json`. Validates RFC-0027 Law 2
+        /// (Intent Equality) by verifying the PCAC intent digest in the
+        /// emitted evidence metadata matches the expected value
+        /// computed from the canonical (daemon-overwritten) entry.
         #[test]
         fn test_publish_work_context_entry_intent_digest_binds_canonical_bytes() {
             use prost::Message;
