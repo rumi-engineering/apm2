@@ -713,8 +713,10 @@ pub fn reconcile_on_startup(
 ///
 /// INV-RECON-006: Stale lease recovery transitions through CLEANUP → IDLE.
 ///
-/// Active-job tracking includes only lanes whose lease identity is
-/// `AliveMatch`, preventing false positives from PID-exists-only checks.
+/// Active-job tracking includes lanes with `AliveMatch` identity and, for
+/// orphan suppression only, lock-held lanes with `Unknown` identity. This
+/// avoids requeueing/failing active claimed jobs when identity evidence is
+/// temporarily unverifiable.
 #[allow(clippy::too_many_lines)] // lane reconciliation with corrupt-marker persistence is inherently branchy
 fn reconcile_lanes(
     manager: &LaneManager,
@@ -888,10 +890,48 @@ fn reconcile_lanes(
                 });
             },
             LaneState::Running | LaneState::Leased | LaneState::Cleanup => {
-                if let (Some(job_id), Some(ProcessIdentity::AliveMatch)) =
-                    (status.job_id.as_ref(), lease_identity)
+                let unknown_identity_with_live_job = status.lock_held
+                    && status.job_id.is_some()
+                    && matches!(lease_identity, Some(ProcessIdentity::Unknown));
+                if let Some(job_id) = status.job_id.as_ref()
+                    && (matches!(lease_identity, Some(ProcessIdentity::AliveMatch))
+                        || unknown_identity_with_live_job)
                 {
+                    // Preserve orphan suppression for lock-held active lanes even
+                    // when identity is unknown. Queue phase then keeps claimed jobs
+                    // as StillActive rather than requeue/fail.
                     active_job_ids.insert(job_id.clone());
+                }
+
+                if unknown_identity_with_live_job {
+                    // Fail-closed: emit a corrupt marker so operators have durable
+                    // evidence and manual cleanup guidance, while preserving active
+                    // claimed job suppression for this startup pass.
+                    let reason = if let Some(lease) = lease_snapshot.as_ref() {
+                        format!(
+                            "active lane state {} (pid={}) has lock held but process identity is unknown; preserving active job for orphan suppression and marking lane corrupt for manual cleanup",
+                            status.state, lease.pid
+                        )
+                    } else {
+                        format!(
+                            "active lane state {} has lock held but process identity is unknown; preserving active job for orphan suppression and marking lane corrupt for manual cleanup",
+                            status.state
+                        )
+                    };
+                    if !dry_run {
+                        if let Err(marker_err) =
+                            persist_corrupt_marker(fac_root, lane_id, &reason, timestamp)
+                        {
+                            partial_error = Some(marker_err);
+                            break;
+                        }
+                    }
+                    actions.push(LaneRecoveryAction::MarkedCorrupt {
+                        lane_id: lane_id.clone(),
+                        reason: truncate_string(&reason, MAX_STRING_LENGTH),
+                    });
+                    lanes_marked_corrupt += 1;
+                    continue;
                 }
                 actions.push(LaneRecoveryAction::AlreadyConsistent {
                     lane_id: lane_id.clone(),
@@ -925,10 +965,13 @@ fn reconcile_lanes(
                         }
                     }
                 }
-                // Corrupt lanes are considered active only when process
-                // identity still matches the lease owner.
-                if let (Some(job_id), Some(ProcessIdentity::AliveMatch)) =
-                    (status.job_id.as_ref(), lease_identity)
+                // Corrupt lanes still suppress orphan handling when a lock-held
+                // active job has unknown identity (fail-closed liveness) or when
+                // identity matches the lease owner.
+                if let Some(job_id) = status.job_id.as_ref()
+                    && (matches!(lease_identity, Some(ProcessIdentity::AliveMatch))
+                        || (status.lock_held
+                            && matches!(lease_identity, Some(ProcessIdentity::Unknown))))
                 {
                     active_job_ids.insert(job_id.clone());
                 }
@@ -2154,6 +2197,87 @@ mod tests {
         assert!(
             !lease_path.exists(),
             "stale mismatched lease file should be removed"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_lock_held_unknown_identity_keeps_claimed_job_still_active() {
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(1);
+        let lane_id = "lane-00";
+        let job_id = "job-unknown-identity-active";
+
+        // Seed a running lease for this process, then clear proc_start_time_ticks
+        // to force ProcessIdentity::Unknown.
+        write_lease(
+            &fac_root,
+            lane_id,
+            job_id,
+            std::process::id(),
+            LaneState::Running,
+        );
+        let lease_path = fac_root.join("lanes").join(lane_id).join("lease.v1.json");
+        let mut lease_value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&lease_path).expect("read lease")).expect("parse");
+        lease_value["proc_start_time_ticks"] = serde_json::Value::Null;
+        fs::write(
+            &lease_path,
+            serde_json::to_vec_pretty(&lease_value).expect("serialize lease"),
+        )
+        .expect("persist unknown-identity lease");
+
+        // Keep the lane lock held to represent an active in-flight owner.
+        let lane_lock_path = fac_root
+            .join("locks")
+            .join("lanes")
+            .join(format!("{lane_id}.lock"));
+        let lane_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lane_lock_path)
+            .expect("open lane lock");
+        crate::fac::flock_util::acquire_exclusive_blocking(&lane_lock).expect("acquire lane lock");
+
+        write_claimed_job(&queue_root, job_id);
+
+        let receipt =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
+                .expect("reconcile");
+
+        assert_eq!(
+            receipt.orphaned_jobs_requeued, 0,
+            "lock-held unknown identity lane must suppress orphan requeue"
+        );
+        assert_eq!(
+            receipt.orphaned_jobs_failed, 0,
+            "lock-held unknown identity lane must not fail active claimed job"
+        );
+        assert!(
+            receipt.queue_actions.iter().any(|action| matches!(
+                action,
+                QueueRecoveryAction::StillActive { job_id, lane_id }
+                if job_id == "job-unknown-identity-active" && lane_id == "unknown"
+            )),
+            "expected StillActive action via active-job suppression for unknown identity"
+        );
+        assert!(
+            receipt.lanes_marked_corrupt >= 1,
+            "unknown identity should be durably marked corrupt for manual cleanup"
+        );
+
+        let claimed_path = queue_root.join("claimed").join(format!("{job_id}.json"));
+        assert!(
+            claimed_path.exists(),
+            "claimed job must remain in claimed/ while active lane lock is held"
+        );
+        let marker = LaneCorruptMarkerV1::load(&fac_root, lane_id)
+            .expect("load marker")
+            .expect("marker should exist");
+        assert!(
+            marker.reason.contains("process identity is unknown"),
+            "corrupt marker should explain unknown identity: {}",
+            marker.reason
         );
     }
 
