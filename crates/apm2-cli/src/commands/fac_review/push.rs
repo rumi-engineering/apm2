@@ -377,9 +377,10 @@ fn run_blocking_evidence_gates(
         // Prefer worker execution when available, but do not hard-require it:
         // push must remain single-command operable for callers.
         require_external_worker: false,
-        // TCK-00577: Use the caller-provided write mode. Default is
-        // ServiceUserOnly; only bypass when --unsafe-local-write is
-        // explicitly passed at the top-level FacCommand.
+        // TCK-00577/TCK-00657: Use caller-provided write mode. Default is
+        // ServiceUserOnly; user-mode bypass happens inside
+        // check_queue_write_permission, while explicit unsafe mode is still
+        // available via top-level FacCommand.
         write_mode,
     };
     let outcome = run_queued_gates_and_collect(&request)?;

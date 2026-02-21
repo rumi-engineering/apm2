@@ -10,9 +10,11 @@
 //!
 //! - The FAC service user (`_apm2-job` by default) owns receipt and queue
 //!   directories with mode 0700 (no group/world access).
-//! - CLI commands running as a non-service-user are denied direct writes to
-//!   these directories unless `--unsafe-local-write` is explicitly passed
-//!   (backward compatibility escape hatch).
+//! - In system-mode, CLI commands running as a non-service-user are denied
+//!   direct writes to these directories unless `--unsafe-local-write` is
+//!   explicitly passed (backward compatibility escape hatch).
+//! - In user-mode, the service user gate is bypassed automatically because
+//!   worker and CLI execute under the same principal.
 //! - The `--unsafe-local-write` flag is logged as a security audit event and
 //!   MUST NOT be used in production deployments.
 //!
@@ -32,7 +34,10 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use super::execution_backend::{DEFAULT_SERVICE_USER, SERVICE_USER_ENV_VAR};
+use super::execution_backend::{
+    DEFAULT_SERVICE_USER, EXECUTION_BACKEND_ENV_VAR, ExecutionBackend, SERVICE_USER_ENV_VAR,
+    select_backend,
+};
 
 /// Maximum length for service user names (mirrors `execution_backend.rs`).
 const MAX_SERVICE_USER_LENGTH: usize = 64;
@@ -164,9 +169,13 @@ impl fmt::Display for QueueWriteMode {
 /// # Algorithm
 ///
 /// 1. If `write_mode` is `UnsafeLocalWrite`, permit with an audit warning.
-/// 2. Resolve the FAC service user from `APM2_FAC_SERVICE_USER` (or default).
-/// 3. Compare the current effective uid against the service user's uid.
-/// 4. If they match, permit. Otherwise, deny with structured error.
+/// 2. Resolve the execution backend from `APM2_FAC_EXECUTION_BACKEND`.
+/// 3. If backend is `UserMode`, permit automatically (single-principal local
+///    mode).
+/// 4. If backend is `SystemMode`, resolve the FAC service user from
+///    `APM2_FAC_SERVICE_USER` (or default).
+/// 5. Compare current effective uid against the service user's uid.
+/// 6. If they match, permit. Otherwise, deny with structured error.
 ///
 /// # Errors
 ///
@@ -176,11 +185,34 @@ impl fmt::Display for QueueWriteMode {
 pub fn check_queue_write_permission(
     write_mode: QueueWriteMode,
 ) -> Result<(), ServiceUserGateError> {
+    let backend = select_backend().map_err(|err| ServiceUserGateError::EnvError {
+        var: EXECUTION_BACKEND_ENV_VAR,
+        reason: format!("cannot resolve FAC execution backend: {err}"),
+    })?;
+    check_queue_write_permission_with_backend(write_mode, backend)
+}
+
+/// Backend-specialized gate check used by tests to validate mode-specific
+/// behavior without mutating process-global environment variables.
+#[cfg(unix)]
+fn check_queue_write_permission_with_backend(
+    write_mode: QueueWriteMode,
+    backend: ExecutionBackend,
+) -> Result<(), ServiceUserGateError> {
     if write_mode == QueueWriteMode::UnsafeLocalWrite {
         tracing::warn!(
             mode = %write_mode,
             "TCK-00577: --unsafe-local-write active — bypassing service user gate. \
              This is NOT recommended for production deployments."
+        );
+        return Ok(());
+    }
+
+    if backend == ExecutionBackend::UserMode {
+        tracing::info!(
+            mode = %write_mode,
+            backend = %backend,
+            "TCK-00657: execution backend is user-mode — bypassing service user gate"
         );
         return Ok(());
     }
@@ -527,7 +559,10 @@ mod tests {
     fn check_queue_write_service_user_only_denies_when_user_not_found() {
         // The default service user `_apm2-job` almost certainly does not
         // exist in test environments. ServiceUserOnly mode must deny.
-        let result = check_queue_write_permission(QueueWriteMode::ServiceUserOnly);
+        let result = check_queue_write_permission_with_backend(
+            QueueWriteMode::ServiceUserOnly,
+            ExecutionBackend::SystemMode,
+        );
         // Two valid outcomes:
         // - Err(ServiceUserNotResolved) if the user does not exist
         // - Err(NotServiceUser) if the user exists but is different
@@ -557,6 +592,19 @@ mod tests {
                 );
             },
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn check_queue_write_service_user_only_allows_user_mode_backend() {
+        let result = check_queue_write_permission_with_backend(
+            QueueWriteMode::ServiceUserOnly,
+            ExecutionBackend::UserMode,
+        );
+        assert!(
+            result.is_ok(),
+            "user-mode backend should bypass service-user gate: {result:?}"
+        );
     }
 
     #[test]
@@ -653,13 +701,18 @@ mod tests {
         std::fs::create_dir(&real_dir).expect("create real dir");
 
         let result = validate_directory_service_user_ownership(&real_dir);
-        assert!(result.is_err(), "should deny when service user not found");
-        let err = result.unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("could not be resolved") || msg.contains("not found"),
-            "should indicate service user not resolved: {msg}"
-        );
+        match result {
+            Err(
+                ServiceUserGateError::ServiceUserNotResolved { .. }
+                | ServiceUserGateError::OwnershipMismatch { .. },
+            ) => {},
+            Err(other) => {
+                panic!("unexpected error variant: {other}");
+            },
+            Ok(()) => {
+                panic!("ownership validation unexpectedly passed");
+            },
+        }
     }
 
     #[test]

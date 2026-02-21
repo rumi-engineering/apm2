@@ -225,12 +225,13 @@ until cleared via `apm2 fac lane reset`.
 |------------|----------|-------------|
 | `apm2 fac bootstrap` | `run_bootstrap()` | One-shot compute-host provisioning for FESv1 |
 
-Five-phase provisioning sequence:
-1. **Directories**: creates `$APM2_HOME/private/fac/**` tree via `create_dir_restricted` (0o700 user-mode, 0o770 system-mode) (CTR-2611)
-2. **Policy**: writes default `FacPolicyV1` (safe no-secrets posture) via `persist_policy()`
-3. **Lanes**: initializes lane pool via `LaneManager::init_lanes()`
-4. **Services** (optional): installs systemd templates from `contrib/systemd/` (`--user` or `--system`)
-5. **Doctor**: runs `collect_doctor_checks()` and gates exit code on result
+Six-phase provisioning sequence:
+1. **Directories**: creates `$APM2_HOME/private/fac/**` and `$APM2_HOME/queue/**` trees via `create_dir_restricted` (CTR-2611)
+2. **System identity** (`--system` only): provisions service-user identity and ownership (`useradd` if needed, queue mode normalization, recursive `chown`, caller group membership via `usermod -aG`)
+3. **Policy**: writes default `FacPolicyV1` (safe no-secrets posture) via `persist_policy()`
+4. **Lanes**: initializes lane pool via `LaneManager::init_lanes()`
+5. **Services** (optional): installs systemd templates from `contrib/systemd/` (`--user` or `--system`)
+6. **Doctor**: runs `collect_doctor_checks()` and gates exit code on result
 
 Flags: `--dry-run` (show planned actions), `--user`/`--system` (systemd install mode), `--json`.
 
@@ -239,8 +240,12 @@ Security invariants:
 - [INV-BOOT-002] Policy files written with 0o600 permissions
 - [INV-BOOT-003] Existing state never destroyed (additive-only)
 - [INV-BOOT-004] Doctor checks gate the exit code (fail-closed)
-- [INV-BOOT-005] Phase 4 (service installation) degrades gracefully when not in a git repository (e.g. binary releases). Missing templates are skipped with a warning, not fatal.
+- [INV-BOOT-005] Phase 5 (service installation) degrades gracefully when not in a git repository (e.g. binary releases). Missing templates are skipped with a warning, not fatal.
 - [INV-BOOT-006] Installs `apm2-worker@.service` template unit alongside non-templated units for parallel lane-specific workers.
+- [INV-BOOT-007] `--system` provisioning is root-only and fails closed when service-user identity or ownership updates cannot be verified.
+- [INV-BOOT-008] Queue runtime modes are normalized during `--system` provisioning (`queue/**` 0711, `broker_requests/` 01733).
+- [INV-BOOT-009] `--system` account-management calls are PATH-independent and fail-closed: `useradd`/`usermod` execute only from trusted absolute root-owned non-symlink binaries with group/other-writable modes rejected, and subprocess env is cleared to a minimal PATH allowlist.
+- [INV-BOOT-010] Caller group enrollment resolves the provisioned service group by effective service GID (not assumed service username), preventing drift when user and primary-group names diverge.
 
 ### Work (work.rs)
 
@@ -307,6 +312,12 @@ Security invariants:
 - **RUNNING lease lifecycle** (`fac_worker.rs`): A RUNNING `LaneLeaseV1` is persisted after lane
   acquisition and lane profile loading, before any execution. Every early-return path removes the
   lease. This satisfies the `run_lane_cleanup` RUNNING-state precondition (INV-LANE-CLEANUP-005).
+- **Lease timestamp normalization** (`fac_worker.rs`, TCK-00657): New RUNNING
+  leases are created via `build_running_lane_lease()` using core
+  `current_time_iso8601()` so persisted `started_at` is RFC3339 UTC (`...Z`).
+  Poll-tick orphan-lease warnings derive age and canonical timestamp through
+  `LaneLeaseV1` core helpers (`started_at_rfc3339`, `started_at_epoch_secs`,
+  `age_secs`) instead of worker-local parsing.
 - **Completion-before-cleanup** (`fac_worker.rs`): Lane cleanup runs AFTER job completion receipt
   emission and move to `completed/`. Cleanup failures log warnings and mark lanes corrupt but do
   not retroactively negate a completed job outcome (INV-LANE-CLEANUP-006).
@@ -671,13 +682,20 @@ systemd service executables:
 
 ### Service-user ownership validation (TCK-00577 round 3)
 
-- **Worker startup wires ownership check**: `run_fac_worker` validates that
-  queue subdirectories (`pending/`, `claimed/`, `completed/`, `denied/`,
-  `cancelled/`, `quarantine/`) and `receipts/` are owned by the configured
-  FAC service user (via `validate_directory_service_user_ownership`). This
-  check runs after directories are created but before the worker loop starts.
-  Fail-closed: if the service user cannot be resolved or ownership deviates,
-  the worker refuses to start.
+- **System-mode worker startup wires ownership check**: In `SystemMode`,
+  `run_fac_worker` validates that queue subdirectories (`pending/`, `claimed/`,
+  `completed/`, `denied/`, `cancelled/`, `quarantine/`) and `receipts/` are
+  owned by the configured FAC service user (via
+  `validate_directory_service_user_ownership`). This check runs after
+  directories are created but before the worker loop starts.
+- **User-mode skip**: In `UserMode`, worker startup skips service-user
+  ownership validation because worker and CLI run under one principal.
+  This preserves local-dev single-user semantics.
+- **Malformed backend env fallback for ownership checks**: Worker startup now
+  treats `APM2_FAC_EXECUTION_BACKEND=<invalid>` as an ownership-check-only
+  config drift signal and falls back to deterministic `auto` backend selection
+  (`probe_user_bus` -> user/system) with an explicit warning/event, instead of
+  hard-failing startup before the UserMode bypass path can apply.
 
 ### Relaxed startup validation for enqueue-class commands (TCK-00577 round 3)
 
@@ -709,9 +727,12 @@ systemd service executables:
   user identity cannot be confirmed, so no write path (including broker
   fallback) is permitted. This prevents a local user from bypassing the
   service user gate by misconfiguring or removing the service user account.
-- **Dev environment escape hatch**: Callers in dev environments MUST use
-  `--unsafe-local-write` to bypass the service user check. This is the
-  explicit opt-in that tells the system "I know there's no service user."
+- **User-mode automatic bypass (TCK-00657)**: When execution backend resolves
+  to `UserMode`, `check_queue_write_permission` bypasses service-user
+  resolution and permits direct enqueue semantics. This restores local-dev
+  single-principal behavior without requiring `_apm2-job`.
+- **System-mode escape hatch**: In `SystemMode`, callers can still use
+  `--unsafe-local-write` as an explicit opt-in bypass.
 - **NotServiceUser still falls back to broker**: Only `ServiceUserNotResolved`
   is a hard error. `NotServiceUser` (identity IS resolved, caller is not
   that user) correctly routes to broker-mediated enqueue.
@@ -821,10 +842,9 @@ systemd service executables:
   service user is not resolvable OR fchown fails, the function returns an error.
   The previous 0644 fallback was removed in round 17 (it was fail-open because
   job filenames are not opaque UUIDs and can be guessed).
-- **No 0644 fallback**: Dev environments without a service user MUST use
-  `--unsafe-local-write` (which routes through `enqueue_direct`, bypassing the
-  broker path entirely). This is the explicit opt-in for "I know there's no
-  service user."
+- **No 0644 fallback**: In `SystemMode`, environments without a resolvable
+  service user must use `--unsafe-local-write` (routes through `enqueue_direct`)
+  or provision the system user via `apm2 fac bootstrap --system`.
 - **Cross-user deployments**: The worker may get EACCES when reading
   broker files owned by a different UID. The worker handles this
   fail-closed: unreadable files are quarantined with a logged warning
