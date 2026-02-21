@@ -411,6 +411,16 @@ impl PulsePublisher {
                     );
                     None
                 },
+                TopicDerivationResult::MultiTopicEventError { event_type } => {
+                    // Should never happen: derive_topics() does not return this variant.
+                    // Log at warn level as a defensive measure.
+                    warn!(
+                        seq_id = notification.seq_id,
+                        event_type = %event_type,
+                        "BUG: MultiTopicEventError in derive_topics path (skipped)"
+                    );
+                    None
+                },
             })
             .collect();
 

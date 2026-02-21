@@ -76,6 +76,14 @@ pub enum TopicDerivationResult {
     },
     /// No topic could be derived (e.g., missing required data).
     NoTopic,
+    /// The event is a multi-topic event type (e.g., `work_graph.edge.*`) and
+    /// must be routed through [`TopicDeriver::derive_topics`] instead of
+    /// [`TopicDeriver::derive_topic`]. Using the single-topic API on these
+    /// events would silently drop the secondary topic.
+    MultiTopicEventError {
+        /// The event type that requires multi-topic derivation.
+        event_type: String,
+    },
 }
 
 impl TopicDerivationResult {
@@ -250,12 +258,12 @@ impl TopicDeriver {
     ///
     /// The derived topic result. On success, contains a validated topic string.
     ///
-    /// # Note
+    /// # Errors
     ///
-    /// For work graph edge events (`work_graph.edge.*`), this returns only
-    /// the first topic (for `from_work_id`). Use
-    /// [`derive_topics`](Self::derive_topics) to get topics for both work
-    /// IDs.
+    /// Returns [`TopicDerivationResult::MultiTopicEventError`] when invoked on
+    /// a multi-topic event type (`work_graph.edge.*`). Callers **must** use
+    /// [`derive_topics`](Self::derive_topics) for those events to avoid
+    /// silently dropping the secondary `to_work_id` topic.
     ///
     /// # Determinism
     ///
@@ -267,6 +275,18 @@ impl TopicDeriver {
         notification: &CommitNotification,
         event: &KernelEvent,
     ) -> TopicDerivationResult {
+        // Fail-closed: reject multi-topic events that would silently lose the
+        // secondary topic if routed through this single-topic API.
+        if is_multi_topic_event_type(notification.event_type.as_str()) {
+            warn!(
+                event_type = %notification.event_type,
+                "derive_topic called on multi-topic event; use derive_topics instead"
+            );
+            return TopicDerivationResult::MultiTopicEventError {
+                event_type: notification.event_type.clone(),
+            };
+        }
+
         let topic = self.derive_topic_internal(notification, event);
 
         // Validate the derived topic
@@ -315,9 +335,7 @@ impl TopicDeriver {
     ) -> Vec<TopicDerivationResult> {
         // Check if this is a multi-topic event (work graph edges)
         match notification.event_type.as_str() {
-            "WorkEdgeAdded" | "WorkEdgeRemoved" | "WorkEdgeWaived" => {
-                derive_work_graph_topics(event)
-            },
+            t if is_multi_topic_event_type(t) => derive_work_graph_topics(event),
             _ => {
                 // Single-topic events: delegate to the existing method
                 vec![self.derive_topic(notification, event)]
@@ -380,9 +398,10 @@ impl TopicDeriver {
             // Work graph edge events -> work_graph.<from_work_id>.edge (TCK-00642)
             // INV-TOPIC-005: Uses `work_graph.` prefix, NOT `work.`, to avoid
             // WorkReducer decoding.
-            // Note: This returns only the from_work_id topic. For multi-topic
-            // derivation (both work IDs), use derive_topics().
-            "WorkEdgeAdded" | "WorkEdgeRemoved" | "WorkEdgeWaived" => {
+            // Note: derive_topic() rejects these event types with
+            // MultiTopicEventError. This arm is reached only from derive_topics()
+            // via the internal path.
+            "work_graph.edge.added" | "work_graph.edge.removed" | "work_graph.edge.waived" => {
                 derive_work_graph_primary_topic(event, &sanitized_namespace)
             },
 
@@ -542,6 +561,22 @@ fn derive_io_artifact_topic(event: &KernelEvent, fallback_namespace: &str) -> St
 // ============================================================================
 // Work Graph Topic Derivation (TCK-00642)
 // ============================================================================
+
+/// Returns `true` if the event type is a multi-topic work graph edge event.
+///
+/// These events (`work_graph.edge.added/removed/waived`) produce topics for
+/// both `from_work_id` and `to_work_id`, and MUST be routed through
+/// [`TopicDeriver::derive_topics`].
+///
+/// INV-TOPIC-005: canonical event types use `work_graph.edge.*` prefix, NOT
+/// `WorkEdgeAdded`-style names.
+#[must_use]
+fn is_multi_topic_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "work_graph.edge.added" | "work_graph.edge.removed" | "work_graph.edge.waived"
+    )
+}
 
 /// Extracts the `from_work_id` and `to_work_id` from a `WorkGraphEvent`.
 ///
@@ -2080,21 +2115,28 @@ mod tests {
         // ====================================================================
 
         #[test]
-        fn work_edge_added_derives_correct_primary_topic() {
+        fn work_edge_added_derive_topic_returns_multi_topic_error() {
+            // derive_topic MUST reject multi-topic events with a hard error
             let deriver = TopicDeriver::new();
-            let notification = CommitNotification::new(1, [0; 32], "WorkEdgeAdded", "kernel");
+            let notification =
+                CommitNotification::new(1, [0; 32], "work_graph.edge.added", "kernel");
             let event = work_edge_added_event("W-FROM-1", "W-TO-1", WorkEdgeType::Dependency);
 
             let result = deriver.derive_topic(&notification, &event);
 
-            assert!(result.is_success());
-            assert_eq!(result.topic(), Some("work_graph.W-FROM-1.edge"));
+            assert_eq!(
+                result,
+                TopicDerivationResult::MultiTopicEventError {
+                    event_type: "work_graph.edge.added".to_string(),
+                }
+            );
         }
 
         #[test]
         fn work_edge_added_derives_two_topics() {
             let deriver = TopicDeriver::new();
-            let notification = CommitNotification::new(1, [0; 32], "WorkEdgeAdded", "kernel");
+            let notification =
+                CommitNotification::new(1, [0; 32], "work_graph.edge.added", "kernel");
             let event = work_edge_added_event("W-FROM-2", "W-TO-2", WorkEdgeType::Blocks);
 
             let results = deriver.derive_topics(&notification, &event);
@@ -2110,7 +2152,8 @@ mod tests {
         fn work_edge_added_topic_prefix_avoids_work_reducer() {
             // INV-TOPIC-005: work_graph.edge.* MUST NOT start with `work.`
             let deriver = TopicDeriver::new();
-            let notification = CommitNotification::new(1, [0; 32], "WorkEdgeAdded", "kernel");
+            let notification =
+                CommitNotification::new(1, [0; 32], "work_graph.edge.added", "kernel");
             let event = work_edge_added_event("W-123", "W-456", WorkEdgeType::Enables);
 
             let results = deriver.derive_topics(&notification, &event);
@@ -2138,7 +2181,8 @@ mod tests {
                 WorkEdgeType::Enables,
                 WorkEdgeType::Sequence,
             ] {
-                let notification = CommitNotification::new(1, [0; 32], "WorkEdgeAdded", "kernel");
+                let notification =
+                    CommitNotification::new(1, [0; 32], "work_graph.edge.added", "kernel");
                 let event = work_edge_added_event("W-A", "W-B", edge_type);
 
                 let results = deriver.derive_topics(&notification, &event);
@@ -2162,21 +2206,27 @@ mod tests {
         // ====================================================================
 
         #[test]
-        fn work_edge_removed_derives_correct_primary_topic() {
+        fn work_edge_removed_derive_topic_returns_multi_topic_error() {
             let deriver = TopicDeriver::new();
-            let notification = CommitNotification::new(1, [0; 32], "WorkEdgeRemoved", "kernel");
+            let notification =
+                CommitNotification::new(1, [0; 32], "work_graph.edge.removed", "kernel");
             let event = work_edge_removed_event("W-REM-FROM", "W-REM-TO");
 
             let result = deriver.derive_topic(&notification, &event);
 
-            assert!(result.is_success());
-            assert_eq!(result.topic(), Some("work_graph.W-REM-FROM.edge"));
+            assert_eq!(
+                result,
+                TopicDerivationResult::MultiTopicEventError {
+                    event_type: "work_graph.edge.removed".to_string(),
+                }
+            );
         }
 
         #[test]
         fn work_edge_removed_derives_two_topics() {
             let deriver = TopicDeriver::new();
-            let notification = CommitNotification::new(1, [0; 32], "WorkEdgeRemoved", "kernel");
+            let notification =
+                CommitNotification::new(1, [0; 32], "work_graph.edge.removed", "kernel");
             let event = work_edge_removed_event("W-REM-A", "W-REM-B");
 
             let results = deriver.derive_topics(&notification, &event);
@@ -2191,7 +2241,8 @@ mod tests {
         #[test]
         fn work_edge_removed_topic_prefix_avoids_work_reducer() {
             let deriver = TopicDeriver::new();
-            let notification = CommitNotification::new(1, [0; 32], "WorkEdgeRemoved", "kernel");
+            let notification =
+                CommitNotification::new(1, [0; 32], "work_graph.edge.removed", "kernel");
             let event = work_edge_removed_event("W-789", "W-012");
 
             let results = deriver.derive_topics(&notification, &event);
@@ -2214,21 +2265,27 @@ mod tests {
         // ====================================================================
 
         #[test]
-        fn work_edge_waived_derives_correct_primary_topic() {
+        fn work_edge_waived_derive_topic_returns_multi_topic_error() {
             let deriver = TopicDeriver::new();
-            let notification = CommitNotification::new(1, [0; 32], "WorkEdgeWaived", "kernel");
+            let notification =
+                CommitNotification::new(1, [0; 32], "work_graph.edge.waived", "kernel");
             let event = work_edge_waived_event("W-WAI-FROM", "W-WAI-TO", WorkEdgeType::Dependency);
 
             let result = deriver.derive_topic(&notification, &event);
 
-            assert!(result.is_success());
-            assert_eq!(result.topic(), Some("work_graph.W-WAI-FROM.edge"));
+            assert_eq!(
+                result,
+                TopicDerivationResult::MultiTopicEventError {
+                    event_type: "work_graph.edge.waived".to_string(),
+                }
+            );
         }
 
         #[test]
         fn work_edge_waived_derives_two_topics() {
             let deriver = TopicDeriver::new();
-            let notification = CommitNotification::new(1, [0; 32], "WorkEdgeWaived", "kernel");
+            let notification =
+                CommitNotification::new(1, [0; 32], "work_graph.edge.waived", "kernel");
             let event = work_edge_waived_event("W-WAI-A", "W-WAI-B", WorkEdgeType::Blocks);
 
             let results = deriver.derive_topics(&notification, &event);
@@ -2243,7 +2300,8 @@ mod tests {
         #[test]
         fn work_edge_waived_topic_prefix_avoids_work_reducer() {
             let deriver = TopicDeriver::new();
-            let notification = CommitNotification::new(1, [0; 32], "WorkEdgeWaived", "kernel");
+            let notification =
+                CommitNotification::new(1, [0; 32], "work_graph.edge.waived", "kernel");
             let event = work_edge_waived_event("W-X1", "W-X2", WorkEdgeType::Sequence);
 
             let results = deriver.derive_topics(&notification, &event);
@@ -2269,7 +2327,8 @@ mod tests {
         fn identical_work_ids_produce_single_topic() {
             // When from_work_id == to_work_id, should deduplicate
             let deriver = TopicDeriver::new();
-            let notification = CommitNotification::new(1, [0; 32], "WorkEdgeAdded", "kernel");
+            let notification =
+                CommitNotification::new(1, [0; 32], "work_graph.edge.added", "kernel");
             let event = work_edge_added_event("W-SAME", "W-SAME", WorkEdgeType::Dependency);
 
             let results = deriver.derive_topics(&notification, &event);
@@ -2286,7 +2345,8 @@ mod tests {
         #[test]
         fn special_chars_in_work_ids_are_sanitized() {
             let deriver = TopicDeriver::new();
-            let notification = CommitNotification::new(1, [0; 32], "WorkEdgeAdded", "kernel");
+            let notification =
+                CommitNotification::new(1, [0; 32], "work_graph.edge.added", "kernel");
             let event = work_edge_added_event("W@from#1", "W.to.2", WorkEdgeType::Enables);
 
             let results = deriver.derive_topics(&notification, &event);
@@ -2302,7 +2362,8 @@ mod tests {
         #[test]
         fn empty_work_ids_sanitize_to_underscore() {
             let deriver = TopicDeriver::new();
-            let notification = CommitNotification::new(1, [0; 32], "WorkEdgeAdded", "kernel");
+            let notification =
+                CommitNotification::new(1, [0; 32], "work_graph.edge.added", "kernel");
             let event = work_edge_added_event("", "", WorkEdgeType::Dependency);
 
             let results = deriver.derive_topics(&notification, &event);
@@ -2316,7 +2377,8 @@ mod tests {
         #[test]
         fn missing_work_graph_payload_returns_no_topic() {
             let deriver = TopicDeriver::new();
-            let notification = CommitNotification::new(1, [0; 32], "WorkEdgeAdded", "kernel");
+            let notification =
+                CommitNotification::new(1, [0; 32], "work_graph.edge.added", "kernel");
             // No payload at all
             let event = KernelEvent::default();
 
@@ -2329,7 +2391,8 @@ mod tests {
         #[test]
         fn work_graph_event_none_variant_returns_no_topic() {
             let deriver = TopicDeriver::new();
-            let notification = CommitNotification::new(1, [0; 32], "WorkEdgeAdded", "kernel");
+            let notification =
+                CommitNotification::new(1, [0; 32], "work_graph.edge.added", "kernel");
             let event = KernelEvent {
                 payload: Some(Payload::WorkGraph(WorkGraphEvent { event: None })),
                 ..Default::default()
@@ -2348,7 +2411,8 @@ mod tests {
         #[test]
         fn work_graph_topic_derivation_is_deterministic() {
             let deriver = TopicDeriver::new();
-            let notification = CommitNotification::new(42, [0xab; 32], "WorkEdgeAdded", "kernel");
+            let notification =
+                CommitNotification::new(42, [0xab; 32], "work_graph.edge.added", "kernel");
             let event = work_edge_added_event("W-DET-A", "W-DET-B", WorkEdgeType::Dependency);
 
             // Derive multiple times
@@ -2370,7 +2434,8 @@ mod tests {
         fn derive_topics_ordering_is_stable() {
             // from_work_id topic always comes first, to_work_id second
             let deriver = TopicDeriver::new();
-            let notification = CommitNotification::new(1, [0; 32], "WorkEdgeAdded", "kernel");
+            let notification =
+                CommitNotification::new(1, [0; 32], "work_graph.edge.added", "kernel");
             let event = work_edge_added_event("W-ALPHA", "W-BETA", WorkEdgeType::Sequence);
 
             for _ in 0..20 {
