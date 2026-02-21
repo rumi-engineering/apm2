@@ -1,0 +1,99 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00671"
+    title: "apm2-core: introduce OrchestratorKernel runtime harness (cursor-driven reducer + idempotent effects) and refactor one daemon orchestrator to use it"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0020"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_KERNEL", "DOMAIN_DAEMON", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets: []
+
+root_cause_analysis:
+  summary: |
+    APM2 already has multiple orchestration loops (gate orchestrator, work loop manager,
+    FAC worker, FAC review) that all re-implement the same hard problems:
+
+      - reading canonical events incrementally (cursor handling),
+      - deterministic state folding + checkpointing,
+      - effect execution with intent->receipt idempotency,
+      - crash-point recovery and bounded work per tick,
+      - liveness nudges / retry policies.
+
+    Without a shared runtime harness, orchestration logic drifts, subtle bugs reappear,
+    and new systems (FAC review, holon) tend to build bespoke frameworks.
+
+    This ticket creates a shared OrchestratorKernel harness in apm2-core so all
+    orchestrators converge on one tested controller loop suitable for scaling to
+    100B agents.
+
+scope:
+  in_scope:
+    - id: "OK-001"
+      title: "Create apm2_core::orchestrator_kernel module"
+      detail: |
+        Implement a small runtime harness with:
+          - Cursor abstraction over ledger (seq_id / consensus cursor)
+          - Reducer/step trait (pure deterministic)
+          - Effect enum + Driver trait (I/O boundary)
+          - Checkpoint store interface (serialize state; bounded)
+          - Tick source interface (injected clock)
+          - Built-in idempotency guard: before executing an effect with key K, check for receipt event for K
+
+        The harness must support:
+          - bounded per-iteration work limits
+          - crash-point safe execution ordering (intent -> op -> receipt)
+          - deterministic replay tests
+
+    - id: "OK-002"
+      title: "Refactor one existing orchestrator to use OrchestratorKernel (reference implementation)"
+      detail: |
+        Choose one daemon orchestrator with clear event vocabulary (recommended: gate orchestrator):
+          - port its loop to the harness
+          - keep its domain logic (step/reducer) unchanged where possible
+          - ensure all external ops are Effects executed by Driver
+          - ensure receipts exist in ledger for idempotency
+
+        The refactor should demonstrate:
+          - restart-safe behavior
+          - fewer bespoke concurrency primitives
+
+    - id: "OK-003"
+      title: "Verification suite for OrchestratorKernel"
+      detail: |
+        Add tests that:
+          - prove replay determinism (genesis vs checkpoint+delta)
+          - simulate crashes between intent/op/receipt and ensure safe replay
+          - enforce bounded work per tick
+          - optionally: simulate duplicate inputs and ensure idempotency
+
+  out_of_scope:
+    - Refactoring all orchestrators in one shot (follow-on tickets should port FAC worker and review once the kernel exists).
+    - Introducing new BFT consensus logic (backend already exists; harness must be compatible).
+
+plan:
+  steps:
+    - Implement kernel module and minimal traits.
+    - Add a reference driver implementation for the chosen orchestrator.
+    - Port chosen orchestrator and keep API compatibility.
+    - Add determinism/crash/idempotency tests.
+
+definition_of_done:
+  criteria:
+    - "apm2_core::orchestrator_kernel exists with cursor/reducer/driver/checkpoint/tick interfaces."
+    - "At least one daemon orchestrator runs on the harness and passes existing tests."
+    - "New tests cover determinism + crash-point recovery + boundedness."
+
+risks:
+  - id: "R-OK-01"
+    title: "Over-generalizing the harness creates friction and slows refactors"
+    mitigation: |
+      Keep the kernel minimal and opinionated: event-sourced reducers + intent/receipt idempotency.
+      Avoid modeling every possible orchestrator; expand only when a second consumer needs it.
