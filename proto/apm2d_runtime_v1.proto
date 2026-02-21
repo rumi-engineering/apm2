@@ -1865,7 +1865,7 @@ message OpenWorkRequest {
 }
 
 message OpenWorkResponse {
-  // Assigned canonical work identifier (W-<uuid> or from WorkSpec).
+  // Assigned canonical work identifier (W-{uuid} or from WorkSpec).
   string work_id = 1;
   // BLAKE3 hash of the canonical WorkSpec stored in CAS (32 bytes).
   bytes spec_snapshot_hash = 2;
