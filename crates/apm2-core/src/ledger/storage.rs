@@ -146,20 +146,6 @@ pub enum LedgerError {
     #[error("ledger is in legacy compatibility mode and is read-only")]
     LegacyModeReadOnly,
 
-    /// Migration error: the legacy frozen table already exists but `events`
-    /// also has rows, indicating a broken partial migration state.
-    #[error(
-        "migration failed: ledger_events_legacy_frozen already exists with \
-         {frozen_rows} row(s) and events has {events_rows} row(s); \
-         cannot determine migration state"
-    )]
-    MigrationAmbiguousState {
-        /// Number of rows in the frozen table.
-        frozen_rows: u64,
-        /// Number of rows in `events`.
-        events_rows: u64,
-    },
-
     /// Migration error: the frozen snapshot indicates a prior migration
     /// occurred but the canonical `events` chain is empty, suggesting
     /// data loss or truncation.
@@ -307,8 +293,35 @@ pub fn migrate_legacy_ledger_events(conn: &Connection) -> Result<MigrationStats,
                     ),
                 });
             }
-            // frozen_snapshot_rows == 0: empty legacy was migrated, nothing
-            // to restore — this is a valid no-op.
+            // frozen_snapshot_rows == 0: prior migration ran on an empty
+            // `ledger_events` table.  Check if new live legacy rows appeared
+            // since then (written by a legacy daemon after the empty migration).
+            let live_legacy_rows: u64 =
+                conn.query_row("SELECT COUNT(*) FROM ledger_events", [], |row| {
+                    row.get::<_, i64>(0).map(|v| v as u64)
+                })?;
+            if live_legacy_rows > 0 {
+                // New legacy rows written after the empty-frozen migration.
+                // Perform a full migration from genesis — same initial-migration
+                // path as the no-frozen case.  We must drop the empty frozen
+                // table first because `migrate_legacy_inner` creates a new one
+                // with the actual migrated row snapshot.
+                SqliteLedgerBackend::validate_legacy_ledger_events_schema(conn)?;
+                conn.execute_batch("BEGIN EXCLUSIVE")?;
+                conn.execute_batch("DROP TABLE ledger_events_legacy_frozen")?;
+                let result = migrate_legacy_inner(conn);
+                match result {
+                    Ok(stats) => {
+                        conn.execute_batch("COMMIT")?;
+                        return Ok(stats);
+                    },
+                    Err(e) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err(e);
+                    },
+                }
+            }
+            // frozen==0, events==0, live==0: truly clean, no-op.
             return Ok(MigrationStats {
                 rows_migrated: 0,
                 already_migrated: true,

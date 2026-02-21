@@ -3302,3 +3302,123 @@ fn tck_00630_frozen_nonempty_events_empty_live_legacy_nonzero_fails_closed() {
         }
     }
 }
+
+/// Helper: assert that a migration created a valid genesis hash chain
+/// with the expected number of events, and that `ledger_events` is emptied.
+fn assert_genesis_migration_result(conn: &Connection, expected_events: i64) {
+    let events_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        events_count, expected_events,
+        "events must have {expected_events} rows after migration"
+    );
+
+    let live_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        live_count, 0,
+        "ledger_events must be emptied after migration"
+    );
+
+    let first_prev_hash: Vec<u8> = conn
+        .query_row(
+            "SELECT prev_hash FROM events ORDER BY rowid ASC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        first_prev_hash,
+        crate::crypto::EventHasher::GENESIS_PREV_HASH.to_vec(),
+        "first event must chain from genesis prev_hash"
+    );
+
+    let null_hashes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE event_hash IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(null_hashes, 0, "no NULL event_hash values after migration");
+}
+
+/// Regression (TCK-00630 R6): empty frozen migration followed by new legacy
+/// rows must trigger a full migration from genesis, NOT return
+/// `already_migrated`.
+///
+/// Scenario: migration runs on an empty `ledger_events` (creates empty frozen,
+/// zero events).  Then new rows are written to `ledger_events` by a legacy
+/// daemon.  On next startup, migration should discover the new rows and perform
+/// a full genesis migration (hash chain from `GENESIS_PREV_HASH`).
+#[test]
+fn tck_00630_empty_frozen_with_new_live_rows_migrates_from_genesis() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("empty_frozen_new_live_rows.db");
+
+    // Step 1: Migrate an empty `ledger_events` table (creates empty frozen).
+    {
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_ledger_events_table(&conn);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 0, "empty legacy yields zero migrated");
+        assert!(!stats.already_migrated, "first migration of empty table");
+    }
+
+    // Step 2: Simulate new legacy writes AFTER the empty migration.
+    {
+        let conn = Connection::open(&path).unwrap();
+        for i in 1..=3_usize {
+            conn.execute(
+                "INSERT INTO ledger_events \
+                 (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    format!("EVT-POST-EMPTY-{i}"),
+                    "work_claimed",
+                    format!("work-post-{i}"),
+                    format!("actor-post-{i}"),
+                    format!(r#"{{"post_empty_migration":true,"index":{i}}}"#).as_bytes(),
+                    vec![0xBB_u8, u8::try_from(i).unwrap()],
+                    i64::try_from(i).unwrap() * 1_000_000_000_i64,
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    // Step 3: Re-migrate.  Must migrate 3 new rows from genesis.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(
+            stats.rows_migrated, 3,
+            "must migrate 3 new rows from genesis"
+        );
+        assert!(!stats.already_migrated, "must NOT be already_migrated");
+        assert_genesis_migration_result(&conn, 3);
+    }
+
+    // Step 4: Verify `determine_read_mode` returns `CanonicalEvents`.
+    {
+        let ledger = Ledger::open(&path).unwrap();
+        let events = ledger.read_from(1, 100).unwrap();
+        assert_eq!(events.len(), 3, "Ledger must expose 3 canonical events");
+
+        let verify_result = ledger.verify_chain(
+            |payload, prev_hash| {
+                let prev: [u8; 32] = prev_hash.try_into().unwrap();
+                crate::crypto::EventHasher::hash_event(payload, &prev).to_vec()
+            },
+            |_event_hash, _signature| true,
+        );
+        assert!(verify_result.is_ok(), "hash chain must verify");
+    }
+}
