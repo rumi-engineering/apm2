@@ -3081,8 +3081,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             };
 
             // Decode JSON envelope: { "payload": "<hex-encoded protobuf>", ... }
-            let Ok(payload_json) =
-                serde_json::from_slice::<serde_json::Value>(&event.payload)
+            let Ok(payload_json) = serde_json::from_slice::<serde_json::Value>(&event.payload)
             else {
                 continue;
             };
