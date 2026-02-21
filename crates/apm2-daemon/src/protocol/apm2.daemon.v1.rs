@@ -1825,6 +1825,10 @@ pub struct OpenWorkRequest {
     /// Must pass bounded decode + schema validation before acceptance.
     #[prost(bytes = "vec", tag = "1")]
     pub work_spec_json: ::prost::alloc::vec::Vec<u8>,
+    /// Governing lease ID for PCAC lifecycle enforcement.
+    /// Required when PCAC lifecycle gate is wired (fail-closed if empty).
+    #[prost(string, tag = "2")]
+    pub lease_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OpenWorkResponse {

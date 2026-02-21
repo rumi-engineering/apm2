@@ -654,6 +654,26 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// Queries events by work ID.
     fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent>;
 
+    /// Returns the first event matching a `(work_id, event_type)` pair, or
+    /// `None` if no such event exists.
+    ///
+    /// This is the bounded-query counterpart of `get_events_by_work_id`:
+    /// implementations SHOULD use `LIMIT 1` (SQL) or short-circuit iteration
+    /// to avoid materializing the full event history for the work item.
+    ///
+    /// The default implementation delegates to `get_events_by_work_id` and
+    /// performs an O(N) scan; callers on hot paths should prefer backends
+    /// that override this with an indexed query.
+    fn get_first_event_by_work_id_and_type(
+        &self,
+        work_id: &str,
+        event_type: &str,
+    ) -> Option<SignedLedgerEvent> {
+        self.get_events_by_work_id(work_id)
+            .into_iter()
+            .find(|e| e.event_type == event_type)
+    }
+
     /// Queries all persisted ledger events in deterministic replay order.
     ///
     /// Implementations must return events ordered by causal append ordering
@@ -3439,6 +3459,22 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn get_first_event_by_work_id_and_type(
+        &self,
+        work_id: &str,
+        event_type: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
+        let guard = self.events.read().expect("lock poisoned");
+
+        events_by_work.get(work_id).and_then(|event_ids| {
+            event_ids.iter().find_map(|id| {
+                let event = guard.1.get(id)?;
+                (event.event_type == event_type).then(|| event.clone())
+            })
+        })
     }
 
     fn get_all_events(&self) -> Vec<SignedLedgerEvent> {
@@ -7577,6 +7613,7 @@ pub struct PrivilegedPcacPolicy {}
 pub(crate) enum PrivilegedHandlerClass {
     DelegateSublease,
     IngestReviewReceipt,
+    OpenWork,
     RegisterRecoveryEvidence,
     RequestUnfreeze,
 }
@@ -7587,6 +7624,7 @@ impl PrivilegedHandlerClass {
         match self {
             Self::DelegateSublease => "pcac-privileged-delegate-sublease",
             Self::IngestReviewReceipt => "pcac-privileged-ingest-review",
+            Self::OpenWork => "pcac-privileged-open-work",
             Self::RegisterRecoveryEvidence => "pcac-privileged-register-recovery-evidence",
             Self::RequestUnfreeze => "pcac-privileged-request-unfreeze",
         }
@@ -7596,6 +7634,7 @@ impl PrivilegedHandlerClass {
         match self {
             Self::DelegateSublease => "DelegateSublease",
             Self::IngestReviewReceipt => "IngestReviewReceipt",
+            Self::OpenWork => "OpenWork",
             Self::RegisterRecoveryEvidence => "RegisterRecoveryEvidence",
             Self::RequestUnfreeze => "RequestUnfreeze",
         }
@@ -14303,11 +14342,12 @@ impl PrivilegedDispatcher {
     /// 1. Bounded-decoding and validating the `WorkSpec` JSON
     /// 2. Deriving `actor_id` from peer credentials (never client input)
     /// 3. Canonicalizing the `WorkSpec` JSON for deterministic CAS storage
-    /// 4. Checking idempotency: same `work_id` + same hash -> no-op; same
-    ///    `work_id` + different hash -> `ALREADY_EXISTS` error
-    /// 5. Storing canonical bytes to CAS (fail-closed when CAS is not
+    /// 4. Checking idempotency via bounded query: same `work_id` + same hash ->
+    ///    no-op; same `work_id` + different hash -> `ALREADY_EXISTS` error
+    /// 5. PCAC lifecycle enforcement (admission BEFORE mutation)
+    /// 6. Storing canonical bytes to CAS (fail-closed when CAS is not
     ///    configured)
-    /// 6. Emitting exactly one `work.opened` event via the canonical ledger
+    /// 7. Emitting exactly one `work.opened` event via the canonical ledger
     fn handle_open_work(
         &self,
         payload: &[u8],
@@ -14391,17 +14431,23 @@ impl PrivilegedDispatcher {
         let spec_hash = blake3::hash(canonical_bytes);
         let spec_hash_bytes: [u8; 32] = *spec_hash.as_bytes();
 
-        // 6. Idempotency check: query existing events for this work_id.
+        // 6. Idempotency check: bounded query for the first `work.opened` event for
+        //    this work_id.
+        //
+        //    Security (BLOCKER fix): replaces unbounded `get_events_by_work_id`
+        //    which materialised the FULL event history, causing O(N) memory
+        //    and CPU per request.  The new `get_first_event_by_work_id_and_type`
+        //    uses `LIMIT 1` in SQL backends and short-circuit iteration in
+        //    in-memory backends.
         //
         // `emit_session_event` stores the protobuf payload hex-encoded inside
         // a JSON envelope: `{"event_type":"…","session_id":"…","actor_id":"…",
         // "payload":"<hex>"}`. To retrieve the original protobuf `WorkEvent`,
         // we must parse the JSON envelope, hex-decode the `payload` field,
         // then protobuf-decode it.
-        let existing_events = self.event_emitter.get_events_by_work_id(&spec.work_id);
-        let existing_opened = existing_events
-            .iter()
-            .find(|e| e.event_type == "work.opened");
+        let existing_opened = self
+            .event_emitter
+            .get_first_event_by_work_id_and_type(&spec.work_id, "work.opened");
 
         if let Some(opened_event) = existing_opened {
             // Work already opened. Extract the inner protobuf from the JSON
@@ -14447,7 +14493,148 @@ impl PrivilegedDispatcher {
             }
         }
 
-        // 7. Store canonical WorkSpec bytes to CAS (fail-closed when not configured — a
+        // 7. PCAC lifecycle enforcement (admission BEFORE mutation).
+        //
+        //    Security (MAJOR fix): OpenWork performs authoritative state
+        //    mutations (CAS store + ledger event emission) and must enforce
+        //    PCAC lifecycle in authoritative mode, consistent with all other
+        //    effect-capable privileged handlers.
+        //
+        //    Fail-closed: when the PCAC lifecycle gate is wired, a valid
+        //    `lease_id` is required to derive revalidation inputs. When the
+        //    gate is NOT wired, the handler denies (fail-closed).
+        let Some(pcac_gate) = self.pcac_lifecycle_gate.as_deref() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "PCAC authority gate not wired for OpenWork (fail-closed)",
+            ));
+        };
+
+        if request.lease_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "lease_id is required for PCAC lifecycle enforcement",
+            ));
+        }
+        if request.lease_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!("lease_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
+            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
+                Ok(values) => values,
+                Err(error) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "PCAC authority denied for OpenWork: \
+                             authoritative revalidation unavailable: {error}"
+                        ),
+                    ));
+                },
+            };
+
+        let (risk_tier, _resolved_policy_hash) =
+            self.resolve_risk_tier_for_lease(&request.lease_id, spec_hash_bytes);
+        let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
+
+        let pcac_builder = PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::OpenWork)
+            .session_id(spec.work_id.clone())
+            .lease_id(request.lease_id.clone())
+            .boundary_intent_class(apm2_core::pcac::BoundaryIntentClass::Assert)
+            .identity_proof_hash(spec_hash_bytes)
+            .identity_evidence_level(IdentityEvidenceLevel::PointerOnly)
+            .risk_tier(pcac_risk_tier);
+
+        let capability_manifest_hash = pcac_builder.hash(
+            "capability",
+            &[
+                request.lease_id.as_bytes(),
+                spec.work_id.as_bytes(),
+                &spec_hash_bytes,
+            ],
+        );
+
+        let scope_witness_hash = pcac_builder.hash(
+            "scope",
+            &[
+                spec.work_id.as_bytes(),
+                &spec_hash_bytes,
+                actor_id.as_bytes(),
+            ],
+        );
+
+        let freshness_policy_hash = pcac_builder.hash(
+            "freshness-policy",
+            &[request.lease_id.as_bytes(), spec.work_id.as_bytes()],
+        );
+
+        let stop_budget_profile_digest = pcac_builder.hash(
+            "stop-budget",
+            &[
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.emergency_stop_active(),
+                ))],
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.governance_stop_active(),
+                ))],
+                spec.work_id.as_bytes(),
+            ],
+        );
+
+        let effect_intent_digest = domain_tagged_hash(
+            PrivilegedHandlerClass::OpenWork,
+            "intent",
+            &[
+                request.lease_id.as_bytes(),
+                spec.work_id.as_bytes(),
+                actor_id.as_bytes(),
+                &spec_hash_bytes,
+            ],
+        );
+
+        let pcac_builder = pcac_builder
+            .capability_manifest_hash(capability_manifest_hash)
+            .scope_witness_hash(scope_witness_hash)
+            .freshness_policy_hash(freshness_policy_hash)
+            .stop_budget_profile_digest(stop_budget_profile_digest)
+            .effect_intent_digest(effect_intent_digest);
+
+        let pcac_input = pcac_builder.build(
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+        );
+
+        let _pcac_lifecycle_artifacts = match self.enforce_privileged_pcac_lifecycle(
+            PrivilegedHandlerClass::OpenWork.operation_name(),
+            pcac_gate,
+            &pcac_input,
+            &request.lease_id,
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+            effect_intent_digest,
+        ) {
+            Ok(artifacts) => {
+                if artifacts.is_none() {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        "OpenWork requires PCAC lifecycle evidence \
+                         (mandatory cutover); lifecycle_enforcement is disabled in claim policy",
+                    ));
+                }
+                artifacts
+            },
+            Err(response) => return Ok(response),
+        };
+
+        // 8. Store canonical WorkSpec bytes to CAS (fail-closed when not configured — a
         //    MemoryCas fallback would be ephemeral and useless, violating CAS
         //    durability).
         let Some(cas) = self.cas.as_ref() else {
@@ -14465,7 +14652,7 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // 8. Get HTF timestamp
+        // 9. Get HTF timestamp
         let timestamp_ns = match self.get_htf_timestamp_ns() {
             Ok(ts) => ts,
             Err(e) => {
@@ -14477,7 +14664,7 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // 9. Build and emit work.opened event
+        // 10. Build and emit work.opened event
         let work_type_str = match spec.work_type {
             apm2_core::fac::work_cas_schemas::WorkSpecType::Ticket => "TICKET",
             apm2_core::fac::work_cas_schemas::WorkSpecType::PrdRefinement => "PRD_REFINEMENT",
@@ -30744,6 +30931,7 @@ mod tests {
         fn test_encode_open_work_request() {
             let request = OpenWorkRequest {
                 work_spec_json: b"{}".to_vec(),
+                lease_id: TEST_OPEN_WORK_LEASE_ID.to_string(),
             };
             let encoded = encode_open_work_request(&request);
             assert_eq!(encoded[0], PrivilegedMessageType::OpenWork.tag());
@@ -30771,6 +30959,7 @@ mod tests {
             }));
             let request = OpenWorkRequest {
                 work_spec_json: Vec::new(),
+                lease_id: String::new(),
             };
             let mut buf = Vec::new();
             request.encode(&mut buf).expect("encode");
@@ -30799,6 +30988,7 @@ mod tests {
             }));
             let request = OpenWorkRequest {
                 work_spec_json: b"not valid json".to_vec(),
+                lease_id: String::new(),
             };
             let mut buf = Vec::new();
             request.encode(&mut buf).expect("encode");
@@ -30831,6 +31021,7 @@ mod tests {
             let spec_bytes = serde_json::to_vec(&valid_spec).unwrap();
             let request = OpenWorkRequest {
                 work_spec_json: spec_bytes,
+                lease_id: TEST_OPEN_WORK_LEASE_ID.to_string(),
             };
             let mut buf = Vec::new();
             request.encode(&mut buf).expect("encode");
@@ -30842,15 +31033,49 @@ mod tests {
         }
 
         #[test]
-        fn test_open_work_no_cas_fails_closed() {
-            // A dispatcher without CAS should reject valid OpenWork requests
-            // rather than silently falling back to ephemeral storage.
-            let dispatcher = PrivilegedDispatcher::new().without_cas();
+        fn test_open_work_no_pcac_gate_fails_closed() {
+            // A dispatcher without PCAC lifecycle gate should reject valid
+            // OpenWork requests (fail-closed).
+            let dispatcher = PrivilegedDispatcher::new();
             let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
             }));
+            let valid_spec = serde_json::json!({
+                "schema": "apm2.work_spec.v1",
+                "work_id": "W-test-no-pcac",
+                "title": "Test no PCAC",
+                "work_type": "TICKET"
+            });
+            let spec_bytes = serde_json::to_vec(&valid_spec).unwrap();
+            let request = OpenWorkRequest {
+                work_spec_json: spec_bytes,
+                lease_id: TEST_OPEN_WORK_LEASE_ID.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let result = dispatcher.handle_open_work(&buf, &ctx);
+            assert!(result.is_ok());
+            match result.unwrap() {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("PCAC") && err.message.contains("fail-closed"),
+                        "Expected PCAC fail-closed error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected Error for missing PCAC gate, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_open_work_no_cas_fails_closed() {
+            // A dispatcher with PCAC gate but without CAS should reject
+            // valid OpenWork requests.
+            let dispatcher = open_work_dispatcher_with_cas().without_cas();
+            let ctx = test_open_work_ctx();
             let valid_spec = serde_json::json!({
                 "schema": "apm2.work_spec.v1",
                 "work_id": "W-test-no-cas",
@@ -30860,6 +31085,7 @@ mod tests {
             let spec_bytes = serde_json::to_vec(&valid_spec).unwrap();
             let request = OpenWorkRequest {
                 work_spec_json: spec_bytes,
+                lease_id: TEST_OPEN_WORK_LEASE_ID.to_string(),
             };
             let mut buf = Vec::new();
             request.encode(&mut buf).expect("encode");
@@ -30878,11 +31104,62 @@ mod tests {
             }
         }
 
-        /// Helper: creates a dispatcher with CAS wired for `OpenWork` tests.
-        /// `PrivilegedDispatcher::new()` already includes a `MemoryCas`, so
-        /// this is an alias for clarity in test naming.
+        /// The canonical test lease ID used by `OpenWork` tests.
+        const TEST_OPEN_WORK_LEASE_ID: &str = "L-open-work-test-001";
+        /// The canonical test work ID used for the governing lease.
+        const TEST_OPEN_WORK_GOVERNING_WORK_ID: &str = "W-governing-work-001";
+        /// The canonical test gate ID used for the governing lease.
+        const TEST_OPEN_WORK_GATE_ID: &str = "G-open-work-test-001";
+
+        /// Helper: creates a dispatcher with CAS and PCAC gate wired for
+        /// `OpenWork` tests.  `PrivilegedDispatcher::new()` already includes a
+        /// `MemoryCas`; this additionally wires the PCAC lifecycle gate and
+        /// registers the test lease + work claim so that PCAC enforcement
+        /// (fail-closed) does not reject the request.
         fn open_work_dispatcher_with_cas() -> PrivilegedDispatcher {
-            PrivilegedDispatcher::new()
+            let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_privileged_pcac_policy(PrivilegedPcacPolicy {});
+
+            // Register the governing lease and work claim so PCAC
+            // revalidation inputs can be derived.
+            dispatcher.lease_validator.register_lease(
+                TEST_OPEN_WORK_LEASE_ID,
+                TEST_OPEN_WORK_GOVERNING_WORK_ID,
+                TEST_OPEN_WORK_GATE_ID,
+            );
+            let policy_resolution = PolicyResolution {
+                policy_resolved_ref: "test-policy-ref".to_string(),
+                resolved_policy_hash: [0xAA; 32],
+                capability_manifest_hash: [0xBB; 32],
+                context_pack_hash: [0xCC; 32],
+                resolved_risk_tier: 0, // Tier0
+                resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
+                pcac_policy: Some(apm2_core::pcac::PcacPolicyKnobs::default()),
+                pointer_only_waiver: None,
+                role_spec_hash: [0xDD; 32],
+                context_pack_recipe_hash: [0xEE; 32],
+            };
+            let claim = WorkClaim {
+                work_id: TEST_OPEN_WORK_GOVERNING_WORK_ID.to_string(),
+                lease_id: TEST_OPEN_WORK_LEASE_ID.to_string(),
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution,
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+            dispatcher
+                .work_registry
+                .register_claim(claim)
+                .expect("claim registration should succeed");
+
+            dispatcher
         }
 
         /// Helper: builds a valid `WorkSpec` JSON for testing.
@@ -30912,6 +31189,7 @@ mod tests {
             let spec_bytes = test_work_spec_json("W-test-success-001");
             let request = OpenWorkRequest {
                 work_spec_json: spec_bytes,
+                lease_id: TEST_OPEN_WORK_LEASE_ID.to_string(),
             };
             let mut buf = Vec::new();
             request.encode(&mut buf).expect("encode");
@@ -30937,6 +31215,7 @@ mod tests {
             let spec_bytes = test_work_spec_json("W-test-idempotent-001");
             let request = OpenWorkRequest {
                 work_spec_json: spec_bytes,
+                lease_id: TEST_OPEN_WORK_LEASE_ID.to_string(),
             };
             let mut buf = Vec::new();
             request.encode(&mut buf).expect("encode");
@@ -30956,6 +31235,7 @@ mod tests {
             let mut buf2 = Vec::new();
             let request2 = OpenWorkRequest {
                 work_spec_json: test_work_spec_json("W-test-idempotent-001"),
+                lease_id: TEST_OPEN_WORK_LEASE_ID.to_string(),
             };
             request2.encode(&mut buf2).expect("encode");
 
@@ -31006,6 +31286,7 @@ mod tests {
             });
             let request1 = OpenWorkRequest {
                 work_spec_json: serde_json::to_vec(&spec1).unwrap(),
+                lease_id: TEST_OPEN_WORK_LEASE_ID.to_string(),
             };
             let mut buf1 = Vec::new();
             request1.encode(&mut buf1).expect("encode");
@@ -31028,6 +31309,7 @@ mod tests {
             });
             let request2 = OpenWorkRequest {
                 work_spec_json: serde_json::to_vec(&spec2).unwrap(),
+                lease_id: TEST_OPEN_WORK_LEASE_ID.to_string(),
             };
             let mut buf2 = Vec::new();
             request2.encode(&mut buf2).expect("encode");
@@ -31060,6 +31342,7 @@ mod tests {
             let spec_bytes = test_work_spec_json("W-test-event-count-001");
             let request = OpenWorkRequest {
                 work_spec_json: spec_bytes,
+                lease_id: TEST_OPEN_WORK_LEASE_ID.to_string(),
             };
             let mut buf = Vec::new();
             request.encode(&mut buf).expect("encode");
@@ -31129,6 +31412,95 @@ mod tests {
             let bytes = serde_json::to_vec(&envelope).unwrap();
             let result = PrivilegedDispatcher::extract_spec_hash_from_event_payload(&bytes);
             assert_eq!(result, None);
+        }
+
+        #[test]
+        fn test_open_work_empty_lease_id_rejected() {
+            // When PCAC gate is wired, empty lease_id must be rejected.
+            let dispatcher = open_work_dispatcher_with_cas();
+            let ctx = test_open_work_ctx();
+            let spec_bytes = test_work_spec_json("W-test-empty-lease");
+            let request = OpenWorkRequest {
+                work_spec_json: spec_bytes,
+                lease_id: String::new(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let result = dispatcher.handle_open_work(&buf, &ctx);
+            assert!(result.is_ok());
+            match result.unwrap() {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("lease_id"),
+                        "Expected lease_id error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected Error for empty lease_id, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_open_work_bounded_idempotency_query() {
+            // Verify that the bounded query correctly detects existing
+            // work.opened events without materialising the full history.
+            let dispatcher = open_work_dispatcher_with_cas();
+            let ctx = test_open_work_ctx();
+            let spec_bytes = test_work_spec_json("W-test-bounded-query-001");
+            let request = OpenWorkRequest {
+                work_spec_json: spec_bytes.clone(),
+                lease_id: TEST_OPEN_WORK_LEASE_ID.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            // First call creates the event
+            let result = dispatcher.handle_open_work(&buf, &ctx);
+            assert!(result.is_ok());
+            match result.unwrap() {
+                PrivilegedResponse::OpenWork(resp) => {
+                    assert!(!resp.already_existed, "first call must create");
+                },
+                other => panic!("Expected OpenWork success, got: {other:?}"),
+            }
+
+            // Verify the bounded query finds the event
+            let found = dispatcher
+                .event_emitter
+                .get_first_event_by_work_id_and_type("W-test-bounded-query-001", "work.opened");
+            assert!(
+                found.is_some(),
+                "bounded query must find existing work.opened event"
+            );
+
+            // Verify querying a non-existent event type returns None
+            let not_found = dispatcher
+                .event_emitter
+                .get_first_event_by_work_id_and_type("W-test-bounded-query-001", "work.closed");
+            assert!(
+                not_found.is_none(),
+                "bounded query must return None for non-existent event type"
+            );
+
+            // Second call with same spec is idempotent
+            let mut buf2 = Vec::new();
+            let request2 = OpenWorkRequest {
+                work_spec_json: spec_bytes,
+                lease_id: TEST_OPEN_WORK_LEASE_ID.to_string(),
+            };
+            request2.encode(&mut buf2).expect("encode");
+            let result2 = dispatcher.handle_open_work(&buf2, &ctx);
+            assert!(result2.is_ok());
+            match result2.unwrap() {
+                PrivilegedResponse::OpenWork(resp) => {
+                    assert!(
+                        resp.already_existed,
+                        "second call with same spec must be idempotent"
+                    );
+                },
+                other => panic!("Expected idempotent OpenWork, got: {other:?}"),
+            }
         }
 
         #[test]

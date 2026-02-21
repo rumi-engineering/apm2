@@ -143,6 +143,9 @@ pub struct OpenArgs {
     /// Path to the ticket YAML file to import as a `WorkSpec`.
     #[arg(long, required = true)]
     pub from_ticket: String,
+    /// Governing lease ID for PCAC lifecycle enforcement.
+    #[arg(long, required = true)]
+    pub lease_id: String,
 }
 
 // ============================================================================
@@ -498,7 +501,9 @@ fn run_open(args: &OpenArgs, socket_path: &Path, json_output: bool) -> u8 {
     // Execute OpenWork RPC
     let result = rt.block_on(async {
         let mut client = OperatorClient::connect(socket_path).await?;
-        client.open_work(work_spec_json.as_bytes()).await
+        client
+            .open_work(work_spec_json.as_bytes(), &args.lease_id)
+            .await
     });
 
     match result {
@@ -892,6 +897,7 @@ mod tests {
     fn test_open_rejects_missing_file() {
         let args = OpenArgs {
             from_ticket: "/nonexistent/ticket.yaml".to_string(),
+            lease_id: "L-test-001".to_string(),
         };
         let socket_path = Path::new("/nonexistent/operator.sock");
         let exit_code = run_open(&args, socket_path, true);

@@ -2359,6 +2359,59 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         events
     }
 
+    fn get_first_event_by_work_id_and_type(
+        &self,
+        work_id: &str,
+        event_type: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let Ok(conn) = self.conn.lock() else {
+            return None;
+        };
+
+        // Legacy table: bounded LIMIT 1 query (O(1) with index).
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+             FROM ledger_events WHERE work_id = ?1 AND event_type = ?2
+             ORDER BY timestamp_ns ASC, rowid ASC LIMIT 1",
+        ) {
+            if let Ok(mut rows) = stmt.query_map(params![work_id, event_type], |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            }) {
+                if let Some(Ok(event)) = rows.next() {
+                    return Some(event);
+                }
+            }
+        }
+
+        // TCK-00631 / Finding 1: check canonical events table when frozen.
+        if self.is_frozen_internal() {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                        COALESCE(signature, X''), timestamp_ns \
+                 FROM events WHERE session_id = ?1 AND event_type = ?2 \
+                 ORDER BY timestamp_ns ASC, rowid ASC LIMIT 1",
+            ) {
+                if let Ok(mut rows) =
+                    stmt.query_map(params![work_id, event_type], Self::canonical_row_to_event)
+                {
+                    if let Some(Ok(event)) = rows.next() {
+                        return Some(event);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     fn get_all_events(&self) -> Vec<SignedLedgerEvent> {
         let Ok(conn) = self.conn.lock() else {
             return Vec::new();
