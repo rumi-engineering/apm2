@@ -568,7 +568,7 @@ pub struct DoctorArgs {
     )]
     pub repo: Option<String>,
 
-    /// Execute doctor-prescribed recovery actions for the PR.
+    /// Execute doctor-prescribed recovery actions.
     #[arg(long, default_value_t = false)]
     pub fix: bool,
 
@@ -1868,10 +1868,28 @@ enum SystemDoctorFixActionStatus {
     Failed,
 }
 
+#[derive(Debug, Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum SystemDoctorFixActionKind {
+    LaneReconcile,
+    QueueReconcileApply,
+    LaneLogGc,
+    LaneStatusScan,
+    LaneTmpCorruptionDetection,
+    LaneTmpCorruptionDetected,
+    LaneTmpScrub,
+    LaneResetOrphanedSystemdUnit,
+    LaneResetTmpCorruption,
+    LaneResetCleanupRecovery,
+    QueueReconcilePostLaneReset,
+    WorkerRestart,
+    DoctorPostCheck,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SystemDoctorFixAction {
-    pub action: String,
+    pub action: SystemDoctorFixActionKind,
     pub status: SystemDoctorFixActionStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lane_id: Option<String>,
@@ -2037,13 +2055,13 @@ fn collect_orphaned_systemd_units(
 
 fn push_system_doctor_fix_action(
     actions: &mut Vec<SystemDoctorFixAction>,
-    action: &str,
+    action: SystemDoctorFixActionKind,
     status: SystemDoctorFixActionStatus,
     lane_id: Option<&str>,
     detail: impl Into<String>,
 ) {
     actions.push(SystemDoctorFixAction {
-        action: action.to_string(),
+        action,
         status,
         lane_id: lane_id.map(std::string::ToString::to_string),
         detail: detail.into(),
@@ -2522,7 +2540,7 @@ fn run_system_doctor_fix(
                 || receipt.infrastructure_failures > 0;
             push_system_doctor_fix_action(
                 &mut actions,
-                "lane_reconcile",
+                SystemDoctorFixActionKind::LaneReconcile,
                 if has_lane_errors {
                     SystemDoctorFixActionStatus::Blocked
                 } else {
@@ -2543,7 +2561,7 @@ fn run_system_doctor_fix(
             action_failed = true;
             push_system_doctor_fix_action(
                 &mut actions,
-                "lane_reconcile",
+                SystemDoctorFixActionKind::LaneReconcile,
                 SystemDoctorFixActionStatus::Failed,
                 None,
                 format!("lane reconcile failed: {err}"),
@@ -2562,7 +2580,7 @@ fn run_system_doctor_fix(
             }
             push_system_doctor_fix_action(
                 &mut actions,
-                "queue_reconcile_apply",
+                SystemDoctorFixActionKind::QueueReconcileApply,
                 SystemDoctorFixActionStatus::Applied,
                 None,
                 format!(
@@ -2580,7 +2598,7 @@ fn run_system_doctor_fix(
             action_failed = true;
             push_system_doctor_fix_action(
                 &mut actions,
-                "queue_reconcile_apply",
+                SystemDoctorFixActionKind::QueueReconcileApply,
                 SystemDoctorFixActionStatus::Failed,
                 None,
                 format!("queue reconcile failed: {err}"),
@@ -2592,7 +2610,7 @@ fn run_system_doctor_fix(
         Ok(summary) if summary.targets == 0 => {
             push_system_doctor_fix_action(
                 &mut actions,
-                "lane_log_gc",
+                SystemDoctorFixActionKind::LaneLogGc,
                 SystemDoctorFixActionStatus::Skipped,
                 None,
                 "no stale lane log targets matched retention policy",
@@ -2601,7 +2619,7 @@ fn run_system_doctor_fix(
         Ok(summary) if summary.errors == 0 => {
             push_system_doctor_fix_action(
                 &mut actions,
-                "lane_log_gc",
+                SystemDoctorFixActionKind::LaneLogGc,
                 SystemDoctorFixActionStatus::Applied,
                 None,
                 format!(
@@ -2614,7 +2632,7 @@ fn run_system_doctor_fix(
             action_failed = true;
             push_system_doctor_fix_action(
                 &mut actions,
-                "lane_log_gc",
+                SystemDoctorFixActionKind::LaneLogGc,
                 SystemDoctorFixActionStatus::Failed,
                 None,
                 format!(
@@ -2627,7 +2645,7 @@ fn run_system_doctor_fix(
             action_failed = true;
             push_system_doctor_fix_action(
                 &mut actions,
-                "lane_log_gc",
+                SystemDoctorFixActionKind::LaneLogGc,
                 SystemDoctorFixActionStatus::Failed,
                 None,
                 err,
@@ -2641,7 +2659,7 @@ fn run_system_doctor_fix(
             action_failed = true;
             push_system_doctor_fix_action(
                 &mut actions,
-                "lane_status_scan",
+                SystemDoctorFixActionKind::LaneStatusScan,
                 SystemDoctorFixActionStatus::Failed,
                 None,
                 format!("failed to load lane statuses: {err}"),
@@ -2665,7 +2683,7 @@ fn run_system_doctor_fix(
                 action_failed = true;
                 push_system_doctor_fix_action(
                     &mut actions,
-                    "lane_tmp_corruption_detection",
+                    SystemDoctorFixActionKind::LaneTmpCorruptionDetection,
                     SystemDoctorFixActionStatus::Failed,
                     Some(&lane_id),
                     err,
@@ -2681,7 +2699,7 @@ fn run_system_doctor_fix(
         if let Some(detail) = tmp_trigger_detail.as_ref() {
             push_system_doctor_fix_action(
                 &mut actions,
-                "lane_tmp_corruption_detected",
+                SystemDoctorFixActionKind::LaneTmpCorruptionDetected,
                 SystemDoctorFixActionStatus::Blocked,
                 Some(&lane_id),
                 detail.clone(),
@@ -2690,7 +2708,7 @@ fn run_system_doctor_fix(
                 Ok(scrub_summary) => {
                     push_system_doctor_fix_action(
                         &mut actions,
-                        "lane_tmp_scrub",
+                        SystemDoctorFixActionKind::LaneTmpScrub,
                         SystemDoctorFixActionStatus::Applied,
                         Some(&lane_id),
                         format!(
@@ -2703,7 +2721,7 @@ fn run_system_doctor_fix(
                     action_failed = true;
                     push_system_doctor_fix_action(
                         &mut actions,
-                        "lane_tmp_scrub",
+                        SystemDoctorFixActionKind::LaneTmpScrub,
                         SystemDoctorFixActionStatus::Failed,
                         Some(&lane_id),
                         err,
@@ -2723,7 +2741,7 @@ fn run_system_doctor_fix(
             let Some(job_id) = job_id else {
                 push_system_doctor_fix_action(
                     &mut actions,
-                    "lane_reset_orphaned_systemd_unit",
+                    SystemDoctorFixActionKind::LaneResetOrphanedSystemdUnit,
                     SystemDoctorFixActionStatus::Blocked,
                     Some(&lane_id),
                     "cannot reset orphaned-systemd lane without lease job_id",
@@ -2743,7 +2761,7 @@ fn run_system_doctor_fix(
                 };
                 push_system_doctor_fix_action(
                     &mut actions,
-                    "lane_reset_orphaned_systemd_unit",
+                    SystemDoctorFixActionKind::LaneResetOrphanedSystemdUnit,
                     SystemDoctorFixActionStatus::Blocked,
                     Some(&lane_id),
                     detail,
@@ -2752,12 +2770,12 @@ fn run_system_doctor_fix(
             }
         }
 
-        let reset_action_name = if reason_is_orphaned {
-            "lane_reset_orphaned_systemd_unit"
+        let reset_action = if reason_is_orphaned {
+            SystemDoctorFixActionKind::LaneResetOrphanedSystemdUnit
         } else if reason_is_tmp_corrupt {
-            "lane_reset_tmp_corruption"
+            SystemDoctorFixActionKind::LaneResetTmpCorruption
         } else {
-            "lane_reset_cleanup_recovery"
+            SystemDoctorFixActionKind::LaneResetCleanupRecovery
         };
         match doctor_reset_lane_once(&manager, &lane_id) {
             Ok(reset_summary) => {
@@ -2765,7 +2783,7 @@ fn run_system_doctor_fix(
                 should_restart_worker = true;
                 push_system_doctor_fix_action(
                     &mut actions,
-                    reset_action_name,
+                    reset_action,
                     SystemDoctorFixActionStatus::Applied,
                     Some(&lane_id),
                     format!(
@@ -2777,7 +2795,7 @@ fn run_system_doctor_fix(
             Err(DoctorLaneResetError::Running { pid }) => {
                 push_system_doctor_fix_action(
                     &mut actions,
-                    reset_action_name,
+                    reset_action,
                     SystemDoctorFixActionStatus::Blocked,
                     Some(&lane_id),
                     format!(
@@ -2793,7 +2811,7 @@ fn run_system_doctor_fix(
                     Ok(scrub_summary) => {
                         push_system_doctor_fix_action(
                             &mut actions,
-                            "lane_tmp_scrub",
+                            SystemDoctorFixActionKind::LaneTmpScrub,
                             SystemDoctorFixActionStatus::Applied,
                             Some(&lane_id),
                             format!(
@@ -2807,7 +2825,7 @@ fn run_system_doctor_fix(
                                 should_restart_worker = true;
                                 push_system_doctor_fix_action(
                                     &mut actions,
-                                    reset_action_name,
+                                    reset_action,
                                     SystemDoctorFixActionStatus::Applied,
                                     Some(&lane_id),
                                     format!(
@@ -2820,7 +2838,7 @@ fn run_system_doctor_fix(
                                 action_failed = true;
                                 push_system_doctor_fix_action(
                                     &mut actions,
-                                    reset_action_name,
+                                    reset_action,
                                     SystemDoctorFixActionStatus::Failed,
                                     Some(&lane_id),
                                     format!("reset still failing after tmp scrub: {err:?}"),
@@ -2832,7 +2850,7 @@ fn run_system_doctor_fix(
                         action_failed = true;
                         push_system_doctor_fix_action(
                             &mut actions,
-                            "lane_tmp_scrub",
+                            SystemDoctorFixActionKind::LaneTmpScrub,
                             SystemDoctorFixActionStatus::Failed,
                             Some(&lane_id),
                             err,
@@ -2849,7 +2867,7 @@ fn run_system_doctor_fix(
                     .join("; ");
                 push_system_doctor_fix_action(
                     &mut actions,
-                    reset_action_name,
+                    reset_action,
                     SystemDoctorFixActionStatus::Failed,
                     Some(&lane_id),
                     format!("reset refused: {detail}"),
@@ -2859,7 +2877,7 @@ fn run_system_doctor_fix(
                 action_failed = true;
                 push_system_doctor_fix_action(
                     &mut actions,
-                    reset_action_name,
+                    reset_action,
                     SystemDoctorFixActionStatus::Failed,
                     Some(&lane_id),
                     err,
@@ -2873,7 +2891,7 @@ fn run_system_doctor_fix(
             Ok(receipt) => {
                 push_system_doctor_fix_action(
                     &mut actions,
-                    "queue_reconcile_post_lane_reset",
+                    SystemDoctorFixActionKind::QueueReconcilePostLaneReset,
                     SystemDoctorFixActionStatus::Applied,
                     None,
                     format!(
@@ -2889,7 +2907,7 @@ fn run_system_doctor_fix(
                 action_failed = true;
                 push_system_doctor_fix_action(
                     &mut actions,
-                    "queue_reconcile_post_lane_reset",
+                    SystemDoctorFixActionKind::QueueReconcilePostLaneReset,
                     SystemDoctorFixActionStatus::Failed,
                     None,
                     format!("post-reset queue reconcile failed: {err}"),
@@ -2899,7 +2917,7 @@ fn run_system_doctor_fix(
     } else {
         push_system_doctor_fix_action(
             &mut actions,
-            "queue_reconcile_post_lane_reset",
+            SystemDoctorFixActionKind::QueueReconcilePostLaneReset,
             SystemDoctorFixActionStatus::Skipped,
             None,
             "no lane reset actions applied; post-reset reconcile skipped",
@@ -2911,7 +2929,7 @@ fn run_system_doctor_fix(
             Ok(scope) => {
                 push_system_doctor_fix_action(
                     &mut actions,
-                    "worker_restart",
+                    SystemDoctorFixActionKind::WorkerRestart,
                     SystemDoctorFixActionStatus::Applied,
                     None,
                     format!("restarted apm2-worker.service in {scope} scope"),
@@ -2921,7 +2939,7 @@ fn run_system_doctor_fix(
                 action_failed = true;
                 push_system_doctor_fix_action(
                     &mut actions,
-                    "worker_restart",
+                    SystemDoctorFixActionKind::WorkerRestart,
                     SystemDoctorFixActionStatus::Failed,
                     None,
                     err,
@@ -2931,7 +2949,7 @@ fn run_system_doctor_fix(
     } else {
         push_system_doctor_fix_action(
             &mut actions,
-            "worker_restart",
+            SystemDoctorFixActionKind::WorkerRestart,
             SystemDoctorFixActionStatus::Skipped,
             None,
             "no repair actions required worker restart",
@@ -2950,7 +2968,7 @@ fn run_system_doctor_fix(
             action_failed = true;
             push_system_doctor_fix_action(
                 &mut actions,
-                "doctor_post_check",
+                SystemDoctorFixActionKind::DoctorPostCheck,
                 SystemDoctorFixActionStatus::Failed,
                 None,
                 format!("failed to collect post-fix checks: {err}"),
@@ -7027,6 +7045,118 @@ mod tests {
                 target.display()
             );
         }
+    }
+
+    #[test]
+    fn test_detect_lane_tmp_corruption_flags_transient_residue() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let residue = manager.lane_dir(lane_id).join("tmp").join(".tmp-stale");
+        std::fs::write(&residue, b"stale residue").expect("write residue");
+
+        let detection =
+            detect_lane_tmp_corruption(&manager, lane_id).expect("tmp corruption detection");
+        let detail = detection.expect("residue should be detected");
+        assert!(detail.contains("transient residue"));
+        assert!(detail.contains(".tmp-stale"));
+    }
+
+    #[test]
+    fn test_scrub_lane_tmp_dir_removes_nested_entries() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let tmp_dir = manager.lane_dir(lane_id).join("tmp");
+
+        std::fs::write(tmp_dir.join(".tmp-residue"), b"stale").expect("write residue file");
+        std::fs::write(tmp_dir.join("leftover.txt"), b"leftover").expect("write leftover file");
+        let nested_dir = tmp_dir.join("nested");
+        std::fs::create_dir_all(&nested_dir).expect("create nested tmp dir");
+        std::fs::write(nested_dir.join("nested.log"), b"nested").expect("write nested file");
+
+        let scrub = scrub_lane_tmp_dir(&manager, lane_id).expect("tmp scrub should succeed");
+        assert!(
+            scrub.entries_deleted >= 3,
+            "expected scrub to delete multiple entries, got {}",
+            scrub.entries_deleted
+        );
+        let remaining = std::fs::read_dir(&tmp_dir)
+            .expect("read tmp dir after scrub")
+            .count();
+        assert_eq!(remaining, 0, "tmp dir should be empty after scrub");
+    }
+
+    #[test]
+    fn test_gc_stale_lane_logs_reports_over_quota_lane_log_targets() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let logs_dir = manager.lane_dir(lane_id).join("logs");
+        let mut created_job_dirs = Vec::new();
+        for idx in 0..6 {
+            let job_dir = logs_dir.join(format!("job-{idx:02}"));
+            std::fs::create_dir_all(&job_dir).expect("create job log directory");
+            let file = std::fs::File::create(job_dir.join("build.log")).expect("create build.log");
+            // Sparse file: 20 MiB logical size without heavy write I/O.
+            file.set_len(20 * 1024 * 1024)
+                .expect("set sparse file size");
+            created_job_dirs.push(job_dir);
+        }
+        let _oldest_dir = created_job_dirs
+            .into_iter()
+            .min()
+            .expect("at least one created job log dir");
+
+        let summary =
+            gc_stale_lane_logs(manager.fac_root(), &manager).expect("lane log gc should succeed");
+        assert!(
+            summary.targets >= 1,
+            "expected at least one lane log gc target, got {}",
+            summary.targets
+        );
+        assert_eq!(
+            summary.actions_applied + summary.errors,
+            summary.targets,
+            "every target must resolve to exactly one action or error"
+        );
+        assert!(
+            summary.actions_applied > 0 || summary.errors > 0,
+            "gc should report at least one applied action or error for non-empty target set"
+        );
+    }
+
+    #[test]
+    fn test_system_doctor_fix_action_kind_serializes_as_snake_case() {
+        let payload = serde_json::to_value(SystemDoctorFixAction {
+            action: SystemDoctorFixActionKind::LaneTmpCorruptionDetected,
+            status: SystemDoctorFixActionStatus::Blocked,
+            lane_id: Some("lane-00".to_string()),
+            detail: "tmp residue detected".to_string(),
+        })
+        .expect("serialize doctor action");
+        assert_eq!(
+            payload.get("action").and_then(|value| value.as_str()),
+            Some("lane_tmp_corruption_detected")
+        );
     }
 
     #[test]
