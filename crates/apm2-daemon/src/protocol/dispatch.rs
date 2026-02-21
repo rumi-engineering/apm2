@@ -715,6 +715,58 @@ pub trait LedgerEventEmitter: Send + Sync {
             .find(|e| e.event_type == event_type)
     }
 
+    /// Returns the most recent `work_transitioned` event for a
+    /// `(work_id, rationale_code)` pair, or `None` if no match exists.
+    ///
+    /// This is the bounded O(1) counterpart of the full-scan pattern used
+    /// by `handle_claim_work_v2_idempotency`. SQL implementations SHOULD
+    /// use `json_extract` + `ORDER BY timestamp_ns DESC LIMIT 1` to resolve
+    /// at the database level without application-level O(N) JSON parsing.
+    ///
+    /// The default implementation delegates to `get_events_by_work_id` and
+    /// performs a filtered reverse scan; override in SQL backends for O(1).
+    fn get_latest_work_transition_by_rationale(
+        &self,
+        work_id: &str,
+        rationale_code: &str,
+    ) -> Option<SignedLedgerEvent> {
+        self.get_events_by_work_id(work_id)
+            .into_iter()
+            .rev()
+            .filter(|e| e.event_type == "work_transitioned")
+            .find(|event| {
+                serde_json::from_slice::<serde_json::Value>(&event.payload).is_ok_and(|payload| {
+                    payload.get("rationale_code").and_then(|v| v.as_str()) == Some(rationale_code)
+                })
+            })
+    }
+
+    /// Returns the `evidence.published` event matching a deterministic
+    /// `evidence_id`, or `None` if no match exists.
+    ///
+    /// This is the bounded O(1) counterpart of the full-scan pattern used
+    /// by `handle_claim_work_v2_idempotency`. SQL implementations SHOULD
+    /// use `json_extract` + indexed lookup to resolve at the database level
+    /// without application-level O(N) JSON parsing.
+    ///
+    /// The default implementation delegates to `get_events_by_work_id` and
+    /// performs a filtered reverse scan; override in SQL backends for O(1).
+    fn get_evidence_by_evidence_id(
+        &self,
+        work_id: &str,
+        evidence_id: &str,
+    ) -> Option<SignedLedgerEvent> {
+        self.get_events_by_work_id(work_id)
+            .into_iter()
+            .rev()
+            .filter(|e| e.event_type == "evidence.published")
+            .find(|e| {
+                serde_json::from_slice::<serde_json::Value>(&e.payload).is_ok_and(|envelope| {
+                    envelope.get("evidence_id").and_then(|v| v.as_str()) == Some(evidence_id)
+                })
+            })
+    }
+
     /// Queries all persisted ledger events in deterministic replay order.
     ///
     /// Implementations must return events ordered by causal append ordering
@@ -15598,43 +15650,10 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // 8. Emit work_transitioned event (Open -> Claimed or ReadyForReview -> Review)
-        // Use the legacy `emit_work_transitioned` path which emits event_type
-        // "work_transitioned" with a JSON payload. The projection bridge
-        // (`translate_signed_events`) normalizes "work_transitioned" events into
-        // canonical "work.transitioned" protobuf payloads for the WorkReducer.
-        // Using `emit_session_event` with "work.transitioned" would JSON-wrap the
-        // protobuf payload, which the bridge cannot decode (it expects native
-        // protobuf for "work." events).
-        if let Err(e) = self.event_emitter.emit_work_transitioned(&WorkTransition {
-            work_id: &request.work_id,
-            from_state: from_state_str,
-            to_state: to_state_str,
-            rationale_code,
-            previous_transition_count: work_status.transition_count,
-            actor_id: &actor_id,
-            timestamp_ns,
-        }) {
-            warn!(error = %e, "work_transitioned event emission failed");
-            return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                format!("ClaimWorkV2 event emission failed: {e}"),
-            ));
-        }
-
-        info!(
-            work_id = %request.work_id,
-            from_state = from_state_str,
-            to_state = to_state_str,
-            "work_transitioned event emitted for ClaimWorkV2"
-        );
-
-        // 9. Issue a new lease
+        // 8. Issue a new lease and resolve policy (pre-CAS, no durable state mutated
+        //    yet).
         let issued_lease_id = generate_lease_id();
 
-        // 9a. Register the claim in WorkRegistry so SpawnEpisode and other
-        // downstream handlers can find this claim.
-        //
         // Resolve actual policy resolution from the governing lease's claim.
         // Fail-closed: if no real policy resolution is available, reject the
         // claim rather than recording synthetic PCAC-derived hashes that
@@ -15664,64 +15683,8 @@ impl PrivilegedDispatcher {
             ));
         };
 
-        let v2_claim = WorkClaim {
-            work_id: request.work_id.clone(),
-            lease_id: issued_lease_id.clone(),
-            actor_id: actor_id.clone(),
-            role,
-            policy_resolution: resolved_policy.clone(),
-            executor_custody_domains: vec![],
-            author_custody_domains: vec![],
-            permeability_receipt: None,
-        };
-
-        // DuplicateWorkId for the same (work_id, role) pair means this exact
-        // role was already claimed (legacy path or re-claim); treat as
-        // non-fatal. Different roles for the same work_id are allowed and
-        // expected in multi-role workflows.
-        match self.work_registry.register_claim(v2_claim) {
-            Ok(_) => {
-                info!(
-                    work_id = %request.work_id,
-                    lease_id = %issued_lease_id,
-                    role = ?role,
-                    "ClaimWorkV2: claim registered in WorkRegistry"
-                );
-            },
-            Err(WorkRegistryError::DuplicateWorkId { .. }) => {
-                debug!(
-                    work_id = %request.work_id,
-                    role = ?role,
-                    "ClaimWorkV2: (work_id, role) already in WorkRegistry \
-                     (legacy path or re-claim)"
-                );
-            },
-            Err(e) => {
-                warn!(error = %e, "ClaimWorkV2: WorkRegistry registration failed");
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!("ClaimWorkV2 work registration failed: {e}"),
-                ));
-            },
-        }
-
-        // 9b. Register the issued lease in LeaseValidator so downstream
-        // privileged handlers (SpawnEpisode, DelegateSublease, etc.) can
-        // resolve lease -> work_id mappings.
-        self.lease_validator.register_lease_with_executor(
-            &issued_lease_id,
-            &request.work_id,
-            "claim_work_v2",
-            &actor_id,
-        );
-        info!(
-            lease_id = %issued_lease_id,
-            work_id = %request.work_id,
-            actor_id = %actor_id,
-            "ClaimWorkV2: lease registered in LeaseValidator"
-        );
-
-        // 10. Build WorkAuthorityBindings CAS document
+        // 9. Build WorkAuthorityBindings CAS document (pure computation, no durable
+        //    side effects).
         let role_str = match role {
             WorkRole::Implementer => "IMPLEMENTER",
             WorkRole::Reviewer => "REVIEWER",
@@ -15777,7 +15740,12 @@ impl PrivilegedDispatcher {
         let bindings_hash = blake3::hash(canonical_bytes);
         let bindings_hash_hex = bindings_hash.to_hex().to_string();
 
-        // 11. Store to CAS (fail-closed when not configured)
+        // 10. Store to CAS FIRST (fail-closed when not configured).
+        //
+        // SECURITY FIX (Finding 3): CAS storage MUST complete before any
+        // ledger events are emitted. If CAS store fails after ledger events
+        // are emitted, the work_transitioned event is orphaned without its
+        // evidence.published counterpart, permanently bricking the work item.
         let Some(cas) = self.cas.as_ref() else {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
@@ -15792,9 +15760,121 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // 12. Anchor via evidence.published with category WORK_AUTHORITY_BINDINGS and
+        // 11. Emit work_transitioned event (Open -> Claimed or ReadyForReview ->
+        //     Review). CAS is already stored so we can safely persist ledger events.
+        //
+        // Uses legacy `emit_work_transitioned` path which emits event_type
+        // "work_transitioned" with a JSON payload. The projection bridge
+        // (`translate_signed_events`) normalizes "work_transitioned" events
+        // into canonical "work.transitioned" protobuf payloads for the
+        // WorkReducer.
+        //
+        // SECURITY FIX (Finding 4): UNIQUE constraint violations on
+        // work_transitioned indicate a concurrent race. Instead of returning
+        // a phantom lease, recover the existing authoritative lease_id from
+        // the idempotency path or return FAILED_PRECONDITION.
+        match self.event_emitter.emit_work_transitioned(&WorkTransition {
+            work_id: &request.work_id,
+            from_state: from_state_str,
+            to_state: to_state_str,
+            rationale_code,
+            previous_transition_count: work_status.transition_count,
+            actor_id: &actor_id,
+            timestamp_ns,
+        }) {
+            Ok(_) => {
+                info!(
+                    work_id = %request.work_id,
+                    from_state = from_state_str,
+                    to_state = to_state_str,
+                    "work_transitioned event emitted for ClaimWorkV2"
+                );
+            },
+            Err(e) if e.to_string().contains("UNIQUE constraint") => {
+                // Concurrent race: another ClaimWorkV2 won the transition.
+                // Recover via idempotency or return FAILED_PRECONDITION.
+                info!(
+                    work_id = %request.work_id,
+                    role = ?role,
+                    "ClaimWorkV2: UNIQUE constraint on work_transitioned \
+                     (concurrent race detected), attempting idempotency recovery"
+                );
+                return self.handle_claim_work_v2_idempotency(&request.work_id, &actor_id, role);
+            },
+            Err(e) => {
+                warn!(error = %e, "work_transitioned event emission failed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("ClaimWorkV2 event emission failed: {e}"),
+                ));
+            },
+        }
+
+        // 12. Register the claim in WorkRegistry so SpawnEpisode and other downstream
+        //     handlers can find this claim.
+        let v2_claim = WorkClaim {
+            work_id: request.work_id.clone(),
+            lease_id: issued_lease_id.clone(),
+            actor_id: actor_id.clone(),
+            role,
+            policy_resolution: resolved_policy,
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+
+        // DuplicateWorkId for the same (work_id, role) pair means this exact
+        // role was already claimed (legacy path or re-claim). On duplicate,
+        // recover the existing authoritative lease via idempotency rather
+        // than returning a phantom lease that no registry knows about.
+        match self.work_registry.register_claim(v2_claim) {
+            Ok(_) => {
+                info!(
+                    work_id = %request.work_id,
+                    lease_id = %issued_lease_id,
+                    role = ?role,
+                    "ClaimWorkV2: claim registered in WorkRegistry"
+                );
+            },
+            Err(WorkRegistryError::DuplicateWorkId { .. }) => {
+                // The (work_id, role) pair already exists. Recover
+                // existing authoritative claim via idempotency path.
+                info!(
+                    work_id = %request.work_id,
+                    role = ?role,
+                    "ClaimWorkV2: (work_id, role) already registered, \
+                     recovering via idempotency"
+                );
+                return self.handle_claim_work_v2_idempotency(&request.work_id, &actor_id, role);
+            },
+            Err(e) => {
+                warn!(error = %e, "ClaimWorkV2: WorkRegistry registration failed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("ClaimWorkV2 work registration failed: {e}"),
+                ));
+            },
+        }
+
+        // 12b. Register the issued lease in LeaseValidator so downstream
+        // privileged handlers (SpawnEpisode, DelegateSublease, etc.) can
+        // resolve lease -> work_id mappings.
+        self.lease_validator.register_lease_with_executor(
+            &issued_lease_id,
+            &request.work_id,
+            "claim_work_v2",
+            &actor_id,
+        );
+        info!(
+            lease_id = %issued_lease_id,
+            work_id = %request.work_id,
+            actor_id = %actor_id,
+            "ClaimWorkV2: lease registered in LeaseValidator"
+        );
+
+        // 13. Anchor via evidence.published with category WORK_AUTHORITY_BINDINGS and
         //     deterministic evidence_id (WAB- prefix + BLAKE3 of work_id + role +
-        //     actor_id)
+        //     actor_id).
         let evidence_id = {
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"WAB:");
@@ -15879,10 +15959,12 @@ impl PrivilegedDispatcher {
     /// same role. If so, returns the existing claim info. If a different actor
     /// claimed the same role, returns `FAILED_PRECONDITION`.
     ///
-    /// Uses role-filtered event search to support multi-role workflows where
-    /// an Implementer and a Reviewer each claim the same `work_id` in
-    /// sequence. Searches from newest to oldest (`rev()`) to find the most
-    /// recent event matching the requested role's `rationale_code`.
+    /// # Bounded Query Design (Findings 5/8)
+    ///
+    /// Uses targeted SQL queries via `get_latest_work_transition_by_rationale`
+    /// and `get_evidence_by_evidence_id` to avoid O(N) full-history scans
+    /// with per-row `serde_json::from_slice` parsing. SQL backends use
+    /// `json_extract` + `LIMIT 1` for O(1) lookups.
     #[allow(clippy::unnecessary_wraps)]
     fn handle_claim_work_v2_idempotency(
         &self,
@@ -15909,22 +15991,12 @@ impl PrivilegedDispatcher {
             _ => "UNKNOWN",
         };
 
-        // Search all work_transitioned events for this work_id, in reverse
-        // order (newest first), to find the most recent claim matching the
-        // requested role's rationale_code. This correctly handles multi-role
-        // workflows where Implementer and Reviewer claim the same work_id.
-        let events = self.event_emitter.get_events_by_work_id(work_id);
-
-        let claim_event = events
-            .iter()
-            .rev()
-            .filter(|e| e.event_type == "work_transitioned")
-            .find(|event| {
-                serde_json::from_slice::<serde_json::Value>(&event.payload).is_ok_and(|payload| {
-                    payload.get("rationale_code").and_then(|v| v.as_str())
-                        == Some(expected_rationale)
-                })
-            });
+        // Bounded O(1) lookup: find the most recent work_transitioned event
+        // matching the requested role's rationale_code. SQL backends use
+        // json_extract + LIMIT 1 instead of materializing all events.
+        let claim_event = self
+            .event_emitter
+            .get_latest_work_transition_by_rationale(work_id, expected_rationale);
 
         if let Some(event) = claim_event {
             // Use constant-time comparison to check actor_id match
@@ -15936,10 +16008,6 @@ impl PrivilegedDispatcher {
                 // Same actor, same role: idempotent re-claim. Look for the
                 // matching evidence.published event using the deterministic
                 // `evidence_id` (WAB- prefix + BLAKE3 of work_id:role:actor_id).
-                // The ledger stores evidence.published events in an envelope
-                // with hex-encoded inner payload, so we match on the outer
-                // `evidence_id` field and then decode the inner payload for
-                // detail fields (`lease_id`, `cas_hash`).
                 let expected_evidence_id = {
                     let mut hasher = blake3::Hasher::new();
                     hasher.update(b"WAB:");
@@ -15952,18 +16020,12 @@ impl PrivilegedDispatcher {
                     format!("WAB-{}", &hash.to_hex()[..32])
                 };
 
-                let wab_event = events
-                    .iter()
-                    .rev()
-                    .filter(|e| e.event_type == "evidence.published")
-                    .find(|e| {
-                        serde_json::from_slice::<serde_json::Value>(&e.payload).is_ok_and(
-                            |envelope| {
-                                envelope.get("evidence_id").and_then(|v| v.as_str())
-                                    == Some(&expected_evidence_id)
-                            },
-                        )
-                    });
+                // Bounded O(1) lookup: find evidence.published by its
+                // deterministic evidence_id. SQL backends use json_extract
+                // indexed lookup instead of O(N) scan.
+                let wab_event = self
+                    .event_emitter
+                    .get_evidence_by_evidence_id(work_id, &expected_evidence_id);
 
                 if let Some(wab) = wab_event {
                     if let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(&wab.payload)
@@ -15973,54 +16035,69 @@ impl PrivilegedDispatcher {
                         // outer level (production SQLite emitter) or inside the
                         // hex-encoded `payload` field (in-memory stub emitter).
                         // Try outer level first, then fall back to inner payload.
-                        let (lease_id, cas_hash) = {
-                            let outer_lease = envelope
-                                .get("lease_id")
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
-                            let outer_cas = envelope
-                                .get("cas_hash")
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
-
-                            if outer_lease.is_some() && outer_cas.is_some() {
-                                (
-                                    outer_lease.unwrap_or_default(),
-                                    outer_cas.unwrap_or_default(),
-                                )
-                            } else {
+                        //
+                        // SECURITY FIX (Finding 2): Explicitly check that
+                        // recovered fields are non-empty before returning
+                        // success. Empty lease_id/cas_hash = fail-closed.
+                        let lease_id: Option<String> = envelope
+                            .get("lease_id")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                            .or_else(|| {
                                 // Decode hex-encoded inner payload
-                                let inner = envelope
+                                envelope
                                     .get("payload")
                                     .and_then(|v| v.as_str())
                                     .and_then(|hex_str| hex::decode(hex_str).ok())
                                     .and_then(|bytes| {
                                         serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-                                    });
+                                    })
+                                    .and_then(|inner| {
+                                        inner
+                                            .get("lease_id")
+                                            .and_then(|v| v.as_str())
+                                            .filter(|s| !s.is_empty())
+                                            .map(String::from)
+                                    })
+                            });
 
-                                let inner_lease = inner
-                                    .as_ref()
-                                    .and_then(|v| v.get("lease_id"))
+                        let cas_hash: Option<String> = envelope
+                            .get("cas_hash")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                            .or_else(|| {
+                                envelope
+                                    .get("payload")
                                     .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let inner_cas = inner
-                                    .as_ref()
-                                    .and_then(|v| v.get("cas_hash"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                (inner_lease, inner_cas)
-                            }
-                        };
+                                    .and_then(|hex_str| hex::decode(hex_str).ok())
+                                    .and_then(|bytes| {
+                                        serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                                    })
+                                    .and_then(|inner| {
+                                        inner
+                                            .get("cas_hash")
+                                            .and_then(|v| v.as_str())
+                                            .filter(|s| !s.is_empty())
+                                            .map(String::from)
+                                    })
+                            });
 
-                        return Ok(PrivilegedResponse::ClaimWorkV2(ClaimWorkV2Response {
-                            work_id: work_id.to_string(),
-                            issued_lease_id: lease_id,
-                            authority_bindings_hash: cas_hash,
-                            evidence_id: expected_evidence_id,
-                            already_claimed: true,
-                        }));
+                        // Fail-closed: both fields MUST be non-empty for a
+                        // valid idempotent recovery. Empty fields indicate
+                        // a malformed or incomplete evidence.published event.
+                        if let (Some(recovered_lease), Some(recovered_cas)) = (lease_id, cas_hash) {
+                            return Ok(PrivilegedResponse::ClaimWorkV2(ClaimWorkV2Response {
+                                work_id: work_id.to_string(),
+                                issued_lease_id: recovered_lease,
+                                authority_bindings_hash: recovered_cas,
+                                evidence_id: expected_evidence_id,
+                                already_claimed: true,
+                            }));
+                        }
+                        // Fall through to fail-closed error below — fields
+                        // are empty/missing, so this is irrecoverable.
                     }
                 }
 

@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
 
+use crate::protocol::WorkRole;
 use crate::protocol::dispatch::{
     CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX, DEFECT_RECORDED_DOMAIN_PREFIX,
     EPISODE_EVENT_DOMAIN_PREFIX, EventTypeClass, GATE_LEASE_ISSUED_LEDGER_DOMAIN_PREFIX,
@@ -91,10 +92,15 @@ const REDUNDANCY_RECEIPT_CONSUMED_EVENT: &str = "redundancy_receipt_consumed";
 ///
 /// TCK-00638: This constant is no longer used in production code — the
 /// scan-bounded lookups were replaced with O(1) indexed lookups via
-/// `json_extract(CAST(payload AS TEXT), '$.evidence_id')`. Retained for the
-/// regression test `test_evidence_lookup_is_indexed_not_scan_bounded` which
-/// verifies the indexed path handles more events than the old scan limit.
-#[cfg(test)]
+/// Maximum number of events returned by `get_events_by_work_id`.
+///
+/// Prevents unbounded memory growth from O(N) event materialization.
+/// Per CTR-1302: evidence-related scans must have explicit LIMIT to
+/// prevent denial-of-service via resource exhaustion.
+///
+/// Also used by the regression test
+/// `test_evidence_lookup_is_indexed_not_scan_bounded` which verifies
+/// the indexed path handles more events than this limit.
 const MAX_EVIDENCE_SCAN_ROWS: u32 = 1_000;
 
 #[derive(Debug)]
@@ -717,6 +723,19 @@ impl SqliteLedgerEventEmitter {
             [],
         )?;
 
+        // TCK-00637 SECURITY BLOCKER: At-most-one work_transitioned per
+        // (work_id, previous_transition_count) to prevent ledger equivocation.
+        // Concurrent ClaimWorkV2 requests that observe the same transition_count
+        // will be serialized by the UNIQUE constraint — only one succeeds, the
+        // other receives a constraint violation and must recover or fail.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_transitioned_unique \
+             ON ledger_events(work_id, json_extract(CAST(payload AS TEXT), \
+             '$.previous_transition_count')) \
+             WHERE event_type = 'work_transitioned'",
+            [],
+        )?;
+
         // SECURITY (f-781-security-1771692992655093-0 — Canonical Events
         // Uniqueness Constraint):
         //
@@ -794,6 +813,18 @@ impl SqliteLedgerEventEmitter {
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_evidence_published_unique \
                  ON events(json_extract(CAST(payload AS TEXT), '$.evidence_id')) \
                  WHERE event_type = 'evidence.published'",
+                [],
+            )?;
+
+            // TCK-00637 SECURITY BLOCKER: At-most-one work_transitioned per
+            // (session_id, previous_transition_count) on the canonical events
+            // table. Mirrors idx_work_transitioned_unique on the legacy table.
+            // Note: canonical events use session_id where legacy uses work_id.
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_work_transitioned_unique \
+                 ON events(session_id, json_extract(CAST(payload AS TEXT), \
+                 '$.previous_transition_count')) \
+                 WHERE event_type = 'work_transitioned'",
                 [],
             )?;
         }
@@ -2603,13 +2634,15 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         };
 
         let mut events = Vec::new();
+        let limit = i64::from(MAX_EVIDENCE_SCAN_ROWS);
 
-        // Legacy events.
+        // Legacy events (bounded by MAX_EVIDENCE_SCAN_ROWS per Finding 6).
         if let Ok(mut stmt) = conn.prepare(
             "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
-             FROM ledger_events WHERE work_id = ?1 ORDER BY timestamp_ns ASC, rowid ASC",
+             FROM ledger_events WHERE work_id = ?1 ORDER BY timestamp_ns ASC, rowid ASC
+             LIMIT ?2",
         ) {
-            if let Ok(rows) = stmt.query_map(params![work_id], |row| {
+            if let Ok(rows) = stmt.query_map(params![work_id, limit], |row| {
                 Ok(SignedLedgerEvent {
                     event_id: row.get(0)?,
                     event_type: row.get(1)?,
@@ -2625,15 +2658,22 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         }
 
         // TCK-00631 / Finding 1: append canonical events when frozen.
+        // Also bounded by MAX_EVIDENCE_SCAN_ROWS.
         if self.is_frozen_internal() {
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT seq_id, event_type, session_id, actor_id, payload, \
-                        COALESCE(signature, X''), timestamp_ns \
-                 FROM events WHERE session_id = ?1 \
-                 ORDER BY timestamp_ns ASC, rowid ASC",
-            ) {
-                if let Ok(rows) = stmt.query_map(params![work_id], Self::canonical_row_to_event) {
-                    events.extend(rows.filter_map(Result::ok));
+            let remaining = limit - i64::try_from(events.len()).unwrap_or(limit);
+            if remaining > 0 {
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                            COALESCE(signature, X''), timestamp_ns \
+                     FROM events WHERE session_id = ?1 \
+                     ORDER BY timestamp_ns ASC, rowid ASC \
+                     LIMIT ?2",
+                ) {
+                    if let Ok(rows) =
+                        stmt.query_map(params![work_id, remaining], Self::canonical_row_to_event)
+                    {
+                        events.extend(rows.filter_map(Result::ok));
+                    }
                 }
             }
         }
@@ -2683,6 +2723,131 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             ) {
                 if let Ok(mut rows) =
                     stmt.query_map(params![work_id, event_type], Self::canonical_row_to_event)
+                {
+                    if let Some(Ok(event)) = rows.next() {
+                        return Some(event);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// TCK-00637 SECURITY FIX (Findings 5/8): Bounded SQL query for the
+    /// most recent `work_transitioned` event matching a `rationale_code`.
+    /// Uses `json_extract` at the database level to avoid O(N)
+    /// application-level JSON parsing.
+    fn get_latest_work_transition_by_rationale(
+        &self,
+        work_id: &str,
+        rationale_code: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let Ok(conn) = self.conn.lock() else {
+            return None;
+        };
+
+        // Legacy table: bounded LIMIT 1 with json_extract filtering.
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT event_id, event_type, work_id, actor_id, payload, \
+                    signature, timestamp_ns \
+             FROM ledger_events \
+             WHERE work_id = ?1 AND event_type = 'work_transitioned' \
+               AND json_extract(CAST(payload AS TEXT), '$.rationale_code') = ?2 \
+             ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
+        ) {
+            if let Ok(mut rows) = stmt.query_map(params![work_id, rationale_code], |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            }) {
+                if let Some(Ok(event)) = rows.next() {
+                    return Some(event);
+                }
+            }
+        }
+
+        // TCK-00631: check canonical events table when frozen.
+        if self.is_frozen_internal() {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                        COALESCE(signature, X''), timestamp_ns \
+                 FROM events \
+                 WHERE session_id = ?1 AND event_type = 'work_transitioned' \
+                   AND json_extract(CAST(payload AS TEXT), '$.rationale_code') = ?2 \
+                 ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
+            ) {
+                if let Ok(mut rows) = stmt.query_map(
+                    params![work_id, rationale_code],
+                    Self::canonical_row_to_event,
+                ) {
+                    if let Some(Ok(event)) = rows.next() {
+                        return Some(event);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// TCK-00637 SECURITY FIX (Findings 5/8): Bounded SQL query for an
+    /// `evidence.published` event by its deterministic `evidence_id`.
+    /// Uses `json_extract` at the database level to avoid O(N)
+    /// application-level JSON parsing.
+    fn get_evidence_by_evidence_id(
+        &self,
+        work_id: &str,
+        evidence_id: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let Ok(conn) = self.conn.lock() else {
+            return None;
+        };
+
+        // Legacy table: direct lookup via json_extract on evidence_id.
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT event_id, event_type, work_id, actor_id, payload, \
+                    signature, timestamp_ns \
+             FROM ledger_events \
+             WHERE work_id = ?1 AND event_type = 'evidence.published' \
+               AND json_extract(CAST(payload AS TEXT), '$.evidence_id') = ?2 \
+             ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
+        ) {
+            if let Ok(mut rows) = stmt.query_map(params![work_id, evidence_id], |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            }) {
+                if let Some(Ok(event)) = rows.next() {
+                    return Some(event);
+                }
+            }
+        }
+
+        // TCK-00631: check canonical events table when frozen.
+        if self.is_frozen_internal() {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                        COALESCE(signature, X''), timestamp_ns \
+                 FROM events \
+                 WHERE session_id = ?1 AND event_type = 'evidence.published' \
+                   AND json_extract(CAST(payload AS TEXT), '$.evidence_id') = ?2 \
+                 ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
+            ) {
+                if let Ok(mut rows) =
+                    stmt.query_map(params![work_id, evidence_id], Self::canonical_row_to_event)
                 {
                     if let Some(Ok(event)) = rows.next() {
                         return Some(event);
@@ -4170,15 +4335,25 @@ impl SqliteWorkRegistry {
     }
 
     /// Initializes the database schema.
+    ///
+    /// Claims are keyed by `(work_id, role)` to support Phase 2 multi-role
+    /// workflows where Implementer and Reviewer each claim the same `work_id`.
     pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS work_claims (
-                work_id TEXT PRIMARY KEY,
+                work_id TEXT NOT NULL,
                 lease_id TEXT NOT NULL,
                 actor_id TEXT NOT NULL,
                 role INTEGER NOT NULL,
                 claim_json BLOB NOT NULL
             )",
+            [],
+        )?;
+        // Multi-role UNIQUE constraint: (work_id, role) instead of just work_id.
+        // Different roles for the same work_id are allowed and expected.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_claims_work_role \
+             ON work_claims(work_id, role)",
             [],
         )?;
         Ok(())
@@ -4194,11 +4369,12 @@ impl WorkRegistry for SqliteWorkRegistry {
                 message: "connection lock poisoned".to_string(),
             })?;
 
-        // Check for duplicate
+        // Check for duplicate (work_id, role) pair — multi-role support.
+        // Different roles for the same work_id are allowed and expected.
         let exists: bool = conn
             .query_row(
-                "SELECT 1 FROM work_claims WHERE work_id = ?1",
-                params![claim.work_id],
+                "SELECT 1 FROM work_claims WHERE work_id = ?1 AND role = ?2",
+                params![claim.work_id, claim.role as i32],
                 |_| Ok(true),
             )
             .optional()
@@ -4236,10 +4412,28 @@ impl WorkRegistry for SqliteWorkRegistry {
 
     fn get_claim(&self, work_id: &str) -> Option<WorkClaim> {
         let conn = self.conn.lock().ok()?;
+        // Return the first claim registered for this work_id (any role),
+        // ordered by role for deterministic results.
         let claim_json: Vec<u8> = conn
             .query_row(
-                "SELECT claim_json FROM work_claims WHERE work_id = ?1",
+                "SELECT claim_json FROM work_claims WHERE work_id = ?1 \
+                 ORDER BY role ASC LIMIT 1",
                 params![work_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+
+        serde_json::from_slice(&claim_json).ok()
+    }
+
+    fn get_claim_for_role(&self, work_id: &str, role: WorkRole) -> Option<WorkClaim> {
+        let conn = self.conn.lock().ok()?;
+        let claim_json: Vec<u8> = conn
+            .query_row(
+                "SELECT claim_json FROM work_claims WHERE work_id = ?1 AND role = ?2",
+                params![work_id, role as i32],
                 |row| row.get(0),
             )
             .optional()
