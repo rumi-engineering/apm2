@@ -59,8 +59,9 @@
 //! - [INV-RECON-008] The `queue/claimed` directory itself is verified via
 //!   `symlink_metadata()` before traversal; symlinked directories are rejected.
 //! - [INV-RECON-009] Orphaned claimed jobs carrying a `channel_context_token`
-//!   are non-retriable under `Requeue` policy: they are moved to `denied/`
-//!   instead of `pending/` to avoid replaying consumed single-use token nonces.
+//!   are requeued under `Requeue` policy only when authoritative token-ledger
+//!   state shows the token nonce is still fresh. Consumed/revoked or
+//!   unverifiable nonce state is fail-closed to `denied/`.
 //! - [INV-RECON-012] Reconciliation is exempt from AJC lifecycle requirements
 //!   (RS-42, RFC-0027). It runs at startup as an internal crash-recovery
 //!   mechanism before the worker accepts any external authority — it is itself
@@ -73,6 +74,7 @@ use std::fs;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -83,6 +85,8 @@ use super::lane::{
 };
 use super::receipt_index::find_receipt_for_job;
 use super::receipt_pipeline::{ReceiptWritePipeline, outcome_to_terminal_state};
+use crate::fac::job_spec::MAX_CHANNEL_CONTEXT_TOKEN_LENGTH;
+use crate::fac::token_ledger::{TokenLedgerError, TokenUseLedger};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -116,9 +120,26 @@ const MAX_DESERIALIZED_LANE_ACTIONS: usize = 256;
 /// Maximum number of queue actions in deserialized receipt (INV-BH-007).
 const MAX_DESERIALIZED_QUEUE_ACTIONS: usize = 8192;
 
-/// Denial reason used when reconciliation encounters an orphaned claimed job
-/// carrying a channel-context token under requeue policy.
-const TOKEN_BOUND_ORPHAN_DENIAL_REASON: &str = "orphaned claimed job carries channel_context_token; non-retriable to avoid replaying a consumed token nonce";
+/// Maximum size of broker state JSON snapshot (matches FAC worker loader).
+const MAX_BROKER_STATE_FILE_SIZE: u64 = 1_048_576;
+
+/// Denial reason for token-bound orphaned jobs whose nonce is already consumed.
+const TOKEN_NONCE_CONSUMED_DENIAL_REASON: &str =
+    "orphaned claimed job token nonce is already consumed; non-retriable to avoid replay";
+
+/// Denial reason prefix for token-bound orphaned jobs with revoked nonces.
+const TOKEN_NONCE_REVOKED_DENIAL_REASON_PREFIX: &str =
+    "orphaned claimed job token nonce is revoked; non-retriable";
+
+/// Denial reason prefix for token-bound orphaned jobs whose nonce cannot be
+/// verified from the token.
+const TOKEN_NONCE_UNVERIFIABLE_DENIAL_REASON_PREFIX: &str =
+    "orphaned claimed job token nonce is missing or invalid; fail-closed";
+
+/// Denial reason prefix for token-bound orphaned jobs when token-ledger state
+/// cannot be loaded or replayed.
+const TOKEN_LEDGER_UNAVAILABLE_DENIAL_REASON_PREFIX: &str =
+    "orphaned claimed job token ledger state unavailable; fail-closed";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error types
@@ -466,7 +487,7 @@ struct QueueReconcileResult {
 #[derive(Debug, Clone, Default)]
 struct ClaimedJobMetadata {
     job_id: Option<String>,
-    has_channel_context_token: bool,
+    channel_context_token: Option<String>,
 }
 
 /// Run crash recovery reconciliation on worker startup.
@@ -1192,6 +1213,7 @@ fn reconcile_queue(
     let mut orphaned_jobs_failed: usize = 0;
     let mut torn_states_recovered: usize = 0;
     let mut claimed_files_inspected: usize = 0;
+    let mut token_ledger_state: Option<Result<TokenUseLedger, String>> = None;
 
     // Helper macro to build QueueReconcileResult with current partial counts.
     // This ensures partial_error receipts always carry the actual inspected
@@ -1433,26 +1455,33 @@ fn reconcile_queue(
         // INV-RECON-007: Only count success after confirmed rename.
         match orphan_policy {
             OrphanedJobPolicy::Requeue => {
-                // INV-RECON-009: Token-bound orphaned claimed jobs are
-                // non-retriable. Requeueing them can replay already-consumed
-                // single-use nonces and cause deterministic token replay
-                // denial loops.
-                if claimed_metadata.has_channel_context_token {
-                    let reason = TOKEN_BOUND_ORPHAN_DENIAL_REASON.to_string();
-                    if !dry_run && let Err(e) = move_file_safe(&path, &denied_dir, &file_name) {
-                        return queue_result!(Some(ReconcileError::MoveFailed {
-                            context: format!(
-                                "claimed job {job_id}: token-bound fallback to denied failed: {e}"
-                            ),
-                        }));
+                // INV-RECON-009: Token-bound orphaned claimed jobs are requeued
+                // only when authoritative token-ledger state confirms the
+                // token nonce is still fresh. Consumed/revoked or unverifiable
+                // nonce state is fail-closed to denied.
+                if let Some(channel_context_token) =
+                    claimed_metadata.channel_context_token.as_deref()
+                {
+                    let ledger_state = token_ledger_state
+                        .get_or_insert_with(|| load_token_ledger_for_reconcile(fac_root));
+                    if let Err(reason) =
+                        evaluate_token_bound_orphan_requeue(channel_context_token, ledger_state)
+                    {
+                        if !dry_run && let Err(e) = move_file_safe(&path, &denied_dir, &file_name) {
+                            return queue_result!(Some(ReconcileError::MoveFailed {
+                                context: format!(
+                                    "claimed job {job_id}: token-bound fallback to denied failed: {e}"
+                                ),
+                            }));
+                        }
+                        actions.push(QueueRecoveryAction::MarkedFailed {
+                            job_id,
+                            file_name,
+                            reason,
+                        });
+                        orphaned_jobs_failed += 1;
+                        continue;
                     }
-                    actions.push(QueueRecoveryAction::MarkedFailed {
-                        job_id,
-                        file_name,
-                        reason,
-                    });
-                    orphaned_jobs_failed += 1;
-                    continue;
                 }
 
                 if dry_run {
@@ -1548,15 +1577,148 @@ fn parse_claimed_job_metadata(file: &fs::File) -> Option<ClaimedJobMetadata> {
         .and_then(serde_json::Value::as_str)
         .filter(|job_id| !job_id.is_empty())
         .map(std::string::ToString::to_string);
-    let has_channel_context_token = value
+    let channel_context_token = value
         .get("actuation")
         .and_then(|actuation| actuation.get("channel_context_token"))
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|token| !token.is_empty());
+        .filter(|token| !token.is_empty())
+        .map(std::string::ToString::to_string);
     Some(ClaimedJobMetadata {
         job_id,
-        has_channel_context_token,
+        channel_context_token,
     })
+}
+
+/// Loads token-ledger authority state for reconciliation.
+///
+/// Returns `Err` when broker state or token-ledger state cannot be loaded,
+/// parsed, or replayed. Callers should treat that as fail-closed ambiguity for
+/// token-bound orphaned jobs.
+fn load_token_ledger_for_reconcile(fac_root: &Path) -> Result<TokenUseLedger, String> {
+    let broker_state_path = fac_root.join("broker_state.json");
+    let broker_state_bytes =
+        read_file_no_follow_bounded(&broker_state_path, MAX_BROKER_STATE_FILE_SIZE)
+            .map_err(|e| format!("broker_state.json load failed: {e}"))?;
+    let broker_state = super::broker::FacBroker::deserialize_state(&broker_state_bytes)
+        .map_err(|e| format!("broker_state.json decode failed: {e}"))?;
+
+    let ledger_dir = fac_root.join("broker").join("token_ledger");
+    let snapshot_path = ledger_dir.join("state.json");
+    let snapshot_bytes = read_file_no_follow_bounded(
+        &snapshot_path,
+        crate::fac::token_ledger::MAX_TOKEN_LEDGER_FILE_SIZE as u64,
+    )
+    .map_err(|e| format!("token ledger snapshot load failed: {e}"))?;
+    let mut ledger = TokenUseLedger::deserialize_state(&snapshot_bytes, broker_state.current_tick)
+        .map_err(|e| format!("token ledger snapshot decode failed: {e}"))?;
+
+    let wal_path = ledger_dir.join("wal.jsonl");
+    if wal_path.exists() {
+        let wal_bytes = read_file_no_follow_bounded(
+            &wal_path,
+            crate::fac::token_ledger::MAX_WAL_FILE_SIZE as u64,
+        )
+        .map_err(|e| format!("token ledger WAL load failed: {e}"))?;
+        ledger
+            .replay_wal(&wal_bytes)
+            .map_err(|e| format!("token ledger WAL replay failed: {e}"))?;
+    }
+
+    Ok(ledger)
+}
+
+/// Determines whether a token-bound orphaned job is safe to requeue.
+///
+/// Returns `Ok(())` only when authoritative token-ledger state confirms the
+/// token nonce is still fresh.
+fn evaluate_token_bound_orphan_requeue(
+    channel_context_token: &str,
+    token_ledger_state: &Result<TokenUseLedger, String>,
+) -> Result<(), String> {
+    let ledger = token_ledger_state
+        .as_ref()
+        .map_err(|e| format!("{TOKEN_LEDGER_UNAVAILABLE_DENIAL_REASON_PREFIX}: {e}"))?;
+
+    let nonce = extract_token_nonce(channel_context_token)
+        .ok_or_else(|| TOKEN_NONCE_UNVERIFIABLE_DENIAL_REASON_PREFIX.to_string())?;
+
+    match ledger.check_nonce(&nonce) {
+        Ok(()) => Ok(()),
+        Err(TokenLedgerError::ReplayDetected) => {
+            Err(TOKEN_NONCE_CONSUMED_DENIAL_REASON.to_string())
+        },
+        Err(TokenLedgerError::TokenRevoked { reason }) => Err(format!(
+            "{TOKEN_NONCE_REVOKED_DENIAL_REASON_PREFIX}: {reason}"
+        )),
+        Err(e) => Err(format!(
+            "{TOKEN_NONCE_UNVERIFIABLE_DENIAL_REASON_PREFIX}: {e}"
+        )),
+    }
+}
+
+/// Extracts the token nonce from a base64-encoded channel-context token.
+///
+/// Returns `None` if the token is missing required fields, malformed, or
+/// exceeds bounded size limits.
+fn extract_token_nonce(channel_context_token: &str) -> Option<[u8; 32]> {
+    #[derive(Deserialize)]
+    struct TokenNonceEnvelope {
+        payload: TokenNoncePayload,
+    }
+
+    #[derive(Deserialize)]
+    struct TokenNoncePayload {
+        #[serde(default)]
+        token_binding: Option<TokenBindingPayload>,
+    }
+
+    #[derive(Deserialize)]
+    struct TokenBindingPayload {
+        #[serde(default)]
+        nonce: Option<[u8; 32]>,
+    }
+
+    if channel_context_token.is_empty()
+        || channel_context_token.len() > MAX_CHANNEL_CONTEXT_TOKEN_LENGTH
+    {
+        return None;
+    }
+
+    let token_bytes = base64::engine::general_purpose::STANDARD
+        .decode(channel_context_token)
+        .ok()?;
+    let token: TokenNonceEnvelope = serde_json::from_slice(&token_bytes).ok()?;
+    token
+        .payload
+        .token_binding
+        .and_then(|binding| binding.nonce)
+}
+
+/// Reads a regular file with `O_NOFOLLOW` and bounded size.
+fn read_file_no_follow_bounded(path: &Path, max_size: u64) -> Result<Vec<u8>, String> {
+    let file = open_file_no_follow(path).map_err(|e| e.to_string())?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if metadata.len() > max_size {
+        return Err(format!(
+            "{} exceeds bounded read cap: {} > {max_size}",
+            path.display(),
+            metadata.len()
+        ));
+    }
+
+    let mut reader = file.take(max_size);
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| format!("{} size does not fit usize", path.display()))?;
+    let mut buf = Vec::with_capacity(capacity);
+    reader
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(buf)
 }
 
 /// Open a file without following symlinks (`O_NOFOLLOW` on Unix).
@@ -1730,6 +1892,7 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 mod tests {
     use std::fs;
 
+    use base64::Engine;
     use tempfile::TempDir;
 
     use super::*;
@@ -1787,7 +1950,53 @@ mod tests {
         fs::write(path, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
     }
 
-    fn write_claimed_job_with_token(queue_root: &Path, job_id: &str) {
+    fn write_broker_state_with_current_tick(fac_root: &Path, current_tick: u64) {
+        let mut broker = super::super::broker::FacBroker::new();
+        while broker.current_tick() < current_tick {
+            let _ = broker.advance_tick();
+        }
+        fs::write(
+            fac_root.join("broker_state.json"),
+            broker.serialize_state().expect("serialize broker state"),
+        )
+        .expect("persist broker state");
+    }
+
+    fn write_token_ledger_snapshot_and_wal(
+        fac_root: &Path,
+        snapshot_bytes: &[u8],
+        wal_entries: &[crate::fac::token_ledger::WalEntry],
+    ) {
+        let ledger_dir = fac_root.join("broker").join("token_ledger");
+        fs::create_dir_all(&ledger_dir).expect("create token ledger dir");
+        fs::write(ledger_dir.join("state.json"), snapshot_bytes).expect("persist token snapshot");
+
+        if wal_entries.is_empty() {
+            return;
+        }
+        let mut wal_bytes = Vec::new();
+        for entry in wal_entries {
+            wal_bytes.extend(
+                crate::fac::token_ledger::TokenUseLedger::serialize_wal_entry(entry)
+                    .expect("serialize wal entry"),
+            );
+        }
+        fs::write(ledger_dir.join("wal.jsonl"), wal_bytes).expect("persist token wal");
+    }
+
+    fn make_channel_context_token_with_nonce(nonce: [u8; 32]) -> String {
+        let token_json = serde_json::json!({
+            "payload": {
+                "token_binding": {
+                    "nonce": nonce,
+                }
+            }
+        });
+        base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&token_json).expect("serialize token payload"))
+    }
+
+    fn write_claimed_job_with_token(queue_root: &Path, job_id: &str, channel_context_token: &str) {
         let claimed_dir = queue_root.join("claimed");
         let spec = serde_json::json!({
             "schema": "apm2.fac.job_spec.v1",
@@ -1796,14 +2005,18 @@ mod tests {
             "actuation": {
                 "lease_id": "lease-test",
                 "request_id": "request-test",
-                "channel_context_token": "token-test"
+                "channel_context_token": channel_context_token
             }
         });
         let path = claimed_dir.join(format!("{job_id}.json"));
         fs::write(path, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
     }
 
-    fn write_claimed_job_with_token_without_job_id(queue_root: &Path, file_stem: &str) {
+    fn write_claimed_job_with_token_without_job_id(
+        queue_root: &Path,
+        file_stem: &str,
+        channel_context_token: &str,
+    ) {
         let claimed_dir = queue_root.join("claimed");
         let spec = serde_json::json!({
             "schema": "apm2.fac.job_spec.v1",
@@ -1811,7 +2024,7 @@ mod tests {
             "actuation": {
                 "lease_id": "lease-test",
                 "request_id": "request-test",
-                "channel_context_token": "token-test"
+                "channel_context_token": channel_context_token
             }
         });
         let path = claimed_dir.join(format!("{file_stem}.json"));
@@ -1994,10 +2207,11 @@ mod tests {
     }
 
     #[test]
-    fn test_reconcile_orphaned_token_bound_claimed_mark_failed_under_requeue_policy() {
+    fn test_reconcile_orphaned_token_bound_claimed_fail_closed_when_ledger_unavailable() {
         let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+        let token = make_channel_context_token_with_nonce([0x42; 32]);
 
-        write_claimed_job_with_token(&queue_root, "job-orphan-token");
+        write_claimed_job_with_token(&queue_root, "job-orphan-token", &token);
 
         let receipt =
             reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
@@ -2009,15 +2223,15 @@ mod tests {
         );
         assert_eq!(
             receipt.orphaned_jobs_failed, 1,
-            "token-bound orphaned jobs should be denied under requeue policy"
+            "token-bound orphaned jobs should fail-closed when ledger state is unavailable"
         );
         assert!(
             receipt.queue_actions.iter().any(|action| matches!(
                 action,
                 QueueRecoveryAction::MarkedFailed { reason, .. }
-                    if reason == TOKEN_BOUND_ORPHAN_DENIAL_REASON
+                    if reason.starts_with(TOKEN_LEDGER_UNAVAILABLE_DENIAL_REASON_PREFIX)
             )),
-            "queue action should record token-bound denial reason"
+            "queue action should record token-ledger fail-closed reason"
         );
 
         let claimed_path = queue_root.join("claimed").join("job-orphan-token.json");
@@ -2033,10 +2247,26 @@ mod tests {
     }
 
     #[test]
-    fn test_reconcile_orphaned_token_bound_claimed_without_job_id_uses_filename_fallback() {
+    fn test_reconcile_orphaned_token_bound_claimed_consumed_nonce_marks_failed() {
         let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
-        let file_stem = "job-orphan-token-no-job-id";
-        write_claimed_job_with_token_without_job_id(&queue_root, file_stem);
+        let job_id = "job-orphan-token-consumed";
+        let nonce = [0x9A; 32];
+        let request_digest = [0x11; 32];
+        let token = make_channel_context_token_with_nonce(nonce);
+
+        // Snapshot has nonce in Issued state; WAL records transition to Consumed.
+        let mut ledger = TokenUseLedger::new();
+        ledger
+            .register_nonce(&nonce, &request_digest, 10)
+            .expect("register nonce");
+        let snapshot_bytes = ledger.serialize_state().expect("serialize snapshot");
+        let consume_wal = ledger
+            .record_token_use(&nonce, &request_digest, 11)
+            .expect("consume nonce");
+
+        write_broker_state_with_current_tick(&fac_root, 11);
+        write_token_ledger_snapshot_and_wal(&fac_root, &snapshot_bytes, &[consume_wal]);
+        write_claimed_job_with_token(&queue_root, job_id, &token);
 
         let receipt =
             reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
@@ -2044,23 +2274,23 @@ mod tests {
 
         assert_eq!(
             receipt.orphaned_jobs_requeued, 0,
-            "token-bound orphaned jobs must not be requeued even without job_id field"
+            "consumed nonce jobs must not be requeued"
         );
         assert_eq!(
             receipt.orphaned_jobs_failed, 1,
-            "token-bound orphaned jobs should be denied under requeue policy"
+            "consumed nonce jobs should be marked failed under requeue policy"
         );
         assert!(
             receipt.queue_actions.iter().any(|action| matches!(
                 action,
                 QueueRecoveryAction::MarkedFailed {
                     job_id, reason, ..
-                } if job_id == file_stem && reason == TOKEN_BOUND_ORPHAN_DENIAL_REASON
+                } if job_id == "job-orphan-token-consumed" && reason == TOKEN_NONCE_CONSUMED_DENIAL_REASON
             )),
-            "missing job_id should fall back to filename while preserving token-bound denial reason"
+            "expected consumed-nonce denial reason for replay prevention"
         );
 
-        let claimed_path = queue_root.join("claimed").join(format!("{file_stem}.json"));
+        let claimed_path = queue_root.join("claimed").join(format!("{job_id}.json"));
         assert!(
             !claimed_path.exists(),
             "token-bound claimed file should be moved out of claimed/"
@@ -2073,10 +2303,92 @@ mod tests {
     }
 
     #[test]
-    fn test_reconcile_orphaned_token_bound_claimed_dry_run_marks_failed_without_move() {
+    fn test_reconcile_orphaned_token_bound_claimed_fresh_nonce_requeues() {
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+        let job_id = "job-orphan-token-fresh";
+        let nonce = [0xB7; 32];
+        let request_digest = [0x22; 32];
+        let token = make_channel_context_token_with_nonce(nonce);
+
+        let mut ledger = TokenUseLedger::new();
+        ledger
+            .register_nonce(&nonce, &request_digest, 10)
+            .expect("register nonce");
+        let snapshot_bytes = ledger.serialize_state().expect("serialize snapshot");
+
+        write_broker_state_with_current_tick(&fac_root, 10);
+        write_token_ledger_snapshot_and_wal(&fac_root, &snapshot_bytes, &[]);
+        write_claimed_job_with_token(&queue_root, job_id, &token);
+
+        let receipt =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
+                .unwrap();
+
+        assert_eq!(
+            receipt.orphaned_jobs_requeued, 1,
+            "fresh nonce jobs should requeue under requeue policy"
+        );
+        assert_eq!(
+            receipt.orphaned_jobs_failed, 0,
+            "fresh nonce jobs should not be marked failed"
+        );
+        let claimed_path = queue_root.join("claimed").join(format!("{job_id}.json"));
+        assert!(
+            !claimed_path.exists(),
+            "claimed file should be moved to pending/"
+        );
+        let pending_entries: Vec<_> = fs::read_dir(queue_root.join("pending"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(pending_entries.len(), 1, "file should be in pending/");
+    }
+
+    #[test]
+    fn test_reconcile_orphaned_token_bound_claimed_without_job_id_uses_filename_fallback() {
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+        let file_stem = "job-orphan-token-no-job-id";
+        let token = make_channel_context_token_with_nonce([0x61; 32]);
+        write_claimed_job_with_token_without_job_id(&queue_root, file_stem, &token);
+
+        let receipt =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
+                .unwrap();
+
+        assert_eq!(receipt.orphaned_jobs_requeued, 0);
+        assert_eq!(receipt.orphaned_jobs_failed, 1);
+        assert!(
+            receipt.queue_actions.iter().any(|action| matches!(
+                action,
+                QueueRecoveryAction::MarkedFailed {
+                    job_id, reason, ..
+                } if job_id == file_stem && reason.starts_with(TOKEN_LEDGER_UNAVAILABLE_DENIAL_REASON_PREFIX)
+            )),
+            "missing job_id should fall back to filename under fail-closed token-ledger ambiguity"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_orphaned_token_bound_claimed_consumed_nonce_dry_run_marks_failed_without_move()
+     {
         let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
         let job_id = "job-orphan-token-dry-run";
-        write_claimed_job_with_token(&queue_root, job_id);
+        let nonce = [0xC3; 32];
+        let request_digest = [0x33; 32];
+        let token = make_channel_context_token_with_nonce(nonce);
+
+        let mut ledger = TokenUseLedger::new();
+        ledger
+            .register_nonce(&nonce, &request_digest, 10)
+            .expect("register nonce");
+        let snapshot_bytes = ledger.serialize_state().expect("serialize snapshot");
+        let consume_wal = ledger
+            .record_token_use(&nonce, &request_digest, 11)
+            .expect("consume nonce");
+
+        write_broker_state_with_current_tick(&fac_root, 11);
+        write_token_ledger_snapshot_and_wal(&fac_root, &snapshot_bytes, &[consume_wal]);
+        write_claimed_job_with_token(&queue_root, job_id, &token);
 
         let receipt = reconcile_on_startup(
             &fac_root,
@@ -2086,19 +2398,18 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            receipt.orphaned_jobs_requeued, 0,
-            "token-bound orphaned jobs must not be requeued in dry-run"
-        );
-        assert_eq!(
-            receipt.orphaned_jobs_failed, 1,
-            "token-bound orphaned jobs should be classified as failed in dry-run"
+        assert_eq!(receipt.orphaned_jobs_requeued, 0);
+        assert_eq!(receipt.orphaned_jobs_failed, 1);
+        assert!(
+            receipt.queue_actions.iter().any(|action| matches!(
+                action,
+                QueueRecoveryAction::MarkedFailed { reason, .. }
+                    if reason == TOKEN_NONCE_CONSUMED_DENIAL_REASON
+            )),
+            "dry-run should classify consumed nonce as non-retriable"
         );
         let claimed_path = queue_root.join("claimed").join(format!("{job_id}.json"));
-        assert!(
-            claimed_path.exists(),
-            "dry-run must not move token-bound claimed files"
-        );
+        assert!(claimed_path.exists(), "dry-run must not move claimed files");
         let denied_entries: Vec<_> = fs::read_dir(queue_root.join("denied"))
             .unwrap()
             .filter_map(std::result::Result::ok)
