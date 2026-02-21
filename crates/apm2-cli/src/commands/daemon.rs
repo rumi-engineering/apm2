@@ -12,6 +12,10 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use apm2_core::config::{default_data_dir, normalize_pid_file_path, normalize_state_file_path};
 use apm2_core::fac::execution_backend::{probe_user_bus, select_backend};
+use apm2_core::fac::{
+    FacUnitLiveness, LaneLeaseV1, LaneManager, LaneState, ORPHANED_SYSTEMD_UNIT_REASON_CODE,
+    ProcessIdentity, check_fac_unit_liveness, verify_pid_identity,
+};
 use apm2_core::github::{GitHubAppTokenProvider, resolve_apm2_home};
 use apm2_daemon::telemetry::is_cgroup_v2_available;
 use tracing::info;
@@ -406,6 +410,106 @@ pub struct DaemonDoctorCheck {
 /// the vector can grow beyond this if more checks are added.
 const MAX_DOCTOR_CHECKS: usize = 64;
 
+fn check_orphaned_systemd_units() -> DaemonDoctorCheck {
+    let Some(home) = resolve_apm2_home() else {
+        return DaemonDoctorCheck {
+            name: "orphaned_systemd_units".to_string(),
+            status: "WARN",
+            message: "cannot resolve APM2_HOME; orphaned systemd unit check skipped".to_string(),
+        };
+    };
+    let fac_root = home.join("private").join("fac");
+    let lane_mgr = match LaneManager::new(fac_root) {
+        Ok(manager) => manager,
+        Err(err) => {
+            return DaemonDoctorCheck {
+                name: "orphaned_systemd_units".to_string(),
+                status: "WARN",
+                message: format!(
+                    "cannot initialize lane manager for orphaned systemd unit check: {err}"
+                ),
+            };
+        },
+    };
+
+    let mut findings: Vec<String> = Vec::new();
+    for lane_id in LaneManager::default_lane_ids() {
+        let lane_dir = lane_mgr.lane_dir(&lane_id);
+        let lease = match LaneLeaseV1::load(&lane_dir) {
+            Ok(value) => value,
+            Err(err) => {
+                return DaemonDoctorCheck {
+                    name: "orphaned_systemd_units".to_string(),
+                    status: "WARN",
+                    message: format!("failed to load lease for {lane_id}: {err}"),
+                };
+            },
+        };
+        let Some(lease) = lease else {
+            continue;
+        };
+        if !matches!(
+            lease.state,
+            LaneState::Running | LaneState::Leased | LaneState::Cleanup
+        ) {
+            continue;
+        }
+        if !matches!(
+            verify_pid_identity(lease.pid, lease.proc_start_time_ticks),
+            ProcessIdentity::Dead | ProcessIdentity::AliveMismatch
+        ) {
+            continue;
+        }
+
+        let liveness = check_fac_unit_liveness(&lane_id, &lease.job_id);
+        match liveness {
+            FacUnitLiveness::Inactive => {},
+            FacUnitLiveness::Active { active_units } => {
+                let preview = active_units
+                    .iter()
+                    .take(3)
+                    .map(std::string::String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                findings.push(format!(
+                    "lane={lane_id} job_id={} pid={} active_units={}{}",
+                    lease.job_id,
+                    lease.pid,
+                    active_units.len(),
+                    if preview.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{preview}]")
+                    }
+                ));
+            },
+            FacUnitLiveness::Unknown { reason } => {
+                findings.push(format!(
+                    "lane={lane_id} job_id={} pid={} liveness=unknown ({reason})",
+                    lease.job_id, lease.pid
+                ));
+            },
+        }
+    }
+
+    if findings.is_empty() {
+        return DaemonDoctorCheck {
+            name: "orphaned_systemd_units".to_string(),
+            status: "OK",
+            message: "no orphaned systemd unit blockers detected".to_string(),
+        };
+    }
+
+    DaemonDoctorCheck {
+        name: "orphaned_systemd_units".to_string(),
+        status: "ERROR",
+        message: format!(
+            "{ORPHANED_SYSTEMD_UNIT_REASON_CODE} detected: {}. Remediation: stop_revoke target job(s) to terminate active units, then run `apm2 fac lane reset <lane_id>` for affected lanes.",
+            findings.join("; ")
+        ),
+    }
+}
+
 pub fn collect_doctor_checks(
     operator_socket: &Path,
     config_path: &Path,
@@ -521,6 +625,12 @@ pub fn collect_doctor_checks(
         status: projection_check.status,
         message: projection_check.message,
     });
+
+    let orphaned_units_check = check_orphaned_systemd_units();
+    if orphaned_units_check.status == "ERROR" {
+        has_error = true;
+    }
+    checks.push(orphaned_units_check);
 
     // Disk space
     let data_dir = default_data_dir();

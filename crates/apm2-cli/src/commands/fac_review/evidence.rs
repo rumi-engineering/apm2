@@ -129,6 +129,9 @@ pub struct EvidenceGateOptions {
     /// Prevents parent process env inheritance of `sccache`/`RUSTC_WRAPPER`
     /// keys that could bypass cgroup containment (TCK-00548).
     pub env_remove_keys: Vec<String>,
+    /// Optional base unit name used for deterministic bounded gate units.
+    /// When set, non-test bounded units are named `<base>-<gate_name>`.
+    pub bounded_gate_unit_base: Option<String>,
     /// Skip the heavyweight test gate for quick inner-loop validation.
     pub skip_test_gate: bool,
     /// Skip merge-conflict gate when caller already pre-validated it.
@@ -1211,6 +1214,7 @@ fn build_pipeline_test_command(
             cpu_quota: &effective_cpu_quota,
         },
         &build_nextest_command(),
+        None,
         &test_env,
         policy.sandbox_hardening,
         evidence_network_policy,
@@ -1894,6 +1898,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
             let mut specs = Vec::new();
             for &(gate_name, cmd_args) in gates {
                 let gate_cmd: Vec<String> = cmd_args.iter().map(|s| (*s).to_string()).collect();
+                let gate_unit_name = opts
+                    .and_then(|options| options.bounded_gate_unit_base.as_ref())
+                    .map(|base| format!("{base}-{gate_name}"));
                 let bounded = build_systemd_bounded_gate_command(
                     workspace_root,
                     BoundedTestLimits {
@@ -1904,6 +1911,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
                         cpu_quota: "200%",
                     },
                     &gate_cmd,
+                    gate_unit_name.as_deref(),
                     &gate_env,
                     policy.sandbox_hardening.clone(),
                     gate_network_policy.clone(),
@@ -2787,6 +2795,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cpu_quota: "200%",
                 },
                 &gate_cmd,
+                None,
                 &gate_env,
                 fac_policy.sandbox_hardening.clone(),
                 gate_network_policy.clone(),
@@ -4431,6 +4440,7 @@ mod tests {
             test_command: Some(test_command),
             test_command_environment: Vec::new(),
             env_remove_keys: Vec::new(),
+            bounded_gate_unit_base: None,
             skip_test_gate: false,
             skip_merge_conflict_gate: true,
             emit_human_logs: false,

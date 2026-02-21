@@ -51,11 +51,12 @@ use std::process::Command;
 
 use apm2_core::fac::service_user_gate::QueueWriteMode;
 use apm2_core::fac::{
-    LANE_ENV_DIRS, LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1, LaneManager,
-    LaneReconcileReceiptV1, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
-    ProcessIdentity, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt,
-    SUMMARY_RECEIPT_SCHEMA, SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA,
-    TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1, safe_rmtree_v1, verify_pid_identity,
+    FacUnitLiveness, LANE_ENV_DIRS, LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1,
+    LaneManager, LaneReconcileReceiptV1, LaneState, LaneStatusV1,
+    ORPHANED_SYSTEMD_UNIT_REASON_CODE, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, ProcessIdentity,
+    REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA,
+    SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
+    check_fac_unit_liveness, safe_rmtree_v1, verify_pid_identity,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
@@ -1870,6 +1871,28 @@ struct ServiceStatusResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct OrphanedSystemdUnitDiagnostic {
+    /// Lane whose stale lease has orphaned systemd evidence.
+    pub lane_id: String,
+    /// Job bound to the stale lease.
+    pub job_id: String,
+    /// Lease PID observed as dead/reused.
+    pub pid: u32,
+    /// Stable machine-readable reason code.
+    pub reason_code: String,
+    /// Liveness verdict for associated units ("active" or "unknown").
+    pub liveness: String,
+    /// Human-readable detail for operators.
+    pub detail: String,
+    /// Remediation guidance for operators.
+    pub recommended_action: String,
+    /// Active associated unit names (if known).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_units: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ServicesStatusResponse {
     /// Overall health: "healthy" if all services are healthy, "degraded"
     /// otherwise.
@@ -1886,6 +1909,12 @@ struct ServicesStatusResponse {
     /// daemon's internal health checks are passing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub broker_health: Option<apm2_core::fac::broker_health_ipc::BrokerHealthIpcStatus>,
+    /// Stale-lease reclaim blockers caused by orphaned systemd units.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orphaned_systemd_units: Vec<OrphanedSystemdUnitDiagnostic>,
+    /// Probe error for orphaned-systemd-unit diagnostics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orphaned_systemd_unit_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1913,6 +1942,91 @@ impl ServiceScope {
 }
 
 const SERVICE_SCOPES: [ServiceScope; 2] = [ServiceScope::User, ServiceScope::System];
+
+fn describe_orphaned_unit_liveness(liveness: FacUnitLiveness) -> (String, String, Vec<String>) {
+    match liveness {
+        FacUnitLiveness::Active { active_units } => {
+            let preview = active_units
+                .iter()
+                .take(4)
+                .map(std::string::String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let detail = if preview.is_empty() {
+                format!(
+                    "associated systemd units still active (count={})",
+                    active_units.len()
+                )
+            } else {
+                let suffix = if active_units.len() > 4 { " +more" } else { "" };
+                format!(
+                    "associated systemd units still active (count={}, units=[{preview}]{suffix})",
+                    active_units.len()
+                )
+            };
+            ("active".to_string(), detail, active_units)
+        },
+        FacUnitLiveness::Unknown { reason } => (
+            "unknown".to_string(),
+            format!("systemd liveness probe inconclusive ({reason}); fail-closed"),
+            Vec::new(),
+        ),
+        FacUnitLiveness::Inactive => (
+            "inactive".to_string(),
+            "no active associated systemd units".to_string(),
+            Vec::new(),
+        ),
+    }
+}
+
+fn collect_orphaned_systemd_units(
+    fac_root: &Path,
+) -> Result<Vec<OrphanedSystemdUnitDiagnostic>, String> {
+    let lane_mgr = LaneManager::new(fac_root.to_path_buf())
+        .map_err(|err| format!("lane manager init failed: {err}"))?;
+    let mut diagnostics = Vec::new();
+
+    for lane_id in LaneManager::default_lane_ids() {
+        let lane_dir = lane_mgr.lane_dir(&lane_id);
+        let lease = LaneLeaseV1::load(&lane_dir)
+            .map_err(|err| format!("failed to load lease for {lane_id}: {err}"))?;
+        let Some(lease) = lease else {
+            continue;
+        };
+        if !matches!(
+            lease.state,
+            LaneState::Running | LaneState::Leased | LaneState::Cleanup
+        ) {
+            continue;
+        }
+        let identity = verify_pid_identity(lease.pid, lease.proc_start_time_ticks);
+        if !matches!(
+            identity,
+            ProcessIdentity::Dead | ProcessIdentity::AliveMismatch
+        ) {
+            continue;
+        }
+
+        let (liveness_state, detail, active_units) =
+            describe_orphaned_unit_liveness(check_fac_unit_liveness(&lane_id, &lease.job_id));
+        if liveness_state == "inactive" {
+            continue;
+        }
+        diagnostics.push(OrphanedSystemdUnitDiagnostic {
+            lane_id: lane_id.clone(),
+            job_id: lease.job_id.clone(),
+            pid: lease.pid,
+            reason_code: ORPHANED_SYSTEMD_UNIT_REASON_CODE.to_string(),
+            liveness: liveness_state,
+            detail,
+            recommended_action:
+                "run stop_revoke for the target job to stop active units, then run `apm2 fac lane reset <lane_id>`".to_string(),
+            active_units,
+        });
+    }
+
+    Ok(diagnostics)
+}
 
 fn run_services_status(_json_output: bool) -> u8 {
     let current_boot_micros = read_boot_time_micros();
@@ -1985,6 +2099,22 @@ fn run_services_status(_json_output: bool) -> u8 {
         }
     }
 
+    let (orphaned_systemd_units, orphaned_systemd_unit_error) = fac_root.as_ref().map_or_else(
+        || (Vec::new(), None),
+        |root| match collect_orphaned_systemd_units(root) {
+            Ok(units) => {
+                if !units.is_empty() {
+                    degraded = true;
+                }
+                (units, None)
+            },
+            Err(err) => {
+                degraded = true;
+                (Vec::new(), Some(err))
+            },
+        },
+    );
+
     let overall_health = if degraded { "degraded" } else { "healthy" }.to_string();
 
     let response = ServicesStatusResponse {
@@ -1992,6 +2122,8 @@ fn run_services_status(_json_output: bool) -> u8 {
         services: services.clone(),
         worker_heartbeat,
         broker_health,
+        orphaned_systemd_units,
+        orphaned_systemd_unit_error,
     };
     if let Ok(json) = serde_json::to_string_pretty(&response) {
         println!("{json}");

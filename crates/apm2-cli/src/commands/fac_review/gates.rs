@@ -1640,6 +1640,7 @@ pub(super) fn run_gates_local_worker(
     cpu_quota: &str,
     gate_profile: GateThroughputProfile,
     workspace_root: &Path,
+    bounded_unit_base: Option<&str>,
 ) -> Result<LocalGatesRunResult, String> {
     let (resolved_profile, effective_cpu_quota) =
         resolve_effective_execution_profile(cpu_quota, gate_profile)?;
@@ -1721,6 +1722,7 @@ pub(super) fn run_gates_local_worker(
         false,
         Some(prep_step_callback.as_ref()),
         Some(gate_progress_callback),
+        bounded_unit_base,
     ) {
         Ok(summary) => summary,
         Err(failure) => {
@@ -3553,6 +3555,7 @@ fn run_gates_inner(
         emit_human_logs,
         None,
         on_gate_progress,
+        None,
     )
     .map_err(GatesRunFailure::render)
 }
@@ -3572,6 +3575,7 @@ fn run_gates_inner_detailed(
     emit_human_logs: bool,
     on_prep_step: Option<PrepStepCallback<'_>>,
     on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
+    bounded_unit_base: Option<&str>,
 ) -> Result<GatesSummary, GatesRunFailure> {
     validate_timeout_seconds(timeout_seconds).map_err(|message| {
         let structured = StructuredFailure::prep_not_ready(
@@ -3630,6 +3634,7 @@ fn run_gates_inner_detailed(
                 test_parallelism,
                 emit_human_logs,
                 on_gate_progress,
+                bounded_unit_base,
             )
             .map_err(|message| {
                 let structured = StructuredFailure::gate_execution_failed(
@@ -3678,6 +3683,7 @@ fn run_execute_phase(
     test_parallelism: u32,
     emit_human_logs: bool,
     on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
+    bounded_unit_base: Option<&str>,
 ) -> Result<GatesSummary, String> {
     let timeout_decision = resolve_bounded_test_timeout(workspace_root, timeout_seconds);
 
@@ -3803,6 +3809,7 @@ fn run_execute_phase(
                 cpu_quota,
             },
             &default_nextest_command,
+            bounded_unit_base,
             &test_command_environment,
             policy.sandbox_hardening,
             gate_network_policy,
@@ -3857,6 +3864,7 @@ fn run_execute_phase(
         test_command,
         test_command_environment,
         env_remove_keys,
+        bounded_gate_unit_base: bounded_unit_base.map(std::string::ToString::to_string),
         skip_test_gate: quick,
         skip_merge_conflict_gate: true,
         emit_human_logs,
@@ -6905,6 +6913,7 @@ time.sleep(20)\n",
             test_command: None,
             test_command_environment: Vec::new(),
             env_remove_keys: Vec::new(),
+            bounded_gate_unit_base: None,
             skip_test_gate: true,
             skip_merge_conflict_gate: true,
             emit_human_logs: false,

@@ -72,6 +72,7 @@ use super::execution_backend::{
     ExecutionBackend, ExecutionBackendError, SystemModeConfig, build_systemd_run_command,
 };
 use super::systemd_properties::SystemdUnitProperties;
+use super::systemd_unit::detect_systemd_unit_name;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -635,11 +636,13 @@ fn build_phase_command(
             job_id
         };
         let unit_name = format!("apm2-warm-{lane_id}-{job_prefix}-{}", phase.name());
+        let parent_unit = detect_systemd_unit_name();
         let systemd_cmd = build_systemd_run_command(
             containment.backend,
             &containment.properties,
             workspace,
             Some(&unit_name),
+            parent_unit.as_deref(),
             containment.system_config.as_ref(),
             &cargo_args,
         )
