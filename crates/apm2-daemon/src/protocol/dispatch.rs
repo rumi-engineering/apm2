@@ -14408,7 +14408,7 @@ impl PrivilegedDispatcher {
             // envelope to compare spec hashes.
             let existing_hash = Self::extract_spec_hash_from_event_payload(&opened_event.payload);
             match existing_hash {
-                Some(hash) if hash == spec_hash_bytes => {
+                Some(hash) if bool::from(hash.ct_eq(&spec_hash_bytes)) => {
                     // Idempotent: same spec hash, return success
                     info!(
                         work_id = %spec.work_id,
@@ -14546,14 +14546,18 @@ impl PrivilegedDispatcher {
     ///
     /// Returns `None` if any decode step fails (fail-closed).
     fn extract_spec_hash_from_event_payload(payload_bytes: &[u8]) -> Option<[u8; 32]> {
-        // 1. Parse JSON envelope
-        let envelope: serde_json::Value = serde_json::from_slice(payload_bytes).ok()?;
+        // Strictly typed envelope for zero-copy extraction of the hex-encoded
+        // protobuf payload. Avoids building a full serde_json::Value DOM.
+        #[derive(serde::Deserialize)]
+        struct Envelope<'a> {
+            payload: &'a str,
+        }
 
-        // 2. Extract hex-encoded protobuf payload
-        let hex_payload = envelope.get("payload")?.as_str()?;
+        // 1. Parse JSON envelope into typed struct (zero-copy for payload str)
+        let envelope: Envelope<'_> = serde_json::from_slice(payload_bytes).ok()?;
 
-        // 3. Hex-decode to raw bytes
-        let raw_bytes = hex::decode(hex_payload).ok()?;
+        // 2. Hex-decode the protobuf payload
+        let raw_bytes = hex::decode(envelope.payload).ok()?;
 
         // 4. Protobuf-decode WorkEvent
         let work_event =
