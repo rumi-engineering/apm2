@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -797,7 +797,7 @@ pub struct LaneLeaseV1 {
     pub pid: u32,
     /// Current lane state.
     pub state: LaneState,
-    /// ISO 8601 timestamp when lease was acquired.
+    /// RFC3339 UTC timestamp when lease was acquired.
     pub started_at: String,
     /// Lane profile hash at lease time (b3-256 hex).
     pub lane_profile_hash: String,
@@ -811,6 +811,7 @@ impl LaneLeaseV1 {
     /// # Errors
     ///
     /// Returns `LaneError::StringTooLong` if any field exceeds its limit.
+    /// Returns `LaneError::InvalidLease` if `started_at` is not RFC3339.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         lane_id: &str,
@@ -830,16 +831,79 @@ impl LaneLeaseV1 {
             toolchain_fingerprint,
             MAX_STRING_LENGTH,
         )?;
+        let normalized_started_at =
+            Self::normalize_rfc3339_utc(started_at).ok_or_else(|| LaneError::InvalidLease {
+                lane_id: lane_id.to_string(),
+                reason: "started_at must be RFC3339".to_string(),
+            })?;
         Ok(Self {
             schema: LANE_LEASE_V1_SCHEMA.to_string(),
             lane_id: lane_id.to_string(),
             job_id: job_id.to_string(),
             pid,
             state,
-            started_at: started_at.to_string(),
+            started_at: normalized_started_at,
             lane_profile_hash: lane_profile_hash.to_string(),
             toolchain_fingerprint: toolchain_fingerprint.to_string(),
         })
+    }
+
+    /// Return `started_at` normalized to canonical RFC3339 UTC (`...Z`).
+    ///
+    /// This accepts native RFC3339 values and legacy epoch-second strings.
+    /// Returns `None` if the value is not parseable.
+    #[must_use]
+    pub fn started_at_rfc3339(&self) -> Option<String> {
+        if let Some(normalized) = Self::normalize_rfc3339_utc(&self.started_at) {
+            return Some(normalized);
+        }
+        let legacy_epoch_secs = Self::parse_legacy_epoch_secs(&self.started_at)?;
+        Self::epoch_secs_to_rfc3339(legacy_epoch_secs)
+    }
+
+    /// Return `started_at` as epoch seconds.
+    ///
+    /// This accepts native RFC3339 values and legacy epoch-second strings.
+    /// Returns `None` if the value is not parseable or is pre-epoch.
+    #[must_use]
+    pub fn started_at_epoch_secs(&self) -> Option<u64> {
+        if let Some(parsed) = Self::parse_rfc3339_utc(&self.started_at) {
+            return u64::try_from(parsed.timestamp()).ok();
+        }
+        Self::parse_legacy_epoch_secs(&self.started_at)
+    }
+
+    /// Compute lease age relative to `now_epoch_secs`.
+    ///
+    /// Returns `None` if `started_at` cannot be parsed or if `started_at` is
+    /// in the future relative to `now_epoch_secs`.
+    #[must_use]
+    pub fn age_secs(&self, now_epoch_secs: u64) -> Option<u64> {
+        let started_epoch_secs = self.started_at_epoch_secs()?;
+        now_epoch_secs.checked_sub(started_epoch_secs)
+    }
+
+    fn parse_rfc3339_utc(started_at: &str) -> Option<chrono::DateTime<Utc>> {
+        chrono::DateTime::parse_from_rfc3339(started_at)
+            .ok()
+            .map(|parsed| parsed.with_timezone(&Utc))
+    }
+
+    fn normalize_rfc3339_utc(started_at: &str) -> Option<String> {
+        let parsed = Self::parse_rfc3339_utc(started_at)?;
+        Some(parsed.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+    }
+
+    fn parse_legacy_epoch_secs(started_at: &str) -> Option<u64> {
+        let epoch_secs = started_at.parse::<u64>().ok()?;
+        let epoch_i64 = i64::try_from(epoch_secs).ok()?;
+        Utc.timestamp_opt(epoch_i64, 0).single().map(|_| epoch_secs)
+    }
+
+    fn epoch_secs_to_rfc3339(epoch_secs: u64) -> Option<String> {
+        let epoch_i64 = i64::try_from(epoch_secs).ok()?;
+        let parsed = Utc.timestamp_opt(epoch_i64, 0).single()?;
+        Some(parsed.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
     }
 
     /// Persist this lease to the lane directory.
@@ -897,6 +961,18 @@ impl LaneLeaseV1 {
             });
         }
         validate_lane_id(&lease.lane_id)?;
+        validate_string_field("job_id", &lease.job_id, MAX_STRING_LENGTH)?;
+        validate_string_field("started_at", &lease.started_at, MAX_STRING_LENGTH)?;
+        validate_string_field(
+            "lane_profile_hash",
+            &lease.lane_profile_hash,
+            MAX_STRING_LENGTH,
+        )?;
+        validate_string_field(
+            "toolchain_fingerprint",
+            &lease.toolchain_fingerprint,
+            MAX_STRING_LENGTH,
+        )?;
         Ok(Some(lease))
     }
 
@@ -936,6 +1012,9 @@ pub struct LaneStatusV1 {
     /// PID of executor (if leased/running).
     pub pid: Option<u32>,
     /// When lease was acquired (if leased/running).
+    ///
+    /// Exposed as canonical RFC3339 UTC when parseable (including legacy
+    /// epoch-seconds lease values).
     pub started_at: Option<String>,
     /// Toolchain fingerprint (if leased/running).
     pub toolchain_fingerprint: Option<String>,
@@ -2045,7 +2124,9 @@ impl LaneManager {
                 (
                     Some(lease.job_id.clone()),
                     Some(lease.pid),
-                    Some(lease.started_at.clone()),
+                    lease
+                        .started_at_rfc3339()
+                        .or_else(|| Some(lease.started_at.clone())),
                     Some(lease.lane_profile_hash.clone()),
                     Some(lease.toolchain_fingerprint.clone()),
                 )
@@ -3981,7 +4062,7 @@ mod tests {
 
     #[test]
     fn lane_lease_rejects_unknown_fields() {
-        let json = r#"{"schema":"apm2.fac.lane_lease.v1","lane_id":"lane-00","job_id":"j","pid":1,"state":"RUNNING","started_at":"t","lane_profile_hash":"h","toolchain_fingerprint":"f","extra":"evil"}"#;
+        let json = r#"{"schema":"apm2.fac.lane_lease.v1","lane_id":"lane-00","job_id":"j","pid":1,"state":"RUNNING","started_at":"2026-02-12T03:15:00Z","lane_profile_hash":"h","toolchain_fingerprint":"f","extra":"evil"}"#;
         let result: Result<LaneLeaseV1, _> = serde_json::from_str(json);
         assert!(result.is_err(), "must reject unknown fields (CTR-1604)");
     }
@@ -4035,8 +4116,82 @@ mod tests {
     #[test]
     fn lane_lease_rejects_oversized_job_id() {
         let long_id = "x".repeat(MAX_STRING_LENGTH + 1);
-        let result = LaneLeaseV1::new("lane-00", &long_id, 1, LaneState::Idle, "t", "h", "f");
+        let result = LaneLeaseV1::new(
+            "lane-00",
+            &long_id,
+            1,
+            LaneState::Idle,
+            "2026-01-01T00:00:00Z",
+            "h",
+            "f",
+        );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn lane_lease_rejects_non_rfc3339_started_at() {
+        let result = LaneLeaseV1::new(
+            "lane-00",
+            "job-test",
+            1,
+            LaneState::Idle,
+            "1735689600",
+            "h",
+            "f",
+        );
+        assert!(matches!(result, Err(LaneError::InvalidLease { .. })));
+    }
+
+    #[test]
+    fn lane_lease_normalizes_started_at_to_utc_z() {
+        let lease = LaneLeaseV1::new(
+            "lane-00",
+            "job-test",
+            1,
+            LaneState::Idle,
+            "2026-02-12T04:15:00+01:00",
+            "h",
+            "f",
+        )
+        .expect("create lease");
+        assert_eq!(lease.started_at, "2026-02-12T03:15:00Z");
+    }
+
+    #[test]
+    fn lane_lease_helpers_parse_legacy_epoch_started_at() {
+        let lease = LaneLeaseV1 {
+            schema: LANE_LEASE_V1_SCHEMA.to_string(),
+            lane_id: "lane-00".to_string(),
+            job_id: "job-test".to_string(),
+            pid: 1,
+            state: LaneState::Leased,
+            started_at: "1735689600".to_string(),
+            lane_profile_hash: "h".to_string(),
+            toolchain_fingerprint: "f".to_string(),
+        };
+        assert_eq!(lease.started_at_epoch_secs(), Some(1_735_689_600));
+        assert_eq!(
+            lease.started_at_rfc3339().as_deref(),
+            Some("2025-01-01T00:00:00Z")
+        );
+        assert_eq!(lease.age_secs(1_735_689_660), Some(60));
+    }
+
+    #[test]
+    fn lane_lease_helpers_return_none_for_unparseable_started_at() {
+        let lease = LaneLeaseV1 {
+            schema: LANE_LEASE_V1_SCHEMA.to_string(),
+            lane_id: "lane-00".to_string(),
+            job_id: "job-test".to_string(),
+            pid: 1,
+            state: LaneState::Leased,
+            started_at: "not-a-timestamp".to_string(),
+            lane_profile_hash: "h".to_string(),
+            toolchain_fingerprint: "f".to_string(),
+        };
+        assert!(lease.started_at_epoch_secs().is_none());
+        assert!(lease.started_at_rfc3339().is_none());
+        assert!(lease.age_secs(100).is_none());
     }
 
     #[test]
@@ -4167,6 +4322,43 @@ mod tests {
             },
             other => panic!("expected invalid record, got {other}"),
         }
+    }
+
+    #[test]
+    fn lane_lease_load_rejects_oversized_started_at() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let lane_dir = dir.path().join("lane-00");
+        fs::create_dir_all(&lane_dir).expect("create lane dir");
+
+        let lease = LaneLeaseV1::new(
+            "lane-00",
+            "job_20260213T000000Z",
+            123,
+            LaneState::Running,
+            "2026-02-13T00:00:00Z",
+            "b3-256:ph",
+            "b3-256:tf",
+        )
+        .expect("create lease");
+        let mut value = serde_json::to_value(lease).expect("to value");
+        value["started_at"] = serde_json::Value::String("x".repeat(MAX_STRING_LENGTH + 1));
+        fs::write(
+            lane_dir.join("lease.v1.json"),
+            serde_json::to_vec_pretty(&value).expect("to json"),
+        )
+        .expect("write bad lease");
+
+        let err = LaneLeaseV1::load(&lane_dir).expect_err("oversized started_at should fail");
+        assert!(
+            matches!(
+                err,
+                LaneError::StringTooLong {
+                    field: "started_at",
+                    ..
+                }
+            ),
+            "expected started_at length failure, got {err:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -5681,6 +5873,47 @@ mod tests {
         assert_eq!(status.pid, Some(pid));
         assert!(status.lock_held);
         assert_eq!(status.pid_alive, Some(true));
+        drop(guard);
+    }
+
+    #[test]
+    fn lane_manager_status_normalizes_legacy_epoch_started_at() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let lease = LaneLeaseV1::new(
+            lane_id,
+            "job_test",
+            std::process::id(),
+            LaneState::Running,
+            "2026-02-12T03:15:00Z",
+            "b3-256:ph",
+            "b3-256:th",
+        )
+        .expect("create lease");
+        let mut value = serde_json::to_value(lease).expect("to value");
+        value["started_at"] = serde_json::Value::String("1735689600".to_string());
+        fs::write(
+            lane_dir.join("lease.v1.json"),
+            serde_json::to_vec_pretty(&value).expect("to json"),
+        )
+        .expect("write legacy lease");
+
+        let guard = manager
+            .try_lock(lane_id)
+            .expect("try_lock")
+            .expect("acquire");
+        let status = manager.lane_status(lane_id).expect("status");
+        assert_eq!(
+            status.started_at.as_deref(),
+            Some("2025-01-01T00:00:00Z"),
+            "legacy epoch lease should be exposed as canonical RFC3339"
+        );
         drop(guard);
     }
 
