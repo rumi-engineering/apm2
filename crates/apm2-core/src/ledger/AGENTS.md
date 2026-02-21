@@ -451,6 +451,29 @@ let backend = BftLedgerBackend::with_schema_registry(
 - [`apm2_core::lease`](../lease/AGENTS.md) - Lease state derived from ledger events
 - [`apm2_core::schema_registry`](../schema_registry/AGENTS.md) - Schema registration and lookup
 
+## Acceptance Tests
+
+### AT-0: Ledger Unification (TCK-00632)
+
+RFC-0032 Phase 0 acceptance tests in `tests.rs` (prefixed `tck_00632_at0_`):
+
+| Test | Purpose |
+|------|---------|
+| `tck_00632_at0_legacy_db_to_canonical_append` | Full lifecycle: seed legacy DB, migrate, verify canonical mode + hash chain, append via `Ledger`, verify end-to-end chain |
+| `tck_00632_at0_negative_legacy_mode_refuses_writes` | Unmigrated legacy DB must be in legacy read mode and refuse writes |
+| `tck_00632_at0_negative_null_event_hash_detected` | NULL `event_hash` injection detected by `verify_chain` |
+| `tck_00632_at0_negative_chain_discontinuity_detected` | Wrong `prev_hash` linkage detected by `verify_chain` |
+| `tck_00632_at0_migration_idempotent` | Double migration does not duplicate rows or alter hashes |
+
+**Covered invariants:** INV-LED-010 through INV-LED-019, CTR-LED-001.
+
+**Helper functions:**
+- `seed_at0_legacy_db(dir, db_name, count)` — seed a legacy-only DB with `count` rows
+- `verify_at0_hash_chain(conn)` — verify every row in `events` has non-NULL 32-byte hash with contiguous Blake3 chain
+- `run_at0_migration_phase(path, count)` — run daemon startup migration and verify post-conditions
+- `at0_append_canonical_events(ledger, legacy_count, count)` — append canonical events via `append_signed`
+- `verify_at0_full_chain(ledger, legacy_count, post_count)` — verify full chain integrity and per-event metadata
+
 ## References
 
 ### Rust Textbook Chapters
