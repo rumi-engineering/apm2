@@ -264,14 +264,16 @@ pub(super) fn enqueue_job(
             // the service user gate simply by misconfiguring or removing the
             // service user account.
             //
-            // For dev environments without a service user, callers MUST use
-            // `--unsafe-local-write` explicitly (which returns Ok(()) from
+            // In system-mode environments without a service user, callers
+            // must provision the service user or use `--unsafe-local-write`
+            // explicitly (which returns Ok(()) from
             // check_queue_write_permission before resolution is attempted).
             Err(format!(
                 "service user gate denied queue write (fail-closed): \
                  service user '{service_user}' not resolvable ({reason}). \
                  In ServiceUserOnly mode, an unresolvable service user is a hard denial. \
-                 Use --unsafe-local-write to bypass in development environments."
+                 Use --unsafe-local-write for explicit local bypass, or run \
+                 `apm2 fac bootstrap --system` to provision the service user."
             ))
         },
         Err(ServiceUserGateError::NotServiceUser { .. })
@@ -1096,13 +1098,17 @@ mod tests {
     // ── enqueue_job fallback (TCK-00577) ─────────────────────────────
 
     #[cfg(unix)]
+    #[allow(unsafe_code)] // Env var mutation serialized via env_var_test_lock.
     #[test]
     fn enqueue_job_hard_denies_when_service_user_not_resolved_in_service_user_only_mode() {
-        // TCK-00577 round 10 MAJOR fix: ServiceUserNotResolved in
-        // ServiceUserOnly mode is a HARD error (fail-closed). The service
-        // user identity cannot be confirmed, so we must not allow any
-        // write path (not even broker fallback). Callers in dev
-        // environments MUST use --unsafe-local-write explicitly.
+        // TCK-00657: In system-mode, ServiceUserNotResolved in
+        // ServiceUserOnly mode remains a HARD error (fail-closed). Force
+        // backend=system to make this deterministic.
+        let _lock = crate::commands::env_var_test_lock().lock().unwrap();
+        let previous_backend = std::env::var_os("APM2_FAC_EXECUTION_BACKEND");
+        // SAFETY: serialized through env_var_test_lock in test scope.
+        unsafe { std::env::set_var("APM2_FAC_EXECUTION_BACKEND", "system") };
+
         let dir = tempfile::TempDir::new().expect("create temp dir");
         let queue_root = dir.path().join("queue");
         let fac_root = dir.path().join("fac");
@@ -1119,6 +1125,14 @@ mod tests {
             QueueWriteMode::ServiceUserOnly,
         );
 
+        // SAFETY: serialized through env_var_test_lock in test scope.
+        unsafe {
+            match previous_backend {
+                Some(value) => std::env::set_var("APM2_FAC_EXECUTION_BACKEND", value),
+                None => std::env::remove_var("APM2_FAC_EXECUTION_BACKEND"),
+            }
+        }
+
         // ServiceUserNotResolved + ServiceUserOnly = hard error.
         assert!(
             result.is_err(),
@@ -1127,8 +1141,11 @@ mod tests {
 
         let err = result.unwrap_err();
         assert!(
-            err.contains("fail-closed") && err.contains("not resolvable"),
-            "error should mention fail-closed and not resolvable: {err}"
+            err.contains("fail-closed")
+                && (err.contains("not resolvable")
+                    || err.contains("service user")
+                    || err.contains("fchown")),
+            "error should be a fail-closed service-user denial: {err}"
         );
 
         // Verify no file was written to broker_requests/ either.
@@ -1139,6 +1156,48 @@ mod tests {
                     .map(|mut d| d.next().is_none())
                     .unwrap_or(true),
             "no files should be written to broker_requests/ on hard denial"
+        );
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)] // Env var mutation serialized via env_var_test_lock.
+    #[test]
+    fn enqueue_job_service_user_only_bypasses_gate_in_user_mode() {
+        // TCK-00657: In user-mode, service-user-only enqueue auto-bypasses
+        // to direct local write semantics.
+        let _lock = crate::commands::env_var_test_lock().lock().unwrap();
+        let previous_backend = std::env::var_os("APM2_FAC_EXECUTION_BACKEND");
+        // SAFETY: serialized through env_var_test_lock in test scope.
+        unsafe { std::env::set_var("APM2_FAC_EXECUTION_BACKEND", "user") };
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path().join("queue");
+        let fac_root = dir.path().join("fac");
+        std::fs::create_dir_all(&fac_root).expect("create fac root");
+
+        let spec = test_job_spec("test-user-mode-direct-001");
+        let policy = QueueBoundsPolicy::default();
+
+        let result = enqueue_job(
+            &queue_root,
+            &fac_root,
+            &spec,
+            &policy,
+            QueueWriteMode::ServiceUserOnly,
+        );
+
+        // SAFETY: serialized through env_var_test_lock in test scope.
+        unsafe {
+            match previous_backend {
+                Some(value) => std::env::set_var("APM2_FAC_EXECUTION_BACKEND", value),
+                None => std::env::remove_var("APM2_FAC_EXECUTION_BACKEND"),
+            }
+        }
+
+        let path = result.expect("user-mode bypass should allow direct enqueue");
+        assert!(
+            path.starts_with(queue_root.join(PENDING_DIR)),
+            "user-mode bypass should write to pending/: {path:?}"
         );
     }
 

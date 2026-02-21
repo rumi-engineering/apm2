@@ -22,11 +22,14 @@ ticket_meta:
   dependencies:
     tickets:
       - 'TCK-00622' # receipt pipeline + reconcile hardening (already merged)
+      - 'TCK-00577' # service user gate (regression introduced here)
 
 context:
   observed_symptoms:
     - 'Lane lease age warnings are frequently "unknown"; on-call cannot reliably reason about lane lease staleness from logs.'
     - 'Downstream logic that expects RFC3339 cannot safely compute lease age or enforce TTL policies.'
+    - 'After TCK-00577, `apm2 fac push` hard-fails in user-mode (local dev) because _apm2-job is not in /etc/passwd — no service user is ever provisioned.'
+    - 'Even when _apm2-job exists, fchown(fd, -1, _apm2-job_gid) fails for calling user (ubuntu) because it is not in the group and lacks CAP_CHOWN — broker-mediated path is broken for unprivileged users.'
   code_evidence:
     - |
       LaneLeaseV1 documents started_at as ISO 8601 (RFC3339):
@@ -38,6 +41,14 @@ context:
     - |
       Worker-side helper expects RFC3339 and returns None on epoch seconds:
         crates/apm2-cli/src/commands/fac_worker.rs:1367-1373 (parse_started_at_age_secs)
+    - |
+      Service user gate fires unconditionally in check_queue_write_permission regardless of
+      execution backend mode; no user-mode bypass path exists:
+        crates/apm2-cli/src/commands/fac.rs (check_queue_write_permission)
+    - |
+      bootstrap never calls useradd or creates _apm2-job; RFC-0019 assigned this to bootstrap
+      but no implementation exists:
+        crates/apm2-cli/src/commands/fac.rs (bootstrap subcommand)
 
 problem_statement: |
   LaneLeaseV1.started_at is semantically specified as an ISO 8601 timestamp, but at least one producer
@@ -103,9 +114,28 @@ scope:
           - Unit: invalid started_at is rejected by LaneLeaseV1::new OR produces None canonical view.
             (Choose one policy; prefer "reject on persist" but allow load for migration.)
           - Regression: worker lease writes RFC3339.
+    - id: 'S5'
+      description: |
+        Fix user-mode (local dev) regression introduced by TCK-00577:
+          - In check_queue_write_permission, detect when the execution backend is UserMode.
+          - When UserMode: bypass the service user gate entirely and use UnsafeLocalWrite
+            semantics automatically. No env var opt-in, no useradd required.
+          - Rationale: in user-mode, worker and CLI both run as the same user (e.g., ubuntu);
+            privilege separation is not applicable and the gate is unreachable by design.
+          - Scope covers push, gates, and warm enqueue paths (all callers of check_queue_write_permission).
+    - id: 'S6'
+      description: |
+        Implement _apm2-job service user provisioning in bootstrap --system:
+          - `apm2 fac bootstrap --system` must:
+              * Create _apm2-job system user (useradd -r -s /usr/sbin/nologin _apm2-job) if not present.
+              * chown/chgrp the FAC root directories to _apm2-job where required.
+              * Add the calling user to the _apm2-job group (usermod -aG _apm2-job $SUDO_USER).
+          - Provisioning must be idempotent (safe to re-run).
+          - bootstrap --user (local dev mode) MUST NOT attempt provisioning.
   out_of_scope:
     - 'Changing queue/job receipt timestamp formats (handled elsewhere).'
     - 'Introducing TTL-based reclaim policies (separate ticket once timestamps are trustworthy).'
+    - 'Full redesign of the broker-mediated ownership transfer path (larger change, system-mode only).'
 
 plan:
   steps:
@@ -117,6 +147,10 @@ plan:
       description: 'Replace worker-local age parsing with apm2-core helper; improve log messages for legacy leases.'
     - id: 'P4'
       description: 'Run full test suite; specifically exercise fac worker reconcile paths against a legacy lease fixture.'
+    - id: 'P5'
+      description: 'Add UserMode bypass in check_queue_write_permission; verify push/gates/warm enqueue work in local dev without _apm2-job present.'
+    - id: 'P6'
+      description: 'Implement idempotent _apm2-job provisioning in bootstrap --system (useradd, chown dirs, add caller to group); add --system vs --user guard.'
 
 definition_of_done:
   criteria:
@@ -126,12 +160,17 @@ definition_of_done:
   evidence_ids:
     - 'EVID-TCK-00657-01 (unit): lane lease timestamp normalization tests'
     - 'EVID-TCK-00657-02 (integration): fac_worker writes RFC3339 leases'
+    - 'EVID-TCK-00657-03 (integration): apm2 fac push succeeds in UserMode without _apm2-job present'
+    - 'EVID-TCK-00657-04 (integration): bootstrap --system creates _apm2-job and adds caller to group (idempotent)'
 
 test_plan:
   unit_tests:
     - 'crates/apm2-core/src/fac/lane.rs: add tests for started_at parsing + normalization'
+    - 'check_queue_write_permission: UserMode returns UnsafeLocalWrite without consulting /etc/passwd'
   integration_tests:
     - 'crates/apm2-cli/src/commands/fac_worker.rs: extend existing lane tests to assert started_at is RFC3339'
+    - 'fac push in UserMode environment (no _apm2-job): assert success end-to-end'
+    - 'bootstrap --system (in CI with sudo or a test double): assert _apm2-job created, dirs chowned, caller added to group; re-run asserts idempotent'
 
 rollout:
   migration_notes: |
