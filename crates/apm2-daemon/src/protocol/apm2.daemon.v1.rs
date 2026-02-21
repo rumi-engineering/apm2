@@ -1828,7 +1828,7 @@ pub struct OpenWorkRequest {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OpenWorkResponse {
-    /// Assigned canonical work identifier (`W-<uuid>` or from WorkSpec).
+    /// Assigned canonical work identifier (W-{uuid} or from WorkSpec).
     #[prost(string, tag = "1")]
     pub work_id: ::prost::alloc::string::String,
     /// BLAKE3 hash of the canonical WorkSpec stored in CAS (32 bytes).
