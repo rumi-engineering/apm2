@@ -376,43 +376,69 @@ impl PulsePublisher {
         // Update index for TCK-00305 (PolicyResolvedForChangeSet lookup)
         self.topic_deriver.update_index(&kernel_event);
 
-        // Build the topic from the notification and payload using TopicDeriver
-        // (TCK-00305)
-        let topic = match self
+        // Derive topics using multi-topic derivation (TCK-00642).
+        // Most events produce a single topic; work graph edge events produce
+        // topics for both from_work_id and to_work_id.
+        let topic_results = self
             .topic_deriver
-            .derive_topic(&notification, &kernel_event)
-        {
-            TopicDerivationResult::Success(t) => t,
-            TopicDerivationResult::ValidationFailed {
-                attempted_topic,
-                error,
-            } => {
-                debug!(
-                    seq_id = notification.seq_id,
-                    event_type = %notification.event_type,
-                    namespace = %notification.namespace,
-                    attempted_topic = %attempted_topic,
-                    error = %error,
-                    "Notification dropped: derived topic failed validation"
-                );
-                return;
-            },
-            TopicDerivationResult::NoTopic => {
-                debug!(
-                    seq_id = notification.seq_id,
-                    event_type = %notification.event_type,
-                    namespace = %notification.namespace,
-                    "Notification dropped: no topic could be derived"
-                );
-                return;
-            },
-        };
+            .derive_topics(&notification, &kernel_event);
 
+        // Filter to successful topics only, logging failures
+        let topics: Vec<String> = topic_results
+            .into_iter()
+            .filter_map(|result| match result {
+                TopicDerivationResult::Success(t) => Some(t),
+                TopicDerivationResult::ValidationFailed {
+                    attempted_topic,
+                    error,
+                } => {
+                    debug!(
+                        seq_id = notification.seq_id,
+                        event_type = %notification.event_type,
+                        namespace = %notification.namespace,
+                        attempted_topic = %attempted_topic,
+                        error = %error,
+                        "Derived topic failed validation (skipped)"
+                    );
+                    None
+                },
+                TopicDerivationResult::NoTopic => {
+                    debug!(
+                        seq_id = notification.seq_id,
+                        event_type = %notification.event_type,
+                        namespace = %notification.namespace,
+                        "No topic could be derived (skipped)"
+                    );
+                    None
+                },
+            })
+            .collect();
+
+        if topics.is_empty() {
+            debug!(
+                seq_id = notification.seq_id,
+                event_type = %notification.event_type,
+                "Notification dropped: no valid topics derived"
+            );
+            return;
+        }
+
+        // Fan out to all derived topics
+        for topic in &topics {
+            self.publish_to_topic(&notification, topic);
+        }
+    }
+
+    /// Publishes a pulse event for a single topic.
+    ///
+    /// Builds the envelope, finds matching subscriptions, encodes the pulse
+    /// event, and fans out to matching subscribers with backpressure.
+    fn publish_to_topic(&self, notification: &CommitNotification, topic: &str) {
         // Build the pulse envelope
-        let envelope = self.build_envelope(&notification, &topic);
+        let envelope = self.build_envelope(notification, topic);
 
         // Find matching subscriptions
-        let matches = self.registry.find_matching_subscriptions(&topic);
+        let matches = self.registry.find_matching_subscriptions(topic);
 
         if matches.is_empty() {
             trace!(topic = %topic, "No matching subscriptions for pulse");
