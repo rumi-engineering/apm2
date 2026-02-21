@@ -1158,6 +1158,22 @@ async fn async_main(args: Args) -> Result<()> {
             .context("failed to init ledger events schema")?;
         SqliteWorkRegistry::init_schema(&conn).context("failed to init work claims schema")?;
 
+        // TCK-00630: RFC-0032 Phase 0 — migrate legacy `ledger_events` to
+        // canonical `events` table before any consumers initialize.
+        // Fail-closed: if migration fails, the daemon must not start.
+        apm2_core::ledger::init_canonical_schema(&conn)
+            .context("failed to init canonical events schema for migration")?;
+        let migration_stats = apm2_core::ledger::migrate_legacy_ledger_events(&conn)
+            .context("failed to migrate legacy ledger events (RFC-0032)")?;
+        if migration_stats.already_migrated {
+            info!("Legacy ledger migration: already migrated (no-op)");
+        } else {
+            info!(
+                rows_migrated = migration_stats.rows_migrated,
+                "Legacy ledger migration completed (RFC-0032)"
+            );
+        }
+
         Some(Arc::new(Mutex::new(conn)))
     } else {
         None
