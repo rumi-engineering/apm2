@@ -377,10 +377,9 @@ fn run_blocking_evidence_gates(
         // Prefer worker execution when available, but do not hard-require it:
         // push must remain single-command operable for callers.
         require_external_worker: false,
-        // TCK-00577/TCK-00657: Use caller-provided write mode. Default is
-        // ServiceUserOnly; user-mode bypass happens inside
-        // check_queue_write_permission, while explicit unsafe mode is still
-        // available via top-level FacCommand.
+        // TCK-00577: Use the caller-provided write mode. Default is
+        // ServiceUserOnly; only bypass when --unsafe-local-write is
+        // explicitly passed at the top-level FacCommand.
         write_mode,
     };
     let outcome = run_queued_gates_and_collect(&request)?;
@@ -2253,7 +2252,7 @@ pub fn run_push(
         );
         human_log!("WARNING: review dispatch failed: {e}");
         human_log!("  Reviewers are NOT running. Use one of:");
-        human_log!("    apm2 fac review dispatch <PR_URL> --type all");
+        human_log!("    apm2 fac review run --pr {pr_number} --type all");
         human_log!("    apm2 fac restart --pr {pr_number}");
         // BF-001 (TCK-00626): Emit structured dispatch_failed event so
         // the event stream captures the failure for automated recovery.
@@ -2265,7 +2264,7 @@ pub fn run_push(
                 "sha": sha,
                 "error": e,
                 "recovery_commands": [
-                    format!("apm2 fac review dispatch <PR_URL> --type all"),
+                    format!("apm2 fac review run --pr {pr_number} --type all"),
                     format!("apm2 fac restart --pr {pr_number}"),
                 ],
             }));

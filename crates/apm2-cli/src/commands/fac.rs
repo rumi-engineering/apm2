@@ -53,9 +53,9 @@ use apm2_core::fac::service_user_gate::QueueWriteMode;
 use apm2_core::fac::{
     LANE_ENV_DIRS, LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1, LaneManager,
     LaneReconcileReceiptV1, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
-    REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA,
-    SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
-    safe_rmtree_v1,
+    ProcessIdentity, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt,
+    SUMMARY_RECEIPT_SCHEMA, SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA,
+    TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1, safe_rmtree_v1, verify_pid_identity,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
@@ -1476,7 +1476,7 @@ pub struct ReviewRunArgs {
     pub json: bool,
 }
 
-/// Review lane filter for `apm2 fac review status`.
+/// Review lane filter for `apm2 fac review terminate`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ReviewStatusTypeArg {
     Security,
@@ -4629,13 +4629,19 @@ fn run_lane_reset_with_manager(
     }
 
     // With --force on a RUNNING lane, attempt to kill the process (under lock).
-    // If kill fails (EPERM, PID reuse, etc.), abort the reset and mark CORRUPT
+    // If kill fails (identity mismatch, unknown identity, EPERM, etc.), abort
+    // the reset and mark CORRUPT
     // to prevent deleting directories of a still-running process.
     if status.state == LaneState::Running && args.force {
-        if let Some(pid) = status.pid {
-            if !kill_process_best_effort(pid) {
+        let lane_dir = manager.lane_dir(&args.lane_id);
+        let lease = LaneLeaseV1::load(&lane_dir).ok().flatten();
+        let pid = lease.as_ref().map(|lease| lease.pid).or(status.pid);
+        let expected_start_ticks = lease.as_ref().and_then(|lease| lease.proc_start_time_ticks);
+
+        if let Some(pid) = pid {
+            if !kill_process_best_effort(pid, expected_start_ticks) {
                 let corrupt_reason = format!(
-                    "failed to kill process {} for lane {} -- process may still be running or PID was reused",
+                    "failed to kill process {} for lane {} -- process identity was unknown or process may still be running",
                     pid, args.lane_id
                 );
                 persist_corrupt_lease(manager, &args.lane_id, &corrupt_reason);
@@ -5173,10 +5179,15 @@ fn print_lane_reconcile_receipt(receipt: &LaneReconcileReceiptV1) {
 ///
 /// # PID Reuse Safety
 ///
-/// Stale lease PIDs may have been reused by a different process. We
-/// verify the process exists via `/proc/<pid>/comm` before sending
-/// signals. If `/proc/<pid>/comm` does not exist, the PID is dead and
-/// we return `true` (success).
+/// Stale lease PIDs may have been reused by a different process. Before
+/// sending signals, we verify process identity using
+/// `verify_pid_identity(pid, expected_start_ticks)`:
+///
+/// - `AliveMatch` => safe to signal.
+/// - `Dead` => already gone (success).
+/// - `AliveMismatch` => original owner is gone (success, do not signal reused
+///   PID).
+/// - `Unknown` => fail-closed, do not signal.
 ///
 /// # Blocking Wait (intentional)
 ///
@@ -5187,23 +5198,22 @@ fn print_lane_reconcile_receipt(receipt: &LaneReconcileReceiptV1) {
 /// expects synchronous completion before proceeding with directory deletion.
 /// The blocking wait ensures the process has actually exited before we
 /// attempt to delete its workspace.
-fn kill_process_best_effort(pid: u32) -> bool {
+fn kill_process_best_effort(pid: u32, expected_start_ticks: Option<u64>) -> bool {
     #[cfg(unix)]
     {
         use nix::sys::signal::{self, Signal};
         use nix::unistd::Pid;
 
+        match verify_pid_identity(pid, expected_start_ticks) {
+            ProcessIdentity::Dead | ProcessIdentity::AliveMismatch => return true,
+            ProcessIdentity::Unknown => return false,
+            ProcessIdentity::AliveMatch => {},
+        }
+
         let Ok(pid_i32) = i32::try_from(pid) else {
             return false;
         };
         let nix_pid = Pid::from_raw(pid_i32);
-
-        // Verify PID is alive via /proc/<pid>/comm. If the procfs entry
-        // does not exist, the process is already dead -- success.
-        let proc_comm = format!("/proc/{pid}/comm");
-        if std::fs::read_to_string(&proc_comm).is_err() {
-            return true; // Process doesn't exist
-        }
 
         // Send SIGTERM first (graceful shutdown request).
         match signal::kill(nix_pid, Signal::SIGTERM) {
@@ -5217,12 +5227,19 @@ fn kill_process_best_effort(pid: u32) -> bool {
         // See doc comment above for why this blocking wait is intentional.
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            // kill(pid, signal 0) checks existence without sending a signal.
-            match signal::kill(nix_pid, None) {
-                Err(nix::errno::Errno::ESRCH) => return true, // gone
-                Ok(()) => {},                                 // still alive
-                Err(_) => return false,                       // can't determine, don't proceed
+            match verify_pid_identity(pid, expected_start_ticks) {
+                ProcessIdentity::Dead | ProcessIdentity::AliveMismatch => return true,
+                ProcessIdentity::AliveMatch => {},
+                ProcessIdentity::Unknown => return false,
             }
+        }
+
+        // Re-check identity immediately before SIGKILL to avoid signaling a
+        // reused PID if ownership changed during the SIGTERM wait window.
+        match verify_pid_identity(pid, expected_start_ticks) {
+            ProcessIdentity::Dead | ProcessIdentity::AliveMismatch => return true,
+            ProcessIdentity::AliveMatch => {},
+            ProcessIdentity::Unknown => return false,
         }
 
         // Process still alive after 5s -- send SIGKILL (uncatchable).
@@ -5234,7 +5251,10 @@ fn kill_process_best_effort(pid: u32) -> bool {
 
         // Final wait for SIGKILL to take effect.
         std::thread::sleep(std::time::Duration::from_millis(200));
-        matches!(signal::kill(nix_pid, None), Err(nix::errno::Errno::ESRCH))
+        matches!(
+            verify_pid_identity(pid, expected_start_ticks),
+            ProcessIdentity::Dead | ProcessIdentity::AliveMismatch
+        )
     }
 
     #[cfg(not(unix))]
@@ -6552,6 +6572,22 @@ mod tests {
                 target.display()
             );
         }
+    }
+
+    #[test]
+    fn test_kill_process_best_effort_treats_pid_identity_mismatch_as_already_gone() {
+        let pid = std::process::id();
+        let start_ticks =
+            apm2_core::fac::read_proc_start_time_ticks(pid).expect("read current pid start ticks");
+        assert!(
+            kill_process_best_effort(pid, Some(start_ticks.saturating_add(1))),
+            "mismatched pid identity should be treated as stale owner gone"
+        );
+        assert_eq!(
+            apm2_core::fac::verify_pid_identity(pid, Some(start_ticks)),
+            apm2_core::fac::ProcessIdentity::AliveMatch,
+            "current process must remain alive after mismatch refusal"
+        );
     }
 
     #[test]

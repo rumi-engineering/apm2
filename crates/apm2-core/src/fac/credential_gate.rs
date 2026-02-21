@@ -4,7 +4,7 @@
 //! credential mount descriptor for FAC execution paths. The gate ensures:
 //!
 //! - `apm2 fac gates` (local-only) never requires GitHub credentials.
-//! - GitHub-facing commands (`fac push`, `fac review dispatch`) fail fast with
+//! - GitHub-facing commands (`fac push`, `fac review run`) fail fast with
 //!   actionable errors when credentials are missing.
 //! - Secrets never enter job specs, receipts, or log output.
 //!
@@ -314,7 +314,7 @@ fn resolved_posture(source: CredentialSource) -> CredentialPosture {
 /// Fail-fast gate: require GitHub credentials to be available.
 ///
 /// Call this at the entry point of GitHub-facing commands (`fac push`,
-/// `fac review dispatch`, etc.) to produce an actionable error before
+/// `fac review run`, etc.) to produce an actionable error before
 /// attempting any GitHub API operations.
 ///
 /// # Errors

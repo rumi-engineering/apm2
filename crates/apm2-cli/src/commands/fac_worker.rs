@@ -89,7 +89,8 @@ use apm2_core::fac::job_spec::{
     parse_b3_256_digest, validate_job_spec_control_lane_with_policy, validate_job_spec_with_policy,
 };
 use apm2_core::fac::lane::{
-    LaneLeaseV1, LaneLockGuard, LaneManager, LaneState, current_time_iso8601,
+    LaneLeaseV1, LaneLockGuard, LaneManager, LaneState, ProcessIdentity, current_time_iso8601,
+    verify_pid_identity,
 };
 use apm2_core::fac::queue_bounds::{QueueBoundsPolicy, check_queue_bounds};
 use apm2_core::fac::scan_lock::{ScanLockResult, check_stuck_scan_lock, try_acquire_scan_lock};
@@ -1421,7 +1422,10 @@ fn reap_orphaned_leases_on_tick(fac_root: &Path, json_output: bool) {
         let orphaned = match loaded_lease.as_ref() {
             Some(lease) => {
                 lease.state == LaneState::Leased
-                    && matches!(check_process_liveness(lease.pid), ProcessLiveness::Dead)
+                    && matches!(
+                        check_process_identity(lease),
+                        ProcessIdentity::Dead | ProcessIdentity::AliveMismatch
+                    )
             },
             None => status.state == LaneState::Leased && status.pid.is_none(),
         };
@@ -5934,79 +5938,12 @@ fn owns_sccache_server(
     false
 }
 
-/// Result of a process liveness check via `kill(pid, 0)`.
+/// Check lease process identity using PID + proc start-time binding.
 ///
-/// Distinguishes three outcomes to prevent EPERM-based false negatives
-/// from causing lane reuse while a process is still running.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessLiveness {
-    /// Process exists and is owned by the current user (kill -0 succeeded).
-    Alive,
-    /// Process does not exist (ESRCH).
-    Dead,
-    /// Process exists but is not owned by the current user (EPERM).
-    /// Treat as busy/corrupt — do NOT assume the lane is idle.
-    PermissionDenied,
-}
-
-/// Check whether a process is alive using `kill(pid, 0)` with proper
-/// errno discrimination.
-///
-/// BLOCKER FIX (f-685-code_quality-1): The previous implementation used
-/// `status.success()` which conflated ESRCH (no such process) with EPERM
-/// (operation not permitted). EPERM means the process EXISTS but belongs
-/// to a different user — treating this as "dead" could cause lane reuse
-/// while the previous process is still running.
-///
-/// This implementation uses `libc::kill` directly and checks errno:
-/// - Success (0): process is alive and we can signal it
-/// - ESRCH (3): process does not exist — safe to reclaim the lane
-/// - EPERM (1): process exists but we lack permission — NOT safe
-#[allow(unsafe_code)]
-fn check_process_liveness(pid: u32) -> ProcessLiveness {
-    // Guard against signaling pid 0 (entire process group) or negative
-    // PIDs (which signal process groups by absolute value).
-    if pid == 0 {
-        return ProcessLiveness::Dead;
-    }
-
-    // SAFETY: This block is safe because the following pre-conditions are
-    // upheld by the caller and the guard above, and result in a sound
-    // post-condition:
-    //
-    // Pre-conditions:
-    //   1. `pid` is non-zero (guarded by the `pid == 0` early return above).
-    //   2. Signal 0 is used, which performs an existence check without delivering
-    //      any signal — a standard POSIX `kill(2)` operation.
-    //   3. The cast from `u32` to `i32` (`pid_t`) is bounded: valid Linux PIDs fit
-    //      in `i32`. Wrapping of very large `u32` values (> i32::MAX) produces a
-    //      negative `pid_t`. Negative values sent to `kill()` signal process groups
-    //      by absolute value (e.g., -1 signals all processes). However, the
-    //      function remains safe and fail-closed: signal 0 delivers no actual
-    //      signal, and only an explicit ESRCH errno maps to `Dead`. Process-group
-    //      signals that succeed return 0 (mapped to `Alive`), and EPERM or other
-    //      errors map to `PermissionDenied` — both are fail-closed outcomes that
-    //      prevent lane reuse.
-    //
-    // Post-condition: `ret` contains the kernel return value (0 = exists,
-    // -1 = error with errno set). No memory is accessed, no signal is
-    // delivered, and no UB can result from any `pid_t` value passed to
-    // `kill(2)` with signal 0.
-    #[allow(clippy::cast_possible_wrap)]
-    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
-
-    if ret == 0 {
-        ProcessLiveness::Alive
-    } else {
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        if errno == libc::ESRCH {
-            ProcessLiveness::Dead
-        } else {
-            // EPERM: process exists but we lack permission to signal it.
-            // Any other errno: fail-closed — assume process may exist.
-            ProcessLiveness::PermissionDenied
-        }
-    }
+/// Returns `AliveMismatch` when PID was reused and now points to another
+/// process, allowing stale lease recovery without treating the lane as active.
+fn check_process_identity(lease: &LaneLeaseV1) -> ProcessIdentity {
+    verify_pid_identity(lease.pid, lease.proc_start_time_ticks)
 }
 
 /// Structured reset recommendation emitted when the worker encounters a
@@ -6131,12 +6068,10 @@ fn acquire_worker_lane(
                             );
                         },
                         LaneState::Running | LaneState::Cleanup => {
-                            // Check process liveness with proper errno
-                            // discrimination (BLOCKER fix for EPERM vs ESRCH).
-                            match check_process_liveness(lease.pid) {
-                                ProcessLiveness::Dead => {
-                                    // Process is confirmed dead (ESRCH). Safe to
-                                    // recover this lane by removing the stale lease.
+                            match check_process_identity(&lease) {
+                                ProcessIdentity::Dead => {
+                                    // Process is confirmed dead. Safe to recover this lane
+                                    // by removing the stale lease.
                                     tracing::info!(
                                         lane_id = lane_id.as_str(),
                                         pid = lease.pid,
@@ -6145,13 +6080,23 @@ fn acquire_worker_lane(
                                     let _ = LaneLeaseV1::remove(&lane_dir);
                                     return Some((guard, lane_id.clone()));
                                 },
-                                ProcessLiveness::Alive => {
-                                    // Process is still running. We have the flock
-                                    // but the process is alive — this is unexpected
-                                    // (flock should prevent concurrent acquisition).
-                                    // Mark as corrupt to be safe.
+                                ProcessIdentity::AliveMismatch => {
+                                    // PID was reused by another process. This lease no longer
+                                    // owns the lane, so recover as stale.
+                                    tracing::info!(
+                                        lane_id = lane_id.as_str(),
+                                        pid = lease.pid,
+                                        "stale lease recovery: pid identity mismatch, reclaiming lane"
+                                    );
+                                    let _ = LaneLeaseV1::remove(&lane_dir);
+                                    return Some((guard, lane_id.clone()));
+                                },
+                                ProcessIdentity::AliveMatch => {
+                                    // Process identity still matches the lease owner.
+                                    // We have the flock but the owner appears alive —
+                                    // unexpected/inconsistent. Mark as corrupt.
                                     let reason = format!(
-                                        "lane has RUNNING lease for pid {} which is still alive (unexpected with flock held)",
+                                        "lane has RUNNING lease for pid {} with matching identity while flock is held (unexpected)",
                                         lease.pid
                                     );
                                     tracing::warn!(
@@ -6175,35 +6120,19 @@ fn acquire_worker_lane(
                                     // after marking lane corrupt.
                                     emit_lane_reset_recommendation(lane_id, &reason);
                                 },
-                                ProcessLiveness::PermissionDenied => {
-                                    // Process exists but we lack permission to
-                                    // signal it (EPERM). The lane is NOT idle.
-                                    // Mark as corrupt because we cannot determine
-                                    // whether the process is still using the lane.
-                                    let reason = format!(
-                                        "lane has RUNNING lease for pid {} which exists but is not signalable (EPERM), marking corrupt",
-                                        lease.pid
-                                    );
+                                ProcessIdentity::Unknown => {
+                                    let reason = if lease.proc_start_time_ticks.is_none() {
+                                        "lease missing proc_start_time_ticks; cannot verify identity".to_string()
+                                    } else {
+                                        "process identity verification failed (procfs or liveness probe error)".to_string()
+                                    };
                                     tracing::warn!(
                                         lane_id = lane_id.as_str(),
+                                        pid = lease.pid,
                                         reason = reason.as_str(),
-                                        "lane has running lease with permission-denied liveness check"
+                                        recommended_action = "apm2 fac lane reset <lane_id>",
+                                        "skipping lane because lease identity is unknown"
                                     );
-                                    if let Err(err) = persist_corrupt_marker_with_retries(
-                                        lane_mgr.fac_root(),
-                                        lane_id,
-                                        &reason,
-                                        None,
-                                    ) {
-                                        tracing::error!(
-                                            lane_id = lane_id.as_str(),
-                                            error = %err,
-                                            "failed to persist corrupt marker for lane"
-                                        );
-                                    }
-                                    // TCK-00570: Emit structured reset recommendation
-                                    // after marking lane corrupt.
-                                    emit_lane_reset_recommendation(lane_id, &reason);
                                 },
                             }
                         },
@@ -10813,20 +10742,23 @@ mod tests {
         );
     }
 
-    /// Find a PID that is guaranteed to not exist (returns ESRCH on kill -0).
+    /// Find a PID that is guaranteed to not exist.
     ///
     /// Starts from a high PID and walks down until one is confirmed dead.
-    /// Falls back to PID 0 which `check_process_liveness` treats as Dead.
+    /// Falls back to PID 0 which identity checks treat as dead.
     fn find_dead_pid() -> u32 {
-        // Walk from a high PID downward to find one that returns ESRCH.
+        // Walk from a high PID downward to find one classified as dead.
         // Typical Linux pid_max is 32768 or 4194304; we start well above
         // the common range to minimize collision risk with running processes.
         for pid_candidate in (100_000..200_000).rev() {
-            if matches!(check_process_liveness(pid_candidate), ProcessLiveness::Dead) {
+            if matches!(
+                verify_pid_identity(pid_candidate, Some(0)),
+                ProcessIdentity::Dead
+            ) {
                 return pid_candidate;
             }
         }
-        // Fallback: PID 0 is special-cased as Dead in check_process_liveness.
+        // Fallback: PID 0 is special-cased as dead in identity checks.
         0
     }
 
@@ -10880,9 +10812,86 @@ mod tests {
             .expect("marker load")
             .expect("marker should exist for alive-process lease");
         assert!(
-            marker.reason.contains("still alive"),
-            "marker reason should mention process is still alive, got: {}",
+            marker.reason.contains("matching identity"),
+            "marker reason should mention matching identity, got: {}",
             marker.reason
+        );
+    }
+
+    #[test]
+    fn test_acquire_worker_lane_recovers_pid_identity_mismatch_lease() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let lane_mgr = LaneManager::new(fac_root.clone()).expect("create lane manager");
+        lane_mgr.ensure_directories().expect("ensure lanes");
+
+        // Persist a running lease, then corrupt proc_start_time_ticks to
+        // simulate PID reuse mismatch for the same numeric PID.
+        persist_running_lease(&lane_mgr, "lane-00");
+        let lane_dir = lane_mgr.lane_dir("lane-00");
+        let lease_path = lane_dir.join("lease.v1.json");
+        let mut lease_value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&lease_path).expect("read lease")).expect("parse");
+        let ticks = lease_value
+            .get("proc_start_time_ticks")
+            .and_then(serde_json::Value::as_u64)
+            .expect("lease should include proc_start_time_ticks");
+        lease_value["proc_start_time_ticks"] = serde_json::Value::from(ticks + 1);
+        fs::write(
+            &lease_path,
+            serde_json::to_vec_pretty(&lease_value).expect("serialize lease"),
+        )
+        .expect("write mismatched lease");
+
+        let lane_ids = vec!["lane-00".to_string(), "lane-01".to_string()];
+        let (_guard, acquired_lane_id) =
+            acquire_worker_lane(&lane_mgr, &lane_ids).expect("lane should be acquired");
+        assert_eq!(
+            acquired_lane_id, "lane-00",
+            "PID identity mismatch lease should be treated as stale and reclaimed"
+        );
+        assert!(
+            LaneCorruptMarkerV1::load(&fac_root, "lane-00")
+                .expect("marker load")
+                .is_none(),
+            "PID mismatch recovery should not mark lane corrupt"
+        );
+    }
+
+    #[test]
+    fn test_acquire_worker_lane_skips_unknown_identity_lease() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let lane_mgr = LaneManager::new(fac_root.clone()).expect("create lane manager");
+        lane_mgr.ensure_directories().expect("ensure lanes");
+
+        // Simulate legacy lease without proc_start_time_ticks.
+        persist_running_lease(&lane_mgr, "lane-00");
+        let lane_dir = lane_mgr.lane_dir("lane-00");
+        let lease_path = lane_dir.join("lease.v1.json");
+        let mut lease_value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&lease_path).expect("read lease")).expect("parse");
+        lease_value["proc_start_time_ticks"] = serde_json::Value::Null;
+        fs::write(
+            &lease_path,
+            serde_json::to_vec_pretty(&lease_value).expect("serialize lease"),
+        )
+        .expect("write legacy lease");
+
+        let lane_ids = vec!["lane-00".to_string(), "lane-01".to_string()];
+        let (_guard, acquired_lane_id) =
+            acquire_worker_lane(&lane_mgr, &lane_ids).expect("lane should be acquired");
+        assert_eq!(
+            acquired_lane_id, "lane-01",
+            "unknown identity lease should be skipped fail-closed"
+        );
+        assert!(
+            LaneCorruptMarkerV1::load(&fac_root, "lane-00")
+                .expect("marker load")
+                .is_none(),
+            "unknown identity path should skip with warning, not mark corrupt"
         );
     }
 

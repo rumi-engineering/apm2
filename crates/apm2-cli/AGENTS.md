@@ -137,7 +137,7 @@ Credential management subcommands.
 | `apm2 fac lane init --json` | Same, with JSON receipt output |
 | `apm2 fac lane reconcile` | Repair missing lane directories/profiles, mark unrecoverable lanes CORRUPT |
 | `apm2 fac lane reconcile --json` | Same, with JSON receipt output |
-| `apm2 fac lane status` | Show all lane states (lock + lease + PID liveness) |
+| `apm2 fac lane status` | Show all lane states (lock + lease + PID identity/liveness) |
 | `apm2 fac lane status --state RUNNING` | Filter lanes by state |
 | `apm2 fac lane reset <lane_id>` | Reset lane: delete workspace/target/logs, remove lease |
 | `apm2 fac lane reset <lane_id> --force` | Force-reset RUNNING lane (kills process first) |
