@@ -1859,7 +1859,7 @@ struct ServicesStatusResponse {
     pub orphaned_systemd_unit_error: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum SystemDoctorFixActionStatus {
     Applied,
@@ -2066,6 +2066,18 @@ fn push_system_doctor_fix_action(
         lane_id: lane_id.map(std::string::ToString::to_string),
         detail: detail.into(),
     });
+}
+
+const fn system_doctor_fix_exit_code(
+    action_failed: bool,
+    has_blocked_actions: bool,
+    has_errors_after: bool,
+) -> u8 {
+    if action_failed || has_blocked_actions || has_errors_after {
+        exit_codes::GENERIC_ERROR
+    } else {
+        exit_codes::SUCCESS
+    }
 }
 
 fn collect_system_doctor_snapshot(
@@ -2995,11 +3007,15 @@ fn run_system_doctor_fix(
         serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
     );
 
-    if action_failed || after_snapshot.has_critical_error {
-        exit_codes::GENERIC_ERROR
-    } else {
-        exit_codes::SUCCESS
-    }
+    let has_blocked_actions = response
+        .actions
+        .iter()
+        .any(|action| action.status == SystemDoctorFixActionStatus::Blocked);
+    system_doctor_fix_exit_code(
+        action_failed,
+        has_blocked_actions,
+        after_snapshot.has_critical_error,
+    )
 }
 
 fn run_services_status(_json_output: bool) -> u8 {
@@ -7157,6 +7173,18 @@ mod tests {
             payload.get("action").and_then(|value| value.as_str()),
             Some("lane_tmp_corruption_detected")
         );
+    }
+
+    #[test]
+    fn test_system_doctor_fix_exit_code_returns_error_for_blocked_actions() {
+        let exit_code = system_doctor_fix_exit_code(false, true, false);
+        assert_eq!(exit_code, exit_codes::GENERIC_ERROR);
+    }
+
+    #[test]
+    fn test_system_doctor_fix_exit_code_returns_success_when_clean() {
+        let exit_code = system_doctor_fix_exit_code(false, false, false);
+        assert_eq!(exit_code, exit_codes::SUCCESS);
     }
 
     #[test]
