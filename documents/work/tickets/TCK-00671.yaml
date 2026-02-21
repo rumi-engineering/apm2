@@ -37,15 +37,17 @@ root_cause_analysis:
 scope:
   in_scope:
     - id: "OK-001"
-      title: "Create apm2_core::orchestrator_kernel module"
+      title: "Create apm2_core::orchestrator_kernel module via extraction, not invention"
       detail: |
-        Implement a small runtime harness with:
-          - Cursor abstraction over ledger (seq_id / consensus cursor)
-          - Reducer/step trait (pure deterministic)
-          - Effect enum + Driver trait (I/O boundary)
-          - Checkpoint store interface (serialize state; bounded)
-          - Tick source interface (injected clock)
-          - Built-in idempotency guard: before executing an effect with key K, check for receipt event for K
+        Implement a thin, mechanical controller loop by extracting existing primitives rather than building a generic framework.
+        MUST extract and reuse:
+          - `LedgerTailer` (from `crates/apm2-daemon/src/projection/worker.rs`) for durable cursoring and crash-safe resume.
+          - `EffectJournal` (from `crates/apm2-daemon/src/admission_kernel/effect_journal.rs`) for crash-window classification and idempotent effect execution.
+        
+        The module (`controller_loop.rs` or similar) should provide a minimal API:
+          - Observe -> Plan -> Execute -> Receipt
+          - A simple `OrchestratorDomain` trait with `apply_events`, `plan` (returning durable intents), and `execute`.
+          - Explicit backpressure (intent store / buffering) and timeout semantics.
 
         The harness must support:
           - bounded per-iteration work limits
@@ -53,17 +55,20 @@ scope:
           - deterministic replay tests
 
     - id: "OK-002"
-      title: "Refactor one existing orchestrator to use OrchestratorKernel (reference implementation)"
+      title: "Implement smallest orchestrator on the loop (e.g. timeout receipt generator) as reference"
       detail: |
-        Choose one daemon orchestrator with clear event vocabulary (recommended: gate orchestrator):
-          - port its loop to the harness
-          - keep its domain logic (step/reducer) unchanged where possible
-          - ensure all external ops are Effects executed by Driver
-          - ensure receipts exist in ledger for idempotency
-
-        The refactor should demonstrate:
+        To de-risk the extraction without cementing a "framework," build the simplest possible orchestrator on the loop:
+          - E.g., a "timeout receipt generator" that watches for expired leases and emits deterministic timeout receipts.
+        
+        This establishes the pattern:
+          - observe ledger
+          - plan timeout intent
+          - execute via EffectJournal
+          - emit ledger receipt
+        
+        The implementation should demonstrate:
           - restart-safe behavior
-          - fewer bespoke concurrency primitives
+          - consolidation of cursor tracking and effect idempotency
 
     - id: "OK-003"
       title: "Verification suite for OrchestratorKernel"
@@ -75,21 +80,53 @@ scope:
           - optionally: simulate duplicate inputs and ensure idempotency
 
   out_of_scope:
-    - Refactoring all orchestrators in one shot (follow-on tickets should port FAC worker and review once the kernel exists).
-    - Introducing new BFT consensus logic (backend already exists; harness must be compatible).
+    - Building a generic workflow engine or complex trait hierarchies.
+    - Inventing a new event model or a new persistence store (must reuse existing SQLite/File stores).
+    - Porting FAC Review immediately (this is the *target* for a follow-on ticket, not the test subject for the initial harness).
+    - Refactoring all existing orchestrators in one shot.
+    - Cementing the split between `apm2_core::ledger` and daemon ledger (the loop should abstract over a thin trait to allow future migration).
+
+implementation_notes:
+  critical_structural_boundaries:
+    - id: "IMPL-01"
+      title: "Crate Dependency Trap (apm2-core vs apm2-daemon)"
+      detail: |
+        LedgerTailer and EffectJournal implementations currently live in apm2-daemon. The loop must live in apm2-core.
+        Do NOT create a circular dependency. Move the *traits* to apm2-core and inject the daemon *implementations*
+        into the loop at runtime (e.g. via `&dyn EffectJournal`).
+    - id: "IMPL-02"
+      title: "The 'Two Ledgers' Schism"
+      detail: |
+        apm2_core uses the new BFT-ready ledger schema. The daemon uses a legacy SQLite schema.
+        The loop MUST be written against an abstract `LedgerRead` trait. The implementor should create a
+        `DaemonLedgerAdapter` in the daemon to wrap the legacy DB. Do not rewrite the database layer here.
+    - id: "IMPL-03"
+      title: "EffectJournal 'InDoubt' Resolution"
+      detail: |
+        When an effect is left in an 'Unknown' crash-window state, the loop must explicitly handle it.
+        It must NOT blindly retry (which breaks idempotency for external APIs). It must either query the external
+        state or emit a 'Blocked/NeedsIntervention' ledger receipt and fail-closed for that intent.
+    - id: "IMPL-04"
+      title: "Intent Buffering (Plan vs Execute Seam)"
+      detail: |
+        The loop's `Plan` phase may generate 10,000 intents. `Execute` cannot process them in one tick.
+        Intents MUST be durably buffered (e.g., a simple SQLite `intent_store` table) before execution. The loop then
+        pulls bounded batches (e.g., LIMIT 50) from this buffer for the `Execute` phase.
 
 plan:
   steps:
-    - Implement kernel module and minimal traits.
-    - Add a reference driver implementation for the chosen orchestrator.
-    - Port chosen orchestrator and keep API compatibility.
-    - Add determinism/crash/idempotency tests.
+    - Extract `LedgerTailer` into a shared module (currently in projection worker).
+    - Reuse `EffectJournal` (currently in admission kernel).
+    - Implement a thin controller loop `run_loop(domain, deps, cfg)`.
+    - Implement the smallest orchestrator (e.g. timeout receipt generator) as the reference driver.
+    - Add determinism/crash/idempotency tests for the new loop.
 
 definition_of_done:
   criteria:
     - "apm2_core::orchestrator_kernel exists with cursor/reducer/driver/checkpoint/tick interfaces."
     - "At least one daemon orchestrator runs on the harness and passes existing tests."
     - "New tests cover determinism + crash-point recovery + boundedness."
+    - "Extracts LedgerTailer and EffectJournal rather than creating net-new equivalents."
 
 risks:
   - id: "R-OK-01"
