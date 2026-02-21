@@ -680,13 +680,15 @@ systemd service executables:
 
 ### Service-user ownership validation (TCK-00577 round 3)
 
-- **Worker startup wires ownership check**: `run_fac_worker` validates that
-  queue subdirectories (`pending/`, `claimed/`, `completed/`, `denied/`,
-  `cancelled/`, `quarantine/`) and `receipts/` are owned by the configured
-  FAC service user (via `validate_directory_service_user_ownership`). This
-  check runs after directories are created but before the worker loop starts.
-  Fail-closed: if the service user cannot be resolved or ownership deviates,
-  the worker refuses to start.
+- **System-mode worker startup wires ownership check**: In `SystemMode`,
+  `run_fac_worker` validates that queue subdirectories (`pending/`, `claimed/`,
+  `completed/`, `denied/`, `cancelled/`, `quarantine/`) and `receipts/` are
+  owned by the configured FAC service user (via
+  `validate_directory_service_user_ownership`). This check runs after
+  directories are created but before the worker loop starts.
+- **User-mode skip**: In `UserMode`, worker startup skips service-user
+  ownership validation because worker and CLI run under one principal.
+  This preserves local-dev single-user semantics.
 
 ### Relaxed startup validation for enqueue-class commands (TCK-00577 round 3)
 
