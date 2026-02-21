@@ -452,6 +452,7 @@ impl ReconcileReceiptV1 {
 struct LaneReconcileResult {
     actions: Vec<LaneRecoveryAction>,
     active_job_ids: HashSet<String>,
+    unknown_identity_job_ids_for_orphan_suppression: HashSet<String>,
     stale_leases_recovered: usize,
     lanes_marked_corrupt: usize,
     /// If phase 1 encountered an error after partial mutations, the error
@@ -622,6 +623,7 @@ pub fn reconcile_on_startup(
         fac_root,
         queue_root,
         &lane_result.active_job_ids,
+        &lane_result.unknown_identity_job_ids_for_orphan_suppression,
         orphan_policy,
         dry_run,
     );
@@ -713,10 +715,12 @@ pub fn reconcile_on_startup(
 ///
 /// INV-RECON-006: Stale lease recovery transitions through CLEANUP → IDLE.
 ///
-/// Active-job tracking includes lanes with `AliveMatch` identity and, for
-/// orphan suppression only, lock-held lanes with `Unknown` identity. This
-/// avoids requeueing/failing active claimed jobs when identity evidence is
-/// temporarily unverifiable.
+/// Active-job tracking includes only lanes whose lease identity is
+/// `AliveMatch`, preventing false positives from PID-exists-only checks.
+///
+/// Lock-held lanes with `Unknown` identity are tracked separately for
+/// orphan-suppression handling in queue reconciliation so this invariant
+/// remains strict.
 #[allow(clippy::too_many_lines)] // lane reconciliation with corrupt-marker persistence is inherently branchy
 fn reconcile_lanes(
     manager: &LaneManager,
@@ -729,6 +733,7 @@ fn reconcile_lanes(
     let mut stale_leases_recovered: usize = 0;
     let mut lanes_marked_corrupt: usize = 0;
     let mut active_job_ids: HashSet<String> = HashSet::new();
+    let mut unknown_identity_job_ids_for_orphan_suppression: HashSet<String> = HashSet::new();
     let mut partial_error: Option<ReconcileError> = None;
 
     for lane_id in lane_ids {
@@ -894,27 +899,29 @@ fn reconcile_lanes(
                     && status.job_id.is_some()
                     && matches!(lease_identity, Some(ProcessIdentity::Unknown));
                 if let Some(job_id) = status.job_id.as_ref()
-                    && (matches!(lease_identity, Some(ProcessIdentity::AliveMatch))
-                        || unknown_identity_with_live_job)
+                    && matches!(lease_identity, Some(ProcessIdentity::AliveMatch))
                 {
-                    // Preserve orphan suppression for lock-held active lanes even
-                    // when identity is unknown. Queue phase then keeps claimed jobs
-                    // as StillActive rather than requeue/fail.
                     active_job_ids.insert(job_id.clone());
                 }
 
                 if unknown_identity_with_live_job {
+                    if let Some(job_id) = status.job_id.as_ref() {
+                        // Do not widen active_job_ids invariant; carry a dedicated
+                        // suppression set for lock-held unknown identity jobs.
+                        unknown_identity_job_ids_for_orphan_suppression.insert(job_id.clone());
+                    }
                     // Fail-closed: emit a corrupt marker so operators have durable
-                    // evidence and manual cleanup guidance, while preserving active
-                    // claimed job suppression for this startup pass.
+                    // evidence and manual cleanup guidance. Queue phase uses the
+                    // dedicated suppression set to avoid orphan mutations on this
+                    // lock-held ambiguous job.
                     let reason = if let Some(lease) = lease_snapshot.as_ref() {
                         format!(
-                            "active lane state {} (pid={}) has lock held but process identity is unknown; preserving active job for orphan suppression and marking lane corrupt for manual cleanup",
+                            "active lane state {} (pid={}) has lock held but process identity is unknown; preserving orphan suppression via dedicated unknown-identity set and marking lane corrupt for manual cleanup",
                             status.state, lease.pid
                         )
                     } else {
                         format!(
-                            "active lane state {} has lock held but process identity is unknown; preserving active job for orphan suppression and marking lane corrupt for manual cleanup",
+                            "active lane state {} has lock held but process identity is unknown; preserving orphan suppression via dedicated unknown-identity set and marking lane corrupt for manual cleanup",
                             status.state
                         )
                     };
@@ -966,14 +973,19 @@ fn reconcile_lanes(
                     }
                 }
                 // Corrupt lanes still suppress orphan handling when a lock-held
-                // active job has unknown identity (fail-closed liveness) or when
-                // identity matches the lease owner.
+                // active job has unknown identity (fail-closed liveness) via a
+                // dedicated suppression set, or when identity matches the lease
+                // owner via active_job_ids.
                 if let Some(job_id) = status.job_id.as_ref()
-                    && (matches!(lease_identity, Some(ProcessIdentity::AliveMatch))
-                        || (status.lock_held
-                            && matches!(lease_identity, Some(ProcessIdentity::Unknown))))
+                    && matches!(lease_identity, Some(ProcessIdentity::AliveMatch))
                 {
                     active_job_ids.insert(job_id.clone());
+                }
+                if let Some(job_id) = status.job_id.as_ref()
+                    && status.lock_held
+                    && matches!(lease_identity, Some(ProcessIdentity::Unknown))
+                {
+                    unknown_identity_job_ids_for_orphan_suppression.insert(job_id.clone());
                 }
                 actions.push(LaneRecoveryAction::AlreadyConsistent {
                     lane_id: lane_id.clone(),
@@ -987,6 +999,7 @@ fn reconcile_lanes(
     LaneReconcileResult {
         actions,
         active_job_ids,
+        unknown_identity_job_ids_for_orphan_suppression,
         stale_leases_recovered,
         lanes_marked_corrupt,
         partial_error,
@@ -1243,6 +1256,7 @@ fn reconcile_queue(
     fac_root: &Path,
     queue_root: &Path,
     active_job_ids: &HashSet<String>,
+    unknown_identity_job_ids_for_orphan_suppression: &HashSet<String>,
     orphan_policy: OrphanedJobPolicy,
     dry_run: bool,
 ) -> QueueReconcileResult {
@@ -1428,6 +1442,13 @@ fn reconcile_queue(
             actions.push(QueueRecoveryAction::StillActive {
                 job_id,
                 lane_id: "unknown".to_string(),
+            });
+            continue;
+        }
+        if unknown_identity_job_ids_for_orphan_suppression.contains(&job_id) {
+            actions.push(QueueRecoveryAction::StillActive {
+                job_id,
+                lane_id: "unknown_identity_lock_held".to_string(),
             });
             continue;
         }
@@ -2257,7 +2278,8 @@ mod tests {
             receipt.queue_actions.iter().any(|action| matches!(
                 action,
                 QueueRecoveryAction::StillActive { job_id, lane_id }
-                if job_id == "job-unknown-identity-active" && lane_id == "unknown"
+                if job_id == "job-unknown-identity-active"
+                    && lane_id == "unknown_identity_lock_held"
             )),
             "expected StillActive action via active-job suppression for unknown identity"
         );
