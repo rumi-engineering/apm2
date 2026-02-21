@@ -774,6 +774,23 @@ The `lane` submodule implements FESv1 execution lane primitives: lane
 directories, profiles, leases, status derivation, cleanup, and corrupt
 marker persistence.
 
+### Lease Timestamp Contract (TCK-00657)
+
+- `LaneLeaseV1::new()` is strict for persisted writes: `started_at` MUST be
+  RFC3339 and is normalized to canonical UTC `...Z` form before persistence.
+- `LaneLeaseV1::load()` remains migration-tolerant for existing on-disk leases:
+  legacy epoch-seconds `started_at` values are accepted and exposed through
+  canonical helper views.
+- Canonical helpers:
+  - `started_at_rfc3339()` returns normalized RFC3339 UTC for both native and
+    legacy values when parseable.
+  - `started_at_epoch_secs()` returns epoch seconds for both native and legacy
+    values when parseable.
+  - `age_secs(now_epoch_secs)` computes bounded age (`None` on parse failure or
+    future timestamps).
+- `LaneManager::lane_status()` exposes canonical `started_at` when parseable so
+  status/CLI surfaces do not leak legacy epoch-seconds format.
+
 ### Lane CORRUPT Persistence and Refusal Semantics (TCK-00570)
 
 - `LaneCorruptMarkerV1`: Persistent marker at

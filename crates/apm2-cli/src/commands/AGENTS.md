@@ -307,6 +307,12 @@ Security invariants:
 - **RUNNING lease lifecycle** (`fac_worker.rs`): A RUNNING `LaneLeaseV1` is persisted after lane
   acquisition and lane profile loading, before any execution. Every early-return path removes the
   lease. This satisfies the `run_lane_cleanup` RUNNING-state precondition (INV-LANE-CLEANUP-005).
+- **Lease timestamp normalization** (`fac_worker.rs`, TCK-00657): New RUNNING
+  leases are created via `build_running_lane_lease()` using core
+  `current_time_iso8601()` so persisted `started_at` is RFC3339 UTC (`...Z`).
+  Poll-tick orphan-lease warnings derive age and canonical timestamp through
+  `LaneLeaseV1` core helpers (`started_at_rfc3339`, `started_at_epoch_secs`,
+  `age_secs`) instead of worker-local parsing.
 - **Completion-before-cleanup** (`fac_worker.rs`): Lane cleanup runs AFTER job completion receipt
   emission and move to `completed/`. Cleanup failures log warnings and mark lanes corrupt but do
   not retroactively negate a completed job outcome (INV-LANE-CLEANUP-006).

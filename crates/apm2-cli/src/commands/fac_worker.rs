@@ -88,7 +88,9 @@ use apm2_core::fac::job_spec::{
     FacJobSpecV1, JobSpecError, MAX_JOB_SPEC_SIZE, deserialize_job_spec, job_kind_to_budget_key,
     parse_b3_256_digest, validate_job_spec_control_lane_with_policy, validate_job_spec_with_policy,
 };
-use apm2_core::fac::lane::{LaneLeaseV1, LaneLockGuard, LaneManager, LaneState};
+use apm2_core::fac::lane::{
+    LaneLeaseV1, LaneLockGuard, LaneManager, LaneState, current_time_iso8601,
+};
 use apm2_core::fac::queue_bounds::{QueueBoundsPolicy, check_queue_bounds};
 use apm2_core::fac::scan_lock::{ScanLockResult, check_stuck_scan_lock, try_acquire_scan_lock};
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
@@ -1433,20 +1435,23 @@ fn reap_orphaned_leases_on_tick(fac_root: &Path, json_output: bool) {
                 continue;
             },
         };
-        let orphaned = match LaneLeaseV1::load(&lane_dir) {
-            Ok(Some(lease)) => {
-                lease.state == LaneState::Leased
-                    && matches!(check_process_liveness(lease.pid), ProcessLiveness::Dead)
-            },
-            Ok(None) => status.state == LaneState::Leased && status.pid.is_none(),
+        let loaded_lease = match LaneLeaseV1::load(&lane_dir) {
+            Ok(lease) => lease,
             Err(err) => {
                 tracing::warn!(
                     lane_id = lane_id.as_str(),
                     error = %err,
                     "lane maintenance lease load failed"
                 );
-                false
+                None
             },
+        };
+        let orphaned = match loaded_lease.as_ref() {
+            Some(lease) => {
+                lease.state == LaneState::Leased
+                    && matches!(check_process_liveness(lease.pid), ProcessLiveness::Dead)
+            },
+            None => status.state == LaneState::Leased && status.pid.is_none(),
         };
         if !orphaned {
             continue;
@@ -1455,7 +1460,27 @@ fn reap_orphaned_leases_on_tick(fac_root: &Path, json_output: bool) {
         let expected_runtime_secs = load_lane_expected_runtime_secs(&lane_mgr, &lane_id);
         let warning_threshold_secs =
             expected_runtime_secs.saturating_mul(ORPHAN_LEASE_WARNING_MULTIPLIER);
-        let age_secs = parse_started_at_age_secs(status.started_at.as_deref());
+        let now_epoch_secs = current_timestamp_epoch_secs();
+        let started_at_raw = loaded_lease
+            .as_ref()
+            .map(|lease| lease.started_at.clone())
+            .or_else(|| status.started_at.clone());
+        let started_at_canonical = loaded_lease
+            .as_ref()
+            .and_then(LaneLeaseV1::started_at_rfc3339);
+        let started_at_epoch_secs = loaded_lease
+            .as_ref()
+            .and_then(LaneLeaseV1::started_at_epoch_secs);
+        let started_at_legacy_epoch_secs = loaded_lease.as_ref().and_then(|lease| {
+            if lease.started_at.bytes().all(|byte| byte.is_ascii_digit()) {
+                started_at_epoch_secs
+            } else {
+                None
+            }
+        });
+        let age_secs = loaded_lease
+            .as_ref()
+            .and_then(|lease| lease.age_secs(now_epoch_secs));
         if age_secs.is_none_or(|age| age >= warning_threshold_secs) {
             if json_output {
                 emit_worker_event(
@@ -1465,14 +1490,23 @@ fn reap_orphaned_leases_on_tick(fac_root: &Path, json_output: bool) {
                         "state": status.state.to_string(),
                         "pid": status.pid,
                         "pid_alive": status.pid_alive,
+                        "started_at_raw": started_at_raw,
+                        "started_at_canonical": started_at_canonical,
+                        "started_at_legacy_epoch_secs": started_at_legacy_epoch_secs,
                         "age_secs": age_secs,
                         "warning_threshold_secs": warning_threshold_secs,
                     }),
                 );
             } else {
                 eprintln!(
-                    "WARNING: orphaned lane lease detected (lane={}, pid={:?}, pid_alive={:?}, age_secs={:?}, threshold_secs={})",
-                    lane_id, status.pid, status.pid_alive, age_secs, warning_threshold_secs
+                    "WARNING: orphaned lane lease detected (lane={}, pid={:?}, pid_alive={:?}, started_at_raw={:?}, started_at_canonical={:?}, age_secs={:?}, threshold_secs={})",
+                    lane_id,
+                    status.pid,
+                    status.pid_alive,
+                    started_at_raw,
+                    started_at_canonical,
+                    age_secs,
+                    warning_threshold_secs
                 );
             }
         }
@@ -1529,13 +1563,23 @@ fn load_lane_expected_runtime_secs(lane_mgr: &LaneManager, lane_id: &str) -> u64
         .unwrap_or(1_800)
 }
 
-fn parse_started_at_age_secs(started_at: Option<&str>) -> Option<u64> {
-    let started_at = started_at?;
-    let parsed = chrono::DateTime::parse_from_rfc3339(started_at).ok()?;
-    let age_secs = Utc::now()
-        .signed_duration_since(parsed.with_timezone(&Utc))
-        .num_seconds();
-    u64::try_from(age_secs).ok()
+fn build_running_lane_lease(
+    lane_id: &str,
+    job_id: &str,
+    pid: u32,
+    lane_profile_hash: &str,
+    toolchain_fingerprint: &str,
+) -> Result<LaneLeaseV1, apm2_core::fac::lane::LaneError> {
+    let lease_started_at = current_time_iso8601();
+    LaneLeaseV1::new(
+        lane_id,
+        job_id,
+        pid,
+        LaneState::Running,
+        &lease_started_at,
+        lane_profile_hash,
+        toolchain_fingerprint,
+    )
 }
 
 fn persist_queue_scheduler_state(
@@ -4993,13 +5037,10 @@ fn process_job(
     // Worker startup is fail-closed (refuses to start without fingerprint), so
     // this should always be Some. The unwrap_or is defensive only.
     let toolchain_fp_for_lease = toolchain_fingerprint.unwrap_or("b3-256:unknown");
-
-    let lane_lease = match LaneLeaseV1::new(
+    let lane_lease = match build_running_lane_lease(
         &acquired_lane_id,
         &spec.job_id,
         std::process::id(),
-        LaneState::Running,
-        &current_timestamp_epoch_secs().to_string(),
         &lane_profile_hash,
         toolchain_fp_for_lease,
     ) {
@@ -9167,6 +9208,28 @@ mod tests {
     fn test_current_timestamp_epoch_secs_is_nonzero() {
         let secs = current_timestamp_epoch_secs();
         assert!(secs > 0, "timestamp should be nonzero");
+    }
+
+    #[test]
+    fn test_build_running_lane_lease_uses_rfc3339_started_at() {
+        let lease = build_running_lane_lease(
+            "lane-00",
+            "job-001",
+            std::process::id(),
+            "b3-256:ph",
+            "b3-256:th",
+        )
+        .expect("build running lease");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&lease.started_at).is_ok(),
+            "worker lease started_at must be RFC3339, got {}",
+            lease.started_at
+        );
+        assert!(
+            lease.started_at.ends_with('Z'),
+            "worker lease started_at must be UTC-Z, got {}",
+            lease.started_at
+        );
     }
 
     #[test]
