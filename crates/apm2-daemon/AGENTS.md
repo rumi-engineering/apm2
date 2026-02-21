@@ -17,6 +17,8 @@ The `apm2-daemon` crate implements the persistent daemon process in APM2's four-
 
 **Performance/Security Constraint:** verifier-economics bounds are containment controls. Tier2+ lifecycle operations fail closed on timing/proof-check budget exceedance; Tier0/1 stays monitor-only.
 
+**Legacy Ledger Freeze Guard (TCK-00631):** After RFC-0032 Phase 0 migration, both `SqliteLedgerEventEmitter` and `SqliteLeaseValidator` are frozen at daemon startup via `freeze_legacy_writes()`. Once frozen, all `INSERT INTO ledger_events` paths reject without mutating state. This enforces the no-dual-writer invariant: post-migration, all event persistence goes through the canonical `events` table. Both types use an `AtomicBool` with `Acquire`/`Release` ordering. The freeze is wired in `state.rs` (`DispatcherState`) immediately after construction.
+
 ```
 ┌─────────────────┐
 │   apm2-cli      │  CLI client

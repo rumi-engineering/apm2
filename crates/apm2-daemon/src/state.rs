@@ -913,6 +913,12 @@ impl DispatcherState {
             if let Err(e) = emitter_inner.freeze_legacy_writes_self() {
                 tracing::warn!(error = %e, "freeze_legacy_writes failed (writes blocked, fail-closed)");
             }
+            // TCK-00631: Freeze legacy writes on lease validator as well.
+            // Both the emitter and validator write to ledger_events; both must
+            // be frozen after migration to enforce the no-dual-writer invariant.
+            if let Err(e) = lease_validator.freeze_legacy_writes() {
+                tracing::warn!(error = %e, "lease_validator freeze_legacy_writes failed (writes blocked, fail-closed)");
+            }
             let event_emitter = Arc::new(emitter_inner);
 
             // TCK-00319 SECURITY: Configure EpisodeRuntime with workspace-rooted handlers
@@ -1432,6 +1438,10 @@ impl DispatcherState {
         // TCK-00631: Freeze legacy writes after RFC-0032 migration.
         if let Err(e) = emitter_inner.freeze_legacy_writes_self() {
             tracing::warn!(error = %e, "freeze_legacy_writes failed (writes blocked, fail-closed)");
+        }
+        // TCK-00631: Freeze legacy writes on lease validator as well.
+        if let Err(e) = lease_validator.freeze_legacy_writes() {
+            tracing::warn!(error = %e, "lease_validator freeze_legacy_writes failed (writes blocked, fail-closed)");
         }
         let event_emitter = Arc::new(emitter_inner);
 

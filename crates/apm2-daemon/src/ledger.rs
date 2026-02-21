@@ -3520,10 +3520,33 @@ impl WorkRegistry for SqliteWorkRegistry {
 }
 
 /// Durable lease validator backed by `SQLite`.
+///
+/// # Freeze Guard (TCK-00631)
+///
+/// After RFC-0032 Phase 0 migration, this validator can be frozen via
+/// [`Self::freeze_legacy_writes`]. Once frozen, all write methods
+/// (`register_full_lease_inner`, `register_lease_with_executor`) return
+/// an error without mutating state.
+///
+/// ## Synchronization Protocol (CTR-1002)
+///
+/// The `frozen` flag is an `AtomicBool` with `Acquire`/`Release` ordering:
+/// - **Protected data**: The legacy `ledger_events` table (no writes after
+///   freeze).
+/// - **Publication**: `freeze_legacy_writes` stores `true` with `Release`.
+/// - **Consumption**: Every write method loads with `Acquire` before any
+///   mutation.
+/// - **Happens-before**: `freeze_legacy_writes(Release)` -> write method
+///   `load(Acquire)` ensures all write methods see the freeze after it is set.
+/// - **Allowed reorderings**: None — once frozen, the flag is never unset.
 #[derive(Debug)]
 pub struct SqliteLeaseValidator {
     conn: Arc<Mutex<Connection>>,
     signing_key: ed25519_dalek::SigningKey,
+    /// Freeze guard: when `true`, all write methods reject.
+    /// Set once by `freeze_legacy_writes` and never cleared.
+    /// See synchronization protocol above.
+    frozen: AtomicBool,
 }
 
 impl SqliteLeaseValidator {
@@ -3532,6 +3555,9 @@ impl SqliteLeaseValidator {
     /// Generates an ephemeral signing key — suitable for tests only.
     /// Production code MUST use `new_with_signing_key` with the daemon
     /// lifecycle signing key.
+    ///
+    /// The validator starts unfrozen. Call [`Self::freeze_legacy_writes`]
+    /// after migration to activate the freeze guard.
     #[cfg(test)]
     #[must_use]
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
@@ -3540,16 +3566,96 @@ impl SqliteLeaseValidator {
         Self {
             conn,
             signing_key: ed25519_dalek::SigningKey::generate(&mut OsRng),
+            frozen: AtomicBool::new(false),
         }
     }
 
     /// Creates a new validator bound to the daemon authority signing key.
+    ///
+    /// The validator starts unfrozen. Call [`Self::freeze_legacy_writes`]
+    /// after migration to activate the freeze guard.
     #[must_use]
     pub const fn new_with_signing_key(
         conn: Arc<Mutex<Connection>>,
         signing_key: ed25519_dalek::SigningKey,
     ) -> Self {
-        Self { conn, signing_key }
+        Self {
+            conn,
+            signing_key,
+            frozen: AtomicBool::new(false),
+        }
+    }
+
+    /// Activates the freeze guard if `ledger_events_legacy_frozen` exists.
+    ///
+    /// After this call returns `Ok(true)`, all subsequent write methods on
+    /// this validator will reject without mutating the database.
+    ///
+    /// # Fail-Closed Semantics
+    ///
+    /// If the existence check itself fails (e.g., database error), the
+    /// validator is frozen anyway — it is safer to block writes than to risk
+    /// dual-writing. The error is returned so the caller can log it.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)` if the freeze guard was activated (table exists or DB check
+    ///   failed).
+    /// - `Ok(false)` if the frozen table does not exist (legacy mode, no
+    ///   migration ran).
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying database error after freezing the validator.
+    pub fn freeze_legacy_writes(&self) -> Result<bool, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| format!("connection lock poisoned during freeze check: {e}"))?;
+
+        let frozen_exists = match conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ledger_events_legacy_frozen' LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+        {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                // Fail-closed: freeze even if the check itself fails.
+                self.frozen.store(true, Ordering::Release);
+                return Err(format!(
+                    "failed to check ledger_events_legacy_frozen existence \
+                     (fail-closed: writes frozen): {e}"
+                ));
+            },
+        };
+
+        if frozen_exists {
+            self.frozen.store(true, Ordering::Release);
+        }
+
+        Ok(frozen_exists)
+    }
+
+    /// Returns `true` if the freeze guard is active (writes blocked).
+    #[must_use]
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.load(Ordering::Acquire)
+    }
+
+    /// Returns `Err` if the freeze guard is active.
+    fn check_frozen(&self) -> Result<(), String> {
+        if self.frozen.load(Ordering::Acquire) {
+            return Err(
+                "legacy ledger_events writer is frozen after RFC-0032 migration \
+                 (TCK-00631): writes to ledger_events are permanently blocked"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// Returns the verifier corresponding to the validator's signing key.
@@ -3580,6 +3686,8 @@ impl SqliteLeaseValidator {
         lease: &apm2_core::fac::GateLease,
         delegated_parent_lease_id: Option<&str>,
     ) -> Result<(), String> {
+        // TCK-00631: Reject writes when legacy ledger_events is frozen.
+        self.check_frozen()?;
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
         let conn = self
             .conn
@@ -3807,6 +3915,10 @@ impl LeaseValidator for SqliteLeaseValidator {
         gate_id: &str,
         executor_actor_id: &str,
     ) {
+        // TCK-00631: Reject writes when legacy ledger_events is frozen.
+        if self.check_frozen().is_err() {
+            return;
+        }
         // Emit an authoritative signed ledger event so chain verification can
         // authenticate lease-admission history.
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
@@ -6457,6 +6569,144 @@ mod tests {
         assert_eq!(
             legacy_count_after, 0,
             "ledger_events must remain empty after rejected write"
+        );
+    }
+
+    /// TCK-00631: Redteam test — lease validator writes rejected after
+    /// migration.
+    ///
+    /// Verifies:
+    /// 1. After `migrate_legacy_ledger_events`, `freeze_legacy_writes` on
+    ///    `SqliteLeaseValidator` detects the frozen table and activates the
+    ///    guard.
+    /// 2. `register_full_lease` returns an error.
+    /// 3. `register_lease_with_executor` silently refuses (trait returns `()`).
+    /// 4. No rows are added to `ledger_events`.
+    #[test]
+    fn tck_00631_lease_write_rejected_after_migration() {
+        use apm2_core::ledger::{init_canonical_schema, migrate_legacy_ledger_events};
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+
+        // 1. Set up legacy schema with test rows.
+        conn.execute(
+            "CREATE TABLE ledger_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                work_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                signature BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        // Insert 2 legacy rows.
+        for i in 1_u64..=2 {
+            conn.execute(
+                "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, \
+                 payload, signature, timestamp_ns) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    format!("evt-lease-{i}"),
+                    "test.event",
+                    format!("work-lease-{i}"),
+                    "actor-1",
+                    format!("{{\"n\":{i}}}").as_bytes(),
+                    b"sig",
+                    1_000_000_000_u64 * i,
+                ],
+            )
+            .unwrap();
+        }
+
+        // 2. Initialize canonical schema and run migration.
+        init_canonical_schema(&conn).unwrap();
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 2, "expected 2 rows migrated");
+
+        // 3. Initialize emitter schema (needed for hash chain metadata).
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
+
+        // 4. Verify ledger_events is empty after migration.
+        let legacy_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            legacy_count, 0,
+            "ledger_events must be empty after migration"
+        );
+
+        // 5. Construct lease validator and freeze.
+        let conn_arc = Arc::new(Mutex::new(conn));
+        let validator = SqliteLeaseValidator::new(Arc::clone(&conn_arc));
+
+        assert!(
+            !validator.is_frozen(),
+            "validator should not be frozen before freeze_legacy_writes"
+        );
+
+        let frozen = validator.freeze_legacy_writes().unwrap();
+        assert!(
+            frozen,
+            "freeze_legacy_writes should return true (frozen table exists)"
+        );
+        assert!(
+            validator.is_frozen(),
+            "validator must be frozen after freeze_legacy_writes"
+        );
+
+        // 6. Attempt register_full_lease — must fail.
+        let signer = apm2_core::crypto::Signer::generate();
+        let lease = apm2_core::fac::GateLeaseBuilder::new(
+            "LEASE-FROZEN-TEST",
+            "WORK-FROZEN-TEST",
+            "GATE-FROZEN-TEST",
+        )
+        .changeset_digest([0x42; 32])
+        .executor_actor_id("actor-frozen")
+        .issued_at(999_000_000)
+        .expires_at(999_999_999)
+        .policy_hash([0xAB; 32])
+        .issuer_actor_id("issuer-frozen")
+        .time_envelope_ref("htf:tick:0")
+        .build_and_sign(&signer);
+        let result = validator.register_full_lease(&lease);
+        assert!(result.is_err(), "register_full_lease must fail when frozen");
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("frozen"),
+            "error must mention 'frozen', got: {err_msg}"
+        );
+
+        // 7. Attempt register_lease_with_executor — must silently refuse.
+        validator.register_lease_with_executor(
+            "LEASE-FROZEN-2",
+            "WORK-FROZEN-2",
+            "GATE-FROZEN-2",
+            "actor-frozen",
+        );
+
+        // 8. Verify no rows were added to ledger_events.
+        let conn_guard = conn_arc.lock().unwrap();
+        let legacy_count_after: i64 = conn_guard
+            .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            legacy_count_after, 0,
+            "ledger_events must remain empty after rejected lease writes"
+        );
+
+        // 9. Verify canonical events still has exactly 2 migrated rows.
+        let events_count: i64 = conn_guard
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            events_count, 2,
+            "canonical events must have exactly 2 migrated rows, no additions"
         );
     }
 
