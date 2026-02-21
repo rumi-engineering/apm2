@@ -58,6 +58,15 @@
       ]
     },
     "north_star_properties": {
+      "dominance_ordered_failure": {
+        "definition": "Conflict resolution must strictly adhere to META-DOMINANCE: Containment/Security > Verification/Correctness > Liveness/Progress.",
+        "mechanics": [
+          "If a containment boundary or correctness constraint fails, the orchestrator MUST fail-closed.",
+          "Liveness watchdogs or retries must never override a containment or correctness failure.",
+          "Record failures as defects; do not silently mask them to maintain progress."
+        ],
+        "machine_check": "Tests assert that containment/correctness failures trap execution into terminal/escalated states, halting further progress."
+      },
       "single_source_of_truth": {
         "definition": "Each fact has one canonical owner; all other representations are references or derived projections.",
         "mechanics": [
@@ -137,7 +146,7 @@
         "Observe: read new ledger events since cursor (and any bounded external observations as Inputs).",
         "Fold: run deterministic step/reducer to update State.",
         "Plan: compute required effects to converge toward invariants (leases, dispatch, reconciliation).",
-        "Commit: emit intent events to ledger; write CAS blobs; execute irreversible ops; emit receipts/results.",
+        "Commit: scale evidence emission with action leverage (Evidence Tiering). Low-leverage actions yield Summary Receipts or Ephemeral State; high-leverage boundaries yield Merkle-linked, persistent ledger intents/receipts.",
         "Repeat: advance cursor; checkpoint projection."
       ],
       "anti_patterns": [
@@ -208,7 +217,8 @@
       "rules": [
         "State fields must be sufficient statistics for folding the next event; do not store convenience copies of facts already owned by the ledger.",
         "Any filesystem representation (queues, pulse files, caches) must be: bounded, versioned, and rebuildable from ledger+CAS.",
-        "If a derived cache disagrees with the projection, the projection wins; delete and rebuild the cache."
+        "If a derived cache disagrees with the projection, the projection wins; delete and rebuild the cache.",
+        "Unbounded dynamic discovery of context is forbidden; orchestrators must enforce ContextPacks and strict token/tool budgets (LAW-02 & LAW-06)."
       ],
       "witnessed_cache_pattern": {
         "definition": "A cache that is safe to delete because it is fully derivable from canonical evidence; it may include additional indexing, but no new facts.",
@@ -231,6 +241,7 @@
       "effect_emission": {
         "ordering": [
           "1) Emit intent event (ledger) and/or CAS blob write (if content must exist before action)",
+          "1.5) Validate stop-state (budget > 0, lease valid, no revocation signals) before irreversibility (INV-F-11 & INV-F-17)",
           "2) Perform operational effect (spawn/process/API call)",
           "3) Emit receipt/result event (ledger) binding outcome to intent idempotency_key"
         ],
@@ -245,6 +256,7 @@
       "rules": [
         "Driver must be restart-safe: on startup it replays ledger, reconstructs State, and resumes from cursor without special-case recovery logic.",
         "Driver must be idempotent by design: before executing an operational effect, check whether a receipt/result event already exists for the idempotency key.",
+        "Driver must verify stop-state bounds (budget limit, revocation signals, lease freshness) before crossing outside execution boundaries.",
         "All external reads used for decisions must be captured as Inputs and (when they matter) recorded as ledger events so replay is possible."
       ],
       "interfaces": {
