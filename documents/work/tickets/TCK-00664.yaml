@@ -1,0 +1,125 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: 'TCK-00664'
+    title: 'FAC: Refactor worker orchestration into explicit state machine modules (reduce brittleness, improve crash recovery)'
+    status: 'OPEN'
+  binds:
+    prd_id: 'PRD-0001'
+    rfc_id: 'RFC-0019'
+    requirements:
+      - 'REQ-0037'
+      - 'REQ-0020'
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+      - 'Implementer'
+      - 'Reviewer'
+    responsibility_domains:
+      - 'fac/worker'
+      - 'fac/queue'
+      - 'fac/lane'
+  dependencies:
+    tickets:
+      - 'TCK-00660' # reconcile-on-tick baseline
+      - 'TCK-00663' # regression harness (protect refactor)
+
+context:
+  motivation: |
+    The worker orchestration logic is spread across a very large file with many intertwined concerns
+    (scan lock, admission, claim, lane acquisition, warm execution, gate execution, receipts, reconcile
+    hooks, watchdog/heartbeat). This increases the probability of brittle behavior and makes it hard
+    to reason about crash recovery and invariants.
+  code_evidence:
+    - 'crates/apm2-cli/src/commands/fac_worker.rs is >8k LOC and mixes queue I/O, lane logic, execution, and recovery.'
+    - 'Several failure paths intentionally leave partially transitioned state (claimed without receipt) and rely on startup reconcile.'
+
+problem_statement: |
+  Reliability work keeps accumulating as local patches inside fac_worker.rs. Without a clearer
+  orchestration model (explicit states + transitions + persisted checkpoints), we will keep
+  reintroducing edge-case bugs (stuck claimed, corrupt lanes, inconsistent cleanup) as the feature
+  set expands (FESv1 subprocess spawning, cgroup containment, multi-worker scaling).
+
+proposed_change:
+  intent: |
+    Refactor the worker into a small set of modules with an explicit state machine that:
+      - makes the allowed transitions explicit
+      - centralizes error handling + classification
+      - surfaces where durable state is written (and what crash recovery expects)
+      - enables targeted unit tests per transition
+
+state_machine_model:
+  states:
+    - 'Idle (no job claimed)'
+    - 'Claimed(job_id)'
+    - 'LaneAcquired(job_id, lane_id)'
+    - 'LeasePersisted(job_id, lane_id)'
+    - 'Executing(job_id, lane_id)'
+    - 'Committing(job_id, lane_id)'
+    - 'Completed(job_id, outcome)'
+  invariants:
+    - 'A job may be in claimed/ IFF state >= Claimed and < Completed.'
+    - 'A lane may have a lease IFF state >= LeasePersisted and < Completed.'
+    - 'Receipt is the source of truth for terminal outcome; reconcile can repair torn state.'
+
+scope:
+  in_scope:
+    - id: 'S1'
+      description: |
+        Extract modules (behavior-preserving):
+          - worker_loop.rs: poll cadence, scan lock, watchdog + heartbeat, periodic reconcile trigger
+          - queue_ops.rs: claim/requeue/move-to-terminal, open_no_follow, flock handling
+          - lane_ops.rs: acquire lane, persist/remove lease, lane cleanup, liveness checks
+          - execution_ops.rs: warm + gates + stop_revoke execution
+          - commit_ops.rs: receipt pipeline + failure handling
+    - id: 'S2'
+      description: |
+        Implement an explicit orchestration struct:
+          - struct WorkerOrchestrator { ... }
+          - fn step(&mut self) -> StepOutcome
+          - transitions expressed as enums; all filesystem writes go through queue_ops/lane_ops.
+    - id: 'S3'
+      description: |
+        Introduce a single error taxonomy:
+          - enum OrchestrationError { Recoverable, NeedsReconcile, CorruptLane, ... }
+          - ensures every error path either:
+              * requeues job safely
+              * leaves for reconcile (and schedules reconcile-on-tick)
+              * quarantines lane/job with explicit reason
+    - id: 'S4'
+      description: |
+        Use the fault-injection harness (TCK-00663) to lock in behavior:
+          - All crash-point tests must still pass after refactor.
+          - Add at least 3 new unit tests for state transitions.
+  out_of_scope:
+    - 'Changing queue on-disk format or adding new directories.'
+    - 'Rewriting execution backend (systemd/cgroup) — separate efforts.'
+
+plan:
+  steps:
+    - id: 'P1'
+      description: 'Introduce modules with minimal movement of code; keep public signatures stable.'
+    - id: 'P2'
+      description: 'Introduce WorkerOrchestrator with explicit states; migrate main loop to call orchestrator.step().'
+    - id: 'P3'
+      description: 'Unify error taxonomy and remove ad-hoc string matching (e.g., "no lane available").'
+    - id: 'P4'
+      description: 'Run regression harness; add new transition unit tests.'
+
+
+definition_of_done:
+  criteria:
+    - 'fac_worker.rs is reduced materially (target: <3k LOC) with logic moved into focused modules.'
+    - 'All existing worker integration tests + new fault-injection tests pass.'
+    - 'All state transitions are explicit and auditable (no hidden partial transitions).'
+  evidence_ids:
+    - 'EVID-TCK-00664-01: diff shows modularization + LOC reduction'
+    - 'EVID-TCK-00664-02: regression harness passes'
+
+notes:
+  risk:
+    - 'Large refactor can destabilize; must be protected by deterministic tests (TCK-00663) and done incrementally.'
+  guiding_principle: |
+    Prefer making illegal states unrepresentable in code. Where the filesystem can contain illegal
+    states (crash), isolate recovery logic in reconcile_tick and keep it testable.

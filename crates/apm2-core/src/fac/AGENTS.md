@@ -774,6 +774,23 @@ The `lane` submodule implements FESv1 execution lane primitives: lane
 directories, profiles, leases, status derivation, cleanup, and corrupt
 marker persistence.
 
+### Lease Timestamp Contract (TCK-00657)
+
+- `LaneLeaseV1::new()` is strict for persisted writes: `started_at` MUST be
+  RFC3339 and is normalized to canonical UTC `...Z` form before persistence.
+- `LaneLeaseV1::load()` remains migration-tolerant for existing on-disk leases:
+  legacy epoch-seconds `started_at` values are accepted and exposed through
+  canonical helper views.
+- Canonical helpers:
+  - `started_at_rfc3339()` returns normalized RFC3339 UTC for both native and
+    legacy values when parseable.
+  - `started_at_epoch_secs()` returns epoch seconds for both native and legacy
+    values when parseable.
+  - `age_secs(now_epoch_secs)` computes bounded age (`None` on parse failure or
+    future timestamps).
+- `LaneManager::lane_status()` exposes canonical `started_at` when parseable so
+  status/CLI surfaces do not leak legacy epoch-seconds format.
+
 ### Lane CORRUPT Persistence and Refusal Semantics (TCK-00570)
 
 - `LaneCorruptMarkerV1`: Persistent marker at
@@ -3890,12 +3907,16 @@ admission pipeline with deterministic inputs. Security domains:
 
 Enforces the receipt store permissions model: a dedicated FAC service user
 owns queue and receipt directories. Non-service-user processes must use
-broker-mediated enqueue or explicit `--unsafe-local-write`.
+broker-mediated enqueue or explicit `--unsafe-local-write` in system-mode.
+In user-mode, the gate is bypassed automatically.
 
 ### Key invariants
 
-- [INV-SU-001] Direct queue/receipt writes denied for non-service-user
-  processes unless `--unsafe-local-write` is active. **Fail-closed.**
+- [INV-SU-001] In `SystemMode`, direct queue/receipt writes are denied for
+  non-service-user processes unless `--unsafe-local-write` is active.
+  **Fail-closed.**
+- [INV-SU-001A] In `UserMode`, `check_queue_write_permission` bypasses
+  service-user resolution and permits direct enqueue semantics.
 - [INV-SU-002] Service user identity resolved from effective uid at
   decision time, not cached.
 - [INV-SU-003] `--unsafe-local-write` is per-invocation, does not persist.

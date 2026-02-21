@@ -137,10 +137,14 @@ pub struct FacCommand {
 }
 
 impl FacCommand {
-    /// Derive the queue write mode from the `--unsafe-local-write` flag.
+    /// Derive the requested queue write mode from the `--unsafe-local-write`
+    /// flag.
     ///
     /// Returns `QueueWriteMode::UnsafeLocalWrite` if the flag is set,
     /// otherwise `QueueWriteMode::ServiceUserOnly` (the secure default).
+    ///
+    /// Note: `ServiceUserOnly` may still auto-bypass in user-mode inside
+    /// `check_queue_write_permission` (TCK-00657).
     #[must_use]
     pub const fn queue_write_mode(&self) -> QueueWriteMode {
         if self.unsafe_local_write {

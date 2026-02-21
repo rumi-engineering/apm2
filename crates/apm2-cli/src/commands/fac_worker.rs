@@ -88,22 +88,25 @@ use apm2_core::fac::job_spec::{
     FacJobSpecV1, JobSpecError, MAX_JOB_SPEC_SIZE, deserialize_job_spec, job_kind_to_budget_key,
     parse_b3_256_digest, validate_job_spec_control_lane_with_policy, validate_job_spec_with_policy,
 };
-use apm2_core::fac::lane::{LaneLeaseV1, LaneLockGuard, LaneManager, LaneState};
+use apm2_core::fac::lane::{
+    LaneLeaseV1, LaneLockGuard, LaneManager, LaneState, current_time_iso8601,
+};
 use apm2_core::fac::queue_bounds::{QueueBoundsPolicy, check_queue_bounds};
 use apm2_core::fac::scan_lock::{ScanLockResult, check_stuck_scan_lock, try_acquire_scan_lock};
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
 use apm2_core::fac::{
     BlobStore, BudgetAdmissionTrace as FacBudgetAdmissionTrace, CanonicalizerTupleV1,
-    ChannelBoundaryTrace, DenialReasonCode, ExecutionBackend, FAC_LANE_CLEANUP_RECEIPT_SCHEMA,
-    FacJobOutcome, FacJobReceiptV1, FacJobReceiptV1Builder, FacPolicyV1, GateReceipt,
-    GateReceiptBuilder, LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1,
-    LaneCorruptMarkerV1, LaneProfileV1, LogRetentionConfig, MAX_POLICY_SIZE,
-    PATCH_FORMAT_GIT_DIFF_V1, QueueAdmissionTrace as JobQueueAdmissionTrace, ReceiptPipelineError,
-    ReceiptWritePipeline, RepoMirrorManager, SystemModeConfig, SystemdUnitProperties,
-    TOOLCHAIN_MAX_CACHE_FILE_BYTES, apply_credential_mount_to_env, build_github_credential_mount,
-    build_job_environment, compute_policy_hash, deserialize_policy, fingerprint_short_hex,
-    load_or_default_boundary_id, move_job_to_terminal, outcome_to_terminal_state,
-    parse_policy_hash, persist_content_addressed_receipt, persist_policy, rename_noreplace,
+    ChannelBoundaryTrace, DenialReasonCode, EXECUTION_BACKEND_ENV_VAR, ExecutionBackend,
+    ExecutionBackendError, FAC_LANE_CLEANUP_RECEIPT_SCHEMA, FacJobOutcome, FacJobReceiptV1,
+    FacJobReceiptV1Builder, FacPolicyV1, GateReceipt, GateReceiptBuilder,
+    LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1, LaneCorruptMarkerV1,
+    LaneProfileV1, LogRetentionConfig, MAX_POLICY_SIZE, PATCH_FORMAT_GIT_DIFF_V1,
+    QueueAdmissionTrace as JobQueueAdmissionTrace, ReceiptPipelineError, ReceiptWritePipeline,
+    RepoMirrorManager, SystemModeConfig, SystemdUnitProperties, TOOLCHAIN_MAX_CACHE_FILE_BYTES,
+    apply_credential_mount_to_env, build_github_credential_mount, build_job_environment,
+    compute_policy_hash, deserialize_policy, fingerprint_short_hex, load_or_default_boundary_id,
+    move_job_to_terminal, outcome_to_terminal_state, parse_policy_hash,
+    persist_content_addressed_receipt, persist_policy, probe_user_bus, rename_noreplace,
     resolve_toolchain_fingerprint_cached, run_preflight, select_and_validate_backend,
     serialize_cache, toolchain_cache_dir, toolchain_cache_file_path,
 };
@@ -490,82 +493,19 @@ pub fn run_fac_worker(
         return exit_codes::GENERIC_ERROR;
     }
 
-    // TCK-00577 round 3+5: Validate that queue and receipt directories are
-    // owned by the configured FAC service user (not just the caller EUID).
-    // This wires the service-user ownership validator into the command
-    // execution path.
-    //
-    // Behavior (round 5 MAJOR fix — all errors are now fail-closed):
-    // - ServiceUserNotResolved: fail-closed. If the configured service user cannot
-    //   be resolved in passwd/NSS, this may indicate a mistyped service-user value
-    //   or corrupted NSS database. Ownership validation cannot be completed, so the
-    //   worker MUST NOT start.
-    // - OwnershipMismatch: the service user EXISTS but the directory is owned by
-    //   someone else. This is a hard failure (fail-closed).
-    // - Other errors (metadata, env, etc.): fail-closed.
+    let ownership_backend = match resolve_ownership_backend(json_output) {
+        Ok(backend) => backend,
+        Err(e) => {
+            output_worker_error(json_output, &e);
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    if let Err(msg) =
+        validate_worker_service_user_ownership(&fac_root, &queue_root, ownership_backend)
     {
-        use apm2_core::fac::service_user_gate::{
-            ServiceUserGateError, validate_directory_service_user_ownership,
-        };
-
-        // Directories that MUST be owned by the service user in production.
-        // Note: BROKER_REQUESTS_DIR is intentionally excluded — it uses
-        // mode 01733 (world-writable with sticky) so that non-service-user
-        // callers can submit broker requests.
-        let service_user_dirs = [
-            queue_root.join(PENDING_DIR),
-            queue_root.join("claimed"),
-            queue_root.join("completed"),
-            queue_root.join("denied"),
-            queue_root.join("cancelled"),
-            queue_root.join(QUARANTINE_DIR),
-            queue_root.join(CONSUME_RECEIPTS_DIR),
-        ];
-        // Also validate the receipt store if it exists.
-        let receipt_dir = fac_root.join("receipts");
-
-        for dir in service_user_dirs
-            .iter()
-            .chain(std::iter::once(&receipt_dir))
-        {
-            if !dir.exists() {
-                continue;
-            }
-            match validate_directory_service_user_ownership(dir) {
-                Ok(()) => {},
-                Err(ServiceUserGateError::ServiceUserNotResolved {
-                    ref service_user,
-                    ref reason,
-                    ..
-                }) => {
-                    // TCK-00577 round 5 MAJOR fix: ServiceUserNotResolved is
-                    // now a hard failure. If the service user cannot be
-                    // resolved, ownership cannot be validated — fail-closed.
-                    output_worker_error(
-                        json_output,
-                        &format!(
-                            "service user '{service_user}' not resolvable: {reason} \
-                             (fail-closed: worker will not start when service user \
-                              identity cannot be confirmed)",
-                        ),
-                    );
-                    return exit_codes::GENERIC_ERROR;
-                },
-                Err(e) => {
-                    // OwnershipMismatch or other hard errors: fail-closed.
-                    output_worker_error(
-                        json_output,
-                        &format!(
-                            "service user ownership check failed for {}: {e} \
-                             (fail-closed: worker will not start with incorrect \
-                              directory ownership)",
-                            dir.display()
-                        ),
-                    );
-                    return exit_codes::GENERIC_ERROR;
-                },
-            }
-        }
+        output_worker_error(json_output, &msg);
+        return exit_codes::GENERIC_ERROR;
     }
 
     // Load persistent signing key for stable broker identity and receipts across
@@ -1415,6 +1355,40 @@ pub fn run_fac_worker(
     exit_codes::SUCCESS
 }
 
+fn resolve_ownership_backend(json_output: bool) -> Result<ExecutionBackend, String> {
+    match apm2_core::fac::select_backend() {
+        Ok(backend) => Ok(backend),
+        Err(ExecutionBackendError::InvalidBackendValue { value }) => {
+            let fallback_backend = if probe_user_bus() {
+                ExecutionBackend::UserMode
+            } else {
+                ExecutionBackend::SystemMode
+            };
+            let warning = format!(
+                "invalid {EXECUTION_BACKEND_ENV_VAR}='{value}' for worker ownership checks; \
+                 falling back to auto-selected backend '{fallback_backend}'"
+            );
+            if json_output {
+                emit_worker_event(
+                    "execution_backend_fallback",
+                    serde_json::json!({
+                        "env_var": EXECUTION_BACKEND_ENV_VAR,
+                        "invalid_value": value,
+                        "fallback_backend": fallback_backend.to_string(),
+                        "scope": "ownership_checks",
+                    }),
+                );
+            } else {
+                eprintln!("worker: WARNING: {warning}");
+            }
+            Ok(fallback_backend)
+        },
+        Err(err) => Err(format!(
+            "cannot resolve execution backend for ownership checks: {err}"
+        )),
+    }
+}
+
 fn reap_orphaned_leases_on_tick(fac_root: &Path, json_output: bool) {
     let lane_mgr = match LaneManager::new(fac_root.to_path_buf()) {
         Ok(manager) => manager,
@@ -1433,20 +1407,23 @@ fn reap_orphaned_leases_on_tick(fac_root: &Path, json_output: bool) {
                 continue;
             },
         };
-        let orphaned = match LaneLeaseV1::load(&lane_dir) {
-            Ok(Some(lease)) => {
-                lease.state == LaneState::Leased
-                    && matches!(check_process_liveness(lease.pid), ProcessLiveness::Dead)
-            },
-            Ok(None) => status.state == LaneState::Leased && status.pid.is_none(),
+        let loaded_lease = match LaneLeaseV1::load(&lane_dir) {
+            Ok(lease) => lease,
             Err(err) => {
                 tracing::warn!(
                     lane_id = lane_id.as_str(),
                     error = %err,
                     "lane maintenance lease load failed"
                 );
-                false
+                None
             },
+        };
+        let orphaned = match loaded_lease.as_ref() {
+            Some(lease) => {
+                lease.state == LaneState::Leased
+                    && matches!(check_process_liveness(lease.pid), ProcessLiveness::Dead)
+            },
+            None => status.state == LaneState::Leased && status.pid.is_none(),
         };
         if !orphaned {
             continue;
@@ -1455,7 +1432,27 @@ fn reap_orphaned_leases_on_tick(fac_root: &Path, json_output: bool) {
         let expected_runtime_secs = load_lane_expected_runtime_secs(&lane_mgr, &lane_id);
         let warning_threshold_secs =
             expected_runtime_secs.saturating_mul(ORPHAN_LEASE_WARNING_MULTIPLIER);
-        let age_secs = parse_started_at_age_secs(status.started_at.as_deref());
+        let now_epoch_secs = current_timestamp_epoch_secs();
+        let started_at_raw = loaded_lease
+            .as_ref()
+            .map(|lease| lease.started_at.clone())
+            .or_else(|| status.started_at.clone());
+        let started_at_canonical = loaded_lease
+            .as_ref()
+            .and_then(LaneLeaseV1::started_at_rfc3339);
+        let started_at_epoch_secs = loaded_lease
+            .as_ref()
+            .and_then(LaneLeaseV1::started_at_epoch_secs);
+        let started_at_legacy_epoch_secs = loaded_lease.as_ref().and_then(|lease| {
+            if lease.started_at.bytes().all(|byte| byte.is_ascii_digit()) {
+                started_at_epoch_secs
+            } else {
+                None
+            }
+        });
+        let age_secs = loaded_lease
+            .as_ref()
+            .and_then(|lease| lease.age_secs(now_epoch_secs));
         if age_secs.is_none_or(|age| age >= warning_threshold_secs) {
             if json_output {
                 emit_worker_event(
@@ -1465,14 +1462,23 @@ fn reap_orphaned_leases_on_tick(fac_root: &Path, json_output: bool) {
                         "state": status.state.to_string(),
                         "pid": status.pid,
                         "pid_alive": status.pid_alive,
+                        "started_at_raw": started_at_raw,
+                        "started_at_canonical": started_at_canonical,
+                        "started_at_legacy_epoch_secs": started_at_legacy_epoch_secs,
                         "age_secs": age_secs,
                         "warning_threshold_secs": warning_threshold_secs,
                     }),
                 );
             } else {
                 eprintln!(
-                    "WARNING: orphaned lane lease detected (lane={}, pid={:?}, pid_alive={:?}, age_secs={:?}, threshold_secs={})",
-                    lane_id, status.pid, status.pid_alive, age_secs, warning_threshold_secs
+                    "WARNING: orphaned lane lease detected (lane={}, pid={:?}, pid_alive={:?}, started_at_raw={:?}, started_at_canonical={:?}, age_secs={:?}, threshold_secs={})",
+                    lane_id,
+                    status.pid,
+                    status.pid_alive,
+                    started_at_raw,
+                    started_at_canonical,
+                    age_secs,
+                    warning_threshold_secs
                 );
             }
         }
@@ -1529,13 +1535,23 @@ fn load_lane_expected_runtime_secs(lane_mgr: &LaneManager, lane_id: &str) -> u64
         .unwrap_or(1_800)
 }
 
-fn parse_started_at_age_secs(started_at: Option<&str>) -> Option<u64> {
-    let started_at = started_at?;
-    let parsed = chrono::DateTime::parse_from_rfc3339(started_at).ok()?;
-    let age_secs = Utc::now()
-        .signed_duration_since(parsed.with_timezone(&Utc))
-        .num_seconds();
-    u64::try_from(age_secs).ok()
+fn build_running_lane_lease(
+    lane_id: &str,
+    job_id: &str,
+    pid: u32,
+    lane_profile_hash: &str,
+    toolchain_fingerprint: &str,
+) -> Result<LaneLeaseV1, apm2_core::fac::lane::LaneError> {
+    let lease_started_at = current_time_iso8601();
+    LaneLeaseV1::new(
+        lane_id,
+        job_id,
+        pid,
+        LaneState::Running,
+        &lease_started_at,
+        lane_profile_hash,
+        toolchain_fingerprint,
+    )
 }
 
 fn persist_queue_scheduler_state(
@@ -4993,13 +5009,10 @@ fn process_job(
     // Worker startup is fail-closed (refuses to start without fingerprint), so
     // this should always be Some. The unwrap_or is defensive only.
     let toolchain_fp_for_lease = toolchain_fingerprint.unwrap_or("b3-256:unknown");
-
-    let lane_lease = match LaneLeaseV1::new(
+    let lane_lease = match build_running_lane_lease(
         &acquired_lane_id,
         &spec.job_id,
         std::process::id(),
-        LaneState::Running,
-        &current_timestamp_epoch_secs().to_string(),
         &lane_profile_hash,
         toolchain_fp_for_lease,
     ) {
@@ -7866,6 +7879,72 @@ fn consume_authority(queue_root: &Path, job_id: &str, spec_digest: &str) -> Resu
     Ok(())
 }
 
+fn validate_worker_service_user_ownership(
+    fac_root: &Path,
+    queue_root: &Path,
+    backend: ExecutionBackend,
+) -> Result<(), String> {
+    use apm2_core::fac::service_user_gate::{
+        ServiceUserGateError, validate_directory_service_user_ownership,
+    };
+
+    if backend == ExecutionBackend::UserMode {
+        tracing::info!(
+            backend = %backend,
+            "TCK-00657: user-mode backend selected — skipping service-user ownership checks"
+        );
+        return Ok(());
+    }
+
+    // Directories that MUST be owned by the service user in production.
+    // Note: BROKER_REQUESTS_DIR is intentionally excluded — it uses
+    // mode 01733 (world-writable with sticky) so that non-service-user
+    // callers can submit broker requests.
+    let service_user_dirs = [
+        queue_root.join(PENDING_DIR),
+        queue_root.join(CLAIMED_DIR),
+        queue_root.join(COMPLETED_DIR),
+        queue_root.join(DENIED_DIR),
+        queue_root.join(CANCELLED_DIR),
+        queue_root.join(QUARANTINE_DIR),
+        queue_root.join(CONSUME_RECEIPTS_DIR),
+    ];
+    // Also validate the receipt store if it exists.
+    let receipt_dir = fac_root.join(FAC_RECEIPTS_DIR);
+
+    for dir in service_user_dirs
+        .iter()
+        .chain(std::iter::once(&receipt_dir))
+    {
+        if !dir.exists() {
+            continue;
+        }
+        match validate_directory_service_user_ownership(dir) {
+            Ok(()) => {},
+            Err(ServiceUserGateError::ServiceUserNotResolved {
+                ref service_user,
+                ref reason,
+                ..
+            }) => {
+                return Err(format!(
+                    "service user '{service_user}' not resolvable: {reason} \
+                     (fail-closed: worker will not start when service user \
+                      identity cannot be confirmed)",
+                ));
+            },
+            Err(e) => {
+                return Err(format!(
+                    "service user ownership check failed for {}: {e} \
+                     (fail-closed: worker will not start with incorrect \
+                      directory ownership)",
+                    dir.display()
+                ));
+            },
+        }
+    }
+    Ok(())
+}
+
 /// Reads a file with bounded I/O (INV-WRK-001).
 ///
 /// Returns an error if the file is larger than `max_size` or cannot be read.
@@ -9167,6 +9246,28 @@ mod tests {
     fn test_current_timestamp_epoch_secs_is_nonzero() {
         let secs = current_timestamp_epoch_secs();
         assert!(secs > 0, "timestamp should be nonzero");
+    }
+
+    #[test]
+    fn test_build_running_lane_lease_uses_rfc3339_started_at() {
+        let lease = build_running_lane_lease(
+            "lane-00",
+            "job-001",
+            std::process::id(),
+            "b3-256:ph",
+            "b3-256:th",
+        )
+        .expect("build running lease");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&lease.started_at).is_ok(),
+            "worker lease started_at must be RFC3339, got {}",
+            lease.started_at
+        );
+        assert!(
+            lease.started_at.ends_with('Z'),
+            "worker lease started_at must be UTC-Z, got {}",
+            lease.started_at
+        );
     }
 
     #[test]
@@ -12183,6 +12284,123 @@ mod tests {
         } else {
             panic!("expected ServiceUserNotResolved variant");
         }
+    }
+
+    #[test]
+    fn worker_service_user_ownership_bypasses_checks_in_user_mode() {
+        let _guard = env_var_test_lock().lock().expect("serialize env test");
+        let original_service_user = std::env::var_os("APM2_FAC_SERVICE_USER");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("fac");
+        let queue_root = dir.path().join("queue");
+        fs::create_dir_all(queue_root.join(PENDING_DIR)).expect("create pending dir");
+        fs::create_dir_all(fac_root.join(FAC_RECEIPTS_DIR)).expect("create receipts dir");
+
+        set_env_var_for_test("APM2_FAC_SERVICE_USER", "_apm2_nonexistent_tck_00657");
+        let result = validate_worker_service_user_ownership(
+            &fac_root,
+            &queue_root,
+            ExecutionBackend::UserMode,
+        );
+
+        if let Some(value) = original_service_user {
+            set_env_var_for_test("APM2_FAC_SERVICE_USER", value);
+        } else {
+            remove_env_var_for_test("APM2_FAC_SERVICE_USER");
+        }
+
+        assert!(
+            result.is_ok(),
+            "user-mode must bypass service-user ownership checks: {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_ownership_backend_invalid_env_falls_back_to_auto_mode() {
+        let _guard = env_var_test_lock().lock().expect("serialize env test");
+        let original_backend = std::env::var_os(EXECUTION_BACKEND_ENV_VAR);
+
+        set_env_var_for_test(EXECUTION_BACKEND_ENV_VAR, "totally_invalid_backend_value");
+        let resolved = resolve_ownership_backend(true).expect(
+            "invalid backend value should degrade to auto-selected backend for ownership checks",
+        );
+        let expected = if probe_user_bus() {
+            ExecutionBackend::UserMode
+        } else {
+            ExecutionBackend::SystemMode
+        };
+
+        if let Some(value) = original_backend {
+            set_env_var_for_test(EXECUTION_BACKEND_ENV_VAR, value);
+        } else {
+            remove_env_var_for_test(EXECUTION_BACKEND_ENV_VAR);
+        }
+
+        assert_eq!(
+            resolved, expected,
+            "invalid backend env must fall back deterministically to auto mode"
+        );
+    }
+
+    #[test]
+    fn resolve_ownership_backend_env_too_long_fails_closed() {
+        let _guard = env_var_test_lock().lock().expect("serialize env test");
+        let original_backend = std::env::var_os(EXECUTION_BACKEND_ENV_VAR);
+
+        set_env_var_for_test(EXECUTION_BACKEND_ENV_VAR, "x".repeat(300));
+        let err =
+            resolve_ownership_backend(false).expect_err("oversized backend env must fail closed");
+
+        if let Some(value) = original_backend {
+            set_env_var_for_test(EXECUTION_BACKEND_ENV_VAR, value);
+        } else {
+            remove_env_var_for_test(EXECUTION_BACKEND_ENV_VAR);
+        }
+
+        assert!(
+            err.contains("cannot resolve execution backend for ownership checks"),
+            "expected fail-closed backend resolution error, got: {err}"
+        );
+        assert!(
+            err.contains("value too long"),
+            "expected bounded env validation context, got: {err}"
+        );
+    }
+
+    #[test]
+    fn worker_service_user_ownership_fails_closed_in_system_mode_when_unresolvable() {
+        let _guard = env_var_test_lock().lock().expect("serialize env test");
+        let original_service_user = std::env::var_os("APM2_FAC_SERVICE_USER");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("fac");
+        let queue_root = dir.path().join("queue");
+        fs::create_dir_all(queue_root.join(PENDING_DIR)).expect("create pending dir");
+        fs::create_dir_all(fac_root.join(FAC_RECEIPTS_DIR)).expect("create receipts dir");
+
+        set_env_var_for_test("APM2_FAC_SERVICE_USER", "_apm2_nonexistent_tck_00657");
+        let result = validate_worker_service_user_ownership(
+            &fac_root,
+            &queue_root,
+            ExecutionBackend::SystemMode,
+        );
+
+        if let Some(value) = original_service_user {
+            set_env_var_for_test("APM2_FAC_SERVICE_USER", value);
+        } else {
+            remove_env_var_for_test("APM2_FAC_SERVICE_USER");
+        }
+
+        let err = result.expect_err("system-mode must fail when service user cannot be resolved");
+        assert!(
+            err.contains("not resolvable"),
+            "expected fail-closed unresolvable-user error, got: {err}"
+        );
+        assert!(
+            err.contains("fail-closed"),
+            "error must communicate fail-closed behavior: {err}"
+        );
     }
 
     /// TCK-00577 round 11 BLOCKER regression: Queue subdirs must have

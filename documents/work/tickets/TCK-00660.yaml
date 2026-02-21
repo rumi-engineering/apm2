@@ -1,0 +1,135 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: 'TCK-00660'
+    title: 'FAC worker: Periodic reconcile pass to self-heal stuck claimed jobs (no restart required)'
+    status: 'OPEN'
+  binds:
+    prd_id: 'PRD-0001'
+    rfc_id: 'RFC-0019'
+    requirements:
+      - 'REQ-0008'
+      - 'REQ-0020'
+      - 'REQ-0037'
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+      - 'Implementer'
+      - 'Reviewer'
+    responsibility_domains:
+      - 'fac/worker'
+      - 'fac/reconcile'
+      - 'fac/queue'
+  dependencies:
+    tickets:
+      - 'TCK-00622' # reconcile + receipt pipeline locking
+
+context:
+  observed_symptoms:
+    - 'Queue lanes go idle while claimed/ contains jobs that are not being processed; pending/ is empty.'
+    - 'Recovery currently relies on worker restart (startup reconcile) or manual `apm2 fac reconcile`.'
+  code_evidence:
+    - |
+      Worker reconcile is only invoked at startup:
+        crates/apm2-cli/src/commands/fac_worker.rs:658-694
+    - |
+      On commit pipeline failure, worker intentionally leaves job in claimed and returns Skipped:
+        crates/apm2-cli/src/commands/fac_worker.rs:7929-8008
+    - |
+      reconcile_queue already uses a non-blocking flock probe on claimed files to avoid racing with
+      an active commit pipeline:
+        crates/apm2-core/src/fac/reconcile.rs:1177-1244
+
+problem_statement: |
+  The system has a known failure mode where jobs can remain in claimed/ without a worker actively
+  processing them (e.g., commit pipeline failures, crashes after claim, transient I/O errors). Because
+  workers only process pending/ and reconcile is only done at startup, this can cause the system to
+  stall indefinitely without operator intervention.
+
+root_cause_analysis:
+  primary_cause: |
+    Reconciliation is treated as a startup-only repair, but the system's write-path explicitly leaves
+    some failures in a partially transitioned state (claimed without terminal transition). That choice
+    is correct for safety, but it requires a recurring repair mechanism to guarantee liveness.
+
+proposed_change:
+  intent: |
+    Add a periodic, bounded reconcile pass inside the worker main loop that:
+      - repairs torn state (receipt present but job still in claimed)
+      - requeues orphaned claimed jobs (not backed by active lane)
+      - optionally emits "needs manual intervention" signals for corrupt/ambiguous cases
+    This must be concurrency-safe with active job execution and must not introduce double execution.
+
+invariants:
+  - id: 'INV-RECON-TICK-001'
+    statement: 'Reconcile-on-tick MUST NOT move a claimed job that is actively being committed/executed (guarded by flock probe + active_job_ids evidence).'
+  - id: 'INV-RECON-TICK-002'
+    statement: 'Reconcile-on-tick MUST be bounded (time + number of inspected entries) to avoid starving job execution.'
+  - id: 'INV-RECON-TICK-003'
+    statement: 'If reconcile cannot safely decide, it must fail closed and surface the reason rather than requeue blindly.'
+
+scope:
+  in_scope:
+    - id: 'S1'
+      description: |
+        Add a public, incremental reconcile API in apm2-core:
+          - New function: reconcile_tick(fac_root, queue_root, lane_mgr, config) -> summary
+          - Config includes:
+              * max_claimed_inspect_per_tick
+              * max_lanes_inspect_per_tick (optional)
+              * apply=true
+              * min_interval_secs (enforced by worker)
+          - Internally reuse existing reconcile_queue and reconcile_lanes logic, but allow bounding.
+    - id: 'S2'
+      description: |
+        Integrate into fac_worker main loop:
+          - Track last_reconcile_at (Instant)
+          - Only run reconcile when:
+              * scan lock is held (reduces multi-worker duplication)
+              * interval elapsed OR a "commit_failed" flag is set
+          - Ensure reconcile summary is reflected in heartbeat counters and logs.
+    - id: 'S3'
+      description: |
+        Improve immediate recovery on commit pipeline failure:
+          - In handle_pipeline_commit_failure, set a flag requesting an out-of-band reconcile next tick.
+          - (Optional) run a targeted reconcile for just the affected job file when safe.
+    - id: 'S4'
+      description: |
+        Add tests:
+          - Unit: reconcile_tick respects max_inspect bound.
+          - Integration: create a claimed job with no active lane and verify reconcile_tick moves it to pending.
+          - Integration: create a claimed job with a receipt and verify reconcile_tick moves it to done/denied.
+          - Safety: hold an exclusive flock on a claimed job file and verify reconcile_tick skips it.
+  out_of_scope:
+    - 'Changing the commit pipeline semantics (receipt-first) beyond what exists.'
+    - 'Adding new queue states/directories (quarantine) — separate design.'
+
+plan:
+  steps:
+    - id: 'P1'
+      description: 'Implement reconcile_tick API (incremental wrapper) in apm2-core.'
+    - id: 'P2'
+      description: 'Wire reconcile_tick into worker loop with interval gating + scan-lock gating.'
+    - id: 'P3'
+      description: 'Add tests + regression fixtures for claimed-stuck scenarios.'
+
+
+definition_of_done:
+  criteria:
+    - 'A worker can self-heal a stuck claimed job (orphan or torn) within a bounded interval without restart.'
+    - 'No reconcile-on-tick action can race an active commit: flock-protected jobs are skipped.'
+    - 'Reconcile-on-tick is bounded and does not meaningfully reduce throughput under normal load.'
+  evidence_ids:
+    - 'EVID-TCK-00660-01 (integration): orphan claimed job requeued to pending without restart'
+    - 'EVID-TCK-00660-02 (integration): torn state repaired (receipt→terminal) without restart'
+    - 'EVID-TCK-00660-03 (safety): locked claimed job is skipped'
+
+notes:
+  performance: |
+    - Default interval: 60s (tunable).
+    - Default claimed scan budget: 100 entries/tick.
+    - Always prefer progress over perfect cleanliness; reconcile should do the minimum work needed.
+  safety: |
+    This ticket relies on prior work that added the claimed-file flock probe during commit (TCK-00622).
+    If that invariant is violated, reconcile-on-tick must be disabled.
