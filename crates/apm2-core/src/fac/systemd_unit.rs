@@ -17,6 +17,9 @@ use wait_timeout::ChildExt;
 
 /// Marker embedded in lane-corruption reasons for orphaned active systemd work.
 pub const ORPHANED_SYSTEMD_UNIT_REASON_CODE: &str = "ORPHANED_SYSTEMD_UNIT";
+/// Canonical reason used when systemd liveness probes are unavailable.
+pub const FAC_UNIT_LIVENESS_UNAVAILABLE_REASON: &str =
+    "systemd liveness probe unavailable in all scopes";
 
 const MAX_CGROUP_FILE_BYTES: u64 = 8192;
 const MAX_SYSTEMD_UNIT_NAME_LENGTH: usize = 255;
@@ -149,9 +152,76 @@ pub fn check_fac_unit_liveness(lane_id: &str, job_id: &str) -> FacUnitLiveness {
         };
     }
 
+    summarize_probe_result(active_units, &unknown_reasons, successful_probe_count)
+}
+
+/// Check whether any FAC-associated units are active for a lane when `job_id`
+/// is unavailable.
+///
+/// Associated units include:
+/// - any `apm2-fac-job-{lane_id}-*.service`
+/// - any `apm2-warm-{lane_id}-*.service`
+#[must_use]
+pub fn check_fac_lane_liveness(lane_id: &str) -> FacUnitLiveness {
+    if !is_safe_unit_fragment(lane_id) {
+        return FacUnitLiveness::Unknown {
+            reason: format!("unsafe lane id for systemd probe: {lane_id:?}"),
+        };
+    }
+
+    let fac_job_prefix = format!("apm2-fac-job-{lane_id}-");
+    let warm_prefix = format!("apm2-warm-{lane_id}-");
+    let mut active_units: BTreeSet<String> = BTreeSet::new();
+    let mut unknown_reasons: Vec<String> = Vec::new();
+    let mut successful_probe_count: usize = 0;
+
+    for scope_flag in ["--user", "--system"] {
+        match probe_pattern_units(scope_flag, &fac_job_prefix) {
+            Ok(units) => {
+                successful_probe_count = successful_probe_count.saturating_add(1);
+                active_units.extend(units);
+            },
+            Err(
+                UnitProbeStatus::Unavailable | UnitProbeStatus::Inactive | UnitProbeStatus::Active,
+            ) => {},
+            Err(UnitProbeStatus::Unknown(reason)) => unknown_reasons.push(reason),
+        }
+
+        match probe_pattern_units(scope_flag, &warm_prefix) {
+            Ok(units) => {
+                successful_probe_count = successful_probe_count.saturating_add(1);
+                active_units.extend(units);
+            },
+            Err(
+                UnitProbeStatus::Unavailable | UnitProbeStatus::Inactive | UnitProbeStatus::Active,
+            ) => {},
+            Err(UnitProbeStatus::Unknown(reason)) => unknown_reasons.push(reason),
+        }
+    }
+
+    summarize_probe_result(active_units, &unknown_reasons, successful_probe_count)
+}
+
+fn summarize_probe_result(
+    active_units: BTreeSet<String>,
+    unknown_reasons: &[String],
+    successful_probe_count: usize,
+) -> FacUnitLiveness {
+    if !active_units.is_empty() {
+        return FacUnitLiveness::Active {
+            active_units: active_units.into_iter().collect(),
+        };
+    }
+
+    if !unknown_reasons.is_empty() {
+        return FacUnitLiveness::Unknown {
+            reason: unknown_reasons.join("; "),
+        };
+    }
+
     if successful_probe_count == 0 {
         return FacUnitLiveness::Unknown {
-            reason: "systemd liveness probe unavailable in all scopes".to_string(),
+            reason: FAC_UNIT_LIVENESS_UNAVAILABLE_REASON.to_string(),
         };
     }
 
@@ -540,5 +610,16 @@ mod tests {
     fn safe_unit_fragment_allows_dots() {
         assert!(is_safe_unit_fragment("job.123"));
         assert!(!is_safe_unit_fragment("job/123"));
+    }
+
+    #[test]
+    fn check_fac_lane_liveness_rejects_unsafe_lane_id() {
+        let liveness = check_fac_lane_liveness("lane/00");
+        match liveness {
+            FacUnitLiveness::Unknown { reason } => {
+                assert!(reason.contains("unsafe lane id"));
+            },
+            _ => panic!("unsafe lane id must return Unknown"),
+        }
     }
 }

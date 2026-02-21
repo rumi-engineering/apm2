@@ -51,12 +51,13 @@ use std::process::Command;
 
 use apm2_core::fac::service_user_gate::QueueWriteMode;
 use apm2_core::fac::{
-    FacUnitLiveness, GcActionKind, GcPlan, LANE_ENV_DIRS, LaneCorruptMarkerV1, LaneInitReceiptV1,
-    LaneLeaseV1, LaneManager, LaneState, LaneStatusV1, LogRetentionConfig, MAX_LOG_DIR_ENTRIES,
-    ORPHANED_SYSTEMD_UNIT_REASON_CODE, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, ProcessIdentity,
-    REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA,
-    SafeRmtreeError, SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA,
-    ToolLogIndexV1, check_fac_unit_liveness, execute_gc, plan_gc_with_log_retention,
+    FAC_UNIT_LIVENESS_UNAVAILABLE_REASON, FacUnitLiveness, GcActionKind, GcPlan, LANE_ENV_DIRS,
+    LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1, LaneManager, LaneState, LaneStatusV1,
+    LogRetentionConfig, MAX_LOG_DIR_ENTRIES, ORPHANED_SYSTEMD_UNIT_REASON_CODE,
+    PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, ProcessIdentity, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER,
+    RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA, SafeRmtreeError, SafeRmtreeOutcome,
+    TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
+    check_fac_lane_liveness, check_fac_unit_liveness, execute_gc, plan_gc_with_log_retention,
     safe_rmtree_v1, safe_rmtree_v1_with_entry_limit, verify_pid_identity,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
@@ -2010,7 +2011,7 @@ fn enforce_lane_reset_liveness_guard<F>(
     probe: F,
 ) -> Result<(), String>
 where
-    F: FnOnce(&str, &str) -> FacUnitLiveness,
+    F: Fn(&str, &str) -> FacUnitLiveness,
 {
     let Some(job_id) = job_id else {
         return Err("reset blocked: cannot verify unit liveness without lease job_id".to_string());
@@ -2028,6 +2029,52 @@ where
             "reset blocked while liveness={state}: {detail}; active_units={}",
             active_units.join(", ")
         ))
+    }
+}
+
+fn enforce_lane_reset_liveness_for_context<F, G>(
+    lane_id: &str,
+    job_id: Option<&str>,
+    reason_is_orphaned: bool,
+    unit_probe: F,
+    lane_probe: G,
+) -> Result<(), String>
+where
+    F: Fn(&str, &str) -> FacUnitLiveness,
+    G: Fn(&str) -> FacUnitLiveness,
+{
+    if job_id.is_some() {
+        return enforce_lane_reset_liveness_guard(lane_id, job_id, unit_probe);
+    }
+
+    if reason_is_orphaned {
+        return Err(
+            "reset blocked: orphaned-systemd lane is missing lease job_id for liveness verification"
+                .to_string(),
+        );
+    }
+
+    let liveness = lane_probe(lane_id);
+    match liveness {
+        FacUnitLiveness::Inactive => Ok(()),
+        FacUnitLiveness::Unknown { reason }
+            if reason.contains(FAC_UNIT_LIVENESS_UNAVAILABLE_REASON) =>
+        {
+            // No reachable systemd scope on this host; allow non-orphaned
+            // manual recovery when no lane/job identity exists.
+            Ok(())
+        },
+        other => {
+            let (state, detail, active_units) = describe_orphaned_unit_liveness(other);
+            if active_units.is_empty() {
+                Err(format!("reset blocked while liveness={state}: {detail}"))
+            } else {
+                Err(format!(
+                    "reset blocked while liveness={state}: {detail}; active_units={}",
+                    active_units.join(", ")
+                ))
+            }
+        },
     }
 }
 
@@ -2168,6 +2215,7 @@ fn load_lane_reason_hint(manager: &LaneManager, status: &LaneStatusV1) -> Option
     None
 }
 
+#[cfg(test)]
 fn should_attempt_cleanup_scrub(reason_hint: &str) -> bool {
     let reason = reason_hint.to_ascii_lowercase();
     reason.contains("more than") && reason.contains("entries")
@@ -2707,7 +2755,6 @@ fn run_system_doctor_fix(
         let lane_id = status.lane_id.clone();
         let reason_hint = load_lane_reason_hint(&manager, &status).unwrap_or_default();
         let reason_is_orphaned = reason_hint.contains(ORPHANED_SYSTEMD_UNIT_REASON_CODE);
-        let reason_is_cleanup = should_attempt_cleanup_scrub(&reason_hint);
         let tmp_trigger_detail = match detect_lane_tmp_corruption(&manager, &lane_id) {
             Ok(value) => value,
             Err(err) => {
@@ -2723,7 +2770,34 @@ fn run_system_doctor_fix(
             },
         };
         let reason_is_tmp_corrupt = tmp_trigger_detail.is_some();
-        if !reason_is_orphaned && !reason_is_cleanup && !reason_is_tmp_corrupt {
+
+        let reset_action = if reason_is_orphaned {
+            SystemDoctorFixActionKind::LaneResetOrphanedSystemdUnit
+        } else if reason_is_tmp_corrupt {
+            SystemDoctorFixActionKind::LaneResetTmpCorruption
+        } else {
+            SystemDoctorFixActionKind::LaneResetCleanupRecovery
+        };
+        let job_id = status.job_id.clone().or_else(|| {
+            LaneLeaseV1::load(&manager.lane_dir(&lane_id))
+                .ok()
+                .flatten()
+                .map(|lease| lease.job_id)
+        });
+        if let Err(detail) = enforce_lane_reset_liveness_for_context(
+            &lane_id,
+            job_id.as_deref(),
+            reason_is_orphaned,
+            check_fac_unit_liveness,
+            check_fac_lane_liveness,
+        ) {
+            push_system_doctor_fix_action(
+                &mut actions,
+                reset_action,
+                SystemDoctorFixActionStatus::Blocked,
+                Some(&lane_id),
+                detail,
+            );
             continue;
         }
 
@@ -2762,31 +2836,6 @@ fn run_system_doctor_fix(
             }
         }
 
-        let reset_action = if reason_is_orphaned {
-            SystemDoctorFixActionKind::LaneResetOrphanedSystemdUnit
-        } else if reason_is_tmp_corrupt {
-            SystemDoctorFixActionKind::LaneResetTmpCorruption
-        } else {
-            SystemDoctorFixActionKind::LaneResetCleanupRecovery
-        };
-        let job_id = status.job_id.clone().or_else(|| {
-            LaneLeaseV1::load(&manager.lane_dir(&lane_id))
-                .ok()
-                .flatten()
-                .map(|lease| lease.job_id)
-        });
-        if let Err(detail) =
-            enforce_lane_reset_liveness_guard(&lane_id, job_id.as_deref(), check_fac_unit_liveness)
-        {
-            push_system_doctor_fix_action(
-                &mut actions,
-                reset_action,
-                SystemDoctorFixActionStatus::Blocked,
-                Some(&lane_id),
-                detail,
-            );
-            continue;
-        }
         match doctor_reset_lane_once(&manager, &lane_id) {
             Ok(reset_summary) => {
                 lane_resets_applied = true;
@@ -2817,6 +2866,22 @@ fn run_system_doctor_fix(
             Err(DoctorLaneResetError::RefusedDelete { receipts })
                 if refused_delete_mentions_tmp(&receipts) =>
             {
+                if let Err(detail) = enforce_lane_reset_liveness_for_context(
+                    &lane_id,
+                    job_id.as_deref(),
+                    reason_is_orphaned,
+                    check_fac_unit_liveness,
+                    check_fac_lane_liveness,
+                ) {
+                    push_system_doctor_fix_action(
+                        &mut actions,
+                        reset_action,
+                        SystemDoctorFixActionStatus::Blocked,
+                        Some(&lane_id),
+                        format!("reset blocked before retry scrub: {detail}"),
+                    );
+                    continue;
+                }
                 match scrub_lane_tmp_dir(&manager, &lane_id) {
                     Ok(scrub_summary) => {
                         push_system_doctor_fix_action(
@@ -7238,14 +7303,14 @@ mod tests {
     }
 
     #[test]
-    fn test_lane_reset_liveness_guard_blocks_when_job_id_missing() {
+    fn test_lane_reset_liveness_guard_blocks_missing_job_id() {
         let err = enforce_lane_reset_liveness_guard("lane-00", None, |_lane_id, _job_id| {
             FacUnitLiveness::Inactive
         })
-        .expect_err("missing job_id must block reset");
+        .expect_err("missing job_id must block direct job-based guard");
         assert!(
             err.contains("cannot verify unit liveness without lease job_id"),
-            "expected missing job_id guard detail, got: {err}"
+            "unexpected missing-job_id guard detail: {err}"
         );
     }
 
@@ -7256,6 +7321,66 @@ mod tests {
                 FacUnitLiveness::Inactive
             });
         assert!(result.is_ok(), "inactive liveness should allow reset");
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_context_blocks_missing_job_id_for_orphaned() {
+        let err = enforce_lane_reset_liveness_for_context(
+            "lane-00",
+            None,
+            true,
+            |_lane_id, _job_id| FacUnitLiveness::Inactive,
+            |_lane_id| FacUnitLiveness::Inactive,
+        )
+        .expect_err("orphaned missing job_id must block");
+        assert!(err.contains("orphaned-systemd lane is missing lease job_id"));
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_context_allows_missing_job_id_when_lane_inactive() {
+        let result = enforce_lane_reset_liveness_for_context(
+            "lane-00",
+            None,
+            false,
+            |_lane_id, _job_id| FacUnitLiveness::Inactive,
+            |_lane_id| FacUnitLiveness::Inactive,
+        );
+        assert!(
+            result.is_ok(),
+            "non-orphaned missing job_id should allow when lane probe is inactive"
+        );
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_context_allows_missing_job_id_when_systemd_unavailable() {
+        let result = enforce_lane_reset_liveness_for_context(
+            "lane-00",
+            None,
+            false,
+            |_lane_id, _job_id| FacUnitLiveness::Inactive,
+            |_lane_id| FacUnitLiveness::Unknown {
+                reason: FAC_UNIT_LIVENESS_UNAVAILABLE_REASON.to_string(),
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "non-orphaned missing job_id should allow when systemd probe is unavailable"
+        );
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_context_blocks_missing_job_id_when_lane_active() {
+        let err = enforce_lane_reset_liveness_for_context(
+            "lane-00",
+            None,
+            false,
+            |_lane_id, _job_id| FacUnitLiveness::Inactive,
+            |_lane_id| FacUnitLiveness::Active {
+                active_units: vec!["apm2-fac-job-lane-00-job-123.service".to_string()],
+            },
+        )
+        .expect_err("active lane-wide liveness must block missing-job_id reset");
+        assert!(err.contains("reset blocked while liveness=active"));
     }
 
     #[test]
