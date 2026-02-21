@@ -678,6 +678,24 @@ const WORK_INDEX_SCHEMA_SQL: &str = r"
 
     CREATE INDEX IF NOT EXISTS idx_comment_created ON comment_receipts(created_at);
     CREATE INDEX IF NOT EXISTS idx_work_pr_created ON work_pr_index(created_at);
+
+    -- TCK-00638: Work context entry projection (RFC-0032 Phase 2)
+    CREATE TABLE IF NOT EXISTS work_context (
+        work_id TEXT NOT NULL,
+        entry_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL,
+        actor_id TEXT NOT NULL DEFAULT '',
+        cas_hash TEXT NOT NULL,
+        evidence_id TEXT NOT NULL,
+        created_at_ns INTEGER NOT NULL,
+        PRIMARY KEY (work_id, entry_id)
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_work_context_dedupe
+        ON work_context(work_id, kind, dedupe_key);
+    CREATE INDEX IF NOT EXISTS idx_work_context_work_id ON work_context(work_id);
+    CREATE INDEX IF NOT EXISTS idx_work_context_created ON work_context(created_at_ns);
 ";
 
 /// Work index for tracking changeset -> `work_id` -> PR associations.
@@ -1077,6 +1095,72 @@ impl WorkIndex {
         })
         .await
         .map_err(|e| ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}")))?
+    }
+
+    /// Registers a work context entry in the projection table (TCK-00638).
+    ///
+    /// Uses `INSERT OR IGNORE` to support idempotent replays: the primary key
+    /// `(work_id, entry_id)` and the uniqueness constraint on
+    /// `(work_id, kind, dedupe_key)` together ensure that duplicate entries
+    /// from retries are silently absorbed.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_id` - Canonical work identifier
+    /// * `entry_id` - Deterministically derived entry ID (`CTX-` prefix +
+    ///   blake3 hex)
+    /// * `kind` - Entry kind discriminant
+    /// * `dedupe_key` - Deduplication key
+    /// * `actor_id` - Actor that published the entry
+    /// * `cas_hash` - CAS hash of the canonical entry bytes (hex)
+    /// * `evidence_id` - Evidence ID (same as `entry_id`)
+    /// * `created_at_ns` - HTF timestamp in nanoseconds
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    #[allow(clippy::too_many_arguments, clippy::cast_possible_wrap)]
+    pub fn register_work_context_entry(
+        &self,
+        work_id: &str,
+        entry_id: &str,
+        kind: &str,
+        dedupe_key: &str,
+        actor_id: &str,
+        cas_hash: &str,
+        evidence_id: &str,
+        created_at_ns: u64,
+    ) -> Result<(), ProjectionWorkerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
+
+        conn.execute(
+            "INSERT OR IGNORE INTO work_context
+             (work_id, entry_id, kind, dedupe_key, actor_id, cas_hash, evidence_id, created_at_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                work_id,
+                entry_id,
+                kind,
+                dedupe_key,
+                actor_id,
+                cas_hash,
+                evidence_id,
+                created_at_ns as i64,
+            ],
+        )
+        .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+        debug!(
+            work_id = %work_id,
+            entry_id = %entry_id,
+            kind = %kind,
+            "Registered work context entry in projection"
+        );
+
+        Ok(())
     }
 }
 
@@ -1648,6 +1732,9 @@ pub struct ProjectionWorker {
     work_pr_tailer: LedgerTailer,
     /// Tailer for `review_receipt_recorded` events.
     review_tailer: LedgerTailer,
+    /// Tailer for `evidence.published` events with `WORK_CONTEXT_ENTRY`
+    /// category (TCK-00638).
+    evidence_published_tailer: LedgerTailer,
     adapter: Option<GitHubProjectionAdapter>,
     authoritative_cas: Option<Arc<dyn ContentAddressedStore>>,
     /// Durable buffer for recording admission decisions (TCK-00504/00505).
@@ -1696,6 +1783,8 @@ impl ProjectionWorker {
             Arc::clone(&conn),
             "projection_worker:review_receipt_recorded",
         );
+        let evidence_published_tailer =
+            LedgerTailer::with_id(Arc::clone(&conn), "projection_worker:evidence_published");
 
         // NOTE: Adapter is NOT created here to avoid fail-open issues.
         // The adapter MUST be injected via set_adapter() with a properly
@@ -1719,6 +1808,7 @@ impl ProjectionWorker {
             changeset_tailer,
             work_pr_tailer,
             review_tailer,
+            evidence_published_tailer,
             adapter,
             authoritative_cas: None,
             intent_buffer: None,
@@ -1866,6 +1956,12 @@ impl ProjectionWorker {
             // (Major fix: Thread blocking in async context - uses spawn_blocking)
             if let Err(e) = self.process_review_receipts().await {
                 warn!(error = %e, "Error processing ReviewReceiptRecorded events");
+            }
+
+            // Process evidence.published events to index WORK_CONTEXT_ENTRY entries
+            // (TCK-00638: RFC-0032 Phase 2 work_context projection)
+            if let Err(e) = self.process_evidence_published().await {
+                warn!(error = %e, "Error processing evidence.published events");
             }
 
             // Periodic eviction of expired entries (Blocker fix: Unbounded State Growth)
@@ -2279,6 +2375,124 @@ impl ProjectionWorker {
                 },
             }
         }
+
+        Ok(())
+    }
+
+    /// Processes `evidence.published` events to populate the `work_context`
+    /// projection table (TCK-00638).
+    ///
+    /// Only events with category `WORK_CONTEXT_ENTRY` are indexed. All other
+    /// evidence categories are silently skipped (acknowledged without
+    /// indexing).
+    ///
+    /// Uses at-least-once delivery: events are acknowledged only after
+    /// successful projection.
+    async fn process_evidence_published(&mut self) -> Result<(), ProjectionWorkerError> {
+        let events = self
+            .evidence_published_tailer
+            .poll_events_async("evidence.published", self.config.batch_size)
+            .await?;
+
+        for event in events {
+            match self.handle_evidence_published(&event) {
+                Ok(()) => {
+                    self.evidence_published_tailer
+                        .acknowledge_async(event.timestamp_ns, &event.event_id)
+                        .await?;
+                },
+                Err(e) => {
+                    warn!(
+                        event_id = %event.event_id,
+                        error = %e,
+                        "Failed to process evidence.published event - will retry"
+                    );
+                    break;
+                },
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handles a single `evidence.published` event for work context projection.
+    ///
+    /// Decodes the `EvidencePublished` protobuf payload, checks if the category
+    /// is `WORK_CONTEXT_ENTRY`, and if so, extracts metadata fields and inserts
+    /// into the `work_context` projection table.
+    ///
+    /// Non-`WORK_CONTEXT_ENTRY` events are silently skipped (return `Ok(())`).
+    fn handle_evidence_published(
+        &self,
+        event: &SignedLedgerEvent,
+    ) -> Result<(), ProjectionWorkerError> {
+        use prost::Message;
+
+        // Decode the outer EvidenceEvent protobuf wrapper.
+        let evidence_event = apm2_core::events::EvidenceEvent::decode(event.payload.as_slice())
+            .map_err(|e| {
+                ProjectionWorkerError::InvalidPayload(format!(
+                    "failed to decode EvidenceEvent: {e}"
+                ))
+            })?;
+
+        let Some(apm2_core::events::evidence_event::Event::Published(published)) =
+            evidence_event.event
+        else {
+            // Not a Published event — skip.
+            return Ok(());
+        };
+
+        // Only index WORK_CONTEXT_ENTRY evidence.
+        if published.category != "WORK_CONTEXT_ENTRY" {
+            return Ok(());
+        }
+
+        // Extract metadata fields from the evidence metadata list.
+        let mut entry_id = String::new();
+        let mut kind = String::new();
+        let mut dedupe_key = String::new();
+        let mut actor_id = String::new();
+
+        for meta in &published.metadata {
+            if let Some(val) = meta.strip_prefix("entry_id=") {
+                entry_id = val.to_string();
+            } else if let Some(val) = meta.strip_prefix("kind=") {
+                kind = val.to_string();
+            } else if let Some(val) = meta.strip_prefix("dedupe_key=") {
+                dedupe_key = val.to_string();
+            } else if let Some(val) = meta.strip_prefix("actor_id=") {
+                actor_id = val.to_string();
+            }
+        }
+
+        if entry_id.is_empty() || kind.is_empty() || dedupe_key.is_empty() {
+            return Err(ProjectionWorkerError::InvalidPayload(format!(
+                "evidence.published WORK_CONTEXT_ENTRY missing required metadata: \
+                 entry_id={entry_id:?}, kind={kind:?}, dedupe_key={dedupe_key:?}"
+            )));
+        }
+
+        let cas_hash_hex = hex::encode(&published.artifact_hash);
+
+        self.work_index.register_work_context_entry(
+            &published.work_id,
+            &entry_id,
+            &kind,
+            &dedupe_key,
+            &actor_id,
+            &cas_hash_hex,
+            &published.evidence_id,
+            event.timestamp_ns,
+        )?;
+
+        debug!(
+            event_id = %event.event_id,
+            work_id = %published.work_id,
+            entry_id = %entry_id,
+            kind = %kind,
+            "Projected WORK_CONTEXT_ENTRY evidence to work_context table"
+        );
 
         Ok(())
     }

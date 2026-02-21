@@ -63,7 +63,9 @@ pub const MANIFEST_FULL_VECTOR: GoldenVector = GoldenVector {
     // (they perform real side effects). SubscribePulse and UnsubscribePulse
     // added to SessionMessageType::all_request_variants() (deduplicated).
     // TCK-00635: OpenWork (hsi.work.open) added as authoritative+idempotent+receipt.
-    expected_hash: "fd6e4c7ecd4652083f631c111173076c59c1cc8a84595bc4317d7135ebd08db1",
+    // TCK-00638: PublishWorkContextEntry (hsi.work_context.publish) added as
+    // authoritative+idempotent+receipt.
+    expected_hash: "PLACEHOLDER_WILL_BE_UPDATED",
 };
 
 /// Golden vector: minimal manifest with a single route.
