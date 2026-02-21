@@ -167,7 +167,7 @@ Topic grammar, wildcard matching, and deterministic topic derivation.
 
 **Multi-Topic Derivation (TCK-00642):**
 
-Work graph edge events (`work_graph.edge.added/removed/waived`) produce **two** topics per event: one for `from_work_id` and one for `to_work_id`. The `derive_topics()` method handles this, while `derive_topic()` returns only the primary (from) topic. Topic prefix is `work_graph.` (NOT `work.`) to avoid WorkReducer decoding collision (INV-TOPIC-005).
+Work graph edge events (`work_graph.edge.added/removed/waived`) produce **two** topics per event: one for `from_work_id` and one for `to_work_id`. The `derive_topics()` method handles this. `derive_topic()` returns `MultiTopicEventError` for these event types to prevent silent data loss of the secondary topic. Topic prefix is `work_graph.` (NOT `work.`) to avoid WorkReducer decoding collision (INV-TOPIC-005). Canonical event type strings use dotted notation (`work_graph.edge.added`, not `WorkEdgeAdded`).
 
 ## Public API
 
