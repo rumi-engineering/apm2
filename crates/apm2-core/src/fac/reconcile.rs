@@ -4,22 +4,23 @@
 //! After an unclean shutdown (crash, SIGKILL, OOM-kill), the queue and lane
 //! state can become inconsistent:
 //!
-//! - Lanes may have stale leases (PID dead, lock released, but lease file still
-//!   present with RUNNING/LEASED/CLEANUP state).
+//! - Lanes may have stale leases (owner process dead or PID identity mismatch,
+//!   lock released, but lease file still present with RUNNING/LEASED/CLEANUP
+//!   state).
 //! - The `queue/claimed/` directory may contain job specs that are no longer
 //!   being processed by any worker.
 //!
 //! This module implements deterministic recovery:
 //!
-//! 1. **Lane reconciliation**: Detect stale leases (PID dead + lock not held),
-//!    transition through CLEANUP → remove lease (IDLE), emit recovery receipts.
+//! 1. **Lane reconciliation**: Detect stale leases (identity dead/mismatch +
+//!    lock not held), transition through CLEANUP → remove lease (IDLE), emit
+//!    recovery receipts.
 //! 2. **Queue reconciliation**: Detect claimed jobs that are not backed by any
 //!    active lane lease, and requeue them (move back to `pending/`).
 //!
 //! # Security Model
 //!
-//! - Stale lease detection uses PID liveness checks (fail-closed: ambiguous →
-//!   CORRUPT).
+//! - Stale lease detection uses PID identity checks (fail-closed on unknown).
 //! - All recovery actions emit structured receipts for auditability.
 //! - In-memory collections are bounded by hard MAX_* constants.
 //! - Reconciliation is idempotent: running it multiple times produces the same
@@ -38,8 +39,9 @@
 //!   final receipt and for partial receipts after Phase-1 or Phase-2 failures.
 //!   If partial receipt persistence also fails, a combined error is returned so
 //!   that apply-mode lane mutations never lack durable receipt evidence.
-//! - [INV-RECON-002] Stale lease detection is fail-closed: ambiguous PID state
-//!   → CORRUPT (not recovered). Ambiguous states are durably marked via
+//! - [INV-RECON-002] Stale lease detection uses PID identity classification:
+//!   `AliveMismatch` (PID reuse) is recoverable stale state; `Unknown` is
+//!   fail-closed `CORRUPT`. Ambiguous states are durably marked via
 //!   `LaneCorruptMarkerV1`. Corrupt marker persistence failure is a hard error
 //!   in apply mode — ambiguous states must not proceed without durable
 //!   evidence.
@@ -74,7 +76,7 @@ use thiserror::Error;
 use super::flock_util::try_acquire_exclusive_nonblocking;
 use super::lane::{
     LANE_CORRUPT_MARKER_SCHEMA, LaneCorruptMarkerV1, LaneLeaseV1, LaneManager, LaneState,
-    MAX_STRING_LENGTH, atomic_write, create_dir_restricted, is_pid_alive,
+    MAX_STRING_LENGTH, ProcessIdentity, atomic_write, create_dir_restricted, verify_pid_identity,
 };
 use super::receipt_index::find_receipt_for_job;
 use super::receipt_pipeline::{ReceiptWritePipeline, outcome_to_terminal_state};
@@ -453,7 +455,8 @@ struct QueueReconcileResult {
 /// Run crash recovery reconciliation on worker startup.
 ///
 /// This function:
-/// 1. Scans all lanes for stale leases (PID dead + lock not held).
+/// 1. Scans all lanes for stale leases (identity dead/mismatch + lock not
+///    held).
 /// 2. For stale lanes: transitions lease through CLEANUP → removes lease
 ///    (IDLE), emitting recovery receipts (INV-RECON-006).
 /// 3. Scans `queue/claimed/` for orphaned jobs not backed by any active lane.
@@ -667,13 +670,13 @@ pub fn reconcile_on_startup(
 /// Returns the set of active job IDs (used by phase 2 to detect orphans)
 /// along with recovery actions taken.
 ///
-/// INV-RECON-002: Ambiguous PID states (EPERM, alive-but-unlocked) are
-/// durably marked CORRUPT via `LaneCorruptMarkerV1`.
+/// INV-RECON-002: Unknown identity states are durably marked CORRUPT via
+/// `LaneCorruptMarkerV1`.
 ///
 /// INV-RECON-006: Stale lease recovery transitions through CLEANUP → IDLE.
 ///
-/// THEME 7: Corrupt lanes with live PIDs add their `job_id` to `active_job_ids`
-/// to prevent orphan requeue of still-executing jobs.
+/// Active-job tracking includes only lanes whose lease identity is
+/// `AliveMatch`, preventing false positives from PID-exists-only checks.
 #[allow(clippy::too_many_lines)] // lane reconciliation with corrupt-marker persistence is inherently branchy
 fn reconcile_lanes(
     manager: &LaneManager,
@@ -720,14 +723,22 @@ fn reconcile_lanes(
                 continue;
             },
         };
+        let lane_dir = manager.lane_dir(lane_id);
+        let lease_snapshot = LaneLeaseV1::load(&lane_dir).ok().flatten();
+        let lease_identity = lease_snapshot
+            .as_ref()
+            .map(|lease| verify_pid_identity(lease.pid, lease.proc_start_time_ticks));
 
         match status.state {
             LaneState::Idle => {
-                let lane_dir = manager.lane_dir(lane_id);
-                let lease = LaneLeaseV1::load(&lane_dir).ok().flatten();
-                if let Some(lease) = lease {
-                    let pid_alive = is_pid_alive(lease.pid);
-                    if !pid_alive && !status.lock_held {
+                if let (Some(lease), Some(pid_identity)) = (lease_snapshot.as_ref(), lease_identity)
+                {
+                    if !status.lock_held
+                        && matches!(
+                            pid_identity,
+                            ProcessIdentity::Dead | ProcessIdentity::AliveMismatch
+                        )
+                    {
                         // Dead PID + free lock → stale lease.
                         // INV-RECON-006: Transition through CLEANUP → IDLE.
                         if dry_run {
@@ -739,7 +750,7 @@ fn reconcile_lanes(
                             });
                             stale_leases_recovered += 1;
                         } else {
-                            match recover_stale_lease(&lane_dir, &lease, fac_root) {
+                            match recover_stale_lease(&lane_dir, lease, fac_root) {
                                 Ok(StaleLeaseOutcome::Recovered) => {
                                     actions.push(LaneRecoveryAction::StaleLeaseCleared {
                                         lane_id: lane_id.clone(),
@@ -779,31 +790,59 @@ fn reconcile_lanes(
                         }
                         continue;
                     }
-                    // INV-RECON-002: PID alive (or EPERM) but lock free with
-                    // lease present is an ambiguous/inconsistent state. Mark
-                    // CORRUPT durably and treat as active to prevent orphan
-                    // requeue (THEME 5, THEME 7).
-                    let reason = format!(
-                        "ambiguous lane state: lease present (pid={}, state={}) \
-                         but lock is free and pid is alive/EPERM",
-                        lease.pid, lease.state,
-                    );
-                    if !dry_run {
-                        if let Err(marker_err) =
-                            persist_corrupt_marker(fac_root, lane_id, &reason, timestamp)
-                        {
-                            partial_error = Some(marker_err);
-                            break;
-                        }
+                    match pid_identity {
+                        ProcessIdentity::AliveMatch => {
+                            // INV-RECON-002: lock free + active owner identity match is
+                            // ambiguous/inconsistent. Mark CORRUPT durably and treat as active
+                            // to prevent orphan requeue.
+                            let reason = format!(
+                                "ambiguous lane state: lease present (pid={}, state={}) \
+                                 but lock is free and process identity matches",
+                                lease.pid, lease.state,
+                            );
+                            if !dry_run {
+                                if let Err(marker_err) =
+                                    persist_corrupt_marker(fac_root, lane_id, &reason, timestamp)
+                                {
+                                    partial_error = Some(marker_err);
+                                    break;
+                                }
+                            }
+                            active_job_ids.insert(lease.job_id.clone());
+                            actions.push(LaneRecoveryAction::MarkedCorrupt {
+                                lane_id: lane_id.clone(),
+                                reason: truncate_string(&reason, MAX_STRING_LENGTH),
+                            });
+                            lanes_marked_corrupt += 1;
+                            continue;
+                        },
+                        ProcessIdentity::Unknown => {
+                            // Fail-closed when identity cannot be verified.
+                            let reason = format!(
+                                "ambiguous lane state: lease present (pid={}, state={}) \
+                                 but process identity is unknown",
+                                lease.pid, lease.state
+                            );
+                            if !dry_run {
+                                if let Err(marker_err) =
+                                    persist_corrupt_marker(fac_root, lane_id, &reason, timestamp)
+                                {
+                                    partial_error = Some(marker_err);
+                                    break;
+                                }
+                            }
+                            actions.push(LaneRecoveryAction::MarkedCorrupt {
+                                lane_id: lane_id.clone(),
+                                reason: truncate_string(&reason, MAX_STRING_LENGTH),
+                            });
+                            lanes_marked_corrupt += 1;
+                            continue;
+                        },
+                        ProcessIdentity::Dead | ProcessIdentity::AliveMismatch => {
+                            // Already handled by stale-lease branch above when
+                            // lock is free.
+                        },
                     }
-                    // THEME 7: treat this as active to prevent orphan requeue.
-                    active_job_ids.insert(lease.job_id.clone());
-                    actions.push(LaneRecoveryAction::MarkedCorrupt {
-                        lane_id: lane_id.clone(),
-                        reason: truncate_string(&reason, MAX_STRING_LENGTH),
-                    });
-                    lanes_marked_corrupt += 1;
-                    continue;
                 }
                 actions.push(LaneRecoveryAction::AlreadyConsistent {
                     lane_id: lane_id.clone(),
@@ -811,7 +850,9 @@ fn reconcile_lanes(
                 });
             },
             LaneState::Running | LaneState::Leased | LaneState::Cleanup => {
-                if let Some(ref job_id) = status.job_id {
+                if let (Some(job_id), Some(ProcessIdentity::AliveMatch)) =
+                    (status.job_id.as_ref(), lease_identity)
+                {
                     active_job_ids.insert(job_id.clone());
                 }
                 actions.push(LaneRecoveryAction::AlreadyConsistent {
@@ -846,13 +887,12 @@ fn reconcile_lanes(
                         }
                     }
                 }
-                // THEME 7: Corrupt lanes with a live PID may still be
-                // executing. Add their job_id to active_job_ids to prevent
-                // orphan requeue of still-running jobs.
-                if let Some(ref job_id) = status.job_id {
-                    if status.pid_alive == Some(true) {
-                        active_job_ids.insert(job_id.clone());
-                    }
+                // Corrupt lanes are considered active only when process
+                // identity still matches the lease owner.
+                if let (Some(job_id), Some(ProcessIdentity::AliveMatch)) =
+                    (status.job_id.as_ref(), lease_identity)
+                {
+                    active_job_ids.insert(job_id.clone());
                 }
                 actions.push(LaneRecoveryAction::AlreadyConsistent {
                     lane_id: lane_id.clone(),
@@ -1770,6 +1810,61 @@ mod tests {
         assert!(
             lease_path.exists(),
             "stale lease file should still exist in dry-run mode"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_pid_identity_mismatch_recovers_and_requeues_claimed_job() {
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(1);
+        let lane_id = "lane-00";
+        let job_id = "job-pid-mismatch";
+
+        // Write a running lease for the current PID, then corrupt the
+        // proc_start_time_ticks to simulate PID reuse identity mismatch.
+        write_lease(
+            &fac_root,
+            lane_id,
+            job_id,
+            std::process::id(),
+            LaneState::Running,
+        );
+        let lease_path = fac_root.join("lanes").join(lane_id).join("lease.v1.json");
+        let mut lease_value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&lease_path).expect("read lease")).expect("parse");
+        let observed_ticks = lease_value
+            .get("proc_start_time_ticks")
+            .and_then(serde_json::Value::as_u64)
+            .expect("lease should include proc_start_time_ticks");
+        lease_value["proc_start_time_ticks"] = serde_json::Value::from(observed_ticks + 1);
+        fs::write(
+            &lease_path,
+            serde_json::to_vec_pretty(&lease_value).expect("serialize lease"),
+        )
+        .expect("persist mismatched lease");
+
+        // Claimed job should be requeued once stale mismatched lease is
+        // recovered.
+        write_claimed_job(&queue_root, job_id);
+
+        let receipt =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
+                .expect("reconcile");
+
+        assert_eq!(
+            receipt.stale_leases_recovered, 1,
+            "identity mismatch must recover stale lease"
+        );
+        assert_eq!(
+            receipt.lanes_marked_corrupt, 0,
+            "identity mismatch should not fail-closed to corrupt"
+        );
+        assert_eq!(
+            receipt.orphaned_jobs_requeued, 1,
+            "claimed job should be requeued once mismatched lease is recovered"
+        );
+        assert!(
+            !lease_path.exists(),
+            "stale mismatched lease file should be removed"
         );
     }
 
