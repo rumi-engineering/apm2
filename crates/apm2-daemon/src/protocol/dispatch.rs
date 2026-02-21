@@ -15517,25 +15517,24 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // 8. Emit work.transitioned event (Open -> Claimed or ReadyForReview -> Review)
-        let transition_payload = apm2_core::work::helpers::work_transitioned_payload_with_sequence(
-            &request.work_id,
-            from_state_str,
-            to_state_str,
+        // 8. Emit work_transitioned event (Open -> Claimed or ReadyForReview -> Review)
+        // Use the legacy `emit_work_transitioned` path which emits event_type
+        // "work_transitioned" with a JSON payload. The projection bridge
+        // (`translate_signed_events`) normalizes "work_transitioned" events into
+        // canonical "work.transitioned" protobuf payloads for the WorkReducer.
+        // Using `emit_session_event` with "work.transitioned" would JSON-wrap the
+        // protobuf payload, which the bridge cannot decode (it expects native
+        // protobuf for "work." events).
+        if let Err(e) = self.event_emitter.emit_work_transitioned(&WorkTransition {
+            work_id: &request.work_id,
+            from_state: from_state_str,
+            to_state: to_state_str,
             rationale_code,
-            work_status.transition_count,
-        );
-
-        // Emit through the session event path with event_type "work.transitioned".
-        // The `session_id` arg doubles as the `work_id` index key.
-        if let Err(e) = self.event_emitter.emit_session_event(
-            &request.work_id,
-            "work.transitioned",
-            &transition_payload,
-            &actor_id,
+            previous_transition_count: work_status.transition_count,
+            actor_id: &actor_id,
             timestamp_ns,
-        ) {
-            warn!(error = %e, "work.transitioned event emission failed");
+        }) {
+            warn!(error = %e, "work_transitioned event emission failed");
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
                 format!("ClaimWorkV2 event emission failed: {e}"),
@@ -15546,11 +15545,93 @@ impl PrivilegedDispatcher {
             work_id = %request.work_id,
             from_state = from_state_str,
             to_state = to_state_str,
-            "work.transitioned event emitted for ClaimWorkV2"
+            "work_transitioned event emitted for ClaimWorkV2"
         );
 
         // 9. Issue a new lease
         let issued_lease_id = generate_lease_id();
+
+        // 9a. Register the claim in WorkRegistry so SpawnEpisode and other
+        // downstream handlers can find this claim (BLOCKER fix: SpawnEpisode
+        // remains bound to legacy WorkRegistry).
+        // Resolve actual policy resolution from the governing lease's claim
+        // for downstream compatibility. Fall back to a minimal resolution
+        // when the governing claim is not found (fail-closed: risk_tier=4).
+        let resolved_policy = self
+            .work_registry
+            .get_claim(&request.work_id)
+            .map(|c| c.policy_resolution)
+            .or_else(|| {
+                self.lease_validator
+                    .get_lease_work_id(&request.lease_id)
+                    .and_then(|wid| self.work_registry.get_claim(&wid))
+                    .map(|c| c.policy_resolution)
+            })
+            .unwrap_or_else(|| PolicyResolution {
+                policy_resolved_ref: String::new(),
+                resolved_policy_hash: claim_content_hash,
+                capability_manifest_hash,
+                context_pack_hash: scope_witness_hash,
+                resolved_risk_tier: 4, // fail-closed: Tier4
+                resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
+                role_spec_hash: [0u8; 32],
+                context_pack_recipe_hash: [0u8; 32],
+            });
+
+        let v2_claim = WorkClaim {
+            work_id: request.work_id.clone(),
+            lease_id: issued_lease_id.clone(),
+            actor_id: actor_id.clone(),
+            role,
+            policy_resolution: resolved_policy.clone(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+
+        // DuplicateWorkId is expected if the same work was already claimed via
+        // the legacy ClaimWork path; treat it as a non-fatal condition.
+        match self.work_registry.register_claim(v2_claim) {
+            Ok(_) => {
+                info!(
+                    work_id = %request.work_id,
+                    lease_id = %issued_lease_id,
+                    "ClaimWorkV2: claim registered in WorkRegistry"
+                );
+            },
+            Err(WorkRegistryError::DuplicateWorkId { .. }) => {
+                debug!(
+                    work_id = %request.work_id,
+                    "ClaimWorkV2: work_id already in WorkRegistry (legacy path or re-claim)"
+                );
+            },
+            Err(e) => {
+                warn!(error = %e, "ClaimWorkV2: WorkRegistry registration failed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("ClaimWorkV2 work registration failed: {e}"),
+                ));
+            },
+        }
+
+        // 9b. Register the issued lease in LeaseValidator so downstream
+        // privileged handlers (SpawnEpisode, DelegateSublease, etc.) can
+        // resolve lease -> work_id mappings.
+        self.lease_validator.register_lease_with_executor(
+            &issued_lease_id,
+            &request.work_id,
+            "claim_work_v2",
+            &actor_id,
+        );
+        info!(
+            lease_id = %issued_lease_id,
+            work_id = %request.work_id,
+            actor_id = %actor_id,
+            "ClaimWorkV2: lease registered in LeaseValidator"
+        );
 
         // 10. Build WorkAuthorityBindings CAS document
         let role_str = match role {
@@ -15560,6 +15641,9 @@ impl PrivilegedDispatcher {
             _ => "UNKNOWN",
         };
 
+        // Use actual policy artifact hashes from the resolved policy rather
+        // than synthetic PCAC-derived hashes. This ensures auditors and
+        // downstream components can reconstruct authority from CAS.
         let bindings = apm2_core::fac::work_cas_schemas::WorkAuthorityBindingsV1 {
             schema: apm2_core::fac::work_cas_schemas::WORK_AUTHORITY_BINDINGS_V1_SCHEMA.to_string(),
             work_id: request.work_id.clone(),
@@ -15567,10 +15651,12 @@ impl PrivilegedDispatcher {
             lease_id: issued_lease_id.clone(),
             actor_id: actor_id.clone(),
             claimed_at_ns: Some(timestamp_ns),
-            adapter_profile_hash: None,
-            policy_resolution_hash: None,
-            capability_manifest_hash: Some(hex::encode(capability_manifest_hash)),
-            context_pack_hash: Some(hex::encode(scope_witness_hash)),
+            adapter_profile_hash: resolved_policy
+                .expected_adapter_profile_hash
+                .map(hex::encode),
+            policy_resolution_hash: Some(hex::encode(resolved_policy.resolved_policy_hash)),
+            capability_manifest_hash: Some(hex::encode(resolved_policy.capability_manifest_hash)),
+            context_pack_hash: Some(hex::encode(resolved_policy.context_pack_hash)),
             stop_condition_hash: Some(hex::encode(stop_budget_profile_digest)),
             typed_budget_contract_hash: None,
             permeability_receipt_hash: Some(hex::encode(freshness_policy_hash)),
@@ -15704,6 +15790,9 @@ impl PrivilegedDispatcher {
     /// Checks whether the work was already claimed by the same actor.
     /// If so, returns the existing claim info. If a different actor claimed,
     /// returns `FAILED_PRECONDITION`.
+    ///
+    /// Uses bounded queries (`get_first_event_by_work_id_and_type`) and proper
+    /// JSON deserialization instead of raw byte window matching.
     #[allow(clippy::unnecessary_wraps)]
     fn handle_claim_work_v2_idempotency(
         &self,
@@ -15711,34 +15800,47 @@ impl PrivilegedDispatcher {
         actor_id: &str,
         _role: WorkRole,
     ) -> ProtocolResult<PrivilegedResponse> {
-        // Look for the most recent work.transitioned event for this work_id
-        // that performed a claim transition (to CLAIMED or REVIEW).
-        let events = self.event_emitter.get_events_by_work_id(work_id);
-        let claim_event = events.iter().rev().find(|e| {
-            e.event_type == "work.transitioned"
-                && (e
-                    .payload
-                    .windows(b"claim_work_v2_implementer".len())
-                    .any(|w| w == b"claim_work_v2_implementer")
-                    || e.payload
-                        .windows(b"claim_work_v2_reviewer".len())
-                        .any(|w| w == b"claim_work_v2_reviewer"))
+        // Use bounded LIMIT-1 query to find the most recent work_transitioned
+        // event for this work_id. The bridge stores ClaimWorkV2 transitions
+        // as event_type "work_transitioned" with a JSON payload.
+        let claim_event = self
+            .event_emitter
+            .get_first_event_by_work_id_and_type(work_id, "work_transitioned");
+
+        // Verify the claim event has a ClaimWorkV2 rationale code by
+        // deserializing the JSON payload (not raw byte window matching).
+        let claim_event = claim_event.filter(|event| {
+            serde_json::from_slice::<serde_json::Value>(&event.payload).is_ok_and(|payload| {
+                matches!(
+                    payload.get("rationale_code").and_then(|v| v.as_str()),
+                    Some("claim_work_v2_implementer" | "claim_work_v2_reviewer")
+                )
+            })
         });
 
         if let Some(event) = claim_event {
             if event.actor_id == actor_id {
                 // Same actor: idempotent re-claim. Look for the existing
                 // evidence.published event to recover the lease/bindings.
-                let evidence_events = self.event_emitter.get_events_by_work_id(work_id);
-                let wab_event = evidence_events.iter().rev().find(|e| {
-                    e.event_type == "evidence.published"
-                        && e.payload
-                            .windows(b"WORK_AUTHORITY_BINDINGS".len())
-                            .any(|w| w == b"WORK_AUTHORITY_BINDINGS")
-                });
+                // Uses bounded LIMIT-1 query instead of full table scan.
+                let wab_event = self
+                    .event_emitter
+                    .get_first_event_by_work_id_and_type(work_id, "evidence.published")
+                    .filter(|e| {
+                        // Verify this is a WORK_AUTHORITY_BINDINGS evidence
+                        // event via proper JSON deserialization.
+                        serde_json::from_slice::<serde_json::Value>(&e.payload).is_ok_and(
+                            |envelope| {
+                                matches!(
+                                    envelope.get("category").and_then(|v| v.as_str()),
+                                    Some("WORK_AUTHORITY_BINDINGS")
+                                )
+                            },
+                        )
+                    });
 
                 if let Some(wab) = wab_event {
-                    // Try to extract lease_id and evidence_id from the payload
+                    // Extract lease_id and evidence_id from the deserialized payload
                     if let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(&wab.payload)
                     {
                         let lease_id = envelope
@@ -35584,15 +35686,16 @@ mod tests {
                 other => panic!("Expected ClaimWorkV2 success, got: {other:?}"),
             }
 
-            // Verify work.transitioned event was emitted
+            // Verify work_transitioned event was emitted (legacy event type
+            // used by the projection bridge for proper payload normalization)
             let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
             let transitioned_count = events
                 .iter()
-                .filter(|e| e.event_type == "work.transitioned")
+                .filter(|e| e.event_type == "work_transitioned")
                 .count();
             assert_eq!(
                 transitioned_count, 1,
-                "ClaimWorkV2 must emit exactly 1 work.transitioned event"
+                "ClaimWorkV2 must emit exactly 1 work_transitioned event"
             );
 
             // Verify evidence.published event was emitted
@@ -35762,6 +35865,180 @@ mod tests {
                 Some("IMPLEMENTER"),
                 "CAS content must reference correct role"
             );
+        }
+
+        #[test]
+        fn lease_registered_in_validator() {
+            // BLOCKER fix: verify the issued lease is registered in LeaseValidator
+            let dispatcher = claim_v2_dispatcher();
+            let ctx = test_ctx();
+            let work_id = "W-test-lease-reg-001".to_string();
+            inject_work_opened(&dispatcher, &work_id);
+
+            let request = ClaimWorkV2Request {
+                work_id: work_id.clone(),
+                role: i32::from(WorkRole::Implementer),
+                lease_id: TEST_GOV_LEASE_ID.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let result = dispatcher.handle_claim_work_v2(&buf, &ctx);
+            let issued_lease_id = match result.unwrap() {
+                PrivilegedResponse::ClaimWorkV2(resp) => resp.issued_lease_id,
+                other => panic!("Expected ClaimWorkV2 success, got: {other:?}"),
+            };
+
+            // Verify the issued lease is registered in the LeaseValidator
+            let resolved_work_id = dispatcher
+                .lease_validator
+                .get_lease_work_id(&issued_lease_id);
+            assert_eq!(
+                resolved_work_id.as_deref(),
+                Some(work_id.as_str()),
+                "Issued lease must be resolvable to work_id via LeaseValidator"
+            );
+        }
+
+        #[test]
+        fn claim_registered_in_work_registry() {
+            // BLOCKER fix: verify the claim is registered in WorkRegistry
+            let dispatcher = claim_v2_dispatcher();
+            let ctx = test_ctx();
+            let work_id = "W-test-claim-reg-001".to_string();
+            inject_work_opened(&dispatcher, &work_id);
+
+            let request = ClaimWorkV2Request {
+                work_id: work_id.clone(),
+                role: i32::from(WorkRole::Implementer),
+                lease_id: TEST_GOV_LEASE_ID.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let result = dispatcher.handle_claim_work_v2(&buf, &ctx);
+            assert!(result.is_ok());
+            match result.unwrap() {
+                PrivilegedResponse::ClaimWorkV2(_) => {},
+                other => panic!("Expected ClaimWorkV2 success, got: {other:?}"),
+            }
+
+            // Verify the claim is registered
+            let claim = dispatcher.work_registry.get_claim(&work_id);
+            assert!(
+                claim.is_some(),
+                "Claim must be registered in WorkRegistry after ClaimWorkV2"
+            );
+            let claim = claim.unwrap();
+            assert_eq!(claim.work_id, work_id);
+            assert_eq!(claim.role, WorkRole::Implementer);
+        }
+
+        #[test]
+        fn idempotent_reclaim_same_actor_succeeds() {
+            // MAJOR fix: test that same-actor re-claim returns existing
+            // claim info (idempotency recovery).
+            let dispatcher = claim_v2_dispatcher();
+            let ctx = test_ctx();
+            let work_id = "W-test-idempotent-same-001".to_string();
+            inject_work_opened(&dispatcher, &work_id);
+
+            // First claim
+            let request = ClaimWorkV2Request {
+                work_id: work_id.clone(),
+                role: i32::from(WorkRole::Implementer),
+                lease_id: TEST_GOV_LEASE_ID.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let first_result = dispatcher.handle_claim_work_v2(&buf, &ctx);
+            let first_resp = match first_result.unwrap() {
+                PrivilegedResponse::ClaimWorkV2(resp) => resp,
+                other => panic!("Expected first ClaimWorkV2 success, got: {other:?}"),
+            };
+            assert!(
+                !first_resp.already_claimed,
+                "first claim should not be already_claimed"
+            );
+            assert!(!first_resp.issued_lease_id.is_empty());
+
+            // Second claim by same actor (same UID in peer credentials)
+            let mut buf2 = Vec::new();
+            request.encode(&mut buf2).expect("encode");
+            let second_result = dispatcher.handle_claim_work_v2(&buf2, &ctx);
+            let second_resp = match second_result.unwrap() {
+                PrivilegedResponse::ClaimWorkV2(resp) => resp,
+                other => panic!("Expected second ClaimWorkV2 idempotent success, got: {other:?}"),
+            };
+            assert!(
+                second_resp.already_claimed,
+                "second claim by same actor should return already_claimed=true"
+            );
+            assert_eq!(
+                second_resp.work_id, work_id,
+                "idempotent re-claim must return same work_id"
+            );
+        }
+
+        #[test]
+        fn reclaim_different_actor_rejected() {
+            // MAJOR fix: test that a different actor re-claiming fails
+            // with FAILED_PRECONDITION.
+            let dispatcher = claim_v2_dispatcher();
+            let work_id = "W-test-different-actor-001";
+            inject_work_opened(&dispatcher, work_id);
+
+            // First claim by actor with uid=1000
+            let ctx1 = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+            let request = ClaimWorkV2Request {
+                work_id: work_id.to_string(),
+                role: i32::from(WorkRole::Implementer),
+                lease_id: TEST_GOV_LEASE_ID.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let first_result = dispatcher.handle_claim_work_v2(&buf, &ctx1);
+            match first_result.unwrap() {
+                PrivilegedResponse::ClaimWorkV2(resp) => {
+                    assert!(!resp.already_claimed, "first claim should succeed");
+                },
+                other => panic!("Expected first ClaimWorkV2 success, got: {other:?}"),
+            }
+
+            // Second claim by different actor (uid=2000)
+            let ctx2 = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 2000,
+                gid: 2000,
+                pid: Some(99999),
+            }));
+            let mut buf2 = Vec::new();
+            request.encode(&mut buf2).expect("encode");
+            let second_result = dispatcher.handle_claim_work_v2(&buf2, &ctx2);
+            match second_result.unwrap() {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::FailedPrecondition),
+                        "Different actor re-claim must return FAILED_PRECONDITION"
+                    );
+                    assert!(
+                        err.message.contains("different actor"),
+                        "Error message should mention different actor, got: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!(
+                        "Expected FAILED_PRECONDITION for different actor re-claim, got: {other:?}"
+                    )
+                },
+            }
         }
     }
 
