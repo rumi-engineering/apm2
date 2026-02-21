@@ -477,6 +477,7 @@ fn test_work_completed_from_review() {
         vec![10, 20, 30],
         vec!["EVID-001".to_string(), "EVID-002".to_string()],
         "GATE-001",
+        "merge-receipt-sha123",
     );
     let mut complete_event = create_event("work.completed", "session-1", complete_payload);
     complete_event.timestamp_ns = 5_000_000_000;
@@ -488,6 +489,10 @@ fn test_work_completed_from_review() {
     assert_eq!(work.evidence_bundle_hash, Some(vec![10, 20, 30]));
     assert_eq!(work.evidence_ids, vec!["EVID-001", "EVID-002"]);
     assert_eq!(work.gate_receipt_id, Some("GATE-001".to_string()));
+    assert_eq!(
+        work.merge_receipt_id,
+        Some("merge-receipt-sha123".to_string())
+    );
     assert_eq!(work.last_transition_at, 5_000_000_000);
 }
 
@@ -505,6 +510,7 @@ fn test_work_completed_not_from_review_errors() {
         vec![10, 20, 30],
         vec!["EVID-001".to_string()],
         "GATE-001",
+        "",
     );
     let result = reducer.apply(
         &create_event("work.completed", "session-1", complete_payload),
@@ -537,7 +543,7 @@ fn test_work_completed_without_evidence_errors() {
         .unwrap();
 
     // Try to complete without evidence
-    let complete_payload = helpers::work_completed_payload("work-1", vec![], vec![], "");
+    let complete_payload = helpers::work_completed_payload("work-1", vec![], vec![], "", "");
     let result = reducer.apply(
         &create_event("work.completed", "session-1", complete_payload),
         &ctx,
@@ -546,6 +552,101 @@ fn test_work_completed_without_evidence_errors() {
         result,
         Err(WorkError::CompletionWithoutEvidence { .. })
     ));
+}
+
+// =============================================================================
+// TCK-00650: merge_receipt_id / gate_receipt_id field semantics
+// =============================================================================
+
+#[test]
+fn test_work_completed_rejects_merge_receipt_in_gate_receipt_id() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> Review
+    setup_review_work(&mut reducer, &ctx, "work-1");
+
+    // Attempt to complete with a merge-receipt-* string in gate_receipt_id
+    let complete_payload = helpers::work_completed_payload(
+        "work-1",
+        vec![10, 20, 30],
+        vec!["EVID-001".to_string()],
+        "merge-receipt-abc123",
+        "",
+    );
+    let result = reducer.apply(
+        &create_event("work.completed", "session-1", complete_payload),
+        &ctx,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(WorkError::MergeReceiptInGateReceiptField { .. })
+        ),
+        "expected MergeReceiptInGateReceiptField error, got: {result:?}"
+    );
+}
+
+#[test]
+fn test_work_completed_accepts_merge_receipt_in_dedicated_field() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> Review
+    setup_review_work(&mut reducer, &ctx, "work-1");
+
+    // Complete with merge_receipt_id in the dedicated field (gate_receipt_id left
+    // empty)
+    let complete_payload = helpers::work_completed_payload(
+        "work-1",
+        vec![10, 20, 30],
+        vec!["EVID-001".to_string()],
+        "",
+        "merge-receipt-abc123",
+    );
+    let mut complete_event = create_event("work.completed", "session-1", complete_payload);
+    complete_event.timestamp_ns = 5_000_000_000;
+    reducer.apply(&complete_event, &ctx).unwrap();
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Completed);
+    assert_eq!(work.gate_receipt_id, None);
+    assert_eq!(
+        work.merge_receipt_id,
+        Some("merge-receipt-abc123".to_string())
+    );
+}
+
+#[test]
+fn test_work_completed_stores_both_gate_and_merge_receipt_ids() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> Review
+    setup_review_work(&mut reducer, &ctx, "work-1");
+
+    // Complete with both gate_receipt_id (a real gate receipt) and merge_receipt_id
+    let complete_payload = helpers::work_completed_payload(
+        "work-1",
+        vec![10, 20, 30],
+        vec!["EVID-001".to_string()],
+        "gate-receipt-quality-001",
+        "merge-receipt-sha456",
+    );
+    let mut complete_event = create_event("work.completed", "session-1", complete_payload);
+    complete_event.timestamp_ns = 5_000_000_000;
+    reducer.apply(&complete_event, &ctx).unwrap();
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Completed);
+    assert_eq!(
+        work.gate_receipt_id,
+        Some("gate-receipt-quality-001".to_string())
+    );
+    assert_eq!(
+        work.merge_receipt_id,
+        Some("merge-receipt-sha456".to_string())
+    );
 }
 
 // =============================================================================
@@ -716,7 +817,7 @@ fn test_state_counts() {
         .apply(&create_event("work.transitioned", "s", review1), &ctx)
         .unwrap();
     let complete1 =
-        helpers::work_completed_payload("work-1", vec![1], vec!["E1".to_string()], "G1");
+        helpers::work_completed_payload("work-1", vec![1], vec!["E1".to_string()], "G1", "");
     reducer
         .apply(&create_event("work.completed", "s", complete1), &ctx)
         .unwrap();
@@ -908,6 +1009,24 @@ fn setup_in_progress_work(reducer: &mut WorkReducer, ctx: &ReducerContext, work_
         .unwrap();
 }
 
+/// Sets up a work item in the `Review` state.
+/// After this function: `transition_count` = 3
+fn setup_review_work(reducer: &mut WorkReducer, ctx: &ReducerContext, work_id: &str) {
+    setup_in_progress_work(reducer, ctx, work_id);
+
+    // transition_count = 2 after setup_in_progress_work
+    let review_payload = helpers::work_transitioned_payload_with_sequence(
+        work_id,
+        "IN_PROGRESS",
+        "REVIEW",
+        "submitted",
+        2,
+    );
+    reducer
+        .apply(&create_event("work.transitioned", "s", review_payload), ctx)
+        .unwrap();
+}
+
 /// Sets up a work item in the Completed state.
 /// After this function: `transition_count` = 4
 fn setup_completed_work(reducer: &mut WorkReducer, ctx: &ReducerContext, work_id: &str) {
@@ -926,7 +1045,7 @@ fn setup_completed_work(reducer: &mut WorkReducer, ctx: &ReducerContext, work_id
         .unwrap();
 
     let complete_payload =
-        helpers::work_completed_payload(work_id, vec![1], vec!["E1".to_string()], "G1");
+        helpers::work_completed_payload(work_id, vec![1], vec!["E1".to_string()], "G1", "");
     reducer
         .apply(&create_event("work.completed", "s", complete_payload), ctx)
         .unwrap();

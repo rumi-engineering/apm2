@@ -348,6 +348,11 @@ pub struct WorkCompleted {
     pub evidence_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, tag = "4")]
     pub gate_receipt_id: ::prost::alloc::string::String,
+    /// Dedicated merge receipt identifier, separate from gate_receipt_id.
+    /// Populated when work completes via merge executor.  The merge receipt
+    /// atomically binds gate outcomes to the observed merge result.
+    #[prost(string, tag = "5")]
+    pub merge_receipt_id: ::prost::alloc::string::String,
 }
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]

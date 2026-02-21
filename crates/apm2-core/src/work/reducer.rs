@@ -344,6 +344,15 @@ impl WorkReducer {
             });
         }
 
+        // Reject merge receipt identifiers from being placed in gate_receipt_id.
+        // Merge receipts belong in the dedicated merge_receipt_id field.
+        if event.gate_receipt_id.starts_with("merge-receipt-") {
+            return Err(WorkError::MergeReceiptInGateReceiptField {
+                work_id: work_id.clone(),
+                value: event.gate_receipt_id,
+            });
+        }
+
         // Apply completion
         work.state = WorkState::Completed;
         work.last_transition_at = timestamp;
@@ -354,6 +363,11 @@ impl WorkReducer {
             None
         } else {
             Some(event.gate_receipt_id)
+        };
+        work.merge_receipt_id = if event.merge_receipt_id.is_empty() {
+            None
+        } else {
+            Some(event.merge_receipt_id)
         };
 
         Ok(())
@@ -581,18 +595,29 @@ pub mod helpers {
     }
 
     /// Creates a `WorkCompleted` event payload.
+    ///
+    /// # Parameters
+    ///
+    /// * `gate_receipt_id` - ID of the gate receipt that authorized this
+    ///   completion.  Must NOT contain a merge receipt identifier (values
+    ///   matching `merge-receipt-*` are rejected at the reducer level).
+    /// * `merge_receipt_id` - Dedicated merge receipt identifier populated when
+    ///   work completes via the merge executor.  Pass `""` when no merge
+    ///   receipt is involved.
     #[must_use]
     pub fn work_completed_payload(
         work_id: &str,
         evidence_bundle_hash: Vec<u8>,
         evidence_ids: Vec<String>,
         gate_receipt_id: &str,
+        merge_receipt_id: &str,
     ) -> Vec<u8> {
         let completed = WorkCompleted {
             work_id: work_id.to_string(),
             evidence_bundle_hash,
             evidence_ids,
             gate_receipt_id: gate_receipt_id.to_string(),
+            merge_receipt_id: merge_receipt_id.to_string(),
         };
         let event = WorkEvent {
             event: Some(work_event::Event::Completed(completed)),

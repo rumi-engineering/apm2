@@ -95,6 +95,7 @@ pub struct Work {
     pub evidence_bundle_hash: Option<Vec<u8>>,
     pub evidence_ids: Vec<String>,
     pub gate_receipt_id: Option<String>,
+    pub merge_receipt_id: Option<String>,
     pub abort_reason: Option<String>,
     pub pr_number: Option<u64>,      // CI gating: PR number for CI event matching
     pub commit_sha: Option<String>,  // CI gating: commit SHA for CI verification
@@ -106,6 +107,8 @@ pub struct Work {
 - [INV-0105] `transition_count` monotonically increases on each transition
 - [INV-0106] `evidence_bundle_hash` and `evidence_ids` are populated only on completion
 - [INV-0107] `abort_reason` is populated only on abort
+- [INV-0113] `gate_receipt_id` MUST NOT contain merge receipt identifiers (values matching `merge-receipt-*`); use `merge_receipt_id` instead
+- [INV-0114] `merge_receipt_id` is populated on completion via merge executor; distinct from `gate_receipt_id`
 - [INV-0111] `pr_number` is set only via `WorkPrAssociated` event from `InProgress` state
 - [INV-0112] `commit_sha` is set together with `pr_number` for CI verification
 
@@ -148,6 +151,7 @@ pub enum WorkError {
     InvalidWorkState { value: String },
     InvalidWorkType { value: String },
     SequenceMismatch { work_id: String, expected: u32, actual: u32 },
+    MergeReceiptInGateReceiptField { work_id: String, value: String },
     ProtobufDecode(#[from] prost::DecodeError),
     PrAssociationNotAllowed { work_id: String, current_state: WorkState },
     PrNumberAlreadyAssociated { pr_number: u64, existing_work_id: String },
@@ -248,6 +252,7 @@ pub fn work_completed_payload(
     evidence_bundle_hash: Vec<u8>,
     evidence_ids: Vec<String>,
     gate_receipt_id: &str,
+    merge_receipt_id: &str,
 ) -> Vec<u8>
 
 pub fn work_aborted_payload(
@@ -353,7 +358,24 @@ Work cannot transition to `Completed` without evidence:
 
 ```rust
 // WorkError::CompletionWithoutEvidence
-let no_evidence = helpers::work_completed_payload("WORK-001", vec![], vec![], "");
+let no_evidence = helpers::work_completed_payload("WORK-001", vec![], vec![], "", "");
+```
+
+### Gate Receipt / Merge Receipt Domain Separation (TCK-00650)
+
+The `gate_receipt_id` field is reserved for gate-level receipts (AAT, Quality, Security). Merge receipt identifiers (values matching `merge-receipt-*`) MUST be placed in the dedicated `merge_receipt_id` field. The reducer enforces this at event application time:
+
+```rust
+// WorkError::MergeReceiptInGateReceiptField
+let bad = helpers::work_completed_payload(
+    "WORK-001", vec![1], vec!["E1".into()], "merge-receipt-abc123", "",
+);
+// Fails: merge receipt pattern rejected in gate_receipt_id
+
+// Correct usage: merge receipt in dedicated field
+let good = helpers::work_completed_payload(
+    "WORK-001", vec![1], vec!["E1".into()], "", "merge-receipt-abc123",
+);
 ```
 
 ### PR Association Constraints (CI Gating)

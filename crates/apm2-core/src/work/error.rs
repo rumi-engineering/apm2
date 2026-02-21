@@ -47,6 +47,19 @@ pub enum WorkError {
         work_id: String,
     },
 
+    /// Merge receipt ID placed into `gate_receipt_id` field.
+    ///
+    /// The `gate_receipt_id` field is reserved for gate-level receipts.
+    /// Merge receipts must be stored in the dedicated `merge_receipt_id`
+    /// field to avoid semantic confusion.
+    #[error("gate_receipt_id contains a merge receipt identifier for work_id {work_id}: '{value}'")]
+    MergeReceiptInGateReceiptField {
+        /// The work ID.
+        work_id: String,
+        /// The invalid value that was placed in `gate_receipt_id`.
+        value: String,
+    },
+
     /// Invalid work state string.
     #[error("invalid work state: {value}")]
     InvalidWorkState {
