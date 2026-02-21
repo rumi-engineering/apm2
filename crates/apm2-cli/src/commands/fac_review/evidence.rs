@@ -1401,7 +1401,8 @@ fn resolve_evidence_gate_progress_callback(
 /// * `lane_dir` - The lane directory from the actually-locked lane (returned by
 ///   `allocate_lane_job_logs_dir`). This MUST correspond to the lane protected
 ///   by the caller's `LaneLockGuard` to maintain lock/env coupling and prevent
-///   concurrent access races (e.g., with `apm2 fac lane reset`).
+///   concurrent access races (e.g., with `apm2 fac doctor --fix` lane
+///   remediation).
 fn build_gate_policy_env(lane_dir: &Path) -> Result<Vec<(String, String)>, String> {
     let apm2_home = apm2_core::github::resolve_apm2_home()
         .ok_or_else(|| "cannot resolve APM2_HOME for gate env policy enforcement".to_string())?;
@@ -1453,7 +1454,7 @@ pub(super) struct EvidenceLaneContext {
     lane_dir: PathBuf,
     /// Exclusive lock guard for the allocated lane. Must be held for the
     /// entire duration of lane usage to prevent concurrent access (e.g.,
-    /// `apm2 fac lane reset` racing with env dir creation).
+    /// doctor remediation racing with env dir creation).
     _lane_guard: LaneLockGuard,
 }
 

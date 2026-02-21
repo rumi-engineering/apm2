@@ -818,8 +818,8 @@ pub use systemd_properties::{
     NetworkPolicy, SandboxHardeningProfile, SystemdUnitProperties, resolve_network_policy,
 };
 pub use systemd_unit::{
-    FacUnitLiveness, ORPHANED_SYSTEMD_UNIT_REASON_CODE, check_fac_unit_liveness,
-    detect_systemd_unit_name,
+    FAC_UNIT_LIVENESS_UNAVAILABLE_REASON, FacUnitLiveness, ORPHANED_SYSTEMD_UNIT_REASON_CODE,
+    check_fac_lane_liveness, check_fac_unit_liveness, detect_systemd_unit_name,
 };
 pub use warm::{
     DEFAULT_WARM_PHASES, MAX_WARM_PHASES, MAX_WARM_RECEIPT_SIZE, MAX_WARM_STRING_LENGTH,

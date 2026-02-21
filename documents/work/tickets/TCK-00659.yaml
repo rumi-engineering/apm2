@@ -32,28 +32,33 @@ context:
     - 'Operators observe "dead PID" leases but still see systemd units consuming CPU/memory.'
   code_evidence:
     - |
-      Warm phases execute via systemd-run (unit name includes lane_id + job_id prefix):
-        crates/apm2-core/src/fac/warm.rs:624-636
+      Baseline control already present on main: worker unit name detection from /proc/self/cgroup:
+        crates/apm2-core/src/fac/systemd_unit.rs
     - |
-      build_systemd_run_command does not bind transient units to the parent worker unit:
-        crates/apm2-core/src/fac/execution_backend.rs:404-455
+      Baseline control already present on main: systemd-run includes PartOf/BindsTo parent binding:
+        crates/apm2-core/src/fac/execution_backend.rs
     - |
-      Lane lease PID is currently the worker PID (not the systemd unit main PID):
-        crates/apm2-cli/src/commands/fac_worker.rs:4385-4416
+      Baseline control already present on main: stale-lease reclaim consults FAC unit liveness fail-closed:
+        crates/apm2-cli/src/commands/fac_worker.rs
+    - |
+      Remaining gap addressed by this ticket revision: host-side remediation was still fragmented
+      and tmp scrub used nested per-directory limits that could amplify resource use:
+        crates/apm2-cli/src/commands/fac.rs
 
 problem_statement: |
-  The system currently assumes that "worker process liveness" implies "job liveness". This is false
-  when execution is delegated to systemd transient units (systemd-run). A worker crash can orphan
-  job units, releasing lane locks and enabling unsafe concurrent work, while reconcile may clear
-  leases as stale because the worker PID is dead.
+  Core orphan-prevention controls (unit binding + reclaim guard) now exist in baseline code, but
+  host recovery remained operationally fragmented across legacy commands and `apm2 fac doctor --fix`
+  still had boundedness gaps in tmp scrub. This caused confusing remediation workflows and exposed a
+  denial-of-service risk from nested tmp directory fan-out.
 
 root_cause_analysis:
   primary_cause: |
-    systemd-run units are not tied to the lifetime of the worker service unit, so they can outlive
-    the worker process. Lane ownership is tracked via a PID that may die while the unit continues.
+    Recovery entrypoints diverged over time (doctor + legacy reconcile/reset paths), and the tmp
+    scrub implementation applied a fresh large nested-directory budget per entry instead of one
+    bounded traversal for the tmp tree.
   contributing_factors:
-    - 'Lane reclaim logic uses lock + PID, but does not consult systemd unit state as additional evidence.'
-    - 'Unit naming is job-specific; there is no lane-scoped exclusivity enforced at the systemd layer.'
+    - 'Ticket scope evolved after baseline S1-S3 landed, but the in-scope list was not narrowed.'
+    - 'Operator runbooks and recommendations still referenced removed legacy commands.'
 
 proposed_change:
   intent: |
@@ -62,6 +67,8 @@ proposed_change:
       1) Bind transient units to the parent worker systemd unit (PartOf/BindsTo).
       2) Add a lane reclaim guard: before clearing a stale lease (pid dead), check if any job units
          associated with that lease are still active; if yes, fail-closed and surface remediation.
+      3) Consolidate host-side repair into `apm2 fac doctor --fix` (no new command surface): run
+         deterministic reconcile + targeted lane recovery/remediation when trigger conditions match.
 
 invariants:
   - id: 'INV-SD-BIND-001'
@@ -71,82 +78,76 @@ invariants:
 
 scope:
   in_scope:
-    - id: 'S1'
-      description: |
-        Detect the current systemd unit name for the running worker process:
-          - Implement apm2-core helper: detect_systemd_unit_name()
-            * Parse /proc/self/cgroup (preferred) to extract the .service/.scope component.
-            * Return None when not running under systemd.
-          - Unit tests: parse representative cgroup paths for system + user scope.
-    - id: 'S2'
-      description: |
-        Bind spawned transient units to the detected parent unit:
-          - In execution_backend::build_systemd_run_command:
-              * If parent_unit is Some, append:
-                  --property=PartOf=<parent_unit>
-                  --property=BindsTo=<parent_unit>
-              * Keep existing KillMode semantics; ensure Stop/Kill behavior is cgroup-scoped.
-          - Ensure warm.rs and any other systemd-run call sites use this updated builder.
-    - id: 'S3'
-      description: |
-        Lane reclaim guard using systemd unit liveness (defense-in-depth):
-          - Add helper (apm2-core or apm2-cli): is_fac_unit_active(lane_id, job_id) -> tri-state
-              * Check apm2-fac-job-{lane_id}-{job_id}.service
-              * Check apm2-warm-{lane_id}-{job_prefix}-*.service (any active)
-            Implementation notes:
-              * Prefer `systemctl is-active` or `systemctl show -p ActiveState` in the correct scope.
-              * Fail-closed on errors (Unknown => treat as active for reclaim decisions).
-          - Update reconcile_lanes and acquire_worker_lane:
-              * Before removing a lease because PID is dead, consult unit liveness.
-              * If units are active => mark lane Corrupt with a specific reason (ORPHANED_SYSTEMD_UNIT)
-                and do NOT requeue claimed job automatically.
     - id: 'S4'
       description: |
         Documentation + operator UX:
           - fac doctor / services status should surface "orphaned systemd unit" clearly and suggest
-            remediation (stop_revoke, lane reset).
+            remediation (stop_revoke, `apm2 fac doctor --fix`).
           - Add an explicit log line when reclaim is blocked due to active units.
+    - id: 'S5'
+      description: |
+        Doctor fix consolidation (no new commands):
+          - `apm2 fac doctor --fix` without `--pr` becomes a system reconciler that:
+              * runs lane reconcile and queue reconcile apply paths,
+              * detects tmp-corruption triggers and performs bounded tmp scrub,
+              * performs stale lane-log GC under bounded retention policy,
+              * attempts bounded lane recovery (including lane reset retry) for
+                trigger-matched CORRUPT lanes,
+              * fails closed when orphaned units are still active/unknown,
+              * re-runs doctor checks and emits structured action outcomes.
+          - Keep `apm2 fac doctor --pr <N> --fix` semantics unchanged.
+          - Remove legacy crash-recovery command entrypoints (`fac reconcile`, `fac lane reset`,
+            `fac lane reconcile`) so doctor is the sole remediation surface.
+    - id: 'S6'
+      description: |
+        Tmp scrub hardening:
+          - Replace per-entry nested tmp deletion with one bounded traversal of the tmp tree.
+          - Enforce a single fail-closed bound for tmp scrub traversal to prevent nested
+            limit amplification and resource exhaustion.
+          - Recreate tmp directory after scrub so lane structure remains valid.
   out_of_scope:
+    - 'Re-implementing S1/S2/S3 controls (already present in baseline code on main).'
     - 'Replacing file locks with systemd unit-name locks (larger redesign).'
     - 'Full D-Bus integration (CLI-based systemctl calls are acceptable for now).'
+    - 'Adding a new FAC remediation command family; doctor is the consolidation surface.'
 
 plan:
   steps:
-    - id: 'P1'
-      description: 'Implement detect_systemd_unit_name() + tests.'
-    - id: 'P2'
-      description: 'Update build_systemd_run_command to optionally bind to parent unit; add unit tests to assert args are present.'
-    - id: 'P3'
-      description: 'Add systemd unit liveness helper and integrate into lane reclaim logic (reconcile + acquire_worker_lane).'
     - id: 'P4'
       description: 'Update fac doctor/status output to expose orphaned units (actionable output).'
+    - id: 'P5'
+      description: 'Implement no-PR `apm2 fac doctor --fix` reconciliation flow (reconcile + tmp detection/scrub + stale log GC + trigger-based lane reset + post-check).'
+    - id: 'P6'
+      description: 'Harden tmp scrub with one bounded traversal and deterministic fail-closed errors.'
 
 
 definition_of_done:
   criteria:
-    - 'systemd-run commands emitted by FAC include PartOf/BindsTo when worker is running under systemd.'
-    - 'Lane reclaim will not clear a lease (and thus not re-use a lane) while systemd indicates associated work units are active.'
+    - 'Scope S4 docs/UX updates are complete and only doctor is advertised for host remediation.'
     - 'Operator-facing tooling surfaces orphaned-unit situations and points to remediation.'
+    - '`apm2 fac doctor --fix` (without `--pr`) performs bounded reconciliation/remediation and emits structured action/check output.'
+    - 'Tmp scrub is bounded by a single traversal limit and fails closed on oversized trees.'
   evidence_ids:
-    - 'EVID-TCK-00659-01 (unit): detect_systemd_unit_name() parsing tests'
-    - 'EVID-TCK-00659-02 (unit): build_systemd_run_command includes PartOf/BindsTo'
-    - 'EVID-TCK-00659-03 (unit/integration): lane reclaim blocked when unit active (mocked systemctl)'
+    - 'EVID-TCK-00659-04 (unit): doctor --fix action schema and exit-code behavior tests'
+    - 'EVID-TCK-00659-05 (unit): tmp scrub bounded traversal + fail-closed oversized-tree behavior'
+    - 'EVID-TCK-00659-06 (docs): runbooks/skills/reference text migrated to `apm2 fac doctor --fix`'
 
 test_plan:
   unit_tests:
-    - 'apm2-core execution_backend: verify constructed argv contains binding properties'
-    - 'apm2-core helper: parse /proc/self/cgroup fixtures'
+    - 'apm2-cli fac doctor: structured action serialization and blocked-action exit-code tests'
+    - 'apm2-cli tmp scrub: nested entries are removed and tmp root is recreated'
+    - 'apm2-cli tmp scrub: oversized nested tree returns deterministic entry-bound error'
   integration_tests:
     - |
-      Provide a test double for systemctl queries (dependency-injected command runner) so CI does not
-      require a real systemd instance. Verify lane reclaim behavior across:
-        - unit active => do not reclaim
-        - unit inactive => reclaim allowed
+      Validate no-PR `apm2 fac doctor --fix` reconciliation flow in a seeded lane/queue fixture:
+        - trigger-matched CORRUPT lane remediation path executes in bounded order
+        - post-fix doctor rerun emits structured action outcomes and fail-closed status on blockers
 
 notes:
   risk:
-    - 'Adding PartOf/BindsTo could fail on systems where the detected parent unit name is malformed; sanitize extracted unit names.'
-    - 'systemctl calls can be slow; cache results per lane per tick and bound total time.'
+    - 'Bounded tmp scrub may refuse extremely large transient trees; this is intentional fail-closed behavior.'
+    - 'Doctor-only remediation increases dependency on doctor correctness; tests must cover action ordering and exit semantics.'
   safety: |
-    This is safety-critical: the reclaim guard prevents concurrent execution in a lane. If systemd
-    queries fail, default must be fail-closed (treat as active).
+    This is safety-critical: recovery must remain deterministic and fail-closed. Oversized or ambiguous
+    tmp state must not trigger unbounded cleanup work, and blocked remediation actions must produce
+    non-zero exit to prevent false-success automation.

@@ -51,12 +51,14 @@ use std::process::Command;
 
 use apm2_core::fac::service_user_gate::QueueWriteMode;
 use apm2_core::fac::{
-    FacUnitLiveness, LANE_ENV_DIRS, LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1,
-    LaneManager, LaneReconcileReceiptV1, LaneState, LaneStatusV1,
-    ORPHANED_SYSTEMD_UNIT_REASON_CODE, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, ProcessIdentity,
-    REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA,
-    SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
-    check_fac_unit_liveness, safe_rmtree_v1, verify_pid_identity,
+    FAC_UNIT_LIVENESS_UNAVAILABLE_REASON, FacUnitLiveness, GcActionKind, GcPlan, LANE_ENV_DIRS,
+    LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1, LaneManager, LaneState, LaneStatusV1,
+    LogRetentionConfig, MAX_LOG_DIR_ENTRIES, ORPHANED_SYSTEMD_UNIT_REASON_CODE,
+    PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, ProcessIdentity, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER,
+    RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA, SafeRmtreeError, SafeRmtreeOutcome,
+    TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
+    check_fac_lane_liveness, check_fac_unit_liveness, execute_gc, plan_gc_with_log_retention,
+    safe_rmtree_v1, safe_rmtree_v1_with_entry_limit, verify_pid_identity,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
@@ -102,6 +104,9 @@ const SERVICE_STATUS_PROPERTIES: [&str; 7] = [
     "ActiveEnterTimestampMonotonic",
     "WatchdogUSec",
 ];
+const FAC_DOCTOR_SYSTEM_SCHEMA: &str = "apm2.fac.doctor.system.v1";
+const FAC_DOCTOR_SYSTEM_FIX_SCHEMA: &str = "apm2.fac.doctor.system_fix.v1";
+const MAX_TMP_SCRUB_ENTRIES: usize = 250_000;
 
 // =============================================================================
 // Command Types
@@ -315,11 +320,6 @@ pub enum FacSubcommand {
     /// Import validates RFC-0028 channel boundary and RFC-0029 economics
     /// receipts, rejecting bundles that fail either check (fail-closed).
     Bundle(BundleArgs),
-    /// Reconcile queue and lane state after crash or unclean shutdown.
-    ///
-    /// Detects stale lane leases (PID dead, lock released), orphaned claimed
-    /// jobs, and recovers them deterministically. All actions emit receipts.
-    Reconcile(ReconcileArgs),
     /// Introspect FAC queue state (forensics-first UX).
     ///
     /// Shows job counts by directory, oldest pending job, and
@@ -569,7 +569,7 @@ pub struct DoctorArgs {
     )]
     pub repo: Option<String>,
 
-    /// Execute doctor-prescribed recovery actions for the PR.
+    /// Execute doctor-prescribed recovery actions.
     #[arg(long, default_value_t = false)]
     pub fix: bool,
 
@@ -981,13 +981,6 @@ pub enum LaneSubcommand {
     /// Reports each lane's state derived from lock state, lease records,
     /// and PID liveness checks. Detects stale leases from crashed jobs.
     Status(LaneStatusArgs),
-    /// Reset a lane by deleting its workspace, target, and logs.
-    ///
-    /// Refuses to reset a RUNNING lane unless `--force` is provided.
-    /// With `--force`, attempts to kill the lane's process before
-    /// cleaning up. Uses `safe_rmtree_v1` which refuses symlink
-    /// traversal and crossing filesystem boundaries.
-    Reset(LaneResetArgs),
     /// Initialize the lane pool: create directories and write default profiles.
     ///
     /// Bootstraps a fresh `$APM2_HOME` into a ready lane pool with one
@@ -995,18 +988,11 @@ pub enum LaneSubcommand {
     /// Lane count is configurable via `$APM2_FAC_LANE_COUNT` (default: 3,
     /// max: 32).
     Init(LaneInitArgs),
-    /// Reconcile lane state: repair missing directories and profiles.
-    ///
-    /// Inspects all configured lanes and repairs missing directories or
-    /// profiles. Lanes that cannot be repaired are marked CORRUPT.
-    /// Existing corrupt markers are reported but not cleared (use
-    /// `apm2 fac lane reset` to clear them).
-    Reconcile(LaneReconcileArgs),
     /// Mark a lane as CORRUPT with an operator-provided reason.
     ///
     /// Writes a `corrupt.v1.json` marker file into the lane directory.
     /// A CORRUPT lane refuses all future job leases until an operator
-    /// clears the marker via `apm2 fac lane reset`.
+    /// clears the marker via `apm2 fac doctor --fix`.
     ///
     /// This is an operator tool for manually quarantining a lane when
     /// automated detection has not yet triggered (e.g., suspected data
@@ -1027,32 +1013,9 @@ pub struct LaneStatusArgs {
     pub json: bool,
 }
 
-/// Arguments for `apm2 fac lane reset`.
-#[derive(Debug, Args)]
-pub struct LaneResetArgs {
-    /// Lane identifier to reset (e.g., `lane-00`).
-    pub lane_id: String,
-
-    /// Force reset even if lane is RUNNING. Kills the lane's process first.
-    #[arg(long, default_value_t = false)]
-    pub force: bool,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
-
 /// Arguments for `apm2 fac lane init` (TCK-00539).
 #[derive(Debug, Args)]
 pub struct LaneInitArgs {
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
-
-/// Arguments for `apm2 fac lane reconcile` (TCK-00539).
-#[derive(Debug, Args)]
-pub struct LaneReconcileArgs {
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -1072,26 +1035,6 @@ pub struct LaneMarkCorruptArgs {
     /// marker to an evidence artifact.
     #[arg(long)]
     pub receipt_digest: Option<String>,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
-
-/// Arguments for `apm2 fac reconcile`.
-#[derive(Debug, Args)]
-pub struct ReconcileArgs {
-    /// Report what would be done without mutating state.
-    #[arg(long, default_value_t = false)]
-    pub dry_run: bool,
-
-    /// Apply all recovery mutations.
-    #[arg(long, default_value_t = false)]
-    pub apply: bool,
-
-    /// Policy for orphaned claimed jobs: "requeue" (default) or "mark-failed".
-    #[arg(long, default_value = "requeue")]
-    pub orphan_policy: String,
 
     /// Emit JSON output for this command.
     #[arg(long, default_value_t = false)]
@@ -1917,6 +1860,89 @@ struct ServicesStatusResponse {
     pub orphaned_systemd_unit_error: Option<String>,
 }
 
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SystemDoctorFixActionStatus {
+    Applied,
+    Skipped,
+    Blocked,
+    Failed,
+}
+
+#[derive(Debug, Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum SystemDoctorFixActionKind {
+    LaneReconcile,
+    QueueReconcileApply,
+    LaneLogGc,
+    LaneStatusScan,
+    LaneTmpCorruptionDetection,
+    LaneTmpCorruptionDetected,
+    LaneTmpScrub,
+    LaneResetOrphanedSystemdUnit,
+    LaneResetTmpCorruption,
+    LaneResetCleanupRecovery,
+    QueueReconcilePostLaneReset,
+    WorkerRestart,
+    DoctorPostCheck,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SystemDoctorFixAction {
+    pub action: SystemDoctorFixActionKind,
+    pub status: SystemDoctorFixActionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane_id: Option<String>,
+    pub detail: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SystemDoctorFixResponse {
+    pub schema: String,
+    pub actions: Vec<SystemDoctorFixAction>,
+    pub checks_before: Vec<crate::commands::daemon::DaemonDoctorCheck>,
+    pub checks_after: Vec<crate::commands::daemon::DaemonDoctorCheck>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tracked_prs: Vec<fac_review::DoctorTrackedPrSummary>,
+    pub had_errors_before: bool,
+    pub has_errors_after: bool,
+}
+
+#[derive(Debug)]
+struct DoctorSystemSnapshot {
+    checks: Vec<crate::commands::daemon::DaemonDoctorCheck>,
+    tracked_prs: Vec<fac_review::DoctorTrackedPrSummary>,
+    has_critical_error: bool,
+}
+
+#[derive(Debug)]
+enum DoctorLaneResetError {
+    Running { pid: Option<u32> },
+    RefusedDelete { receipts: Vec<RefusedDeleteReceipt> },
+    Other(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DoctorLaneResetSummary {
+    files_deleted: u64,
+    dirs_deleted: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TmpScrubSummary {
+    entries_deleted: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LaneLogGcSummary {
+    targets: usize,
+    actions_applied: usize,
+    errors: usize,
+    bytes_freed: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ServiceScope {
     /// User systemd scope.
@@ -1979,6 +2005,79 @@ fn describe_orphaned_unit_liveness(liveness: FacUnitLiveness) -> (String, String
     }
 }
 
+fn enforce_lane_reset_liveness_guard<F>(
+    lane_id: &str,
+    job_id: Option<&str>,
+    probe: F,
+) -> Result<(), String>
+where
+    F: Fn(&str, &str) -> FacUnitLiveness,
+{
+    let Some(job_id) = job_id else {
+        return Err("reset blocked: cannot verify unit liveness without lease job_id".to_string());
+    };
+    let liveness = probe(lane_id, job_id);
+    if matches!(liveness, FacUnitLiveness::Inactive) {
+        return Ok(());
+    }
+
+    let (state, detail, active_units) = describe_orphaned_unit_liveness(liveness);
+    if active_units.is_empty() {
+        Err(format!("reset blocked while liveness={state}: {detail}"))
+    } else {
+        Err(format!(
+            "reset blocked while liveness={state}: {detail}; active_units={}",
+            active_units.join(", ")
+        ))
+    }
+}
+
+fn enforce_lane_reset_liveness_for_context<F, G>(
+    lane_id: &str,
+    job_id: Option<&str>,
+    reason_is_orphaned: bool,
+    unit_probe: F,
+    lane_probe: G,
+) -> Result<(), String>
+where
+    F: Fn(&str, &str) -> FacUnitLiveness,
+    G: Fn(&str) -> FacUnitLiveness,
+{
+    if job_id.is_some() {
+        return enforce_lane_reset_liveness_guard(lane_id, job_id, unit_probe);
+    }
+
+    if reason_is_orphaned {
+        return Err(
+            "reset blocked: orphaned-systemd lane is missing lease job_id for liveness verification"
+                .to_string(),
+        );
+    }
+
+    let liveness = lane_probe(lane_id);
+    match liveness {
+        FacUnitLiveness::Inactive => Ok(()),
+        FacUnitLiveness::Unknown { reason }
+            if reason.contains(FAC_UNIT_LIVENESS_UNAVAILABLE_REASON) =>
+        {
+            // No reachable systemd scope on this host; allow non-orphaned
+            // manual recovery when no lane/job identity exists.
+            Ok(())
+        },
+        other => {
+            let (state, detail, active_units) = describe_orphaned_unit_liveness(other);
+            if active_units.is_empty() {
+                Err(format!("reset blocked while liveness={state}: {detail}"))
+            } else {
+                Err(format!(
+                    "reset blocked while liveness={state}: {detail}; active_units={}",
+                    active_units.join(", ")
+                ))
+            }
+        },
+    }
+}
+
 fn collect_orphaned_systemd_units(
     fac_root: &Path,
 ) -> Result<Vec<OrphanedSystemdUnitDiagnostic>, String> {
@@ -2020,12 +2119,966 @@ fn collect_orphaned_systemd_units(
             liveness: liveness_state,
             detail,
             recommended_action:
-                "run stop_revoke for the target job to stop active units, then run `apm2 fac lane reset <lane_id>`".to_string(),
+                "run stop_revoke for the target job to stop active units, then run `apm2 fac doctor --fix`".to_string(),
             active_units,
         });
     }
 
     Ok(diagnostics)
+}
+
+fn push_system_doctor_fix_action(
+    actions: &mut Vec<SystemDoctorFixAction>,
+    action: SystemDoctorFixActionKind,
+    status: SystemDoctorFixActionStatus,
+    lane_id: Option<&str>,
+    detail: impl Into<String>,
+) {
+    actions.push(SystemDoctorFixAction {
+        action,
+        status,
+        lane_id: lane_id.map(std::string::ToString::to_string),
+        detail: detail.into(),
+    });
+}
+
+const fn system_doctor_fix_exit_code(
+    action_failed: bool,
+    has_blocked_actions: bool,
+    has_errors_after: bool,
+) -> u8 {
+    if action_failed || has_blocked_actions || has_errors_after {
+        exit_codes::GENERIC_ERROR
+    } else {
+        exit_codes::SUCCESS
+    }
+}
+
+fn collect_system_doctor_snapshot(
+    operator_socket: &Path,
+    config_path: &Path,
+    full: bool,
+    include_tracked_prs: bool,
+    repo_filter: Option<&str>,
+) -> Result<DoctorSystemSnapshot, String> {
+    let (mut checks, has_critical_error) =
+        crate::commands::daemon::collect_doctor_checks(operator_socket, config_path, full)
+            .map_err(|err| err.to_string())?;
+    let tracked_prs = if include_tracked_prs {
+        match fac_review::collect_tracked_pr_summaries(repo_filter, repo_filter) {
+            Ok(value) => value,
+            Err(err) => {
+                checks.push(crate::commands::daemon::DaemonDoctorCheck {
+                    name: "tracked_pr_summary".to_string(),
+                    status: "WARN",
+                    message: format!("failed to build tracked PR doctor summary: {err}"),
+                });
+                Vec::new()
+            },
+        }
+    } else {
+        Vec::new()
+    };
+
+    Ok(DoctorSystemSnapshot {
+        checks,
+        tracked_prs,
+        has_critical_error,
+    })
+}
+
+fn emit_system_doctor_snapshot(snapshot: &DoctorSystemSnapshot) {
+    let payload = serde_json::json!({
+        "schema": FAC_DOCTOR_SYSTEM_SCHEMA,
+        "checks": snapshot.checks,
+        "tracked_prs": snapshot.tracked_prs,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+    );
+}
+
+fn load_lane_reason_hint(manager: &LaneManager, status: &LaneStatusV1) -> Option<String> {
+    if let Some(reason) = status.corrupt_reason.as_ref() {
+        return Some(reason.clone());
+    }
+    if status.state != LaneState::Corrupt {
+        return None;
+    }
+    let lease = LaneLeaseV1::load(&manager.lane_dir(&status.lane_id))
+        .ok()
+        .flatten()?;
+    if lease.state == LaneState::Corrupt && lease.pid == 0 {
+        return Some(lease.job_id);
+    }
+    None
+}
+
+#[cfg(test)]
+fn should_attempt_cleanup_scrub(reason_hint: &str) -> bool {
+    let reason = reason_hint.to_ascii_lowercase();
+    reason.contains("more than") && reason.contains("entries")
+        || reason.contains("unexpected file type")
+        || reason.contains("symlink detected")
+        || reason.contains("tmp")
+}
+
+fn is_tmp_residue_name(name: &str) -> bool {
+    name.starts_with(".tmp")
+        || name.starts_with("tmp.")
+        || Path::new(name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+}
+
+fn detect_lane_tmp_corruption(
+    manager: &LaneManager,
+    lane_id: &str,
+) -> Result<Option<String>, String> {
+    let tmp_dir = manager.lane_dir(lane_id).join("tmp");
+    let tmp_meta = match std::fs::symlink_metadata(&tmp_dir) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "failed to stat tmp dir {}: {err}",
+                tmp_dir.display()
+            ));
+        },
+    };
+
+    if !tmp_meta.is_dir() {
+        return Ok(Some(format!(
+            "tmp path is not a directory: {}",
+            tmp_dir.display()
+        )));
+    }
+
+    let entries = std::fs::read_dir(&tmp_dir)
+        .map_err(|err| format!("failed to read tmp dir {}: {err}", tmp_dir.display()))?;
+    let mut scanned_entries: usize = 0;
+    for entry in entries {
+        scanned_entries = scanned_entries.saturating_add(1);
+        if scanned_entries > MAX_TMP_SCRUB_ENTRIES {
+            return Ok(Some(format!(
+                "tmp entry count exceeded bound (>{MAX_TMP_SCRUB_ENTRIES})"
+            )));
+        }
+
+        let entry = entry.map_err(|err| format!("failed to read tmp entry: {err}"))?;
+        let path = entry.path();
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(format!(
+                    "failed to stat tmp entry {}: {err}",
+                    path.display()
+                ));
+            },
+        };
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            return Ok(Some(format!(
+                "tmp contains symlink entry {}",
+                path.display()
+            )));
+        }
+        if meta.is_dir() {
+            continue;
+        }
+        if meta.is_file() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if is_tmp_residue_name(&name) {
+                return Ok(Some(format!(
+                    "tmp contains transient residue entry {}",
+                    path.display()
+                )));
+            }
+            continue;
+        }
+        return Ok(Some(format!(
+            "tmp contains unsupported file type at {}",
+            path.display()
+        )));
+    }
+
+    Ok(None)
+}
+
+fn doctor_reset_lane_once(
+    manager: &LaneManager,
+    lane_id: &str,
+) -> Result<DoctorLaneResetSummary, DoctorLaneResetError> {
+    manager.ensure_directories().map_err(|err| {
+        DoctorLaneResetError::Other(format!("failed to ensure directories: {err}"))
+    })?;
+
+    let _lock_guard = manager
+        .acquire_lock(lane_id)
+        .map_err(|err| DoctorLaneResetError::Other(format!("failed to acquire lock: {err}")))?;
+    let status = manager
+        .lane_status(lane_id)
+        .map_err(|err| DoctorLaneResetError::Other(format!("failed to load lane status: {err}")))?;
+    if status.state == LaneState::Running {
+        return Err(DoctorLaneResetError::Running { pid: status.pid });
+    }
+
+    let lane_dir = manager.lane_dir(lane_id);
+    let Some(lanes_root) = lane_dir.parent() else {
+        return Err(DoctorLaneResetError::Other(format!(
+            "lane directory {} has no parent",
+            lane_dir.display()
+        )));
+    };
+
+    let mut subdirs: Vec<&str> = vec!["workspace", "target", "logs"];
+    subdirs.extend_from_slice(LANE_ENV_DIRS);
+
+    let mut total_files: u64 = 0;
+    let mut total_dirs: u64 = 0;
+    let mut refused_receipts: Vec<RefusedDeleteReceipt> = Vec::new();
+    for subdir in &subdirs {
+        let subdir_path = lane_dir.join(subdir);
+        match safe_rmtree_v1(&subdir_path, lanes_root) {
+            Ok(SafeRmtreeOutcome::Deleted {
+                files_deleted,
+                dirs_deleted,
+            }) => {
+                total_files = total_files.saturating_add(files_deleted);
+                total_dirs = total_dirs.saturating_add(dirs_deleted);
+            },
+            Ok(SafeRmtreeOutcome::AlreadyAbsent) => {},
+            Err(err) => {
+                refused_receipts.push(RefusedDeleteReceipt {
+                    root: subdir_path,
+                    allowed_parent: lanes_root.to_path_buf(),
+                    reason: err.to_string(),
+                    mark_corrupt: true,
+                });
+            },
+        }
+    }
+    if !refused_receipts.is_empty() {
+        return Err(DoctorLaneResetError::RefusedDelete {
+            receipts: refused_receipts,
+        });
+    }
+
+    LaneLeaseV1::remove(&lane_dir).map_err(|err| {
+        DoctorLaneResetError::Other(format!("failed to remove lane lease: {err}"))
+    })?;
+    LaneCorruptMarkerV1::remove(manager.fac_root(), lane_id).map_err(|err| {
+        DoctorLaneResetError::Other(format!("failed to clear corrupt marker: {err}"))
+    })?;
+
+    manager.ensure_directories().map_err(|err| {
+        DoctorLaneResetError::Other(format!("failed to re-create lane directories: {err}"))
+    })?;
+
+    Ok(DoctorLaneResetSummary {
+        files_deleted: total_files,
+        dirs_deleted: total_dirs,
+    })
+}
+
+fn refused_delete_mentions_tmp(receipts: &[RefusedDeleteReceipt]) -> bool {
+    receipts
+        .iter()
+        .any(|receipt| receipt.root.file_name().and_then(|name| name.to_str()) == Some("tmp"))
+}
+
+fn scrub_lane_tmp_dir(manager: &LaneManager, lane_id: &str) -> Result<TmpScrubSummary, String> {
+    scrub_lane_tmp_dir_with_entry_limit(manager, lane_id, MAX_TMP_SCRUB_ENTRIES)
+}
+
+fn ensure_tmp_dir_exists(tmp_dir: &Path) -> Result<(), String> {
+    match std::fs::create_dir(tmp_dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let meta = std::fs::symlink_metadata(tmp_dir).map_err(|meta_err| {
+                format!(
+                    "failed to verify existing tmp path {}: {meta_err}",
+                    tmp_dir.display()
+                )
+            })?;
+            if meta.is_dir() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "tmp path {} exists but is not a directory",
+                    tmp_dir.display()
+                ))
+            }
+        },
+        Err(err) => Err(format!(
+            "failed to create tmp directory {}: {err}",
+            tmp_dir.display()
+        )),
+    }
+}
+
+fn scrub_lane_tmp_dir_with_entry_limit(
+    manager: &LaneManager,
+    lane_id: &str,
+    max_entries_per_dir: usize,
+) -> Result<TmpScrubSummary, String> {
+    let lane_dir = manager.lane_dir(lane_id);
+    let tmp_dir = lane_dir.join("tmp");
+    let effective_limit = max_entries_per_dir.min(MAX_LOG_DIR_ENTRIES);
+
+    let tmp_meta = match std::fs::symlink_metadata(&tmp_dir) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TmpScrubSummary { entries_deleted: 0 });
+        },
+        Err(err) => {
+            return Err(format!(
+                "failed to stat tmp dir {}: {err}",
+                tmp_dir.display()
+            ));
+        },
+    };
+
+    if !tmp_meta.is_dir() {
+        std::fs::remove_file(&tmp_dir)
+            .map_err(|err| format!("failed to remove non-directory tmp path: {err}"))?;
+        ensure_tmp_dir_exists(&tmp_dir)?;
+        return Ok(TmpScrubSummary { entries_deleted: 1 });
+    }
+
+    // Delete the tmp tree in one bounded traversal, then recreate it.
+    // This prevents per-entry nested traversals from multiplying bounds.
+    let scrubbed =
+        safe_rmtree_v1_with_entry_limit(&tmp_dir, &lane_dir, effective_limit).map_err(|err| {
+            match err {
+                SafeRmtreeError::TooManyEntries { .. } => format!(
+                    "tmp scrub refused directory {} due to entry bound (> {})",
+                    tmp_dir.display(),
+                    effective_limit
+                ),
+                _ => format!("tmp scrub failed to delete {}: {err}", tmp_dir.display()),
+            }
+        })?;
+
+    ensure_tmp_dir_exists(&tmp_dir)?;
+
+    let entries_deleted = match scrubbed {
+        SafeRmtreeOutcome::Deleted {
+            files_deleted,
+            dirs_deleted,
+        } => files_deleted.saturating_add(dirs_deleted.saturating_sub(1)),
+        SafeRmtreeOutcome::AlreadyAbsent => 0,
+    };
+
+    Ok(TmpScrubSummary { entries_deleted })
+}
+
+fn gc_stale_lane_logs(fac_root: &Path, manager: &LaneManager) -> Result<LaneLogGcSummary, String> {
+    let gc_plan =
+        plan_gc_with_log_retention(fac_root, manager, 0, 0, &LogRetentionConfig::default())
+            .map_err(|err| format!("failed to build lane log GC plan: {err:?}"))?;
+
+    let targets: Vec<_> = gc_plan
+        .targets
+        .into_iter()
+        .filter(|target| {
+            matches!(
+                target.kind,
+                GcActionKind::LaneLogRetention | GcActionKind::LaneLog
+            )
+        })
+        .collect();
+    if targets.is_empty() {
+        return Ok(LaneLogGcSummary {
+            targets: 0,
+            actions_applied: 0,
+            errors: 0,
+            bytes_freed: 0,
+        });
+    }
+
+    let target_count = targets.len();
+    let receipt = execute_gc(&GcPlan { targets });
+    let bytes_freed = receipt
+        .actions
+        .iter()
+        .fold(0_u64, |acc, action| acc.saturating_add(action.bytes_freed));
+
+    Ok(LaneLogGcSummary {
+        targets: target_count,
+        actions_applied: receipt.actions.len(),
+        errors: receipt.errors.len(),
+        bytes_freed,
+    })
+}
+
+fn restart_worker_service_unit() -> Result<String, String> {
+    let mut errors = Vec::new();
+    for scope in SERVICE_SCOPES {
+        let mut command = Command::new("systemctl");
+        if let Some(scope_flag) = scope.scope_flag() {
+            command.arg(scope_flag);
+        }
+        let output = command
+            .args(["restart", "apm2-worker.service"])
+            .output()
+            .map_err(|err| {
+                format!(
+                    "failed to execute systemctl in {} scope: {err}",
+                    scope.label()
+                )
+            });
+        match output {
+            Ok(output) if output.status.success() => return Ok(scope.label().to_string()),
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                errors.push(format!(
+                    "{} scope restart failed: {}",
+                    scope.label(),
+                    if stderr.is_empty() {
+                        format!("exit {}", output.status.code().unwrap_or(-1))
+                    } else {
+                        stderr
+                    }
+                ));
+            },
+            Err(err) => errors.push(err),
+        }
+    }
+
+    Err(format!(
+        "failed to restart apm2-worker.service in all scopes: {}",
+        errors.join("; ")
+    ))
+}
+
+fn run_system_doctor_fix(
+    operator_socket: &Path,
+    config_path: &Path,
+    full: bool,
+    include_tracked_prs: bool,
+    repo_filter: Option<&str>,
+    json_output: bool,
+) -> u8 {
+    use apm2_core::fac::{OrphanedJobPolicy, reconcile_on_startup};
+    use apm2_core::github::resolve_apm2_home;
+
+    let before_snapshot = match collect_system_doctor_snapshot(
+        operator_socket,
+        config_path,
+        full,
+        include_tracked_prs,
+        repo_filter,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            return output_error(
+                json_output,
+                "fac_doctor_failed",
+                &format!("failed to collect pre-fix doctor checks: {err}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let Some(home) = resolve_apm2_home() else {
+        return output_error(
+            json_output,
+            "fac_doctor_fix_home_unresolved",
+            "cannot resolve APM2 home for doctor --fix",
+            exit_codes::GENERIC_ERROR,
+        );
+    };
+    let fac_root = home.join("private").join("fac");
+    let queue_root = home.join("queue");
+
+    let manager = match LaneManager::new(fac_root.clone()) {
+        Ok(manager) => manager,
+        Err(err) => {
+            return output_error(
+                json_output,
+                "fac_doctor_fix_lane_manager_init_failed",
+                &format!("failed to initialize lane manager: {err}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let mut actions: Vec<SystemDoctorFixAction> = Vec::new();
+    let mut action_failed = false;
+    let mut should_restart_worker = false;
+    let mut lane_resets_applied = false;
+
+    match manager.reconcile_lanes() {
+        Ok(receipt) => {
+            let has_lane_errors = receipt.lanes_failed > 0
+                || receipt.lanes_marked_corrupt > 0
+                || receipt.infrastructure_failures > 0;
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::LaneReconcile,
+                if has_lane_errors {
+                    SystemDoctorFixActionStatus::Blocked
+                } else {
+                    SystemDoctorFixActionStatus::Applied
+                },
+                None,
+                format!(
+                    "inspected={} repaired={} marked_corrupt={} failed={} infra_failures={}",
+                    receipt.lanes_inspected,
+                    receipt.lanes_repaired,
+                    receipt.lanes_marked_corrupt,
+                    receipt.lanes_failed,
+                    receipt.infrastructure_failures
+                ),
+            );
+        },
+        Err(err) => {
+            action_failed = true;
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::LaneReconcile,
+                SystemDoctorFixActionStatus::Failed,
+                None,
+                format!("lane reconcile failed: {err}"),
+            );
+        },
+    }
+
+    match reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false) {
+        Ok(receipt) => {
+            if receipt.stale_leases_recovered > 0
+                || receipt.orphaned_jobs_requeued > 0
+                || receipt.orphaned_jobs_failed > 0
+                || receipt.torn_states_recovered > 0
+            {
+                should_restart_worker = true;
+            }
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::QueueReconcileApply,
+                SystemDoctorFixActionStatus::Applied,
+                None,
+                format!(
+                    "lanes_inspected={} stale_leases_recovered={} orphaned_jobs_requeued={} orphaned_jobs_failed={} torn_states_recovered={} lanes_marked_corrupt={}",
+                    receipt.lanes_inspected,
+                    receipt.stale_leases_recovered,
+                    receipt.orphaned_jobs_requeued,
+                    receipt.orphaned_jobs_failed,
+                    receipt.torn_states_recovered,
+                    receipt.lanes_marked_corrupt
+                ),
+            );
+        },
+        Err(err) => {
+            action_failed = true;
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::QueueReconcileApply,
+                SystemDoctorFixActionStatus::Failed,
+                None,
+                format!("queue reconcile failed: {err}"),
+            );
+        },
+    }
+
+    match gc_stale_lane_logs(&fac_root, &manager) {
+        Ok(summary) if summary.targets == 0 => {
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::LaneLogGc,
+                SystemDoctorFixActionStatus::Skipped,
+                None,
+                "no stale lane log targets matched retention policy",
+            );
+        },
+        Ok(summary) if summary.errors == 0 => {
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::LaneLogGc,
+                SystemDoctorFixActionStatus::Applied,
+                None,
+                format!(
+                    "targets={} actions={} bytes_freed={}",
+                    summary.targets, summary.actions_applied, summary.bytes_freed
+                ),
+            );
+        },
+        Ok(summary) => {
+            action_failed = true;
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::LaneLogGc,
+                SystemDoctorFixActionStatus::Failed,
+                None,
+                format!(
+                    "targets={} actions={} errors={} bytes_freed={}",
+                    summary.targets, summary.actions_applied, summary.errors, summary.bytes_freed
+                ),
+            );
+        },
+        Err(err) => {
+            action_failed = true;
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::LaneLogGc,
+                SystemDoctorFixActionStatus::Failed,
+                None,
+                err,
+            );
+        },
+    }
+
+    let lane_statuses = match manager.all_lane_statuses() {
+        Ok(statuses) => statuses,
+        Err(err) => {
+            action_failed = true;
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::LaneStatusScan,
+                SystemDoctorFixActionStatus::Failed,
+                None,
+                format!("failed to load lane statuses: {err}"),
+            );
+            Vec::new()
+        },
+    };
+
+    for status in lane_statuses {
+        if status.state != LaneState::Corrupt {
+            continue;
+        }
+
+        let lane_id = status.lane_id.clone();
+        let reason_hint = load_lane_reason_hint(&manager, &status).unwrap_or_default();
+        let reason_is_orphaned = reason_hint.contains(ORPHANED_SYSTEMD_UNIT_REASON_CODE);
+        let tmp_trigger_detail = match detect_lane_tmp_corruption(&manager, &lane_id) {
+            Ok(value) => value,
+            Err(err) => {
+                action_failed = true;
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    SystemDoctorFixActionKind::LaneTmpCorruptionDetection,
+                    SystemDoctorFixActionStatus::Failed,
+                    Some(&lane_id),
+                    err,
+                );
+                None
+            },
+        };
+        let reason_is_tmp_corrupt = tmp_trigger_detail.is_some();
+
+        let reset_action = if reason_is_orphaned {
+            SystemDoctorFixActionKind::LaneResetOrphanedSystemdUnit
+        } else if reason_is_tmp_corrupt {
+            SystemDoctorFixActionKind::LaneResetTmpCorruption
+        } else {
+            SystemDoctorFixActionKind::LaneResetCleanupRecovery
+        };
+        let job_id = status.job_id.clone().or_else(|| {
+            LaneLeaseV1::load(&manager.lane_dir(&lane_id))
+                .ok()
+                .flatten()
+                .map(|lease| lease.job_id)
+        });
+        if let Err(detail) = enforce_lane_reset_liveness_for_context(
+            &lane_id,
+            job_id.as_deref(),
+            reason_is_orphaned,
+            check_fac_unit_liveness,
+            check_fac_lane_liveness,
+        ) {
+            push_system_doctor_fix_action(
+                &mut actions,
+                reset_action,
+                SystemDoctorFixActionStatus::Blocked,
+                Some(&lane_id),
+                detail,
+            );
+            continue;
+        }
+
+        if let Some(detail) = tmp_trigger_detail.as_ref() {
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::LaneTmpCorruptionDetected,
+                SystemDoctorFixActionStatus::Blocked,
+                Some(&lane_id),
+                detail.clone(),
+            );
+            match scrub_lane_tmp_dir(&manager, &lane_id) {
+                Ok(scrub_summary) => {
+                    push_system_doctor_fix_action(
+                        &mut actions,
+                        SystemDoctorFixActionKind::LaneTmpScrub,
+                        SystemDoctorFixActionStatus::Applied,
+                        Some(&lane_id),
+                        format!(
+                            "tmp scrubbed (entries_deleted={})",
+                            scrub_summary.entries_deleted
+                        ),
+                    );
+                },
+                Err(err) => {
+                    action_failed = true;
+                    push_system_doctor_fix_action(
+                        &mut actions,
+                        SystemDoctorFixActionKind::LaneTmpScrub,
+                        SystemDoctorFixActionStatus::Failed,
+                        Some(&lane_id),
+                        err,
+                    );
+                    continue;
+                },
+            }
+        }
+
+        match doctor_reset_lane_once(&manager, &lane_id) {
+            Ok(reset_summary) => {
+                lane_resets_applied = true;
+                should_restart_worker = true;
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    reset_action,
+                    SystemDoctorFixActionStatus::Applied,
+                    Some(&lane_id),
+                    format!(
+                        "reset complete (files_deleted={}, dirs_deleted={})",
+                        reset_summary.files_deleted, reset_summary.dirs_deleted
+                    ),
+                );
+            },
+            Err(DoctorLaneResetError::Running { pid }) => {
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    reset_action,
+                    SystemDoctorFixActionStatus::Blocked,
+                    Some(&lane_id),
+                    format!(
+                        "lane is RUNNING (pid={}); refusing non-force reset",
+                        pid.unwrap_or(0)
+                    ),
+                );
+            },
+            Err(DoctorLaneResetError::RefusedDelete { receipts })
+                if refused_delete_mentions_tmp(&receipts) =>
+            {
+                if let Err(detail) = enforce_lane_reset_liveness_for_context(
+                    &lane_id,
+                    job_id.as_deref(),
+                    reason_is_orphaned,
+                    check_fac_unit_liveness,
+                    check_fac_lane_liveness,
+                ) {
+                    push_system_doctor_fix_action(
+                        &mut actions,
+                        reset_action,
+                        SystemDoctorFixActionStatus::Blocked,
+                        Some(&lane_id),
+                        format!("reset blocked before retry scrub: {detail}"),
+                    );
+                    continue;
+                }
+                match scrub_lane_tmp_dir(&manager, &lane_id) {
+                    Ok(scrub_summary) => {
+                        push_system_doctor_fix_action(
+                            &mut actions,
+                            SystemDoctorFixActionKind::LaneTmpScrub,
+                            SystemDoctorFixActionStatus::Applied,
+                            Some(&lane_id),
+                            format!(
+                                "tmp scrubbed (entries_deleted={})",
+                                scrub_summary.entries_deleted
+                            ),
+                        );
+                        match doctor_reset_lane_once(&manager, &lane_id) {
+                            Ok(reset_summary) => {
+                                lane_resets_applied = true;
+                                should_restart_worker = true;
+                                push_system_doctor_fix_action(
+                                    &mut actions,
+                                    reset_action,
+                                    SystemDoctorFixActionStatus::Applied,
+                                    Some(&lane_id),
+                                    format!(
+                                        "reset complete after tmp scrub (files_deleted={}, dirs_deleted={})",
+                                        reset_summary.files_deleted, reset_summary.dirs_deleted
+                                    ),
+                                );
+                            },
+                            Err(err) => {
+                                action_failed = true;
+                                push_system_doctor_fix_action(
+                                    &mut actions,
+                                    reset_action,
+                                    SystemDoctorFixActionStatus::Failed,
+                                    Some(&lane_id),
+                                    format!("reset still failing after tmp scrub: {err:?}"),
+                                );
+                            },
+                        }
+                    },
+                    Err(err) => {
+                        action_failed = true;
+                        push_system_doctor_fix_action(
+                            &mut actions,
+                            SystemDoctorFixActionKind::LaneTmpScrub,
+                            SystemDoctorFixActionStatus::Failed,
+                            Some(&lane_id),
+                            err,
+                        );
+                    },
+                }
+            },
+            Err(DoctorLaneResetError::RefusedDelete { receipts }) => {
+                action_failed = true;
+                let detail = receipts
+                    .iter()
+                    .map(|receipt| format!("{}: {}", receipt.root.display(), receipt.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    reset_action,
+                    SystemDoctorFixActionStatus::Failed,
+                    Some(&lane_id),
+                    format!("reset refused: {detail}"),
+                );
+            },
+            Err(DoctorLaneResetError::Other(err)) => {
+                action_failed = true;
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    reset_action,
+                    SystemDoctorFixActionStatus::Failed,
+                    Some(&lane_id),
+                    err,
+                );
+            },
+        }
+    }
+
+    if lane_resets_applied {
+        match reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false) {
+            Ok(receipt) => {
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    SystemDoctorFixActionKind::QueueReconcilePostLaneReset,
+                    SystemDoctorFixActionStatus::Applied,
+                    None,
+                    format!(
+                        "post-reset reconcile complete (stale_leases_recovered={}, orphaned_jobs_requeued={}, orphaned_jobs_failed={}, torn_states_recovered={})",
+                        receipt.stale_leases_recovered,
+                        receipt.orphaned_jobs_requeued,
+                        receipt.orphaned_jobs_failed,
+                        receipt.torn_states_recovered
+                    ),
+                );
+            },
+            Err(err) => {
+                action_failed = true;
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    SystemDoctorFixActionKind::QueueReconcilePostLaneReset,
+                    SystemDoctorFixActionStatus::Failed,
+                    None,
+                    format!("post-reset queue reconcile failed: {err}"),
+                );
+            },
+        }
+    } else {
+        push_system_doctor_fix_action(
+            &mut actions,
+            SystemDoctorFixActionKind::QueueReconcilePostLaneReset,
+            SystemDoctorFixActionStatus::Skipped,
+            None,
+            "no lane reset actions applied; post-reset reconcile skipped",
+        );
+    }
+
+    if should_restart_worker {
+        match restart_worker_service_unit() {
+            Ok(scope) => {
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    SystemDoctorFixActionKind::WorkerRestart,
+                    SystemDoctorFixActionStatus::Applied,
+                    None,
+                    format!("restarted apm2-worker.service in {scope} scope"),
+                );
+            },
+            Err(err) => {
+                action_failed = true;
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    SystemDoctorFixActionKind::WorkerRestart,
+                    SystemDoctorFixActionStatus::Failed,
+                    None,
+                    err,
+                );
+            },
+        }
+    } else {
+        push_system_doctor_fix_action(
+            &mut actions,
+            SystemDoctorFixActionKind::WorkerRestart,
+            SystemDoctorFixActionStatus::Skipped,
+            None,
+            "no repair actions required worker restart",
+        );
+    }
+
+    let after_snapshot = match collect_system_doctor_snapshot(
+        operator_socket,
+        config_path,
+        full,
+        include_tracked_prs,
+        repo_filter,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            action_failed = true;
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::DoctorPostCheck,
+                SystemDoctorFixActionStatus::Failed,
+                None,
+                format!("failed to collect post-fix checks: {err}"),
+            );
+            DoctorSystemSnapshot {
+                checks: Vec::new(),
+                tracked_prs: Vec::new(),
+                has_critical_error: true,
+            }
+        },
+    };
+
+    let response = SystemDoctorFixResponse {
+        schema: FAC_DOCTOR_SYSTEM_FIX_SCHEMA.to_string(),
+        actions,
+        checks_before: before_snapshot.checks,
+        checks_after: after_snapshot.checks,
+        tracked_prs: after_snapshot.tracked_prs,
+        had_errors_before: before_snapshot.has_critical_error,
+        has_errors_after: after_snapshot.has_critical_error,
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
+    );
+
+    let has_blocked_actions = response
+        .actions
+        .iter()
+        .any(|action| action.status == SystemDoctorFixActionStatus::Blocked);
+    system_doctor_fix_exit_code(
+        action_failed,
+        has_blocked_actions,
+        after_snapshot.has_critical_error,
+    )
 }
 
 fn run_services_status(_json_output: bool) -> u8 {
@@ -2387,7 +3440,6 @@ pub fn run_fac(
             | FacSubcommand::Warm(_)
             | FacSubcommand::Bench(_)
             | FacSubcommand::Bundle(_)
-            | FacSubcommand::Reconcile(_)
             | FacSubcommand::Queue(_)
             | FacSubcommand::Policy(_)
             | FacSubcommand::Economics(_)
@@ -2465,14 +3517,6 @@ pub fn run_fac(
                     exit_codes::GENERIC_ERROR,
                 );
             }
-            if args.fix && args.pr.is_none() {
-                return output_error(
-                    output_json,
-                    "fac_doctor_fix_requires_pr",
-                    "`apm2 fac doctor --fix` requires `--pr <N>`",
-                    exit_codes::GENERIC_ERROR,
-                );
-            }
             if args.wait_for_recommended_action && args.fix {
                 return output_error(
                     output_json,
@@ -2501,56 +3545,36 @@ pub fn run_fac(
                     args.wait_timeout_seconds,
                     &exit_on,
                 )
+            } else if args.fix {
+                run_system_doctor_fix(
+                    operator_socket,
+                    config_path,
+                    args.full,
+                    args.tracked_prs || args.full,
+                    args.repo.as_deref(),
+                    output_json,
+                )
             } else {
-                let (mut checks, has_critical_error) =
-                    match crate::commands::daemon::collect_doctor_checks(
-                        operator_socket,
-                        config_path,
-                        args.full,
-                    ) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            return output_error(
-                                output_json,
-                                "fac_doctor_failed",
-                                &err.to_string(),
-                                exit_codes::GENERIC_ERROR,
-                            );
-                        },
-                    };
-                let include_tracked_prs = args.tracked_prs || args.full;
-                let tracked_prs = if include_tracked_prs {
-                    let repo_hint = args.repo.clone();
-                    match fac_review::collect_tracked_pr_summaries(
-                        repo_hint.as_deref(),
-                        args.repo.as_deref(),
-                    ) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            let message =
-                                format!("failed to build tracked PR doctor summary: {err}");
-                            checks.push(crate::commands::daemon::DaemonDoctorCheck {
-                                name: "tracked_pr_summary".to_string(),
-                                status: "WARN",
-                                message,
-                            });
-                            Vec::new()
-                        },
-                    }
-                } else {
-                    Vec::new()
+                let snapshot = match collect_system_doctor_snapshot(
+                    operator_socket,
+                    config_path,
+                    args.full,
+                    args.tracked_prs || args.full,
+                    args.repo.as_deref(),
+                ) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        return output_error(
+                            output_json,
+                            "fac_doctor_failed",
+                            &err,
+                            exit_codes::GENERIC_ERROR,
+                        );
+                    },
                 };
-                let payload = serde_json::json!({
-                    "schema": "apm2.fac.doctor.system.v1",
-                    "checks": checks,
-                    "tracked_prs": tracked_prs,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-                );
+                emit_system_doctor_snapshot(&snapshot);
 
-                if has_critical_error {
+                if snapshot.has_critical_error {
                     exit_codes::GENERIC_ERROR
                 } else {
                     exit_codes::SUCCESS
@@ -2627,14 +3651,8 @@ pub fn run_fac(
             LaneSubcommand::Status(status_args) => {
                 run_lane_status(status_args, resolve_json(status_args.json))
             },
-            LaneSubcommand::Reset(reset_args) => {
-                run_lane_reset(reset_args, resolve_json(reset_args.json))
-            },
             LaneSubcommand::Init(init_args) => {
                 run_lane_init(init_args, resolve_json(init_args.json))
-            },
-            LaneSubcommand::Reconcile(reconcile_args) => {
-                run_lane_reconcile(reconcile_args, resolve_json(reconcile_args.json))
             },
             LaneSubcommand::MarkCorrupt(mark_args) => {
                 run_lane_mark_corrupt(mark_args, resolve_json(mark_args.json))
@@ -2899,7 +3917,6 @@ pub fn run_fac(
                 run_bundle_import(import_args, resolve_json(import_args.json))
             },
         },
-        FacSubcommand::Reconcile(args) => run_reconcile(args, resolve_json(args.json)),
         FacSubcommand::Policy(args) => fac_policy::run_policy_command(args, json_output),
         FacSubcommand::Economics(args) => fac_economics::run_economics_command(args, json_output),
         FacSubcommand::Bootstrap(args) => {
@@ -2911,102 +3928,6 @@ pub fn run_fac(
         FacSubcommand::Metrics(args) => run_metrics(args, json_output),
         FacSubcommand::Caches(args) => {
             crate::commands::fac_caches::run_caches_command(args, json_output)
-        },
-    }
-}
-
-/// Execute `apm2 fac reconcile`.
-fn run_reconcile(args: &ReconcileArgs, json_output: bool) -> u8 {
-    use apm2_core::fac::{OrphanedJobPolicy, reconcile_on_startup};
-    use apm2_core::github::resolve_apm2_home;
-
-    let Some(home) = resolve_apm2_home() else {
-        if json_output {
-            let err_json = serde_json::json!({"error": "cannot resolve APM2 home"});
-            println!("{}", serde_json::to_string(&err_json).unwrap_or_default());
-        } else {
-            eprintln!("ERROR: cannot resolve APM2 home directory");
-        }
-        return crate::exit_codes::codes::GENERIC_ERROR;
-    };
-    let fac_root = home.join("private").join("fac");
-    let queue_root = home.join("queue");
-
-    // Parse orphan policy.
-    let orphan_policy = match args.orphan_policy.as_str() {
-        "requeue" => OrphanedJobPolicy::Requeue,
-        "mark-failed" => OrphanedJobPolicy::MarkFailed,
-        other => {
-            if json_output {
-                let err_json = serde_json::json!({
-                    "error": format!("invalid orphan-policy: {other}, expected requeue or mark-failed")
-                });
-                println!("{}", serde_json::to_string(&err_json).unwrap_or_default());
-            } else {
-                eprintln!(
-                    "ERROR: invalid --orphan-policy '{other}', expected 'requeue' or 'mark-failed'"
-                );
-            }
-            return crate::exit_codes::codes::GENERIC_ERROR;
-        },
-    };
-
-    // Determine mode: --dry-run takes priority; without flags, default to dry-run.
-    let dry_run = !args.apply;
-
-    if !dry_run && args.dry_run {
-        // Contradiction: both --dry-run and --apply specified.
-        if json_output {
-            let err_json =
-                serde_json::json!({"error": "cannot specify both --dry-run and --apply"});
-            println!("{}", serde_json::to_string(&err_json).unwrap_or_default());
-        } else {
-            eprintln!("ERROR: cannot specify both --dry-run and --apply");
-        }
-        return crate::exit_codes::codes::GENERIC_ERROR;
-    }
-
-    match reconcile_on_startup(&fac_root, &queue_root, orphan_policy, dry_run) {
-        Ok(receipt) => {
-            if json_output {
-                if let Ok(json) = serde_json::to_string_pretty(&receipt) {
-                    println!("{json}");
-                }
-            } else {
-                let mode = if dry_run { "DRY RUN" } else { "APPLIED" };
-                println!("Reconciliation complete ({mode}):");
-                println!("  Lanes inspected:          {}", receipt.lanes_inspected);
-                println!(
-                    "  Stale leases recovered:   {}",
-                    receipt.stale_leases_recovered
-                );
-                println!(
-                    "  Claimed files inspected:  {}",
-                    receipt.claimed_files_inspected
-                );
-                println!(
-                    "  Orphaned jobs requeued:    {}",
-                    receipt.orphaned_jobs_requeued
-                );
-                println!(
-                    "  Orphaned jobs failed:      {}",
-                    receipt.orphaned_jobs_failed
-                );
-                println!(
-                    "  Lanes marked corrupt:      {}",
-                    receipt.lanes_marked_corrupt
-                );
-            }
-            0
-        },
-        Err(e) => {
-            if json_output {
-                let err_json = serde_json::json!({"error": e.to_string()});
-                println!("{}", serde_json::to_string(&err_json).unwrap_or_default());
-            } else {
-                eprintln!("ERROR: reconciliation failed: {e}");
-            }
-            crate::exit_codes::codes::GENERIC_ERROR
         },
     }
 }
@@ -3039,7 +3960,6 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Warm(_)
         | FacSubcommand::Bench(_)
         | FacSubcommand::Bundle(_)
-        | FacSubcommand::Reconcile(_)
         | FacSubcommand::Queue(_)
         | FacSubcommand::Policy(_)
         | FacSubcommand::Economics(_)
@@ -4661,307 +5581,6 @@ fn run_lane_status(args: &LaneStatusArgs, json_output: bool) -> u8 {
 }
 
 // =============================================================================
-// Lane Reset Command (TCK-00516)
-// =============================================================================
-
-/// Execute `apm2 fac lane reset <lane_id>`.
-///
-/// Resets a lane by deleting its workspace, target, logs, and per-lane env
-/// isolation subdirectories (`home`, `tmp`, `xdg_cache`, `xdg_config`,
-/// `xdg_data`, `xdg_state`, `xdg_runtime`) using
-/// `safe_rmtree_v1` (symlink-safe, boundary-enforced deletion).
-///
-/// # State Machine
-///
-/// - IDLE: resets all lane subdirs, removes lease, remains IDLE.
-/// - CORRUPT: resets all lane subdirs, removes lease, transitions to IDLE.
-/// - LEASED/CLEANUP: resets all lane subdirs, removes lease, transitions to
-///   IDLE.
-/// - RUNNING: refuses unless `--force` is provided. With `--force`, kills the
-///   process first, then resets.
-///
-/// # Security
-///
-/// Deletion is performed via `safe_rmtree_v1` which refuses:
-/// - Symlink traversal at any depth
-/// - Crossing filesystem boundaries
-/// - Unexpected file types (FIFOs, sockets, devices)
-/// - Deletion outside the allowed parent boundary
-fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
-    let manager = match LaneManager::from_default_home() {
-        Ok(m) => m,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "lane_error",
-                &format!("Failed to initialize lane manager: {e}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-    run_lane_reset_with_manager(&manager, args, json_output)
-}
-
-fn run_lane_reset_with_manager(
-    manager: &LaneManager,
-    args: &LaneResetArgs,
-    json_output: bool,
-) -> u8 {
-    // Ensure directories exist
-    if let Err(e) = manager.ensure_directories() {
-        return output_error(
-            json_output,
-            "lane_error",
-            &format!("Failed to ensure lane directories: {e}"),
-            exit_codes::GENERIC_ERROR,
-        );
-    }
-
-    // Acquire exclusive lock for the lane BEFORE any status reads or
-    // mutations. The lock is held across the entire reset operation
-    // (status check + force-kill + deletion + lease cleanup) to prevent
-    // concurrent writers from racing the reset.
-    let _lock_guard = match manager.acquire_lock(&args.lane_id) {
-        Ok(guard) => guard,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "lane_error",
-                &format!("Failed to acquire lock for lane {}: {e}", args.lane_id),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-
-    // Get current lane status (under lock)
-    let status = match manager.lane_status(&args.lane_id) {
-        Ok(s) => s,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "lane_error",
-                &format!("Failed to query lane status: {e}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-
-    // Check if lane is RUNNING and refuse without --force
-    if status.state == LaneState::Running && !args.force {
-        return output_error(
-            json_output,
-            "lane_running",
-            &format!(
-                "Lane {} is RUNNING (pid={}). Use --force to kill the process and reset.",
-                args.lane_id,
-                status.pid.unwrap_or(0)
-            ),
-            exit_codes::VALIDATION_ERROR,
-        );
-    }
-
-    // With --force on a RUNNING lane, attempt to kill the process (under lock).
-    // If kill fails (identity mismatch, unknown identity, EPERM, etc.), abort
-    // the reset and mark CORRUPT
-    // to prevent deleting directories of a still-running process.
-    if status.state == LaneState::Running && args.force {
-        let lane_dir = manager.lane_dir(&args.lane_id);
-        let lease = LaneLeaseV1::load(&lane_dir).ok().flatten();
-        let pid = lease.as_ref().map(|lease| lease.pid).or(status.pid);
-        let expected_start_ticks = lease.as_ref().and_then(|lease| lease.proc_start_time_ticks);
-
-        if let Some(pid) = pid {
-            if !kill_process_best_effort(pid, expected_start_ticks) {
-                let corrupt_reason = format!(
-                    "failed to kill process {} for lane {} -- process identity was unknown or process may still be running",
-                    pid, args.lane_id
-                );
-                persist_corrupt_lease(manager, &args.lane_id, &corrupt_reason);
-                return output_error(
-                    json_output,
-                    "kill_failed",
-                    &corrupt_reason,
-                    exit_codes::GENERIC_ERROR,
-                );
-            }
-        }
-    }
-
-    // Perform safe deletion of all lane subdirectories (under lock)
-    let lane_dir = manager.lane_dir(&args.lane_id);
-    let Some(lanes_root) = lane_dir.parent() else {
-        return output_error(
-            json_output,
-            "lane_error",
-            &format!(
-                "Lane directory {} has no parent directory",
-                lane_dir.display()
-            ),
-            exit_codes::GENERIC_ERROR,
-        );
-    };
-
-    // TCK-00575: Include all per-lane env isolation directories (home, tmp,
-    // xdg_cache, xdg_config, xdg_data, xdg_state, xdg_runtime) in the reset
-    // so that stale env state does not
-    // persist across lane reuses.
-    let mut subdirs: Vec<&str> = vec!["workspace", "target", "logs"];
-    subdirs.extend_from_slice(LANE_ENV_DIRS);
-
-    let mut total_files: u64 = 0;
-    let mut total_dirs: u64 = 0;
-    let mut refused_receipts: Vec<RefusedDeleteReceipt> = Vec::new();
-
-    for subdir in &subdirs {
-        let subdir_path = lane_dir.join(subdir);
-        match safe_rmtree_v1(&subdir_path, lanes_root) {
-            Ok(SafeRmtreeOutcome::Deleted {
-                files_deleted,
-                dirs_deleted,
-            }) => {
-                total_files = total_files.saturating_add(files_deleted);
-                total_dirs = total_dirs.saturating_add(dirs_deleted);
-            },
-            Ok(SafeRmtreeOutcome::AlreadyAbsent) => {},
-            Err(e) => {
-                let receipt = RefusedDeleteReceipt {
-                    root: subdir_path.clone(),
-                    allowed_parent: lanes_root.to_path_buf(),
-                    reason: e.to_string(),
-                    mark_corrupt: true,
-                };
-                refused_receipts.push(receipt);
-            },
-        }
-    }
-
-    // If any deletions were refused, mark lane as CORRUPT (under lock)
-    if !refused_receipts.is_empty() {
-        let corrupt_reason = refused_receipts
-            .iter()
-            .map(|r| r.reason.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
-
-        // Persist CORRUPT state to the lease file so that lane_status
-        // reflects the corruption even after restart.
-        persist_corrupt_lease(manager, &args.lane_id, &corrupt_reason);
-
-        let response = serde_json::json!({
-            "lane_id": args.lane_id,
-            "status": "CORRUPT",
-            "reason": corrupt_reason,
-            "refused_receipts": refused_receipts.iter().map(|r| {
-                serde_json::json!({
-                    "root": r.root.display().to_string(),
-                    "allowed_parent": r.allowed_parent.display().to_string(),
-                    "reason": r.reason,
-                    "mark_corrupt": r.mark_corrupt,
-                })
-            }).collect::<Vec<_>>(),
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response).unwrap_or_default()
-        );
-
-        return exit_codes::GENERIC_ERROR;
-    }
-
-    // Remove the lease file to transition lane to IDLE (under lock)
-    let lane_dir_owned = manager.lane_dir(&args.lane_id);
-    if let Err(e) = LaneLeaseV1::remove(&lane_dir_owned) {
-        return output_error(
-            json_output,
-            "lane_error",
-            &format!("Failed to remove lease for lane {}: {e}", args.lane_id),
-            exit_codes::GENERIC_ERROR,
-        );
-    }
-
-    if let Err(e) = LaneCorruptMarkerV1::remove(manager.fac_root(), &args.lane_id) {
-        return output_error(
-            json_output,
-            "lane_error",
-            &format!(
-                "Failed to clear corrupt marker for lane {}: {e}",
-                args.lane_id
-            ),
-            exit_codes::GENERIC_ERROR,
-        );
-    }
-    if !json_output {
-        eprintln!("Corrupt marker cleared for lane {}", args.lane_id);
-    }
-
-    // Re-create the empty subdirectories for the reset lane so it is
-    // ready for reuse. This calls ensure_directories() which re-inits
-    // all lanes, not just the reset lane. This is acceptable because
-    // ensure_directories is idempotent (mkdir -p semantics) and only
-    // creates directories that don't already exist.
-    if let Err(e) = manager.ensure_directories() {
-        eprintln!("WARNING: failed to re-create lane directories: {e}");
-    }
-
-    // Lock is released here when _lock_guard drops.
-
-    let response = serde_json::json!({
-        "lane_id": args.lane_id,
-        "status": "IDLE",
-        "files_deleted": total_files,
-        "dirs_deleted": total_dirs,
-    });
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&response).unwrap_or_default()
-    );
-
-    exit_codes::SUCCESS
-}
-
-/// Persist a CORRUPT lease to the lane directory so that `lane_status`
-/// reports CORRUPT even after restart.
-///
-/// This is best-effort: if the lease write fails, a warning is printed
-/// but the overall CORRUPT error flow continues (fail-closed: the lane
-/// is already in a bad state).
-fn persist_corrupt_lease(manager: &LaneManager, lane_id: &str, reason: &str) {
-    let lane_dir = manager.lane_dir(lane_id);
-    // Truncate reason to avoid exceeding string length limits.
-    // Use char_indices to find a safe UTF-8 boundary instead of byte
-    // slicing, which would panic on multi-byte characters.
-    let truncated_reason = if reason.len() > 200 {
-        let truncated: String = reason
-            .char_indices()
-            .take_while(|&(i, _)| i < 197)
-            .map(|(_, c)| c)
-            .collect();
-        format!("{truncated}...")
-    } else {
-        reason.to_string()
-    };
-
-    match LaneLeaseV1::new(
-        lane_id,
-        &truncated_reason,
-        0, // pid=0: no running process
-        LaneState::Corrupt,
-        "1970-01-01T00:00:00Z", // sentinel timestamp
-        "corrupt",
-        "corrupt",
-    ) {
-        Ok(lease) => {
-            if let Err(e) = lease.persist(&lane_dir) {
-                eprintln!("WARNING: failed to persist CORRUPT lease for lane {lane_id}: {e}");
-            }
-        },
-        Err(e) => {
-            eprintln!("WARNING: failed to create CORRUPT lease for lane {lane_id}: {e}");
-        },
-    }
-}
-
-// =============================================================================
 // Lane Mark-Corrupt Command (TCK-00570)
 // =============================================================================
 
@@ -4969,13 +5588,13 @@ fn persist_corrupt_lease(manager: &LaneManager, lane_id: &str, reason: &str) {
 ///
 /// Operator workflow: manually mark a lane as CORRUPT with a reason string.
 /// The lane refuses all future job leases until an operator clears the marker
-/// via `apm2 fac lane reset`.
+/// via `apm2 fac doctor --fix`.
 ///
 /// # State Machine
 ///
 /// - Any state except RUNNING: writes `corrupt.v1.json` marker.
 /// - Already CORRUPT: returns an error (marker already exists).
-/// - RUNNING: returns an error (use `apm2 fac lane reset --force` instead).
+/// - RUNNING: returns an error (stop work and run `apm2 fac doctor --fix`).
 ///
 /// # Security
 ///
@@ -5038,13 +5657,13 @@ fn run_lane_mark_corrupt_with_manager(
         },
     };
 
-    // Refuse to mark a RUNNING lane -- operator should use `lane reset --force`.
+    // Refuse to mark a RUNNING lane.
     if status.state == LaneState::Running {
         return output_error(
             json_output,
             "lane_running",
             &format!(
-                "Lane {} is RUNNING (pid={}). Stop the job first or use `apm2 fac lane reset --force`.",
+                "Lane {} is RUNNING (pid={}). Stop active work first, then run `apm2 fac doctor --fix`.",
                 args.lane_id,
                 status.pid.unwrap_or(0)
             ),
@@ -5058,7 +5677,7 @@ fn run_lane_mark_corrupt_with_manager(
             json_output,
             "already_corrupt",
             &format!(
-                "Lane {} is already CORRUPT (reason: {}). Use `apm2 fac lane reset` to clear.",
+                "Lane {} is already CORRUPT (reason: {}). Run `apm2 fac doctor --fix` to reconcile.",
                 args.lane_id,
                 status.corrupt_reason.as_deref().unwrap_or("unknown")
             ),
@@ -5125,7 +5744,7 @@ fn run_lane_mark_corrupt_with_manager(
 
     if !json_output {
         eprintln!(
-            "Lane {} marked as CORRUPT. Use `apm2 fac lane reset` to clear.",
+            "Lane {} marked as CORRUPT. Run `apm2 fac doctor --fix` to reconcile.",
             args.lane_id
         );
     }
@@ -5210,189 +5829,6 @@ fn print_lane_init_receipt(receipt: &LaneInitReceiptV1) {
                 println!("    {:<12} {}", entry.lane_id, entry.profile_hash);
             }
         }
-    }
-}
-
-// =============================================================================
-// Lane Reconcile Command (TCK-00539)
-// =============================================================================
-
-/// Execute `apm2 fac lane reconcile`.
-///
-/// Inspects all lanes and repairs missing directories or profiles. Lanes
-/// that cannot be repaired are marked CORRUPT.
-fn run_lane_reconcile(_args: &LaneReconcileArgs, json_output: bool) -> u8 {
-    let manager = match LaneManager::from_default_home() {
-        Ok(m) => m,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "lane_error",
-                &format!("Failed to initialize lane manager: {e}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-
-    let receipt = match manager.reconcile_lanes() {
-        Ok(r) => r,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "lane_reconcile_error",
-                &format!("Lane reconcile failed: {e}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-
-    if json_output {
-        match serde_json::to_string_pretty(&receipt) {
-            Ok(json) => println!("{json}"),
-            Err(e) => {
-                return output_error(
-                    json_output,
-                    "serialization_error",
-                    &format!("Failed to serialize reconcile receipt: {e}"),
-                    exit_codes::GENERIC_ERROR,
-                );
-            },
-        }
-    } else {
-        print_lane_reconcile_receipt(&receipt);
-    }
-
-    if receipt.lanes_marked_corrupt > 0
-        || receipt.lanes_failed > 0
-        || receipt.infrastructure_failures > 0
-    {
-        exit_codes::GENERIC_ERROR
-    } else {
-        exit_codes::SUCCESS
-    }
-}
-
-/// Print a human-readable reconcile receipt.
-fn print_lane_reconcile_receipt(receipt: &LaneReconcileReceiptV1) {
-    println!("Lane reconciliation complete");
-    println!();
-    println!("  Lanes inspected:          {}", receipt.lanes_inspected);
-    println!("  Lanes OK:                 {}", receipt.lanes_ok);
-    println!("  Lanes repaired:           {}", receipt.lanes_repaired);
-    println!(
-        "  Lanes marked corrupt:     {}",
-        receipt.lanes_marked_corrupt
-    );
-    println!("  Lanes failed:             {}", receipt.lanes_failed);
-    println!(
-        "  Infrastructure failures:  {}",
-        receipt.infrastructure_failures
-    );
-
-    if !receipt.actions.is_empty() {
-        println!();
-        println!("  Actions:");
-        for action in &receipt.actions {
-            let detail = action.detail.as_deref().unwrap_or("");
-            println!(
-                "    {:<12} {:<30} {:?} {}",
-                action.lane_id, action.action, action.outcome, detail
-            );
-        }
-    }
-}
-
-/// Best-effort process kill using SIGTERM then SIGKILL.
-///
-/// Returns `true` if the process is confirmed dead (ESRCH) or was
-/// successfully killed, `false` if the process could not be signaled
-/// (EPERM or other errors). The caller MUST abort the reset and mark
-/// the lane CORRUPT if this returns `false`.
-///
-/// # PID Reuse Safety
-///
-/// Stale lease PIDs may have been reused by a different process. Before
-/// sending signals, we verify process identity using
-/// `verify_pid_identity(pid, expected_start_ticks)`:
-///
-/// - `AliveMatch` => safe to signal.
-/// - `Dead` => already gone (success).
-/// - `AliveMismatch` => original owner is gone (success, do not signal reused
-///   PID).
-/// - `Unknown` => fail-closed, do not signal.
-///
-/// # Blocking Wait (intentional)
-///
-/// This function blocks the calling thread for up to ~5.2 seconds while
-/// waiting for the process to exit after SIGTERM. This is acceptable because
-/// `kill_process_best_effort` is called exclusively from the `apm2 fac lane
-/// reset --force` CLI command, which is an interactive operator action that
-/// expects synchronous completion before proceeding with directory deletion.
-/// The blocking wait ensures the process has actually exited before we
-/// attempt to delete its workspace.
-fn kill_process_best_effort(pid: u32, expected_start_ticks: Option<u64>) -> bool {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{self, Signal};
-        use nix::unistd::Pid;
-
-        match verify_pid_identity(pid, expected_start_ticks) {
-            ProcessIdentity::Dead | ProcessIdentity::AliveMismatch => return true,
-            ProcessIdentity::Unknown => return false,
-            ProcessIdentity::AliveMatch => {},
-        }
-
-        let Ok(pid_i32) = i32::try_from(pid) else {
-            return false;
-        };
-        let nix_pid = Pid::from_raw(pid_i32);
-
-        // Send SIGTERM first (graceful shutdown request).
-        match signal::kill(nix_pid, Signal::SIGTERM) {
-            Ok(()) => {},
-            Err(nix::errno::Errno::ESRCH) => return true, // already gone
-            Err(_) => return false,                       /* EPERM or other: can't signal, don't
-                                                            * proceed */
-        }
-
-        // Wait for graceful shutdown (up to 5 seconds, polling every 100ms).
-        // See doc comment above for why this blocking wait is intentional.
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            match verify_pid_identity(pid, expected_start_ticks) {
-                ProcessIdentity::Dead | ProcessIdentity::AliveMismatch => return true,
-                ProcessIdentity::AliveMatch => {},
-                ProcessIdentity::Unknown => return false,
-            }
-        }
-
-        // Re-check identity immediately before SIGKILL to avoid signaling a
-        // reused PID if ownership changed during the SIGTERM wait window.
-        match verify_pid_identity(pid, expected_start_ticks) {
-            ProcessIdentity::Dead | ProcessIdentity::AliveMismatch => return true,
-            ProcessIdentity::AliveMatch => {},
-            ProcessIdentity::Unknown => return false,
-        }
-
-        // Process still alive after 5s -- send SIGKILL (uncatchable).
-        match signal::kill(nix_pid, Signal::SIGKILL) {
-            Err(nix::errno::Errno::ESRCH) => return true,
-            Err(_) => return false,
-            Ok(()) => {},
-        }
-
-        // Final wait for SIGKILL to take effect.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        matches!(
-            verify_pid_identity(pid, expected_start_ticks),
-            ProcessIdentity::Dead | ProcessIdentity::AliveMismatch
-        )
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
     }
 }
 
@@ -6611,7 +7047,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lane_reset_clears_corrupt_marker() {
+    fn test_doctor_lane_reset_clears_corrupt_marker() {
         let home = tempfile::tempdir().expect("temp dir");
         let fac_root = home.path().join("private").join("fac");
 
@@ -6632,16 +7068,8 @@ mod tests {
         let status = manager.lane_status(lane_id).expect("initial lane status");
         assert_eq!(status.state, LaneState::Corrupt);
 
-        let exit_code = run_lane_reset_with_manager(
-            &manager,
-            &LaneResetArgs {
-                lane_id: lane_id.to_string(),
-                force: false,
-                json: false,
-            },
-            false,
-        );
-        assert_eq!(exit_code, exit_codes::SUCCESS);
+        let reset = doctor_reset_lane_once(&manager, lane_id);
+        assert!(reset.is_ok(), "doctor reset should succeed: {reset:?}");
         assert!(
             LaneCorruptMarkerV1::load(manager.fac_root(), lane_id)
                 .expect("load marker")
@@ -6655,7 +7083,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lane_reset_removes_all_per_lane_env_dirs() {
+    fn test_doctor_lane_reset_removes_all_per_lane_env_dirs() {
         let home = tempfile::tempdir().expect("temp dir");
         let fac_root = home.path().join("private").join("fac");
 
@@ -6681,45 +7109,290 @@ mod tests {
             std::fs::write(target.join("stale-state"), b"stale").expect("write stale state");
         }
 
-        let exit_code = run_lane_reset_with_manager(
-            &manager,
-            &LaneResetArgs {
-                lane_id: lane_id.to_string(),
-                force: false,
-                json: false,
-            },
-            false,
-        );
-        assert_eq!(exit_code, exit_codes::SUCCESS);
+        let reset = doctor_reset_lane_once(&manager, lane_id);
+        assert!(reset.is_ok(), "doctor reset should succeed: {reset:?}");
 
         for target in &reset_targets {
             assert!(
                 target.exists(),
-                "target {} should be recreated by lane reset",
+                "target {} should be recreated by doctor lane reset",
                 target.display()
             );
             assert!(
                 !target.join("stale-state").exists(),
-                "stale-state in {} should be deleted by lane reset",
+                "stale-state in {} should be deleted by doctor lane reset",
                 target.display()
             );
         }
     }
 
     #[test]
-    fn test_kill_process_best_effort_treats_pid_identity_mismatch_as_already_gone() {
-        let pid = std::process::id();
-        let start_ticks =
-            apm2_core::fac::read_proc_start_time_ticks(pid).expect("read current pid start ticks");
+    fn test_detect_lane_tmp_corruption_flags_transient_residue() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let residue = manager.lane_dir(lane_id).join("tmp").join(".tmp-stale");
+        std::fs::write(&residue, b"stale residue").expect("write residue");
+
+        let detection =
+            detect_lane_tmp_corruption(&manager, lane_id).expect("tmp corruption detection");
+        let detail = detection.expect("residue should be detected");
+        assert!(detail.contains("transient residue"));
+        assert!(detail.contains(".tmp-stale"));
+    }
+
+    #[test]
+    fn test_scrub_lane_tmp_dir_removes_nested_entries() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let tmp_dir = manager.lane_dir(lane_id).join("tmp");
+
+        std::fs::write(tmp_dir.join(".tmp-residue"), b"stale").expect("write residue file");
+        std::fs::write(tmp_dir.join("leftover.txt"), b"leftover").expect("write leftover file");
+        let nested_dir = tmp_dir.join("nested");
+        std::fs::create_dir_all(&nested_dir).expect("create nested tmp dir");
+        std::fs::write(nested_dir.join("nested.log"), b"nested").expect("write nested file");
+
+        let scrub = scrub_lane_tmp_dir(&manager, lane_id).expect("tmp scrub should succeed");
         assert!(
-            kill_process_best_effort(pid, Some(start_ticks.saturating_add(1))),
-            "mismatched pid identity should be treated as stale owner gone"
+            scrub.entries_deleted >= 3,
+            "expected scrub to delete multiple entries, got {}",
+            scrub.entries_deleted
+        );
+        let remaining = std::fs::read_dir(&tmp_dir)
+            .expect("read tmp dir after scrub")
+            .count();
+        assert_eq!(remaining, 0, "tmp dir should be empty after scrub");
+    }
+
+    #[test]
+    fn test_scrub_lane_tmp_dir_recreates_tmp_when_path_is_file() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let tmp_dir = manager.lane_dir(lane_id).join("tmp");
+        std::fs::remove_dir(&tmp_dir).expect("remove tmp dir");
+        std::fs::write(&tmp_dir, b"not-a-dir").expect("write tmp file");
+
+        let scrub = scrub_lane_tmp_dir(&manager, lane_id).expect("tmp scrub should succeed");
+        assert_eq!(scrub.entries_deleted, 1);
+        assert!(
+            tmp_dir.is_dir(),
+            "tmp path should be recreated as directory after scrub"
+        );
+    }
+
+    #[test]
+    fn test_scrub_lane_tmp_dir_with_entry_limit_fails_closed() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let nested_dir = manager.lane_dir(lane_id).join("tmp").join("nested");
+        std::fs::create_dir_all(&nested_dir).expect("create nested tmp dir");
+        for idx in 0..4 {
+            std::fs::write(nested_dir.join(format!("file-{idx}.tmp")), b"tmp")
+                .expect("write nested tmp file");
+        }
+
+        let err = scrub_lane_tmp_dir_with_entry_limit(&manager, lane_id, 2)
+            .expect_err("tmp scrub should fail when entry limit is exceeded");
+        assert!(
+            err.contains("entry bound"),
+            "expected entry bound failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_gc_stale_lane_logs_reports_over_quota_lane_log_targets() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let logs_dir = manager.lane_dir(lane_id).join("logs");
+        let mut created_job_dirs = Vec::new();
+        for idx in 0..6 {
+            let job_dir = logs_dir.join(format!("job-{idx:02}"));
+            std::fs::create_dir_all(&job_dir).expect("create job log directory");
+            let file = std::fs::File::create(job_dir.join("build.log")).expect("create build.log");
+            // Sparse file: 20 MiB logical size without heavy write I/O.
+            file.set_len(20 * 1024 * 1024)
+                .expect("set sparse file size");
+            created_job_dirs.push(job_dir);
+        }
+        let _oldest_dir = created_job_dirs
+            .into_iter()
+            .min()
+            .expect("at least one created job log dir");
+
+        let summary =
+            gc_stale_lane_logs(manager.fac_root(), &manager).expect("lane log gc should succeed");
+        assert!(
+            summary.targets >= 1,
+            "expected at least one lane log gc target, got {}",
+            summary.targets
         );
         assert_eq!(
-            apm2_core::fac::verify_pid_identity(pid, Some(start_ticks)),
-            apm2_core::fac::ProcessIdentity::AliveMatch,
-            "current process must remain alive after mismatch refusal"
+            summary.actions_applied + summary.errors,
+            summary.targets,
+            "every target must resolve to exactly one action or error"
         );
+        assert!(
+            summary.actions_applied > 0 || summary.errors > 0,
+            "gc should report at least one applied action or error for non-empty target set"
+        );
+    }
+
+    #[test]
+    fn test_system_doctor_fix_action_kind_serializes_as_snake_case() {
+        let payload = serde_json::to_value(SystemDoctorFixAction {
+            action: SystemDoctorFixActionKind::LaneTmpCorruptionDetected,
+            status: SystemDoctorFixActionStatus::Blocked,
+            lane_id: Some("lane-00".to_string()),
+            detail: "tmp residue detected".to_string(),
+        })
+        .expect("serialize doctor action");
+        assert_eq!(
+            payload.get("action").and_then(|value| value.as_str()),
+            Some("lane_tmp_corruption_detected")
+        );
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_guard_blocks_active_for_non_orphaned_reset() {
+        let err =
+            enforce_lane_reset_liveness_guard("lane-00", Some("job-123"), |_lane_id, _job_id| {
+                FacUnitLiveness::Active {
+                    active_units: vec!["apm2-fac-job-lane-00-job-123.service".to_string()],
+                }
+            })
+            .expect_err("active liveness must block reset");
+        assert!(
+            err.contains("reset blocked while liveness=active"),
+            "expected active liveness block detail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_guard_blocks_missing_job_id() {
+        let err = enforce_lane_reset_liveness_guard("lane-00", None, |_lane_id, _job_id| {
+            FacUnitLiveness::Inactive
+        })
+        .expect_err("missing job_id must block direct job-based guard");
+        assert!(
+            err.contains("cannot verify unit liveness without lease job_id"),
+            "unexpected missing-job_id guard detail: {err}"
+        );
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_guard_allows_inactive() {
+        let result =
+            enforce_lane_reset_liveness_guard("lane-00", Some("job-123"), |_lane_id, _job_id| {
+                FacUnitLiveness::Inactive
+            });
+        assert!(result.is_ok(), "inactive liveness should allow reset");
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_context_blocks_missing_job_id_for_orphaned() {
+        let err = enforce_lane_reset_liveness_for_context(
+            "lane-00",
+            None,
+            true,
+            |_lane_id, _job_id| FacUnitLiveness::Inactive,
+            |_lane_id| FacUnitLiveness::Inactive,
+        )
+        .expect_err("orphaned missing job_id must block");
+        assert!(err.contains("orphaned-systemd lane is missing lease job_id"));
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_context_allows_missing_job_id_when_lane_inactive() {
+        let result = enforce_lane_reset_liveness_for_context(
+            "lane-00",
+            None,
+            false,
+            |_lane_id, _job_id| FacUnitLiveness::Inactive,
+            |_lane_id| FacUnitLiveness::Inactive,
+        );
+        assert!(
+            result.is_ok(),
+            "non-orphaned missing job_id should allow when lane probe is inactive"
+        );
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_context_allows_missing_job_id_when_systemd_unavailable() {
+        let result = enforce_lane_reset_liveness_for_context(
+            "lane-00",
+            None,
+            false,
+            |_lane_id, _job_id| FacUnitLiveness::Inactive,
+            |_lane_id| FacUnitLiveness::Unknown {
+                reason: FAC_UNIT_LIVENESS_UNAVAILABLE_REASON.to_string(),
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "non-orphaned missing job_id should allow when systemd probe is unavailable"
+        );
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_context_blocks_missing_job_id_when_lane_active() {
+        let err = enforce_lane_reset_liveness_for_context(
+            "lane-00",
+            None,
+            false,
+            |_lane_id, _job_id| FacUnitLiveness::Inactive,
+            |_lane_id| FacUnitLiveness::Active {
+                active_units: vec!["apm2-fac-job-lane-00-job-123.service".to_string()],
+            },
+        )
+        .expect_err("active lane-wide liveness must block missing-job_id reset");
+        assert!(err.contains("reset blocked while liveness=active"));
+    }
+
+    #[test]
+    fn test_system_doctor_fix_exit_code_returns_error_for_blocked_actions() {
+        let exit_code = system_doctor_fix_exit_code(false, true, false);
+        assert_eq!(exit_code, exit_codes::GENERIC_ERROR);
+    }
+
+    #[test]
+    fn test_system_doctor_fix_exit_code_returns_success_when_clean() {
+        let exit_code = system_doctor_fix_exit_code(false, false, false);
+        assert_eq!(exit_code, exit_codes::SUCCESS);
     }
 
     #[test]
@@ -7315,6 +7988,38 @@ mod tests {
     }
 
     #[test]
+    fn test_doctor_fix_without_pr_parses_for_system_reconcile() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "doctor", "--fix"])
+            .expect("doctor --fix without --pr should parse");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert!(args.fix);
+                assert!(args.pr.is_none());
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_should_attempt_cleanup_scrub_matches_entry_limit_reason() {
+        assert!(should_attempt_cleanup_scrub(
+            "directory /tmp/lane/tmp has more than 10000 entries"
+        ));
+        assert!(!should_attempt_cleanup_scrub("operator-marked corrupt"));
+    }
+
+    #[test]
+    fn test_refused_delete_mentions_tmp_matches_tmp_root() {
+        let receipts = vec![RefusedDeleteReceipt {
+            root: PathBuf::from("/tmp/apm2/private/fac/lanes/lane-00/tmp"),
+            allowed_parent: PathBuf::from("/tmp/apm2/private/fac/lanes"),
+            reason: "directory has more than 10000 entries".to_string(),
+            mark_corrupt: true,
+        }];
+        assert!(refused_delete_mentions_tmp(&receipts));
+    }
+
+    #[test]
     fn test_doctor_full_flag_parses() {
         let parsed = FacLogsCliHarness::try_parse_from(["fac", "doctor", "--full"])
             .expect("doctor --full should parse");
@@ -7681,9 +8386,8 @@ mod tests {
     }
 
     #[test]
-    fn test_lane_reset_and_worker_commands_parse() {
-        assert_fac_command_parses(&["fac", "lane", "reset", "lane-00"]);
-        assert_fac_command_parses(&["fac", "lane", "reset", "lane-07", "--force"]);
+    fn test_doctor_and_worker_commands_parse() {
+        assert_fac_command_parses(&["fac", "doctor", "--fix"]);
         assert_fac_command_parses(&["fac", "worker", "--once"]);
         assert_fac_command_parses(&[
             "fac",
@@ -8557,7 +9261,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lane_mark_corrupt_then_reset_clears() {
+    fn test_lane_mark_corrupt_then_doctor_reset_clears() {
         let home = tempfile::tempdir().expect("temp dir");
         let fac_root = home.path().join("private").join("fac");
 
@@ -8581,17 +9285,9 @@ mod tests {
         );
         assert_eq!(mark_exit, exit_codes::SUCCESS);
 
-        // Reset the lane.
-        let reset_exit = run_lane_reset_with_manager(
-            &manager,
-            &LaneResetArgs {
-                lane_id: lane_id.to_string(),
-                force: false,
-                json: false,
-            },
-            false,
-        );
-        assert_eq!(reset_exit, exit_codes::SUCCESS);
+        // Reset the lane through doctor remediation logic.
+        let reset = doctor_reset_lane_once(&manager, lane_id);
+        assert!(reset.is_ok(), "doctor reset should succeed: {reset:?}");
 
         // Marker should be cleared.
         assert!(
