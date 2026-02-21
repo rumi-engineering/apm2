@@ -244,6 +244,8 @@ Security invariants:
 - [INV-BOOT-006] Installs `apm2-worker@.service` template unit alongside non-templated units for parallel lane-specific workers.
 - [INV-BOOT-007] `--system` provisioning is root-only and fails closed when service-user identity or ownership updates cannot be verified.
 - [INV-BOOT-008] Queue runtime modes are normalized during `--system` provisioning (`queue/**` 0711, `broker_requests/` 01733).
+- [INV-BOOT-009] `--system` account-management calls are PATH-independent and fail-closed: `useradd`/`usermod` execute only from trusted absolute root-owned non-symlink binaries with group/other-writable modes rejected, and subprocess env is cleared to a minimal PATH allowlist.
+- [INV-BOOT-010] Caller group enrollment resolves the provisioned service group by effective service GID (not assumed service username), preventing drift when user and primary-group names diverge.
 
 ### Work (work.rs)
 

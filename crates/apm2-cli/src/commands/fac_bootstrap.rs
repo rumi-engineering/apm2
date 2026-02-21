@@ -31,6 +31,8 @@
 
 use std::fs;
 #[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -54,6 +56,8 @@ use crate::exit_codes::codes as exit_codes;
 /// Maximum number of planned actions to collect in dry-run mode.
 /// Prevents unbounded memory growth from adversarial lane counts.
 const MAX_PLANNED_ACTIONS: usize = 256;
+#[cfg(unix)]
+const MINIMAL_ADMIN_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Subdirectories under `$APM2_HOME/private/fac/` that bootstrap creates.
 const FAC_SUBDIRS: &[&str] = &[
@@ -745,7 +749,7 @@ fn plan_system_mode_provisioning(
     actions.push(BootstrapAction {
         kind: "system_identity",
         description:
-            "[plan] add invoking user to service group (usermod -aG <service_user> <caller>)"
+            "[plan] add invoking user to service group (usermod -aG <service_group> <caller>)"
                 .to_string(),
         skipped: false,
     });
@@ -796,6 +800,20 @@ fn provision_system_mode_identity(
         .map_err(|err| format!("cannot resolve provisioned service user identity: {err}"))?;
     let owner_uid = Uid::from_raw(identity.uid);
     let owner_group = Gid::from_raw(identity.gid);
+    let owner_group_name = unistd::Group::from_gid(owner_group)
+        .map_err(|err| {
+            format!(
+                "cannot resolve provisioned service group for gid {}: {err}",
+                owner_group.as_raw()
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "provisioned service group for gid {} not found",
+                owner_group.as_raw()
+            )
+        })?
+        .name;
 
     chown_tree_no_symlink(fac_root, owner_uid, owner_group)?;
     actions.push(BootstrapAction {
@@ -803,7 +821,7 @@ fn provision_system_mode_identity(
         description: format!(
             "applied recursive ownership {}:{} to {}",
             identity.name,
-            identity.name,
+            owner_group_name,
             fac_root.display()
         ),
         skipped: false,
@@ -815,7 +833,7 @@ fn provision_system_mode_identity(
         description: format!(
             "applied recursive ownership {}:{} to {}",
             identity.name,
-            identity.name,
+            owner_group_name,
             queue_root.display()
         ),
         skipped: false,
@@ -823,18 +841,17 @@ fn provision_system_mode_identity(
 
     match resolve_bootstrap_caller_user() {
         Some(caller_user) => {
-            let added = ensure_user_in_service_group(&caller_user, &identity.name, owner_group)?;
+            let (added, service_group_name) =
+                ensure_user_in_service_group(&caller_user, owner_group)?;
             actions.push(BootstrapAction {
                 kind: "system_identity",
                 description: if added {
                     format!(
-                        "added user '{caller_user}' to group '{}'; re-login may be required",
-                        identity.name
+                        "added user '{caller_user}' to group '{service_group_name}'; re-login may be required"
                     )
                 } else {
                     format!(
-                        "user '{caller_user}' is already a member of group '{}'",
-                        identity.name
+                        "user '{caller_user}' is already a member of group '{service_group_name}'"
                     )
                 },
                 skipped: !added,
@@ -875,11 +892,15 @@ fn ensure_system_service_user_exists(service_user: &str) -> Result<bool, String>
     } else {
         "/usr/bin/nologin"
     };
+    let useradd_path =
+        resolve_root_owned_admin_tool("useradd", &["/usr/sbin/useradd", "/usr/bin/useradd"])?;
 
-    let output = Command::new("useradd")
+    let output = Command::new(&useradd_path)
+        .env_clear()
+        .env("PATH", MINIMAL_ADMIN_PATH)
         .args(["-r", "-s", nologin_shell, "-U", service_user])
         .output()
-        .map_err(|err| format!("failed to execute useradd: {err}"))?;
+        .map_err(|err| format!("failed to execute {useradd_path}: {err}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -997,36 +1018,102 @@ fn resolve_bootstrap_caller_user() -> Option<String> {
 #[cfg(unix)]
 fn ensure_user_in_service_group(
     caller_user: &str,
-    service_group: &str,
     service_gid: Gid,
-) -> Result<bool, String> {
+) -> Result<(bool, String), String> {
     let caller = unistd::User::from_name(caller_user)
         .map_err(|err| format!("cannot resolve caller user '{caller_user}': {err}"))?
         .ok_or_else(|| format!("caller user '{caller_user}' not found"))?;
 
-    let group = unistd::Group::from_name(service_group)
-        .map_err(|err| format!("cannot resolve service group '{service_group}': {err}"))?
-        .ok_or_else(|| format!("service group '{service_group}' not found"))?;
+    let group = unistd::Group::from_gid(service_gid)
+        .map_err(|err| {
+            format!(
+                "cannot resolve service group for gid {}: {err}",
+                service_gid.as_raw()
+            )
+        })?
+        .ok_or_else(|| format!("service group for gid {} not found", service_gid.as_raw()))?;
+    let group_name = group.name;
 
     let already_member =
         caller.gid == service_gid || group.mem.iter().any(|member| member == caller_user);
     if already_member {
-        return Ok(false);
+        return Ok((false, group_name));
     }
+    let usermod_path =
+        resolve_root_owned_admin_tool("usermod", &["/usr/sbin/usermod", "/usr/bin/usermod"])?;
 
-    let output = Command::new("usermod")
-        .args(["-aG", service_group, caller_user])
+    let output = Command::new(&usermod_path)
+        .env_clear()
+        .env("PATH", MINIMAL_ADMIN_PATH)
+        .args(["-aG", group_name.as_str(), caller_user])
         .output()
-        .map_err(|err| format!("failed to execute usermod: {err}"))?;
+        .map_err(|err| format!("failed to execute {usermod_path}: {err}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "usermod failed while adding '{caller_user}' to '{service_group}': {}",
+            "usermod failed while adding '{caller_user}' to '{}': {}",
+            group_name,
             stderr.trim()
         ));
     }
 
-    Ok(true)
+    Ok((true, group_name))
+}
+
+#[cfg(unix)]
+fn resolve_root_owned_admin_tool(tool_name: &str, candidates: &[&str]) -> Result<String, String> {
+    let mut errors: Vec<String> = Vec::new();
+    for candidate in candidates {
+        let candidate_path = Path::new(candidate);
+        if !candidate_path.is_absolute() {
+            errors.push(format!("{candidate}: must be an absolute path"));
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(candidate) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                errors.push(format!("{candidate}: {err}"));
+                continue;
+            },
+        };
+        if metadata.file_type().is_symlink() {
+            errors.push(format!("{candidate}: must not be a symlink"));
+            continue;
+        }
+        if !metadata.is_file() {
+            errors.push(format!("{candidate}: not a regular file"));
+            continue;
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o100 == 0 {
+            errors.push(format!("{candidate}: owner execute bit is not set"));
+            continue;
+        }
+        if mode & 0o022 != 0 {
+            errors.push(format!(
+                "{candidate}: group/other writable mode is not allowed ({:04o})",
+                mode & 0o7777
+            ));
+            continue;
+        }
+        if metadata.uid() != 0 {
+            errors.push(format!(
+                "{candidate}: owner uid is {} (expected 0)",
+                metadata.uid()
+            ));
+            continue;
+        }
+        return Ok((*candidate).to_string());
+    }
+    Err(format!(
+        "no trusted absolute path found for {tool_name}: {}",
+        errors.join("; ")
+    ))
+}
+
+#[cfg(not(unix))]
+fn resolve_root_owned_admin_tool(_tool_name: &str, _candidates: &[&str]) -> Result<String, String> {
+    Err("root-owned admin tool resolution is only supported on Unix".to_string())
 }
 
 // =============================================================================
@@ -1507,5 +1594,82 @@ mod tests {
         assert!(!written2);
         assert_eq!(actions.len(), 2);
         assert!(actions[1].skipped);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_root_owned_admin_tool_rejects_relative_candidate() {
+        let err = resolve_root_owned_admin_tool("useradd", &["useradd"])
+            .expect_err("relative candidate must be rejected");
+        assert!(err.contains("must be an absolute path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_root_owned_admin_tool_rejects_symlink_candidate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target-tool");
+        fs::write(&target, "#!/bin/sh\nexit 0\n").expect("write target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
+            .expect("set executable mode");
+        let symlink_path = dir.path().join("tool-link");
+        std::os::unix::fs::symlink(&target, &symlink_path).expect("create symlink");
+        let candidate = symlink_path.to_string_lossy().to_string();
+
+        let err = resolve_root_owned_admin_tool("useradd", &[candidate.as_str()])
+            .expect_err("symlink candidate must be rejected");
+        assert!(err.contains("must not be a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_root_owned_admin_tool_rejects_non_root_owned_candidate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let candidate_path = dir.path().join("tool");
+        fs::write(&candidate_path, "#!/bin/sh\nexit 0\n").expect("write tool");
+        fs::set_permissions(&candidate_path, fs::Permissions::from_mode(0o700))
+            .expect("set executable mode");
+        let candidate = candidate_path.to_string_lossy().to_string();
+
+        let err = resolve_root_owned_admin_tool("usermod", &[candidate.as_str()])
+            .expect_err("non-root-owned candidate must be rejected");
+        assert!(err.contains("owner uid is"));
+        assert!(err.contains("expected 0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_root_owned_admin_tool_accepts_trusted_candidate() {
+        let fallback_candidates = [
+            "/usr/sbin/useradd",
+            "/usr/bin/useradd",
+            "/usr/sbin/usermod",
+            "/usr/bin/usermod",
+            "/usr/bin/env",
+            "/bin/sh",
+        ];
+        let trusted_candidates: Vec<&str> = fallback_candidates
+            .iter()
+            .copied()
+            .filter(|path| {
+                let Ok(metadata) = fs::symlink_metadata(path) else {
+                    return false;
+                };
+                let mode = metadata.permissions().mode();
+                metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.uid() == 0
+                    && (mode & 0o100 != 0)
+                    && (mode & 0o022 == 0)
+            })
+            .collect();
+
+        if trusted_candidates.is_empty() {
+            return;
+        }
+
+        let resolved = resolve_root_owned_admin_tool("test", &trusted_candidates)
+            .expect("trusted system candidate should resolve");
+        assert_eq!(resolved, trusted_candidates[0]);
     }
 }
