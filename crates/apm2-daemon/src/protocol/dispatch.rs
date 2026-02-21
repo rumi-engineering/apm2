@@ -7033,6 +7033,20 @@ pub trait LeaseValidator: Send + Sync {
     fn freeze_legacy_writes(&self) -> Result<(), String> {
         Ok(())
     }
+
+    /// Removes a lease by ID, simulating lease revocation.
+    ///
+    /// This method exists primarily to support test fixtures that need to
+    /// simulate lease revocation for PCAC revalidation tests. The default
+    /// implementation is a no-op that returns `false`.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the lease was found and removed, `false` otherwise.
+    fn remove_lease(&self, lease_id: &str) -> bool {
+        let _ = lease_id;
+        false
+    }
 }
 
 /// Entry for a registered lease.
@@ -7239,6 +7253,17 @@ impl LeaseValidator for StubLeaseValidator {
         Ok(guard
             .get(lease_id)
             .and_then(|entry| entry.delegated_parent_lease_id.clone()))
+    }
+
+    fn remove_lease(&self, lease_id: &str) -> bool {
+        let mut guard = self.leases.write().expect("lock poisoned");
+        let (order, leases) = &mut *guard;
+        if leases.remove(lease_id).is_some() {
+            order.retain(|k| k != lease_id);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -17604,29 +17629,6 @@ impl PrivilegedDispatcher {
         };
         let evidence_id = entry_id.clone();
 
-        // TCK-00638: Idempotency check — if an evidence.published event with
-        // this entry_id already exists in the ledger, return the existing
-        // response without emitting a duplicate event. This prevents ledger
-        // bloat on retries.
-        if let Some((existing_event_id, existing_cas_hash)) =
-            self.find_work_context_published_replay(&request.work_id, &entry_id)
-        {
-            debug!(
-                work_id = %request.work_id,
-                entry_id = %entry_id,
-                event_id = %existing_event_id,
-                "Idempotent: returning existing WorkContextEntry evidence event"
-            );
-            return Ok(PrivilegedResponse::PublishWorkContextEntry(
-                PublishWorkContextEntryResponse {
-                    entry_id,
-                    evidence_id,
-                    cas_hash: existing_cas_hash,
-                    work_id: request.work_id,
-                },
-            ));
-        }
-
         // ---- Daemon-authoritative field overwrite ----
         // The daemon is authoritative for entry_id, actor_id, created_at_ns,
         // and source_session_id. Client-supplied values are silently overwritten.
@@ -17781,6 +17783,36 @@ impl PrivilegedDispatcher {
             },
             Err(response) => return Ok(response),
         };
+
+        // TCK-00638: Idempotency check — AFTER PCAC lifecycle enforcement.
+        // If an evidence.published event with this entry_id already exists in
+        // the ledger, return the existing response without emitting a duplicate
+        // event. This prevents ledger bloat on retries.
+        //
+        // CRITICAL: this check is deliberately placed AFTER PCAC enforcement
+        // (derive_privileged_pcac_revalidation_inputs +
+        // enforce_privileged_pcac_lifecycle) so that replay requests are always
+        // revalidated against current lease freshness and revocation state. A
+        // previously-accepted entry must not bypass PCAC if the caller's lease
+        // has since been revoked or policy state has changed.
+        if let Some((existing_event_id, existing_cas_hash)) =
+            self.find_work_context_published_replay(&request.work_id, &entry_id)
+        {
+            debug!(
+                work_id = %request.work_id,
+                entry_id = %entry_id,
+                event_id = %existing_event_id,
+                "Idempotent: returning existing WorkContextEntry evidence event (post-PCAC)"
+            );
+            return Ok(PrivilegedResponse::PublishWorkContextEntry(
+                PublishWorkContextEntryResponse {
+                    entry_id,
+                    evidence_id,
+                    cas_hash: existing_cas_hash,
+                    work_id: request.work_id,
+                },
+            ));
+        }
 
         // ---- Mutation Phase: CAS store then ledger append ----
 
@@ -29733,6 +29765,82 @@ mod tests {
                 evidence_count, 1,
                 "Idempotent retry must NOT produce a second evidence event"
             );
+        }
+
+        /// Regression [f-783-code_quality-1771692967902566-0]: replay requests
+        /// for previously-published work context entries must revalidate PCAC
+        /// lifecycle (lease freshness, revocation) before returning the cached
+        /// response. Removing the lease simulates revocation; the idempotent
+        /// replay path must fail-closed instead of returning a stale success.
+        #[test]
+        fn test_publish_work_context_entry_replay_denied_after_lease_revocation() {
+            let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher();
+
+            // First call: succeeds normally.
+            let entry_json = make_entry_json(&work_id, "DIAGNOSIS", "key-revoke-001");
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "DIAGNOSIS".to_string(),
+                dedupe_key: "key-revoke-001".to_string(),
+                entry_json: entry_json.clone(),
+                lease_id: lease_id.clone(),
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+            let resp1 = match dispatcher.dispatch(&frame, &ctx).unwrap() {
+                PrivilegedResponse::PublishWorkContextEntry(r) => r,
+                other => panic!("Expected PublishWorkContextEntry, got: {other:?}"),
+            };
+            assert!(!resp1.entry_id.is_empty(), "first call must succeed");
+
+            // Simulate lease revocation: remove the lease from the validator.
+            // This causes derive_privileged_pcac_revalidation_inputs to fail
+            // because get_lease_work_id returns None.
+            assert!(
+                dispatcher.lease_validator.remove_lease(&lease_id),
+                "lease must exist to be removed"
+            );
+
+            // Retry (replay) with the same idempotency key: must be DENIED
+            // because PCAC revalidation now fails (lease revoked).
+            let request2 = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "DIAGNOSIS".to_string(),
+                dedupe_key: "key-revoke-001".to_string(),
+                entry_json,
+                lease_id: lease_id.clone(),
+            };
+            let frame2 = encode_publish_work_context_entry_request(&request2);
+            let resp2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+
+            // The replay must NOT succeed: PCAC enforcement must deny because
+            // the lease is revoked (absent from the validator).
+            match &resp2 {
+                PrivilegedResponse::PublishWorkContextEntry(_) => {
+                    panic!(
+                        "Replay after lease revocation must be DENIED, but got success. \
+                         This is the exact bypass described in finding \
+                         f-783-code_quality-1771692967902566-0."
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        i32::from(PrivilegedErrorCode::CapabilityRequestRejected),
+                        "Expected CapabilityRequestRejected, got code {}: {}",
+                        err.code,
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("revalidation unavailable")
+                            || err.message.contains("PCAC authority denied"),
+                        "Error message should indicate PCAC/revalidation failure, got: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected Error response after lease revocation, got: {other:?}");
+                },
+            }
         }
 
         /// Regression: two different `entry_id` values (different `dedupe_key`
