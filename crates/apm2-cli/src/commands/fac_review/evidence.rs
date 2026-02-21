@@ -3,7 +3,7 @@
 
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -50,6 +50,9 @@ const WRAPPER_STRIP_KEYS: &[&str] = &["RUSTC_WRAPPER"];
 
 /// Prefix for env vars unconditionally stripped from ALL gate phases.
 const WRAPPER_STRIP_PREFIXES: &[&str] = &["SCCACHE_"];
+const SYSTEMD_TRANSIENT_UNIT_NOT_FOUND_PREFIX: &str =
+    "Failed to start transient service unit: Unit ";
+const RETRY_LOG_SCAN_MAX_BYTES: usize = 8192;
 
 /// Compute the full set of wrapper-stripping `env_remove_keys` by combining the
 /// static `WRAPPER_STRIP_KEYS` with any variables matching
@@ -129,6 +132,9 @@ pub struct EvidenceGateOptions {
     /// Prevents parent process env inheritance of `sccache`/`RUSTC_WRAPPER`
     /// keys that could bypass cgroup containment (TCK-00548).
     pub env_remove_keys: Vec<String>,
+    /// Optional base unit name used for deterministic bounded gate units.
+    /// When set, non-test bounded units are named `<base>-<gate_name>`.
+    pub bounded_gate_unit_base: Option<String>,
     /// Skip the heavyweight test gate for quick inner-loop validation.
     pub skip_test_gate: bool,
     /// Skip merge-conflict gate when caller already pre-validated it.
@@ -898,7 +904,7 @@ fn run_single_evidence_gate_with_env_and_progress(
     on_gate_progress: Option<&dyn Fn(GateProgressEvent)>,
 ) -> (bool, StreamStats) {
     let started = Instant::now();
-    let output = run_gate_command_with_heartbeat(
+    let mut output = run_gate_command_with_heartbeat(
         workspace_root,
         gate_name,
         cmd,
@@ -909,6 +915,36 @@ fn run_single_evidence_gate_with_env_and_progress(
         emit_human_logs,
         on_gate_progress,
     );
+
+    // S8: retry once without parent binding when systemd reports parent unit
+    // not found (e.g., stale session scope).
+    if cmd == "systemd-run" {
+        let stripped_args = strip_parent_binding_properties(args);
+        if stripped_args.len() != args.len()
+            && output.as_ref().is_ok_and(|out| !out.status.success())
+            && is_systemd_unit_not_found_failure(log_path)
+        {
+            if emit_human_logs {
+                eprintln!(
+                    "ts={} gate={gate_name} retry=without_parent_binding reason=systemd_unit_not_found",
+                    now_iso8601()
+                );
+            }
+            let retry_args: Vec<&str> = stripped_args.iter().map(String::as_str).collect();
+            output = run_gate_command_with_heartbeat(
+                workspace_root,
+                gate_name,
+                cmd,
+                &retry_args,
+                log_path,
+                extra_env,
+                env_remove_keys,
+                emit_human_logs,
+                on_gate_progress,
+            );
+        }
+    }
+
     let duration = started.elapsed().as_secs();
     match output {
         Ok(out) => {
@@ -954,6 +990,45 @@ fn run_single_evidence_gate_with_env_and_progress(
             )
         },
     }
+}
+
+fn strip_parent_binding_properties(args: &[&str]) -> Vec<String> {
+    let mut stripped = Vec::with_capacity(args.len());
+    let mut idx = 0usize;
+    while idx < args.len() {
+        if args[idx] == "--property" {
+            if let Some(value) = args.get(idx + 1) {
+                if value.starts_with("PartOf=") || value.starts_with("BindsTo=") {
+                    idx += 2;
+                    continue;
+                }
+            }
+        }
+        stripped.push(args[idx].to_string());
+        idx += 1;
+    }
+    stripped
+}
+
+fn is_systemd_unit_not_found_failure(log_path: &Path) -> bool {
+    let Ok(mut file) = File::open(log_path) else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    let start = metadata
+        .len()
+        .saturating_sub(u64::try_from(RETRY_LOG_SCAN_MAX_BYTES).unwrap_or(u64::MAX));
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return false;
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    text.contains(SYSTEMD_TRANSIENT_UNIT_NOT_FOUND_PREFIX) && text.contains(" not found.")
 }
 
 fn run_native_evidence_gate(
@@ -1211,6 +1286,7 @@ fn build_pipeline_test_command(
             cpu_quota: &effective_cpu_quota,
         },
         &build_nextest_command(),
+        None,
         &test_env,
         policy.sandbox_hardening,
         evidence_network_policy,
@@ -1894,6 +1970,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
             let mut specs = Vec::new();
             for &(gate_name, cmd_args) in gates {
                 let gate_cmd: Vec<String> = cmd_args.iter().map(|s| (*s).to_string()).collect();
+                let gate_unit_name = opts
+                    .and_then(|options| options.bounded_gate_unit_base.as_ref())
+                    .map(|base| format!("{base}-{gate_name}"));
                 let bounded = build_systemd_bounded_gate_command(
                     workspace_root,
                     BoundedTestLimits {
@@ -1904,6 +1983,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
                         cpu_quota: "200%",
                     },
                     &gate_cmd,
+                    gate_unit_name.as_deref(),
                     &gate_env,
                     policy.sandbox_hardening.clone(),
                     gate_network_policy.clone(),
@@ -2787,6 +2867,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     cpu_quota: "200%",
                 },
                 &gate_cmd,
+                None,
                 &gate_env,
                 fac_policy.sandbox_hardening.clone(),
                 gate_network_policy.clone(),
@@ -4431,6 +4512,7 @@ mod tests {
             test_command: Some(test_command),
             test_command_environment: Vec::new(),
             env_remove_keys: Vec::new(),
+            bounded_gate_unit_base: None,
             skip_test_gate: false,
             skip_merge_conflict_gate: true,
             emit_human_logs: false,

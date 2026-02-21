@@ -56,6 +56,7 @@
 
 use std::fmt;
 use std::path::Path;
+use std::process::Command;
 
 use thiserror::Error;
 
@@ -90,6 +91,10 @@ const MAX_PROPERTY_ARGS: usize = 32;
 /// defense-in-depth measure against misconfigured `/etc/passwd` entries
 /// where `root` might be remapped to a non-zero uid.
 const DENIED_SERVICE_USER_NAMES: &[&str] = &["root"];
+
+/// Maximum length for systemd unit names passed to `--unit` and
+/// unit-binding properties.
+const MAX_SYSTEMD_UNIT_NAME_LENGTH: usize = 255;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error Types
@@ -178,6 +183,15 @@ pub enum ExecutionBackendError {
     EnvValueNotUtf8 {
         /// Name of the environment variable.
         var: &'static str,
+    },
+
+    /// Invalid systemd unit name.
+    #[error("invalid systemd unit name '{unit}': {reason}")]
+    InvalidSystemdUnitName {
+        /// The invalid unit name.
+        unit: String,
+        /// Why it is invalid.
+        reason: String,
     },
 }
 
@@ -369,6 +383,7 @@ pub struct SystemdRunCommand {
 /// * `working_directory` — Working directory for the job.
 /// * `unit_name` — Optional transient unit name (system-mode only; if `None`,
 ///   systemd auto-generates a name).
+/// * `parent_unit` — Optional parent unit name used for lifecycle binding.
 /// * `system_config` — Required for system-mode; ignored for user-mode.
 /// * `job_command` — The command and arguments to execute.
 ///
@@ -383,6 +398,7 @@ pub fn build_systemd_run_command(
     properties: &SystemdUnitProperties,
     working_directory: &Path,
     unit_name: Option<&str>,
+    parent_unit: Option<&str>,
     system_config: Option<&SystemModeConfig>,
     job_command: &[String],
 ) -> Result<SystemdRunCommand, ExecutionBackendError> {
@@ -408,6 +424,7 @@ pub fn build_systemd_run_command(
 
     // Unit name (system-mode uses explicit names for auditability)
     if let Some(name) = unit_name {
+        validate_systemd_unit_name(name, false)?;
         args.push("--unit".to_string());
         args.push(name.to_string());
     }
@@ -426,6 +443,20 @@ pub fn build_systemd_run_command(
     } else {
         None
     };
+
+    // Parent lifecycle binding (defense-in-depth against orphaned transient
+    // units when the parent worker unit terminates).
+    if let Some(parent) = parent_unit {
+        validate_systemd_unit_name(parent, true)?;
+        if parent_unit_is_active(backend, parent) {
+            property_list.push(format!("PartOf={parent}"));
+            property_list.push(format!("BindsTo={parent}"));
+        } else {
+            eprintln!(
+                "apm2 fac: skipping parent unit binding for {parent} (inactive/not-found in {backend} mode)"
+            );
+        }
+    }
 
     // Validate property count bound
     if property_list.len() > MAX_PROPERTY_ARGS {
@@ -570,6 +601,79 @@ fn build_property_list(props: &SystemdUnitProperties, backend: ExecutionBackend)
 // ─────────────────────────────────────────────────────────────────────────────
 // Validation
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Validate a systemd unit name used in `--unit`, `PartOf=`, and `BindsTo=`.
+///
+/// Accepts only a conservative character set and requires a `.service` or
+/// `.scope` suffix to avoid malformed property values.
+fn validate_systemd_unit_name(
+    unit: &str,
+    require_suffix: bool,
+) -> Result<(), ExecutionBackendError> {
+    if unit.is_empty() {
+        return Err(ExecutionBackendError::InvalidSystemdUnitName {
+            unit: unit.to_string(),
+            reason: "empty unit name".to_string(),
+        });
+    }
+    if unit.len() > MAX_SYSTEMD_UNIT_NAME_LENGTH {
+        return Err(ExecutionBackendError::InvalidSystemdUnitName {
+            unit: unit.to_string(),
+            reason: format!("exceeds maximum length of {MAX_SYSTEMD_UNIT_NAME_LENGTH}"),
+        });
+    }
+    let has_supported_suffix = unit
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| matches!(ext, "service" | "scope"));
+    if require_suffix && !has_supported_suffix {
+        return Err(ExecutionBackendError::InvalidSystemdUnitName {
+            unit: unit.to_string(),
+            reason: "must end with .service or .scope".to_string(),
+        });
+    }
+    if !unit
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'@'))
+    {
+        return Err(ExecutionBackendError::InvalidSystemdUnitName {
+            unit: unit.to_string(),
+            reason: "contains unsupported characters".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn parent_unit_is_active(backend: ExecutionBackend, unit: &str) -> bool {
+    let scope_flag = match backend {
+        ExecutionBackend::UserMode => "--user",
+        ExecutionBackend::SystemMode => "--system",
+    };
+    let output = Command::new("systemctl")
+        .args([
+            scope_flag,
+            "show",
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--value",
+            "--",
+            unit,
+        ])
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut values = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let load_state = values.next().unwrap_or_default();
+    let active_state = values.next().unwrap_or_default();
+    load_state == "loaded" && matches!(active_state, "active" | "activating" | "reloading")
+}
 
 /// Validate a service user name.
 ///
@@ -835,6 +939,7 @@ mod tests {
             Path::new("/tmp/workspace"),
             None,
             None,
+            None,
             &["cargo".to_string(), "test".to_string()],
         )
         .unwrap();
@@ -863,6 +968,7 @@ mod tests {
             &props,
             Path::new("/tmp/workspace"),
             Some("apm2-fac-job-lane00-job42"),
+            None,
             Some(&config),
             &["cargo".to_string(), "test".to_string()],
         )
@@ -883,12 +989,86 @@ mod tests {
     }
 
     #[test]
+    fn command_includes_parent_unit_bindings_when_provided() {
+        let props = test_properties();
+        let config = SystemModeConfig::new("_apm2-job").unwrap();
+        let cmd = build_systemd_run_command(
+            ExecutionBackend::SystemMode,
+            &props,
+            Path::new("/tmp/workspace"),
+            Some("apm2-fac-job-lane00-job42.service"),
+            Some("apm2-worker.service"),
+            Some(&config),
+            &["cargo".to_string(), "test".to_string()],
+        )
+        .unwrap();
+
+        let has_part_of = cmd.args.iter().any(|a| a == "PartOf=apm2-worker.service");
+        let has_binds_to = cmd.args.iter().any(|a| a == "BindsTo=apm2-worker.service");
+        assert!(
+            has_part_of == has_binds_to,
+            "parent bindings must be applied/omitted together"
+        );
+    }
+
+    #[test]
+    fn command_omits_parent_bindings_when_parent_not_found() {
+        let props = test_properties();
+        let config = SystemModeConfig::new("_apm2-job").unwrap();
+        let cmd = build_systemd_run_command(
+            ExecutionBackend::SystemMode,
+            &props,
+            Path::new("/tmp/workspace"),
+            Some("apm2-fac-job-lane00-job42.service"),
+            Some("apm2-parent-definitely-not-found-xyz.service"),
+            Some(&config),
+            &["cargo".to_string(), "test".to_string()],
+        )
+        .unwrap();
+
+        assert!(
+            !cmd.args
+                .iter()
+                .any(|a| a == "PartOf=apm2-parent-definitely-not-found-xyz.service"),
+            "missing parent must not be bound"
+        );
+        assert!(
+            !cmd.args
+                .iter()
+                .any(|a| a == "BindsTo=apm2-parent-definitely-not-found-xyz.service"),
+            "missing parent must not be bound"
+        );
+    }
+
+    #[test]
+    fn command_rejects_invalid_parent_unit_name() {
+        let props = test_properties();
+        let config = SystemModeConfig::new("_apm2-job").unwrap();
+        let err = build_systemd_run_command(
+            ExecutionBackend::SystemMode,
+            &props,
+            Path::new("/tmp/workspace"),
+            Some("apm2-fac-job-lane00-job42.service"),
+            Some("bad unit name"),
+            Some(&config),
+            &["cargo".to_string(), "test".to_string()],
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("invalid systemd unit name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn system_mode_requires_config() {
         let props = test_properties();
         let err = build_systemd_run_command(
             ExecutionBackend::SystemMode,
             &props,
             Path::new("/tmp/workspace"),
+            None,
             None,
             None, // Missing config
             &["echo".to_string()],
@@ -917,6 +1097,7 @@ mod tests {
                 backend,
                 &props,
                 Path::new("/work"),
+                None,
                 None,
                 system_config,
                 &["test".to_string()],
@@ -975,6 +1156,7 @@ mod tests {
             ExecutionBackend::UserMode,
             &props,
             Path::new("/work"),
+            None,
             None,
             None,
             &["test".to_string()],
@@ -1259,6 +1441,7 @@ mod tests {
             Path::new("/work"),
             None,
             None,
+            None,
             &[],
         )
         .unwrap();
@@ -1276,6 +1459,7 @@ mod tests {
             &props,
             Path::new("/work"),
             None, // No unit name
+            None,
             Some(&config),
             &["echo".to_string()],
         )
@@ -1313,6 +1497,7 @@ mod tests {
             ExecutionBackend::UserMode,
             &props,
             Path::new("/work"),
+            None,
             None,
             None,
             &["test".to_string()],
