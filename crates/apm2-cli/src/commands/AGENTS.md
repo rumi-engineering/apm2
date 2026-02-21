@@ -325,8 +325,9 @@ Security invariants:
   - `AliveMismatch`: PID reuse; stale lease is reclaimed.
   - `Dead`: stale lease is reclaimed.
   - `Unknown`: fail-closed lane skip/corrupt behavior depending on command path.
-  `lane reset --force` only signals when identity is `AliveMatch`, preventing
-  kill-on-reused-PID hazards.
+  `apm2 fac doctor --fix` lane recovery paths refuse reset when liveness cannot
+  be proven inactive for orphaned-unit conditions, preventing kill-on-reused-PID
+  hazards and detached-unit clobber.
 - **JSON-only stderr recommendation channel** (`fac_worker.rs`, TCK-00570): The
   `emit_lane_reset_recommendation` function emits exactly one JSON line per recommendation
   to stderr.  No plain-text preamble or human-readable log lines are mixed into the stream.

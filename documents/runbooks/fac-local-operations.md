@@ -263,8 +263,8 @@ apm2 fac gc --json
 |------|-----------|
 | `gate_cache` | 30-day TTL; entries at `gate_cache_v2/{sha}/{gate}.yaml` |
 | `blob_prune` | Policy-determined |
-| `lane_target` | On lane reset or explicit GC |
-| `lane_log` | On lane reset or explicit GC |
+| `lane_target` | During `apm2 fac doctor --fix` remediation or explicit GC |
+| `lane_log` | During `apm2 fac doctor --fix` remediation or explicit GC |
 | `quarantine_prune` | Default TTL from policy |
 | `denied_prune` | Default TTL from policy |
 | `cargo_cache` | Policy-determined |
@@ -351,38 +351,38 @@ apm2 fac gates
 
 ---
 
-## 5. PLANNED — Safe lane reset (not yet implemented)
+## 5. Safe lane recovery with doctor
 
-> **PLANNED -- not yet implemented.** This entire section describes planned
-> behavior for the FESv1 lane management surface. Lanes do not exist in the
-> current implementation. The current `apm2 fac gates` command executes
-> gates locally in-process and does not use lanes.
+### 5.1 When to run host remediation
 
-### 5.1 When to reset a lane (PLANNED)
-
-Reset a lane when it enters CORRUPT state or when you need to recover
-from a failed cleanup. Common triggers:
+Run `apm2 fac doctor --fix` when a lane is `CORRUPT` or when recovery
+signals appear in services/doctor output. Common triggers:
 
 - Lane cleanup failed (e.g., permission error, disk full during cleanup)
-- Process outlived its lease (cgroup kill timed out)
+- Process outlived its lease while associated systemd units remained active
 - Symlink safety check refused deletion (suspicious filesystem state)
-- Lane workspace contaminated (unknown files from escaped process)
+- Tmp residue/corruption prevents lane cleanup
 
-### 5.2 Check lane state before reset (PLANNED)
+### 5.2 Check lane state before remediation
 
 ```bash
-# PLANNED: apm2 fac lane status
-# Lane state inspection commands will be available when FESv1 is implemented
+# Current lane state and process identity/liveness:
+apm2 fac lane status --json
 ```
 
-### 5.3 Perform safe lane recovery (PLANNED)
+### 5.3 Apply deterministic remediation
 
-When `apm2 fac doctor --fix` runs lane recovery, it provides
-these safety guarantees:
+```bash
+# Single host-side remediation entrypoint:
+apm2 fac doctor --fix --json
+```
+
+`apm2 fac doctor --fix` provides these guarantees:
 1. Symlink-safe recursive deletion (verifies each path component)
 2. Refuses to cross filesystem boundaries
 3. Refuses to delete unexpected file types (device nodes, sockets)
-4. Writes a reset receipt with lane state before and after
+4. Runs lane+queue reconcile, bounded tmp scrub, stale log GC, and post-fix checks
+5. Fails closed when orphaned units are still active or liveness is inconclusive
 
 ---
 
