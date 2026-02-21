@@ -13312,6 +13312,26 @@ mod tests {
                 .emit_session_event(session_id, event_type, payload, actor_id, timestamp_ns)
         }
 
+        fn emit_evidence_published_event(
+            &self,
+            session_id: &str,
+            payload: &[u8],
+            actor_id: &str,
+            timestamp_ns: u64,
+            evidence_id: &str,
+        ) -> Result<
+            crate::protocol::dispatch::SignedLedgerEvent,
+            crate::protocol::dispatch::LedgerEventError,
+        > {
+            self.inner.emit_evidence_published_event(
+                session_id,
+                payload,
+                actor_id,
+                timestamp_ns,
+                evidence_id,
+            )
+        }
+
         fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
             self.verifying_key_override
                 .unwrap_or_else(|| self.inner.verifying_key())
@@ -17524,6 +17544,23 @@ mod tests {
                     payload,
                     actor_id,
                     timestamp_ns,
+                )
+            }
+
+            fn emit_evidence_published_event(
+                &self,
+                session_id: &str,
+                payload: &[u8],
+                actor_id: &str,
+                timestamp_ns: u64,
+                evidence_id: &str,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_evidence_published_event(
+                    session_id,
+                    payload,
+                    actor_id,
+                    timestamp_ns,
+                    evidence_id,
                 )
             }
 
