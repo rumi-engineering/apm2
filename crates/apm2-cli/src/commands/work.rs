@@ -586,15 +586,23 @@ fn ticket_yaml_to_work_spec_json(yaml_content: &str) -> Result<String, String> {
         .and_then(serde_yaml::Value::as_str)
         .filter(|s| !s.is_empty() && *s != "RFC-PLACEHOLDER");
 
-    // Extract requirement IDs from binds.requirements
+    // Extract requirement IDs from binds.requirements.
+    //
+    // SECURITY (f-781-code_quality-1771692768456455-0): Prioritize
+    // `requirement_id` as the canonical identifier. Fall back to
+    // `requirement_ref` only when `requirement_id` is absent on a given
+    // entry, to support both common ticket shapes.
     let requirement_ids: Vec<String> = binds
         .and_then(|b| b.get("requirements"))
         .and_then(serde_yaml::Value::as_sequence)
         .map(|reqs| {
             reqs.iter()
                 .filter_map(|r| {
-                    r.get("requirement_ref")
+                    // Prefer requirement_id (canonical); fall back to
+                    // requirement_ref for backward compatibility.
+                    r.get("requirement_id")
                         .and_then(serde_yaml::Value::as_str)
+                        .or_else(|| r.get("requirement_ref").and_then(serde_yaml::Value::as_str))
                         .map(String::from)
                 })
                 .collect()
@@ -1034,14 +1042,15 @@ ticket_meta:
         );
     }
 
-    /// Tests that `requirement_ids` are extracted from binds.requirements.
+    /// Tests that `requirement_ids` are extracted from binds.requirements
+    /// using `requirement_ref` as fallback when `requirement_id` is absent.
     #[test]
-    fn test_ticket_yaml_extracts_requirement_ids() {
+    fn test_ticket_yaml_extracts_requirement_ids_from_ref_fallback() {
         let yaml = r#"
 ticket_meta:
   ticket:
     id: TCK-00999
-    title: 'With requirements'
+    title: 'With requirements (ref only)'
   binds:
     rfc_id: RFC-0032
     requirements:
@@ -1057,5 +1066,67 @@ ticket_meta:
         assert_eq!(req_ids.len(), 2);
         assert_eq!(req_ids[0], "REQ-001");
         assert_eq!(req_ids[1], "REQ-002");
+    }
+
+    /// SECURITY (f-781-code_quality-1771692768456455-0): Tests that
+    /// `requirement_id` is prioritized as the canonical identifier.
+    #[test]
+    fn test_ticket_yaml_prioritizes_requirement_id_over_ref() {
+        let yaml = r#"
+ticket_meta:
+  ticket:
+    id: TCK-00999
+    title: 'With requirement_id'
+  binds:
+    rfc_id: RFC-0032
+    requirements:
+      - requirement_id: "RQ-0001"
+      - requirement_id: "RQ-0002"
+"#;
+        let result = ticket_yaml_to_work_spec_json(yaml);
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let req_ids = parsed["requirement_ids"].as_array().unwrap();
+        assert_eq!(req_ids.len(), 2);
+        assert_eq!(req_ids[0], "RQ-0001");
+        assert_eq!(req_ids[1], "RQ-0002");
+    }
+
+    /// Tests mixed ticket shape: entries with `requirement_id` and entries
+    /// with only `requirement_ref`. The former should use `requirement_id`
+    /// and the latter should fall back to `requirement_ref`.
+    #[test]
+    fn test_ticket_yaml_mixed_requirement_id_and_ref() {
+        let yaml = r#"
+ticket_meta:
+  ticket:
+    id: TCK-00999
+    title: 'Mixed requirements'
+  binds:
+    rfc_id: RFC-0032
+    requirements:
+      - requirement_id: "RQ-0001"
+        requirement_ref: "documents/rfcs/RFC-0032/requirements.md#RQ-0001"
+      - requirement_ref: "documents/rfcs/RFC-0032/requirements.md#RQ-0002"
+      - requirement_id: "RQ-0003"
+"#;
+        let result = ticket_yaml_to_work_spec_json(yaml);
+        assert!(result.is_ok());
+
+        let json_str = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let req_ids = parsed["requirement_ids"].as_array().unwrap();
+        assert_eq!(req_ids.len(), 3);
+        // First entry: requirement_id takes priority over requirement_ref
+        assert_eq!(req_ids[0], "RQ-0001");
+        // Second entry: falls back to requirement_ref
+        assert_eq!(
+            req_ids[1],
+            "documents/rfcs/RFC-0032/requirements.md#RQ-0002"
+        );
+        // Third entry: requirement_id only
+        assert_eq!(req_ids[2], "RQ-0003");
     }
 }

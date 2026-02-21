@@ -14365,10 +14365,10 @@ impl PrivilegedDispatcher {
     /// Opens a new work item by:
     /// 1. Bounded-decoding and validating the `WorkSpec` JSON
     /// 2. Deriving `actor_id` from peer credentials (never client input)
-    /// 3. Canonicalizing the `WorkSpec` JSON for deterministic CAS storage
-    /// 4. Checking idempotency via bounded query: same `work_id` + same hash ->
+    /// 3. PCAC lifecycle enforcement (admission BEFORE any state queries)
+    /// 4. Canonicalizing the `WorkSpec` JSON for deterministic CAS storage
+    /// 5. Checking idempotency via bounded query: same `work_id` + same hash ->
     ///    no-op; same `work_id` + different hash -> `ALREADY_EXISTS` error
-    /// 5. PCAC lifecycle enforcement (admission BEFORE mutation)
     /// 6. Storing canonical bytes to CAS (fail-closed when CAS is not
     ///    configured)
     /// 7. Emitting exactly one `work.opened` event via the canonical ledger
@@ -14455,74 +14455,15 @@ impl PrivilegedDispatcher {
         let spec_hash = blake3::hash(canonical_bytes);
         let spec_hash_bytes: [u8; 32] = *spec_hash.as_bytes();
 
-        // 6. Idempotency check: bounded query for the first `work.opened` event for
-        //    this work_id.
+        // 6. PCAC lifecycle enforcement (admission BEFORE idempotency queries).
         //
-        //    Security (BLOCKER fix): replaces unbounded `get_events_by_work_id`
-        //    which materialised the FULL event history, causing O(N) memory
-        //    and CPU per request.  The new `get_first_event_by_work_id_and_type`
-        //    uses `LIMIT 1` in SQL backends and short-circuit iteration in
-        //    in-memory backends.
-        //
-        // `emit_session_event` stores the protobuf payload hex-encoded inside
-        // a JSON envelope: `{"event_type":"…","session_id":"…","actor_id":"…",
-        // "payload":"<hex>"}`. To retrieve the original protobuf `WorkEvent`,
-        // we must parse the JSON envelope, hex-decode the `payload` field,
-        // then protobuf-decode it.
-        let existing_opened = self
-            .event_emitter
-            .get_first_event_by_work_id_and_type(&spec.work_id, "work.opened");
-
-        if let Some(opened_event) = existing_opened {
-            // Work already opened. Extract the inner protobuf from the JSON
-            // envelope to compare spec hashes.
-            let existing_hash = Self::extract_spec_hash_from_event_payload(&opened_event.payload);
-            match existing_hash {
-                Some(hash) if bool::from(hash.ct_eq(&spec_hash_bytes)) => {
-                    // Idempotent: same spec hash, return success
-                    info!(
-                        work_id = %spec.work_id,
-                        "OpenWork idempotent no-op: work already exists with same spec hash"
-                    );
-                    #[allow(clippy::redundant_clone)]
-                    let work_id = spec.work_id.clone();
-                    return Ok(PrivilegedResponse::OpenWork(OpenWorkResponse {
-                        work_id,
-                        spec_snapshot_hash: spec_hash_bytes.to_vec(),
-                        already_existed: true,
-                    }));
-                },
-                Some(_) => {
-                    // Different spec hash: ALREADY_EXISTS error
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::WorkAlreadyExists,
-                        format!(
-                            "work_id '{}' already exists with different spec hash",
-                            spec.work_id
-                        ),
-                    ));
-                },
-                None => {
-                    // Fail-closed: existing event found but payload is not
-                    // decodable. Refuse to overwrite.
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::InvalidArgument,
-                        format!(
-                            "work_id '{}' has existing work.opened event but \
-                             payload is not decodable",
-                            spec.work_id
-                        ),
-                    ));
-                },
-            }
-        }
-
-        // 7. PCAC lifecycle enforcement (admission BEFORE mutation).
-        //
-        //    Security (MAJOR fix): OpenWork performs authoritative state
-        //    mutations (CAS store + ledger event emission) and must enforce
-        //    PCAC lifecycle in authoritative mode, consistent with all other
-        //    effect-capable privileged handlers.
+        //    SECURITY (f-781-security-1771692980518105-0): PCAC gate presence
+        //    and lease_id validity MUST be enforced before ANY idempotency
+        //    response path to prevent unauthorized callers from probing
+        //    work_id existence or spec-hash compatibility. All rejection
+        //    responses use uniform CapabilityRequestRejected error codes
+        //    to avoid leaking existence/state information to unauthorized
+        //    callers.
         //
         //    Fail-closed: when the PCAC lifecycle gate is wired, a valid
         //    `lease_id` is required to derive revalidation inputs. When the
@@ -14530,20 +14471,20 @@ impl PrivilegedDispatcher {
         let Some(pcac_gate) = self.pcac_lifecycle_gate.as_deref() else {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
-                "PCAC authority gate not wired for OpenWork (fail-closed)",
+                "PCAC authority gate not wired (fail-closed)",
             ));
         };
 
         if request.lease_id.is_empty() {
             return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::InvalidArgument,
-                "lease_id is required for PCAC lifecycle enforcement",
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "lease_id is required for authority admission",
             ));
         }
         if request.lease_id.len() > MAX_ID_LENGTH {
             return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::InvalidArgument,
-                format!("lease_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "lease_id validation failed",
             ));
         }
 
@@ -14658,7 +14599,70 @@ impl PrivilegedDispatcher {
             Err(response) => return Ok(response),
         };
 
-        // 8. Store canonical WorkSpec bytes to CAS (fail-closed when not configured — a
+        // 7. Idempotency check: bounded query for the first `work.opened` event for
+        //    this work_id. Runs AFTER PCAC admission to prevent unauthorized callers
+        //    from probing work_id existence.
+        //
+        //    Security (BLOCKER fix): replaces unbounded `get_events_by_work_id`
+        //    which materialised the FULL event history, causing O(N) memory
+        //    and CPU per request.  The new `get_first_event_by_work_id_and_type`
+        //    uses `LIMIT 1` in SQL backends and short-circuit iteration in
+        //    in-memory backends.
+        //
+        // `emit_session_event` stores the protobuf payload hex-encoded inside
+        // a JSON envelope: `{"event_type":"…","session_id":"…","actor_id":"…",
+        // "payload":"<hex>"}`. To retrieve the original protobuf `WorkEvent`,
+        // we must parse the JSON envelope, hex-decode the `payload` field,
+        // then protobuf-decode it.
+        let existing_opened = self
+            .event_emitter
+            .get_first_event_by_work_id_and_type(&spec.work_id, "work.opened");
+
+        if let Some(opened_event) = existing_opened {
+            // Work already opened. Extract the inner protobuf from the JSON
+            // envelope to compare spec hashes.
+            let existing_hash = Self::extract_spec_hash_from_event_payload(&opened_event.payload);
+            match existing_hash {
+                Some(hash) if bool::from(hash.ct_eq(&spec_hash_bytes)) => {
+                    // Idempotent: same spec hash, return success
+                    info!(
+                        work_id = %spec.work_id,
+                        "OpenWork idempotent no-op: work already exists with same spec hash"
+                    );
+                    #[allow(clippy::redundant_clone)]
+                    let work_id = spec.work_id.clone();
+                    return Ok(PrivilegedResponse::OpenWork(OpenWorkResponse {
+                        work_id,
+                        spec_snapshot_hash: spec_hash_bytes.to_vec(),
+                        already_existed: true,
+                    }));
+                },
+                Some(_) => {
+                    // Different spec hash: ALREADY_EXISTS error
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::WorkAlreadyExists,
+                        format!(
+                            "work_id '{}' already exists with different spec hash",
+                            spec.work_id
+                        ),
+                    ));
+                },
+                None => {
+                    // Fail-closed: existing event found but payload is not
+                    // decodable. Refuse to overwrite.
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::InvalidArgument,
+                        format!(
+                            "work_id '{}' has existing work.opened event but \
+                             payload is not decodable",
+                            spec.work_id
+                        ),
+                    ));
+                },
+            }
+        }
+
+        // 9. Store canonical WorkSpec bytes to CAS (fail-closed when not configured — a
         //    MemoryCas fallback would be ephemeral and useless, violating CAS
         //    durability).
         let Some(cas) = self.cas.as_ref() else {
@@ -14676,7 +14680,7 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // 9. Get HTF timestamp
+        // 10. Get HTF timestamp
         let timestamp_ns = match self.get_htf_timestamp_ns() {
             Ok(ts) => ts,
             Err(e) => {
@@ -14688,7 +14692,7 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // 10. Build and emit work.opened event
+        // 11. Build and emit work.opened event
         let work_type_str = match spec.work_type {
             apm2_core::fac::work_cas_schemas::WorkSpecType::Ticket => "TICKET",
             apm2_core::fac::work_cas_schemas::WorkSpecType::PrdRefinement => "PRD_REFINEMENT",
@@ -14718,13 +14722,15 @@ impl PrivilegedDispatcher {
         //
         // SECURITY (TCK-00635 — Race-Safe Idempotency):
         //
-        // The database has a partial unique index
-        // `idx_work_opened_unique ON ledger_events(work_id)
-        //  WHERE event_type = 'work.opened'`
-        // that enforces at-most-one `work.opened` per `work_id`.
+        // The database has partial unique indices on BOTH tables:
+        // - `idx_work_opened_unique ON ledger_events(work_id) WHERE event_type =
+        //   'work.opened'` (legacy table)
+        // - `idx_canonical_work_opened_unique ON events(session_id) WHERE event_type =
+        //   'work.opened'` (canonical table)
+        // that enforce at-most-one `work.opened` per `work_id`.
         //
         // If a concurrent request already committed a `work.opened` event
-        // between our check (step 6) and this emit, SQLite will reject the
+        // between our check (step 7) and this emit, SQLite will reject the
         // INSERT with a UNIQUE constraint violation. We catch that error,
         // re-read the persisted event, and return idempotent success (same
         // hash) or WORK_ALREADY_EXISTS (different hash).
@@ -14745,7 +14751,7 @@ impl PrivilegedDispatcher {
             },
             Err(e) if e.to_string().contains("UNIQUE constraint") => {
                 // Race detected: another concurrent request committed the
-                // `work.opened` event between our idempotency check (step 6)
+                // `work.opened` event between our idempotency check (step 7)
                 // and this emit. Re-read the persisted event and resolve.
                 warn!(
                     work_id = %spec.work_id,
@@ -31516,7 +31522,8 @@ mod tests {
 
         #[test]
         fn test_open_work_empty_lease_id_rejected() {
-            // When PCAC gate is wired, empty lease_id must be rejected.
+            // When PCAC gate is wired, empty lease_id must be rejected
+            // with uniform CapabilityRequestRejected (no existence oracle).
             let dispatcher = open_work_dispatcher_with_cas();
             let ctx = test_open_work_ctx();
             let spec_bytes = test_work_spec_json("W-test-empty-lease");
@@ -31536,9 +31543,96 @@ mod tests {
                         "Expected lease_id error, got: {}",
                         err.message
                     );
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                        "Empty lease_id must return uniform CapabilityRequestRejected"
+                    );
                 },
                 other => panic!("Expected Error for empty lease_id, got: {other:?}"),
             }
+        }
+
+        /// SECURITY (f-781-security-1771692980518105-0): Verify that PCAC
+        /// admission is enforced BEFORE idempotency queries. An
+        /// unauthorized caller must not be able to distinguish between
+        /// existing and non-existing `work_ids` — all rejections must use
+        /// uniform `CapabilityRequestRejected`.
+        #[test]
+        fn test_open_work_pcac_before_idempotency_no_existence_oracle() {
+            // First: create a work item with a valid dispatcher.
+            let authorized_dispatcher = open_work_dispatcher_with_cas();
+            let ctx = test_open_work_ctx();
+            let spec_bytes = test_work_spec_json("W-test-oracle-001");
+            let request = OpenWorkRequest {
+                work_spec_json: spec_bytes,
+                lease_id: TEST_OPEN_WORK_LEASE_ID.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+            let result = authorized_dispatcher.handle_open_work(&buf, &ctx);
+            assert!(result.is_ok());
+            match result.unwrap() {
+                PrivilegedResponse::OpenWork(resp) => assert!(!resp.already_existed),
+                other => panic!("Expected OpenWork success, got: {other:?}"),
+            }
+
+            // Now: a dispatcher WITHOUT PCAC gate tries to probe the same
+            // work_id (which exists) and a non-existing work_id.
+            // Both must return the SAME error type (no existence oracle).
+            let unauthorized_dispatcher = PrivilegedDispatcher::new();
+
+            // Probe existing work_id
+            let request_existing = OpenWorkRequest {
+                work_spec_json: test_work_spec_json("W-test-oracle-001"),
+                lease_id: "L-unauthorized".to_string(),
+            };
+            let mut buf_existing = Vec::new();
+            request_existing.encode(&mut buf_existing).expect("encode");
+            let result_existing = unauthorized_dispatcher.handle_open_work(&buf_existing, &ctx);
+            assert!(result_existing.is_ok());
+            let err_existing = match result_existing.unwrap() {
+                PrivilegedResponse::Error(err) => err,
+                other => panic!("Expected error for unauthorized existing probe, got: {other:?}"),
+            };
+
+            // Probe non-existing work_id
+            let request_nonexisting = OpenWorkRequest {
+                work_spec_json: test_work_spec_json("W-test-oracle-nonexist"),
+                lease_id: "L-unauthorized".to_string(),
+            };
+            let mut buf_nonexisting = Vec::new();
+            request_nonexisting
+                .encode(&mut buf_nonexisting)
+                .expect("encode");
+            let result_nonexisting =
+                unauthorized_dispatcher.handle_open_work(&buf_nonexisting, &ctx);
+            assert!(result_nonexisting.is_ok());
+            let err_nonexisting = match result_nonexisting.unwrap() {
+                PrivilegedResponse::Error(err) => err,
+                other => {
+                    panic!("Expected error for unauthorized non-existing probe, got: {other:?}")
+                },
+            };
+
+            // SECURITY ASSERTION: Both error codes must be identical —
+            // no existence oracle.
+            assert_eq!(
+                err_existing.code,
+                err_nonexisting.code,
+                "Unauthorized probes of existing vs non-existing work_ids must \
+                 return identical error codes to prevent existence oracle. \
+                 Existing: {} ({}), Non-existing: {} ({})",
+                err_existing.code,
+                err_existing.message,
+                err_nonexisting.code,
+                err_nonexisting.message
+            );
+            assert_eq!(
+                PrivilegedErrorCode::try_from(err_existing.code),
+                Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                "Unauthorized probe must return CapabilityRequestRejected"
+            );
         }
 
         #[test]
@@ -31607,14 +31701,16 @@ mod tests {
         fn test_open_work_concurrent_race_only_one_persisted() {
             // SECURITY (TCK-00635): Prove that concurrent OpenWork requests
             // for the same work_id result in exactly one persisted
-            // `work.opened` event, with the losing request resolved via
-            // the UNIQUE constraint fallback path.
+            // `work.opened` event.
             //
             // Strategy: use a shared dispatcher across multiple threads,
             // each sending the same OpenWork request. Exactly one thread
-            // should succeed with `already_existed=false`; all others
-            // must return idempotent success (`already_existed=true`).
-            // No duplicates may exist in the event store.
+            // should succeed with `already_existed=false`; other threads
+            // may return idempotent success (`already_existed=true`) or
+            // PCAC rejection (due to ledger anchor drift when the first
+            // thread's event changes the ledger between PCAC join and
+            // revalidation). Both outcomes are valid — the key invariant
+            // is: exactly one event is persisted, and no duplicates exist.
             use std::sync::Arc;
 
             let dispatcher = Arc::new(open_work_dispatcher_with_cas());
@@ -31645,6 +31741,7 @@ mod tests {
 
             let mut created_count = 0u32;
             let mut idempotent_count = 0u32;
+            let mut pcac_rejected_count = 0u32;
             for handle in handles {
                 let result = handle.join().expect("thread panicked");
                 let response = result.expect("handler returned Err");
@@ -31656,7 +31753,20 @@ mod tests {
                             created_count += 1;
                         }
                     },
-                    other => panic!("Expected OpenWork response, got: {other:?}"),
+                    PrivilegedResponse::Error(err) => {
+                        // PCAC rejection due to ledger anchor drift is a
+                        // valid concurrent outcome — the first thread's
+                        // event emission changes the ledger anchor, causing
+                        // subsequent threads' PCAC revalidation to fail.
+                        assert_eq!(
+                            PrivilegedErrorCode::try_from(err.code),
+                            Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                            "Concurrent rejection must be CapabilityRequestRejected, got: {}",
+                            err.message
+                        );
+                        pcac_rejected_count += 1;
+                    },
+                    other => panic!("Expected OpenWork or Error response, got: {other:?}"),
                 }
             }
 
@@ -31665,8 +31775,10 @@ mod tests {
                 "Exactly one thread must create the work.opened event (got {created_count})"
             );
             assert_eq!(
-                idempotent_count, 3,
-                "Remaining threads must return idempotent success (got {idempotent_count})"
+                idempotent_count + pcac_rejected_count,
+                3,
+                "Remaining threads must return idempotent success or PCAC rejection \
+                 (idempotent={idempotent_count}, pcac_rejected={pcac_rejected_count})"
             );
 
             // Verify exactly 1 work.opened event in the store
