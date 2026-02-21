@@ -1,0 +1,148 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: 'TCK-00658'
+    title: 'FAC: PID-reuse safe lane liveness (bind LaneLease to /proc start time)'
+    status: 'OPEN'
+  binds:
+    prd_id: 'PRD-0001'
+    rfc_id: 'RFC-0019'
+    requirements:
+      - 'REQ-0008' # lease mechanics are atomic + idempotent
+      - 'REQ-0037' # deterministic reconciliation (avoid false positives)
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+      - 'Implementer'
+      - 'Reviewer'
+    responsibility_domains:
+      - 'fac/lane-lease'
+      - 'fac/reconcile'
+  dependencies:
+    tickets:
+      - 'TCK-00657' # timestamp normalization improves safe fallbacks
+      - 'TCK-00622' # queue/lane reconcile baseline
+
+context:
+  observed_symptoms:
+    - 'Lanes marked Corrupt and jobs remain stuck in claimed because the lease PID appears alive even though the original worker is gone.'
+    - 'Operators report dead-PID situations; recovery often requires manual lane reset and/or queue surgery.'
+  code_evidence:
+    - |
+      Lane liveness uses kill(pid, 0) only (PID existence), which is vulnerable to PID reuse:
+        crates/apm2-core/src/fac/lane.rs:3030-3078 (derive_lane_state + is_pid_alive)
+    - |
+      Reconcile treats "lock free + pid alive" as Corrupt and then considers the job active,
+      preventing claimed→pending recovery:
+        crates/apm2-core/src/fac/reconcile.rs:769-817
+    - |
+      Lane reset kill path only checks /proc/<pid>/comm exists before SIGTERM/SIGKILL,
+      which can kill the wrong process under PID reuse:
+        crates/apm2-cli/src/commands/fac.rs:5124-5171
+
+problem_statement: |
+  PID existence is an insufficient identity for lane ownership. Linux PID reuse can cause the system
+  to believe a dead lease is still alive, producing Corrupt lanes and preventing requeue of claimed
+  jobs. This is both a liveness failure (jobs stuck) and a safety risk (potentially killing unrelated
+  processes via operator tools).
+
+root_cause_analysis:
+  primary_cause: |
+    LaneLeaseV1 stores only a PID and the system uses kill(0) to test liveness. PID reuse yields
+    false positives; the reconcile logic then fail-closes by marking Corrupt and treating the job as
+    active, which can strand work indefinitely.
+  secondary_cause: |
+    There is no durable process-identity binding (e.g., /proc/<pid>/stat starttime) in LaneLeaseV1.
+
+proposed_change:
+  intent: |
+    Bind lane leases to process identity by recording the process start time (in kernel ticks since
+    boot) at lease creation and verifying it during liveness checks. This makes PID reuse detectable
+    and allows safe, automatic recovery from stale leases without killing unrelated processes.
+
+invariants:
+  - id: 'INV-PROC-ID-001'
+    statement: 'If a LaneLeaseV1 contains pid + proc_start_time_ticks, the lane is considered owned by that process IFF (kill(pid,0) == alive) AND (/proc/<pid>/stat starttime == proc_start_time_ticks).'
+  - id: 'INV-PROC-ID-002'
+    statement: 'If PID is alive but starttime mismatches, it MUST be treated as NOT the lease owner (PID reuse or identity loss).'
+  - id: 'INV-PROC-ID-003'
+    statement: 'Reconcile MUST NOT strand claimed jobs solely due to PID existence; it must use identity checks or additional evidence.'
+
+scope:
+  in_scope:
+    - id: 'S1'
+      description: |
+        Extend LaneLeaseV1 with process identity:
+          - Add field: proc_start_time_ticks: optional u64
+          - Record this value at lease creation (worker + any other lease writers)
+          - Update serialization versioning carefully (keep schema_version = 1; field optional)
+    - id: 'S2'
+      description: |
+        Add process identity helpers (prefer apm2-core, reusable across CLI + daemon):
+          - read_proc_start_time_ticks(pid: u32) -> io::Result<u64>
+            * parse /proc/<pid>/stat field 22 (starttime)
+          - verify_pid_identity(pid, expected_start_ticks) -> ProcessIdentity
+            * AliveMatch | AliveMismatch | Dead | Unknown
+          - Must be pure/testable where possible; OS errors should be surfaced as Unknown.
+    - id: 'S3'
+      description: |
+        Update lane status + reconcile to use identity:
+          - crates/apm2-core/src/fac/lane.rs:
+              * replace is_pid_alive checks with verify_pid_identity when start ticks available
+              * derive_lane_state uses identity result (AliveMatch behaves like Alive; AliveMismatch behaves like Dead)
+          - crates/apm2-core/src/fac/reconcile.rs:
+              * when lock free + lease present:
+                  - if identity == AliveMismatch => treat as stale lease (recover), DO NOT mark Corrupt
+                  - if identity == Unknown => keep fail-closed behavior (Corrupt) but annotate reason
+              * only insert job_id into active_job_ids when identity == AliveMatch (not mere PID existence)
+    - id: 'S4'
+      description: |
+        Update acquire_worker_lane (fac_worker) to avoid taking a lane based on PID-only:
+          - If lease exists and identity == AliveMismatch => remove lease (stale) and proceed
+          - If identity == Unknown => skip lane and emit actionable log
+    - id: 'S5'
+      description: |
+        Add tests (no PID reuse required):
+          - Spawn a child process (sleep) and read its start ticks; assert identity matches.
+          - Write a lease with the same pid but wrong start ticks; assert identity mismatch path is taken.
+          - Reconcile test: a lane with lock free + lease (pid alive, start ticks mismatch) is recovered and its job is eligible for claimed→pending.
+  out_of_scope:
+    - 'Systemd unit liveness binding (separate ticket).'
+    - 'Full lease/receipt schema version bump (optional later).'
+
+plan:
+  steps:
+    - id: 'P1'
+      description: 'Introduce proc start time helper + unit tests (apm2-core).'
+    - id: 'P2'
+      description: 'Extend LaneLeaseV1 with proc_start_time_ticks (optional) and write it from all producers.'
+    - id: 'P3'
+      description: 'Update lane_status + reconcile + acquire_worker_lane to use identity verification.'
+    - id: 'P4'
+      description: 'Add focused regression tests for the previously-stuck scenario (Corrupt lane due to PID reuse false positive).'
+
+definition_of_done:
+  criteria:
+    - 'Lane reconciliation no longer treats PID existence as sufficient evidence of ownership when proc_start_time_ticks is present.'
+    - 'The "lock free + pid alive" ambiguous path is significantly reduced: PID reuse becomes a recoverable stale lease, not a permanent Corrupt lane.'
+    - 'Newly written leases include proc_start_time_ticks.'
+  evidence_ids:
+    - 'EVID-TCK-00658-01 (unit): process identity helper tests'
+    - 'EVID-TCK-00658-02 (unit): lane reconcile recovers on identity mismatch'
+
+test_plan:
+  unit_tests:
+    - 'apm2-core: parse /proc/<pid>/stat starttime; identity mismatch/match behavior'
+  integration_tests:
+    - 'apm2-cli fac_worker lane acquisition: stale lease with mismatched starttime is removed and lane becomes available'
+
+notes:
+  safety_and_fail_closed: |
+    - Identity mismatch MUST be treated as non-ownership; this is safer than killing or blocking.
+    - Identity unknown MUST remain fail-closed (do not reclaim automatically) to avoid double execution.
+  migration: |
+    Existing leases will not have proc_start_time_ticks. The system should:
+      - log a one-time warning when identity cannot be verified due to missing field
+      - rely on other evidence (lock held + receipt presence + unit liveness) for safe recovery
+      - naturally converge as new leases are written.

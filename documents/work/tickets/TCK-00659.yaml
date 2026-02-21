@@ -1,0 +1,152 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: 'TCK-00659'
+    title: 'FAC: Prevent orphaned systemd-run work after worker crash (bind units + lane reclaim guard)'
+    status: 'OPEN'
+  binds:
+    prd_id: 'PRD-0001'
+    rfc_id: 'RFC-0019'
+    requirements:
+      - 'REQ-0008' # atomic/idempotent leases
+      - 'REQ-0020' # reconcile correctness
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+      - 'Implementer'
+      - 'Reviewer'
+    responsibility_domains:
+      - 'fac/execution-backend'
+      - 'fac/worker'
+      - 'fac/lane-lease'
+  dependencies:
+    tickets:
+      - 'TCK-00658' # process identity binding (defense-in-depth)
+      - 'TCK-00622' # reconcile baseline
+
+context:
+  observed_symptoms:
+    - 'Worker crashes/restarts can leave behind running systemd transient units (warm phases, gate execution), while the lane lock is released.'
+    - 'Subsequent workers may reclaim the lane (pid dead) and start a new job, risking concurrent execution in the same lane resources.'
+    - 'Operators observe "dead PID" leases but still see systemd units consuming CPU/memory.'
+  code_evidence:
+    - |
+      Warm phases execute via systemd-run (unit name includes lane_id + job_id prefix):
+        crates/apm2-core/src/fac/warm.rs:624-636
+    - |
+      build_systemd_run_command does not bind transient units to the parent worker unit:
+        crates/apm2-core/src/fac/execution_backend.rs:404-455
+    - |
+      Lane lease PID is currently the worker PID (not the systemd unit main PID):
+        crates/apm2-cli/src/commands/fac_worker.rs:4385-4416
+
+problem_statement: |
+  The system currently assumes that "worker process liveness" implies "job liveness". This is false
+  when execution is delegated to systemd transient units (systemd-run). A worker crash can orphan
+  job units, releasing lane locks and enabling unsafe concurrent work, while reconcile may clear
+  leases as stale because the worker PID is dead.
+
+root_cause_analysis:
+  primary_cause: |
+    systemd-run units are not tied to the lifetime of the worker service unit, so they can outlive
+    the worker process. Lane ownership is tracked via a PID that may die while the unit continues.
+  contributing_factors:
+    - 'Lane reclaim logic uses lock + PID, but does not consult systemd unit state as additional evidence.'
+    - 'Unit naming is job-specific; there is no lane-scoped exclusivity enforced at the systemd layer.'
+
+proposed_change:
+  intent: |
+    Make it impossible (or at least extremely unlikely) for systemd-run work to outlive the worker
+    without the system noticing. Implement defense-in-depth:
+      1) Bind transient units to the parent worker systemd unit (PartOf/BindsTo).
+      2) Add a lane reclaim guard: before clearing a stale lease (pid dead), check if any job units
+         associated with that lease are still active; if yes, fail-closed and surface remediation.
+
+invariants:
+  - id: 'INV-SD-BIND-001'
+    statement: 'All systemd transient units spawned for FAC execution MUST be bound to the worker unit when running under systemd.'
+  - id: 'INV-SD-BIND-002'
+    statement: 'Lane reclaim MUST NOT clear a lease solely because the recorded PID is dead if systemd indicates associated units are still active.'
+
+scope:
+  in_scope:
+    - id: 'S1'
+      description: |
+        Detect the current systemd unit name for the running worker process:
+          - Implement apm2-core helper: detect_systemd_unit_name()
+            * Parse /proc/self/cgroup (preferred) to extract the .service/.scope component.
+            * Return None when not running under systemd.
+          - Unit tests: parse representative cgroup paths for system + user scope.
+    - id: 'S2'
+      description: |
+        Bind spawned transient units to the detected parent unit:
+          - In execution_backend::build_systemd_run_command:
+              * If parent_unit is Some, append:
+                  --property=PartOf=<parent_unit>
+                  --property=BindsTo=<parent_unit>
+              * Keep existing KillMode semantics; ensure Stop/Kill behavior is cgroup-scoped.
+          - Ensure warm.rs and any other systemd-run call sites use this updated builder.
+    - id: 'S3'
+      description: |
+        Lane reclaim guard using systemd unit liveness (defense-in-depth):
+          - Add helper (apm2-core or apm2-cli): is_fac_unit_active(lane_id, job_id) -> tri-state
+              * Check apm2-fac-job-{lane_id}-{job_id}.service
+              * Check apm2-warm-{lane_id}-{job_prefix}-*.service (any active)
+            Implementation notes:
+              * Prefer `systemctl is-active` or `systemctl show -p ActiveState` in the correct scope.
+              * Fail-closed on errors (Unknown => treat as active for reclaim decisions).
+          - Update reconcile_lanes and acquire_worker_lane:
+              * Before removing a lease because PID is dead, consult unit liveness.
+              * If units are active => mark lane Corrupt with a specific reason (ORPHANED_SYSTEMD_UNIT)
+                and do NOT requeue claimed job automatically.
+    - id: 'S4'
+      description: |
+        Documentation + operator UX:
+          - fac doctor / services status should surface "orphaned systemd unit" clearly and suggest
+            remediation (stop_revoke, lane reset).
+          - Add an explicit log line when reclaim is blocked due to active units.
+  out_of_scope:
+    - 'Replacing file locks with systemd unit-name locks (larger redesign).'
+    - 'Full D-Bus integration (CLI-based systemctl calls are acceptable for now).'
+
+plan:
+  steps:
+    - id: 'P1'
+      description: 'Implement detect_systemd_unit_name() + tests.'
+    - id: 'P2'
+      description: 'Update build_systemd_run_command to optionally bind to parent unit; add unit tests to assert args are present.'
+    - id: 'P3'
+      description: 'Add systemd unit liveness helper and integrate into lane reclaim logic (reconcile + acquire_worker_lane).'
+    - id: 'P4'
+      description: 'Update fac doctor/status output to expose orphaned units (actionable output).'
+
+
+definition_of_done:
+  criteria:
+    - 'systemd-run commands emitted by FAC include PartOf/BindsTo when worker is running under systemd.'
+    - 'Lane reclaim will not clear a lease (and thus not re-use a lane) while systemd indicates associated work units are active.'
+    - 'Operator-facing tooling surfaces orphaned-unit situations and points to remediation.'
+  evidence_ids:
+    - 'EVID-TCK-00659-01 (unit): detect_systemd_unit_name() parsing tests'
+    - 'EVID-TCK-00659-02 (unit): build_systemd_run_command includes PartOf/BindsTo'
+    - 'EVID-TCK-00659-03 (unit/integration): lane reclaim blocked when unit active (mocked systemctl)'
+
+test_plan:
+  unit_tests:
+    - 'apm2-core execution_backend: verify constructed argv contains binding properties'
+    - 'apm2-core helper: parse /proc/self/cgroup fixtures'
+  integration_tests:
+    - |
+      Provide a test double for systemctl queries (dependency-injected command runner) so CI does not
+      require a real systemd instance. Verify lane reclaim behavior across:
+        - unit active => do not reclaim
+        - unit inactive => reclaim allowed
+
+notes:
+  risk:
+    - 'Adding PartOf/BindsTo could fail on systems where the detected parent unit name is malformed; sanitize extracted unit names.'
+    - 'systemctl calls can be slow; cache results per lane per tick and bound total time.'
+  safety: |
+    This is safety-critical: the reclaim guard prevents concurrent execution in a lane. If systemd
+    queries fail, default must be fail-closed (treat as active).
