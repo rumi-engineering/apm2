@@ -835,36 +835,33 @@ fn run_warm_command_once(
 ) -> Option<i32> {
     let start = Instant::now();
     let mut last_heartbeat = Instant::now();
-    match cmd.spawn() {
-        Ok(mut child) => {
-            let mut result = None;
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        result = status.code();
+    cmd.spawn().map_or(None, |mut child| {
+        let mut result = None;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    result = status.code();
+                    break;
+                },
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
                         break;
-                    },
-                    Ok(None) => {
-                        if start.elapsed() >= timeout {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            break;
+                    }
+                    if let Some(hb) = heartbeat_fn {
+                        if last_heartbeat.elapsed() >= HEARTBEAT_REFRESH_INTERVAL {
+                            hb();
+                            last_heartbeat = Instant::now();
                         }
-                        if let Some(hb) = heartbeat_fn {
-                            if last_heartbeat.elapsed() >= HEARTBEAT_REFRESH_INTERVAL {
-                                hb();
-                                last_heartbeat = Instant::now();
-                            }
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
-                    },
-                    Err(_) => break,
-                }
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                },
+                Err(_) => break,
             }
-            result
-        },
-        Err(_) => None,
-    }
+        }
+        result
+    })
 }
 
 /// Execute all requested warm phases and build a `WarmReceiptV1`.
