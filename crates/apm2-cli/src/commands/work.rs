@@ -454,6 +454,50 @@ fn run_open(args: &OpenArgs, socket_path: &Path, json_output: bool) -> u8 {
         },
     };
 
+    // Defense-in-depth (f-781-security-1771696040689027-0): Verify the
+    // opened handle refers to a regular file.  FIFOs, device nodes,
+    // sockets, etc. can block indefinitely or behave unexpectedly.
+    // We check via fstat on the already-opened fd to avoid TOCTOU.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        match file.metadata() {
+            Ok(meta) => {
+                let ft = meta.file_type();
+                if !ft.is_file() {
+                    let kind = if ft.is_fifo() {
+                        "FIFO"
+                    } else if ft.is_socket() {
+                        "socket"
+                    } else if ft.is_block_device() {
+                        "block device"
+                    } else if ft.is_char_device() {
+                        "character device"
+                    } else {
+                        "non-regular file"
+                    };
+                    return output_error(
+                        json_output,
+                        "not_regular_file",
+                        &format!(
+                            "Ticket path is a {kind}, not a regular file: {}",
+                            args.from_ticket
+                        ),
+                        exit_codes::VALIDATION_ERROR,
+                    );
+                }
+            },
+            Err(e) => {
+                return output_error(
+                    json_output,
+                    "io_error",
+                    &format!("Failed to stat ticket file: {e}"),
+                    exit_codes::GENERIC_ERROR,
+                );
+            },
+        }
+    }
+
     // Read at most MAX_TICKET_FILE_SIZE + 1 bytes from the file handle.
     // If we read more than MAX_TICKET_FILE_SIZE, the file is too large.
     let mut yaml_content = String::new();
