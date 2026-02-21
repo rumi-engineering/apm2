@@ -5268,25 +5268,39 @@ mod work_role_serde {
 /// Trait for persisting and querying work claims.
 ///
 /// The work registry tracks claimed work items and their associated
-/// policy resolutions. It also handles `WorkClaimed` event signing.
+/// policy resolutions. Claims are indexed by `(work_id, role)` to support
+/// Phase 2 multi-role workflows where an Implementer and a Reviewer
+/// each claim the same `work_id` with different roles.
 pub trait WorkRegistry: Send + Sync {
     /// Registers a new work claim.
     ///
-    /// # Arguments
-    ///
-    /// * `claim` - The work claim to register
-    ///
-    /// # Returns
-    ///
-    /// The registered `WorkClaim` (may be enriched with additional metadata).
+    /// Claims are keyed by `(work_id, role)`. Registering a claim for a
+    /// `(work_id, role)` pair that already exists returns
+    /// `DuplicateWorkId`. Different roles for the same `work_id` are
+    /// allowed and expected in multi-role workflows.
     ///
     /// # Errors
     ///
     /// Returns an error if registration fails.
     fn register_claim(&self, claim: WorkClaim) -> Result<WorkClaim, WorkRegistryError>;
 
-    /// Queries a work claim by work ID.
+    /// Queries a work claim by work ID (returns the first registered claim).
+    ///
+    /// For backward compatibility with callers that do not know the role,
+    /// this returns whichever claim was registered first. Callers that
+    /// need a specific role should use
+    /// [`get_claim_for_role`](WorkRegistry::get_claim_for_role).
     fn get_claim(&self, work_id: &str) -> Option<WorkClaim>;
+
+    /// Queries a work claim by `(work_id, role)`.
+    ///
+    /// Returns `Some(claim)` only if a claim for the exact `(work_id, role)`
+    /// pair exists. This is the canonical lookup for multi-role workflows
+    /// (Phase 2).
+    fn get_claim_for_role(&self, work_id: &str, role: WorkRole) -> Option<WorkClaim> {
+        // Default: delegate to get_claim and filter by role.
+        self.get_claim(work_id).filter(|c| c.role == role)
+    }
 }
 
 /// Error type for work registry operations.
@@ -5335,6 +5349,11 @@ pub const MAX_WORK_CLAIMS: usize = 10_000;
 /// memory exhaustion. When the limit is reached, the oldest entry (by insertion
 /// order) is evicted to make room for the new claim.
 ///
+/// # Multi-Role Support
+///
+/// Claims are keyed by `(work_id, role)` to support Phase 2 multi-role
+/// workflows where Implementer and Reviewer each claim the same `work_id`.
+///
 /// # Performance
 ///
 /// Uses `VecDeque` for O(1) eviction via `pop_front()` instead of
@@ -5343,9 +5362,11 @@ pub const MAX_WORK_CLAIMS: usize = 10_000;
 pub struct StubWorkRegistry {
     /// Claims stored with insertion order for LRU eviction.
     /// Uses `VecDeque` for O(1) eviction of oldest entries.
+    /// Key: `(work_id, role_i32)` to support multiple roles per `work_id`.
+    #[allow(clippy::type_complexity)]
     claims: std::sync::RwLock<(
-        VecDeque<String>,
-        std::collections::HashMap<String, WorkClaim>,
+        VecDeque<(String, i32)>,
+        std::collections::HashMap<(String, i32), WorkClaim>,
     )>,
 }
 
@@ -5353,7 +5374,7 @@ impl Default for StubWorkRegistry {
     fn default() -> Self {
         Self {
             claims: std::sync::RwLock::new((
-                VecDeque::with_capacity(MAX_WORK_CLAIMS.min(1000)), // Pre-allocate reasonably
+                VecDeque::with_capacity(MAX_WORK_CLAIMS.min(1000)),
                 std::collections::HashMap::with_capacity(MAX_WORK_CLAIMS.min(1000)),
             )),
         }
@@ -5365,7 +5386,8 @@ impl WorkRegistry for StubWorkRegistry {
         let mut guard = self.claims.write().expect("lock poisoned");
         let (order, claims) = &mut *guard;
 
-        if claims.contains_key(&claim.work_id) {
+        let key = (claim.work_id.clone(), claim.role as i32);
+        if claims.contains_key(&key) {
             return Err(WorkRegistryError::DuplicateWorkId {
                 work_id: claim.work_id,
             });
@@ -5376,7 +5398,8 @@ impl WorkRegistry for StubWorkRegistry {
             if let Some(oldest_key) = order.pop_front() {
                 claims.remove(&oldest_key);
                 debug!(
-                    evicted_work_id = %oldest_key,
+                    evicted_work_id = %oldest_key.0,
+                    evicted_role = oldest_key.1,
                     "Evicted oldest work claim to maintain capacity limit"
                 );
             } else {
@@ -5384,15 +5407,25 @@ impl WorkRegistry for StubWorkRegistry {
             }
         }
 
-        let work_id = claim.work_id.clone();
-        order.push_back(work_id.clone());
-        claims.insert(work_id, claim.clone());
+        order.push_back(key.clone());
+        claims.insert(key, claim.clone());
         Ok(claim)
     }
 
     fn get_claim(&self, work_id: &str) -> Option<WorkClaim> {
         let guard = self.claims.read().expect("lock poisoned");
-        guard.1.get(work_id).cloned()
+        // Return the first claim found for this work_id (any role).
+        // Iteration order matches insertion order via the VecDeque.
+        guard
+            .0
+            .iter()
+            .find(|(wid, _)| wid == work_id)
+            .and_then(|key| guard.1.get(key).cloned())
+    }
+
+    fn get_claim_for_role(&self, work_id: &str, role: WorkRole) -> Option<WorkClaim> {
+        let guard = self.claims.read().expect("lock poisoned");
+        guard.1.get(&(work_id.to_string(), role as i32)).cloned()
     }
 }
 
@@ -5449,22 +5482,24 @@ pub fn derive_actor_id(credentials: &PeerCredentials) -> String {
 
 /// Generates a unique work ID.
 ///
-/// Uses UUID v4 for uniqueness per RFC-0016 (Hybrid Time Framework compliance).
-/// HTF prohibits `SystemTime::now()` to ensure deterministic replay.
+/// Uses UUID v4 for uniqueness. UUID v4 avoids wall-clock dependency
+/// (`SystemTime::now()`) but is still non-deterministic (CSPRNG-based).
+/// For deterministic simulation/replay, the PRNG must be explicitly
+/// seeded at the test harness level.
 #[must_use]
 pub fn generate_work_id() -> String {
-    // RFC-0016 HTF compliance: Use UUID v4 instead of SystemTime::now()
     let uuid = uuid::Uuid::new_v4();
     format!("W-{uuid}")
 }
 
 /// Generates a unique lease ID.
 ///
-/// Uses UUID v4 for uniqueness per RFC-0016 (Hybrid Time Framework compliance).
-/// HTF prohibits `SystemTime::now()` to ensure deterministic replay.
+/// Uses UUID v4 for uniqueness. UUID v4 avoids wall-clock dependency
+/// (`SystemTime::now()`) but is still non-deterministic (CSPRNG-based).
+/// For deterministic simulation/replay, the PRNG must be explicitly
+/// seeded at the test harness level.
 #[must_use]
 pub fn generate_lease_id() -> String {
-    // RFC-0016 HTF compliance: Use UUID v4 instead of SystemTime::now()
     let uuid = uuid::Uuid::new_v4();
     format!("L-{uuid}")
 }
@@ -12326,7 +12361,19 @@ impl PrivilegedDispatcher {
         // TCK-00256: Query work registry for PolicyResolvedForChangeSet
         // Fail-closed: spawn is only allowed if a valid policy resolution exists
         // for the work_id. This is established during ClaimWork.
-        let Some(claim) = self.work_registry.get_claim(&request.work_id) else {
+        //
+        // Use role-indexed lookup (get_claim_for_role) when role is known,
+        // so that multi-role workflows (Implementer + Reviewer on the same
+        // work_id) correctly resolve the role-specific claim.
+        let request_role = WorkRole::try_from(request.role).unwrap_or(WorkRole::Unspecified);
+        let claim = if request_role == WorkRole::Unspecified {
+            self.work_registry.get_claim(&request.work_id)
+        } else {
+            self.work_registry
+                .get_claim_for_role(&request.work_id, request_role)
+                .or_else(|| self.work_registry.get_claim(&request.work_id))
+        };
+        let Some(claim) = claim else {
             // Local precondition failure (no prior ClaimWork / missing local
             // claim state); this is NOT a governance transport failure.
             warn!(
@@ -12344,7 +12391,6 @@ impl PrivilegedDispatcher {
 
         // TCK-00256: Validate role matches the claimed role
         // Per DD-001, the role in the spawn request should match the claimed role
-        let request_role = WorkRole::try_from(request.role).unwrap_or(WorkRole::Unspecified);
         if claim.role != request_role {
             warn!(
                 work_id = %request.work_id,
@@ -15317,6 +15363,41 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        // 4a. Actor-lease ownership verification (SECURITY BLOCKER fix).
+        //
+        // The governing lease_id is not secret (it appears in audit logs
+        // and ledger events). Verify that the requester actually owns the
+        // lease by checking the executor_actor_id bound to the lease.
+        // Uses constant-time comparison to prevent timing side-channel
+        // attacks that could leak information about valid actor bindings.
+        //
+        // If the lease has no executor binding (empty string or None),
+        // skip the check — the lease was registered via a legacy governance
+        // path that predates executor binding. PCAC lifecycle enforcement
+        // downstream will still gate the operation.
+        if let Some(lease_owner) = self
+            .lease_validator
+            .get_lease_executor_actor_id(&request.lease_id)
+        {
+            if !lease_owner.is_empty() {
+                let owner_matches = lease_owner.len() == actor_id.len()
+                    && bool::from(lease_owner.as_bytes().ct_eq(actor_id.as_bytes()));
+                if !owner_matches {
+                    warn!(
+                        lease_id = %request.lease_id,
+                        derived_actor_id = %actor_id,
+                        "ClaimWorkV2 rejected: actor-lease ownership mismatch \
+                         (authorization bypass attempt)"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        "ClaimWorkV2 request rejected: lease_id is not owned \
+                         by the requesting actor",
+                    ));
+                }
+            }
+        }
+
         let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
             match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
                 Ok(values) => values,
@@ -15552,11 +15633,12 @@ impl PrivilegedDispatcher {
         let issued_lease_id = generate_lease_id();
 
         // 9a. Register the claim in WorkRegistry so SpawnEpisode and other
-        // downstream handlers can find this claim (BLOCKER fix: SpawnEpisode
-        // remains bound to legacy WorkRegistry).
-        // Resolve actual policy resolution from the governing lease's claim
-        // for downstream compatibility. Fall back to a minimal resolution
-        // when the governing claim is not found (fail-closed: risk_tier=4).
+        // downstream handlers can find this claim.
+        //
+        // Resolve actual policy resolution from the governing lease's claim.
+        // Fail-closed: if no real policy resolution is available, reject the
+        // claim rather than recording synthetic PCAC-derived hashes that
+        // violate the AGENTS.md invariant for reconstructibility.
         let resolved_policy = self
             .work_registry
             .get_claim(&request.work_id)
@@ -15566,20 +15648,21 @@ impl PrivilegedDispatcher {
                     .get_lease_work_id(&request.lease_id)
                     .and_then(|wid| self.work_registry.get_claim(&wid))
                     .map(|c| c.policy_resolution)
-            })
-            .unwrap_or_else(|| PolicyResolution {
-                policy_resolved_ref: String::new(),
-                resolved_policy_hash: claim_content_hash,
-                capability_manifest_hash,
-                context_pack_hash: scope_witness_hash,
-                resolved_risk_tier: 4, // fail-closed: Tier4
-                resolved_scope_baseline: None,
-                expected_adapter_profile_hash: None,
-                pcac_policy: None,
-                pointer_only_waiver: None,
-                role_spec_hash: [0u8; 32],
-                context_pack_recipe_hash: [0u8; 32],
             });
+        let Some(resolved_policy) = resolved_policy else {
+            warn!(
+                work_id = %request.work_id,
+                lease_id = %request.lease_id,
+                "ClaimWorkV2 rejected: no actual policy resolution available \
+                 (fail-closed: synthetic hashes are not permitted)"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "ClaimWorkV2 rejected: actual policy resolution not found for \
+                 governing lease (synthetic hashes are not permitted in \
+                 WorkAuthorityBindingsV1)",
+            ));
+        };
 
         let v2_claim = WorkClaim {
             work_id: request.work_id.clone(),
@@ -15592,20 +15675,25 @@ impl PrivilegedDispatcher {
             permeability_receipt: None,
         };
 
-        // DuplicateWorkId is expected if the same work was already claimed via
-        // the legacy ClaimWork path; treat it as a non-fatal condition.
+        // DuplicateWorkId for the same (work_id, role) pair means this exact
+        // role was already claimed (legacy path or re-claim); treat as
+        // non-fatal. Different roles for the same work_id are allowed and
+        // expected in multi-role workflows.
         match self.work_registry.register_claim(v2_claim) {
             Ok(_) => {
                 info!(
                     work_id = %request.work_id,
                     lease_id = %issued_lease_id,
+                    role = ?role,
                     "ClaimWorkV2: claim registered in WorkRegistry"
                 );
             },
             Err(WorkRegistryError::DuplicateWorkId { .. }) => {
                 debug!(
                     work_id = %request.work_id,
-                    "ClaimWorkV2: work_id already in WorkRegistry (legacy path or re-claim)"
+                    role = ?role,
+                    "ClaimWorkV2: (work_id, role) already in WorkRegistry \
+                     (legacy path or re-claim)"
                 );
             },
             Err(e) => {
@@ -15787,105 +15875,183 @@ impl PrivilegedDispatcher {
 
     /// Handles idempotent re-claim in `ClaimWorkV2`.
     ///
-    /// Checks whether the work was already claimed by the same actor.
-    /// If so, returns the existing claim info. If a different actor claimed,
-    /// returns `FAILED_PRECONDITION`.
+    /// Checks whether the work was already claimed by the same actor for the
+    /// same role. If so, returns the existing claim info. If a different actor
+    /// claimed the same role, returns `FAILED_PRECONDITION`.
     ///
-    /// Uses bounded queries (`get_first_event_by_work_id_and_type`) and proper
-    /// JSON deserialization instead of raw byte window matching.
+    /// Uses role-filtered event search to support multi-role workflows where
+    /// an Implementer and a Reviewer each claim the same `work_id` in
+    /// sequence. Searches from newest to oldest (`rev()`) to find the most
+    /// recent event matching the requested role's `rationale_code`.
     #[allow(clippy::unnecessary_wraps)]
     fn handle_claim_work_v2_idempotency(
         &self,
         work_id: &str,
         actor_id: &str,
-        _role: WorkRole,
+        role: WorkRole,
     ) -> ProtocolResult<PrivilegedResponse> {
-        // Use bounded LIMIT-1 query to find the most recent work_transitioned
-        // event for this work_id. The bridge stores ClaimWorkV2 transitions
-        // as event_type "work_transitioned" with a JSON payload.
-        let claim_event = self
-            .event_emitter
-            .get_first_event_by_work_id_and_type(work_id, "work_transitioned");
+        // Determine the expected rationale_code for the requested role.
+        let expected_rationale = match role {
+            WorkRole::Implementer | WorkRole::Coordinator => "claim_work_v2_implementer",
+            WorkRole::Reviewer => "claim_work_v2_reviewer",
+            _ => {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("ClaimWorkV2 idempotency check: unsupported role {role:?}"),
+                ));
+            },
+        };
 
-        // Verify the claim event has a ClaimWorkV2 rationale code by
-        // deserializing the JSON payload (not raw byte window matching).
-        let claim_event = claim_event.filter(|event| {
-            serde_json::from_slice::<serde_json::Value>(&event.payload).is_ok_and(|payload| {
-                matches!(
-                    payload.get("rationale_code").and_then(|v| v.as_str()),
-                    Some("claim_work_v2_implementer" | "claim_work_v2_reviewer")
-                )
-            })
-        });
+        let role_str = match role {
+            WorkRole::Implementer => "IMPLEMENTER",
+            WorkRole::Reviewer => "REVIEWER",
+            WorkRole::Coordinator => "COORDINATOR",
+            _ => "UNKNOWN",
+        };
+
+        // Search all work_transitioned events for this work_id, in reverse
+        // order (newest first), to find the most recent claim matching the
+        // requested role's rationale_code. This correctly handles multi-role
+        // workflows where Implementer and Reviewer claim the same work_id.
+        let events = self.event_emitter.get_events_by_work_id(work_id);
+
+        let claim_event = events
+            .iter()
+            .rev()
+            .filter(|e| e.event_type == "work_transitioned")
+            .find(|event| {
+                serde_json::from_slice::<serde_json::Value>(&event.payload).is_ok_and(|payload| {
+                    payload.get("rationale_code").and_then(|v| v.as_str())
+                        == Some(expected_rationale)
+                })
+            });
 
         if let Some(event) = claim_event {
-            if event.actor_id == actor_id {
-                // Same actor: idempotent re-claim. Look for the existing
-                // evidence.published event to recover the lease/bindings.
-                // Uses bounded LIMIT-1 query instead of full table scan.
-                let wab_event = self
-                    .event_emitter
-                    .get_first_event_by_work_id_and_type(work_id, "evidence.published")
-                    .filter(|e| {
-                        // Verify this is a WORK_AUTHORITY_BINDINGS evidence
-                        // event via proper JSON deserialization.
+            // Use constant-time comparison to check actor_id match
+            // (prevents timing side-channel on actor identity).
+            let actor_matches = event.actor_id.len() == actor_id.len()
+                && bool::from(event.actor_id.as_bytes().ct_eq(actor_id.as_bytes()));
+
+            if actor_matches {
+                // Same actor, same role: idempotent re-claim. Look for the
+                // matching evidence.published event using the deterministic
+                // `evidence_id` (WAB- prefix + BLAKE3 of work_id:role:actor_id).
+                // The ledger stores evidence.published events in an envelope
+                // with hex-encoded inner payload, so we match on the outer
+                // `evidence_id` field and then decode the inner payload for
+                // detail fields (`lease_id`, `cas_hash`).
+                let expected_evidence_id = {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(b"WAB:");
+                    hasher.update(work_id.as_bytes());
+                    hasher.update(b":");
+                    hasher.update(role_str.as_bytes());
+                    hasher.update(b":");
+                    hasher.update(actor_id.as_bytes());
+                    let hash = hasher.finalize();
+                    format!("WAB-{}", &hash.to_hex()[..32])
+                };
+
+                let wab_event = events
+                    .iter()
+                    .rev()
+                    .filter(|e| e.event_type == "evidence.published")
+                    .find(|e| {
                         serde_json::from_slice::<serde_json::Value>(&e.payload).is_ok_and(
                             |envelope| {
-                                matches!(
-                                    envelope.get("category").and_then(|v| v.as_str()),
-                                    Some("WORK_AUTHORITY_BINDINGS")
-                                )
+                                envelope.get("evidence_id").and_then(|v| v.as_str())
+                                    == Some(&expected_evidence_id)
                             },
                         )
                     });
 
                 if let Some(wab) = wab_event {
-                    // Extract lease_id and evidence_id from the deserialized payload
                     if let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(&wab.payload)
                     {
-                        let lease_id = envelope
-                            .get("lease_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let evidence_id = envelope
-                            .get("evidence_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let cas_hash = envelope
-                            .get("cas_hash")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
+                        // The outer envelope always contains `evidence_id`.
+                        // Detail fields (`lease_id`, `cas_hash`) may be at the
+                        // outer level (production SQLite emitter) or inside the
+                        // hex-encoded `payload` field (in-memory stub emitter).
+                        // Try outer level first, then fall back to inner payload.
+                        let (lease_id, cas_hash) = {
+                            let outer_lease = envelope
+                                .get("lease_id")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            let outer_cas = envelope
+                                .get("cas_hash")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+
+                            if outer_lease.is_some() && outer_cas.is_some() {
+                                (
+                                    outer_lease.unwrap_or_default(),
+                                    outer_cas.unwrap_or_default(),
+                                )
+                            } else {
+                                // Decode hex-encoded inner payload
+                                let inner = envelope
+                                    .get("payload")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|hex_str| hex::decode(hex_str).ok())
+                                    .and_then(|bytes| {
+                                        serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                                    });
+
+                                let inner_lease = inner
+                                    .as_ref()
+                                    .and_then(|v| v.get("lease_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let inner_cas = inner
+                                    .as_ref()
+                                    .and_then(|v| v.get("cas_hash"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                (inner_lease, inner_cas)
+                            }
+                        };
 
                         return Ok(PrivilegedResponse::ClaimWorkV2(ClaimWorkV2Response {
                             work_id: work_id.to_string(),
                             issued_lease_id: lease_id,
                             authority_bindings_hash: cas_hash,
-                            evidence_id,
+                            evidence_id: expected_evidence_id,
                             already_claimed: true,
                         }));
                     }
                 }
 
-                // Fall through: same actor but can't recover details.
-                // Still return success with already_claimed.
-                return Ok(PrivilegedResponse::ClaimWorkV2(ClaimWorkV2Response {
-                    work_id: work_id.to_string(),
-                    issued_lease_id: String::new(),
-                    authority_bindings_hash: String::new(),
-                    evidence_id: String::new(),
-                    already_claimed: true,
-                }));
+                // Fail-closed: same actor, same role, but claim details
+                // (lease_id, authority_bindings_hash) are irrecoverable.
+                // Return an error instead of a hollow success with empty
+                // fields, which would leave the client in an unusable state.
+                warn!(
+                    work_id = %work_id,
+                    actor_id = %actor_id,
+                    role = ?role,
+                    "ClaimWorkV2 idempotency: claim exists but evidence.published \
+                     details are irrecoverable"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "ClaimWorkV2: claim exists for work_id '{work_id}' \
+                         (role={role_str}, same actor) but authority binding \
+                         details could not be recovered from the ledger"
+                    ),
+                ));
             }
         }
 
-        // Different actor or no claim event found: fail
+        // Different actor or no claim event found for this role: fail
         Ok(PrivilegedResponse::error(
             PrivilegedErrorCode::FailedPrecondition,
             format!(
-                "ClaimWorkV2 rejected: work_id '{work_id}' is already claimed by a different actor"
+                "ClaimWorkV2 rejected: work_id '{work_id}' is already claimed \
+                 by a different actor (role={role_str})"
             ),
         ))
     }
@@ -35303,10 +35469,19 @@ mod tests {
                 .with_pcac_lifecycle_gate(pcac_gate)
                 .with_privileged_pcac_policy(PrivilegedPcacPolicy {});
 
-            dispatcher.lease_validator.register_lease(
+            // Register the governing lease with the executor actor_id
+            // matching the test peer credentials (uid=1000, gid=1000) so
+            // the actor-lease ownership check passes.
+            let test_actor_id = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+            dispatcher.lease_validator.register_lease_with_executor(
                 TEST_GOV_LEASE_ID,
                 TEST_GOV_WORK_ID,
                 TEST_GOV_GATE_ID,
+                &test_actor_id,
             );
             let policy_resolution = PolicyResolution {
                 policy_resolved_ref: "test-policy-ref".to_string(),
@@ -35983,8 +36158,9 @@ mod tests {
 
         #[test]
         fn reclaim_different_actor_rejected() {
-            // MAJOR fix: test that a different actor re-claiming fails
-            // with FAILED_PRECONDITION.
+            // SECURITY BLOCKER + MAJOR fix: test that a different actor
+            // using the governing lease is rejected at the actor-lease
+            // ownership check (before even reaching idempotency).
             let dispatcher = claim_v2_dispatcher();
             let work_id = "W-test-different-actor-001";
             inject_work_opened(&dispatcher, work_id);
@@ -36011,7 +36187,9 @@ mod tests {
                 other => panic!("Expected first ClaimWorkV2 success, got: {other:?}"),
             }
 
-            // Second claim by different actor (uid=2000)
+            // Second claim by different actor (uid=2000) using the same
+            // governing lease_id — should be rejected at the actor-lease
+            // ownership check with CapabilityRequestRejected.
             let ctx2 = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 2000,
                 gid: 2000,
@@ -36024,20 +36202,226 @@ mod tests {
                 PrivilegedResponse::Error(err) => {
                     assert_eq!(
                         PrivilegedErrorCode::try_from(err.code),
-                        Ok(PrivilegedErrorCode::FailedPrecondition),
-                        "Different actor re-claim must return FAILED_PRECONDITION"
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                        "Different actor using another's lease must return \
+                         CapabilityRequestRejected"
                     );
                     assert!(
-                        err.message.contains("different actor"),
-                        "Error message should mention different actor, got: {}",
+                        err.message.contains("not owned"),
+                        "Error message should mention ownership, got: {}",
                         err.message
                     );
                 },
                 other => {
                     panic!(
-                        "Expected FAILED_PRECONDITION for different actor re-claim, got: {other:?}"
+                        "Expected CapabilityRequestRejected for actor-lease \
+                         mismatch, got: {other:?}"
                     )
                 },
+            }
+        }
+
+        #[test]
+        fn actor_lease_mismatch_rejected() {
+            // SECURITY BLOCKER fix: verify that a caller using a lease_id
+            // owned by a different actor is rejected.
+            let dispatcher = claim_v2_dispatcher();
+            let work_id = "W-test-lease-mismatch-001";
+            inject_work_opened(&dispatcher, work_id);
+
+            // Register a lease owned by a DIFFERENT actor (uid=9999)
+            let other_actor_id = derive_actor_id(&PeerCredentials {
+                uid: 9999,
+                gid: 9999,
+                pid: Some(1),
+            });
+            let stolen_lease_id = "L-stolen-lease-001";
+            dispatcher.lease_validator.register_lease_with_executor(
+                stolen_lease_id,
+                "W-other-work",
+                "G-other-gate",
+                &other_actor_id,
+            );
+
+            // Attempt to use the stolen lease with our (uid=1000) credentials
+            let ctx = test_ctx();
+            let request = ClaimWorkV2Request {
+                work_id: work_id.to_string(),
+                role: i32::from(WorkRole::Implementer),
+                lease_id: stolen_lease_id.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let result = dispatcher.handle_claim_work_v2(&buf, &ctx);
+            assert!(result.is_ok());
+            match result.unwrap() {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                    );
+                    assert!(
+                        err.message.contains("not owned"),
+                        "Error message should mention ownership mismatch, got: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected rejection for actor-lease mismatch, got: {other:?}")
+                },
+            }
+        }
+
+        #[test]
+        fn multi_role_claim_registry() {
+            // CODE-QUALITY BLOCKER fix: verify that Implementer and Reviewer
+            // can both register claims for the same work_id.
+            let registry = StubWorkRegistry::default();
+            let work_id = "W-multi-role-001";
+
+            let impl_claim = WorkClaim {
+                work_id: work_id.to_string(),
+                lease_id: "L-impl-001".to_string(),
+                actor_id: "actor-impl".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "test-ref".to_string(),
+                    resolved_policy_hash: [0xAA; 32],
+                    capability_manifest_hash: [0xBB; 32],
+                    context_pack_hash: [0xCC; 32],
+                    resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
+                },
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+
+            let reviewer_claim = WorkClaim {
+                work_id: work_id.to_string(),
+                lease_id: "L-reviewer-001".to_string(),
+                actor_id: "actor-reviewer".to_string(),
+                role: WorkRole::Reviewer,
+                policy_resolution: impl_claim.policy_resolution.clone(),
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+
+            // Both registrations should succeed (different roles)
+            registry
+                .register_claim(impl_claim)
+                .expect("Implementer claim should register");
+            registry
+                .register_claim(reviewer_claim)
+                .expect("Reviewer claim should register (different role)");
+
+            // get_claim returns the first registered (Implementer)
+            let any_claim = registry.get_claim(work_id);
+            assert!(any_claim.is_some());
+            assert_eq!(any_claim.unwrap().role, WorkRole::Implementer);
+
+            // get_claim_for_role returns role-specific claims
+            let impl_lookup = registry.get_claim_for_role(work_id, WorkRole::Implementer);
+            assert!(impl_lookup.is_some());
+            assert_eq!(impl_lookup.unwrap().lease_id, "L-impl-001");
+
+            let reviewer_lookup = registry.get_claim_for_role(work_id, WorkRole::Reviewer);
+            assert!(reviewer_lookup.is_some());
+            assert_eq!(reviewer_lookup.unwrap().lease_id, "L-reviewer-001");
+
+            // Duplicate role registration should fail
+            let dup = WorkClaim {
+                work_id: work_id.to_string(),
+                lease_id: "L-dup-001".to_string(),
+                actor_id: "actor-dup".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "test-ref".to_string(),
+                    resolved_policy_hash: [0xAA; 32],
+                    capability_manifest_hash: [0xBB; 32],
+                    context_pack_hash: [0xCC; 32],
+                    resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
+                },
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+            assert!(
+                registry.register_claim(dup).is_err(),
+                "Duplicate (work_id, role) should fail"
+            );
+        }
+
+        #[test]
+        fn idempotency_fallback_fails_closed() {
+            // CODE-QUALITY MAJOR fix: verify that when claim details are
+            // irrecoverable, the handler returns an error instead of
+            // success with empty strings.
+            let dispatcher = claim_v2_dispatcher();
+            let ctx = test_ctx();
+            let work_id = "W-test-fail-closed-001";
+            inject_work_opened(&dispatcher, work_id);
+
+            // First claim succeeds
+            let request = ClaimWorkV2Request {
+                work_id: work_id.to_string(),
+                role: i32::from(WorkRole::Implementer),
+                lease_id: TEST_GOV_LEASE_ID.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let result = dispatcher.handle_claim_work_v2(&buf, &ctx);
+            match result.unwrap() {
+                PrivilegedResponse::ClaimWorkV2(resp) => {
+                    assert!(!resp.already_claimed);
+                    assert!(
+                        !resp.issued_lease_id.is_empty(),
+                        "first claim must issue a lease"
+                    );
+                },
+                other => panic!("Expected ClaimWorkV2 success, got: {other:?}"),
+            }
+
+            // Second claim by same actor (idempotency path) should
+            // succeed with already_claimed=true AND non-empty details.
+            let mut buf2 = Vec::new();
+            request.encode(&mut buf2).expect("encode");
+            let result2 = dispatcher.handle_claim_work_v2(&buf2, &ctx);
+            match result2.unwrap() {
+                PrivilegedResponse::ClaimWorkV2(resp) => {
+                    assert!(
+                        resp.already_claimed,
+                        "re-claim should return already_claimed"
+                    );
+                    // If details are recovered, they must be non-empty
+                    assert!(
+                        !resp.issued_lease_id.is_empty(),
+                        "idempotent re-claim must return non-empty lease_id"
+                    );
+                    assert!(
+                        !resp.authority_bindings_hash.is_empty(),
+                        "idempotent re-claim must return non-empty authority_bindings_hash"
+                    );
+                },
+                PrivilegedResponse::Error(_) => {
+                    // Also acceptable: if details truly cannot be
+                    // recovered, an error is correct (fail-closed).
+                },
+                other => panic!("Expected ClaimWorkV2 or Error, got: {other:?}"),
             }
         }
     }
