@@ -72,7 +72,8 @@ pub use bft_backend::{
 };
 pub use storage::{
     ArtifactRef, CURRENT_RECORD_VERSION, EventRecord, Ledger, LedgerError, LedgerStats,
-    MigrationStats, SqliteLedgerBackend, init_canonical_schema, migrate_legacy_ledger_events,
+    MigrationStats, SqliteLedgerBackend, init_canonical_schema, is_canonical_events_mode,
+    migrate_legacy_ledger_events,
 };
 
 // ============================================================================
