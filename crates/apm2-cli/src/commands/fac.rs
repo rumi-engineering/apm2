@@ -2236,6 +2236,14 @@ fn detect_lane_tmp_corruption(
     manager: &LaneManager,
     lane_id: &str,
 ) -> Result<Option<String>, String> {
+    detect_lane_tmp_corruption_with_entry_limit(manager, lane_id, MAX_TMP_SCRUB_ENTRIES)
+}
+
+fn detect_lane_tmp_corruption_with_entry_limit(
+    manager: &LaneManager,
+    lane_id: &str,
+    max_entries: usize,
+) -> Result<Option<String>, String> {
     let tmp_dir = manager.lane_dir(lane_id).join("tmp");
     let tmp_meta = match std::fs::symlink_metadata(&tmp_dir) {
         Ok(meta) => meta,
@@ -2255,54 +2263,59 @@ fn detect_lane_tmp_corruption(
         )));
     }
 
-    let entries = std::fs::read_dir(&tmp_dir)
-        .map_err(|err| format!("failed to read tmp dir {}: {err}", tmp_dir.display()))?;
+    let mut dirs_to_scan = vec![tmp_dir];
     let mut scanned_entries: usize = 0;
-    for entry in entries {
-        scanned_entries = scanned_entries.saturating_add(1);
-        if scanned_entries > MAX_TMP_SCRUB_ENTRIES {
-            return Ok(Some(format!(
-                "tmp entry count exceeded bound (>{MAX_TMP_SCRUB_ENTRIES})"
-            )));
-        }
 
-        let entry = entry.map_err(|err| format!("failed to read tmp entry: {err}"))?;
-        let path = entry.path();
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(format!(
-                    "failed to stat tmp entry {}: {err}",
-                    path.display()
-                ));
-            },
-        };
-        let file_type = meta.file_type();
-        if file_type.is_symlink() {
-            return Ok(Some(format!(
-                "tmp contains symlink entry {}",
-                path.display()
-            )));
-        }
-        if meta.is_dir() {
-            continue;
-        }
-        if meta.is_file() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if is_tmp_residue_name(&name) {
+    while let Some(scan_dir) = dirs_to_scan.pop() {
+        let entries = std::fs::read_dir(&scan_dir)
+            .map_err(|err| format!("failed to read tmp dir {}: {err}", scan_dir.display()))?;
+        for entry in entries {
+            scanned_entries = scanned_entries.saturating_add(1);
+            if scanned_entries > max_entries {
                 return Ok(Some(format!(
-                    "tmp contains transient residue entry {}",
+                    "tmp entry count exceeded bound (>{max_entries})"
+                )));
+            }
+
+            let entry = entry.map_err(|err| format!("failed to read tmp entry: {err}"))?;
+            let path = entry.path();
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(format!(
+                        "failed to stat tmp entry {}: {err}",
+                        path.display()
+                    ));
+                },
+            };
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                return Ok(Some(format!(
+                    "tmp contains symlink entry {}",
                     path.display()
                 )));
             }
-            continue;
+            if file_type.is_dir() {
+                dirs_to_scan.push(path);
+                continue;
+            }
+            if file_type.is_file() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if is_tmp_residue_name(&name) {
+                    return Ok(Some(format!(
+                        "tmp contains transient residue entry {}",
+                        path.display()
+                    )));
+                }
+                continue;
+            }
+            return Ok(Some(format!(
+                "tmp contains unsupported file type at {}",
+                path.display()
+            )));
         }
-        return Ok(Some(format!(
-            "tmp contains unsupported file type at {}",
-            path.display()
-        )));
     }
 
     Ok(None)
@@ -2805,7 +2818,7 @@ fn run_system_doctor_fix(
             push_system_doctor_fix_action(
                 &mut actions,
                 SystemDoctorFixActionKind::LaneTmpCorruptionDetected,
-                SystemDoctorFixActionStatus::Blocked,
+                SystemDoctorFixActionStatus::Applied,
                 Some(&lane_id),
                 detail.clone(),
             );
@@ -7145,6 +7158,56 @@ mod tests {
         let detail = detection.expect("residue should be detected");
         assert!(detail.contains("transient residue"));
         assert!(detail.contains(".tmp-stale"));
+    }
+
+    #[test]
+    fn test_detect_lane_tmp_corruption_flags_nested_transient_residue() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let nested_dir = manager.lane_dir(lane_id).join("tmp").join("nested");
+        std::fs::create_dir_all(&nested_dir).expect("create nested dir");
+        let residue = nested_dir.join("transient.tmp");
+        std::fs::write(&residue, b"stale residue").expect("write nested residue");
+
+        let detection =
+            detect_lane_tmp_corruption(&manager, lane_id).expect("tmp corruption detection");
+        let detail = detection.expect("nested residue should be detected");
+        assert!(detail.contains("transient residue"));
+        assert!(detail.contains("transient.tmp"));
+    }
+
+    #[test]
+    fn test_detect_lane_tmp_corruption_with_entry_limit_fails_closed() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let nested_dir = manager.lane_dir(lane_id).join("tmp").join("nested");
+        std::fs::create_dir_all(&nested_dir).expect("create nested dir");
+        for idx in 0..4 {
+            std::fs::write(nested_dir.join(format!("file-{idx}.txt")), b"data")
+                .expect("write nested file");
+        }
+
+        let detection = detect_lane_tmp_corruption_with_entry_limit(&manager, lane_id, 2)
+            .expect("tmp corruption detection should succeed");
+        let detail = detection.expect("entry limit overflow should be detected");
+        assert!(
+            detail.contains("entry count exceeded bound (>2)"),
+            "unexpected entry bound detail: {detail}"
+        );
     }
 
     #[test]
