@@ -60,7 +60,7 @@
 //! - [INV-WRK-008] Lane lease is acquired before job execution; jobs that
 //!   cannot acquire a lane are moved back to pending.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -328,6 +328,7 @@ const UNKNOWN_REPO_SEGMENT: &str = "unknown";
 const ALLOWED_WORKSPACE_ROOTS_ENV: &str = "APM2_FAC_ALLOWED_WORKSPACE_ROOTS";
 const GATES_HEARTBEAT_REFRESH_SECS: u64 = 5;
 const FAC_JOB_UNIT_BASE_PREFIX: &str = "apm2-fac-job-";
+const FAC_GATES_SYNTHETIC_LANE_ID: &str = "lane-00";
 const MAX_QUEUED_GATES_UNIT_BASE_LEN: usize = 200;
 const ORPHAN_LEASE_WARNING_MULTIPLIER: u64 = 2;
 const MAX_COMPLETED_SCAN_ENTRIES: usize = 4096;
@@ -2561,10 +2562,10 @@ fn sanitize_repo_segment(raw: &str) -> String {
     }
 }
 
-fn build_queued_gates_bounded_unit_base(queue_lane: &str, job_id: &str) -> String {
-    let safe_queue_lane = sanitize_repo_segment(queue_lane);
+fn build_queued_gates_bounded_unit_base(lane_id: &str, job_id: &str) -> String {
+    let safe_lane_id = sanitize_repo_segment(lane_id);
     let safe_job_id = sanitize_repo_segment(job_id);
-    let mut base = format!("{FAC_JOB_UNIT_BASE_PREFIX}{safe_queue_lane}-{safe_job_id}");
+    let mut base = format!("{FAC_JOB_UNIT_BASE_PREFIX}{safe_lane_id}-{safe_job_id}");
     if base.len() > MAX_QUEUED_GATES_UNIT_BASE_LEN {
         base.truncate(MAX_QUEUED_GATES_UNIT_BASE_LEN);
         while base.ends_with('-') || base.ends_with('.') || base.ends_with('_') {
@@ -2826,7 +2827,8 @@ fn execute_queued_gates_job(
         return JobOutcome::Denied { reason };
     }
 
-    let bounded_unit_base = build_queued_gates_bounded_unit_base(&spec.queue_lane, &spec.job_id);
+    let bounded_unit_base =
+        build_queued_gates_bounded_unit_base(FAC_GATES_SYNTHETIC_LANE_ID, &spec.job_id);
     let gate_run_result = match run_gates_in_workspace(
         &options,
         fac_root,
@@ -7680,23 +7682,58 @@ fn find_target_job_in_dir(dir: &Path, target_job_id: &str) -> Option<PathBuf> {
     None
 }
 
-/// Attempts to stop the exact systemd unit for a target job.
+fn build_stop_revoke_lane_candidates(lane_hint: &str) -> Vec<String> {
+    let mut lanes = BTreeSet::new();
+    lanes.insert(lane_hint.to_string());
+    lanes.extend(LaneManager::default_lane_ids());
+    lanes.into_iter().collect()
+}
+
+fn stop_systemd_unit_both_scopes(unit_name: &str) -> Result<(), String> {
+    let mut last_err = String::new();
+    let mut any_stop_succeeded = false;
+    let mut not_found_count: u32 = 0;
+    let scopes: &[&str] = &["--user", "--system"];
+
+    for mode_flag in scopes {
+        eprintln!("worker: stop_revoke: stopping unit {unit_name} ({mode_flag})");
+        let stop_result = std::process::Command::new("systemctl")
+            .args([mode_flag, "stop", "--", unit_name])
+            .output();
+        match stop_result {
+            Ok(out) if out.status.success() => {
+                any_stop_succeeded = true;
+            },
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if out.status.code() == Some(5) {
+                    not_found_count = not_found_count.saturating_add(1);
+                } else {
+                    last_err = format!("{mode_flag}: {}", stderr.trim());
+                }
+            },
+            Err(e) => {
+                last_err = format!("{mode_flag}: {e}");
+            },
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let total_scopes = scopes.len() as u32;
+    if any_stop_succeeded || not_found_count == total_scopes {
+        return Ok(());
+    }
+
+    Err(format!(
+        "systemctl stop failed for unit {unit_name}: {last_err}"
+    ))
+}
+
+/// Attempts to stop all associated systemd units for a target job.
 ///
-/// MAJOR 7: Uses the exact unit name `apm2-fac-job-{lane}-{job_id}` instead
-/// of wildcard matching.  The `queue_lane` is read from the target job spec
-/// in `claimed/`.
-///
-/// Tries both user-mode and system-mode `systemctl stop` commands.
-/// Uses `KillMode=control-group` semantics to kill all processes in the
-/// cgroup.
-///
-/// BLOCKER fix (round 3): Exit code 5 from one scope no longer short-circuits.
-/// The function attempts BOTH scopes and only returns `Ok(())` when:
-/// - A stop actually succeeded (exit code 0) in at least one scope, OR
-/// - Both scopes confirm the unit is not found (exit code 5 in both).
-///
-/// Returns `Ok(())` if the unit was stopped or confirmed absent in all scopes,
-/// or `Err` with details.
+/// Uses the same unit association model as `check_fac_unit_liveness`
+/// (exact FAC unit, suffixed FAC units, and warm units) and fail-closes
+/// if unit liveness cannot be verified before or after stop attempts.
 fn stop_target_unit_exact(lane: &str, target_job_id: &str) -> Result<(), String> {
     // MAJOR-1 fix: Sanitize queue_lane to only allow [A-Za-z0-9_-].
     // Fail-closed: reject lanes containing unsafe characters to prevent
@@ -7711,73 +7748,69 @@ fn stop_target_unit_exact(lane: &str, target_job_id: &str) -> Result<(), String>
         ));
     }
     let safe_target_job_id = sanitize_repo_segment(target_job_id);
-    let unit_name = format!("apm2-fac-job-{lane}-{safe_target_job_id}");
-    let mut last_err = String::new();
-    let mut any_stop_succeeded = false;
-    let mut not_found_count: u32 = 0;
-    let scopes: &[&str] = &["--user", "--system"];
+    let lane_candidates = build_stop_revoke_lane_candidates(lane);
+    let mut units_to_stop: BTreeSet<String> = BTreeSet::new();
 
-    // Attempt to stop in BOTH scopes (user and system).
-    // Exit code 5 means "unit not loaded in this scope" — NOT "already stopped".
-    // We must check both scopes because the unit may be running in either.
-    for mode_flag in scopes {
-        eprintln!("worker: stop_revoke: stopping unit {unit_name} ({mode_flag})");
-        let stop_result = std::process::Command::new("systemctl")
-            .args([mode_flag, "stop", "--", &unit_name])
-            .output();
-        match stop_result {
-            Ok(out) if out.status.success() => {
-                eprintln!(
-                    "worker: stop_revoke: unit {unit_name} stopped successfully ({mode_flag})"
-                );
-                any_stop_succeeded = true;
+    for lane_id in &lane_candidates {
+        match check_fac_unit_liveness(lane_id, &safe_target_job_id) {
+            FacUnitLiveness::Inactive => {},
+            FacUnitLiveness::Active { active_units } => {
+                units_to_stop.extend(active_units);
             },
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                // Exit code 5 means "unit not loaded" — NOT in this scope.
-                // The unit might still be running in the other scope, so we
-                // record "not found here" and continue checking.
-                if out.status.code() == Some(5) {
-                    eprintln!(
-                        "worker: stop_revoke: unit {unit_name} not loaded ({mode_flag}), \
-                         not found in this scope"
-                    );
-                    not_found_count = not_found_count.saturating_add(1);
-                } else {
-                    last_err = format!("{mode_flag}: {stderr}");
-                    eprintln!(
-                        "worker: stop_revoke: stop {unit_name} failed ({mode_flag}): {stderr}"
-                    );
-                }
-            },
-            Err(e) => {
-                last_err = format!("{mode_flag}: {e}");
-                eprintln!("worker: stop_revoke: systemctl stop failed ({mode_flag}): {e}");
+            FacUnitLiveness::Unknown { reason } => {
+                return Err(format!(
+                    "cannot verify associated units for lane {lane_id}: {reason}"
+                ));
             },
         }
     }
 
-    // Success conditions:
-    // 1. At least one scope returned exit code 0 (stop succeeded), OR
-    // 2. Both scopes returned exit code 5 (unit not found in either — truly
-    //    absent).
-    #[allow(clippy::cast_possible_truncation)]
-    let total_scopes = scopes.len() as u32;
-    if any_stop_succeeded || not_found_count == total_scopes {
-        if not_found_count == total_scopes {
-            eprintln!(
-                "worker: stop_revoke: unit {unit_name} not found in any scope, \
-                 treating as already stopped"
-            );
-        }
+    if units_to_stop.is_empty() {
+        eprintln!(
+            "worker: stop_revoke: no active associated units found for job {target_job_id}; \
+             treating as already stopped"
+        );
         return Ok(());
     }
 
-    // Fail-closed: neither mode confirmed the unit as stopped or absent.
-    // Return error so the caller emits a failure receipt.
-    Err(format!(
-        "systemctl stop failed for unit {unit_name}: {last_err}"
-    ))
+    let mut stop_errors = Vec::new();
+    for unit_name in &units_to_stop {
+        if let Err(err) = stop_systemd_unit_both_scopes(unit_name) {
+            stop_errors.push(err);
+        }
+    }
+    if !stop_errors.is_empty() {
+        return Err(format!(
+            "failed to stop associated units for job {target_job_id}: {}",
+            stop_errors.join("; ")
+        ));
+    }
+
+    let mut lingering_units = Vec::new();
+    for lane_id in &lane_candidates {
+        match check_fac_unit_liveness(lane_id, &safe_target_job_id) {
+            FacUnitLiveness::Inactive => {},
+            FacUnitLiveness::Active { active_units } => {
+                lingering_units.extend(active_units);
+            },
+            FacUnitLiveness::Unknown { reason } => {
+                return Err(format!(
+                    "post-stop verification inconclusive for lane {lane_id}: {reason}"
+                ));
+            },
+        }
+    }
+
+    lingering_units.sort();
+    lingering_units.dedup();
+    if lingering_units.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "stop_revoke incomplete for job {target_job_id}: associated units still active [{}]",
+            lingering_units.join(", ")
+        ))
+    }
 }
 
 // =============================================================================
@@ -9347,15 +9380,15 @@ mod tests {
     }
 
     #[test]
-    fn test_build_queued_gates_bounded_unit_base_includes_queue_lane_and_job_id() {
-        let base = build_queued_gates_bounded_unit_base("consume", "job_123");
-        assert_eq!(base, "apm2-fac-job-consume-job_123");
+    fn test_build_queued_gates_bounded_unit_base_includes_lane_and_job_id() {
+        let base = build_queued_gates_bounded_unit_base("lane-00", "job_123");
+        assert_eq!(base, "apm2-fac-job-lane-00-job_123");
     }
 
     #[test]
     fn test_build_queued_gates_bounded_unit_base_sanitizes_segments() {
-        let base = build_queued_gates_bounded_unit_base("consume lane", "job/id");
-        assert_eq!(base, "apm2-fac-job-consume-lane-job-id");
+        let base = build_queued_gates_bounded_unit_base("lane 00", "job/id");
+        assert_eq!(base, "apm2-fac-job-lane-00-job-id");
     }
 
     #[test]

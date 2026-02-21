@@ -10,13 +10,17 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Read as _;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
+
+use wait_timeout::ChildExt;
 
 /// Marker embedded in lane-corruption reasons for orphaned active systemd work.
 pub const ORPHANED_SYSTEMD_UNIT_REASON_CODE: &str = "ORPHANED_SYSTEMD_UNIT";
 
 const MAX_CGROUP_FILE_BYTES: u64 = 8192;
 const MAX_SYSTEMD_UNIT_NAME_LENGTH: usize = 255;
+const SYSTEMCTL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Liveness state for FAC-associated systemd units.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,21 +156,11 @@ pub fn check_fac_unit_liveness(lane_id: &str, job_id: &str) -> FacUnitLiveness {
 }
 
 fn probe_exact_unit(scope_flag: &str, unit_name: &str) -> UnitProbeStatus {
-    let output = Command::new("systemctl")
-        .args([scope_flag, "is-active", "--quiet", "--", unit_name])
-        .output();
-
-    let output = match output {
-        Ok(value) => value,
-        Err(err) => {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                return UnitProbeStatus::Unavailable;
-            }
-            return UnitProbeStatus::Unknown(format!(
-                "systemctl {scope_flag} is-active failed to execute: {err}"
-            ));
-        },
-    };
+    let output =
+        match run_systemctl_with_timeout(&[scope_flag, "is-active", "--quiet", "--", unit_name]) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
 
     if output.status.success() {
         return UnitProbeStatus::Active;
@@ -195,28 +189,18 @@ fn probe_pattern_units(
     unit_prefix: &str,
 ) -> Result<Vec<String>, UnitProbeStatus> {
     let pattern = format!("{unit_prefix}*.service");
-    let output = Command::new("systemctl")
-        .args([
-            scope_flag,
-            "list-units",
-            "--all",
-            "--plain",
-            "--no-legend",
-            "--no-pager",
-            "--type=service",
-            "--state=active,activating,reloading",
-            "--",
-            &pattern,
-        ])
-        .output()
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                return UnitProbeStatus::Unavailable;
-            }
-            UnitProbeStatus::Unknown(format!(
-                "systemctl {scope_flag} list-units failed to execute for pattern {pattern}: {err}"
-            ))
-        })?;
+    let output = run_systemctl_with_timeout(&[
+        scope_flag,
+        "list-units",
+        "--all",
+        "--plain",
+        "--no-legend",
+        "--no-pager",
+        "--type=service",
+        "--state=active,activating,reloading",
+        "--",
+        &pattern,
+    ])?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -332,7 +316,45 @@ fn is_safe_unit_fragment(value: &str) -> bool {
     !value.is_empty()
         && value
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn run_systemctl_with_timeout(args: &[&str]) -> Result<Output, UnitProbeStatus> {
+    let mut child = Command::new("systemctl")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                UnitProbeStatus::Unavailable
+            } else {
+                UnitProbeStatus::Unknown(format!(
+                    "systemctl {} failed to execute: {err}",
+                    args.join(" ")
+                ))
+            }
+        })?;
+
+    let status = child.wait_timeout(SYSTEMCTL_PROBE_TIMEOUT).map_err(|err| {
+        UnitProbeStatus::Unknown(format!("systemctl {} wait failed: {err}", args.join(" ")))
+    })?;
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(UnitProbeStatus::Unknown(format!(
+            "systemctl {} timed out after {}s",
+            args.join(" "),
+            SYSTEMCTL_PROBE_TIMEOUT.as_secs()
+        )));
+    }
+
+    child.wait_with_output().map_err(|err| {
+        UnitProbeStatus::Unknown(format!(
+            "systemctl {} output capture failed: {err}",
+            args.join(" ")
+        ))
+    })
 }
 
 fn is_scope_unavailable(stderr: &str) -> bool {
@@ -405,5 +427,11 @@ mod tests {
         assert!(!is_valid_systemd_unit_name("apm2 worker.service"));
         assert!(!is_valid_systemd_unit_name("../../evil.service"));
         assert!(!is_valid_systemd_unit_name("apm2-worker"));
+    }
+
+    #[test]
+    fn safe_unit_fragment_allows_dots() {
+        assert!(is_safe_unit_fragment("job.123"));
+        assert!(!is_safe_unit_fragment("job/123"));
     }
 }
