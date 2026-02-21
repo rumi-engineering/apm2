@@ -3040,21 +3040,29 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
     fn get_event_by_evidence_identity(
         &self,
         work_id: &str,
-        _entry_id: &str,
+        entry_id: &str,
     ) -> Option<SignedLedgerEvent> {
-        // emit_session_event stores work_id as the event's work_id column.
-        // Filter by event_type and work_id, then the caller verifies
-        // evidence_id == entry_id from the protobuf payload.
+        use prost::Message;
+
+        // Fetch ALL evidence.published events for this work_id (bounded by
+        // rowid DESC ordering). We decode the JSON envelope → hex payload →
+        // protobuf to verify category=WORK_CONTEXT_ENTRY, work_id match,
+        // and evidence_id == entry_id before returning. This prevents false
+        // idempotency hits when multiple entries exist for the same work_id.
         let conn = self.conn.lock().ok()?;
 
-        conn.query_row(
-            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns \
-             FROM ledger_events \
-             WHERE event_type = 'evidence.published' \
-             AND work_id = ?1 \
-             ORDER BY rowid DESC LIMIT 1",
-            params![work_id],
-            |row| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns \
+                 FROM ledger_events \
+                 WHERE event_type = 'evidence.published' \
+                 AND work_id = ?1 \
+                 ORDER BY rowid DESC",
+            )
+            .ok()?;
+
+        let rows = stmt
+            .query_map(params![work_id], |row| {
                 Ok(SignedLedgerEvent {
                     event_id: row.get(0)?,
                     event_type: row.get(1)?,
@@ -3064,11 +3072,49 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
                     signature: row.get(5)?,
                     timestamp_ns: row.get(6)?,
                 })
-            },
-        )
-        .optional()
-        .ok()
-        .flatten()
+            })
+            .ok()?;
+
+        for row_result in rows {
+            let Ok(event) = row_result else {
+                continue;
+            };
+
+            // Decode JSON envelope: { "payload": "<hex-encoded protobuf>", ... }
+            let Ok(payload_json) =
+                serde_json::from_slice::<serde_json::Value>(&event.payload)
+            else {
+                continue;
+            };
+            let Some(hex_payload) = payload_json.get("payload").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok(inner_bytes) = hex::decode(hex_payload) else {
+                continue;
+            };
+
+            // Decode protobuf EvidenceEvent and extract Published variant.
+            let Ok(evidence_event) =
+                apm2_core::events::EvidenceEvent::decode(inner_bytes.as_slice())
+            else {
+                continue;
+            };
+            let Some(apm2_core::events::evidence_event::Event::Published(published)) =
+                evidence_event.event
+            else {
+                continue;
+            };
+
+            // Semantic match: category, work_id, and evidence_id must all match.
+            if published.category == "WORK_CONTEXT_ENTRY"
+                && published.work_id == work_id
+                && published.evidence_id == entry_id
+            {
+                return Some(event);
+            }
+        }
+
+        None
     }
 
     fn get_work_transition_count(&self, work_id: &str) -> u32 {

@@ -17628,10 +17628,13 @@ impl PrivilegedDispatcher {
         }
 
         // ---- Daemon-authoritative field overwrite ----
-        // The daemon is authoritative for entry_id, actor_id, and created_at_ns.
-        // Client-supplied values are silently overwritten.
+        // The daemon is authoritative for entry_id, actor_id, created_at_ns,
+        // and source_session_id. Client-supplied values are silently overwritten.
+        // For privileged operator socket calls there is no active session, so
+        // source_session_id is cleared to prevent client-spoofed attribution.
         entry.entry_id.clone_from(&entry_id);
         entry.actor_id = Some(actor_id.clone());
+        entry.source_session_id = None;
 
         // Get HTF-compliant timestamp for created_at_ns.
         let timestamp_ns = match self.get_htf_timestamp_ns() {
@@ -17937,6 +17940,11 @@ impl PrivilegedDispatcher {
     ///
     /// Matching key: `(work_id, entry_id)`. Response values are the
     /// authoritative persisted `event_id` and `cas_hash` (hex).
+    ///
+    /// Defense-in-depth: even though `get_event_by_evidence_identity` is
+    /// supposed to verify semantic identity, this method re-validates
+    /// `category`, `work_id`, and `evidence_id` from the decoded protobuf
+    /// before accepting the replay binding.
     fn find_work_context_published_replay(
         &self,
         work_id: &str,
@@ -17961,6 +17969,16 @@ impl PrivilegedDispatcher {
         else {
             return None;
         };
+
+        // Defense-in-depth: verify semantic identity from the decoded
+        // protobuf even though the emitter should already have checked.
+        if published.category != "WORK_CONTEXT_ENTRY"
+            || published.work_id != work_id
+            || published.evidence_id != entry_id
+        {
+            return None;
+        }
+
         let cas_hash_hex = hex::encode(&published.artifact_hash);
         Some((event.event_id, cas_hash_hex))
     }
@@ -29714,6 +29732,73 @@ mod tests {
             assert_eq!(
                 evidence_count, 1,
                 "Idempotent retry must NOT produce a second evidence event"
+            );
+        }
+
+        /// Regression: two different `entry_id` values (different `dedupe_key`
+        /// values) under the same `work_id` must produce two distinct evidence
+        /// events. The second publish must NOT false-hit the first entry's
+        /// idempotency check.
+        #[test]
+        fn test_publish_work_context_entry_no_false_idempotency_across_entries() {
+            let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher();
+
+            // First entry: HANDOFF_NOTE with dedupe_key "key-a".
+            let entry_json_a = make_entry_json(&work_id, "HANDOFF_NOTE", "key-a");
+            let request_a = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: "key-a".to_string(),
+                entry_json: entry_json_a,
+                lease_id: lease_id.clone(),
+            };
+            let frame_a = encode_publish_work_context_entry_request(&request_a);
+            let resp_a = match dispatcher.dispatch(&frame_a, &ctx).unwrap() {
+                PrivilegedResponse::PublishWorkContextEntry(r) => r,
+                other => panic!("Expected PublishWorkContextEntry, got: {other:?}"),
+            };
+
+            // Second entry: HANDOFF_NOTE with dedupe_key "key-b" — different
+            // semantic identity, must NOT be treated as idempotent replay.
+            let entry_json_b = make_entry_json(&work_id, "HANDOFF_NOTE", "key-b");
+            let request_b = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: "key-b".to_string(),
+                entry_json: entry_json_b,
+                lease_id: lease_id.clone(),
+            };
+            let frame_b = encode_publish_work_context_entry_request(&request_b);
+            let resp_b = match dispatcher.dispatch(&frame_b, &ctx).unwrap() {
+                PrivilegedResponse::PublishWorkContextEntry(r) => r,
+                other => panic!("Expected PublishWorkContextEntry, got: {other:?}"),
+            };
+
+            // The two entries must have distinct entry_ids (deterministic IDs
+            // derived from different (work_id, kind, dedupe_key) tuples).
+            assert_ne!(
+                resp_a.entry_id, resp_b.entry_id,
+                "Different dedupe_keys must produce different entry_ids"
+            );
+
+            // CAS hashes may differ (different entry JSON content).
+            // The important thing is that both operations succeeded and
+            // produced separate evidence events.
+            assert_ne!(
+                resp_a.cas_hash, resp_b.cas_hash,
+                "Different entries should produce different CAS hashes"
+            );
+
+            // Verify exactly 2 evidence.published events in the ledger.
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let evidence_count = events
+                .iter()
+                .filter(|e| e.event_type == "evidence.published")
+                .count();
+            assert_eq!(
+                evidence_count, 2,
+                "Two distinct entries must produce two evidence.published events, \
+                 not one (false idempotency regression)"
             );
         }
 

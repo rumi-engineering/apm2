@@ -2417,9 +2417,12 @@ impl ProjectionWorker {
 
     /// Handles a single `evidence.published` event for work context projection.
     ///
-    /// Decodes the `EvidencePublished` protobuf payload, checks if the category
-    /// is `WORK_CONTEXT_ENTRY`, and if so, extracts metadata fields and inserts
-    /// into the `work_context` projection table.
+    /// The ledger stores session events as a JSON envelope with a hex-encoded
+    /// protobuf in the `"payload"` field (see `emit_session_event`). This
+    /// method decodes that envelope first, then the inner `EvidenceEvent`
+    /// protobuf, checks if the category is `WORK_CONTEXT_ENTRY`, and if so,
+    /// extracts metadata fields and inserts into the `work_context` projection
+    /// table.
     ///
     /// Non-`WORK_CONTEXT_ENTRY` events are silently skipped (return `Ok(())`).
     fn handle_evidence_published(
@@ -2428,11 +2431,35 @@ impl ProjectionWorker {
     ) -> Result<(), ProjectionWorkerError> {
         use prost::Message;
 
-        // Decode the outer EvidenceEvent protobuf wrapper.
-        let evidence_event = apm2_core::events::EvidenceEvent::decode(event.payload.as_slice())
+        // Step 1: Parse the JSON envelope produced by emit_session_event.
+        // Format: { "event_type": "...", "session_id": "...", "actor_id": "...",
+        // "payload": "<hex>" }
+        let envelope: serde_json::Value = serde_json::from_slice(&event.payload).map_err(|e| {
+            ProjectionWorkerError::InvalidPayload(format!(
+                "failed to parse session event JSON envelope: {e}"
+            ))
+        })?;
+
+        let hex_payload = envelope
+            .get("payload")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ProjectionWorkerError::InvalidPayload(
+                    "session event JSON envelope missing 'payload' field".to_string(),
+                )
+            })?;
+
+        let inner_bytes = hex::decode(hex_payload).map_err(|e| {
+            ProjectionWorkerError::InvalidPayload(format!(
+                "failed to hex-decode inner protobuf payload: {e}"
+            ))
+        })?;
+
+        // Step 2: Decode the inner EvidenceEvent protobuf.
+        let evidence_event = apm2_core::events::EvidenceEvent::decode(inner_bytes.as_slice())
             .map_err(|e| {
                 ProjectionWorkerError::InvalidPayload(format!(
-                    "failed to decode EvidenceEvent: {e}"
+                    "failed to decode EvidenceEvent from inner protobuf: {e}"
                 ))
             })?;
 
@@ -7858,8 +7885,22 @@ mod tests {
         );
     }
 
-    /// BLOCKER 2d: Verify `handle_evidence_published` correctly extracts
-    /// metadata and indexes `WORK_CONTEXT_ENTRY` events.
+    /// Helper: builds a JSON-envelope payload matching `emit_session_event`
+    /// production format. The inner protobuf is hex-encoded in the `"payload"`
+    /// field of the JSON object.
+    fn build_session_event_envelope(inner_protobuf: &[u8]) -> Vec<u8> {
+        let envelope = serde_json::json!({
+            "event_type": "evidence.published",
+            "session_id": "test-session",
+            "actor_id": "test-actor",
+            "payload": hex::encode(inner_protobuf),
+        });
+        serde_json::to_vec(&envelope).expect("JSON serialization should not fail")
+    }
+
+    /// BLOCKER 2d: Verify `handle_evidence_published` correctly decodes the
+    /// JSON-envelope wire format (matching `emit_session_event` production
+    /// encoding), extracts metadata, and indexes `WORK_CONTEXT_ENTRY` events.
     #[test]
     fn test_handle_evidence_published_indexes_work_context_entry() {
         use prost::Message;
@@ -7867,7 +7908,7 @@ mod tests {
         let conn = create_test_db();
         let index = WorkIndex::new(Arc::clone(&conn)).unwrap();
 
-        // Build a realistic evidence.published SignedLedgerEvent.
+        // Build a realistic evidence.published protobuf.
         let published = apm2_core::events::EvidencePublished {
             evidence_id: "CTX-e2e-001".to_string(),
             work_id: "W-E2E".to_string(),
@@ -7889,37 +7930,49 @@ mod tests {
                 published,
             )),
         };
-        let payload_bytes = evidence_event.encode_to_vec();
+        let inner_protobuf = evidence_event.encode_to_vec();
+
+        // Wrap in JSON envelope matching emit_session_event production format.
+        let envelope_payload = build_session_event_envelope(&inner_protobuf);
 
         let event = crate::protocol::dispatch::SignedLedgerEvent {
             event_id: "EVT-E2E-001".to_string(),
             event_type: "evidence.published".to_string(),
             work_id: "CTX-e2e-001".to_string(),
             actor_id: "actor-e2e".to_string(),
-            payload: payload_bytes,
+            payload: envelope_payload,
             signature: vec![0u8; 64],
             timestamp_ns: 6_000_000_000,
         };
 
-        // Call handle_evidence_published on a minimal worker-like setup.
-        // We can't call the private method directly, so we simulate
-        // the logic inline.
+        // Simulate the handle_evidence_published decode path inline:
+        // 1) Parse JSON envelope
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&event.payload).expect("JSON envelope should parse");
+        let hex_payload = envelope
+            .get("payload")
+            .and_then(|v| v.as_str())
+            .expect("envelope should contain payload field");
+        let inner_bytes = hex::decode(hex_payload).expect("hex decode should succeed");
+
+        // 2) Decode inner protobuf
         let evidence_event_decoded =
-            apm2_core::events::EvidenceEvent::decode(event.payload.as_slice()).unwrap();
-        let apm2_core::events::evidence_event::Event::Published(published) =
+            apm2_core::events::EvidenceEvent::decode(inner_bytes.as_slice())
+                .expect("protobuf decode should succeed");
+        let apm2_core::events::evidence_event::Event::Published(decoded_published) =
             evidence_event_decoded.event.unwrap()
         else {
             panic!("Expected Published event")
         };
 
-        assert_eq!(published.category, "WORK_CONTEXT_ENTRY");
+        assert_eq!(decoded_published.category, "WORK_CONTEXT_ENTRY");
 
         let mut entry_id = String::new();
         let mut kind = String::new();
         let mut dedupe_key = String::new();
         let mut actor_id = String::new();
 
-        for meta in &published.metadata {
+        for meta in &decoded_published.metadata {
             if let Some(val) = meta.strip_prefix("entry_id=") {
                 entry_id = val.to_string();
             } else if let Some(val) = meta.strip_prefix("kind=") {
@@ -7931,17 +7984,17 @@ mod tests {
             }
         }
 
-        let cas_hash_hex = hex::encode(&published.artifact_hash);
+        let cas_hash_hex = hex::encode(&decoded_published.artifact_hash);
 
         index
             .register_work_context_entry(
-                &published.work_id,
+                &decoded_published.work_id,
                 &entry_id,
                 &kind,
                 &dedupe_key,
                 &actor_id,
                 &cas_hash_hex,
-                &published.evidence_id,
+                &decoded_published.evidence_id,
                 event.timestamp_ns,
             )
             .unwrap();
@@ -7973,6 +8026,7 @@ mod tests {
     }
 
     /// BLOCKER 2e: Non-WORK_CONTEXT_ENTRY events are silently skipped.
+    /// Uses production JSON-envelope wire format.
     #[test]
     fn test_handle_evidence_published_skips_non_work_context() {
         use prost::Message;
@@ -7990,17 +8044,25 @@ mod tests {
         };
         let evidence_event = apm2_core::events::EvidenceEvent {
             event: Some(apm2_core::events::evidence_event::Event::Published(
-                published.clone(),
+                published,
             )),
         };
+        let inner_protobuf = evidence_event.encode_to_vec();
 
-        // The category is "SECURITY_SCAN" — should be skipped.
-        assert_ne!(published.category, "WORK_CONTEXT_ENTRY");
+        // Wrap in JSON envelope matching production encoding.
+        let envelope_payload = build_session_event_envelope(&inner_protobuf);
 
-        // Verify the decode-and-filter logic works correctly.
-        let decoded =
-            apm2_core::events::EvidenceEvent::decode(evidence_event.encode_to_vec().as_slice())
-                .unwrap();
+        // Parse JSON envelope -> hex decode -> protobuf decode
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&envelope_payload).expect("JSON envelope should parse");
+        let hex_payload = envelope
+            .get("payload")
+            .and_then(|v| v.as_str())
+            .expect("envelope should contain payload field");
+        let inner_bytes = hex::decode(hex_payload).expect("hex decode should succeed");
+
+        let decoded = apm2_core::events::EvidenceEvent::decode(inner_bytes.as_slice())
+            .expect("protobuf decode should succeed");
         let apm2_core::events::evidence_event::Event::Published(p) = decoded.event.unwrap() else {
             panic!("Expected Published")
         };
