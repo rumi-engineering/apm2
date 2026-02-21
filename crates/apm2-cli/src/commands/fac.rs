@@ -2004,6 +2004,33 @@ fn describe_orphaned_unit_liveness(liveness: FacUnitLiveness) -> (String, String
     }
 }
 
+fn enforce_lane_reset_liveness_guard<F>(
+    lane_id: &str,
+    job_id: Option<&str>,
+    probe: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&str, &str) -> FacUnitLiveness,
+{
+    let Some(job_id) = job_id else {
+        return Err("reset blocked: cannot verify unit liveness without lease job_id".to_string());
+    };
+    let liveness = probe(lane_id, job_id);
+    if matches!(liveness, FacUnitLiveness::Inactive) {
+        return Ok(());
+    }
+
+    let (state, detail, active_units) = describe_orphaned_unit_liveness(liveness);
+    if active_units.is_empty() {
+        Err(format!("reset blocked while liveness={state}: {detail}"))
+    } else {
+        Err(format!(
+            "reset blocked while liveness={state}: {detail}; active_units={}",
+            active_units.join(", ")
+        ))
+    }
+}
+
 fn collect_orphaned_systemd_units(
     fac_root: &Path,
 ) -> Result<Vec<OrphanedSystemdUnitDiagnostic>, String> {
@@ -2735,45 +2762,6 @@ fn run_system_doctor_fix(
             }
         }
 
-        if reason_is_orphaned {
-            let job_id = status.job_id.clone().or_else(|| {
-                LaneLeaseV1::load(&manager.lane_dir(&lane_id))
-                    .ok()
-                    .flatten()
-                    .map(|lease| lease.job_id)
-            });
-            let Some(job_id) = job_id else {
-                push_system_doctor_fix_action(
-                    &mut actions,
-                    SystemDoctorFixActionKind::LaneResetOrphanedSystemdUnit,
-                    SystemDoctorFixActionStatus::Blocked,
-                    Some(&lane_id),
-                    "cannot reset orphaned-systemd lane without lease job_id",
-                );
-                continue;
-            };
-            let liveness = check_fac_unit_liveness(&lane_id, &job_id);
-            if !matches!(liveness, FacUnitLiveness::Inactive) {
-                let (state, detail, active_units) = describe_orphaned_unit_liveness(liveness);
-                let detail = if active_units.is_empty() {
-                    format!("reset blocked while liveness={state}: {detail}")
-                } else {
-                    format!(
-                        "reset blocked while liveness={state}: {detail}; active_units={}",
-                        active_units.join(", ")
-                    )
-                };
-                push_system_doctor_fix_action(
-                    &mut actions,
-                    SystemDoctorFixActionKind::LaneResetOrphanedSystemdUnit,
-                    SystemDoctorFixActionStatus::Blocked,
-                    Some(&lane_id),
-                    detail,
-                );
-                continue;
-            }
-        }
-
         let reset_action = if reason_is_orphaned {
             SystemDoctorFixActionKind::LaneResetOrphanedSystemdUnit
         } else if reason_is_tmp_corrupt {
@@ -2781,6 +2769,24 @@ fn run_system_doctor_fix(
         } else {
             SystemDoctorFixActionKind::LaneResetCleanupRecovery
         };
+        let job_id = status.job_id.clone().or_else(|| {
+            LaneLeaseV1::load(&manager.lane_dir(&lane_id))
+                .ok()
+                .flatten()
+                .map(|lease| lease.job_id)
+        });
+        if let Err(detail) =
+            enforce_lane_reset_liveness_guard(&lane_id, job_id.as_deref(), check_fac_unit_liveness)
+        {
+            push_system_doctor_fix_action(
+                &mut actions,
+                reset_action,
+                SystemDoctorFixActionStatus::Blocked,
+                Some(&lane_id),
+                detail,
+            );
+            continue;
+        }
         match doctor_reset_lane_once(&manager, &lane_id) {
             Ok(reset_summary) => {
                 lane_resets_applied = true;
@@ -7214,6 +7220,42 @@ mod tests {
             payload.get("action").and_then(|value| value.as_str()),
             Some("lane_tmp_corruption_detected")
         );
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_guard_blocks_active_for_non_orphaned_reset() {
+        let err =
+            enforce_lane_reset_liveness_guard("lane-00", Some("job-123"), |_lane_id, _job_id| {
+                FacUnitLiveness::Active {
+                    active_units: vec!["apm2-fac-job-lane-00-job-123.service".to_string()],
+                }
+            })
+            .expect_err("active liveness must block reset");
+        assert!(
+            err.contains("reset blocked while liveness=active"),
+            "expected active liveness block detail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_guard_blocks_when_job_id_missing() {
+        let err = enforce_lane_reset_liveness_guard("lane-00", None, |_lane_id, _job_id| {
+            FacUnitLiveness::Inactive
+        })
+        .expect_err("missing job_id must block reset");
+        assert!(
+            err.contains("cannot verify unit liveness without lease job_id"),
+            "expected missing job_id guard detail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_guard_allows_inactive() {
+        let result =
+            enforce_lane_reset_liveness_guard("lane-00", Some("job-123"), |_lane_id, _job_id| {
+                FacUnitLiveness::Inactive
+            });
+        assert!(result.is_ok(), "inactive liveness should allow reset");
     }
 
     #[test]
