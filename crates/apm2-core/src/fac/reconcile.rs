@@ -570,10 +570,10 @@ struct ClaimedJobMetadata {
 ///    shutdown.
 ///
 /// 3. **No external request surface.** Reconciliation is invoked only by the
-///    worker's own startup path or by the CLI `apm2 fac reconcile` command.
-///    There is no IPC handler, no network endpoint, and no delegated capability
-///    that could be confused or replayed. The filesystem-level access to
-///    `$APM2_HOME` is the sole trust anchor.
+///    worker's own startup path or by `apm2 fac doctor --fix`. There is no IPC
+///    handler, no network endpoint, and no delegated capability that could be
+///    confused or replayed. The filesystem-level access to `$APM2_HOME` is the
+///    sole trust anchor.
 ///
 /// 4. **Boundary conditions.** This exemption holds only when:
 ///    - Reconciliation runs before the worker's job-processing loop starts.
@@ -1118,7 +1118,7 @@ enum StaleLeaseOutcome {
 /// If any cleanup step fails, the lane is marked CORRUPT via
 /// `LaneCorruptMarkerV1` rather than silently continuing. This ensures the
 /// lane will not accept new jobs until explicitly reset via
-/// `apm2 fac lane reset`.
+/// `apm2 fac doctor --fix`.
 fn recover_stale_lease(
     lane_dir: &Path,
     lease: &LaneLeaseV1,
@@ -1152,7 +1152,7 @@ fn recover_stale_lease(
 
     if let Some(cleanup_reason) = cleanup_failed {
         // Cleanup failed — mark lane CORRUPT (fail-closed). The lane must
-        // not accept new jobs until explicitly reset via `apm2 fac lane reset`.
+        // not accept new jobs until explicitly reset via `apm2 fac doctor --fix`.
         //
         // BLOCKER FIX: The corrupt marker IS the fail-closed safety net.
         // Once the lane is marked CORRUPT, the worker can safely continue
@@ -1167,7 +1167,7 @@ fn recover_stale_lease(
             .unwrap_or("unknown");
         let reason = format!(
             "stale lease recovery cleanup failed for lane {lane_id}: {cleanup_reason}; \
-             lane marked corrupt (fail-closed, requires `apm2 fac lane reset`)"
+             lane marked corrupt (fail-closed, requires `apm2 fac doctor --fix`)"
         );
         let timestamp = current_timestamp_rfc3339();
         let marker = LaneCorruptMarkerV1 {
@@ -1184,7 +1184,7 @@ fn recover_stale_lease(
                 // not accept new jobs until reset.
                 eprintln!(
                     "WARNING: lane cleanup failed during stale lease recovery at {}: \
-                     {cleanup_reason}; lane marked CORRUPT (requires `apm2 fac lane reset`)",
+                     {cleanup_reason}; lane marked CORRUPT (requires `apm2 fac doctor --fix`)",
                     lane_dir.display()
                 );
                 // Do NOT remove the lease — lane is corrupt and needs
@@ -1236,7 +1236,7 @@ fn recover_stale_lease(
 /// invariant, failures are logged as warnings and accumulated. The caller
 /// marks the lane CORRUPT on any failure, which is the fail-closed safety
 /// net — the lane will not accept new jobs until explicitly reset via
-/// `apm2 fac lane reset`.
+/// `apm2 fac doctor --fix`.
 ///
 /// This is a subset of the full `LaneManager::run_lane_cleanup` that can run
 /// without knowledge of the workspace path or git state.

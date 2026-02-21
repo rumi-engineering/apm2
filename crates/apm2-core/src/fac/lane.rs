@@ -1235,7 +1235,7 @@ pub struct LaneInitProfileEntry {
     pub created: bool,
 }
 
-/// Receipt for `apm2 fac lane reconcile` (TCK-00539).
+/// Receipt for lane reconciliation used by `apm2 fac doctor --fix` (TCK-00539).
 ///
 /// Records all reconciliation actions taken, lanes inspected, and outcomes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1548,8 +1548,8 @@ impl LaneManager {
     /// Reconcile lane state: repair missing directories and profiles, mark
     /// lanes CORRUPT if unrecoverable.
     ///
-    /// This is the operator recovery command for `apm2 fac lane reconcile`.
-    /// It inspects each configured lane and repairs what it can:
+    /// This powers operator recovery via `apm2 fac doctor --fix`. It inspects
+    /// each configured lane and repairs what it can:
     ///
     /// - Missing lane directories are recreated with `0o700` permissions.
     /// - Missing profiles are regenerated with defaults.
@@ -1800,7 +1800,7 @@ impl LaneManager {
     ///
     /// Corrupt-marked lanes are skipped immediately — no repair attempts are
     /// made. This preserves the quarantine contract: operators must explicitly
-    /// clear the corrupt marker via `apm2 fac lane reset` before the lane is
+    /// clear the corrupt marker via `apm2 fac doctor --fix` before the lane is
     /// eligible for repair.
     fn reconcile_single_lane(
         fac_root: &Path,
@@ -1819,7 +1819,7 @@ impl LaneManager {
                 action: "existing_corrupt_marker".to_string(),
                 outcome: LaneReconcileOutcome::Skipped,
                 detail: Some(
-                    "corrupt marker present; use `apm2 fac lane reset` to clear".to_string(),
+                    "corrupt marker present; use `apm2 fac doctor --fix` to clear".to_string(),
                 ),
             });
             return;
