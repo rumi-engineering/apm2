@@ -145,6 +145,479 @@ pub enum LedgerError {
     /// linking.
     #[error("ledger is in legacy compatibility mode and is read-only")]
     LegacyModeReadOnly,
+
+    /// Migration error: the frozen snapshot indicates a prior migration
+    /// occurred but the canonical `events` chain is empty, suggesting
+    /// data loss or truncation.
+    #[error("migration failed: {message}")]
+    MigrationPartialState {
+        /// Human-readable description of the partial state.
+        message: String,
+    },
+}
+
+/// Statistics returned by [`migrate_legacy_ledger_events`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MigrationStats {
+    /// Number of rows migrated from `ledger_events` to `events`.
+    pub rows_migrated: u64,
+    /// Whether the migration was a no-op (already completed or no legacy
+    /// table).
+    pub already_migrated: bool,
+}
+
+/// Maximum number of legacy rows to migrate in a single transaction.
+///
+/// This is a safety bound to prevent unbounded memory allocation if
+/// `ledger_events` contains an unexpectedly large number of rows.
+/// 10 million rows is generous for any realistic daemon ledger while
+/// preventing multi-gigabyte in-memory accumulation.
+const MAX_LEGACY_MIGRATION_ROWS: u64 = 10_000_000;
+
+/// Initializes the canonical `events` table schema on a raw `SQLite`
+/// connection.
+///
+/// This is a prerequisite for [`migrate_legacy_ledger_events`]: the
+/// canonical `events` table must exist before migration can insert rows
+/// into it.  The function is idempotent (`CREATE TABLE IF NOT EXISTS`)
+/// and also runs the RFC-0014 consensus column migration.
+///
+/// Callers that open the database through [`SqliteLedgerBackend::open`]
+/// do not need to call this — the schema is applied automatically.  This
+/// function is intended for daemon startup paths that open a raw
+/// `Connection` (e.g., via `rusqlite::Connection::open`) and then call
+/// `migrate_legacy_ledger_events` before constructing a full `Ledger`.
+///
+/// # Errors
+///
+/// Returns [`LedgerError::Database`] if the schema cannot be applied.
+pub fn init_canonical_schema(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(SCHEMA_SQL)?;
+    SqliteLedgerBackend::migrate_consensus_columns(conn)?;
+    Ok(())
+}
+
+/// Migrates legacy `ledger_events` rows into the canonical `events` table
+/// with a real hash chain.
+///
+/// This function implements RFC-0032 Phase 0: unification of the daemon's
+/// `ledger_events` table into the kernel's `events` table. After migration,
+/// `determine_read_mode()` returns `CanonicalEvents` because `events` has
+/// rows and `ledger_events` has zero rows.
+///
+/// The original `ledger_events` table is preserved (emptied, not renamed)
+/// so that legacy daemon writers can still INSERT into it without crashing.
+/// An immutable audit copy is stored as `ledger_events_legacy_frozen`.
+///
+/// # Atomicity
+///
+/// The entire migration (read legacy rows, insert into `events`, rename
+/// table) executes within a single `EXCLUSIVE` `SQLite` transaction. If any
+/// step fails, the database is unchanged.
+///
+/// # Idempotency
+///
+/// - If `ledger_events` does not exist, returns `Ok` with `already_migrated =
+///   true`.
+/// - If `ledger_events_legacy_frozen` exists and `ledger_events` has zero rows,
+///   returns `Ok` with `already_migrated = true` (previous migration
+///   completed).
+/// - If `ledger_events_legacy_frozen` exists AND `ledger_events` also has rows,
+///   performs an idempotent re-migration: appends those rows to `events`
+///   continuing the hash chain from the current tail, then re-empties
+///   `ledger_events`.  This handles post-cutover legacy writes without causing
+///   a restart-fatal error.
+/// - If `events` has rows and `ledger_events` has zero rows, returns `Ok` with
+///   `already_migrated = true` (canonical DB with empty legacy table).
+/// - If both `events` and `ledger_events` have rows, fails with
+///   `AmbiguousSchemaState`.
+///
+/// # Hash Chain
+///
+/// For each legacy row (ordered by `rowid ASC`):
+/// - First row: `prev_hash = EventHasher::GENESIS_PREV_HASH`
+/// - Subsequent rows: `prev_hash = previous event_hash`
+/// - `event_hash = EventHasher::hash_event(&payload, &prev_hash)`
+///
+/// Signatures are preserved verbatim without verification (per RFC-0032:
+/// signature verification for historical rows is explicitly out of scope).
+///
+/// # Errors
+///
+/// - [`LedgerError::AmbiguousSchemaState`] if `events` has rows and
+///   `ledger_events` still exists.
+/// - [`LedgerError::MigrationPartialState`] if `ledger_events_legacy_frozen`
+///   has rows but `events` is empty (canonical chain missing after prior
+///   migration — possible data loss).
+/// - [`LedgerError::LegacySchemaMismatch`] if the `ledger_events` table schema
+///   does not match the expected shape.
+/// - [`LedgerError::Database`] for `SQLite` errors.
+pub fn migrate_legacy_ledger_events(conn: &Connection) -> Result<MigrationStats, LedgerError> {
+    // Step 1: If `ledger_events` does not exist, migration is a no-op.
+    if !SqliteLedgerBackend::table_exists(conn, "ledger_events")? {
+        return Ok(MigrationStats {
+            rows_migrated: 0,
+            already_migrated: true,
+        });
+    }
+
+    // Step 2: Check if `ledger_events_legacy_frozen` already exists
+    // (idempotency check).
+    let frozen_exists = SqliteLedgerBackend::table_exists(conn, "ledger_events_legacy_frozen")?;
+    if frozen_exists {
+        // ALWAYS check canonical events chain integrity FIRST, before
+        // considering re-migration of live legacy rows.  If the frozen
+        // snapshot has rows but `events` is empty, a prior migration
+        // completed but the canonical chain was lost or truncated —
+        // fail closed regardless of live legacy row count.
+        let events_rows: u64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| {
+            row.get::<_, i64>(0).map(|v| v as u64)
+        })?;
+
+        if events_rows == 0 {
+            let frozen_snapshot_rows: u64 = conn.query_row(
+                "SELECT COUNT(*) FROM ledger_events_legacy_frozen",
+                [],
+                |row| row.get::<_, i64>(0).map(|v| v as u64),
+            )?;
+            if frozen_snapshot_rows > 0 {
+                // Fail closed: prior migration created frozen snapshot with
+                // rows but canonical chain is now missing.  This is true
+                // REGARDLESS of whether live legacy rows exist — allowing
+                // re-migration here would hide data loss / truncation.
+                return Err(LedgerError::MigrationPartialState {
+                    message: format!(
+                        "ledger_events_legacy_frozen has {frozen_snapshot_rows} snapshot row(s) \
+                         but canonical events chain is empty (events_rows=0); \
+                         possible data loss — manual remediation required"
+                    ),
+                });
+            }
+            // frozen_snapshot_rows == 0: prior migration ran on an empty
+            // `ledger_events` table.  Check if new live legacy rows appeared
+            // since then (written by a legacy daemon after the empty migration).
+            let live_legacy_rows: u64 =
+                conn.query_row("SELECT COUNT(*) FROM ledger_events", [], |row| {
+                    row.get::<_, i64>(0).map(|v| v as u64)
+                })?;
+            if live_legacy_rows > 0 {
+                // New legacy rows written after the empty-frozen migration.
+                // Perform a full migration from genesis — same initial-migration
+                // path as the no-frozen case.  We must drop the empty frozen
+                // table first because `migrate_legacy_inner` creates a new one
+                // with the actual migrated row snapshot.
+                SqliteLedgerBackend::validate_legacy_ledger_events_schema(conn)?;
+                conn.execute_batch("BEGIN EXCLUSIVE")?;
+                conn.execute_batch("DROP TABLE ledger_events_legacy_frozen")?;
+                let result = migrate_legacy_inner(conn);
+                match result {
+                    Ok(stats) => {
+                        conn.execute_batch("COMMIT")?;
+                        return Ok(stats);
+                    },
+                    Err(e) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err(e);
+                    },
+                }
+            }
+            // frozen==0, events==0, live==0: truly clean, no-op.
+            return Ok(MigrationStats {
+                rows_migrated: 0,
+                already_migrated: true,
+            });
+        }
+
+        // events_rows > 0: canonical chain exists.  Check for post-cutover
+        // legacy writes that need re-migration.
+        let live_legacy_rows: u64 =
+            conn.query_row("SELECT COUNT(*) FROM ledger_events", [], |row| {
+                row.get::<_, i64>(0).map(|v| v as u64)
+            })?;
+        if live_legacy_rows > 0 {
+            // Post-cutover legacy writes: a legacy writer appended rows
+            // after the initial migration.  Instead of failing fatally
+            // (which would make the daemon unable to restart), perform an
+            // idempotent re-migration: append these rows to `events`
+            // continuing the hash chain from the current tail, then
+            // re-empty `ledger_events`.
+            SqliteLedgerBackend::validate_legacy_ledger_events_schema(conn)?;
+            conn.execute_batch("BEGIN EXCLUSIVE")?;
+            let result = remigrate_post_cutover_rows(conn);
+            match result {
+                Ok(stats) => {
+                    conn.execute_batch("COMMIT")?;
+                    return Ok(stats);
+                },
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                },
+            }
+        }
+
+        // events_rows > 0 and no live legacy rows — previous migration
+        // completed cleanly.
+        return Ok(MigrationStats {
+            rows_migrated: 0,
+            already_migrated: true,
+        });
+    }
+
+    // Step 3: Validate the legacy schema before we trust any reads.
+    SqliteLedgerBackend::validate_legacy_ledger_events_schema(conn)?;
+
+    // Step 4: Begin EXCLUSIVE transaction.
+    conn.execute_batch("BEGIN EXCLUSIVE")?;
+
+    // From here on, any error must rollback.
+    let result = migrate_legacy_inner(conn);
+
+    match result {
+        Ok(stats) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(stats)
+        },
+        Err(e) => {
+            // Best-effort rollback; if this fails the connection is unusable
+            // anyway.
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        },
+    }
+}
+
+/// Inner migration logic, called within an exclusive transaction.
+fn migrate_legacy_inner(conn: &Connection) -> Result<MigrationStats, LedgerError> {
+    // Check `events` row count against `ledger_events` for migration decision.
+    let events_rows: u64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| {
+        row.get::<_, i64>(0).map(|v| v as u64)
+    })?;
+
+    let legacy_rows: u64 = conn.query_row("SELECT COUNT(*) FROM ledger_events", [], |row| {
+        row.get::<_, i64>(0).map(|v| v as u64)
+    })?;
+
+    if events_rows > 0 && legacy_rows > 0 {
+        // Both tables have rows — truly ambiguous, fail-closed.
+        return Err(LedgerError::AmbiguousSchemaState {
+            events_rows,
+            legacy_rows,
+        });
+    }
+
+    if events_rows > 0 && legacy_rows == 0 {
+        // Canonical events already present, legacy table is empty.
+        // This is the idempotent case: e.g., `init_schema_with_signing_key`
+        // created an empty `ledger_events` on a pre-canonicalized DB.
+        // Migration is a no-op.
+        return Ok(MigrationStats {
+            rows_migrated: 0,
+            already_migrated: true,
+        });
+    }
+
+    // `legacy_rows` was already counted above.
+    if legacy_rows == 0 {
+        // No rows to migrate — create a frozen backup (empty) and clear
+        // the compatibility view, but preserve `ledger_events` as a
+        // write-compatible sink for legacy runtime writers (BLOCKER 2 fix).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ledger_events_legacy_frozen AS \
+             SELECT * FROM ledger_events WHERE 0",
+        )?;
+        conn.execute_batch(&format!("DROP VIEW IF EXISTS {LEGACY_EVENTS_COMPAT_VIEW}"))?;
+
+        return Ok(MigrationStats {
+            rows_migrated: 0,
+            already_migrated: false,
+        });
+    }
+
+    if legacy_rows > MAX_LEGACY_MIGRATION_ROWS {
+        return Err(LedgerError::LegacySchemaMismatch {
+            details: format!(
+                "ledger_events has {legacy_rows} rows, exceeding safety limit of \
+                 {MAX_LEGACY_MIGRATION_ROWS}; manual migration required"
+            ),
+        });
+    }
+
+    // Select all legacy rows ordered by rowid ASC for deterministic hash chain.
+    let mut select_stmt = conn.prepare(
+        "SELECT event_type, work_id, actor_id, payload, signature, timestamp_ns \
+         FROM ledger_events ORDER BY rowid ASC",
+    )?;
+
+    let mut insert_stmt = conn.prepare(
+        "INSERT INTO events (event_type, session_id, actor_id, record_version, \
+         payload, timestamp_ns, prev_hash, event_hash, signature) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+
+    let mut prev_hash = crate::crypto::EventHasher::GENESIS_PREV_HASH;
+    let mut rows_migrated: u64 = 0;
+
+    let rows = select_stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,  // event_type
+            row.get::<_, String>(1)?,  // work_id -> session_id
+            row.get::<_, String>(2)?,  // actor_id
+            row.get::<_, Vec<u8>>(3)?, // payload
+            row.get::<_, Vec<u8>>(4)?, // signature
+            row.get::<_, i64>(5)?,     // timestamp_ns
+        ))
+    })?;
+
+    for row_result in rows {
+        let (event_type, session_id, actor_id, payload, signature, timestamp_ns) = row_result?;
+
+        let event_hash = crate::crypto::EventHasher::hash_event(&payload, &prev_hash);
+
+        insert_stmt.execute(params![
+            event_type,
+            session_id,
+            actor_id,
+            i64::from(CURRENT_RECORD_VERSION),
+            payload,
+            timestamp_ns,
+            prev_hash.as_slice(),
+            event_hash.as_slice(),
+            signature,
+        ])?;
+
+        prev_hash = event_hash;
+        rows_migrated += 1;
+    }
+
+    // Drop the compatibility view (it is no longer needed after migration).
+    conn.execute_batch(&format!("DROP VIEW IF EXISTS {LEGACY_EVENTS_COMPAT_VIEW}"))?;
+
+    // BLOCKER 2 fix: Preserve `ledger_events` as a write-compatible sink for
+    // legacy runtime writers.  Instead of renaming it (which breaks daemon
+    // code that still INSERTs into `ledger_events`), create an immutable
+    // audit copy and clear the original table.
+    //
+    // 1. `ledger_events_legacy_frozen` = immutable audit record of migrated rows.
+    // 2. `ledger_events` = emptied but still exists for legacy writer compat.
+    // 3. `determine_read_mode` sees events > 0, legacy == 0 → CanonicalEvents.
+    // 4. Next startup: migration sees events > 0, legacy == 0 → no-op (BLOCKER 1).
+    conn.execute_batch("CREATE TABLE ledger_events_legacy_frozen AS SELECT * FROM ledger_events")?;
+    conn.execute_batch("DELETE FROM ledger_events")?;
+
+    Ok(MigrationStats {
+        rows_migrated,
+        already_migrated: false,
+    })
+}
+
+/// Re-migrate post-cutover legacy rows.
+///
+/// Called when `ledger_events_legacy_frozen` exists AND `ledger_events` has
+/// rows (written by a legacy daemon writer after the initial migration).
+/// Instead of treating this as fatal, we append the new legacy rows to
+/// `events` continuing the hash chain from the current tail, then re-empty
+/// `ledger_events`.
+///
+/// Must be called within an EXCLUSIVE transaction.
+fn remigrate_post_cutover_rows(conn: &Connection) -> Result<MigrationStats, LedgerError> {
+    let legacy_rows: u64 = conn.query_row("SELECT COUNT(*) FROM ledger_events", [], |row| {
+        row.get::<_, i64>(0).map(|v| v as u64)
+    })?;
+
+    if legacy_rows == 0 {
+        // Race: rows disappeared between check and transaction.
+        return Ok(MigrationStats {
+            rows_migrated: 0,
+            already_migrated: true,
+        });
+    }
+
+    if legacy_rows > MAX_LEGACY_MIGRATION_ROWS {
+        return Err(LedgerError::LegacySchemaMismatch {
+            details: format!(
+                "post-cutover ledger_events has {legacy_rows} rows, exceeding safety limit of \
+                 {MAX_LEGACY_MIGRATION_ROWS}; manual migration required"
+            ),
+        });
+    }
+
+    // Retrieve the current chain tail from `events` to continue the
+    // hash chain.  Use the last non-NULL event_hash (migrated rows
+    // always have hashes; unsigned appends via Ledger::append may
+    // store NULL event_hash).  Fall back to genesis if all hashes
+    // are NULL (unlikely in production but handles test scenarios).
+    let tail_hash_opt: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT event_hash FROM events WHERE event_hash IS NOT NULL \
+             ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    let mut prev_hash: [u8; 32] = match tail_hash_opt {
+        Some(ref h) => h
+            .as_slice()
+            .try_into()
+            .map_err(|_| LedgerError::LegacySchemaMismatch {
+                details: format!("events tail event_hash has length {}, expected 32", h.len()),
+            })?,
+        None => crate::crypto::EventHasher::GENESIS_PREV_HASH,
+    };
+
+    let mut select_stmt = conn.prepare(
+        "SELECT event_type, work_id, actor_id, payload, signature, timestamp_ns \
+         FROM ledger_events ORDER BY rowid ASC",
+    )?;
+
+    let mut insert_stmt = conn.prepare(
+        "INSERT INTO events (event_type, session_id, actor_id, record_version, \
+         payload, timestamp_ns, prev_hash, event_hash, signature) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+
+    let mut rows_migrated: u64 = 0;
+
+    let rows = select_stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,  // event_type
+            row.get::<_, String>(1)?,  // work_id -> session_id
+            row.get::<_, String>(2)?,  // actor_id
+            row.get::<_, Vec<u8>>(3)?, // payload
+            row.get::<_, Vec<u8>>(4)?, // signature
+            row.get::<_, i64>(5)?,     // timestamp_ns
+        ))
+    })?;
+
+    for row_result in rows {
+        let (event_type, session_id, actor_id, payload, signature, timestamp_ns) = row_result?;
+
+        let event_hash = crate::crypto::EventHasher::hash_event(&payload, &prev_hash);
+
+        insert_stmt.execute(params![
+            event_type,
+            session_id,
+            actor_id,
+            i64::from(CURRENT_RECORD_VERSION),
+            payload,
+            timestamp_ns,
+            prev_hash.as_slice(),
+            event_hash.as_slice(),
+            signature,
+        ])?;
+
+        prev_hash = event_hash;
+        rows_migrated += 1;
+    }
+
+    // Re-empty `ledger_events` so the next startup sees zero legacy rows.
+    conn.execute_batch("DELETE FROM ledger_events")?;
+
+    Ok(MigrationStats {
+        rows_migrated,
+        already_migrated: false,
+    })
 }
 
 /// Current record version for the event schema.

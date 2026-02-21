@@ -144,6 +144,10 @@ pub enum LedgerError {
     HashChainBroken { seq_id: u64, details: String },
     SignatureInvalid { seq_id: u64, details: String },
     Crypto(String),
+    AmbiguousSchemaState { events_rows: u64, legacy_rows: u64 },
+    LegacySchemaMismatch { details: String },
+    LegacyModeReadOnly,
+    MigrationPartialState { message: String },
 }
 ```
 
@@ -209,6 +213,38 @@ Returns the hash of the last event, or genesis hash (32 zero bytes) if empty. Us
 ### `Ledger::verify_chain(verify_hash_fn, verify_sig_fn) -> Result<(), LedgerError>`
 
 Verifies the entire hash chain from genesis. Returns `HashChainBroken` or `SignatureInvalid` on failure.
+
+### `init_canonical_schema(conn) -> Result<(), LedgerError>`
+
+Initializes the canonical `events` table schema on a raw SQLite connection. Required before calling `migrate_legacy_ledger_events` from daemon startup paths that open a raw `Connection` rather than a full `Ledger`. Idempotent (`CREATE TABLE IF NOT EXISTS`). Also applies RFC-0014 consensus column migrations.
+
+### `migrate_legacy_ledger_events(conn) -> Result<MigrationStats, LedgerError>`
+
+RFC-0032 Phase 0: Migrates legacy `ledger_events` rows into the canonical `events` table with a real hash chain. Callable from daemon startup before opening a `Ledger`. Runs atomically under an EXCLUSIVE SQLite transaction. Idempotent: safe to call on every startup. After migration, `determine_read_mode()` returns `CanonicalEvents` and write operations succeed. The `ledger_events` table is preserved (emptied, not renamed) so legacy daemon writers can still INSERT into it without crashing. An immutable audit copy is stored as `ledger_events_legacy_frozen`.
+
+**Migration decision matrix (initial, no frozen table):**
+- `events > 0, legacy > 0, !frozen` -> `AmbiguousSchemaState` error (fail-closed)
+- `events > 0, legacy == 0` -> no-op (`already_migrated: true`)
+- `events == 0, legacy > 0, !frozen` -> full initial migration from genesis
+- `events == 0, legacy == 0, !frozen` -> no-op (`already_migrated: false`, empty table cleanup)
+
+**Migration decision matrix (frozen table exists):**
+- `events > 0, legacy > 0, frozen` -> re-migrate live rows (append to chain tail), re-empty `ledger_events`
+- `events > 0, legacy == 0, frozen` -> no-op (`already_migrated: true`)
+- `events == 0, frozen_rows > 0` -> `MigrationPartialState` error (data loss — frozen had rows but canonical chain empty)
+- `events == 0, frozen_rows == 0, legacy > 0` -> full migration from genesis (new rows after empty-frozen migration)
+- `events == 0, frozen_rows == 0, legacy == 0` -> no-op (`already_migrated: true`, clean)
+- `events == 0, frozen_rows > 0, legacy > 0` -> `MigrationPartialState` error (data loss takes precedence over live rows)
+
+**Invariants:**
+- [INV-LED-010] Migration is atomic: on failure the database is unchanged
+- [INV-LED-011] Migration is idempotent: running twice does not duplicate rows or change hashes
+- [INV-LED-012] Hash chain is contiguous after migration: no NULL `event_hash` values
+- [INV-LED-013] Fail-closed: ambiguous schema state (both tables have rows, no frozen) is rejected
+- [INV-LED-014] Idempotent re-migration: if `ledger_events_legacy_frozen` exists AND `events` has rows AND `ledger_events` also has rows, the migration appends those rows to `events` continuing the hash chain from the current tail, then re-empties `ledger_events`
+- [INV-LED-015] `ledger_events` table is preserved after migration (emptied, not renamed) for legacy writer compatibility
+- [INV-LED-016] Fail-closed on data loss: if `ledger_events_legacy_frozen` has rows but `events` is empty, the migration fails with `MigrationPartialState` (canonical chain missing), regardless of live legacy row count
+- [INV-LED-017] Empty-frozen genesis recovery: if frozen exists with 0 rows, events is empty, and new legacy rows appeared, perform full migration from genesis (not a no-op)
 
 ### `Ledger::open_reader() -> Result<LedgerReader, LedgerError>`
 

@@ -1651,3 +1651,1774 @@ fn tck_00398_legacy_mode_reads_still_work() {
     let stats = ledger.stats().unwrap();
     assert_eq!(stats.event_count, 1);
 }
+
+// =============================================================================
+// TCK-00630: RFC-0032 Phase 0 — Legacy Migration with Hash Chain
+// =============================================================================
+
+/// Helper: check if a `SQLite` table exists (test-local, avoids private
+/// method).
+fn test_table_exists(conn: &Connection, table_name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+        params![table_name],
+        |_row| Ok(()),
+    )
+    .is_ok()
+}
+
+/// Helper: initialize canonical schema on a raw connection so migration has
+/// the `events` table available.
+fn init_schema(conn: &Connection) {
+    // Open and immediately drop a Ledger to ensure schema is applied.
+    // This is a shortcut: SCHEMA_SQL is private, but Ledger::open applies it.
+    // For direct `Connection` usage, embed the minimal required schema.
+    conn.execute_batch(include_str!("schema.sql")).unwrap();
+}
+
+/// Helper: seed a legacy `ledger_events` table with N rows.
+fn seed_legacy_table(conn: &Connection, count: usize) {
+    create_legacy_ledger_events_table(conn);
+    for i in 1..=count {
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                format!("EVT-{i}"),
+                "work_claimed",
+                format!("work-{i}"),
+                format!("actor-{i}"),
+                format!(r#"{{"work_id":"work-{i}","index":{i}}}"#).as_bytes(),
+                vec![0xAA_u8, u8::try_from(i).unwrap()],
+                i64::try_from(i).unwrap() * 1_000_000_000_i64,
+            ],
+        )
+        .unwrap();
+    }
+}
+
+/// Migration on a fresh DB (no `ledger_events` table) is a no-op.
+#[test]
+fn tck_00630_migration_fresh_db_noop() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("fresh.db");
+
+    // Open a fresh ledger (creates `events` but no `ledger_events`).
+    let _ledger = Ledger::open(&path).unwrap();
+
+    // Run migration against a fresh connection.
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+        .unwrap();
+    let stats = migrate_legacy_ledger_events(&conn).unwrap();
+
+    assert!(stats.already_migrated);
+    assert_eq!(stats.rows_migrated, 0);
+}
+
+/// Migration copies legacy rows into `events` with a contiguous hash chain.
+#[test]
+fn tck_00630_migration_copies_rows_with_hash_chain() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("migrate.db");
+
+    // Seed legacy data.
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 5);
+    }
+
+    // Open via Ledger to ensure schema is initialized (creates `events` table).
+    // This will be in legacy-read mode since `ledger_events` has rows.
+    let ledger = Ledger::open(&path).unwrap();
+
+    // Confirm we are in legacy read mode (write should fail).
+    let write_result = ledger.append(&EventRecord::new(
+        "test.event",
+        "session",
+        "actor",
+        b"payload".to_vec(),
+    ));
+    assert!(
+        matches!(write_result, Err(LedgerError::LegacyModeReadOnly)),
+        "pre-migration: should be in legacy read-only mode"
+    );
+    drop(ledger);
+
+    // Run migration on a direct connection.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+
+        assert!(!stats.already_migrated);
+        assert_eq!(stats.rows_migrated, 5);
+
+        // Verify `ledger_events` still exists but is now empty
+        // (preserved as a write-compatible sink for legacy writers).
+        assert!(
+            test_table_exists(&conn, "ledger_events"),
+            "ledger_events should still exist (emptied, not renamed)"
+        );
+        let legacy_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            legacy_count, 0,
+            "ledger_events should be empty after migration"
+        );
+
+        // Verify `ledger_events_legacy_frozen` exists with the audit copy.
+        assert!(
+            test_table_exists(&conn, "ledger_events_legacy_frozen"),
+            "frozen table should exist for audit"
+        );
+        let frozen_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ledger_events_legacy_frozen",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            frozen_count, 5,
+            "frozen table should have all migrated rows"
+        );
+
+        // Verify hash chain continuity in `events`.
+        let mut stmt = conn
+            .prepare("SELECT payload, prev_hash, event_hash FROM events ORDER BY seq_id ASC")
+            .unwrap();
+        let rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(rows.len(), 5);
+
+        let mut expected_prev = crate::crypto::EventHasher::GENESIS_PREV_HASH;
+        for (i, (payload, prev_hash, event_hash)) in rows.iter().enumerate() {
+            assert_eq!(
+                prev_hash.as_slice(),
+                expected_prev.as_slice(),
+                "row {i}: prev_hash mismatch"
+            );
+
+            let computed = crate::crypto::EventHasher::hash_event(payload, &expected_prev);
+            assert_eq!(
+                event_hash.as_slice(),
+                computed.as_slice(),
+                "row {i}: event_hash mismatch"
+            );
+
+            // No NULL event_hash.
+            assert_eq!(event_hash.len(), 32, "row {i}: event_hash must be 32 bytes");
+
+            expected_prev = computed;
+        }
+    }
+
+    // Reopen via Ledger — should now be in canonical mode.
+    let ledger = Ledger::open(&path).unwrap();
+    let events = ledger.read_from(1, 100).unwrap();
+    assert_eq!(events.len(), 5);
+    assert_eq!(events[0].event_type, "work_claimed");
+    assert_eq!(events[0].session_id, "work-1");
+    assert_eq!(events[0].record_version, CURRENT_RECORD_VERSION);
+
+    // Writes should now succeed.
+    let seq_id = ledger
+        .append(&EventRecord::new(
+            "post_migration.event",
+            "session-new",
+            "actor-new",
+            b"new payload".to_vec(),
+        ))
+        .unwrap();
+    assert_eq!(seq_id, 6);
+}
+
+/// Migration is idempotent: running twice does not duplicate rows.
+#[test]
+fn tck_00630_migration_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("idempotent.db");
+
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 3);
+    }
+
+    // First migration.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 3);
+        assert!(!stats.already_migrated);
+    }
+
+    // Second migration — should be a no-op.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 0);
+        assert!(stats.already_migrated);
+    }
+
+    // Verify row count is still 3 (not 6).
+    {
+        let conn = Connection::open(&path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+}
+
+/// Migration fails fast on ambiguous state (both `events` and `ledger_events`
+/// have rows).
+#[test]
+fn tck_00630_migration_fails_on_ambiguous_state() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("ambiguous.db");
+
+    // Seed canonical events.
+    {
+        let ledger = Ledger::open(&path).unwrap();
+        ledger
+            .append(&EventRecord::new(
+                "canonical.event",
+                "session-1",
+                "actor-1",
+                b"canonical".to_vec(),
+            ))
+            .unwrap();
+    }
+
+    // Seed legacy table.
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 2);
+    }
+
+    // Migration should fail with AmbiguousSchemaState.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let result = migrate_legacy_ledger_events(&conn);
+        assert!(
+            matches!(result, Err(LedgerError::AmbiguousSchemaState { .. })),
+            "should fail on ambiguous state, got {result:?}"
+        );
+    }
+}
+
+/// Migration preserves signature bytes and column mapping
+/// (`work_id` -> `session_id`).
+#[test]
+fn tck_00630_migration_preserves_columns() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("columns.db");
+
+    {
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_ledger_events_table(&conn);
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "EVT-SIG-1",
+                "episode_spawned",
+                "work-999",
+                "actor-42",
+                br#"{"episode_id":"ep-1"}"#,
+                vec![0xDE_u8, 0xAD, 0xBE, 0xEF],
+                42_000_000_000_i64,
+            ],
+        )
+        .unwrap();
+    }
+
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 1);
+    }
+
+    let ledger = Ledger::open(&path).unwrap();
+    let events = ledger.read_from(1, 10).unwrap();
+    assert_eq!(events.len(), 1);
+
+    let event = &events[0];
+    assert_eq!(event.event_type, "episode_spawned");
+    assert_eq!(event.session_id, "work-999"); // work_id -> session_id
+    assert_eq!(event.actor_id, "actor-42");
+    assert_eq!(event.signature, Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+    assert_eq!(event.timestamp_ns, 42_000_000_000);
+    assert_eq!(event.record_version, CURRENT_RECORD_VERSION);
+    assert!(event.prev_hash.is_some());
+    assert!(event.event_hash.is_some());
+    assert_eq!(event.event_hash.as_ref().unwrap().len(), 32);
+}
+
+/// Regression test: `LegacyModeReadOnly` pre-migration disappears
+/// post-migration.
+#[test]
+fn tck_00630_legacy_read_only_resolved_after_migration() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("readonly_regression.db");
+
+    // Seed legacy data.
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 2);
+    }
+
+    // Pre-migration: open ledger, confirm LegacyModeReadOnly.
+    {
+        let ledger = Ledger::open(&path).unwrap();
+        let result = ledger.append(&EventRecord::new("test", "s", "a", b"payload".to_vec()));
+        assert!(
+            matches!(result, Err(LedgerError::LegacyModeReadOnly)),
+            "pre-migration: writes must be rejected, got {result:?}"
+        );
+
+        // Reads work.
+        let events = ledger.read_from(1, 10).unwrap();
+        assert_eq!(events.len(), 2);
+    }
+
+    // Run migration.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 2);
+    }
+
+    // Post-migration: open ledger, confirm canonical mode.
+    {
+        let ledger = Ledger::open(&path).unwrap();
+
+        // Reads still work.
+        let events = ledger.read_from(1, 10).unwrap();
+        assert_eq!(events.len(), 2);
+
+        // Writes now succeed.
+        let seq_id = ledger
+            .append(&EventRecord::new(
+                "post_migration",
+                "session-new",
+                "actor-new",
+                b"new".to_vec(),
+            ))
+            .unwrap();
+        assert_eq!(seq_id, 3);
+
+        // head_sync is correct.
+        assert_eq!(ledger.head_sync().unwrap(), 3);
+    }
+}
+
+/// After migration, `determine_read_mode` returns `CanonicalEvents`
+/// (not `LegacyLedgerEvents` or `AmbiguousSchemaState`).
+#[test]
+fn tck_00630_determine_read_mode_canonical_after_migration() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("readmode.db");
+
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 3);
+    }
+
+    // Run migration.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        migrate_legacy_ledger_events(&conn).unwrap();
+    }
+
+    // Open a fresh Ledger — should be canonical mode (no error, no legacy).
+    let ledger = Ledger::open(&path).unwrap();
+
+    // Verify all events are readable via canonical path.
+    let events = ledger.read_from(1, 100).unwrap();
+    assert_eq!(events.len(), 3);
+
+    // Verify hash chain via verify_chain.
+    let verify_result = ledger.verify_chain(
+        |payload, prev_hash| {
+            let prev: [u8; 32] = prev_hash.try_into().unwrap();
+            crate::crypto::EventHasher::hash_event(payload, &prev).to_vec()
+        },
+        |_event_hash, _signature| true, // Signature verification out of scope.
+    );
+    assert!(
+        verify_result.is_ok(),
+        "hash chain verification should pass after migration"
+    );
+}
+
+/// Migration of an empty `ledger_events` table works (rename-only, no hash
+/// chain).
+#[test]
+fn tck_00630_migration_empty_legacy_table() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("empty_legacy.db");
+
+    {
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_ledger_events_table(&conn);
+        // No rows inserted.
+    }
+
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+
+        assert!(!stats.already_migrated);
+        assert_eq!(stats.rows_migrated, 0);
+
+        // Verify `ledger_events` still exists (preserved but empty) and
+        // `ledger_events_legacy_frozen` was created as audit copy.
+        assert!(test_table_exists(&conn, "ledger_events"));
+        assert!(test_table_exists(&conn, "ledger_events_legacy_frozen"));
+    }
+
+    // Ledger opens cleanly in canonical mode.
+    let ledger = Ledger::open(&path).unwrap();
+    let events = ledger.read_from(1, 10).unwrap();
+    assert!(events.is_empty());
+
+    // Writes succeed.
+    let seq_id = ledger
+        .append(&EventRecord::new("test", "s", "a", b"data".to_vec()))
+        .unwrap();
+    assert_eq!(seq_id, 1);
+}
+
+/// Migration rejects mismatched legacy schema.
+#[test]
+fn tck_00630_migration_rejects_bad_schema() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("bad_schema.db");
+
+    {
+        let conn = Connection::open(&path).unwrap();
+        // Create a table with wrong column types.
+        conn.execute(
+            "CREATE TABLE ledger_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                work_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                signature BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ledger_events VALUES ('E1', 'test', 'w1', 'a1', '{}', x'AA', 100)",
+            [],
+        )
+        .unwrap();
+    }
+
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let result = migrate_legacy_ledger_events(&conn);
+        assert!(
+            matches!(result, Err(LedgerError::LegacySchemaMismatch { .. })),
+            "should reject bad schema, got {result:?}"
+        );
+    }
+}
+
+/// After migration, appending signed events continues the hash chain from
+/// the migrated tail.
+#[test]
+fn tck_00630_post_migration_hash_chain_continuity() {
+    use crate::crypto::EventHasher;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("continuity.db");
+
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 3);
+    }
+
+    // Migrate.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        migrate_legacy_ledger_events(&conn).unwrap();
+    }
+
+    // Open ledger, append new events using append_signed.
+    let ledger = Ledger::open(&path).unwrap();
+
+    // Get the last event hash (tail of migrated chain).
+    let tail_hash = ledger.last_event_hash().unwrap();
+    assert_eq!(tail_hash.len(), 32);
+    // Tail hash should NOT be genesis (since we migrated 3 rows).
+    assert_ne!(tail_hash, vec![0u8; 32]);
+
+    // Append a new event via append_signed.
+    let new_event = EventRecord::new(
+        "post_migration.signed",
+        "session-new",
+        "actor-new",
+        b"new payload".to_vec(),
+    );
+    let seq_id = ledger
+        .append_signed(
+            new_event,
+            |payload, prev_hash| {
+                let prev: [u8; 32] = prev_hash.try_into().unwrap();
+                EventHasher::hash_event(payload, &prev).to_vec()
+            },
+            <[u8]>::to_vec, // Dummy signer for test.
+        )
+        .unwrap();
+    assert_eq!(seq_id, 4);
+
+    // Verify the full chain (migrated + new).
+    let verify_result = ledger.verify_chain(
+        |payload, prev_hash| {
+            let prev: [u8; 32] = prev_hash.try_into().unwrap();
+            EventHasher::hash_event(payload, &prev).to_vec()
+        },
+        |_event_hash, _signature| true,
+    );
+    assert!(
+        verify_result.is_ok(),
+        "full chain (migrated + new) should verify"
+    );
+}
+
+/// Regression: if `ledger_events_legacy_frozen` exists AND a live
+/// `ledger_events` table also exists with rows (recreated by a legacy
+/// writer after the initial migration), the migration MUST idempotently
+/// re-migrate those rows into `events` continuing the hash chain from
+/// the current tail, then re-empty `ledger_events`.  This prevents
+/// a restart-fatal error while preserving chain continuity.
+#[test]
+fn tck_00630_remigration_frozen_plus_live_legacy_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("frozen_plus_live.db");
+
+    // Step 1: Seed legacy data and perform an initial migration.
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 3);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 3);
+        assert!(!stats.already_migrated);
+
+        // Verify: `ledger_events` still exists (empty), `ledger_events_legacy_frozen`
+        // exists.
+        assert!(test_table_exists(&conn, "ledger_events"));
+        let live_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            live_count, 0,
+            "ledger_events should be empty after migration"
+        );
+        assert!(test_table_exists(&conn, "ledger_events_legacy_frozen"));
+    }
+
+    // Step 2: Simulate a legacy writer inserting rogue rows into the
+    // still-existing (but empty) `ledger_events` table.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "EVT-ROGUE-1",
+                "work_claimed",
+                "work-rogue",
+                "actor-rogue",
+                br#"{"rogue":true}"#,
+                vec![0xBB_u8, 0x01],
+                99_000_000_000_i64,
+            ],
+        )
+        .unwrap();
+    }
+
+    // Step 3: Re-migration succeeds, appending 1 row to events.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 1, "should re-migrate the 1 rogue row");
+        assert!(!stats.already_migrated);
+
+        // ledger_events should now be empty again.
+        let live_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(live_count, 0, "ledger_events should be re-emptied");
+
+        // events should have 3 (initial) + 1 (re-migrated) = 4 rows.
+        let events_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events_count, 4, "events should have 4 rows total");
+    }
+
+    // Step 4: Verify hash chain integrity across the full chain.
+    let ledger = Ledger::open(&path).unwrap();
+    let verify_result = ledger.verify_chain(
+        |payload, prev_hash| {
+            let prev: [u8; 32] = prev_hash.try_into().unwrap();
+            crate::crypto::EventHasher::hash_event(payload, &prev).to_vec()
+        },
+        |_event_hash, _signature| true,
+    );
+    assert!(
+        verify_result.is_ok(),
+        "hash chain should be intact after re-migration: {verify_result:?}"
+    );
+}
+
+/// Regression: if `ledger_events_legacy_frozen` exists AND `ledger_events`
+/// is recreated but empty (zero rows), the migration returns
+/// `already_migrated = true` (this is the benign case).
+#[test]
+fn tck_00630_migration_frozen_plus_empty_live_legacy_ok() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("frozen_plus_empty.db");
+
+    // Initial migration.
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 2);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 2);
+    }
+
+    // Recreate `ledger_events` but leave it empty.
+    {
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_ledger_events_table(&conn);
+        // No rows inserted — table exists but is empty.
+    }
+
+    // Migration should succeed as already_migrated = true.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert!(
+            stats.already_migrated,
+            "empty recreated ledger_events should be treated as already migrated"
+        );
+        assert_eq!(stats.rows_migrated, 0);
+    }
+}
+
+/// `init_canonical_schema` is idempotent and creates the `events` table.
+#[test]
+fn tck_00630_init_canonical_schema_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("canon_schema.db");
+
+    let conn = Connection::open(&path).unwrap();
+
+    // First call creates the table.
+    init_canonical_schema(&conn).unwrap();
+    assert!(test_table_exists(&conn, "events"));
+
+    // Second call is a no-op.
+    init_canonical_schema(&conn).unwrap();
+
+    // Events table is functional.
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+/// Integration: daemon startup migration path — seed legacy data, apply
+/// canonical schema, run migration, then confirm canonical appendability.
+#[test]
+fn tck_00630_daemon_startup_migration_integration() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("daemon_startup.db");
+
+    // Seed legacy data (simulates pre-migration daemon database).
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 4);
+    }
+
+    // Simulate daemon startup: init canonical schema + migrate.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_canonical_schema(&conn).unwrap();
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 4);
+        assert!(!stats.already_migrated);
+    }
+
+    // Open via Ledger and confirm canonical mode + appendability.
+    let ledger = Ledger::open(&path).unwrap();
+
+    // Should be able to write (not in legacy read-only mode).
+    let seq_id = ledger
+        .append(&EventRecord::new(
+            "post_migration.daemon",
+            "session-daemon",
+            "actor-daemon",
+            b"daemon payload".to_vec(),
+        ))
+        .unwrap();
+    // 4 migrated + 1 new = seq_id 5.
+    assert_eq!(seq_id, 5);
+
+    // All 5 events readable.
+    let events = ledger.read_from(1, 100).unwrap();
+    assert_eq!(events.len(), 5);
+}
+
+/// BLOCKER 1 regression: on a pre-canonicalized DB where `init_schema`
+/// has already created an empty `ledger_events` table, migration must be
+/// a no-op (not `AmbiguousSchemaState`).
+///
+/// Counterexample: daemon startup calls `init_schema_with_signing_key`
+/// first (which creates `ledger_events` via `CREATE TABLE IF NOT EXISTS`),
+/// then `init_canonical_schema` (which creates `events`), then populates
+/// `events`, then calls `migrate_legacy_ledger_events`.  The old code
+/// returned `AmbiguousSchemaState` because `events_rows > 0`, even
+/// though `ledger_events` had zero rows.
+#[test]
+fn tck_00630_blocker1_canonical_db_with_empty_legacy_table_is_noop() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("blocker1_pre_canonical.db");
+
+    // Step 1: Create a canonical DB with events.
+    {
+        let ledger = Ledger::open(&path).unwrap();
+        ledger
+            .append(&EventRecord::new(
+                "canonical.event",
+                "session-1",
+                "actor-1",
+                b"canonical payload".to_vec(),
+            ))
+            .unwrap();
+    }
+
+    // Step 2: Simulate daemon `init_schema_with_signing_key` creating
+    // an empty `ledger_events` table (as it does on every startup).
+    {
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_ledger_events_table(&conn);
+        // No rows — just the table schema.
+    }
+
+    // Step 3: Run migration — MUST be a no-op, not AmbiguousSchemaState.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert!(
+            stats.already_migrated,
+            "canonical DB + empty ledger_events should be already_migrated, got {stats:?}"
+        );
+        assert_eq!(stats.rows_migrated, 0);
+    }
+
+    // Step 4: Ledger opens cleanly in canonical mode.
+    let ledger = Ledger::open(&path).unwrap();
+    let events = ledger.read_from(1, 100).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, "canonical.event");
+
+    // Step 5: Writes still succeed.
+    let seq_id = ledger
+        .append(&EventRecord::new(
+            "post_check.event",
+            "session-2",
+            "actor-2",
+            b"new payload".to_vec(),
+        ))
+        .unwrap();
+    assert_eq!(seq_id, 2);
+}
+
+/// BLOCKER 2 regression: after migration, legacy writers can still INSERT
+/// into `ledger_events` without crashing.  On next startup, the migration
+/// idempotently re-migrates the new rows into `events` and re-empties
+/// `ledger_events`.  The daemon restarts cleanly.
+#[test]
+fn tck_00630_blocker2_legacy_writers_survive_after_migration() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("blocker2_legacy_writers.db");
+
+    // Step 1: Seed legacy data and migrate.
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 3);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 3);
+    }
+
+    // Step 2: Verify `ledger_events` still exists and is empty.
+    {
+        let conn = Connection::open(&path).unwrap();
+        assert!(
+            test_table_exists(&conn, "ledger_events"),
+            "ledger_events must still exist after migration"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "ledger_events should be empty after migration");
+    }
+
+    // Step 3: Legacy writer INSERTs into `ledger_events` — must NOT crash.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, \
+             payload, signature, timestamp_ns) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "EVT-POST-MIG-1",
+                "work_claimed",
+                "work-post",
+                "actor-post",
+                br#"{"post_migration":true}"#,
+                vec![0xCC_u8, 0x01],
+                200_000_000_000_i64,
+            ],
+        )
+        .expect("legacy writer INSERT must not crash after migration");
+    }
+
+    // Step 4: On next "startup", migration re-migrates the 1 rogue row.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(
+            stats.rows_migrated, 1,
+            "should re-migrate the 1 post-cutover legacy row"
+        );
+        assert!(!stats.already_migrated);
+
+        // ledger_events is empty again.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "ledger_events should be re-emptied");
+
+        // events has 3 (initial) + 1 (re-migrated) = 4.
+        let events_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events_count, 4);
+    }
+
+    // Step 5: Ledger opens cleanly and writes succeed.
+    let ledger = Ledger::open(&path).unwrap();
+    let events = ledger.read_from(1, 100).unwrap();
+    assert_eq!(events.len(), 4);
+
+    let seq_id = ledger
+        .append(&EventRecord::new(
+            "post_remigration.event",
+            "session-post",
+            "actor-post",
+            b"post remigration".to_vec(),
+        ))
+        .unwrap();
+    assert_eq!(
+        seq_id, 5,
+        "should be 5th event after 3 initial + 1 remigrated"
+    );
+}
+
+/// BLOCKER 2 regression: after migration + restart with no legacy writes,
+/// migration is a no-op and the daemon operates in canonical mode.
+#[test]
+fn tck_00630_blocker2_restart_after_migration_no_legacy_writes() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("blocker2_restart.db");
+
+    // Step 1: Seed legacy data and migrate.
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 2);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 2);
+    }
+
+    // Step 2: Simulate daemon restart — init_schema + migrate again.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert!(
+            stats.already_migrated,
+            "second startup should be a no-op migration"
+        );
+        assert_eq!(stats.rows_migrated, 0);
+    }
+
+    // Step 3: Ledger is in canonical mode, reads and writes work.
+    let ledger = Ledger::open(&path).unwrap();
+    let events = ledger.read_from(1, 100).unwrap();
+    assert_eq!(events.len(), 2);
+
+    let seq_id = ledger
+        .append(&EventRecord::new(
+            "restart.event",
+            "session-restart",
+            "actor-restart",
+            b"restart payload".to_vec(),
+        ))
+        .unwrap();
+    assert_eq!(seq_id, 3);
+}
+
+/// BLOCKER 1+2 combined: full daemon startup sequence on a canonical DB
+/// where `init_schema_with_signing_key` creates empty `ledger_events`,
+/// `init_canonical_schema` creates `events` (already has rows from
+/// previous startup), and migration is called.  Validates the exact
+/// daemon startup codepath from main.rs.
+#[test]
+fn tck_00630_blocker1_blocker2_full_daemon_startup_canonical_db() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("full_daemon_startup.db");
+
+    // First "daemon lifetime": seed legacy data, migrate, emit new events.
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 3);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 3);
+    }
+    // Emit some canonical events (simulates daemon runtime).
+    {
+        let ledger = Ledger::open(&path).unwrap();
+        ledger
+            .append(&EventRecord::new(
+                "runtime.event",
+                "session-runtime",
+                "actor-runtime",
+                b"runtime payload".to_vec(),
+            ))
+            .unwrap();
+    }
+
+    // Second "daemon lifetime" restart: same startup sequence as main.rs:
+    // 1. init_schema_with_signing_key (creates `ledger_events` IF NOT EXISTS)
+    // 2. init_canonical_schema (creates `events` IF NOT EXISTS)
+    // 3. migrate_legacy_ledger_events
+    {
+        let conn = Connection::open(&path).unwrap();
+
+        // (1) Simulates SqliteLedgerEventEmitter::init_schema_with_signing_key
+        create_legacy_ledger_events_table(&conn);
+
+        // (2) init_canonical_schema
+        init_schema(&conn);
+
+        // (3) migrate — must be no-op, not AmbiguousSchemaState
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert!(
+            stats.already_migrated,
+            "second startup on canonical DB must be no-op, got {stats:?}"
+        );
+        assert_eq!(stats.rows_migrated, 0);
+    }
+
+    // Verify ledger is fully operational in canonical mode.
+    let ledger = Ledger::open(&path).unwrap();
+    let events = ledger.read_from(1, 100).unwrap();
+    // 3 migrated + 1 runtime = 4
+    assert_eq!(events.len(), 4);
+
+    let seq_id = ledger
+        .append(&EventRecord::new(
+            "second_startup.event",
+            "session-2nd",
+            "actor-2nd",
+            b"second startup".to_vec(),
+        ))
+        .unwrap();
+    assert_eq!(seq_id, 5);
+}
+
+/// Re-migration hash chain continuation: after initial migration +
+/// legacy writes to `ledger_events`, the re-migration appends from the
+/// tail of the hashed chain in `events` (not from genesis).
+#[test]
+fn tck_00630_remigration_hash_chain_continues_from_tail() {
+    use crate::crypto::EventHasher;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("remig_chain_tail.db");
+
+    // Step 1: Initial migration of 3 legacy rows (gives 3 hashed events).
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 3);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 3);
+    }
+
+    // Capture the tail hash after initial migration (event #3's hash).
+    let tail_hash_before: Vec<u8> = {
+        let conn = Connection::open(&path).unwrap();
+        conn.query_row(
+            "SELECT event_hash FROM events WHERE event_hash IS NOT NULL \
+             ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        tail_hash_before.len(),
+        32,
+        "migration must produce 32-byte hashes"
+    );
+
+    // Step 2: Legacy writer inserts a post-cutover row.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "EVT-POSTCUTOVER-1",
+                "gate_lease_issued",
+                "work-post",
+                "actor-post",
+                br#"{"lease":"post-cutover"}"#,
+                vec![0xDD_u8, 0x01],
+                300_000_000_000_i64,
+            ],
+        )
+        .unwrap();
+    }
+
+    // Step 3: Re-migration.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 1);
+    }
+
+    // Step 4: Verify the re-migrated event's prev_hash equals tail_hash_before.
+    {
+        let conn = Connection::open(&path).unwrap();
+        // Event #4 is the re-migrated row (last by rowid).
+        let prev_hash_of_remigrated: Vec<u8> = conn
+            .query_row(
+                "SELECT prev_hash FROM events ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            prev_hash_of_remigrated, tail_hash_before,
+            "re-migrated event's prev_hash must equal the tail hash before re-migration"
+        );
+
+        // Verify event_hash is correctly computed.
+        let (payload, event_hash): (Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT payload, event_hash FROM events ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let prev: [u8; 32] = tail_hash_before.as_slice().try_into().unwrap();
+        let expected_hash = EventHasher::hash_event(&payload, &prev);
+        assert_eq!(
+            event_hash,
+            expected_hash.as_slice(),
+            "re-migrated event_hash must be computed from tail prev_hash"
+        );
+    }
+
+    // Step 5: Full chain verification (all events have hashes from migration).
+    let ledger = Ledger::open(&path).unwrap();
+    let verify_result = ledger.verify_chain(
+        |payload, prev_hash| {
+            let prev: [u8; 32] = prev_hash.try_into().unwrap();
+            EventHasher::hash_event(payload, &prev).to_vec()
+        },
+        |_event_hash, _signature| true,
+    );
+    assert!(
+        verify_result.is_ok(),
+        "full chain (initial migration + re-migrated) must verify"
+    );
+}
+
+/// Re-migration is idempotent: re-migrating after a re-migration (with no
+/// new legacy rows) is a no-op and does not duplicate rows.
+#[test]
+fn tck_00630_remigration_idempotent_no_duplicates() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("remig_idempotent.db");
+
+    // Step 1: Initial migration.
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 2);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 2);
+    }
+
+    // Step 2: Legacy writer inserts 1 post-cutover row.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "EVT-REMIG-1",
+                "work_claimed",
+                "work-remig",
+                "actor-remig",
+                br#"{"remig":1}"#,
+                vec![0xEE_u8, 0x01],
+                400_000_000_000_i64,
+            ],
+        )
+        .unwrap();
+    }
+
+    // Step 3: First re-migration.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 1, "first re-migration migrates 1 row");
+        assert!(!stats.already_migrated);
+
+        let events_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events_count, 3, "2 initial + 1 re-migrated = 3");
+    }
+
+    // Step 4: Second re-migration (no new legacy rows) — must be no-op.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert!(
+            stats.already_migrated,
+            "second re-migration should be no-op"
+        );
+        assert_eq!(stats.rows_migrated, 0);
+
+        let events_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events_count, 3, "no duplicates: still 3 rows");
+    }
+
+    // Step 5: Third re-migration — still no-op.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert!(stats.already_migrated);
+        assert_eq!(stats.rows_migrated, 0);
+
+        let events_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            events_count, 3,
+            "no duplicates: still 3 rows after third run"
+        );
+    }
+}
+
+/// `AmbiguousSchemaState` still fires when `events > 0, legacy > 0,
+/// frozen NOT exists` (initial ambiguity — no prior migration).
+#[test]
+fn tck_00630_ambiguous_schema_state_without_frozen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("ambiguous_no_frozen.db");
+
+    // Step 1: Create both tables with rows but NO frozen table.
+    {
+        let conn = Connection::open(&path).unwrap();
+        // Create canonical events table and insert a row.
+        init_schema(&conn);
+        conn.execute(
+            "INSERT INTO events (event_type, session_id, actor_id, record_version, \
+             payload, timestamp_ns, prev_hash, event_hash, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                "canonical.event",
+                "session-1",
+                "actor-1",
+                1_i64,
+                b"canonical payload",
+                1_000_000_000_i64,
+                vec![0_u8; 32],
+                vec![1_u8; 32],
+                Vec::<u8>::new(),
+            ],
+        )
+        .unwrap();
+
+        // Create legacy table with rows.
+        seed_legacy_table(&conn, 2);
+    }
+
+    // Step 2: Verify frozen does NOT exist.
+    {
+        let conn = Connection::open(&path).unwrap();
+        assert!(
+            !test_table_exists(&conn, "ledger_events_legacy_frozen"),
+            "frozen table must NOT exist for this test"
+        );
+    }
+
+    // Step 3: Migration MUST fail with AmbiguousSchemaState.
+    {
+        let conn = Connection::open(&path).unwrap();
+        let result = migrate_legacy_ledger_events(&conn);
+        assert!(
+            matches!(
+                result,
+                Err(LedgerError::AmbiguousSchemaState {
+                    events_rows: 1,
+                    legacy_rows: 2,
+                })
+            ),
+            "expected AmbiguousSchemaState(events=1, legacy=2), got {result:?}"
+        );
+    }
+}
+
+/// Full daemon lifecycle: migrate -> runtime writes (canonical + legacy) ->
+/// restart -> re-migrate -> runtime writes -> restart -> no-op.
+/// Validates the complete production scenario end-to-end.
+#[test]
+fn tck_00630_full_lifecycle_migrate_write_restart_remigrate() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("full_lifecycle.db");
+
+    // === First daemon lifetime ===
+    // Seed legacy data.
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 3);
+    }
+    // Startup: init schema + migrate.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 3);
+    }
+    // Runtime: canonical events via Ledger + legacy events via
+    // SqliteLedgerEventEmitter.
+    {
+        let ledger = Ledger::open(&path).unwrap();
+        ledger
+            .append(&EventRecord::new(
+                "runtime.canonical",
+                "session-rt",
+                "actor-rt",
+                b"canonical runtime".to_vec(),
+            ))
+            .unwrap();
+    }
+    // Legacy writer during runtime.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "EVT-RT-LEGACY-1",
+                "gate_lease_issued",
+                "work-rt",
+                "actor-rt",
+                br#"{"lease":"runtime"}"#,
+                vec![0xFF_u8, 0x01],
+                500_000_000_000_i64,
+            ],
+        )
+        .unwrap();
+    }
+
+    // === Second daemon lifetime (restart) ===
+    // Startup: init schema + re-migrate.
+    {
+        let conn = Connection::open(&path).unwrap();
+        // Simulate daemon init_schema_with_signing_key (creates ledger_events IF NOT
+        // EXISTS).
+        create_legacy_ledger_events_table(&conn);
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(
+            stats.rows_migrated, 1,
+            "re-migrates the 1 runtime legacy row"
+        );
+        assert!(!stats.already_migrated);
+    }
+    // Runtime: more canonical events.
+    {
+        let ledger = Ledger::open(&path).unwrap();
+        ledger
+            .append(&EventRecord::new(
+                "runtime2.canonical",
+                "session-rt2",
+                "actor-rt2",
+                b"second runtime".to_vec(),
+            ))
+            .unwrap();
+    }
+
+    // === Third daemon lifetime (restart, no legacy writes) ===
+    {
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_ledger_events_table(&conn);
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert!(stats.already_migrated, "no legacy rows, should be no-op");
+        assert_eq!(stats.rows_migrated, 0);
+    }
+
+    // Final verification: 3 initial + 1 canonical + 1 re-migrated + 1 canonical =
+    // 6.
+    let ledger = Ledger::open(&path).unwrap();
+    let events = ledger.read_from(1, 100).unwrap();
+    assert_eq!(
+        events.len(),
+        6,
+        "3 initial + 1 canonical + 1 remig + 1 canonical = 6"
+    );
+
+    // Verify the hashed subset of the chain (migrated + re-migrated events
+    // have proper hashes; unsigned Ledger::append events have NULL hashes
+    // and are excluded from cryptographic verification).
+    // Check that all 4 hashed events (3 initial + 1 re-migrated) form a
+    // valid chain.
+    {
+        let conn = Connection::open(&path).unwrap();
+        let hashed_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_hash IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hashed_count, 4,
+            "3 initial migration + 1 re-migration = 4 hashed events"
+        );
+    }
+}
+
+/// Regression: frozen snapshot has rows but canonical `events` chain is empty.
+/// This indicates data loss after a prior successful migration.  Must fail
+/// closed with `MigrationPartialState`.
+#[test]
+fn tck_00630_frozen_exists_events_empty_frozen_nonempty_fails_closed() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("frozen_nonempty_events_empty.db");
+
+    // Step 1: Perform a normal migration of 3 legacy rows.
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 3);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 3);
+    }
+
+    // Step 2: Simulate data loss — delete all rows from `events`.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DELETE FROM events").unwrap();
+        // Verify: frozen has rows, events is empty.
+        let frozen_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ledger_events_legacy_frozen",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(frozen_count > 0, "frozen snapshot must have rows");
+        let events_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events_count, 0, "events must be empty for this test");
+    }
+
+    // Step 3: Re-create `ledger_events` (simulates daemon restart with
+    // init_schema_with_signing_key that does CREATE TABLE IF NOT EXISTS).
+    {
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_ledger_events_table(&conn);
+    }
+
+    // Step 4: Migration must fail closed.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let result = migrate_legacy_ledger_events(&conn);
+        assert!(
+            matches!(result, Err(LedgerError::MigrationPartialState { .. })),
+            "expected MigrationPartialState error for frozen-nonempty + events-empty, got: {result:?}"
+        );
+        // Verify the error message mentions data loss.
+        if let Err(LedgerError::MigrationPartialState { message }) = result {
+            assert!(
+                message.contains("data loss"),
+                "error message should mention data loss: {message}"
+            );
+        }
+    }
+}
+
+/// Regression: frozen snapshot is empty AND canonical `events` is empty.
+/// This means the original legacy table was empty when migrated — valid no-op.
+#[test]
+fn tck_00630_frozen_exists_events_empty_frozen_empty_noop() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("frozen_empty_events_empty.db");
+
+    // Step 1: Perform a migration with an empty legacy table (0 rows).
+    {
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_ledger_events_table(&conn);
+        // Don't insert any rows — empty legacy table.
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 0);
+        assert!(!stats.already_migrated, "first migration of empty table");
+    }
+
+    // Verify state: frozen exists (empty), events is empty.
+    {
+        let conn = Connection::open(&path).unwrap();
+        let frozen_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='ledger_events_legacy_frozen'",
+                [],
+                |row| row.get::<_, i64>(0).map(|v| v > 0),
+            )
+            .unwrap();
+        assert!(frozen_exists, "frozen table must exist after migration");
+        let frozen_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ledger_events_legacy_frozen",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(frozen_count, 0, "frozen snapshot must be empty");
+        let events_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events_count, 0, "events must be empty");
+    }
+
+    // Step 2: Re-create `ledger_events` (simulates daemon restart).
+    {
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_ledger_events_table(&conn);
+    }
+
+    // Step 3: Migration should succeed as a no-op (already_migrated = true).
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert!(
+            stats.already_migrated,
+            "empty-frozen + empty-events should be treated as already migrated"
+        );
+        assert_eq!(stats.rows_migrated, 0);
+    }
+}
+
+/// Regression (TCK-00630 R5): frozen snapshot has rows, canonical `events` is
+/// empty, but `ledger_events` has live rows (simulating truncation + rogue
+/// write).  The old code checked `live_legacy_rows` BEFORE `events_rows`
+/// inside the `frozen_exists` branch, allowing re-migration to bypass the
+/// fail-closed `MigrationPartialState` guard.  After the fix, `events_rows`
+/// is checked FIRST — this scenario must always fail closed.
+#[test]
+fn tck_00630_frozen_nonempty_events_empty_live_legacy_nonzero_fails_closed() {
+    let dir = TempDir::new().unwrap();
+    let path = dir
+        .path()
+        .join("frozen_nonempty_events_empty_live_nonzero.db");
+
+    // Step 1: Perform a normal migration of 3 legacy rows.
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 3);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 3);
+        assert!(!stats.already_migrated);
+    }
+
+    // Step 2: Simulate data loss — delete all rows from `events`.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DELETE FROM events").unwrap();
+
+        // Verify preconditions: frozen has rows, events is empty.
+        let frozen_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ledger_events_legacy_frozen",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(frozen_count, 3, "frozen snapshot must have 3 rows");
+        let events_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events_count, 0, "events must be empty after truncation");
+    }
+
+    // Step 3: Simulate rogue write — insert a new row into `ledger_events`.
+    // This is the key differentiator from the existing test: live_legacy > 0.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO ledger_events \
+             (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "EVT-ROGUE-TRUNC",
+                "work_claimed",
+                "work-rogue",
+                "actor-rogue",
+                br#"{"rogue_after_truncation":true}"#,
+                vec![0xCC_u8, 0x01],
+                200_000_000_000_i64,
+            ],
+        )
+        .unwrap();
+
+        // Verify: live legacy has 1 row.
+        let live_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            live_count, 1,
+            "ledger_events must have 1 rogue row for this test"
+        );
+    }
+
+    // Step 4: Migration must fail closed — NOT re-migrate the rogue row.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let result = migrate_legacy_ledger_events(&conn);
+        assert!(
+            matches!(result, Err(LedgerError::MigrationPartialState { .. })),
+            "expected MigrationPartialState for frozen-nonempty + events-empty + \
+             live-legacy-nonzero, got: {result:?}"
+        );
+        // Verify the error message includes diagnostic context.
+        if let Err(LedgerError::MigrationPartialState { message }) = result {
+            assert!(
+                message.contains("data loss"),
+                "error message should mention data loss: {message}"
+            );
+            assert!(
+                message.contains("events_rows=0"),
+                "error message should include events_rows=0 diagnostic: {message}"
+            );
+        }
+    }
+}
+
+/// Helper: assert that a migration created a valid genesis hash chain
+/// with the expected number of events, and that `ledger_events` is emptied.
+fn assert_genesis_migration_result(conn: &Connection, expected_events: i64) {
+    let events_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        events_count, expected_events,
+        "events must have {expected_events} rows after migration"
+    );
+
+    let live_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        live_count, 0,
+        "ledger_events must be emptied after migration"
+    );
+
+    let first_prev_hash: Vec<u8> = conn
+        .query_row(
+            "SELECT prev_hash FROM events ORDER BY rowid ASC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        first_prev_hash,
+        crate::crypto::EventHasher::GENESIS_PREV_HASH.to_vec(),
+        "first event must chain from genesis prev_hash"
+    );
+
+    let null_hashes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE event_hash IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(null_hashes, 0, "no NULL event_hash values after migration");
+}
+
+/// Regression (TCK-00630 R6): empty frozen migration followed by new legacy
+/// rows must trigger a full migration from genesis, NOT return
+/// `already_migrated`.
+///
+/// Scenario: migration runs on an empty `ledger_events` (creates empty frozen,
+/// zero events).  Then new rows are written to `ledger_events` by a legacy
+/// daemon.  On next startup, migration should discover the new rows and perform
+/// a full genesis migration (hash chain from `GENESIS_PREV_HASH`).
+#[test]
+fn tck_00630_empty_frozen_with_new_live_rows_migrates_from_genesis() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("empty_frozen_new_live_rows.db");
+
+    // Step 1: Migrate an empty `ledger_events` table (creates empty frozen).
+    {
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_ledger_events_table(&conn);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 0, "empty legacy yields zero migrated");
+        assert!(!stats.already_migrated, "first migration of empty table");
+    }
+
+    // Step 2: Simulate new legacy writes AFTER the empty migration.
+    {
+        let conn = Connection::open(&path).unwrap();
+        for i in 1..=3_usize {
+            conn.execute(
+                "INSERT INTO ledger_events \
+                 (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    format!("EVT-POST-EMPTY-{i}"),
+                    "work_claimed",
+                    format!("work-post-{i}"),
+                    format!("actor-post-{i}"),
+                    format!(r#"{{"post_empty_migration":true,"index":{i}}}"#).as_bytes(),
+                    vec![0xBB_u8, u8::try_from(i).unwrap()],
+                    i64::try_from(i).unwrap() * 1_000_000_000_i64,
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    // Step 3: Re-migrate.  Must migrate 3 new rows from genesis.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(
+            stats.rows_migrated, 3,
+            "must migrate 3 new rows from genesis"
+        );
+        assert!(!stats.already_migrated, "must NOT be already_migrated");
+        assert_genesis_migration_result(&conn, 3);
+    }
+
+    // Step 4: Verify `determine_read_mode` returns `CanonicalEvents`.
+    {
+        let ledger = Ledger::open(&path).unwrap();
+        let events = ledger.read_from(1, 100).unwrap();
+        assert_eq!(events.len(), 3, "Ledger must expose 3 canonical events");
+
+        let verify_result = ledger.verify_chain(
+            |payload, prev_hash| {
+                let prev: [u8; 32] = prev_hash.try_into().unwrap();
+                crate::crypto::EventHasher::hash_event(payload, &prev).to_vec()
+            },
+            |_event_hash, _signature| true,
+        );
+        assert!(verify_result.is_ok(), "hash chain must verify");
+    }
+}
