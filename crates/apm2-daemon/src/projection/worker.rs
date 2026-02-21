@@ -7898,15 +7898,59 @@ mod tests {
         serde_json::to_vec(&envelope).expect("JSON serialization should not fail")
     }
 
-    /// BLOCKER 2d: Verify `handle_evidence_published` correctly decodes the
+    /// Helper: inserts an `evidence.published` event into the ledger with
+    /// production JSON-envelope wire format (matching `emit_session_event`).
+    fn insert_evidence_published_event(
+        conn: &Arc<Mutex<Connection>>,
+        event_id: &str,
+        work_id: &str,
+        inner_protobuf: &[u8],
+        timestamp_ns: i64,
+    ) {
+        let envelope_payload = build_session_event_envelope(inner_protobuf);
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO ledger_events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    event_id,
+                    "evidence.published",
+                    work_id,
+                    "actor-test",
+                    envelope_payload,
+                    vec![0u8; 64],
+                    timestamp_ns
+                ],
+            )
+            .expect("insert evidence.published event");
+    }
+
+    /// Helper: runs `process_evidence_published` on the worker via a
+    /// single-threaded tokio runtime (same pattern as `run_review_poll_once`).
+    fn run_evidence_published_poll_once(
+        worker: &mut ProjectionWorker,
+    ) -> Result<(), ProjectionWorkerError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async { worker.process_evidence_published().await })
+    }
+
+    /// BLOCKER: Verify `handle_evidence_published` correctly decodes the
     /// JSON-envelope wire format (matching `emit_session_event` production
     /// encoding), extracts metadata, and indexes `WORK_CONTEXT_ENTRY` events.
+    ///
+    /// This test calls the actual `handle_evidence_published` method on a
+    /// real `ProjectionWorker` with a properly wrapped JSON-envelope payload,
+    /// proving the production decode path works end-to-end.
     #[test]
     fn test_handle_evidence_published_indexes_work_context_entry() {
         use prost::Message;
 
         let conn = create_test_db();
-        let index = WorkIndex::new(Arc::clone(&conn)).unwrap();
+        let worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
 
         // Build a realistic evidence.published protobuf.
         let published = apm2_core::events::EvidencePublished {
@@ -7945,59 +7989,10 @@ mod tests {
             timestamp_ns: 6_000_000_000,
         };
 
-        // Simulate the handle_evidence_published decode path inline:
-        // 1) Parse JSON envelope
-        let envelope: serde_json::Value =
-            serde_json::from_slice(&event.payload).expect("JSON envelope should parse");
-        let hex_payload = envelope
-            .get("payload")
-            .and_then(|v| v.as_str())
-            .expect("envelope should contain payload field");
-        let inner_bytes = hex::decode(hex_payload).expect("hex decode should succeed");
-
-        // 2) Decode inner protobuf
-        let evidence_event_decoded =
-            apm2_core::events::EvidenceEvent::decode(inner_bytes.as_slice())
-                .expect("protobuf decode should succeed");
-        let apm2_core::events::evidence_event::Event::Published(decoded_published) =
-            evidence_event_decoded.event.unwrap()
-        else {
-            panic!("Expected Published event")
-        };
-
-        assert_eq!(decoded_published.category, "WORK_CONTEXT_ENTRY");
-
-        let mut entry_id = String::new();
-        let mut kind = String::new();
-        let mut dedupe_key = String::new();
-        let mut actor_id = String::new();
-
-        for meta in &decoded_published.metadata {
-            if let Some(val) = meta.strip_prefix("entry_id=") {
-                entry_id = val.to_string();
-            } else if let Some(val) = meta.strip_prefix("kind=") {
-                kind = val.to_string();
-            } else if let Some(val) = meta.strip_prefix("dedupe_key=") {
-                dedupe_key = val.to_string();
-            } else if let Some(val) = meta.strip_prefix("actor_id=") {
-                actor_id = val.to_string();
-            }
-        }
-
-        let cas_hash_hex = hex::encode(&decoded_published.artifact_hash);
-
-        index
-            .register_work_context_entry(
-                &decoded_published.work_id,
-                &entry_id,
-                &kind,
-                &dedupe_key,
-                &actor_id,
-                &cas_hash_hex,
-                &decoded_published.evidence_id,
-                event.timestamp_ns,
-            )
-            .unwrap();
+        // Call the ACTUAL handle_evidence_published method on the worker.
+        worker
+            .handle_evidence_published(&event)
+            .expect("handle_evidence_published should succeed with JSON-envelope payload");
 
         // Verify the row landed in the projection table.
         let guard = conn.lock().unwrap();
@@ -8025,11 +8020,16 @@ mod tests {
         );
     }
 
-    /// BLOCKER 2e: Non-WORK_CONTEXT_ENTRY events are silently skipped.
-    /// Uses production JSON-envelope wire format.
+    /// BLOCKER: Non-WORK_CONTEXT_ENTRY events are silently skipped by the
+    /// actual `handle_evidence_published` method. Uses production
+    /// JSON-envelope wire format and calls the real method.
     #[test]
     fn test_handle_evidence_published_skips_non_work_context() {
         use prost::Message;
+
+        let conn = create_test_db();
+        let worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
 
         let published = apm2_core::events::EvidencePublished {
             evidence_id: "EV-other".to_string(),
@@ -8052,23 +8052,215 @@ mod tests {
         // Wrap in JSON envelope matching production encoding.
         let envelope_payload = build_session_event_envelope(&inner_protobuf);
 
-        // Parse JSON envelope -> hex decode -> protobuf decode
-        let envelope: serde_json::Value =
-            serde_json::from_slice(&envelope_payload).expect("JSON envelope should parse");
-        let hex_payload = envelope
-            .get("payload")
-            .and_then(|v| v.as_str())
-            .expect("envelope should contain payload field");
-        let inner_bytes = hex::decode(hex_payload).expect("hex decode should succeed");
-
-        let decoded = apm2_core::events::EvidenceEvent::decode(inner_bytes.as_slice())
-            .expect("protobuf decode should succeed");
-        let apm2_core::events::evidence_event::Event::Published(p) = decoded.event.unwrap() else {
-            panic!("Expected Published")
+        let event = crate::protocol::dispatch::SignedLedgerEvent {
+            event_id: "EVT-SKIP-001".to_string(),
+            event_type: "evidence.published".to_string(),
+            work_id: "W-SKIP".to_string(),
+            actor_id: "actor-skip".to_string(),
+            payload: envelope_payload,
+            signature: vec![0u8; 64],
+            timestamp_ns: 7_000_000_000,
         };
+
+        // Call the ACTUAL handle_evidence_published method — should succeed
+        // (skip) without error.
+        worker
+            .handle_evidence_published(&event)
+            .expect("non-WORK_CONTEXT_ENTRY events should be silently skipped");
+
+        // Verify no row was inserted.
+        let guard = conn.lock().unwrap();
+        let count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM work_context WHERE work_id = ?1",
+                params!["W-SKIP"],
+                |row| row.get(0),
+            )
+            .expect("count query should succeed");
         assert_eq!(
-            p.category, "SECURITY_SCAN",
-            "Non-WORK_CONTEXT_ENTRY events must be recognized and skipped"
+            count, 0,
+            "Non-WORK_CONTEXT_ENTRY events must not produce work_context rows"
+        );
+    }
+
+    /// E2E: Feeds a real wrapped ledger payload through the full
+    /// `process_evidence_published` async path (tailer poll -> decode ->
+    /// projection insert -> acknowledge) and verifies successful indexing.
+    #[test]
+    fn test_process_evidence_published_e2e_full_pipeline() {
+        use prost::Message;
+
+        let conn = create_test_db();
+        let mut worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
+
+        // Build a WORK_CONTEXT_ENTRY evidence event protobuf.
+        let published = apm2_core::events::EvidencePublished {
+            evidence_id: "CTX-pipeline-001".to_string(),
+            work_id: "W-PIPELINE".to_string(),
+            category: "WORK_CONTEXT_ENTRY".to_string(),
+            artifact_hash: vec![0xCC; 32],
+            verification_command_ids: Vec::new(),
+            classification: "INTERNAL".to_string(),
+            artifact_size: 99,
+            metadata: vec![
+                "entry_id=CTX-pipeline-001".to_string(),
+                "kind=REVIEW_FINDING".to_string(),
+                "dedupe_key=pipeline-dedup".to_string(),
+                "actor_id=actor-pipeline".to_string(),
+            ],
+            time_envelope_ref: None,
+        };
+        let evidence_event = apm2_core::events::EvidenceEvent {
+            event: Some(apm2_core::events::evidence_event::Event::Published(
+                published,
+            )),
+        };
+        let inner_protobuf = evidence_event.encode_to_vec();
+
+        // Insert the event into the ledger in production JSON-envelope format.
+        insert_evidence_published_event(
+            &conn,
+            "EVT-PIPELINE-001",
+            "W-PIPELINE",
+            &inner_protobuf,
+            8_000_000_000,
+        );
+
+        // Also insert a non-WORK_CONTEXT_ENTRY event to verify it is skipped.
+        let skip_published = apm2_core::events::EvidencePublished {
+            evidence_id: "EV-sec-scan".to_string(),
+            work_id: "W-PIPELINE".to_string(),
+            category: "SECURITY_SCAN".to_string(),
+            artifact_hash: vec![0xDD; 32],
+            verification_command_ids: Vec::new(),
+            classification: "INTERNAL".to_string(),
+            artifact_size: 50,
+            metadata: vec![],
+            time_envelope_ref: None,
+        };
+        let skip_event = apm2_core::events::EvidenceEvent {
+            event: Some(apm2_core::events::evidence_event::Event::Published(
+                skip_published,
+            )),
+        };
+        insert_evidence_published_event(
+            &conn,
+            "EVT-SKIP-002",
+            "W-PIPELINE",
+            &skip_event.encode_to_vec(),
+            9_000_000_000,
+        );
+
+        // Poll: process_evidence_published should decode both events,
+        // index the WORK_CONTEXT_ENTRY one, skip the SECURITY_SCAN one,
+        // and acknowledge both.
+        run_evidence_published_poll_once(&mut worker)
+            .expect("process_evidence_published should succeed");
+
+        // Verify: exactly 1 work_context row for the WORK_CONTEXT_ENTRY event.
+        let guard = conn.lock().unwrap();
+        let (stored_kind, stored_dedupe, stored_actor, stored_cas): (
+            String,
+            String,
+            String,
+            String,
+        ) = guard
+            .query_row(
+                "SELECT kind, dedupe_key, actor_id, cas_hash FROM work_context \
+                 WHERE work_id = ?1 AND entry_id = ?2",
+                params!["W-PIPELINE", "CTX-pipeline-001"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("work_context row should exist after full pipeline");
+
+        assert_eq!(stored_kind, "REVIEW_FINDING");
+        assert_eq!(stored_dedupe, "pipeline-dedup");
+        assert_eq!(stored_actor, "actor-pipeline");
+        assert_eq!(
+            stored_cas,
+            hex::encode([0xCC; 32]),
+            "cas_hash must match artifact_hash hex"
+        );
+
+        // Verify: no row for the SECURITY_SCAN event.
+        let skip_count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM work_context WHERE entry_id = ?1",
+                params!["EV-sec-scan"],
+                |row| row.get(0),
+            )
+            .expect("count query should succeed");
+        assert_eq!(
+            skip_count, 0,
+            "SECURITY_SCAN evidence must not produce work_context rows"
+        );
+
+        // Verify: total work_context rows for W-PIPELINE is exactly 1.
+        let total_count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM work_context WHERE work_id = ?1",
+                params!["W-PIPELINE"],
+                |row| row.get(0),
+            )
+            .expect("count query should succeed");
+        assert_eq!(
+            total_count, 1,
+            "Only the WORK_CONTEXT_ENTRY event should produce a projection row"
+        );
+    }
+
+    /// Regression: raw protobuf payload (without JSON envelope) must be
+    /// rejected by `handle_evidence_published`. This proves that the method
+    /// does NOT silently accept the old incorrect format.
+    #[test]
+    fn test_handle_evidence_published_rejects_raw_protobuf() {
+        use prost::Message;
+
+        let conn = create_test_db();
+        let worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
+
+        let published = apm2_core::events::EvidencePublished {
+            evidence_id: "CTX-raw".to_string(),
+            work_id: "W-RAW".to_string(),
+            category: "WORK_CONTEXT_ENTRY".to_string(),
+            artifact_hash: vec![0xEE; 32],
+            verification_command_ids: Vec::new(),
+            classification: "INTERNAL".to_string(),
+            artifact_size: 42,
+            metadata: vec![
+                "entry_id=CTX-raw".to_string(),
+                "kind=HANDOFF_NOTE".to_string(),
+                "dedupe_key=raw-key".to_string(),
+                "actor_id=actor-raw".to_string(),
+            ],
+            time_envelope_ref: None,
+        };
+        let evidence_event = apm2_core::events::EvidenceEvent {
+            event: Some(apm2_core::events::evidence_event::Event::Published(
+                published,
+            )),
+        };
+        // Raw protobuf bytes WITHOUT the JSON envelope wrapper.
+        let raw_protobuf = evidence_event.encode_to_vec();
+
+        let event = crate::protocol::dispatch::SignedLedgerEvent {
+            event_id: "EVT-RAW-001".to_string(),
+            event_type: "evidence.published".to_string(),
+            work_id: "W-RAW".to_string(),
+            actor_id: "actor-raw".to_string(),
+            payload: raw_protobuf,
+            signature: vec![0u8; 64],
+            timestamp_ns: 10_000_000_000,
+        };
+
+        // The method must return an error because the payload is not a valid
+        // JSON envelope.
+        let result = worker.handle_evidence_published(&event);
+        assert!(
+            result.is_err(),
+            "Raw protobuf payload (without JSON envelope) must be rejected"
         );
     }
 }

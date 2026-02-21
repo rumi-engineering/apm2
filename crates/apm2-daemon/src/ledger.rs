@@ -7744,4 +7744,108 @@ mod tests {
             "Exactly one work.opened must exist in canonical events for W-race-frozen-001"
         );
     }
+
+    /// Regression: `get_event_by_evidence_identity` on
+    /// `SqliteLedgerEventEmitter` must decode the JSON envelope, hex-decode
+    /// the protobuf payload, and verify `published.evidence_id == entry_id`
+    /// before returning. With two different `entry_id` values under the same
+    /// `work_id`, the second publish must NOT false-hit the first entry.
+    #[test]
+    fn test_sqlite_get_event_by_evidence_identity_no_false_idempotency() {
+        use prost::Message;
+
+        let emitter = test_emitter();
+
+        // Build two different WORK_CONTEXT_ENTRY evidence events under the
+        // same work_id but with different evidence_id / entry_id values.
+        let make_evidence_protobuf = |evidence_id: &str, artifact_byte: u8| {
+            let published = apm2_core::events::EvidencePublished {
+                evidence_id: evidence_id.to_string(),
+                work_id: "W-IDEM-TEST".to_string(),
+                category: "WORK_CONTEXT_ENTRY".to_string(),
+                artifact_hash: vec![artifact_byte; 32],
+                verification_command_ids: Vec::new(),
+                classification: "INTERNAL".to_string(),
+                artifact_size: 42,
+                metadata: vec![
+                    format!("entry_id={evidence_id}"),
+                    "kind=HANDOFF_NOTE".to_string(),
+                    format!("dedupe_key=dedup-{evidence_id}"),
+                    "actor_id=actor-test".to_string(),
+                ],
+                time_envelope_ref: None,
+            };
+            let event = apm2_core::events::EvidenceEvent {
+                event: Some(apm2_core::events::evidence_event::Event::Published(
+                    published,
+                )),
+            };
+            event.encode_to_vec()
+        };
+
+        // Emit first evidence event via emit_session_event (which wraps in
+        // JSON envelope with hex-encoded protobuf). Session_id is used as
+        // work_id in the ledger, so pass the work_id as session_id.
+        let proto_a = make_evidence_protobuf("CTX-entry-A", 0xAA);
+        let event_a = emitter
+            .emit_session_event(
+                "W-IDEM-TEST",
+                "evidence.published",
+                &proto_a,
+                "actor-test",
+                1_000_000_000,
+            )
+            .expect("first evidence event should emit");
+
+        // Emit second evidence event with a DIFFERENT evidence_id.
+        let proto_b = make_evidence_protobuf("CTX-entry-B", 0xBB);
+        let event_b = emitter
+            .emit_session_event(
+                "W-IDEM-TEST",
+                "evidence.published",
+                &proto_b,
+                "actor-test",
+                2_000_000_000,
+            )
+            .expect("second evidence event should emit");
+
+        // Verify: looking up entry_id "CTX-entry-A" returns the first event.
+        let result_a = emitter.get_event_by_evidence_identity("W-IDEM-TEST", "CTX-entry-A");
+        assert!(
+            result_a.is_some(),
+            "get_event_by_evidence_identity must find CTX-entry-A"
+        );
+        assert_eq!(
+            result_a.unwrap().event_id,
+            event_a.event_id,
+            "Must return the event matching CTX-entry-A, not the latest one"
+        );
+
+        // Verify: looking up entry_id "CTX-entry-B" returns the second event.
+        let result_b = emitter.get_event_by_evidence_identity("W-IDEM-TEST", "CTX-entry-B");
+        assert!(
+            result_b.is_some(),
+            "get_event_by_evidence_identity must find CTX-entry-B"
+        );
+        assert_eq!(
+            result_b.unwrap().event_id,
+            event_b.event_id,
+            "Must return the event matching CTX-entry-B, not the first one"
+        );
+
+        // Verify: looking up a non-existent entry_id returns None (no false positive).
+        let result_none = emitter.get_event_by_evidence_identity("W-IDEM-TEST", "CTX-nonexistent");
+        assert!(
+            result_none.is_none(),
+            "Non-existent entry_id must return None"
+        );
+
+        // Verify: looking up the correct entry_id but wrong work_id returns None.
+        let result_wrong_work =
+            emitter.get_event_by_evidence_identity("W-WRONG-WORK", "CTX-entry-A");
+        assert!(
+            result_wrong_work.is_none(),
+            "Wrong work_id must return None"
+        );
+    }
 }
