@@ -197,6 +197,23 @@ pub fn init_canonical_schema(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// Returns `true` if the ledger schema is in canonical `events` mode (not
+/// legacy `ledger_events` mode).
+///
+/// This is the post-migration invariant check for TCK-00631: after
+/// `migrate_legacy_ledger_events` completes, this function MUST return
+/// `true`. If it returns `false`, the daemon should refuse to start.
+///
+/// # Errors
+///
+/// Returns [`LedgerError::AmbiguousSchemaState`] if both tables have rows
+/// (ambiguous state). Returns [`LedgerError::Database`] for `SQLite`
+/// errors.
+pub fn is_canonical_events_mode(conn: &Connection) -> Result<bool, LedgerError> {
+    let mode = SqliteLedgerBackend::determine_read_mode(conn)?;
+    Ok(mode == LedgerReadMode::CanonicalEvents)
+}
+
 /// Migrates legacy `ledger_events` rows into the canonical `events` table
 /// with a real hash chain.
 ///

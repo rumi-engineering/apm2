@@ -3422,3 +3422,42 @@ fn tck_00630_empty_frozen_with_new_live_rows_migrates_from_genesis() {
         assert!(verify_result.is_ok(), "hash chain must verify");
     }
 }
+
+/// TCK-00631: `is_canonical_events_mode` returns correct results
+/// for all three DB states:
+/// (a) legacy-only -> false
+/// (b) canonical-only -> true
+/// (c) after migration -> true
+#[test]
+fn tck_00631_is_canonical_events_mode_three_states() {
+    // (b) Canonical-only: no legacy table at all.
+    let conn_b = Connection::open_in_memory().unwrap();
+    init_canonical_schema(&conn_b).unwrap();
+    assert!(
+        super::is_canonical_events_mode(&conn_b).unwrap(),
+        "canonical-only DB must be in canonical mode"
+    );
+
+    // (a) Legacy-only: legacy table with rows, events table empty.
+    let conn_a = Connection::open_in_memory().unwrap();
+    init_canonical_schema(&conn_a).unwrap();
+    create_legacy_ledger_events_table(&conn_a);
+    conn_a
+        .execute(
+            "INSERT INTO ledger_events VALUES ('e1', 'test', 'w1', 'a1', X'AA', X'BB', 1000)",
+            [],
+        )
+        .unwrap();
+    assert!(
+        !super::is_canonical_events_mode(&conn_a).unwrap(),
+        "legacy-only DB must NOT be in canonical mode"
+    );
+
+    // (c) After migration: canonical mode.
+    let stats = migrate_legacy_ledger_events(&conn_a).unwrap();
+    assert_eq!(stats.rows_migrated, 1);
+    assert!(
+        super::is_canonical_events_mode(&conn_a).unwrap(),
+        "post-migration DB must be in canonical mode"
+    );
+}

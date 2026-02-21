@@ -905,10 +905,15 @@ impl DispatcherState {
                 Arc::clone(&conn),
                 signing_key.clone(),
             ));
-            let event_emitter = Arc::new(SqliteLedgerEventEmitter::new(
+            let emitter_inner = SqliteLedgerEventEmitter::new(
                 Arc::clone(&conn),
                 signing_key,
-            ));
+            );
+            // TCK-00631: Freeze legacy writes after RFC-0032 migration.
+            if let Err(e) = emitter_inner.freeze_legacy_writes_self() {
+                tracing::warn!(error = %e, "freeze_legacy_writes failed (writes blocked, fail-closed)");
+            }
+            let event_emitter = Arc::new(emitter_inner);
 
             // TCK-00319 SECURITY: Configure EpisodeRuntime with workspace-rooted handlers
             // All file/execute handlers MUST use rooted factories that receive the
@@ -1423,10 +1428,12 @@ impl DispatcherState {
             Arc::clone(&sqlite_conn),
             signing_key.clone(),
         ));
-        let event_emitter = Arc::new(SqliteLedgerEventEmitter::new(
-            Arc::clone(&sqlite_conn),
-            signing_key,
-        ));
+        let emitter_inner = SqliteLedgerEventEmitter::new(Arc::clone(&sqlite_conn), signing_key);
+        // TCK-00631: Freeze legacy writes after RFC-0032 migration.
+        if let Err(e) = emitter_inner.freeze_legacy_writes_self() {
+            tracing::warn!(error = %e, "freeze_legacy_writes failed (writes blocked, fail-closed)");
+        }
+        let event_emitter = Arc::new(emitter_inner);
 
         // TCK-00316: Initialize EpisodeRuntime with CAS and handlers
         // Use safe production defaults:
