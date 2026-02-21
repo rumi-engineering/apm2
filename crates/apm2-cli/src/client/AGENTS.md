@@ -187,6 +187,7 @@ pub struct EpisodeBudgetSummary  { pub tokens: String, pub tool_calls: String, p
 | `refresh_credential(profile_id)` | Force refresh credentials |
 | `switch_credential(process, profile)` | Switch process credentials |
 | `login_credential(provider, profile)` | Interactive login |
+| `open_work(work_spec_json)` | Open a new work item (TCK-00635) |
 
 ### `SessionClient` (protocol.rs)
 

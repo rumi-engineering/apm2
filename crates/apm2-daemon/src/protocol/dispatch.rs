@@ -112,6 +112,9 @@ use super::messages::{
     ListProcessesResponse,
     LoginCredentialRequest,
     LoginCredentialResponse,
+    // TCK-00635: OpenWork (RFC-0032 Phase 1)
+    OpenWorkRequest,
+    OpenWorkResponse,
     OrchestratorLaunchProjectionRequest,
     OrchestratorLaunchProjectionResponse,
     PatternRejection,
@@ -6024,6 +6027,9 @@ pub enum PrivilegedMessageType {
     RegisterRecoveryEvidence = 74,
     /// `RequestUnfreeze` request (IPC-PRIV-075)
     RequestUnfreeze     = 75,
+    // --- Work Lifecycle (RFC-0032, TCK-00635) ---
+    /// `OpenWork` request (IPC-PRIV-076)
+    OpenWork            = 28,
 }
 
 impl PrivilegedMessageType {
@@ -6068,6 +6074,8 @@ impl PrivilegedMessageType {
             26 => Some(Self::LoginCredential),
             // TCK-00452: orchestrator projection
             27 => Some(Self::OrchestratorLaunchProjection),
+            // TCK-00635: OpenWork (RFC-0032 Phase 1)
+            28 => Some(Self::OpenWork),
             // HEF tags (64-68)
             64 => Some(Self::SubscribePulse),
             66 => Some(Self::UnsubscribePulse),
@@ -6134,6 +6142,7 @@ impl PrivilegedMessageType {
             Self::VerifyLedgerChain,
             Self::RegisterRecoveryEvidence,
             Self::RequestUnfreeze,
+            Self::OpenWork,
         ]
     }
 
@@ -6184,7 +6193,8 @@ impl PrivilegedMessageType {
             | Self::DelegateSublease
             | Self::VerifyLedgerChain
             | Self::RegisterRecoveryEvidence
-            | Self::RequestUnfreeze => true,
+            | Self::RequestUnfreeze
+            | Self::OpenWork => true,
             // Server-to-client notification only — not a client request.
             Self::PulseEvent => false,
         }
@@ -6232,6 +6242,7 @@ impl PrivilegedMessageType {
             Self::VerifyLedgerChain => "hsi.ledger.verify_chain",
             Self::RegisterRecoveryEvidence => "hsi.projection.register_recovery_evidence",
             Self::RequestUnfreeze => "hsi.projection.request_unfreeze",
+            Self::OpenWork => "hsi.work.open",
             Self::PulseEvent => "hsi.pulse.event",
         }
     }
@@ -6274,6 +6285,7 @@ impl PrivilegedMessageType {
             Self::VerifyLedgerChain => "VERIFY_LEDGER_CHAIN",
             Self::RegisterRecoveryEvidence => "REGISTER_RECOVERY_EVIDENCE",
             Self::RequestUnfreeze => "REQUEST_UNFREEZE",
+            Self::OpenWork => "OPEN_WORK",
             Self::PulseEvent => "PULSE_EVENT",
         }
     }
@@ -6316,6 +6328,7 @@ impl PrivilegedMessageType {
             Self::VerifyLedgerChain => "apm2.verify_ledger_chain_request.v1",
             Self::RegisterRecoveryEvidence => "apm2.register_recovery_evidence_request.v1",
             Self::RequestUnfreeze => "apm2.request_unfreeze_request.v1",
+            Self::OpenWork => "apm2.open_work_request.v1",
             Self::PulseEvent => "apm2.pulse_event_request.v1",
         }
     }
@@ -6358,6 +6371,7 @@ impl PrivilegedMessageType {
             Self::VerifyLedgerChain => "apm2.verify_ledger_chain_response.v1",
             Self::RegisterRecoveryEvidence => "apm2.register_recovery_evidence_response.v1",
             Self::RequestUnfreeze => "apm2.request_unfreeze_response.v1",
+            Self::OpenWork => "apm2.open_work_response.v1",
             Self::PulseEvent => "apm2.pulse_event_response.v1",
         }
     }
@@ -6442,6 +6456,8 @@ pub enum PrivilegedResponse {
     RegisterRecoveryEvidence(RegisterRecoveryEvidenceResponse),
     /// Successful `RequestUnfreeze` response (TCK-00469).
     RequestUnfreeze(RequestUnfreezeResponse),
+    /// Successful `OpenWork` response (TCK-00635).
+    OpenWork(OpenWorkResponse),
     /// Error response.
     Error(PrivilegedError),
 }
@@ -6642,6 +6658,10 @@ impl PrivilegedResponse {
             },
             Self::RequestUnfreeze(resp) => {
                 buf.push(PrivilegedMessageType::RequestUnfreeze.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::OpenWork(resp) => {
+                buf.push(PrivilegedMessageType::OpenWork.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::Error(err) => {
@@ -10450,6 +10470,8 @@ impl PrivilegedDispatcher {
                 self.handle_register_recovery_evidence(payload, ctx)
             },
             PrivilegedMessageType::RequestUnfreeze => self.handle_request_unfreeze(payload, ctx),
+            // TCK-00635: OpenWork (RFC-0032 Phase 1)
+            PrivilegedMessageType::OpenWork => self.handle_open_work(payload, ctx),
         };
 
         // TCK-00268: Emit IPC request completion metrics
@@ -10506,6 +10528,8 @@ impl PrivilegedDispatcher {
                 // TCK-00469
                 PrivilegedMessageType::RegisterRecoveryEvidence => "RegisterRecoveryEvidence",
                 PrivilegedMessageType::RequestUnfreeze => "RequestUnfreeze",
+                // TCK-00635
+                PrivilegedMessageType::OpenWork => "OpenWork",
             };
             let status = match &result {
                 Ok(PrivilegedResponse::Error(_)) => "error",
@@ -14270,6 +14294,277 @@ impl PrivilegedDispatcher {
                 }))
             },
             Err(error) => Ok(Self::map_work_authority_error(error)),
+        }
+    }
+
+    /// Handles `OpenWork` requests (IPC-PRIV-076, TCK-00635).
+    ///
+    /// Opens a new work item by:
+    /// 1. Bounded-decoding and validating the `WorkSpec` JSON
+    /// 2. Deriving `actor_id` from peer credentials (never client input)
+    /// 3. Canonicalizing the `WorkSpec` JSON for deterministic CAS storage
+    /// 4. Checking idempotency: same `work_id` + same hash -> no-op; same
+    ///    `work_id` + different hash -> `ALREADY_EXISTS` error
+    /// 5. Storing canonical bytes to CAS (fail-closed when CAS is not
+    ///    configured)
+    /// 6. Emitting exactly one `work.opened` event via the canonical ledger
+    fn handle_open_work(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        // 1. Bounded decode the OpenWorkRequest protobuf
+        let request =
+            OpenWorkRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid OpenWorkRequest: {e}"),
+                }
+            })?;
+
+        // CTR-1603: Validate work_spec_json size before JSON parsing
+        if request.work_spec_json.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "work_spec_json cannot be empty",
+            ));
+        }
+
+        // 2. Bounded decode + validate the WorkSpec JSON
+        let spec = match apm2_core::fac::work_cas_schemas::bounded_decode_work_spec(
+            &request.work_spec_json,
+        ) {
+            Ok(spec) => spec,
+            Err(e) => {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::InvalidArgument,
+                    format!("WorkSpec validation failed: {e}"),
+                ));
+            },
+        };
+
+        // CTR-1603: Validate work_id length (bounded_decode_work_spec
+        // already validates non-empty and per-field lengths via
+        // WorkSpecV1::validate, but we enforce MAX_ID_LENGTH for IPC
+        // consistency).
+        if spec.work_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!("WorkSpec work_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        // 3. Derive actor_id from peer credentials (NEVER from client input)
+        let peer_creds = ctx
+            .peer_credentials()
+            .ok_or_else(|| ProtocolError::Serialization {
+                reason: "peer credentials required for OpenWork".to_string(),
+            })?;
+        let actor_id = derive_actor_id(peer_creds);
+
+        info!(
+            work_id = %spec.work_id,
+            work_type = ?spec.work_type,
+            derived_actor_id = %actor_id,
+            peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+            "OpenWork request received"
+        );
+
+        // 4. Canonicalize the WorkSpec JSON for deterministic CAS storage
+        let spec_json_str = std::str::from_utf8(&request.work_spec_json).map_err(|e| {
+            ProtocolError::Serialization {
+                reason: format!("WorkSpec JSON is not valid UTF-8: {e}"),
+            }
+        })?;
+        let canonical_json =
+            match apm2_core::fac::work_cas_schemas::canonicalize_for_cas(spec_json_str) {
+                Ok(c) => c,
+                Err(e) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::InvalidArgument,
+                        format!("WorkSpec canonicalization failed: {e}"),
+                    ));
+                },
+            };
+        let canonical_bytes = canonical_json.as_bytes();
+
+        // 5. BLAKE3 hash for CAS key
+        let spec_hash = blake3::hash(canonical_bytes);
+        let spec_hash_bytes: [u8; 32] = *spec_hash.as_bytes();
+
+        // 6. Idempotency check: query existing events for this work_id.
+        //
+        // `emit_session_event` stores the protobuf payload hex-encoded inside
+        // a JSON envelope: `{"event_type":"…","session_id":"…","actor_id":"…",
+        // "payload":"<hex>"}`. To retrieve the original protobuf `WorkEvent`,
+        // we must parse the JSON envelope, hex-decode the `payload` field,
+        // then protobuf-decode it.
+        let existing_events = self.event_emitter.get_events_by_work_id(&spec.work_id);
+        let existing_opened = existing_events
+            .iter()
+            .find(|e| e.event_type == "work.opened");
+
+        if let Some(opened_event) = existing_opened {
+            // Work already opened. Extract the inner protobuf from the JSON
+            // envelope to compare spec hashes.
+            let existing_hash = Self::extract_spec_hash_from_event_payload(&opened_event.payload);
+            match existing_hash {
+                Some(hash) if hash == spec_hash_bytes => {
+                    // Idempotent: same spec hash, return success
+                    info!(
+                        work_id = %spec.work_id,
+                        "OpenWork idempotent no-op: work already exists with same spec hash"
+                    );
+                    #[allow(clippy::redundant_clone)]
+                    let work_id = spec.work_id.clone();
+                    return Ok(PrivilegedResponse::OpenWork(OpenWorkResponse {
+                        work_id,
+                        spec_snapshot_hash: spec_hash_bytes.to_vec(),
+                        already_existed: true,
+                    }));
+                },
+                Some(_) => {
+                    // Different spec hash: ALREADY_EXISTS error
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::WorkAlreadyExists,
+                        format!(
+                            "work_id '{}' already exists with different spec hash",
+                            spec.work_id
+                        ),
+                    ));
+                },
+                None => {
+                    // Fail-closed: existing event found but payload is not
+                    // decodable. Refuse to overwrite.
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::InvalidArgument,
+                        format!(
+                            "work_id '{}' has existing work.opened event but \
+                             payload is not decodable",
+                            spec.work_id
+                        ),
+                    ));
+                },
+            }
+        }
+
+        // 7. Store canonical WorkSpec bytes to CAS (fail-closed when not configured — a
+        //    MemoryCas fallback would be ephemeral and useless, violating CAS
+        //    durability).
+        let Some(cas) = self.cas.as_ref() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "CAS backend not configured (fail-closed)",
+            ));
+        };
+
+        if let Err(e) = cas.store(canonical_bytes) {
+            warn!(error = %e, "CAS store failed for WorkSpec");
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("CAS storage failed: {e}"),
+            ));
+        }
+
+        // 8. Get HTF timestamp
+        let timestamp_ns = match self.get_htf_timestamp_ns() {
+            Ok(ts) => ts,
+            Err(e) => {
+                warn!(error = %e, "HTF timestamp generation failed - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("HTF timestamp error: {e}"),
+                ));
+            },
+        };
+
+        // 9. Build and emit work.opened event
+        let work_type_str = match spec.work_type {
+            apm2_core::fac::work_cas_schemas::WorkSpecType::Ticket => "TICKET",
+            apm2_core::fac::work_cas_schemas::WorkSpecType::PrdRefinement => "PRD_REFINEMENT",
+            apm2_core::fac::work_cas_schemas::WorkSpecType::RfcRefinement => "RFC_REFINEMENT",
+            apm2_core::fac::work_cas_schemas::WorkSpecType::Review => "REVIEW",
+            // Fail-closed: reject unknown work types (non_exhaustive guard)
+            _ => {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::InvalidArgument,
+                    "unsupported work_type variant",
+                ));
+            },
+        };
+
+        let event_payload = apm2_core::work::helpers::work_opened_payload(
+            &spec.work_id,
+            work_type_str,
+            spec_hash_bytes.to_vec(),
+            spec.requirement_ids.clone(),
+            spec.parent_work_ids.clone(),
+        );
+
+        // Emit through the session event path with event_type "work.opened".
+        // The first argument (`session_id`) doubles as the `work_id` index
+        // key in `SignedLedgerEvent`, so we pass `spec.work_id` to ensure
+        // `get_events_by_work_id` can find this event for idempotency.
+        match self.event_emitter.emit_session_event(
+            &spec.work_id,
+            "work.opened",
+            &event_payload,
+            &actor_id,
+            timestamp_ns,
+        ) {
+            Ok(signed_event) => {
+                info!(
+                    event_id = %signed_event.event_id,
+                    work_id = %spec.work_id,
+                    spec_hash = %hex::encode(spec_hash_bytes),
+                    "work.opened event emitted"
+                );
+            },
+            Err(e) => {
+                warn!(error = %e, "work.opened event emission failed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("event emission failed: {e}"),
+                ));
+            },
+        }
+
+        Ok(PrivilegedResponse::OpenWork(OpenWorkResponse {
+            work_id: spec.work_id,
+            spec_snapshot_hash: spec_hash_bytes.to_vec(),
+            already_existed: false,
+        }))
+    }
+
+    /// Extracts the `spec_snapshot_hash` from a stored `work.opened` event
+    /// payload.
+    ///
+    /// The `emit_session_event` method stores payloads as a JSON envelope
+    /// containing the original protobuf bytes hex-encoded in the `payload`
+    /// field. This helper parses that envelope, hex-decodes the inner
+    /// payload, then protobuf-decodes it as a `WorkEvent` to extract the
+    /// `spec_snapshot_hash` from the `Opened` variant.
+    ///
+    /// Returns `None` if any decode step fails (fail-closed).
+    fn extract_spec_hash_from_event_payload(payload_bytes: &[u8]) -> Option<[u8; 32]> {
+        // 1. Parse JSON envelope
+        let envelope: serde_json::Value = serde_json::from_slice(payload_bytes).ok()?;
+
+        // 2. Extract hex-encoded protobuf payload
+        let hex_payload = envelope.get("payload")?.as_str()?;
+
+        // 3. Hex-decode to raw bytes
+        let raw_bytes = hex::decode(hex_payload).ok()?;
+
+        // 4. Protobuf-decode WorkEvent
+        let work_event =
+            <apm2_core::events::WorkEvent as prost::Message>::decode(raw_bytes.as_slice()).ok()?;
+
+        // 5. Extract spec_snapshot_hash from Opened variant
+        if let Some(apm2_core::events::work_event::Event::Opened(ref opened)) = work_event.event {
+            let hash: [u8; 32] = opened.spec_snapshot_hash.as_slice().try_into().ok()?;
+            Some(hash)
+        } else {
+            None
         }
     }
 
@@ -18945,6 +19240,16 @@ pub fn encode_switch_credential_request(request: &SwitchCredentialRequest) -> By
 #[must_use]
 pub fn encode_login_credential_request(request: &LoginCredentialRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::LoginCredential.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes an `OpenWork` request to bytes for sending (TCK-00635).
+///
+/// The format is: `[tag: u8][payload: protobuf]`
+#[must_use]
+pub fn encode_open_work_request(request: &OpenWorkRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::OpenWork.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }
@@ -30392,6 +30697,434 @@ mod tests {
                 PrivilegedMessageType::from_tag(75),
                 Some(PrivilegedMessageType::RequestUnfreeze)
             );
+        }
+
+        // =====================================================================
+        // TCK-00635: OpenWork tag, encoding, and handler tests
+        // =====================================================================
+
+        #[test]
+        fn test_open_work_tag_and_routing() {
+            assert_eq!(PrivilegedMessageType::OpenWork.tag(), 28);
+            assert_eq!(
+                PrivilegedMessageType::from_tag(28),
+                Some(PrivilegedMessageType::OpenWork)
+            );
+        }
+
+        #[test]
+        fn test_open_work_is_client_request() {
+            assert!(PrivilegedMessageType::OpenWork.is_client_request());
+        }
+
+        #[test]
+        fn test_open_work_in_all_request_variants() {
+            let variants = PrivilegedMessageType::all_request_variants();
+            assert!(
+                variants.contains(&PrivilegedMessageType::OpenWork),
+                "OpenWork must be in all_request_variants"
+            );
+        }
+
+        #[test]
+        fn test_open_work_hsi_route() {
+            assert_eq!(PrivilegedMessageType::OpenWork.hsi_route(), "hsi.work.open");
+        }
+
+        #[test]
+        fn test_open_work_hsi_route_id() {
+            assert_eq!(PrivilegedMessageType::OpenWork.hsi_route_id(), "OPEN_WORK");
+        }
+
+        #[test]
+        fn test_encode_open_work_request() {
+            let request = OpenWorkRequest {
+                work_spec_json: b"{}".to_vec(),
+            };
+            let encoded = encode_open_work_request(&request);
+            assert_eq!(encoded[0], PrivilegedMessageType::OpenWork.tag());
+            assert!(encoded.len() > 1, "encoded frame must include payload");
+        }
+
+        #[test]
+        fn test_open_work_response_encoding() {
+            let response = PrivilegedResponse::OpenWork(OpenWorkResponse {
+                work_id: "W-test-123".to_string(),
+                spec_snapshot_hash: vec![0xAA; 32],
+                already_existed: false,
+            });
+            let encoded = response.encode();
+            assert_eq!(encoded[0], PrivilegedMessageType::OpenWork.tag());
+        }
+
+        #[test]
+        fn test_open_work_empty_payload_rejected() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+            let request = OpenWorkRequest {
+                work_spec_json: Vec::new(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let result = dispatcher.handle_open_work(&buf, &ctx);
+            assert!(result.is_ok());
+            match result.unwrap() {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::InvalidArgument),
+                        "Empty work_spec_json should return InvalidArgument"
+                    );
+                },
+                other => panic!("Expected Error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_open_work_invalid_json_rejected() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+            let request = OpenWorkRequest {
+                work_spec_json: b"not valid json".to_vec(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let result = dispatcher.handle_open_work(&buf, &ctx);
+            assert!(result.is_ok());
+            match result.unwrap() {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::InvalidArgument),
+                        "Invalid JSON should return InvalidArgument"
+                    );
+                },
+                other => panic!("Expected Error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_open_work_missing_peer_credentials_rejected() {
+            let dispatcher = PrivilegedDispatcher::new();
+            // No peer credentials
+            let ctx = ConnectionContext::privileged_session_open(None);
+            let valid_spec = serde_json::json!({
+                "schema": "apm2.work_spec.v1",
+                "work_id": "W-test-creds",
+                "title": "Test work",
+                "work_type": "TICKET"
+            });
+            let spec_bytes = serde_json::to_vec(&valid_spec).unwrap();
+            let request = OpenWorkRequest {
+                work_spec_json: spec_bytes,
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let result = dispatcher.handle_open_work(&buf, &ctx);
+            // Should fail at the protocol level (Serialization error) since
+            // peer credentials are required
+            assert!(result.is_err(), "Missing peer credentials should fail");
+        }
+
+        #[test]
+        fn test_open_work_no_cas_fails_closed() {
+            // A dispatcher without CAS should reject valid OpenWork requests
+            // rather than silently falling back to ephemeral storage.
+            let dispatcher = PrivilegedDispatcher::new().without_cas();
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+            let valid_spec = serde_json::json!({
+                "schema": "apm2.work_spec.v1",
+                "work_id": "W-test-no-cas",
+                "title": "Test no CAS",
+                "work_type": "TICKET"
+            });
+            let spec_bytes = serde_json::to_vec(&valid_spec).unwrap();
+            let request = OpenWorkRequest {
+                work_spec_json: spec_bytes,
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let result = dispatcher.handle_open_work(&buf, &ctx);
+            assert!(result.is_ok());
+            match result.unwrap() {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("CAS") || err.message.contains("cas"),
+                        "Expected CAS-related error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected Error for missing CAS, got: {other:?}"),
+            }
+        }
+
+        /// Helper: creates a dispatcher with CAS wired for `OpenWork` tests.
+        /// `PrivilegedDispatcher::new()` already includes a `MemoryCas`, so
+        /// this is an alias for clarity in test naming.
+        fn open_work_dispatcher_with_cas() -> PrivilegedDispatcher {
+            PrivilegedDispatcher::new()
+        }
+
+        /// Helper: builds a valid `WorkSpec` JSON for testing.
+        fn test_work_spec_json(work_id: &str) -> Vec<u8> {
+            let spec = serde_json::json!({
+                "schema": "apm2.work_spec.v1",
+                "work_id": work_id,
+                "title": "Test work item",
+                "work_type": "TICKET"
+            });
+            serde_json::to_vec(&spec).unwrap()
+        }
+
+        /// Helper: builds a test `PeerCredentials` context.
+        fn test_open_work_ctx() -> ConnectionContext {
+            ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }))
+        }
+
+        #[test]
+        fn test_open_work_success() {
+            let dispatcher = open_work_dispatcher_with_cas();
+            let ctx = test_open_work_ctx();
+            let spec_bytes = test_work_spec_json("W-test-success-001");
+            let request = OpenWorkRequest {
+                work_spec_json: spec_bytes,
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let result = dispatcher.handle_open_work(&buf, &ctx);
+            assert!(result.is_ok());
+            match result.unwrap() {
+                PrivilegedResponse::OpenWork(resp) => {
+                    assert_eq!(resp.work_id, "W-test-success-001");
+                    assert_eq!(resp.spec_snapshot_hash.len(), 32);
+                    assert!(!resp.already_existed);
+                },
+                other => panic!("Expected OpenWork success, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_open_work_idempotent_same_hash() {
+            // Sending the same WorkSpec twice should be idempotent:
+            // second call returns already_existed=true.
+            let dispatcher = open_work_dispatcher_with_cas();
+            let ctx = test_open_work_ctx();
+            let spec_bytes = test_work_spec_json("W-test-idempotent-001");
+            let request = OpenWorkRequest {
+                work_spec_json: spec_bytes,
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            // First call: creates work item
+            let result1 = dispatcher.handle_open_work(&buf, &ctx);
+            assert!(result1.is_ok());
+            let first_hash = match result1.unwrap() {
+                PrivilegedResponse::OpenWork(resp) => {
+                    assert!(!resp.already_existed);
+                    resp.spec_snapshot_hash
+                },
+                other => panic!("Expected OpenWork success, got: {other:?}"),
+            };
+
+            // Second call: idempotent no-op with same spec
+            let mut buf2 = Vec::new();
+            let request2 = OpenWorkRequest {
+                work_spec_json: test_work_spec_json("W-test-idempotent-001"),
+            };
+            request2.encode(&mut buf2).expect("encode");
+
+            let result2 = dispatcher.handle_open_work(&buf2, &ctx);
+            assert!(result2.is_ok());
+            match result2.unwrap() {
+                PrivilegedResponse::OpenWork(resp) => {
+                    assert!(
+                        resp.already_existed,
+                        "Second call with same spec should return already_existed=true"
+                    );
+                    assert_eq!(
+                        resp.spec_snapshot_hash, first_hash,
+                        "Idempotent response should return same hash"
+                    );
+                    assert_eq!(resp.work_id, "W-test-idempotent-001");
+                },
+                other => panic!("Expected idempotent OpenWork, got: {other:?}"),
+            }
+
+            // Verify exactly 1 work.opened event exists (not 2)
+            let events = dispatcher
+                .event_emitter
+                .get_events_by_work_id("W-test-idempotent-001");
+            let opened_count = events
+                .iter()
+                .filter(|e| e.event_type == "work.opened")
+                .count();
+            assert_eq!(
+                opened_count, 1,
+                "Idempotent retry must not duplicate events"
+            );
+        }
+
+        #[test]
+        fn test_open_work_different_hash_already_exists() {
+            // Opening the same work_id with a DIFFERENT spec should return
+            // ALREADY_EXISTS error.
+            let dispatcher = open_work_dispatcher_with_cas();
+            let ctx = test_open_work_ctx();
+
+            // First call: create work item
+            let spec1 = serde_json::json!({
+                "schema": "apm2.work_spec.v1",
+                "work_id": "W-test-mismatch-001",
+                "title": "Original title",
+                "work_type": "TICKET"
+            });
+            let request1 = OpenWorkRequest {
+                work_spec_json: serde_json::to_vec(&spec1).unwrap(),
+            };
+            let mut buf1 = Vec::new();
+            request1.encode(&mut buf1).expect("encode");
+
+            let result1 = dispatcher.handle_open_work(&buf1, &ctx);
+            assert!(result1.is_ok());
+            match result1.unwrap() {
+                PrivilegedResponse::OpenWork(resp) => {
+                    assert!(!resp.already_existed);
+                },
+                other => panic!("Expected OpenWork success, got: {other:?}"),
+            }
+
+            // Second call: same work_id but different title (different hash)
+            let spec2 = serde_json::json!({
+                "schema": "apm2.work_spec.v1",
+                "work_id": "W-test-mismatch-001",
+                "title": "Modified title",
+                "work_type": "TICKET"
+            });
+            let request2 = OpenWorkRequest {
+                work_spec_json: serde_json::to_vec(&spec2).unwrap(),
+            };
+            let mut buf2 = Vec::new();
+            request2.encode(&mut buf2).expect("encode");
+
+            let result2 = dispatcher.handle_open_work(&buf2, &ctx);
+            assert!(result2.is_ok());
+            match result2.unwrap() {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::WorkAlreadyExists),
+                        "Different spec hash should return WORK_ALREADY_EXISTS"
+                    );
+                    assert!(
+                        err.message.contains("already exists"),
+                        "Error message should mention already exists: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected ALREADY_EXISTS error, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_open_work_emits_exactly_one_event() {
+            // Verify that a successful OpenWork emits exactly 1 work.opened
+            // event.
+            let dispatcher = open_work_dispatcher_with_cas();
+            let ctx = test_open_work_ctx();
+            let spec_bytes = test_work_spec_json("W-test-event-count-001");
+            let request = OpenWorkRequest {
+                work_spec_json: spec_bytes,
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let result = dispatcher.handle_open_work(&buf, &ctx);
+            assert!(result.is_ok());
+
+            let events = dispatcher
+                .event_emitter
+                .get_events_by_work_id("W-test-event-count-001");
+            let opened_count = events
+                .iter()
+                .filter(|e| e.event_type == "work.opened")
+                .count();
+            assert_eq!(
+                opened_count, 1,
+                "OpenWork must emit exactly 1 work.opened event"
+            );
+        }
+
+        #[test]
+        fn test_extract_spec_hash_from_event_payload_valid() {
+            // Verify the helper correctly extracts spec hash from a
+            // JSON-enveloped hex-encoded protobuf payload.
+            let spec_hash = [0xAB_u8; 32];
+            let protobuf_payload = apm2_core::work::helpers::work_opened_payload(
+                "W-test-extract",
+                "TICKET",
+                spec_hash.to_vec(),
+                vec![],
+                vec![],
+            );
+            let envelope = serde_json::json!({
+                "event_type": "work.opened",
+                "session_id": "W-test-extract",
+                "actor_id": "test-actor",
+                "payload": hex::encode(&protobuf_payload),
+            });
+            let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
+
+            let extracted =
+                PrivilegedDispatcher::extract_spec_hash_from_event_payload(&envelope_bytes);
+            assert_eq!(
+                extracted,
+                Some(spec_hash),
+                "Should extract the exact spec_snapshot_hash"
+            );
+        }
+
+        #[test]
+        fn test_extract_spec_hash_from_invalid_payload_returns_none() {
+            // Invalid JSON → None
+            let result = PrivilegedDispatcher::extract_spec_hash_from_event_payload(b"not json");
+            assert_eq!(result, None);
+
+            // Missing payload field → None
+            let envelope = serde_json::json!({"event_type": "work.opened"});
+            let bytes = serde_json::to_vec(&envelope).unwrap();
+            let result = PrivilegedDispatcher::extract_spec_hash_from_event_payload(&bytes);
+            assert_eq!(result, None);
+
+            // Invalid hex → None
+            let envelope = serde_json::json!({
+                "event_type": "work.opened",
+                "payload": "not_hex_zzzz",
+            });
+            let bytes = serde_json::to_vec(&envelope).unwrap();
+            let result = PrivilegedDispatcher::extract_spec_hash_from_event_payload(&bytes);
+            assert_eq!(result, None);
         }
 
         #[test]
