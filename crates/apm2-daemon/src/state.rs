@@ -1904,15 +1904,26 @@ impl DispatcherState {
     /// Returns an error if either freeze call fails. The freeze guard is
     /// still activated (fail-closed) — the error is for observability.
     pub fn freeze_legacy_writes(&self) -> Result<(), String> {
-        self.privileged_dispatcher
+        // Attempt BOTH freeze operations regardless of first failure so that
+        // a transient SQLite error on one writer does not leave the other
+        // unfrozen.  Both AtomicBool guards are set unconditionally inside
+        // freeze_legacy_writes, so even on error the writer is frozen
+        // (fail-closed).
+        let emitter_result = self
+            .privileged_dispatcher
             .event_emitter()
             .freeze_legacy_writes()
-            .map_err(|e| format!("emitter freeze_legacy_writes failed: {e}"))?;
-        self.privileged_dispatcher
+            .map_err(|e| format!("emitter freeze_legacy_writes failed: {e}"));
+        let lease_result = self
+            .privileged_dispatcher
             .lease_validator()
             .freeze_legacy_writes()
-            .map_err(|e| format!("lease_validator freeze_legacy_writes failed: {e}"))?;
-        Ok(())
+            .map_err(|e| format!("lease_validator freeze_legacy_writes failed: {e}"));
+        match (emitter_result, lease_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e1), Err(e2)) => Err(format!("both freeze failed: {e1}; {e2}")),
+            (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+        }
     }
 
     /// Configures TCK-00565 token binding fields on the dispatcher.
