@@ -98,7 +98,6 @@
       {"path": "@documents/skills/rust-standards/references/33_performance_measurement.md", "purpose": "Performance contracts, benchmark methodology, code-size/monomorphization control."},
       {"path": "@documents/skills/rust-standards/references/35_cfg_features_build_matrix.md", "purpose": "Dark-code control, build matrix coverage, feature stability, fail-closed flags."},
       {"path": "@documents/skills/rust-standards/references/37_macros_buildscripts_proc_macros.md", "purpose": "Macro hygiene, hidden unsafe prevention, build-time execution control."},
-      {"path": "@documents/skills/rust-standards/references/38_ffi_and_abi.md", "purpose": "FFI validity, ABI unwinding, ownership transfer, safe wrapper patterns."},
       {"path": "@documents/skills/rust-standards/references/40_time_monotonicity_determinism.md", "purpose": "Monotonic clocks, wall-clock hazards, distributed ordering, defensive duration handling."},
       {"path": "@documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md", "purpose": "APM2-specific: typed IDs, secret redaction, state machines, atomic writes, identity boundaries."},
       {"path": "@documents/skills/rust-standards/references/03_compilation_pipeline.md", "purpose": "Phase-aware reasoning; macro expansion, dark code, drop/borrow checking semantics."},
@@ -122,7 +121,8 @@
       {"path": "@documents/skills/rust-standards/references/44_deterministic_simulated_testing.md", "purpose": "Deterministic simulated testing — test isolation, reproducibility, nondeterminism elimination, side-effect capture, simulation harnesses."},
       {"path": "@documents/skills/modes-of-reasoning/assets/06-constraint-satisfiability.json", "purpose": "REQUIRED REASONING MODE: Encode invariants as constraints — verify all contracts and invariants still hold after the change."},
       {"path": "@documents/skills/modes-of-reasoning/assets/07-type-theoretic.json", "purpose": "REQUIRED REASONING MODE: Type-level reasoning — verify types encode the right invariants and invalid states cannot be constructed."},
-      {"path": "@documents/skills/modes-of-reasoning/assets/08-counterexample-guided.json", "purpose": "REQUIRED REASONING MODE: Counterexample search — find concrete inputs or states that violate claimed properties."}
+      {"path": "@documents/skills/modes-of-reasoning/assets/08-counterexample-guided.json", "purpose": "REQUIRED REASONING MODE: Counterexample search — find concrete inputs or states that violate claimed properties."},
+      {"path": "@documents/prompts/instruction.alien_coding.v1.json", "purpose": "Alien coding instruction set — exotic implementation patterns and constraints that may appear in reviewed code."}
     ],
     "decision_tree": {
       "entrypoint": "STEP_1_PREPARE",
