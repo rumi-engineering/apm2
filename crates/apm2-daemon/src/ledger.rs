@@ -89,10 +89,12 @@ const REDUNDANCY_RECEIPT_CONSUMED_EVENT: &str = "redundancy_receipt_consumed";
 /// over **all** `evidence.published` events for a `work_id`, performing per-row
 /// JSON + Protobuf deserialization — an `O(N)` `DoS` vector.
 ///
-/// The constant is deliberately generous (1 000 rows): legitimate work items
-/// should never have anywhere near that many evidence events for a single
-/// `work_id`. If the matching event is not found within this window the lookup
-/// returns `None`, which causes the caller to attempt a fresh publish.
+/// TCK-00638: This constant is no longer used in production code — the
+/// scan-bounded lookups were replaced with O(1) indexed lookups via
+/// `json_extract(CAST(payload AS TEXT), '$.evidence_id')`. Retained for the
+/// regression test `test_evidence_lookup_is_indexed_not_scan_bounded` which
+/// verifies the indexed path handles more events than the old scan limit.
+#[cfg(test)]
 const MAX_EVIDENCE_SCAN_ROWS: u32 = 1_000;
 
 #[derive(Debug)]
@@ -351,6 +353,13 @@ impl SqliteLedgerEventEmitter {
     /// events are written to the canonical `events` table. This helper
     /// ensures replay/idempotency lookup covers canonical-mode writes.
     ///
+    /// TCK-00638 SECURITY FIX: Uses an indexed lookup via
+    /// `json_extract(CAST(payload AS TEXT), '$.evidence_id')` (backed by
+    /// `idx_canonical_evidence_published_unique`) instead of scanning up to
+    /// `MAX_EVIDENCE_SCAN_ROWS` with per-row protobuf decoding. This
+    /// eliminates the false-negative risk in long-lived work streams with
+    /// >1000 evidence entries.
+    ///
     /// Column mapping: `events.session_id` → `work_id` (same mapping as
     /// `canonical_row_to_event`).
     fn canonical_get_evidence_by_identity(
@@ -358,66 +367,26 @@ impl SqliteLedgerEventEmitter {
         work_id: &str,
         entry_id: &str,
     ) -> Option<SignedLedgerEvent> {
-        use prost::Message;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT seq_id, event_type, session_id, actor_id, payload, \
-                        COALESCE(signature, X''), timestamp_ns \
-                 FROM events \
-                 WHERE event_type = 'evidence.published' \
-                 AND session_id = ?1 \
-                 ORDER BY rowid DESC \
-                 LIMIT ?2",
-            )
-            .ok()?;
-
-        let rows = stmt
-            .query_map(
-                params![work_id, MAX_EVIDENCE_SCAN_ROWS],
-                Self::canonical_row_to_event,
-            )
-            .ok()?;
-
-        for row_result in rows {
-            let Ok(event) = row_result else {
-                continue;
-            };
-
-            // Decode JSON envelope: { "payload": "<hex-encoded protobuf>", ... }
-            let Ok(payload_json) = serde_json::from_slice::<serde_json::Value>(&event.payload)
-            else {
-                continue;
-            };
-            let Some(hex_payload) = payload_json.get("payload").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Ok(inner_bytes) = hex::decode(hex_payload) else {
-                continue;
-            };
-
-            // Decode protobuf EvidenceEvent and extract Published variant.
-            let Ok(evidence_event) =
-                apm2_core::events::EvidenceEvent::decode(inner_bytes.as_slice())
-            else {
-                continue;
-            };
-            let Some(apm2_core::events::evidence_event::Event::Published(published)) =
-                evidence_event.event
-            else {
-                continue;
-            };
-
-            // Semantic match: category, work_id, and evidence_id must all match.
-            if published.category == "WORK_CONTEXT_ENTRY"
-                && published.work_id == work_id
-                && published.evidence_id == entry_id
-            {
-                return Some(event);
-            }
-        }
-
-        None
+        // O(1) indexed lookup using the UNIQUE index on
+        // json_extract(CAST(payload AS TEXT), '$.evidence_id'). No scan, no
+        // protobuf decode — the evidence_id is at the top level of the JSON
+        // envelope. CAST is required because the payload column is BLOB and
+        // SQLite < 3.45 does not support json_extract on BLOB directly.
+        conn.query_row(
+            "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                    COALESCE(signature, X''), timestamp_ns \
+             FROM events \
+             WHERE event_type = 'evidence.published' \
+             AND session_id = ?1 \
+             AND json_extract(CAST(payload AS TEXT), '$.evidence_id') = ?2 \
+             ORDER BY rowid DESC \
+             LIMIT 1",
+            params![work_id, entry_id],
+            Self::canonical_row_to_event,
+        )
+        .optional()
+        .ok()
+        .flatten()
     }
 
     /// Canonical-table latest event hash (BLOB → hex), for
@@ -736,6 +705,18 @@ impl SqliteLedgerEventEmitter {
             [],
         )?;
 
+        // TCK-00638 SECURITY FIX: At-most-one evidence.published per
+        // evidence_id on the legacy `ledger_events` table.  The evidence_id
+        // is surfaced at the top level of the JSON payload by
+        // `emit_evidence_published_event` so that `json_extract` can enforce
+        // uniqueness without decoding the nested hex-encoded protobuf.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_evidence_published_unique \
+             ON ledger_events(json_extract(CAST(payload AS TEXT), '$.evidence_id')) \
+             WHERE event_type = 'evidence.published'",
+            [],
+        )?;
+
         // SECURITY (f-781-security-1771692992655093-0 — Canonical Events
         // Uniqueness Constraint):
         //
@@ -783,6 +764,36 @@ impl SqliteLedgerEventEmitter {
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_work_opened_unique \
                  ON events(session_id) \
                  WHERE event_type = 'work.opened'",
+                [],
+            )?;
+
+            // TCK-00638 SECURITY FIX: At-most-one evidence.published per
+            // evidence_id on the canonical `events` table. Mirrors
+            // `idx_evidence_published_unique` on the legacy table.
+            //
+            // Historical duplicate handling: before creating the unique
+            // index, deduplicate any pre-existing `evidence.published` rows
+            // by keeping only the earliest row (MIN(rowid)) per evidence_id.
+            let canonical_evidence_dedup = conn.execute(
+                "DELETE FROM events WHERE rowid NOT IN ( \
+                     SELECT MIN(rowid) FROM events \
+                     WHERE event_type = 'evidence.published' \
+                     GROUP BY json_extract(CAST(payload AS TEXT), '$.evidence_id') \
+                 ) AND event_type = 'evidence.published' \
+                 AND json_extract(CAST(payload AS TEXT), '$.evidence_id') IS NOT NULL",
+                [],
+            )?;
+            if canonical_evidence_dedup > 0 {
+                warn!(
+                    count = canonical_evidence_dedup,
+                    "deduped historical evidence.published rows in canonical events table"
+                );
+                migration_changes_applied = true;
+            }
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_evidence_published_unique \
+                 ON events(json_extract(CAST(payload AS TEXT), '$.evidence_id')) \
+                 WHERE event_type = 'evidence.published'",
                 [],
             )?;
         }
@@ -2373,6 +2384,71 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         Ok(signed_event)
     }
 
+    /// TCK-00638 SECURITY FIX: Emit `evidence.published` with `evidence_id`
+    /// surfaced in the JSON envelope for UNIQUE index enforcement.
+    ///
+    /// The canonical `events` table has a partial UNIQUE index on
+    /// `json_extract(CAST(payload AS TEXT), '$.evidence_id') WHERE event_type =
+    /// 'evidence.published'` that prevents duplicate evidence events at the
+    /// database level. The legacy `ledger_events` table has an analogous
+    /// index on `json_extract(CAST(payload AS TEXT), '$.evidence_id')`.
+    /// CAST is required because the payload column is BLOB and `SQLite` < 3.45
+    /// does not support `json_extract` on BLOB directly.
+    ///
+    /// By including `evidence_id` at the top level of the JSON envelope,
+    /// `SQLite`'s `json_extract` can enforce uniqueness without decoding the
+    /// nested hex-encoded protobuf payload.
+    fn emit_evidence_published_event(
+        &self,
+        session_id: &str,
+        payload: &[u8],
+        actor_id: &str,
+        timestamp_ns: u64,
+        evidence_id: &str,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        // Domain prefix for generic session events (TCK-00290)
+        const SESSION_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_event:";
+
+        // Build payload as JSON with evidence_id at the top level for UNIQUE
+        // index enforcement. The evidence_id is deterministically derived from
+        // (work_id, kind, dedupe_key) and matches the protobuf's evidence_id.
+        let payload_json = serde_json::json!({
+            "event_type": "evidence.published",
+            "session_id": session_id,
+            "actor_id": actor_id,
+            "payload": hex::encode(payload),
+            "evidence_id": evidence_id,
+        });
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LedgerEventError::PersistenceFailed {
+                message: "connection lock poisoned".to_string(),
+            })?;
+        let prev_hash = self.latest_event_hash_routed(&conn)?;
+        let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
+            "evidence.published",
+            session_id, // Use session_id as work_id for indexing
+            actor_id,
+            payload_json,
+            timestamp_ns,
+            SESSION_EVENT_DOMAIN_PREFIX,
+            &prev_hash,
+        )?;
+        self.persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
+
+        info!(
+            event_id = %signed_event.event_id,
+            session_id = %session_id,
+            evidence_id = %evidence_id,
+            actor_id = %actor_id,
+            "Persisted evidence.published event with evidence_id for UNIQUE enforcement"
+        );
+
+        Ok(signed_event)
+    }
+
     fn emit_stop_flags_mutated(
         &self,
         mutation: &StopFlagsMutation<'_>,
@@ -3129,13 +3205,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         work_id: &str,
         entry_id: &str,
     ) -> Option<SignedLedgerEvent> {
-        use prost::Message;
-
-        // Fetch ALL evidence.published events for this work_id (bounded by
-        // rowid DESC ordering). We decode the JSON envelope → hex payload →
-        // protobuf to verify category=WORK_CONTEXT_ENTRY, work_id match,
-        // and evidence_id == entry_id before returning. This prevents false
-        // idempotency hits when multiple entries exist for the same work_id.
         let conn = self.conn.lock().ok()?;
 
         // TCK-00638 / BLOCKER fix: When frozen, also search the canonical
@@ -3148,19 +3217,23 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             }
         }
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns \
-                 FROM ledger_events \
-                 WHERE event_type = 'evidence.published' \
-                 AND work_id = ?1 \
-                 ORDER BY rowid DESC \
-                 LIMIT ?2",
-            )
-            .ok()?;
-
-        let rows = stmt
-            .query_map(params![work_id, MAX_EVIDENCE_SCAN_ROWS], |row| {
+        // TCK-00638 SECURITY FIX: Use O(1) indexed lookup via
+        // json_extract(CAST(payload AS TEXT), '$.evidence_id') backed by
+        // `idx_evidence_published_unique`. This replaces the previous
+        // O(N) scan with per-row protobuf decoding bounded by
+        // MAX_EVIDENCE_SCAN_ROWS, which could miss duplicates in
+        // long-lived work streams with >1000 evidence entries.
+        // CAST is required because the payload column is BLOB and
+        // SQLite < 3.45 does not support json_extract on BLOB directly.
+        conn.query_row(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns \
+             FROM ledger_events \
+             WHERE event_type = 'evidence.published' \
+             AND work_id = ?1 \
+             AND json_extract(CAST(payload AS TEXT), '$.evidence_id') = ?2 \
+             ORDER BY rowid DESC LIMIT 1",
+            params![work_id, entry_id],
+            |row| {
                 Ok(SignedLedgerEvent {
                     event_id: row.get(0)?,
                     event_type: row.get(1)?,
@@ -3170,48 +3243,11 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
                     signature: row.get(5)?,
                     timestamp_ns: row.get(6)?,
                 })
-            })
-            .ok()?;
-
-        for row_result in rows {
-            let Ok(event) = row_result else {
-                continue;
-            };
-
-            // Decode JSON envelope: { "payload": "<hex-encoded protobuf>", ... }
-            let Ok(payload_json) = serde_json::from_slice::<serde_json::Value>(&event.payload)
-            else {
-                continue;
-            };
-            let Some(hex_payload) = payload_json.get("payload").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Ok(inner_bytes) = hex::decode(hex_payload) else {
-                continue;
-            };
-
-            // Decode protobuf EvidenceEvent and extract Published variant.
-            let Ok(evidence_event) =
-                apm2_core::events::EvidenceEvent::decode(inner_bytes.as_slice())
-            else {
-                continue;
-            };
-            let Some(apm2_core::events::evidence_event::Event::Published(published)) =
-                evidence_event.event
-            else {
-                continue;
-            };
-
-            // Semantic match: category, work_id, and evidence_id must all match.
-            if published.category == "WORK_CONTEXT_ENTRY"
-                && published.work_id == work_id
-                && published.evidence_id == entry_id
-            {
-                return Some(event);
-            }
-        }
-
-        None
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
     }
 
     fn get_work_transition_count(&self, work_id: &str) -> u32 {
@@ -7881,29 +7917,30 @@ mod tests {
             event.encode_to_vec()
         };
 
-        // Emit first evidence event via emit_session_event (which wraps in
-        // JSON envelope with hex-encoded protobuf). Session_id is used as
+        // Emit first evidence event via emit_evidence_published_event (which
+        // wraps in JSON envelope with hex-encoded protobuf and top-level
+        // evidence_id for UNIQUE index enforcement). Session_id is used as
         // work_id in the ledger, so pass the work_id as session_id.
         let proto_a = make_evidence_protobuf("CTX-entry-A", 0xAA);
         let event_a = emitter
-            .emit_session_event(
+            .emit_evidence_published_event(
                 "W-IDEM-TEST",
-                "evidence.published",
                 &proto_a,
                 "actor-test",
                 1_000_000_000,
+                "CTX-entry-A",
             )
             .expect("first evidence event should emit");
 
         // Emit second evidence event with a DIFFERENT evidence_id.
         let proto_b = make_evidence_protobuf("CTX-entry-B", 0xBB);
         let event_b = emitter
-            .emit_session_event(
+            .emit_evidence_published_event(
                 "W-IDEM-TEST",
-                "evidence.published",
                 &proto_b,
                 "actor-test",
                 2_000_000_000,
+                "CTX-entry-B",
             )
             .expect("second evidence event should emit");
 
@@ -7981,7 +8018,7 @@ mod tests {
         }
         assert!(emitter.is_frozen(), "emitter must be frozen");
 
-        // 4. Emit an evidence.published event via emit_session_event.
+        // 4. Emit an evidence.published event via emit_evidence_published_event.
         // This write goes to the canonical `events` table (not legacy).
         let published = apm2_core::events::EvidencePublished {
             evidence_id: "CTX-canonical-entry".to_string(),
@@ -8007,14 +8044,14 @@ mod tests {
         let proto_bytes = evidence_event.encode_to_vec();
 
         let emit_result = emitter
-            .emit_session_event(
+            .emit_evidence_published_event(
                 "W-CANONICAL-TEST",
-                "evidence.published",
                 &proto_bytes,
                 "actor-canonical",
                 5_000_000_000,
+                "CTX-canonical-entry",
             )
-            .expect("emit_session_event must succeed in frozen mode");
+            .expect("emit_evidence_published_event must succeed in frozen mode");
 
         // 5. Verify the event was written to canonical `events` (not legacy).
         {
@@ -8088,15 +8125,16 @@ mod tests {
     }
 
     /// BLOCKER regression: `get_event_by_evidence_identity` must scan at most
-    /// `MAX_EVIDENCE_SCAN_ROWS` events, preventing `O(N)` `DoS` via unbounded
-    /// iteration with per-row JSON + Protobuf deserialization.
+    /// TCK-00638 SECURITY FIX: With the UNIQUE index on
+    /// `json_extract(CAST(payload AS TEXT), '$.evidence_id')`, lookups are now
+    /// O(1) indexed instead of O(N) scan with per-row protobuf decoding.
     ///
-    /// This test publishes more than `MAX_EVIDENCE_SCAN_ROWS` evidence events
-    /// under the same `work_id` and verifies the lookup still returns `None`
-    /// for a non-existent `entry_id` (proving the scan is bounded and does
-    /// not panic or hang).
+    /// This test publishes more than the previous `MAX_EVIDENCE_SCAN_ROWS`
+    /// evidence events under the same `work_id` and verifies the indexed
+    /// lookup returns `None` for a non-existent `entry_id` and correctly
+    /// finds existing entries regardless of position.
     #[test]
-    fn test_evidence_scan_is_bounded_by_max_rows() {
+    fn test_evidence_lookup_is_indexed_not_scan_bounded() {
         use prost::Message;
 
         let emitter = test_emitter();
@@ -8105,7 +8143,8 @@ mod tests {
         let actor_id = "test-actor";
 
         // Publish MAX_EVIDENCE_SCAN_ROWS + 10 events with distinct entry_ids.
-        // Each uses a valid protobuf payload with a unique evidence_id.
+        // Each uses emit_evidence_published_event with evidence_id at the
+        // top level of the JSON envelope for UNIQUE index enforcement.
         let event_count = MAX_EVIDENCE_SCAN_ROWS + 10;
         for i in 0..event_count {
             let evidence_id = format!("CTX-dos-entry-{i:06}");
@@ -8128,31 +8167,135 @@ mod tests {
             let proto_bytes = event.encode_to_vec();
 
             emitter
-                .emit_session_event(
+                .emit_evidence_published_event(
                     work_id,
-                    "evidence.published",
                     &proto_bytes,
                     actor_id,
                     1_000_000_000 + u64::from(i),
+                    &evidence_id,
                 )
                 .expect("emit must succeed");
         }
 
-        // Lookup a non-existent entry_id — must return None without unbounded
-        // iteration (the LIMIT in the SQL query bounds the scan).
+        // Lookup a non-existent entry_id — must return None via indexed
+        // lookup (no scan needed).
         let result = emitter.get_event_by_evidence_identity(work_id, "CTX-does-not-exist");
         assert!(
             result.is_none(),
             "Non-existent entry_id must return None even with > MAX_EVIDENCE_SCAN_ROWS events"
         );
 
-        // Lookup an entry_id that exists within the scan window (the most
-        // recent event). Must still be found.
+        // Lookup the most recent entry — must be found via indexed lookup.
         let last_id = format!("CTX-dos-entry-{:06}", event_count - 1);
         let found = emitter.get_event_by_evidence_identity(work_id, &last_id);
         assert!(
             found.is_some(),
-            "Most recent entry must be findable within the bounded scan window"
+            "Most recent entry must be findable via indexed lookup"
+        );
+
+        // TCK-00638 FIX: Lookup the FIRST entry — must ALSO be found since
+        // the indexed lookup does not have a scan window limitation.
+        let first_id = "CTX-dos-entry-000000";
+        let found_first = emitter.get_event_by_evidence_identity(work_id, first_id);
+        assert!(
+            found_first.is_some(),
+            "First entry must be findable via indexed lookup (no scan truncation)"
+        );
+    }
+
+    /// TCK-00638 SECURITY: Verify that the UNIQUE constraint on
+    /// `json_extract(CAST(payload AS TEXT), '$.evidence_id')` rejects duplicate
+    /// `evidence.published` events for the same `evidence_id`.
+    ///
+    /// Concurrent `PublishWorkContextEntry` requests that race past the
+    /// application-level idempotency check must be caught by the DB UNIQUE
+    /// index, causing `emit_evidence_published_event` to return an error
+    /// that triggers the `find_work_context_published_replay` fallback.
+    #[test]
+    fn test_evidence_published_unique_constraint_rejects_duplicate() {
+        use prost::Message;
+
+        let emitter = test_emitter();
+
+        let make_proto = |evidence_id: &str| {
+            let published = apm2_core::events::EvidencePublished {
+                evidence_id: evidence_id.to_string(),
+                work_id: "W-UNIQUE-TEST".to_string(),
+                category: "WORK_CONTEXT_ENTRY".to_string(),
+                artifact_hash: vec![0xDD; 32],
+                verification_command_ids: Vec::new(),
+                classification: "INTERNAL".to_string(),
+                artifact_size: 64,
+                metadata: vec![],
+                time_envelope_ref: None,
+            };
+            let event = apm2_core::events::EvidenceEvent {
+                event: Some(apm2_core::events::evidence_event::Event::Published(
+                    published,
+                )),
+            };
+            event.encode_to_vec()
+        };
+
+        let proto = make_proto("CTX-unique-entry");
+
+        // First emit succeeds.
+        let first = emitter
+            .emit_evidence_published_event(
+                "W-UNIQUE-TEST",
+                &proto,
+                "actor-test",
+                1_000_000_000,
+                "CTX-unique-entry",
+            )
+            .expect("first emit must succeed");
+
+        // Second emit with the SAME evidence_id must fail with UNIQUE
+        // constraint violation.
+        let second = emitter.emit_evidence_published_event(
+            "W-UNIQUE-TEST",
+            &proto,
+            "actor-test",
+            2_000_000_000,
+            "CTX-unique-entry",
+        );
+        assert!(
+            second.is_err(),
+            "Duplicate evidence_id must be rejected by UNIQUE constraint; got: {second:?}"
+        );
+        let err_msg = format!("{}", second.unwrap_err());
+        assert!(
+            err_msg.contains("UNIQUE constraint failed"),
+            "Error must mention UNIQUE constraint: {err_msg}"
+        );
+
+        // Third emit with a DIFFERENT evidence_id must succeed (not falsely rejected).
+        let proto_different = make_proto("CTX-different-entry");
+        let third = emitter
+            .emit_evidence_published_event(
+                "W-UNIQUE-TEST",
+                &proto_different,
+                "actor-test",
+                3_000_000_000,
+                "CTX-different-entry",
+            )
+            .expect("different evidence_id must succeed");
+
+        // Verify lookup returns the correct event for each evidence_id.
+        let found_first =
+            emitter.get_event_by_evidence_identity("W-UNIQUE-TEST", "CTX-unique-entry");
+        assert_eq!(
+            found_first.as_ref().map(|e| &e.event_id),
+            Some(&first.event_id),
+            "lookup must return the first persisted event"
+        );
+
+        let found_third =
+            emitter.get_event_by_evidence_identity("W-UNIQUE-TEST", "CTX-different-entry");
+        assert_eq!(
+            found_third.as_ref().map(|e| &e.event_id),
+            Some(&third.event_id),
+            "lookup must return the third persisted event"
         );
     }
 }

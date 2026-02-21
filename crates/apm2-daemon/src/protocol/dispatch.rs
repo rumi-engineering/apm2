@@ -620,6 +620,41 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
+    /// Emits an `evidence.published` event with an explicit `evidence_id`
+    /// included in the top-level JSON envelope for database-level uniqueness
+    /// enforcement.
+    ///
+    /// TCK-00638 SECURITY FIX: The `evidence_id` is surfaced in the JSON
+    /// payload so that a partial UNIQUE index
+    /// (`json_extract(payload, '$.evidence_id') WHERE event_type =
+    /// 'evidence.published'`) can enforce at-most-once semantics at the
+    /// database level. Without this, concurrent `PublishWorkContextEntry`
+    /// requests could both succeed, producing duplicate ledger events.
+    ///
+    /// The default implementation delegates to `emit_session_event`; durable
+    /// backends override this to include the `evidence_id` field in the
+    /// JSON envelope and rely on the UNIQUE index for race-safe
+    /// idempotency.
+    fn emit_evidence_published_event(
+        &self,
+        session_id: &str,
+        payload: &[u8],
+        actor_id: &str,
+        timestamp_ns: u64,
+        evidence_id: &str,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        // Default: delegate to emit_session_event (in-memory backends
+        // override this with their own uniqueness check).
+        let _ = evidence_id; // suppress unused warning in default impl
+        self.emit_session_event(
+            session_id,
+            "evidence.published",
+            payload,
+            actor_id,
+            timestamp_ns,
+        )
+    }
+
     /// Returns whether emitted events are durably persisted.
     ///
     /// `false` indicates in-memory/test-only emitters where audit evidence
@@ -3301,6 +3336,121 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         false
     }
 
+    /// TCK-00638 SECURITY FIX: In-memory enforcement of at-most-one
+    /// `evidence.published` per `evidence_id`, mirroring the `SQLite` UNIQUE
+    /// index `idx_evidence_published_unique` /
+    /// `idx_canonical_evidence_published_unique`.
+    fn emit_evidence_published_event(
+        &self,
+        session_id: &str,
+        payload: &[u8],
+        actor_id: &str,
+        timestamp_ns: u64,
+        evidence_id: &str,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        const SESSION_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_event:";
+
+        // Check for existing evidence.published event with the same evidence_id
+        // before delegating to emit_session_event. This mirrors the UNIQUE
+        // constraint in SQLite.
+        {
+            let guard = self.events.read().expect("lock poisoned");
+            let (_order, events) = &*guard;
+            let already_exists = events.values().any(|e| {
+                if e.event_type != "evidence.published" {
+                    return false;
+                }
+                // Parse the JSON envelope to check evidence_id
+                serde_json::from_slice::<serde_json::Value>(&e.payload).is_ok_and(|json| {
+                    json.get("evidence_id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|eid| eid == evidence_id)
+                })
+            });
+            if already_exists {
+                return Err(LedgerEventError::PersistenceFailed {
+                    message: format!(
+                        "UNIQUE constraint failed: idx_evidence_published_unique \
+                         (duplicate evidence.published for evidence_id '{evidence_id}')"
+                    ),
+                });
+            }
+        }
+
+        // Build the JSON payload with evidence_id at the top level
+        // (same format as SqliteLedgerEventEmitter::emit_evidence_published_event)
+
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        let payload_json = serde_json::json!({
+            "event_type": "evidence.published",
+            "session_id": session_id,
+            "actor_id": actor_id,
+            "payload": hex::encode(payload),
+            "evidence_id": evidence_id,
+        });
+
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        let mut canonical_bytes =
+            Vec::with_capacity(SESSION_EVENT_DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(SESSION_EVENT_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "evidence.published".to_string(),
+            work_id: session_id.to_string(),
+            actor_id: actor_id.to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            // Evict oldest entries if at capacity
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(session_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        Ok(signed_event)
+    }
+
     fn emit_stop_flags_mutated(
         &self,
         mutation: &StopFlagsMutation<'_>,
@@ -3649,22 +3799,30 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         work_id: &str,
         entry_id: &str,
     ) -> Option<SignedLedgerEvent> {
-        use prost::Message;
-
-        // emit_session_event stores work_id as the event's work_id column
-        // (session_id -> work_id). We filter by event.work_id == work_id,
-        // then decode protobuf to verify category and evidence_id == entry_id.
+        // TCK-00638: First try O(1) lookup via the top-level evidence_id
+        // field in the JSON envelope (written by emit_evidence_published_event).
+        // This mirrors the indexed SQL lookup in SqliteLedgerEventEmitter.
         let guard = self.events.read().expect("lock poisoned");
         guard.1.values().find_map(|event| {
+            use prost::Message;
+
             if event.event_type != "evidence.published" || event.work_id != work_id {
                 return None;
             }
-            // The payload is a JSON envelope containing hex-encoded protobuf
-            // in the "payload" field. Decode to verify category and evidence_id.
             let payload_json = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
+
+            // Indexed path: check top-level evidence_id field.
+            if let Some(eid) = payload_json.get("evidence_id").and_then(|v| v.as_str()) {
+                if eid == entry_id {
+                    return Some(event.clone());
+                }
+                return None;
+            }
+
+            // Fallback for legacy events without top-level evidence_id:
+            // decode protobuf to verify category and evidence_id.
             let hex_payload = payload_json.get("payload")?.as_str()?;
             let inner_bytes = hex::decode(hex_payload).ok()?;
-
             let evidence_event =
                 apm2_core::events::EvidenceEvent::decode(inner_bytes.as_slice()).ok()?;
             let Some(apm2_core::events::evidence_event::Event::Published(published)) =
@@ -17926,12 +18084,17 @@ impl PrivilegedDispatcher {
             event.encode_to_vec()
         };
 
-        match self.event_emitter.emit_session_event(
+        // TCK-00638 SECURITY FIX: Use `emit_evidence_published_event` which
+        // surfaces the `evidence_id` in the JSON envelope for UNIQUE index
+        // enforcement. The DB UNIQUE constraint on
+        // `json_extract(payload, '$.evidence_id')` will reject concurrent
+        // duplicate submissions, triggering the fallback below.
+        match self.event_emitter.emit_evidence_published_event(
             &request.work_id,
-            "evidence.published",
             &evidence_event_payload,
             &actor_id,
             timestamp_ns,
+            &evidence_id,
         ) {
             Ok(signed_event) => {
                 info!(
