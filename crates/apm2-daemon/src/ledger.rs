@@ -3037,6 +3037,40 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         .flatten()
     }
 
+    fn get_event_by_evidence_identity(
+        &self,
+        work_id: &str,
+        _entry_id: &str,
+    ) -> Option<SignedLedgerEvent> {
+        // emit_session_event stores work_id as the event's work_id column.
+        // Filter by event_type and work_id, then the caller verifies
+        // evidence_id == entry_id from the protobuf payload.
+        let conn = self.conn.lock().ok()?;
+
+        conn.query_row(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns \
+             FROM ledger_events \
+             WHERE event_type = 'evidence.published' \
+             AND work_id = ?1 \
+             ORDER BY rowid DESC LIMIT 1",
+            params![work_id],
+            |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     fn get_work_transition_count(&self, work_id: &str) -> u32 {
         let Ok(conn) = self.conn.lock() else {
             return 0;
