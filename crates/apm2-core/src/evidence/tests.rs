@@ -333,6 +333,9 @@ fn test_category_requires_verification() {
         EvidenceCategory::ConfigSnapshots,
         EvidenceCategory::Documentation,
         EvidenceCategory::DeploymentRecords,
+        EvidenceCategory::WorkContextEntry,
+        EvidenceCategory::WorkAuthorityBindings,
+        EvidenceCategory::WorkLoopProfile,
     ];
 
     for category in verifiable {

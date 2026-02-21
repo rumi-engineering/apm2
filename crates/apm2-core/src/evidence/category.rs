@@ -47,6 +47,27 @@ pub enum EvidenceCategory {
 
     /// Bootstrap schema artifacts (immutable trust root).
     BootstrapSchema,
+
+    /// FAC work context entry evidence (RFC-0032).
+    ///
+    /// Anchors the serialized `WorkContextEntry` CAS schema describing the
+    /// execution context for a unit of work (ticket bindings, dependency
+    /// graph, scope constraints).
+    WorkContextEntry,
+
+    /// FAC work authority bindings evidence (RFC-0032).
+    ///
+    /// Anchors the serialized `WorkAuthorityBindings` CAS schema describing
+    /// the authority chain and delegation bindings attached to a work unit
+    /// (custody, responsibility domains, PCAC policy references).
+    WorkAuthorityBindings,
+
+    /// FAC work loop profile evidence (RFC-0032).
+    ///
+    /// Anchors the serialized `WorkLoopProfile` CAS schema describing the
+    /// execution loop telemetry for a work unit (iteration counts, gate
+    /// pass/fail history, resource consumption envelope).
+    WorkLoopProfile,
 }
 
 impl std::fmt::Display for EvidenceCategory {
@@ -78,6 +99,9 @@ impl EvidenceCategory {
             "BENCHMARKS" => Ok(Self::Benchmarks),
             "DEPLOYMENT_RECORDS" => Ok(Self::DeploymentRecords),
             "BOOTSTRAP_SCHEMA" => Ok(Self::BootstrapSchema),
+            "WORK_CONTEXT_ENTRY" => Ok(Self::WorkContextEntry),
+            "WORK_AUTHORITY_BINDINGS" => Ok(Self::WorkAuthorityBindings),
+            "WORK_LOOP_PROFILE" => Ok(Self::WorkLoopProfile),
             _ => Err(EvidenceError::InvalidCategory {
                 value: s.to_string(),
             }),
@@ -99,6 +123,9 @@ impl EvidenceCategory {
             Self::Benchmarks => "BENCHMARKS",
             Self::DeploymentRecords => "DEPLOYMENT_RECORDS",
             Self::BootstrapSchema => "BOOTSTRAP_SCHEMA",
+            Self::WorkContextEntry => "WORK_CONTEXT_ENTRY",
+            Self::WorkAuthorityBindings => "WORK_AUTHORITY_BINDINGS",
+            Self::WorkLoopProfile => "WORK_LOOP_PROFILE",
         }
     }
 
@@ -117,6 +144,9 @@ impl EvidenceCategory {
             Self::Benchmarks,
             Self::DeploymentRecords,
             Self::BootstrapSchema,
+            Self::WorkContextEntry,
+            Self::WorkAuthorityBindings,
+            Self::WorkLoopProfile,
         ]
     }
 
@@ -134,7 +164,10 @@ impl EvidenceCategory {
             | Self::ConfigSnapshots
             | Self::Documentation
             | Self::DeploymentRecords
-            | Self::BootstrapSchema => false,
+            | Self::BootstrapSchema
+            | Self::WorkContextEntry
+            | Self::WorkAuthorityBindings
+            | Self::WorkLoopProfile => false,
         }
     }
 }
@@ -197,6 +230,30 @@ mod unit_tests {
             EvidenceCategory::parse("bootstrap_schema").unwrap(),
             EvidenceCategory::BootstrapSchema
         );
+        assert_eq!(
+            EvidenceCategory::parse("WORK_CONTEXT_ENTRY").unwrap(),
+            EvidenceCategory::WorkContextEntry
+        );
+        assert_eq!(
+            EvidenceCategory::parse("work_context_entry").unwrap(),
+            EvidenceCategory::WorkContextEntry
+        );
+        assert_eq!(
+            EvidenceCategory::parse("WORK_AUTHORITY_BINDINGS").unwrap(),
+            EvidenceCategory::WorkAuthorityBindings
+        );
+        assert_eq!(
+            EvidenceCategory::parse("work_authority_bindings").unwrap(),
+            EvidenceCategory::WorkAuthorityBindings
+        );
+        assert_eq!(
+            EvidenceCategory::parse("WORK_LOOP_PROFILE").unwrap(),
+            EvidenceCategory::WorkLoopProfile
+        );
+        assert_eq!(
+            EvidenceCategory::parse("work_loop_profile").unwrap(),
+            EvidenceCategory::WorkLoopProfile
+        );
     }
 
     #[test]
@@ -233,6 +290,18 @@ mod unit_tests {
             EvidenceCategory::BootstrapSchema.as_str(),
             "BOOTSTRAP_SCHEMA"
         );
+        assert_eq!(
+            EvidenceCategory::WorkContextEntry.as_str(),
+            "WORK_CONTEXT_ENTRY"
+        );
+        assert_eq!(
+            EvidenceCategory::WorkAuthorityBindings.as_str(),
+            "WORK_AUTHORITY_BINDINGS"
+        );
+        assert_eq!(
+            EvidenceCategory::WorkLoopProfile.as_str(),
+            "WORK_LOOP_PROFILE"
+        );
     }
 
     #[test]
@@ -243,11 +312,14 @@ mod unit_tests {
     #[test]
     fn test_category_all() {
         let all = EvidenceCategory::all();
-        assert_eq!(all.len(), 11);
+        assert_eq!(all.len(), 14);
         assert!(all.contains(&EvidenceCategory::TestResults));
         assert!(all.contains(&EvidenceCategory::LintReports));
         assert!(all.contains(&EvidenceCategory::DeploymentRecords));
         assert!(all.contains(&EvidenceCategory::BootstrapSchema));
+        assert!(all.contains(&EvidenceCategory::WorkContextEntry));
+        assert!(all.contains(&EvidenceCategory::WorkAuthorityBindings));
+        assert!(all.contains(&EvidenceCategory::WorkLoopProfile));
     }
 
     #[test]
@@ -264,6 +336,9 @@ mod unit_tests {
         assert!(!EvidenceCategory::Documentation.requires_verification());
         assert!(!EvidenceCategory::DeploymentRecords.requires_verification());
         assert!(!EvidenceCategory::BootstrapSchema.requires_verification());
+        assert!(!EvidenceCategory::WorkContextEntry.requires_verification());
+        assert!(!EvidenceCategory::WorkAuthorityBindings.requires_verification());
+        assert!(!EvidenceCategory::WorkLoopProfile.requires_verification());
     }
 
     #[test]
@@ -272,6 +347,94 @@ mod unit_tests {
             let s = category.as_str();
             let parsed = EvidenceCategory::parse(s).unwrap();
             assert_eq!(*category, parsed);
+        }
+    }
+
+    /// RFC-0032 Phase 1: round-trip stability for FAC evidence anchor
+    /// categories.
+    ///
+    /// Verifies that each new category:
+    /// 1. Survives `as_str()` -> `parse()` round-trip with exact token
+    ///    equality.
+    /// 2. Survives case-insensitive `parse()` from lowercase form.
+    /// 3. Has a stable canonical string that does not change across
+    ///    serialization/deserialization (serde round-trip via JSON).
+    #[test]
+    fn test_rfc0032_fac_category_roundtrip_stability() {
+        let fac_categories = [
+            (EvidenceCategory::WorkContextEntry, "WORK_CONTEXT_ENTRY"),
+            (
+                EvidenceCategory::WorkAuthorityBindings,
+                "WORK_AUTHORITY_BINDINGS",
+            ),
+            (EvidenceCategory::WorkLoopProfile, "WORK_LOOP_PROFILE"),
+        ];
+
+        for (variant, expected_str) in fac_categories {
+            // as_str() produces the expected canonical token
+            assert_eq!(
+                variant.as_str(),
+                expected_str,
+                "as_str() mismatch for {variant:?}"
+            );
+
+            // parse(canonical) round-trips exactly
+            let parsed =
+                EvidenceCategory::parse(expected_str).expect("parse canonical should succeed");
+            assert_eq!(parsed, variant, "parse(canonical) mismatch for {variant:?}");
+
+            // parse(lowercase) round-trips via case-insensitive path
+            let lower = expected_str.to_lowercase();
+            let parsed_lower =
+                EvidenceCategory::parse(&lower).expect("parse lowercase should succeed");
+            assert_eq!(
+                parsed_lower, variant,
+                "parse(lowercase) mismatch for {variant:?}"
+            );
+
+            // Display uses the canonical string
+            assert_eq!(
+                format!("{variant}"),
+                expected_str,
+                "Display mismatch for {variant:?}"
+            );
+
+            // Serde JSON round-trip stability
+            let json =
+                serde_json::to_string(&variant).expect("serde_json::to_string should succeed");
+            let deserialized: EvidenceCategory =
+                serde_json::from_str(&json).expect("serde_json::from_str should succeed");
+            assert_eq!(
+                deserialized, variant,
+                "serde JSON round-trip mismatch for {variant:?}"
+            );
+        }
+    }
+
+    /// Verify that existing category canonical strings have not changed
+    /// (backwards compatibility).
+    #[test]
+    fn test_existing_category_strings_unchanged() {
+        let expected = [
+            (EvidenceCategory::TestResults, "TEST_RESULTS"),
+            (EvidenceCategory::LintReports, "LINT_REPORTS"),
+            (EvidenceCategory::BuildArtifacts, "BUILD_ARTIFACTS"),
+            (EvidenceCategory::SecurityScans, "SECURITY_SCANS"),
+            (EvidenceCategory::ReviewRecords, "REVIEW_RECORDS"),
+            (EvidenceCategory::AuditLogs, "AUDIT_LOGS"),
+            (EvidenceCategory::ConfigSnapshots, "CONFIG_SNAPSHOTS"),
+            (EvidenceCategory::Documentation, "DOCUMENTATION"),
+            (EvidenceCategory::Benchmarks, "BENCHMARKS"),
+            (EvidenceCategory::DeploymentRecords, "DEPLOYMENT_RECORDS"),
+            (EvidenceCategory::BootstrapSchema, "BOOTSTRAP_SCHEMA"),
+        ];
+
+        for (variant, expected_str) in expected {
+            assert_eq!(
+                variant.as_str(),
+                expected_str,
+                "existing category string changed for {variant:?}"
+            );
         }
     }
 }
