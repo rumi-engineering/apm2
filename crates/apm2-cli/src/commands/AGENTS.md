@@ -691,6 +691,11 @@ systemd service executables:
 - **User-mode skip**: In `UserMode`, worker startup skips service-user
   ownership validation because worker and CLI run under one principal.
   This preserves local-dev single-user semantics.
+- **Malformed backend env fallback for ownership checks**: Worker startup now
+  treats `APM2_FAC_EXECUTION_BACKEND=<invalid>` as an ownership-check-only
+  config drift signal and falls back to deterministic `auto` backend selection
+  (`probe_user_bus` -> user/system) with an explicit warning/event, instead of
+  hard-failing startup before the UserMode bypass path can apply.
 
 ### Relaxed startup validation for enqueue-class commands (TCK-00577 round 3)
 

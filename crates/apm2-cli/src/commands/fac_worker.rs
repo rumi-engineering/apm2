@@ -96,16 +96,17 @@ use apm2_core::fac::scan_lock::{ScanLockResult, check_stuck_scan_lock, try_acqui
 use apm2_core::fac::scheduler_state::{load_scheduler_state, persist_scheduler_state};
 use apm2_core::fac::{
     BlobStore, BudgetAdmissionTrace as FacBudgetAdmissionTrace, CanonicalizerTupleV1,
-    ChannelBoundaryTrace, DenialReasonCode, ExecutionBackend, FAC_LANE_CLEANUP_RECEIPT_SCHEMA,
-    FacJobOutcome, FacJobReceiptV1, FacJobReceiptV1Builder, FacPolicyV1, GateReceipt,
-    GateReceiptBuilder, LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1,
-    LaneCorruptMarkerV1, LaneProfileV1, LogRetentionConfig, MAX_POLICY_SIZE,
-    PATCH_FORMAT_GIT_DIFF_V1, QueueAdmissionTrace as JobQueueAdmissionTrace, ReceiptPipelineError,
-    ReceiptWritePipeline, RepoMirrorManager, SystemModeConfig, SystemdUnitProperties,
-    TOOLCHAIN_MAX_CACHE_FILE_BYTES, apply_credential_mount_to_env, build_github_credential_mount,
-    build_job_environment, compute_policy_hash, deserialize_policy, fingerprint_short_hex,
-    load_or_default_boundary_id, move_job_to_terminal, outcome_to_terminal_state,
-    parse_policy_hash, persist_content_addressed_receipt, persist_policy, rename_noreplace,
+    ChannelBoundaryTrace, DenialReasonCode, EXECUTION_BACKEND_ENV_VAR, ExecutionBackend,
+    ExecutionBackendError, FAC_LANE_CLEANUP_RECEIPT_SCHEMA, FacJobOutcome, FacJobReceiptV1,
+    FacJobReceiptV1Builder, FacPolicyV1, GateReceipt, GateReceiptBuilder,
+    LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1, LaneCorruptMarkerV1,
+    LaneProfileV1, LogRetentionConfig, MAX_POLICY_SIZE, PATCH_FORMAT_GIT_DIFF_V1,
+    QueueAdmissionTrace as JobQueueAdmissionTrace, ReceiptPipelineError, ReceiptWritePipeline,
+    RepoMirrorManager, SystemModeConfig, SystemdUnitProperties, TOOLCHAIN_MAX_CACHE_FILE_BYTES,
+    apply_credential_mount_to_env, build_github_credential_mount, build_job_environment,
+    compute_policy_hash, deserialize_policy, fingerprint_short_hex, load_or_default_boundary_id,
+    move_job_to_terminal, outcome_to_terminal_state, parse_policy_hash,
+    persist_content_addressed_receipt, persist_policy, probe_user_bus, rename_noreplace,
     resolve_toolchain_fingerprint_cached, run_preflight, select_and_validate_backend,
     serialize_cache, toolchain_cache_dir, toolchain_cache_file_path,
 };
@@ -492,13 +493,10 @@ pub fn run_fac_worker(
         return exit_codes::GENERIC_ERROR;
     }
 
-    let ownership_backend = match apm2_core::fac::select_backend() {
+    let ownership_backend = match resolve_ownership_backend(json_output) {
         Ok(backend) => backend,
         Err(e) => {
-            output_worker_error(
-                json_output,
-                &format!("cannot resolve execution backend for ownership checks: {e}"),
-            );
+            output_worker_error(json_output, &e);
             return exit_codes::GENERIC_ERROR;
         },
     };
@@ -1355,6 +1353,40 @@ pub fn run_fac_worker(
         return exit_codes::GENERIC_ERROR;
     }
     exit_codes::SUCCESS
+}
+
+fn resolve_ownership_backend(json_output: bool) -> Result<ExecutionBackend, String> {
+    match apm2_core::fac::select_backend() {
+        Ok(backend) => Ok(backend),
+        Err(ExecutionBackendError::InvalidBackendValue { value }) => {
+            let fallback_backend = if probe_user_bus() {
+                ExecutionBackend::UserMode
+            } else {
+                ExecutionBackend::SystemMode
+            };
+            let warning = format!(
+                "invalid {EXECUTION_BACKEND_ENV_VAR}='{value}' for worker ownership checks; \
+                 falling back to auto-selected backend '{fallback_backend}'"
+            );
+            if json_output {
+                emit_worker_event(
+                    "execution_backend_fallback",
+                    serde_json::json!({
+                        "env_var": EXECUTION_BACKEND_ENV_VAR,
+                        "invalid_value": value,
+                        "fallback_backend": fallback_backend.to_string(),
+                        "scope": "ownership_checks",
+                    }),
+                );
+            } else {
+                eprintln!("worker: WARNING: {warning}");
+            }
+            Ok(fallback_backend)
+        },
+        Err(err) => Err(format!(
+            "cannot resolve execution backend for ownership checks: {err}"
+        )),
+    }
 }
 
 fn reap_orphaned_leases_on_tick(fac_root: &Path, json_output: bool) {
@@ -12281,6 +12313,58 @@ mod tests {
         assert!(
             result.is_ok(),
             "user-mode must bypass service-user ownership checks: {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_ownership_backend_invalid_env_falls_back_to_auto_mode() {
+        let _guard = env_var_test_lock().lock().expect("serialize env test");
+        let original_backend = std::env::var_os(EXECUTION_BACKEND_ENV_VAR);
+
+        set_env_var_for_test(EXECUTION_BACKEND_ENV_VAR, "totally_invalid_backend_value");
+        let resolved = resolve_ownership_backend(true).expect(
+            "invalid backend value should degrade to auto-selected backend for ownership checks",
+        );
+        let expected = if probe_user_bus() {
+            ExecutionBackend::UserMode
+        } else {
+            ExecutionBackend::SystemMode
+        };
+
+        if let Some(value) = original_backend {
+            set_env_var_for_test(EXECUTION_BACKEND_ENV_VAR, value);
+        } else {
+            remove_env_var_for_test(EXECUTION_BACKEND_ENV_VAR);
+        }
+
+        assert_eq!(
+            resolved, expected,
+            "invalid backend env must fall back deterministically to auto mode"
+        );
+    }
+
+    #[test]
+    fn resolve_ownership_backend_env_too_long_fails_closed() {
+        let _guard = env_var_test_lock().lock().expect("serialize env test");
+        let original_backend = std::env::var_os(EXECUTION_BACKEND_ENV_VAR);
+
+        set_env_var_for_test(EXECUTION_BACKEND_ENV_VAR, "x".repeat(300));
+        let err =
+            resolve_ownership_backend(false).expect_err("oversized backend env must fail closed");
+
+        if let Some(value) = original_backend {
+            set_env_var_for_test(EXECUTION_BACKEND_ENV_VAR, value);
+        } else {
+            remove_env_var_for_test(EXECUTION_BACKEND_ENV_VAR);
+        }
+
+        assert!(
+            err.contains("cannot resolve execution backend for ownership checks"),
+            "expected fail-closed backend resolution error, got: {err}"
+        );
+        assert!(
+            err.contains("value too long"),
+            "expected bounded env validation context, got: {err}"
         );
     }
 
