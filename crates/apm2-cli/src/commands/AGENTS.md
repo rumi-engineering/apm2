@@ -249,6 +249,12 @@ Security invariants:
 | Function | Description |
 |----------|-------------|
 | `run_work(cmd, socket_path)` | Dispatch work claim/status/list |
+| `run_open(args, socket_path, json_output)` | Open work from ticket YAML via OpenWork RPC (TCK-00635) |
+
+**Security invariants (TCK-00635):**
+- [INV-WORK-001] Ticket file opened with `O_NOFOLLOW` to refuse symlinks at kernel level (TOCTOU prevention).
+- [INV-WORK-002] After open, `fstat` verifies the handle is a regular file; FIFOs, sockets, block/char devices are rejected fail-closed before any read (prevents blocking-file DoS).
+- [INV-WORK-003] Bounded read via `take(MAX_TICKET_FILE_SIZE + 1)` prevents memory exhaustion from oversized or special files.
 
 ### Event (event.rs)
 

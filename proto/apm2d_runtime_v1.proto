@@ -766,6 +766,8 @@ enum PrivilegedErrorCode {
   CREDENTIAL_INVALID_CONFIG = 18;
   // Invalid argument in request (generic validation failure).
   INVALID_ARGUMENT = 19;
+  // Work item already exists with a different spec hash (TCK-00635).
+  WORK_ALREADY_EXISTS = 20;
 }
 
 // Generic error response for privileged endpoints.
@@ -1850,4 +1852,26 @@ message RequestUnfreezeResponse {
   string freeze_id = 2;
   // Human-readable message.
   string message = 3;
+}
+
+// IPC-PRIV-076: OpenWork (RFC-0032, TCK-00635)
+// Opens a new work item by persisting a validated WorkSpec to CAS
+// and emitting a canonical work.opened event. Actor ID is derived
+// from peer credentials (never from client input).
+message OpenWorkRequest {
+  // Canonical JSON-encoded WorkSpec (schema: apm2.work_spec.v1).
+  // Must pass bounded decode + schema validation before acceptance.
+  bytes work_spec_json = 1;
+  // Governing lease ID for PCAC lifecycle enforcement.
+  // Required when PCAC lifecycle gate is wired (fail-closed if empty).
+  string lease_id = 2;
+}
+
+message OpenWorkResponse {
+  // Assigned canonical work identifier (W-{uuid} or from WorkSpec).
+  string work_id = 1;
+  // BLAKE3 hash of the canonical WorkSpec stored in CAS (32 bytes).
+  bytes spec_snapshot_hash = 2;
+  // Whether this was an idempotent no-op (work already existed with same hash).
+  bool already_existed = 3;
 }

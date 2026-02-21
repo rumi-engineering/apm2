@@ -191,6 +191,8 @@ pub use dispatch::{
     // TCK-00342: Process management encoding helpers
     encode_list_processes_request,
     encode_login_credential_request,
+    // TCK-00635: OpenWork encoding
+    encode_open_work_request,
     // TCK-00452: Orchestrator projection encoding
     encode_orchestrator_launch_projection_request,
     encode_process_status_request,
@@ -285,6 +287,9 @@ pub use messages::{
     LogEntry,
     LoginCredentialRequest,
     LoginCredentialResponse,
+    // TCK-00635: OpenWork (RFC-0032 Phase 1)
+    OpenWorkRequest,
+    OpenWorkResponse,
     OrchestratorLaunchProjectionRequest,
     OrchestratorLaunchProjectionResponse,
     PatternRejection,

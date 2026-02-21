@@ -74,6 +74,9 @@ use apm2_daemon::protocol::{
     ListProcessesResponse,
     LoginCredentialRequest,
     LoginCredentialResponse,
+    // TCK-00635: OpenWork (RFC-0032 Phase 1)
+    OpenWorkRequest,
+    OpenWorkResponse,
     PrivilegedError,
     PrivilegedErrorCode,
     PrivilegedMessageType,
@@ -140,6 +143,8 @@ use apm2_daemon::protocol::{
     // TCK-00342: Process management encoding
     encode_list_processes_request,
     encode_login_credential_request,
+    // TCK-00635: OpenWork encoding
+    encode_open_work_request,
     encode_process_status_request,
     encode_publish_changeset_request,
     encode_publish_evidence_request,
@@ -1200,6 +1205,86 @@ impl OperatorClient {
 
         // Decode response
         Self::decode_work_list_response(&response_frame)
+    }
+
+    // =========================================================================
+    // TCK-00635: OpenWork (RFC-0032 Phase 1)
+    // =========================================================================
+
+    /// Opens a new work item by sending a validated `WorkSpec` to the daemon
+    /// (TCK-00635).
+    ///
+    /// The daemon validates the `WorkSpec`, canonicalizes it, stores to CAS,
+    /// and emits a `work.opened` event. Idempotent: same `work_id` + same
+    /// spec hash returns success with `already_existed=true`.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_spec_json` - Canonical JSON-encoded `WorkSpec` bytes
+    ///
+    /// # Returns
+    ///
+    /// [`OpenWorkResponse`] with `work_id`, spec hash, and idempotency flag.
+    pub async fn open_work(
+        &mut self,
+        work_spec_json: &[u8],
+        lease_id: &str,
+    ) -> Result<OpenWorkResponse, ProtocolClientError> {
+        let request = OpenWorkRequest {
+            work_spec_json: work_spec_json.to_vec(),
+            lease_id: lease_id.to_string(),
+        };
+        let request_bytes = encode_open_work_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_open_work_response(&response_frame)
+    }
+
+    /// Decodes an `OpenWork` response (TCK-00635).
+    fn decode_open_work_response(frame: &Bytes) -> Result<OpenWorkResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            // Error response
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::OpenWork.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected OpenWork response (tag {}), got tag {tag}",
+                PrivilegedMessageType::OpenWork.tag()
+            )));
+        }
+
+        OpenWorkResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 
     // =========================================================================
