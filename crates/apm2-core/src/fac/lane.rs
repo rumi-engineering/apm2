@@ -53,6 +53,9 @@ use thiserror::Error;
 
 use super::execution_backend::{ExecutionBackend, select_backend};
 use super::safe_rmtree::{MAX_LOG_DIR_ENTRIES, safe_rmtree_v1, safe_rmtree_v1_with_entry_limit};
+use super::systemd_unit::{
+    FacUnitLiveness, ORPHANED_SYSTEMD_UNIT_REASON_CODE, check_fac_unit_liveness,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -111,6 +114,19 @@ pub const MAX_LANE_ID_LENGTH: usize = 64;
 
 /// Maximum string field length in lane records.
 pub const MAX_STRING_LENGTH: usize = 512;
+
+fn truncate_to_max_string(raw: &str) -> String {
+    let char_count = raw.chars().count();
+    if char_count <= MAX_STRING_LENGTH {
+        return raw.to_string();
+    }
+    if MAX_STRING_LENGTH <= 3 {
+        return raw.chars().take(MAX_STRING_LENGTH).collect();
+    }
+    let mut out = raw.chars().take(MAX_STRING_LENGTH - 3).collect::<String>();
+    out.push_str("...");
+    out
+}
 
 /// Maximum lease file size to read (1 MiB, CTR-1603).
 pub const MAX_LEASE_FILE_SIZE: u64 = 1024 * 1024;
@@ -1634,6 +1650,64 @@ impl LaneManager {
                             "lease state=LEASED with unverifiable identity".to_string()
                         },
                     };
+                    let liveness = check_fac_unit_liveness(lane_id, &lease.job_id);
+                    if !matches!(liveness, FacUnitLiveness::Inactive) {
+                        let liveness_detail = match &liveness {
+                            FacUnitLiveness::Active { active_units } => {
+                                let preview = active_units
+                                    .iter()
+                                    .take(4)
+                                    .map(std::string::String::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                if preview.is_empty() {
+                                    format!(
+                                        "associated systemd units still active (count={})",
+                                        active_units.len()
+                                    )
+                                } else {
+                                    let suffix = if active_units.len() > 4 { " +more" } else { "" };
+                                    format!(
+                                        "associated systemd units still active (count={}, units=[{preview}]{suffix})",
+                                        active_units.len()
+                                    )
+                                }
+                            },
+                            FacUnitLiveness::Unknown { reason } => {
+                                format!(
+                                    "systemd liveness probe inconclusive ({reason}); fail-closed"
+                                )
+                            },
+                            FacUnitLiveness::Inactive => {
+                                "no active associated systemd units".to_string()
+                            },
+                        };
+                        let reason = truncate_to_max_string(&format!(
+                            "{ORPHANED_SYSTEMD_UNIT_REASON_CODE}: lane={lane_id} job_id={} pid={} stale lease reap blocked: {liveness_detail}",
+                            lease.job_id, lease.pid
+                        ));
+                        match self.mark_corrupt(lane_id, &reason, None) {
+                            Ok(_) => {
+                                actions.push(LaneReconcileAction {
+                                    lane_id: lane_id.to_string(),
+                                    action: "reap_orphan_lease".to_string(),
+                                    outcome: LaneReconcileOutcome::MarkedCorrupt,
+                                    detail: Some(reason),
+                                });
+                            },
+                            Err(err) => {
+                                actions.push(LaneReconcileAction {
+                                    lane_id: lane_id.to_string(),
+                                    action: "reap_orphan_lease".to_string(),
+                                    outcome: LaneReconcileOutcome::Failed,
+                                    detail: Some(format!(
+                                        "failed to persist corrupt marker for blocked orphan-lease reap: {err}"
+                                    )),
+                                });
+                            },
+                        }
+                        return;
+                    }
                     Some(detail)
                 } else {
                     return;

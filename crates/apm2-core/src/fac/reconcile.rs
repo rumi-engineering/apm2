@@ -85,6 +85,9 @@ use super::lane::{
 };
 use super::receipt_index::find_receipt_for_job;
 use super::receipt_pipeline::{ReceiptWritePipeline, outcome_to_terminal_state};
+use super::systemd_unit::{
+    FacUnitLiveness, ORPHANED_SYSTEMD_UNIT_REASON_CODE, check_fac_unit_liveness,
+};
 use crate::fac::job_spec::MAX_CHANNEL_CONTEXT_TOKEN_LENGTH;
 use crate::fac::token_ledger::{TokenLedgerError, TokenUseLedger};
 
@@ -481,6 +484,47 @@ struct QueueReconcileResult {
     partial_error: Option<ReconcileError>,
 }
 
+fn build_orphaned_systemd_reclaim_reason(
+    lane_id: &str,
+    lease: &LaneLeaseV1,
+    liveness: &FacUnitLiveness,
+) -> String {
+    let detail = match liveness {
+        FacUnitLiveness::Active { active_units } => {
+            let preview = active_units
+                .iter()
+                .take(4)
+                .map(std::string::String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if preview.is_empty() {
+                format!(
+                    "associated systemd units still active (count={})",
+                    active_units.len()
+                )
+            } else {
+                let suffix = if active_units.len() > 4 { " +more" } else { "" };
+                format!(
+                    "associated systemd units still active (count={}, units=[{preview}]{suffix})",
+                    active_units.len()
+                )
+            }
+        },
+        FacUnitLiveness::Unknown { reason } => {
+            format!("systemd liveness probe inconclusive ({reason}); fail-closed")
+        },
+        FacUnitLiveness::Inactive => "no active associated systemd units".to_string(),
+    };
+
+    truncate_string(
+        &format!(
+            "{ORPHANED_SYSTEMD_UNIT_REASON_CODE}: lane={lane_id} job_id={} pid={} stale lease recovery blocked: {detail}",
+            lease.job_id, lease.pid
+        ),
+        MAX_STRING_LENGTH,
+    )
+}
+
 /// Metadata parsed from a claimed job spec.
 ///
 /// Parsed with bounded I/O and `O_NOFOLLOW` to preserve reconciliation safety
@@ -715,8 +759,10 @@ pub fn reconcile_on_startup(
 ///
 /// INV-RECON-006: Stale lease recovery transitions through CLEANUP → IDLE.
 ///
-/// Active-job tracking includes only lanes whose lease identity is
-/// `AliveMatch`, preventing false positives from PID-exists-only checks.
+/// Active-job tracking includes lanes whose lease identity is `AliveMatch`,
+/// plus stale-lease jobs blocked by the orphaned-systemd-unit reclaim guard.
+/// This prevents false orphan requeue when detached systemd units are still
+/// active or liveness probing is inconclusive.
 ///
 /// Lock-held lanes with `Unknown` identity are tracked separately for
 /// orphan-suppression handling in queue reconciliation so this invariant
@@ -784,6 +830,29 @@ fn reconcile_lanes(
                             ProcessIdentity::Dead | ProcessIdentity::AliveMismatch
                         )
                     {
+                        let liveness = check_fac_unit_liveness(lane_id, &lease.job_id);
+                        if !matches!(liveness, FacUnitLiveness::Inactive) {
+                            let reason =
+                                build_orphaned_systemd_reclaim_reason(lane_id, lease, &liveness);
+                            if !dry_run {
+                                if let Err(marker_err) =
+                                    persist_corrupt_marker(fac_root, lane_id, &reason, timestamp)
+                                {
+                                    partial_error = Some(marker_err);
+                                    break;
+                                }
+                            }
+                            // Prevent queue reconcile from requeueing this
+                            // claimed job while orphaned systemd units are
+                            // active or liveness probing is inconclusive.
+                            active_job_ids.insert(lease.job_id.clone());
+                            actions.push(LaneRecoveryAction::MarkedCorrupt {
+                                lane_id: lane_id.clone(),
+                                reason,
+                            });
+                            lanes_marked_corrupt += 1;
+                            continue;
+                        }
                         // Dead PID + free lock → stale lease.
                         // INV-RECON-006: Transition through CLEANUP → IDLE.
                         if dry_run {
@@ -906,8 +975,8 @@ fn reconcile_lanes(
 
                 if unknown_identity_with_live_job {
                     if let Some(job_id) = status.job_id.as_ref() {
-                        // Do not widen active_job_ids invariant; carry a dedicated
-                        // suppression set for lock-held unknown identity jobs.
+                        // Keep lock-held unknown-identity suppression separate
+                        // from active_job_ids for clearer queue-action labels.
                         unknown_identity_job_ids_for_orphan_suppression.insert(job_id.clone());
                     }
                     // Fail-closed: emit a corrupt marker so operators have durable

@@ -99,17 +99,18 @@ use apm2_core::fac::{
     BlobStore, BudgetAdmissionTrace as FacBudgetAdmissionTrace, CanonicalizerTupleV1,
     ChannelBoundaryTrace, DenialReasonCode, EXECUTION_BACKEND_ENV_VAR, ExecutionBackend,
     ExecutionBackendError, FAC_LANE_CLEANUP_RECEIPT_SCHEMA, FacJobOutcome, FacJobReceiptV1,
-    FacJobReceiptV1Builder, FacPolicyV1, GateReceipt, GateReceiptBuilder,
+    FacJobReceiptV1Builder, FacPolicyV1, FacUnitLiveness, GateReceipt, GateReceiptBuilder,
     LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1, LaneCorruptMarkerV1,
-    LaneProfileV1, LogRetentionConfig, MAX_POLICY_SIZE, PATCH_FORMAT_GIT_DIFF_V1,
-    QueueAdmissionTrace as JobQueueAdmissionTrace, ReceiptPipelineError, ReceiptWritePipeline,
-    RepoMirrorManager, SystemModeConfig, SystemdUnitProperties, TOOLCHAIN_MAX_CACHE_FILE_BYTES,
-    apply_credential_mount_to_env, build_github_credential_mount, build_job_environment,
-    compute_policy_hash, deserialize_policy, fingerprint_short_hex, load_or_default_boundary_id,
-    move_job_to_terminal, outcome_to_terminal_state, parse_policy_hash,
-    persist_content_addressed_receipt, persist_policy, probe_user_bus, rename_noreplace,
-    resolve_toolchain_fingerprint_cached, run_preflight, select_and_validate_backend,
-    serialize_cache, toolchain_cache_dir, toolchain_cache_file_path,
+    LaneProfileV1, LogRetentionConfig, MAX_POLICY_SIZE, ORPHANED_SYSTEMD_UNIT_REASON_CODE,
+    PATCH_FORMAT_GIT_DIFF_V1, QueueAdmissionTrace as JobQueueAdmissionTrace, ReceiptPipelineError,
+    ReceiptWritePipeline, RepoMirrorManager, SystemModeConfig, SystemdUnitProperties,
+    TOOLCHAIN_MAX_CACHE_FILE_BYTES, apply_credential_mount_to_env, build_github_credential_mount,
+    build_job_environment, check_fac_unit_liveness, compute_policy_hash, deserialize_policy,
+    fingerprint_short_hex, load_or_default_boundary_id, move_job_to_terminal,
+    outcome_to_terminal_state, parse_policy_hash, persist_content_addressed_receipt,
+    persist_policy, probe_user_bus, rename_noreplace, resolve_toolchain_fingerprint_cached,
+    run_preflight, select_and_validate_backend, serialize_cache, toolchain_cache_dir,
+    toolchain_cache_file_path,
 };
 use apm2_core::github::{parse_github_remote_url, resolve_apm2_home};
 use base64::Engine;
@@ -172,6 +173,7 @@ mod fac_review_api {
         _cpu_quota: &str,
         _gate_profile: GateThroughputProfile,
         _workspace_root: &std::path::Path,
+        _bounded_unit_base: Option<&str>,
     ) -> Result<LocalGatesRunResult, String> {
         if let Some(override_result) =
             RUN_GATES_LOCAL_WORKER_OVERRIDE.with(|slot| slot.borrow().clone())
@@ -325,6 +327,8 @@ const DEFAULT_GATES_CPU_QUOTA: &str = "auto";
 const UNKNOWN_REPO_SEGMENT: &str = "unknown";
 const ALLOWED_WORKSPACE_ROOTS_ENV: &str = "APM2_FAC_ALLOWED_WORKSPACE_ROOTS";
 const GATES_HEARTBEAT_REFRESH_SECS: u64 = 5;
+const FAC_JOB_UNIT_BASE_PREFIX: &str = "apm2-fac-job-";
+const MAX_QUEUED_GATES_UNIT_BASE_LEN: usize = 200;
 const ORPHAN_LEASE_WARNING_MULTIPLIER: u64 = 2;
 const MAX_COMPLETED_SCAN_ENTRIES: usize = 4096;
 const MAX_TERMINAL_JOB_METADATA_FILE_SIZE: usize = MAX_JOB_SPEC_SIZE * 4;
@@ -1488,32 +1492,72 @@ fn reap_orphaned_leases_on_tick(fac_root: &Path, json_output: bool) {
         }
 
         match lane_mgr.try_lock(&lane_id) {
-            Ok(Some(_guard)) => match LaneLeaseV1::remove(&lane_dir) {
-                Ok(()) => {
-                    tracing::warn!(
-                        lane_id = lane_id.as_str(),
-                        pid = ?status.pid,
-                        pid_alive = ?status.pid_alive,
-                        "reaped orphaned lane lease during poll tick"
-                    );
-                    if json_output {
-                        emit_worker_event(
-                            "lane_orphan_lease_reaped",
-                            serde_json::json!({
-                                "lane_id": lane_id,
-                                "pid": status.pid,
-                                "pid_alive": status.pid_alive,
-                            }),
+            Ok(Some(_guard)) => {
+                if let Some(lease) = loaded_lease.as_ref() {
+                    let liveness = check_fac_unit_liveness(&lane_id, &lease.job_id);
+                    if !matches!(liveness, FacUnitLiveness::Inactive) {
+                        let reason = build_orphaned_systemd_lane_reason(&lane_id, lease, &liveness);
+                        tracing::warn!(
+                            lane_id = lane_id.as_str(),
+                            job_id = lease.job_id.as_str(),
+                            pid = lease.pid,
+                            reason = reason.as_str(),
+                            "orphaned lease reap blocked due to orphaned systemd unit evidence"
                         );
+                        if let Err(err) = persist_corrupt_marker_with_retries(
+                            lane_mgr.fac_root(),
+                            &lane_id,
+                            &reason,
+                            None,
+                        ) {
+                            tracing::error!(
+                                lane_id = lane_id.as_str(),
+                                error = %err,
+                                "failed to persist corrupt marker for blocked orphan-lease reap"
+                            );
+                        }
+                        if json_output {
+                            emit_worker_event(
+                                "lane_orphan_lease_reap_blocked",
+                                serde_json::json!({
+                                    "lane_id": lane_id,
+                                    "job_id": lease.job_id,
+                                    "pid": lease.pid,
+                                    "reason_code": ORPHANED_SYSTEMD_UNIT_REASON_CODE,
+                                    "reason": reason,
+                                }),
+                            );
+                        }
+                        continue;
                     }
-                },
-                Err(err) => {
-                    tracing::warn!(
-                        lane_id = lane_id.as_str(),
-                        error = %err,
-                        "failed to remove orphaned lease during poll tick"
-                    );
-                },
+                }
+                match LaneLeaseV1::remove(&lane_dir) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            lane_id = lane_id.as_str(),
+                            pid = ?status.pid,
+                            pid_alive = ?status.pid_alive,
+                            "reaped orphaned lane lease during poll tick"
+                        );
+                        if json_output {
+                            emit_worker_event(
+                                "lane_orphan_lease_reaped",
+                                serde_json::json!({
+                                    "lane_id": lane_id,
+                                    "pid": status.pid,
+                                    "pid_alive": status.pid_alive,
+                                }),
+                            );
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!(
+                            lane_id = lane_id.as_str(),
+                            error = %err,
+                            "failed to remove orphaned lease during poll tick"
+                        );
+                    },
+                }
             },
             Ok(None) => {
                 tracing::debug!(
@@ -2517,6 +2561,24 @@ fn sanitize_repo_segment(raw: &str) -> String {
     }
 }
 
+fn build_queued_gates_bounded_unit_base(queue_lane: &str, job_id: &str) -> String {
+    let safe_queue_lane = sanitize_repo_segment(queue_lane);
+    let safe_job_id = sanitize_repo_segment(job_id);
+    let mut base = format!("{FAC_JOB_UNIT_BASE_PREFIX}{safe_queue_lane}-{safe_job_id}");
+    if base.len() > MAX_QUEUED_GATES_UNIT_BASE_LEN {
+        base.truncate(MAX_QUEUED_GATES_UNIT_BASE_LEN);
+        while base.ends_with('-') || base.ends_with('.') || base.ends_with('_') {
+            base.pop();
+        }
+        if base.len() <= FAC_JOB_UNIT_BASE_PREFIX.len() {
+            return format!(
+                "{FAC_JOB_UNIT_BASE_PREFIX}{UNKNOWN_REPO_SEGMENT}-{UNKNOWN_REPO_SEGMENT}"
+            );
+        }
+    }
+    base
+}
+
 fn resolve_workspace_head(workspace_root: &Path) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
@@ -2543,6 +2605,7 @@ fn run_gates_in_workspace(
     heartbeat_jobs_denied: u64,
     heartbeat_jobs_quarantined: u64,
     heartbeat_job_id: &str,
+    bounded_unit_base: Option<&str>,
 ) -> Result<fac_review_api::LocalGatesRunResult, String> {
     let stop_refresh = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_refresh_bg = std::sync::Arc::clone(&stop_refresh);
@@ -2580,6 +2643,7 @@ fn run_gates_in_workspace(
         &options.cpu_quota,
         options.gate_profile,
         &options.workspace_root,
+        bounded_unit_base,
     );
 
     stop_refresh.store(true, std::sync::atomic::Ordering::Release);
@@ -2762,6 +2826,7 @@ fn execute_queued_gates_job(
         return JobOutcome::Denied { reason };
     }
 
+    let bounded_unit_base = build_queued_gates_bounded_unit_base(&spec.queue_lane, &spec.job_id);
     let gate_run_result = match run_gates_in_workspace(
         &options,
         fac_root,
@@ -2770,6 +2835,7 @@ fn execute_queued_gates_job(
         heartbeat_jobs_denied,
         heartbeat_jobs_quarantined,
         &spec.job_id,
+        Some(bounded_unit_base.as_str()),
     ) {
         Ok(code) => code,
         Err(err) => {
@@ -6022,6 +6088,43 @@ fn emit_lane_reset_recommendation(lane_id: &str, reason: &str) {
     }
 }
 
+fn build_orphaned_systemd_lane_reason(
+    lane_id: &str,
+    lease: &LaneLeaseV1,
+    liveness: &FacUnitLiveness,
+) -> String {
+    let detail = match liveness {
+        FacUnitLiveness::Active { active_units } => {
+            let preview = active_units
+                .iter()
+                .take(4)
+                .map(std::string::String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if preview.is_empty() {
+                format!(
+                    "associated systemd units still active (count={})",
+                    active_units.len()
+                )
+            } else {
+                let suffix = if active_units.len() > 4 { " +more" } else { "" };
+                format!(
+                    "associated systemd units still active (count={}, units=[{preview}]{suffix})",
+                    active_units.len()
+                )
+            }
+        },
+        FacUnitLiveness::Unknown { reason } => {
+            format!("systemd liveness probe inconclusive ({reason}); fail-closed")
+        },
+        FacUnitLiveness::Inactive => "no active associated systemd units".to_string(),
+    };
+    truncate_receipt_reason(&format!(
+        "{ORPHANED_SYSTEMD_UNIT_REASON_CODE}: lane={lane_id} job_id={} pid={} reclaim blocked: {detail}",
+        lease.job_id, lease.pid
+    ))
+}
+
 fn acquire_worker_lane(
     lane_mgr: &LaneManager,
     lane_ids: &[String],
@@ -6069,27 +6172,51 @@ fn acquire_worker_lane(
                         },
                         LaneState::Running | LaneState::Cleanup => {
                             match check_process_identity(&lease) {
-                                ProcessIdentity::Dead => {
-                                    // Process is confirmed dead. Safe to recover this lane
-                                    // by removing the stale lease.
-                                    tracing::info!(
+                                identity @ (ProcessIdentity::Dead
+                                | ProcessIdentity::AliveMismatch) => {
+                                    let reclaim_observation =
+                                        if matches!(identity, ProcessIdentity::Dead) {
+                                            "pid is dead"
+                                        } else {
+                                            "pid identity mismatch (PID reuse)"
+                                        };
+                                    let liveness = check_fac_unit_liveness(lane_id, &lease.job_id);
+                                    if matches!(liveness, FacUnitLiveness::Inactive) {
+                                        tracing::info!(
+                                            lane_id = lane_id.as_str(),
+                                            pid = lease.pid,
+                                            job_id = lease.job_id.as_str(),
+                                            observation = reclaim_observation,
+                                            "stale lease recovery: reclaiming lane"
+                                        );
+                                        let _ = LaneLeaseV1::remove(&lane_dir);
+                                        return Some((guard, lane_id.clone()));
+                                    }
+
+                                    let reason = build_orphaned_systemd_lane_reason(
+                                        lane_id, &lease, &liveness,
+                                    );
+                                    tracing::warn!(
                                         lane_id = lane_id.as_str(),
                                         pid = lease.pid,
-                                        "stale lease recovery: pid is dead, reclaiming lane"
+                                        job_id = lease.job_id.as_str(),
+                                        observation = reclaim_observation,
+                                        reason = reason.as_str(),
+                                        "stale lease reclaim blocked due to orphaned systemd unit evidence"
                                     );
-                                    let _ = LaneLeaseV1::remove(&lane_dir);
-                                    return Some((guard, lane_id.clone()));
-                                },
-                                ProcessIdentity::AliveMismatch => {
-                                    // PID was reused by another process. This lease no longer
-                                    // owns the lane, so recover as stale.
-                                    tracing::info!(
-                                        lane_id = lane_id.as_str(),
-                                        pid = lease.pid,
-                                        "stale lease recovery: pid identity mismatch, reclaiming lane"
-                                    );
-                                    let _ = LaneLeaseV1::remove(&lane_dir);
-                                    return Some((guard, lane_id.clone()));
+                                    if let Err(err) = persist_corrupt_marker_with_retries(
+                                        lane_mgr.fac_root(),
+                                        lane_id,
+                                        &reason,
+                                        None,
+                                    ) {
+                                        tracing::error!(
+                                            lane_id = lane_id.as_str(),
+                                            error = %err,
+                                            "failed to persist corrupt marker for blocked stale lease reclaim"
+                                        );
+                                    }
+                                    emit_lane_reset_recommendation(lane_id, &reason);
                                 },
                                 ProcessIdentity::AliveMatch => {
                                     // Process identity still matches the lease owner.
@@ -7583,7 +7710,8 @@ fn stop_target_unit_exact(lane: &str, target_job_id: &str) -> Result<(), String>
             "unsafe queue_lane value {lane:?}: only [A-Za-z0-9_-] allowed"
         ));
     }
-    let unit_name = format!("apm2-fac-job-{lane}-{target_job_id}");
+    let safe_target_job_id = sanitize_repo_segment(target_job_id);
+    let unit_name = format!("apm2-fac-job-{lane}-{safe_target_job_id}");
     let mut last_err = String::new();
     let mut any_stop_succeeded = false;
     let mut not_found_count: u32 = 0;
@@ -9216,6 +9344,18 @@ mod tests {
     fn test_parse_queue_lane_unknown_defaults_to_bulk() {
         assert_eq!(parse_queue_lane("unknown_lane"), QueueLane::Bulk);
         assert_eq!(parse_queue_lane(""), QueueLane::Bulk);
+    }
+
+    #[test]
+    fn test_build_queued_gates_bounded_unit_base_includes_queue_lane_and_job_id() {
+        let base = build_queued_gates_bounded_unit_base("consume", "job_123");
+        assert_eq!(base, "apm2-fac-job-consume-job_123");
+    }
+
+    #[test]
+    fn test_build_queued_gates_bounded_unit_base_sanitizes_segments() {
+        let base = build_queued_gates_bounded_unit_base("consume lane", "job/id");
+        assert_eq!(base, "apm2-fac-job-consume-lane-job-id");
     }
 
     #[test]

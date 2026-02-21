@@ -210,6 +210,7 @@ pub mod serde_helpers;
 pub mod service_user_gate;
 pub mod signed_receipt;
 mod systemd_properties;
+pub mod systemd_unit;
 pub mod taint;
 mod terminal_verifier;
 pub mod token_ledger;
@@ -815,6 +816,10 @@ pub use safe_rmtree::{
 };
 pub use systemd_properties::{
     NetworkPolicy, SandboxHardeningProfile, SystemdUnitProperties, resolve_network_policy,
+};
+pub use systemd_unit::{
+    FacUnitLiveness, ORPHANED_SYSTEMD_UNIT_REASON_CODE, check_fac_unit_liveness,
+    detect_systemd_unit_name,
 };
 pub use warm::{
     DEFAULT_WARM_PHASES, MAX_WARM_PHASES, MAX_WARM_RECEIPT_SIZE, MAX_WARM_STRING_LENGTH,
