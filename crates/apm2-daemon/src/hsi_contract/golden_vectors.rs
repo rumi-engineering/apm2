@@ -65,7 +65,8 @@ pub const MANIFEST_FULL_VECTOR: GoldenVector = GoldenVector {
     // TCK-00635: OpenWork (hsi.work.open) added as authoritative+idempotent+receipt.
     // TCK-00638: PublishWorkContextEntry (hsi.work_context.publish) added as
     // authoritative+idempotent+receipt.
-    expected_hash: "5643d6c36b35ff46382598874df1201a656a00d07b062a5feb4bb6415579cfb0",
+    // TCK-00637: ClaimWorkV2 (hsi.work.claim_v2) added as authoritative+idempotent+receipt.
+    expected_hash: "ed524bd791e6fe39015202ca6b92340245508d39b66084a02a7cae44ec20d1d2",
 };
 
 /// Golden vector: minimal manifest with a single route.
