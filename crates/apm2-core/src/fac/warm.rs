@@ -606,7 +606,8 @@ fn build_phase_command(
     containment: Option<&WarmContainment>,
     lane_id: &str,
     job_id: &str,
-) -> Result<(Command, String), WarmError> {
+    skip_parent_binding: bool,
+) -> Result<(Command, String, bool), WarmError> {
     let (cargo_args, cmd_str) = phase_cargo_args(phase);
 
     // Build the composite environment including lane overrides and git config
@@ -636,7 +637,11 @@ fn build_phase_command(
             job_id
         };
         let unit_name = format!("apm2-warm-{lane_id}-{job_prefix}-{}", phase.name());
-        let parent_unit = detect_systemd_unit_name();
+        let parent_unit = if skip_parent_binding {
+            None
+        } else {
+            detect_systemd_unit_name()
+        };
         let systemd_cmd = build_systemd_run_command(
             containment.backend,
             &containment.properties,
@@ -699,7 +704,10 @@ fn build_phase_command(
         }
 
         let display_str = format!("systemd-run [contained] {cmd_str}");
-        Ok((cmd, display_str))
+        let parent_binding_applied = full_args
+            .iter()
+            .any(|arg| arg.starts_with("PartOf=") || arg.starts_with("BindsTo="));
+        Ok((cmd, display_str, parent_binding_applied))
     } else {
         // Direct spawn fallback (no systemd-run).
         let mut cmd = Command::new("cargo");
@@ -710,7 +718,7 @@ fn build_phase_command(
         cmd.env_clear();
         cmd.envs(&env_map);
 
-        Ok((cmd, cmd_str))
+        Ok((cmd, cmd_str, false))
     }
 }
 
@@ -755,7 +763,7 @@ pub fn execute_warm_phase(
     lane_id: &str,
     job_id: &str,
 ) -> WarmPhaseResult {
-    let (mut cmd, cmd_str) = match build_phase_command(
+    let (mut cmd, mut cmd_str, parent_binding_applied) = match build_phase_command(
         phase,
         workspace,
         cargo_home,
@@ -764,6 +772,7 @@ pub fn execute_warm_phase(
         containment,
         lane_id,
         job_id,
+        false,
     ) {
         Ok(pair) => pair,
         Err(e) => {
@@ -783,49 +792,29 @@ pub fn execute_warm_phase(
 
     let start = Instant::now();
     let timeout = Duration::from_secs(MAX_PHASE_TIMEOUT_SECS);
-    let mut last_heartbeat = Instant::now();
+    let mut exit_code = run_warm_command_once(&mut cmd, timeout, heartbeat_fn);
 
-    #[allow(clippy::option_if_let_else)] // complex timeout logic not suited for map_or
-    let exit_code = match cmd.spawn() {
-        Ok(mut child) => {
-            // [INV-WARM-007] Enforce MAX_PHASE_TIMEOUT_SECS via polling
-            // wait loop. On timeout, kill the child and report None exit
-            // code to indicate abnormal termination.
-            let mut result = None;
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        result = status.code();
-                        break;
-                    },
-                    Ok(None) => {
-                        if start.elapsed() >= timeout {
-                            // Timeout exceeded — kill and break.
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            // exit_code = None signals timeout/kill.
-                            break;
-                        }
-                        // [INV-WARM-015] Refresh heartbeat during the polling
-                        // loop to prevent stale heartbeat files during
-                        // long-running warm phases (which can take hours).
-                        if let Some(hb) = heartbeat_fn {
-                            if last_heartbeat.elapsed() >= HEARTBEAT_REFRESH_INTERVAL {
-                                hb();
-                                last_heartbeat = Instant::now();
-                            }
-                        }
-                        // Sleep briefly to avoid busy-spinning. 100ms resolution
-                        // is adequate for phases running minutes.
-                        std::thread::sleep(Duration::from_millis(100));
-                    },
-                    Err(_) => break,
-                }
-            }
-            result
-        },
-        Err(_) => None,
-    };
+    // S8 fallback: when a contained warm phase exits with code 1 and parent
+    // binding was applied, retry once without parent binding. This handles the
+    // race where a detected parent unit disappears before systemd-run starts.
+    if containment.is_some() && parent_binding_applied && exit_code == Some(1) {
+        if let Ok((mut retry_cmd, retry_cmd_str, _)) = build_phase_command(
+            phase,
+            workspace,
+            cargo_home,
+            cargo_target_dir,
+            hardened_env,
+            containment,
+            lane_id,
+            job_id,
+            true,
+        ) {
+            retry_cmd.stdout(Stdio::null());
+            retry_cmd.stderr(Stdio::null());
+            exit_code = run_warm_command_once(&mut retry_cmd, timeout, heartbeat_fn);
+            cmd_str = format!("{retry_cmd_str} [retry_without_parent_binding]");
+        }
+    }
 
     let duration = start.elapsed();
     #[allow(clippy::cast_possible_truncation)] // clamped to u64::MAX before cast
@@ -836,6 +825,45 @@ pub fn execute_warm_phase(
         cmd: cmd_str,
         exit_code,
         duration_ms,
+    }
+}
+
+fn run_warm_command_once(
+    cmd: &mut Command,
+    timeout: Duration,
+    heartbeat_fn: Option<&dyn Fn()>,
+) -> Option<i32> {
+    let start = Instant::now();
+    let mut last_heartbeat = Instant::now();
+    match cmd.spawn() {
+        Ok(mut child) => {
+            let mut result = None;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        result = status.code();
+                        break;
+                    },
+                    Ok(None) => {
+                        if start.elapsed() >= timeout {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break;
+                        }
+                        if let Some(hb) = heartbeat_fn {
+                            if last_heartbeat.elapsed() >= HEARTBEAT_REFRESH_INTERVAL {
+                                hb();
+                                last_heartbeat = Instant::now();
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    },
+                    Err(_) => break,
+                }
+            }
+            result
+        },
+        Err(_) => None,
     }
 }
 
@@ -1636,7 +1664,7 @@ mod tests {
 
         // Also verify that build_phase_command itself doesn't panic.
         let workspace = Path::new("/tmp");
-        let (cmd, cmd_str) = build_phase_command(
+        let (cmd, cmd_str, _) = build_phase_command(
             WarmPhase::Fetch,
             workspace,
             cargo_home,
@@ -1645,6 +1673,7 @@ mod tests {
             None, // no containment
             "lane-0",
             "test-job-00000000",
+            false,
         )
         .expect("build_phase_command should not fail without containment");
         assert_eq!(cmd_str, "cargo fetch --locked");
@@ -1813,7 +1842,7 @@ mod tests {
             system_config: None,
         };
 
-        let (cmd, cmd_str) = build_phase_command(
+        let (cmd, cmd_str, _) = build_phase_command(
             WarmPhase::Build,
             Path::new("/tmp/workspace"),
             Path::new("/tmp/cargo_home"),
@@ -1822,6 +1851,7 @@ mod tests {
             Some(&containment),
             "lane-0",
             "abcd1234-5678-90ab-cdef-1234567890ab",
+            false,
         )
         .expect("containment command construction should succeed");
 
@@ -1858,7 +1888,7 @@ mod tests {
             system_config: None,
         };
 
-        let (cmd, _cmd_str) = build_phase_command(
+        let (cmd, _cmd_str, _) = build_phase_command(
             WarmPhase::Build,
             Path::new("/tmp/workspace"),
             Path::new("/tmp/cargo_home"),
@@ -1867,6 +1897,7 @@ mod tests {
             Some(&containment),
             "lane-0",
             "abcd1234-5678-90ab-cdef-1234567890ab",
+            false,
         )
         .expect("containment command construction should succeed");
 
@@ -1901,7 +1932,7 @@ mod tests {
         // Verify that build_phase_command falls back to direct cargo command
         // when containment is None.
         let env = test_hardened_env();
-        let (cmd, cmd_str) = build_phase_command(
+        let (cmd, cmd_str, _) = build_phase_command(
             WarmPhase::Fetch,
             Path::new("/tmp/workspace"),
             Path::new("/tmp/cargo_home"),
@@ -1910,6 +1941,7 @@ mod tests {
             None,
             "lane-0",
             "test-job-00000000",
+            false,
         )
         .expect("should succeed without containment");
 
@@ -1985,7 +2017,7 @@ mod tests {
         };
 
         // Build commands for the same phase but different lane/job combinations.
-        let (cmd_a, _) = build_phase_command(
+        let (cmd_a, _, _) = build_phase_command(
             WarmPhase::Build,
             Path::new("/tmp/ws"),
             Path::new("/tmp/ch"),
@@ -1994,11 +2026,12 @@ mod tests {
             Some(&containment),
             "lane-0",
             "aaaaaaaa-1111-2222-3333-444444444444",
+            false,
         )
         .unwrap();
         let unit_a = extract_unit_name(&cmd_a);
 
-        let (cmd_b, _) = build_phase_command(
+        let (cmd_b, _, _) = build_phase_command(
             WarmPhase::Build,
             Path::new("/tmp/ws"),
             Path::new("/tmp/ch"),
@@ -2007,11 +2040,12 @@ mod tests {
             Some(&containment),
             "lane-0",
             "bbbbbbbb-1111-2222-3333-444444444444",
+            false,
         )
         .unwrap();
         let unit_b = extract_unit_name(&cmd_b);
 
-        let (cmd_c, _) = build_phase_command(
+        let (cmd_c, _, _) = build_phase_command(
             WarmPhase::Build,
             Path::new("/tmp/ws"),
             Path::new("/tmp/ch"),
@@ -2020,6 +2054,7 @@ mod tests {
             Some(&containment),
             "lane-1",
             "aaaaaaaa-1111-2222-3333-444444444444",
+            false,
         )
         .unwrap();
         let unit_c = extract_unit_name(&cmd_c);
@@ -2035,7 +2070,7 @@ mod tests {
             "unit names must differ for different lanes with the same job ID"
         );
         // Same lane and job must produce the same name (deterministic).
-        let (cmd_a2, _) = build_phase_command(
+        let (cmd_a2, _, _) = build_phase_command(
             WarmPhase::Build,
             Path::new("/tmp/ws"),
             Path::new("/tmp/ch"),
@@ -2044,6 +2079,7 @@ mod tests {
             Some(&containment),
             "lane-0",
             "aaaaaaaa-1111-2222-3333-444444444444",
+            false,
         )
         .unwrap();
         let unit_a2 = extract_unit_name(&cmd_a2);

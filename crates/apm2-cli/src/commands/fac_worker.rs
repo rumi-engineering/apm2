@@ -7689,17 +7689,23 @@ fn build_stop_revoke_lane_candidates(lane_hint: &str) -> Vec<String> {
     lanes.into_iter().collect()
 }
 
-fn stop_systemd_unit_both_scopes(unit_name: &str) -> Result<(), String> {
+const STOP_REVOKE_BATCH_SIZE: usize = 32;
+
+fn stop_systemd_units_both_scopes(unit_names: &[String]) -> Result<(), String> {
+    if unit_names.is_empty() {
+        return Ok(());
+    }
     let mut last_err = String::new();
     let mut any_stop_succeeded = false;
     let mut not_found_count: u32 = 0;
     let scopes: &[&str] = &["--user", "--system"];
+    let joined_units = unit_names.join(", ");
 
     for mode_flag in scopes {
-        eprintln!("worker: stop_revoke: stopping unit {unit_name} ({mode_flag})");
-        let stop_result = std::process::Command::new("systemctl")
-            .args([mode_flag, "stop", "--", unit_name])
-            .output();
+        eprintln!("worker: stop_revoke: stopping units [{joined_units}] ({mode_flag})");
+        let mut args = vec![mode_flag.to_string(), "stop".to_string(), "--".to_string()];
+        args.extend(unit_names.iter().cloned());
+        let stop_result = std::process::Command::new("systemctl").args(&args).output();
         match stop_result {
             Ok(out) if out.status.success() => {
                 any_stop_succeeded = true;
@@ -7725,7 +7731,7 @@ fn stop_systemd_unit_both_scopes(unit_name: &str) -> Result<(), String> {
     }
 
     Err(format!(
-        "systemctl stop failed for unit {unit_name}: {last_err}"
+        "systemctl stop failed for units [{joined_units}]: {last_err}"
     ))
 }
 
@@ -7747,12 +7753,20 @@ fn stop_target_unit_exact(lane: &str, target_job_id: &str) -> Result<(), String>
             "unsafe queue_lane value {lane:?}: only [A-Za-z0-9_-] allowed"
         ));
     }
-    let safe_target_job_id = sanitize_repo_segment(target_job_id);
+    if target_job_id.is_empty()
+        || !target_job_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return Err(format!(
+            "unsafe target_job_id value {target_job_id:?}: only [A-Za-z0-9_.-] allowed"
+        ));
+    }
     let lane_candidates = build_stop_revoke_lane_candidates(lane);
     let mut units_to_stop: BTreeSet<String> = BTreeSet::new();
 
     for lane_id in &lane_candidates {
-        match check_fac_unit_liveness(lane_id, &safe_target_job_id) {
+        match check_fac_unit_liveness(lane_id, target_job_id) {
             FacUnitLiveness::Inactive => {},
             FacUnitLiveness::Active { active_units } => {
                 units_to_stop.extend(active_units);
@@ -7774,8 +7788,9 @@ fn stop_target_unit_exact(lane: &str, target_job_id: &str) -> Result<(), String>
     }
 
     let mut stop_errors = Vec::new();
-    for unit_name in &units_to_stop {
-        if let Err(err) = stop_systemd_unit_both_scopes(unit_name) {
+    let units: Vec<String> = units_to_stop.into_iter().collect();
+    for batch in units.chunks(STOP_REVOKE_BATCH_SIZE) {
+        if let Err(err) = stop_systemd_units_both_scopes(batch) {
             stop_errors.push(err);
         }
     }
@@ -7788,7 +7803,7 @@ fn stop_target_unit_exact(lane: &str, target_job_id: &str) -> Result<(), String>
 
     let mut lingering_units = Vec::new();
     for lane_id in &lane_candidates {
-        match check_fac_unit_liveness(lane_id, &safe_target_job_id) {
+        match check_fac_unit_liveness(lane_id, target_job_id) {
             FacUnitLiveness::Inactive => {},
             FacUnitLiveness::Active { active_units } => {
                 lingering_units.extend(active_units);

@@ -21,6 +21,9 @@ pub const ORPHANED_SYSTEMD_UNIT_REASON_CODE: &str = "ORPHANED_SYSTEMD_UNIT";
 const MAX_CGROUP_FILE_BYTES: u64 = 8192;
 const MAX_SYSTEMD_UNIT_NAME_LENGTH: usize = 255;
 const SYSTEMCTL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_SYSTEMCTL_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_ASSOCIATED_UNITS: usize = 256;
+const SYSTEMCTL_STREAM_CHUNK_BYTES: usize = 8192;
 
 /// Liveness state for FAC-associated systemd units.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +236,12 @@ fn probe_pattern_units(
         }
 
         if matches!(active, "active" | "activating" | "reloading") {
+            if active_units.len() >= MAX_ASSOCIATED_UNITS {
+                return Err(UnitProbeStatus::Unknown(format!(
+                    "systemctl {scope_flag} list-units exceeded associated unit limit \
+                     ({MAX_ASSOCIATED_UNITS}) for pattern {pattern}"
+                )));
+            }
             active_units.insert(unit.to_string());
         }
     }
@@ -333,12 +342,67 @@ fn run_systemctl_with_timeout(args: &[&str]) -> Result<Output, UnitProbeStatus> 
             }
         })?;
 
+    let stdout = child.stdout.take().ok_or_else(|| {
+        UnitProbeStatus::Unknown(format!(
+            "systemctl {} failed to capture stdout",
+            args.join(" ")
+        ))
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        UnitProbeStatus::Unknown(format!(
+            "systemctl {} failed to capture stderr",
+            args.join(" ")
+        ))
+    })?;
+    let stdout_handle = std::thread::spawn(move || read_stream_bounded(stdout));
+    let stderr_handle = std::thread::spawn(move || read_stream_bounded(stderr));
+
     let status = child.wait_timeout(SYSTEMCTL_PROBE_TIMEOUT).map_err(|err| {
         UnitProbeStatus::Unknown(format!("systemctl {} wait failed: {err}", args.join(" ")))
     })?;
-    if status.is_none() {
+    let (final_status, timed_out) = if let Some(exit) = status {
+        (exit, false)
+    } else {
         let _ = child.kill();
-        let _ = child.wait();
+        let exit = child.wait().map_err(|err| {
+            UnitProbeStatus::Unknown(format!(
+                "systemctl {} wait-after-kill failed: {err}",
+                args.join(" ")
+            ))
+        })?;
+        (exit, true)
+    };
+
+    let stdout = stdout_handle
+        .join()
+        .map_err(|_| {
+            UnitProbeStatus::Unknown(format!(
+                "systemctl {} stdout capture thread panicked",
+                args.join(" ")
+            ))
+        })?
+        .map_err(|err| {
+            UnitProbeStatus::Unknown(format!(
+                "systemctl {} stdout capture failed: {err}",
+                args.join(" ")
+            ))
+        })?;
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| {
+            UnitProbeStatus::Unknown(format!(
+                "systemctl {} stderr capture thread panicked",
+                args.join(" ")
+            ))
+        })?
+        .map_err(|err| {
+            UnitProbeStatus::Unknown(format!(
+                "systemctl {} stderr capture failed: {err}",
+                args.join(" ")
+            ))
+        })?;
+
+    if timed_out {
         return Err(UnitProbeStatus::Unknown(format!(
             "systemctl {} timed out after {}s",
             args.join(" "),
@@ -346,11 +410,10 @@ fn run_systemctl_with_timeout(args: &[&str]) -> Result<Output, UnitProbeStatus> 
         )));
     }
 
-    child.wait_with_output().map_err(|err| {
-        UnitProbeStatus::Unknown(format!(
-            "systemctl {} output capture failed: {err}",
-            args.join(" ")
-        ))
+    Ok(Output {
+        status: final_status,
+        stdout,
+        stderr,
     })
 }
 
@@ -361,6 +424,23 @@ fn is_scope_unavailable(stderr: &str) -> bool {
         || lower.contains("access denied")
         || lower.contains("permission denied")
         || lower.contains("connection refused")
+}
+
+fn read_stream_bounded<R: std::io::Read>(mut stream: R) -> std::io::Result<Vec<u8>> {
+    let mut captured = Vec::new();
+    let mut chunk = [0u8; SYSTEMCTL_STREAM_CHUNK_BYTES];
+    loop {
+        let bytes_read = stream.read(&mut chunk)?;
+        if bytes_read == 0 {
+            break;
+        }
+        if captured.len() < MAX_SYSTEMCTL_OUTPUT_BYTES {
+            let remaining = MAX_SYSTEMCTL_OUTPUT_BYTES.saturating_sub(captured.len());
+            let to_copy = bytes_read.min(remaining);
+            captured.extend_from_slice(&chunk[..to_copy]);
+        }
+    }
+    Ok(captured)
 }
 
 #[cfg(test)]

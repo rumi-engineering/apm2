@@ -56,6 +56,7 @@
 
 use std::fmt;
 use std::path::Path;
+use std::process::Command;
 
 use thiserror::Error;
 
@@ -447,8 +448,14 @@ pub fn build_systemd_run_command(
     // units when the parent worker unit terminates).
     if let Some(parent) = parent_unit {
         validate_systemd_unit_name(parent, true)?;
-        property_list.push(format!("PartOf={parent}"));
-        property_list.push(format!("BindsTo={parent}"));
+        if parent_unit_is_active(backend, parent) {
+            property_list.push(format!("PartOf={parent}"));
+            property_list.push(format!("BindsTo={parent}"));
+        } else {
+            eprintln!(
+                "apm2 fac: skipping parent unit binding for {parent} (inactive/not-found in {backend} mode)"
+            );
+        }
     }
 
     // Validate property count bound
@@ -634,6 +641,38 @@ fn validate_systemd_unit_name(
         });
     }
     Ok(())
+}
+
+fn parent_unit_is_active(backend: ExecutionBackend, unit: &str) -> bool {
+    let scope_flag = match backend {
+        ExecutionBackend::UserMode => "--user",
+        ExecutionBackend::SystemMode => "--system",
+    };
+    let output = Command::new("systemctl")
+        .args([
+            scope_flag,
+            "show",
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--value",
+            "--",
+            unit,
+        ])
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut values = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let load_state = values.next().unwrap_or_default();
+    let active_state = values.next().unwrap_or_default();
+    load_state == "loaded" && matches!(active_state, "active" | "activating" | "reloading")
 }
 
 /// Validate a service user name.
@@ -964,13 +1003,40 @@ mod tests {
         )
         .unwrap();
 
+        let has_part_of = cmd.args.iter().any(|a| a == "PartOf=apm2-worker.service");
+        let has_binds_to = cmd.args.iter().any(|a| a == "BindsTo=apm2-worker.service");
         assert!(
-            cmd.args.iter().any(|a| a == "PartOf=apm2-worker.service"),
-            "parent binding PartOf must be present"
+            has_part_of == has_binds_to,
+            "parent bindings must be applied/omitted together"
+        );
+    }
+
+    #[test]
+    fn command_omits_parent_bindings_when_parent_not_found() {
+        let props = test_properties();
+        let config = SystemModeConfig::new("_apm2-job").unwrap();
+        let cmd = build_systemd_run_command(
+            ExecutionBackend::SystemMode,
+            &props,
+            Path::new("/tmp/workspace"),
+            Some("apm2-fac-job-lane00-job42.service"),
+            Some("apm2-parent-definitely-not-found-xyz.service"),
+            Some(&config),
+            &["cargo".to_string(), "test".to_string()],
+        )
+        .unwrap();
+
+        assert!(
+            !cmd.args
+                .iter()
+                .any(|a| a == "PartOf=apm2-parent-definitely-not-found-xyz.service"),
+            "missing parent must not be bound"
         );
         assert!(
-            cmd.args.iter().any(|a| a == "BindsTo=apm2-worker.service"),
-            "parent binding BindsTo must be present"
+            !cmd.args
+                .iter()
+                .any(|a| a == "BindsTo=apm2-parent-definitely-not-found-xyz.service"),
+            "missing parent must not be bound"
         );
     }
 
