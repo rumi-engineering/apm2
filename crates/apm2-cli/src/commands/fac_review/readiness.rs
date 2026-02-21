@@ -120,7 +120,7 @@ impl SubstrateComponent {
                 "ensure $APM2_HOME is writable and rerun `apm2 fac gates`; if needed run `apm2 fac bootstrap`"
             },
             Self::LanePool => {
-                "repair lane substrate with `apm2 fac lane reconcile` or reinitialize with `apm2 fac lane init`"
+                "repair lane substrate with `apm2 fac doctor --fix` or reinitialize with `apm2 fac lane init`"
             },
             Self::Canonicalizer => {
                 "reset broker admission artifacts under $APM2_HOME/private/fac/broker and rerun readiness"

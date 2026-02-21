@@ -187,23 +187,21 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
 |----------|-------------|
 | `run_fac(cmd, operator_socket, session_socket)` | Route FAC subcommands; returns exit code |
 
-### Lane Init/Reconcile Commands (fac.rs, TCK-00539)
+### Lane Init/Doctor Commands (fac.rs, TCK-00539, TCK-00659)
 
 | Subcommand | Function | Description |
 |------------|----------|-------------|
 | `apm2 fac lane init` | `run_lane_init()` | Bootstrap a fresh lane pool with directories and default profiles |
-| `apm2 fac lane reconcile` | `run_lane_reconcile()` | Repair missing lane directories/profiles, mark unrecoverable lanes CORRUPT |
+| `apm2 fac doctor --fix` | `run_system_doctor_fix()` | Deterministic host reconciliation/remediation (lane+queue reconcile, tmp scrub, lane reset retry, stale log GC) |
 
-Both subcommands accept a `--json` flag for structured output. Human-readable
-tables are printed by default via `print_lane_init_receipt()` and
-`print_lane_reconcile_receipt()`.
+Both command paths support JSON output. `lane init` prints a human-readable
+receipt by default via `print_lane_init_receipt()`.
 
-**Exit code policy for `run_lane_reconcile`**: non-zero when any of
-`lanes_marked_corrupt`, `lanes_failed`, or `infrastructure_failures` is > 0.
+**Exit code policy for `run_system_doctor_fix`**: non-zero when remediation
+actions fail or post-fix doctor checks still contain critical errors.
 
 **LaneSubcommand** enum variants added:
 - `Init(LaneInitArgs)` -- `--json` flag
-- `Reconcile(LaneReconcileArgs)` -- `--json` flag
 - `MarkCorrupt(LaneMarkCorruptArgs)` -- `--reason`, `--receipt-digest`, `--json` flags (TCK-00570)
 
 ### Lane Mark-Corrupt Command (fac.rs, TCK-00570)
@@ -213,11 +211,10 @@ tables are printed by default via `print_lane_init_receipt()` and
 | `apm2 fac lane mark-corrupt <lane_id> --reason ...` | `run_lane_mark_corrupt()` | Operator tool to manually mark a lane as CORRUPT |
 
 Writes a `corrupt.v1.json` marker under exclusive lane lock. Refuses
-RUNNING lanes (use `lane reset --force`) and already-CORRUPT lanes (use
-`lane reset` first). Accepts optional `--receipt-digest` to bind the
+RUNNING lanes and already-CORRUPT lanes. Accepts optional `--receipt-digest` to bind the
 marker to an evidence artifact. Validates reason and digest against
 `MAX_STRING_LENGTH` (512). The marker prevents all future job leases
-until cleared via `apm2 fac lane reset`.
+until reconciled by `apm2 fac doctor --fix`.
 
 ### Bootstrap (fac_bootstrap.rs, TCK-00599)
 

@@ -62,6 +62,8 @@ proposed_change:
       1) Bind transient units to the parent worker systemd unit (PartOf/BindsTo).
       2) Add a lane reclaim guard: before clearing a stale lease (pid dead), check if any job units
          associated with that lease are still active; if yes, fail-closed and surface remediation.
+      3) Consolidate host-side repair into `apm2 fac doctor --fix` (no new command surface): run
+         deterministic reconcile + targeted lane recovery/remediation when trigger conditions match.
 
 invariants:
   - id: 'INV-SD-BIND-001'
@@ -104,11 +106,26 @@ scope:
       description: |
         Documentation + operator UX:
           - fac doctor / services status should surface "orphaned systemd unit" clearly and suggest
-            remediation (stop_revoke, lane reset).
+            remediation (stop_revoke, `apm2 fac doctor --fix`).
           - Add an explicit log line when reclaim is blocked due to active units.
+    - id: 'S5'
+      description: |
+        Doctor fix consolidation (no new commands):
+          - `apm2 fac doctor --fix` without `--pr` becomes a system reconciler that:
+              * runs lane reconcile and queue reconcile apply paths,
+              * detects tmp-corruption triggers and performs bounded tmp scrub,
+              * performs stale lane-log GC under bounded retention policy,
+              * attempts bounded lane recovery (including lane reset retry) for
+                trigger-matched CORRUPT lanes,
+              * fails closed when orphaned units are still active/unknown,
+              * re-runs doctor checks and emits structured action outcomes.
+          - Keep `apm2 fac doctor --pr <N> --fix` semantics unchanged.
+          - Remove legacy crash-recovery command entrypoints (`fac reconcile`, `fac lane reset`,
+            `fac lane reconcile`) so doctor is the sole remediation surface.
   out_of_scope:
     - 'Replacing file locks with systemd unit-name locks (larger redesign).'
     - 'Full D-Bus integration (CLI-based systemctl calls are acceptable for now).'
+    - 'Adding a new FAC remediation command family; doctor is the consolidation surface.'
 
 plan:
   steps:
@@ -120,6 +137,8 @@ plan:
       description: 'Add systemd unit liveness helper and integrate into lane reclaim logic (reconcile + acquire_worker_lane).'
     - id: 'P4'
       description: 'Update fac doctor/status output to expose orphaned units (actionable output).'
+    - id: 'P5'
+      description: 'Implement no-PR `apm2 fac doctor --fix` reconciliation flow (reconcile + tmp detection/scrub + stale log GC + trigger-based lane reset + post-check).'
 
 
 definition_of_done:
@@ -127,6 +146,7 @@ definition_of_done:
     - 'systemd-run commands emitted by FAC include PartOf/BindsTo when worker is running under systemd.'
     - 'Lane reclaim will not clear a lease (and thus not re-use a lane) while systemd indicates associated work units are active.'
     - 'Operator-facing tooling surfaces orphaned-unit situations and points to remediation.'
+    - '`apm2 fac doctor --fix` (without `--pr`) performs bounded reconciliation/remediation and emits structured action/check output.'
   evidence_ids:
     - 'EVID-TCK-00659-01 (unit): detect_systemd_unit_name() parsing tests'
     - 'EVID-TCK-00659-02 (unit): build_systemd_run_command includes PartOf/BindsTo'
