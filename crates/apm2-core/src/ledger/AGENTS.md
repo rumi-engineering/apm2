@@ -245,7 +245,7 @@ RFC-0032 Phase 0: Migrates legacy `ledger_events` rows into the canonical `event
 - [INV-LED-015] `ledger_events` table is preserved after migration (emptied, not renamed) for legacy writer compatibility
 - [INV-LED-016] Fail-closed on data loss: if `ledger_events_legacy_frozen` has rows but `events` is empty, the migration fails with `MigrationPartialState` (canonical chain missing), regardless of live legacy row count
 - [INV-LED-017] Empty-frozen genesis recovery: if frozen exists with 0 rows, events is empty, and new legacy rows appeared, perform full migration from genesis (not a no-op)
-- [INV-LED-018] After migration, `ledger_events` writes are blocked by the freeze guard on `SqliteLedgerEventEmitter`. The `FrozenLegacyWriter` error is returned when the guard is active. The freeze guard uses an `AtomicBool` with `Acquire`/`Release` ordering; once set, it is never cleared.
+- [INV-LED-018] After migration, `ledger_events` writes are redirected by the freeze guard on `SqliteLedgerEventEmitter` and `SqliteLeaseValidator`. When frozen, all write methods route to the canonical `events` table with BLAKE3 hash chain continuity (`persist_to_canonical_events` / `persist_lease_to_canonical_events`). The freeze guard uses an `AtomicBool` with `Acquire`/`Release` ordering; once set, it is never cleared.
 - [INV-LED-019] Post-migration invariant: `is_canonical_events_mode(conn)` must return `true` after startup migration. If `false`, the daemon must not start (fail-closed).
 
 ### `is_canonical_events_mode(conn) -> Result<bool, LedgerError>`

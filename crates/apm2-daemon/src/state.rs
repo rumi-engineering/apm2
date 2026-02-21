@@ -905,21 +905,10 @@ impl DispatcherState {
                 Arc::clone(&conn),
                 signing_key.clone(),
             ));
-            let emitter_inner = SqliteLedgerEventEmitter::new(
+            let event_emitter = Arc::new(SqliteLedgerEventEmitter::new(
                 Arc::clone(&conn),
                 signing_key,
-            );
-            // TCK-00631: Freeze legacy writes after RFC-0032 migration.
-            if let Err(e) = emitter_inner.freeze_legacy_writes_self() {
-                tracing::warn!(error = %e, "freeze_legacy_writes failed (writes blocked, fail-closed)");
-            }
-            // TCK-00631: Freeze legacy writes on lease validator as well.
-            // Both the emitter and validator write to ledger_events; both must
-            // be frozen after migration to enforce the no-dual-writer invariant.
-            if let Err(e) = lease_validator.freeze_legacy_writes() {
-                tracing::warn!(error = %e, "lease_validator freeze_legacy_writes failed (writes blocked, fail-closed)");
-            }
-            let event_emitter = Arc::new(emitter_inner);
+            ));
 
             // TCK-00319 SECURITY: Configure EpisodeRuntime with workspace-rooted handlers
             // All file/execute handlers MUST use rooted factories that receive the
@@ -1434,16 +1423,10 @@ impl DispatcherState {
             Arc::clone(&sqlite_conn),
             signing_key.clone(),
         ));
-        let emitter_inner = SqliteLedgerEventEmitter::new(Arc::clone(&sqlite_conn), signing_key);
-        // TCK-00631: Freeze legacy writes after RFC-0032 migration.
-        if let Err(e) = emitter_inner.freeze_legacy_writes_self() {
-            tracing::warn!(error = %e, "freeze_legacy_writes failed (writes blocked, fail-closed)");
-        }
-        // TCK-00631: Freeze legacy writes on lease validator as well.
-        if let Err(e) = lease_validator.freeze_legacy_writes() {
-            tracing::warn!(error = %e, "lease_validator freeze_legacy_writes failed (writes blocked, fail-closed)");
-        }
-        let event_emitter = Arc::new(emitter_inner);
+        let event_emitter = Arc::new(SqliteLedgerEventEmitter::new(
+            Arc::clone(&sqlite_conn),
+            signing_key,
+        ));
 
         // TCK-00316: Initialize EpisodeRuntime with CAS and handlers
         // Use safe production defaults:
@@ -1908,6 +1891,28 @@ impl DispatcherState {
     pub fn with_daemon_state(mut self, state: SharedState) -> Self {
         self.privileged_dispatcher = self.privileged_dispatcher.with_daemon_state(state);
         self
+    }
+
+    /// TCK-00631: Freeze legacy `ledger_events` writes on both the event
+    /// emitter and lease validator.
+    ///
+    /// Called from daemon startup after RFC-0032 Phase 0 migration completes.
+    /// After this call, all new appends route to the canonical `events` table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either freeze call fails. The freeze guard is
+    /// still activated (fail-closed) — the error is for observability.
+    pub fn freeze_legacy_writes(&self) -> Result<(), String> {
+        self.privileged_dispatcher
+            .event_emitter()
+            .freeze_legacy_writes()
+            .map_err(|e| format!("emitter freeze_legacy_writes failed: {e}"))?;
+        self.privileged_dispatcher
+            .lease_validator()
+            .freeze_legacy_writes()
+            .map_err(|e| format!("lease_validator freeze_legacy_writes failed: {e}"))?;
+        Ok(())
     }
 
     /// Configures TCK-00565 token binding fields on the dispatcher.

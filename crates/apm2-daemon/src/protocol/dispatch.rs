@@ -1438,6 +1438,15 @@ pub trait LedgerEventEmitter: Send + Sync {
                 .to_string(),
         })
     }
+
+    /// TCK-00631: Freeze legacy `ledger_events` writes and route future appends
+    /// to the canonical `events` table.
+    ///
+    /// Called by daemon startup after RFC-0032 Phase 0 migration.
+    /// Default implementation is a no-op (for in-memory/stub emitters).
+    fn freeze_legacy_writes(&self) -> Result<(), LedgerEventError> {
+        Ok(())
+    }
 }
 
 /// Domain separation prefix for `WorkClaimed` events.
@@ -6857,6 +6866,15 @@ pub trait LeaseValidator: Send + Sync {
     fn get_delegation_parent_lease_id(&self, lease_id: &str) -> Result<Option<String>, String> {
         let _ = lease_id;
         Ok(None)
+    }
+
+    /// TCK-00631: Freeze legacy `ledger_events` writes and route future
+    /// appends/reads to the canonical `events` table.
+    ///
+    /// Called by daemon startup after RFC-0032 Phase 0 migration.
+    /// Default implementation is a no-op (for in-memory/stub validators).
+    fn freeze_legacy_writes(&self) -> Result<(), String> {
+        Ok(())
     }
 }
 

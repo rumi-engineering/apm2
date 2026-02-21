@@ -1321,6 +1321,17 @@ async fn async_main(args: Args) -> Result<()> {
         .with_token_binding_config(boundary_id.clone(), [0u8; 32]),
     );
 
+    // TCK-00631: Freeze legacy `ledger_events` writes on both the event emitter
+    // and lease validator. After this, all new appends route to canonical `events`.
+    // This MUST happen after init_canonical_schema + migrate_legacy_ledger_events
+    // (above) to ensure the `events` table exists.
+    if sqlite_conn.is_some() {
+        if let Err(e) = dispatcher_state.freeze_legacy_writes() {
+            warn!(error = %e, "freeze_legacy_writes failed (writes blocked, fail-closed)");
+        }
+        info!("TCK-00631: Legacy ledger writes frozen; new appends route to canonical events");
+    }
+
     // TCK-00388: Wire gate orchestrator into daemon for autonomous gate lifecycle.
     //
     // The orchestrator is instantiated with the daemon lifecycle signing key
@@ -2746,15 +2757,11 @@ async fn perform_crash_recovery(
     // ensures ONE signing key per daemon lifecycle, shared between recovery and
     // the dispatcher.
     let emitter = sqlite_conn.map(|conn| {
-        let emitter = SqliteLedgerEventEmitter::new(Arc::clone(conn), ledger_signing_key.clone());
-        // TCK-00631: Freeze legacy writes after RFC-0032 migration.
-        if let Err(e) = emitter.freeze_legacy_writes_self() {
-            warn!(
-                error = %e,
-                "freeze_legacy_writes failed for recovery emitter (writes blocked, fail-closed)"
-            );
-        }
-        emitter
+        SqliteLedgerEventEmitter::new(Arc::clone(conn), ledger_signing_key.clone())
+        // NOTE: Recovery emitter is NOT frozen. Crash recovery runs BEFORE
+        // the main freeze (in async_main). Recovery events go to legacy
+        // `ledger_events` and will be re-migrated on next startup if needed
+        // (the migration function handles post-cutover legacy rows).
     });
 
     // Security Review v4 BLOCKER 2: Create the daemon's shared HTF clock for

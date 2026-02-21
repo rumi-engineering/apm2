@@ -40,20 +40,24 @@ use crate::protocol::dispatch::{
 
 /// Durable ledger event emitter backed by `SQLite`.
 ///
-/// # Freeze Guard (TCK-00631)
+/// # Freeze Guard and Canonical Bridge (TCK-00631)
 ///
 /// After RFC-0032 Phase 0 migration, this emitter can be frozen via
-/// [`Self::freeze_legacy_writes`]. Once frozen, all write methods return
-/// [`LedgerEventError::FrozenLegacyWriter`] without mutating state.
+/// [`Self::freeze_legacy_writes`]. Once frozen, all write methods route
+/// to the canonical `events` table via `persist_to_canonical_events`
+/// instead of the legacy `ledger_events` table. This ensures new events
+/// always append to the canonical ledger with BLAKE3 hash chain continuity.
+///
+/// `freeze_legacy_writes` is **unconditional**: it always activates the
+/// freeze guard, regardless of whether `ledger_events_legacy_frozen` exists.
 ///
 /// ## Synchronization Protocol (CTR-1002)
 ///
 /// The `frozen` flag is an `AtomicBool` with `Acquire`/`Release` ordering:
-/// - **Protected data**: The legacy `ledger_events` table (no writes after
-///   freeze).
+/// - **Protected data**: Write-target routing (`events` vs `ledger_events`).
 /// - **Publication**: `freeze_legacy_writes` stores `true` with `Release`.
-/// - **Consumption**: Every write method loads with `Acquire` before any
-///   mutation.
+/// - **Consumption**: Every write method loads with `Acquire` to determine the
+///   write target.
 /// - **Happens-before**: `freeze_legacy_writes(Release)` -> write method
 ///   `load(Acquire)` ensures all write methods see the freeze after it is set.
 /// - **Allowed reorderings**: None — once frozen, the flag is never unset.
@@ -61,9 +65,9 @@ use crate::protocol::dispatch::{
 pub struct SqliteLedgerEventEmitter {
     conn: Arc<Mutex<Connection>>,
     signing_key: ed25519_dalek::SigningKey,
-    /// Freeze guard: when `true`, all write methods reject with
-    /// `FrozenLegacyWriter`. Set once by `freeze_legacy_writes` and
-    /// never cleared. See synchronization protocol above.
+    /// Freeze guard: when `true`, all write methods route to the
+    /// canonical `events` table. Set once by `freeze_legacy_writes`
+    /// and never cleared. See synchronization protocol above.
     frozen: AtomicBool,
 }
 
@@ -142,30 +146,36 @@ impl SqliteLedgerEventEmitter {
         }
     }
 
-    /// Activates the freeze guard if `ledger_events_legacy_frozen` exists.
+    /// Activates the freeze guard, routing all subsequent writes to the
+    /// canonical `events` table instead of the legacy `ledger_events` table.
     ///
-    /// After this call returns `Ok(true)`, all subsequent write methods on
-    /// this emitter will return [`LedgerEventError::FrozenLegacyWriter`]
-    /// without mutating the database.
-    ///
-    /// # Fail-Closed Semantics
-    ///
-    /// If the existence check itself fails (e.g., database error), the
-    /// emitter is frozen anyway — it is safer to block writes than to risk
-    /// dual-writing. The error is returned so the caller can log it.
+    /// This method is called at daemon startup after migration. It
+    /// **unconditionally** freezes the emitter: after this call, all write
+    /// methods (`emit_*`) route through the canonical bridge
+    /// (`persist_to_canonical_events`) regardless of whether the
+    /// `ledger_events_legacy_frozen` table exists. This eliminates the
+    /// counterexample where a canonical-mode DB (events > 0, no frozen
+    /// table) would leave the guard inactive.
     ///
     /// # Returns
     ///
-    /// - `Ok(true)` if the freeze guard was activated (table exists or DB check
-    ///   failed).
-    /// - `Ok(false)` if the frozen table does not exist (legacy mode, no
-    ///   migration ran).
+    /// - `Ok(true)` — always; the freeze guard is now active.
     ///
     /// # Errors
     ///
-    /// Returns the underlying database error after freezing the emitter.
+    /// Returns the underlying database error if the
+    /// `ledger_events_legacy_frozen` existence check fails, but the emitter
+    /// is still frozen (fail-closed).
     pub fn freeze_legacy_writes(&self, conn: &Connection) -> Result<bool, LedgerEventError> {
-        let frozen_exists = match conn
+        // Always freeze — there is no valid production scenario where
+        // freeze_legacy_writes() is called and the guard should remain
+        // inactive.  The method is only called at daemon startup after
+        // migration runs.
+        self.frozen.store(true, Ordering::Release);
+
+        // Best-effort check: log whether the frozen table exists for
+        // observability, but the freeze decision is unconditional.
+        match conn
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ledger_events_legacy_frozen' LIMIT 1",
                 [],
@@ -173,11 +183,17 @@ impl SqliteLedgerEventEmitter {
             )
             .optional()
         {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
+            Ok(Some(_)) => {
+                info!("freeze_legacy_writes: ledger_events_legacy_frozen table exists");
+            },
+            Ok(None) => {
+                info!(
+                    "freeze_legacy_writes: ledger_events_legacy_frozen table absent \
+                     (canonical-mode DB); writes routed to canonical events"
+                );
+            },
             Err(e) => {
-                // Fail-closed: freeze even if the check itself fails.
-                self.frozen.store(true, Ordering::Release);
+                // Emitter is already frozen; log the error for observability.
                 return Err(LedgerEventError::PersistenceFailed {
                     message: format!(
                         "failed to check ledger_events_legacy_frozen existence \
@@ -185,19 +201,16 @@ impl SqliteLedgerEventEmitter {
                     ),
                 });
             },
-        };
-
-        if frozen_exists {
-            self.frozen.store(true, Ordering::Release);
         }
 
-        Ok(frozen_exists)
+        Ok(true)
     }
 
     /// Activates the freeze guard using the emitter's own connection.
     ///
     /// Convenience wrapper around [`Self::freeze_legacy_writes`] that acquires
-    /// the internal connection lock.
+    /// the internal connection lock. After this call, all write methods route
+    /// to the canonical `events` table.
     ///
     /// # Errors
     ///
@@ -219,12 +232,13 @@ impl SqliteLedgerEventEmitter {
         self.frozen.load(Ordering::Acquire)
     }
 
-    /// Returns `Err(FrozenLegacyWriter)` if the freeze guard is active.
-    fn check_frozen(&self) -> Result<(), LedgerEventError> {
-        if self.frozen.load(Ordering::Acquire) {
-            return Err(LedgerEventError::FrozenLegacyWriter);
-        }
-        Ok(())
+    /// Returns `true` if the freeze guard is active (writes routed to
+    /// canonical `events`).
+    ///
+    /// Used internally to select the write target (canonical `events` vs
+    /// legacy `ledger_events`) and the chain-tip source.
+    fn is_frozen_internal(&self) -> bool {
+        self.frozen.load(Ordering::Acquire)
     }
 
     /// Initializes the database schema using a deterministic test-only signing
@@ -1242,9 +1256,40 @@ impl SqliteLedgerEventEmitter {
         hex::encode(hasher.finalize())
     }
 
+    /// Returns the latest event hash, selecting the source table based on
+    /// the freeze guard state:
+    /// - **Frozen**: reads from canonical `events` table (BLOB → hex).
+    /// - **Unfrozen**: reads from legacy `ledger_events` table (TEXT).
+    fn latest_event_hash_routed(&self, conn: &Connection) -> Result<String, LedgerEventError> {
+        if self.is_frozen_internal() {
+            Self::latest_canonical_event_hash(conn)
+        } else {
+            Self::latest_event_hash(conn)
+        }
+    }
+
     fn latest_event_hash(conn: &Connection) -> Result<String, LedgerEventError> {
         Self::latest_event_hash_opt(conn)
             .map(|hash| hash.unwrap_or_else(|| Self::LEDGER_CHAIN_GENESIS.to_string()))
+    }
+
+    /// Returns the latest `event_hash` from the canonical `events` table
+    /// (BLOB → hex string). Falls back to `LEDGER_CHAIN_GENESIS` if the
+    /// table is empty.
+    fn latest_canonical_event_hash(conn: &Connection) -> Result<String, LedgerEventError> {
+        let hash_opt: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT event_hash FROM events WHERE event_hash IS NOT NULL \
+                 ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| LedgerEventError::PersistenceFailed {
+                message: format!("sqlite canonical events latest event_hash query failed: {e}"),
+            })?;
+
+        Ok(hash_opt.map_or_else(|| Self::LEDGER_CHAIN_GENESIS.to_string(), hex::encode))
     }
 
     fn latest_event_hash_opt(conn: &Connection) -> Result<Option<String>, LedgerEventError> {
@@ -1326,9 +1371,10 @@ impl SqliteLedgerEventEmitter {
         prev_hash: &str,
         event_hash: &str,
     ) -> Result<(), LedgerEventError> {
-        // TCK-00631: Defense-in-depth freeze guard at the mutation chokepoint.
-        // All ledger_events INSERTs flow through this method.
-        self.check_frozen()?;
+        // TCK-00631: Route to canonical `events` table when frozen.
+        if self.is_frozen_internal() {
+            return self.persist_to_canonical_events(conn, signed_event, prev_hash, event_hash);
+        }
 
         conn.execute("SAVEPOINT persist_event", []).map_err(|e| {
             LedgerEventError::PersistenceFailed {
@@ -1389,6 +1435,118 @@ impl SqliteLedgerEventEmitter {
         if let Err(error) = persist_result {
             let _ = conn.execute("ROLLBACK TO persist_event", []);
             let _ = conn.execute("RELEASE persist_event", []);
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    /// Persists a signed event to the canonical `events` table.
+    ///
+    /// Called when the freeze guard is active. Instead of inserting into the
+    /// legacy `ledger_events` table, this method writes to the canonical
+    /// `events` table using the BLAKE3-based hash chain from
+    /// `apm2_core::crypto::EventHasher`.
+    ///
+    /// # Hash-chain conversion
+    ///
+    /// The legacy emitter uses SHA-256 hex-encoded `event_hash` / `prev_hash`
+    /// strings. The canonical `events` table uses BLAKE3 32-byte BLOBs.
+    /// This method computes a fresh BLAKE3 chain hash from the payload and
+    /// the canonical chain tip (BLOB), maintaining chain continuity with the
+    /// existing `events` tail set during migration.
+    ///
+    /// # Column mapping
+    ///
+    /// | `SignedLedgerEvent` field | `events` column |
+    /// |---------------------------|-----------------|
+    /// | `event_type`              | `event_type`    |
+    /// | `work_id`                 | `session_id`    |
+    /// | `actor_id`                | `actor_id`      |
+    /// | `payload`                 | `payload`       |
+    /// | `timestamp_ns`            | `timestamp_ns`  |
+    /// | `signature`               | `signature`     |
+    /// | (computed)                | `prev_hash`     |
+    /// | (computed)                | `event_hash`    |
+    #[allow(clippy::unused_self)] // &self needed for method dispatch consistency with persist_signed_event
+    fn persist_to_canonical_events(
+        &self,
+        conn: &Connection,
+        signed_event: &SignedLedgerEvent,
+        _legacy_prev_hash: &str,
+        _legacy_event_hash: &str,
+    ) -> Result<(), LedgerEventError> {
+        use apm2_core::crypto::EventHasher;
+
+        conn.execute("SAVEPOINT persist_canonical", [])
+            .map_err(|e| LedgerEventError::PersistenceFailed {
+                message: format!("sqlite savepoint begin failed: {e}"),
+            })?;
+
+        #[allow(clippy::cast_possible_wrap)]
+        // u64 timestamp_ns → i64 for SQLite; nanosecond epoch fits i64 until ~2262
+        let persist_result = (|| {
+            // Fetch canonical chain tip (BLOB).
+            let tail_hash_opt: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT event_hash FROM events WHERE event_hash IS NOT NULL \
+                     ORDER BY rowid DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| LedgerEventError::PersistenceFailed {
+                    message: format!("failed to read canonical chain tip: {e}"),
+                })?;
+
+            let prev_hash: [u8; 32] =
+                match tail_hash_opt {
+                    Some(ref h) => h.as_slice().try_into().map_err(|_| {
+                        LedgerEventError::PersistenceFailed {
+                            message: format!(
+                                "canonical events tail event_hash has length {}, expected 32",
+                                h.len()
+                            ),
+                        }
+                    })?,
+                    None => EventHasher::GENESIS_PREV_HASH,
+                };
+
+            // Compute BLAKE3 event hash for chain continuity.
+            let event_hash = EventHasher::hash_event(&signed_event.payload, &prev_hash);
+
+            conn.execute(
+                "INSERT INTO events (event_type, session_id, actor_id, record_version, \
+                 payload, timestamp_ns, prev_hash, event_hash, signature) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    signed_event.event_type,
+                    signed_event.work_id, // work_id maps to session_id
+                    signed_event.actor_id,
+                    1_i64, // record_version
+                    signed_event.payload,
+                    signed_event.timestamp_ns as i64,
+                    prev_hash.as_slice(),
+                    event_hash.as_slice(),
+                    signed_event.signature,
+                ],
+            )
+            .map_err(|e| LedgerEventError::PersistenceFailed {
+                message: format!("sqlite canonical events insert failed: {e}"),
+            })?;
+
+            conn.execute("RELEASE persist_canonical", []).map_err(|e| {
+                LedgerEventError::PersistenceFailed {
+                    message: format!("sqlite savepoint release failed: {e}"),
+                }
+            })?;
+
+            Ok(())
+        })();
+
+        if let Err(error) = persist_result {
+            let _ = conn.execute("ROLLBACK TO persist_canonical", []);
+            let _ = conn.execute("RELEASE persist_canonical", []);
             return Err(error);
         }
 
@@ -1759,7 +1917,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         claim: &WorkClaim,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        self.check_frozen()?;
         let payload = serde_json::json!({
             "event_type": "work_claimed",
             "work_id": claim.work_id,
@@ -1779,7 +1936,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-        let prev_hash = Self::latest_event_hash(&conn)?;
+        let prev_hash = self.latest_event_hash_routed(&conn)?;
         let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
             "work_claimed",
             &claim.work_id,
@@ -1835,8 +1992,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // Domain prefix for session events (must be at function start per clippy)
         const SESSION_STARTED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_started:";
 
-        self.check_frozen()?;
-
         let payload = build_session_started_payload(
             session_id,
             work_id,
@@ -1855,7 +2010,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-        let prev_hash = Self::latest_event_hash(&conn)?;
+        let prev_hash = self.latest_event_hash_routed(&conn)?;
         let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
             "session_started",
             work_id,
@@ -1887,8 +2042,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // Domain prefix for generic session events (TCK-00290)
         const SESSION_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_event:";
 
-        self.check_frozen()?;
-
         // Build payload as JSON with actual event type and base64-encoded payload
         let payload_json = serde_json::json!({
             "event_type": event_type,
@@ -1903,7 +2056,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-        let prev_hash = Self::latest_event_hash(&conn)?;
+        let prev_hash = self.latest_event_hash_routed(&conn)?;
         let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
             event_type,
             session_id, // Use session_id as work_id for indexing
@@ -1930,7 +2083,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         &self,
         mutation: &StopFlagsMutation<'_>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        self.check_frozen()?;
         let payload = serde_json::json!({
             "event_type": "stop_flags_mutated",
             "actor_id": mutation.actor_id,
@@ -1948,7 +2100,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-        let prev_hash = Self::latest_event_hash(&conn)?;
+        let prev_hash = self.latest_event_hash_routed(&conn)?;
         let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
             "stop_flags_mutated",
             STOP_FLAGS_MUTATED_WORK_ID,
@@ -1978,7 +2130,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         defect: &DefectRecorded,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        self.check_frozen()?;
         // TCK-00307 MAJOR 4: Call validate() to enforce DoS protections
         defect
             .validate()
@@ -2010,7 +2161,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-        let prev_hash = Self::latest_event_hash(&conn)?;
+        let prev_hash = self.latest_event_hash_routed(&conn)?;
         let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
             "defect_recorded",
             &defect.work_id,
@@ -2277,8 +2428,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         const RECEIPT_CONSUMED_DOMAIN_PREFIX: &[u8] = b"apm2.event.redundancy_receipt_consumed:";
 
-        self.check_frozen()?;
-
         let payload = serde_json::json!({
             "event_type": REDUNDANCY_RECEIPT_CONSUMED_EVENT,
             "session_id": session_id,
@@ -2300,7 +2449,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-        let prev_hash = Self::latest_event_hash(&conn)?;
+        let prev_hash = self.latest_event_hash_routed(&conn)?;
         let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
             REDUNDANCY_RECEIPT_CONSUMED_EVENT,
             session_id,
@@ -2579,7 +2728,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         payload: &[u8],
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        self.check_frozen()?;
         // Build payload as JSON with episode event metadata
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
         // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
@@ -2597,7 +2745,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-        let prev_hash = Self::latest_event_hash(&conn)?;
+        let prev_hash = self.latest_event_hash_routed(&conn)?;
         let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
             event_type,
             episode_id, // Use episode_id as work_id for indexing
@@ -2635,7 +2783,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         time_envelope_ref: &str,
         pcac_lifecycle: Option<&PrivilegedPcacLifecycleArtifacts>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        self.check_frozen()?;
         // TCK-00321: Use REVIEW_RECEIPT_RECORDED_PREFIX from apm2_core::fac for
         // protocol compatibility across daemon/core boundary.
         // (Previously used daemon-local prefix; now aligned with core.)
@@ -2714,7 +2861,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-        let prev_hash = Self::latest_event_hash(&conn)?;
+        let prev_hash = self.latest_event_hash_routed(&conn)?;
         let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
             "review_receipt_recorded",
             work_id,
@@ -2758,8 +2905,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         pcac_lifecycle: Option<&PrivilegedPcacLifecycleArtifacts>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use crate::protocol::dispatch::REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX;
-
-        self.check_frozen()?;
 
         for (name, hash) in [
             ("capability_manifest_hash", capability_manifest_hash),
@@ -2839,7 +2984,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-        let prev_hash = Self::latest_event_hash(&conn)?;
+        let prev_hash = self.latest_event_hash_routed(&conn)?;
         let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
             "review_blocked_recorded",
             work_id,
@@ -2876,8 +3021,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // This is imported from dispatch.rs and used to ensure domain separation.
         const EPISODE_RUN_ATTRIBUTED_PREFIX: &[u8] = b"apm2.event.episode_run_attributed:";
 
-        self.check_frozen()?;
-
         // Build payload as JSON with run attribution data
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
         // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
@@ -2898,7 +3041,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-        let prev_hash = Self::latest_event_hash(&conn)?;
+        let prev_hash = self.latest_event_hash_routed(&conn)?;
         let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
             "episode_run_attributed",
             work_id,
@@ -2926,7 +3069,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         &self,
         transition: &WorkTransition<'_>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        self.check_frozen()?;
         // Build payload as JSON with work transition data
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
         // malleability per LAW-09 (Temporal Pinning & Freshness)
@@ -2946,7 +3088,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-        let prev_hash = Self::latest_event_hash(&conn)?;
+        let prev_hash = self.latest_event_hash_routed(&conn)?;
         let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
             "work_transitioned",
             transition.work_id,
@@ -2978,7 +3120,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         actor_id: &str,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        self.check_frozen()?;
         // Build payload as JSON with session termination data
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
         // malleability per LAW-09 (Temporal Pinning & Freshness)
@@ -2997,7 +3138,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-        let prev_hash = Self::latest_event_hash(&conn)?;
+        let prev_hash = self.latest_event_hash_routed(&conn)?;
         let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
             "session_terminated",
             work_id,
@@ -3031,7 +3172,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         actor_id: &str,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        self.check_frozen()?;
         let conn = self
             .conn
             .lock()
@@ -3046,7 +3186,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             })?;
 
         // --- Event 1: WorkClaimed ---
-        let prev_hash = Self::latest_event_hash(&conn).inspect_err(|_e| {
+        let prev_hash = self.latest_event_hash_routed(&conn).inspect_err(|_e| {
             let _ = conn.execute("ROLLBACK", []);
         })?;
         let claimed_payload = serde_json::json!({
@@ -3173,8 +3313,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         const SESSION_STARTED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_started:";
 
-        self.check_frozen()?;
-
         let conn = self
             .conn
             .lock()
@@ -3189,7 +3327,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             })?;
 
         // --- Event 1: SessionStarted ---
-        let prev_hash = Self::latest_event_hash(&conn).inspect_err(|_e| {
+        let prev_hash = self.latest_event_hash_routed(&conn).inspect_err(|_e| {
             let _ = conn.execute("ROLLBACK", []);
         })?;
         let session_payload = build_session_started_payload(
@@ -3303,7 +3441,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         actor_id: &str,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        self.check_frozen()?;
         // Build payload as JSON with changeset publication data.
         // SECURITY: timestamp_ns is included in signed payload to prevent
         // temporal malleability per LAW-09.
@@ -3321,7 +3458,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-        let prev_hash = Self::latest_event_hash(&conn)?;
+        let prev_hash = self.latest_event_hash_routed(&conn)?;
         let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
             "changeset_published",
             work_id,
@@ -3363,7 +3500,6 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         bindings: &crate::episode::EnvelopeBindings,
         identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        self.check_frozen()?;
         // Fail-closed: validate bindings before emission
         bindings
             .validate()
@@ -3397,7 +3533,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             .map_err(|_| LedgerEventError::PersistenceFailed {
                 message: "connection lock poisoned".to_string(),
             })?;
-        let prev_hash = Self::latest_event_hash(&conn)?;
+        let prev_hash = self.latest_event_hash_routed(&conn)?;
         let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
             "review_receipt_recorded",
             episode_id,
@@ -3422,6 +3558,10 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
     fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
         self.signing_key.verifying_key()
+    }
+
+    fn freeze_legacy_writes(&self) -> Result<(), LedgerEventError> {
+        self.freeze_legacy_writes_self().map(|_| ())
     }
 }
 
@@ -3521,21 +3661,25 @@ impl WorkRegistry for SqliteWorkRegistry {
 
 /// Durable lease validator backed by `SQLite`.
 ///
-/// # Freeze Guard (TCK-00631)
+/// # Freeze Guard and Canonical Bridge (TCK-00631)
 ///
 /// After RFC-0032 Phase 0 migration, this validator can be frozen via
 /// [`Self::freeze_legacy_writes`]. Once frozen, all write methods
-/// (`register_full_lease_inner`, `register_lease_with_executor`) return
-/// an error without mutating state.
+/// (`register_full_lease_inner`, `register_lease_with_executor`) route
+/// to the canonical `events` table via
+/// `persist_lease_to_canonical_events` instead of the legacy
+/// `ledger_events` table.
+///
+/// `freeze_legacy_writes` is **unconditional**: it always activates the
+/// freeze guard.
 ///
 /// ## Synchronization Protocol (CTR-1002)
 ///
 /// The `frozen` flag is an `AtomicBool` with `Acquire`/`Release` ordering:
-/// - **Protected data**: The legacy `ledger_events` table (no writes after
-///   freeze).
+/// - **Protected data**: Write-target routing (`events` vs `ledger_events`).
 /// - **Publication**: `freeze_legacy_writes` stores `true` with `Release`.
-/// - **Consumption**: Every write method loads with `Acquire` before any
-///   mutation.
+/// - **Consumption**: Every write method loads with `Acquire` to determine the
+///   write target.
 /// - **Happens-before**: `freeze_legacy_writes(Release)` -> write method
 ///   `load(Acquire)` ensures all write methods see the freeze after it is set.
 /// - **Allowed reorderings**: None — once frozen, the flag is never unset.
@@ -3607,13 +3751,20 @@ impl SqliteLeaseValidator {
     /// # Errors
     ///
     /// Returns the underlying database error after freezing the validator.
-    pub fn freeze_legacy_writes(&self) -> Result<bool, String> {
+    fn freeze_legacy_writes_inner(&self) -> Result<bool, String> {
+        // Always freeze — there is no valid production scenario where
+        // freeze_legacy_writes() is called and the guard should remain
+        // inactive.  This matches the emitter's unconditional freeze
+        // semantics (TCK-00631 BLOCKER 1 fix).
+        self.frozen.store(true, Ordering::Release);
+
         let conn = self
             .conn
             .lock()
             .map_err(|e| format!("connection lock poisoned during freeze check: {e}"))?;
 
-        let frozen_exists = match conn
+        // Best-effort observability check — freeze decision is unconditional.
+        match conn
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ledger_events_legacy_frozen' LIMIT 1",
                 [],
@@ -3621,41 +3772,29 @@ impl SqliteLeaseValidator {
             )
             .optional()
         {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
+            Ok(Some(_)) => {},
+            Ok(None) => {
+                info!(
+                    "lease_validator freeze_legacy_writes: ledger_events_legacy_frozen \
+                     table absent (canonical-mode DB); writes routed to canonical events"
+                );
+            },
             Err(e) => {
-                // Fail-closed: freeze even if the check itself fails.
-                self.frozen.store(true, Ordering::Release);
+                // Validator is already frozen; log the error for observability.
                 return Err(format!(
                     "failed to check ledger_events_legacy_frozen existence \
                      (fail-closed: writes frozen): {e}"
                 ));
             },
-        };
-
-        if frozen_exists {
-            self.frozen.store(true, Ordering::Release);
         }
 
-        Ok(frozen_exists)
+        Ok(true)
     }
 
     /// Returns `true` if the freeze guard is active (writes blocked).
     #[must_use]
     pub fn is_frozen(&self) -> bool {
         self.frozen.load(Ordering::Acquire)
-    }
-
-    /// Returns `Err` if the freeze guard is active.
-    fn check_frozen(&self) -> Result<(), String> {
-        if self.frozen.load(Ordering::Acquire) {
-            return Err(
-                "legacy ledger_events writer is frozen after RFC-0032 migration \
-                 (TCK-00631): writes to ledger_events are permanently blocked"
-                    .to_string(),
-            );
-        }
-        Ok(())
     }
 
     /// Returns the verifier corresponding to the validator's signing key.
@@ -3681,20 +3820,124 @@ impl SqliteLeaseValidator {
         self.signing_key.sign(&canonical_bytes).to_bytes().to_vec()
     }
 
+    /// Persists a lease event to the canonical `events` table using BLAKE3
+    /// hash chain. Called when the freeze guard is active.
+    #[allow(clippy::unused_self, clippy::too_many_arguments)] // &self for method consistency; params match column set
+    fn persist_lease_to_canonical_events(
+        &self,
+        conn: &Connection,
+        event_type: &str,
+        session_id: &str,
+        actor_id: &str,
+        payload_bytes: &[u8],
+        signature: &[u8],
+        timestamp_ns: i64,
+    ) -> Result<(), String> {
+        use apm2_core::crypto::EventHasher;
+
+        let tail_hash_opt: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT event_hash FROM events WHERE event_hash IS NOT NULL \
+                 ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| {
+                let _ = conn.execute("ROLLBACK", []);
+                format!("failed to read canonical chain tip: {e}")
+            })?;
+
+        let prev_hash: [u8; 32] = match tail_hash_opt {
+            Some(ref h) => h.as_slice().try_into().map_err(|_| {
+                let _ = conn.execute("ROLLBACK", []);
+                format!(
+                    "canonical events tail event_hash has length {}, expected 32",
+                    h.len()
+                )
+            })?,
+            None => EventHasher::GENESIS_PREV_HASH,
+        };
+
+        let event_hash = EventHasher::hash_event(payload_bytes, &prev_hash);
+
+        conn.execute(
+            "INSERT INTO events (event_type, session_id, actor_id, record_version, \
+             payload, timestamp_ns, prev_hash, event_hash, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                event_type,
+                session_id,
+                actor_id,
+                1_i64,
+                payload_bytes,
+                timestamp_ns,
+                prev_hash.as_slice(),
+                event_hash.as_slice(),
+                signature,
+            ],
+        )
+        .map_err(|e| {
+            let _ = conn.execute("ROLLBACK", []);
+            format!("canonical events insert failed: {e}")
+        })?;
+
+        conn.execute("COMMIT", [])
+            .map_err(|e| format!("failed to commit canonical events insert: {e}"))?;
+
+        Ok(())
+    }
+
     fn register_full_lease_inner(
         &self,
         lease: &apm2_core::fac::GateLease,
         delegated_parent_lease_id: Option<&str>,
     ) -> Result<(), String> {
-        // TCK-00631: Reject writes when legacy ledger_events is frozen.
-        self.check_frozen()?;
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
         let conn = self
             .conn
             .lock()
             .map_err(|e| format!("failed to acquire ledger lock: {e}"))?;
         conn.execute("BEGIN IMMEDIATE", [])
             .map_err(|e| format!("failed to begin lease transaction: {e}"))?;
+
+        // TCK-00631: When frozen, route to canonical `events` table.
+        if self.frozen.load(Ordering::Acquire) {
+            let prev_hash_hex = SqliteLedgerEventEmitter::latest_canonical_event_hash(&conn)
+                .map_err(|e| {
+                    let _ = conn.execute("ROLLBACK", []);
+                    format!("failed to read canonical chain tip: {e}")
+                })?;
+            let payload = serde_json::json!({
+                "event_type": "gate_lease_issued",
+                "lease_id": lease.lease_id,
+                "work_id": lease.work_id,
+                "gate_id": lease.gate_id,
+                "executor_actor_id": lease.executor_actor_id,
+                "full_lease": lease,
+                "delegated_parent_lease_id": delegated_parent_lease_id,
+                "prev_hash": prev_hash_hex,
+            });
+            let payload_bytes = Self::canonicalize_lease_payload(&payload).inspect_err(|_e| {
+                let _ = conn.execute("ROLLBACK", []);
+            })?;
+            let signature = self.sign_gate_lease_payload(&payload_bytes);
+            let issued_at_i64 = i64::try_from(lease.issued_at).map_err(|_| {
+                let _ = conn.execute("ROLLBACK", []);
+                format!("lease issued_at '{}' exceeds i64 range", lease.issued_at)
+            })?;
+            return self.persist_lease_to_canonical_events(
+                &conn,
+                "gate_lease_issued",
+                &lease.work_id,
+                "system",
+                &payload_bytes,
+                &signature,
+                issued_at_i64,
+            );
+        }
+
+        // Legacy path (unfrozen): insert into `ledger_events`.
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
         let duplicate_exists: bool = conn
             .query_row(
@@ -3915,30 +4158,19 @@ impl LeaseValidator for SqliteLeaseValidator {
         gate_id: &str,
         executor_actor_id: &str,
     ) {
-        // TCK-00631: Reject writes when legacy ledger_events is frozen.
-        if self.check_frozen().is_err() {
-            return;
-        }
         // Emit an authoritative signed ledger event so chain verification can
         // authenticate lease-admission history.
-        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-        if let Ok(conn) = self.conn.lock() {
-            if conn.execute("BEGIN IMMEDIATE", []).is_err() {
-                return;
-            }
-            let Ok(prev_hash) = SqliteLedgerEventEmitter::latest_event_hash(&conn) else {
-                let _ = conn.execute("ROLLBACK", []);
-                return;
-            };
-            let Ok(tip_timestamp_i64) = conn.query_row(
-                "SELECT COALESCE(MAX(timestamp_ns), 0) FROM ledger_events",
-                [],
-                |row| row.get::<_, i64>(0),
-            ) else {
-                let _ = conn.execute("ROLLBACK", []);
-                return;
-            };
-            let Ok(timestamp_ns) = u64::try_from(tip_timestamp_i64) else {
+        let Ok(conn) = self.conn.lock() else {
+            return;
+        };
+        if conn.execute("BEGIN IMMEDIATE", []).is_err() {
+            return;
+        }
+
+        // TCK-00631: When frozen, route to canonical `events` table.
+        if self.frozen.load(Ordering::Acquire) {
+            let Ok(prev_hash_hex) = SqliteLedgerEventEmitter::latest_canonical_event_hash(&conn)
+            else {
                 let _ = conn.execute("ROLLBACK", []);
                 return;
             };
@@ -3948,63 +4180,105 @@ impl LeaseValidator for SqliteLeaseValidator {
                 "work_id": work_id,
                 "gate_id": gate_id,
                 "executor_actor_id": executor_actor_id,
-                "prev_hash": prev_hash,
+                "prev_hash": prev_hash_hex,
             });
             let Ok(payload_bytes) = Self::canonicalize_lease_payload(&payload) else {
                 let _ = conn.execute("ROLLBACK", []);
                 return;
             };
             let signature = self.sign_gate_lease_payload(&payload_bytes);
-            let event_hash = SqliteLedgerEventEmitter::compute_event_hash(&EventHashInput {
-                event_id: &event_id,
-                event_type: "gate_lease_issued",
-                work_id,
-                actor_id: "system",
-                payload: &payload_bytes,
-                signature: &signature,
-                timestamp_ns,
-                prev_hash: &prev_hash,
-            });
-            if conn
-                .execute(
-                "INSERT INTO ledger_events (
-                    event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns, prev_hash, event_hash
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    event_id,
-                    "gate_lease_issued",
-                    work_id,
-                    "system",
-                    payload_bytes,
-                    signature,
-                    tip_timestamp_i64,
-                    &prev_hash,
-                    &event_hash,
-                ],
-            )
-                .is_err()
-            {
-                let _ = conn.execute("ROLLBACK", []);
-                return;
-            }
-            let checkpoint = HashChainCheckpoint {
-                rowid: conn.last_insert_rowid(),
-                event_id: Some(event_id),
-                event_hash,
-            };
-            if SqliteLedgerEventEmitter::persist_hash_chain_checkpoint(
+            let _ = self.persist_lease_to_canonical_events(
                 &conn,
-                &checkpoint,
-                &self.signing_key,
-            )
+                "gate_lease_issued",
+                work_id,
+                "system",
+                &payload_bytes,
+                &signature,
+                0_i64,
+            );
+            return;
+        }
+
+        // Legacy path (unfrozen): insert into `ledger_events`.
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+        let Ok(prev_hash) = SqliteLedgerEventEmitter::latest_event_hash(&conn) else {
+            let _ = conn.execute("ROLLBACK", []);
+            return;
+        };
+        let Ok(tip_timestamp_i64) = conn.query_row(
+            "SELECT COALESCE(MAX(timestamp_ns), 0) FROM ledger_events",
+            [],
+            |row| row.get::<_, i64>(0),
+        ) else {
+            let _ = conn.execute("ROLLBACK", []);
+            return;
+        };
+        let Ok(timestamp_ns) = u64::try_from(tip_timestamp_i64) else {
+            let _ = conn.execute("ROLLBACK", []);
+            return;
+        };
+        let payload = serde_json::json!({
+            "event_type": "gate_lease_issued",
+            "lease_id": lease_id,
+            "work_id": work_id,
+            "gate_id": gate_id,
+            "executor_actor_id": executor_actor_id,
+            "prev_hash": prev_hash,
+        });
+        let Ok(payload_bytes) = Self::canonicalize_lease_payload(&payload) else {
+            let _ = conn.execute("ROLLBACK", []);
+            return;
+        };
+        let signature = self.sign_gate_lease_payload(&payload_bytes);
+        let event_hash = SqliteLedgerEventEmitter::compute_event_hash(&EventHashInput {
+            event_id: &event_id,
+            event_type: "gate_lease_issued",
+            work_id,
+            actor_id: "system",
+            payload: &payload_bytes,
+            signature: &signature,
+            timestamp_ns,
+            prev_hash: &prev_hash,
+        });
+        if conn
+            .execute(
+            "INSERT INTO ledger_events (
+                event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns, prev_hash, event_hash
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                event_id,
+                "gate_lease_issued",
+                work_id,
+                "system",
+                payload_bytes,
+                signature,
+                tip_timestamp_i64,
+                &prev_hash,
+                &event_hash,
+            ],
+        )
             .is_err()
-            {
-                let _ = conn.execute("ROLLBACK", []);
-                return;
-            }
-            if conn.execute("COMMIT", []).is_err() {
-                let _ = conn.execute("ROLLBACK", []);
-            }
+        {
+            let _ = conn.execute("ROLLBACK", []);
+            return;
+        }
+        let checkpoint = HashChainCheckpoint {
+            rowid: conn.last_insert_rowid(),
+            event_id: Some(event_id),
+            event_hash,
+        };
+        if SqliteLedgerEventEmitter::persist_hash_chain_checkpoint(
+            &conn,
+            &checkpoint,
+            &self.signing_key,
+        )
+        .is_err()
+        {
+            let _ = conn.execute("ROLLBACK", []);
+            return;
+        }
+        if conn.execute("COMMIT", []).is_err() {
+            let _ = conn.execute("ROLLBACK", []);
         }
     }
 
@@ -4132,6 +4406,10 @@ impl LeaseValidator for SqliteLeaseValidator {
             ));
         }
         Ok(Some(parent_lease_id.to_owned()))
+    }
+
+    fn freeze_legacy_writes(&self) -> Result<(), String> {
+        self.freeze_legacy_writes_inner().map(|_| ())
     }
 }
 
@@ -6416,16 +6694,17 @@ mod tests {
         );
     }
 
-    /// TCK-00631: Redteam test — legacy writes rejected after migration.
+    /// TCK-00631: After migration + freeze, writes route to canonical
+    /// `events` table (not legacy `ledger_events`).
     ///
     /// Verifies:
-    /// 1. After `migrate_legacy_ledger_events`, `freeze_legacy_writes` detects
-    ///    the frozen table and activates the guard.
-    /// 2. Subsequent write attempts return `FrozenLegacyWriter`.
-    /// 3. No state is mutated (canonical chain unchanged, `ledger_events`
-    ///    empty).
+    /// 1. After `migrate_legacy_ledger_events`, `freeze_legacy_writes`
+    ///    activates the guard.
+    /// 2. Subsequent write attempts succeed and insert into canonical `events`.
+    /// 3. No rows are added to `ledger_events` (legacy table stays empty).
+    /// 4. At least one new event is appended to `events` after migration.
     #[test]
-    fn tck_00631_legacy_write_rejected_after_migration() {
+    fn tck_00631_canonical_append_after_migration() {
         use apm2_core::ledger::{init_canonical_schema, migrate_legacy_ledger_events};
         use rusqlite::Connection;
 
@@ -6471,32 +6750,7 @@ mod tests {
         assert_eq!(stats.rows_migrated, 3, "expected 3 rows migrated");
         assert!(!stats.already_migrated, "should not be a no-op");
 
-        // 3. Verify frozen table exists.
-        let frozen_exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' \
-                 AND name = 'ledger_events_legacy_frozen' LIMIT 1",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .unwrap()
-            .is_some();
-        assert!(
-            frozen_exists,
-            "ledger_events_legacy_frozen must exist after migration"
-        );
-
-        // 4. Verify `ledger_events` is empty after migration.
-        let legacy_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(
-            legacy_count, 0,
-            "ledger_events must be empty after migration"
-        );
-
-        // 5. Verify canonical `events` has the migrated rows.
+        // 3. Verify canonical `events` has the migrated rows.
         let events_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .unwrap();
@@ -6505,34 +6759,23 @@ mod tests {
             "canonical events must have 3 migrated rows"
         );
 
-        // 6. Construct emitter, initialize schema, and freeze.
+        // 4. Construct emitter, initialize schema, and freeze.
         SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let conn_arc = Arc::new(Mutex::new(conn));
         let emitter = SqliteLedgerEventEmitter::new(Arc::clone(&conn_arc), signing_key);
 
-        // Before freeze: emitter should not be frozen.
-        assert!(
-            !emitter.is_frozen(),
-            "emitter should not be frozen before freeze_legacy_writes"
-        );
-
-        // Freeze: should detect frozen table and return true.
         let conn_guard = conn_arc.lock().unwrap();
         let frozen = emitter.freeze_legacy_writes(&conn_guard).unwrap();
-        assert!(
-            frozen,
-            "freeze_legacy_writes should return true (frozen table exists)"
-        );
+        assert!(frozen, "freeze_legacy_writes must always return true");
         drop(conn_guard);
 
-        // After freeze: emitter should be frozen.
         assert!(
             emitter.is_frozen(),
             "emitter must be frozen after freeze_legacy_writes"
         );
 
-        // 7. Attempt to write — should fail with FrozenLegacyWriter.
+        // 5. Write MUST SUCCEED — routed to canonical `events`.
         let claim = WorkClaim {
             work_id: "frozen-test-work".to_string(),
             lease_id: "frozen-test-lease".to_string(),
@@ -6544,46 +6787,77 @@ mod tests {
             permeability_receipt: None,
         };
         let result = emitter.emit_work_claimed(&claim, 999_000_000);
-        assert!(result.is_err(), "write must fail when frozen");
-        let err = result.unwrap_err();
-        assert_eq!(
-            err,
-            LedgerEventError::FrozenLegacyWriter,
-            "error must be FrozenLegacyWriter, got: {err:?}"
+        assert!(
+            result.is_ok(),
+            "write must succeed when frozen (routed to canonical events), got: {:?}",
+            result.err()
         );
 
-        // 8. Verify no state was mutated (canonical chain still has exactly 3 rows).
+        // 6. Verify canonical `events` now has 4 rows (3 migrated + 1 new).
         let conn_guard = conn_arc.lock().unwrap();
         let events_count_after: i64 = conn_guard
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
-            events_count_after, 3,
-            "canonical events must remain at 3 after rejected write"
+            events_count_after, 4,
+            "canonical events must have 4 rows (3 migrated + 1 new)"
         );
 
-        // Also verify `ledger_events` is still empty (no legacy write leaked through).
+        // 7. Verify `ledger_events` is still empty (no legacy write leaked).
         let legacy_count_after: i64 = conn_guard
             .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
             legacy_count_after, 0,
-            "ledger_events must remain empty after rejected write"
+            "ledger_events must remain empty after frozen write"
+        );
+
+        // 8. Verify hash chain continuity: the new event's prev_hash matches the last
+        //    migrated event's event_hash.
+        let new_row: (Vec<u8>, Vec<u8>) = conn_guard
+            .query_row(
+                "SELECT prev_hash, event_hash FROM events ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            new_row.0.len(),
+            32,
+            "new event prev_hash must be 32 bytes (BLAKE3)"
+        );
+        assert_eq!(
+            new_row.1.len(),
+            32,
+            "new event event_hash must be 32 bytes (BLAKE3)"
+        );
+
+        // The prev_hash of the new row should match the event_hash of row #3.
+        let third_row_hash: Vec<u8> = conn_guard
+            .query_row(
+                "SELECT event_hash FROM events WHERE rowid = (SELECT MAX(rowid) - 1 FROM events)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            new_row.0, third_row_hash,
+            "new event prev_hash must chain from the last migrated event"
         );
     }
 
-    /// TCK-00631: Redteam test — lease validator writes rejected after
-    /// migration.
+    /// TCK-00631: After migration + freeze, lease validator writes route to
+    /// canonical `events` table.
     ///
     /// Verifies:
-    /// 1. After `migrate_legacy_ledger_events`, `freeze_legacy_writes` on
-    ///    `SqliteLeaseValidator` detects the frozen table and activates the
-    ///    guard.
-    /// 2. `register_full_lease` returns an error.
-    /// 3. `register_lease_with_executor` silently refuses (trait returns `()`).
-    /// 4. No rows are added to `ledger_events`.
+    /// 1. After migration, `freeze_legacy_writes` activates the guard.
+    /// 2. `register_full_lease` succeeds by routing to canonical `events`.
+    /// 3. `register_lease_with_executor` succeeds by routing to canonical
+    ///    `events`.
+    /// 4. No rows are added to `ledger_events` (legacy table stays empty).
+    /// 5. New rows appear in canonical `events`.
     #[test]
-    fn tck_00631_lease_write_rejected_after_migration() {
+    fn tck_00631_lease_write_routes_to_canonical_after_migration() {
         use apm2_core::ledger::{init_canonical_schema, migrate_legacy_ledger_events};
         use rusqlite::Connection;
 
@@ -6644,22 +6918,13 @@ mod tests {
         let conn_arc = Arc::new(Mutex::new(conn));
         let validator = SqliteLeaseValidator::new(Arc::clone(&conn_arc));
 
-        assert!(
-            !validator.is_frozen(),
-            "validator should not be frozen before freeze_legacy_writes"
-        );
-
-        let frozen = validator.freeze_legacy_writes().unwrap();
-        assert!(
-            frozen,
-            "freeze_legacy_writes should return true (frozen table exists)"
-        );
+        validator.freeze_legacy_writes_inner().unwrap();
         assert!(
             validator.is_frozen(),
             "validator must be frozen after freeze_legacy_writes"
         );
 
-        // 6. Attempt register_full_lease — must fail.
+        // 6. register_full_lease — must succeed, routing to canonical events.
         let signer = apm2_core::crypto::Signer::generate();
         let lease = apm2_core::fac::GateLeaseBuilder::new(
             "LEASE-FROZEN-TEST",
@@ -6675,14 +6940,13 @@ mod tests {
         .time_envelope_ref("htf:tick:0")
         .build_and_sign(&signer);
         let result = validator.register_full_lease(&lease);
-        assert!(result.is_err(), "register_full_lease must fail when frozen");
-        let err_msg = result.unwrap_err();
         assert!(
-            err_msg.contains("frozen"),
-            "error must mention 'frozen', got: {err_msg}"
+            result.is_ok(),
+            "register_full_lease must succeed when frozen (routed to canonical events), got: {:?}",
+            result.err()
         );
 
-        // 7. Attempt register_lease_with_executor — must silently refuse.
+        // 7. register_lease_with_executor — must succeed (canonical routing).
         validator.register_lease_with_executor(
             "LEASE-FROZEN-2",
             "WORK-FROZEN-2",
@@ -6697,16 +6961,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             legacy_count_after, 0,
-            "ledger_events must remain empty after rejected lease writes"
+            "ledger_events must remain empty after frozen lease writes"
         );
 
-        // 9. Verify canonical events still has exactly 2 migrated rows.
+        // 9. Verify canonical events has 2 migrated + 2 new = 4 rows.
         let events_count: i64 = conn_guard
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
-            events_count, 2,
-            "canonical events must have exactly 2 migrated rows, no additions"
+            events_count, 4,
+            "canonical events must have 4 rows (2 migrated + 2 lease writes)"
         );
     }
 
@@ -6762,11 +7026,10 @@ mod tests {
         );
     }
 
-    /// TCK-00631: Verify freeze guard is fail-closed — even without
-    /// the frozen table, `freeze_legacy_writes` on a DB error freezes
-    /// the emitter.
+    /// TCK-00631: Verify freeze guard is unconditional — even without
+    /// the frozen table, `freeze_legacy_writes` always activates the guard.
     #[test]
-    fn tck_00631_freeze_guard_fail_closed_on_db_error() {
+    fn tck_00631_freeze_guard_unconditional() {
         // Create an emitter without a frozen table (no migration ran).
         let conn = Connection::open_in_memory().unwrap();
         SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
@@ -6774,17 +7037,129 @@ mod tests {
         let conn_arc = Arc::new(Mutex::new(conn));
         let emitter = SqliteLedgerEventEmitter::new(Arc::clone(&conn_arc), signing_key);
 
-        // No frozen table — freeze should return false.
+        // Even without frozen table — freeze ALWAYS returns true.
         let conn_guard = conn_arc.lock().unwrap();
         let frozen = emitter.freeze_legacy_writes(&conn_guard).unwrap();
-        assert!(!frozen, "no frozen table: freeze should return false");
         assert!(
-            !emitter.is_frozen(),
-            "emitter should not be frozen when no frozen table exists"
+            frozen,
+            "freeze_legacy_writes must always return true (unconditional)"
+        );
+        assert!(
+            emitter.is_frozen(),
+            "emitter must be frozen after freeze_legacy_writes regardless of table state"
+        );
+        drop(conn_guard);
+    }
+
+    /// TCK-00631: BLOCKER 1 regression — canonical-mode DB (events > 0, no
+    /// frozen table) must still freeze and route writes to canonical events.
+    ///
+    /// Counterexample path that was previously unfrozen:
+    /// 1. Startup: `init_schema_with_signing_key` creates `ledger_events`.
+    /// 2. `migrate_legacy_ledger_events` returns `already_migrated=true`
+    ///    (events > 0, `ledger_events` == 0) without creating
+    ///    `ledger_events_legacy_frozen`.
+    /// 3. `freeze_legacy_writes()` must still freeze and route to canonical.
+    #[test]
+    fn tck_00631_canonical_mode_no_frozen_table_still_freezes() {
+        use apm2_core::ledger::init_canonical_schema;
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Set up canonical-mode DB: `events` has rows, `ledger_events` empty.
+        init_canonical_schema(&conn).unwrap();
+
+        // Insert a canonical event directly.
+        conn.execute(
+            "INSERT INTO events (event_type, session_id, actor_id, record_version, \
+             payload, timestamp_ns, prev_hash, event_hash, signature) \
+             VALUES ('test.event', 'work-1', 'actor-1', 1, X'7B226E223A317D', \
+             1000000000, X'0000000000000000000000000000000000000000000000000000000000000000', \
+             X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', X'7369676E')",
+            [],
+        )
+        .unwrap();
+
+        // Create empty ledger_events (as init_schema_with_signing_key would).
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
+
+        // Confirm: events has rows, ledger_events has 0 rows, NO frozen table.
+        let events_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert!(events_count > 0, "events must have rows");
+
+        let legacy_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(legacy_count, 0, "ledger_events must be empty");
+
+        let frozen_table_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' \
+                 AND name = 'ledger_events_legacy_frozen' LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+            .is_some();
+        assert!(
+            !frozen_table_exists,
+            "ledger_events_legacy_frozen must NOT exist for this test"
+        );
+
+        // Construct emitter and freeze.
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let conn_arc = Arc::new(Mutex::new(conn));
+        let emitter = SqliteLedgerEventEmitter::new(Arc::clone(&conn_arc), signing_key);
+
+        let conn_guard = conn_arc.lock().unwrap();
+        let frozen = emitter.freeze_legacy_writes(&conn_guard).unwrap();
+        assert!(
+            frozen,
+            "freeze_legacy_writes must return true even without frozen table"
         );
         drop(conn_guard);
 
-        // Emitter should still allow writes (no frozen flag set).
-        assert!(!emitter.is_frozen());
+        assert!(emitter.is_frozen(), "emitter must be frozen");
+
+        // Write must succeed via canonical bridge.
+        let claim = WorkClaim {
+            work_id: "canonical-test-work".to_string(),
+            lease_id: "canonical-test-lease".to_string(),
+            actor_id: "canonical-test-actor".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        let result = emitter.emit_work_claimed(&claim, 2_000_000_000);
+        assert!(
+            result.is_ok(),
+            "write must succeed via canonical bridge, got: {:?}",
+            result.err()
+        );
+
+        // Verify: new row in canonical `events`, legacy still empty.
+        let conn_guard = conn_arc.lock().unwrap();
+        let events_after: i64 = conn_guard
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            events_after,
+            events_count + 1,
+            "canonical events must gain 1 row"
+        );
+
+        let legacy_after: i64 = conn_guard
+            .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            legacy_after, 0,
+            "ledger_events must remain empty after frozen write"
+        );
     }
 }
