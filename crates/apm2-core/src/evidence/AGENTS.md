@@ -103,22 +103,26 @@ pub enum DataClassification {
 
 ```rust
 pub enum EvidenceCategory {
-    TestResults,        // Test execution results and coverage
-    LintReports,        // Static analysis outputs
-    BuildArtifacts,     // Compilation outputs
-    SecurityScans,      // Vulnerability reports
-    ReviewRecords,      // Code review and approvals
-    AuditLogs,          // Compliance records
-    ConfigSnapshots,    // Environment captures
-    Documentation,      // Generated docs
-    Benchmarks,         // Performance metrics
-    DeploymentRecords,  // Release artifacts
+    TestResults,            // Test execution results and coverage
+    LintReports,            // Static analysis outputs
+    BuildArtifacts,         // Compilation outputs
+    SecurityScans,          // Vulnerability reports
+    ReviewRecords,          // Code review and approvals
+    AuditLogs,              // Compliance records
+    ConfigSnapshots,        // Environment captures
+    Documentation,          // Generated docs
+    Benchmarks,             // Performance metrics
+    DeploymentRecords,      // Release artifacts
+    BootstrapSchema,        // Immutable trust root
+    WorkContextEntry,       // FAC work context entry (RFC-0032)
+    WorkAuthorityBindings,  // FAC work authority bindings (RFC-0032)
+    WorkLoopProfile,        // FAC work loop profile (RFC-0032)
 }
 ```
 
 **Contracts:**
 - [CTR-0008] Categories requiring verification: `TestResults`, `LintReports`, `SecurityScans`, `BuildArtifacts`, `Benchmarks`
-- [CTR-0009] Categories NOT requiring verification: `ReviewRecords`, `AuditLogs`, `ConfigSnapshots`, `Documentation`, `DeploymentRecords`
+- [CTR-0009] Categories NOT requiring verification: `ReviewRecords`, `AuditLogs`, `ConfigSnapshots`, `Documentation`, `DeploymentRecords`, `BootstrapSchema`, `WorkContextEntry`, `WorkAuthorityBindings`, `WorkLoopProfile`
 
 ### `Evidence`
 
