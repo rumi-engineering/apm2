@@ -58,6 +58,9 @@
 //!   after confirmed rename success.
 //! - [INV-RECON-008] The `queue/claimed` directory itself is verified via
 //!   `symlink_metadata()` before traversal; symlinked directories are rejected.
+//! - [INV-RECON-009] Orphaned claimed jobs carrying a `channel_context_token`
+//!   are non-retriable under `Requeue` policy: they are moved to `denied/`
+//!   instead of `pending/` to avoid replaying consumed single-use token nonces.
 //! - [INV-RECON-012] Reconciliation is exempt from AJC lifecycle requirements
 //!   (RS-42, RFC-0027). It runs at startup as an internal crash-recovery
 //!   mechanism before the worker accepts any external authority — it is itself
@@ -67,7 +70,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -112,6 +115,10 @@ const MAX_DESERIALIZED_LANE_ACTIONS: usize = 256;
 
 /// Maximum number of queue actions in deserialized receipt (INV-BH-007).
 const MAX_DESERIALIZED_QUEUE_ACTIONS: usize = 8192;
+
+/// Denial reason used when reconciliation encounters an orphaned claimed job
+/// carrying a channel-context token under requeue policy.
+const TOKEN_BOUND_ORPHAN_DENIAL_REASON: &str = "orphaned claimed job carries channel_context_token; non-retriable to avoid replaying a consumed token nonce";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error types
@@ -450,6 +457,16 @@ struct QueueReconcileResult {
     /// the caller can include the actual `claimed_files_inspected` in the
     /// partial receipt before propagating (INV-RECON-001).
     partial_error: Option<ReconcileError>,
+}
+
+/// Metadata parsed from a claimed job spec.
+///
+/// Parsed with bounded I/O and `O_NOFOLLOW` to preserve reconciliation safety
+/// invariants.
+#[derive(Debug, Clone, Default)]
+struct ClaimedJobMetadata {
+    job_id: Option<String>,
+    has_channel_context_token: bool,
 }
 
 /// Run crash recovery reconciliation on worker startup.
@@ -1334,11 +1351,11 @@ fn reconcile_queue(
             });
             continue;
         }
-        let _claimed_lock_guard = claimed_lock_file;
-
-        // Try to extract `job_id` from the file contents.
-        // If unparseable, fall back to filename stem as ID.
-        let job_id = extract_job_id_from_claimed(&path)
+        // Parse claimed job metadata using bounded I/O. If parsing fails, fall
+        // back to filename-derived job_id and treat token binding as unknown.
+        let claimed_metadata = parse_claimed_job_metadata(&claimed_lock_file).unwrap_or_default();
+        let job_id = claimed_metadata
+            .job_id
             .unwrap_or_else(|| file_name.trim_end_matches(".json").to_string());
 
         // Check if this job is backed by an active lane.
@@ -1416,41 +1433,64 @@ fn reconcile_queue(
         // INV-RECON-007: Only count success after confirmed rename.
         match orphan_policy {
             OrphanedJobPolicy::Requeue => {
+                // INV-RECON-009: Token-bound orphaned claimed jobs are
+                // non-retriable. Requeueing them can replay already-consumed
+                // single-use nonces and cause deterministic token replay
+                // denial loops.
+                if claimed_metadata.has_channel_context_token {
+                    let reason = TOKEN_BOUND_ORPHAN_DENIAL_REASON.to_string();
+                    if !dry_run && let Err(e) = move_file_safe(&path, &denied_dir, &file_name) {
+                        return queue_result!(Some(ReconcileError::MoveFailed {
+                            context: format!(
+                                "claimed job {job_id}: token-bound fallback to denied failed: {e}"
+                            ),
+                        }));
+                    }
+                    actions.push(QueueRecoveryAction::MarkedFailed {
+                        job_id,
+                        file_name,
+                        reason,
+                    });
+                    orphaned_jobs_failed += 1;
+                    continue;
+                }
+
                 if dry_run {
                     actions.push(QueueRecoveryAction::Requeued { job_id, file_name });
                     orphaned_jobs_requeued += 1;
-                } else {
-                    match move_file_safe(&path, &pending_dir, &file_name) {
-                        Ok(()) => {
-                            actions.push(QueueRecoveryAction::Requeued { job_id, file_name });
-                            orphaned_jobs_requeued += 1;
-                        },
-                        Err(requeue_err) => {
-                            // Requeue failed — try fallback to denied.
-                            let reason = format!("requeue failed: {requeue_err}");
-                            match move_file_safe(&path, &denied_dir, &file_name) {
-                                Ok(()) => {
-                                    actions.push(QueueRecoveryAction::MarkedFailed {
-                                        job_id,
-                                        file_name,
-                                        reason,
-                                    });
-                                    orphaned_jobs_failed += 1;
-                                },
-                                Err(deny_err) => {
-                                    // Both moves failed — propagate as error
-                                    // with partial counts (INV-RECON-007).
-                                    return queue_result!(Some(ReconcileError::MoveFailed {
-                                        context: format!(
-                                            "claimed job {job_id}: requeue failed \
-                                             ({requeue_err}), fallback to denied also \
-                                             failed ({deny_err})"
-                                        ),
-                                    }));
-                                },
-                            }
-                        },
-                    }
+                    continue;
+                }
+
+                match move_file_safe(&path, &pending_dir, &file_name) {
+                    Ok(()) => {
+                        actions.push(QueueRecoveryAction::Requeued { job_id, file_name });
+                        orphaned_jobs_requeued += 1;
+                    },
+                    Err(requeue_err) => {
+                        // Requeue failed — try fallback to denied.
+                        let reason = format!("requeue failed: {requeue_err}");
+                        match move_file_safe(&path, &denied_dir, &file_name) {
+                            Ok(()) => {
+                                actions.push(QueueRecoveryAction::MarkedFailed {
+                                    job_id,
+                                    file_name,
+                                    reason,
+                                });
+                                orphaned_jobs_failed += 1;
+                            },
+                            Err(deny_err) => {
+                                // Both moves failed — propagate as error
+                                // with partial counts (INV-RECON-007).
+                                return queue_result!(Some(ReconcileError::MoveFailed {
+                                    context: format!(
+                                        "claimed job {job_id}: requeue failed \
+                                         ({requeue_err}), fallback to denied also \
+                                         failed ({deny_err})"
+                                    ),
+                                }));
+                            },
+                        }
+                    },
                 }
             },
             OrphanedJobPolicy::MarkFailed => {
@@ -1482,36 +1522,41 @@ fn reconcile_queue(
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Extract a `job_id` from a claimed job spec file.
+/// Parse bounded metadata from an already-open claimed job spec file.
 ///
-/// Uses bounded I/O to read at most `MAX_CLAIMED_FILE_SIZE` bytes, then
-/// extracts the `job_id` field from the JSON.
-///
-/// Security: Opens file with `O_NOFOLLOW` to reject symlinks (CTR-1503).
-/// Validates regular file type before reading. Uses bounded read (CTR-1603).
-fn extract_job_id_from_claimed(path: &Path) -> Option<String> {
-    // CTR-1503: Reject symlinks via symlink_metadata check.
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if !metadata.is_file() {
+/// Security: Caller opens the file with `O_NOFOLLOW` and holds an exclusive
+/// flock while parsing. This keeps parsing bound to the same inode that was
+/// type-checked and lock-probed in the reconcile loop.
+fn parse_claimed_job_metadata(file: &fs::File) -> Option<ClaimedJobMetadata> {
+    let file_metadata = file.metadata().ok()?;
+    if !file_metadata.is_file() {
         return None;
     }
-
-    // Open with O_NOFOLLOW to prevent symlink traversal.
-    let file = open_file_no_follow(path).ok()?;
-    let file_metadata = file.metadata().ok()?;
     if file_metadata.len() > MAX_CLAIMED_FILE_SIZE {
         return None;
     }
+    let mut reader = file.try_clone().ok()?;
+    reader.seek(std::io::SeekFrom::Start(0)).ok()?;
     let mut buf = Vec::with_capacity(file_metadata.len().min(MAX_CLAIMED_FILE_SIZE) as usize);
-    let mut reader = file.take(MAX_CLAIMED_FILE_SIZE);
+    let mut reader = reader.take(MAX_CLAIMED_FILE_SIZE);
     reader.read_to_end(&mut buf).ok()?;
 
-    // Minimal JSON extraction — we only need the job_id field.
+    // Minimal JSON extraction — reconciliation needs only stable metadata.
     let value: serde_json::Value = serde_json::from_slice(&buf).ok()?;
-    value
-        .get("job_id")?
-        .as_str()
-        .map(std::string::ToString::to_string)
+    let job_id = value
+        .get("job_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|job_id| !job_id.is_empty())
+        .map(std::string::ToString::to_string);
+    let has_channel_context_token = value
+        .get("actuation")
+        .and_then(|actuation| actuation.get("channel_context_token"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|token| !token.is_empty());
+    Some(ClaimedJobMetadata {
+        job_id,
+        has_channel_context_token,
+    })
 }
 
 /// Open a file without following symlinks (`O_NOFOLLOW` on Unix).
@@ -1742,6 +1787,37 @@ mod tests {
         fs::write(path, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
     }
 
+    fn write_claimed_job_with_token(queue_root: &Path, job_id: &str) {
+        let claimed_dir = queue_root.join("claimed");
+        let spec = serde_json::json!({
+            "schema": "apm2.fac.job_spec.v1",
+            "job_id": job_id,
+            "kind": "gates",
+            "actuation": {
+                "lease_id": "lease-test",
+                "request_id": "request-test",
+                "channel_context_token": "token-test"
+            }
+        });
+        let path = claimed_dir.join(format!("{job_id}.json"));
+        fs::write(path, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+    }
+
+    fn write_claimed_job_with_token_without_job_id(queue_root: &Path, file_stem: &str) {
+        let claimed_dir = queue_root.join("claimed");
+        let spec = serde_json::json!({
+            "schema": "apm2.fac.job_spec.v1",
+            "kind": "gates",
+            "actuation": {
+                "lease_id": "lease-test",
+                "request_id": "request-test",
+                "channel_context_token": "token-test"
+            }
+        });
+        let path = claimed_dir.join(format!("{file_stem}.json"));
+        fs::write(path, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+    }
+
     #[test]
     fn test_reconcile_clean_state() {
         // No stale leases, no orphaned claimed jobs.
@@ -1915,6 +1991,119 @@ mod tests {
             .filter_map(std::result::Result::ok)
             .collect();
         assert_eq!(denied_entries.len(), 1, "file should be in denied/");
+    }
+
+    #[test]
+    fn test_reconcile_orphaned_token_bound_claimed_mark_failed_under_requeue_policy() {
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+
+        write_claimed_job_with_token(&queue_root, "job-orphan-token");
+
+        let receipt =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
+                .unwrap();
+
+        assert_eq!(
+            receipt.orphaned_jobs_requeued, 0,
+            "token-bound orphaned jobs must not be requeued"
+        );
+        assert_eq!(
+            receipt.orphaned_jobs_failed, 1,
+            "token-bound orphaned jobs should be denied under requeue policy"
+        );
+        assert!(
+            receipt.queue_actions.iter().any(|action| matches!(
+                action,
+                QueueRecoveryAction::MarkedFailed { reason, .. }
+                    if reason == TOKEN_BOUND_ORPHAN_DENIAL_REASON
+            )),
+            "queue action should record token-bound denial reason"
+        );
+
+        let claimed_path = queue_root.join("claimed").join("job-orphan-token.json");
+        assert!(
+            !claimed_path.exists(),
+            "token-bound claimed file should be moved out of claimed/"
+        );
+        let denied_entries: Vec<_> = fs::read_dir(queue_root.join("denied"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(denied_entries.len(), 1, "file should be in denied/");
+    }
+
+    #[test]
+    fn test_reconcile_orphaned_token_bound_claimed_without_job_id_uses_filename_fallback() {
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+        let file_stem = "job-orphan-token-no-job-id";
+        write_claimed_job_with_token_without_job_id(&queue_root, file_stem);
+
+        let receipt =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
+                .unwrap();
+
+        assert_eq!(
+            receipt.orphaned_jobs_requeued, 0,
+            "token-bound orphaned jobs must not be requeued even without job_id field"
+        );
+        assert_eq!(
+            receipt.orphaned_jobs_failed, 1,
+            "token-bound orphaned jobs should be denied under requeue policy"
+        );
+        assert!(
+            receipt.queue_actions.iter().any(|action| matches!(
+                action,
+                QueueRecoveryAction::MarkedFailed {
+                    job_id, reason, ..
+                } if job_id == file_stem && reason == TOKEN_BOUND_ORPHAN_DENIAL_REASON
+            )),
+            "missing job_id should fall back to filename while preserving token-bound denial reason"
+        );
+
+        let claimed_path = queue_root.join("claimed").join(format!("{file_stem}.json"));
+        assert!(
+            !claimed_path.exists(),
+            "token-bound claimed file should be moved out of claimed/"
+        );
+        let denied_entries: Vec<_> = fs::read_dir(queue_root.join("denied"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(denied_entries.len(), 1, "file should be in denied/");
+    }
+
+    #[test]
+    fn test_reconcile_orphaned_token_bound_claimed_dry_run_marks_failed_without_move() {
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+        let job_id = "job-orphan-token-dry-run";
+        write_claimed_job_with_token(&queue_root, job_id);
+
+        let receipt = reconcile_on_startup(
+            &fac_root,
+            &queue_root,
+            OrphanedJobPolicy::Requeue,
+            true, // dry_run
+        )
+        .unwrap();
+
+        assert_eq!(
+            receipt.orphaned_jobs_requeued, 0,
+            "token-bound orphaned jobs must not be requeued in dry-run"
+        );
+        assert_eq!(
+            receipt.orphaned_jobs_failed, 1,
+            "token-bound orphaned jobs should be classified as failed in dry-run"
+        );
+        let claimed_path = queue_root.join("claimed").join(format!("{job_id}.json"));
+        assert!(
+            claimed_path.exists(),
+            "dry-run must not move token-bound claimed files"
+        );
+        let denied_entries: Vec<_> = fs::read_dir(queue_root.join("denied"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(denied_entries.len(), 0, "dry-run must not populate denied/");
     }
 
     #[test]
@@ -3042,8 +3231,8 @@ mod tests {
                 .unwrap();
 
         // The file was already gone, so it should not appear in requeued
-        // or failed counts (extract_job_id_from_claimed would also fail
-        // since the file is missing, so it won't even enter the move path).
+        // or failed counts (metadata parsing will also fail since the file
+        // is missing, so it won't even enter the move path).
         // The important thing is no MoveFailed error.
         assert_eq!(receipt.orphaned_jobs_requeued, 0);
         assert_eq!(receipt.orphaned_jobs_failed, 0);
