@@ -49,7 +49,7 @@ enum UnitProbeStatus {
     Unknown(String),
 }
 
-/// Detect the current process's parent systemd unit name.
+/// Detect the current process's parent systemd service unit name.
 ///
 /// Returns `None` when the process is not running under systemd or when the
 /// unit component is malformed.
@@ -264,11 +264,14 @@ fn read_self_cgroup_path(proc_root: &Path) -> Option<String> {
 }
 
 fn extract_systemd_unit_from_cgroup_path(cgroup_path: &str) -> Option<String> {
+    // Prefer stable service units for lifecycle binding. Scope units (for
+    // example, session or app scopes) are ephemeral and can disappear between
+    // detection and `systemd-run`, causing transient unit creation failures.
     for component in cgroup_path.split('/').rev() {
         if component.is_empty() {
             continue;
         }
-        if !has_supported_unit_suffix(component) {
+        if !component.ends_with(".service") {
             continue;
         }
         if !is_valid_systemd_unit_name(component) {
@@ -304,12 +307,6 @@ fn is_valid_systemd_unit_name(unit_name: &str) -> bool {
     unit_name
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'@'))
-}
-
-fn has_supported_unit_suffix(unit_name: &str) -> bool {
-    unit_name
-        .rsplit_once('.')
-        .is_some_and(|(_, ext)| matches!(ext, "service" | "scope"))
 }
 
 fn is_safe_unit_fragment(value: &str) -> bool {
@@ -411,6 +408,36 @@ mod tests {
 
         let detected = detect_systemd_unit_name_from_proc(tmp.path());
         assert!(detected.is_none());
+    }
+
+    #[test]
+    fn detect_systemd_unit_name_returns_none_for_scope_only_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let self_dir = tmp.path().join("self");
+        fs::create_dir_all(&self_dir).expect("create self dir");
+        fs::write(
+            self_dir.join("cgroup"),
+            "0::/user.slice/user-1000.slice/session-1811.scope\n",
+        )
+        .expect("write cgroup");
+
+        let detected = detect_systemd_unit_name_from_proc(tmp.path());
+        assert!(detected.is_none());
+    }
+
+    #[test]
+    fn detect_systemd_unit_name_prefers_service_over_scope() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let self_dir = tmp.path().join("self");
+        fs::create_dir_all(&self_dir).expect("create self dir");
+        fs::write(
+            self_dir.join("cgroup"),
+            "0::/user.slice/user-1000.slice/user@1000.service/session-1811.scope\n",
+        )
+        .expect("write cgroup");
+
+        let detected = detect_systemd_unit_name_from_proc(tmp.path());
+        assert_eq!(detected.as_deref(), Some("user@1000.service"));
     }
 
     #[test]
