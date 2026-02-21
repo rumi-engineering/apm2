@@ -284,7 +284,8 @@
           "hard_constraints": [
             "Fail dominates verdict aggregation.",
             "Missing required evidence cannot mask existing fail.",
-            "Tiered policy defines pass/pending/fail acceptance semantics."
+            "Tiered policy defines pass/pending/fail acceptance semantics.",
+            "Receipt retention and verification depth must scale proportionally with transition leverage (Evidence Tiering)."
           ],
           "law_refs": [
             "LAW-01",
@@ -727,8 +728,11 @@
         "LAW-07": {
           "name": "Verifiable Summaries",
           "reference_path": "unified-theory-v2.json",
-          "role": "Summaries are derived receipts with evidence pointers and deterministic zoom-in; admissible for planning/triage, but gates needing exactness MUST zoom-in to evidence or fail-closed.",
-          "node_class": "NORMATIVE"
+          "role": "Summaries are derived receipts with evidence pointers and deterministic zoom-in; admissible for planning/triage, but gates needing exactness MUST zoom-in to evidence or fail-closed. Low-leverage execution traces should be folded into compressed Summary Receipts to preserve verifier economics.",
+          "node_class": "NORMATIVE",
+          "amendments": [
+            "Receipt Compression and Tiered Retention"
+          ]
         },
         "LAW-08": {
           "name": "Verifier Economics (Goodhart Resistance)",
@@ -793,7 +797,8 @@
           "node_class": "NORMATIVE",
           "amendments": [
             "Evaluator Validity",
-            "Evaluator Brittleness as Defect"
+            "Evaluator Brittleness as Defect",
+            "Evidence Tiering"
           ],
           "defect_classes": [
             "EVALUATOR_DRIFT"
@@ -1056,7 +1061,7 @@
             "name": "Verifiable Summaries",
             "status": "active",
             "effective_date": "2026-01-27",
-            "statement": "Hierarchical summaries are lossy claims and must be treated as **\"Summary Receipts\" with explicit evidence pointers.**",
+            "statement": "Hierarchical summaries and low-leverage execution traces are lossy claims and must be treated as **\"Summary Receipts\" with explicit evidence pointers and tiered retention.** This prevents receipt explosion and preserves verifier economics.",
             "kernel_alignment": {
               "primary": "AXIOM-SUBSTRATE",
               "secondary": []
@@ -1281,7 +1286,7 @@
             "name": "Measurement Integrity",
             "status": "active",
             "effective_date": "2026-01-27",
-            "statement": "Measurements and receipts MUST be tamper-evident; omission of required evidence is a defect.",
+            "statement": "Measurements and receipts MUST be tamper-evident; omission of required evidence is a defect. Receipt weight and retention posture must scale with the leverage of the action bound (Evidence Tiering).",
             "kernel_alignment": {
               "primary": "AXIOM-CLOSURE",
               "secondary": []
@@ -1819,7 +1824,7 @@
                 "AXIOM-CLOSURE"
               ]
             },
-            "signal_statement": "Summaries should be treated as budgeted information products. For Tier2+, summary-only decisions are valid only when distortion bounds and selector coverage satisfy the governing gate policy.",
+            "signal_statement": "Summaries should be treated as budgeted information products. For Tier2+, summary-only decisions are valid only when distortion bounds and selector coverage satisfy the governing gate policy. To preserve verifier economics at exabyte scale, low-leverage actions must be compressed into ephemeral or summary receipts rather than requiring persistent, Merkle-linked storage.",
             "connections": [
               "PRIN-005"
             ],
