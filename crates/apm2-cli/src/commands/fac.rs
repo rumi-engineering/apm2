@@ -2316,7 +2316,43 @@ fn refused_delete_mentions_tmp(receipts: &[RefusedDeleteReceipt]) -> bool {
 }
 
 fn scrub_lane_tmp_dir(manager: &LaneManager, lane_id: &str) -> Result<TmpScrubSummary, String> {
-    let tmp_dir = manager.lane_dir(lane_id).join("tmp");
+    scrub_lane_tmp_dir_with_entry_limit(manager, lane_id, MAX_TMP_SCRUB_ENTRIES)
+}
+
+fn ensure_tmp_dir_exists(tmp_dir: &Path) -> Result<(), String> {
+    match std::fs::create_dir(tmp_dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let meta = std::fs::symlink_metadata(tmp_dir).map_err(|meta_err| {
+                format!(
+                    "failed to verify existing tmp path {}: {meta_err}",
+                    tmp_dir.display()
+                )
+            })?;
+            if meta.is_dir() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "tmp path {} exists but is not a directory",
+                    tmp_dir.display()
+                ))
+            }
+        },
+        Err(err) => Err(format!(
+            "failed to create tmp directory {}: {err}",
+            tmp_dir.display()
+        )),
+    }
+}
+
+fn scrub_lane_tmp_dir_with_entry_limit(
+    manager: &LaneManager,
+    lane_id: &str,
+    max_entries_per_dir: usize,
+) -> Result<TmpScrubSummary, String> {
+    let lane_dir = manager.lane_dir(lane_id);
+    let tmp_dir = lane_dir.join("tmp");
+    let effective_limit = max_entries_per_dir.min(MAX_LOG_DIR_ENTRIES);
 
     let tmp_meta = match std::fs::symlink_metadata(&tmp_dir) {
         Ok(meta) => meta,
@@ -2334,77 +2370,33 @@ fn scrub_lane_tmp_dir(manager: &LaneManager, lane_id: &str) -> Result<TmpScrubSu
     if !tmp_meta.is_dir() {
         std::fs::remove_file(&tmp_dir)
             .map_err(|err| format!("failed to remove non-directory tmp path: {err}"))?;
+        ensure_tmp_dir_exists(&tmp_dir)?;
         return Ok(TmpScrubSummary { entries_deleted: 1 });
     }
 
-    let entries = std::fs::read_dir(&tmp_dir)
-        .map_err(|err| format!("failed to read tmp dir {}: {err}", tmp_dir.display()))?;
-    let mut scanned_entries: usize = 0;
-    let mut entries_deleted: u64 = 0;
-
-    for entry in entries {
-        scanned_entries = scanned_entries.saturating_add(1);
-        if scanned_entries > MAX_TMP_SCRUB_ENTRIES {
-            return Err(format!(
-                "tmp scrub entry limit exceeded for {} (> {})",
-                tmp_dir.display(),
-                MAX_TMP_SCRUB_ENTRIES
-            ));
-        }
-
-        let entry = entry.map_err(|err| format!("failed to read tmp entry: {err}"))?;
-        let path = entry.path();
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(format!(
-                    "failed to stat tmp entry {}: {err}",
-                    path.display()
-                ));
-            },
-        };
-
-        if meta.is_dir() {
-            match safe_rmtree_v1_with_entry_limit(&path, &tmp_dir, MAX_LOG_DIR_ENTRIES) {
-                Ok(SafeRmtreeOutcome::Deleted {
-                    files_deleted,
-                    dirs_deleted,
-                }) => {
-                    entries_deleted = entries_deleted
-                        .saturating_add(files_deleted)
-                        .saturating_add(dirs_deleted);
-                },
-                Ok(SafeRmtreeOutcome::AlreadyAbsent) => {},
-                Err(SafeRmtreeError::TooManyEntries { .. }) => {
-                    return Err(format!(
-                        "tmp scrub refused nested directory {} due to entry bound",
-                        path.display()
-                    ));
-                },
-                Err(err) => {
-                    return Err(format!(
-                        "tmp scrub failed to delete nested directory {}: {err}",
-                        path.display()
-                    ));
-                },
+    // Delete the tmp tree in one bounded traversal, then recreate it.
+    // This prevents per-entry nested traversals from multiplying bounds.
+    let scrubbed =
+        safe_rmtree_v1_with_entry_limit(&tmp_dir, &lane_dir, effective_limit).map_err(|err| {
+            match err {
+                SafeRmtreeError::TooManyEntries { .. } => format!(
+                    "tmp scrub refused directory {} due to entry bound (> {})",
+                    tmp_dir.display(),
+                    effective_limit
+                ),
+                _ => format!("tmp scrub failed to delete {}: {err}", tmp_dir.display()),
             }
-            continue;
-        }
+        })?;
 
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                entries_deleted = entries_deleted.saturating_add(1);
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
-            Err(err) => {
-                return Err(format!(
-                    "failed to remove tmp entry {}: {err}",
-                    path.display()
-                ));
-            },
-        }
-    }
+    ensure_tmp_dir_exists(&tmp_dir)?;
+
+    let entries_deleted = match scrubbed {
+        SafeRmtreeOutcome::Deleted {
+            files_deleted,
+            dirs_deleted,
+        } => files_deleted.saturating_add(dirs_deleted.saturating_sub(1)),
+        SafeRmtreeOutcome::AlreadyAbsent => 0,
+    };
 
     Ok(TmpScrubSummary { entries_deleted })
 }
@@ -7113,6 +7105,55 @@ mod tests {
             .expect("read tmp dir after scrub")
             .count();
         assert_eq!(remaining, 0, "tmp dir should be empty after scrub");
+    }
+
+    #[test]
+    fn test_scrub_lane_tmp_dir_recreates_tmp_when_path_is_file() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let tmp_dir = manager.lane_dir(lane_id).join("tmp");
+        std::fs::remove_dir(&tmp_dir).expect("remove tmp dir");
+        std::fs::write(&tmp_dir, b"not-a-dir").expect("write tmp file");
+
+        let scrub = scrub_lane_tmp_dir(&manager, lane_id).expect("tmp scrub should succeed");
+        assert_eq!(scrub.entries_deleted, 1);
+        assert!(
+            tmp_dir.is_dir(),
+            "tmp path should be recreated as directory after scrub"
+        );
+    }
+
+    #[test]
+    fn test_scrub_lane_tmp_dir_with_entry_limit_fails_closed() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let nested_dir = manager.lane_dir(lane_id).join("tmp").join("nested");
+        std::fs::create_dir_all(&nested_dir).expect("create nested tmp dir");
+        for idx in 0..4 {
+            std::fs::write(nested_dir.join(format!("file-{idx}.tmp")), b"tmp")
+                .expect("write nested tmp file");
+        }
+
+        let err = scrub_lane_tmp_dir_with_entry_limit(&manager, lane_id, 2)
+            .expect_err("tmp scrub should fail when entry limit is exceeded");
+        assert!(
+            err.contains("entry bound"),
+            "expected entry bound failure, got: {err}"
+        );
     }
 
     #[test]
