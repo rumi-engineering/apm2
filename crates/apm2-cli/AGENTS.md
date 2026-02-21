@@ -143,6 +143,23 @@ Credential management subcommands.
 | `apm2 fac lane reset <lane_id> --force` | Force-reset RUNNING lane (kills process first) |
 | `apm2 fac services status` | Check daemon/worker service status with health verdicts |
 
+### Work Management (TCK-00635)
+
+| Command | Description |
+|---------|-------------|
+| `apm2 work open --from-ticket <path>` | Import ticket YAML as a WorkSpec via `OpenWork` RPC |
+| `apm2 work claim --actor-id <id>` | Claim work from the daemon queue |
+| `apm2 work status --work-id <id>` | Query work item status |
+
+**Security Invariants:**
+- [INV-WORK-001] File reads use handle-based `.take(MAX + 1)` bounding to
+  prevent TOCTOU between stat and read. No separate metadata check.
+- [INV-WORK-002] `work_id` is derived deterministically from `ticket_id`
+  (`W-<ticket_id>`) so retrying the CLI with the same ticket yields the
+  same `work_id`, preserving daemon-side idempotency.
+- [INV-WORK-003] Daemon idempotency hash comparison uses `subtle::ConstantTimeEq`
+  to prevent timing side-channel leakage of cryptographic digests (INV-DW-001).
+
 ### FAC Install and Binary Alignment (TCK-00625)
 
 | Command | Description |
