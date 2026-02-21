@@ -14372,24 +14372,38 @@ impl PrivilegedDispatcher {
     /// 6. Storing canonical bytes to CAS (fail-closed when CAS is not
     ///    configured)
     /// 7. Emitting exactly one `work.opened` event via the canonical ledger
+    // Signature matches the privileged dispatch table contract
+    // (ProtocolResult<PrivilegedResponse>).  All pre-PCAC errors now
+    // return Ok(Error(CapabilityRequestRejected)) for uniform error
+    // codes, so the Err path is not exercised in practice.
+    #[allow(clippy::unnecessary_wraps)]
     fn handle_open_work(
         &self,
         payload: &[u8],
         ctx: &ConnectionContext,
     ) -> ProtocolResult<PrivilegedResponse> {
         // 1. Bounded decode the OpenWorkRequest protobuf
-        let request =
-            OpenWorkRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
-                ProtocolError::Serialization {
-                    reason: format!("invalid OpenWorkRequest: {e}"),
-                }
-            })?;
+        //
+        // UNIFORM PRE-ADMISSION ERROR (f-781-code_quality-1771695656826338-0):
+        // All pre-PCAC admission failures return CapabilityRequestRejected to
+        // avoid side-channel variability. Internal diagnostics are preserved
+        // in the error message for logs/tests.
+        let request = match OpenWorkRequest::decode_bounded(payload, &self.decode_config) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "OpenWork: protobuf decode failed (pre-admission)");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("OpenWork request rejected: decode failed: {e}"),
+                ));
+            },
+        };
 
         // CTR-1603: Validate work_spec_json size before JSON parsing
         if request.work_spec_json.is_empty() {
             return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::InvalidArgument,
-                "work_spec_json cannot be empty",
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "OpenWork request rejected: work_spec_json cannot be empty",
             ));
         }
 
@@ -14400,8 +14414,8 @@ impl PrivilegedDispatcher {
             Ok(spec) => spec,
             Err(e) => {
                 return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::InvalidArgument,
-                    format!("WorkSpec validation failed: {e}"),
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("OpenWork request rejected: WorkSpec validation failed: {e}"),
                 ));
             },
         };
@@ -14412,17 +14426,22 @@ impl PrivilegedDispatcher {
         // consistency).
         if spec.work_id.len() > MAX_ID_LENGTH {
             return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::InvalidArgument,
-                format!("WorkSpec work_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "OpenWork request rejected: work_id exceeds maximum length of \
+                     {MAX_ID_LENGTH} bytes"
+                ),
             ));
         }
 
         // 3. Derive actor_id from peer credentials (NEVER from client input)
-        let peer_creds = ctx
-            .peer_credentials()
-            .ok_or_else(|| ProtocolError::Serialization {
-                reason: "peer credentials required for OpenWork".to_string(),
-            })?;
+        let Some(peer_creds) = ctx.peer_credentials() else {
+            warn!("OpenWork: peer credentials missing (pre-admission)");
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "OpenWork request rejected: peer credentials required",
+            ));
+        };
         let actor_id = derive_actor_id(peer_creds);
 
         info!(
@@ -14434,18 +14453,20 @@ impl PrivilegedDispatcher {
         );
 
         // 4. Canonicalize the WorkSpec JSON for deterministic CAS storage
-        let spec_json_str = std::str::from_utf8(&request.work_spec_json).map_err(|e| {
-            ProtocolError::Serialization {
-                reason: format!("WorkSpec JSON is not valid UTF-8: {e}"),
-            }
-        })?;
+        let Ok(spec_json_str) = std::str::from_utf8(&request.work_spec_json) else {
+            warn!("OpenWork: UTF-8 validation failed (pre-admission)");
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "OpenWork request rejected: work_spec_json is not valid UTF-8",
+            ));
+        };
         let canonical_json =
             match apm2_core::fac::work_cas_schemas::canonicalize_for_cas(spec_json_str) {
                 Ok(c) => c,
                 Err(e) => {
                     return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::InvalidArgument,
-                        format!("WorkSpec canonicalization failed: {e}"),
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("OpenWork request rejected: canonicalization failed: {e}"),
                     ));
                 },
             };
@@ -31076,8 +31097,8 @@ mod tests {
                 PrivilegedResponse::Error(err) => {
                     assert_eq!(
                         PrivilegedErrorCode::try_from(err.code),
-                        Ok(PrivilegedErrorCode::InvalidArgument),
-                        "Empty work_spec_json should return InvalidArgument"
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                        "Empty work_spec_json should return uniform CapabilityRequestRejected"
                     );
                 },
                 other => panic!("Expected Error response, got: {other:?}"),
@@ -31105,8 +31126,8 @@ mod tests {
                 PrivilegedResponse::Error(err) => {
                     assert_eq!(
                         PrivilegedErrorCode::try_from(err.code),
-                        Ok(PrivilegedErrorCode::InvalidArgument),
-                        "Invalid JSON should return InvalidArgument"
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                        "Invalid JSON should return uniform CapabilityRequestRejected"
                     );
                 },
                 other => panic!("Expected Error response, got: {other:?}"),
@@ -31132,10 +31153,29 @@ mod tests {
             let mut buf = Vec::new();
             request.encode(&mut buf).expect("encode");
 
+            // Uniform pre-admission error: missing peer credentials now
+            // returns Ok(Error(CapabilityRequestRejected)) instead of
+            // Err(Serialization) to avoid side-channel variability.
             let result = dispatcher.handle_open_work(&buf, &ctx);
-            // Should fail at the protocol level (Serialization error) since
-            // peer credentials are required
-            assert!(result.is_err(), "Missing peer credentials should fail");
+            assert!(
+                result.is_ok(),
+                "Missing peer credentials should return Ok(Error), not Err"
+            );
+            match result.unwrap() {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                        "Missing peer credentials should return uniform CapabilityRequestRejected"
+                    );
+                    assert!(
+                        err.message.contains("peer credentials"),
+                        "Error message should mention peer credentials, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected Error response, got: {other:?}"),
+            }
         }
 
         #[test]
