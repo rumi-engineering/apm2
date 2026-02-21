@@ -21,6 +21,8 @@ The `apm2-daemon` crate implements the persistent daemon process in APM2's four-
 
 **Freeze-Aware Reads (TCK-00638):** Read paths that were introduced before the freeze guard also query the canonical `events` table when frozen. `get_event_by_evidence_identity` (idempotent replay detection for `PublishWorkContextEntry`) checks canonical events via `canonical_get_evidence_by_identity` before falling back to legacy. `LedgerTailer::poll_events` and `poll_events_async` merge canonical and legacy results using lazy `sqlite_master` detection cached in an `AtomicU8`.
 
+**Bounded Evidence Scans (TCK-00638):** `get_event_by_evidence_identity` and `canonical_get_evidence_by_identity` enforce `LIMIT MAX_EVIDENCE_SCAN_ROWS` (1 000) on their SQL queries to prevent O(N) iteration with per-row JSON + Protobuf deserialization. Without this bound, an attacker with a valid lease could publish evidence to grow the event count for a work_id, causing subsequent lookups to exhaust CPU and memory.
+
 ```
 ┌─────────────────┐
 │   apm2-cli      │  CLI client

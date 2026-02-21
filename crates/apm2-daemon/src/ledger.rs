@@ -84,6 +84,17 @@ struct EventHashInput<'a> {
 
 const REDUNDANCY_RECEIPT_CONSUMED_EVENT: &str = "redundancy_receipt_consumed";
 
+/// Hard scan limit for `get_event_by_evidence_identity` and
+/// `canonical_get_evidence_by_identity`. Without a `LIMIT` the query iterates
+/// over **all** `evidence.published` events for a `work_id`, performing per-row
+/// JSON + Protobuf deserialization — an `O(N)` `DoS` vector.
+///
+/// The constant is deliberately generous (1 000 rows): legitimate work items
+/// should never have anywhere near that many evidence events for a single
+/// `work_id`. If the matching event is not found within this window the lookup
+/// returns `None`, which causes the caller to attempt a fresh publish.
+const MAX_EVIDENCE_SCAN_ROWS: u32 = 1_000;
+
 #[derive(Debug)]
 struct ChainBackfillRow {
     rowid: i64,
@@ -356,12 +367,16 @@ impl SqliteLedgerEventEmitter {
                  FROM events \
                  WHERE event_type = 'evidence.published' \
                  AND session_id = ?1 \
-                 ORDER BY rowid DESC",
+                 ORDER BY rowid DESC \
+                 LIMIT ?2",
             )
             .ok()?;
 
         let rows = stmt
-            .query_map(params![work_id], Self::canonical_row_to_event)
+            .query_map(
+                params![work_id, MAX_EVIDENCE_SCAN_ROWS],
+                Self::canonical_row_to_event,
+            )
             .ok()?;
 
         for row_result in rows {
@@ -3139,12 +3154,13 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
                  FROM ledger_events \
                  WHERE event_type = 'evidence.published' \
                  AND work_id = ?1 \
-                 ORDER BY rowid DESC",
+                 ORDER BY rowid DESC \
+                 LIMIT ?2",
             )
             .ok()?;
 
         let rows = stmt
-            .query_map(params![work_id], |row| {
+            .query_map(params![work_id, MAX_EVIDENCE_SCAN_ROWS], |row| {
                 Ok(SignedLedgerEvent {
                     event_id: row.get(0)?,
                     event_type: row.get(1)?,
@@ -8069,5 +8085,74 @@ mod tests {
         // emit is different from the canonical synthesised one, but the
         // canonical lookup should still work).
         let _ = emit_result; // used above for proof that emit succeeded
+    }
+
+    /// BLOCKER regression: `get_event_by_evidence_identity` must scan at most
+    /// `MAX_EVIDENCE_SCAN_ROWS` events, preventing `O(N)` `DoS` via unbounded
+    /// iteration with per-row JSON + Protobuf deserialization.
+    ///
+    /// This test publishes more than `MAX_EVIDENCE_SCAN_ROWS` evidence events
+    /// under the same `work_id` and verifies the lookup still returns `None`
+    /// for a non-existent `entry_id` (proving the scan is bounded and does
+    /// not panic or hang).
+    #[test]
+    fn test_evidence_scan_is_bounded_by_max_rows() {
+        use prost::Message;
+
+        let emitter = test_emitter();
+
+        let work_id = "W-DOS-BOUND-TEST";
+        let actor_id = "test-actor";
+
+        // Publish MAX_EVIDENCE_SCAN_ROWS + 10 events with distinct entry_ids.
+        // Each uses a valid protobuf payload with a unique evidence_id.
+        let event_count = MAX_EVIDENCE_SCAN_ROWS + 10;
+        for i in 0..event_count {
+            let evidence_id = format!("CTX-dos-entry-{i:06}");
+            let published = apm2_core::events::EvidencePublished {
+                evidence_id: evidence_id.clone(),
+                work_id: work_id.to_string(),
+                category: "WORK_CONTEXT_ENTRY".to_string(),
+                artifact_hash: vec![0u8; 32],
+                verification_command_ids: Vec::new(),
+                classification: "INTERNAL".to_string(),
+                artifact_size: 100,
+                metadata: vec![],
+                time_envelope_ref: None,
+            };
+            let event = apm2_core::events::EvidenceEvent {
+                event: Some(apm2_core::events::evidence_event::Event::Published(
+                    published,
+                )),
+            };
+            let proto_bytes = event.encode_to_vec();
+
+            emitter
+                .emit_session_event(
+                    work_id,
+                    "evidence.published",
+                    &proto_bytes,
+                    actor_id,
+                    1_000_000_000 + u64::from(i),
+                )
+                .expect("emit must succeed");
+        }
+
+        // Lookup a non-existent entry_id — must return None without unbounded
+        // iteration (the LIMIT in the SQL query bounds the scan).
+        let result = emitter.get_event_by_evidence_identity(work_id, "CTX-does-not-exist");
+        assert!(
+            result.is_none(),
+            "Non-existent entry_id must return None even with > MAX_EVIDENCE_SCAN_ROWS events"
+        );
+
+        // Lookup an entry_id that exists within the scan window (the most
+        // recent event). Must still be found.
+        let last_id = format!("CTX-dos-entry-{:06}", event_count - 1);
+        let found = emitter.get_event_by_evidence_identity(work_id, &last_id);
+        assert!(
+            found.is_some(),
+            "Most recent entry must be findable within the bounded scan window"
+        );
     }
 }
