@@ -135,12 +135,9 @@ Credential management subcommands.
 |---------|-------------|
 | `apm2 fac lane init` | Bootstrap a fresh lane pool with directories and default profiles |
 | `apm2 fac lane init --json` | Same, with JSON receipt output |
-| `apm2 fac lane reconcile` | Repair missing lane directories/profiles, mark unrecoverable lanes CORRUPT |
-| `apm2 fac lane reconcile --json` | Same, with JSON receipt output |
 | `apm2 fac lane status` | Show all lane states (lock + lease + PID identity/liveness) |
 | `apm2 fac lane status --state RUNNING` | Filter lanes by state |
-| `apm2 fac lane reset <lane_id>` | Reset lane: delete workspace/target/logs, remove lease |
-| `apm2 fac lane reset <lane_id> --force` | Force-reset RUNNING lane (kills process first) |
+| `apm2 fac doctor --fix` | Run deterministic host reconciliation/remediation (queue+lives lanes, tmp scrub, stale log GC) |
 | `apm2 fac services status` | Check daemon/worker service status with health verdicts |
 
 ### FAC Install and Binary Alignment (TCK-00625)
@@ -208,24 +205,25 @@ correctness tool -- read-only, no state mutations.
 - [INV-CFG-003] Fail-closed: unresolvable fields report errors inline rather
   than omitting or synthesising default values.
 
-### FAC Reconciliation (TCK-00534)
+### FAC Doctor Reconciler (TCK-00534, TCK-00659)
 
 | Command | Description |
 |---------|-------------|
-| `apm2 fac reconcile --dry-run` | Preview crash recovery actions without mutating state |
-| `apm2 fac reconcile --apply` | Apply crash recovery: reconcile stale leases and orphaned claimed jobs |
+| `apm2 fac doctor` | Host/system health checks only (no mutation) |
+| `apm2 fac doctor --fix` | Applies deterministic crash recovery and remediation |
 
-**Overview:** The `reconcile` subcommand performs deterministic crash recovery
-on worker startup (or on-demand via CLI). After an unclean shutdown (crash,
-SIGKILL, OOM-kill), queue and lane state can become inconsistent. Reconciliation
-detects and repairs these inconsistencies:
+**Overview:** The no-PR doctor path is the single host remediation entrypoint.
+`apm2 fac doctor --fix` runs deterministic crash recovery for queue/lane state
+and applies bounded remediation actions when trigger conditions match:
 
 1. **Lane reconciliation (Phase 1):** Scans all lanes for stale leases (dead PID
    + free lock). Stale leases are transitioned through CLEANUP to IDLE with
    receipts. Ambiguous PID states are marked CORRUPT (fail-closed).
 2. **Queue reconciliation (Phase 2):** Scans `queue/claimed/` for orphaned jobs
-   not backed by any active lane. Orphaned jobs are requeued (moved to
-   `pending/`) or marked failed (moved to `denied/`) based on policy.
+   not backed by any active lane and requeues deterministically.
+3. **Bounded remediation:** Performs tmp corruption scrub + lane reset retry
+   for trigger-matched CORRUPT lanes, runs stale lane-log GC, reruns reconcile,
+   and emits structured action outcomes.
 
 **Security Invariants:**
 

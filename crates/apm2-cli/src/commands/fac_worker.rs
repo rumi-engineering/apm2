@@ -6072,7 +6072,7 @@ fn emit_lane_reset_recommendation(lane_id: &str, reason: &str) {
         lane_id: lane_id.to_string(),
         message: format!("worker: RECOMMENDATION: lane {lane_id} needs reset"),
         reason: reason.to_string(),
-        recommended_action: "apm2 fac lane reset",
+        recommended_action: "apm2 fac doctor --fix",
     };
     match serde_json::to_string(&rec) {
         Ok(json) => {
@@ -6259,7 +6259,7 @@ fn acquire_worker_lane(
                                         lane_id = lane_id.as_str(),
                                         pid = lease.pid,
                                         reason = reason.as_str(),
-                                        recommended_action = "apm2 fac lane reset <lane_id>",
+                                        recommended_action = "apm2 fac doctor --fix",
                                         "skipping lane because lease identity is unknown"
                                     );
                                 },
@@ -11756,7 +11756,7 @@ mod tests {
             lane_id: "lane-42".to_string(),
             message: "worker: RECOMMENDATION: lane lane-42 needs reset".to_string(),
             reason: "cleanup failure: disk full".to_string(),
-            recommended_action: "apm2 fac lane reset",
+            recommended_action: "apm2 fac doctor --fix",
         };
         let json_str = serde_json::to_string(&rec).expect("serialization must succeed");
 
@@ -11775,7 +11775,7 @@ mod tests {
             "human-readable context must be encoded inside JSON, not as a separate plain-text line"
         );
         assert_eq!(parsed["reason"], "cleanup failure: disk full");
-        assert_eq!(parsed["recommended_action"], "apm2 fac lane reset");
+        assert_eq!(parsed["recommended_action"], "apm2 fac doctor --fix");
 
         // The output must NOT contain any non-JSON prefix — verify the first
         // non-whitespace character is '{'.
@@ -11802,7 +11802,7 @@ mod tests {
             lane_id: lane_id.to_string(),
             message: format!("worker: RECOMMENDATION: lane {lane_id} needs reset"),
             reason: reason.to_string(),
-            recommended_action: "apm2 fac lane reset",
+            recommended_action: "apm2 fac doctor --fix",
         };
         let json_str =
             serde_json::to_string(&rec).expect("serialization must succeed for test fixture");
@@ -11853,7 +11853,7 @@ mod tests {
                 lane_id: lane_id.to_string(),
                 message: format!("worker: RECOMMENDATION: lane {lane_id} needs reset"),
                 reason: reason.to_string(),
-                recommended_action: "apm2 fac lane reset",
+                recommended_action: "apm2 fac doctor --fix",
             };
             let json_str =
                 serde_json::to_string(&rec).expect("serialization must succeed for test fixture");

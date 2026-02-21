@@ -504,7 +504,7 @@ fn check_orphaned_systemd_units() -> DaemonDoctorCheck {
         name: "orphaned_systemd_units".to_string(),
         status: "ERROR",
         message: format!(
-            "{ORPHANED_SYSTEMD_UNIT_REASON_CODE} detected: {}. Remediation: stop_revoke target job(s) to terminate active units, then run `apm2 fac lane reset <lane_id>` for affected lanes.",
+            "{ORPHANED_SYSTEMD_UNIT_REASON_CODE} detected: {}. Remediation: stop_revoke target job(s) to terminate active units, then run `apm2 fac doctor --fix`.",
             findings.join("; ")
         ),
     }

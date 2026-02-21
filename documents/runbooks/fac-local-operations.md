@@ -375,9 +375,9 @@ from a failed cleanup. Common triggers:
 # Lane state inspection commands will be available when FESv1 is implemented
 ```
 
-### 5.3 Perform safe lane reset (PLANNED)
+### 5.3 Perform safe lane recovery (PLANNED)
 
-When the `apm2 fac lane reset` command is implemented, it will provide
+When `apm2 fac doctor --fix` runs lane recovery, it provides
 these safety guarantees:
 1. Symlink-safe recursive deletion (verifies each path component)
 2. Refuses to cross filesystem boundaries
@@ -509,8 +509,7 @@ Symptom: Builds fail with "No space left on device"
 | Command | Purpose |
 |---------|---------|
 | `apm2 fac lane status` | Show all lane states |
-| `apm2 fac lane reset <id>` | Reset a lane to known-good state |
-| `apm2 fac lane reset <id> --force` | Force-reset a running lane |
+| `apm2 fac doctor --fix` | Reconcile and recover lane/queue state with bounded remediation |
 | `apm2 fac worker --once` | Run one job claim/execute cycle |
 | `apm2 fac worker` | Run worker continuously |
 | `apm2 fac enqueue <spec>` | Enqueue a job from a spec file |

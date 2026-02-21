@@ -74,13 +74,9 @@ apm2 fac lane status          # Check for LEASED lanes with no PID
    ```
    systemctl --user restart apm2-worker.service
    ```
-2. If that doesn't clear it, run lane reconcile:
+2. If that doesn't clear it, run doctor fix:
    ```
-   apm2 fac lane reconcile
-   ```
-3. If still stuck, reset the lane (destructive — clears workspace/target/logs):
-   ```
-   apm2 fac lane reset --lane-id lane-XX
+   apm2 fac doctor --fix
    ```
 
 ### 2C: Lane Corruption
@@ -89,8 +85,7 @@ apm2 fac lane status          # Check for LEASED lanes with no PID
 
 **Fix**:
 ```
-apm2 fac lane reset --lane-id lane-XX
-apm2 fac lane reconcile
+apm2 fac doctor --fix
 ```
 
 ### 2D: Broker Unhealthy

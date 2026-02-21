@@ -4357,7 +4357,7 @@ fn acquire_gates_lane_lock(lane_manager: &LaneManager) -> Result<LaneLockGuard, 
 ///
 /// If a previous gate run (or worker) marked the lane as corrupt, running
 /// gates in that environment risks non-deterministic results. The user must
-/// run `apm2 fac lane reset lane-00` to clear the corrupt marker first.
+/// run `apm2 fac doctor --fix` to clear the corrupt marker first.
 fn check_lane_not_corrupt(lane_manager: &LaneManager) -> Result<(), String> {
     let status = lane_manager
         .lane_status("lane-00")
@@ -4367,7 +4367,7 @@ fn check_lane_not_corrupt(lane_manager: &LaneManager) -> Result<(), String> {
         return Err(format!(
             "lane-00 is in CORRUPT state (reason: {reason}). \
              Cannot run gates in a dirty environment. \
-             Run `apm2 fac lane reset lane-00` to clear the corrupt marker first."
+             Run `apm2 fac doctor --fix` to clear the corrupt marker first."
         ));
     }
     Ok(())
