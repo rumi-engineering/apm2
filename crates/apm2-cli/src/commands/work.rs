@@ -24,6 +24,7 @@
 //! - 21: Protocol error
 //! - 22: Policy deny
 
+use std::io::Read as _;
 use std::path::Path;
 
 use apm2_daemon::protocol::WorkRole;
@@ -418,46 +419,34 @@ fn run_status(args: &StatusArgs, socket_path: &Path, json_output: bool) -> u8 {
 /// Reads a ticket YAML file, converts it to a `WorkSpec` JSON, canonicalizes
 /// it, and sends to the daemon via the `OpenWork` RPC.
 fn run_open(args: &OpenArgs, socket_path: &Path, json_output: bool) -> u8 {
-    // Validate file path
+    // CTR-1603: Bounded file read via file handle to prevent TOCTOU.
+    // Open file first, then enforce size bound on the file handle itself
+    // so that a replaced-after-stat file or special file (/dev/zero) cannot
+    // bypass the size limit.
     let ticket_path = Path::new(&args.from_ticket);
-    if !ticket_path.exists() {
-        return output_error(
-            json_output,
-            "file_not_found",
-            &format!("Ticket file not found: {}", args.from_ticket),
-            exit_codes::VALIDATION_ERROR,
-        );
-    }
-
-    // CTR-1603: Bounded file read - check file size before reading
-    let metadata = match std::fs::metadata(ticket_path) {
-        Ok(m) => m,
+    let file = match std::fs::File::open(ticket_path) {
+        Ok(f) => f,
         Err(e) => {
-            return output_error(
-                json_output,
-                "io_error",
-                &format!("Failed to read file metadata: {e}"),
-                exit_codes::GENERIC_ERROR,
-            );
+            let (code, msg) = if e.kind() == std::io::ErrorKind::NotFound {
+                (
+                    "file_not_found",
+                    format!("Ticket file not found: {}", args.from_ticket),
+                )
+            } else {
+                ("io_error", format!("Failed to open ticket file: {e}"))
+            };
+            return output_error(json_output, code, &msg, exit_codes::VALIDATION_ERROR);
         },
     };
 
-    if metadata.len() > MAX_TICKET_FILE_SIZE {
-        return output_error(
-            json_output,
-            "file_too_large",
-            &format!(
-                "Ticket file exceeds maximum size ({} > {} bytes)",
-                metadata.len(),
-                MAX_TICKET_FILE_SIZE
-            ),
-            exit_codes::VALIDATION_ERROR,
-        );
-    }
-
-    // Read ticket YAML
-    let yaml_content = match std::fs::read_to_string(ticket_path) {
-        Ok(content) => content,
+    // Read at most MAX_TICKET_FILE_SIZE + 1 bytes from the file handle.
+    // If we read more than MAX_TICKET_FILE_SIZE, the file is too large.
+    let mut yaml_content = String::new();
+    let bytes_read = match file
+        .take(MAX_TICKET_FILE_SIZE + 1)
+        .read_to_string(&mut yaml_content)
+    {
+        Ok(n) => n as u64,
         Err(e) => {
             return output_error(
                 json_output,
@@ -467,6 +456,15 @@ fn run_open(args: &OpenArgs, socket_path: &Path, json_output: bool) -> u8 {
             );
         },
     };
+
+    if bytes_read > MAX_TICKET_FILE_SIZE {
+        return output_error(
+            json_output,
+            "file_too_large",
+            &format!("Ticket file exceeds maximum size (>{MAX_TICKET_FILE_SIZE} bytes)"),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
 
     // Parse YAML and convert to WorkSpec JSON
     let work_spec_json = match ticket_yaml_to_work_spec_json(&yaml_content) {
@@ -586,8 +584,10 @@ fn ticket_yaml_to_work_spec_json(yaml_content: &str) -> Result<String, String> {
         })
         .unwrap_or_default();
 
-    // Generate a canonical work ID
-    let work_id = format!("W-{}", uuid::Uuid::new_v4());
+    // Derive work_id deterministically from ticket_id so retrying the CLI
+    // with the same ticket file yields the same work_id, preserving daemon
+    // idempotency semantics.
+    let work_id = format!("W-{ticket_id}");
 
     // Build WorkSpec JSON
     let mut spec = serde_json::Map::new();
@@ -926,7 +926,30 @@ ticket_meta:
         assert_eq!(parsed["title"], "Test ticket title");
         assert_eq!(parsed["work_type"], "TICKET");
         assert_eq!(parsed["rfc_id"], "RFC-0032");
-        assert!(parsed["work_id"].as_str().unwrap().starts_with("W-"));
+        // work_id is deterministic: "W-<ticket_id>"
+        assert_eq!(parsed["work_id"], "W-TCK-00999");
+    }
+
+    /// Tests that `work_id` is deterministic across invocations (MAJOR-1 fix).
+    #[test]
+    fn test_ticket_yaml_deterministic_work_id() {
+        let yaml = r"
+ticket_meta:
+  ticket:
+    id: TCK-12345
+    title: 'Determinism test'
+";
+        let first = ticket_yaml_to_work_spec_json(yaml).unwrap();
+        let second = ticket_yaml_to_work_spec_json(yaml).unwrap();
+
+        let p1: serde_json::Value = serde_json::from_str(&first).unwrap();
+        let p2: serde_json::Value = serde_json::from_str(&second).unwrap();
+
+        assert_eq!(
+            p1["work_id"], p2["work_id"],
+            "Repeated invocations with same ticket must produce identical work_id"
+        );
+        assert_eq!(p1["work_id"], "W-TCK-12345");
     }
 
     /// Tests that ticket YAML conversion rejects missing required fields.
