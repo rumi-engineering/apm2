@@ -587,7 +587,9 @@ impl Canonicalize for KernelEvent {
                 // ReviewReceiptRecorded has no repeated fields (TCK-00312)
                 | kernel_event::Payload::ReviewReceiptRecorded(_)
                 // ProjectionReceiptRecorded has no repeated fields (TCK-00323)
-                | kernel_event::Payload::ProjectionReceiptRecorded(_),
+                | kernel_event::Payload::ProjectionReceiptRecorded(_)
+                // WorkGraphEvent has no repeated fields (TCK-00642)
+                | kernel_event::Payload::WorkGraph(_),
             )
             | None => {},
         }

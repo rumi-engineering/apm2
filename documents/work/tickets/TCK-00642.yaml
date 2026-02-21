@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00642
     title: 'RFC-0032 Phase 3: add WorkGraphEvent protobuf + canonical event types `work_graph.edge.*` + topic-derivation tests'
-    status: OPEN
+    status: IN_PROGRESS
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032

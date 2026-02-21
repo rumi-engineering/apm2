@@ -1,5 +1,14 @@
 // APM2 Kernel Event Schema
-// Version: 0.10.0
+// Version: 0.11.0
+//
+// CHANGELOG (0.11.0):
+// - Added WorkGraphEvent for work dependency graph edges (RFC-0032, TCK-00642)
+// - Added WorkEdgeAdded, WorkEdgeRemoved, WorkEdgeWaived messages
+// - Added WorkEdgeType enum (DEPENDENCY, BLOCKS, ENABLES, SEQUENCE)
+// - Added WorkGraphEvent to KernelEvent payload (tag 35)
+// - Event type strings: work_graph.edge.added/removed/waived
+// - MUST NOT start with `work.` to avoid WorkReducer decoding
+// - Multi-topic derivation: emits work topics for both from_work_id and to_work_id
 //
 // CHANGELOG (0.10.0):
 // - Added role_spec_hash to ReviewReceiptRecorded (RFC-0019, TCK-00331)
@@ -140,6 +149,7 @@ message KernelEvent {
     ReviewBlockedRecorded review_blocked_recorded = 32;
     ReviewReceiptRecorded review_receipt_recorded = 33;
     ProjectionReceiptRecorded projection_receipt_recorded = 34;
+    WorkGraphEvent work_graph = 35;
   }
 }
 
@@ -1818,4 +1828,95 @@ message ProjectionReceiptRecorded {
   string projector_actor_id = 5;
   // Ed25519 signature over canonical bytes with PROJECTION_RECEIPT_RECORDED: domain (64 bytes).
   bytes projector_signature = 6;
+}
+
+// ============================================================
+// WORK GRAPH EVENTS (RFC-0032, TCK-00642)
+// ============================================================
+//
+// WorkGraphEvent models dependency edges between work items in the
+// work graph. These events form a DAG of work dependencies that is
+// separate from the WorkReducer's lifecycle state machine.
+//
+// IMPORTANT: Event type strings use the `work_graph.edge.*` prefix,
+// NOT `work.*`, to avoid collision with WorkReducer event decoding.
+//
+// Key properties:
+// - Edges are directional: from_work_id -> to_work_id
+// - Multi-topic derivation: events emit topics for BOTH work IDs
+// - Edge types classify the dependency relationship
+// - Waived edges record intentional dependency overrides
+
+// Type of dependency edge between work items.
+enum WorkEdgeType {
+  // Unspecified edge type (invalid).
+  WORK_EDGE_TYPE_UNSPECIFIED = 0;
+  // from_work_id depends on to_work_id (must complete first).
+  WORK_EDGE_TYPE_DEPENDENCY = 1;
+  // from_work_id blocks to_work_id (prevents progress).
+  WORK_EDGE_TYPE_BLOCKS = 2;
+  // from_work_id enables to_work_id (prerequisite capability).
+  WORK_EDGE_TYPE_ENABLES = 3;
+  // from_work_id must complete before to_work_id starts (ordering).
+  WORK_EDGE_TYPE_SEQUENCE = 4;
+}
+
+// Envelope for work graph edge events.
+message WorkGraphEvent {
+  oneof event {
+    WorkEdgeAdded added = 1;
+    WorkEdgeRemoved removed = 2;
+    WorkEdgeWaived waived = 3;
+  }
+}
+
+// Emitted when a dependency edge is added between two work items.
+//
+// This event establishes a directional relationship in the work graph.
+// The edge_type classifies the nature of the dependency.
+//
+// Topic derivation produces topics for BOTH from_work_id and to_work_id
+// so that subscribers to either work item receive the notification.
+message WorkEdgeAdded {
+  // Source work item in the edge.
+  string from_work_id = 1;
+  // Target work item in the edge.
+  string to_work_id = 2;
+  // Type of dependency relationship.
+  WorkEdgeType edge_type = 3;
+  // Human-readable rationale for why this edge exists.
+  string rationale = 4;
+}
+
+// Emitted when a dependency edge is removed between two work items.
+//
+// This event removes a previously established edge from the work graph.
+//
+// Topic derivation produces topics for BOTH from_work_id and to_work_id.
+message WorkEdgeRemoved {
+  // Source work item in the edge.
+  string from_work_id = 1;
+  // Target work item in the edge.
+  string to_work_id = 2;
+  // Reason for edge removal.
+  string reason = 3;
+}
+
+// Emitted when a dependency edge is waived (intentionally overridden).
+//
+// A waiver records that a dependency was acknowledged but intentionally
+// skipped, with audit evidence for the override decision.
+//
+// Topic derivation produces topics for BOTH from_work_id and to_work_id.
+message WorkEdgeWaived {
+  // Source work item in the edge.
+  string from_work_id = 1;
+  // Target work item in the edge.
+  string to_work_id = 2;
+  // Type of the original edge being waived.
+  WorkEdgeType original_edge_type = 3;
+  // Justification for the waiver.
+  string waiver_justification = 4;
+  // Actor who authorized the waiver.
+  string waiver_actor_id = 5;
 }
