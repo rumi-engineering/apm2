@@ -321,9 +321,15 @@ Security invariants:
 - **Completion-before-cleanup** (`fac_worker.rs`): Lane cleanup runs AFTER job completion receipt
   emission and move to `completed/`. Cleanup failures log warnings and mark lanes corrupt but do
   not retroactively negate a completed job outcome (INV-LANE-CLEANUP-006).
-- **Process liveness** (`fac_worker.rs`): Stale lease detection uses `libc::kill(pid, 0)` with
-  errno discrimination (ESRCH vs EPERM) instead of shell `kill -0` with `status.success()`.
-  EPERM means the process exists but is unpermissioned; the lane is marked corrupt, not idle.
+- **Process identity binding** (`fac_worker.rs`, `fac.rs`, TCK-00658): Lease
+  liveness decisions use `verify_pid_identity(pid, proc_start_time_ticks)` from
+  core lane primitives.
+  - `AliveMatch`: process still owns the lease.
+  - `AliveMismatch`: PID reuse; stale lease is reclaimed.
+  - `Dead`: stale lease is reclaimed.
+  - `Unknown`: fail-closed lane skip/corrupt behavior depending on command path.
+  `lane reset --force` only signals when identity is `AliveMatch`, preventing
+  kill-on-reused-PID hazards.
 - **JSON-only stderr recommendation channel** (`fac_worker.rs`, TCK-00570): The
   `emit_lane_reset_recommendation` function emits exactly one JSON line per recommendation
   to stderr.  No plain-text preamble or human-readable log lines are mixed into the stream.

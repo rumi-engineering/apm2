@@ -1,443 +1,367 @@
 {
-    "kind": "instruction.spec",
-    "schema": "cac.instruction_spec.v1",
-    "schema_version": "1.0.0",
-    "meta": {
-        "classification": "INTERNAL",
-        "created_at": "2026-02-20T06:00:00Z",
-        "dependencies": [
-            "dcp://apm2.local/instructions/alien_engineering_protocol/master@v1"
-        ],
-        "labels": [
-            "alien-coding",
-            "agent-orchestrators",
-            "rust",
-            "state-machines",
-            "verification-first",
-            "derived-state-discipline",
-            "v2"
-        ],
-        "provenance": {
-            "actor_id": "HOLON-INSTR-EMITTER",
-            "work_id": "alien_coding_orchestrators_master_v2"
-        },
-        "stable_id": "dcp://apm2.local/instructions/alien_coding_orchestrators/master@v2"
+  "kind": "instruction.spec",
+  "schema": "cac.instruction_spec.v1",
+  "schema_version": "1.0.0",
+  "meta": {
+    "classification": "INTERNAL",
+    "created_at": "2026-02-21T00:00:00Z",
+    "dependencies": [
+      "dcp://apm2.local/instructions/alien_engineering_protocol/master@v1"
+    ],
+    "labels": [
+      "alien-coding",
+      "agent-orchestrators",
+      "rust",
+      "state-machines",
+      "verification-first",
+      "derived-state-discipline",
+      "ledger-first",
+      "cas-first",
+      "bft-ready",
+      "controller-loop",
+      "projection-cache",
+      "v3"
+    ],
+    "provenance": {
+      "actor_id": "HOLON-INSTR-EMITTER",
+      "work_id": "alien_coding_orchestrators_master_v3"
     },
-    "payload": {
-        "i": "Alien Coding (Orchestrators) v2: implement agent orchestrators as deterministic, replayable Rust state machines with explicit identity, explicit evidence, explicit effects, and a strict derived-state discipline that makes divergence structurally hard.",
-        "t": {
-            "sys": "APM2",
-            "repo": "{repo_root}",
-            "language": "Rust (edition 2024)",
-            "platform": "Ubuntu 24.04 only",
-            "users": "agents and internal operators",
-            "deployment_model": "rolling updates + rollback; architectural cleanliness is rewarded",
-            "scope": [
-                "crates/apm2-core",
-                "crates/apm2-daemon",
-                "crates/apm2-holon",
-                "crates/apm2-cli (orchestrator-like loops)"
-            ],
-            "anchor_patterns_in_repo": [
-                "Reducer determinism + checkpoint replay equivalence: crates/apm2-core/src/reducer/*",
-                "Explicit state machine with invariants: crates/apm2-daemon/src/episode/state.rs",
-                "Gate orchestrator with resource bounds + injected clock + explicit statuses: crates/apm2-daemon/src/gate/orchestrator.rs",
-                "Event-sourced orchestration state: crates/apm2-holon/src/orchestration/state.rs"
-            ]
+    "stable_id": "dcp://apm2.local/instructions/alien_coding_orchestrators/master@v3"
+  },
+  "payload": {
+    "i": "Alien Coding (Orchestrators) v3: build orchestration as a deterministic controller over the APM2 substrate (Ledger + CAS + optional BFT finality). One canonical event log, one artifact plane, zero ad-hoc durable state.",
+    "t": {
+      "sys": "APM2",
+      "repo": "{repo_root}",
+      "language": "Rust (edition 2024)",
+      "platform": "Ubuntu 24.04 only",
+      "users": "agents and internal operators",
+      "deployment_model": "rolling updates + rollback; architectural cleanliness is rewarded",
+      "scope": [
+        "crates/apm2-core",
+        "crates/apm2-daemon",
+        "crates/apm2-holon",
+        "crates/apm2-cli (orchestrator-like loops)"
+      ],
+      "anchor_patterns_in_repo": [
+        "Reducer determinism + checkpoint replay equivalence: crates/apm2-core/src/reducer/*",
+        "Ledger as canonical substrate (seq_id, schema_digest, consensus fields): crates/apm2-core/src/ledger/*",
+        "BFT-integrated ledger backend + consensus metadata persistence: crates/apm2-core/src/ledger/bft_backend.rs",
+        "HotStuff BFT state machine (Chained HotStuff): crates/apm2-core/src/consensus/bft.rs",
+        "CAS trait + bounded verification: crates/apm2-core/src/evidence/cas.rs",
+        "Daemon durable CAS (filesystem-backed, tamper-evident): crates/apm2-daemon/src/cas/mod.rs",
+        "Read-only CAS reader used by CLI workers: crates/apm2-core/src/fac/cas_reader.rs",
+        "Explicit state machine with invariants: crates/apm2-daemon/src/episode/state.rs",
+        "Gate orchestrator with resource bounds + injected clock + explicit statuses: crates/apm2-daemon/src/gate/orchestrator.rs",
+        "Event-sourced work/lease/session reducers: crates/apm2-core/src/work/* ; crates/apm2-core/src/lease/* ; crates/apm2-core/src/session/*",
+        "FAC review (legacy divergent persistence patterns to refactor away): crates/apm2-cli/src/commands/fac_review/*"
+      ]
+    },
+    "north_star_properties": {
+      "dominance_ordered_failure": {
+        "definition": "Conflict resolution must strictly adhere to META-DOMINANCE: Containment/Security > Verification/Correctness > Liveness/Progress.",
+        "mechanics": [
+          "If a containment boundary or correctness constraint fails, the orchestrator MUST fail-closed.",
+          "Liveness watchdogs or retries must never override a containment or correctness failure.",
+          "Record failures as defects; do not silently mask them to maintain progress."
+        ],
+        "machine_check": "Tests assert that containment/correctness failures trap execution into terminal/escalated states, halting further progress."
+      },
+      "single_source_of_truth": {
+        "definition": "Each fact has one canonical owner; all other representations are references or derived projections.",
+        "mechanics": [
+          "Canonical owners are: finalized ledger events (optionally BFT-finalized), CAS artifacts (by digest), signed config, and stable IDs minted by authority.",
+          "Orchestrator State stores references (ids, digests, cursors), plus the minimal sufficient statistic required for future decisions.",
+          "Any on-disk cache (queues, state.json, gate caches) must be rebuildable from ledger+CAS or be explicitly labeled as best-effort telemetry."
+        ],
+        "machine_check": "Given only the ledger + referenced CAS blobs + config, tests can reconstruct the projection/state exactly. Derived caches can be deleted without data loss."
+      },
+      "deterministic_under_replay": {
+        "definition": "Given the same ordered input sequence, the transition core yields byte-identical state and effect list.",
+        "mechanics": [
+          "Treat time, randomness, external observations, and I/O outcomes as explicit Inputs (never implicit reads inside step).",
+          "Treat ordering as explicit: ledger cursor (seq_id/consensus index), sequence numbers, or HLC."
+        ],
+        "machine_check": "Property test: replay from genesis equals replay from checkpoint; repeated replay yields identical final state."
+      },
+      "idempotent_authority": {
+        "definition": "Repeating the same logical trigger yields the same durable result (no duplicate spawns/leases/comments/verdicts).",
+        "mechanics": [
+          "Compute idempotency keys from stable digests (work_id + inputs_digest + action_kind + revision).",
+          "Write an intent event before irreversible actions; on retry, driver checks for existing receipt/result events."
+        ],
+        "machine_check": "Tests feed duplicated Inputs; effects remain stable; at-most-once issuance is preserved."
+      },
+      "finality_aware_authority": {
+        "definition": "Irreversible side effects are gated on authoritative finality. Under BFT, do not act on tentative/forkable facts.",
+        "mechanics": [
+          "Separate: Intent -> Execute -> Receipt. Only treat receipts anchored in finalized ledger as authoritative.",
+          "When BFT is enabled, treat consensus-committed events (QC/epoch/round) as the canonical order; avoid relying on local wall-clock ordering."
+        ],
+        "machine_check": "Simulation test: reorder/delay tentative inputs; orchestrator never produces conflicting irreversible effects."
+      },
+      "closed_by_default_progression": {
+        "definition": "Progression requires explicit evidence; ambiguity selects a safe terminal outcome that preserves auditability.",
+        "mechanics": [
+          "Model terminal outcomes as explicit absorbing states.",
+          "Bind authority actions to receipts/signatures/digests; store those bindings."
+        ],
+        "machine_check": "Invariant tests: terminal states absorb; missing evidence yields terminal-deny/quarantine outcomes."
+      },
+      "bounded_resources": {
+        "definition": "State growth and work per input are explicitly bounded.",
+        "mechanics": [
+          "Bound maps/sets/strings by constants.",
+          "Select bounded behavior: reject, evict, degrade, checkpoint, compact.",
+          "Never scan unbounded directories or ledgers in the hot path; use cursors and incremental iteration."
+        ],
+        "machine_check": "Tests push inputs to bounds; State remains within limits; behavior remains deterministic."
+      },
+      "no_shadow_state": {
+        "definition": "Do not create new durable state stores outside the substrate (Ledger+CAS).",
+        "mechanics": [
+          "If you think you need `~/.apm2/<thing>.json`, you probably need a ledger event type + reducer projection.",
+          "If you think you need `~/.apm2/<thing>/cache`, it must be a witnessed cache: versioned, bounded, rebuildable from ledger+CAS, and safe to delete."
+        ],
+        "machine_check": "Code review: any new persistent file format requires an explicit justification for why it is not a ledger event or CAS blob."
+      }
+    },
+    "orchestrator_information_flow": {
+      "thesis": "Orchestrators are controllers that converge the world toward invariants by folding the ledger and emitting idempotent effects. They do not 'remember' progress in ad-hoc files; they re-derive it from durable evidence.",
+      "planes": {
+        "authority_plane": [
+          "Ledger events (append-only, hash-chained; optionally BFT-finalized).",
+          "Consensus metadata (epoch/round/QC) when enabled."
+        ],
+        "artifact_plane": [
+          "CAS blobs keyed by digest (patch bundles, diffs, logs, transcripts, review artifacts).",
+          "Ledger stores only digests and semantic references."
+        ],
+        "derived_plane": [
+          "Projections (reducers) computed from ledger events.",
+          "Witnessed caches (optional): accelerators that can be dropped and rebuilt."
+        ]
+      },
+      "controller_loop": [
+        "Observe: read new ledger events since cursor (and any bounded external observations as Inputs).",
+        "Fold: run deterministic step/reducer to update State.",
+        "Plan: compute required effects to converge toward invariants (leases, dispatch, reconciliation).",
+        "Commit: scale evidence emission with action leverage (Evidence Tiering). Low-leverage actions yield Summary Receipts or Ephemeral State; high-leverage boundaries yield Merkle-linked, persistent ledger intents/receipts.",
+        "Repeat: advance cursor; checkpoint projection."
+      ],
+      "anti_patterns": [
+        "A separate 'review_state.json' (canonical) beside the ledger.",
+        "Unbounded scans of filesystem directories to infer truth (should be derived/projection).",
+        "Executing an irreversible action without first writing an intent event with an idempotency key."
+      ]
+    },
+    "ledger_projection_grounding": {
+      "thesis": "The step function is a fold over the (finalized) ledger. State is the projection that fold produces. Effects are primarily acts of evidence creation (ledger events + CAS blobs).",
+      "event_first_design": {
+        "instruction": "Before designing State or the Input enum, design the ledger event vocabulary. Ask: if this machine ran to completion, what named events would appear in the ledger, and what would each contain?",
+        "test": "Can you reconstruct the full machine history from ledger events + referenced CAS blobs alone? If not, a ledger event (or CAS reference) is missing."
+      },
+      "finality_model": {
+        "instruction": "Design event types with explicit finality semantics. Under BFT, the ledger may have tentative observations and finalized authority events.",
+        "rules": [
+          "Only perform irreversible external effects after recording an intent and verifying no finalized receipt already exists for the same idempotency key.",
+          "If BFT is enabled, prefer acting only once the relevant intent is finalized/committed (QC present) unless the action is explicitly 'safe under forks' (pure reads, bounded observations).",
+          "When finality is unavailable/unknown, fail closed for authority actions and proceed only with reversible/local effects."
+        ]
+      },
+      "closure_operator": {
+        "instruction": "The step function must satisfy closure/idempotence/monotonicity properties: fold is deterministic; folding more evidence can only advance state; folding duplicates does not change semantics.",
+        "idempotent": {
+          "definition": "fold(A ++ A) == fold(A).",
+          "machine_check": "Property test with duplicated input sequences."
         },
-        "north_star_properties": {
-            "deterministic_under_replay": {
-                "definition": "Given the same ordered input sequence, the transition core yields byte-identical state and effect list.",
-                "mechanics": [
-                    "Treat time, randomness, external observations, and I/O outcomes as explicit Inputs.",
-                    "Treat ordering as explicit (ledger cursor, sequence numbers, HLC)."
-                ],
-                "machine_check": "Property test: replay from genesis equals replay from checkpoint; repeated replay yields identical final state."
-            },
-            "single_source_of_truth": {
-                "definition": "Each fact has one canonical owner; other consumers hold references or derive views.",
-                "mechanics": [
-                    "Canonical owners are: ledger events, CAS artifacts, signed config, and stable IDs minted by authority.",
-                    "Orchestrator State stores references (ids, digests, cursors), plus the minimal sufficient statistic required for future decisions."
-                ],
-                "machine_check": "Tests reconstruct State from canonical inputs; derived views recompute from State with no external reads."
-            },
-            "closed_by_default_progression": {
-                "definition": "Progression requires explicit evidence; ambiguity selects a safe terminal outcome that preserves auditability.",
-                "mechanics": [
-                    "Model terminal outcomes as explicit absorbing states.",
-                    "Bind authority actions to receipts/signatures/digests; store those bindings."
-                ],
-                "machine_check": "Invariant tests: terminal states absorb; missing evidence yields terminal-deny/quarantine outcomes."
-            },
-            "idempotent_authority": {
-                "definition": "Repeating the same logical trigger yields the same durable result, not duplicated spawns/leases/receipts.",
-                "mechanics": [
-                    "Compute idempotency keys from stable input digests (work_id + changeset_digest + gate_type + revision).",
-                    "Store bounded idempotency memory in State or in an authority-backed store."
-                ],
-                "machine_check": "Tests feed duplicated Inputs; effects stay stable; at-most-once issuance is preserved."
-            },
-            "bounded_resources": {
-                "definition": "State growth and work per input are explicitly bounded.",
-                "mechanics": [
-                    "Bound maps/sets/strings by constants.",
-                    "Select bounded behavior: reject, evict, degrade, checkpoint, compact."
-                ],
-                "machine_check": "Tests push inputs to bounds; State remains within limits; behavior remains deterministic."
-            }
-        },
-        "orchestrator_information_flow": {
-            "shape": "Inputs -> normalize -> step(State, Input, Snapshot) -> (NextState, Effects) -> drive(Effects) -> Observations -> Inputs",
-            "contract": {
-                "step": [
-                    "Deterministic function producing NextState + Effects as data.",
-                    "Only branches on explicit State/Input/Decision enums.",
-                    "Uses ContextSnapshot values passed in (time, budgets, liveness, environment readings)."
-                ],
-                "drive": [
-                    "Executes Effects (I/O, process ops, ledger writes, CAS writes).",
-                    "Converts outcomes into Observations, then Inputs.",
-                    "Records durable evidence for every authority-relevant effect."
-                ]
-            }
-        },
-        "ledger_projection_grounding": {
-            "thesis": "The step function is a fold over the append-only ledger. State is the projection that fold produces. Effects are primarily acts of evidence creation — their operational consequence (API call, process spawn, lease issuance) is the side effect, not the substance.",
-            "event_first_design": {
-                "instruction": "Before designing State or the Input enum, design the ledger event vocabulary. Ask: if this machine ran to completion, what named events would appear in the ledger, and what would each contain? The events define the information domain; State is only what you must carry between events to fold the next one correctly.",
-                "test": "Can you reconstruct the full machine history from ledger events alone, with no in-memory state? If not, a ledger event is missing."
-            },
-            "step_is_the_reducer": {
-                "instruction": "The step function IS the reduce/fold. Input enum variants correspond to ledger event types (observed by the driver) plus driver-boundary observations (time readings, process signals, API outcomes). Determinism is not a testing nicety — it is the requirement that derives from the ledger being ground truth: if step is non-deterministic, the machine's projection diverges across restarts.",
-                "state_field_test": "For every State field ask: 'Do I need this to correctly fold the next event?' If the answer is no, it is a cache and belongs in a witnessed cache or derived view, not in canonical State."
-            },
-            "closure_properties": {
-                "instruction": "The step function must satisfy the three properties of the Cl_P closure operator. These are the algebraic requirements that make the ledger the single source of truth — not guidelines.",
-                "extensive": {
-                    "definition": "Missing evidence yields fail/pending/quarantine, never a spurious pass.",
-                    "machine_check": "Invariant test: step called with an Input carrying no evidence for a required gate must produce a non-Pass terminal or a waiting state. A Completed/Pass state with empty evidence refs is a defect."
-                },
-                "monotone": {
-                    "definition": "Additional evidence can only advance state, never retract it. A passing gate cannot be un-passed by a subsequent event.",
-                    "machine_check": "Property test: fold(A) then fold(A ++ B) — final state from A+B is at least as advanced as from A alone."
-                },
-                "idempotent": {
-                    "definition": "Same event sequence, same output. This is why replay-from-genesis equals replay-from-checkpoint, and why replaying a deduplicated event stream is safe.",
-                    "machine_check": "Already covered in verification_suite.property_tests. Extend with: fold(dedupe(events ++ events)) == fold(events)."
-                }
-            },
-            "effects_as_evidence_creation": {
-                "instruction": "For every Effect, identify its primary evidence artifact first: what named ledger event or CAS digest does it produce? The API call or process op is the mechanism; the ledger/CAS write is the substance. This ordering is what makes replay safe.",
-                "sequencing_rule": "Emit the evidence-anchoring ledger event BEFORE the irreversible operational effect (already stated in effect_emission.ordering). The reason: on restart, the driver checks the ledger first and skips re-execution if the result event already exists.",
-                "canonical_pattern_external_write": {
-                    "description": "Idempotent write to a 3rd-party authority (GitHub PR creation, issue comment, external API mutation).",
-                    "steps": [
-                        "1. Step emits Effect::RecordIntent { idempotency_key, action_id, action } — driver writes intent event to ledger.",
-                        "2. Step emits Effect::CallExternalApi { action_id, params } — driver checks ledger for an existing result event for action_id FIRST; if found, synthesizes the Input from the ledger record and skips the call.",
-                        "3. Call returns; driver converts outcome to Input::ApiResult { action_id, outcome }.",
-                        "4. Step processes ApiResult, emits Effect::RecordOutcome { action_id, outcome } — driver writes result event to ledger.",
-                        "5. On any subsequent replay: step 2 finds the result event; no call is made; Input::ApiResult is synthesized from the ledger record."
-                    ],
-                    "anti_pattern": "Executing the external call as a bare driver side-effect without a prior intent event. A crash between the call and the result record leaves the system unable to determine whether the call succeeded. The next restart re-executes, producing a duplicate action."
-                }
-            }
-        },
-        "cursor_and_activation": {
-            "goal": "Give every machine an explicit, durable position in the event stream so that cross-machine coordination is exactly-once by construction, not by memory.",
-            "ledger_cursor_in_state": {
-                "instruction": "Include a ledger cursor field in State representing the position up to which the machine has durably processed events. Justification as sufficient statistic: it is the minimal information needed to resume folding from the correct position after a crash.",
-                "invariant": "Events before the cursor are provably already processed — not because the machine remembers processing them, but because the cursor is structurally past them. No in-memory seen-set can provide this guarantee across restarts."
-            },
-            "cursor_advancement_ordering": {
-                "instruction": "Advance the cursor only AFTER the result effects that justify the advancement have been durably written to the ledger. If you advance the cursor in State before your result events are flushed, a crash between those two operations produces a checkpoint that claims progress the ledger does not contain.",
-                "ordering": [
-                    "1. Read events from ledger starting at state.ledger_cursor.",
-                    "2. Feed each event into step as an Input variant; collect (NextState, Effects).",
-                    "3. Execute Effects: write result events to ledger (durable).",
-                    "4. Only then checkpoint NextState (which contains the advanced cursor).",
-                    "5. On crash-restart: load checkpoint, read ledger from checkpoint.cursor — events before cursor are skipped structurally."
-                ]
-            },
-            "at_most_once_activation": {
-                "instruction": "When a machine activates in response to a cross-machine ledger event (e.g., session_terminated triggering gate orchestration), the activation itself must be a ledger event whose idempotency key is derived from the triggering event's stable position or id. The driver checks the ledger for an existing activation record before processing — no in-memory lock required as the primary guarantee.",
-                "pattern": [
-                    "Triggering event arrives at cursor position P.",
-                    "Driver checks ledger: does an activation record exist for trigger_event_id=P?",
-                    "If yes: advance cursor past P, no further action (already processed).",
-                    "If no: emit Effect::RecordActivation { trigger_event_id: P, action_id } to ledger, then proceed with activation effects.",
-                    "Crash at any point: restart reads the ledger, finds (or doesn't find) the activation record, and branches correctly."
-                ],
-                "benefit": "Double-activation becomes structurally impossible without relying on in-memory deduplication state that does not survive crashes."
-            }
-        },
-        "derived_state_discipline": {
-            "core_axiom": "State is a sufficient statistic for future decisions under the modeled Inputs; every other datum is a derived view or an external observation.",
-            "fact_ownership_map": {
-                "instruction": "For every value used by the orchestrator, name its owner explicitly: ledger event, CAS artifact, config field, minted id, or a State field justified as a sufficient statistic.",
-                "owner_catalog": {
-                    "ledger": [
-                        "Authoritative lifecycle transitions",
-                        "Receipts and verdicts (signed)",
-                        "Work/session/episode identifiers and relationships"
-                    ],
-                    "cas": [
-                        "Large payloads, prompts, evidence bundles, manifests",
-                        "Content-addressed documents referenced by digest"
-                    ],
-                    "config": [
-                        "Timeouts, limits, policy profiles, role specs"
-                    ],
-                    "state": [
-                        "Cursor into event stream / processing position",
-                        "Outstanding obligations (pending leases, pending episodes, pending receipts)",
-                        "Idempotency memory and bounded dedupe windows",
-                        "Controller memory (backoff state, escalation level) as sufficient statistic"
-                    ]
-                },
-                "output": "A code-level comment block near the State definition listing each State field and its justification as a sufficient statistic."
-            },
-            "derived_views": {
-                "instruction": "Expose derived information through pure view functions computed from canonical State (and optional stable config), returning purpose-specific view structs.",
-                "pattern": {
-                    "name": "Projection -> View -> Decision",
-                    "definition": [
-                        "Projection: durable State folded from Inputs/events.",
-                        "View: ephemeral struct computed from State to simplify decisions.",
-                        "Decision: typed enum expressing branching outcomes in a compact vocabulary."
-                    ],
-                    "benefit": "Derived values become impossible to desynchronize because a single function defines their computation.",
-                    "implementation": [
-                        "Implement `impl State { fn view(&self, cfg: &Config) -> View }`.",
-                        "Keep View small and purpose-specific; create multiple Views for different decisions when useful."
-                    ]
-                }
-            },
-            "reference_over_copy": {
-                "instruction": "Represent canonical artifacts by stable references (ids, digests, cursors) and derive expanded content on demand in the driver boundary.",
-                "examples": [
-                    "Store `changeset_digest` and a `cas_ref` to the changeset bundle; driver loads bundle by digest when executing an effect.",
-                    "Store `receipt_id` and verifying key reference; driver fetches and verifies receipt to produce an Input."
-                ]
-            },
-            "witnessed_caches": {
-                "instruction": "When performance benefits from materializing derived values, store a cache paired with a witness that makes validity decidable.",
-                "witness_forms": [
-                    "source_digest (hash of canonical inputs used for derivation)",
-                    "epoch / version counter that increments on any relevant State change",
-                    "cursor_range (ledger position interval covered by the cache)"
-                ],
-                "pattern": {
-                    "name": "CacheWithWitness",
-                    "rust": "/// Cache with an explicit validity witness.\n#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct CacheWithWitness<T> {\n    pub witness: [u8; 32],\n    pub value: T,\n}\n\nimpl<T> CacheWithWitness<T> {\n    pub fn is_valid_for(&self, witness: [u8; 32]) -> bool {\n        self.witness == witness\n    }\n}\n"
-                }
-            },
-            "local_state_budget": {
-                "instruction": "Use local variables inside a function as ephemeral computations; use State only for sufficient statistics required across calls/restarts.",
-                "decision_test": [
-                    "If the value is recomputable from (State, Input, Config), keep it derived.",
-                    "If the value must survive restarts or deduplicate authority actions, keep it in State with a justification comment."
-                ]
-            }
-        },
-        "transition_core": {
-            "goal": "Make the core logic mechanically checkable: total transitions, explicit branching vocabulary, explicit effects.",
-            "types": {
-                "State": [
-                    "Enum or struct with explicit variants/fields reflecting real phases.",
-                    "Serde tags and deny-unknown-fields when persisted.",
-                    "Explicit discriminants for persisted enums when overlapping versions are expected during rolling updates."
-                ],
-                "Input": [
-                    "Every external observation represented as an enum variant.",
-                    "Includes Tick/Time inputs as explicit data.",
-                    "Includes driver outcomes (spawn ok/fail, receipt verified/invalid, pid exited, liveness report)."
-                ],
-                "Effect": [
-                    "Every authority action as explicit data.",
-                    "Includes intent, idempotency key, and evidence binding fields.",
-                    "Driver produces Observations that become Inputs."
-                ],
-                "Decision": [
-                    "Small enums used as guard outcomes (e.g., Progression::Allow/Block/Quarantine, SpawnPlan::Spawn/Resume/Skip).",
-                    "Decision enums replace boolean branching vocabulary."
-                ]
-            },
-            "branching_form": {
-                "instruction": "Centralize branching in exhaustive matches on (State, Input) and (Decision, State).",
-                "guard_style": [
-                    "Compute Decision via pure functions returning enums.",
-                    "Use match guards for numeric thresholds when the threshold is explicit and tested."
-                ],
-                "benefit": "Branch coverage becomes enumeratable; missing cases become compile-visible."
-            },
-            "effect_emission": {
-                "instruction": "Emit Effects as a list returned from step; treat the list as an ordered script that the driver interprets.",
-                "ordering": [
-                    "Place evidence-anchoring effects before irreversible effects (e.g., emit policy-resolution event before issuing a lease).",
-                    "Place dedupe/idempotency marking effects in the same step that decides issuance."
-                ],
-                "idempotency_shape": [
-                    "Effect includes `idempotency_key` and `logical_action_id`.",
-                    "State stores the action id in a bounded structure."
-                ]
-            },
-            "template": {
-                "rust": "/// Deterministic transition core.\npub fn step(\n    state: State,\n    input: Input,\n    snapshot: Snapshot,\n    cfg: &Config,\n) -> Result<(State, Vec<Effect>), Error> {\n    use State::*;\n    use Input::*;\n\n    match (state, input) {\n        (Idle { .. }, Start { work_id, changeset_digest }) => {\n            let action_id = ActionId::from_parts(&work_id, &changeset_digest);\n            let effects = vec![\n                Effect::EmitEvent(Event::OrchestrationStarted { work_id, changeset_digest }),\n                Effect::IssueLease { action_id },\n            ];\n            Ok((Leasing { action_id }, effects))\n        }\n\n        (Leasing { action_id }, LeaseIssued { lease_id }) => {\n            let effects = vec![Effect::SpawnEpisode { action_id, lease_id: lease_id.clone() }];\n            Ok((Running { action_id, lease_id, controller: Controller::new() }, effects))\n        }\n\n        (Running { action_id, lease_id, controller }, Tick { elapsed_ms }) => {\n            let (controller2, plan) = controller.plan(elapsed_ms, cfg);\n            match plan {\n                NudgePlan::None => Ok((Running { action_id, lease_id, controller: controller2 }, vec![])),\n                NudgePlan::Nudge { message_ref } => {\n                    let effects = vec![Effect::SendNudge { action_id, lease_id: lease_id.clone(), message_ref }];\n                    Ok((Running { action_id, lease_id, controller: controller2 }, effects))\n                }\n                NudgePlan::Escalate { reason } => {\n                    let effects = vec![Effect::EmitEvent(Event::Escalated { action_id, reason })];\n                    Ok((Quarantined { action_id, lease_id, reason }, effects))\n                }\n            }\n        }\n\n        (Running { action_id, lease_id, .. }, ReceiptVerified { receipt_id, passed }) => {\n            let effects = vec![Effect::EmitEvent(Event::Completed { action_id, receipt_id: receipt_id.clone(), passed })];\n            Ok((Completed { action_id, lease_id, receipt_id, passed }, effects))\n        }\n\n        (terminal @ (Completed { .. } | Quarantined { .. }), _) => Ok((terminal, vec![])),\n    }\n}\n"
-            }
-        },
-        "driver_shell": {
-            "goal": "Convert effects into reality while preserving determinism through explicit Inputs and durable evidence.",
-            "effect_execution": {
-                "instruction": "Implement a driver loop that executes Effects and immediately records an Observation as an Input for the next step.",
-                "primitives": [
-                    "CAS writes yield a digest; store digest in emitted event and in State references.",
-                    "Ledger writes yield an event id / cursor; feed it back as Input.",
-                    "Process operations yield a ProcessBinding; feed it back as Input."
-                ]
-            },
-            "context_snapshot": {
-                "instruction": "Provide the transition core with a Snapshot object holding bounded, validated observations. Snapshot is a trust boundary: the step function branches on its values without further validation, so the driver owns all validation.",
-                "snapshot_fields": [
-                    "monotonic_elapsed_ms",
-                    "budget_remaining",
-                    "liveness_report_summary",
-                    "authoritative_head_sha / changeset_digest",
-                    "active_leases set for dedupe (bounded view)"
-                ],
-                "trust_boundary": {
-                    "property": "The step function fully trusts every Snapshot field. An elapsed time that goes backwards, a budget that exceeds its initial value, or an active_leases set with unbounded entries will cause step to produce wrong state — which gets checkpointed and replayed indefinitely.",
-                    "validation_rule": "All Snapshot fields must be validated and clamped at the driver boundary before step is called. Validation failures must not be silently truncated and passed to step.",
-                    "on_invalid_snapshot": "Emit Input::SnapshotRejected { field, reason } rather than passing a corrupted Snapshot to step. The machine handles this as a structured event (typically: pause, emit escalation ledger event, await corrected observation). Rejection becomes observable in the ledger, not a silent divergence."
-                }
-            }
-        },
-        "universal_addressing": {
-            "goal": "Bind ephemeral handles to stable identities so that authority targets remain unambiguous across time and restarts.",
-            "address_types": {
-                "instruction": "Define newtypes/enums for stable addressing and store them in State, Events, and Effects.",
-                "recommended": [
-                    "WorkId, SessionId, EpisodeId, LeaseId (typed newtypes)",
-                    "ActorId / RoleId (typed newtypes)",
-                    "Digest32 (CAS hash wrapper)"
-                ]
-            },
-            "process_binding": {
-                "instruction": "Represent process identity as a binding between a stable address and a measured handle.",
-                "fields": [
-                    "pid",
-                    "proc_start_time (or equivalent kernel identity witness)",
-                    "lease_id or session_id (stable authority binding)",
-                    "spawn_nonce (deterministic nonce derived from action id + attempt number)",
-                    "cgroup_path or sandbox capsule id (when available)"
-                ],
-                "benefit": "PID reuse becomes mechanically distinguishable; process control operations target a specific binding."
-            },
-            "addressing_rule": {
-                "instruction": "Carry the stable address through every layer: event -> state -> effect -> driver call -> observation -> input.",
-                "result": "Logs, receipts, and evidence become joinable by stable keys without inference."
-            }
-        },
-        "nudging_and_control": {
-            "goal": "Model nudges/restarts/escalations as an explicit controller state machine with saturation and memory.",
-            "controller_state": {
-                "instruction": "Store controller memory in State as a sufficient statistic (attempt count, last action time, backoff stage, escalation stage).",
-                "fields": [
-                    "attempt: u32",
-                    "last_progress_at_ms: u64",
-                    "last_nudge_at_ms: Option<u64>",
-                    "backoff: BackoffStage",
-                    "escalation: EscalationStage"
-                ]
-            },
-            "signals": {
-                "instruction": "Compute progress signals as derived views from canonical evidence.",
-                "examples": [
-                    "receipt count delta",
-                    "ledger cursor advanced for this action id",
-                    "heartbeat freshness bucket",
-                    "budget burn rate bucket"
-                ]
-            },
-            "plans": {
-                "instruction": "Emit a typed plan (None / Nudge / Restart / Escalate) as a Decision enum, then translate it into Effects.",
-                "deterministic_jitter": "When jitter helps stability, derive it from a stable seed (hash(action_id || attempt)) so replay stays deterministic."
-            }
-        },
-        "persistence_and_schema": {
-            "goal": "Make persisted state/events resilient under rolling updates and mechanically verifiable.",
-            "serde_profile": [
-                "serde tags for enums (`#[serde(tag = \"state\")]` or explicit field tags).",
-                "deny unknown fields for persisted structs/enums.",
-                "bounded string lengths validated at boundaries."
-            ],
-            "evolution": {
-                "instruction": "When versions overlap in production, keep discriminants/tags stable; introduce new variants/fields with explicit defaults and bounded validation.",
-                "artifact_binding": [
-                    "Store digests for CAS artifacts in events/state.",
-                    "Store verifying key references and signature verification results as Inputs."
-                ]
-            }
-        },
-        "verification_suite": {
-            "goal": "Ship executable proofs: invariants, replay determinism, idempotency, and bound behavior.",
-            "invariants_as_tests": [
-                "Terminal absorption: terminal states yield empty effects for all inputs.",
-                "Monotonicity: elapsed/budget counters progress monotonically within modeled semantics.",
-                "At-most-once issuance: repeating Start/Trigger inputs yields stable authority outputs.",
-                "Evidence binding: every Completed state has a receipt id and verified flag in its causal history."
-            ],
-            "property_tests": {
-                "instruction": "Generate event/input sequences and assert determinism and invariants.",
-                "minimum": [
-                    "Replay equivalence: fold(inputs) equals fold(inputs) repeated.",
-                    "Checkpoint equivalence: fold(genesis) equals fold(prefix)+fold(suffix) with checkpoint."
-                ]
-            },
-            "transition_enumeration": {
-                "instruction": "Enumerate (State variant × Input variant) combinations for small machines and assert each pair produces a defined Outcome.",
-                "result": "Branch coverage becomes mechanical; missing cases surface early."
-            },
-            "golden_vectors": {
-                "instruction": "Keep golden vectors for serialization and signatures on authority-relevant artifacts.",
-                "targets": [
-                    "receipts",
-                    "leases",
-                    "context packs / manifests"
-                ]
-            }
-        },
-        "refactor_moves_for_existing_orchestrators": {
-            "goal": "Turn a loop with scattered branching into a state machine with explicit effects while preserving behavior.",
-            "moves": [
-                "Name the phases currently implicit in control flow; encode them as a State enum with explicit data fields.",
-                "Name the external triggers and observations; encode them as an Input enum.",
-                "Name the authority actions; encode them as an Effect enum with idempotency keys and evidence binding fields.",
-                "Lift branching vocabulary into Decision enums and pure guard functions.",
-                "Wrap existing side-effecting code as driver handlers for Effects; convert outcomes into Inputs.",
-                "Add invariant tests first for current behavior; then strengthen invariants that delete bug classes (determinism, idempotency, boundedness)."
-            ]
-        },
-        "review_lenses": {
-            "lens_1_state_is_sufficient_statistic": [
-                "Each State field has a justification as sufficient statistic.",
-                "Derived information is provided via view functions.",
-                "Artifacts appear as references (ids/digests/cursors) rather than expanded copies."
-            ],
-            "lens_2_determinism_and_replay": [
-                "Transition core accepts time and observations as Inputs/Snapshot fields.",
-                "Effect list ordering is stable and intentional.",
-                "Tests cover replay equivalence."
-            ],
-            "lens_3_identity_and_evidence": [
-                "Stable addresses flow end-to-end.",
-                "Ephemeral handles appear only within bindings that include identity witnesses.",
-                "Every authority outcome has a durable receipt/event trail."
-            ],
-            "lens_4_bounds_and_containment": [
-                "All collections have explicit limits and defined behavior at the limit.",
-                "String sizes and external payload sizes are bounded and validated."
-            ]
+        "monotone": {
+          "definition": "Additional evidence can only advance state, never retract it (unless the domain explicitly models retractions as separate events).",
+          "machine_check": "Property test: fold(A) then fold(A ++ B) never regresses."
         }
+      },
+      "effects_as_evidence_creation": {
+        "instruction": "For every Effect, identify its primary evidence artifact first: what ledger event or CAS digest does it produce? The API call/process op is the mechanism; the ledger/CAS write is the substance.",
+        "sequencing_rule": "Emit the evidence-anchoring intent event BEFORE the irreversible operational effect; then emit a receipt/result event AFTER.",
+        "canonical_pattern_external_write": {
+          "description": "Idempotent write to an external authority (GitHub comment, verdict update, PR body mutation).",
+          "steps": [
+            "1) Emit Event::IntentRecorded { idempotency_key, action }",
+            "2) Driver checks ledger for existing Event::ReceiptRecorded with same idempotency_key; if found, synthesize Input and skip external call",
+            "3) Execute external call",
+            "4) Emit Event::ReceiptRecorded { idempotency_key, outcome, external_ref }",
+            "5) Replay is safe: step 2 finds receipt and no duplicate call occurs"
+          ],
+          "anti_pattern": "Perform the external call first and only then write an outcome; crashes create ambiguity and duplicates."
+        }
+      }
+    },
+    "cursor_and_activation": {
+      "goal": "Make orchestration incremental, bounded, and restart-safe by driving everything off cursors over the canonical substrate.",
+      "cursor_types": [
+        "Ledger seq_id cursor (single-node or local finalized).",
+        "Consensus cursor (epoch, committed height, QC hash) when BFT is enabled.",
+        "Derived cursor for external observations (e.g., GitHub timeline cursor) stored as ledger events."
+      ],
+      "activation": [
+        "Activation should be triggered by 'new events since cursor' rather than ad-hoc timers.",
+        "Timers exist only to schedule nudges/retries; they must not be the source of truth."
+      ],
+      "checkpointing": [
+        "Checkpoint State periodically (bounded) to accelerate restart.",
+        "Checkpoint is a cache; correctness always derives from ledger replay."
+      ]
+    },
+    "derived_state_discipline": {
+      "instruction": "Everything not in (ledger events, CAS blobs, signed config, minted IDs) is derived. Treat derived caches as disposable accelerators.",
+      "rules": [
+        "State fields must be sufficient statistics for folding the next event; do not store convenience copies of facts already owned by the ledger.",
+        "Any filesystem representation (queues, pulse files, caches) must be: bounded, versioned, and rebuildable from ledger+CAS.",
+        "If a derived cache disagrees with the projection, the projection wins; delete and rebuild the cache.",
+        "Unbounded dynamic discovery of context is forbidden; orchestrators must enforce ContextPacks and strict token/tool budgets (LAW-02 & LAW-06)."
+      ],
+      "witnessed_cache_pattern": {
+        "definition": "A cache that is safe to delete because it is fully derivable from canonical evidence; it may include additional indexing, but no new facts.",
+        "required_fields": [
+          "cache_version",
+          "source_cursor_range",
+          "bounds (max entries/bytes)",
+          "integrity checks (hashes) for index files when needed"
+        ]
+      }
+    },
+    "transition_core": {
+      "goal": "Pure decision logic: (State, Input, Snapshot, Config) -> (State, Effects). No I/O; no syscalls; no hidden time reads.",
+      "types": {
+        "State": "projection over ledger events; small and bounded; stores cursors, ids, digests, and minimal sufficient statistics",
+        "Input": "ledger events plus explicit driver observations (time tick, process exit, API result, file lock probe result)",
+        "Effect": "intent/receipt ledger writes, CAS writes, and operational actions (spawn/kill) that are idempotent by key"
+      },
+      "branching_form": "match (state, input) with exhaustive enums. No booleans-as-state; represent terminal states explicitly.",
+      "effect_emission": {
+        "ordering": [
+          "1) Emit intent event (ledger) and/or CAS blob write (if content must exist before action)",
+          "1.5) Validate stop-state (budget > 0, lease valid, no revocation signals) before irreversibility (INV-F-11 & INV-F-17)",
+          "2) Perform operational effect (spawn/process/API call)",
+          "3) Emit receipt/result event (ledger) binding outcome to intent idempotency_key"
+        ],
+        "idempotency": "Every operational effect must have an idempotency key derived from stable inputs; driver must be able to skip if receipt already exists."
+      },
+      "template": {
+        "rust": "/// Deterministic transition core (controller/reconciler style).\npub fn step(state: State, input: Input, snap: Snapshot, cfg: &Config) -> Result<(State, Vec<Effect>), Error> {\n    use Input::*;\n    use State::*;\n\n    match (state, input) {\n        (Idle { work_id, cursor }, Input::LedgerEvent(ev)) => {\n            // Fold events first; planning happens on Tick.\n            let st = state.fold(ev, cfg)?;\n            Ok((st, vec![]))\n        }\n\n        (st, Tick { now_ms }) => {\n            // Plan is a pure function of the projection + bounded snapshot.\n            let plan = st.plan(snap, cfg, now_ms)?;\n            Ok((st, plan.effects))\n        }\n\n        // Example: external authority mutation is intent->execute->receipt.\n        (Mutating { idempotency_key, action, .. }, ExternalCallResult { idempotency_key: k, outcome }) if k == idempotency_key => {\n            let effects = vec![\n                Effect::EmitLedgerEvent(Event::ReceiptRecorded { idempotency_key, outcome }),\n            ];\n            Ok((Done { last_outcome: Some(outcome) }, effects))\n        }\n\n        // Default: ignore unknown combinations (closed world via exhaustive enums preferred).\n        (st, _) => Ok((st, vec![])),\n    }\n}"
+      }
+    },
+    "driver_shell": {
+      "goal": "The driver is the only place that touches the outside world. It executes Effects, writes ledger events, writes/reads CAS blobs, and converts outcomes into Inputs.",
+      "rules": [
+        "Driver must be restart-safe: on startup it replays ledger, reconstructs State, and resumes from cursor without special-case recovery logic.",
+        "Driver must be idempotent by design: before executing an operational effect, check whether a receipt/result event already exists for the idempotency key.",
+        "Driver must verify stop-state bounds (budget limit, revocation signals, lease freshness) before crossing outside execution boundaries.",
+        "All external reads used for decisions must be captured as Inputs and (when they matter) recorded as ledger events so replay is possible."
+      ],
+      "interfaces": {
+        "Ledger": [
+          "append(event) -> seq_id / consensus index",
+          "read_since(cursor, limit) -> events",
+          "optional: append_via_bft(event, metadata) -> consensus index"
+        ],
+        "CAS": [
+          "store(bytes) -> digest",
+          "retrieve(digest) -> bytes (bounded + verified)",
+          "never embed large blobs directly in ledger payloads"
+        ]
+      },
+      "concurrency": [
+        "Multiple drivers may run; only one should own a given (work_id, role) lease at a time.",
+        "Use leases issued by authority (ledger) rather than ad-hoc PID checks as the primary concurrency guard.",
+        "If local OS locks exist (FAC lane locks), treat them as derived enforcement mechanisms; canonical ownership is still ledger/lease."
+      ]
+    },
+    "universal_addressing": {
+      "instruction": "Identity must be stable across replays, restarts, and distributed replicas.",
+      "rules": [
+        "Use stable IDs (DCP stable_id) for instructions, prompts, work items, policies.",
+        "Use digests (BLAKE3) for content-addressed artifacts; store digest references in events/state.",
+        "Construct idempotency keys from stable IDs + content digests + action kind (never from wall clock)."
+      ],
+      "examples": [
+        "review_session_id = hash(owner_repo + pr_number + head_sha + review_kind)",
+        "dispatch_idempotency_key = hash(review_session_id + backend + model_id + prompt_digest)"
+      ]
+    },
+    "nudging_and_control": {
+      "goal": "Progress must be controller-driven and measurable. Liveness is a first-class signal, not inferred from PID existence.",
+      "rules": [
+        "All nudges/retries are planned in step() and emitted as Effects (e.g., schedule tick, re-dispatch, renew lease).",
+        "Watchdogs must be progress-aware (gated on projection updates), not background threads that mask deadlocks.",
+        "Prefer evidence-based liveness: leases, receipts, systemd unit states, CAS artifacts; PID checks are a last resort and must be identity-verified."
+      ]
+    },
+    "persistence_and_schema": {
+      "goal": "Persisted state/events must survive rolling updates and be mechanically verifiable.",
+      "serde_profile": [
+        "serde tags for enums (`#[serde(tag = \"type\")]` or explicit field tags).",
+        "deny unknown fields for persisted structs/enums.",
+        "bounded string lengths validated at boundaries."
+      ],
+      "evolution": {
+        "instruction": "Keep discriminants stable; add new variants/fields with explicit defaults and bounded validation. Never silently repurpose fields.",
+        "artifact_binding": [
+          "Store CAS digests in events/state; verify on read.",
+          "Include schema_digest in ledger events where supported (BLAKE3 of schema).",
+          "Canonicalize JSON payloads (RFC 8785 / JCS) before hashing/signing when applicable."
+        ]
+      }
+    },
+    "verification_suite": {
+      "goal": "Orchestrators must have a mechanical proof surface: determinism, idempotency, crash recovery, boundedness.",
+      "required": [
+        "Replay equivalence: fold(genesis..N) == fold(checkpoint)+fold(delta).",
+        "Duplicate input idempotence: folding duplicated events does not change final semantics.",
+        "Crash-point recovery: model crashes between (intent, operational effect, receipt) and assert replay-safe behavior.",
+        "Fault injection: simulate I/O errors, partial writes, delayed receipts, and ensure safe convergence."
+      ],
+      "bft_ready_tests": [
+        "Reordering/delay of tentative inputs does not cause conflicting irreversible effects.",
+        "At-most-once external authority writes under duplicated/replayed intents."
+      ],
+      "cas_tests": [
+        "Hash mismatch fails closed.",
+        "Reads are bounded before allocation.",
+        "Digest references in events/state are validated."
+      ]
+    },
+    "refactor_moves_for_existing_orchestrators": {
+      "top_priority": "Collapse divergent persistence systems into the substrate: ledger for events, CAS for blobs. Eliminate bespoke state files and unstructured telemetry as canonical truth.",
+      "moves": [
+        "FAC queue: treat on-disk directories as a projection cache; move canonical job lifecycle (claim/lease/receipt/terminal) into ledger events; keep filesystem as an accelerator during migration.",
+        "FAC lane leases: bind ownership to durable lease identity and evidence (receipt/unit identity), not PID existence; PID checks must be identity-verified if used.",
+        "FAC review: replace review_state.json + pulse files + NDJSON as canonical state with a ledger event vocabulary + reducer projection; store diffs/logs/findings in CAS and reference digests.",
+        "Holon orchestration: avoid creating another ledger; reuse apm2-core ledger + CAS abstractions, and project holon state via reducers.",
+        "Any cache (gate_cache, projection_store): enforce witnessed-cache rules (versioned, bounded, rebuildable)."
+      ],
+      "migration_rule": "During migration, you may keep legacy files as derived views for operator UX, but the canonical source must become ledger+CAS. Derived views must be deletable without losing truth."
+    },
+    "review_lenses": {
+      "what_to_praise": [
+        "A clear event vocabulary with stable discriminants and bounded payloads.",
+        "CAS-first artifact handling (digest references everywhere).",
+        "Intent->execute->receipt patterns for all irreversible operations.",
+        "Incremental cursor-based loops with bounded work per tick.",
+        "Deterministic step() with explicit Inputs and injected time."
+      ],
+      "red_flags": [
+        "New canonical JSON files under ~/.apm2 not backed by ledger events.",
+        "Unbounded scans of directories or ledgers inside the hot path.",
+        "PID existence used as ownership without identity binding.",
+        "External authority calls without a prior intent event and idempotency key.",
+        "Mixing multiple sources of truth (e.g., review_state.json says Done but ledger says Pending)."
+      ],
+      "fac_review_specific": [
+        "Pulse files should not be the canonical liveness mechanism; they may be a derived operator convenience only.",
+        "Finding stores should be CAS-backed with digest references in events; do not treat local directories as truth.",
+        "GitHub projection cache must be witnessed-cache compliant and rebuildable."
+      ]
     }
+  }
 }

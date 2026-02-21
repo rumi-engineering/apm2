@@ -28,6 +28,7 @@ context:
   observed_symptoms:
     - 'Lanes marked Corrupt and jobs remain stuck in claimed because the lease PID appears alive even though the original worker is gone.'
     - 'Operators report dead-PID situations; recovery often requires manual lane reset and/or queue surgery.'
+    - 'Orphaned claimed jobs with consumed channel_context_token are requeued by startup reconcile, then denied at replay by nonce check — job is permanently stuck rather than cleanly failed.'
   code_evidence:
     - |
       Lane liveness uses kill(pid, 0) only (PID existence), which is vulnerable to PID reuse:
@@ -40,6 +41,13 @@ context:
       Lane reset kill path only checks /proc/<pid>/comm exists before SIGTERM/SIGKILL,
       which can kill the wrong process under PID reuse:
         crates/apm2-cli/src/commands/fac.rs:5124-5171
+    - |
+      Token nonce is consumed before job completes; reconcile requeues orphaned claimed
+      jobs unconditionally (OrphanedJobPolicy::Requeue), violating single-use semantics:
+        crates/apm2-core/src/fac/token_ledger.rs:567 (nonce marked consumed)
+        crates/apm2-cli/src/commands/fac_worker.rs:772 (OrphanedJobPolicy::Requeue at startup)
+        crates/apm2-core/src/fac/reconcile.rs:1418 (requeue without token-awareness)
+        crates/apm2-core/src/fac/token_ledger.rs:657 (replay denial on second execution)
 
 problem_statement: |
   PID existence is an insufficient identity for lane ownership. Linux PID reuse can cause the system
@@ -68,6 +76,10 @@ invariants:
     statement: 'If PID is alive but starttime mismatches, it MUST be treated as NOT the lease owner (PID reuse or identity loss).'
   - id: 'INV-PROC-ID-003'
     statement: 'Reconcile MUST NOT strand claimed jobs solely due to PID existence; it must use identity checks or additional evidence.'
+  - id: 'INV-TOKEN-REQUEUE-001'
+    statement: 'Reconcile MUST NOT requeue an orphaned claimed job that has a consumed channel_context_token; such jobs MUST be marked MarkFailed to preserve single-use token semantics.'
+  - id: 'INV-TOKEN-REQUEUE-002'
+    statement: 'OrphanedJobPolicy::Requeue is only valid for explicitly idempotent or token-free jobs; token-bound jobs MUST use OrphanedJobPolicy::Fail.'
 
 scope:
   in_scope:
@@ -107,9 +119,28 @@ scope:
           - Spawn a child process (sleep) and read its start ticks; assert identity matches.
           - Write a lease with the same pid but wrong start ticks; assert identity mismatch path is taken.
           - Reconcile test: a lane with lock free + lease (pid alive, start ticks mismatch) is recovered and its job is eligible for claimed→pending.
+    - id: 'S6'
+      description: |
+        Fix reconcile token-awareness (immediate fix for the requeue/replay-denial bug):
+          - Before requeuing an orphaned claimed job, check whether the job has a channel_context_token
+            with a consumed nonce in the token ledger.
+          - If nonce is consumed: call MarkFailed instead of requeue.
+          - If nonce is not consumed (or job has no token): existing requeue path is safe.
+          - Applies at startup reconcile (OrphanedJobPolicy) and periodic reconcile-on-tick paths.
+    - id: 'S7'
+      description: |
+        Add regression test for the specific failure sequence observed 2026-02-21:
+          - Consume a token nonce (simulate via token_ledger WAL write).
+          - Create an orphaned claimed job referencing that nonce.
+          - Run reconcile with OrphanedJobPolicy::Requeue.
+          - Assert job is NOT moved back to pending; assert it is marked failed.
+          - Assert no subsequent replay-denial error is possible for this job.
+        Longer-term note: bind reconcile token checks to authoritative token ledger state
+        via daemon-mediated query rather than direct WAL reads, to support distributed reconcile.
   out_of_scope:
     - 'Systemd unit liveness binding (separate ticket).'
     - 'Full lease/receipt schema version bump (optional later).'
+    - 'Broader daemon-mediated token ledger authority (follow-on; note captured in S7).'
 
 plan:
   steps:
@@ -121,6 +152,10 @@ plan:
       description: 'Update lane_status + reconcile + acquire_worker_lane to use identity verification.'
     - id: 'P4'
       description: 'Add focused regression tests for the previously-stuck scenario (Corrupt lane due to PID reuse false positive).'
+    - id: 'P5'
+      description: 'Add token-awareness check in reconcile orphan path: consumed-nonce jobs take MarkFailed, not Requeue.'
+    - id: 'P6'
+      description: 'Add regression test for the 2026-02-21 nonce-requeue-replay-denial sequence (S7).'
 
 definition_of_done:
   criteria:
@@ -130,12 +165,15 @@ definition_of_done:
   evidence_ids:
     - 'EVID-TCK-00658-01 (unit): process identity helper tests'
     - 'EVID-TCK-00658-02 (unit): lane reconcile recovers on identity mismatch'
+    - 'EVID-TCK-00658-03 (regression): consumed-nonce orphaned job is marked failed, not requeued'
 
 test_plan:
   unit_tests:
     - 'apm2-core: parse /proc/<pid>/stat starttime; identity mismatch/match behavior'
+    - 'apm2-core reconcile: orphaned claimed job with consumed nonce → MarkFailed (not Requeue)'
   integration_tests:
     - 'apm2-cli fac_worker lane acquisition: stale lease with mismatched starttime is removed and lane becomes available'
+    - 'End-to-end regression (2026-02-21): nonce consumed → orphan → reconcile → job marked failed, no replay-denial reachable'
 
 notes:
   safety_and_fail_closed: |

@@ -15,6 +15,10 @@ prd_requirement:
     attempt transitioning to ABORTED_CONFLICT.
     - All evidence produced by the losing attempt is preserved for audit and potential
       manual integration.
+  - Startup reconciliation consults authoritative token-ledger nonce state for orphaned
+    claimed work carrying single-use actuation authority (for example, channel-context
+    tokens): consumed/revoked or unverifiable nonce state MUST route to deterministic
+    terminal denied outcome; fresh nonce state MAY requeue.
   evidence:
     evidence_ids:
     - EVID-0006

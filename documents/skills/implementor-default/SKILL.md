@@ -54,6 +54,8 @@ references[17]:
     purpose: "Daemon wiring and runtime invariants that commonly regress. CRITICAL: SQL patterns (no O(N) scans), atomicity protocols."
   - path: "@documents/skills/implementor-default/references/common-review-findings.md"
     purpose: "Frequent BLOCKER/MAJOR patterns from recent PRs. CRITICAL: § 3 (unbounded DoS), § 2 (stale TOCTOU), § 6 (containment)."
+  - path: "@documents/prompts/instruction.alien_coding.v1.json"
+    purpose: "Alien coding instruction set — exotic implementation patterns and constraints to apply during implementation."
 
 decision_tree:
   entrypoint: START

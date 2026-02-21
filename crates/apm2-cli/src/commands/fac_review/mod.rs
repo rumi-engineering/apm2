@@ -5937,7 +5937,7 @@ mod tests {
             seen.insert(fallback.model.clone());
         }
         assert!(seen.contains("gemini-3-flash-preview"));
-        assert!(seen.contains("gemini-3-pro-preview"));
+        assert!(seen.contains("gemini-3.1-pro-preview"));
         assert!(seen.contains("gpt-5.3-codex-spark"));
     }
 
