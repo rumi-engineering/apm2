@@ -768,6 +768,8 @@ enum PrivilegedErrorCode {
   INVALID_ARGUMENT = 19;
   // Work item already exists with a different spec hash (TCK-00635).
   WORK_ALREADY_EXISTS = 20;
+  // Precondition failed (e.g., work is in wrong state for the requested operation).
+  FAILED_PRECONDITION = 21;
 }
 
 // Generic error response for privileged endpoints.
@@ -1906,4 +1908,33 @@ message PublishWorkContextEntryResponse {
   string cas_hash = 3;
   // Work ID echoed back.
   string work_id = 4;
+}
+
+// IPC-PRIV-078: ClaimWorkV2 (RFC-0032, TCK-00637)
+// Claims an EXISTING work item (opened via OpenWork). Does not create a new
+// work_id. Transitions Open -> Claimed (IMPLEMENTER/COORDINATOR) or
+// ReadyForReview -> Review (REVIEWER). Issues a lease and publishes
+// WorkAuthorityBindings to CAS anchored via evidence.published.
+// Actor ID is derived from peer credentials (never from client input).
+message ClaimWorkV2Request {
+  // Canonical work identifier from a prior OpenWork. Must already exist.
+  string work_id = 1;
+  // Role for this claim (IMPLEMENTER, REVIEWER, COORDINATOR).
+  WorkRole role = 2;
+  // Governing lease ID for PCAC lifecycle enforcement.
+  // Required when PCAC lifecycle gate is wired (fail-closed if empty).
+  string lease_id = 3;
+}
+
+message ClaimWorkV2Response {
+  // Echoed canonical work identifier.
+  string work_id = 1;
+  // Newly issued lease identifier for this claim.
+  string issued_lease_id = 2;
+  // BLAKE3 hash of the WorkAuthorityBindings CAS document (hex-encoded).
+  string authority_bindings_hash = 3;
+  // Evidence ID anchoring the authority bindings (WAB- prefix).
+  string evidence_id = 4;
+  // Whether this was an idempotent re-claim by the same actor.
+  bool already_claimed = 5;
 }
