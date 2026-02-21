@@ -623,6 +623,7 @@ mod tests {
             evidence_bundle_hash: vec![],
             evidence_ids: vec!["EVID-3".into(), "EVID-1".into(), "EVID-2".into()],
             gate_receipt_id: String::new(),
+            merge_receipt_id: String::new(),
         };
 
         completed.canonicalize();

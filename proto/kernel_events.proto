@@ -297,6 +297,10 @@ message WorkCompleted {
   bytes evidence_bundle_hash = 2;
   repeated string evidence_ids = 3;
   string gate_receipt_id = 4;
+  // Dedicated merge receipt identifier, separate from gate_receipt_id.
+  // Populated when work completes via merge executor.  The merge receipt
+  // atomically binds gate outcomes to the observed merge result.
+  string merge_receipt_id = 5;
 }
 
 message WorkAborted {

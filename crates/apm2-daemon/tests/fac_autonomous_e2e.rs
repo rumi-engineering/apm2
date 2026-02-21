@@ -238,9 +238,15 @@ impl FacAutonomousHarness {
         evidence_bundle_hash: Vec<u8>,
         evidence_ids: Vec<String>,
         gate_receipt_id: &str,
+        merge_receipt_id: &str,
     ) {
-        let payload =
-            work_completed_payload(work_id, evidence_bundle_hash, evidence_ids, gate_receipt_id);
+        let payload = work_completed_payload(
+            work_id,
+            evidence_bundle_hash,
+            evidence_ids,
+            gate_receipt_id,
+            merge_receipt_id,
+        );
 
         let record = EventRecord::with_timestamp(
             "work.completed",
@@ -636,9 +642,17 @@ async fn test_fac_autonomous_full_lifecycle() {
 
     let evidence_bundle_hash = vec![0xDD; 32];
     let evidence_ids = vec!["EVID-FAC-001".to_string(), "EVID-FAC-002".to_string()];
-    let gate_receipt_id = "merge-receipt-abc123def456";
+    // gate_receipt_id is empty because the merge executor no longer overloads it
+    let gate_receipt_id = "";
+    let merge_receipt_id = "merge-receipt-abc123def456";
 
-    harness.emit_work_completed(work_id, evidence_bundle_hash, evidence_ids, gate_receipt_id);
+    harness.emit_work_completed(
+        work_id,
+        evidence_bundle_hash,
+        evidence_ids,
+        gate_receipt_id,
+        merge_receipt_id,
+    );
     harness.assert_work_state(work_id, WorkState::Completed);
 
     // =========================================================================
@@ -672,9 +686,13 @@ async fn test_fac_autonomous_full_lifecycle() {
     );
     assert_eq!(work.evidence_ids.len(), 2, "Should have 2 evidence IDs");
     assert_eq!(
-        work.gate_receipt_id,
+        work.gate_receipt_id, None,
+        "Gate receipt ID should be None (merge receipts no longer stored here)"
+    );
+    assert_eq!(
+        work.merge_receipt_id,
         Some("merge-receipt-abc123def456".to_string()),
-        "Gate receipt ID should reference merge receipt"
+        "Merge receipt ID should reference merge receipt in dedicated field"
     );
 
     // Verify work type
@@ -1117,7 +1135,8 @@ async fn test_review_rejection_halts_lifecycle() {
         work_id,
         vec![], // empty evidence_bundle_hash
         vec![], // empty evidence_ids
-        "",
+        "",     // gate_receipt_id
+        "",     // merge_receipt_id
     );
 
     let record = EventRecord::with_timestamp(
