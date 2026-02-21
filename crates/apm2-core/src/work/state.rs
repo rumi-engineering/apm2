@@ -275,9 +275,10 @@ pub struct Work {
 
     /// Merge receipt ID (populated on completion via merge executor).
     ///
-    /// Distinct from `gate_receipt_id`: a merge receipt atomically binds
-    /// gate outcomes to the observed merge result, while a gate receipt
-    /// attests a single gate evaluation.
+    /// When present, MUST start with `merge-receipt-` (positive allowlist
+    /// per INV-0114).  Distinct from `gate_receipt_id`: a merge receipt
+    /// atomically binds gate outcomes to the observed merge result, while
+    /// a gate receipt attests a single gate evaluation.
     pub merge_receipt_id: Option<String>,
 
     /// Abort reason (populated on abort).

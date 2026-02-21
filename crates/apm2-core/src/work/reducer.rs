@@ -344,8 +344,19 @@ impl WorkReducer {
             });
         }
 
-        // Reject merge receipt identifiers from being placed in gate_receipt_id.
-        // Merge receipts belong in the dedicated merge_receipt_id field.
+        // --- Domain separation: gate_receipt_id vs merge_receipt_id ---
+        //
+        // INV-0113 (fail-closed): gate_receipt_id MUST NOT contain a merge
+        // receipt identifier.  Any value starting with "merge-receipt-" is
+        // rejected.
+        //
+        // INV-0114 (positive allowlist): merge_receipt_id, when non-empty,
+        // MUST start with "merge-receipt-".  This prevents gate receipt
+        // identifiers from being injected into the merge field.
+        //
+        // Together these two checks enforce bidirectional domain separation
+        // at the reducer boundary.
+
         if event.gate_receipt_id.starts_with("merge-receipt-") {
             return Err(WorkError::MergeReceiptInGateReceiptField {
                 work_id: work_id.clone(),
@@ -353,7 +364,16 @@ impl WorkReducer {
             });
         }
 
-        // Apply completion
+        if !event.merge_receipt_id.is_empty()
+            && !event.merge_receipt_id.starts_with("merge-receipt-")
+        {
+            return Err(WorkError::InvalidMergeReceiptId {
+                work_id: work_id.clone(),
+                value: event.merge_receipt_id,
+            });
+        }
+
+        // Apply completion (all deny gates passed — safe to mutate)
         work.state = WorkState::Completed;
         work.last_transition_at = timestamp;
         work.transition_count += 1;
@@ -600,10 +620,12 @@ pub mod helpers {
     ///
     /// * `gate_receipt_id` - ID of the gate receipt that authorized this
     ///   completion.  Must NOT contain a merge receipt identifier (values
-    ///   matching `merge-receipt-*` are rejected at the reducer level).
+    ///   starting with `merge-receipt-` are rejected at the reducer level per
+    ///   INV-0113).
     /// * `merge_receipt_id` - Dedicated merge receipt identifier populated when
-    ///   work completes via the merge executor.  Pass `""` when no merge
-    ///   receipt is involved.
+    ///   work completes via the merge executor.  When non-empty, MUST start
+    ///   with `merge-receipt-` (positive allowlist per INV-0114).  Pass `""`
+    ///   when no merge receipt is involved.
     #[must_use]
     pub fn work_completed_payload(
         work_id: &str,
