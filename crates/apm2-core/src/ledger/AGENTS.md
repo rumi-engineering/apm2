@@ -245,6 +245,12 @@ RFC-0032 Phase 0: Migrates legacy `ledger_events` rows into the canonical `event
 - [INV-LED-015] `ledger_events` table is preserved after migration (emptied, not renamed) for legacy writer compatibility
 - [INV-LED-016] Fail-closed on data loss: if `ledger_events_legacy_frozen` has rows but `events` is empty, the migration fails with `MigrationPartialState` (canonical chain missing), regardless of live legacy row count
 - [INV-LED-017] Empty-frozen genesis recovery: if frozen exists with 0 rows, events is empty, and new legacy rows appeared, perform full migration from genesis (not a no-op)
+- [INV-LED-018] After migration, `ledger_events` writes are redirected by the freeze guard on `SqliteLedgerEventEmitter` and `SqliteLeaseValidator`. When frozen, all write methods route to the canonical `events` table with BLAKE3 hash chain continuity (`persist_to_canonical_events` / `persist_lease_to_canonical_events`). The freeze guard uses an `AtomicBool` with `Acquire`/`Release` ordering; once set, it is never cleared.
+- [INV-LED-019] Post-migration invariant: `is_canonical_events_mode(conn)` must return `true` after startup migration. If `false`, the daemon must not start (fail-closed).
+
+### `is_canonical_events_mode(conn) -> Result<bool, LedgerError>`
+
+Returns `true` if the ledger is in canonical `events` mode (not legacy `ledger_events` mode). Used as a post-migration invariant check at daemon startup: after `migrate_legacy_ledger_events` completes, this function MUST return `true` or the daemon MUST abort.
 
 ### `Ledger::open_reader() -> Result<LedgerReader, LedgerError>`
 
@@ -444,6 +450,29 @@ let backend = BftLedgerBackend::with_schema_registry(
 - [`apm2_core::session`](../session/AGENTS.md) - Session state derived from ledger events
 - [`apm2_core::lease`](../lease/AGENTS.md) - Lease state derived from ledger events
 - [`apm2_core::schema_registry`](../schema_registry/AGENTS.md) - Schema registration and lookup
+
+## Acceptance Tests
+
+### AT-0: Ledger Unification (TCK-00632)
+
+RFC-0032 Phase 0 acceptance tests in `tests.rs` (prefixed `tck_00632_at0_`):
+
+| Test | Purpose |
+|------|---------|
+| `tck_00632_at0_legacy_db_to_canonical_append` | Full lifecycle: seed legacy DB, migrate, verify canonical mode + hash chain, append via `Ledger`, verify end-to-end chain |
+| `tck_00632_at0_negative_legacy_mode_refuses_writes` | Unmigrated legacy DB must be in legacy read mode and refuse writes |
+| `tck_00632_at0_negative_null_event_hash_detected` | NULL `event_hash` injection detected by `verify_chain` |
+| `tck_00632_at0_negative_chain_discontinuity_detected` | Wrong `prev_hash` linkage detected by `verify_chain` |
+| `tck_00632_at0_migration_idempotent` | Double migration does not duplicate rows or alter hashes |
+
+**Covered invariants:** INV-LED-010 through INV-LED-019, CTR-LED-001.
+
+**Helper functions:**
+- `seed_at0_legacy_db(dir, db_name, count)` — seed a legacy-only DB with `count` rows
+- `verify_at0_hash_chain(conn)` — verify every row in `events` has non-NULL 32-byte hash with contiguous Blake3 chain
+- `run_at0_migration_phase(path, count)` — run daemon startup migration and verify post-conditions
+- `at0_append_canonical_events(ledger, legacy_count, count)` — append canonical events via `append_signed`
+- `verify_at0_full_chain(ledger, legacy_count, post_count)` — verify full chain integrity and per-event metadata
 
 ## References
 

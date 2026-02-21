@@ -1893,6 +1893,39 @@ impl DispatcherState {
         self
     }
 
+    /// TCK-00631: Freeze legacy `ledger_events` writes on both the event
+    /// emitter and lease validator.
+    ///
+    /// Called from daemon startup after RFC-0032 Phase 0 migration completes.
+    /// After this call, all new appends route to the canonical `events` table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either freeze call fails. The freeze guard is
+    /// still activated (fail-closed) — the error is for observability.
+    pub fn freeze_legacy_writes(&self) -> Result<(), String> {
+        // Attempt BOTH freeze operations regardless of first failure so that
+        // a transient SQLite error on one writer does not leave the other
+        // unfrozen.  Both AtomicBool guards are set unconditionally inside
+        // freeze_legacy_writes, so even on error the writer is frozen
+        // (fail-closed).
+        let emitter_result = self
+            .privileged_dispatcher
+            .event_emitter()
+            .freeze_legacy_writes()
+            .map_err(|e| format!("emitter freeze_legacy_writes failed: {e}"));
+        let lease_result = self
+            .privileged_dispatcher
+            .lease_validator()
+            .freeze_legacy_writes()
+            .map_err(|e| format!("lease_validator freeze_legacy_writes failed: {e}"));
+        match (emitter_result, lease_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e1), Err(e2)) => Err(format!("both freeze failed: {e1}; {e2}")),
+            (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+        }
+    }
+
     /// Configures TCK-00565 token binding fields on the dispatcher.
     ///
     /// Sets the `boundary_id` and policy digest used when issuing tokens

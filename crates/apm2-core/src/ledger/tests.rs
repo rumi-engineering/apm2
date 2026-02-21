@@ -3422,3 +3422,643 @@ fn tck_00630_empty_frozen_with_new_live_rows_migrates_from_genesis() {
         assert!(verify_result.is_ok(), "hash chain must verify");
     }
 }
+
+/// TCK-00631: `is_canonical_events_mode` returns correct results
+/// for all three DB states:
+/// (a) legacy-only -> false
+/// (b) canonical-only -> true
+/// (c) after migration -> true
+#[test]
+fn tck_00631_is_canonical_events_mode_three_states() {
+    // (b) Canonical-only: no legacy table at all.
+    let conn_b = Connection::open_in_memory().unwrap();
+    init_canonical_schema(&conn_b).unwrap();
+    assert!(
+        super::is_canonical_events_mode(&conn_b).unwrap(),
+        "canonical-only DB must be in canonical mode"
+    );
+
+    // (a) Legacy-only: legacy table with rows, events table empty.
+    let conn_a = Connection::open_in_memory().unwrap();
+    init_canonical_schema(&conn_a).unwrap();
+    create_legacy_ledger_events_table(&conn_a);
+    conn_a
+        .execute(
+            "INSERT INTO ledger_events VALUES ('e1', 'test', 'w1', 'a1', X'AA', X'BB', 1000)",
+            [],
+        )
+        .unwrap();
+    assert!(
+        !super::is_canonical_events_mode(&conn_a).unwrap(),
+        "legacy-only DB must NOT be in canonical mode"
+    );
+
+    // (c) After migration: canonical mode.
+    let stats = migrate_legacy_ledger_events(&conn_a).unwrap();
+    assert_eq!(stats.rows_migrated, 1);
+    assert!(
+        super::is_canonical_events_mode(&conn_a).unwrap(),
+        "post-migration DB must be in canonical mode"
+    );
+}
+
+// =============================================================================
+// TCK-00632: RFC-0032 AT-0 — Ledger Unification Acceptance Test
+//
+// System-level acceptance test that seeds a DB containing only legacy
+// `ledger_events` rows and verifies that the daemon startup migration
+// path produces a valid canonical `events` hash chain and enables
+// canonical append.
+//
+// Definition of Done:
+// - AT-0 runs in CI and locally without external dependencies.
+// - AT-0 fails if `determine_read_mode` returns legacy mode after migration.
+// - AT-0 fails if any migrated row has NULL `event_hash` or if chain
+//   discontinuity is detected.
+// =============================================================================
+
+/// Seed a legacy-only DB with `count` rows in `ledger_events` (no
+/// `events` table).  Returns the path to the seeded DB file.
+fn seed_at0_legacy_db(dir: &TempDir, db_name: &str, count: usize) -> std::path::PathBuf {
+    let path = dir.path().join(db_name);
+    let conn = Connection::open(&path).unwrap();
+    create_legacy_ledger_events_table(&conn);
+    for i in 1..=count {
+        let ts: i64 = i64::try_from(i).expect("row index fits i64") * 1_000_000_000;
+        conn.execute(
+            "INSERT INTO ledger_events \
+             (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                format!("EVT-AT0-{i}"),
+                format!("at0.event_type_{}", i % 3),
+                format!("work-at0-{i}"),
+                format!("actor-at0-{i}"),
+                format!(r#"{{"at0_index":{i},"work_id":"work-at0-{i}"}}"#).as_bytes(),
+                vec![0xA0_u8, u8::try_from(i).unwrap()],
+                ts,
+            ],
+        )
+        .unwrap();
+    }
+    assert!(
+        !test_table_exists(&conn, "events"),
+        "pre-migration: `events` table must not exist in a legacy-only DB"
+    );
+    path
+}
+
+/// A single row from the `events` table for hash-chain verification.
+struct At0EventRow {
+    seq_id: i64,
+    payload: Vec<u8>,
+    prev_hash: Vec<u8>,
+    event_hash: Vec<u8>,
+}
+
+/// Verify every row in `events` has a non-NULL 32-byte `event_hash` and
+/// contiguous Blake3 hash chain starting from genesis.  Returns the
+/// number of rows verified.
+fn verify_at0_hash_chain(conn: &Connection) -> usize {
+    use crate::crypto::EventHasher;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT seq_id, payload, prev_hash, event_hash \
+             FROM events ORDER BY seq_id ASC",
+        )
+        .unwrap();
+
+    let rows: Vec<At0EventRow> = stmt
+        .query_map([], |row| {
+            Ok(At0EventRow {
+                seq_id: row.get(0)?,
+                payload: row.get(1)?,
+                prev_hash: row.get(2)?,
+                event_hash: row.get(3)?,
+            })
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let mut expected_prev = EventHasher::GENESIS_PREV_HASH;
+    for r in &rows {
+        assert_eq!(
+            r.event_hash.len(),
+            32,
+            "AT-0 FAIL: seq_id={} has event_hash length {}, expected 32 \
+             (NULL event_hash detected)",
+            r.seq_id,
+            r.event_hash.len()
+        );
+        assert_eq!(
+            r.prev_hash.len(),
+            32,
+            "AT-0 FAIL: seq_id={} has prev_hash length {}, expected 32",
+            r.seq_id,
+            r.prev_hash.len()
+        );
+        assert_eq!(
+            r.prev_hash.as_slice(),
+            expected_prev.as_slice(),
+            "AT-0 FAIL: seq_id={} chain discontinuity — \
+             prev_hash does not match previous event_hash",
+            r.seq_id,
+        );
+        let computed = EventHasher::hash_event(&r.payload, &expected_prev);
+        assert_eq!(
+            r.event_hash.as_slice(),
+            computed.as_slice(),
+            "AT-0 FAIL: seq_id={} event_hash mismatch — \
+             stored hash does not match recomputed Blake3 hash",
+            r.seq_id,
+        );
+        expected_prev = computed;
+    }
+
+    // Diagnostic output for CI failure investigation.
+    if let (Some(first), Some(last)) = (rows.first(), rows.last()) {
+        eprintln!(
+            "AT-0 hash chain OK: first_seq_id={}, last_seq_id={}, \
+             first_hash={}, last_hash={}",
+            first.seq_id,
+            last.seq_id,
+            hex::encode(&first.event_hash),
+            hex::encode(&last.event_hash),
+        );
+    }
+
+    rows.len()
+}
+
+/// Run daemon startup migration on a legacy-only DB, verify canonical
+/// mode, hash chain integrity, and frozen legacy table.
+fn run_at0_migration_phase(path: &std::path::Path, legacy_row_count: usize) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+        .unwrap();
+
+    init_canonical_schema(&conn).unwrap();
+    let stats = migrate_legacy_ledger_events(&conn).unwrap();
+
+    let expected_migrated = u64::try_from(legacy_row_count).expect("count fits u64");
+    assert_eq!(
+        stats.rows_migrated, expected_migrated,
+        "AT-0: all {legacy_row_count} legacy rows must be migrated"
+    );
+    assert!(
+        !stats.already_migrated,
+        "AT-0: first migration must not be a no-op"
+    );
+
+    // DoD criterion: `is_canonical_events_mode` must return true.
+    assert!(
+        super::is_canonical_events_mode(&conn).unwrap(),
+        "AT-0 FAIL: `is_canonical_events_mode` returned false after migration \
+         (determine_read_mode returned legacy mode)"
+    );
+
+    // DoD criterion: no NULL `event_hash`; contiguous hash chain.
+    let verified = verify_at0_hash_chain(&conn);
+    assert_eq!(
+        verified, legacy_row_count,
+        "AT-0: canonical `events` table must have exactly {legacy_row_count} rows"
+    );
+
+    // Verify: legacy table is frozen.
+    assert!(
+        test_table_exists(&conn, "ledger_events"),
+        "AT-0: ledger_events must still exist (emptied, not dropped)"
+    );
+    let legacy_remaining: i64 = conn
+        .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        legacy_remaining, 0,
+        "AT-0: ledger_events must be empty after migration"
+    );
+
+    assert!(
+        test_table_exists(&conn, "ledger_events_legacy_frozen"),
+        "AT-0: immutable audit copy must exist"
+    );
+    let frozen_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ledger_events_legacy_frozen",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let expected_frozen = i64::try_from(legacy_row_count).expect("count fits i64");
+    assert_eq!(
+        frozen_count, expected_frozen,
+        "AT-0: frozen table must contain all original legacy rows"
+    );
+}
+
+/// Append `count` canonical events via `Ledger::append_signed` and
+/// verify contiguous `seq_id` assignment starting after
+/// `legacy_row_count`.
+fn at0_append_canonical_events(ledger: &Ledger, legacy_row_count: usize, count: usize) {
+    use crate::crypto::EventHasher;
+
+    for i in 1..=count {
+        let event = EventRecord::new(
+            "at0.post_migration",
+            format!("session-post-{i}"),
+            format!("actor-post-{i}"),
+            format!(r#"{{"post_migration_index":{i}}}"#).into_bytes(),
+        );
+        let seq_id = ledger
+            .append_signed(
+                event,
+                |payload, prev_hash| {
+                    let prev: [u8; 32] = prev_hash.try_into().expect("prev_hash must be 32 bytes");
+                    EventHasher::hash_event(payload, &prev).to_vec()
+                },
+                <[u8]>::to_vec, // Dummy signer for test.
+            )
+            .unwrap();
+        assert_eq!(
+            seq_id,
+            u64::try_from(legacy_row_count + i).expect("index fits u64"),
+            "AT-0: post-migration seq_id must be contiguous"
+        );
+    }
+}
+
+/// Verify the full chain (migrated + appended) passes `verify_chain`
+/// and validate per-event metadata.
+fn verify_at0_full_chain(ledger: &Ledger, legacy_row_count: usize, post_count: usize) {
+    use crate::crypto::EventHasher;
+
+    let verify_result = ledger.verify_chain(
+        |payload, prev_hash| {
+            let prev: [u8; 32] = prev_hash.try_into().expect("prev_hash must be 32 bytes");
+            EventHasher::hash_event(payload, &prev).to_vec()
+        },
+        |_event_hash, _signature| true, // Signature verification out of scope for AT-0.
+    );
+    assert!(
+        verify_result.is_ok(),
+        "AT-0 FAIL: full chain verification failed after migration + append: {verify_result:?}"
+    );
+
+    let total_expected = legacy_row_count + post_count;
+    let all_events = ledger.read_from(1, 200).unwrap();
+    assert_eq!(
+        all_events.len(),
+        total_expected,
+        "AT-0: total event count must be {total_expected} (migrated + appended)"
+    );
+
+    for (i, event) in all_events.iter().take(legacy_row_count).enumerate() {
+        assert_eq!(
+            event.record_version, CURRENT_RECORD_VERSION,
+            "AT-0: migrated event {i} must have current record version"
+        );
+        assert!(
+            event.event_hash.is_some(),
+            "AT-0 FAIL: migrated event {i} has None event_hash"
+        );
+        assert!(
+            event.prev_hash.is_some(),
+            "AT-0 FAIL: migrated event {i} has None prev_hash"
+        );
+    }
+
+    for (i, event) in all_events.iter().skip(legacy_row_count).enumerate() {
+        assert_eq!(
+            event.event_type, "at0.post_migration",
+            "AT-0: post-migration event {i} type mismatch"
+        );
+        assert!(
+            event.event_hash.is_some(),
+            "AT-0 FAIL: post-migration event {i} has None event_hash"
+        );
+    }
+
+    eprintln!(
+        "AT-0 PASS: {legacy_row_count} legacy rows migrated, \
+         {post_count} canonical events appended, \
+         full chain verified ({total_expected} total events)"
+    );
+}
+
+/// AT-0: Full lifecycle — legacy DB seed, migrate, verify canonical mode,
+/// verify hash chain integrity, append new events, and verify end-to-end
+/// chain.
+///
+/// This is the primary acceptance test for RFC-0032 Phase 0 ledger
+/// unification.  It exercises the complete daemon startup migration path:
+///
+/// 1. Seed a fresh `SQLite` DB with only `ledger_events` rows (no `events`
+///    table rows).
+/// 2. Run `init_canonical_schema` + `migrate_legacy_ledger_events` (the exact
+///    sequence daemon `main.rs` uses at startup).
+/// 3. Assert `is_canonical_events_mode` returns `true`.
+/// 4. Assert every migrated row in `events` has non-NULL `event_hash` and
+///    32-byte `prev_hash` with contiguous Blake3 chain linkage.
+/// 5. Open a `Ledger`, append a new canonical event via `append_signed`, and
+///    verify hash chain continuity across the migration boundary.
+/// 6. Verify the full chain (migrated + post-migration) passes `verify_chain`.
+#[test]
+fn tck_00632_at0_legacy_db_to_canonical_append() {
+    let dir = TempDir::new().unwrap();
+    let legacy_row_count: usize = 7;
+    let path = seed_at0_legacy_db(&dir, "at0_ledger_unification.db", legacy_row_count);
+
+    // Phase 2: Daemon startup migration sequence.
+    run_at0_migration_phase(&path, legacy_row_count);
+
+    // Phase 3: Canonical append path — open via `Ledger` (production path).
+    let ledger = Ledger::open(&path).unwrap();
+
+    let pre_append_events = ledger.read_from(1, 100).unwrap();
+    assert_eq!(
+        pre_append_events.len(),
+        legacy_row_count,
+        "AT-0: Ledger must see all migrated events"
+    );
+
+    let tail_hash = ledger.last_event_hash().unwrap();
+    assert_eq!(tail_hash.len(), 32);
+    assert_ne!(
+        tail_hash,
+        vec![0u8; 32],
+        "AT-0: tail hash must not be genesis (we migrated rows)"
+    );
+
+    let post_count = 3;
+    at0_append_canonical_events(&ledger, legacy_row_count, post_count);
+
+    // Phase 4: Full chain verification.
+    verify_at0_full_chain(&ledger, legacy_row_count, post_count);
+}
+
+/// AT-0 negative: Ledger opened against a legacy-only DB (without
+/// migration) must be in legacy read mode and refuse writes.
+///
+/// This ensures the test would fail if `determine_read_mode` were to
+/// incorrectly return `CanonicalEvents` for a legacy DB.
+#[test]
+fn tck_00632_at0_negative_legacy_mode_refuses_writes() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("at0_legacy_refuse.db");
+
+    // Seed legacy-only DB.
+    {
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_ledger_events_table(&conn);
+        conn.execute(
+            "INSERT INTO ledger_events \
+             (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "EVT-NEG-1",
+                "test.event",
+                "work-neg",
+                "actor-neg",
+                br#"{"negative_test":true}"#,
+                vec![0xDD_u8],
+                1_000_000_000_i64,
+            ],
+        )
+        .unwrap();
+    }
+
+    // Open via Ledger — triggers `determine_read_mode`.
+    let ledger = Ledger::open(&path).unwrap();
+
+    // Must be in legacy mode: writes should fail.
+    let write_result = ledger.append(&EventRecord::new(
+        "should.fail",
+        "session",
+        "actor",
+        b"payload".to_vec(),
+    ));
+    assert!(
+        matches!(write_result, Err(LedgerError::LegacyModeReadOnly)),
+        "AT-0 negative: unmigrated legacy DB must refuse writes, got: {write_result:?}"
+    );
+
+    // `is_canonical_events_mode` on raw conn must return false.
+    let conn = Connection::open(&path).unwrap();
+    init_canonical_schema(&conn).unwrap();
+    assert!(
+        !super::is_canonical_events_mode(&conn).unwrap(),
+        "AT-0 negative: unmigrated DB must not be in canonical mode"
+    );
+}
+
+/// AT-0 negative: After migration, manually injecting a NULL
+/// `event_hash` row into `events` must be detectable as a chain
+/// integrity violation via `verify_chain`.
+///
+/// This proves the AT-0 invariant that NULL `event_hash` is not
+/// silently tolerated in the canonical chain.
+#[test]
+fn tck_00632_at0_negative_null_event_hash_detected() {
+    use crate::crypto::EventHasher;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("at0_null_hash.db");
+
+    // Seed and migrate.
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 3);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        migrate_legacy_ledger_events(&conn).unwrap();
+    }
+
+    // Inject a row with NULL event_hash (simulating corruption).
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO events \
+             (event_type, session_id, actor_id, record_version, \
+              payload, timestamp_ns, prev_hash, event_hash, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)",
+            params![
+                "corrupted.event",
+                "session-corrupt",
+                "actor-corrupt",
+                i64::from(CURRENT_RECORD_VERSION),
+                b"corrupted payload",
+                999_000_000_000_i64,
+                vec![0u8; 32],
+                vec![0xEE_u8],
+            ],
+        )
+        .unwrap();
+    }
+
+    // Open ledger and verify chain — must detect the NULL hash.
+    let ledger = Ledger::open(&path).unwrap();
+    let verify_result = ledger.verify_chain(
+        |payload, prev_hash| {
+            let prev: [u8; 32] = prev_hash.try_into().expect("prev_hash must be 32 bytes");
+            EventHasher::hash_event(payload, &prev).to_vec()
+        },
+        |_event_hash, _signature| true,
+    );
+    assert!(
+        verify_result.is_err(),
+        "AT-0 negative: chain verification must fail when a row has NULL event_hash"
+    );
+}
+
+/// AT-0 negative: A chain discontinuity (wrong `prev_hash` linkage)
+/// must be detected by `verify_chain`.
+///
+/// This proves the AT-0 invariant that hash chain breaks are not
+/// silently tolerated.
+#[test]
+fn tck_00632_at0_negative_chain_discontinuity_detected() {
+    use crate::crypto::EventHasher;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("at0_chain_break.db");
+
+    // Seed and migrate.
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, 3);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        migrate_legacy_ledger_events(&conn).unwrap();
+    }
+
+    // Inject a row with a wrong prev_hash (discontinuity).
+    {
+        let conn = Connection::open(&path).unwrap();
+        let bogus_prev_hash = [0xFF_u8; 32];
+        let bogus_payload = b"discontinuous event";
+        let bogus_event_hash = EventHasher::hash_event(bogus_payload.as_slice(), &bogus_prev_hash);
+
+        conn.execute(
+            "INSERT INTO events \
+             (event_type, session_id, actor_id, record_version, \
+              payload, timestamp_ns, prev_hash, event_hash, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                "discontinuous.event",
+                "session-disc",
+                "actor-disc",
+                i64::from(CURRENT_RECORD_VERSION),
+                bogus_payload.as_slice(),
+                888_000_000_000_i64,
+                bogus_prev_hash.as_slice(),
+                bogus_event_hash.as_slice(),
+                vec![0xDD_u8],
+            ],
+        )
+        .unwrap();
+    }
+
+    // Open ledger and verify chain — must detect the discontinuity.
+    let ledger = Ledger::open(&path).unwrap();
+    let verify_result = ledger.verify_chain(
+        |payload, prev_hash| {
+            let prev: [u8; 32] = prev_hash.try_into().expect("prev_hash must be 32 bytes");
+            EventHasher::hash_event(payload, &prev).to_vec()
+        },
+        |_event_hash, _signature| true,
+    );
+    assert!(
+        verify_result.is_err(),
+        "AT-0 negative: chain verification must fail on prev_hash discontinuity"
+    );
+}
+
+/// AT-0: Migration idempotency — running migration twice on the same
+/// legacy DB must not duplicate rows or alter the hash chain.
+#[test]
+fn tck_00632_at0_migration_idempotent() {
+    use crate::crypto::EventHasher;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("at0_idempotent.db");
+
+    let legacy_count: usize = 5;
+    {
+        let conn = Connection::open(&path).unwrap();
+        seed_legacy_table(&conn, legacy_count);
+    }
+
+    // First migration.
+    let first_hashes: Vec<Vec<u8>>;
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(
+            stats.rows_migrated,
+            u64::try_from(legacy_count).expect("count fits u64")
+        );
+        assert!(!stats.already_migrated);
+
+        // Capture hashes.
+        first_hashes = conn
+            .prepare("SELECT event_hash FROM events ORDER BY seq_id ASC")
+            .unwrap()
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(first_hashes.len(), legacy_count);
+    }
+
+    // Second migration — must be no-op.
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn);
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 0);
+        assert!(stats.already_migrated);
+
+        // Verify row count unchanged.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let expected_count = i64::try_from(legacy_count).expect("count fits i64");
+        assert_eq!(
+            count, expected_count,
+            "AT-0: idempotent migration must not duplicate rows"
+        );
+
+        // Verify hashes unchanged.
+        let second_hashes: Vec<Vec<u8>> = conn
+            .prepare("SELECT event_hash FROM events ORDER BY seq_id ASC")
+            .unwrap()
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            first_hashes, second_hashes,
+            "AT-0: idempotent migration must not alter hashes"
+        );
+    }
+
+    // Verify full chain integrity after double migration.
+    let ledger = Ledger::open(&path).unwrap();
+    let verify_result = ledger.verify_chain(
+        |payload, prev_hash| {
+            let prev: [u8; 32] = prev_hash.try_into().expect("prev_hash must be 32 bytes");
+            EventHasher::hash_event(payload, &prev).to_vec()
+        },
+        |_event_hash, _signature| true,
+    );
+    assert!(
+        verify_result.is_ok(),
+        "AT-0: chain must be intact after idempotent migration: {verify_result:?}"
+    );
+}

@@ -69,7 +69,7 @@ use apm2_daemon::state::{DaemonStateHandle, DispatcherState, SharedDispatcherSta
 use axum::Router;
 use axum::routing::get;
 use clap::Parser;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use secrecy::ExposeSecret;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{debug, error, info, trace, warn};
@@ -1174,6 +1174,38 @@ async fn async_main(args: Args) -> Result<()> {
             );
         }
 
+        // TCK-00631: Post-migration invariant check — after migration, the
+        // ledger MUST be in canonical events mode. If it is still in legacy
+        // mode, something went wrong and the daemon must not start.
+        let is_canonical = apm2_core::ledger::is_canonical_events_mode(&conn)
+            .context("failed to determine ledger read mode after migration")?;
+        if !is_canonical {
+            anyhow::bail!(
+                "post-migration invariant violated: ledger is NOT in canonical events mode \
+                 after migration completed; daemon startup aborted (fail-closed)"
+            );
+        }
+
+        // TCK-00631: Check whether the frozen legacy table exists and log
+        // the current ledger mode.
+        let frozen_table_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' \
+                 AND name = 'ledger_events_legacy_frozen' LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap_or(None)
+            .is_some();
+
+        info!(
+            ledger_mode = "canonical_events",
+            frozen_table_exists = frozen_table_exists,
+            legacy_writes_frozen = frozen_table_exists,
+            "TCK-00631: Ledger mode after startup migration"
+        );
+
         Some(Arc::new(Mutex::new(conn)))
     } else {
         None
@@ -1289,6 +1321,17 @@ async fn async_main(args: Args) -> Result<()> {
         .with_token_binding_config(boundary_id.clone(), [0u8; 32]),
     );
 
+    // TCK-00631: Freeze legacy `ledger_events` writes on both the event emitter
+    // and lease validator. After this, all new appends route to canonical `events`.
+    // This MUST happen after init_canonical_schema + migrate_legacy_ledger_events
+    // (above) to ensure the `events` table exists.
+    if sqlite_conn.is_some() {
+        if let Err(e) = dispatcher_state.freeze_legacy_writes() {
+            warn!(error = %e, "freeze_legacy_writes failed (writes blocked, fail-closed)");
+        }
+        info!("TCK-00631: Legacy ledger writes frozen; new appends route to canonical events");
+    }
+
     // TCK-00388: Wire gate orchestrator into daemon for autonomous gate lifecycle.
     //
     // The orchestrator is instantiated with the daemon lifecycle signing key
@@ -1346,7 +1389,13 @@ async fn async_main(args: Args) -> Result<()> {
         let timeout_ledger_emitter: Option<SqliteLedgerEventEmitter> =
             sqlite_conn.as_ref().map(|conn| {
                 let signing_key = ed25519_dalek::SigningKey::from_bytes(&timeout_signing_key_bytes);
-                SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key)
+                let emitter = SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key);
+                // TCK-00631: Freeze legacy writes after RFC-0032 migration.
+                // Fail-closed: if freeze check fails, writes are blocked anyway.
+                if let Err(e) = emitter.freeze_legacy_writes_self() {
+                    warn!(error = %e, "freeze_legacy_writes failed (writes blocked, fail-closed)");
+                }
+                emitter
             });
 
         // MAJOR-1 fix: Create a daemon-level FacBroker and
@@ -2025,7 +2074,12 @@ async fn async_main(args: Args) -> Result<()> {
                 sqlite_conn.as_ref().map(|conn| {
                     let signing_key =
                         ed25519_dalek::SigningKey::from_bytes(&watchdog_signing_key_bytes);
-                    SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key)
+                    let emitter = SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key);
+                    // TCK-00631: Freeze legacy writes after RFC-0032 migration.
+                    if let Err(e) = emitter.freeze_legacy_writes_self() {
+                        warn!(error = %e, "freeze_legacy_writes failed (writes blocked, fail-closed)");
+                    }
+                    emitter
                 });
 
             // Capture values for the spawned task
@@ -2702,8 +2756,13 @@ async fn perform_crash_recovery(
     // in from async_main) instead of generating a separate ephemeral key. This
     // ensures ONE signing key per daemon lifecycle, shared between recovery and
     // the dispatcher.
-    let emitter = sqlite_conn
-        .map(|conn| SqliteLedgerEventEmitter::new(Arc::clone(conn), ledger_signing_key.clone()));
+    let emitter = sqlite_conn.map(|conn| {
+        SqliteLedgerEventEmitter::new(Arc::clone(conn), ledger_signing_key.clone())
+        // NOTE: Recovery emitter is NOT frozen. Crash recovery runs BEFORE
+        // the main freeze (in async_main). Recovery events go to legacy
+        // `ledger_events` and will be re-migrated on next startup if needed
+        // (the migration function handles post-cutover legacy rows).
+    });
 
     // Security Review v4 BLOCKER 2: Create the daemon's shared HTF clock for
     // recovery timestamps. Per RFC-0016, all ledger event timestamps must come

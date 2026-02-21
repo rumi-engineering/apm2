@@ -361,6 +361,15 @@ pub enum LedgerEventError {
         /// Error message describing the validation failure.
         message: String,
     },
+
+    /// Write rejected because the legacy `ledger_events` writer has been
+    /// frozen after RFC-0032 Phase 0 migration (TCK-00631).
+    ///
+    /// Once `migrate_legacy_ledger_events` runs and
+    /// `ledger_events_legacy_frozen` exists, all writes to `ledger_events`
+    /// are permanently blocked for the lifetime of this emitter instance.
+    /// No state is mutated when this error is returned.
+    FrozenLegacyWriter,
 }
 
 impl std::fmt::Display for LedgerEventError {
@@ -369,6 +378,11 @@ impl std::fmt::Display for LedgerEventError {
             Self::SigningFailed { message } => write!(f, "signing failed: {message}"),
             Self::PersistenceFailed { message } => write!(f, "persistence failed: {message}"),
             Self::ValidationFailed { message } => write!(f, "validation failed: {message}"),
+            Self::FrozenLegacyWriter => write!(
+                f,
+                "legacy ledger_events writer is frozen after RFC-0032 migration; \
+                 writes to ledger_events are permanently blocked"
+            ),
         }
     }
 }
@@ -1423,6 +1437,15 @@ pub trait LedgerEventEmitter: Send + Sync {
                       override to persist envelope bindings correctly"
                 .to_string(),
         })
+    }
+
+    /// TCK-00631: Freeze legacy `ledger_events` writes and route future appends
+    /// to the canonical `events` table.
+    ///
+    /// Called by daemon startup after RFC-0032 Phase 0 migration.
+    /// Default implementation is a no-op (for in-memory/stub emitters).
+    fn freeze_legacy_writes(&self) -> Result<(), LedgerEventError> {
+        Ok(())
     }
 }
 
@@ -6843,6 +6866,15 @@ pub trait LeaseValidator: Send + Sync {
     fn get_delegation_parent_lease_id(&self, lease_id: &str) -> Result<Option<String>, String> {
         let _ = lease_id;
         Ok(None)
+    }
+
+    /// TCK-00631: Freeze legacy `ledger_events` writes and route future
+    /// appends/reads to the canonical `events` table.
+    ///
+    /// Called by daemon startup after RFC-0032 Phase 0 migration.
+    /// Default implementation is a no-op (for in-memory/stub validators).
+    fn freeze_legacy_writes(&self) -> Result<(), String> {
+        Ok(())
     }
 }
 
