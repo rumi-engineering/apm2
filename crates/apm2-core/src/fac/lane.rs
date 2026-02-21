@@ -22,7 +22,7 @@
 //!
 //! - Lock acquisition is atomic and exclusive via `flock(LOCK_EX | LOCK_NB)`.
 //! - Lease records are persisted via atomic write (temp → rename).
-//! - Stale lease detection uses PID liveness checks (fail-closed).
+//! - Stale lease detection uses PID identity checks (`pid + proc starttime`).
 //! - Directories are created with mode 0o700 in operator mode and 0o770 in
 //!   system-mode (CTR-2611).
 //!
@@ -32,8 +32,8 @@
 //! - [INV-LANE-002] Lane profile hash is computed via BLAKE3 over canonical
 //!   JSON.
 //! - [INV-LANE-003] Lock acquisition uses file-lock pattern (RAII + jitter).
-//! - [INV-LANE-004] Stale lease detection is fail-closed: ambiguous PID state →
-//!   CORRUPT.
+//! - [INV-LANE-004] Stale lease detection is fail-closed: unknown identity →
+//!   CORRUPT; PID identity mismatch is stale/non-owner.
 //! - [INV-LANE-005] All in-memory collections are bounded by hard MAX_*
 //!   constants.
 
@@ -44,6 +44,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Once;
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{TimeZone, Utc};
@@ -117,6 +118,9 @@ pub const MAX_LEASE_FILE_SIZE: u64 = 1024 * 1024;
 /// Maximum profile file size to read (1 MiB, CTR-1603).
 pub const MAX_PROFILE_FILE_SIZE: u64 = 1024 * 1024;
 
+/// Maximum `/proc/<pid>/stat` payload size accepted for PID identity checks.
+const MAX_PROC_STAT_FILE_SIZE: usize = 16 * 1024;
+
 /// Maximum allowed test timeout in seconds for FAC execution paths.
 pub const MAX_TEST_TIMEOUT_SECONDS: u64 = 600;
 
@@ -137,6 +141,9 @@ pub const LANE_COUNT_ENV_VAR: &str = "APM2_FAC_LANE_COUNT";
 
 /// Lane ID prefix for generated lane IDs.
 pub const LANE_ID_PREFIX: &str = "lane-";
+
+/// Warn once when legacy leases are missing `proc_start_time_ticks`.
+static LEGACY_PROC_START_TICKS_WARNING: Once = Once::new();
 
 /// Cleanup outcome for lane cleanup execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -799,6 +806,11 @@ pub struct LaneLeaseV1 {
     pub state: LaneState,
     /// RFC3339 UTC timestamp when lease was acquired.
     pub started_at: String,
+    /// Linux `/proc/<pid>/stat` starttime ticks captured at lease creation.
+    ///
+    /// Optional for migration tolerance with legacy leases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proc_start_time_ticks: Option<u64>,
     /// Lane profile hash at lease time (b3-256 hex).
     pub lane_profile_hash: String,
     /// Toolchain fingerprint at lease time (b3-256 hex).
@@ -843,6 +855,7 @@ impl LaneLeaseV1 {
             pid,
             state,
             started_at: normalized_started_at,
+            proc_start_time_ticks: read_proc_start_time_ticks(pid).ok(),
             lane_profile_hash: lane_profile_hash.to_string(),
             toolchain_fingerprint: toolchain_fingerprint.to_string(),
         })
@@ -1026,6 +1039,19 @@ pub struct LaneStatusV1 {
     pub lock_held: bool,
     /// Whether the PID in the lease is still alive.
     pub pid_alive: Option<bool>,
+}
+
+/// Process identity classification for PID reuse-safe lease liveness checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessIdentity {
+    /// Process exists and `/proc/<pid>/stat` starttime matches the lease.
+    AliveMatch,
+    /// Process exists, but starttime does not match the lease (PID reuse).
+    AliveMismatch,
+    /// Process is not alive.
+    Dead,
+    /// Process identity could not be determined safely.
+    Unknown,
 }
 
 /// Persistent marker indicating a lane is corrupt and cannot accept new jobs.
@@ -1581,15 +1607,34 @@ impl LaneManager {
     ///
     /// S10: Detect `LEASED` lanes with missing/dead PID and proactively remove
     /// stale lease metadata when the lane lock can be acquired.
+    #[allow(clippy::too_many_lines)]
     fn reconcile_orphan_lease(&self, lane_id: &str, actions: &mut Vec<LaneReconcileAction>) {
         let lane_dir = self.lane_dir(lane_id);
         let orphan_detail = match LaneLeaseV1::load(&lane_dir) {
             Ok(Some(lease)) => {
-                if lease.state == LaneState::Leased && !is_pid_alive(lease.pid) {
-                    Some(format!(
-                        "lease state=LEASED with dead pid {} (stale lease)",
-                        lease.pid
-                    ))
+                let identity = verify_pid_identity(lease.pid, lease.proc_start_time_ticks);
+                if lease.state == LaneState::Leased
+                    && matches!(
+                        identity,
+                        ProcessIdentity::Dead | ProcessIdentity::AliveMismatch
+                    )
+                {
+                    let detail = match identity {
+                        ProcessIdentity::Dead => {
+                            format!(
+                                "lease state=LEASED with dead pid {} (stale lease)",
+                                lease.pid
+                            )
+                        },
+                        ProcessIdentity::AliveMismatch => format!(
+                            "lease state=LEASED with pid {} identity mismatch (PID reuse, stale lease)",
+                            lease.pid
+                        ),
+                        ProcessIdentity::AliveMatch | ProcessIdentity::Unknown => {
+                            "lease state=LEASED with unverifiable identity".to_string()
+                        },
+                    };
+                    Some(detail)
                 } else {
                     return;
                 }
@@ -2081,8 +2126,8 @@ impl LaneManager {
         }
     }
 
-    /// Derive the status of a lane from lock state, lease record, PID
-    /// liveness, and corrupt marker.
+    /// Derive the status of a lane from lock state, lease record, process
+    /// identity, and corrupt marker.
     ///
     /// # Stale Lease Detection Rules (RFC-0019 §4.4)
     ///
@@ -2091,9 +2136,10 @@ impl LaneManager {
     ///   is cleared explicitly via `LaneCorruptMarkerV1::remove()`
     /// - Lock held + lease missing/invalid → LEASED
     /// - Lock free + lease missing/invalid → IDLE
-    /// - Lock free + lease RUNNING + PID alive → CORRUPT (INV-LANE-004)
-    /// - Lock free + PID dead → stale lease (IDLE)
-    /// - Lock held + lease RUNNING + PID alive → RUNNING
+    /// - Lock free + lease RUNNING + identity match/unknown → CORRUPT
+    /// - Lock free + lease RUNNING + identity mismatch/dead → stale lease
+    ///   (IDLE)
+    /// - Lock held + lease RUNNING → RUNNING
     ///
     /// # Errors
     ///
@@ -2111,13 +2157,9 @@ impl LaneManager {
             Err(err) => return Err(err),
         };
         let is_corrupt = corrupt_marker.is_some();
-        let pid_alive = lease.as_ref().map(|lease| is_pid_alive(lease.pid));
-        let state = derive_lane_state(
-            lock_held,
-            lease.as_ref(),
-            pid_alive.unwrap_or(false),
-            is_corrupt,
-        );
+        let pid_identity = lease.as_ref().map(process_identity_for_lease);
+        let pid_alive = pid_identity.and_then(pid_alive_from_identity);
+        let state = derive_lane_state(lock_held, lease.as_ref(), pid_identity, is_corrupt);
         let (job_id, pid, started_at, lane_profile_hash, toolchain_fingerprint) = lease
             .as_ref()
             .map_or((None, None, None, None, None), |lease| {
@@ -3091,7 +3133,7 @@ impl LaneManager {
 fn derive_lane_state(
     lock_held: bool,
     lease: Option<&LaneLeaseV1>,
-    pid_alive: bool,
+    pid_identity: Option<ProcessIdentity>,
     has_corrupt_marker: bool,
 ) -> LaneState {
     if has_corrupt_marker {
@@ -3103,29 +3145,22 @@ fn derive_lane_state(
         // transitional state until lease metadata is refreshed.
         (true, None) => LaneState::Leased,
 
-        // Lock free + active state (RUNNING/LEASED/CLEANUP) + PID alive →
-        // ambiguous ownership → CORRUPT (fail-closed, INV-LANE-004).
+        // Lock free + active state (RUNNING/LEASED/CLEANUP) + identity
+        // alive/unknown → ambiguous ownership → CORRUPT (fail-closed,
+        // INV-LANE-004).
         // Lock free + CORRUPT → remains CORRUPT regardless of PID.
-        (false, Some(lease))
-            if matches!(
-                lease.state,
-                LaneState::Running | LaneState::Leased | LaneState::Cleanup
-            ) && pid_alive =>
-        {
-            LaneState::Corrupt
-        },
-        (false, Some(lease)) if lease.state == LaneState::Corrupt => LaneState::Corrupt,
-
-        // Lock free + active state + PID dead → stale lease → IDLE.
-        // Lock free + IDLE → IDLE.
         (false, Some(lease))
             if matches!(
                 lease.state,
                 LaneState::Running | LaneState::Leased | LaneState::Cleanup
             ) =>
         {
-            LaneState::Idle
+            match pid_identity.unwrap_or(ProcessIdentity::Unknown) {
+                ProcessIdentity::Dead | ProcessIdentity::AliveMismatch => LaneState::Idle,
+                ProcessIdentity::AliveMatch | ProcessIdentity::Unknown => LaneState::Corrupt,
+            }
         },
+        (false, Some(lease)) if lease.state == LaneState::Corrupt => LaneState::Corrupt,
 
         // For lease-present cases not handled above, use lease state. Lock-held
         // lanes use this path when lease state is available.
@@ -3140,37 +3175,143 @@ fn derive_lane_state(
 // PID Liveness
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Check whether a given PID is alive.
-///
-/// Uses `kill(pid, 0)` which checks for process existence without sending a
-/// signal.
-pub(crate) fn is_pid_alive(pid: u32) -> bool {
+const fn pid_alive_from_identity(identity: ProcessIdentity) -> Option<bool> {
+    match identity {
+        ProcessIdentity::AliveMatch | ProcessIdentity::AliveMismatch => Some(true),
+        ProcessIdentity::Dead => Some(false),
+        ProcessIdentity::Unknown => None,
+    }
+}
+
+fn process_identity_for_lease(lease: &LaneLeaseV1) -> ProcessIdentity {
+    let identity = verify_pid_identity(lease.pid, lease.proc_start_time_ticks);
+    if lease.proc_start_time_ticks.is_none() && matches!(identity, ProcessIdentity::Unknown) {
+        LEGACY_PROC_START_TICKS_WARNING.call_once(|| {
+            eprintln!(
+                "WARNING: lane lease missing proc_start_time_ticks; PID identity cannot be fully verified"
+            );
+        });
+    }
+    identity
+}
+
+fn check_pid_exists_kill0(pid: u32) -> io::Result<bool> {
     if pid == 0 {
-        return false;
+        return Ok(false);
     }
     let Ok(pid_i32) = i32::try_from(pid) else {
-        return false;
+        return Ok(false);
     };
     #[cfg(unix)]
     {
-        // SAFETY: kill with signal 0 only checks for process existence.
-        // This is a standard POSIX pattern. PID casting is validated against
-        // platform bounds before invocation.
+        // SAFETY: `kill(pid, 0)` probes existence without sending a signal.
         #[allow(unsafe_code)]
         let result = unsafe { libc::kill(pid_i32, 0) };
         if result == 0 {
-            return true;
+            return Ok(true);
         }
-        // EPERM means the process exists but we don't have permission to
-        // signal it. Treat as alive (fail-closed for stale detection).
         let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        errno == libc::EPERM
+        if errno == libc::ESRCH {
+            return Ok(false);
+        }
+        if errno == libc::EPERM {
+            return Ok(true);
+        }
+        Err(io::Error::from_raw_os_error(errno))
     }
     #[cfg(not(unix))]
     {
-        // On non-Unix platforms, conservatively assume alive (fail-closed).
+        let _ = pid_i32;
+        Ok(true)
+    }
+}
+
+fn parse_proc_stat_start_time_ticks(contents: &str) -> io::Result<u64> {
+    // `/proc/<pid>/stat`: field 2 (`comm`) is parenthesized and may contain
+    // spaces, so split from the final ')' boundary first.
+    let close_paren = contents
+        .rfind(')')
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing ')' in /proc stat"))?;
+    let tail = contents
+        .get(close_paren + 1..)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid /proc stat tail"))?
+        .trim_start();
+
+    // Field 22 (`starttime`) becomes index 19 in the tail token stream
+    // because tail starts at field 3 (`state`).
+    let start_ticks = tail
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing starttime field"))?;
+    start_ticks.parse::<u64>().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid starttime field in /proc stat: {e}"),
+        )
+    })
+}
+
+/// Read Linux `/proc/<pid>/stat` field 22 (`starttime`) as clock ticks.
+///
+/// # Errors
+///
+/// Returns an `io::Error` if procfs cannot be read, is oversized, or does not
+/// contain a valid starttime field.
+pub fn read_proc_start_time_ticks(pid: u32) -> io::Result<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = format!("/proc/{pid}/stat");
+        let mut file = File::open(&path)?;
+        let mut buf = Vec::with_capacity(256);
+        let mut chunk = [0_u8; 512];
+        loop {
+            let read = file.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            if buf.len().saturating_add(read) > MAX_PROC_STAT_FILE_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "proc stat file exceeds size limit",
+                ));
+            }
+            buf.extend_from_slice(&chunk[..read]);
+        }
+        let contents = String::from_utf8_lossy(&buf);
+        parse_proc_stat_start_time_ticks(&contents)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
         let _ = pid;
-        true
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "proc starttime identity checks require Linux",
+        ))
+    }
+}
+
+/// Verify process identity using PID + `/proc/<pid>/stat` starttime ticks.
+///
+/// When `expected_start_ticks` is `None` (legacy lease), identity cannot be
+/// proven and the result is `Unknown` unless the process is already dead.
+#[must_use]
+pub fn verify_pid_identity(pid: u32, expected_start_ticks: Option<u64>) -> ProcessIdentity {
+    let Ok(exists) = check_pid_exists_kill0(pid) else {
+        return ProcessIdentity::Unknown;
+    };
+    if !exists {
+        return ProcessIdentity::Dead;
+    }
+
+    let Some(expected_ticks) = expected_start_ticks else {
+        return ProcessIdentity::Unknown;
+    };
+
+    match read_proc_start_time_ticks(pid) {
+        Ok(actual_ticks) if actual_ticks == expected_ticks => ProcessIdentity::AliveMatch,
+        Ok(_) => ProcessIdentity::AliveMismatch,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => ProcessIdentity::Dead,
+        Err(_) => ProcessIdentity::Unknown,
     }
 }
 
@@ -4166,6 +4307,7 @@ mod tests {
             pid: 1,
             state: LaneState::Leased,
             started_at: "1735689600".to_string(),
+            proc_start_time_ticks: None,
             lane_profile_hash: "h".to_string(),
             toolchain_fingerprint: "f".to_string(),
         };
@@ -4186,6 +4328,7 @@ mod tests {
             pid: 1,
             state: LaneState::Leased,
             started_at: "not-a-timestamp".to_string(),
+            proc_start_time_ticks: None,
             lane_profile_hash: "h".to_string(),
             toolchain_fingerprint: "f".to_string(),
         };
@@ -4495,7 +4638,7 @@ mod tests {
     #[test]
     fn pid_above_i32_max_is_not_alive() {
         let pid = (i32::MAX as u32) + 1;
-        assert!(!is_pid_alive(pid));
+        assert_eq!(verify_pid_identity(pid, Some(0)), ProcessIdentity::Dead);
     }
 
     #[test]
@@ -4980,6 +5123,7 @@ mod tests {
             pid: 1,
             state,
             started_at: "2026-02-12T03:15:00Z".to_string(),
+            proc_start_time_ticks: Some(42),
             lane_profile_hash: "h".to_string(),
             toolchain_fingerprint: "f".to_string(),
         }
@@ -4989,11 +5133,11 @@ mod tests {
     fn derive_state_lock_held_running() {
         let lease = make_lease(LaneState::Running);
         assert_eq!(
-            derive_lane_state(true, Some(&lease), true, false),
+            derive_lane_state(true, Some(&lease), Some(ProcessIdentity::AliveMatch), false),
             LaneState::Running
         );
         assert_eq!(
-            derive_lane_state(true, Some(&lease), false, false),
+            derive_lane_state(true, Some(&lease), Some(ProcessIdentity::Dead), false),
             LaneState::Running
         );
     }
@@ -5001,7 +5145,7 @@ mod tests {
     #[test]
     fn derive_state_lock_held_no_lease_is_leased() {
         assert_eq!(
-            derive_lane_state(true, None, false, false),
+            derive_lane_state(true, None, None, false),
             LaneState::Leased,
             "locked lane without lease should remain LEASED"
         );
@@ -5010,7 +5154,7 @@ mod tests {
     #[test]
     fn derive_state_lock_free_no_lease_is_idle() {
         assert_eq!(
-            derive_lane_state(false, None, false, false),
+            derive_lane_state(false, None, None, false),
             LaneState::Idle,
             "unlocked lane without lease should be IDLE"
         );
@@ -5040,7 +5184,12 @@ mod tests {
     fn derive_state_lock_free_running_pid_alive_is_corrupt() {
         let lease = make_lease(LaneState::Running);
         assert_eq!(
-            derive_lane_state(false, Some(&lease), true, false),
+            derive_lane_state(
+                false,
+                Some(&lease),
+                Some(ProcessIdentity::AliveMatch),
+                false
+            ),
             LaneState::Corrupt,
             "lock free + RUNNING + PID alive → CORRUPT (fail-closed)"
         );
@@ -5050,9 +5199,34 @@ mod tests {
     fn derive_state_lock_free_running_pid_dead_is_idle() {
         let lease = make_lease(LaneState::Running);
         assert_eq!(
-            derive_lane_state(false, Some(&lease), false, false),
+            derive_lane_state(false, Some(&lease), Some(ProcessIdentity::Dead), false),
             LaneState::Idle,
             "lock free + RUNNING + PID dead → IDLE (stale lease)"
+        );
+    }
+
+    #[test]
+    fn derive_state_lock_free_running_pid_identity_mismatch_is_idle() {
+        let lease = make_lease(LaneState::Running);
+        assert_eq!(
+            derive_lane_state(
+                false,
+                Some(&lease),
+                Some(ProcessIdentity::AliveMismatch),
+                false
+            ),
+            LaneState::Idle,
+            "lock free + RUNNING + PID reuse mismatch → IDLE (stale lease)"
+        );
+    }
+
+    #[test]
+    fn derive_state_lock_free_running_pid_identity_unknown_is_corrupt() {
+        let lease = make_lease(LaneState::Running);
+        assert_eq!(
+            derive_lane_state(false, Some(&lease), Some(ProcessIdentity::Unknown), false),
+            LaneState::Corrupt,
+            "lock free + RUNNING + unknown identity → CORRUPT (fail-closed)"
         );
     }
 
@@ -5060,11 +5234,16 @@ mod tests {
     fn derive_state_lock_free_corrupt_stays_corrupt() {
         let lease = make_lease(LaneState::Corrupt);
         assert_eq!(
-            derive_lane_state(false, Some(&lease), false, false),
+            derive_lane_state(false, Some(&lease), Some(ProcessIdentity::Dead), false),
             LaneState::Corrupt
         );
         assert_eq!(
-            derive_lane_state(false, Some(&lease), true, false),
+            derive_lane_state(
+                false,
+                Some(&lease),
+                Some(ProcessIdentity::AliveMatch),
+                false
+            ),
             LaneState::Corrupt
         );
     }
@@ -5073,15 +5252,15 @@ mod tests {
     fn test_derive_lane_state_corrupt_marker() {
         let lease = make_lease(LaneState::Running);
         assert_eq!(
-            derive_lane_state(false, Some(&lease), false, true),
+            derive_lane_state(false, Some(&lease), Some(ProcessIdentity::Dead), true),
             LaneState::Corrupt
         );
         assert_eq!(
-            derive_lane_state(true, Some(&lease), false, true),
+            derive_lane_state(true, Some(&lease), Some(ProcessIdentity::Dead), true),
             LaneState::Corrupt
         );
         assert_eq!(
-            derive_lane_state(false, None, false, true),
+            derive_lane_state(false, None, None, true),
             LaneState::Corrupt,
             "corrupt marker remains authoritative when lease is absent"
         );
@@ -5091,7 +5270,12 @@ mod tests {
     fn derive_state_lock_free_leased_pid_alive_is_corrupt() {
         let lease = make_lease(LaneState::Leased);
         assert_eq!(
-            derive_lane_state(false, Some(&lease), true, false),
+            derive_lane_state(
+                false,
+                Some(&lease),
+                Some(ProcessIdentity::AliveMatch),
+                false
+            ),
             LaneState::Corrupt,
             "lock free + LEASED + PID alive → CORRUPT (fail-closed)"
         );
@@ -5101,7 +5285,7 @@ mod tests {
     fn derive_state_lock_free_leased_pid_dead_is_idle() {
         let lease = make_lease(LaneState::Leased);
         assert_eq!(
-            derive_lane_state(false, Some(&lease), false, false),
+            derive_lane_state(false, Some(&lease), Some(ProcessIdentity::Dead), false),
             LaneState::Idle
         );
     }
@@ -5110,11 +5294,16 @@ mod tests {
     fn derive_state_lock_free_idle_is_idle() {
         let lease = make_lease(LaneState::Idle);
         assert_eq!(
-            derive_lane_state(false, Some(&lease), false, false),
+            derive_lane_state(false, Some(&lease), Some(ProcessIdentity::Dead), false),
             LaneState::Idle
         );
         assert_eq!(
-            derive_lane_state(false, Some(&lease), true, false),
+            derive_lane_state(
+                false,
+                Some(&lease),
+                Some(ProcessIdentity::AliveMatch),
+                false
+            ),
             LaneState::Idle
         );
     }
@@ -5722,19 +5911,70 @@ mod tests {
 
     #[test]
     fn pid_zero_is_not_alive() {
-        assert!(!is_pid_alive(0));
+        assert_eq!(verify_pid_identity(0, Some(0)), ProcessIdentity::Dead);
     }
 
     #[test]
     fn current_pid_is_alive() {
         let pid = std::process::id();
-        assert!(is_pid_alive(pid), "current process should be alive");
+        assert!(
+            matches!(
+                verify_pid_identity(pid, read_proc_start_time_ticks(pid).ok()),
+                ProcessIdentity::AliveMatch
+            ),
+            "current process should be alive and identity-matched"
+        );
     }
 
     #[test]
     fn nonexistent_pid_is_not_alive() {
         // PID 4_000_000 is extremely unlikely to exist
-        assert!(!is_pid_alive(4_000_000));
+        assert_eq!(
+            verify_pid_identity(4_000_000, Some(0)),
+            ProcessIdentity::Dead
+        );
+    }
+
+    #[test]
+    fn verify_pid_identity_matches_current_pid_start_ticks() {
+        let pid = std::process::id();
+        let start_ticks = read_proc_start_time_ticks(pid).expect("read current pid start ticks");
+        assert_eq!(
+            verify_pid_identity(pid, Some(start_ticks)),
+            ProcessIdentity::AliveMatch
+        );
+    }
+
+    #[test]
+    fn verify_pid_identity_detects_mismatch_for_live_pid() {
+        let pid = std::process::id();
+        let start_ticks = read_proc_start_time_ticks(pid).expect("read current pid start ticks");
+        assert_eq!(
+            verify_pid_identity(pid, Some(start_ticks.saturating_add(1))),
+            ProcessIdentity::AliveMismatch
+        );
+    }
+
+    #[test]
+    fn verify_pid_identity_returns_unknown_for_legacy_missing_start_ticks() {
+        let pid = std::process::id();
+        assert_eq!(verify_pid_identity(pid, None), ProcessIdentity::Unknown);
+    }
+
+    #[test]
+    fn verify_pid_identity_child_process_roundtrip() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn sleep child");
+        let pid = child.id();
+        let start_ticks = read_proc_start_time_ticks(pid).expect("read child start ticks");
+        assert_eq!(
+            verify_pid_identity(pid, Some(start_ticks)),
+            ProcessIdentity::AliveMatch
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     // ── LaneManager ────────────────────────────────────────────────────
@@ -5950,6 +6190,46 @@ mod tests {
         );
         assert!(!status.lock_held);
         assert_eq!(status.pid_alive, Some(false));
+    }
+
+    #[test]
+    fn lane_manager_status_pid_identity_mismatch_is_stale_idle() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let pid = std::process::id();
+        let mut lease = LaneLeaseV1::new(
+            lane_id,
+            "job_mismatch",
+            pid,
+            LaneState::Running,
+            "2026-02-12T03:15:00Z",
+            "b3-256:ph",
+            "b3-256:th",
+        )
+        .expect("create lease");
+        let actual_start_ticks = lease
+            .proc_start_time_ticks
+            .expect("running process should have start ticks");
+        lease.proc_start_time_ticks = Some(actual_start_ticks.saturating_add(1));
+        lease.persist(&lane_dir).expect("persist lease");
+
+        let status = manager.lane_status(lane_id).expect("status");
+        assert_eq!(
+            status.state,
+            LaneState::Idle,
+            "PID identity mismatch must be treated as stale lease"
+        );
+        assert_eq!(
+            status.pid_alive,
+            Some(true),
+            "process exists, but ownership identity mismatched"
+        );
     }
 
     #[test]
@@ -6263,6 +6543,7 @@ mod tests {
             job_id: "test-job".to_string(),
             pid: std::process::id(),
             started_at: "2026-01-01T00:00:00Z".to_string(),
+            proc_start_time_ticks: read_proc_start_time_ticks(std::process::id()).ok(),
             toolchain_fingerprint: "test-fp".to_string(),
             lane_profile_hash:
                 "b3-256:0000000000000000000000000000000000000000000000000000000000000000"

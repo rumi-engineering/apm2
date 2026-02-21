@@ -24,7 +24,7 @@ pub const MODEL_POOL: [ModelPoolEntry; 4] = [
         backend: ReviewBackend::Gemini,
     },
     ModelPoolEntry {
-        model: "gemini-3-pro-preview",
+        model: "gemini-3.1-pro-preview",
         backend: ReviewBackend::Gemini,
     },
     ModelPoolEntry {
@@ -37,7 +37,7 @@ pub const MODEL_POOL: [ModelPoolEntry; 4] = [
     },
 ];
 
-pub const GEMINI_ALLOWED_MODELS: [&str; 2] = ["gemini-3-flash-preview", "gemini-3-pro-preview"];
+pub const GEMINI_ALLOWED_MODELS: [&str; 2] = ["gemini-3-flash-preview", "gemini-3.1-pro-preview"];
 
 // ── Selection ───────────────────────────────────────────────────────────────
 
@@ -265,8 +265,8 @@ mod tests {
             "gemini-3-flash-preview"
         );
         assert_eq!(
-            normalize_gemini_model("GEMINI-3-PRO-PREVIEW"),
-            "gemini-3-pro-preview"
+            normalize_gemini_model("GEMINI-3.1-PRO-PREVIEW"),
+            "gemini-3.1-pro-preview"
         );
     }
 
@@ -278,6 +278,6 @@ mod tests {
         );
         assert!(!is_allowed_gemini_model("gemini-2.5-pro"));
         assert!(is_allowed_gemini_model("gemini-3-flash-preview"));
-        assert!(is_allowed_gemini_model("gemini-3-pro-preview"));
+        assert!(is_allowed_gemini_model("gemini-3.1-pro-preview"));
     }
 }

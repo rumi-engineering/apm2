@@ -1,0 +1,109 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00669"
+    title: "FAC execution queue: migrate toward ledger-backed job lifecycle; treat filesystem queue as witnessed cache and add rehydration reconciler"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0032"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_QUEUE", "DOMAIN_KERNEL", "DOMAIN_DAEMON", "DOMAIN_RUNTIME"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00656"
+        reason: "Immediate lane-lease identity fixes reduce risk during migration; this ticket builds the longer-term substrate alignment."
+
+root_cause_analysis:
+  summary: |
+    The current FAC queue uses filesystem directories (pending/claimed/running/done)
+    as the primary state store. This creates inherent brittleness:
+      - claimed-but-unpicked jobs when workers crash (directory state becomes stuck),
+      - PID-based ownership drift,
+      - difficulty auditing, replaying, or distributing queue state,
+      - multiple sources of truth (filesystem vs daemon ledger vs pulses).
+
+    The long-term direction (100B agents) requires the queue lifecycle to be an
+    event-sourced projection over the canonical substrate:
+      - ledger events define job lifecycle and authority,
+      - filesystem representations are derived caches for local execution backends.
+
+scope:
+  in_scope:
+    - id: "QL-001"
+      title: "Define ledger event vocabulary for FAC job lifecycle (enqueue/claim/start/finish/release)"
+      detail: |
+        Introduce canonical event types (names illustrative; align with existing event naming conventions):
+          - fac.job.enqueued { job_id, work_id, changeset_digest, lane_id?, spec_digest }
+          - fac.job.claimed { job_id, lease_id, actor_id, claim_epoch }
+          - fac.job.started { job_id, worker_instance_id, start_receipt }
+          - fac.job.completed { job_id, outcome, receipts[], artifact_digests[] }
+          - fac.job.released { job_id, reason, previous_lease_id }
+          - fac.job.failed { job_id, reason_class, retryable }
+
+        Requirements:
+          - job_id must be stable and content-addressable (digest of work_id + changeset_digest + gate/profile + revision).
+          - events must be idempotent and safe under replay; use intent->receipt patterns for irreversible actions.
+
+    - id: "QL-002"
+      title: "Implement a JobLifecycleProjectionV1 and a filesystem rehydration reconciler"
+      detail: |
+        Implement a projection that derives the current queue state from ledger events.
+        Add a reconciler that:
+          - reads projection deltas since cursor
+          - ensures filesystem queue directories reflect the projection (create pending files, release stale claims, etc.)
+          - treats filesystem as a witnessed cache: deletable and rebuildable
+
+        The reconciler MUST be bounded:
+          - fixed max events processed per tick
+          - fixed max filesystem ops per tick
+          - maintains cursor/checkpoint
+
+    - id: "QL-003"
+      title: "Dual-write migration path (temporary): emit ledger events alongside existing filesystem mutations"
+      detail: |
+        During cutover:
+          - whenever queue code mutates filesystem state, also emit the corresponding ledger event.
+          - worker pickup path should prefer the ledger projection when available, but may fall back to filesystem for compatibility.
+
+        Provide a config flag to enable/disable dual-write, defaulting to off until tested.
+
+    - id: "QL-004"
+      title: "Verification: crash recovery and divergence healing"
+      detail: |
+        Add tests / harnesses that simulate:
+          - crash after filesystem mutate but before ledger append (divergence)
+          - crash after ledger append but before filesystem mutate
+          - restart reconciler heals divergence into the projection-defined truth (fail-closed for ambiguous authority)
+
+        The correctness rule: ledger projection wins; filesystem is repaired to match.
+
+  out_of_scope:
+    - Full deletion of filesystem queue implementation (future phase).
+    - Distributed queue scheduling beyond a single node (future; BFT-backed ledger backend becomes relevant then).
+
+plan:
+  steps:
+    - Define event types + schemas; add bounded decode/encode.
+    - Implement projection reducer and storage.
+    - Implement reconciler loop + cursor/checkpoint.
+    - Add dual-write hooks in existing queue mutation sites.
+    - Add crash/divergence tests.
+
+definition_of_done:
+  criteria:
+    - "A daemon-side projection can describe the job lifecycle from ledger events."
+    - "A reconciler can (re)create filesystem queue state from projection (witnessed cache)."
+    - "Crash/divergence tests demonstrate that restart converges to ledger-defined truth."
+    - "Dual-write flag exists and is off by default."
+
+risks:
+  - id: "R-QL-01"
+    title: "Large refactor touches hot-path queue logic"
+    mitigation: |
+      Keep migration staged (dual-write behind flag). Use extensive tests + staged rollout in CI.
+      Do not remove existing queue behavior until projection has parity evidence.

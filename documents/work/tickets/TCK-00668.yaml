@@ -1,0 +1,108 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00668"
+    title: "FAC review artifacts: publish findings/verdict as WorkContextEntry (CAS-backed) and make GitHub publication idempotent + ledger-receipted; retire local findings_store as truth"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0032"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER"]
+    responsibility_domains: ["DOMAIN_CLI", "DOMAIN_DAEMON", "DOMAIN_EVIDENCE", "DOMAIN_PROTOCOL"]
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00638"
+        reason: "PublishWorkContextEntry is the canonical CAS-backed vehicle for findings/verdict."
+      - ticket_id: "TCK-00649"
+        reason: "Defines REVIEW_FINDING/REVIEW_VERDICT context entry kinds and storage expectations."
+      - ticket_id: "TCK-00666"
+        reason: "Daemon projection should index these entries for query/doctor output."
+
+root_cause_analysis:
+  summary: |
+    fac_review maintains findings in a local findings_store directory and duplicates
+    them into GitHub comments using marker conventions. This leads to:
+      - missing/duplicated comments when restarts occur,
+      - inability to reconstruct review evidence without access to the operator machine,
+      - brittle parsing and drift between "what happened" and "what GitHub shows".
+
+    RFC-0032 introduces WorkContextEntry as the kernel-native artifact carrier:
+      - CAS-backed, hash-addressed, replayable.
+      - Indexable by daemon projections.
+      - Suitable for BFT-ready audit and automated implementer orchestration.
+
+scope:
+  in_scope:
+    - id: "FND-001"
+      title: "Represent each review finding as a WorkContextEntry (REVIEW_FINDING) stored in CAS"
+      detail: |
+        For each finding, publish a WorkContextEntry whose CAS payload includes:
+          - finding_id (stable across retries; derived from digest of content)
+          - severity / category
+          - human-readable text
+          - optional machine-readable fields (file/line anchors)
+          - provenance: reviewer role, model/backend, run/session ids, head_sha/changeset_digest
+
+        The WorkContextEntry must be bounded (string length caps; max findings per run).
+        Local findings_store may remain as a derived cache for UX, but must be rebuildable from context entries.
+
+    - id: "FND-002"
+      title: "Represent review verdict as a WorkContextEntry (REVIEW_VERDICT) stored in CAS"
+      detail: |
+        Publish a single verdict entry per (work_id, review_kind, head_sha) with:
+          - verdict (pass/fail/blocked)
+          - summary
+          - receipt_id linkage (if a review receipt exists)
+          - pointer(s) to finding_ids or CAS hashes (bounded)
+
+        This verdict entry becomes the canonical artifact the implementer loop consumes.
+
+    - id: "FND-003"
+      title: "Make GitHub publication idempotent and ledger-receipted"
+      detail: |
+        Any GitHub mutation (posting findings, updating PR body gate status, setting verdict)
+        MUST follow intent->execute->receipt:
+
+          - Intent: ledger event keyed by idempotency_key = hash(work_id + head_sha + review_kind + finding_id/verdict_rev)
+          - Execute: perform gh CLI/API call only if no receipt exists
+          - Receipt: ledger event recording GitHub comment IDs / PR body revision pointers
+
+        This eliminates duplicated comments on retries and makes GitHub a derived surface, not truth.
+
+    - id: "FND-004"
+      title: "Deprecate findings_store as canonical truth"
+      detail: |
+        Remove any logic that treats local findings_store as authoritative when deciding
+        whether to re-post or to consider a review 'complete'. The daemon projections and
+        context entries become canonical.
+
+  out_of_scope:
+    - Full removal of GitHub marker conventions (may remain as rendering format).
+    - Changes to non-review gates.
+
+plan:
+  steps:
+    - Add WorkContextEntry payload schemas for REVIEW_FINDING and REVIEW_VERDICT (if not already present post-00649).
+    - Implement publishing path in reviewer completion flow (daemon or CLI wrapper).
+    - Implement idempotent GitHub publication with ledger receipts.
+    - Update CLI/doctor to read from daemon projection and render findings/verdict.
+    - Add tests for:
+        * duplicate publish attempts do not create duplicate GitHub comments
+        * context entries are stored and replayable
+
+definition_of_done:
+  criteria:
+    - "Findings and verdict are present as WorkContextEntries (CAS-backed) and indexed by daemon projections."
+    - "GitHub publications are idempotent and receipt-backed in the ledger."
+    - "Local findings_store is no longer a source of truth for completion decisions."
+    - "Tests cover duplicate publish idempotency."
+
+risks:
+  - id: "R-FND-01"
+    title: "Large finding payloads cause unbounded CAS writes or ledger indexing blowup"
+    mitigation: |
+      Enforce strict bounds (max findings per run; max string sizes) and store large attachments separately in CAS blobs referenced by digest.

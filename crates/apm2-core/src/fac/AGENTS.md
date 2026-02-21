@@ -791,6 +791,22 @@ marker persistence.
 - `LaneManager::lane_status()` exposes canonical `started_at` when parseable so
   status/CLI surfaces do not leak legacy epoch-seconds format.
 
+### Lease Process Identity Contract (TCK-00658)
+
+- `LaneLeaseV1` persists optional `proc_start_time_ticks` (Linux
+  `/proc/<pid>/stat` field 22) to bind lease ownership to process identity,
+  not PID existence alone.
+- `read_proc_start_time_ticks(pid)` performs bounded procfs reads
+  (`MAX_PROC_STAT_FILE_SIZE`) and parses starttime with `comm`-aware
+  tokenization.
+- `verify_pid_identity(pid, expected_start_ticks)` classifies ownership as:
+  `AliveMatch`, `AliveMismatch` (PID reuse), `Dead`, or `Unknown`.
+- `LaneManager::lane_status()` and `derive_lane_state()` treat
+  `AliveMismatch` as stale/non-owner (equivalent to dead for recovery), and
+  treat `Unknown` as fail-closed (CORRUPT for lock-free active leases).
+- Legacy leases missing `proc_start_time_ticks` remain loadable; identity is
+  `Unknown` unless the process is already dead.
+
 ### Lane CORRUPT Persistence and Refusal Semantics (TCK-00570)
 
 - `LaneCorruptMarkerV1`: Persistent marker at
@@ -942,10 +958,12 @@ integrity from infrastructure lifecycle management.
 `xdg_config/` via `safe_rmtree_v1`; `tmp/` is already handled by step 3),
 (4) `log_quota`.
 
-**Process liveness**: Stale lease detection uses `libc::kill(pid, 0)` with
-errno discrimination: ESRCH = dead (safe to recover), EPERM = alive but
-unpermissioned (mark corrupt), success = alive (mark corrupt if flock held
-by another worker).
+**Process identity**: Stale lease detection uses
+`verify_pid_identity(pid, proc_start_time_ticks)`:
+- `AliveMatch` = lease owner still alive.
+- `AliveMismatch` = PID reused; treat as stale lease owner loss.
+- `Dead` = safe stale recovery path.
+- `Unknown` = fail-closed ambiguity (mark/keep CORRUPT where required).
 
 ### Security Invariants (TCK-00569)
 
@@ -2726,13 +2744,13 @@ inconsistencies deterministically on worker startup.
   also fails, a combined error is returned that includes both the phase
   failure context and the persistence failure context, so apply-mode mutations
   never lack durable receipt evidence.
-- [INV-RECON-002] Stale lease detection is fail-closed: ambiguous PID state
-  (EPERM) marks lane CORRUPT (not recovered). Corrupt marker persistence
-  failure is a hard error in apply mode — ambiguous states must not proceed
-  without durable corruption evidence, because subsequent startups would not
-  see the lane as corrupt and could attempt unsafe recovery. Corrupt lanes
-  with alive PIDs contribute their job_id to the active_job_ids set, preventing
-  queue reconciliation from treating those jobs as orphans.
+- [INV-RECON-002] Stale lease detection uses PID identity classification:
+  `AliveMismatch` (PID reuse) is recoverable stale lease state (not CORRUPT),
+  `Dead` is recoverable stale state, and `Unknown` remains fail-closed CORRUPT.
+  Corrupt marker persistence failure is a hard error in apply mode — ambiguous
+  states must not proceed without durable corruption evidence. Queue phase
+  active job tracking includes only lanes with `AliveMatch` identity, preventing
+  false positives from PID-exists-only checks.
 - [INV-RECON-003] All in-memory collections are bounded by hard `MAX_*`
   constants (`MAX_LANE_RECOVERY_ACTIONS=64`,
   `MAX_QUEUE_RECOVERY_ACTIONS=4096`). Receipt deserialization enforces
