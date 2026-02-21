@@ -492,82 +492,22 @@ pub fn run_fac_worker(
         return exit_codes::GENERIC_ERROR;
     }
 
-    // TCK-00577 round 3+5: Validate that queue and receipt directories are
-    // owned by the configured FAC service user (not just the caller EUID).
-    // This wires the service-user ownership validator into the command
-    // execution path.
-    //
-    // Behavior (round 5 MAJOR fix — all errors are now fail-closed):
-    // - ServiceUserNotResolved: fail-closed. If the configured service user cannot
-    //   be resolved in passwd/NSS, this may indicate a mistyped service-user value
-    //   or corrupted NSS database. Ownership validation cannot be completed, so the
-    //   worker MUST NOT start.
-    // - OwnershipMismatch: the service user EXISTS but the directory is owned by
-    //   someone else. This is a hard failure (fail-closed).
-    // - Other errors (metadata, env, etc.): fail-closed.
+    let ownership_backend = match apm2_core::fac::select_backend() {
+        Ok(backend) => backend,
+        Err(e) => {
+            output_worker_error(
+                json_output,
+                &format!("cannot resolve execution backend for ownership checks: {e}"),
+            );
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    if let Err(msg) =
+        validate_worker_service_user_ownership(&fac_root, &queue_root, ownership_backend)
     {
-        use apm2_core::fac::service_user_gate::{
-            ServiceUserGateError, validate_directory_service_user_ownership,
-        };
-
-        // Directories that MUST be owned by the service user in production.
-        // Note: BROKER_REQUESTS_DIR is intentionally excluded — it uses
-        // mode 01733 (world-writable with sticky) so that non-service-user
-        // callers can submit broker requests.
-        let service_user_dirs = [
-            queue_root.join(PENDING_DIR),
-            queue_root.join("claimed"),
-            queue_root.join("completed"),
-            queue_root.join("denied"),
-            queue_root.join("cancelled"),
-            queue_root.join(QUARANTINE_DIR),
-            queue_root.join(CONSUME_RECEIPTS_DIR),
-        ];
-        // Also validate the receipt store if it exists.
-        let receipt_dir = fac_root.join("receipts");
-
-        for dir in service_user_dirs
-            .iter()
-            .chain(std::iter::once(&receipt_dir))
-        {
-            if !dir.exists() {
-                continue;
-            }
-            match validate_directory_service_user_ownership(dir) {
-                Ok(()) => {},
-                Err(ServiceUserGateError::ServiceUserNotResolved {
-                    ref service_user,
-                    ref reason,
-                    ..
-                }) => {
-                    // TCK-00577 round 5 MAJOR fix: ServiceUserNotResolved is
-                    // now a hard failure. If the service user cannot be
-                    // resolved, ownership cannot be validated — fail-closed.
-                    output_worker_error(
-                        json_output,
-                        &format!(
-                            "service user '{service_user}' not resolvable: {reason} \
-                             (fail-closed: worker will not start when service user \
-                              identity cannot be confirmed)",
-                        ),
-                    );
-                    return exit_codes::GENERIC_ERROR;
-                },
-                Err(e) => {
-                    // OwnershipMismatch or other hard errors: fail-closed.
-                    output_worker_error(
-                        json_output,
-                        &format!(
-                            "service user ownership check failed for {}: {e} \
-                             (fail-closed: worker will not start with incorrect \
-                              directory ownership)",
-                            dir.display()
-                        ),
-                    );
-                    return exit_codes::GENERIC_ERROR;
-                },
-            }
-        }
+        output_worker_error(json_output, &msg);
+        return exit_codes::GENERIC_ERROR;
     }
 
     // Load persistent signing key for stable broker identity and receipts across
@@ -7907,6 +7847,72 @@ fn consume_authority(queue_root: &Path, job_id: &str, spec_digest: &str) -> Resu
     Ok(())
 }
 
+fn validate_worker_service_user_ownership(
+    fac_root: &Path,
+    queue_root: &Path,
+    backend: ExecutionBackend,
+) -> Result<(), String> {
+    use apm2_core::fac::service_user_gate::{
+        ServiceUserGateError, validate_directory_service_user_ownership,
+    };
+
+    if backend == ExecutionBackend::UserMode {
+        tracing::info!(
+            backend = %backend,
+            "TCK-00657: user-mode backend selected — skipping service-user ownership checks"
+        );
+        return Ok(());
+    }
+
+    // Directories that MUST be owned by the service user in production.
+    // Note: BROKER_REQUESTS_DIR is intentionally excluded — it uses
+    // mode 01733 (world-writable with sticky) so that non-service-user
+    // callers can submit broker requests.
+    let service_user_dirs = [
+        queue_root.join(PENDING_DIR),
+        queue_root.join(CLAIMED_DIR),
+        queue_root.join(COMPLETED_DIR),
+        queue_root.join(DENIED_DIR),
+        queue_root.join(CANCELLED_DIR),
+        queue_root.join(QUARANTINE_DIR),
+        queue_root.join(CONSUME_RECEIPTS_DIR),
+    ];
+    // Also validate the receipt store if it exists.
+    let receipt_dir = fac_root.join(FAC_RECEIPTS_DIR);
+
+    for dir in service_user_dirs
+        .iter()
+        .chain(std::iter::once(&receipt_dir))
+    {
+        if !dir.exists() {
+            continue;
+        }
+        match validate_directory_service_user_ownership(dir) {
+            Ok(()) => {},
+            Err(ServiceUserGateError::ServiceUserNotResolved {
+                ref service_user,
+                ref reason,
+                ..
+            }) => {
+                return Err(format!(
+                    "service user '{service_user}' not resolvable: {reason} \
+                     (fail-closed: worker will not start when service user \
+                      identity cannot be confirmed)",
+                ));
+            },
+            Err(e) => {
+                return Err(format!(
+                    "service user ownership check failed for {}: {e} \
+                     (fail-closed: worker will not start with incorrect \
+                      directory ownership)",
+                    dir.display()
+                ));
+            },
+        }
+    }
+    Ok(())
+}
+
 /// Reads a file with bounded I/O (INV-WRK-001).
 ///
 /// Returns an error if the file is larger than `max_size` or cannot be read.
@@ -12246,6 +12252,71 @@ mod tests {
         } else {
             panic!("expected ServiceUserNotResolved variant");
         }
+    }
+
+    #[test]
+    fn worker_service_user_ownership_bypasses_checks_in_user_mode() {
+        let _guard = env_var_test_lock().lock().expect("serialize env test");
+        let original_service_user = std::env::var_os("APM2_FAC_SERVICE_USER");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("fac");
+        let queue_root = dir.path().join("queue");
+        fs::create_dir_all(queue_root.join(PENDING_DIR)).expect("create pending dir");
+        fs::create_dir_all(fac_root.join(FAC_RECEIPTS_DIR)).expect("create receipts dir");
+
+        set_env_var_for_test("APM2_FAC_SERVICE_USER", "_apm2_nonexistent_tck_00657");
+        let result = validate_worker_service_user_ownership(
+            &fac_root,
+            &queue_root,
+            ExecutionBackend::UserMode,
+        );
+
+        if let Some(value) = original_service_user {
+            set_env_var_for_test("APM2_FAC_SERVICE_USER", value);
+        } else {
+            remove_env_var_for_test("APM2_FAC_SERVICE_USER");
+        }
+
+        assert!(
+            result.is_ok(),
+            "user-mode must bypass service-user ownership checks: {result:?}"
+        );
+    }
+
+    #[test]
+    fn worker_service_user_ownership_fails_closed_in_system_mode_when_unresolvable() {
+        let _guard = env_var_test_lock().lock().expect("serialize env test");
+        let original_service_user = std::env::var_os("APM2_FAC_SERVICE_USER");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("fac");
+        let queue_root = dir.path().join("queue");
+        fs::create_dir_all(queue_root.join(PENDING_DIR)).expect("create pending dir");
+        fs::create_dir_all(fac_root.join(FAC_RECEIPTS_DIR)).expect("create receipts dir");
+
+        set_env_var_for_test("APM2_FAC_SERVICE_USER", "_apm2_nonexistent_tck_00657");
+        let result = validate_worker_service_user_ownership(
+            &fac_root,
+            &queue_root,
+            ExecutionBackend::SystemMode,
+        );
+
+        if let Some(value) = original_service_user {
+            set_env_var_for_test("APM2_FAC_SERVICE_USER", value);
+        } else {
+            remove_env_var_for_test("APM2_FAC_SERVICE_USER");
+        }
+
+        let err = result.expect_err("system-mode must fail when service user cannot be resolved");
+        assert!(
+            err.contains("not resolvable"),
+            "expected fail-closed unresolvable-user error, got: {err}"
+        );
+        assert!(
+            err.contains("fail-closed"),
+            "error must communicate fail-closed behavior: {err}"
+        );
     }
 
     /// TCK-00577 round 11 BLOCKER regression: Queue subdirs must have
