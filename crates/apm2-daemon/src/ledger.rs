@@ -625,6 +625,81 @@ impl SqliteLedgerEventEmitter {
              WHERE event_type = 'changeset_published'",
             [],
         )?;
+        // SECURITY (TCK-00635 — OpenWork Idempotency Constraint):
+        //
+        // Enforce at-most-once semantics for `work.opened` events at the
+        // database level. The `handle_open_work` handler uses a
+        // check-then-act pattern: `get_first_event_by_work_id_and_type`
+        // queries for an existing `work.opened` event before emitting.
+        // Under concurrent dispatch (`&self`, not `&mut self`), two racing
+        // requests can both observe no existing event and both commit,
+        // creating duplicate `work.opened` events for the same `work_id`.
+        //
+        // This partial unique index converts the pattern into
+        // defense-in-depth: the application-level check provides the
+        // idempotent fast-path, while the database constraint provides
+        // the authoritative uniqueness guarantee that cannot be bypassed
+        // by race conditions. The handler catches UNIQUE violations and
+        // re-reads the persisted event to return idempotent success (same
+        // hash) or WORK_ALREADY_EXISTS (different hash).
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_opened_unique \
+             ON ledger_events(work_id) \
+             WHERE event_type = 'work.opened'",
+            [],
+        )?;
+
+        // SECURITY (f-781-security-1771692992655093-0 — Canonical Events
+        // Uniqueness Constraint):
+        //
+        // The `idx_work_opened_unique` index above only protects the legacy
+        // `ledger_events` table. When the freeze guard routes writes to the
+        // canonical `events` table (`persist_to_canonical_events`), duplicate
+        // `work.opened` events could be inserted without constraint
+        // enforcement. This canonical-side index provides the same
+        // defense-in-depth guarantee on the `events` table.
+        //
+        // Guard: only apply when the canonical `events` table exists
+        // (it may not in legacy-only daemon databases that haven't yet
+        // run RFC-0032 Phase 0 migration).
+        //
+        // Historical duplicate handling: before creating the unique index,
+        // deduplicate any pre-existing `work.opened` rows in the canonical
+        // `events` table by keeping only the earliest row (MIN(rowid)) per
+        // `session_id` (which maps to `work_id`).
+        let canonical_events_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if canonical_events_exists {
+            let canonical_work_opened_dedup = conn.execute(
+                "DELETE FROM events WHERE rowid NOT IN ( \
+                     SELECT MIN(rowid) FROM events \
+                     WHERE event_type = 'work.opened' \
+                     GROUP BY session_id \
+                 ) AND event_type = 'work.opened'",
+                [],
+            )?;
+            if canonical_work_opened_dedup > 0 {
+                warn!(
+                    count = canonical_work_opened_dedup,
+                    "deduped historical work.opened rows in canonical events table"
+                );
+                migration_changes_applied = true;
+            }
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_work_opened_unique \
+                 ON events(session_id) \
+                 WHERE event_type = 'work.opened'",
+                [],
+            )?;
+        }
+
         if migration_changes_applied {
             warn!(
                 "ledger startup migrations mutated rows; rebuilding hash-chain links and invalidating stored checkpoint metadata before full verification"
@@ -2357,6 +2432,59 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         }
 
         events
+    }
+
+    fn get_first_event_by_work_id_and_type(
+        &self,
+        work_id: &str,
+        event_type: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let Ok(conn) = self.conn.lock() else {
+            return None;
+        };
+
+        // Legacy table: bounded LIMIT 1 query (O(1) with index).
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+             FROM ledger_events WHERE work_id = ?1 AND event_type = ?2
+             ORDER BY timestamp_ns ASC, rowid ASC LIMIT 1",
+        ) {
+            if let Ok(mut rows) = stmt.query_map(params![work_id, event_type], |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            }) {
+                if let Some(Ok(event)) = rows.next() {
+                    return Some(event);
+                }
+            }
+        }
+
+        // TCK-00631 / Finding 1: check canonical events table when frozen.
+        if self.is_frozen_internal() {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                        COALESCE(signature, X''), timestamp_ns \
+                 FROM events WHERE session_id = ?1 AND event_type = ?2 \
+                 ORDER BY timestamp_ns ASC, rowid ASC LIMIT 1",
+            ) {
+                if let Ok(mut rows) =
+                    stmt.query_map(params![work_id, event_type], Self::canonical_row_to_event)
+                {
+                    if let Some(Ok(event)) = rows.next() {
+                        return Some(event);
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     fn get_all_events(&self) -> Vec<SignedLedgerEvent> {
@@ -7390,6 +7518,151 @@ mod tests {
         assert_eq!(
             legacy_after, 0,
             "ledger_events must remain empty after frozen write"
+        );
+    }
+
+    /// SECURITY (f-781-security-1771692992655093-0): Verify that the
+    /// `idx_canonical_work_opened_unique` index on the canonical `events`
+    /// table enforces at-most-one `work.opened` per `work_id` (mapped to
+    /// `session_id`) when the emitter is frozen. Concurrent threads
+    /// attempting to emit `work.opened` for the same `work_id` must
+    /// produce exactly one persisted row; the duplicate must receive a
+    /// UNIQUE constraint violation error.
+    #[test]
+    fn tck_00635_frozen_concurrent_work_opened_unique_constraint() {
+        use std::sync::Arc;
+
+        use apm2_core::ledger::{init_canonical_schema, migrate_legacy_ledger_events};
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+
+        // 1. Set up legacy schema with one seed row.
+        conn.execute(
+            "CREATE TABLE ledger_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                work_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                signature BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, \
+             payload, signature, timestamp_ns) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "evt-seed-1",
+                "test.event",
+                "work-seed",
+                "actor-1",
+                b"{\"n\":1}",
+                b"sig",
+                1_000_000_000_u64,
+            ],
+        )
+        .unwrap();
+
+        // 2. Initialize canonical schema and migrate.
+        init_canonical_schema(&conn).unwrap();
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 1);
+
+        // 3. Verify idx_canonical_work_opened_unique exists on events.
+        let has_idx: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_canonical_work_opened_unique'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            has_idx,
+            "idx_canonical_work_opened_unique must exist on canonical events table"
+        );
+
+        // 4. Construct emitter, initialize legacy schema, and freeze.
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let conn_arc = Arc::new(Mutex::new(conn));
+        let emitter = Arc::new(SqliteLedgerEventEmitter::new(
+            Arc::clone(&conn_arc),
+            signing_key,
+        ));
+
+        let conn_guard = conn_arc.lock().unwrap();
+        emitter.freeze_legacy_writes(&conn_guard).unwrap();
+        drop(conn_guard);
+
+        assert!(
+            emitter.is_frozen(),
+            "emitter must be frozen for canonical writes"
+        );
+
+        // 5. Concurrently emit work.opened for the same work_id from 4 threads. Exactly
+        //    1 must succeed; the rest must fail with UNIQUE constraint violations.
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+
+        for i in 0..4_u64 {
+            let e = Arc::clone(&emitter);
+            let bar = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                bar.wait();
+                let payload = format!("{{\"event_type\":\"work.opened\",\"n\":{i}}}");
+                e.emit_session_event(
+                    "W-race-frozen-001",
+                    "work.opened",
+                    payload.as_bytes(),
+                    &format!("actor-{i}"),
+                    2_000_000_000 + i,
+                )
+            }));
+        }
+
+        let mut success_count = 0_u32;
+        let mut unique_violation_count = 0_u32;
+        for handle in handles {
+            match handle.join().expect("thread panicked") {
+                Ok(_) => success_count += 1,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("UNIQUE constraint"),
+                        "Non-success emit must be UNIQUE constraint violation, got: {msg}"
+                    );
+                    unique_violation_count += 1;
+                },
+            }
+        }
+
+        assert_eq!(
+            success_count, 1,
+            "Exactly one thread must successfully emit work.opened (got {success_count})"
+        );
+        assert_eq!(
+            unique_violation_count, 3,
+            "Remaining threads must fail with UNIQUE constraint (got {unique_violation_count})"
+        );
+
+        // 6. Verify exactly 1 work.opened row in canonical events.
+        let conn_guard = conn_arc.lock().unwrap();
+        let work_opened_count: i64 = conn_guard
+            .query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE event_type = 'work.opened' AND session_id = 'W-race-frozen-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            work_opened_count, 1,
+            "Exactly one work.opened must exist in canonical events for W-race-frozen-001"
         );
     }
 }

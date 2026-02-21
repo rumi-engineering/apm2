@@ -107,6 +107,7 @@ pub fn annotate_route(route: &str) -> Option<HsiRouteSemantics> {
         // Core state-mutating operations with world effects.
         // =================================================================
         "hsi.work.claim"
+        | "hsi.work.open"
         | "hsi.episode.spawn"
         | "hsi.capability.issue"
         | "hsi.process.start"
@@ -183,6 +184,7 @@ mod tests {
         // Verify a representative sample of routes have annotations
         let known_routes = [
             "hsi.work.claim",
+            "hsi.work.open",
             "hsi.episode.spawn",
             "hsi.capability.issue",
             "hsi.daemon.shutdown",
@@ -219,6 +221,7 @@ mod tests {
         // require receipts.
         let all_routes = [
             "hsi.work.claim",
+            "hsi.work.open",
             "hsi.episode.spawn",
             "hsi.capability.issue",
             "hsi.process.start",
@@ -330,6 +333,7 @@ mod tests {
         let side_effectful_routes = [
             // Core state-mutating operations
             "hsi.work.claim",
+            "hsi.work.open",
             "hsi.episode.spawn",
             "hsi.capability.issue",
             "hsi.process.start",

@@ -305,6 +305,7 @@ PRAGMA foreign_keys = ON;
 - `events` table: append-only event storage
 - `artifact_refs` table: CAS references with foreign key to events
 - Indexes on session_id, timestamp, event_type, actor_id
+- TCK-00635: `idx_canonical_work_opened_unique ON events(session_id) WHERE event_type = 'work.opened'` enforces at-most-one `work.opened` per work_id in canonical mode
 
 ## Examples
 

@@ -419,6 +419,9 @@ impl_bounded_decode_simple!(
     RegisterRecoveryEvidenceResponse,
     RequestUnfreezeRequest,
     RequestUnfreezeResponse,
+    // TCK-00635: OpenWork (RFC-0032 Phase 1)
+    OpenWorkRequest,
+    OpenWorkResponse,
 );
 
 // Implement BoundedDecode for messages with repeated fields

@@ -289,6 +289,14 @@ impl WorkSpecV1 {
         if self.work_id.is_empty() {
             return Err(WorkCasSchemaError::MissingField("work_id"));
         }
+        // Enforce canonical work_id prefix for consistency with the work
+        // lifecycle namespace convention (W-<identifier>).
+        if !self.work_id.starts_with("W-") {
+            return Err(WorkCasSchemaError::InvalidValue {
+                field: "work_id",
+                value: self.work_id.clone(),
+            });
+        }
         validate_field_length("work_id", &self.work_id, MAX_WORK_ID_LENGTH)?;
         validate_field_length("title", &self.title, MAX_MEDIUM_STRING_LENGTH)?;
         // work_type is validated at decode time via WorkSpecType enum — no
@@ -1003,6 +1011,28 @@ mod tests {
         assert!(
             matches!(result, Err(WorkCasSchemaError::MissingField("work_id"))),
             "empty work_id should be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn tck_00635_work_spec_rejects_work_id_without_w_prefix() {
+        let data = serde_json::to_vec(&serde_json::json!({
+            "schema": WORK_SPEC_V1_SCHEMA,
+            "work_id": "bad-work-id-001",
+            "title": "Test",
+            "work_type": "TICKET"
+        }))
+        .expect("valid json");
+        let result = bounded_decode_work_spec(&data);
+        assert!(
+            matches!(
+                result,
+                Err(WorkCasSchemaError::InvalidValue {
+                    field: "work_id",
+                    ..
+                })
+            ),
+            "work_id without 'W-' prefix should be rejected, got: {result:?}"
         );
     }
 

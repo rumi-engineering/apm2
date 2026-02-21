@@ -62,7 +62,8 @@ pub const MANIFEST_FULL_VECTOR: GoldenVector = GoldenVector {
     // advisory to authoritative with receipt_required per RFC-0020 section 1.3
     // (they perform real side effects). SubscribePulse and UnsubscribePulse
     // added to SessionMessageType::all_request_variants() (deduplicated).
-    expected_hash: "a7a8ffa941c507ace06c73d5ce27ef39a9e267390c0c820c16466aa3b2ac41a7",
+    // TCK-00635: OpenWork (hsi.work.open) added as authoritative+idempotent+receipt.
+    expected_hash: "fd6e4c7ecd4652083f631c111173076c59c1cc8a84595bc4317d7135ebd08db1",
 };
 
 /// Golden vector: minimal manifest with a single route.

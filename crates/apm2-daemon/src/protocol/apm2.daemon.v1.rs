@@ -1815,6 +1815,33 @@ pub struct RequestUnfreezeResponse {
     #[prost(string, tag = "3")]
     pub message: ::prost::alloc::string::String,
 }
+/// IPC-PRIV-076: OpenWork (RFC-0032, TCK-00635)
+/// Opens a new work item by persisting a validated WorkSpec to CAS
+/// and emitting a canonical work.opened event. Actor ID is derived
+/// from peer credentials (never from client input).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenWorkRequest {
+    /// Canonical JSON-encoded WorkSpec (schema: apm2.work_spec.v1).
+    /// Must pass bounded decode + schema validation before acceptance.
+    #[prost(bytes = "vec", tag = "1")]
+    pub work_spec_json: ::prost::alloc::vec::Vec<u8>,
+    /// Governing lease ID for PCAC lifecycle enforcement.
+    /// Required when PCAC lifecycle gate is wired (fail-closed if empty).
+    #[prost(string, tag = "2")]
+    pub lease_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenWorkResponse {
+    /// Assigned canonical work identifier (W-{uuid} or from WorkSpec).
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// BLAKE3 hash of the canonical WorkSpec stored in CAS (32 bytes).
+    #[prost(bytes = "vec", tag = "2")]
+    pub spec_snapshot_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Whether this was an idempotent no-op (work already existed with same hash).
+    #[prost(bool, tag = "3")]
+    pub already_existed: bool,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StopReason {
@@ -2343,6 +2370,8 @@ pub enum PrivilegedErrorCode {
     CredentialInvalidConfig = 18,
     /// Invalid argument in request (generic validation failure).
     InvalidArgument = 19,
+    /// Work item already exists with a different spec hash (TCK-00635).
+    WorkAlreadyExists = 20,
 }
 impl PrivilegedErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2367,6 +2396,7 @@ impl PrivilegedErrorCode {
             Self::CredentialRefreshNotSupported => "CREDENTIAL_REFRESH_NOT_SUPPORTED",
             Self::CredentialInvalidConfig => "CREDENTIAL_INVALID_CONFIG",
             Self::InvalidArgument => "INVALID_ARGUMENT",
+            Self::WorkAlreadyExists => "WORK_ALREADY_EXISTS",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2390,6 +2420,7 @@ impl PrivilegedErrorCode {
             }
             "CREDENTIAL_INVALID_CONFIG" => Some(Self::CredentialInvalidConfig),
             "INVALID_ARGUMENT" => Some(Self::InvalidArgument),
+            "WORK_ALREADY_EXISTS" => Some(Self::WorkAlreadyExists),
             _ => None,
         }
     }
