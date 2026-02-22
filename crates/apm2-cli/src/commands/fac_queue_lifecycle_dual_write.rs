@@ -4,6 +4,7 @@
 //! mutation paths emit `fac.job.*` lifecycle events into a local SQLite-backed
 //! ledger stream (`queue_lifecycle_ledger.db`) in addition to filesystem
 //! mutations.
+#![allow(dead_code)] // Staged migration helper: additional emit_* paths wire in follow-up tickets.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
