@@ -3,6 +3,20 @@
 //! The kernel provides a minimal extraction-first control loop:
 //! Observe -> Plan -> Execute -> Receipt.
 //! It is intentionally narrow and reusable across daemon orchestrators.
+//!
+//! Phase contracts:
+//! - Observe: read ledger events strictly after a durable composite cursor.
+//! - Plan: derive intents deterministically from folded state.
+//! - Execute: dispatch bounded intent batches behind effect-journal fencing.
+//! - Receipt: durably persist receipt events before acknowledging completion.
+//!
+//! Safety invariants:
+//! - Cursor progression is monotonic by `(timestamp_ns, event_id)`.
+//! - Cursor advancement never happens before receipt durability for the same
+//!   observed span.
+//! - `Unknown`/in-doubt effect states require explicit resolution; ambiguity is
+//!   fail-closed.
+//! - Per-tick observe and execute work is explicitly bounded by `TickConfig`.
 
 pub mod controller_loop;
 pub mod effect_journal;

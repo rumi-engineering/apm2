@@ -12,6 +12,10 @@ use crate::orchestrator_kernel::ledger_tailer::{
 use crate::orchestrator_kernel::types::{ExecutionOutcome, TickConfig, TickReport};
 
 /// Domain contract for orchestrator runtime loops.
+///
+/// Implementations should keep `apply_events` and `plan` deterministic and free
+/// of external side effects. `execute` is the only phase that may dispatch
+/// effects and must return outcomes that preserve fail-closed semantics.
 #[allow(async_fn_in_trait)]
 pub trait OrchestratorDomain<Event, Intent, IntentKey, Receipt>: Send {
     /// Domain-specific error type.
@@ -22,12 +26,24 @@ pub trait OrchestratorDomain<Event, Intent, IntentKey, Receipt>: Send {
     fn intent_key(&self, intent: &Intent) -> IntentKey;
 
     /// Applies observed events deterministically into domain state.
+    ///
+    /// Contract: this fold must be replay-stable for identical ordered inputs.
     async fn apply_events(&mut self, events: &[Event]) -> Result<(), Self::Error>;
 
     /// Produces planned intents from current domain state.
+    ///
+    /// Contract: returned intents are treated as data and durably enqueued
+    /// before any execute call in the same tick.
     async fn plan(&mut self) -> Result<Vec<Intent>, Self::Error>;
 
     /// Executes a single intent.
+    ///
+    /// Contract:
+    /// - `Completed` means all externally-visible effects for this intent have
+    ///   finished and any receipt payload is ready for durable persistence.
+    /// - `Retry` may only be returned when no external side effect was
+    ///   dispatched.
+    /// - `Blocked` must be used for fail-closed non-retryable outcomes.
     async fn execute(&mut self, intent: &Intent) -> Result<ExecutionOutcome<Receipt>, Self::Error>;
 }
 
@@ -38,6 +54,9 @@ pub trait ReceiptWriter<Receipt>: Send + Sync {
     type Error;
 
     /// Persists receipt events durably.
+    ///
+    /// Contract: successful return indicates receipts are durable enough for
+    /// downstream replay recovery to treat them as committed.
     async fn persist_many(&self, receipts: &[Receipt]) -> Result<(), Self::Error>;
 }
 

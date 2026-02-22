@@ -8,7 +8,9 @@ ticket_meta:
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0020"
-    requirements: []
+    requirements:
+      - "REQ-0035"
+      - "REQ-0039"
     evidence_artifacts: []
   custody:
     agent_roles: ["AGENT_IMPLEMENTER"]
@@ -35,6 +37,34 @@ root_cause_analysis:
     This ticket creates a shared OrchestratorKernel harness in apm2-core so all
     orchestrators converge on one tested controller loop suitable for scaling to
     100B agents.
+
+requirements_alignment:
+  - id: "REQ-0035"
+    statement: |
+      The orchestration runtime must be budget-bound and deterministic under load:
+      bounded observe/execute work, bounded intent drain, and fail-closed handling
+      when bounded durability steps fail.
+    implementation_refs:
+      - "crates/apm2-core/src/orchestrator_kernel/controller_loop.rs (`run_tick` bounded observe/execute + durable ordering)"
+      - "crates/apm2-core/src/orchestrator_kernel/types.rs (`TickConfig` explicit per-tick bounds)"
+      - "crates/apm2-core/src/orchestrator_kernel/intent_store.rs (durable dequeue batch contract)"
+      - "crates/apm2-daemon/src/gate/timeout_kernel.rs (bounded timeout poll integration on kernel tick)"
+    verification_refs:
+      - "`run_tick_enforces_execute_limit`"
+      - "`run_tick_replay_determinism_matches_full_replay_and_checkpoint_delta`"
+      - "`run_tick_does_not_mark_done_when_receipt_persistence_fails`"
+  - id: "REQ-0039"
+    statement: |
+      Ambiguous runtime/effect states must deny progression until explicit
+      resolution; restart recovery must avoid duplicate authority effects.
+    implementation_refs:
+      - "crates/apm2-core/src/orchestrator_kernel/effect_journal.rs (`Unknown` + explicit `resolve_in_doubt` contract)"
+      - "crates/apm2-core/src/orchestrator_kernel/controller_loop.rs (Started/Unknown fail-closed routing)"
+      - "crates/apm2-daemon/src/gate/timeout_kernel.rs (terminal-receipt observation + fallback terminal checker before emitting timeout)"
+    verification_refs:
+      - "`run_tick_blocks_unknown_without_resolution`"
+      - "`run_tick_crash_replay_fail_closed_prevents_duplicate_effects`"
+      - "`execute_fallback_skips_when_ledger_already_contains_terminal_receipt`"
 
 scope:
   in_scope:
