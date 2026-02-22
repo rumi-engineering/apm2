@@ -194,7 +194,7 @@ Maps `changeset_digest` to `work_id` to PR metadata for projection routing. Also
 
 - `changeset_map`, `pr_metadata` -- projection routing tables
 - `work_context` -- work context entries projected from `evidence.published` events (TCK-00638). Primary key `(work_id, entry_id)`, unique constraint on `(work_id, kind, dedupe_key)`, indexed by `work_id` and `created_at_ns`. Included in `evict_expired` / `evict_expired_async` TTL-based eviction using `created_at_ns` (nanoseconds) with seconds-to-nanoseconds conversion (BLOCKER fix: unbounded state growth).
-- `work_active_loop_profile` -- active work loop profile per `work_id` projected from `evidence.published` events with category `WORK_LOOP_PROFILE` (TCK-00645). Primary key `work_id`, indexed by `work_id` and `anchored_at_ns`. Stores `dedupe_key` as metadata and applies latest-wins semantics by `anchored_at_ns`. Included in `evict_expired` / `evict_expired_async` TTL-based eviction using `anchored_at_ns` (nanoseconds).
+- `work_active_loop_profile` -- active work loop profile per `work_id` projected from `evidence.published` events with category `WORK_LOOP_PROFILE` (TCK-00645). Primary key `work_id`, indexed by `work_id` and `anchored_at_ns`. Stores `dedupe_key` plus canonical ledger `seq_id`; latest-wins semantics are `(anchored_at_ns DESC, seq_id DESC)` so same-timestamp events resolve deterministically to the higher sequence. Included in `evict_expired` / `evict_expired_async` TTL-based eviction using `anchored_at_ns` (nanoseconds).
 
 ### `LedgerTailer`
 
