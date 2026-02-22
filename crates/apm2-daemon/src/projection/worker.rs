@@ -1453,15 +1453,18 @@ impl WorkIndex {
             .lock()
             .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
 
-        // Latest-wins: INSERT OR REPLACE keyed on (work_id, dedupe_key).
-        // For idempotent replays, the same evidence_id + cas_hash produces
-        // an identical row, so REPLACE is safe. For genuinely newer profiles,
-        // the caller (handle_evidence_published) processes events in ledger
-        // order, so the last write wins deterministically.
+        // Monotonic latest-wins keyed on (work_id, dedupe_key): update only
+        // when the incoming anchored_at_ns is strictly newer. This prevents
+        // stale replay from rolling back already projected state.
         conn.execute(
-            "INSERT OR REPLACE INTO work_active_loop_profile
+            "INSERT INTO work_active_loop_profile
              (work_id, dedupe_key, evidence_id, cas_hash, anchored_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(work_id, dedupe_key) DO UPDATE SET
+                 evidence_id = excluded.evidence_id,
+                 cas_hash = excluded.cas_hash,
+                 anchored_at_ns = excluded.anchored_at_ns
+             WHERE excluded.anchored_at_ns > work_active_loop_profile.anchored_at_ns",
             params![
                 work_id,
                 dedupe_key,
@@ -3076,22 +3079,70 @@ impl ProjectionWorker {
             },
             "WORK_LOOP_PROFILE" => {
                 // TCK-00645: Project active work loop profile.
-                // Extract metadata fields from the evidence metadata list.
-                let mut dedupe_key = String::new();
-                let mut evidence_id = String::new();
+                // Extract and validate metadata fields from the evidence
+                // metadata list. Projection identity is derived from canonical
+                // protobuf fields, not metadata labels.
+                let mut dedupe_key: Option<String> = None;
+                let mut metadata_evidence_id: Option<String> = None;
 
                 for meta in &published.metadata {
                     if let Some(val) = meta.strip_prefix("dedupe_key=") {
-                        dedupe_key = val.to_string();
+                        if val.is_empty() {
+                            return Err(ProjectionWorkerError::InvalidPayload(
+                                "evidence.published WORK_LOOP_PROFILE dedupe_key metadata is empty"
+                                    .to_string(),
+                            ));
+                        }
+                        match dedupe_key.as_deref() {
+                            Some(existing) if existing != val => {
+                                return Err(ProjectionWorkerError::InvalidPayload(format!(
+                                    "evidence.published WORK_LOOP_PROFILE has conflicting \
+                                     dedupe_key metadata values: existing={existing:?}, new={val:?}"
+                                )));
+                            },
+                            Some(_) => {},
+                            None => dedupe_key = Some(val.to_string()),
+                        }
                     } else if let Some(val) = meta.strip_prefix("evidence_id=") {
-                        evidence_id = val.to_string();
+                        if val.is_empty() {
+                            return Err(ProjectionWorkerError::InvalidPayload(
+                                "evidence.published WORK_LOOP_PROFILE evidence_id metadata is empty"
+                                    .to_string(),
+                            ));
+                        }
+                        match metadata_evidence_id.as_deref() {
+                            Some(existing) if existing != val => {
+                                return Err(ProjectionWorkerError::InvalidPayload(format!(
+                                    "evidence.published WORK_LOOP_PROFILE has conflicting \
+                                     evidence_id metadata values: existing={existing:?}, new={val:?}"
+                                )));
+                            },
+                            Some(_) => {},
+                            None => metadata_evidence_id = Some(val.to_string()),
+                        }
                     }
                 }
 
-                if dedupe_key.is_empty() || evidence_id.is_empty() {
-                    return Err(ProjectionWorkerError::InvalidPayload(format!(
+                let dedupe_key = dedupe_key.ok_or_else(|| {
+                    ProjectionWorkerError::InvalidPayload(
                         "evidence.published WORK_LOOP_PROFILE missing required metadata: \
-                         dedupe_key={dedupe_key:?}, evidence_id={evidence_id:?}"
+                         dedupe_key"
+                            .to_string(),
+                    )
+                })?;
+                let metadata_evidence_id = metadata_evidence_id.ok_or_else(|| {
+                    ProjectionWorkerError::InvalidPayload(
+                        "evidence.published WORK_LOOP_PROFILE missing required metadata: \
+                         evidence_id"
+                            .to_string(),
+                    )
+                })?;
+
+                if metadata_evidence_id != published.evidence_id {
+                    return Err(ProjectionWorkerError::InvalidPayload(format!(
+                        "evidence.published WORK_LOOP_PROFILE evidence_id metadata mismatch: \
+                         metadata={metadata_evidence_id:?}, published={:?}",
+                        published.evidence_id
                     )));
                 }
 
@@ -3100,7 +3151,7 @@ impl ProjectionWorker {
                 self.work_index.register_work_active_loop_profile(
                     &published.work_id,
                     &dedupe_key,
-                    &evidence_id,
+                    &published.evidence_id,
                     &cas_hash_hex,
                     event.timestamp_ns,
                 )?;
@@ -3109,7 +3160,7 @@ impl ProjectionWorker {
                     event_id = %event.event_id,
                     work_id = %published.work_id,
                     dedupe_key = %dedupe_key,
-                    evidence_id = %evidence_id,
+                    evidence_id = %published.evidence_id,
                     "Projected WORK_LOOP_PROFILE evidence to work_active_loop_profile table"
                 );
             },
@@ -9634,7 +9685,7 @@ mod tests {
     }
 
     /// Verify duplicate events with same (`work_id`, `dedupe_key`) are handled
-    /// idempotently via INSERT OR REPLACE (latest-wins).
+    /// idempotently with monotonic latest-wins updates.
     #[test]
     fn test_work_active_loop_profile_latest_wins() {
         let conn = create_test_db();
@@ -9662,7 +9713,7 @@ mod tests {
             )
             .unwrap();
 
-        // Verify only 1 row exists (REPLACE, not INSERT).
+        // Verify only 1 row exists (update-in-place, not insert of a second row).
         let guard = conn.lock().unwrap();
         let count: i64 = guard
             .query_row(
@@ -9672,9 +9723,9 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count query should succeed");
-        assert_eq!(count, 1, "INSERT OR REPLACE must not create a second row");
+        assert_eq!(count, 1, "Monotonic upsert must not create a second row");
 
-        // Verify the latest values are stored (INSERT OR REPLACE keeps the last write).
+        // Verify the latest values are stored.
         let (evidence_id, cas_hash, anchored_at_ns): (String, String, i64) = guard
             .query_row(
                 "SELECT evidence_id, cas_hash, anchored_at_ns \
@@ -9684,17 +9735,65 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("row should exist");
-        assert_eq!(
-            evidence_id, "WLP-second",
-            "Latest evidence_id must win via REPLACE"
-        );
-        assert_eq!(
-            cas_hash, "hash-second",
-            "Latest cas_hash must win via REPLACE"
-        );
+        assert_eq!(evidence_id, "WLP-second", "Latest evidence_id must win");
+        assert_eq!(cas_hash, "hash-second", "Latest cas_hash must win");
         assert_eq!(
             anchored_at_ns, 2_000_000_000,
-            "Latest anchored_at_ns must win via REPLACE"
+            "Latest anchored_at_ns must win"
+        );
+    }
+
+    /// Security regression: out-of-order replay with stale `anchored_at_ns`
+    /// must NOT overwrite a newer active profile row.
+    #[test]
+    fn test_work_active_loop_profile_stale_replay_does_not_overwrite() {
+        let conn = create_test_db();
+        let index = WorkIndex::new(Arc::clone(&conn)).unwrap();
+
+        // Insert the newest profile first.
+        index
+            .register_work_active_loop_profile(
+                "W-STALE",
+                "rev:1",
+                "WLP-newest",
+                "hash-newest",
+                9_000_000_000,
+            )
+            .unwrap();
+
+        // Replay a stale event with an older timestamp.
+        index
+            .register_work_active_loop_profile(
+                "W-STALE",
+                "rev:1",
+                "WLP-stale",
+                "hash-stale",
+                8_000_000_000,
+            )
+            .unwrap();
+
+        let guard = conn.lock().unwrap();
+        let (evidence_id, cas_hash, anchored_at_ns): (String, String, i64) = guard
+            .query_row(
+                "SELECT evidence_id, cas_hash, anchored_at_ns \
+                 FROM work_active_loop_profile \
+                 WHERE work_id = ?1 AND dedupe_key = ?2",
+                params!["W-STALE", "rev:1"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("row should exist");
+
+        assert_eq!(
+            evidence_id, "WLP-newest",
+            "Stale replay must not overwrite evidence_id"
+        );
+        assert_eq!(
+            cas_hash, "hash-newest",
+            "Stale replay must not overwrite cas_hash"
+        );
+        assert_eq!(
+            anchored_at_ns, 9_000_000_000,
+            "Stale replay must not overwrite anchored_at_ns"
         );
     }
 
@@ -9937,6 +10036,69 @@ mod tests {
         assert_eq!(
             count, 0,
             "Non-WORK_LOOP_PROFILE events must not produce work_active_loop_profile rows"
+        );
+    }
+
+    /// Security regression: `WORK_LOOP_PROFILE` metadata `evidence_id` must
+    /// match canonical protobuf `published.evidence_id`; mismatches are
+    /// rejected.
+    #[test]
+    fn test_handle_evidence_published_rejects_loop_profile_evidence_id_mismatch() {
+        use prost::Message;
+
+        let conn = create_test_db();
+        let worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
+
+        let published = apm2_core::events::EvidencePublished {
+            evidence_id: "WLP-canonical".to_string(),
+            work_id: "W-LOOP-MISMATCH".to_string(),
+            category: "WORK_LOOP_PROFILE".to_string(),
+            artifact_hash: vec![0xAB, 0xCD],
+            verification_command_ids: Vec::new(),
+            classification: "INTERNAL".to_string(),
+            artifact_size: 64,
+            metadata: vec![
+                "dedupe_key=rev:loop-mismatch".to_string(),
+                "evidence_id=WLP-attacker".to_string(),
+            ],
+            time_envelope_ref: None,
+        };
+        let evidence_event = apm2_core::events::EvidenceEvent {
+            event: Some(apm2_core::events::evidence_event::Event::Published(
+                published,
+            )),
+        };
+        let inner_protobuf = evidence_event.encode_to_vec();
+        let envelope_payload = build_session_event_envelope(&inner_protobuf);
+
+        let event = crate::protocol::dispatch::SignedLedgerEvent {
+            event_id: "EVT-LOOP-MISMATCH-001".to_string(),
+            event_type: "evidence.published".to_string(),
+            work_id: "W-LOOP-MISMATCH".to_string(),
+            actor_id: "actor-loop".to_string(),
+            payload: envelope_payload,
+            signature: vec![0u8; 64],
+            timestamp_ns: 7_000_000_000,
+        };
+
+        let result = worker.handle_evidence_published(&event);
+        assert!(
+            matches!(result, Err(ProjectionWorkerError::InvalidPayload(_))),
+            "Mismatched metadata evidence_id must be rejected"
+        );
+
+        let guard = conn.lock().unwrap();
+        let count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM work_active_loop_profile WHERE work_id = ?1",
+                params!["W-LOOP-MISMATCH"],
+                |row| row.get(0),
+            )
+            .expect("count query should succeed");
+        assert_eq!(
+            count, 0,
+            "Rejected mismatch must not produce work_active_loop_profile rows"
         );
     }
 }
