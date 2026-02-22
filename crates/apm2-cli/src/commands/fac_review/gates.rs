@@ -786,6 +786,7 @@ fn prepare_queued_gates_job(
         &spec,
         &fac_policy.queue_bounds_policy,
         request.write_mode,
+        fac_policy.queue_lifecycle_dual_write_enabled,
     )
     .map_err(|err| QueuePreparationFailure::Runtime {
         message: format!("failed to enqueue gates job: {err}"),

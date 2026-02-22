@@ -54,6 +54,9 @@ pub mod fac_secure_io;
 #[path = "../src/commands/fac_key_material.rs"]
 pub mod fac_key_material;
 
+#[path = "../src/commands/fac_queue_lifecycle_dual_write.rs"]
+pub mod fac_queue_lifecycle_dual_write;
+
 #[path = "../src/commands/fac_worker/mod.rs"]
 mod fac_worker;
 
