@@ -875,16 +875,16 @@ const WORK_INDEX_SCHEMA_SQL: &str = r"
 
     -- TCK-00645: Active work loop profile projection (RFC-0032 Phase 4)
     -- Selects the latest anchored profile per work_id as active, keyed by
-    -- ledger timestamp. INSERT OR REPLACE on (work_id, dedupe_key) ensures
-    -- idempotent replay; the latest-wins semantics are enforced by comparing
-    -- anchored_at_ns before replacing.
+    -- ledger timestamp. Exactly one active row is stored per work_id.
+    -- dedupe_key is retained as metadata for traceability, but does not
+    -- contribute to uniqueness.
     CREATE TABLE IF NOT EXISTS work_active_loop_profile (
         work_id TEXT NOT NULL,
         dedupe_key TEXT NOT NULL,
         evidence_id TEXT NOT NULL,
         cas_hash TEXT NOT NULL,
         anchored_at_ns INTEGER NOT NULL,
-        PRIMARY KEY (work_id, dedupe_key)
+        PRIMARY KEY (work_id)
     );
 
     CREATE INDEX IF NOT EXISTS idx_work_active_loop_profile_work_id
@@ -910,7 +910,7 @@ impl WorkIndex {
     /// Returns an error if schema initialization fails.
     pub fn new(conn: Arc<Mutex<Connection>>) -> Result<Self, ProjectionWorkerError> {
         {
-            let conn_guard = conn.lock().map_err(|e| {
+            let mut conn_guard = conn.lock().map_err(|e| {
                 ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
             })?;
 
@@ -919,9 +919,107 @@ impl WorkIndex {
                 .map_err(|e| {
                     ProjectionWorkerError::DatabaseError(format!("schema init failed: {e}"))
                 })?;
+
+            Self::migrate_work_active_loop_profile_schema_if_needed(&mut conn_guard)?;
         }
 
         Ok(Self { conn })
+    }
+
+    /// Migrates legacy `work_active_loop_profile` schemas that used
+    /// `(work_id, dedupe_key)` as a composite primary key.
+    ///
+    /// The migrated schema stores exactly one active row per `work_id`.
+    /// If multiple legacy rows exist for a `work_id`, the row with the
+    /// greatest `anchored_at_ns` wins; ties break by latest `rowid`.
+    fn migrate_work_active_loop_profile_schema_if_needed(
+        conn: &mut Connection,
+    ) -> Result<(), ProjectionWorkerError> {
+        let pk_columns = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(work_active_loop_profile)")
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+            stmt.query_map([], |row| {
+                let name: String = row.get(1)?;
+                let pk_order: i64 = row.get(5)?;
+                Ok((name, pk_order))
+            })
+            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
+            .into_iter()
+            .filter(|(_, pk_order)| *pk_order > 0)
+            .collect::<Vec<_>>()
+        };
+
+        if pk_columns.is_empty() {
+            return Ok(());
+        }
+
+        if pk_columns == [("work_id".to_string(), 1)] {
+            return Ok(());
+        }
+
+        if pk_columns != [("work_id".to_string(), 1), ("dedupe_key".to_string(), 2)] {
+            let description = pk_columns
+                .iter()
+                .map(|(name, pk_order)| format!("{name}:{pk_order}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ProjectionWorkerError::DatabaseError(format!(
+                "unexpected work_active_loop_profile primary key shape: [{description}]"
+            )));
+        }
+
+        let tx = conn
+            .transaction()
+            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+        tx.execute_batch(
+            "
+            ALTER TABLE work_active_loop_profile
+                RENAME TO work_active_loop_profile_legacy;
+
+            CREATE TABLE work_active_loop_profile (
+                work_id TEXT NOT NULL PRIMARY KEY,
+                dedupe_key TEXT NOT NULL,
+                evidence_id TEXT NOT NULL,
+                cas_hash TEXT NOT NULL,
+                anchored_at_ns INTEGER NOT NULL
+            );
+
+            INSERT INTO work_active_loop_profile
+                (work_id, dedupe_key, evidence_id, cas_hash, anchored_at_ns)
+            SELECT legacy.work_id,
+                   legacy.dedupe_key,
+                   legacy.evidence_id,
+                   legacy.cas_hash,
+                   legacy.anchored_at_ns
+            FROM work_active_loop_profile_legacy AS legacy
+            WHERE legacy.rowid = (
+                SELECT pick.rowid
+                FROM work_active_loop_profile_legacy AS pick
+                WHERE pick.work_id = legacy.work_id
+                ORDER BY pick.anchored_at_ns DESC, pick.rowid DESC
+                LIMIT 1
+            );
+
+            DROP TABLE work_active_loop_profile_legacy;
+
+            CREATE INDEX IF NOT EXISTS idx_work_active_loop_profile_work_id
+                ON work_active_loop_profile(work_id);
+            CREATE INDEX IF NOT EXISTS idx_work_active_loop_profile_anchored
+                ON work_active_loop_profile(anchored_at_ns);
+            ",
+        )
+        .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+        tx.commit()
+            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+        info!("Migrated work_active_loop_profile schema to single-active-row per work_id");
+        Ok(())
     }
 
     /// Registers a changeset -> `work_id` association.
@@ -1423,10 +1521,9 @@ impl WorkIndex {
     /// Registers or updates an active work loop profile in the projection
     /// table (TCK-00645).
     ///
-    /// Uses latest-wins semantics: if a row already exists for the same
-    /// `(work_id, dedupe_key)`, it is replaced only when the new
-    /// `anchored_at_ns` is strictly greater. Duplicate replays with the
-    /// same or older timestamp are silently ignored.
+    /// Uses latest-wins semantics per `work_id`: if a row already exists for
+    /// the same `work_id`, it is replaced only when the new `anchored_at_ns`
+    /// is strictly greater. Duplicate or stale replays are silently ignored.
     ///
     /// # Arguments
     ///
@@ -1453,14 +1550,15 @@ impl WorkIndex {
             .lock()
             .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
 
-        // Monotonic latest-wins keyed on (work_id, dedupe_key): update only
-        // when the incoming anchored_at_ns is strictly newer. This prevents
-        // stale replay from rolling back already projected state.
+        // Monotonic latest-wins keyed on work_id: update only when the
+        // incoming anchored_at_ns is strictly newer. This prevents stale
+        // replay from rolling back already projected state.
         conn.execute(
             "INSERT INTO work_active_loop_profile
              (work_id, dedupe_key, evidence_id, cas_hash, anchored_at_ns)
              VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(work_id, dedupe_key) DO UPDATE SET
+             ON CONFLICT(work_id) DO UPDATE SET
+                 dedupe_key = excluded.dedupe_key,
                  evidence_id = excluded.evidence_id,
                  cas_hash = excluded.cas_hash,
                  anchored_at_ns = excluded.anchored_at_ns
@@ -2922,6 +3020,16 @@ impl ProjectionWorker {
     /// - All other categories are silently skipped (acknowledged without
     ///   indexing).
     ///
+    /// Trust model:
+    /// - This path replays immutable ledger facts already admitted by
+    ///   authoritative daemon handlers at write time.
+    /// - The projection writes here are deterministic derived-state updates in
+    ///   local `SQLite`, not authoritative admission decisions or external sink
+    ///   effects.
+    /// - Lifecycle/economics gates remain mandatory on authoritative mutation
+    ///   paths (`review_receipt_recorded` -> GitHub projection), where this
+    ///   module performs external side effects.
+    ///
     /// Uses at-least-once delivery: events are acknowledged only after
     /// successful projection.
     async fn process_evidence_published(&mut self) -> Result<(), ProjectionWorkerError> {
@@ -3082,11 +3190,15 @@ impl ProjectionWorker {
                 // Extract and validate metadata fields from the evidence
                 // metadata list. Projection identity is derived from canonical
                 // protobuf fields, not metadata labels.
+                validate_string_length("work_id", &published.work_id)?;
+                validate_string_length("published.evidence_id", &published.evidence_id)?;
+
                 let mut dedupe_key: Option<String> = None;
                 let mut metadata_evidence_id: Option<String> = None;
 
                 for meta in &published.metadata {
                     if let Some(val) = meta.strip_prefix("dedupe_key=") {
+                        validate_string_length("dedupe_key", val)?;
                         if val.is_empty() {
                             return Err(ProjectionWorkerError::InvalidPayload(
                                 "evidence.published WORK_LOOP_PROFILE dedupe_key metadata is empty"
@@ -3104,6 +3216,7 @@ impl ProjectionWorker {
                             None => dedupe_key = Some(val.to_string()),
                         }
                     } else if let Some(val) = meta.strip_prefix("evidence_id=") {
+                        validate_string_length("metadata_evidence_id", val)?;
                         if val.is_empty() {
                             return Err(ProjectionWorkerError::InvalidPayload(
                                 "evidence.published WORK_LOOP_PROFILE evidence_id metadata is empty"
@@ -8713,6 +8826,44 @@ mod tests {
         serde_json::to_vec(&envelope).expect("JSON serialization should not fail")
     }
 
+    fn build_work_loop_profile_event(
+        event_id: &str,
+        work_id: &str,
+        evidence_id: &str,
+        metadata: Vec<String>,
+        timestamp_ns: u64,
+    ) -> SignedLedgerEvent {
+        use prost::Message;
+
+        let published = apm2_core::events::EvidencePublished {
+            evidence_id: evidence_id.to_string(),
+            work_id: work_id.to_string(),
+            category: "WORK_LOOP_PROFILE".to_string(),
+            artifact_hash: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            verification_command_ids: Vec::new(),
+            classification: "INTERNAL".to_string(),
+            artifact_size: 256,
+            metadata,
+            time_envelope_ref: None,
+        };
+        let evidence_event = apm2_core::events::EvidenceEvent {
+            event: Some(apm2_core::events::evidence_event::Event::Published(
+                published,
+            )),
+        };
+        let inner_protobuf = evidence_event.encode_to_vec();
+
+        crate::protocol::dispatch::SignedLedgerEvent {
+            event_id: event_id.to_string(),
+            event_type: "evidence.published".to_string(),
+            work_id: work_id.to_string(),
+            actor_id: "actor-loop".to_string(),
+            payload: build_session_event_envelope(&inner_protobuf),
+            signature: vec![0u8; 64],
+            timestamp_ns,
+        }
+    }
+
     /// Helper: inserts an `evidence.published` event into the ledger with
     /// production JSON-envelope wire format (matching `emit_session_event`).
     fn insert_evidence_published_event(
@@ -9672,8 +9823,8 @@ mod tests {
             guard
                 .query_row(
                     "SELECT dedupe_key, evidence_id, cas_hash, anchored_at_ns \
-                     FROM work_active_loop_profile WHERE work_id = ?1 AND dedupe_key = ?2",
-                    params!["W-001", "rev:1"],
+                     FROM work_active_loop_profile WHERE work_id = ?1",
+                    params!["W-001"],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .expect("work_active_loop_profile row should exist");
@@ -9713,28 +9864,32 @@ mod tests {
             )
             .unwrap();
 
-        // Verify only 1 row exists (update-in-place, not insert of a second row).
+        // Verify only 1 active row exists for the work_id.
         let guard = conn.lock().unwrap();
         let count: i64 = guard
             .query_row(
-                "SELECT COUNT(*) FROM work_active_loop_profile \
-                 WHERE work_id = ?1 AND dedupe_key = ?2",
-                params!["W-002", "rev:1"],
+                "SELECT COUNT(*) FROM work_active_loop_profile WHERE work_id = ?1",
+                params!["W-002"],
                 |row| row.get(0),
             )
             .expect("count query should succeed");
-        assert_eq!(count, 1, "Monotonic upsert must not create a second row");
+        assert_eq!(count, 1, "Monotonic upsert must maintain one active row");
 
         // Verify the latest values are stored.
-        let (evidence_id, cas_hash, anchored_at_ns): (String, String, i64) = guard
-            .query_row(
-                "SELECT evidence_id, cas_hash, anchored_at_ns \
+        let (dedupe_key, evidence_id, cas_hash, anchored_at_ns): (String, String, String, i64) =
+            guard
+                .query_row(
+                    "SELECT dedupe_key, evidence_id, cas_hash, anchored_at_ns \
                  FROM work_active_loop_profile \
-                 WHERE work_id = ?1 AND dedupe_key = ?2",
-                params!["W-002", "rev:1"],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("row should exist");
+                 WHERE work_id = ?1",
+                    params!["W-002"],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("row should exist");
+        assert_eq!(
+            dedupe_key, "rev:1",
+            "Stored dedupe_key must match active row"
+        );
         assert_eq!(evidence_id, "WLP-second", "Latest evidence_id must win");
         assert_eq!(cas_hash, "hash-second", "Latest cas_hash must win");
         assert_eq!(
@@ -9777,8 +9932,8 @@ mod tests {
             .query_row(
                 "SELECT evidence_id, cas_hash, anchored_at_ns \
                  FROM work_active_loop_profile \
-                 WHERE work_id = ?1 AND dedupe_key = ?2",
-                params!["W-STALE", "rev:1"],
+                 WHERE work_id = ?1",
+                params!["W-STALE"],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("row should exist");
@@ -9797,10 +9952,10 @@ mod tests {
         );
     }
 
-    /// Verify different `dedupe_key` values for the same `work_id` produce
-    /// separate rows.
+    /// Verify a newer profile with a different `dedupe_key` replaces the
+    /// active row for the same `work_id` (single active row semantics).
     #[test]
-    fn test_work_active_loop_profile_separate_dedupe_keys() {
+    fn test_work_active_loop_profile_latest_wins_across_dedupe_keys() {
         let conn = create_test_db();
         let index = WorkIndex::new(Arc::clone(&conn)).unwrap();
 
@@ -9832,7 +9987,135 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count query should succeed");
-        assert_eq!(count, 2, "Different dedupe_keys must produce separate rows");
+        assert_eq!(count, 1, "Exactly one active row must exist per work_id");
+
+        let (dedupe_key, evidence_id, cas_hash, anchored_at_ns): (String, String, String, i64) =
+            guard
+                .query_row(
+                    "SELECT dedupe_key, evidence_id, cas_hash, anchored_at_ns \
+                     FROM work_active_loop_profile WHERE work_id = ?1",
+                    params!["W-003"],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("active row should exist");
+        assert_eq!(dedupe_key, "rev:2", "Newest dedupe_key must become active");
+        assert_eq!(
+            evidence_id, "WLP-rev2",
+            "Newest evidence_id must become active"
+        );
+        assert_eq!(cas_hash, "hash-rev2", "Newest cas_hash must become active");
+        assert_eq!(
+            anchored_at_ns, 2_000_000_000,
+            "Newest anchored_at_ns must become active"
+        );
+    }
+
+    /// Regression: startup migration must collapse legacy composite-PK rows
+    /// into a single active row per `work_id`.
+    #[test]
+    fn test_work_active_loop_profile_migrates_legacy_composite_pk_schema() {
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        {
+            let guard = conn.lock().unwrap();
+            guard
+                .execute_batch(
+                    "
+                    CREATE TABLE work_active_loop_profile (
+                        work_id TEXT NOT NULL,
+                        dedupe_key TEXT NOT NULL,
+                        evidence_id TEXT NOT NULL,
+                        cas_hash TEXT NOT NULL,
+                        anchored_at_ns INTEGER NOT NULL,
+                        PRIMARY KEY (work_id, dedupe_key)
+                    );
+                    ",
+                )
+                .expect("create legacy work_active_loop_profile schema");
+
+            guard
+                .execute(
+                    "INSERT INTO work_active_loop_profile
+                     (work_id, dedupe_key, evidence_id, cas_hash, anchored_at_ns)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params!["W-MIG", "rev:1", "WLP-old", "hash-old", 1_000_i64],
+                )
+                .expect("insert legacy old row");
+            guard
+                .execute(
+                    "INSERT INTO work_active_loop_profile
+                     (work_id, dedupe_key, evidence_id, cas_hash, anchored_at_ns)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params!["W-MIG", "rev:2", "WLP-new", "hash-new", 2_000_i64],
+                )
+                .expect("insert legacy new row");
+            guard
+                .execute(
+                    "INSERT INTO work_active_loop_profile
+                     (work_id, dedupe_key, evidence_id, cas_hash, anchored_at_ns)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params!["W-OTHER", "rev:1", "WLP-other", "hash-other", 500_i64],
+                )
+                .expect("insert second work row");
+        }
+
+        // WorkIndex startup must detect and migrate the legacy schema.
+        let _index = WorkIndex::new(Arc::clone(&conn)).expect("work index startup must migrate");
+
+        let guard = conn.lock().unwrap();
+        let mut stmt = guard
+            .prepare("PRAGMA table_info(work_active_loop_profile)")
+            .unwrap();
+        let pk_cols = stmt
+            .query_map([], |row| {
+                let name: String = row.get(1)?;
+                let pk_order: i64 = row.get(5)?;
+                Ok((name, pk_order))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .filter(|(_, pk_order)| *pk_order > 0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pk_cols,
+            vec![("work_id".to_string(), 1)],
+            "Migrated schema must use work_id as the sole primary key"
+        );
+
+        let count_for_work: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM work_active_loop_profile WHERE work_id = ?1",
+                params!["W-MIG"],
+                |row| row.get(0),
+            )
+            .expect("count query for migrated work_id");
+        assert_eq!(
+            count_for_work, 1,
+            "Legacy duplicate dedupe_key rows must collapse to one active row"
+        );
+
+        let (dedupe_key, evidence_id, cas_hash, anchored_at_ns): (String, String, String, i64) =
+            guard
+                .query_row(
+                    "SELECT dedupe_key, evidence_id, cas_hash, anchored_at_ns
+                     FROM work_active_loop_profile
+                     WHERE work_id = ?1",
+                    params!["W-MIG"],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("migrated active row must exist");
+        assert_eq!(dedupe_key, "rev:2");
+        assert_eq!(evidence_id, "WLP-new");
+        assert_eq!(cas_hash, "hash-new");
+        assert_eq!(anchored_at_ns, 2_000);
+
+        let total_rows: i64 = guard
+            .query_row("SELECT COUNT(*) FROM work_active_loop_profile", [], |row| {
+                row.get(0)
+            })
+            .expect("count total migrated rows");
+        assert_eq!(total_rows, 2, "Migration must preserve one row per work_id");
     }
 
     /// Verify eviction deletes expired `work_active_loop_profile` entries.
@@ -9965,8 +10248,8 @@ mod tests {
                 .query_row(
                     "SELECT dedupe_key, evidence_id, cas_hash, anchored_at_ns \
                      FROM work_active_loop_profile \
-                     WHERE work_id = ?1 AND dedupe_key = ?2",
-                    params!["W-LOOP-001", "rev:loop-1"],
+                     WHERE work_id = ?1",
+                    params!["W-LOOP-001"],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .expect(
@@ -9977,6 +10260,68 @@ mod tests {
         assert_eq!(evidence_id, "WLP-testevid123");
         assert_eq!(cas_hash, hex::encode([0xDE, 0xAD, 0xBE, 0xEF]));
         assert_eq!(anchored_at_ns, 5_000_000_000);
+    }
+
+    /// Verify full `evidence.published` processing keeps exactly one active
+    /// profile row per `work_id` when `dedupe_key` changes.
+    #[test]
+    fn test_handle_evidence_published_latest_wins_across_dedupe_keys() {
+        let conn = create_test_db();
+        let worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
+
+        let first = build_work_loop_profile_event(
+            "EVT-LOOP-DEDUPE-001",
+            "W-LOOP-SINGLE-ACTIVE",
+            "WLP-first",
+            vec![
+                "dedupe_key=rev:first".to_string(),
+                "evidence_id=WLP-first".to_string(),
+            ],
+            9_000_000_000,
+        );
+        worker
+            .handle_evidence_published(&first)
+            .expect("first WORK_LOOP_PROFILE event should succeed");
+
+        let second = build_work_loop_profile_event(
+            "EVT-LOOP-DEDUPE-002",
+            "W-LOOP-SINGLE-ACTIVE",
+            "WLP-second",
+            vec![
+                "dedupe_key=rev:second".to_string(),
+                "evidence_id=WLP-second".to_string(),
+            ],
+            9_100_000_000,
+        );
+        worker
+            .handle_evidence_published(&second)
+            .expect("second WORK_LOOP_PROFILE event should succeed");
+
+        let guard = conn.lock().unwrap();
+        let count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM work_active_loop_profile WHERE work_id = ?1",
+                params!["W-LOOP-SINGLE-ACTIVE"],
+                |row| row.get(0),
+            )
+            .expect("count query should succeed");
+        assert_eq!(
+            count, 1,
+            "Two dedupe keys for one work_id must produce one active profile row"
+        );
+
+        let (dedupe_key, evidence_id, anchored_at_ns): (String, String, i64) = guard
+            .query_row(
+                "SELECT dedupe_key, evidence_id, anchored_at_ns \
+                 FROM work_active_loop_profile WHERE work_id = ?1",
+                params!["W-LOOP-SINGLE-ACTIVE"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("active row should exist");
+        assert_eq!(dedupe_key, "rev:second");
+        assert_eq!(evidence_id, "WLP-second");
+        assert_eq!(anchored_at_ns, 9_100_000_000);
     }
 
     /// Verify non-WORK_LOOP_PROFILE events do NOT produce rows in the
@@ -10100,5 +10445,137 @@ mod tests {
             count, 0,
             "Rejected mismatch must not produce work_active_loop_profile rows"
         );
+    }
+
+    #[test]
+    fn test_handle_evidence_published_rejects_loop_profile_oversized_dedupe_key_metadata() {
+        let conn = create_test_db();
+        let worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
+
+        let oversized_dedupe = "d".repeat(MAX_STRING_LENGTH + 1);
+        let event = build_work_loop_profile_event(
+            "EVT-LOOP-OVERSIZE-DEDUPE",
+            "W-LOOP-OVERSIZE-DEDUPE",
+            "WLP-oversize-dedupe",
+            vec![
+                format!("dedupe_key={oversized_dedupe}"),
+                "evidence_id=WLP-oversize-dedupe".to_string(),
+            ],
+            8_000_000_000,
+        );
+
+        let result = worker.handle_evidence_published(&event);
+        assert!(
+            matches!(result, Err(ProjectionWorkerError::InvalidPayload(_))),
+            "Oversized dedupe_key metadata must be rejected"
+        );
+
+        let guard = conn.lock().unwrap();
+        let count: i64 = guard
+            .query_row("SELECT COUNT(*) FROM work_active_loop_profile", [], |row| {
+                row.get(0)
+            })
+            .expect("count query should succeed");
+        assert_eq!(count, 0, "Rejected event must not write projection rows");
+    }
+
+    #[test]
+    fn test_handle_evidence_published_rejects_loop_profile_oversized_metadata_evidence_id() {
+        let conn = create_test_db();
+        let worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
+
+        let oversized_evidence_id = "E".repeat(MAX_STRING_LENGTH + 1);
+        let event = build_work_loop_profile_event(
+            "EVT-LOOP-OVERSIZE-META-EVID",
+            "W-LOOP-OVERSIZE-META-EVID",
+            "WLP-canonical-evidence",
+            vec![
+                "dedupe_key=rev:oversized-meta".to_string(),
+                format!("evidence_id={oversized_evidence_id}"),
+            ],
+            8_100_000_000,
+        );
+
+        let result = worker.handle_evidence_published(&event);
+        assert!(
+            matches!(result, Err(ProjectionWorkerError::InvalidPayload(_))),
+            "Oversized metadata evidence_id must be rejected"
+        );
+
+        let guard = conn.lock().unwrap();
+        let count: i64 = guard
+            .query_row("SELECT COUNT(*) FROM work_active_loop_profile", [], |row| {
+                row.get(0)
+            })
+            .expect("count query should succeed");
+        assert_eq!(count, 0, "Rejected event must not write projection rows");
+    }
+
+    #[test]
+    fn test_handle_evidence_published_rejects_loop_profile_oversized_published_work_id() {
+        let conn = create_test_db();
+        let worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
+
+        let oversized_work_id = "W".repeat(MAX_STRING_LENGTH + 1);
+        let event = build_work_loop_profile_event(
+            "EVT-LOOP-OVERSIZE-WORK-ID",
+            &oversized_work_id,
+            "WLP-oversized-work-id",
+            vec![
+                "dedupe_key=rev:oversized-work-id".to_string(),
+                "evidence_id=WLP-oversized-work-id".to_string(),
+            ],
+            8_200_000_000,
+        );
+
+        let result = worker.handle_evidence_published(&event);
+        assert!(
+            matches!(result, Err(ProjectionWorkerError::InvalidPayload(_))),
+            "Oversized published.work_id must be rejected"
+        );
+
+        let guard = conn.lock().unwrap();
+        let count: i64 = guard
+            .query_row("SELECT COUNT(*) FROM work_active_loop_profile", [], |row| {
+                row.get(0)
+            })
+            .expect("count query should succeed");
+        assert_eq!(count, 0, "Rejected event must not write projection rows");
+    }
+
+    #[test]
+    fn test_handle_evidence_published_rejects_loop_profile_oversized_published_evidence_id() {
+        let conn = create_test_db();
+        let worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
+
+        let oversized_evidence_id = "WLP".repeat(MAX_STRING_LENGTH + 1);
+        let event = build_work_loop_profile_event(
+            "EVT-LOOP-OVERSIZE-PUBLISHED-EVID",
+            "W-LOOP-OVERSIZE-PUBLISHED-EVID",
+            &oversized_evidence_id,
+            vec![
+                "dedupe_key=rev:oversized-published-evidence".to_string(),
+                format!("evidence_id={oversized_evidence_id}"),
+            ],
+            8_300_000_000,
+        );
+
+        let result = worker.handle_evidence_published(&event);
+        assert!(
+            matches!(result, Err(ProjectionWorkerError::InvalidPayload(_))),
+            "Oversized published.evidence_id must be rejected"
+        );
+
+        let guard = conn.lock().unwrap();
+        let count: i64 = guard
+            .query_row("SELECT COUNT(*) FROM work_active_loop_profile", [], |row| {
+                row.get(0)
+            })
+            .expect("count query should succeed");
+        assert_eq!(count, 0, "Rejected event must not write projection rows");
     }
 }
