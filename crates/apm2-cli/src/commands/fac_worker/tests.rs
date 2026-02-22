@@ -436,6 +436,75 @@ fn worker_orchestrator_step_committing_emits_staged_outcome_and_terminal_state()
 }
 
 #[test]
+fn worker_orchestrator_step_completed_mismatch_fails_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue_root = dir.path().join("queue");
+    let fac_root = dir.path().join("private").join("fac");
+    fs::create_dir_all(&queue_root).expect("queue root");
+    fs::create_dir_all(&fac_root).expect("fac root");
+
+    let candidate =
+        make_orchestrator_step_candidate("job-step-mismatch", queue_root.join("pending/job.json"));
+    let mut completed_gates_cache = None;
+    let signer = Signer::generate();
+    let verifying_key = signer.verifying_key();
+    let scheduler = QueueSchedulerState::new();
+    let mut broker = FacBroker::new();
+    let policy = FacPolicyV1::default_policy();
+    let policy_hash = compute_policy_hash(&policy).expect("policy hash");
+    let policy_digest = parse_policy_hash(&policy_hash).expect("policy digest");
+    let job_spec_policy = policy
+        .job_spec_validation_policy()
+        .expect("job spec policy");
+    let budget_cas = MemoryCas::new();
+    let cost_model = apm2_core::economics::CostModelV1::with_defaults();
+    let mut ctx = OrchestratorContext {
+        candidate: &candidate,
+        queue_root: &queue_root,
+        fac_root: &fac_root,
+        completed_gates_cache: &mut completed_gates_cache,
+        verifying_key: &verifying_key,
+        scheduler: &scheduler,
+        lane: QueueLane::Bulk,
+        broker: &mut broker,
+        signer: &signer,
+        policy_hash: &policy_hash,
+        policy_digest: &policy_digest,
+        policy: &policy,
+        job_spec_policy: &job_spec_policy,
+        budget_cas: &budget_cas,
+        print_unit: false,
+        canonicalizer_tuple_digest: "b3-256:step",
+        boundary_id: "apm2.fac.local",
+        heartbeat_cycle_count: 0,
+        heartbeat_jobs_completed: 0,
+        heartbeat_jobs_denied: 0,
+        heartbeat_jobs_quarantined: 0,
+        cost_model: &cost_model,
+        toolchain_fingerprint: None,
+    };
+
+    let mut orchestrator = WorkerOrchestrator::new();
+    orchestrator.test_set_state(OrchestratorState::Completed {
+        job_id: "state-job-id".to_string(),
+        outcome: JobOutcome::Completed {
+            job_id: "outcome-job-id".to_string(),
+            observed_cost: None,
+        },
+    });
+
+    let step = orchestrator.step(&mut ctx);
+    let reason = match step {
+        StepOutcome::Skipped(reason) => reason,
+        other => panic!("expected skipped mismatch outcome, got {other:?}"),
+    };
+    assert!(
+        reason.contains("job_id mismatch"),
+        "expected mismatch reason, got: {reason}"
+    );
+}
+
+#[test]
 fn test_move_to_dir_safe_atomic() {
     let dir = tempfile::tempdir().expect("tempdir");
     let src_dir = dir.path().join("src");
@@ -4051,6 +4120,34 @@ fn ensure_queue_dirs_hardens_preexisting_unsafe_broker_requests() {
     assert_eq!(
         post_mode, 0o1733,
         "broker_requests must be hardened from 0333 to 01733, got {post_mode:#o}"
+    );
+}
+
+/// Regression: an unsearchable pre-existing broker directory (0000) must still
+/// be hardened deterministically to 01733.
+#[cfg(unix)]
+#[test]
+fn ensure_queue_dirs_hardens_unsearchable_broker_requests_mode_000() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue_root = dir.path().join("queue");
+    let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+    fs::create_dir_all(&broker_dir).expect("create broker_requests");
+    fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o000))
+        .expect("set mode 0000");
+
+    ensure_queue_dirs(&queue_root).expect("ensure_queue_dirs should succeed");
+
+    let post_mode = fs::metadata(&broker_dir)
+        .expect("broker metadata post-fix")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        post_mode, 0o1733,
+        "broker_requests must be hardened from 0000 to 01733, got {post_mode:#o}"
     );
 }
 

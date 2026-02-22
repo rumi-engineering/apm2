@@ -1021,9 +1021,14 @@ pub(super) fn resolve_fac_root() -> Result<PathBuf, String> {
 fn ensure_directory_mode_nofollow(path: &Path, mode: u32) -> Result<(), String> {
     use nix::errno::Errno;
     use nix::fcntl::{OFlag, open};
-    use nix::sys::stat::{FchmodatFlags, Mode, fchmod, fchmodat};
+    use nix::sys::stat::Mode;
 
-    let open_flags = OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    // Linux-only hardening path:
+    // - O_PATH + O_NOFOLLOW + O_DIRECTORY obtains an fd anchored to the directory
+    //   itself (never dereferences a final symlink).
+    // - fchmodat(..., "", AT_EMPTY_PATH) applies mode by fd, avoiding path-based
+    //   chmod races after classification.
+    let open_flags = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
 
     let classify_path = || -> Result<(), String> {
         let metadata = fs::symlink_metadata(path)
@@ -1066,19 +1071,6 @@ fn ensure_directory_mode_nofollow(path: &Path, mode: u32) -> Result<(), String> 
                 ),
             })?
         },
-        Err(Errno::EACCES) => {
-            classify_path()?;
-            let cwd_fd = fs::File::open(".")
-                .map_err(|e| format!("cannot open current directory for chmodat: {e}"))?;
-            fchmodat(
-                &cwd_fd,
-                path,
-                Mode::from_bits_truncate(mode),
-                FchmodatFlags::NoFollowSymlink,
-            )
-            .map_err(|e| format!("cannot set mode {mode:#o} on {}: {e}", path.display()))?;
-            return Ok(());
-        },
         Err(Errno::ELOOP | Errno::ENOTDIR) => {
             classify_path()?;
             return Err(format!(
@@ -1089,8 +1081,41 @@ fn ensure_directory_mode_nofollow(path: &Path, mode: u32) -> Result<(), String> 
         Err(e) => return Err(format!("cannot open directory {}: {e}", path.display())),
     };
 
-    fchmod(&dir_fd, Mode::from_bits_truncate(mode))
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let mode = mode as libc::mode_t;
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            // SAFETY:
+            // - `dir_fd` is a live fd returned by `open`.
+            // - `c""` is a valid NUL-terminated empty C string.
+            // - `AT_EMPTY_PATH` targets the opened path object directly.
+            libc::fchmodat(dir_fd.as_raw_fd(), c"".as_ptr(), mode, libc::AT_EMPTY_PATH)
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(format!(
+                "cannot set mode {mode:#o} on {}: {err}",
+                path.display()
+            ));
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        use nix::sys::stat::{FchmodatFlags, fchmodat};
+        let cwd_fd = fs::File::open(".")
+            .map_err(|e| format!("cannot open current directory for chmodat: {e}"))?;
+        fchmodat(
+            &cwd_fd,
+            path,
+            Mode::from_bits_truncate(mode),
+            FchmodatFlags::NoFollowSymlink,
+        )
         .map_err(|e| format!("cannot set mode {mode:#o} on {}: {e}", path.display()))?;
+    }
 
     Ok(())
 }
