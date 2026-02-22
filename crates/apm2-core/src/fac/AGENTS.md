@@ -3981,3 +3981,23 @@ CAS-backed JSON schemas for work lifecycle artifacts (RFC-0032 Phase 1).
 - **Bounded decoding**: Per-artifact byte limits enforced before JSON parsing.
 - **`deny_unknown_fields`**: All structs reject payloads with unexpected fields.
 - **Fail-closed**: Unknown or mismatched schema IDs cause rejection.
+
+## work_loop_profile_publish Submodule (TCK-00645)
+
+Publish and anchor `WorkLoopProfileV1` artifacts (RFC-0032 Phase 4).
+
+### Key Types
+
+- `PublishWorkLoopProfileError`: Error enum for validation, CAS, and canonicalization failures.
+- `PublishWorkLoopProfileResult`: Contains validated profile, deterministic evidence ID, CAS publish result, and metadata.
+- `publish_work_loop_profile()`: Validates, canonicalizes, stores in CAS, and computes deterministic evidence ID.
+- `compute_evidence_id()`: Computes `WLP-<first 32 hex chars of blake3(work_id || "\0" || dedupe_key)>`.
+
+### Security Invariants (TCK-00645)
+
+- **Bounded decode**: Payloads exceeding 64 KiB are rejected before parsing (DoS prevention).
+- **`deny_unknown_fields`**: Extra JSON fields are rejected via `WorkLoopProfileV1` serde config.
+- **Fail-closed**: Empty `dedupe_key` or malformed payloads cause explicit rejection.
+- **Canonical JSON**: All artifacts are canonicalized before CAS storage/hashing for deterministic content addressing.
+- **Idempotent**: Publication is idempotent on `(work_id, dedupe_key)`: same inputs produce same `evidence_id`.
+- **Domain separation**: Null byte separator between `work_id` and `dedupe_key` in hash input prevents concatenation ambiguity.

@@ -511,6 +511,12 @@ pub struct WorkLoopProfileV1 {
     /// Canonical work identifier.
     pub work_id: String,
 
+    /// Deduplication key for idempotent publishing.
+    ///
+    /// Must be non-empty. Idempotency on `(work_id, dedupe_key)` prevents
+    /// duplicate profile anchors in the ledger.
+    pub dedupe_key: String,
+
     /// Workspace configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceConfig>,
@@ -589,6 +595,11 @@ impl WorkLoopProfileV1 {
             return Err(WorkCasSchemaError::MissingField("work_id"));
         }
         validate_field_length("work_id", &self.work_id, MAX_WORK_ID_LENGTH)?;
+
+        if self.dedupe_key.is_empty() {
+            return Err(WorkCasSchemaError::MissingField("dedupe_key"));
+        }
+        validate_field_length("dedupe_key", &self.dedupe_key, MAX_SHORT_STRING_LENGTH)?;
 
         if let Some(ref ws) = self.workspace {
             if let Some(ref strategy) = ws.strategy {
@@ -1122,6 +1133,7 @@ mod tests {
         serde_json::to_vec(&serde_json::json!({
             "schema": WORK_LOOP_PROFILE_V1_SCHEMA,
             "work_id": "W-001",
+            "dedupe_key": "rev:1",
             "workspace": {
                 "strategy": "git_worktree",
                 "root": "~/.apm2/worktrees",
@@ -1173,6 +1185,7 @@ mod tests {
         let data = serde_json::to_vec(&serde_json::json!({
             "schema": WORK_LOOP_PROFILE_V1_SCHEMA,
             "work_id": "W-001",
+            "dedupe_key": "rev:1",
             "extra_knob": 42
         }))
         .expect("valid json");
@@ -1382,6 +1395,7 @@ mod tests {
         let data = serde_json::to_vec(&serde_json::json!({
             "schema": WORK_LOOP_PROFILE_V1_SCHEMA,
             "work_id": "W-001",
+            "dedupe_key": "rev:1",
             "retry": {
                 "backoff_seconds": intervals
             }
@@ -1517,11 +1531,13 @@ mod tests {
     fn tck_00633_loop_profile_minimal_valid() {
         let data = serde_json::to_vec(&serde_json::json!({
             "schema": WORK_LOOP_PROFILE_V1_SCHEMA,
-            "work_id": "W-001"
+            "work_id": "W-001",
+            "dedupe_key": "rev:1"
         }))
         .expect("valid json");
         let profile = bounded_decode_loop_profile(&data).expect("minimal profile should decode");
         assert_eq!(profile.work_id, "W-001");
+        assert_eq!(profile.dedupe_key, "rev:1");
         assert!(profile.workspace.is_none());
         assert!(profile.retry.is_none());
         assert!(profile.nudge_policy.is_none());

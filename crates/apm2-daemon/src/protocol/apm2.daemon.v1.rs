@@ -1930,6 +1930,42 @@ pub struct PublishWorkContextEntryResponse {
     #[prost(string, tag = "4")]
     pub work_id: ::prost::alloc::string::String,
 }
+/// IPC-PRIV-079: PublishWorkLoopProfile (TCK-00645, RFC-0032 Phase 4)
+/// Publishes a work loop profile to CAS and anchors it in the ledger via
+/// evidence.published with category WORK_LOOP_PROFILE.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublishWorkLoopProfileRequest {
+    /// Canonical work identifier. Must match an existing work claim.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Deduplication key for idempotent publishing.
+    /// Must not be empty. Idempotency is enforced on (work_id, dedupe_key).
+    #[prost(string, tag = "2")]
+    pub dedupe_key: ::prost::alloc::string::String,
+    /// JSON-encoded WorkLoopProfileV1 payload (max 64 KiB).
+    /// The daemon validates bounded decode and deny_unknown_fields semantics.
+    #[prost(bytes = "vec", tag = "3")]
+    pub profile_json: ::prost::alloc::vec::Vec<u8>,
+    /// Lease ID for PCAC lifecycle enforcement and role-scoped claim resolution.
+    /// Required.
+    #[prost(string, tag = "4")]
+    pub lease_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublishWorkLoopProfileResponse {
+    /// Deterministic evidence ID (WLP- prefix).
+    #[prost(string, tag = "1")]
+    pub evidence_id: ::prost::alloc::string::String,
+    /// CAS hash of the canonical profile bytes (hex-encoded BLAKE3).
+    #[prost(string, tag = "2")]
+    pub cas_hash: ::prost::alloc::string::String,
+    /// Work ID echoed back.
+    #[prost(string, tag = "3")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Dedupe key echoed back.
+    #[prost(string, tag = "4")]
+    pub dedupe_key: ::prost::alloc::string::String,
+}
 /// IPC-PRIV-078: ClaimWorkV2 (RFC-0032, TCK-00637)
 /// Claims an EXISTING work item (opened via OpenWork). Does not create a new
 /// work_id. Transitions Open -> Claimed (IMPLEMENTER/COORDINATOR) or

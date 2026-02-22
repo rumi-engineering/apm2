@@ -424,6 +424,9 @@ impl_bounded_decode_simple!(
     // TCK-00638: Work context entry publishing
     PublishWorkContextEntryRequest,
     PublishWorkContextEntryResponse,
+    // TCK-00645: Work loop profile publishing
+    PublishWorkLoopProfileRequest,
+    PublishWorkLoopProfileResponse,
     // TCK-00637: ClaimWorkV2 (RFC-0032 Phase 2)
     ClaimWorkV2Request,
     ClaimWorkV2Response,
