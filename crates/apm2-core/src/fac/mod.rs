@@ -622,6 +622,13 @@ pub mod view_commitment;
 /// `WorkAuthorityBindingsV1` with bounded decoding, `deny_unknown_fields`,
 /// and per-artifact byte limits.
 pub mod work_cas_schemas;
+/// Publish and anchor `WorkLoopProfileV1` artifacts (RFC-0032 Phase 4,
+/// TCK-00645).
+///
+/// Validates, canonicalizes, stores in CAS, and computes deterministic
+/// evidence IDs for work loop profiles. Publication is idempotent on
+/// `(work_id, dedupe_key)`.
+pub mod work_loop_profile_publish;
 // Re-export view commitment types
 // Re-export summary receipt types (TCK-00327)
 // Re-export builtin role types (TCK-00331)
@@ -839,4 +846,9 @@ pub use work_cas_schemas::{
     WorkContextEntryV1, WorkContextKind, WorkLoopProfileV1, WorkSpecRepo, WorkSpecType, WorkSpecV1,
     WorkspaceConfig, bounded_decode_authority_bindings, bounded_decode_context_entry,
     bounded_decode_loop_profile, bounded_decode_work_spec, canonicalize_for_cas,
+};
+// Re-export work loop profile publish types (TCK-00645, RFC-0032 Phase 4)
+pub use work_loop_profile_publish::{
+    PublishWorkLoopProfileError, PublishWorkLoopProfileResult, compute_evidence_id,
+    publish_work_loop_profile,
 };
