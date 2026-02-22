@@ -1967,6 +1967,46 @@ pub struct ClaimWorkV2Response {
     #[prost(bool, tag = "5")]
     pub already_claimed: bool,
 }
+/// IPC-PRIV-079: RecordWorkPrAssociation (RFC-0032, TCK-00639)
+/// Records a PR association for an existing work item. Emits a canonical
+/// work.pr_associated event and optionally publishes a LINKOUT context entry
+/// with the PR URL. Idempotent on (work_id, pr_number, commit_sha).
+/// Actor ID is derived from peer credentials (never from client input).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordWorkPrAssociationRequest {
+    /// Canonical work identifier. Must match an existing work claim.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Pull request number (must be > 0).
+    #[prost(uint64, tag = "2")]
+    pub pr_number: u64,
+    /// Commit SHA that triggered the PR (must be exactly 40 lowercase hex chars).
+    #[prost(string, tag = "3")]
+    pub commit_sha: ::prost::alloc::string::String,
+    /// Governing lease ID for PCAC lifecycle enforcement. Required.
+    #[prost(string, tag = "4")]
+    pub lease_id: ::prost::alloc::string::String,
+    /// Optional PR URL for LINKOUT context entry publishing.
+    /// If non-empty, a WORK_CONTEXT_ENTRY of kind Linkout is published
+    /// with this URL as the target.
+    #[prost(string, tag = "5")]
+    pub pr_url: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordWorkPrAssociationResponse {
+    /// Echoed canonical work identifier.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Echoed PR number.
+    #[prost(uint64, tag = "2")]
+    pub pr_number: u64,
+    /// Echoed commit SHA.
+    #[prost(string, tag = "3")]
+    pub commit_sha: ::prost::alloc::string::String,
+    /// Whether this was an idempotent no-op (same association already exists).
+    #[prost(bool, tag = "4")]
+    pub already_existed: bool,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StopReason {

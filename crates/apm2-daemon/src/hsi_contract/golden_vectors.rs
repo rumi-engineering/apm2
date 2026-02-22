@@ -66,7 +66,9 @@ pub const MANIFEST_FULL_VECTOR: GoldenVector = GoldenVector {
     // TCK-00638: PublishWorkContextEntry (hsi.work_context.publish) added as
     // authoritative+idempotent+receipt.
     // TCK-00637: ClaimWorkV2 (hsi.work.claim_v2) added as authoritative+idempotent+receipt.
-    expected_hash: "ed524bd791e6fe39015202ca6b92340245508d39b66084a02a7cae44ec20d1d2",
+    // TCK-00639: RecordWorkPrAssociation (hsi.work.record_pr_association) added as
+    // authoritative+idempotent+receipt.
+    expected_hash: "059693879b0eecd208b979b9cb14f22dd2c6200556a56c8806f9181251f76c79",
 };
 
 /// Golden vector: minimal manifest with a single route.

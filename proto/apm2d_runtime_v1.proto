@@ -1979,3 +1979,34 @@ message ClaimWorkV2Response {
   // Whether this was an idempotent re-claim by the same actor.
   bool already_claimed = 5;
 }
+
+// IPC-PRIV-079: RecordWorkPrAssociation (RFC-0032, TCK-00639)
+// Records a PR association for an existing work item. Emits a canonical
+// work.pr_associated event and optionally publishes a LINKOUT context entry
+// with the PR URL. Idempotent on (work_id, pr_number, commit_sha).
+// Actor ID is derived from peer credentials (never from client input).
+message RecordWorkPrAssociationRequest {
+  // Canonical work identifier. Must match an existing work claim.
+  string work_id = 1;
+  // Pull request number (must be > 0).
+  uint64 pr_number = 2;
+  // Commit SHA that triggered the PR (must be exactly 40 lowercase hex chars).
+  string commit_sha = 3;
+  // Governing lease ID for PCAC lifecycle enforcement. Required.
+  string lease_id = 4;
+  // Optional PR URL for LINKOUT context entry publishing.
+  // If non-empty, a WORK_CONTEXT_ENTRY of kind Linkout is published
+  // with this URL as the target.
+  string pr_url = 5;
+}
+
+message RecordWorkPrAssociationResponse {
+  // Echoed canonical work identifier.
+  string work_id = 1;
+  // Echoed PR number.
+  uint64 pr_number = 2;
+  // Echoed commit SHA.
+  string commit_sha = 3;
+  // Whether this was an idempotent no-op (same association already exists).
+  bool already_existed = 4;
+}

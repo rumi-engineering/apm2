@@ -134,6 +134,9 @@ use super::messages::{
     // TCK-00638: Work context entry publishing types
     PublishWorkContextEntryRequest,
     PublishWorkContextEntryResponse,
+    // TCK-00639: PR association recording types
+    RecordWorkPrAssociationRequest,
+    RecordWorkPrAssociationResponse,
     RefreshCredentialRequest,
     RefreshCredentialResponse,
     RegisterRecoveryEvidenceRequest,
@@ -6566,6 +6569,9 @@ pub enum PrivilegedMessageType {
     // --- Work Context Publishing (RFC-0032, TCK-00638) ---
     /// `PublishWorkContextEntry` request (IPC-PRIV-077)
     PublishWorkContextEntry = 76,
+    // --- Work PR Association (RFC-0032, TCK-00639) ---
+    /// `RecordWorkPrAssociation` request (IPC-PRIV-079)
+    RecordWorkPrAssociation = 30,
 }
 
 impl PrivilegedMessageType {
@@ -6614,6 +6620,8 @@ impl PrivilegedMessageType {
             28 => Some(Self::OpenWork),
             // TCK-00637: ClaimWorkV2 (RFC-0032 Phase 2)
             29 => Some(Self::ClaimWorkV2),
+            // TCK-00639: RecordWorkPrAssociation (RFC-0032 Phase 2)
+            30 => Some(Self::RecordWorkPrAssociation),
             // HEF tags (64-68)
             64 => Some(Self::SubscribePulse),
             66 => Some(Self::UnsubscribePulse),
@@ -6685,6 +6693,7 @@ impl PrivilegedMessageType {
             Self::OpenWork,
             Self::ClaimWorkV2,
             Self::PublishWorkContextEntry,
+            Self::RecordWorkPrAssociation,
         ]
     }
 
@@ -6738,7 +6747,8 @@ impl PrivilegedMessageType {
             | Self::RequestUnfreeze
             | Self::OpenWork
             | Self::ClaimWorkV2
-            | Self::PublishWorkContextEntry => true,
+            | Self::PublishWorkContextEntry
+            | Self::RecordWorkPrAssociation => true,
             // Server-to-client notification only — not a client request.
             Self::PulseEvent => false,
         }
@@ -6789,6 +6799,7 @@ impl PrivilegedMessageType {
             Self::OpenWork => "hsi.work.open",
             Self::ClaimWorkV2 => "hsi.work.claim_v2",
             Self::PublishWorkContextEntry => "hsi.work_context.publish",
+            Self::RecordWorkPrAssociation => "hsi.work.record_pr_association",
             Self::PulseEvent => "hsi.pulse.event",
         }
     }
@@ -6834,6 +6845,7 @@ impl PrivilegedMessageType {
             Self::OpenWork => "OPEN_WORK",
             Self::ClaimWorkV2 => "CLAIM_WORK_V2",
             Self::PublishWorkContextEntry => "PUBLISH_WORK_CONTEXT_ENTRY",
+            Self::RecordWorkPrAssociation => "RECORD_WORK_PR_ASSOCIATION",
             Self::PulseEvent => "PULSE_EVENT",
         }
     }
@@ -6879,6 +6891,7 @@ impl PrivilegedMessageType {
             Self::OpenWork => "apm2.open_work_request.v1",
             Self::ClaimWorkV2 => "apm2.claim_work_v2_request.v1",
             Self::PublishWorkContextEntry => "apm2.publish_work_context_entry_request.v1",
+            Self::RecordWorkPrAssociation => "apm2.record_work_pr_association_request.v1",
             Self::PulseEvent => "apm2.pulse_event_request.v1",
         }
     }
@@ -6924,6 +6937,7 @@ impl PrivilegedMessageType {
             Self::OpenWork => "apm2.open_work_response.v1",
             Self::ClaimWorkV2 => "apm2.claim_work_v2_response.v1",
             Self::PublishWorkContextEntry => "apm2.publish_work_context_entry_response.v1",
+            Self::RecordWorkPrAssociation => "apm2.record_work_pr_association_response.v1",
             Self::PulseEvent => "apm2.pulse_event_response.v1",
         }
     }
@@ -7014,6 +7028,8 @@ pub enum PrivilegedResponse {
     ClaimWorkV2(ClaimWorkV2Response),
     /// Successful `PublishWorkContextEntry` response (TCK-00638).
     PublishWorkContextEntry(PublishWorkContextEntryResponse),
+    /// Successful `RecordWorkPrAssociation` response (TCK-00639).
+    RecordWorkPrAssociation(RecordWorkPrAssociationResponse),
     /// Error response.
     Error(PrivilegedError),
 }
@@ -7226,6 +7242,10 @@ impl PrivilegedResponse {
             },
             Self::PublishWorkContextEntry(resp) => {
                 buf.push(PrivilegedMessageType::PublishWorkContextEntry.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::RecordWorkPrAssociation(resp) => {
+                buf.push(PrivilegedMessageType::RecordWorkPrAssociation.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::Error(err) => {
@@ -8178,6 +8198,7 @@ pub(crate) enum PrivilegedHandlerClass {
     RegisterRecoveryEvidence,
     RequestUnfreeze,
     PublishWorkContextEntry,
+    RecordWorkPrAssociation,
 }
 
 #[allow(clippy::missing_const_for_fn)]
@@ -8191,6 +8212,7 @@ impl PrivilegedHandlerClass {
             Self::RegisterRecoveryEvidence => "pcac-privileged-register-recovery-evidence",
             Self::RequestUnfreeze => "pcac-privileged-request-unfreeze",
             Self::PublishWorkContextEntry => "pcac-privileged-publish-work-context-entry",
+            Self::RecordWorkPrAssociation => "pcac-privileged-record-work-pr-association",
         }
     }
 
@@ -8203,6 +8225,7 @@ impl PrivilegedHandlerClass {
             Self::RegisterRecoveryEvidence => "RegisterRecoveryEvidence",
             Self::RequestUnfreeze => "RequestUnfreeze",
             Self::PublishWorkContextEntry => "PublishWorkContextEntry",
+            Self::RecordWorkPrAssociation => "RecordWorkPrAssociation",
         }
     }
 }
@@ -11138,6 +11161,10 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::PublishWorkContextEntry => {
                 self.handle_publish_work_context_entry(payload, ctx)
             },
+            // TCK-00639: Work PR association (RFC-0032 Phase 2)
+            PrivilegedMessageType::RecordWorkPrAssociation => {
+                self.handle_record_work_pr_association(payload, ctx)
+            },
         };
 
         // TCK-00268: Emit IPC request completion metrics
@@ -11200,6 +11227,8 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::ClaimWorkV2 => "ClaimWorkV2",
                 // TCK-00638
                 PrivilegedMessageType::PublishWorkContextEntry => "PublishWorkContextEntry",
+                // TCK-00639
+                PrivilegedMessageType::RecordWorkPrAssociation => "RecordWorkPrAssociation",
             };
             let status = match &result {
                 Ok(PrivilegedResponse::Error(_)) => "error",
@@ -19900,6 +19929,482 @@ impl PrivilegedDispatcher {
     }
 
     // =========================================================================
+    // TCK-00639: RecordWorkPrAssociation Handler
+    // =========================================================================
+
+    /// Maximum length of a commit SHA (40 lowercase hex characters).
+    const COMMIT_SHA_LENGTH: usize = 40;
+
+    /// Maximum length of an optional PR URL.
+    const MAX_PR_URL_LENGTH: usize = 2048;
+
+    /// Handles `RecordWorkPrAssociation` requests (IPC-PRIV-079, TCK-00639).
+    ///
+    /// Records a PR association for an existing work item by emitting a
+    /// canonical `work.pr_associated` event. Optionally publishes a LINKOUT
+    /// context entry with the PR URL.
+    ///
+    /// # Security Invariants
+    ///
+    /// - **Admission before mutation**: PCAC lifecycle enforcement runs before
+    ///   any idempotency queries or state mutations.
+    /// - **Fail-closed**: Missing PCAC gate, invalid lease, or unauthorized
+    ///   caller all deny the request.
+    /// - **Idempotent on (`work_id`, `pr_number`, `commit_sha`)**: Duplicate
+    ///   requests return success without emitting duplicate events.
+    /// - **Input validation**: `commit_sha` must be exactly 40 lowercase hex
+    ///   chars; `pr_number` must be > 0.
+    fn handle_record_work_pr_association(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        // 1. Bounded decode the RecordWorkPrAssociationRequest protobuf. Uses `?`
+        //    propagation so the function has a genuine `Err` path, consistent with
+        //    other handlers (OpenWork, PublishWorkContextEntry).
+        let request = RecordWorkPrAssociationRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid RecordWorkPrAssociationRequest: {e}"),
+            })?;
+
+        info!(
+            work_id = %request.work_id,
+            pr_number = request.pr_number,
+            commit_sha = %request.commit_sha,
+            pr_url_present = !request.pr_url.is_empty(),
+            peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+            "RecordWorkPrAssociation request received"
+        );
+
+        // --- Validation Phase (all checks BEFORE any state mutation) ---
+
+        // 2a. work_id validation
+        if request.work_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "work_id must not be empty",
+            ));
+        }
+        if request.work_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("work_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        // 2b. pr_number validation (must be > 0)
+        if request.pr_number == 0 {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "pr_number must be greater than 0",
+            ));
+        }
+
+        // 2c. commit_sha validation (exactly 40 lowercase hex chars)
+        if request.commit_sha.len() != Self::COMMIT_SHA_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "commit_sha must be exactly {} lowercase hex characters, got {} chars",
+                    Self::COMMIT_SHA_LENGTH,
+                    request.commit_sha.len()
+                ),
+            ));
+        }
+        if !request
+            .commit_sha
+            .as_bytes()
+            .iter()
+            .all(|&b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "commit_sha must contain only lowercase hexadecimal characters [0-9a-f]",
+            ));
+        }
+
+        // 2d. lease_id validation
+        if request.lease_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "lease_id is required for authority admission",
+            ));
+        }
+        if request.lease_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "lease_id validation failed",
+            ));
+        }
+
+        // 2e. Optional pr_url length validation (bounded)
+        if request.pr_url.len() > Self::MAX_PR_URL_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "pr_url exceeds maximum length of {} bytes",
+                    Self::MAX_PR_URL_LENGTH,
+                ),
+            ));
+        }
+
+        // 3. Derive actor_id from peer credentials (NEVER from client input)
+        let Some(peer_creds) = ctx.peer_credentials() else {
+            warn!("RecordWorkPrAssociation: peer credentials missing (pre-admission)");
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "peer credentials required",
+            ));
+        };
+        let actor_id = derive_actor_id(peer_creds);
+
+        // 4. Validate work_id exists in registry (fail-closed)
+        let Some(claim) = self.work_registry.get_claim(&request.work_id) else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("work_id not found in registry: {}", request.work_id),
+            ));
+        };
+
+        // 5. Actor ownership check — the authenticated caller must own the claim.
+        if claim.actor_id != actor_id {
+            warn!(
+                work_id = %request.work_id,
+                claim_actor = %claim.actor_id,
+                caller_actor = %actor_id,
+                "RecordWorkPrAssociation rejected: caller does not own work claim"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                format!(
+                    "authenticated caller '{}' does not own work claim for '{}' (owned by '{}')",
+                    actor_id, request.work_id, claim.actor_id
+                ),
+            ));
+        }
+
+        // 6. Lease ID validation — uses constant-time comparison.
+        {
+            let lease_id_matches = request.lease_id.len() == claim.lease_id.len()
+                && bool::from(request.lease_id.as_bytes().ct_eq(claim.lease_id.as_bytes()));
+            if !lease_id_matches {
+                warn!(
+                    work_id = %request.work_id,
+                    "RecordWorkPrAssociation rejected: lease_id does not match work claim"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::PermissionDenied,
+                    "lease_id does not match the active lease for this work claim",
+                ));
+            }
+        }
+
+        // 7. PCAC lifecycle enforcement (admission BEFORE idempotency queries)
+        let Some(pcac_gate) = self.pcac_lifecycle_gate.as_deref() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "PCAC authority gate not wired (fail-closed)",
+            ));
+        };
+
+        let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
+            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
+                Ok(values) => values,
+                Err(error) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "PCAC authority denied for RecordWorkPrAssociation: \
+                             authoritative revalidation unavailable: {error}"
+                        ),
+                    ));
+                },
+            };
+
+        let pr_num_bytes = request.pr_number.to_le_bytes();
+        let effect_intent_digest = domain_tagged_hash(
+            PrivilegedHandlerClass::RecordWorkPrAssociation,
+            "intent",
+            &[
+                request.lease_id.as_bytes(),
+                request.work_id.as_bytes(),
+                &pr_num_bytes,
+                request.commit_sha.as_bytes(),
+            ],
+        );
+
+        let (risk_tier, _resolved_policy_hash) =
+            self.resolve_risk_tier_for_lease(&request.lease_id, effect_intent_digest);
+        let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
+
+        let pcac_builder =
+            PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::RecordWorkPrAssociation)
+                .session_id(request.work_id.clone())
+                .lease_id(request.lease_id.clone())
+                .boundary_intent_class(apm2_core::pcac::BoundaryIntentClass::Assert)
+                .identity_proof_hash(effect_intent_digest)
+                .identity_evidence_level(IdentityEvidenceLevel::PointerOnly)
+                .risk_tier(pcac_risk_tier);
+
+        let capability_manifest_hash = pcac_builder.hash(
+            "capability",
+            &[
+                request.lease_id.as_bytes(),
+                request.work_id.as_bytes(),
+                &pr_num_bytes,
+            ],
+        );
+
+        let scope_witness_hash = pcac_builder.hash(
+            "scope",
+            &[
+                request.work_id.as_bytes(),
+                request.commit_sha.as_bytes(),
+                actor_id.as_bytes(),
+            ],
+        );
+
+        let freshness_policy_hash = pcac_builder.hash(
+            "freshness-policy",
+            &[request.lease_id.as_bytes(), request.work_id.as_bytes()],
+        );
+
+        let stop_budget_profile_digest = pcac_builder.hash(
+            "stop-budget",
+            &[
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.emergency_stop_active(),
+                ))],
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.governance_stop_active(),
+                ))],
+                request.work_id.as_bytes(),
+            ],
+        );
+
+        let pcac_input = pcac_builder
+            .capability_manifest_hash(capability_manifest_hash)
+            .scope_witness_hash(scope_witness_hash)
+            .freshness_policy_hash(freshness_policy_hash)
+            .stop_budget_profile_digest(stop_budget_profile_digest)
+            .effect_intent_digest(effect_intent_digest)
+            .build(
+                join_freshness_tick,
+                join_time_envelope_ref,
+                join_ledger_anchor,
+                join_revocation_head,
+            );
+
+        let pcac_lifecycle_artifacts = match self.enforce_privileged_pcac_lifecycle(
+            PrivilegedHandlerClass::RecordWorkPrAssociation.operation_name(),
+            pcac_gate,
+            &pcac_input,
+            &request.lease_id,
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+            effect_intent_digest,
+        ) {
+            Ok(artifacts) => artifacts,
+            Err(pcac_error) => {
+                return Ok(pcac_error);
+            },
+        };
+
+        // 8. Idempotency check: look for an existing work.pr_associated event with the
+        //    same (work_id, pr_number, commit_sha). Run AFTER PCAC lifecycle so
+        //    unauthorized callers cannot probe PR association state.
+        //
+        //    The payload is stored as a JSON envelope with a hex-encoded protobuf
+        //    field (same as all session events). Decode via JSON -> hex -> proto.
+        if let Some(existing) = self
+            .event_emitter
+            .get_first_event_by_work_id_and_type(&request.work_id, "work.pr_associated")
+        {
+            // Strictly typed envelope for zero-copy extraction of the
+            // hex-encoded protobuf payload.
+            #[derive(serde::Deserialize)]
+            struct Envelope<'a> {
+                payload: &'a str,
+            }
+
+            if let Ok(envelope) = serde_json::from_slice::<Envelope<'_>>(&existing.payload) {
+                if let Ok(raw_bytes) = hex::decode(envelope.payload) {
+                    if let Ok(decoded) = <apm2_core::events::WorkEvent as prost::Message>::decode(
+                        raw_bytes.as_slice(),
+                    ) {
+                        if let Some(apm2_core::events::work_event::Event::PrAssociated(ref assoc)) =
+                            decoded.event
+                        {
+                            if assoc.pr_number == request.pr_number
+                                && assoc.commit_sha == request.commit_sha
+                            {
+                                info!(
+                                    work_id = %request.work_id,
+                                    pr_number = request.pr_number,
+                                    commit_sha = %request.commit_sha,
+                                    "RecordWorkPrAssociation: idempotent no-op (same association already exists)"
+                                );
+                                return Ok(PrivilegedResponse::RecordWorkPrAssociation(
+                                    RecordWorkPrAssociationResponse {
+                                        work_id: request.work_id,
+                                        pr_number: request.pr_number,
+                                        commit_sha: request.commit_sha,
+                                        already_existed: true,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 9. Build and emit the canonical work.pr_associated event
+        let event_payload = apm2_core::work::helpers::work_pr_associated_payload(
+            &request.work_id,
+            request.pr_number,
+            &request.commit_sha,
+        );
+
+        let timestamp_ns = match self.get_htf_timestamp_ns() {
+            Ok(ts) => ts,
+            Err(e) => {
+                warn!(error = %e, "HTF timestamp generation failed - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("HTF timestamp error: {e}"),
+                ));
+            },
+        };
+
+        // Construct JSON envelope for the event payload with PCAC lifecycle
+        // artifacts attached for audit trail.
+        let mut event_payload_json = serde_json::json!({
+            "work_id": request.work_id,
+            "pr_number": request.pr_number,
+            "commit_sha": request.commit_sha,
+            "protobuf_payload_hex": hex::encode(&event_payload),
+        });
+
+        if let (Some(artifacts), Some(payload_object)) = (
+            pcac_lifecycle_artifacts.as_ref(),
+            event_payload_json.as_object_mut(),
+        ) {
+            append_privileged_pcac_lifecycle_fields(payload_object, artifacts);
+        }
+
+        match self.event_emitter.emit_session_event(
+            &request.work_id,
+            "work.pr_associated",
+            &event_payload,
+            &actor_id,
+            timestamp_ns,
+        ) {
+            Ok(signed_event) => {
+                info!(
+                    event_id = %signed_event.event_id,
+                    work_id = %request.work_id,
+                    pr_number = request.pr_number,
+                    commit_sha = %request.commit_sha,
+                    "work.pr_associated event emitted"
+                );
+            },
+            Err(e) => {
+                // Fail-closed: event emission failure denies the operation
+                warn!(
+                    work_id = %request.work_id,
+                    error = %e,
+                    "RecordWorkPrAssociation: failed to emit work.pr_associated event"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "RecordWorkPrAssociation failed: could not emit work.pr_associated event: {e}"
+                    ),
+                ));
+            },
+        }
+
+        // 10. Optional: If pr_url is provided, publish a LINKOUT context entry using
+        //     the existing PublishWorkContextEntry machinery.
+        if !request.pr_url.is_empty() {
+            // Build a dedupe key from (work_id, pr_number, "linkout")
+            let dedupe_key = format!("pr-{}-linkout", request.pr_number);
+            let linkout_entry_json = serde_json::json!({
+                "schema": "apm2.work_context_entry.v1",
+                "work_id": request.work_id,
+                "kind": "Linkout",
+                "dedupe_key": dedupe_key,
+                "title": format!("PR #{}", request.pr_number),
+                "body": request.pr_url,
+                "entry_id": "",
+                "actor_id": "",
+                "created_at_ns": 0_u64,
+                "source_session_id": "",
+            });
+
+            let entry_json_bytes = serde_json::to_vec(&linkout_entry_json).unwrap_or_default();
+            if !entry_json_bytes.is_empty() {
+                // Construct a PublishWorkContextEntryRequest and dispatch internally
+                let ctx_request = PublishWorkContextEntryRequest {
+                    work_id: request.work_id.clone(),
+                    kind: "Linkout".to_string(),
+                    dedupe_key,
+                    entry_json: entry_json_bytes,
+                    lease_id: request.lease_id.clone(),
+                };
+
+                let ctx_payload = {
+                    let mut buf = Vec::new();
+                    ctx_request.encode(&mut buf).unwrap_or_default();
+                    buf
+                };
+
+                // Best-effort: LINKOUT publishing failure does not block the
+                // primary PR association. The pr_associated event is already
+                // durably committed.
+                match self.handle_publish_work_context_entry(&ctx_payload, ctx) {
+                    Ok(PrivilegedResponse::Error(e)) => {
+                        warn!(
+                            work_id = %request.work_id,
+                            pr_number = request.pr_number,
+                            error_code = e.code,
+                            error_message = %e.message,
+                            "LINKOUT context entry publishing failed (non-blocking)"
+                        );
+                    },
+                    Err(e) => {
+                        warn!(
+                            work_id = %request.work_id,
+                            pr_number = request.pr_number,
+                            error = %e,
+                            "LINKOUT context entry publishing failed with protocol error (non-blocking)"
+                        );
+                    },
+                    Ok(_) => {
+                        info!(
+                            work_id = %request.work_id,
+                            pr_number = request.pr_number,
+                            "LINKOUT context entry published for PR URL"
+                        );
+                    },
+                }
+            }
+        }
+
+        Ok(PrivilegedResponse::RecordWorkPrAssociation(
+            RecordWorkPrAssociationResponse {
+                work_id: request.work_id,
+                pr_number: request.pr_number,
+                commit_sha: request.commit_sha,
+                already_existed: false,
+            },
+        ))
+    }
+
+    // =========================================================================
     // TCK-00340: DelegateSublease Handler
     // =========================================================================
 
@@ -22205,6 +22710,19 @@ pub fn encode_open_work_request(request: &OpenWorkRequest) -> Bytes {
 #[must_use]
 pub fn encode_claim_work_v2_request(request: &ClaimWorkV2Request) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::ClaimWorkV2.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `RecordWorkPrAssociation` request to bytes for sending
+/// (TCK-00639).
+///
+/// The format is: `[tag: u8][payload: protobuf]`
+#[must_use]
+pub fn encode_record_work_pr_association_request(
+    request: &RecordWorkPrAssociationRequest,
+) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::RecordWorkPrAssociation.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }
@@ -32086,6 +32604,444 @@ mod tests {
                     assert!(
                         err.message.contains("does not own work claim"),
                         "Expected actor ownership error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+    }
+
+    // ========================================================================
+    // TCK-00639: RecordWorkPrAssociation Tests
+    // ========================================================================
+    mod record_work_pr_association {
+        use super::*;
+
+        fn privileged_ctx() -> ConnectionContext {
+            ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }))
+        }
+
+        /// Claims work and returns `(work_id, lease_id)`.
+        fn claim_work(
+            dispatcher: &PrivilegedDispatcher,
+            ctx: &ConnectionContext,
+        ) -> (String, String) {
+            let request = ClaimWorkRequest {
+                actor_id: "test:actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let frame = encode_claim_work_request(&request);
+            let response = dispatcher.dispatch(&frame, ctx).unwrap();
+            match response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                other => panic!("Expected ClaimWork response, got: {other:?}"),
+            }
+        }
+
+        /// Valid 40-char lowercase hex commit SHA for tests.
+        const VALID_COMMIT_SHA: &str = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+
+        fn make_request(
+            work_id: &str,
+            pr_number: u64,
+            commit_sha: &str,
+            lease_id: &str,
+        ) -> RecordWorkPrAssociationRequest {
+            RecordWorkPrAssociationRequest {
+                work_id: work_id.to_string(),
+                pr_number,
+                commit_sha: commit_sha.to_string(),
+                lease_id: lease_id.to_string(),
+                pr_url: String::new(),
+            }
+        }
+
+        fn encode_frame(request: &RecordWorkPrAssociationRequest) -> Bytes {
+            encode_record_work_pr_association_request(request)
+        }
+
+        // --- Tag and routing tests ---
+
+        #[test]
+        fn test_record_work_pr_association_tag_and_routing() {
+            assert_eq!(PrivilegedMessageType::RecordWorkPrAssociation.tag(), 30);
+            assert_eq!(
+                PrivilegedMessageType::from_tag(30),
+                Some(PrivilegedMessageType::RecordWorkPrAssociation)
+            );
+        }
+
+        #[test]
+        fn test_record_work_pr_association_is_client_request() {
+            assert!(PrivilegedMessageType::RecordWorkPrAssociation.is_client_request());
+        }
+
+        #[test]
+        fn test_record_work_pr_association_in_all_request_variants() {
+            let variants = PrivilegedMessageType::all_request_variants();
+            assert!(
+                variants.contains(&PrivilegedMessageType::RecordWorkPrAssociation),
+                "RecordWorkPrAssociation must be in all_request_variants"
+            );
+        }
+
+        #[test]
+        fn test_record_work_pr_association_hsi_route() {
+            assert_eq!(
+                PrivilegedMessageType::RecordWorkPrAssociation.hsi_route(),
+                "hsi.work.record_pr_association"
+            );
+        }
+
+        #[test]
+        fn test_record_work_pr_association_hsi_route_id() {
+            assert_eq!(
+                PrivilegedMessageType::RecordWorkPrAssociation.hsi_route_id(),
+                "RECORD_WORK_PR_ASSOCIATION"
+            );
+        }
+
+        #[test]
+        fn test_record_work_pr_association_response_encoding() {
+            let response =
+                PrivilegedResponse::RecordWorkPrAssociation(RecordWorkPrAssociationResponse {
+                    work_id: "W-test-123".to_string(),
+                    pr_number: 42,
+                    commit_sha: VALID_COMMIT_SHA.to_string(),
+                    already_existed: false,
+                });
+            let encoded = response.encode();
+            assert_eq!(
+                encoded[0],
+                PrivilegedMessageType::RecordWorkPrAssociation.tag()
+            );
+            assert!(encoded.len() > 1, "encoded frame must include payload");
+        }
+
+        // --- Input validation tests ---
+
+        #[test]
+        fn test_rejects_empty_work_id() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            let request = make_request("", 1, VALID_COMMIT_SHA, "lease-1");
+            let frame = encode_frame(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                    );
+                    assert!(
+                        err.message.contains("work_id must not be empty"),
+                        "Expected work_id error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_rejects_pr_number_zero() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            let request = make_request("W-test", 0, VALID_COMMIT_SHA, "lease-1");
+            let frame = encode_frame(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                    );
+                    assert!(
+                        err.message.contains("pr_number must be greater than 0"),
+                        "Expected pr_number error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_rejects_commit_sha_wrong_length() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            // Too short (39 chars)
+            let request = make_request(
+                "W-test",
+                1,
+                "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b",
+                "lease-1",
+            );
+            let frame = encode_frame(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                    );
+                    assert!(
+                        err.message.contains("commit_sha must be exactly 40"),
+                        "Expected commit_sha length error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_rejects_commit_sha_uppercase() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            // 40 chars but with uppercase
+            let request = make_request(
+                "W-test",
+                1,
+                "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2",
+                "lease-1",
+            );
+            let frame = encode_frame(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                    );
+                    assert!(
+                        err.message.contains("lowercase hexadecimal"),
+                        "Expected lowercase hex error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_rejects_empty_lease_id() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            let request = make_request("W-test", 1, VALID_COMMIT_SHA, "");
+            let frame = encode_frame(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                    );
+                    assert!(
+                        err.message.contains("lease_id"),
+                        "Expected lease_id error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_rejects_missing_peer_credentials() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged_session_open(None);
+
+            let request = make_request("W-test", 1, VALID_COMMIT_SHA, "lease-1");
+            let frame = encode_frame(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                    );
+                    assert!(
+                        err.message.contains("peer credentials"),
+                        "Expected peer credentials error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_rejects_unknown_work_id() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            let request = make_request("WORK-nonexistent", 42, VALID_COMMIT_SHA, "lease-1");
+            let frame = encode_frame(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("work_id not found"),
+                        "Expected work_id not found error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_rejects_wrong_actor() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
+
+            // Use different credentials to simulate a different actor
+            let wrong_ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 9999,
+                gid: 9999,
+                pid: Some(54321),
+            }));
+
+            let request = make_request(&work_id, 42, VALID_COMMIT_SHA, &lease_id);
+            let frame = encode_frame(&request);
+            let response = dispatcher.dispatch(&frame, &wrong_ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::PermissionDenied),
+                    );
+                    assert!(
+                        err.message.contains("does not own work claim"),
+                        "Expected actor ownership error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_rejects_lease_mismatch() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+            let (work_id, _lease_id) = claim_work(&dispatcher, &ctx);
+
+            // Use a different lease_id
+            let request = make_request(&work_id, 42, VALID_COMMIT_SHA, "WRONG-LEASE-ID");
+            let frame = encode_frame(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::PermissionDenied),
+                    );
+                    assert!(
+                        err.message.contains("lease_id does not match"),
+                        "Expected lease mismatch error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_no_pcac_gate_fails_closed() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
+
+            let request = make_request(&work_id, 42, VALID_COMMIT_SHA, &lease_id);
+            let frame = encode_frame(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("PCAC") && err.message.contains("fail-closed"),
+                        "Expected PCAC fail-closed error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for missing PCAC gate, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_rejects_pr_url_too_long() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            let mut request = make_request("W-test", 1, VALID_COMMIT_SHA, "lease-1");
+            request.pr_url = "x".repeat(2049);
+            let frame = encode_frame(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                    );
+                    assert!(
+                        err.message.contains("pr_url exceeds maximum length"),
+                        "Expected pr_url length error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_rejects_commit_sha_non_hex() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            // 40 chars but contains non-hex 'g'
+            let request = make_request(
+                "W-test",
+                1,
+                "g1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                "lease-1",
+            );
+            let frame = encode_frame(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                    );
+                    assert!(
+                        err.message.contains("lowercase hexadecimal"),
+                        "Expected hex validation error, got: {}",
                         err.message
                     );
                 },
