@@ -1963,6 +1963,9 @@ message PublishWorkLoopProfileRequest {
   // JSON-encoded WorkLoopProfileV1 payload (max 64 KiB).
   // The daemon validates bounded decode and deny_unknown_fields semantics.
   bytes profile_json = 3;
+  // Lease ID for PCAC lifecycle enforcement and role-scoped claim resolution.
+  // Required.
+  string lease_id = 4;
 }
 
 message PublishWorkLoopProfileResponse {

@@ -1946,6 +1946,10 @@ pub struct PublishWorkLoopProfileRequest {
     /// The daemon validates bounded decode and deny_unknown_fields semantics.
     #[prost(bytes = "vec", tag = "3")]
     pub profile_json: ::prost::alloc::vec::Vec<u8>,
+    /// Lease ID for PCAC lifecycle enforcement and role-scoped claim resolution.
+    /// Required.
+    #[prost(string, tag = "4")]
+    pub lease_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PublishWorkLoopProfileResponse {
