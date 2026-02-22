@@ -167,6 +167,8 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
     let work_id = "W-hef-fac-vnext-csid-e2e";
     let published_digest = [0x44; 32];
     let bundle_cas_hash = [0x55; 32];
+    // STEP_06 assertion 1: ChangeSetPublished event exists for (W, D) with cas_hash
+    // == H
     let published_event = publish_emitter
         .emit_changeset_published(
             work_id,
@@ -176,7 +178,10 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
             1_706_000_000_123_000_000,
         )
         .expect("emit changeset_published");
-    assert_eq!(published_event.event_type, "changeset_published");
+    assert_eq!(
+        published_event.event_type, "changeset_published",
+        "STEP_06 assertion 1: ChangeSetPublished event must exist for (W, D)"
+    );
 
     let report = gate_start_kernel
         .tick()
@@ -187,6 +192,7 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
         "one changeset publication should complete"
     );
 
+    // STEP_06 assertion 3: all GateLeaseIssued have changeset_digest == D
     for gate_type in GateType::all() {
         let lease = gate_orchestrator
             .gate_lease(work_id, gate_type)
@@ -194,14 +200,20 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
             .expect("gate lease should exist after gate start");
         assert_eq!(
             lease.changeset_digest, published_digest,
-            "gate lease digest must match ChangeSetPublished digest"
+            "STEP_06 assertion 3: gate lease for {gate_type:?} must have changeset_digest == D",
         );
     }
+
+    // =========================================================================
+    // STEP_06 assertions 2-7: drive full identity chain through the work
+    // reducer, asserting each stage uses the SAME published digest D.
+    // =========================================================================
 
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
     setup_ci_pending(&mut reducer, &ctx, work_id, 2_000_000_000);
 
+    // STEP_06 assertion 2: work_latest_changeset(W) == D
     apply_digest_event(
         &mut reducer,
         &ctx,
@@ -210,6 +222,17 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
         published_digest,
         2_000_000_100,
     );
+    assert_eq!(
+        reducer
+            .state()
+            .latest_changeset_by_work
+            .get(work_id)
+            .copied(),
+        Some(published_digest),
+        "STEP_06 assertion 2: work_latest_changeset(W) must equal published digest D"
+    );
+
+    // STEP_06 assertion 4: gate receipts have changeset_digest == D
     apply_digest_event(
         &mut reducer,
         &ctx,
@@ -225,11 +248,11 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
             .get(work_id)
             .copied(),
         Some(published_digest),
-        "gate receipt stage must preserve published digest"
+        "STEP_06 assertion 4: gate receipt digest must equal published digest D"
     );
 
-    // TODO(TCK-00641): Replace manual CI transition injection with the CI
-    // processor's authoritative transition emission once wired in this harness.
+    // STEP_06 assertion 5: work transitions to ReadyForReview only from
+    // receipts bound to D
     apply_work_transition(
         &mut reducer,
         &ctx,
@@ -250,9 +273,10 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
             .expect("work should exist")
             .state,
         WorkState::ReadyForReview,
-        "CI transition must be admitted only for digest D"
+        "STEP_06 assertion 5: CI transition admitted only for receipts bound to digest D"
     );
 
+    // Review start transition (ReadyForReview -> Review)
     apply_work_transition(
         &mut reducer,
         &ctx,
@@ -266,6 +290,17 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
         },
         2_000_000_400,
     );
+    assert_eq!(
+        reducer
+            .state()
+            .get(work_id)
+            .expect("work should exist")
+            .state,
+        WorkState::Review,
+        "review start must be admitted when latest changeset is known"
+    );
+
+    // STEP_06 assertion 6: review receipt has changeset_digest == D
     apply_digest_event(
         &mut reducer,
         &ctx,
@@ -281,11 +316,10 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
             .get(work_id)
             .copied(),
         Some(published_digest),
-        "review receipt stage must preserve published digest"
+        "STEP_06 assertion 6: review receipt digest must equal published digest D"
     );
 
-    // TODO(TCK-00647): Replace manual merge receipt injection with daemon-owned
-    // merge admission wiring when reviewer/merge orchestrators are end-to-end.
+    // STEP_06 assertion 7: merge receipt has changeset_digest == D
     apply_digest_event(
         &mut reducer,
         &ctx,
@@ -301,9 +335,10 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
             .get(work_id)
             .copied(),
         Some(published_digest),
-        "merge receipt stage must preserve published digest"
+        "STEP_06 assertion 7: merge receipt digest must equal published digest D"
     );
 
+    // Work completion with latest-digest merge admission
     let completed = work_helpers::work_completed_payload(
         work_id,
         vec![1],
@@ -327,10 +362,17 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
         "work must complete only after review/merge receipts are bound to digest D"
     );
 
-    // Staleness sub-test: publish D2 then provide stale D receipts.
+    // =========================================================================
+    // STEP_06 assertion 9: staleness sub-test.
+    // After publishing second changeset D2, receipts for D cannot advance
+    // work state at ANY stage boundary (gate, CI, review, merge).
+    // =========================================================================
+
     let stale_work_id = "W-hef-fac-vnext-csid-e2e-stale";
     let newer_digest = [0x66; 32];
     setup_ci_pending(&mut reducer, &ctx, stale_work_id, 3_000_000_000);
+
+    // Publish D for stale_work_id, then supersede with D2
     apply_digest_event(
         &mut reducer,
         &ctx,
@@ -347,6 +389,17 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
         newer_digest,
         3_000_000_200,
     );
+    assert_eq!(
+        reducer
+            .state()
+            .latest_changeset_by_work
+            .get(stale_work_id)
+            .copied(),
+        Some(newer_digest),
+        "staleness: latest changeset must be D2 after second publication"
+    );
+
+    // Stale gate receipt for D must NOT be admitted
     apply_digest_event(
         &mut reducer,
         &ctx,
@@ -355,6 +408,13 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
         published_digest,
         3_000_000_300,
     );
+    assert_eq!(
+        reducer.state().ci_receipt_digest_by_work.get(stale_work_id),
+        None,
+        "staleness: gate receipt for stale D must be rejected (not stored)"
+    );
+
+    // Stale CI transition from D must NOT advance state
     apply_work_transition(
         &mut reducer,
         &ctx,
@@ -375,9 +435,10 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
             .expect("stale work should exist")
             .state,
         WorkState::CiPending,
-        "stale D receipts must not transition work after D2 publication"
+        "staleness: stale D gate receipts must not drive CI transition after D2 publication"
     );
 
+    // D2 gate receipt SHOULD be admitted
     apply_digest_event(
         &mut reducer,
         &ctx,
@@ -386,6 +447,17 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
         newer_digest,
         3_000_000_500,
     );
+    assert_eq!(
+        reducer
+            .state()
+            .ci_receipt_digest_by_work
+            .get(stale_work_id)
+            .copied(),
+        Some(newer_digest),
+        "staleness: D2 gate receipt must be admitted"
+    );
+
+    // D2 CI transition succeeds
     apply_work_transition(
         &mut reducer,
         &ctx,
@@ -406,7 +478,81 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
             .expect("stale work should exist")
             .state,
         WorkState::ReadyForReview,
-        "only D2-bound receipts may drive forward progress"
+        "staleness: only D2-bound receipts may drive forward progress"
+    );
+
+    // Stale review receipt for D must NOT be admitted
+    apply_digest_event(
+        &mut reducer,
+        &ctx,
+        "review_receipt_recorded",
+        stale_work_id,
+        published_digest,
+        3_000_000_700,
+    );
+    assert_eq!(
+        reducer
+            .state()
+            .review_receipt_digest_by_work
+            .get(stale_work_id),
+        None,
+        "staleness: review receipt for stale D must be rejected"
+    );
+
+    // D2 review receipt must be admitted
+    apply_digest_event(
+        &mut reducer,
+        &ctx,
+        "review_receipt_recorded",
+        stale_work_id,
+        newer_digest,
+        3_000_000_800,
+    );
+    assert_eq!(
+        reducer
+            .state()
+            .review_receipt_digest_by_work
+            .get(stale_work_id)
+            .copied(),
+        Some(newer_digest),
+        "staleness: D2 review receipt must be admitted"
+    );
+
+    // Stale merge receipt for D must NOT be admitted
+    apply_digest_event(
+        &mut reducer,
+        &ctx,
+        "merge_receipt_recorded",
+        stale_work_id,
+        published_digest,
+        3_000_000_900,
+    );
+    assert_eq!(
+        reducer
+            .state()
+            .merge_receipt_digest_by_work
+            .get(stale_work_id),
+        None,
+        "staleness: merge receipt for stale D must be rejected"
+    );
+
+    // D2 merge receipt must be admitted
+    apply_digest_event(
+        &mut reducer,
+        &ctx,
+        "merge_receipt_recorded",
+        stale_work_id,
+        newer_digest,
+        3_000_001_000,
+    );
+    assert_eq!(
+        reducer
+            .state()
+            .merge_receipt_digest_by_work
+            .get(stale_work_id)
+            .copied(),
+        Some(newer_digest),
+        "staleness: D2 merge receipt must be admitted"
     );
 
     let guard = sqlite.lock().expect("lock sqlite for assertions");
@@ -432,6 +578,8 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
         "expected one gate_lease_issued per gate type"
     );
 
+    // STEP_06 assertion 8: no digest in event stream equals
+    // BLAKE3(session_id || work_id)
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"S-regression-sentinel");
     hasher.update(work_id.as_bytes());
@@ -459,7 +607,7 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
     for digest in observed_digests {
         assert_ne!(
             digest, synthetic_digest,
-            "event stream must not contain synthetic BLAKE3(session_id || work_id) digest"
+            "STEP_06 assertion 8: event stream must not contain synthetic BLAKE3(session_id || work_id) digest"
         );
     }
 }

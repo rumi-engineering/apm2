@@ -133,12 +133,15 @@ pub struct WorkReducerState {
 - [INV-0108] Reducer is deterministic: same event sequence produces identical state
 - [INV-0109] Only events with `event_type.starts_with("work.")` are processed
 - [INV-0115] Stage-bound digest admission is fail-closed: CI transitions (`CiPending -> ReadyForReview/Blocked`) and `work.completed` admission require a known latest `changeset_published` digest and matching receipt-bound digest context
-- [INV-0116] Receipt events bound to stale digests are never admitted into review/merge digest projections
+- [INV-0116] Receipt events bound to stale digests are never admitted into gate/review/merge digest projections
+- [INV-0117] Gate receipt collection enforces latest-digest validation: gate receipts bound to superseded changesets are silently dropped (logged, not stored in `ci_receipt_digest_by_work`)
+- [INV-0118] Review-start stage boundary (`ReadyForReview -> Review`) requires a known latest changeset and, if a review receipt digest exists, it must match the latest digest
 
 **Contracts:**
 - [CTR-0106] `apply()` returns `Ok(())` for non-work events (no-op)
 - [CTR-0107] `reset()` clears all state to empty `WorkReducerState`
 - [CTR-0111] Non-work digest events (`changeset_published`, gate/review/merge receipt events) are observed before work-event decoding so stage boundaries can enforce latest-digest checks
+- [CTR-0112] `enforce_stage_boundary_guards` is called on every state transition, enforcing latest-digest validation at CI completion, review-start, and completion boundaries
 
 ### `WorkError`
 
@@ -477,3 +480,5 @@ The holon types are used by agent implementations, while core types are used by 
 - `documents/skills/rust-standards/references/15_errors_panics_diagnostics.md` - Error type design
 - `documents/skills/rust-standards/references/25_api_design_stdlib_quality.md` - State machine patterns
 - README.md: Work Lifecycle State Machine section
+- RFC-0032: FAC vNext changeset identity
+- TCK-00672: End-to-end changeset identity wiring (CSID-004 stage boundary guards)

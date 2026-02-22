@@ -1,4 +1,5 @@
 // AGENT-AUTHORED (TCK-00388)
+#![allow(deprecated)]
 //! TCK-00388: Gate execution orchestrator integration tests.
 //!
 //! This test module verifies the gate orchestrator's runtime wiring by

@@ -26,7 +26,9 @@ Consumes authoritative changeset publication identity and autonomously orchestra
 - [INV-GT02] Maximum concurrent orchestrations bounded to `MAX_CONCURRENT_ORCHESTRATIONS` (1,000).
 - [INV-GT03] Maximum gate types per orchestration bounded to `MAX_GATE_TYPES` (8).
 - [INV-GT04] Expired gate leases produce FAIL verdict (fail-closed timeouts).
-- [INV-GT05] Changeset digest in each lease matches the actual changeset from the terminated session.
+- [INV-GT05] Changeset digest in each lease matches the authoritative `ChangeSetPublished` digest.
+- [INV-GT12] Gate start entrypoint is `start_for_changeset` (CSID-003). `on_session_terminated` is lifecycle-only (timeout polling) and deprecated.
+- [INV-GT13] Idempotency key is `(work_id, changeset_digest)`, a pure function of authoritative publication inputs (CSID-003).
 
 **Contracts:**
 
@@ -120,5 +122,7 @@ Abstraction over GitHub merge operations for testability.
 
 - RFC-0015: Forge Admission Cycle
 - RFC-0019: Automated FAC v0
+- RFC-0032: FAC vNext changeset identity
 - TCK-00388: Gate orchestrator implementation
 - TCK-00390: Merge executor implementation
+- TCK-00672: End-to-end changeset identity wiring (CSID-003 gate-start migration)

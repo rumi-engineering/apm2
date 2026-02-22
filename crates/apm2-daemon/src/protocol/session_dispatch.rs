@@ -1219,10 +1219,9 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     telemetry_store: Option<Arc<crate::session::SessionTelemetryStore>>,
     /// Gate orchestrator for autonomous gate lifecycle (TCK-00388).
     ///
-    /// When set, session termination triggers gate orchestration via
-    /// [`GateOrchestrator::on_session_terminated`]. The returned events
-    /// are persisted to the ledger through the session dispatcher's
-    /// `ledger` emitter.
+    /// Gate start is publication-driven via
+    /// [`GateOrchestrator::start_for_changeset`] (CSID-003). Session
+    /// termination only triggers timeout polling.
     #[allow(dead_code)]
     gate_orchestrator: Option<Arc<GateOrchestrator>>,
     /// Pre-actuation gate for stop/budget checks (TCK-00351).

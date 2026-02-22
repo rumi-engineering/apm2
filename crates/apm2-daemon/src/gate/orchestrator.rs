@@ -1,9 +1,11 @@
-// AGENT-AUTHORED (TCK-00388)
+// AGENT-AUTHORED (TCK-00388, TCK-00672)
 //! Gate execution orchestrator implementation.
 //!
-//! Watches for `session_terminated` ledger events and autonomously drives
-//! the gate lifecycle: policy resolution -> lease issuance -> gate executor
-//! spawn -> receipt collection.
+//! Gate orchestration is publication-driven: the single authoritative
+//! entrypoint is [`GateOrchestrator::start_for_changeset`] which accepts a
+//! [`ChangesetPublication`] derived from an authoritative `ChangeSetPublished`
+//! ledger event. Session termination is a lifecycle-only signal used solely
+//! for timeout polling; it **never** starts new gate orchestrations.
 //!
 //! # Security Model
 //!
@@ -11,7 +13,8 @@
 //!   before any `GateLeaseIssued` event for the same `work_id`.
 //! - **Fail-closed**: Gate timeout produces FAIL verdict, blocking merge.
 //! - **Domain separation**: All leases use `GATE_LEASE_ISSUED:` prefix.
-//! - **Changeset binding**: Lease `changeset_digest` matches session data.
+//! - **Changeset binding**: Lease `changeset_digest` is bound to the
+//!   authoritative `ChangeSetPublished` digest, not session data.
 //! - **Receipt authenticity**: Gate receipt signatures are verified against the
 //!   executor's verifying key before state transitions.
 //!
@@ -135,8 +138,8 @@ impl Clock for SystemClock {
 
 /// Gate types that the orchestrator manages.
 ///
-/// Each terminated session with associated work triggers execution of
-/// all required gate types.
+/// Each published changeset triggers execution of all required gate types
+/// via [`GateOrchestrator::start_for_changeset`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub enum GateType {
     /// Agent Acceptance Testing gate.
@@ -277,15 +280,17 @@ pub struct SessionTerminatedInfo {
 // Idempotency Key
 // =============================================================================
 
-/// Deterministic idempotency key computed from `work_id + changeset_digest`.
+/// Deterministic idempotency key computed from `(work_id, changeset_digest)`.
 ///
 /// This is the authoritative gate-start idempotency tuple for publication-
-/// driven orchestration and is stable across replay/restart.
+/// driven orchestration and is stable across replay/restart. It is a pure
+/// function of authoritative inputs from `ChangeSetPublished` and does not
+/// depend on session identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct IdempotencyKey {
     /// The work item bound to the publication.
     work_id: String,
-    /// The changeset digest from the terminated session.
+    /// The canonical changeset digest from `ChangeSetPublished`.
     changeset_digest: [u8; 32],
 }
 
@@ -609,7 +614,7 @@ pub struct GateOrchestratorConfig {
     pub gate_timeout_ms: u64,
     /// Maximum accepted heartbeat age for authoritative progression checks.
     pub max_heartbeat_age_ticks: u64,
-    /// Gate types to execute for each terminated session.
+    /// Gate types to execute for each published changeset.
     pub gate_types: Vec<GateType>,
     /// Issuer actor ID for gate leases.
     pub issuer_actor_id: String,
@@ -639,13 +644,18 @@ impl Default for GateOrchestratorConfig {
 
 /// Gate execution orchestrator for autonomous gate lifecycle management.
 ///
-/// The `GateOrchestrator` watches for `session_terminated` events and
-/// autonomously orchestrates the gate lifecycle:
+/// Gate orchestration is publication-driven: the single authoritative
+/// entrypoint is [`Self::start_for_changeset`] which consumes a
+/// [`ChangesetPublication`] derived from `ChangeSetPublished`. The
+/// orchestrator autonomously drives the gate lifecycle:
 ///
 /// 1. Resolve policy via `PolicyResolvedForChangeSet`
 /// 2. Issue `GateLease` for each required gate
 /// 3. Spawn gate executor episodes
 /// 4. Collect `GateReceipt` results or handle timeout
+///
+/// Session termination is a lifecycle-only signal used for timeout polling;
+/// it never starts new gate orchestrations.
 ///
 /// # Security
 ///
@@ -653,7 +663,7 @@ impl Default for GateOrchestratorConfig {
 /// - Gate leases use domain-separated Ed25519 signatures
 /// - Receipt signatures are verified against executor verifying key
 /// - Timeout produces fail-closed FAIL verdict
-/// - Changeset digest in leases matches session data
+/// - Changeset digest in leases is bound to the published changeset digest
 ///
 /// # Event Model (BLOCKER 3 fix)
 ///
@@ -787,7 +797,7 @@ impl GateOrchestrator {
     /// Production code MUST use [`Self::start_for_changeset`] and must not
     /// bootstrap gate start from session lifecycle events.
     #[cfg(test)]
-    pub(crate) async fn handle_session_terminated(
+    pub(crate) async fn start_from_test_session(
         &self,
         info: SessionTerminatedInfo,
     ) -> Result<
@@ -807,6 +817,26 @@ impl GateOrchestrator {
             changeset_published_event_id: info.session_id,
         })
         .await
+    }
+
+    /// Legacy test-only shim for session-seeded gate start.
+    ///
+    /// Production code must never start gates from session lifecycle hooks.
+    /// Unit tests that still model pre-CSID-003 behavior can use this helper
+    /// while gradually migrating to [`Self::start_for_changeset`].
+    #[cfg(test)]
+    pub(crate) async fn handle_session_terminated(
+        &self,
+        info: SessionTerminatedInfo,
+    ) -> Result<
+        (
+            Vec<GateType>,
+            HashMap<GateType, Arc<Signer>>,
+            Vec<GateOrchestratorEvent>,
+        ),
+        GateOrchestratorError,
+    > {
+        self.start_from_test_session(info).await
     }
 
     /// Returns the orchestrator's verifying key (for lease signature
@@ -1603,14 +1633,17 @@ impl GateOrchestrator {
     }
 
     // =========================================================================
-    // Daemon Runtime Entry Point (BLOCKER 1)
+    // Publication-Driven Gate Lifecycle (CSID-003)
     // =========================================================================
 
-    /// Daemon runtime hook for session termination notifications.
+    /// Lifecycle-only hook for session termination notifications.
     ///
-    /// Session termination is a lifecycle signal only; it MUST NOT bootstrap
-    /// gate start. Gate orchestration is publication-driven through
-    /// [`Self::start_for_changeset`].
+    /// Session termination is a lifecycle signal only; it **never** starts new
+    /// gate orchestrations. Gate orchestration is exclusively publication-
+    /// driven through [`Self::start_for_changeset`].
+    ///
+    /// This method polls timeout progression on already-active orchestrations
+    /// and returns any resulting timeout events (fail-closed FAIL verdicts).
     ///
     /// # Example Integration
     ///
@@ -1618,20 +1651,34 @@ impl GateOrchestrator {
     /// // In daemon startup:
     /// let orchestrator = Arc::new(GateOrchestrator::new(config, signer));
     ///
-    /// // When a session terminates:
-    /// let (gate_types, events) = orchestrator
-    ///     .on_session_terminated(session_info)
-    ///     .await?;
+    /// // When a session terminates (lifecycle accounting only):
+    /// let events = orchestrator
+    ///     .poll_session_lifecycle()
+    ///     .await;
     ///
-    /// // Persist events to ledger
+    /// // Persist timeout events to ledger
     /// for event in events {
     ///     ledger.append(event).await?;
     /// }
     /// ```
+    pub async fn poll_session_lifecycle(&self) -> Vec<GateOrchestratorEvent> {
+        let events = self.poll_timeouts().await;
+        debug!(
+            event_count = events.len(),
+            "Session lifecycle poll completed (publication-driven gate start only)"
+        );
+        events
+    }
+
+    /// Backwards-compatible wrapper for callers that still pass
+    /// `SessionTerminatedInfo`. Delegates to [`Self::poll_session_lifecycle`].
     ///
-    /// # Errors
-    ///
-    /// Returns `GateOrchestratorError` if validation fails.
+    /// Gate start is publication-driven through [`Self::start_for_changeset`].
+    /// This method only advances timeout lifecycle state on already-active
+    /// orchestrations and ignores the session info payload.
+    #[deprecated(
+        note = "Use `poll_session_lifecycle()` instead; session termination no longer triggers gate start (CSID-003)"
+    )]
     pub async fn on_session_terminated(
         &self,
         info: SessionTerminatedInfo,
@@ -1653,15 +1700,7 @@ impl GateOrchestrator {
             });
         }
 
-        // Lifecycle-only hook: process timeout progression for existing
-        // orchestrations but do not start new ones from session termination.
-        let events = self.poll_timeouts().await;
-        info!(
-            work_id = %info.work_id,
-            event_count = events.len(),
-            "Session termination observed (publication-driven gate start only)"
-        );
-
+        let events = self.poll_session_lifecycle().await;
         Ok((Vec::new(), HashMap::new(), events))
     }
 
@@ -1674,13 +1713,14 @@ impl GateOrchestrator {
     /// Gate start is publication-driven through [`Self::start_for_changeset`].
     /// This method only advances timeout lifecycle state on already-active
     /// orchestrations.
+    #[deprecated(
+        note = "Use `poll_session_lifecycle()` instead; session termination no longer triggers gate start (CSID-003)"
+    )]
     pub async fn drive_gate_execution(
         &self,
-        info: SessionTerminatedInfo,
+        _info: SessionTerminatedInfo,
     ) -> Result<Vec<GateOrchestratorEvent>, GateOrchestratorError> {
-        let work_id = info.work_id.clone();
-        let (_gate_types, _executor_signers, events) = self.on_session_terminated(info).await?;
-        info!(work_id = %work_id, event_count = events.len(), "Session lifecycle progression driven");
+        let events = self.poll_session_lifecycle().await;
         Ok(events)
     }
 
@@ -2196,6 +2236,8 @@ pub fn create_timeout_receipt(
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::*;
 
     /// Helper: creates a test signer (for orchestrator lease signing).
