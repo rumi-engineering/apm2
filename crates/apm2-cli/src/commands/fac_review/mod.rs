@@ -5539,6 +5539,8 @@ pub(super) fn run_gates_local_worker(
     gate_profile: GateThroughputProfile,
     workspace_root: &Path,
     bounded_unit_base: Option<&str>,
+    lease_job_id: Option<&str>,
+    lease_toolchain_fingerprint: Option<&str>,
 ) -> Result<LocalGatesRunResult, String> {
     let result = gates::run_gates_local_worker(
         force,
@@ -5550,6 +5552,8 @@ pub(super) fn run_gates_local_worker(
         gate_profile,
         workspace_root,
         bounded_unit_base,
+        lease_job_id,
+        lease_toolchain_fingerprint,
     )?;
     Ok(LocalGatesRunResult {
         exit_code: result.exit_code,

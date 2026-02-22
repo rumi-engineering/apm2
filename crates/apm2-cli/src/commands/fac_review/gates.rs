@@ -25,9 +25,10 @@ use apm2_core::fac::job_spec::{
 };
 use apm2_core::fac::service_user_gate::QueueWriteMode;
 use apm2_core::fac::{
-    FacPolicyV1, LaneLockGuard, LaneManager, LaneState, apply_lane_env_overrides,
-    build_job_environment, compute_test_env_for_parallelism, ensure_lane_env_dirs,
-    lookup_job_receipt, parse_b3_256_digest, parse_policy_hash, resolve_host_test_parallelism,
+    FacPolicyV1, LaneLeaseV1, LaneLockGuard, LaneManager, LaneProfileV1, LaneState,
+    apply_lane_env_overrides, build_job_environment, compute_test_env_for_parallelism,
+    current_time_iso8601, ensure_lane_env_dirs, lookup_job_receipt, parse_b3_256_digest,
+    parse_policy_hash, resolve_host_test_parallelism,
 };
 use chrono::{SecondsFormat, Utc};
 use fs2::FileExt;
@@ -1640,6 +1641,8 @@ pub(super) fn run_gates_local_worker(
     gate_profile: GateThroughputProfile,
     workspace_root: &Path,
     bounded_unit_base: Option<&str>,
+    lease_job_id: Option<&str>,
+    lease_toolchain_fingerprint: Option<&str>,
 ) -> Result<LocalGatesRunResult, String> {
     let (resolved_profile, effective_cpu_quota) =
         resolve_effective_execution_profile(cpu_quota, gate_profile)?;
@@ -1722,6 +1725,8 @@ pub(super) fn run_gates_local_worker(
         Some(prep_step_callback.as_ref()),
         Some(gate_progress_callback),
         bounded_unit_base,
+        lease_job_id,
+        lease_toolchain_fingerprint,
     ) {
         Ok(summary) => summary,
         Err(failure) => {
@@ -3549,6 +3554,8 @@ fn run_gates_inner(
         None,
         on_gate_progress,
         None,
+        None,
+        None,
     )
     .map_err(GatesRunFailure::render)
 }
@@ -3569,6 +3576,8 @@ fn run_gates_inner_detailed(
     on_prep_step: Option<PrepStepCallback<'_>>,
     on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
     bounded_unit_base: Option<&str>,
+    lease_job_id: Option<&str>,
+    lease_toolchain_fingerprint: Option<&str>,
 ) -> Result<GatesSummary, GatesRunFailure> {
     validate_timeout_seconds(timeout_seconds).map_err(|message| {
         let structured = StructuredFailure::prep_not_ready(
@@ -3628,6 +3637,8 @@ fn run_gates_inner_detailed(
                 emit_human_logs,
                 on_gate_progress,
                 bounded_unit_base,
+                lease_job_id,
+                lease_toolchain_fingerprint,
             )
             .map_err(|message| {
                 let structured = StructuredFailure::gate_execution_failed(
@@ -3677,6 +3688,8 @@ fn run_execute_phase(
     emit_human_logs: bool,
     on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
     bounded_unit_base: Option<&str>,
+    lease_job_id: Option<&str>,
+    lease_toolchain_fingerprint: Option<&str>,
 ) -> Result<GatesSummary, String> {
     let timeout_decision = resolve_bounded_test_timeout(workspace_root, timeout_seconds);
 
@@ -3707,6 +3720,16 @@ fn run_execute_phase(
     // If lane-00 is corrupt (from a previous failed run), refuse to
     // run gates in a dirty environment. The user must reset first.
     check_lane_not_corrupt(&lane_manager)?;
+    let _gates_running_lease_guard = lease_job_id
+        .map(|job_id| {
+            persist_gates_running_lease(
+                &lane_manager,
+                "lane-00",
+                job_id,
+                lease_toolchain_fingerprint,
+            )
+        })
+        .transpose()?;
 
     // 1. Require clean working tree for full gates only. `--force` allows
     // rerunning gates for the same SHA while local edits are in progress.
@@ -4343,6 +4366,65 @@ fn acquire_gates_lane_lock(lane_manager: &LaneManager) -> Result<LaneLockGuard, 
             "cannot acquire exclusive lock on lane-00 for gate execution — \
              another `apm2 fac gates` process may be running: {e}"
         )
+    })
+}
+
+/// Best-effort RAII cleanup guard for lane-00 RUNNING lease records used by
+/// worker-executed queued gates jobs.
+struct GatesRunningLeaseGuard {
+    lane_dir: PathBuf,
+    lane_id: &'static str,
+    job_id: String,
+}
+
+impl Drop for GatesRunningLeaseGuard {
+    fn drop(&mut self) {
+        if let Err(err) = LaneLeaseV1::remove(&self.lane_dir) {
+            eprintln!(
+                "fac gates: WARNING: failed to remove running lease for lane {} job {}: {err}",
+                self.lane_id, self.job_id
+            );
+        }
+    }
+}
+
+fn persist_gates_running_lease(
+    lane_manager: &LaneManager,
+    lane_id: &'static str,
+    job_id: &str,
+    toolchain_fingerprint: Option<&str>,
+) -> Result<GatesRunningLeaseGuard, String> {
+    let lane_dir = lane_manager.lane_dir(lane_id);
+    let lane_profile_hash = match LaneProfileV1::load(&lane_dir) {
+        Ok(lane_profile) => lane_profile
+            .compute_hash()
+            .unwrap_or_else(|_| "b3-256:unknown".to_string()),
+        Err(err) => {
+            eprintln!(
+                "fac gates: WARNING: lane profile unavailable for {lane_id} lease; \
+                 using unknown profile hash: {err}"
+            );
+            "b3-256:unknown".to_string()
+        },
+    };
+    let lease = LaneLeaseV1::new(
+        lane_id,
+        job_id,
+        std::process::id(),
+        LaneState::Running,
+        &current_time_iso8601(),
+        &lane_profile_hash,
+        toolchain_fingerprint.unwrap_or("b3-256:unknown"),
+    )
+    .map_err(|err| format!("failed to build running lane lease for {lane_id}: {err}"))?;
+    lease
+        .persist(&lane_dir)
+        .map_err(|err| format!("failed to persist running lane lease for {lane_id}: {err}"))?;
+
+    Ok(GatesRunningLeaseGuard {
+        lane_dir,
+        lane_id,
+        job_id: job_id.to_string(),
     })
 }
 
@@ -7003,6 +7085,38 @@ time.sleep(20)\n",
         let guard = acquire_gates_lane_lock(&manager).expect("should acquire lock");
         // Lock is held while guard is alive.
         drop(guard);
+    }
+
+    #[test]
+    fn persist_gates_running_lease_tracks_active_job_and_cleans_up() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let _lane_guard = acquire_gates_lane_lock(&manager).expect("acquire lane lock");
+        let lease_guard = persist_gates_running_lease(
+            &manager,
+            "lane-00",
+            "job-gates-active",
+            Some("b3-256:test-toolchain"),
+        )
+        .expect("persist gates running lease");
+        let lane_dir = manager.lane_dir("lane-00");
+        let lease = LaneLeaseV1::load(&lane_dir)
+            .expect("load lease")
+            .expect("lease present");
+        assert_eq!(lease.job_id, "job-gates-active");
+        assert_eq!(lease.state, LaneState::Running);
+
+        drop(lease_guard);
+        assert!(
+            LaneLeaseV1::load(&lane_dir)
+                .expect("reload lease")
+                .is_none(),
+            "drop cleanup must remove lease"
+        );
     }
 
     /// Regression (BLOCKER 1/2): `run_gates_inner` with `lane_count = 1`

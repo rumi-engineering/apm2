@@ -147,10 +147,18 @@ mod fac_review_api {
         pub failure_summary: Option<String>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RunGatesLocalWorkerInvocation {
+        pub lease_job_id: Option<String>,
+        pub lease_toolchain_fingerprint: Option<String>,
+    }
+
     thread_local! {
         static RUN_GATES_LOCAL_WORKER_OVERRIDE: RefCell<Option<Result<LocalGatesRunResult, String>>> =
             const { RefCell::new(None) };
         static GATE_LIFECYCLE_OVERRIDE: RefCell<Option<Result<usize, String>>> =
+            const { RefCell::new(None) };
+        static LAST_RUN_GATES_LOCAL_WORKER_INVOCATION: RefCell<Option<RunGatesLocalWorkerInvocation>> =
             const { RefCell::new(None) };
     }
 
@@ -168,6 +176,10 @@ mod fac_review_api {
         });
     }
 
+    pub fn take_last_run_gates_local_worker_invocation() -> Option<RunGatesLocalWorkerInvocation> {
+        LAST_RUN_GATES_LOCAL_WORKER_INVOCATION.with(|slot| slot.borrow_mut().take())
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::unnecessary_wraps)]
     pub fn run_gates_local_worker(
@@ -180,7 +192,16 @@ mod fac_review_api {
         _gate_profile: GateThroughputProfile,
         _workspace_root: &std::path::Path,
         _bounded_unit_base: Option<&str>,
+        lease_job_id: Option<&str>,
+        lease_toolchain_fingerprint: Option<&str>,
     ) -> Result<LocalGatesRunResult, String> {
+        LAST_RUN_GATES_LOCAL_WORKER_INVOCATION.with(|slot| {
+            *slot.borrow_mut() = Some(RunGatesLocalWorkerInvocation {
+                lease_job_id: lease_job_id.map(std::string::ToString::to_string),
+                lease_toolchain_fingerprint: lease_toolchain_fingerprint
+                    .map(std::string::ToString::to_string),
+            });
+        });
         if let Some(override_result) =
             RUN_GATES_LOCAL_WORKER_OVERRIDE.with(|slot| slot.borrow().clone())
         {
@@ -2228,6 +2249,61 @@ fn acquire_enqueue_lock(queue_root: &Path) -> Result<fs::File, String> {
     Ok(lock_file)
 }
 
+/// Atomically claim a pending queue entry and hold an exclusive flock on the
+/// claimed inode for the caller's full processing lifetime.
+///
+/// Synchronization model:
+/// - Open+lock the pending inode first.
+/// - Atomically rename `pending/<file>` -> `claimed/<file>`.
+/// - Keep the returned file descriptor alive until processing/commit finishes.
+///
+/// This ensures runtime reconcile's non-blocking flock probe never treats an
+/// actively executing claimed job as orphaned.
+fn claim_pending_job_with_exclusive_lock(
+    pending_path: &Path,
+    claimed_dir: &Path,
+    file_name: &str,
+) -> Result<(PathBuf, fs::File), String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+
+    let claimed_lock_file = options.open(pending_path).map_err(|err| {
+        format!(
+            "cannot open pending job for claimed lock {}: {err}",
+            pending_path.display()
+        )
+    })?;
+    let metadata = claimed_lock_file.metadata().map_err(|err| {
+        format!(
+            "cannot stat pending job for claimed lock {}: {err}",
+            pending_path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "pending job is not a regular file (fail-closed): {}",
+            pending_path.display()
+        ));
+    }
+
+    claimed_lock_file.lock_exclusive().map_err(|err| {
+        format!(
+            "cannot acquire claimed flock for pending job {}: {err}",
+            pending_path.display()
+        )
+    })?;
+
+    let claimed_path = move_to_dir_safe(pending_path, claimed_dir, file_name)
+        .map_err(|err| format!("atomic claim failed: {err}"))?;
+
+    Ok((claimed_path, claimed_lock_file))
+}
+
 /// Promote valid job specs from `queue/broker_requests/` into `queue/pending/`
 /// (TCK-00577).
 ///
@@ -3109,6 +3185,8 @@ fn run_gates_in_workspace(
     heartbeat_jobs_quarantined: u64,
     heartbeat_job_id: &str,
     bounded_unit_base: Option<&str>,
+    lease_job_id: Option<&str>,
+    lease_toolchain_fingerprint: Option<&str>,
 ) -> Result<fac_review_api::LocalGatesRunResult, String> {
     let stop_refresh = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_refresh_bg = std::sync::Arc::clone(&stop_refresh);
@@ -3147,6 +3225,8 @@ fn run_gates_in_workspace(
         options.gate_profile,
         &options.workspace_root,
         bounded_unit_base,
+        lease_job_id,
+        lease_toolchain_fingerprint,
     );
 
     stop_refresh.store(true, std::sync::atomic::Ordering::Release);
@@ -3340,6 +3420,8 @@ fn execute_queued_gates_job(
         heartbeat_jobs_quarantined,
         &spec.job_id,
         Some(bounded_unit_base.as_str()),
+        Some(spec.job_id.as_str()),
+        toolchain_fingerprint,
     ) {
         Ok(code) => code,
         Err(err) => {
@@ -5320,15 +5402,20 @@ fn process_job(
         return JobOutcome::Denied { reason };
     }
 
-    // Step 5: Atomic claim via rename (INV-WRK-003).
+    // Step 5: Atomic claim + exclusive claimed lock.
+    //
+    // Keep this lock file alive for the entire remainder of process_job so
+    // runtime reconcile's flock probe cannot reclaim actively executing jobs.
     let claimed_dir = queue_root.join(CLAIMED_DIR);
-    let claimed_path = match move_to_dir_safe(path, &claimed_dir, &file_name) {
-        Ok(p) => p,
-        Err(e) => {
-            // If rename fails (e.g., already claimed by another worker), skip.
-            return JobOutcome::skipped(format!("atomic claim failed: {e}"));
-        },
-    };
+    let (claimed_path, _claimed_lock_file) =
+        match claim_pending_job_with_exclusive_lock(path, &claimed_dir, &file_name) {
+            Ok(result) => result,
+            Err(e) => {
+                // Another worker may have claimed first, or the entry failed lock
+                // invariants; skip this candidate and continue.
+                return JobOutcome::skipped(e);
+            },
+        };
 
     let claimed_file_name = claimed_path
         .file_name()
@@ -10942,6 +11029,103 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_queued_gates_job_passes_lease_binding_to_gates_worker() {
+        let _override_guard = FacReviewApiOverrideGuard::install(
+            Ok(fac_review_api::LocalGatesRunResult {
+                exit_code: exit_codes::SUCCESS,
+                failure_summary: None,
+            }),
+            Ok(1),
+        );
+        let _ = fac_review_api::take_last_run_gates_local_worker_invocation();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let queue_root = dir.path().join("queue");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        ensure_queue_dirs(&queue_root).expect("create queue dirs");
+
+        let claimed_path = queue_root
+            .join(CLAIMED_DIR)
+            .join("gates-lease-binding.json");
+        fs::write(&claimed_path, b"{}").expect("seed claimed file");
+        let claimed_file_name = "gates-lease-binding.json";
+
+        let repo_root = PathBuf::from(repo_toplevel_for_tests());
+        let current_head = resolve_workspace_head(&repo_root).expect("resolve workspace head");
+        let mut spec = make_receipt_test_spec();
+        spec.job_id = "job-gates-lease-binding".to_string();
+        spec.source.head_sha = current_head;
+        spec.source.patch = Some(serde_json::json!({
+            "schema": GATES_JOB_OPTIONS_SCHEMA,
+            "force": false,
+            "quick": false,
+            "timeout_seconds": 600,
+            "memory_max": "48G",
+            "pids_max": 1536,
+            "cpu_quota": "auto",
+            "gate_profile": "throughput",
+            "workspace_root": repo_root.to_string_lossy(),
+        }));
+
+        let boundary_trace = ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
+        };
+        let queue_trace = JobQueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "consume".to_string(),
+            defect_reason: None,
+            cost_estimate_ticks: None,
+        };
+        let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
+        let hardening_hash = apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
+        let network_hash = apm2_core::fac::NetworkPolicy::deny().content_hash_hex();
+        let toolchain_fp = format!("b3-256:{}", "a".repeat(64));
+
+        let outcome = execute_queued_gates_job(
+            &spec,
+            &claimed_path,
+            claimed_file_name,
+            &queue_root,
+            &fac_root,
+            &boundary_trace,
+            &queue_trace,
+            None,
+            &tuple_digest,
+            &spec.job_spec_digest,
+            &hardening_hash,
+            &network_hash,
+            1,
+            0,
+            0,
+            0,
+            Some(toolchain_fp.as_str()),
+        );
+        assert!(
+            matches!(outcome, JobOutcome::Completed { .. }),
+            "expected queued gates completion with API override"
+        );
+
+        let invocation = fac_review_api::take_last_run_gates_local_worker_invocation()
+            .expect("queued gates call should invoke local worker");
+        assert_eq!(
+            invocation.lease_job_id.as_deref(),
+            Some(spec.job_id.as_str())
+        );
+        assert_eq!(
+            invocation.lease_toolchain_fingerprint.as_deref(),
+            Some(toolchain_fp.as_str())
+        );
+    }
+
+    #[test]
     fn test_execute_queued_gates_job_denied_reason_includes_gate_failure_summary() {
         let _override_guard = FacReviewApiOverrideGuard::install(
             Ok(fac_review_api::LocalGatesRunResult {
@@ -14064,6 +14248,49 @@ mod tests {
             !coordinator.repair_requested,
             "successful retry must clear repair request"
         );
+    }
+
+    #[test]
+    fn claim_pending_job_with_exclusive_lock_holds_lock_for_job_lifecycle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let queue_root = temp.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let claimed_dir = queue_root.join(CLAIMED_DIR);
+        std::fs::create_dir_all(&pending_dir).expect("create pending");
+        std::fs::create_dir_all(&claimed_dir).expect("create claimed");
+
+        let pending_path = pending_dir.join("lock-test.json");
+        std::fs::write(&pending_path, b"{\"job_id\":\"lock-test\"}").expect("write pending spec");
+
+        let (claimed_path, claimed_lock_file) =
+            claim_pending_job_with_exclusive_lock(&pending_path, &claimed_dir, "lock-test.json")
+                .expect("claim+lock pending job");
+        assert!(
+            !pending_path.exists(),
+            "pending file should move to claimed during claim"
+        );
+        assert!(claimed_path.exists(), "claimed file must exist");
+
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&claimed_path)
+            .expect("open claimed probe");
+        let lock_attempt = fs2::FileExt::try_lock_exclusive(&probe);
+        assert!(
+            lock_attempt.is_err(),
+            "second exclusive lock attempt must fail while worker lock is held"
+        );
+
+        drop(claimed_lock_file);
+
+        let probe_after_release = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&claimed_path)
+            .expect("open claimed probe after release");
+        fs2::FileExt::try_lock_exclusive(&probe_after_release)
+            .expect("exclusive lock should succeed after worker lock drops");
     }
 
     #[test]
