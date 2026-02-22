@@ -3318,6 +3318,7 @@ pub fn run_fac(
                 fac_review::run_doctor(
                     &repo,
                     pr,
+                    operator_socket,
                     args.fix,
                     output_json,
                     args.wait_for_recommended_action,

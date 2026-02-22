@@ -51,6 +51,7 @@ mod timeout_policy;
 mod types;
 mod verdict_projection;
 
+use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -79,6 +80,7 @@ use types::{
     TERMINATE_TIMEOUT, validate_expected_head_sha,
 };
 
+use crate::client::protocol::OperatorClient;
 use crate::exit_codes::codes as exit_codes;
 
 const DOCTOR_SCHEMA: &str = "apm2.fac.review.doctor.v1";
@@ -107,6 +109,13 @@ const DOCTOR_ACTIVE_AGENT_IDLE_TIMEOUT_SECONDS: i64 = 300;
 const DOCTOR_DISPATCH_PENDING_WARNING_SECONDS: i64 = 120;
 const DOCTOR_WAIT_TIMEOUT_DEFAULT_SECONDS: u64 = 1200;
 const DOCTOR_WAIT_POLL_INTERVAL_SECONDS: u64 = 1;
+const DOCTOR_WAIT_PULSE_CHECK_INTERVAL_MILLIS: u64 = 1000;
+const DOCTOR_WAIT_PULSE_TIMER_BACKSTOP_SECONDS: u64 = 15;
+const DOCTOR_WAIT_PULSE_MAX_PULSES_PER_SEC: u32 = 24;
+const DOCTOR_WAIT_PULSE_CLIENT_SUB_ID_MAX_LEN: usize = 64;
+const DOCTOR_WAIT_PULSE_DEDUPE_CAPACITY: usize = 512;
+const DOCTOR_WAIT_PULSE_RECONNECT_MAX_ATTEMPTS: usize = 3;
+const DOCTOR_WAIT_PULSE_RECONNECT_BACKOFF_MILLIS: u64 = 250;
 const DOCTOR_WAIT_TIMEOUT_EXIT_CODE: u8 = 2;
 const DOCTOR_FIX_MAX_PASSES: usize = 3;
 const FAC_REVIEW_MACHINE_TRACEABILITY_SCHEMA: &str = "apm2.fac.review.machine_traceability.v1";
@@ -130,6 +139,7 @@ const FAC_REVIEW_MACHINE_REQUIREMENT_DR007_ARTIFACT_REFS: &[&str] = &[
 ];
 const FAC_REVIEW_MACHINE_REQUIREMENT_DR008_ARTIFACT_REFS: &[&str] =
     &["documents/reviews/fac_review_state_machine.cac.json"];
+const DOCTOR_WAIT_PULSE_TOPICS: &[&str] = &["work.>", "work_graph.>", "gate.>", "ledger.head"];
 
 #[derive(Debug, Serialize)]
 struct DoctorHealthItem {
@@ -216,6 +226,33 @@ enum DoctorWaitState {
     PollEmit,
     Sleep,
     CollectSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorWaitMode {
+    PulsePrimary,
+    PollingFallback,
+}
+
+impl DoctorWaitMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PulsePrimary => "pulse_primary",
+            Self::PollingFallback => "polling_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorWaitWakeReason {
+    Pulse,
+    Timer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DoctorWaitLoopControl {
+    Exit(u8),
+    Fallback { next_tick: u64, reason: String },
 }
 
 impl DoctorWaitState {
@@ -1255,6 +1292,456 @@ fn exit_signal(status: std::process::ExitStatus) -> Option<i32> {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct DoctorPulseMetadata {
+    pulse_id: Option<String>,
+    topic: Option<String>,
+    event_type: Option<String>,
+    ledger_cursor: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DoctorPulseFingerprint {
+    pulse_id: Option<String>,
+    ledger_cursor: Option<u64>,
+}
+
+#[derive(Debug)]
+struct DoctorPulseDeduper {
+    capacity: usize,
+    entries: VecDeque<DoctorPulseFingerprint>,
+    index: HashSet<DoctorPulseFingerprint>,
+}
+
+impl DoctorPulseDeduper {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: VecDeque::new(),
+            index: HashSet::new(),
+        }
+    }
+
+    fn insert_if_new(&mut self, pulse: &DoctorPulseMetadata) -> bool {
+        let Some(fingerprint) = pulse.fingerprint() else {
+            return true;
+        };
+        if self.index.contains(&fingerprint) {
+            return false;
+        }
+        if self.entries.len() >= self.capacity
+            && let Some(oldest) = self.entries.pop_front()
+        {
+            self.index.remove(&oldest);
+        }
+        self.index.insert(fingerprint.clone());
+        self.entries.push_back(fingerprint);
+        true
+    }
+}
+
+impl DoctorPulseMetadata {
+    fn fingerprint(&self) -> Option<DoctorPulseFingerprint> {
+        if self.pulse_id.is_none() && self.ledger_cursor.is_none() {
+            return None;
+        }
+        Some(DoctorPulseFingerprint {
+            pulse_id: self.pulse_id.clone(),
+            ledger_cursor: self.ledger_cursor,
+        })
+    }
+}
+
+struct DoctorPulseSubscription {
+    runtime: tokio::runtime::Runtime,
+    client: OperatorClient,
+    subscription_id: String,
+    operator_socket: PathBuf,
+    client_sub_id: String,
+    topic_patterns: Vec<String>,
+    since_ledger_cursor: u64,
+}
+
+impl DoctorPulseSubscription {
+    fn connect(
+        operator_socket: &Path,
+        repo: &str,
+        pr_number: u32,
+    ) -> Result<(Self, usize, usize), String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| format!("failed to build pulse runtime: {err}"))?;
+
+        let topic_patterns = doctor_wait_pulse_topic_patterns();
+        let client_sub_id = build_doctor_pulse_client_sub_id(repo, pr_number);
+        let (client, response) = runtime.block_on(async {
+            let mut client = OperatorClient::connect(operator_socket)
+                .await
+                .map_err(|err| format!("operator pulse connect failed: {err}"))?;
+            let response = client
+                .subscribe_pulse(
+                    &client_sub_id,
+                    &topic_patterns,
+                    0,
+                    DOCTOR_WAIT_PULSE_MAX_PULSES_PER_SEC,
+                )
+                .await
+                .map_err(|err| format!("operator pulse subscribe failed: {err}"))?;
+            Ok::<_, String>((client, response))
+        })?;
+
+        let accepted_count = response.accepted_patterns.len();
+        let rejected_count = response.rejected_patterns.len();
+
+        let mut subscription = Self {
+            runtime,
+            client,
+            subscription_id: response.subscription_id,
+            operator_socket: operator_socket.to_path_buf(),
+            client_sub_id,
+            topic_patterns,
+            since_ledger_cursor: response.effective_since_cursor,
+        };
+        if accepted_count == 0 {
+            let _ = subscription.close();
+            return Err("pulse subscription accepted no patterns".to_string());
+        }
+
+        Ok((subscription, accepted_count, rejected_count))
+    }
+
+    fn wait_for_pulse(&mut self, timeout: Duration) -> Result<Option<DoctorPulseMetadata>, String> {
+        let pulse = self
+            .runtime
+            .block_on(async { self.client.wait_for_pulse(timeout).await })
+            .map_err(|err| format!("pulse wait failed: {err}"))?;
+        let Some(event) = pulse else {
+            return Ok(None);
+        };
+
+        let mut metadata = DoctorPulseMetadata::default();
+        if let Some(envelope) = event.envelope {
+            self.since_ledger_cursor = self.since_ledger_cursor.max(envelope.ledger_cursor);
+            metadata.pulse_id = (!envelope.pulse_id.is_empty()).then_some(envelope.pulse_id);
+            metadata.topic = (!envelope.topic.is_empty()).then_some(envelope.topic);
+            metadata.event_type = (!envelope.event_type.is_empty()).then_some(envelope.event_type);
+            metadata.ledger_cursor = Some(envelope.ledger_cursor);
+        }
+        Ok(Some(metadata))
+    }
+
+    fn reconnect(&mut self) -> Result<(usize, usize), String> {
+        let _ = self.close();
+
+        let operator_socket = self.operator_socket.clone();
+        let client_sub_id = self.client_sub_id.clone();
+        let topic_patterns = self.topic_patterns.clone();
+        let since_ledger_cursor = self.since_ledger_cursor;
+
+        let (client, response) = self.runtime.block_on(async move {
+            let mut client = OperatorClient::connect(&operator_socket)
+                .await
+                .map_err(|err| format!("operator pulse reconnect failed: {err}"))?;
+            let response = client
+                .subscribe_pulse(
+                    &client_sub_id,
+                    &topic_patterns,
+                    since_ledger_cursor,
+                    DOCTOR_WAIT_PULSE_MAX_PULSES_PER_SEC,
+                )
+                .await
+                .map_err(|err| format!("operator pulse resubscribe failed: {err}"))?;
+            Ok::<_, String>((client, response))
+        })?;
+
+        let accepted_count = response.accepted_patterns.len();
+        let rejected_count = response.rejected_patterns.len();
+        if accepted_count == 0 {
+            return Err("pulse reconnect accepted no patterns".to_string());
+        }
+
+        self.client = client;
+        self.subscription_id = response.subscription_id;
+        self.since_ledger_cursor = self
+            .since_ledger_cursor
+            .max(response.effective_since_cursor);
+        Ok((accepted_count, rejected_count))
+    }
+
+    fn close(&mut self) -> Result<bool, String> {
+        let subscription_id = self.subscription_id.clone();
+        let response = self
+            .runtime
+            .block_on(async { self.client.unsubscribe_pulse(&subscription_id).await })
+            .map_err(|err| format!("failed to unsubscribe pulse subscription: {err}"))?;
+        Ok(response.removed)
+    }
+}
+
+fn doctor_wait_pulse_topic_patterns() -> Vec<String> {
+    DOCTOR_WAIT_PULSE_TOPICS
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect()
+}
+
+fn build_doctor_pulse_client_sub_id(repo: &str, pr_number: u32) -> String {
+    let prefix = format!("fac-doctor-pr{pr_number}-");
+    let mut sanitized = String::with_capacity(repo.len());
+    for ch in repo.chars() {
+        if ch.is_ascii_alphanumeric() {
+            sanitized.push(ch.to_ascii_lowercase());
+        } else if ch == '-' || ch == '_' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('-');
+        }
+    }
+    let sanitized = sanitized.trim_matches('-');
+    let repo_part = if sanitized.is_empty() {
+        "repo"
+    } else {
+        sanitized
+    };
+
+    let remaining = DOCTOR_WAIT_PULSE_CLIENT_SUB_ID_MAX_LEN.saturating_sub(prefix.len());
+    let trimmed_repo = repo_part.chars().take(remaining.max(1)).collect::<String>();
+    format!("{prefix}{trimmed_repo}")
+}
+
+const fn doctor_wait_should_collect_summary(
+    mode: DoctorWaitMode,
+    wake_reason: DoctorWaitWakeReason,
+    timer_backstop_due: bool,
+) -> bool {
+    match mode {
+        DoctorWaitMode::PulsePrimary => {
+            matches!(wake_reason, DoctorWaitWakeReason::Pulse) || timer_backstop_due
+        },
+        DoctorWaitMode::PollingFallback => true,
+    }
+}
+
+fn emit_doctor_wait_degraded_mode_event(json_output: bool, pr_number: u32, reason: &str) {
+    if json_output {
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_wait_degraded".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "pr_number": pr_number,
+                "from_mode": DoctorWaitMode::PulsePrimary.as_str(),
+                "to_mode": DoctorWaitMode::PollingFallback.as_str(),
+                "reason": reason,
+            }),
+        }) {
+            eprintln!("WARNING: failed to emit doctor wait degraded event: {err}");
+        }
+    } else {
+        eprintln!("doctor wait: degraded to polling fallback for PR #{pr_number}: {reason}");
+    }
+}
+
+fn emit_doctor_pulse_subscribed_event(
+    json_output: bool,
+    pr_number: u32,
+    accepted_count: usize,
+    rejected_count: usize,
+    since_ledger_cursor: u64,
+    reconnect_attempt: Option<usize>,
+) {
+    if json_output {
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_pulse_subscribed".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "pr_number": pr_number,
+                "accepted_patterns": accepted_count,
+                "rejected_patterns": rejected_count,
+                "since_ledger_cursor": since_ledger_cursor,
+                "reconnect_attempt": reconnect_attempt,
+            }),
+        }) {
+            eprintln!("WARNING: failed to emit doctor pulse subscribe event: {err}");
+        }
+    } else if let Some(attempt) = reconnect_attempt {
+        eprintln!(
+            "doctor wait: pulse reconnected on attempt {attempt} (accepted_patterns={accepted_count}, rejected_patterns={rejected_count}, since_cursor={since_ledger_cursor})"
+        );
+    } else {
+        eprintln!(
+            "doctor wait: pulse subscription active (accepted_patterns={accepted_count}, rejected_patterns={rejected_count}, since_cursor={since_ledger_cursor})"
+        );
+    }
+}
+
+fn emit_doctor_pulse_reconnect_event(
+    json_output: bool,
+    pr_number: u32,
+    attempt: usize,
+    outcome: &str,
+    reason: &str,
+) {
+    if json_output {
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_pulse_reconnect".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "pr_number": pr_number,
+                "attempt": attempt,
+                "outcome": outcome,
+                "reason": reason,
+            }),
+        }) {
+            eprintln!("WARNING: failed to emit doctor pulse reconnect event: {err}");
+        }
+    } else {
+        eprintln!(
+            "doctor wait: pulse reconnect attempt {attempt} outcome={outcome} reason={reason}"
+        );
+    }
+}
+
+fn emit_doctor_pulse_skipped_event(
+    json_output: bool,
+    pr_number: u32,
+    reason: &str,
+    pulse: &DoctorPulseMetadata,
+) {
+    if json_output {
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_pulse_skipped".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "pr_number": pr_number,
+                "reason": reason,
+                "pulse_id": pulse.pulse_id,
+                "topic": pulse.topic,
+                "event_type": pulse.event_type,
+                "ledger_cursor": pulse.ledger_cursor,
+            }),
+        }) {
+            eprintln!("WARNING: failed to emit doctor pulse skipped event: {err}");
+        }
+    }
+}
+
+fn emit_doctor_wait_timer_backstop_event(
+    json_output: bool,
+    pr_number: u32,
+    tick: u64,
+    elapsed_seconds: u64,
+) {
+    if json_output {
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_wait_timer_backstop".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "tick": tick,
+                "pr_number": pr_number,
+                "elapsed_seconds": elapsed_seconds,
+                "interval_seconds": DOCTOR_WAIT_PULSE_TIMER_BACKSTOP_SECONDS,
+            }),
+        }) {
+            eprintln!("WARNING: failed to emit doctor wait timer backstop event: {err}");
+        }
+    } else {
+        eprintln!("doctor wait: timer backstop tick={tick} elapsed={elapsed_seconds}s");
+    }
+}
+
+fn doctor_wait_pulse_is_relevant(pulse: &DoctorPulseMetadata) -> bool {
+    if let Some(topic) = pulse.topic.as_deref()
+        && (topic == "ledger.head"
+            || topic.starts_with("work.")
+            || topic.starts_with("work_graph.")
+            || topic.starts_with("gate."))
+    {
+        return true;
+    }
+
+    let Some(event_type) = pulse.event_type.as_deref() else {
+        return false;
+    };
+    let normalized = event_type.to_ascii_lowercase();
+    normalized.starts_with("work.")
+        || normalized.starts_with("work_graph.")
+        || normalized.starts_with("gate.")
+        || matches!(
+            normalized.as_str(),
+            "ledger.head"
+                | "kernelevent"
+                | "workopened"
+                | "worktransitioned"
+                | "workedgeadded"
+                | "workedgeremoved"
+                | "workedgewaived"
+                | "gatereceipt"
+        )
+}
+
+fn close_doctor_pulse_subscription(subscription: &mut DoctorPulseSubscription) {
+    match subscription.close() {
+        Ok(true) => {},
+        Ok(false) => {
+            eprintln!("WARNING: pulse subscription close returned removed=false");
+        },
+        Err(err) => {
+            eprintln!("WARNING: failed to unsubscribe pulse subscription: {err}");
+        },
+    }
+}
+
+fn attempt_doctor_pulse_reconnect(
+    pulse_subscription: &mut DoctorPulseSubscription,
+    json_output: bool,
+    pr_number: u32,
+    wait_error: &str,
+) -> Result<(), String> {
+    let mut last_error = wait_error.to_string();
+    for attempt in 1..=DOCTOR_WAIT_PULSE_RECONNECT_MAX_ATTEMPTS {
+        let delay = Duration::from_millis(
+            DOCTOR_WAIT_PULSE_RECONNECT_BACKOFF_MILLIS.saturating_mul(attempt as u64),
+        );
+        thread::sleep(delay);
+
+        match pulse_subscription.reconnect() {
+            Ok((accepted_count, rejected_count)) => {
+                emit_doctor_pulse_subscribed_event(
+                    json_output,
+                    pr_number,
+                    accepted_count,
+                    rejected_count,
+                    pulse_subscription.since_ledger_cursor,
+                    Some(attempt),
+                );
+                emit_doctor_pulse_reconnect_event(
+                    json_output,
+                    pr_number,
+                    attempt,
+                    "recovered",
+                    wait_error,
+                );
+                return Ok(());
+            },
+            Err(err) => {
+                emit_doctor_pulse_reconnect_event(
+                    json_output,
+                    pr_number,
+                    attempt,
+                    "retry_failed",
+                    &err,
+                );
+                last_error = err;
+            },
+        }
+    }
+
+    Err(format!(
+        "{wait_error}; reconnect exhausted after {DOCTOR_WAIT_PULSE_RECONNECT_MAX_ATTEMPTS} attempts: {last_error}"
+    ))
+}
+
 /// Run doctor diagnostics for a specific PR.
 ///
 /// Doctor is machine-oriented by default. In wait mode, output streams NDJSON
@@ -1263,6 +1750,7 @@ fn exit_signal(status: std::process::ExitStatus) -> Option<i32> {
 pub fn run_doctor(
     repo: &str,
     pr_number: u32,
+    operator_socket: &Path,
     fix: bool,
     json_output: bool,
     wait_for_recommended_action: bool,
@@ -1423,39 +1911,304 @@ pub fn run_doctor(
     };
     interrupted.store(false, Ordering::SeqCst);
 
-    let poll_interval = Duration::from_secs(DOCTOR_WAIT_POLL_INTERVAL_SECONDS);
     let started = Instant::now();
     let mut tick = 0_u64;
     let mut summary = run_doctor_inner(repo, pr_number, repairs_applied, false);
+    if json_output {
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_wait_mode".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "mode": DoctorWaitMode::PulsePrimary.as_str(),
+                "pr_number": pr_number,
+            }),
+        }) {
+            eprintln!("WARNING: failed to emit doctor wait mode event: {err}");
+        }
+    }
+
+    let mut pulse_subscription =
+        match DoctorPulseSubscription::connect(operator_socket, repo, pr_number) {
+            Ok((subscription, accepted_count, rejected_count)) => {
+                emit_doctor_pulse_subscribed_event(
+                    json_output,
+                    pr_number,
+                    accepted_count,
+                    rejected_count,
+                    subscription.since_ledger_cursor,
+                    None,
+                );
+                Some(subscription)
+            },
+            Err(err) => {
+                emit_doctor_wait_degraded_mode_event(json_output, pr_number, &err);
+                None
+            },
+        };
+
+    if let Some(subscription) = pulse_subscription.as_mut() {
+        match run_doctor_wait_pulse_loop(
+            repo,
+            pr_number,
+            json_output,
+            &exit_actions,
+            interrupted.as_ref(),
+            wait_timeout_seconds,
+            started,
+            tick,
+            &mut summary,
+            subscription,
+        ) {
+            DoctorWaitLoopControl::Exit(code) => {
+                close_doctor_pulse_subscription(subscription);
+                return code;
+            },
+            DoctorWaitLoopControl::Fallback { next_tick, reason } => {
+                tick = next_tick;
+                close_doctor_pulse_subscription(subscription);
+                emit_doctor_wait_degraded_mode_event(json_output, pr_number, &reason);
+            },
+        }
+    }
+
+    run_doctor_wait_poll_loop(
+        repo,
+        pr_number,
+        json_output,
+        &exit_actions,
+        interrupted.as_ref(),
+        wait_timeout_seconds,
+        started,
+        tick,
+        summary,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn doctor_wait_maybe_exit(
+    repo: &str,
+    pr_number: u32,
+    summary: &mut DoctorPrSummary,
+    json_output: bool,
+    tick: u64,
+    started: Instant,
+    wait_timeout_seconds: u64,
+    exit_actions: &std::collections::BTreeSet<String>,
+    interrupted: &AtomicBool,
+) -> Option<DoctorWaitLoopControl> {
+    let elapsed_seconds = started.elapsed().as_secs().min(wait_timeout_seconds);
+    let facts = DoctorWaitFacts {
+        recommended_action: summary.recommended_action.action.as_str(),
+        exit_actions,
+        interrupted: interrupted.load(Ordering::SeqCst),
+        elapsed_seconds,
+        wait_timeout_seconds,
+    };
+    match derive_doctor_wait_next_state(DoctorWaitState::Evaluate, Some(&facts)) {
+        DoctorWaitState::ExitOnRecommendedAction => {
+            emit_doctor_wait_terminal_event(json_output, tick, summary, elapsed_seconds);
+            emit_doctor_wait_result(summary, json_output, tick, false, elapsed_seconds);
+            Some(DoctorWaitLoopControl::Exit(exit_codes::SUCCESS))
+        },
+        DoctorWaitState::ExitOnInterrupt => {
+            *summary = run_doctor_inner(repo, pr_number, Vec::new(), true);
+            emit_doctor_wait_result(summary, json_output, tick, false, elapsed_seconds);
+            Some(DoctorWaitLoopControl::Exit(exit_codes::SUCCESS))
+        },
+        DoctorWaitState::ExitOnTimeout => {
+            emit_doctor_wait_timeout_event(json_output, tick, summary, elapsed_seconds);
+            emit_doctor_wait_result(summary, json_output, tick, true, elapsed_seconds);
+            Some(DoctorWaitLoopControl::Exit(DOCTOR_WAIT_TIMEOUT_EXIT_CODE))
+        },
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_doctor_wait_pulse_loop(
+    repo: &str,
+    pr_number: u32,
+    json_output: bool,
+    exit_actions: &std::collections::BTreeSet<String>,
+    interrupted: &AtomicBool,
+    wait_timeout_seconds: u64,
+    started: Instant,
+    initial_tick: u64,
+    summary: &mut DoctorPrSummary,
+    pulse_subscription: &mut DoctorPulseSubscription,
+) -> DoctorWaitLoopControl {
+    let mut tick = initial_tick;
+    let mut pulse_deduper = DoctorPulseDeduper::new(DOCTOR_WAIT_PULSE_DEDUPE_CAPACITY);
+    let mut last_summary_collected_at = Instant::now();
+
+    loop {
+        if let Some(result) = doctor_wait_maybe_exit(
+            repo,
+            pr_number,
+            summary,
+            json_output,
+            tick,
+            started,
+            wait_timeout_seconds,
+            exit_actions,
+            interrupted,
+        ) {
+            return result;
+        }
+
+        let elapsed = started.elapsed().as_secs();
+        let remaining_seconds = wait_timeout_seconds.saturating_sub(elapsed);
+        let wait_slice = Duration::from_millis(DOCTOR_WAIT_PULSE_CHECK_INTERVAL_MILLIS)
+            .min(Duration::from_secs(remaining_seconds.max(1)));
+
+        let pulse_metadata = match pulse_subscription.wait_for_pulse(wait_slice) {
+            Ok(pulse) => pulse,
+            Err(err) => {
+                if let Err(reconnect_err) =
+                    attempt_doctor_pulse_reconnect(pulse_subscription, json_output, pr_number, &err)
+                {
+                    return DoctorWaitLoopControl::Fallback {
+                        next_tick: tick,
+                        reason: reconnect_err,
+                    };
+                }
+                continue;
+            },
+        };
+        let wake_reason = if pulse_metadata.is_some() {
+            DoctorWaitWakeReason::Pulse
+        } else {
+            DoctorWaitWakeReason::Timer
+        };
+        let timer_backstop_due = matches!(wake_reason, DoctorWaitWakeReason::Timer)
+            && last_summary_collected_at.elapsed()
+                >= Duration::from_secs(DOCTOR_WAIT_PULSE_TIMER_BACKSTOP_SECONDS);
+
+        if !doctor_wait_should_collect_summary(
+            DoctorWaitMode::PulsePrimary,
+            wake_reason,
+            timer_backstop_due,
+        ) {
+            continue;
+        }
+
+        if matches!(wake_reason, DoctorWaitWakeReason::Timer) {
+            tick = tick.saturating_add(1);
+            emit_doctor_wait_timer_backstop_event(
+                json_output,
+                pr_number,
+                tick,
+                started.elapsed().as_secs(),
+            );
+            // Temporal recommendation guards (idle/dispatched age) need bounded
+            // wall-clock driven reevaluation when the pulse stream is quiet.
+            let use_lightweight = tick % 5 != 0;
+            *summary = run_doctor_inner(repo, pr_number, Vec::new(), use_lightweight);
+            last_summary_collected_at = Instant::now();
+            continue;
+        }
+
+        let Some(pulse) = pulse_metadata else {
+            continue;
+        };
+
+        if !doctor_wait_pulse_is_relevant(&pulse) {
+            emit_doctor_pulse_skipped_event(json_output, pr_number, "out_of_scope", &pulse);
+            continue;
+        }
+
+        if !pulse_deduper.insert_if_new(&pulse) {
+            emit_doctor_pulse_skipped_event(json_output, pr_number, "duplicate", &pulse);
+            continue;
+        }
+
+        tick = tick.saturating_add(1);
+        if json_output {
+            if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+                event: "doctor_pulse".to_string(),
+                ts: jsonl::ts_now(),
+                extra: serde_json::json!({
+                    "tick": tick,
+                    "pr_number": pr_number,
+                    "pulse_id": pulse.pulse_id,
+                    "topic": pulse.topic,
+                    "event_type": pulse.event_type,
+                    "ledger_cursor": pulse.ledger_cursor,
+                    "action": summary.recommended_action.action.as_str(),
+                }),
+            }) {
+                eprintln!("WARNING: failed to emit doctor pulse event: {err}");
+            }
+        } else {
+            let topic = pulse.topic.as_deref().unwrap_or("unknown");
+            let event_type = pulse.event_type.as_deref().unwrap_or("unknown");
+            eprintln!(
+                "doctor wait: pulse tick={tick} topic={topic} event_type={event_type} elapsed={}s",
+                started.elapsed().as_secs()
+            );
+        }
+
+        // Every 5th reevaluation uses full mode so merge state can still
+        // converge if only partial local projections updated.
+        let use_lightweight = tick % 5 != 0;
+        *summary = run_doctor_inner(repo, pr_number, Vec::new(), use_lightweight);
+        last_summary_collected_at = Instant::now();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_doctor_wait_poll_loop(
+    repo: &str,
+    pr_number: u32,
+    json_output: bool,
+    exit_actions: &std::collections::BTreeSet<String>,
+    interrupted: &AtomicBool,
+    wait_timeout_seconds: u64,
+    started: Instant,
+    initial_tick: u64,
+    mut summary: DoctorPrSummary,
+) -> u8 {
+    let poll_interval = Duration::from_secs(DOCTOR_WAIT_POLL_INTERVAL_SECONDS);
+    let mut tick = initial_tick;
     let mut wait_state = DoctorWaitState::Evaluate;
+
+    if json_output {
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_wait_mode".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "mode": DoctorWaitMode::PollingFallback.as_str(),
+                "pr_number": pr_number,
+            }),
+        }) {
+            eprintln!("WARNING: failed to emit doctor wait mode event: {err}");
+        }
+    }
 
     loop {
         let elapsed_seconds = started.elapsed().as_secs().min(wait_timeout_seconds);
         match wait_state {
             DoctorWaitState::Evaluate => {
-                let facts = DoctorWaitFacts {
-                    recommended_action: summary.recommended_action.action.as_str(),
-                    exit_actions: &exit_actions,
-                    interrupted: interrupted.load(Ordering::SeqCst),
-                    elapsed_seconds,
+                if let Some(DoctorWaitLoopControl::Exit(code)) = doctor_wait_maybe_exit(
+                    repo,
+                    pr_number,
+                    &mut summary,
+                    json_output,
+                    tick,
+                    started,
                     wait_timeout_seconds,
-                };
-                wait_state = derive_doctor_wait_next_state(wait_state, Some(&facts));
+                    exit_actions,
+                    interrupted,
+                ) {
+                    return code;
+                }
+                wait_state = derive_doctor_wait_next_state(wait_state, None);
             },
-            DoctorWaitState::ExitOnRecommendedAction => {
-                emit_doctor_wait_terminal_event(json_output, tick, &summary, elapsed_seconds);
-                emit_doctor_wait_result(&summary, json_output, tick, false, elapsed_seconds);
-                return exit_codes::SUCCESS;
-            },
-            DoctorWaitState::ExitOnInterrupt => {
-                summary = run_doctor_inner(repo, pr_number, Vec::new(), true);
-                emit_doctor_wait_result(&summary, json_output, tick, false, elapsed_seconds);
-                return exit_codes::SUCCESS;
-            },
-            DoctorWaitState::ExitOnTimeout => {
-                emit_doctor_wait_timeout_event(json_output, tick, &summary, elapsed_seconds);
-                emit_doctor_wait_result(&summary, json_output, tick, true, elapsed_seconds);
-                return DOCTOR_WAIT_TIMEOUT_EXIT_CODE;
+            DoctorWaitState::ExitOnRecommendedAction
+            | DoctorWaitState::ExitOnInterrupt
+            | DoctorWaitState::ExitOnTimeout => {
+                // Exit states are handled centrally by `doctor_wait_maybe_exit`.
+                wait_state = DoctorWaitState::Evaluate;
             },
             DoctorWaitState::PollEmit => {
                 if json_output {
@@ -1470,8 +2223,7 @@ pub fn run_doctor(
                 } else {
                     eprintln!(
                         "doctor wait: tick={tick} action={} elapsed={}s",
-                        summary.recommended_action.action,
-                        started.elapsed().as_secs()
+                        summary.recommended_action.action, elapsed_seconds
                     );
                 }
                 wait_state = derive_doctor_wait_next_state(wait_state, None);
@@ -1482,12 +2234,16 @@ pub fn run_doctor(
                 wait_state = derive_doctor_wait_next_state(wait_state, None);
             },
             DoctorWaitState::CollectSummary => {
-                // BF-002 (TCK-00626): Every 5th tick, use non-lightweight
-                // mode to detect externally-merged PRs via GitHub API. This
-                // ensures the wait loop can terminate when a PR is merged
-                // outside the local lifecycle projection.
-                let use_lightweight = tick % 5 != 0;
-                summary = run_doctor_inner(repo, pr_number, Vec::new(), use_lightweight);
+                if doctor_wait_should_collect_summary(
+                    DoctorWaitMode::PollingFallback,
+                    DoctorWaitWakeReason::Timer,
+                    false,
+                ) {
+                    // BF-002 (TCK-00626): Every 5th tick, use non-lightweight
+                    // mode to detect externally-merged PRs via GitHub API.
+                    let use_lightweight = tick % 5 != 0;
+                    summary = run_doctor_inner(repo, pr_number, Vec::new(), use_lightweight);
+                }
                 wait_state = derive_doctor_wait_next_state(wait_state, None);
             },
         }
@@ -9234,6 +9990,114 @@ mod tests {
         let next =
             super::derive_doctor_wait_next_state(super::DoctorWaitState::Evaluate, Some(&facts));
         assert_eq!(next, super::DoctorWaitState::ExitOnTimeout);
+    }
+
+    #[test]
+    fn doctor_wait_pulse_mode_rechecks_on_pulse_wakeups_without_timer_backstop() {
+        assert!(super::doctor_wait_should_collect_summary(
+            super::DoctorWaitMode::PulsePrimary,
+            super::DoctorWaitWakeReason::Pulse,
+            false,
+        ));
+        assert!(!super::doctor_wait_should_collect_summary(
+            super::DoctorWaitMode::PulsePrimary,
+            super::DoctorWaitWakeReason::Timer,
+            false,
+        ));
+    }
+
+    #[test]
+    fn doctor_wait_pulse_mode_rechecks_on_timer_backstop() {
+        assert!(super::doctor_wait_should_collect_summary(
+            super::DoctorWaitMode::PulsePrimary,
+            super::DoctorWaitWakeReason::Timer,
+            true,
+        ));
+    }
+
+    #[test]
+    fn doctor_wait_polling_mode_rechecks_on_timer_wakeups() {
+        assert!(super::doctor_wait_should_collect_summary(
+            super::DoctorWaitMode::PollingFallback,
+            super::DoctorWaitWakeReason::Timer,
+            false,
+        ));
+    }
+
+    #[test]
+    fn doctor_pulse_client_sub_id_is_bounded_and_ascii() {
+        let long_repo = "Guardian-Intelligence/APM2/With/Very/Long/Repository/Path/Components";
+        let sub_id = super::build_doctor_pulse_client_sub_id(long_repo, 42);
+        assert!(!sub_id.is_empty());
+        assert!(sub_id.is_ascii(), "client_sub_id must be ASCII");
+        assert!(
+            sub_id.len() <= super::DOCTOR_WAIT_PULSE_CLIENT_SUB_ID_MAX_LEN,
+            "client_sub_id exceeded max length: {}",
+            sub_id.len()
+        );
+    }
+
+    #[test]
+    fn doctor_pulse_deduper_rejects_duplicate_fingerprint() {
+        let mut deduper = super::DoctorPulseDeduper::new(4);
+        let pulse = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-1".to_string()),
+            topic: Some("work.W-1.events".to_string()),
+            event_type: Some("work.transitioned".to_string()),
+            ledger_cursor: Some(10),
+        };
+
+        assert!(deduper.insert_if_new(&pulse));
+        assert!(!deduper.insert_if_new(&pulse));
+    }
+
+    #[test]
+    fn doctor_pulse_deduper_evicts_oldest_entry_when_capacity_reached() {
+        let mut deduper = super::DoctorPulseDeduper::new(2);
+        let pulse_1 = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-1".to_string()),
+            topic: Some("work.W-1.events".to_string()),
+            event_type: Some("work.transitioned".to_string()),
+            ledger_cursor: Some(10),
+        };
+        let pulse_2 = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-2".to_string()),
+            topic: Some("work.W-2.events".to_string()),
+            event_type: Some("work.transitioned".to_string()),
+            ledger_cursor: Some(11),
+        };
+        let pulse_3 = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-3".to_string()),
+            topic: Some("work.W-3.events".to_string()),
+            event_type: Some("work.transitioned".to_string()),
+            ledger_cursor: Some(12),
+        };
+
+        assert!(deduper.insert_if_new(&pulse_1));
+        assert!(deduper.insert_if_new(&pulse_2));
+        assert!(deduper.insert_if_new(&pulse_3));
+
+        // pulse_1 should have been evicted when pulse_3 was inserted.
+        assert!(deduper.insert_if_new(&pulse_1));
+    }
+
+    #[test]
+    fn doctor_wait_pulse_scope_filters_unrelated_events() {
+        let relevant = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-work".to_string()),
+            topic: Some("work.W-123.events".to_string()),
+            event_type: Some("work.transitioned".to_string()),
+            ledger_cursor: Some(42),
+        };
+        assert!(super::doctor_wait_pulse_is_relevant(&relevant));
+
+        let unrelated = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-session".to_string()),
+            topic: Some("session.S-1.lifecycle".to_string()),
+            event_type: Some("session.started".to_string()),
+            ledger_cursor: Some(43),
+        };
+        assert!(!super::doctor_wait_pulse_is_relevant(&unrelated));
     }
 
     #[test]
