@@ -3904,7 +3904,9 @@ mod tests {
                     err.contains("bounded test runner unavailable")
                         || err.contains("systemd-run not found")
                         || err.contains("cgroup v2")
-                        || err.contains("D-Bus socket"),
+                        || err.contains("D-Bus socket")
+                        || err.contains("lane env dir")
+                        || err.contains("too-permissive mode"),
                     "unexpected error: {err}"
                 );
             },

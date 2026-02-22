@@ -55,16 +55,6 @@ pub(super) fn reap_orphaned_leases_on_tick(fac_root: &Path, json_output: bool) {
         let started_at_canonical = loaded_lease
             .as_ref()
             .and_then(LaneLeaseV1::started_at_rfc3339);
-        let started_at_epoch_secs = loaded_lease
-            .as_ref()
-            .and_then(LaneLeaseV1::started_at_epoch_secs);
-        let started_at_legacy_epoch_secs = loaded_lease.as_ref().and_then(|lease| {
-            if lease.started_at.bytes().all(|byte| byte.is_ascii_digit()) {
-                started_at_epoch_secs
-            } else {
-                None
-            }
-        });
         let age_secs = loaded_lease
             .as_ref()
             .and_then(|lease| lease.age_secs(now_epoch_secs));
@@ -79,7 +69,6 @@ pub(super) fn reap_orphaned_leases_on_tick(fac_root: &Path, json_output: bool) {
                         "pid_alive": status.pid_alive,
                         "started_at_raw": started_at_raw,
                         "started_at_canonical": started_at_canonical,
-                        "started_at_legacy_epoch_secs": started_at_legacy_epoch_secs,
                         "age_secs": age_secs,
                         "warning_threshold_secs": warning_threshold_secs,
                     }),

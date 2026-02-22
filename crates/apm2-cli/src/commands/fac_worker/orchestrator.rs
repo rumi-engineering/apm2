@@ -924,13 +924,8 @@ impl WorkerOrchestrator {
         // profile has been adopted.
         //
         // Error handling is fail-closed by error variant:
-        // - NoAdmittedRoot + policy has non-zero economics_profile_hash: DENY the job.
-        //   The policy requires economics enforcement but there is no admitted root to
-        //   verify against. An attacker could delete the root file to bypass admission
-        //   — this arm prevents that (INV-EADOPT-004).
-        // - NoAdmittedRoot + policy has zero economics_profile_hash: skip check
-        //   (backwards compatibility for installations that have not adopted an
-        //   economics profile and whose policies don't require one).
+        // - NoAdmittedRoot: DENY the job. Without an admitted root we cannot verify
+        //   economics binding, so proceeding would be fail-open.
         // - Any other error (Io, Serialization, FileTooLarge, SchemaMismatch,
         //   UnsupportedSchemaVersion, etc.): DENY the job. Treating I/O/corruption
         //   errors as "no root" would let an attacker bypass admission by tampering
@@ -960,24 +955,11 @@ impl WorkerOrchestrator {
                     }
                 },
                 Err(apm2_core::fac::EconomicsAdoptionError::NoAdmittedRoot { .. }) => {
-                    // No admitted root exists. Fail-closed decision based on
-                    // whether the policy requires economics enforcement:
-                    // - If the policy's economics_profile_hash is all zeros, no economics binding
-                    //   is required, so the check is skipped (backwards compatibility for
-                    //   installations that have not adopted an economics profile).
-                    // - If the policy's economics_profile_hash is non-zero, it specifies a concrete
-                    //   economics binding. Without an admitted root, we cannot verify that binding,
-                    //   so the job MUST be denied. This prevents bypass via root file deletion
-                    //   (INV-EADOPT-004).
-                    if policy.economics_profile_hash == [0u8; 32] {
-                        None
-                    } else {
-                        Some(format!(
-                            "economics admission denied (INV-EADOPT-004, fail-closed): \
-                         policy requires economics binding (economics_profile_hash={profile_hash_str}) \
-                         but no admitted economics root exists on this broker"
-                        ))
-                    }
+                    Some(format!(
+                        "economics admission denied (INV-EADOPT-004, fail-closed): \
+                         no admitted economics root exists on this broker \
+                         (policy economics_profile_hash={profile_hash_str})"
+                    ))
                 },
                 Err(load_err) => {
                     // Any other error (I/O, corruption, schema mismatch,
@@ -1384,102 +1366,129 @@ impl WorkerOrchestrator {
         // BLOCKER fix: the WAL entry MUST be persisted to disk (with fsync)
         // BEFORE job execution begins. This ensures the "consumed" state is
         // durable even if the process crashes during job execution.
-        if let Some(binding) = boundary_check.token_binding.as_ref() {
-            if let Some(ref nonce) = binding.nonce {
-                match broker.validate_and_record_token_nonce(nonce, &spec.actuation.request_id) {
-                    Ok(wal_bytes) => {
-                        // INV-TL-009/INV-TL-010: Persist WAL entry BEFORE job
-                        // execution. If persistence fails, deny the job
-                        // (fail-closed: we cannot guarantee replay protection
-                        // without durable state).
-                        if let Err(wal_err) = append_token_ledger_wal(&wal_bytes) {
-                            let reason = format!(
-                                "FATAL: token ledger WAL persist failed (fail-closed): {wal_err}"
-                            );
-                            eprintln!("worker: {reason}");
-                            let moved_path =
-                                move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                                    .map(|p| {
-                                        p.strip_prefix(queue_root)
-                                            .unwrap_or(&p)
-                                            .to_string_lossy()
-                                            .to_string()
-                                    })
-                                    .ok();
-                            if let Err(receipt_err) = emit_job_receipt(
-                                fac_root,
-                                spec,
-                                FacJobOutcome::Denied,
-                                Some(DenialReasonCode::TokenReplayDetected),
-                                &reason,
-                                Some(&boundary_trace),
-                                None,
-                                None,
-                                None,
-                                Some(canonicalizer_tuple_digest),
-                                moved_path.as_deref(),
-                                policy_hash,
-                                None,
-                                Some(&sbx_hash),
-                                Some(&resolved_net_hash),
-                                None, // bytes_backend
-                                toolchain_fingerprint,
-                            ) {
-                                eprintln!(
-                                    "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
-                                );
-                            }
-                            return IdlePhaseOutcome::Done(JobOutcome::Denied { reason });
-                        }
-                    },
-                    Err(ledger_err) => {
-                        let denial_code = match &ledger_err {
-                            apm2_core::fac::token_ledger::TokenLedgerError::TokenRevoked {
-                                ..
-                            } => DenialReasonCode::TokenRevoked,
-                            _ => DenialReasonCode::TokenReplayDetected,
-                        };
-                        let reason =
-                            format!("token nonce replay/revocation check failed: {ledger_err}");
-                        let moved_path =
-                            move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                                .map(|p| {
-                                    p.strip_prefix(queue_root)
-                                        .unwrap_or(&p)
-                                        .to_string_lossy()
-                                        .to_string()
-                                })
-                                .ok();
-                        if let Err(receipt_err) = emit_job_receipt(
-                            fac_root,
-                            spec,
-                            FacJobOutcome::Denied,
-                            Some(denial_code),
-                            &reason,
-                            Some(&boundary_trace),
-                            None,
-                            None,
-                            None,
-                            Some(canonicalizer_tuple_digest),
-                            moved_path.as_deref(),
-                            policy_hash,
-                            None,
-                            Some(&sbx_hash),
-                            Some(&resolved_net_hash),
-                            None, // bytes_backend
-                            toolchain_fingerprint,
-                        ) {
-                            eprintln!(
-                                "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
-                            );
-                        }
-                        return IdlePhaseOutcome::Done(JobOutcome::Denied { reason });
-                    },
-                }
+        let nonce = boundary_check
+            .token_binding
+            .as_ref()
+            .and_then(|binding| binding.nonce.as_ref());
+        let Some(nonce) = nonce else {
+            let reason = "missing token nonce in channel context binding".to_string();
+            let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+                .map(|p| {
+                    p.strip_prefix(queue_root)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .ok();
+            if let Err(receipt_err) = emit_job_receipt(
+                fac_root,
+                spec,
+                FacJobOutcome::Denied,
+                Some(DenialReasonCode::ChannelBoundaryViolation),
+                &reason,
+                Some(&boundary_trace),
+                None,
+                None,
+                None,
+                Some(canonicalizer_tuple_digest),
+                moved_path.as_deref(),
+                policy_hash,
+                None,
+                Some(&sbx_hash),
+                Some(&resolved_net_hash),
+                None, // bytes_backend
+                toolchain_fingerprint,
+            ) {
+                eprintln!("worker: WARNING: receipt emission failed for denied job: {receipt_err}");
             }
-            // If nonce is None (pre-TCK-00566 token), skip nonce validation.
-            // This is backwards-compatible: old tokens without nonces are
-            // admitted based on other checks alone.
+            return IdlePhaseOutcome::Done(JobOutcome::Denied { reason });
+        };
+        match broker.validate_and_record_token_nonce(nonce, &spec.actuation.request_id) {
+            Ok(wal_bytes) => {
+                // INV-TL-009/INV-TL-010: Persist WAL entry BEFORE job
+                // execution. If persistence fails, deny the job
+                // (fail-closed: we cannot guarantee replay protection
+                // without durable state).
+                if let Err(wal_err) = append_token_ledger_wal(&wal_bytes) {
+                    let reason =
+                        format!("FATAL: token ledger WAL persist failed (fail-closed): {wal_err}");
+                    eprintln!("worker: {reason}");
+                    let moved_path =
+                        move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+                            .map(|p| {
+                                p.strip_prefix(queue_root)
+                                    .unwrap_or(&p)
+                                    .to_string_lossy()
+                                    .to_string()
+                            })
+                            .ok();
+                    if let Err(receipt_err) = emit_job_receipt(
+                        fac_root,
+                        spec,
+                        FacJobOutcome::Denied,
+                        Some(DenialReasonCode::TokenReplayDetected),
+                        &reason,
+                        Some(&boundary_trace),
+                        None,
+                        None,
+                        None,
+                        Some(canonicalizer_tuple_digest),
+                        moved_path.as_deref(),
+                        policy_hash,
+                        None,
+                        Some(&sbx_hash),
+                        Some(&resolved_net_hash),
+                        None, // bytes_backend
+                        toolchain_fingerprint,
+                    ) {
+                        eprintln!(
+                            "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
+                        );
+                    }
+                    return IdlePhaseOutcome::Done(JobOutcome::Denied { reason });
+                }
+            },
+            Err(ledger_err) => {
+                let denial_code = match &ledger_err {
+                    apm2_core::fac::token_ledger::TokenLedgerError::TokenRevoked { .. } => {
+                        DenialReasonCode::TokenRevoked
+                    },
+                    _ => DenialReasonCode::TokenReplayDetected,
+                };
+                let reason = format!("token nonce replay/revocation check failed: {ledger_err}");
+                let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
+                    .map(|p| {
+                        p.strip_prefix(queue_root)
+                            .unwrap_or(&p)
+                            .to_string_lossy()
+                            .to_string()
+                    })
+                    .ok();
+                if let Err(receipt_err) = emit_job_receipt(
+                    fac_root,
+                    spec,
+                    FacJobOutcome::Denied,
+                    Some(denial_code),
+                    &reason,
+                    Some(&boundary_trace),
+                    None,
+                    None,
+                    None,
+                    Some(canonicalizer_tuple_digest),
+                    moved_path.as_deref(),
+                    policy_hash,
+                    None,
+                    Some(&sbx_hash),
+                    Some(&resolved_net_hash),
+                    None, // bytes_backend
+                    toolchain_fingerprint,
+                ) {
+                    eprintln!(
+                        "worker: WARNING: receipt emission failed for denied job: {receipt_err}"
+                    );
+                }
+                return IdlePhaseOutcome::Done(JobOutcome::Denied { reason });
+            },
         }
 
         // Step 4: Evaluate RFC-0029 queue admission.
@@ -2711,14 +2720,8 @@ impl WorkerOrchestrator {
         // the reference because the default-mode worker validates the job
         // spec in-process (no subprocess spawning yet).
         //
-        // TCK-00553: sccache activation is now policy-gated. When
-        // `policy.sccache_enabled` is true, sccache is active (the env
-        // injection happens in `build_job_environment`). When disabled,
-        // we still check ambient RUSTC_WRAPPER for legacy detection.
-        let sccache_active = policy.sccache_enabled
-            || std::env::var("RUSTC_WRAPPER")
-                .ok()
-                .is_some_and(|v| v.contains("sccache"));
+        // TCK-00553: sccache activation is policy-gated.
+        let sccache_active = policy.sccache_enabled;
 
         // TCK-00554: Build sccache env for server lifecycle management.
         // Defined before the containment match so it's accessible for both

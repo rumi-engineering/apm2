@@ -1995,7 +1995,7 @@ fn test_acquire_worker_lane_skips_unknown_identity_lease() {
     let lane_mgr = LaneManager::new(fac_root.clone()).expect("create lane manager");
     lane_mgr.ensure_directories().expect("ensure lanes");
 
-    // Simulate legacy lease without proc_start_time_ticks.
+    // Simulate malformed lease metadata without proc_start_time_ticks.
     persist_running_lease(&lane_mgr, "lane-00");
     let lane_dir = lane_mgr.lane_dir("lane-00");
     let lease_path = lane_dir.join("lease.v1.json");
@@ -2006,7 +2006,7 @@ fn test_acquire_worker_lane_skips_unknown_identity_lease() {
         &lease_path,
         serde_json::to_vec_pretty(&lease_value).expect("serialize lease"),
     )
-    .expect("write legacy lease");
+    .expect("write malformed lease");
 
     let lane_ids = vec!["lane-00".to_string(), "lane-01".to_string()];
     let (_guard, acquired_lane_id) =

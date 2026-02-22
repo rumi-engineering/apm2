@@ -618,17 +618,25 @@ pub(super) fn run_fac_worker_impl(
         return exit_codes::GENERIC_ERROR;
     }
     // Verify that the policy's economics_profile_hash is resolvable from CAS.
-    // Currently only the baseline profile is available. If the policy references
-    // a different hash (future custom profile), we cannot resolve it — fail
-    // explicitly rather than silently denying all jobs.
-    let baseline_hash = baseline_profile.profile_hash().unwrap_or([0u8; 32]);
-    if policy.economics_profile_hash != baseline_hash && policy.economics_profile_hash != [0u8; 32]
-    {
+    // Currently only the baseline profile is available.
+    let baseline_hash = match baseline_profile.profile_hash() {
+        Ok(hash) => hash,
+        Err(err) => {
+            output_worker_error(
+                json_output,
+                &format!(
+                    "baseline economics profile hash computation failed; refusing to start fail-closed: {err}"
+                ),
+            );
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+    if policy.economics_profile_hash != baseline_hash {
         output_worker_error(
             json_output,
             &format!(
                 "fac policy references economics profile hash {:x?} which is not loaded in CAS; \
-                 only baseline profile (hash {:x?}) is currently supported",
+                 only baseline profile (hash {:x?}) is supported",
                 &policy.economics_profile_hash[..8],
                 &baseline_hash[..8],
             ),

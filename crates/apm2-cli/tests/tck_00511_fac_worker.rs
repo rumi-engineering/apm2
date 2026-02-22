@@ -21,7 +21,7 @@ mod exit_codes {
     }
 }
 
-// Test-local compatibility shim for `src/commands/fac_worker.rs`, which
+// Test-local `commands` module shim for `src/commands/fac_worker.rs`, which
 // references `crate::commands::env_var_test_lock()` in its internal test code.
 // This integration crate does not define the production `commands` module.
 #[allow(missing_docs)]
@@ -61,8 +61,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use apm2_core::channel::{
-    ChannelBoundaryCheck, ChannelSource, DeclassificationIntentScope,
-    derive_channel_source_witness, issue_channel_context_token,
+    BoundaryFlowPolicyBinding, ChannelBoundaryCheck, ChannelSource, DeclassificationIntentScope,
+    TokenBindingV1, derive_channel_source_witness, issue_channel_context_token,
+    issue_channel_context_token_with_token_binding,
 };
 use apm2_core::crypto::Signer;
 use apm2_core::economics::queue_admission::{
@@ -71,7 +72,8 @@ use apm2_core::economics::queue_admission::{
 };
 use apm2_core::fac::broker::{BrokerSignatureVerifier, FacBroker};
 use apm2_core::fac::job_spec::{
-    FacJobSpecV1, FacJobSpecV1Builder, JobSource, deserialize_job_spec, validate_job_spec,
+    FacJobSpecV1, FacJobSpecV1Builder, JobSource, deserialize_job_spec, job_kind_to_intent,
+    parse_b3_256_digest, validate_job_spec,
 };
 
 // =============================================================================
@@ -400,7 +402,7 @@ fn test_rfc0029_admission_allows_with_broker_authority() {
 #[test]
 fn test_rfc0029_admission_denies_without_envelope() {
     let eval_window = HtfEvaluationWindow {
-        boundary_id: "local".to_string(),
+        boundary_id: "apm2.fac.local".to_string(),
         authority_clock: "local".to_string(),
         tick_start: 0,
         tick_end: 1,
@@ -854,6 +856,139 @@ fn test_fac_worker_e2e_once_mode_processes_job() {
     }
 }
 
+#[test]
+fn test_worker_denies_token_missing_nonce_after_policy_and_economics_admission() {
+    let _env_lock = fac_worker::env_var_test_lock()
+        .lock()
+        .expect("serialize env mutating test");
+    let (tmp, queue_root) = setup_queue_env();
+
+    let apm2_home = tmp.path().to_path_buf();
+    let previous_apm2_home = std::env::var_os("APM2_HOME");
+    set_env_var_for_test("APM2_HOME", &apm2_home);
+
+    let previous_service_user = std::env::var_os("APM2_FAC_SERVICE_USER");
+    let current_user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "root".to_string());
+    set_env_var_for_test("APM2_FAC_SERVICE_USER", &current_user);
+
+    let signer = Signer::generate();
+    let fac_root = apm2_home.join("private").join("fac");
+    fs::create_dir_all(&fac_root).expect("create fac root");
+    fs::write(
+        fac_root.join("signing_key"),
+        signer.secret_key_bytes().as_ref(),
+    )
+    .expect("write signing key");
+    FacBroker::new()
+        .admit_canonicalizer_tuple(&fac_root)
+        .expect("admit canonicalizer tuple");
+
+    // Admit the exact policy that the worker will load, so the job reaches
+    // token validation (instead of failing earlier on policy admission).
+    let policy = apm2_core::fac::FacPolicyV1::default_policy();
+    apm2_core::fac::persist_policy(&fac_root, &policy).expect("persist policy");
+    let policy_bytes = serde_json::to_vec_pretty(&policy).expect("serialize policy");
+    apm2_core::fac::adopt_policy(
+        &fac_root,
+        &policy_bytes,
+        "operator:local",
+        "test policy adopt",
+    )
+    .expect("adopt policy");
+
+    // Admit economics profile binding for the policy so Step 2.6 passes.
+    let economics_hash = format!("b3-256:{}", hex::encode(policy.economics_profile_hash));
+    apm2_core::fac::economics_adoption::adopt_economics_profile_by_hash(
+        &fac_root,
+        &economics_hash,
+        "operator:local",
+        "test economics adopt",
+    )
+    .expect("adopt economics profile");
+
+    let policy_hash = apm2_core::fac::compute_policy_hash(&policy).expect("compute policy hash");
+    let policy_digest = parse_b3_256_digest(&policy_hash).expect("parse policy hash");
+    let tuple_digest =
+        parse_b3_256_digest(&apm2_core::fac::CanonicalizerTupleV1::from_current().compute_digest())
+            .expect("parse tuple digest");
+
+    let mut spec = FacJobSpecV1Builder::new(
+        "job-missing-nonce",
+        "gates",
+        "bulk",
+        "2026-02-12T00:00:00Z",
+        "lease-missing-nonce",
+        sample_source(),
+    )
+    .priority(50)
+    .build()
+    .expect("valid spec");
+
+    let mut check = baseline_check();
+    check.boundary_flow_policy_binding = Some(BoundaryFlowPolicyBinding {
+        policy_digest,
+        admitted_policy_root_digest: policy_digest,
+        canonicalizer_tuple_digest: tuple_digest,
+        admitted_canonicalizer_tuple_digest: tuple_digest,
+    });
+
+    // Intentionally omit nonce to verify strict fail-closed behavior.
+    let token_binding = TokenBindingV1 {
+        fac_policy_hash: policy_digest,
+        canonicalizer_tuple_digest: tuple_digest,
+        boundary_id: "apm2.fac.local".to_string(),
+        issued_at_tick: 0,
+        expiry_tick: u64::MAX,
+        intent: Some(
+            job_kind_to_intent("gates")
+                .expect("gates intent")
+                .as_str()
+                .to_string(),
+        ),
+        nonce: None,
+    };
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_secs();
+    let token = issue_channel_context_token_with_token_binding(
+        &check,
+        &spec.actuation.lease_id,
+        &spec.actuation.request_id,
+        now_secs,
+        &signer,
+        token_binding,
+    )
+    .expect("token should encode");
+    spec.actuation.channel_context_token = Some(token);
+
+    write_spec_to_pending(&queue_root, &spec);
+    let exit_code = fac_worker::run_fac_worker(true, 1, true, false);
+    assert_eq!(exit_code, exit_codes::codes::SUCCESS);
+
+    let denied_path = queue_root.join("denied").join("job-missing-nonce.json");
+    assert!(
+        denied_path.exists(),
+        "job should be denied when token nonce is missing"
+    );
+    let denied_body = fs::read_to_string(&denied_path).expect("read denied file");
+    assert!(
+        denied_body.contains("missing token nonce in channel context binding"),
+        "denied reason should include missing token nonce, got: {denied_body}"
+    );
+
+    match previous_apm2_home {
+        Some(value) => set_env_var_for_test("APM2_HOME", value),
+        None => remove_env_var_for_test("APM2_HOME"),
+    }
+    match previous_service_user {
+        Some(value) => set_env_var_for_test("APM2_FAC_SERVICE_USER", value),
+        None => remove_env_var_for_test("APM2_FAC_SERVICE_USER"),
+    }
+}
+
 #[allow(unsafe_code)]
 fn set_env_var_for_test<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
     unsafe { std::env::set_var(key, value) };
@@ -1019,4 +1154,76 @@ fn test_economics_admission_denies_corrupted_root() {
         ),
         "corrupted root must NOT be reported as NoAdmittedRoot"
     );
+}
+
+/// Test 17: Worker denies when admitted economics root is missing for an
+/// admitted policy.
+#[test]
+fn test_worker_denies_missing_root_with_admitted_policy() {
+    let _env_lock = fac_worker::env_var_test_lock()
+        .lock()
+        .expect("serialize env mutating test");
+    let (tmp, queue_root) = setup_queue_env();
+
+    let apm2_home = tmp.path().to_path_buf();
+    let previous_apm2_home = std::env::var_os("APM2_HOME");
+    set_env_var_for_test("APM2_HOME", &apm2_home);
+
+    let previous_service_user = std::env::var_os("APM2_FAC_SERVICE_USER");
+    let current_user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "root".to_string());
+    set_env_var_for_test("APM2_FAC_SERVICE_USER", &current_user);
+
+    let signer = Signer::generate();
+    let fac_root = apm2_home.join("private").join("fac");
+    fs::create_dir_all(&fac_root).expect("create fac root");
+    fs::write(
+        fac_root.join("signing_key"),
+        signer.secret_key_bytes().as_ref(),
+    )
+    .expect("write signing key");
+    FacBroker::new()
+        .admit_canonicalizer_tuple(&fac_root)
+        .expect("admit canonicalizer tuple");
+
+    let policy = apm2_core::fac::FacPolicyV1::default_policy();
+    apm2_core::fac::persist_policy(&fac_root, &policy).expect("persist policy");
+    let policy_bytes = serde_json::to_vec_pretty(&policy).expect("serialize policy");
+    apm2_core::fac::adopt_policy(
+        &fac_root,
+        &policy_bytes,
+        "operator:local",
+        "test policy adopt",
+    )
+    .expect("adopt policy");
+
+    // No economics root is adopted. The worker must deny fail-closed.
+    let spec = build_valid_spec_with_token(&signer, "lease-missing-econ-root");
+    write_spec_to_pending(&queue_root, &spec);
+
+    let exit_code = fac_worker::run_fac_worker(true, 1, true, false);
+    assert_eq!(exit_code, exit_codes::codes::SUCCESS);
+
+    let denied_path = queue_root
+        .join("denied")
+        .join(format!("{}.json", spec.job_id));
+    assert!(
+        denied_path.exists(),
+        "job should be denied when admitted economics root is missing"
+    );
+    let denied_body = fs::read_to_string(&denied_path).expect("read denied file");
+    assert!(
+        denied_body.contains("no admitted economics root exists"),
+        "denied reason should include missing admitted economics root, got: {denied_body}"
+    );
+
+    match previous_apm2_home {
+        Some(value) => set_env_var_for_test("APM2_HOME", value),
+        None => remove_env_var_for_test("APM2_HOME"),
+    }
+    match previous_service_user {
+        Some(value) => set_env_var_for_test("APM2_FAC_SERVICE_USER", value),
+        None => remove_env_var_for_test("APM2_FAC_SERVICE_USER"),
+    }
 }
