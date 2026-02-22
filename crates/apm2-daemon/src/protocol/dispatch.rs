@@ -166,6 +166,8 @@ use super::messages::{
     UpdateStopFlagsResponse,
     VerifyLedgerChainRequest,
     VerifyLedgerChainResponse,
+    WorkDependencyDiagnostic as WorkDependencyDiagnosticProto,
+    WorkDependencyDiagnosticSeverity as WorkDependencyDiagnosticSeverityProto,
     WorkListRequest,
     WorkListResponse,
     WorkRole,
@@ -197,6 +199,7 @@ use crate::work::authority::{
     AliasReconciliationGate, ProjectionAliasReconciliationGate, ProjectionWorkAuthority,
     WorkAuthority, WorkAuthorityError, WorkAuthorityStatus, work_id_to_hash,
 };
+use crate::work::projection::{WORK_DIAGNOSTIC_REASON_BLOCKS_UNSATISFIED, WorkDependencySeverity};
 
 // ============================================================================
 // Ledger Event Emitter Interface (TCK-00253)
@@ -14914,7 +14917,8 @@ impl PrivilegedDispatcher {
         );
 
         let authority = self.projection_work_authority();
-        match authority.get_work_status(&request.work_id) {
+        let evaluation_time_ns = self.current_work_dependency_evaluation_time_ns();
+        match authority.get_work_status_at_time(&request.work_id, evaluation_time_ns) {
             Ok(status) => Ok(PrivilegedResponse::WorkStatus(
                 self.authority_status_to_work_status_response(&status),
             )),
@@ -14954,10 +14958,11 @@ impl PrivilegedDispatcher {
         );
 
         let authority = self.projection_work_authority();
+        let evaluation_time_ns = self.current_work_dependency_evaluation_time_ns();
         let statuses = if request.claimable_only {
-            authority.list_claimable(limit, &request.cursor)
+            authority.list_claimable_at_time(limit, &request.cursor, evaluation_time_ns)
         } else {
-            authority.list_all(limit, &request.cursor)
+            authority.list_all_at_time(limit, &request.cursor, evaluation_time_ns)
         };
 
         match statuses {
@@ -15772,10 +15777,23 @@ impl PrivilegedDispatcher {
             Err(response) => return Ok(response),
         };
 
-        // 5. Query work state from projection (AFTER PCAC to prevent unauthorized
+        // 5. Get HTF timestamp used for claimability evaluation and durable event
+        //    emission.
+        let timestamp_ns = match self.get_htf_timestamp_ns() {
+            Ok(ts) => ts,
+            Err(e) => {
+                warn!(error = %e, "HTF timestamp generation failed - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("HTF timestamp error: {e}"),
+                ));
+            },
+        };
+
+        // 6. Query work state from projection (AFTER PCAC to prevent unauthorized
         //    callers from probing work existence).
         let authority = self.projection_work_authority();
-        let work_status = match authority.get_work_status(&request.work_id) {
+        let work_status = match authority.get_work_status_at_time(&request.work_id, timestamp_ns) {
             Ok(status) => status,
             Err(crate::work::authority::WorkAuthorityError::WorkNotFound { .. }) => {
                 return Ok(PrivilegedResponse::error(
@@ -15790,9 +15808,54 @@ impl PrivilegedDispatcher {
             Err(error) => return Ok(Self::map_work_authority_error(error)),
         };
 
-        // 6. Determine the correct transition based on role and current state.
+        // 7. Determine the correct transition based on role and current state.
         let (from_state_str, to_state_str, rationale_code) = match role {
-            WorkRole::Implementer | WorkRole::Coordinator => {
+            WorkRole::Implementer => {
+                if work_status.implementer_claim_blocked {
+                    let unsatisfied_messages: Vec<&str> = work_status
+                        .dependency_diagnostics
+                        .iter()
+                        .filter(|diagnostic| {
+                            diagnostic.reason_code == WORK_DIAGNOSTIC_REASON_BLOCKS_UNSATISFIED
+                        })
+                        .map(|diagnostic| diagnostic.message.as_str())
+                        .collect();
+                    let detail = if unsatisfied_messages.is_empty() {
+                        "unsatisfied incoming BLOCKS dependency".to_string()
+                    } else {
+                        unsatisfied_messages.join("; ")
+                    };
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "ClaimWorkV2 rejected: implementer claim blocked \
+                             ({WORK_DIAGNOSTIC_REASON_BLOCKS_UNSATISFIED}): {detail}"
+                        ),
+                    ));
+                }
+
+                if work_status.state != apm2_core::work::WorkState::Open {
+                    // Idempotency: if already Claimed, check if same actor
+                    if work_status.state == apm2_core::work::WorkState::Claimed {
+                        return self.handle_claim_work_v2_idempotency(
+                            &request.work_id,
+                            &actor_id,
+                            role,
+                        );
+                    }
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::FailedPrecondition,
+                        format!(
+                            "ClaimWorkV2 rejected: work_id '{}' is in state {} \
+                             (expected OPEN for IMPLEMENTER/COORDINATOR claim)",
+                            request.work_id,
+                            work_status.state.as_str()
+                        ),
+                    ));
+                }
+                ("Open", "Claimed", "claim_work_v2_implementer")
+            },
+            WorkRole::Coordinator => {
                 if work_status.state != apm2_core::work::WorkState::Open {
                     // Idempotency: if already Claimed, check if same actor
                     if work_status.state == apm2_core::work::WorkState::Claimed {
@@ -15840,18 +15903,6 @@ impl PrivilegedDispatcher {
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
                     format!("ClaimWorkV2 rejected: unsupported role {role:?}"),
-                ));
-            },
-        };
-
-        // 7. Get HTF timestamp
-        let timestamp_ns = match self.get_htf_timestamp_ns() {
-            Ok(ts) => ts,
-            Err(e) => {
-                warn!(error = %e, "HTF timestamp generation failed - failing closed");
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!("HTF timestamp error: {e}"),
                 ));
             },
         };
@@ -17052,6 +17103,59 @@ impl PrivilegedDispatcher {
         &self.work_authority
     }
 
+    /// Returns the current evaluation time for dependency diagnostics.
+    ///
+    /// Uses HTF when available; falls back to local wall clock for
+    /// read-only status/list surfaces so they remain available during
+    /// transient HTF failures.
+    fn current_work_dependency_evaluation_time_ns(&self) -> u64 {
+        match self.get_htf_timestamp_ns() {
+            Ok(timestamp_ns) => timestamp_ns,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "work dependency evaluation falling back to SystemTime because HTF timestamp lookup failed"
+                );
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |duration| {
+                        u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+                    })
+            },
+        }
+    }
+
+    const fn dependency_severity_to_proto(severity: WorkDependencySeverity) -> i32 {
+        match severity {
+            WorkDependencySeverity::Info => WorkDependencyDiagnosticSeverityProto::Info as i32,
+            WorkDependencySeverity::Warning => {
+                WorkDependencyDiagnosticSeverityProto::Warning as i32
+            },
+            WorkDependencySeverity::Error => WorkDependencyDiagnosticSeverityProto::Error as i32,
+        }
+    }
+
+    fn dependency_diagnostic_to_proto(
+        diagnostic: &crate::work::projection::WorkDependencyDiagnostic,
+    ) -> WorkDependencyDiagnosticProto {
+        WorkDependencyDiagnosticProto {
+            reason_code: diagnostic.reason_code.clone(),
+            severity: Self::dependency_severity_to_proto(diagnostic.severity),
+            message: diagnostic.message.clone(),
+            edge_id: diagnostic.edge_id.clone(),
+            from_work_id: diagnostic.from_work_id.clone(),
+            to_work_id: diagnostic.to_work_id.clone(),
+            from_work_state: diagnostic
+                .from_work_state
+                .map(|state| state.as_str().to_string()),
+            waived: diagnostic.waived,
+            waiver_id: diagnostic.waiver_id.clone(),
+            waiver_expires_at_ns: diagnostic.waiver_expires_at_ns,
+            waiver_remaining_ns: diagnostic.waiver_remaining_ns,
+            late_edge: diagnostic.late_edge,
+        }
+    }
+
     fn authority_status_to_work_status_response(
         &self,
         authority_status: &WorkAuthorityStatus,
@@ -17066,6 +17170,12 @@ impl PrivilegedDispatcher {
             lease_id: None,
             created_at_ns: authority_status.created_at_ns,
             claimed_at_ns: authority_status.claimed_at_ns,
+            implementer_claim_blocked: authority_status.implementer_claim_blocked,
+            dependency_diagnostics: authority_status
+                .dependency_diagnostics
+                .iter()
+                .map(Self::dependency_diagnostic_to_proto)
+                .collect(),
         };
 
         // Supplement with claim metadata when available.
@@ -25853,6 +25963,55 @@ mod tests {
             }))
         }
 
+        fn inject_work_opened(dispatcher: &PrivilegedDispatcher, work_id: &str, timestamp_ns: u64) {
+            dispatcher
+                .event_emitter
+                .inject_raw_event(SignedLedgerEvent {
+                    event_id: format!("EVT-work-opened-{work_id}-{timestamp_ns}"),
+                    event_type: "work.opened".to_string(),
+                    work_id: work_id.to_string(),
+                    actor_id: "actor:test".to_string(),
+                    payload: apm2_core::work::helpers::work_opened_payload(
+                        work_id,
+                        "TICKET",
+                        vec![0xAA; 32],
+                        vec![],
+                        vec![],
+                    ),
+                    signature: vec![0u8; 64],
+                    timestamp_ns,
+                });
+        }
+
+        fn inject_blocks_edge(
+            dispatcher: &PrivilegedDispatcher,
+            from_work_id: &str,
+            to_work_id: &str,
+            timestamp_ns: u64,
+        ) {
+            let mut payload = Vec::new();
+            apm2_core::events::WorkEdgeAdded {
+                from_work_id: from_work_id.to_string(),
+                to_work_id: to_work_id.to_string(),
+                edge_type: apm2_core::events::WorkEdgeType::Blocks as i32,
+                rationale: "late edge test".to_string(),
+            }
+            .encode(&mut payload)
+            .expect("WorkEdgeAdded payload should encode");
+
+            dispatcher
+                .event_emitter
+                .inject_raw_event(SignedLedgerEvent {
+                    event_id: format!("EVT-edge-added-{from_work_id}-{to_work_id}-{timestamp_ns}"),
+                    event_type: "work_graph.edge.added".to_string(),
+                    work_id: to_work_id.to_string(),
+                    actor_id: "actor:test".to_string(),
+                    payload,
+                    signature: vec![0u8; 64],
+                    timestamp_ns,
+                });
+        }
+
         /// IT-00344-01: `WorkStatus` returns projection-backed state with
         /// session metadata overlay.
         ///
@@ -25924,6 +26083,69 @@ mod tests {
                     assert_eq!(resp.status, "IN_PROGRESS");
                     assert_eq!(resp.session_id, Some("S-WS-001".to_string()));
                     assert_eq!(resp.role, Some(WorkRole::Implementer.into()));
+                },
+                other => panic!("Expected WorkStatus response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_work_status_includes_late_edge_diagnostic_without_state_mutation() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+            let prerequisite = "W-LATE-PRE-001";
+            let target = "W-LATE-TARGET-001";
+
+            inject_work_opened(&dispatcher, prerequisite, 1_000_000_000);
+            inject_work_opened(&dispatcher, target, 1_000_000_001);
+            dispatcher
+                .event_emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: target,
+                    from_state: "Open",
+                    to_state: "Claimed",
+                    rationale_code: "claim",
+                    previous_transition_count: 0,
+                    actor_id: "actor:test",
+                    timestamp_ns: 1_000_000_010,
+                })
+                .expect("transition Open->Claimed should persist");
+            dispatcher
+                .event_emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: target,
+                    from_state: "Claimed",
+                    to_state: "InProgress",
+                    rationale_code: "start",
+                    previous_transition_count: 1,
+                    actor_id: "actor:test",
+                    timestamp_ns: 1_000_000_020,
+                })
+                .expect("transition Claimed->InProgress should persist");
+            inject_blocks_edge(&dispatcher, prerequisite, target, 1_000_000_030);
+
+            let request = WorkStatusRequest {
+                work_id: target.to_string(),
+            };
+            let frame = encode_work_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::WorkStatus(resp) => {
+                    assert_eq!(
+                        resp.status, "IN_PROGRESS",
+                        "late dependency diagnostics must not mutate work lifecycle state"
+                    );
+                    assert!(
+                        resp.implementer_claim_blocked,
+                        "unsatisfied incoming BLOCKS dependency should set implementer_claim_blocked"
+                    );
+                    assert!(
+                        resp.dependency_diagnostics.iter().any(|diagnostic| {
+                            diagnostic.reason_code
+                                == crate::work::projection::WORK_DIAGNOSTIC_REASON_BLOCKS_LATE_EDGE
+                        }),
+                        "work status should surface late-edge diagnostic"
+                    );
                 },
                 other => panic!("Expected WorkStatus response, got: {other:?}"),
             }
@@ -36385,6 +36607,68 @@ mod tests {
             dispatcher.event_emitter.inject_raw_event(event);
         }
 
+        /// Helper: injects a raw `work_graph.edge.added` BLOCKS event into
+        /// the shared test emitter.
+        fn inject_blocks_edge(
+            dispatcher: &PrivilegedDispatcher,
+            from_work_id: &str,
+            to_work_id: &str,
+            timestamp_ns: u64,
+        ) {
+            let mut payload = Vec::new();
+            apm2_core::events::WorkEdgeAdded {
+                from_work_id: from_work_id.to_string(),
+                to_work_id: to_work_id.to_string(),
+                edge_type: apm2_core::events::WorkEdgeType::Blocks as i32,
+                rationale: "test dependency".to_string(),
+            }
+            .encode(&mut payload)
+            .expect("WorkEdgeAdded payload should encode");
+
+            dispatcher
+                .event_emitter
+                .inject_raw_event(SignedLedgerEvent {
+                    event_id: format!("EVT-edge-added-{from_work_id}-{to_work_id}-{timestamp_ns}"),
+                    event_type: "work_graph.edge.added".to_string(),
+                    work_id: to_work_id.to_string(),
+                    actor_id: "test-actor".to_string(),
+                    payload,
+                    signature: vec![0u8; 64],
+                    timestamp_ns,
+                });
+        }
+
+        /// Helper: injects a raw `work_graph.edge.waived` BLOCKS waiver event.
+        fn inject_blocks_waiver(
+            dispatcher: &PrivilegedDispatcher,
+            from_work_id: &str,
+            to_work_id: &str,
+            timestamp_ns: u64,
+        ) {
+            let mut payload = Vec::new();
+            apm2_core::events::WorkEdgeWaived {
+                from_work_id: from_work_id.to_string(),
+                to_work_id: to_work_id.to_string(),
+                original_edge_type: apm2_core::events::WorkEdgeType::Blocks as i32,
+                waiver_justification: "test waiver".to_string(),
+                waiver_actor_id: "actor:test".to_string(),
+            }
+            .encode(&mut payload)
+            .expect("WorkEdgeWaived payload should encode");
+
+            dispatcher
+                .event_emitter
+                .inject_raw_event(SignedLedgerEvent {
+                    event_id: format!("EVT-edge-waived-{from_work_id}-{to_work_id}-{timestamp_ns}"),
+                    event_type: "work_graph.edge.waived".to_string(),
+                    work_id: to_work_id.to_string(),
+                    actor_id: "test-actor".to_string(),
+                    payload,
+                    signature: vec![0u8; 64],
+                    timestamp_ns,
+                });
+        }
+
         #[test]
         fn tag_and_routing() {
             assert_eq!(PrivilegedMessageType::ClaimWorkV2.tag(), 29);
@@ -36700,6 +36984,99 @@ mod tests {
                 evidence_count, 1,
                 "ClaimWorkV2 must emit exactly 1 evidence.published event"
             );
+        }
+
+        #[test]
+        fn implementer_claim_rejected_when_incoming_blocks_unsatisfied() {
+            let dispatcher = claim_v2_dispatcher();
+            let ctx = test_ctx();
+            let prerequisite_work_id = "W-test-blocks-prereq-001";
+            let blocked_work_id = "W-test-blocks-target-001";
+
+            inject_work_opened(&dispatcher, prerequisite_work_id);
+            inject_work_opened(&dispatcher, blocked_work_id);
+            inject_blocks_edge(
+                &dispatcher,
+                prerequisite_work_id,
+                blocked_work_id,
+                1_000_000_111,
+            );
+
+            let request = ClaimWorkV2Request {
+                work_id: blocked_work_id.to_string(),
+                role: i32::from(WorkRole::Implementer),
+                lease_id: TEST_GOV_LEASE_ID.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let response = dispatcher
+                .handle_claim_work_v2(&buf, &ctx)
+                .expect("handler should return protocol response");
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                        "blocked implementer claim must fail with CapabilityRequestRejected"
+                    );
+                    assert!(
+                        err.message
+                            .contains(WORK_DIAGNOSTIC_REASON_BLOCKS_UNSATISFIED),
+                        "error must include stable dependency reason code, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "Expected blocked claim rejection for unsatisfied incoming BLOCKS edge, got: {other:?}"
+                ),
+            }
+        }
+
+        #[test]
+        fn implementer_claim_allowed_when_blocks_edge_is_waived() {
+            let dispatcher = claim_v2_dispatcher();
+            let ctx = test_ctx();
+            let prerequisite_work_id = "W-test-waiver-prereq-001";
+            let blocked_work_id = "W-test-waiver-target-001";
+
+            inject_work_opened(&dispatcher, prerequisite_work_id);
+            inject_work_opened(&dispatcher, blocked_work_id);
+            inject_blocks_edge(
+                &dispatcher,
+                prerequisite_work_id,
+                blocked_work_id,
+                1_000_000_221,
+            );
+            inject_blocks_waiver(
+                &dispatcher,
+                prerequisite_work_id,
+                blocked_work_id,
+                1_000_000_222,
+            );
+
+            let request = ClaimWorkV2Request {
+                work_id: blocked_work_id.to_string(),
+                role: i32::from(WorkRole::Implementer),
+                lease_id: TEST_GOV_LEASE_ID.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let response = dispatcher
+                .handle_claim_work_v2(&buf, &ctx)
+                .expect("handler should return protocol response");
+            match response {
+                PrivilegedResponse::ClaimWorkV2(resp) => {
+                    assert!(
+                        !resp.already_claimed,
+                        "fresh waived claim should succeed without idempotent marker"
+                    );
+                },
+                other => panic!(
+                    "Expected successful claim when incoming BLOCKS edge is waived, got: {other:?}"
+                ),
+            }
         }
 
         #[test]

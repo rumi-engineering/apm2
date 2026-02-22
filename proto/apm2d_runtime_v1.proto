@@ -401,6 +401,42 @@ message WorkStatusRequest {
   string work_id = 1;
 }
 
+// Severity for work dependency diagnostics.
+enum WorkDependencyDiagnosticSeverity {
+  WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_UNSPECIFIED = 0;
+  WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_INFO = 1;
+  WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_WARNING = 2;
+  WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_ERROR = 3;
+}
+
+// Structured dependency diagnostic attached to WorkStatus responses.
+message WorkDependencyDiagnostic {
+  // Stable machine-readable reason code.
+  string reason_code = 1;
+  // Severity classification.
+  WorkDependencyDiagnosticSeverity severity = 2;
+  // Human-readable detail.
+  string message = 3;
+  // Deterministic edge identifier.
+  string edge_id = 4;
+  // Source work item ID.
+  string from_work_id = 5;
+  // Target work item ID.
+  string to_work_id = 6;
+  // Current source work state, when known.
+  optional string from_work_state = 7;
+  // Whether a waiver is currently active.
+  bool waived = 8;
+  // Waiver identifier, when present.
+  optional string waiver_id = 9;
+  // Waiver expiry timestamp in ns, when present.
+  optional uint64 waiver_expires_at_ns = 10;
+  // Remaining waiver lifetime in ns, when present.
+  optional uint64 waiver_remaining_ns = 11;
+  // Whether this edge was added late (after dependent had already started).
+  bool late_edge = 12;
+}
+
 message WorkStatusResponse {
   // Work identifier.
   string work_id = 1;
@@ -418,6 +454,11 @@ message WorkStatusResponse {
   uint64 created_at_ns = 7;
   // Work claimed timestamp (nanoseconds since epoch, if claimed).
   optional uint64 claimed_at_ns = 8;
+  // Whether implementer claim is currently blocked by unsatisfied incoming
+  // BLOCKS dependencies.
+  bool implementer_claim_blocked = 9;
+  // Structured dependency diagnostics for doctor/work status consumers.
+  repeated WorkDependencyDiagnostic dependency_diagnostics = 10;
 }
 
 // IPC-PRIV-019: WorkList (TCK-00415)
