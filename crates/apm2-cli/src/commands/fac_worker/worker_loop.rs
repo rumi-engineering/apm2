@@ -839,7 +839,7 @@ pub(super) fn run_fac_worker_impl(
     // TCK-00600: Notify systemd that the worker is ready and spawn a
     // background thread for watchdog pings. The background thread pings
     // independently of the job processing loop, preventing systemd from
-    // restarting the worker during long-running jobs (process_job can
+    // restarting the worker during long-running jobs (the execution path can
     // take minutes). The daemon already uses this pattern (background
     // poller task). The thread is marked as a daemon thread and will
     // exit when the main worker thread exits.
@@ -1121,8 +1121,6 @@ pub(super) fn run_fac_worker_impl(
                 }
             } else {
                 let mut orchestrator = WorkerOrchestrator::new();
-                let mut staged_outcome: Option<JobOutcome> = None;
-                let lane_id = candidate.spec.queue_lane.clone();
                 let mut transition_count = 0usize;
                 let outcome = loop {
                     transition_count = transition_count.saturating_add(1);
@@ -1132,93 +1130,50 @@ pub(super) fn run_fac_worker_impl(
                         );
                     }
 
-                    match orchestrator.step() {
-                        StepOutcome::Advanced => match orchestrator.state() {
-                            OrchestratorState::Idle => {
-                                orchestrator.transition(OrchestratorState::Claimed {
-                                    job_id: candidate.spec.job_id.clone(),
-                                });
-                            },
-                            OrchestratorState::Claimed { .. } => {
-                                orchestrator.transition(OrchestratorState::LaneAcquired {
-                                    job_id: candidate.spec.job_id.clone(),
-                                    lane_id: lane_id.clone(),
-                                });
-                            },
-                            OrchestratorState::LaneAcquired { .. } => {
-                                orchestrator.transition(OrchestratorState::LeasePersisted {
-                                    job_id: candidate.spec.job_id.clone(),
-                                    lane_id: lane_id.clone(),
-                                });
-                            },
-                            OrchestratorState::LeasePersisted { .. } => {
-                                orchestrator.transition(OrchestratorState::Executing {
-                                    job_id: candidate.spec.job_id.clone(),
-                                    lane_id: lane_id.clone(),
-                                });
-                            },
-                            OrchestratorState::Executing { .. } => {
-                                orchestrator.transition(OrchestratorState::Committing {
-                                    job_id: candidate.spec.job_id.clone(),
-                                    lane_id: lane_id.clone(),
-                                });
-                            },
-                            OrchestratorState::Committing { .. } => {
-                                if staged_outcome.is_none() {
-                                    staged_outcome = Some(process_job(
-                                        candidate,
-                                        &queue_root,
-                                        &fac_root,
-                                        &mut completed_gates_cache,
-                                        &verifying_key,
-                                        &cycle_scheduler,
-                                        lane,
-                                        &mut broker,
-                                        &signer,
-                                        &policy_hash,
-                                        &policy_digest,
-                                        &policy,
-                                        &job_spec_policy,
-                                        &budget_cas,
-                                        candidates.len(),
-                                        print_unit,
-                                        &current_tuple_digest,
-                                        &boundary_id,
-                                        cycle_count,
-                                        summary.jobs_completed as u64,
-                                        summary.jobs_denied as u64,
-                                        summary.jobs_quarantined as u64,
-                                        &cost_model,
-                                        Some(toolchain_fingerprint.as_str()),
-                                    ));
-                                }
-                                let committed_outcome =
-                                    staged_outcome.take().unwrap_or_else(|| {
-                                        JobOutcome::skipped(
-                                            "orchestrator reached committing without staged outcome",
-                                        )
-                                    });
-                                orchestrator.complete_with_outcome(
-                                    candidate.spec.job_id.clone(),
-                                    committed_outcome,
-                                );
-                            },
-                            OrchestratorState::Completed { .. } => {},
-                        },
+                    let mut orchestration_ctx = OrchestratorContext {
+                        candidate,
+                        queue_root: &queue_root,
+                        fac_root: &fac_root,
+                        completed_gates_cache: &mut completed_gates_cache,
+                        verifying_key: &verifying_key,
+                        scheduler: &cycle_scheduler,
+                        lane,
+                        broker: &mut broker,
+                        signer: &signer,
+                        policy_hash: &policy_hash,
+                        policy_digest: &policy_digest,
+                        policy: &policy,
+                        job_spec_policy: &job_spec_policy,
+                        budget_cas: &budget_cas,
+                        print_unit,
+                        canonicalizer_tuple_digest: &current_tuple_digest,
+                        boundary_id: &boundary_id,
+                        heartbeat_cycle_count: cycle_count,
+                        heartbeat_jobs_completed: summary.jobs_completed as u64,
+                        heartbeat_jobs_denied: summary.jobs_denied as u64,
+                        heartbeat_jobs_quarantined: summary.jobs_quarantined as u64,
+                        cost_model: &cost_model,
+                        toolchain_fingerprint: Some(toolchain_fingerprint.as_str()),
+                    };
+
+                    match orchestrator.step(&mut orchestration_ctx) {
+                        StepOutcome::Advanced => {},
                         StepOutcome::Done(done) => break done,
-                        StepOutcome::Skipped(reason) => {
-                            break staged_outcome
-                                .take()
-                                .unwrap_or_else(|| JobOutcome::skipped(reason));
-                        },
+                        StepOutcome::Skipped(reason) => break JobOutcome::skipped(reason),
                     }
                 };
                 cycle_scheduler.record_completion(lane);
                 outcome
             };
             let duration_secs = job_started.elapsed().as_secs();
-            let _orchestration_classification =
+            let orchestration_classification =
                 classify_job_outcome_for_orchestration(&candidate.spec.job_id, &outcome);
+            if matches!(
+                orchestration_classification,
+                OrchestrationError::NeedsReconcile(_)
+            ) {
+                repair_coordinator.request(&wake_tx, json_output, "orchestrator_needs_reconcile");
+            }
 
             match &outcome {
                 JobOutcome::Quarantined { reason } => {

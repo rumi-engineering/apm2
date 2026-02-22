@@ -2263,8 +2263,8 @@ fn test_other_errors_map_to_validation_failed() {
 /// TCK-00564 MAJOR-1 regression: denied receipt + pending job must route
 /// to denied/, NOT completed/.
 ///
-/// Prior to fix round 4, the duplicate detection in `process_job` used
-/// `has_receipt_for_job` (boolean) and unconditionally moved duplicates
+/// Prior to fix round 4, the duplicate detection in the worker execution path
+/// used `has_receipt_for_job` (boolean) and unconditionally moved duplicates
 /// to `completed/`. This masked denied outcomes. The fix uses
 /// `find_receipt_for_job` and routes to the correct terminal directory
 /// via `outcome_to_terminal_state`.
@@ -2324,7 +2324,7 @@ fn test_duplicate_detection_routes_denied_receipt_to_denied_dir() {
         "Denied outcome must route to denied/ directory, not completed/"
     );
 
-    // Step 5: Execute the outcome-aware routing (same logic as process_job).
+    // Step 5: Execute the outcome-aware routing (same logic as the execution path).
     let terminal_dir = queue_root.join(terminal_state.dir_name());
     move_to_dir_safe(&pending_file, &terminal_dir, "test-denied-job.json")
         .expect("move to terminal dir");
@@ -2658,7 +2658,7 @@ fn test_handle_pipeline_commit_failure_leaves_job_in_claimed() {
 fn resolve_network_policy_hash_matches_for_gates_kind() {
     // Regression: the resolved network policy hash for "gates" kind
     // must match the hash produced by resolve_network_policy("gates", None).
-    // This validates that the early-resolve approach in process_job
+    // This validates that the early-resolve approach in the execution path
     // produces the same hash as the later resolve_network_policy call.
     let resolved = apm2_core::fac::resolve_network_policy("gates", None);
     let expected_deny = apm2_core::fac::NetworkPolicy::deny();
@@ -4581,84 +4581,8 @@ fn queue_watcher_mode_transitions_to_degraded_once() {
 }
 
 // =========================================================================
-// Orchestrator state machine tests (TCK-00664)
+// Orchestration classification tests
 // =========================================================================
-
-#[test]
-fn test_orchestrator_state_transitions() {
-    let mut orch = WorkerOrchestrator::new();
-    assert_eq!(*orch.state(), OrchestratorState::Idle);
-
-    orch.transition(OrchestratorState::Claimed {
-        job_id: "j-001".to_string(),
-    });
-    assert_eq!(
-        *orch.state(),
-        OrchestratorState::Claimed {
-            job_id: "j-001".to_string(),
-        }
-    );
-
-    orch.transition(OrchestratorState::LaneAcquired {
-        job_id: "j-001".to_string(),
-        lane_id: "lane-0".to_string(),
-    });
-    assert_eq!(
-        *orch.state(),
-        OrchestratorState::LaneAcquired {
-            job_id: "j-001".to_string(),
-            lane_id: "lane-0".to_string(),
-        }
-    );
-
-    orch.transition(OrchestratorState::LeasePersisted {
-        job_id: "j-001".to_string(),
-        lane_id: "lane-0".to_string(),
-    });
-    assert_eq!(
-        *orch.state(),
-        OrchestratorState::LeasePersisted {
-            job_id: "j-001".to_string(),
-            lane_id: "lane-0".to_string(),
-        }
-    );
-
-    orch.transition(OrchestratorState::Executing {
-        job_id: "j-001".to_string(),
-        lane_id: "lane-0".to_string(),
-    });
-    assert_eq!(
-        *orch.state(),
-        OrchestratorState::Executing {
-            job_id: "j-001".to_string(),
-            lane_id: "lane-0".to_string(),
-        }
-    );
-
-    orch.transition(OrchestratorState::Committing {
-        job_id: "j-001".to_string(),
-        lane_id: "lane-0".to_string(),
-    });
-    assert_eq!(
-        *orch.state(),
-        OrchestratorState::Committing {
-            job_id: "j-001".to_string(),
-            lane_id: "lane-0".to_string(),
-        }
-    );
-
-    orch.transition(OrchestratorState::Completed {
-        job_id: "j-001".to_string(),
-        outcome: "completed".to_string(),
-    });
-    assert_eq!(
-        *orch.state(),
-        OrchestratorState::Completed {
-            job_id: "j-001".to_string(),
-            outcome: "completed".to_string(),
-        }
-    );
-}
 
 #[test]
 fn test_orchestration_error_display() {
@@ -4691,101 +4615,50 @@ fn test_orchestration_error_display() {
 }
 
 #[test]
-fn test_orchestrator_terminal_detection() {
-    let mut orch = WorkerOrchestrator::new();
-
-    // Idle is not terminal.
-    assert!(!orch.is_terminal());
-
-    // Claimed is not terminal.
-    orch.transition(OrchestratorState::Claimed {
-        job_id: "j-002".to_string(),
-    });
-    assert!(!orch.is_terminal());
-
-    // LaneAcquired is not terminal.
-    orch.transition(OrchestratorState::LaneAcquired {
-        job_id: "j-002".to_string(),
-        lane_id: "lane-1".to_string(),
-    });
-    assert!(!orch.is_terminal());
-
-    // LeasePersisted is not terminal.
-    orch.transition(OrchestratorState::LeasePersisted {
-        job_id: "j-002".to_string(),
-        lane_id: "lane-1".to_string(),
-    });
-    assert!(!orch.is_terminal());
-
-    // Executing is not terminal.
-    orch.transition(OrchestratorState::Executing {
-        job_id: "j-002".to_string(),
-        lane_id: "lane-1".to_string(),
-    });
-    assert!(!orch.is_terminal());
-
-    // Committing is not terminal.
-    orch.transition(OrchestratorState::Committing {
-        job_id: "j-002".to_string(),
-        lane_id: "lane-1".to_string(),
-    });
-    assert!(!orch.is_terminal());
-
-    // Completed IS terminal.
-    orch.transition(OrchestratorState::Completed {
-        job_id: "j-002".to_string(),
-        outcome: "denied".to_string(),
-    });
-    assert!(orch.is_terminal());
-}
-
-#[test]
-fn test_orchestrator_step_semantics_cover_done_and_skipped() {
-    let mut orch = WorkerOrchestrator::new();
-
-    assert!(
-        matches!(orch.step(), StepOutcome::Advanced),
-        "idle state must request progression"
-    );
-
-    orch.transition(OrchestratorState::Completed {
-        job_id: "j-003".to_string(),
-        outcome: "completed".to_string(),
-    });
-    match orch.step() {
-        StepOutcome::Done(JobOutcome::Completed { job_id, .. }) => {
-            assert_eq!(job_id, "j-003");
-        },
-        other => panic!("expected Done(Completed), got {other:?}"),
-    }
-
-    orch.transition(OrchestratorState::Completed {
-        job_id: "j-004".to_string(),
-        outcome: "unknown-terminal".to_string(),
-    });
-    match orch.step() {
-        StepOutcome::Skipped(reason) => {
-            assert_eq!(reason, "unknown-terminal");
-        },
-        other => panic!("expected Skipped for unknown terminal outcome, got {other:?}"),
-    }
-}
-
-#[test]
-fn test_orchestrator_complete_with_outcome_preserves_job_outcome() {
-    let mut orch = WorkerOrchestrator::new();
-    let expected = JobOutcome::Skipped {
-        reason: "commit deferred".to_string(),
+fn test_orchestration_classification_routes_pipeline_commit_failure_to_reconcile() {
+    let outcome = JobOutcome::Skipped {
+        reason: "receipt pipeline commit failed".to_string(),
         disposition: JobSkipDisposition::PipelineCommitFailed,
     };
 
-    orch.complete_with_outcome("j-005".to_string(), expected.clone());
-    assert!(orch.is_terminal());
-
-    match orch.step() {
-        StepOutcome::Done(actual) => {
-            assert_eq!(actual, expected);
+    let classification = classify_job_outcome_for_orchestration("j-commit", &outcome);
+    match classification {
+        OrchestrationError::NeedsReconcile(reason) => {
+            assert_eq!(reason, "receipt pipeline commit failed");
         },
-        other => panic!("expected Done with preserved terminal outcome, got {other:?}"),
+        other => panic!("expected NeedsReconcile, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_orchestration_classification_routes_no_lane_to_corrupt_lane_signal() {
+    let outcome = JobOutcome::Skipped {
+        reason: "no lane available, returning to pending".to_string(),
+        disposition: JobSkipDisposition::NoLaneAvailable,
+    };
+
+    let classification = classify_job_outcome_for_orchestration("j-nolane", &outcome);
+    match classification {
+        OrchestrationError::CorruptLane { lane_id, reason } => {
+            assert_eq!(lane_id, "unassigned");
+            assert_eq!(reason, "no lane available, returning to pending");
+        },
+        other => panic!("expected CorruptLane classification, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_orchestration_classification_routes_quarantine_with_job_id() {
+    let outcome = JobOutcome::Quarantined {
+        reason: "digest mismatch".to_string(),
+    };
+
+    let classification = classify_job_outcome_for_orchestration("j-quarantine", &outcome);
+    match classification {
+        OrchestrationError::QuarantineJob { job_id, reason } => {
+            assert_eq!(job_id, "j-quarantine");
+            assert_eq!(reason, "digest mismatch");
+        },
+        other => panic!("expected QuarantineJob classification, got {other:?}"),
     }
 }
