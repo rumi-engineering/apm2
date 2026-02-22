@@ -453,6 +453,46 @@ pub struct WorkStatusRequest {
     #[prost(string, tag = "1")]
     pub work_id: ::prost::alloc::string::String,
 }
+/// Structured dependency diagnostic attached to WorkStatus responses.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkDependencyDiagnostic {
+    /// Stable machine-readable reason code.
+    #[prost(string, tag = "1")]
+    pub reason_code: ::prost::alloc::string::String,
+    /// Severity classification.
+    #[prost(enumeration = "WorkDependencyDiagnosticSeverity", tag = "2")]
+    pub severity: i32,
+    /// Human-readable detail.
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+    /// Deterministic edge identifier.
+    #[prost(string, tag = "4")]
+    pub edge_id: ::prost::alloc::string::String,
+    /// Source work item ID.
+    #[prost(string, tag = "5")]
+    pub from_work_id: ::prost::alloc::string::String,
+    /// Target work item ID.
+    #[prost(string, tag = "6")]
+    pub to_work_id: ::prost::alloc::string::String,
+    /// Current source work state, when known.
+    #[prost(string, optional, tag = "7")]
+    pub from_work_state: ::core::option::Option<::prost::alloc::string::String>,
+    /// Whether a waiver is currently active.
+    #[prost(bool, tag = "8")]
+    pub waived: bool,
+    /// Waiver identifier, when present.
+    #[prost(string, optional, tag = "9")]
+    pub waiver_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// Waiver expiry timestamp in ns, when present.
+    #[prost(uint64, optional, tag = "10")]
+    pub waiver_expires_at_ns: ::core::option::Option<u64>,
+    /// Remaining waiver lifetime in ns, when present.
+    #[prost(uint64, optional, tag = "11")]
+    pub waiver_remaining_ns: ::core::option::Option<u64>,
+    /// Whether this edge was added late (after dependent had already started).
+    #[prost(bool, tag = "12")]
+    pub late_edge: bool,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WorkStatusResponse {
     /// Work identifier.
@@ -479,6 +519,13 @@ pub struct WorkStatusResponse {
     /// Work claimed timestamp (nanoseconds since epoch, if claimed).
     #[prost(uint64, optional, tag = "8")]
     pub claimed_at_ns: ::core::option::Option<u64>,
+    /// Whether implementer claim is currently blocked by unsatisfied incoming
+    /// BLOCKS dependencies.
+    #[prost(bool, tag = "9")]
+    pub implementer_claim_blocked: bool,
+    /// Structured dependency diagnostics for doctor/work status consumers.
+    #[prost(message, repeated, tag = "10")]
+    pub dependency_diagnostics: ::prost::alloc::vec::Vec<WorkDependencyDiagnostic>,
 }
 /// IPC-PRIV-019: WorkList (TCK-00415)
 /// List all work items known to projection authority.
@@ -2223,6 +2270,39 @@ impl WorkRole {
             "GATE_EXECUTOR" => Some(Self::GateExecutor),
             "REVIEWER" => Some(Self::Reviewer),
             "COORDINATOR" => Some(Self::Coordinator),
+            _ => None,
+        }
+    }
+}
+/// Severity for work dependency diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum WorkDependencyDiagnosticSeverity {
+    Unspecified = 0,
+    Info = 1,
+    Warning = 2,
+    Error = 3,
+}
+impl WorkDependencyDiagnosticSeverity {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_UNSPECIFIED",
+            Self::Info => "WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_INFO",
+            Self::Warning => "WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_WARNING",
+            Self::Error => "WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_ERROR",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_UNSPECIFIED" => Some(Self::Unspecified),
+            "WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_INFO" => Some(Self::Info),
+            "WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_WARNING" => Some(Self::Warning),
+            "WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_ERROR" => Some(Self::Error),
             _ => None,
         }
     }
