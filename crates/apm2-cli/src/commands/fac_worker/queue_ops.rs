@@ -1021,9 +1021,15 @@ pub(super) fn resolve_fac_root() -> Result<PathBuf, String> {
 fn ensure_directory_mode_nofollow(path: &Path, mode: u32) -> Result<(), String> {
     use nix::errno::Errno;
     use nix::fcntl::{OFlag, open};
-    use nix::sys::stat::{FchmodatFlags, Mode, fchmod, fchmodat};
+    use nix::sys::stat::Mode;
 
-    let open_flags = OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    // Open without following symlinks. Linux uses `O_PATH` so we can recover
+    // mode-000 directories; other Unix targets use `O_RDONLY` and then `fchmod`
+    // directly on the opened descriptor.
+    #[cfg(target_os = "linux")]
+    let open_flags = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let open_flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
 
     let classify_path = || -> Result<(), String> {
         let metadata = fs::symlink_metadata(path)
@@ -1066,19 +1072,6 @@ fn ensure_directory_mode_nofollow(path: &Path, mode: u32) -> Result<(), String> 
                 ),
             })?
         },
-        Err(Errno::EACCES) => {
-            classify_path()?;
-            let cwd_fd = fs::File::open(".")
-                .map_err(|e| format!("cannot open current directory for chmodat: {e}"))?;
-            fchmodat(
-                &cwd_fd,
-                path,
-                Mode::from_bits_truncate(mode),
-                FchmodatFlags::NoFollowSymlink,
-            )
-            .map_err(|e| format!("cannot set mode {mode:#o} on {}: {e}", path.display()))?;
-            return Ok(());
-        },
         Err(Errno::ELOOP | Errno::ENOTDIR) => {
             classify_path()?;
             return Err(format!(
@@ -1089,8 +1082,34 @@ fn ensure_directory_mode_nofollow(path: &Path, mode: u32) -> Result<(), String> 
         Err(e) => return Err(format!("cannot open directory {}: {e}", path.display())),
     };
 
-    fchmod(&dir_fd, Mode::from_bits_truncate(mode))
-        .map_err(|e| format!("cannot set mode {mode:#o} on {}: {e}", path.display()))?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let mode = mode as libc::mode_t;
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            // SAFETY:
+            // - `dir_fd` is a live fd returned by `open`.
+            // - `c""` is a valid NUL-terminated empty C string.
+            // - `AT_EMPTY_PATH` targets the opened path object directly.
+            libc::fchmodat(dir_fd.as_raw_fd(), c"".as_ptr(), mode, libc::AT_EMPTY_PATH)
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(format!(
+                "cannot set mode {mode:#o} on {}: {err}",
+                path.display()
+            ));
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        use nix::sys::stat::fchmod;
+        fchmod(&dir_fd, Mode::from_bits_truncate(mode))
+            .map_err(|e| format!("cannot set mode {mode:#o} on {}: {e}", path.display()))?;
+    }
 
     Ok(())
 }
@@ -1179,12 +1198,6 @@ pub(super) fn consume_authority(
 
     let receipt_path = consume_dir.join(format!("{job_id}.consumed"));
 
-    // Fail-closed: if the receipt already exists, authority was already
-    // consumed.
-    if receipt_path.exists() {
-        return Err(format!("authority already consumed for job {job_id}"));
-    }
-
     let receipt = serde_json::json!({
         "schema": "apm2.fac.pcac_consume.v1",
         "job_id": job_id,
@@ -1194,7 +1207,48 @@ pub(super) fn consume_authority(
 
     let bytes = serde_json::to_vec_pretty(&receipt)
         .map_err(|e| format!("cannot serialize consume receipt: {e}"))?;
-    fs::write(&receipt_path, bytes).map_err(|e| format!("cannot write consume receipt: {e}"))?;
+
+    // Enforce single-use authority consumption with atomic create-only write.
+    // This closes the TOCTOU gap in `exists()` + `write()` under concurrent
+    // workers claiming the same job.
+    let mut receipt_file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&receipt_path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("authority already consumed for job {job_id}")
+            } else {
+                format!(
+                    "cannot create consume receipt {}: {e}",
+                    receipt_path.display()
+                )
+            }
+        })?;
+
+    if let Err(err) = receipt_file.write_all(&bytes) {
+        drop(receipt_file);
+        let cleanup_suffix = match fs::remove_file(&receipt_path) {
+            Ok(()) => String::new(),
+            Err(cleanup_err) => format!("; cleanup failed: {cleanup_err}"),
+        };
+        return Err(format!(
+            "cannot write consume receipt {}: {err}{cleanup_suffix}",
+            receipt_path.display()
+        ));
+    }
+
+    if let Err(err) = receipt_file.sync_all() {
+        drop(receipt_file);
+        let cleanup_suffix = match fs::remove_file(&receipt_path) {
+            Ok(()) => String::new(),
+            Err(cleanup_err) => format!("; cleanup failed: {cleanup_err}"),
+        };
+        return Err(format!(
+            "cannot sync consume receipt {}: {err}{cleanup_suffix}",
+            receipt_path.display()
+        ));
+    }
 
     if let Ok(dir) = fs::File::open(&consume_dir) {
         let _ = dir.sync_all();

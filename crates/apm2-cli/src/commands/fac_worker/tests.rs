@@ -187,6 +187,95 @@ fn ensure_queue_dirs_rejects_non_directory_subdir_fail_closed() {
     );
 }
 
+#[test]
+fn consume_authority_rejects_second_write_without_overwriting_receipt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue_root = dir.path().join("queue");
+    fs::create_dir_all(&queue_root).expect("create queue root");
+
+    consume_authority(&queue_root, "job-atomic", "b3-256:first")
+        .expect("first consume should succeed");
+    let receipt_path = queue_root
+        .join(CONSUME_RECEIPTS_DIR)
+        .join("job-atomic.consumed");
+    let first_bytes = fs::read(&receipt_path).expect("read first consume receipt");
+
+    let err = consume_authority(&queue_root, "job-atomic", "b3-256:second")
+        .expect_err("second consume must fail-closed");
+    assert!(
+        err.contains("authority already consumed"),
+        "second consume should fail with consumed marker, got: {err}"
+    );
+
+    let second_bytes = fs::read(&receipt_path).expect("read consume receipt after second attempt");
+    assert_eq!(
+        second_bytes, first_bytes,
+        "consume receipt must be immutable after first successful write"
+    );
+
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&second_bytes).expect("parse consume receipt");
+    assert_eq!(receipt["job_id"], "job-atomic");
+    assert_eq!(receipt["spec_digest"], "b3-256:first");
+}
+
+#[test]
+fn consume_authority_is_atomic_under_concurrent_race() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue_root = dir.path().join("queue");
+    fs::create_dir_all(&queue_root).expect("create queue root");
+
+    let threads = 8usize;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+    let queue_root = std::sync::Arc::new(queue_root);
+
+    let handles: Vec<_> = (0..threads)
+        .map(|_| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let queue_root = std::sync::Arc::clone(&queue_root);
+            std::thread::spawn(move || {
+                barrier.wait();
+                consume_authority(&queue_root, "job-race", "b3-256:racy")
+            })
+        })
+        .collect();
+
+    let mut ok_count = 0usize;
+    let mut already_consumed_count = 0usize;
+    let mut unexpected_errors = Vec::new();
+
+    for handle in handles {
+        match handle.join().expect("worker thread should not panic") {
+            Ok(()) => ok_count += 1,
+            Err(err) if err.contains("authority already consumed") => already_consumed_count += 1,
+            Err(err) => unexpected_errors.push(err),
+        }
+    }
+
+    assert!(
+        unexpected_errors.is_empty(),
+        "unexpected consume errors: {unexpected_errors:?}"
+    );
+    assert_eq!(
+        ok_count, 1,
+        "exactly one concurrent consume should succeed; got {ok_count}"
+    );
+    assert_eq!(
+        already_consumed_count,
+        threads - 1,
+        "all losing racers must fail as already consumed"
+    );
+
+    let receipt_path = queue_root
+        .join(CONSUME_RECEIPTS_DIR)
+        .join("job-race.consumed");
+    let receipt_bytes = fs::read(&receipt_path).expect("read race consume receipt");
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&receipt_bytes).expect("parse race consume receipt");
+    assert_eq!(receipt["job_id"], "job-race");
+    assert_eq!(receipt["spec_digest"], "b3-256:racy");
+}
+
 fn make_orchestrator_step_candidate(job_id: &str, path: PathBuf) -> PendingCandidate {
     let source = apm2_core::fac::job_spec::JobSource {
         kind: "mirror_commit".to_string(),
@@ -433,6 +522,75 @@ fn worker_orchestrator_step_committing_emits_staged_outcome_and_terminal_state()
         other => panic!("expected denied outcome on terminal replay, got {other:?}"),
     };
     assert_eq!(second_reason, "forced-deny-for-test");
+}
+
+#[test]
+fn worker_orchestrator_step_completed_mismatch_fails_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue_root = dir.path().join("queue");
+    let fac_root = dir.path().join("private").join("fac");
+    fs::create_dir_all(&queue_root).expect("queue root");
+    fs::create_dir_all(&fac_root).expect("fac root");
+
+    let candidate =
+        make_orchestrator_step_candidate("job-step-mismatch", queue_root.join("pending/job.json"));
+    let mut completed_gates_cache = None;
+    let signer = Signer::generate();
+    let verifying_key = signer.verifying_key();
+    let scheduler = QueueSchedulerState::new();
+    let mut broker = FacBroker::new();
+    let policy = FacPolicyV1::default_policy();
+    let policy_hash = compute_policy_hash(&policy).expect("policy hash");
+    let policy_digest = parse_policy_hash(&policy_hash).expect("policy digest");
+    let job_spec_policy = policy
+        .job_spec_validation_policy()
+        .expect("job spec policy");
+    let budget_cas = MemoryCas::new();
+    let cost_model = apm2_core::economics::CostModelV1::with_defaults();
+    let mut ctx = OrchestratorContext {
+        candidate: &candidate,
+        queue_root: &queue_root,
+        fac_root: &fac_root,
+        completed_gates_cache: &mut completed_gates_cache,
+        verifying_key: &verifying_key,
+        scheduler: &scheduler,
+        lane: QueueLane::Bulk,
+        broker: &mut broker,
+        signer: &signer,
+        policy_hash: &policy_hash,
+        policy_digest: &policy_digest,
+        policy: &policy,
+        job_spec_policy: &job_spec_policy,
+        budget_cas: &budget_cas,
+        print_unit: false,
+        canonicalizer_tuple_digest: "b3-256:step",
+        boundary_id: "apm2.fac.local",
+        heartbeat_cycle_count: 0,
+        heartbeat_jobs_completed: 0,
+        heartbeat_jobs_denied: 0,
+        heartbeat_jobs_quarantined: 0,
+        cost_model: &cost_model,
+        toolchain_fingerprint: None,
+    };
+
+    let mut orchestrator = WorkerOrchestrator::new();
+    orchestrator.test_set_state(OrchestratorState::Completed {
+        job_id: "state-job-id".to_string(),
+        outcome: JobOutcome::Completed {
+            job_id: "outcome-job-id".to_string(),
+            observed_cost: None,
+        },
+    });
+
+    let step = orchestrator.step(&mut ctx);
+    let reason = match step {
+        StepOutcome::Skipped(reason) => reason,
+        other => panic!("expected skipped mismatch outcome, got {other:?}"),
+    };
+    assert!(
+        reason.contains("job_id mismatch"),
+        "expected mismatch reason, got: {reason}"
+    );
 }
 
 #[test]
@@ -4051,6 +4209,111 @@ fn ensure_queue_dirs_hardens_preexisting_unsafe_broker_requests() {
     assert_eq!(
         post_mode, 0o1733,
         "broker_requests must be hardened from 0333 to 01733, got {post_mode:#o}"
+    );
+}
+
+/// Regression: an unsearchable pre-existing broker directory (0000) must still
+/// be hardened deterministically to 01733.
+#[cfg(unix)]
+#[test]
+fn ensure_queue_dirs_hardens_unsearchable_broker_requests_mode_000() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue_root = dir.path().join("queue");
+    let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+    fs::create_dir_all(&broker_dir).expect("create broker_requests");
+    fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o000))
+        .expect("set mode 0000");
+
+    ensure_queue_dirs(&queue_root).expect("ensure_queue_dirs should succeed");
+
+    let post_mode = fs::metadata(&broker_dir)
+        .expect("broker metadata post-fix")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        post_mode, 0o1733,
+        "broker_requests must be hardened from 0000 to 01733, got {post_mode:#o}"
+    );
+}
+
+/// Regression: an unsearchable pre-existing queue root (0000) must still be
+/// hardened deterministically to 0711.
+#[cfg(unix)]
+#[test]
+fn ensure_queue_dirs_hardens_unsearchable_queue_root_mode_000() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue_root = dir.path().join("queue");
+
+    fs::create_dir_all(&queue_root).expect("create queue root");
+    fs::set_permissions(&queue_root, std::fs::Permissions::from_mode(0o000))
+        .expect("set mode 0000");
+
+    ensure_queue_dirs(&queue_root).expect("ensure_queue_dirs should succeed");
+
+    let post_mode = fs::metadata(&queue_root)
+        .expect("queue root metadata post-fix")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        post_mode, 0o711,
+        "queue root must be hardened from 0000 to 0711, got {post_mode:#o}"
+    );
+}
+
+/// Regression: an unsearchable pre-existing queue subdirectory (0000) must be
+/// hardened deterministically to 0711.
+#[cfg(unix)]
+#[test]
+fn ensure_queue_dirs_hardens_unsearchable_subdir_mode_000() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue_root = dir.path().join("queue");
+    let pending_dir = queue_root.join(PENDING_DIR);
+
+    fs::create_dir_all(&pending_dir).expect("create pending dir");
+    fs::set_permissions(&pending_dir, std::fs::Permissions::from_mode(0o000))
+        .expect("set mode 0000");
+
+    ensure_queue_dirs(&queue_root).expect("ensure_queue_dirs should succeed");
+
+    let post_mode = fs::metadata(&pending_dir)
+        .expect("pending dir metadata post-fix")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        post_mode, 0o711,
+        "pending dir must be hardened from 0000 to 0711, got {post_mode:#o}"
+    );
+}
+
+/// Regression: symlinked `broker_requests` path must be rejected fail-closed.
+#[cfg(unix)]
+#[test]
+fn ensure_queue_dirs_rejects_symlink_broker_requests_fail_closed() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue_root = dir.path().join("queue");
+    fs::create_dir_all(&queue_root).expect("create queue root");
+    let external_target = dir.path().join("external-target");
+    fs::create_dir_all(&external_target).expect("create external target");
+    symlink(&external_target, queue_root.join(BROKER_REQUESTS_DIR))
+        .expect("create broker_requests symlink");
+
+    let err = ensure_queue_dirs(&queue_root)
+        .expect_err("must fail-closed on broker_requests symlink path");
+    assert!(
+        err.contains("symlink"),
+        "error must report symlink refusal, got: {err}"
     );
 }
 

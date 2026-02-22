@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: 'TCK-00664'
     title: 'FAC: Refactor worker orchestration into explicit state machine modules (reduce brittleness, improve crash recovery)'
-    status: 'OPEN'
+    status: 'IN_PROGRESS'
   binds:
     prd_id: 'PRD-0001'
     rfc_id: 'RFC-0019'
@@ -66,6 +66,7 @@ scope:
   in_scope:
     - id: 'S1'
       description: |
+        Delivered in PR #796 (merged to `main` on 2026-02-22); retained for historical traceability.
         Extract modules (behavior-preserving):
           - worker_loop.rs: wake-driven loop, scan lock, watchdog + heartbeat, runtime repair signal handling
           - queue_ops.rs: claim/requeue/move-to-terminal, open_no_follow, flock handling
@@ -74,12 +75,14 @@ scope:
           - commit_ops.rs: receipt pipeline + failure handling
     - id: 'S2'
       description: |
+        Delivered in PR #796 (merged to `main` on 2026-02-22); retained for historical traceability.
         Implement an explicit orchestration struct:
           - struct WorkerOrchestrator { ... }
           - fn step(&mut self) -> StepOutcome
           - transitions expressed as enums; all filesystem writes go through queue_ops/lane_ops.
     - id: 'S3'
       description: |
+        Delivered in PR #796 (merged to `main` on 2026-02-22); retained for historical traceability.
         Introduce a single error taxonomy:
           - enum OrchestrationError { Recoverable, NeedsReconcile, CorruptLane, ... }
           - ensures every error path either:
@@ -88,9 +91,16 @@ scope:
               * quarantines lane/job with explicit reason
     - id: 'S4'
       description: |
+        Delivered in PR #796 (merged to `main` on 2026-02-22); retained for historical traceability.
         Use existing deterministic reconcile/worker suites to lock in behavior:
           - Existing runtime reconcile and state-machine tests must still pass after refactor.
           - Add at least 3 new unit tests for state transitions.
+    - id: 'S5'
+      description: |
+        Post-merge hardening follow-up for PR #796:
+          - make `consume_authority` durable write path atomic and fail-closed under concurrent races
+          - eliminate path re-resolution chmod fallback by using fd-based chmod on Unix
+          - add regressions for consume idempotency/race behavior and queue dir hardening edges
   out_of_scope:
     - 'Changing queue on-disk format or adding new directories.'
     - 'Rewriting execution backend (systemd/cgroup) — separate efforts.'
@@ -105,16 +115,21 @@ plan:
       description: 'Unify error taxonomy and remove ad-hoc string matching (e.g., "no lane available").'
     - id: 'P4'
       description: 'Run deterministic reconcile/worker suites; add new transition unit tests.'
+    - id: 'P5'
+      description: 'Apply post-merge hardening patches surfaced by FAC review loops and re-run full gates.'
 
 
 definition_of_done:
   criteria:
-    - 'fac_worker.rs is reduced materially (target: <3k LOC) with logic moved into focused modules.'
+    - 'S1-S4 outcomes are present in `main` via merged PR #796 (material LOC reduction + modularized worker).'
+    - 'Post-merge hardening deltas (S5) are implemented with deterministic regressions.'
     - 'All existing deterministic worker/reconcile tests + new transition tests pass.'
     - 'All state transitions are explicit and auditable (no hidden partial transitions).'
   evidence_ids:
     - 'EVID-TCK-00664-01: diff shows modularization + LOC reduction'
     - 'EVID-TCK-00664-02: deterministic worker/reconcile transition suites pass'
+    - 'EVID-TCK-00664-03: consume_authority atomic create+sync hardening with race regression'
+    - 'EVID-TCK-00664-04: fd-based chmod hardening avoids path re-resolution on Unix'
 
 notes:
   risk:
