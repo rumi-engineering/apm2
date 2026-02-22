@@ -5349,9 +5349,21 @@ pub trait WorkRegistry: Send + Sync {
     /// Returns `Some(claim)` only if a claim for the exact `(work_id, role)`
     /// pair exists. This is the canonical lookup for multi-role workflows
     /// (Phase 2).
+    ///
+    /// # Fail-Closed Default
+    ///
+    /// The default returns `None` (fail-closed) to prevent role-agnostic
+    /// leakage: delegating to `get_claim(work_id)` and filtering by role
+    /// is incorrect in multi-role scenarios because `get_claim` returns
+    /// the *first registered* claim (any role), missing claims for other
+    /// roles entirely. All concrete implementations (`StubWorkRegistry`,
+    /// `SqliteWorkRegistry`) MUST override this with a role-keyed lookup.
     fn get_claim_for_role(&self, work_id: &str, role: WorkRole) -> Option<WorkClaim> {
-        // Default: delegate to get_claim and filter by role.
-        self.get_claim(work_id).filter(|c| c.role == role)
+        // Fail-closed: force implementors to provide a role-keyed lookup.
+        // Do NOT delegate to get_claim + filter — that pattern is broken
+        // when multiple roles exist for the same work_id.
+        let _ = (work_id, role);
+        None
     }
 }
 
@@ -15770,15 +15782,22 @@ impl PrivilegedDispatcher {
         // 11. Register the claim in WorkRegistry FIRST so SpawnEpisode and other
         //     downstream handlers can find this claim.
         //
-        // CODE-QUALITY FIX (Finding 3, round 5): The durability chain must be:
-        //   CAS store -> register_claim -> register_lease -> work_transitioned
-        //   -> evidence.published
+        // DURABILITY CHAIN (Finding 3 fix): The ordering guarantees
+        // recoverability at every failure point:
         //
-        // If register_claim or register_lease fails (non-duplicate), return
-        // error WITHOUT emitting work_transitioned. Once work_transitioned
-        // is in the ledger, the idempotency path expects evidence.published
-        // to exist alongside it. Emitting work_transitioned before durable
-        // claim/lease registration creates irrecoverable partial commits.
+        //   CAS store -> register_claim -> register_lease (verified)
+        //     -> evidence.published -> work_transitioned
+        //
+        // `work_transitioned` is emitted LAST because:
+        // 1. It is the state-transition commit point that downstream projection and
+        //    idempotency paths depend on.
+        // 2. The idempotency path requires `evidence.published` to reconstruct
+        //    `lease_id` and `authority_bindings_hash`.
+        // 3. If any prior step fails, no state transition occurred and the client can
+        //    safely retry from scratch.
+        //
+        // If register_claim fails (non-duplicate), return error
+        // WITHOUT emitting any ledger events.
         let v2_claim = WorkClaim {
             work_id: request.work_id.clone(),
             lease_id: issued_lease_id.clone(),
@@ -15832,67 +15851,59 @@ impl PrivilegedDispatcher {
             "claim_work_v2",
             &actor_id,
         );
+
+        // 11c. Verify lease registration succeeded (fail-closed).
+        //
+        // `register_lease_with_executor` returns `()` and silently
+        // swallows errors. Before emitting `work_transitioned`, verify
+        // the lease is actually resolvable. If lease registration failed
+        // silently, the work item would be bricked: `work_transitioned`
+        // commits the state transition but the lease_id cannot be
+        // resolved by downstream handlers, and the idempotency path
+        // expects evidence.published alongside it.
+        if self
+            .lease_validator
+            .get_lease_work_id(&issued_lease_id)
+            .is_none()
+        {
+            warn!(
+                lease_id = %issued_lease_id,
+                work_id = %request.work_id,
+                "ClaimWorkV2: lease registration verification failed \
+                 (get_lease_work_id returned None after registration). \
+                 Aborting before work_transitioned to prevent partial commit."
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "ClaimWorkV2: lease registration failed silently \
+                 (fail-closed: aborting before state transition)",
+            ));
+        }
+
         info!(
             lease_id = %issued_lease_id,
             work_id = %request.work_id,
             actor_id = %actor_id,
-            "ClaimWorkV2: lease registered in LeaseValidator"
+            "ClaimWorkV2: lease registered and verified in LeaseValidator"
         );
 
-        // 12. Emit work_transitioned event (Open -> Claimed or ReadyForReview ->
-        //     Review). Claim and lease registration have already succeeded, so the
-        //     idempotency path can recover if needed.
+        // 12. Anchor evidence.published BEFORE work_transitioned.
         //
-        // Uses legacy `emit_work_transitioned` path which emits event_type
-        // "work_transitioned" with a JSON payload. The projection bridge
-        // (`translate_signed_events`) normalizes "work_transitioned" events
-        // into canonical "work.transitioned" protobuf payloads for the
-        // WorkReducer.
+        // DURABILITY ORDERING (Finding 3 fix): The evidence.published event
+        // MUST be anchored before work_transitioned. If work_transitioned is
+        // emitted first and evidence.published subsequently fails, the work
+        // item enters an irrecoverable partial-commit state: the idempotency
+        // path requires evidence.published to reconstruct lease_id and
+        // authority_bindings_hash, but it was never persisted.
         //
-        // SECURITY FIX (Finding 4): UNIQUE constraint violations on
-        // work_transitioned indicate a concurrent race. Instead of returning
-        // a phantom lease, recover the existing authoritative lease_id from
-        // the idempotency path or return FAILED_PRECONDITION.
-        match self.event_emitter.emit_work_transitioned(&WorkTransition {
-            work_id: &request.work_id,
-            from_state: from_state_str,
-            to_state: to_state_str,
-            rationale_code,
-            previous_transition_count: work_status.transition_count,
-            actor_id: &actor_id,
-            timestamp_ns,
-        }) {
-            Ok(_) => {
-                info!(
-                    work_id = %request.work_id,
-                    from_state = from_state_str,
-                    to_state = to_state_str,
-                    "work_transitioned event emitted for ClaimWorkV2"
-                );
-            },
-            Err(e) if e.to_string().contains("UNIQUE constraint") => {
-                // Concurrent race: another ClaimWorkV2 won the transition.
-                // Recover via idempotency or return FAILED_PRECONDITION.
-                info!(
-                    work_id = %request.work_id,
-                    role = ?role,
-                    "ClaimWorkV2: UNIQUE constraint on work_transitioned \
-                     (concurrent race detected), attempting idempotency recovery"
-                );
-                return self.handle_claim_work_v2_idempotency(&request.work_id, &actor_id, role);
-            },
-            Err(e) => {
-                warn!(error = %e, "work_transitioned event emission failed");
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!("ClaimWorkV2 event emission failed: {e}"),
-                ));
-            },
-        }
-
-        // 13. Anchor via evidence.published with category WORK_AUTHORITY_BINDINGS and
-        //     deterministic evidence_id (WAB- prefix + BLAKE3 of work_id + role +
-        //     actor_id).
+        // By anchoring evidence.published first:
+        // - If evidence.published fails: no state transition occurred, client can
+        //   safely retry.
+        // - If work_transitioned fails after evidence.published: the evidence anchor
+        //   exists, so idempotency recovery can reconstruct the claim.
+        //
+        // The deterministic evidence_id (WAB- prefix + BLAKE3 of
+        // work_id:role:actor_id) makes evidence.published idempotent on retry.
         let evidence_id = {
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"WAB:");
@@ -15942,7 +15953,7 @@ impl PrivilegedDispatcher {
                     evidence_id = %evidence_id,
                     work_id = %request.work_id,
                     cas_hash = %bindings_hash_hex,
-                    "evidence.published event emitted for WorkAuthorityBindings"
+                    "evidence.published event anchored for WorkAuthorityBindings"
                 );
             },
             Err(e) if e.to_string().contains("UNIQUE constraint") => {
@@ -15958,6 +15969,56 @@ impl PrivilegedDispatcher {
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
                     format!("evidence.published event emission failed: {e}"),
+                ));
+            },
+        }
+
+        // 13. Emit work_transitioned event (Open -> Claimed or ReadyForReview ->
+        //     Review) LAST. All supporting durable state (CAS, claim, lease, evidence
+        //     anchor) has been committed. This is the point of no return for the state
+        //     transition.
+        //
+        // Uses legacy `emit_work_transitioned` path which emits event_type
+        // "work_transitioned" with a JSON payload. The projection bridge
+        // (`translate_signed_events`) normalizes "work_transitioned" events
+        // into canonical "work.transitioned" protobuf payloads for the
+        // WorkReducer.
+        //
+        // UNIQUE constraint violations indicate a concurrent race. Recover
+        // the existing authoritative lease via the idempotency path.
+        match self.event_emitter.emit_work_transitioned(&WorkTransition {
+            work_id: &request.work_id,
+            from_state: from_state_str,
+            to_state: to_state_str,
+            rationale_code,
+            previous_transition_count: work_status.transition_count,
+            actor_id: &actor_id,
+            timestamp_ns,
+        }) {
+            Ok(_) => {
+                info!(
+                    work_id = %request.work_id,
+                    from_state = from_state_str,
+                    to_state = to_state_str,
+                    "work_transitioned event emitted for ClaimWorkV2"
+                );
+            },
+            Err(e) if e.to_string().contains("UNIQUE constraint") => {
+                // Concurrent race: another ClaimWorkV2 won the transition.
+                // Recover via idempotency or return FAILED_PRECONDITION.
+                info!(
+                    work_id = %request.work_id,
+                    role = ?role,
+                    "ClaimWorkV2: UNIQUE constraint on work_transitioned \
+                     (concurrent race detected), attempting idempotency recovery"
+                );
+                return self.handle_claim_work_v2_idempotency(&request.work_id, &actor_id, role);
+            },
+            Err(e) => {
+                warn!(error = %e, "work_transitioned event emission failed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("ClaimWorkV2 event emission failed: {e}"),
                 ));
             },
         }
