@@ -237,6 +237,15 @@ scope:
             or `approve`) and execute bounded follow-up projection repair.
           - Run-state-only repair guard: run-state corruption/ambiguity repair MUST NOT imply
             broad lifecycle reset unless lifecycle reset conditions are explicitly present.
+    - id: 'S5'
+      description: |
+        Add cryptographic startup self-heal for canonical-cutover stale legacy checkpoint metadata:
+          - If startup sees `checkpoint_rowid > legacy_chain_tip_rowid` while legacy tip is empty
+            and canonical `events` contains rows, invalidate only hash-chain checkpoint metadata.
+          - Re-run startup validation from legacy genesis with signature + hash-chain verification
+            before reseeding a new signed checkpoint.
+          - Preserve fail-closed behavior when canonical evidence is absent (no blind checkpoint
+            acceptance and no destructive ledger reset).
   out_of_scope:
     - 'Changing startup reconcile semantics or AJC exemption boundaries for full lane+queue reconcile.'
     - 'Adding new FAC remediation commands (doctor remains the host remediation surface).'
@@ -273,6 +282,7 @@ definition_of_done:
     - 'PR-scoped doctor fix executes bounded follow-up repair even when direct lifecycle/registry/run-state plan operations are empty, if doctor still recommends fix.'
     - 'PR-scoped doctor never emits merge/approve when terminal-approved projection lacks authoritative remote comment binding; it emits fix and runs bounded follow-up repair first.'
     - 'Run-state-only repair does not trigger implicit lifecycle reset; lifecycle reset remains explicit/deterministic.'
+    - 'Startup hash-chain validation includes canonical-cutover stale-checkpoint self-heal that only clears checkpoint metadata, re-verifies chain cryptographically, and remains fail-closed without canonical evidence.'
     - 'Blocked or ambiguous repair states are surfaced explicitly with doctor-first remediation guidance (`apm2 fac doctor --fix`, and `apm2 fac doctor --pr <N> --fix` when PR-scoped).'
     - 'No runbook/help/ticket guidance for this flow requires `apm2 fac recover`, `apm2 fac review run`, `apm2 fac restart`, or `apm2 fac review restart`.'
   evidence_ids:
@@ -283,6 +293,7 @@ definition_of_done:
     - 'EVID-TCK-00660-05 (coalescing): burst repair signals execute bounded single-flight reconciles'
     - 'EVID-TCK-00660-06 (idempotency): repeated `apm2 fac doctor --fix` converges with no repeated destructive remediation'
     - 'EVID-TCK-00660-07 (idempotency): repeated `apm2 fac doctor --pr <N> --fix` converges with no repeated lifecycle/registry churn'
+    - 'EVID-TCK-00660-08 (startup-integrity): canonical-cutover stale checkpoint metadata self-heals by metadata invalidation + cryptographic revalidation; fail-closed path still rejects ahead-of-tip checkpoints without canonical evidence'
 
 notes:
   design_note: |

@@ -163,10 +163,11 @@ Credential management subcommands.
 | `apm2 fac install` | Install current worktree binary, re-link symlink, restart services |
 | `apm2 fac install --allow-partial` | Allow non-zero exit suppression for partial failures |
 
-**Overview:** The `fac install` subcommand enforces a single canonical
-runtime binary path by (1) running `cargo install`, (2) re-linking
-`~/.local/bin/apm2 -> ~/.cargo/bin/apm2`, and (3) restarting systemd
-services. This prevents INV-PADOPT-004-class binary drift.
+**Overview:** The `fac install` subcommand enforces canonical wrapper+daemon
+runtime alignment by (1) running `cargo install` for both `apm2-cli` and
+`apm2-daemon`, (2) re-linking `~/.local/bin/apm2 -> ~/.cargo/bin/apm2` and
+`~/.local/bin/apm2-daemon -> ~/.cargo/bin/apm2-daemon`, and (3) restarting
+systemd services. This prevents INV-PADOPT-004-class binary drift.
 
 **Security Invariants:**
 - [INV-INSTALL-001] Binary reads for digest computation bounded to `MAX_BINARY_DIGEST_SIZE`.
@@ -183,6 +184,9 @@ services. This prevents INV-PADOPT-004-class binary drift.
 
 **Doctor Binary Alignment Check (INV-PADOPT-004 prevention):**
 - The `apm2 daemon doctor` command includes a `binary_alignment` check.
+- The `apm2 daemon doctor` command includes a `daemon_runtime_contract`
+  check that verifies `apm2` and the daemon child runtime advertise the same
+  HSI contract hash.
 - Status semantics are fail-closed:
   - `OK`: ALL required service binaries resolved AND all digests match.
   - `WARN`: Partial resolution (at least one unit matched, others unresolvable).
