@@ -49,6 +49,7 @@
 
 pub mod merge_executor;
 mod orchestrator;
+mod timeout_kernel;
 
 pub use merge_executor::{
     ExecuteOrBlockResult, GitHubMergeAdapter, MAX_PENDING_MERGES, MergeExecutor,
@@ -61,3 +62,4 @@ pub use orchestrator::{
     MAX_WORK_ID_LENGTH, SessionTerminatedInfo, SystemClock, TIMEOUT_AUTHORITY_ACTOR_ID,
     create_timeout_receipt,
 };
+pub use timeout_kernel::{GateTimeoutKernel, GateTimeoutKernelConfig, GateTimeoutKernelError};

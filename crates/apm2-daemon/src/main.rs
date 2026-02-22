@@ -59,7 +59,9 @@ use apm2_core::github::resolve_apm2_home;
 use apm2_core::process::ProcessState;
 use apm2_core::schema_registry::{InMemorySchemaRegistry, register_kernel_schemas};
 use apm2_core::supervisor::Supervisor;
-use apm2_daemon::gate::{GateOrchestrator, GateOrchestratorConfig};
+use apm2_daemon::gate::{
+    GateOrchestrator, GateOrchestratorConfig, GateTimeoutKernel, GateTimeoutKernelConfig,
+};
 use apm2_daemon::ledger::{SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use apm2_daemon::metrics::{SharedMetricsRegistry, new_shared_registry};
 use apm2_daemon::projection::{DivergenceWatchdog, DivergenceWatchdogConfig, SystemTimeSource};
@@ -1440,6 +1442,14 @@ async fn async_main(args: Args) -> Result<()> {
                 }
                 emitter
             });
+        let timeout_kernel = GateTimeoutKernel::new(
+            Arc::clone(&orch),
+            sqlite_conn.as_ref(),
+            timeout_ledger_emitter,
+            &fac_root,
+            GateTimeoutKernelConfig::default(),
+        )
+        .map_err(|e| anyhow::anyhow!("failed to initialize gate timeout kernel: {e}"))?;
 
         // MAJOR-1 fix: Create a daemon-level FacBroker and
         // BrokerHealthChecker for periodic health evaluation. The broker
@@ -1472,6 +1482,7 @@ async fn async_main(args: Args) -> Result<()> {
         let daemon_start = std::time::Instant::now();
 
         tokio::spawn(async move {
+            let mut timeout_kernel = timeout_kernel;
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             // TCK-00600: Watchdog ticker sends WATCHDOG=1 to systemd at half
             // the WatchdogSec interval. Runs in the same poller task because
@@ -1481,63 +1492,24 @@ async fn async_main(args: Args) -> Result<()> {
                 interval.tick().await;
                 // TCK-00600: Ping systemd watchdog if due.
                 watchdog.ping_if_due();
-                let events = orch.poll_timeouts().await;
-                if !events.is_empty() {
-                    info!(
-                        event_count = events.len(),
-                        "Gate timeout poller emitted events"
-                    );
-                    // Security BLOCKER 2 fix: Persist events to ledger.
-                    if let Some(ref emitter) = timeout_ledger_emitter {
-                        use apm2_daemon::protocol::dispatch::LedgerEventEmitter;
-                        for event in &events {
-                            let event_type = match event {
-                                apm2_daemon::gate::GateOrchestratorEvent::GateTimedOut { .. } => {
-                                    "gate.timed_out"
-                                },
-                                apm2_daemon::gate::GateOrchestratorEvent::GateTimeoutReceiptGenerated { .. } => {
-                                    "gate.timeout_receipt_generated"
-                                },
-                                apm2_daemon::gate::GateOrchestratorEvent::AllGatesCompleted { .. } => {
-                                    "gate.all_completed"
-                                },
-                                _ => "gate.event",
-                            };
-                            let payload = serde_json::to_vec(event).unwrap_or_default();
-                            let timestamp_ns = match event {
-                                apm2_daemon::gate::GateOrchestratorEvent::GateTimedOut {
-                                    timestamp_ms,
-                                    ..
-                                }
-                                | apm2_daemon::gate::GateOrchestratorEvent::GateTimeoutReceiptGenerated {
-                                    timestamp_ms,
-                                    ..
-                                }
-                                | apm2_daemon::gate::GateOrchestratorEvent::AllGatesCompleted {
-                                    timestamp_ms,
-                                    ..
-                                } => timestamp_ms.saturating_mul(1_000_000),
-                                _ => 0,
-                            };
-                            if let Err(e) = emitter.emit_session_event(
-                                "gate-timeout-poller",
-                                event_type,
-                                &payload,
-                                "orchestrator:timeout-poller",
-                                timestamp_ns,
-                            ) {
-                                // Fail-closed: log the error. The timeout
-                                // verdict still exists in the orchestrator's
-                                // in-memory state and will be re-emitted on
-                                // the next poll if the gate is still active.
-                                error!(
-                                    event_type = %event_type,
-                                    error = %e,
-                                    "Failed to persist gate timeout event to ledger (fail-closed)"
-                                );
-                            }
+                match timeout_kernel.tick().await {
+                    Ok(report) => {
+                        if report.executed_intents > 0 || report.persisted_receipts > 0 {
+                            info!(
+                                executed_intents = report.executed_intents,
+                                completed_intents = report.completed_intents,
+                                blocked_intents = report.blocked_intents,
+                                persisted_receipts = report.persisted_receipts,
+                                "Gate timeout kernel tick completed"
+                            );
                         }
-                    }
+                    },
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            "Gate timeout kernel tick failed (fail-closed)"
+                        );
+                    },
                 }
 
                 // ---------------------------------------------------------------

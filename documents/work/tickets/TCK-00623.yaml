@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00623"
     title: "FAC review/push closure-complete hardening, projection durability, and CLI surface cleanup"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00639
     title: 'RFC-0032 Phase 2: implement RecordWorkPrAssociation (canonical `work.pr_associated` + optional LINKOUT context entry)'
-    status: OPEN
+    status: MERGED
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032

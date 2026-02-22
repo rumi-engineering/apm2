@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00636
     title: 'RFC-0032 Phase 1: WorkSpec projection plumbing + ticket-alias reconciliation integration'
-    status: OPEN
+    status: MERGED
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032

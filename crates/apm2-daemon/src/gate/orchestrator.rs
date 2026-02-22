@@ -1490,6 +1490,40 @@ impl GateOrchestrator {
         timed_out
     }
 
+    /// Returns the orchestrator wall clock time in milliseconds.
+    #[must_use]
+    pub fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
+    /// Builds deterministic timeout events from authoritative lease facts.
+    ///
+    /// This path is used by the orchestrator-kernel timeout migration to avoid
+    /// dependence on in-memory orchestration state after daemon restarts.
+    #[must_use]
+    pub fn build_timeout_events_from_lease(
+        &self,
+        lease: &GateLease,
+        gate_type: GateType,
+    ) -> Vec<GateOrchestratorEvent> {
+        let now_ms = self.clock.now_ms();
+        let timeout_receipt = create_timeout_receipt(gate_type, lease, &self.signer);
+        vec![
+            GateOrchestratorEvent::GateTimedOut {
+                work_id: lease.work_id.clone(),
+                gate_type,
+                lease_id: lease.lease_id.clone(),
+                timestamp_ms: now_ms,
+            },
+            GateOrchestratorEvent::GateTimeoutReceiptGenerated {
+                work_id: lease.work_id.clone(),
+                gate_type,
+                receipt_id: timeout_receipt.receipt_id,
+                timestamp_ms: now_ms,
+            },
+        ]
+    }
+
     /// Production scheduler/driver for periodic timeout progression
     /// (Security BLOCKER 2).
     ///
