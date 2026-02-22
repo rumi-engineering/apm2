@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use apm2_core::events::alias_reconcile::{
     self, AliasReconciliationResult, ObservationWindow, SnapshotEmitterStatus,
@@ -413,11 +414,19 @@ impl ProjectionWorkAuthority {
             evaluation_time_ns,
         ))
     }
+
+    fn default_evaluation_time_ns() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+            })
+    }
 }
 
 impl WorkAuthority for ProjectionWorkAuthority {
     fn get_work_status(&self, work_id: &str) -> Result<WorkAuthorityStatus, WorkAuthorityError> {
-        self.get_work_status_at_time(work_id, 0)
+        self.get_work_status_at_time(work_id, Self::default_evaluation_time_ns())
     }
 
     fn list_claimable(
@@ -425,7 +434,7 @@ impl WorkAuthority for ProjectionWorkAuthority {
         limit: usize,
         cursor: &str,
     ) -> Result<Vec<WorkAuthorityStatus>, WorkAuthorityError> {
-        self.list_claimable_at_time(limit, cursor, 0)
+        self.list_claimable_at_time(limit, cursor, Self::default_evaluation_time_ns())
     }
 
     fn list_all(
@@ -433,7 +442,7 @@ impl WorkAuthority for ProjectionWorkAuthority {
         limit: usize,
         cursor: &str,
     ) -> Result<Vec<WorkAuthorityStatus>, WorkAuthorityError> {
-        self.list_all_at_time(limit, cursor, 0)
+        self.list_all_at_time(limit, cursor, Self::default_evaluation_time_ns())
     }
 
     fn is_claimable(&self, work_id: &str) -> Result<bool, WorkAuthorityError> {

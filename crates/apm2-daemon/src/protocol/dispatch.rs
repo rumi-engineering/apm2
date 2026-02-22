@@ -15811,6 +15811,26 @@ impl PrivilegedDispatcher {
         // 7. Determine the correct transition based on role and current state.
         let (from_state_str, to_state_str, rationale_code) = match role {
             WorkRole::Implementer => {
+                if work_status.state != apm2_core::work::WorkState::Open {
+                    // Idempotency: if already Claimed, check if same actor
+                    if work_status.state == apm2_core::work::WorkState::Claimed {
+                        return self.handle_claim_work_v2_idempotency(
+                            &request.work_id,
+                            &actor_id,
+                            role,
+                        );
+                    }
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::FailedPrecondition,
+                        format!(
+                            "ClaimWorkV2 rejected: work_id '{}' is in state {} \
+                             (expected OPEN for IMPLEMENTER/COORDINATOR claim)",
+                            request.work_id,
+                            work_status.state.as_str()
+                        ),
+                    ));
+                }
+
                 if work_status.implementer_claim_blocked {
                     let unsatisfied_messages: Vec<&str> = work_status
                         .dependency_diagnostics
@@ -15834,25 +15854,6 @@ impl PrivilegedDispatcher {
                     ));
                 }
 
-                if work_status.state != apm2_core::work::WorkState::Open {
-                    // Idempotency: if already Claimed, check if same actor
-                    if work_status.state == apm2_core::work::WorkState::Claimed {
-                        return self.handle_claim_work_v2_idempotency(
-                            &request.work_id,
-                            &actor_id,
-                            role,
-                        );
-                    }
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::FailedPrecondition,
-                        format!(
-                            "ClaimWorkV2 rejected: work_id '{}' is in state {} \
-                             (expected OPEN for IMPLEMENTER/COORDINATOR claim)",
-                            request.work_id,
-                            work_status.state.as_str()
-                        ),
-                    ));
-                }
                 ("Open", "Claimed", "claim_work_v2_implementer")
             },
             WorkRole::Coordinator => {
@@ -37076,6 +37077,68 @@ mod tests {
                 other => panic!(
                     "Expected successful claim when incoming BLOCKS edge is waived, got: {other:?}"
                 ),
+            }
+        }
+
+        #[test]
+        fn implementer_idempotent_claim_remains_allowed_after_late_blocks_edge() {
+            let dispatcher = claim_v2_dispatcher();
+            let ctx = test_ctx();
+            let prerequisite_work_id = "W-test-late-edge-prereq-001";
+            let target_work_id = "W-test-late-edge-target-001";
+
+            inject_work_opened(&dispatcher, prerequisite_work_id);
+            inject_work_opened(&dispatcher, target_work_id);
+
+            let request = ClaimWorkV2Request {
+                work_id: target_work_id.to_string(),
+                role: i32::from(WorkRole::Implementer),
+                lease_id: TEST_GOV_LEASE_ID.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let first = dispatcher
+                .handle_claim_work_v2(&buf, &ctx)
+                .expect("first claim should return protocol response");
+            match first {
+                PrivilegedResponse::ClaimWorkV2(resp) => {
+                    assert!(
+                        !resp.already_claimed,
+                        "first claim should not be marked idempotent"
+                    );
+                },
+                other => panic!("Expected first claim success, got: {other:?}"),
+            }
+
+            let claimed_at = dispatcher
+                .event_emitter
+                .get_events_by_work_id(target_work_id)
+                .into_iter()
+                .filter(|event| event.event_type == "work_transitioned")
+                .map(|event| event.timestamp_ns)
+                .max()
+                .expect("claim should emit work_transitioned");
+            inject_blocks_edge(
+                &dispatcher,
+                prerequisite_work_id,
+                target_work_id,
+                claimed_at.saturating_add(1),
+            );
+
+            let second = dispatcher
+                .handle_claim_work_v2(&buf, &ctx)
+                .expect("idempotent claim should return protocol response");
+            match second {
+                PrivilegedResponse::ClaimWorkV2(resp) => {
+                    assert!(
+                        resp.already_claimed,
+                        "idempotent retry must succeed even after late dependency edge arrives"
+                    );
+                },
+                other => {
+                    panic!("Expected idempotent claim success after late edge, got: {other:?}")
+                },
             }
         }
 

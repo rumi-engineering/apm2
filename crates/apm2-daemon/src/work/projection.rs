@@ -666,36 +666,46 @@ fn decode_work_graph_payload(
         }
     }
 
-    let direct_result = match kind {
-        WorkGraphEventKind::Added => WorkEdgeAdded::decode(payload).map(|added| {
-            ParsedWorkGraphEvent::Added(ParsedWorkEdgeAdded {
-                from_work_id: added.from_work_id,
-                to_work_id: added.to_work_id,
-                edge_type: WorkEdgeType::try_from(added.edge_type)
-                    .unwrap_or(WorkEdgeType::Unspecified),
-                edge_id: None,
-            })
-        }),
-        WorkGraphEventKind::Removed => WorkEdgeRemoved::decode(payload).map(|removed| {
-            ParsedWorkGraphEvent::Removed(ParsedWorkEdgeRemoved {
-                from_work_id: removed.from_work_id,
-                to_work_id: removed.to_work_id,
-                edge_type: None,
-                edge_id: None,
-            })
-        }),
-        WorkGraphEventKind::Waived => WorkEdgeWaived::decode(payload).map(|waived| {
-            ParsedWorkGraphEvent::Waived(ParsedWorkEdgeWaived {
-                from_work_id: waived.from_work_id,
-                to_work_id: waived.to_work_id,
-                edge_type: WorkEdgeType::try_from(waived.original_edge_type).ok(),
-                waiver_id: None,
-                expires_at_ns: None,
-            })
-        }),
-    };
-    if let Ok(parsed) = direct_result {
-        return Ok(parsed);
+    match kind {
+        WorkGraphEventKind::Added => {
+            if let Ok(added) = WorkEdgeAdded::decode(payload) {
+                return Ok(ParsedWorkGraphEvent::Added(ParsedWorkEdgeAdded {
+                    from_work_id: added.from_work_id,
+                    to_work_id: added.to_work_id,
+                    edge_type: parse_required_work_edge_type_raw(
+                        added.edge_type,
+                        event_type,
+                        "edge_type",
+                    )?,
+                    edge_id: None,
+                }));
+            }
+        },
+        WorkGraphEventKind::Removed => {
+            if let Ok(removed) = WorkEdgeRemoved::decode(payload) {
+                return Ok(ParsedWorkGraphEvent::Removed(ParsedWorkEdgeRemoved {
+                    from_work_id: removed.from_work_id,
+                    to_work_id: removed.to_work_id,
+                    edge_type: None,
+                    edge_id: None,
+                }));
+            }
+        },
+        WorkGraphEventKind::Waived => {
+            if let Ok(waived) = WorkEdgeWaived::decode(payload) {
+                return Ok(ParsedWorkGraphEvent::Waived(ParsedWorkEdgeWaived {
+                    from_work_id: waived.from_work_id,
+                    to_work_id: waived.to_work_id,
+                    edge_type: Some(parse_required_work_edge_type_raw(
+                        waived.original_edge_type,
+                        event_type,
+                        "original_edge_type",
+                    )?),
+                    waiver_id: None,
+                    expires_at_ns: None,
+                }));
+            }
+        },
     }
 
     let value: serde_json::Value =
@@ -744,8 +754,11 @@ fn parse_work_graph_envelope(
             Ok(Some(ParsedWorkGraphEvent::Added(ParsedWorkEdgeAdded {
                 from_work_id: added.from_work_id,
                 to_work_id: added.to_work_id,
-                edge_type: WorkEdgeType::try_from(added.edge_type)
-                    .unwrap_or(WorkEdgeType::Unspecified),
+                edge_type: parse_required_work_edge_type_raw(
+                    added.edge_type,
+                    event_type,
+                    "edge_type",
+                )?,
                 edge_id: None,
             })))
         },
@@ -761,7 +774,11 @@ fn parse_work_graph_envelope(
             Ok(Some(ParsedWorkGraphEvent::Waived(ParsedWorkEdgeWaived {
                 from_work_id: waived.from_work_id,
                 to_work_id: waived.to_work_id,
-                edge_type: WorkEdgeType::try_from(waived.original_edge_type).ok(),
+                edge_type: Some(parse_required_work_edge_type_raw(
+                    waived.original_edge_type,
+                    event_type,
+                    "original_edge_type",
+                )?),
                 waiver_id: None,
                 expires_at_ns: None,
             })))
@@ -779,13 +796,7 @@ fn parse_added_from_json(
 ) -> Result<ParsedWorkEdgeAdded, WorkProjectionError> {
     let from_work_id = json_required_string(value, "from_work_id", event_type)?;
     let to_work_id = json_required_string(value, "to_work_id", event_type)?;
-    let edge_type = value
-        .get("edge_type")
-        .and_then(parse_work_edge_type_json)
-        .ok_or_else(|| WorkProjectionError::InvalidPayload {
-            event_type: event_type.to_string(),
-            reason: "missing or invalid edge_type".to_string(),
-        })?;
+    let edge_type = parse_required_work_edge_type_json(value, "edge_type", event_type)?;
     let edge_id = json_optional_string(value, "edge_id");
 
     Ok(ParsedWorkEdgeAdded {
@@ -802,7 +813,7 @@ fn parse_removed_from_json(
 ) -> Result<ParsedWorkEdgeRemoved, WorkProjectionError> {
     let from_work_id = json_required_string(value, "from_work_id", event_type)?;
     let to_work_id = json_required_string(value, "to_work_id", event_type)?;
-    let edge_type = value.get("edge_type").and_then(parse_work_edge_type_json);
+    let edge_type = parse_optional_work_edge_type_json(value, "edge_type", event_type)?;
     let edge_id = json_optional_string(value, "edge_id");
 
     Ok(ParsedWorkEdgeRemoved {
@@ -819,10 +830,16 @@ fn parse_waived_from_json(
 ) -> Result<ParsedWorkEdgeWaived, WorkProjectionError> {
     let from_work_id = json_required_string(value, "from_work_id", event_type)?;
     let to_work_id = json_required_string(value, "to_work_id", event_type)?;
-    let edge_type = value
-        .get("original_edge_type")
-        .and_then(parse_work_edge_type_json)
-        .or_else(|| value.get("edge_type").and_then(parse_work_edge_type_json));
+    let edge_type = parse_optional_work_edge_type_json(value, "original_edge_type", event_type)?
+        .or(parse_optional_work_edge_type_json(
+            value,
+            "edge_type",
+            event_type,
+        )?)
+        .ok_or_else(|| WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: "missing or invalid original_edge_type".to_string(),
+        })?;
     let waiver_id = json_optional_string(value, "waiver_id");
     let expires_at_ns = value
         .get("expires_at_ns")
@@ -832,10 +849,65 @@ fn parse_waived_from_json(
     Ok(ParsedWorkEdgeWaived {
         from_work_id,
         to_work_id,
-        edge_type,
+        edge_type: Some(edge_type),
         waiver_id,
         expires_at_ns,
     })
+}
+
+fn parse_required_work_edge_type_raw(
+    raw: i32,
+    event_type: &str,
+    field: &str,
+) -> Result<WorkEdgeType, WorkProjectionError> {
+    let parsed = WorkEdgeType::try_from(raw).map_err(|_| WorkProjectionError::InvalidPayload {
+        event_type: event_type.to_string(),
+        reason: format!("invalid {field}: unknown edge_type value {raw}"),
+    })?;
+    if parsed == WorkEdgeType::Unspecified {
+        return Err(WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: format!("invalid {field}: WORK_EDGE_TYPE_UNSPECIFIED is not allowed"),
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_required_work_edge_type_json(
+    value: &serde_json::Value,
+    field: &str,
+    event_type: &str,
+) -> Result<WorkEdgeType, WorkProjectionError> {
+    parse_optional_work_edge_type_json(value, field, event_type)?.ok_or_else(|| {
+        WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: format!("missing or invalid {field}"),
+        }
+    })
+}
+
+fn parse_optional_work_edge_type_json(
+    value: &serde_json::Value,
+    field: &str,
+    event_type: &str,
+) -> Result<Option<WorkEdgeType>, WorkProjectionError> {
+    let Some(raw) = value.get(field) else {
+        return Ok(None);
+    };
+
+    let parsed =
+        parse_work_edge_type_json(raw).ok_or_else(|| WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: format!("missing or invalid {field}"),
+        })?;
+    if parsed == WorkEdgeType::Unspecified {
+        return Err(WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: format!("invalid {field}: WORK_EDGE_TYPE_UNSPECIFIED is not allowed"),
+        });
+    }
+
+    Ok(Some(parsed))
 }
 
 fn parse_work_edge_type_json(value: &serde_json::Value) -> Option<WorkEdgeType> {
@@ -1212,6 +1284,25 @@ mod tests {
         signed_event("work_graph.edge.added", to_work_id, payload, timestamp_ns)
     }
 
+    fn work_graph_added_raw_event(
+        from_work_id: &str,
+        to_work_id: &str,
+        edge_type_raw: i32,
+        timestamp_ns: u64,
+    ) -> SignedLedgerEvent {
+        let mut payload = Vec::new();
+        WorkEdgeAdded {
+            from_work_id: from_work_id.to_string(),
+            to_work_id: to_work_id.to_string(),
+            edge_type: edge_type_raw,
+            rationale: "test-edge-raw".to_string(),
+        }
+        .encode(&mut payload)
+        .expect("WorkEdgeAdded protobuf should encode");
+
+        signed_event("work_graph.edge.added", to_work_id, payload, timestamp_ns)
+    }
+
     fn work_graph_waived_json_event(
         from_work_id: &str,
         to_work_id: &str,
@@ -1233,6 +1324,26 @@ mod tests {
             serde_json::to_vec(&payload).expect("WorkEdgeWaived JSON payload should encode"),
             timestamp_ns,
         )
+    }
+
+    fn work_graph_waived_raw_event(
+        from_work_id: &str,
+        to_work_id: &str,
+        original_edge_type_raw: i32,
+        timestamp_ns: u64,
+    ) -> SignedLedgerEvent {
+        let mut payload = Vec::new();
+        WorkEdgeWaived {
+            from_work_id: from_work_id.to_string(),
+            to_work_id: to_work_id.to_string(),
+            original_edge_type: original_edge_type_raw,
+            waiver_justification: "test-waiver-raw".to_string(),
+            waiver_actor_id: "actor:test".to_string(),
+        }
+        .encode(&mut payload)
+        .expect("WorkEdgeWaived protobuf should encode");
+
+        signed_event("work_graph.edge.waived", to_work_id, payload, timestamp_ns)
     }
 
     #[test]
@@ -1335,6 +1446,69 @@ mod tests {
         assert!(
             late_edge.late_edge,
             "late edge diagnostic must explicitly indicate late edge"
+        );
+    }
+
+    #[test]
+    fn malformed_added_edge_type_fails_closed() {
+        let prerequisite = "W-pre-004";
+        let target = "W-target-004";
+        let mut projection = WorkObjectProjection::new();
+
+        let events = vec![
+            work_opened_event(prerequisite, 1_000),
+            work_opened_event(target, 1_001),
+            work_graph_added_raw_event(prerequisite, target, 99, 1_002),
+        ];
+
+        let result = projection.rebuild_from_signed_events(&events);
+        assert!(
+            matches!(result, Err(WorkProjectionError::InvalidPayload { .. })),
+            "unknown edge_type values must fail-closed"
+        );
+    }
+
+    #[test]
+    fn malformed_waiver_edge_type_fails_closed() {
+        let prerequisite = "W-pre-005";
+        let target = "W-target-005";
+        let mut projection = WorkObjectProjection::new();
+
+        let events = vec![
+            work_opened_event(prerequisite, 1_000),
+            work_opened_event(target, 1_001),
+            work_graph_added_event(prerequisite, target, WorkEdgeType::Blocks, 1_002),
+            work_graph_waived_raw_event(prerequisite, target, 77, 1_003),
+        ];
+
+        let result = projection.rebuild_from_signed_events(&events);
+        assert!(
+            matches!(result, Err(WorkProjectionError::InvalidPayload { .. })),
+            "unknown waiver edge_type values must fail-closed"
+        );
+    }
+
+    #[test]
+    fn unspecified_edge_type_fails_closed() {
+        let prerequisite = "W-pre-006";
+        let target = "W-target-006";
+        let mut projection = WorkObjectProjection::new();
+
+        let events = vec![
+            work_opened_event(prerequisite, 1_000),
+            work_opened_event(target, 1_001),
+            work_graph_added_raw_event(
+                prerequisite,
+                target,
+                WorkEdgeType::Unspecified as i32,
+                1_002,
+            ),
+        ];
+
+        let result = projection.rebuild_from_signed_events(&events);
+        assert!(
+            matches!(result, Err(WorkProjectionError::InvalidPayload { .. })),
+            "WORK_EDGE_TYPE_UNSPECIFIED must fail-closed"
         );
     }
 }
