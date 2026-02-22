@@ -620,6 +620,7 @@ struct TicketAliasIndex {
     // Eviction sort key by work_id: (created_at_ns, first_seen_sequence).
     // Lower keys are evicted first when capacity is exceeded.
     work_sort_keys: HashMap<String, (u64, u64)>,
+    work_ids_by_sort_key: BTreeSet<(u64, u64, String)>,
     next_work_sort_seq: u64,
     resolved_alias_by_spec_hash: HashMap<[u8; 32], Option<String>>,
     resolved_spec_hash_order: VecDeque<[u8; 32]>,
@@ -633,6 +634,7 @@ impl TicketAliasIndex {
         self.work_id_to_alias.clear();
         self.spec_hash_by_work_id.clear();
         self.work_sort_keys.clear();
+        self.work_ids_by_sort_key.clear();
         self.next_work_sort_seq = 0;
         self.resolved_alias_by_spec_hash.clear();
         self.resolved_spec_hash_order.clear();
@@ -646,7 +648,10 @@ impl TicketAliasIndex {
         mark_alias_evicted: bool,
     ) -> Result<(), WorkAuthorityError> {
         self.spec_hash_by_work_id.remove(work_id);
-        self.work_sort_keys.remove(work_id);
+        if let Some((created_at_ns, sequence)) = self.work_sort_keys.remove(work_id) {
+            self.work_ids_by_sort_key
+                .remove(&(created_at_ns, sequence, work_id.to_string()));
+        }
 
         if let Some(alias) = self.work_id_to_alias.remove(work_id) {
             if let Some(work_ids) = self.alias_to_work_ids.get_mut(&alias) {
@@ -660,6 +665,21 @@ impl TicketAliasIndex {
             }
         }
         Ok(())
+    }
+
+    fn upsert_work_sort_key(&mut self, work_id: &str, created_at_ns: u64, sequence: u64) {
+        if let Some((previous_created_at_ns, previous_sequence)) = self
+            .work_sort_keys
+            .insert(work_id.to_string(), (created_at_ns, sequence))
+        {
+            self.work_ids_by_sort_key.remove(&(
+                previous_created_at_ns,
+                previous_sequence,
+                work_id.to_string(),
+            ));
+        }
+        self.work_ids_by_sort_key
+            .insert((created_at_ns, sequence, work_id.to_string()));
     }
 
     fn mark_alias_evicted(&mut self, alias: String) -> Result<(), WorkAuthorityError> {
@@ -685,10 +705,8 @@ impl TicketAliasIndex {
     fn upsert_spec_hash(&mut self, work_id: &str, spec_hash: [u8; 32], created_at_ns: u64) -> bool {
         if self.spec_hash_by_work_id.get(work_id) == Some(&spec_hash) {
             if !self.work_sort_keys.contains_key(work_id) {
-                self.work_sort_keys.insert(
-                    work_id.to_string(),
-                    (created_at_ns, self.next_work_sort_seq),
-                );
+                let sequence = self.next_work_sort_seq;
+                self.upsert_work_sort_key(work_id, created_at_ns, sequence);
                 self.next_work_sort_seq = self.next_work_sort_seq.saturating_add(1);
             }
             return false;
@@ -700,16 +718,14 @@ impl TicketAliasIndex {
             .insert(work_id_key.clone(), spec_hash)
             .is_none();
         if is_new {
-            self.work_sort_keys
-                .insert(work_id_key, (created_at_ns, self.next_work_sort_seq));
+            let sequence = self.next_work_sort_seq;
+            self.upsert_work_sort_key(&work_id_key, created_at_ns, sequence);
             self.next_work_sort_seq = self.next_work_sort_seq.saturating_add(1);
-        } else if let Some((existing_created_at_ns, _)) = self.work_sort_keys.get_mut(work_id) {
-            *existing_created_at_ns = created_at_ns;
+        } else if let Some((_, sequence)) = self.work_sort_keys.get(work_id).copied() {
+            self.upsert_work_sort_key(work_id, created_at_ns, sequence);
         } else {
-            self.work_sort_keys.insert(
-                work_id.to_string(),
-                (created_at_ns, self.next_work_sort_seq),
-            );
+            let sequence = self.next_work_sort_seq;
+            self.upsert_work_sort_key(work_id, created_at_ns, sequence);
             self.next_work_sort_seq = self.next_work_sort_seq.saturating_add(1);
         }
         true
@@ -758,23 +774,7 @@ impl TicketAliasIndex {
 
     fn enforce_capacity(&mut self) -> Result<(), WorkAuthorityError> {
         while self.spec_hash_by_work_id.len() > MAX_TICKET_ALIAS_INDEX_WORK_ITEMS {
-            let Some(oldest_work_id) = self
-                .spec_hash_by_work_id
-                .keys()
-                .min_by(|left, right| {
-                    let left_key = self
-                        .work_sort_keys
-                        .get(*left)
-                        .copied()
-                        .unwrap_or((u64::MAX, u64::MAX));
-                    let right_key = self
-                        .work_sort_keys
-                        .get(*right)
-                        .copied()
-                        .unwrap_or((u64::MAX, u64::MAX));
-                    left_key.cmp(&right_key).then_with(|| left.cmp(right))
-                })
-                .cloned()
+            let Some((_, _, oldest_work_id)) = self.work_ids_by_sort_key.iter().next().cloned()
             else {
                 break;
             };
@@ -994,11 +994,27 @@ impl ProjectionAliasReconciliationGate {
             }
         }
 
+        // Also rescan any projection work whose current spec hash has no
+        // resolved cache entry yet (or has changed since the last resolve)
+        // so transient CAS failures are retried even without a matching
+        // event in the latest delta window.
+        for work in projection.iter_work() {
+            let Ok(projected_spec_hash) = Self::extract_spec_snapshot_hash(work) else {
+                work_ids_to_refresh.insert(work.work_id.clone());
+                continue;
+            };
+            let cached_spec_hash = alias_index.spec_hash_by_work_id.get(&work.work_id).copied();
+            if cached_spec_hash != projected_spec_hash {
+                work_ids_to_refresh.insert(work.work_id.clone());
+            }
+        }
+
         if work_ids_to_refresh.is_empty() {
             return Ok(());
         }
 
-        // Incrementally process only work IDs touched since the last refresh.
+        // Incrementally process work IDs touched by event deltas plus any
+        // entries with missing/stale spec-hash cache state.
         for work_id in work_ids_to_refresh {
             let Some(work) = projection.get_work(&work_id) else {
                 alias_index.remove_work(&work_id, false)?;
@@ -2002,12 +2018,13 @@ mod tests {
             "transient CAS failure must not poison index with a permanent miss"
         );
 
-        // Trigger projection refresh with an unrelated event so the failed
-        // hash can be retried.
+        // Trigger projection refresh with an unrelated event that does not
+        // mention the failed work_id. Retry must still occur via projection
+        // rescan of missing/stale spec-hash cache entries.
         emitter.inject_raw_event(SignedLedgerEvent {
             event_id: "EVT-retry-bump-001".to_string(),
             event_type: "non_work.bump".to_string(),
-            work_id: "W-636-RETRY-001".to_string(),
+            work_id: "W-636-UNRELATED-001".to_string(),
             actor_id: "actor:test".to_string(),
             payload: Vec::new(),
             signature: vec![0u8; 64],
