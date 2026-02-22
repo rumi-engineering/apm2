@@ -15658,14 +15658,21 @@ impl PrivilegedDispatcher {
         // Fail-closed: if no real policy resolution is available, reject the
         // claim rather than recording synthetic PCAC-derived hashes that
         // violate the AGENTS.md invariant for reconstructibility.
+        //
+        // SECURITY FIX (Finding 1, round 5): Use role-scoped lookup
+        // `get_claim_for_role(work_id, role)` instead of role-agnostic
+        // `get_claim(work_id)`. Since WorkRegistry is keyed by (work_id,
+        // role), role-agnostic lookup can return the wrong claim when
+        // multiple roles claim the same work_id, misrepresenting policy-
+        // resolution hashes in CAS evidence and breaking role separation.
         let resolved_policy = self
             .work_registry
-            .get_claim(&request.work_id)
+            .get_claim_for_role(&request.work_id, role)
             .map(|c| c.policy_resolution)
             .or_else(|| {
                 self.lease_validator
                     .get_lease_work_id(&request.lease_id)
-                    .and_then(|wid| self.work_registry.get_claim(&wid))
+                    .and_then(|wid| self.work_registry.get_claim_for_role(&wid, role))
                     .map(|c| c.policy_resolution)
             });
         let Some(resolved_policy) = resolved_policy else {
@@ -15760,8 +15767,81 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // 11. Emit work_transitioned event (Open -> Claimed or ReadyForReview ->
-        //     Review). CAS is already stored so we can safely persist ledger events.
+        // 11. Register the claim in WorkRegistry FIRST so SpawnEpisode and other
+        //     downstream handlers can find this claim.
+        //
+        // CODE-QUALITY FIX (Finding 3, round 5): The durability chain must be:
+        //   CAS store -> register_claim -> register_lease -> work_transitioned
+        //   -> evidence.published
+        //
+        // If register_claim or register_lease fails (non-duplicate), return
+        // error WITHOUT emitting work_transitioned. Once work_transitioned
+        // is in the ledger, the idempotency path expects evidence.published
+        // to exist alongside it. Emitting work_transitioned before durable
+        // claim/lease registration creates irrecoverable partial commits.
+        let v2_claim = WorkClaim {
+            work_id: request.work_id.clone(),
+            lease_id: issued_lease_id.clone(),
+            actor_id: actor_id.clone(),
+            role,
+            policy_resolution: resolved_policy,
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+
+        // DuplicateWorkId for the same (work_id, role) pair means this exact
+        // role was already claimed (legacy path or re-claim). On duplicate,
+        // recover the existing authoritative lease via idempotency rather
+        // than returning a phantom lease that no registry knows about.
+        match self.work_registry.register_claim(v2_claim) {
+            Ok(_) => {
+                info!(
+                    work_id = %request.work_id,
+                    lease_id = %issued_lease_id,
+                    role = ?role,
+                    "ClaimWorkV2: claim registered in WorkRegistry"
+                );
+            },
+            Err(WorkRegistryError::DuplicateWorkId { .. }) => {
+                // The (work_id, role) pair already exists. Recover
+                // existing authoritative claim via idempotency path.
+                info!(
+                    work_id = %request.work_id,
+                    role = ?role,
+                    "ClaimWorkV2: (work_id, role) already registered, \
+                     recovering via idempotency"
+                );
+                return self.handle_claim_work_v2_idempotency(&request.work_id, &actor_id, role);
+            },
+            Err(e) => {
+                warn!(error = %e, "ClaimWorkV2: WorkRegistry registration failed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("ClaimWorkV2 work registration failed: {e}"),
+                ));
+            },
+        }
+
+        // 11b. Register the issued lease in LeaseValidator so downstream
+        // privileged handlers (SpawnEpisode, DelegateSublease, etc.) can
+        // resolve lease -> work_id mappings.
+        self.lease_validator.register_lease_with_executor(
+            &issued_lease_id,
+            &request.work_id,
+            "claim_work_v2",
+            &actor_id,
+        );
+        info!(
+            lease_id = %issued_lease_id,
+            work_id = %request.work_id,
+            actor_id = %actor_id,
+            "ClaimWorkV2: lease registered in LeaseValidator"
+        );
+
+        // 12. Emit work_transitioned event (Open -> Claimed or ReadyForReview ->
+        //     Review). Claim and lease registration have already succeeded, so the
+        //     idempotency path can recover if needed.
         //
         // Uses legacy `emit_work_transitioned` path which emits event_type
         // "work_transitioned" with a JSON payload. The projection bridge
@@ -15809,68 +15889,6 @@ impl PrivilegedDispatcher {
                 ));
             },
         }
-
-        // 12. Register the claim in WorkRegistry so SpawnEpisode and other downstream
-        //     handlers can find this claim.
-        let v2_claim = WorkClaim {
-            work_id: request.work_id.clone(),
-            lease_id: issued_lease_id.clone(),
-            actor_id: actor_id.clone(),
-            role,
-            policy_resolution: resolved_policy,
-            executor_custody_domains: vec![],
-            author_custody_domains: vec![],
-            permeability_receipt: None,
-        };
-
-        // DuplicateWorkId for the same (work_id, role) pair means this exact
-        // role was already claimed (legacy path or re-claim). On duplicate,
-        // recover the existing authoritative lease via idempotency rather
-        // than returning a phantom lease that no registry knows about.
-        match self.work_registry.register_claim(v2_claim) {
-            Ok(_) => {
-                info!(
-                    work_id = %request.work_id,
-                    lease_id = %issued_lease_id,
-                    role = ?role,
-                    "ClaimWorkV2: claim registered in WorkRegistry"
-                );
-            },
-            Err(WorkRegistryError::DuplicateWorkId { .. }) => {
-                // The (work_id, role) pair already exists. Recover
-                // existing authoritative claim via idempotency path.
-                info!(
-                    work_id = %request.work_id,
-                    role = ?role,
-                    "ClaimWorkV2: (work_id, role) already registered, \
-                     recovering via idempotency"
-                );
-                return self.handle_claim_work_v2_idempotency(&request.work_id, &actor_id, role);
-            },
-            Err(e) => {
-                warn!(error = %e, "ClaimWorkV2: WorkRegistry registration failed");
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!("ClaimWorkV2 work registration failed: {e}"),
-                ));
-            },
-        }
-
-        // 12b. Register the issued lease in LeaseValidator so downstream
-        // privileged handlers (SpawnEpisode, DelegateSublease, etc.) can
-        // resolve lease -> work_id mappings.
-        self.lease_validator.register_lease_with_executor(
-            &issued_lease_id,
-            &request.work_id,
-            "claim_work_v2",
-            &actor_id,
-        );
-        info!(
-            lease_id = %issued_lease_id,
-            work_id = %request.work_id,
-            actor_id = %actor_id,
-            "ClaimWorkV2: lease registered in LeaseValidator"
-        );
 
         // 13. Anchor via evidence.published with category WORK_AUTHORITY_BINDINGS and
         //     deterministic evidence_id (WAB- prefix + BLAKE3 of work_id + role +

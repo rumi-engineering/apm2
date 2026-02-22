@@ -4338,19 +4338,87 @@ impl SqliteWorkRegistry {
     ///
     /// Claims are keyed by `(work_id, role)` to support Phase 2 multi-role
     /// workflows where Implementer and Reviewer each claim the same `work_id`.
+    ///
+    /// # Migration (Finding 2, round 5)
+    ///
+    /// Pre-existing databases may have the legacy schema with
+    /// `work_id TEXT PRIMARY KEY` (single-role uniqueness). This method
+    /// detects the legacy schema and migrates atomically:
+    ///
+    /// 1. Detect whether `work_claims` already exists with a `work_id` primary
+    ///    key (no composite `(work_id, role)` key).
+    /// 2. If legacy schema: rename old table to `work_claims_legacy`, create
+    ///    new table with composite uniqueness, copy data with default `role =
+    ///    1` (Implementer), drop the legacy backup.
+    /// 3. If new schema or fresh DB: use `CREATE TABLE IF NOT EXISTS`.
+    ///
+    /// The migration is idempotent: running it multiple times on the same
+    /// database is safe. The detection query checks for the `role` column
+    /// in `PRAGMA table_info` — if it exists, no migration is needed.
     pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS work_claims (
-                work_id TEXT NOT NULL,
-                lease_id TEXT NOT NULL,
-                actor_id TEXT NOT NULL,
-                role INTEGER NOT NULL,
-                claim_json BLOB NOT NULL
-            )",
-            [],
-        )?;
+        // Check whether the work_claims table already exists.
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_claims'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+
+        if table_exists {
+            // Check whether the existing table has a `role` column.
+            // If it does, the schema is already migrated (or was created
+            // fresh with the Phase 2 schema). No migration needed.
+            let has_role_column: bool = conn
+                .prepare("PRAGMA table_info(work_claims)")?
+                .query_map([], |row| {
+                    let name: String = row.get(1)?;
+                    Ok(name)
+                })?
+                .filter_map(std::result::Result::ok)
+                .any(|col_name| col_name == "role");
+
+            if !has_role_column {
+                // Legacy schema detected: work_claims has work_id TEXT
+                // PRIMARY KEY but no role column. Migrate atomically.
+                //
+                // Strategy: rename → create new → copy → drop old.
+                // All within a single transaction for atomicity.
+                conn.execute_batch(
+                    "BEGIN IMMEDIATE;
+                     ALTER TABLE work_claims RENAME TO work_claims_legacy;
+                     CREATE TABLE work_claims (
+                         work_id TEXT NOT NULL,
+                         lease_id TEXT NOT NULL,
+                         actor_id TEXT NOT NULL,
+                         role INTEGER NOT NULL DEFAULT 1,
+                         claim_json BLOB NOT NULL
+                     );
+                     INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json)
+                         SELECT work_id, lease_id, actor_id, 1, claim_json
+                         FROM work_claims_legacy;
+                     DROP TABLE work_claims_legacy;
+                     COMMIT;",
+                )?;
+            }
+        } else {
+            // Fresh database: create the table with the Phase 2 schema.
+            conn.execute(
+                "CREATE TABLE work_claims (
+                    work_id TEXT NOT NULL,
+                    lease_id TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    role INTEGER NOT NULL,
+                    claim_json BLOB NOT NULL
+                )",
+                [],
+            )?;
+        }
+
         // Multi-role UNIQUE constraint: (work_id, role) instead of just work_id.
         // Different roles for the same work_id are allowed and expected.
+        // CREATE UNIQUE INDEX IF NOT EXISTS is idempotent.
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_claims_work_role \
              ON work_claims(work_id, role)",
@@ -8654,5 +8722,153 @@ mod tests {
             Some(&third.event_id),
             "lookup must return the third persisted event"
         );
+    }
+
+    // ====================================================================
+    // TCK-00637 Finding 2: Schema migration for legacy work_claims PK
+    // ====================================================================
+
+    /// Verify that `SqliteWorkRegistry::init_schema` migrates a legacy
+    /// `work_claims` table (with `work_id TEXT PRIMARY KEY` and no `role`
+    /// column) to the Phase 2 schema with composite `(work_id, role)`
+    /// uniqueness. The migration must:
+    ///
+    /// 1. Preserve existing claim data with a default `role = 1` (Implementer).
+    /// 2. Allow multi-role inserts after migration.
+    /// 3. Be idempotent (running `init_schema` twice is safe).
+    #[test]
+    fn test_work_claims_legacy_schema_migration() {
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Create the LEGACY schema: work_id TEXT PRIMARY KEY, no role column.
+        conn.execute(
+            "CREATE TABLE work_claims (
+                work_id TEXT PRIMARY KEY,
+                lease_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                claim_json BLOB NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        // Insert a legacy claim (no role column).
+        let claim = WorkClaim {
+            work_id: "W-legacy-001".to_string(),
+            lease_id: "L-legacy-001".to_string(),
+            actor_id: "actor-legacy".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        let claim_json = serde_json::to_vec(&claim).unwrap();
+        conn.execute(
+            "INSERT INTO work_claims (work_id, lease_id, actor_id, claim_json) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params!["W-legacy-001", "L-legacy-001", "actor-legacy", claim_json],
+        )
+        .unwrap();
+
+        // Run the migration via init_schema.
+        SqliteWorkRegistry::init_schema(&conn).expect("migration should succeed");
+
+        // Verify the legacy claim was preserved with role = 1 (Implementer).
+        let role: i32 = conn
+            .query_row(
+                "SELECT role FROM work_claims WHERE work_id = 'W-legacy-001'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy claim should exist after migration");
+        assert_eq!(
+            role, 1,
+            "legacy claims should be assigned role=1 (Implementer)"
+        );
+
+        // Verify multi-role inserts now work (different role for same work_id).
+        let reviewer_claim_json = serde_json::to_vec(&WorkClaim {
+            work_id: "W-legacy-001".to_string(),
+            lease_id: "L-reviewer-001".to_string(),
+            actor_id: "actor-reviewer".to_string(),
+            role: WorkRole::Reviewer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        })
+        .unwrap();
+        conn.execute(
+            "INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "W-legacy-001",
+                "L-reviewer-001",
+                "actor-reviewer",
+                WorkRole::Reviewer as i32,
+                reviewer_claim_json,
+            ],
+        )
+        .expect("multi-role insert should succeed after migration");
+
+        // Verify the UNIQUE index on (work_id, role) rejects duplicates.
+        let dup_result = conn.execute(
+            "INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["W-legacy-001", "L-dup", "actor-dup", 1_i32, claim_json],
+        );
+        assert!(
+            dup_result.is_err(),
+            "duplicate (work_id, role) must be rejected"
+        );
+    }
+
+    /// Verify that `SqliteWorkRegistry::init_schema` is idempotent on the
+    /// new Phase 2 schema (no-op when called twice).
+    #[test]
+    fn test_work_claims_init_schema_idempotent() {
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+
+        // First call: creates the table fresh.
+        SqliteWorkRegistry::init_schema(&conn).expect("first init should succeed");
+
+        // Insert a claim.
+        let claim = WorkClaim {
+            work_id: "W-idem-001".to_string(),
+            lease_id: "L-idem-001".to_string(),
+            actor_id: "actor-idem".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        let claim_json = serde_json::to_vec(&claim).unwrap();
+        conn.execute(
+            "INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "W-idem-001",
+                "L-idem-001",
+                "actor-idem",
+                WorkRole::Implementer as i32,
+                claim_json,
+            ],
+        )
+        .unwrap();
+
+        // Second call: must be a no-op (table exists with role column).
+        SqliteWorkRegistry::init_schema(&conn).expect("second init should succeed (idempotent)");
+
+        // Verify data is preserved.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM work_claims", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "data must be preserved after idempotent re-init");
     }
 }
