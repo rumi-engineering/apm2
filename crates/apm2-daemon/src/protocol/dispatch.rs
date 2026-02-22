@@ -16170,8 +16170,8 @@ impl PrivilegedDispatcher {
     ///    event exists, the handler reconstructs lease/cas/actor fields from
     ///    the immutable ledger record and emits the missing `work_transitioned`
     ///    event before returning success. If no matching evidence exists yet,
-    ///    the handler returns a retriable error without deleting the claim row
-    ///    (concurrency-safe fail-closed behavior). If `evidence.published`
+    ///    the handler removes the stale claim row and returns a retriable error
+    ///    so the next attempt can recreate the claim. If `evidence.published`
     ///    exists but is malformed/ incomplete, recovery fails closed with
     ///    `FAILED_PRECONDITION` to prevent split-brain.
     ///
@@ -16628,17 +16628,16 @@ impl PrivilegedDispatcher {
                     ));
                 }
 
-                // No evidence.published exists. This can be an in-flight
-                // concurrent claim where another request already registered the
-                // claim and has not yet persisted evidence/work_transitioned.
-                // Do NOT remove the claim row here — that can erase an
-                // in-flight successful claim from a concurrent request.
+                // No evidence.published exists. The prior claim row is stale
+                // and must be removed before returning retriable error, or the
+                // same DuplicateWorkId branch will deadlock retries forever.
+                self.work_registry.remove_claim_for_role(work_id, role);
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
                     format!(
                         "ClaimWorkV2: partial durability failure detected for \
-                         work_id '{work_id}' (role={role_str}). Claim state is \
-                         retained for concurrency safety; please retry."
+                         work_id '{work_id}' (role={role_str}). Stale claim was \
+                         cleared; please retry."
                     ),
                 ));
             }
@@ -37376,7 +37375,7 @@ mod tests {
         }
 
         #[test]
-        fn partial_recovery_without_evidence_keeps_claim_for_concurrency_safety() {
+        fn partial_recovery_without_evidence_removes_stale_claim_before_retry() {
             let dispatcher = claim_v2_dispatcher();
             let ctx = test_ctx();
             let work_id = "W-test-partial-no-evidence-001";
@@ -37425,8 +37424,8 @@ mod tests {
                         "no-evidence partial recovery should return retriable error"
                     );
                     assert!(
-                        err.message.contains("concurrency safety"),
-                        "error should mention concurrency-safe retry path, got: {}",
+                        err.message.contains("Stale claim was"),
+                        "error should mention stale-claim cleanup retry path, got: {}",
                         err.message
                     );
                 },
@@ -37439,8 +37438,8 @@ mod tests {
                 .work_registry
                 .get_claim_for_role(work_id, WorkRole::Implementer);
             assert!(
-                persisted_claim.is_some(),
-                "partial recovery must not delete claim rows in no-evidence path"
+                persisted_claim.is_none(),
+                "partial recovery must delete stale claim rows in no-evidence path"
             );
         }
 
