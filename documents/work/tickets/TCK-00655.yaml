@@ -31,11 +31,13 @@ ticket_meta:
       reason: PR association required for AT-3
     - ticket_id: TCK-00653
       reason: Pulse plane required for AT-4
+    - ticket_id: TCK-00654
+      reason: Doctor wait integration must be pulse-driven for AT-4
     - ticket_id: TCK-00650
       reason: Merge completion fix required for AT-5
   scope:
     in_scope:
-    - "Implement AT-1..AT-5 as reproducible system tests matching RFC-0032 \xA715"
+    - "Implement AT-1..AT-5 as reproducible system tests matching RFC-0032 section 15 acceptance contract."
     - Ensure tests are promotion-blocking and run in CI (or at least have a CI-fast subset with nightly full run)
     out_of_scope:
     - Benchmarking/performance testing (separate performance tickets if required)

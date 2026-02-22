@@ -3,8 +3,8 @@ ticket_meta:
   template_version: '2026-01-29'
   ticket:
     id: TCK-00653
-    title: 'RFC-0032: pulse plane correctness (decode by event_type+payload; multi-topic derivation; typed/dotted parity mapping tests)'
-    status: OPEN
+    title: 'RFC-0032: pulse plane correctness completion (event_type+payload decoding + typed/dotted parity + multi-topic routing)'
+    status: IN_PROGRESS
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032
@@ -23,24 +23,35 @@ ticket_meta:
       reason: WorkGraph topics require multi-topic derivation
     - ticket_id: TCK-00631
       reason: Canonical ledger append path influences commit notifications
+  context:
+    observed_state:
+    - "Multi-topic derivation for `work_graph.edge.*` exists in `topic_derivation.rs`, but parity coverage for dotted reducer names vs typed discriminants is incomplete."
+    - "`pulse_outbox.rs` still decodes payloads as `KernelEvent` directly, which is too strict during bridge periods where commit payload formats differ."
+    code_evidence:
+    - 'crates/apm2-daemon/src/protocol/pulse_outbox.rs:367-374 decodes only `KernelEvent` and drops decode failures.'
+    - 'crates/apm2-daemon/src/protocol/topic_derivation.rs:354-410 primarily matches typed names (e.g., `WorkOpened`) with limited dotted-name parity mapping.'
   scope:
     in_scope:
-    - Update PulsePublisher to operate on (event_type, namespace, payload_bytes) from commit notifications without assuming a KernelEvent envelope
-    - Implement multi-topic derivation returning Vec<String> (edges touch two work ids; receipts may touch work+PR indices)
-    - Ensure topic derivation works for both dotted reducer event types (`work.opened`) and typed discriminants (`WorkOpened`) used by existing tests/RFC-0018 taxonomy
-    - Add/extend tests in `crates/apm2-daemon/src/protocol/topic_derivation.rs` to cover new canonical events and typed/dotted parity mapping
-    out_of_scope:
+    - Complete PulsePublisher decoding so routing operates on `(event_type, namespace, payload_bytes)` without assuming all commits are `KernelEvent` envelopes.
+    - Preserve and validate existing multi-topic derivation behavior (`Vec<String>`) for work graph edge events.
+    - Add explicit typed/dotted parity mapping so semantically equivalent events (`WorkOpened` vs `work.opened`) route to identical topics.
+    - Add/extend tests in `crates/apm2-daemon/src/protocol/topic_derivation.rs` and `pulse_outbox.rs` for bridge-format decoding and parity mapping.
+  out_of_scope:
     - Reworking the entire pulse transport protocol (focus is topic correctness + decoding assumptions)
   plan:
     steps:
-    - Audit current `pulse_outbox.rs` decode path; remove hard dependency on KernelEvent envelope
-    - Implement minimal decoding per event_type to extract routing keys (work_id, session_id, etc.) with bounded decode
-    - Add a mapping layer (reuse concepts from `apm2_core::work::parity.rs`) that maps typed discriminants to dotted event types for topic derivation
-    - 'Add tests: same semantic event routed to identical topics regardless of naming form'
+    - Audit current `pulse_outbox.rs` decode path; introduce bounded fallback decode paths when payload is not `KernelEvent`.
+    - Implement minimal event_type-guided extractors for routing keys (work_id, session_id, changeset_digest) across bridge payload variants.
+    - Add a small canonicalization layer mapping typed discriminants and dotted reducer names to the same routing class.
+    - 'Add tests: same semantic event is routed to identical topics regardless of naming form or bridge payload envelope'
   definition_of_done:
-    evidence_ids: []
+    evidence_ids:
+    - 'EVID-TCK-00653-01 (unit): typed/dotted/legacy event-name parity normalizes to identical topic sets, including work_graph typed aliases'
+    - 'EVID-TCK-00653-02 (unit): bridge non-KernelEvent payload (`work_transitioned` JSON) routes to work topic instead of being dropped'
+    - 'EVID-TCK-00653-03 (unit): bridge raw `WorkGraphEvent` payload preserves multi-topic routing (`from_work_id` + `to_work_id`)'
+    - 'EVID-TCK-00653-04 (unit): malformed/oversized bridge payload handling remains bounded and publish loop continues'
     criteria:
-    - PulsePublisher can route legacy JSON events, reducer protobuf events, and typed kernel events during bridge.
+    - PulsePublisher can route bridge-period payload variants without dropping events solely because `KernelEvent` decode failed.
     - Topic derivation returns correct topic sets for work, session, and graph events and is covered by tests.
     - No polling is required for `--wait` flows once CLI integration lands.
   notes:

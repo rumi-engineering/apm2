@@ -3,8 +3,8 @@ ticket_meta:
   template_version: '2026-01-29'
   ticket:
     id: 'TCK-00663'
-    title: 'FAC: Fault-injection + recovery test harness for queue/lane orchestration (reproduce stuck-claimed + dead-PID scenarios)'
-    status: 'OPEN'
+    title: 'SUPERSEDED: FAC queue/lane fault-injection harness (coverage integrated into runtime reconcile suites)'
+    status: 'CANCELLED'
   binds:
     prd_id: 'PRD-0001'
     rfc_id: 'RFC-0019'
@@ -25,6 +25,17 @@ ticket_meta:
       - 'TCK-00658'
       - 'TCK-00659'
       - 'TCK-00660'
+
+supersession:
+  superseded_by_tickets:
+    - 'TCK-00658' # PID identity + stale lease deterministic tests
+    - 'TCK-00659' # doctor-first recovery determinism
+    - 'TCK-00660' # runtime reconcile/state-machine/coalescing/degraded-mode tests
+  rationale: |
+    The original harness intent has been absorbed by deterministic simulated tests added
+    directly to fac worker and reconcile modules. The specific stuck-claimed, flock-held,
+    commit-failure, and recovery idempotency scenarios now have direct regression coverage
+    without introducing a separate shared harness layer.
 
 context:
   why_now: |

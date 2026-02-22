@@ -90,9 +90,8 @@ plan:
     - Implement publishing path in reviewer completion flow (daemon or CLI wrapper).
     - Implement idempotent GitHub publication with ledger receipts.
     - Update CLI/doctor to read from daemon projection and render findings/verdict.
-    - Add tests for:
-        * duplicate publish attempts do not create duplicate GitHub comments
-        * context entries are stored and replayable
+    - Add test: duplicate publish attempts do not create duplicate GitHub comments.
+    - Add test: context entries are stored and replayable.
 
 definition_of_done:
   criteria:

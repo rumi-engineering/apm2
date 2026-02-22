@@ -3,7 +3,7 @@ ticket_meta:
   template_version: "2026-01-29"
   ticket:
     id: "TCK-00667"
-    title: "FAC review CLI: switch orchestration to daemon DispatchReviewer + pulse wait; deprecate systemd-run detached dispatch and PID-based liveness"
+    title: "FAC review orchestration: daemon DispatchReviewer + projection/pulse wait under doctor-first remediation (no legacy review run/restart surfaces)"
     status: "OPEN"
   binds:
     prd_id: "PRD-PLACEHOLDER"
@@ -43,7 +43,7 @@ scope:
       title: "Replace systemd-run detached dispatch with daemon DispatchReviewer"
       detail: |
         Update CLI review dispatch paths to call the daemon DispatchReviewer RPC instead of
-        spawning `systemd-run ... apm2 fac review run ...`.
+        any detached local wrapper orchestration.
 
         Requirements:
           - dispatch must be idempotent (stable dispatch_idempotency_key derived from work_id + head_sha + review_kind + attempt)
@@ -53,7 +53,7 @@ scope:
     - id: "DRP-002"
       title: "Replace PID/pulse-file liveness with pulse subscriptions + status projection"
       detail: |
-        For wait/resume/restart flows:
+        For wait/resume/doctor decision flows:
           - use SubscribePulse/WaitForPulse to wait on reviewer terminal topics
           - use GetReviewStatus (or WorkStatus extension) to decide whether a reviewer is pending/alive/done/blocked
           - eliminate the need to read review_state.json or check /proc for liveness
@@ -61,24 +61,26 @@ scope:
         Local pulse files may remain temporarily as derived UX, but must not be used to make authority decisions.
 
     - id: "DRP-003"
-      title: "Update restart logic to be lease/session-driven"
+      title: "Route PR-scoped remediation through doctor --pr --fix using lease/session signals"
       detail: |
-        Replace restart heuristics that rely on local timestamps with:
+        Replace local timestamp/PID restart heuristics with:
           - lease expiry / renewal signals
           - session termination reasons recorded by daemon
           - WorkLoopManager reaper outputs (RFC-0032 Phase 4)
 
-        Ensure that `apm2 fac restart` does not restart if a reviewer session is still legitimately running.
+        Ensure `apm2 fac doctor --pr <N> --fix` remains bounded and does not attempt reviewer
+        restart when a session is still legitimately running.
 
     - id: "DRP-004"
-      title: "Compatibility shim: keep legacy `apm2 fac review run` as a thin wrapper (temporary)"
+      title: "Hard-cut legacy review orchestration command surfaces"
       detail: |
-        During cutover, keep `apm2 fac review run` but redefine it as:
-          - dispatch via daemon
-          - wait via pulses
-          - print terminal outcome
+        Ensure legacy command surfaces are fully removed and not reintroduced:
+          - `apm2 fac review run`
+          - `apm2 fac review restart`
+          - `apm2 fac restart`
 
-        Any remaining local state files become derived telemetry only.
+        Remediation and follow-up behavior must be expressed via doctor-first flows
+        (`apm2 fac doctor --fix` and `apm2 fac doctor --pr <N> --fix`) with daemon authority.
 
   out_of_scope:
     - Rewriting reviewer model backends (Codex/Gemini/Claude) beyond what is necessary to run under daemon-owned episodes.
@@ -88,16 +90,16 @@ plan:
   steps:
     - Implement dispatch call path and output formatting (work_id + session/run id).
     - Implement wait path using pulses and projection query.
-    - Convert restart logic to lease/session signals.
-    - Add integration tests that simulate:
-        * CLI crash mid-wait and resume still succeeds
-        * duplicate dispatch requests do not spawn duplicate sessions
+    - Convert PR-scoped doctor remediation decisions to lease/session signals.
+    - Add integration test: CLI crash mid-wait and resume still succeeds.
+    - Add integration test: duplicate dispatch requests do not spawn duplicate sessions.
 
 definition_of_done:
   criteria:
     - "CLI review orchestration does not depend on systemd-run detached dispatch for correctness."
     - "CLI liveness and wait behavior uses pulse subscriptions + daemon projection, not PID/pulse-file inference."
-    - "Restart logic is lease/session-driven and idempotent."
+    - "Doctor PR-scoped remediation decisions are lease/session-driven and idempotent."
+    - "Legacy review run/restart command surfaces remain removed."
     - "Integration tests cover crash/resume and duplicate-dispatch idempotency."
 
 risks:
