@@ -1017,21 +1017,91 @@ pub(super) fn resolve_fac_root() -> Result<PathBuf, String> {
 /// enforced unconditionally at every startup, not just when newly
 /// created. Pre-existing `broker_requests/` with unsafe modes (e.g.,
 /// 0333 — world-writable without sticky) are hardened to 01733.
+#[cfg(unix)]
+fn ensure_directory_mode_nofollow(path: &Path, mode: u32) -> Result<(), String> {
+    use nix::errno::Errno;
+    use nix::fcntl::{OFlag, open};
+    use nix::sys::stat::{FchmodatFlags, Mode, fchmod, fchmodat};
+
+    let open_flags = OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+
+    let classify_path = || -> Result<(), String> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Err(format!(
+                "refusing to set permissions on symlink path {} (fail-closed)",
+                path.display()
+            ));
+        }
+        if !file_type.is_dir() {
+            return Err(format!(
+                "expected directory at {}, found non-directory (fail-closed)",
+                path.display()
+            ));
+        }
+        Ok(())
+    };
+
+    let dir_fd = match open(path, open_flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::ENOENT) => {
+            fs::create_dir_all(path)
+                .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+            open(path, open_flags, Mode::empty()).map_err(|e| match e {
+                Errno::ELOOP | Errno::ENOTDIR => {
+                    if let Err(reason) = classify_path() {
+                        reason
+                    } else {
+                        format!(
+                            "expected directory at {}, found non-directory (fail-closed)",
+                            path.display()
+                        )
+                    }
+                },
+                _ => format!(
+                    "cannot open directory {} after creation: {e}",
+                    path.display()
+                ),
+            })?
+        },
+        Err(Errno::EACCES) => {
+            classify_path()?;
+            let cwd_fd = fs::File::open(".")
+                .map_err(|e| format!("cannot open current directory for chmodat: {e}"))?;
+            fchmodat(
+                &cwd_fd,
+                path,
+                Mode::from_bits_truncate(mode),
+                FchmodatFlags::NoFollowSymlink,
+            )
+            .map_err(|e| format!("cannot set mode {mode:#o} on {}: {e}", path.display()))?;
+            return Ok(());
+        },
+        Err(Errno::ELOOP | Errno::ENOTDIR) => {
+            classify_path()?;
+            return Err(format!(
+                "expected directory at {}, found non-directory (fail-closed)",
+                path.display()
+            ));
+        },
+        Err(e) => return Err(format!("cannot open directory {}: {e}", path.display())),
+    };
+
+    fchmod(&dir_fd, Mode::from_bits_truncate(mode))
+        .map_err(|e| format!("cannot set mode {mode:#o} on {}: {e}", path.display()))?;
+
+    Ok(())
+}
+
 pub(super) fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
     // Ensure the queue root itself exists with mode 0711 for traversal.
-    if !queue_root.exists() {
-        fs::create_dir_all(queue_root)
-            .map_err(|e| format!("cannot create {}: {e}", queue_root.display()))?;
-    }
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Mode 0711: owner rwx, group/other execute-only (traversal).
-        // Allows non-service-user callers to reach broker_requests/ without
-        // exposing directory listings.
-        fs::set_permissions(queue_root, std::fs::Permissions::from_mode(0o711))
-            .map_err(|e| format!("cannot set mode 0711 on {}: {e}", queue_root.display()))?;
-    }
+    ensure_directory_mode_nofollow(queue_root, 0o711)?;
+    #[cfg(not(unix))]
+    fs::create_dir_all(queue_root)
+        .map_err(|e| format!("cannot create {}: {e}", queue_root.display()))?;
 
     for dir in [
         PENDING_DIR,
@@ -1043,21 +1113,15 @@ pub(super) fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
         CONSUME_RECEIPTS_DIR,
     ] {
         let path = queue_root.join(dir);
-        if !path.exists() {
-            fs::create_dir_all(&path)
-                .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-        }
         // TCK-00577 round 11 BLOCKER fix: Set deterministic mode 0711 on
         // every queue subdir, regardless of the process umask. Without
         // this, create_dir_all inherits the umask which may produce
         // 0775 or 0777, causing validate_directory_mode_only to reject
         // these directories during relaxed preflight.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, std::fs::Permissions::from_mode(0o711))
-                .map_err(|e| format!("cannot set mode 0711 on {}: {e}", path.display()))?;
-        }
+        ensure_directory_mode_nofollow(&path, 0o711)?;
+        #[cfg(not(unix))]
+        fs::create_dir_all(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
     }
 
     // TCK-00577 round 5 BLOCKER fix: Create broker_requests/ with mode 01733
@@ -1077,16 +1141,11 @@ pub(super) fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
     // attacker from tampering with the directory mode between restarts
     // and ensures the sticky bit invariant is always enforced.
     let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
-    if !broker_dir.exists() {
-        fs::create_dir_all(&broker_dir)
-            .map_err(|e| format!("cannot create {}: {e}", broker_dir.display()))?;
-    }
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&broker_dir, std::fs::Permissions::from_mode(0o1733))
-            .map_err(|e| format!("cannot set mode 01733 on {}: {e}", broker_dir.display()))?;
-    }
+    ensure_directory_mode_nofollow(&broker_dir, 0o1733)?;
+    #[cfg(not(unix))]
+    fs::create_dir_all(&broker_dir)
+        .map_err(|e| format!("cannot create {}: {e}", broker_dir.display()))?;
 
     Ok(())
 }

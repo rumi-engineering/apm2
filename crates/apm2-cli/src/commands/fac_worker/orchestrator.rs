@@ -14,7 +14,7 @@ pub(super) enum OrchestratorState {
     LeasePersisted { job_id: String, lane_id: String },
     Executing { job_id: String, lane_id: String },
     Committing { job_id: String, lane_id: String },
-    Completed { job_id: String, outcome: String },
+    Completed { job_id: String, outcome: JobOutcome },
 }
 
 /// Outcome from a single orchestrator step.
@@ -24,7 +24,7 @@ pub(super) enum StepOutcome {
     Advanced,
     /// Orchestrator reached terminal outcome for this job.
     Done(JobOutcome),
-    /// Defensive fallback for malformed terminal encoding.
+    /// Defensive fallback for malformed terminal payloads.
     Skipped(String),
 }
 
@@ -130,7 +130,7 @@ impl WorkerOrchestrator {
     fn complete_with_outcome(&mut self, job_id: String, outcome: JobOutcome) {
         self.state = OrchestratorState::Completed {
             job_id,
-            outcome: job_outcome_label(&outcome).to_string(),
+            outcome: outcome.clone(),
         };
         self.terminal_outcome = Some(outcome);
         self.clear_phase_data();
@@ -236,18 +236,19 @@ impl WorkerOrchestrator {
                 self.complete_with_outcome(ctx.candidate.spec.job_id.clone(), outcome.clone());
                 StepOutcome::Done(outcome)
             },
-            OrchestratorState::Completed { job_id, outcome } => match outcome.as_str() {
-                "completed" => StepOutcome::Done(JobOutcome::Completed {
-                    job_id,
-                    observed_cost: None,
-                }),
-                "denied" => StepOutcome::Done(JobOutcome::Denied {
-                    reason: "denied".to_string(),
-                }),
-                "quarantined" => StepOutcome::Done(JobOutcome::Quarantined {
-                    reason: "quarantined".to_string(),
-                }),
-                _ => StepOutcome::Skipped(outcome),
+            OrchestratorState::Completed { job_id, outcome } => {
+                if let JobOutcome::Completed {
+                    job_id: completed_job_id,
+                    ..
+                } = &outcome
+                {
+                    if completed_job_id != &job_id {
+                        return StepOutcome::Skipped(format!(
+                            "completed state job_id mismatch: state={job_id} outcome={completed_job_id}"
+                        ));
+                    }
+                }
+                StepOutcome::Done(outcome)
             },
         }
     }
@@ -2916,7 +2917,7 @@ impl WorkerOrchestrator {
                 .job_spec_digest(&spec.job_spec_digest)
                 .sandbox_hardening_hash(&sbx_hash)
                 .network_policy_hash(&resolved_net_hash)
-                .passed(false)
+                .passed(true)
                 .build_and_sign(signer);
 
         let observed_cost = observed_cost_from_elapsed(job_wall_start.elapsed());
@@ -3018,12 +3019,17 @@ impl WorkerOrchestrator {
     }
 }
 
-const fn job_outcome_label(outcome: &JobOutcome) -> &'static str {
-    match outcome {
-        JobOutcome::Quarantined { .. } => "quarantined",
-        JobOutcome::Denied { .. } => "denied",
-        JobOutcome::Completed { .. } => "completed",
-        JobOutcome::Aborted { .. } => "aborted",
-        JobOutcome::Skipped { .. } => "skipped",
+#[cfg(test)]
+impl WorkerOrchestrator {
+    pub(super) fn test_set_state(&mut self, state: OrchestratorState) {
+        self.state = state;
+    }
+
+    pub(super) fn test_set_staged_outcome(&mut self, outcome: JobOutcome) {
+        self.staged_outcome = Some(outcome);
+    }
+
+    pub(super) const fn test_state(&self) -> &OrchestratorState {
+        &self.state
     }
 }

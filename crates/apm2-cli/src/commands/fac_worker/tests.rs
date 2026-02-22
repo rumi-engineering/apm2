@@ -118,6 +118,323 @@ fn test_ensure_queue_dirs_queue_root_mode_0711() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn ensure_queue_dirs_rejects_symlink_queue_root_fail_closed() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let real_queue = dir.path().join("real-queue");
+    fs::create_dir_all(&real_queue).expect("create real queue");
+    let queue_root = dir.path().join("queue");
+    symlink(&real_queue, &queue_root).expect("create queue root symlink");
+
+    let err = ensure_queue_dirs(&queue_root).expect_err("must fail-closed on queue root symlink");
+    assert!(
+        err.contains("symlink"),
+        "error must report symlink refusal, got: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_queue_dirs_rejects_symlink_subdir_fail_closed() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue_root = dir.path().join("queue");
+    fs::create_dir_all(&queue_root).expect("create queue root");
+    let external_target = dir.path().join("external-target");
+    fs::create_dir_all(&external_target).expect("create external target");
+    symlink(&external_target, queue_root.join(PENDING_DIR)).expect("create subdir symlink");
+
+    let err =
+        ensure_queue_dirs(&queue_root).expect_err("must fail-closed on queue subdirectory symlink");
+    assert!(
+        err.contains("symlink"),
+        "error must report symlink refusal, got: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_queue_dirs_rejects_non_directory_queue_root_fail_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue_root = dir.path().join("queue");
+    fs::write(&queue_root, b"not-a-dir").expect("create queue root file");
+
+    let err =
+        ensure_queue_dirs(&queue_root).expect_err("must fail-closed on queue root non-directory");
+    assert!(
+        err.contains("non-directory"),
+        "error must report non-directory refusal, got: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_queue_dirs_rejects_non_directory_subdir_fail_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue_root = dir.path().join("queue");
+    fs::create_dir_all(&queue_root).expect("create queue root");
+    fs::write(queue_root.join(PENDING_DIR), b"not-a-dir").expect("create subdir file");
+
+    let err = ensure_queue_dirs(&queue_root)
+        .expect_err("must fail-closed on queue subdirectory non-directory");
+    assert!(
+        err.contains("non-directory"),
+        "error must report non-directory refusal, got: {err}"
+    );
+}
+
+fn make_orchestrator_step_candidate(job_id: &str, path: PathBuf) -> PendingCandidate {
+    let source = apm2_core::fac::job_spec::JobSource {
+        kind: "mirror_commit".to_string(),
+        repo_id: "test/repo".to_string(),
+        head_sha: "a".repeat(40),
+        patch: None,
+    };
+    let spec = apm2_core::fac::job_spec::FacJobSpecV1Builder::new(
+        job_id,
+        "gates",
+        "bulk",
+        "2026-02-22T00:00:00Z",
+        "lease-step-test",
+        source,
+    )
+    .priority(50)
+    .build()
+    .expect("build step candidate spec");
+    PendingCandidate {
+        path,
+        spec,
+        raw_bytes: b"{}".to_vec(),
+    }
+}
+
+#[test]
+fn worker_orchestrator_step_transitions_lease_persisted_to_executing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue_root = dir.path().join("queue");
+    let fac_root = dir.path().join("private").join("fac");
+    fs::create_dir_all(&queue_root).expect("queue root");
+    fs::create_dir_all(&fac_root).expect("fac root");
+
+    let candidate =
+        make_orchestrator_step_candidate("job-step-lease", queue_root.join("pending/job.json"));
+    let mut completed_gates_cache = None;
+    let signer = Signer::generate();
+    let verifying_key = signer.verifying_key();
+    let scheduler = QueueSchedulerState::new();
+    let mut broker = FacBroker::new();
+    let policy = FacPolicyV1::default_policy();
+    let policy_hash = compute_policy_hash(&policy).expect("policy hash");
+    let policy_digest = parse_policy_hash(&policy_hash).expect("policy digest");
+    let job_spec_policy = policy
+        .job_spec_validation_policy()
+        .expect("job spec policy");
+    let budget_cas = MemoryCas::new();
+    let cost_model = apm2_core::economics::CostModelV1::with_defaults();
+    let mut ctx = OrchestratorContext {
+        candidate: &candidate,
+        queue_root: &queue_root,
+        fac_root: &fac_root,
+        completed_gates_cache: &mut completed_gates_cache,
+        verifying_key: &verifying_key,
+        scheduler: &scheduler,
+        lane: QueueLane::Bulk,
+        broker: &mut broker,
+        signer: &signer,
+        policy_hash: &policy_hash,
+        policy_digest: &policy_digest,
+        policy: &policy,
+        job_spec_policy: &job_spec_policy,
+        budget_cas: &budget_cas,
+        print_unit: false,
+        canonicalizer_tuple_digest: "b3-256:step",
+        boundary_id: "apm2.fac.local",
+        heartbeat_cycle_count: 0,
+        heartbeat_jobs_completed: 0,
+        heartbeat_jobs_denied: 0,
+        heartbeat_jobs_quarantined: 0,
+        cost_model: &cost_model,
+        toolchain_fingerprint: None,
+    };
+
+    let job_id = candidate.spec.job_id.clone();
+    let lane_id = "lane-00".to_string();
+    let mut orchestrator = WorkerOrchestrator::new();
+    orchestrator.test_set_state(OrchestratorState::LeasePersisted {
+        job_id: job_id.clone(),
+        lane_id: lane_id.clone(),
+    });
+
+    let step = orchestrator.step(&mut ctx);
+    assert!(matches!(step, StepOutcome::Advanced));
+    assert_eq!(
+        orchestrator.test_state(),
+        &OrchestratorState::Executing { job_id, lane_id }
+    );
+}
+
+#[test]
+fn worker_orchestrator_step_executing_without_lease_context_fails_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue_root = dir.path().join("queue");
+    let fac_root = dir.path().join("private").join("fac");
+    fs::create_dir_all(&queue_root).expect("queue root");
+    fs::create_dir_all(&fac_root).expect("fac root");
+
+    let candidate = make_orchestrator_step_candidate(
+        "job-step-missing-lease",
+        queue_root.join("pending/job-missing-lease.json"),
+    );
+    let mut completed_gates_cache = None;
+    let signer = Signer::generate();
+    let verifying_key = signer.verifying_key();
+    let scheduler = QueueSchedulerState::new();
+    let mut broker = FacBroker::new();
+    let policy = FacPolicyV1::default_policy();
+    let policy_hash = compute_policy_hash(&policy).expect("policy hash");
+    let policy_digest = parse_policy_hash(&policy_hash).expect("policy digest");
+    let job_spec_policy = policy
+        .job_spec_validation_policy()
+        .expect("job spec policy");
+    let budget_cas = MemoryCas::new();
+    let cost_model = apm2_core::economics::CostModelV1::with_defaults();
+    let mut ctx = OrchestratorContext {
+        candidate: &candidate,
+        queue_root: &queue_root,
+        fac_root: &fac_root,
+        completed_gates_cache: &mut completed_gates_cache,
+        verifying_key: &verifying_key,
+        scheduler: &scheduler,
+        lane: QueueLane::Bulk,
+        broker: &mut broker,
+        signer: &signer,
+        policy_hash: &policy_hash,
+        policy_digest: &policy_digest,
+        policy: &policy,
+        job_spec_policy: &job_spec_policy,
+        budget_cas: &budget_cas,
+        print_unit: false,
+        canonicalizer_tuple_digest: "b3-256:step",
+        boundary_id: "apm2.fac.local",
+        heartbeat_cycle_count: 0,
+        heartbeat_jobs_completed: 0,
+        heartbeat_jobs_denied: 0,
+        heartbeat_jobs_quarantined: 0,
+        cost_model: &cost_model,
+        toolchain_fingerprint: None,
+    };
+
+    let job_id = candidate.spec.job_id.clone();
+    let lane_id = "lane-00".to_string();
+    let mut orchestrator = WorkerOrchestrator::new();
+    orchestrator.test_set_state(OrchestratorState::Executing {
+        job_id: job_id.clone(),
+        lane_id,
+    });
+
+    let step = orchestrator.step(&mut ctx);
+    let reason = match step {
+        StepOutcome::Done(JobOutcome::Skipped { reason, .. }) => reason,
+        other => panic!("expected skipped outcome, got {other:?}"),
+    };
+    assert!(
+        reason.contains("missing lease context"),
+        "expected missing lease context reason, got: {reason}"
+    );
+    assert!(matches!(
+        orchestrator.test_state(),
+        OrchestratorState::Completed {
+            job_id: completed_id,
+            outcome: JobOutcome::Skipped { reason, .. }
+        } if completed_id == &job_id && reason.contains("missing lease context")
+    ));
+}
+
+#[test]
+fn worker_orchestrator_step_committing_emits_staged_outcome_and_terminal_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let queue_root = dir.path().join("queue");
+    let fac_root = dir.path().join("private").join("fac");
+    fs::create_dir_all(&queue_root).expect("queue root");
+    fs::create_dir_all(&fac_root).expect("fac root");
+
+    let candidate =
+        make_orchestrator_step_candidate("job-step-commit", queue_root.join("pending/job.json"));
+    let mut completed_gates_cache = None;
+    let signer = Signer::generate();
+    let verifying_key = signer.verifying_key();
+    let scheduler = QueueSchedulerState::new();
+    let mut broker = FacBroker::new();
+    let policy = FacPolicyV1::default_policy();
+    let policy_hash = compute_policy_hash(&policy).expect("policy hash");
+    let policy_digest = parse_policy_hash(&policy_hash).expect("policy digest");
+    let job_spec_policy = policy
+        .job_spec_validation_policy()
+        .expect("job spec policy");
+    let budget_cas = MemoryCas::new();
+    let cost_model = apm2_core::economics::CostModelV1::with_defaults();
+    let mut ctx = OrchestratorContext {
+        candidate: &candidate,
+        queue_root: &queue_root,
+        fac_root: &fac_root,
+        completed_gates_cache: &mut completed_gates_cache,
+        verifying_key: &verifying_key,
+        scheduler: &scheduler,
+        lane: QueueLane::Bulk,
+        broker: &mut broker,
+        signer: &signer,
+        policy_hash: &policy_hash,
+        policy_digest: &policy_digest,
+        policy: &policy,
+        job_spec_policy: &job_spec_policy,
+        budget_cas: &budget_cas,
+        print_unit: false,
+        canonicalizer_tuple_digest: "b3-256:step",
+        boundary_id: "apm2.fac.local",
+        heartbeat_cycle_count: 0,
+        heartbeat_jobs_completed: 0,
+        heartbeat_jobs_denied: 0,
+        heartbeat_jobs_quarantined: 0,
+        cost_model: &cost_model,
+        toolchain_fingerprint: None,
+    };
+
+    let job_id = candidate.spec.job_id.clone();
+    let mut orchestrator = WorkerOrchestrator::new();
+    orchestrator.test_set_state(OrchestratorState::Committing {
+        job_id: job_id.clone(),
+        lane_id: "lane-00".to_string(),
+    });
+    orchestrator.test_set_staged_outcome(JobOutcome::Denied {
+        reason: "forced-deny-for-test".to_string(),
+    });
+
+    let first_step = orchestrator.step(&mut ctx);
+    let first_reason = match first_step {
+        StepOutcome::Done(JobOutcome::Denied { reason }) => reason,
+        other => panic!("expected denied outcome, got {other:?}"),
+    };
+    assert_eq!(first_reason, "forced-deny-for-test");
+    assert!(matches!(
+        orchestrator.test_state(),
+        OrchestratorState::Completed {
+            job_id: completed_id,
+            outcome: JobOutcome::Denied { reason }
+        } if completed_id == &job_id && reason == "forced-deny-for-test"
+    ));
+
+    let second_step = orchestrator.step(&mut ctx);
+    let second_reason = match second_step {
+        StepOutcome::Done(JobOutcome::Denied { reason }) => reason,
+        other => panic!("expected denied outcome on terminal replay, got {other:?}"),
+    };
+    assert_eq!(second_reason, "forced-deny-for-test");
+}
+
 #[test]
 fn test_move_to_dir_safe_atomic() {
     let dir = tempfile::tempdir().expect("tempdir");
