@@ -1951,6 +1951,34 @@ message PublishWorkContextEntryResponse {
   string work_id = 4;
 }
 
+// IPC-PRIV-079: PublishWorkLoopProfile (TCK-00645, RFC-0032 Phase 4)
+// Publishes a work loop profile to CAS and anchors it in the ledger via
+// evidence.published with category WORK_LOOP_PROFILE.
+message PublishWorkLoopProfileRequest {
+  // Canonical work identifier. Must match an existing work claim.
+  string work_id = 1;
+  // Deduplication key for idempotent publishing.
+  // Must not be empty. Idempotency is enforced on (work_id, dedupe_key).
+  string dedupe_key = 2;
+  // JSON-encoded WorkLoopProfileV1 payload (max 64 KiB).
+  // The daemon validates bounded decode and deny_unknown_fields semantics.
+  bytes profile_json = 3;
+  // Lease ID for PCAC lifecycle enforcement and role-scoped claim resolution.
+  // Required.
+  string lease_id = 4;
+}
+
+message PublishWorkLoopProfileResponse {
+  // Deterministic evidence ID (WLP- prefix).
+  string evidence_id = 1;
+  // CAS hash of the canonical profile bytes (hex-encoded BLAKE3).
+  string cas_hash = 2;
+  // Work ID echoed back.
+  string work_id = 3;
+  // Dedupe key echoed back.
+  string dedupe_key = 4;
+}
+
 // IPC-PRIV-078: ClaimWorkV2 (RFC-0032, TCK-00637)
 // Claims an EXISTING work item (opened via OpenWork). Does not create a new
 // work_id. Transitions Open -> Claimed (IMPLEMENTER/COORDINATOR) or

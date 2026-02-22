@@ -134,6 +134,9 @@ use super::messages::{
     // TCK-00638: Work context entry publishing types
     PublishWorkContextEntryRequest,
     PublishWorkContextEntryResponse,
+    // TCK-00645: Work loop profile publishing types
+    PublishWorkLoopProfileRequest,
+    PublishWorkLoopProfileResponse,
     // TCK-00639: PR association recording types
     RecordWorkPrAssociationRequest,
     RecordWorkPrAssociationResponse,
@@ -235,6 +238,20 @@ pub struct SignedLedgerEvent {
 
     /// Timestamp in nanoseconds since epoch (HTF-compliant).
     pub timestamp_ns: u64,
+}
+
+impl SignedLedgerEvent {
+    /// Returns the canonical ledger sequence ID when this event originates
+    /// from the canonical `events` table.
+    ///
+    /// Canonical events are represented with synthesised IDs of the form
+    /// `canonical-<seq_id>`; legacy `ledger_events` rows return `None`.
+    #[must_use]
+    pub fn canonical_seq_id(&self) -> Option<u64> {
+        self.event_id
+            .strip_prefix("canonical-")
+            .and_then(|value| value.parse::<u64>().ok())
+    }
 }
 
 /// Security class for ledger event namespaces.
@@ -6713,6 +6730,9 @@ pub enum PrivilegedMessageType {
     // --- Work Context Publishing (RFC-0032, TCK-00638) ---
     /// `PublishWorkContextEntry` request (IPC-PRIV-077)
     PublishWorkContextEntry = 76,
+    // --- Work Loop Profile Publishing (RFC-0032, TCK-00645) ---
+    /// `PublishWorkLoopProfile` request (IPC-PRIV-079)
+    PublishWorkLoopProfile = 77,
     // --- Work PR Association (RFC-0032, TCK-00639) ---
     /// `RecordWorkPrAssociation` request (IPC-PRIV-079)
     RecordWorkPrAssociation = 30,
@@ -6781,6 +6801,8 @@ impl PrivilegedMessageType {
             75 => Some(Self::RequestUnfreeze),
             // Work context publishing (TCK-00638)
             76 => Some(Self::PublishWorkContextEntry),
+            // Work loop profile publishing (TCK-00645)
+            77 => Some(Self::PublishWorkLoopProfile),
             _ => None,
         }
     }
@@ -6837,6 +6859,7 @@ impl PrivilegedMessageType {
             Self::OpenWork,
             Self::ClaimWorkV2,
             Self::PublishWorkContextEntry,
+            Self::PublishWorkLoopProfile,
             Self::RecordWorkPrAssociation,
         ]
     }
@@ -6892,6 +6915,7 @@ impl PrivilegedMessageType {
             | Self::OpenWork
             | Self::ClaimWorkV2
             | Self::PublishWorkContextEntry
+            | Self::PublishWorkLoopProfile
             | Self::RecordWorkPrAssociation => true,
             // Server-to-client notification only — not a client request.
             Self::PulseEvent => false,
@@ -6943,6 +6967,7 @@ impl PrivilegedMessageType {
             Self::OpenWork => "hsi.work.open",
             Self::ClaimWorkV2 => "hsi.work.claim_v2",
             Self::PublishWorkContextEntry => "hsi.work_context.publish",
+            Self::PublishWorkLoopProfile => "hsi.work_loop_profile.publish",
             Self::RecordWorkPrAssociation => "hsi.work.record_pr_association",
             Self::PulseEvent => "hsi.pulse.event",
         }
@@ -6989,6 +7014,7 @@ impl PrivilegedMessageType {
             Self::OpenWork => "OPEN_WORK",
             Self::ClaimWorkV2 => "CLAIM_WORK_V2",
             Self::PublishWorkContextEntry => "PUBLISH_WORK_CONTEXT_ENTRY",
+            Self::PublishWorkLoopProfile => "PUBLISH_WORK_LOOP_PROFILE",
             Self::RecordWorkPrAssociation => "RECORD_WORK_PR_ASSOCIATION",
             Self::PulseEvent => "PULSE_EVENT",
         }
@@ -7035,6 +7061,7 @@ impl PrivilegedMessageType {
             Self::OpenWork => "apm2.open_work_request.v1",
             Self::ClaimWorkV2 => "apm2.claim_work_v2_request.v1",
             Self::PublishWorkContextEntry => "apm2.publish_work_context_entry_request.v1",
+            Self::PublishWorkLoopProfile => "apm2.publish_work_loop_profile_request.v1",
             Self::RecordWorkPrAssociation => "apm2.record_work_pr_association_request.v1",
             Self::PulseEvent => "apm2.pulse_event_request.v1",
         }
@@ -7081,6 +7108,7 @@ impl PrivilegedMessageType {
             Self::OpenWork => "apm2.open_work_response.v1",
             Self::ClaimWorkV2 => "apm2.claim_work_v2_response.v1",
             Self::PublishWorkContextEntry => "apm2.publish_work_context_entry_response.v1",
+            Self::PublishWorkLoopProfile => "apm2.publish_work_loop_profile_response.v1",
             Self::RecordWorkPrAssociation => "apm2.record_work_pr_association_response.v1",
             Self::PulseEvent => "apm2.pulse_event_response.v1",
         }
@@ -7172,6 +7200,8 @@ pub enum PrivilegedResponse {
     ClaimWorkV2(ClaimWorkV2Response),
     /// Successful `PublishWorkContextEntry` response (TCK-00638).
     PublishWorkContextEntry(PublishWorkContextEntryResponse),
+    /// Successful `PublishWorkLoopProfile` response (TCK-00645).
+    PublishWorkLoopProfile(PublishWorkLoopProfileResponse),
     /// Successful `RecordWorkPrAssociation` response (TCK-00639).
     RecordWorkPrAssociation(RecordWorkPrAssociationResponse),
     /// Error response.
@@ -7386,6 +7416,10 @@ impl PrivilegedResponse {
             },
             Self::PublishWorkContextEntry(resp) => {
                 buf.push(PrivilegedMessageType::PublishWorkContextEntry.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::PublishWorkLoopProfile(resp) => {
+                buf.push(PrivilegedMessageType::PublishWorkLoopProfile.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::RecordWorkPrAssociation(resp) => {
@@ -8342,6 +8376,7 @@ pub(crate) enum PrivilegedHandlerClass {
     RegisterRecoveryEvidence,
     RequestUnfreeze,
     PublishWorkContextEntry,
+    PublishWorkLoopProfile,
     RecordWorkPrAssociation,
 }
 
@@ -8356,6 +8391,7 @@ impl PrivilegedHandlerClass {
             Self::RegisterRecoveryEvidence => "pcac-privileged-register-recovery-evidence",
             Self::RequestUnfreeze => "pcac-privileged-request-unfreeze",
             Self::PublishWorkContextEntry => "pcac-privileged-publish-work-context-entry",
+            Self::PublishWorkLoopProfile => "pcac-privileged-publish-work-loop-profile",
             Self::RecordWorkPrAssociation => "pcac-privileged-record-work-pr-association",
         }
     }
@@ -8369,6 +8405,7 @@ impl PrivilegedHandlerClass {
             Self::RegisterRecoveryEvidence => "RegisterRecoveryEvidence",
             Self::RequestUnfreeze => "RequestUnfreeze",
             Self::PublishWorkContextEntry => "PublishWorkContextEntry",
+            Self::PublishWorkLoopProfile => "PublishWorkLoopProfile",
             Self::RecordWorkPrAssociation => "RecordWorkPrAssociation",
         }
     }
@@ -11305,6 +11342,10 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::PublishWorkContextEntry => {
                 self.handle_publish_work_context_entry(payload, ctx)
             },
+            // TCK-00645: Work loop profile publishing (RFC-0032 Phase 4)
+            PrivilegedMessageType::PublishWorkLoopProfile => {
+                self.handle_publish_work_loop_profile(payload, ctx)
+            },
             // TCK-00639: Work PR association (RFC-0032 Phase 2)
             PrivilegedMessageType::RecordWorkPrAssociation => {
                 self.handle_record_work_pr_association(payload, ctx)
@@ -11371,6 +11412,8 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::ClaimWorkV2 => "ClaimWorkV2",
                 // TCK-00638
                 PrivilegedMessageType::PublishWorkContextEntry => "PublishWorkContextEntry",
+                // TCK-00645
+                PrivilegedMessageType::PublishWorkLoopProfile => "PublishWorkLoopProfile",
                 // TCK-00639
                 PrivilegedMessageType::RecordWorkPrAssociation => "RecordWorkPrAssociation",
             };
@@ -19433,6 +19476,523 @@ impl PrivilegedDispatcher {
     }
 
     // =========================================================================
+    // TCK-00645: PublishWorkLoopProfile Handler (RFC-0032 Phase 4)
+    // =========================================================================
+
+    /// Handles `PublishWorkLoopProfile` requests (IPC-PRIV-079, TCK-00645).
+    ///
+    /// Publishes a work loop profile to CAS and anchors it in the ledger via
+    /// `evidence.published` with category `WORK_LOOP_PROFILE`.
+    ///
+    /// # Security Invariants
+    ///
+    /// - **Bounded decode**: profile JSON is validated with bounded decode (<=
+    ///   64 KiB) and `deny_unknown_fields`.
+    /// - **Fail-closed**: empty IDs, missing claims, missing CAS, or validation
+    ///   failures reject the request.
+    /// - **Actor ownership**: caller must own the active work claim.
+    /// - **Idempotent**: publishing is idempotent on `(work_id, dedupe_key)`.
+    ///   Duplicate requests return the authoritative prior CAS hash and do not
+    ///   emit duplicate ledger events.
+    fn handle_publish_work_loop_profile(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        use apm2_core::fac::PublishWorkLoopProfileError;
+
+        let request = PublishWorkLoopProfileRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+            reason: format!("invalid PublishWorkLoopProfileRequest: {e}"),
+        })?;
+
+        info!(
+            work_id = %request.work_id,
+            dedupe_key = %request.dedupe_key,
+            profile_json_len = request.profile_json.len(),
+            peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+            "PublishWorkLoopProfile request received"
+        );
+
+        if request.work_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "work_id must not be empty",
+            ));
+        }
+        if request.work_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!("work_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+        if request.dedupe_key.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "dedupe_key must not be empty",
+            ));
+        }
+        if request.dedupe_key.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!("dedupe_key exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+        if request.profile_json.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "profile_json must not be empty",
+            ));
+        }
+        if request.lease_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "lease_id is required for PCAC lifecycle enforcement",
+            ));
+        }
+        if request.lease_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!("lease_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        let peer_creds = ctx
+            .peer_credentials()
+            .ok_or_else(|| ProtocolError::Serialization {
+                reason: "peer credentials required for work loop profile publishing".to_string(),
+            })?;
+        let actor_id = derive_actor_id(peer_creds);
+
+        let Some(claim) = self
+            .work_registry
+            .get_claim_by_lease_id(&request.work_id, &request.lease_id)
+        else {
+            if self.work_registry.get_claim(&request.work_id).is_none() {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::InvalidArgument,
+                    format!("work_id not found in registry: {}", request.work_id),
+                ));
+            }
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                "lease_id does not match the active lease for this work claim",
+            ));
+        };
+
+        let actor_matches = actor_id.len() == claim.actor_id.len()
+            && bool::from(actor_id.as_bytes().ct_eq(claim.actor_id.as_bytes()));
+        if !actor_matches {
+            warn!(
+                work_id = %request.work_id,
+                claim_actor = %claim.actor_id,
+                caller_actor = %actor_id,
+                "PublishWorkLoopProfile rejected: caller does not own work claim"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                format!(
+                    "authenticated caller '{}' does not own work claim for '{}' (owned by '{}')",
+                    actor_id, request.work_id, claim.actor_id
+                ),
+            ));
+        }
+
+        let lease_id_matches = request.lease_id.len() == claim.lease_id.len()
+            && bool::from(request.lease_id.as_bytes().ct_eq(claim.lease_id.as_bytes()));
+        if !lease_id_matches {
+            warn!(
+                work_id = %request.work_id,
+                "PublishWorkLoopProfile rejected: lease_id does not match work claim"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                "lease_id does not match the active lease for this work claim",
+            ));
+        }
+
+        // Validate profile payload before mutation. This enforces bounded
+        // decode and deny_unknown_fields requirements at the request boundary.
+        let parsed_profile =
+            match apm2_core::fac::bounded_decode_loop_profile(&request.profile_json) {
+                Ok(profile) => profile,
+                Err(e) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::InvalidArgument,
+                        format!("invalid WorkLoopProfileV1: {e}"),
+                    ));
+                },
+            };
+
+        if parsed_profile.work_id != request.work_id {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!(
+                    "work_id mismatch: request.work_id='{}' but profile_json.work_id='{}'",
+                    request.work_id, parsed_profile.work_id
+                ),
+            ));
+        }
+        if parsed_profile.dedupe_key != request.dedupe_key {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!(
+                    "dedupe_key mismatch: request.dedupe_key='{}' but \
+                     profile_json.dedupe_key='{}'",
+                    request.dedupe_key, parsed_profile.dedupe_key
+                ),
+            ));
+        }
+
+        let evidence_id =
+            apm2_core::fac::compute_evidence_id(&request.work_id, &request.dedupe_key);
+
+        // Serialize + canonicalize before PCAC digest construction so the
+        // lifecycle authorization binds to the exact artifact bytes.
+        let profile_json_str = match serde_json::to_string(&parsed_profile) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::InvalidArgument,
+                    format!("failed to serialize WorkLoopProfileV1: {e}"),
+                ));
+            },
+        };
+        let canonical_json =
+            match apm2_core::fac::work_cas_schemas::canonicalize_for_cas(&profile_json_str) {
+                Ok(c) => c,
+                Err(e) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::InvalidArgument,
+                        format!("canonicalization failed: {e}"),
+                    ));
+                },
+            };
+        let canonical_bytes = canonical_json.as_bytes();
+        let canonical_content_hash = blake3::hash(canonical_bytes);
+
+        let Some(pcac_gate) = self.pcac_lifecycle_gate.as_deref() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "PCAC authority gate not wired for PublishWorkLoopProfile (fail-closed)",
+            ));
+        };
+        let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
+            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
+                Ok(values) => values,
+                Err(error) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "PCAC authority denied for PublishWorkLoopProfile: \
+                             authoritative revalidation unavailable: {error}"
+                        ),
+                    ));
+                },
+            };
+
+        let identity_proof_hash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(actor_id.as_bytes());
+            *hasher.finalize().as_bytes()
+        };
+
+        let (risk_tier, _resolved_policy_hash) =
+            self.resolve_risk_tier_for_lease(&request.lease_id, identity_proof_hash);
+        let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
+
+        let effect_intent_digest = domain_tagged_hash(
+            PrivilegedHandlerClass::PublishWorkLoopProfile,
+            "intent",
+            &[
+                request.work_id.as_bytes(),
+                request.dedupe_key.as_bytes(),
+                evidence_id.as_bytes(),
+                canonical_content_hash.as_bytes(),
+            ],
+        );
+
+        let pcac_builder =
+            PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::PublishWorkLoopProfile)
+                .session_id(evidence_id.clone())
+                .lease_id(request.lease_id.clone())
+                .boundary_intent_class(apm2_core::pcac::BoundaryIntentClass::Assert)
+                .identity_proof_hash(identity_proof_hash)
+                .identity_evidence_level(IdentityEvidenceLevel::PointerOnly)
+                .risk_tier(pcac_risk_tier);
+
+        let capability_manifest_hash = pcac_builder.hash(
+            "capability",
+            &[
+                request.lease_id.as_bytes(),
+                request.work_id.as_bytes(),
+                evidence_id.as_bytes(),
+            ],
+        );
+        let scope_witness_hash = pcac_builder.hash(
+            "scope",
+            &[request.work_id.as_bytes(), request.dedupe_key.as_bytes()],
+        );
+        let freshness_policy_hash = pcac_builder.hash(
+            "freshness-policy",
+            &[request.lease_id.as_bytes(), request.work_id.as_bytes()],
+        );
+        let stop_budget_profile_digest = pcac_builder.hash(
+            "stop-budget",
+            &[
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.emergency_stop_active(),
+                ))],
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.governance_stop_active(),
+                ))],
+                request.work_id.as_bytes(),
+            ],
+        );
+        let pcac_input = pcac_builder
+            .capability_manifest_hash(capability_manifest_hash)
+            .scope_witness_hash(scope_witness_hash)
+            .freshness_policy_hash(freshness_policy_hash)
+            .stop_budget_profile_digest(stop_budget_profile_digest)
+            .effect_intent_digest(effect_intent_digest)
+            .build(
+                join_freshness_tick,
+                join_time_envelope_ref,
+                join_ledger_anchor,
+                join_revocation_head,
+            );
+
+        let pcac_lifecycle_artifacts = match self.enforce_privileged_pcac_lifecycle(
+            PrivilegedHandlerClass::PublishWorkLoopProfile.operation_name(),
+            pcac_gate,
+            &pcac_input,
+            &request.lease_id,
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+            effect_intent_digest,
+        ) {
+            Ok(artifacts) => {
+                if artifacts.is_none() {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        "PublishWorkLoopProfile requires PCAC lifecycle evidence \
+                         (mandatory cutover); lifecycle_enforcement is disabled in claim policy",
+                    ));
+                }
+                artifacts
+            },
+            Err(response) => return Ok(response),
+        };
+
+        // Idempotency check AFTER PCAC lifecycle enforcement. Replay requests
+        // must always revalidate against current authority state.
+        if let Some((_existing_event_id, existing_cas_hash)) =
+            self.find_work_loop_profile_published_replay(&request.work_id, &evidence_id)
+        {
+            return Ok(PrivilegedResponse::PublishWorkLoopProfile(
+                PublishWorkLoopProfileResponse {
+                    evidence_id,
+                    cas_hash: existing_cas_hash,
+                    work_id: request.work_id,
+                    dedupe_key: request.dedupe_key,
+                },
+            ));
+        }
+
+        let Some(cas) = &self.cas else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "content-addressed store not configured on daemon",
+            ));
+        };
+
+        let publish_result =
+            match apm2_core::fac::publish_work_loop_profile(&request.profile_json, cas.as_ref()) {
+                Ok(result) => result,
+                Err(PublishWorkLoopProfileError::Validation(e)) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::InvalidArgument,
+                        format!("invalid WorkLoopProfileV1: {e}"),
+                    ));
+                },
+                Err(
+                    PublishWorkLoopProfileError::CanonicalizationFailed(e)
+                    | PublishWorkLoopProfileError::CasError(e),
+                ) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("work loop profile publication failed: {e}"),
+                    ));
+                },
+                Err(other) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("work loop profile publication failed: {other}"),
+                    ));
+                },
+            };
+
+        // Fail-closed consistency: request identity tuple and helper-derived
+        // identity tuple must match exactly.
+        if publish_result.profile.work_id != request.work_id
+            || publish_result.profile.dedupe_key != request.dedupe_key
+            || publish_result.evidence_id != evidence_id
+        {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "work loop profile identity tuple mismatch between request and canonical artifact",
+            ));
+        }
+        if publish_result.publish_result.artifact_hash != *canonical_content_hash.as_bytes() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "work loop profile canonical hash mismatch between PCAC intent and CAS artifact",
+            ));
+        }
+
+        let timestamp_ns = match self.get_htf_timestamp_ns() {
+            Ok(ts) => ts,
+            Err(e) => {
+                warn!(error = %e, "HTF timestamp generation failed - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::InvalidArgument,
+                    format!("HTF timestamp error: {e}"),
+                ));
+            },
+        };
+
+        let mut metadata = publish_result
+            .metadata
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>();
+        metadata.push(format!("actor_id={actor_id}"));
+        if let Some(ref artifacts) = pcac_lifecycle_artifacts {
+            metadata.push(format!("pcac_ajc_id={}", hex::encode(artifacts.ajc_id)));
+            metadata.push(format!(
+                "pcac_intent_digest={}",
+                hex::encode(artifacts.intent_digest)
+            ));
+            metadata.push(format!("pcac_consume_tick={}", artifacts.consume_tick));
+            metadata.push(format!(
+                "pcac_time_envelope_ref={}",
+                hex::encode(artifacts.time_envelope_ref)
+            ));
+            metadata.push(format!(
+                "pcac_consume_selector_digest={}",
+                hex::encode(artifacts.consume_selector_digest)
+            ));
+        }
+
+        let evidence_event_payload = {
+            let published = apm2_core::events::EvidencePublished {
+                evidence_id: publish_result.evidence_id.clone(),
+                work_id: request.work_id.clone(),
+                category: "WORK_LOOP_PROFILE".to_string(),
+                artifact_hash: publish_result.publish_result.artifact_hash.to_vec(),
+                verification_command_ids: Vec::new(),
+                classification: "INTERNAL".to_string(),
+                #[allow(clippy::cast_possible_truncation)]
+                artifact_size: publish_result.publish_result.artifact_size as u64,
+                metadata,
+                time_envelope_ref: None,
+            };
+            let event = apm2_core::events::EvidenceEvent {
+                event: Some(apm2_core::events::evidence_event::Event::Published(
+                    published,
+                )),
+            };
+            event.encode_to_vec()
+        };
+
+        let cas_hash_hex = hex::encode(publish_result.publish_result.artifact_hash);
+
+        match self.event_emitter.emit_evidence_published_event(
+            &request.work_id,
+            &evidence_event_payload,
+            &actor_id,
+            timestamp_ns,
+            &publish_result.evidence_id,
+        ) {
+            Ok(_signed_event) => Ok(PrivilegedResponse::PublishWorkLoopProfile(
+                PublishWorkLoopProfileResponse {
+                    evidence_id: publish_result.evidence_id,
+                    cas_hash: cas_hash_hex,
+                    work_id: request.work_id,
+                    dedupe_key: request.dedupe_key,
+                },
+            )),
+            Err(e) => {
+                // Race-safe idempotency fallback for concurrent writers.
+                if let Some((_existing_event_id, existing_cas_hash)) = self
+                    .find_work_loop_profile_published_replay(
+                        &request.work_id,
+                        &publish_result.evidence_id,
+                    )
+                {
+                    return Ok(PrivilegedResponse::PublishWorkLoopProfile(
+                        PublishWorkLoopProfileResponse {
+                            evidence_id: publish_result.evidence_id,
+                            cas_hash: existing_cas_hash,
+                            work_id: request.work_id,
+                            dedupe_key: request.dedupe_key,
+                        },
+                    ));
+                }
+                warn!(
+                    error = %e,
+                    "evidence.published event emission failed for work loop profile"
+                );
+                Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("evidence.published event emission failed: {e}"),
+                ))
+            },
+        }
+    }
+
+    /// Returns persisted replay bindings for a semantically matching
+    /// `evidence.published` event with category `WORK_LOOP_PROFILE`.
+    ///
+    /// Matching key: `(work_id, evidence_id)` where `evidence_id` is the
+    /// deterministic `WLP-` identifier derived from `(work_id, dedupe_key)`.
+    fn find_work_loop_profile_published_replay(
+        &self,
+        work_id: &str,
+        evidence_id: &str,
+    ) -> Option<(String, String)> {
+        use prost::Message;
+
+        let event = self
+            .event_emitter
+            .get_event_by_evidence_identity(work_id, evidence_id)?;
+
+        let payload_json = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
+        let hex_payload = payload_json.get("payload")?.as_str()?;
+        let inner_bytes = hex::decode(hex_payload).ok()?;
+
+        let evidence_event =
+            apm2_core::events::EvidenceEvent::decode(inner_bytes.as_slice()).ok()?;
+        let Some(apm2_core::events::evidence_event::Event::Published(published)) =
+            evidence_event.event
+        else {
+            return None;
+        };
+
+        if published.category != "WORK_LOOP_PROFILE"
+            || published.work_id != work_id
+            || published.evidence_id != evidence_id
+        {
+            return None;
+        }
+
+        let cas_hash_hex = hex::encode(&published.artifact_hash);
+        Some((event.event_id, cas_hash_hex))
+    }
+
+    // =========================================================================
     // TCK-00638: PublishWorkContextEntry Handler (RFC-0032 Phase 2)
     // =========================================================================
 
@@ -22925,6 +23485,15 @@ pub fn encode_publish_work_context_entry_request(
     request: &PublishWorkContextEntryRequest,
 ) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::PublishWorkContextEntry.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `PublishWorkLoopProfile` request to bytes for sending
+/// (TCK-00645).
+#[must_use]
+pub fn encode_publish_work_loop_profile_request(request: &PublishWorkLoopProfileRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::PublishWorkLoopProfile.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }
@@ -33631,6 +34200,444 @@ mod tests {
                     );
                 },
                 other => panic!("Expected flapping error, got: {other:?}"),
+            }
+        }
+    }
+
+    // ========================================================================
+    // TCK-00645: PublishWorkLoopProfile Tests (RFC-0032 Phase 4)
+    // ========================================================================
+    #[allow(clippy::redundant_clone)]
+    mod publish_work_loop_profile {
+        use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+        use apm2_core::fac::work_cas_schemas::WORK_LOOP_PROFILE_V1_SCHEMA;
+        use prost::Message;
+
+        use super::*;
+
+        fn setup_full_dispatcher() -> (PrivilegedDispatcher, ConnectionContext, String, String) {
+            use super::ingest_review_receipt::{TestLeaseConfig, register_full_test_lease};
+
+            let lease_id = "lease-wlp-001";
+            let work_id = "W-WLP-001";
+            let gate_id = "gate-wlp-001";
+            let peer_creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let executor_actor_id = derive_actor_id(&peer_creds);
+
+            let cas = Arc::new(MemoryCas::default());
+            let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
+
+            dispatcher.lease_validator.register_lease_with_executor(
+                lease_id,
+                work_id,
+                gate_id,
+                &executor_actor_id,
+            );
+            register_full_test_lease(&TestLeaseConfig {
+                dispatcher: &dispatcher,
+                cas: cas.as_ref(),
+                lease_id,
+                work_id,
+                gate_id,
+                executor_actor_id: &executor_actor_id,
+                policy_hash: [0u8; 32],
+                wall_time_source: WallTimeSource::AuthenticatedNts,
+                include_attestation: true,
+            });
+
+            let mut policy_resolution = test_policy_resolution_with_lineage(
+                work_id,
+                &executor_actor_id,
+                WorkRole::Implementer,
+                0,
+            );
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                work_id,
+                &executor_actor_id,
+                WorkRole::Implementer,
+                &policy_resolution,
+            );
+
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: work_id.to_string(),
+                    lease_id: lease_id.to_string(),
+                    actor_id: executor_actor_id,
+                    role: WorkRole::Implementer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("single-role claim registration should succeed");
+
+            let ctx = ConnectionContext::privileged_session_open(Some(peer_creds));
+            (dispatcher, ctx, work_id.to_string(), lease_id.to_string())
+        }
+
+        #[allow(clippy::type_complexity)]
+        fn setup_multi_role_dispatcher() -> (
+            PrivilegedDispatcher,
+            ConnectionContext,
+            ConnectionContext,
+            String,
+            String,
+            String,
+        ) {
+            use super::ingest_review_receipt::{TestLeaseConfig, register_full_test_lease};
+
+            let work_id = "W-WLP-MULTI-001";
+            let implementer_lease_id = "lease-wlp-impl-001";
+            let reviewer_lease_id = "lease-wlp-review-001";
+
+            let implementer_creds = PeerCredentials {
+                uid: 1100,
+                gid: 1100,
+                pid: Some(11001),
+            };
+            let reviewer_creds = PeerCredentials {
+                uid: 2200,
+                gid: 2200,
+                pid: Some(22002),
+            };
+            let implementer_actor_id = derive_actor_id(&implementer_creds);
+            let reviewer_actor_id = derive_actor_id(&reviewer_creds);
+
+            let cas = Arc::new(MemoryCas::default());
+            let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
+
+            dispatcher.lease_validator.register_lease_with_executor(
+                implementer_lease_id,
+                work_id,
+                "gate-wlp-impl-001",
+                &implementer_actor_id,
+            );
+            dispatcher.lease_validator.register_lease_with_executor(
+                reviewer_lease_id,
+                work_id,
+                "gate-wlp-review-001",
+                &reviewer_actor_id,
+            );
+
+            register_full_test_lease(&TestLeaseConfig {
+                dispatcher: &dispatcher,
+                cas: cas.as_ref(),
+                lease_id: implementer_lease_id,
+                work_id,
+                gate_id: "gate-wlp-impl-001",
+                executor_actor_id: &implementer_actor_id,
+                policy_hash: [0x11; 32],
+                wall_time_source: WallTimeSource::AuthenticatedNts,
+                include_attestation: true,
+            });
+            register_full_test_lease(&TestLeaseConfig {
+                dispatcher: &dispatcher,
+                cas: cas.as_ref(),
+                lease_id: reviewer_lease_id,
+                work_id,
+                gate_id: "gate-wlp-review-001",
+                executor_actor_id: &reviewer_actor_id,
+                policy_hash: [0x22; 32],
+                wall_time_source: WallTimeSource::AuthenticatedNts,
+                include_attestation: true,
+            });
+
+            let mut implementer_policy_resolution = test_policy_resolution_with_lineage(
+                work_id,
+                &implementer_actor_id,
+                WorkRole::Implementer,
+                0,
+            );
+            implementer_policy_resolution.pcac_policy =
+                Some(apm2_core::pcac::PcacPolicyKnobs::default());
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                work_id,
+                &implementer_actor_id,
+                WorkRole::Implementer,
+                &implementer_policy_resolution,
+            );
+
+            let mut reviewer_policy_resolution = test_policy_resolution_with_lineage(
+                work_id,
+                &reviewer_actor_id,
+                WorkRole::Reviewer,
+                0,
+            );
+            reviewer_policy_resolution.pcac_policy =
+                Some(apm2_core::pcac::PcacPolicyKnobs::default());
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                work_id,
+                &reviewer_actor_id,
+                WorkRole::Reviewer,
+                &reviewer_policy_resolution,
+            );
+
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: work_id.to_string(),
+                    lease_id: implementer_lease_id.to_string(),
+                    actor_id: implementer_actor_id,
+                    role: WorkRole::Implementer,
+                    policy_resolution: implementer_policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("implementer claim registration should succeed");
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: work_id.to_string(),
+                    lease_id: reviewer_lease_id.to_string(),
+                    actor_id: reviewer_actor_id,
+                    role: WorkRole::Reviewer,
+                    policy_resolution: reviewer_policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("reviewer claim registration should succeed");
+
+            (
+                dispatcher,
+                ConnectionContext::privileged_session_open(Some(implementer_creds)),
+                ConnectionContext::privileged_session_open(Some(reviewer_creds)),
+                work_id.to_string(),
+                implementer_lease_id.to_string(),
+                reviewer_lease_id.to_string(),
+            )
+        }
+
+        fn make_profile_json(work_id: &str, dedupe_key: &str) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "schema": WORK_LOOP_PROFILE_V1_SCHEMA,
+                "work_id": work_id,
+                "dedupe_key": dedupe_key,
+                "retry": {
+                    "max_implementer_attempts": 20,
+                    "max_review_rounds": 10,
+                    "backoff_seconds": [60, 300, 900]
+                }
+            }))
+            .unwrap()
+        }
+
+        fn decode_published_event(
+            event: &SignedLedgerEvent,
+        ) -> apm2_core::events::EvidencePublished {
+            let envelope = serde_json::from_slice::<serde_json::Value>(&event.payload)
+                .expect("valid JSON envelope");
+            let hex_payload = envelope
+                .get("payload")
+                .and_then(serde_json::Value::as_str)
+                .expect("JSON envelope must contain hex payload");
+            let inner_bytes = hex::decode(hex_payload).expect("payload must be valid hex");
+            let evidence_event = apm2_core::events::EvidenceEvent::decode(inner_bytes.as_slice())
+                .expect("valid protobuf");
+            match evidence_event.event {
+                Some(apm2_core::events::evidence_event::Event::Published(published)) => published,
+                other => panic!("Expected Published evidence event, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_publish_work_loop_profile_tag_77_routing() {
+            assert_eq!(
+                PrivilegedMessageType::PublishWorkLoopProfile.tag(),
+                77,
+                "PublishWorkLoopProfile must use tag 77"
+            );
+            assert_eq!(
+                PrivilegedMessageType::from_tag(77),
+                Some(PrivilegedMessageType::PublishWorkLoopProfile),
+                "Tag 77 must map to PublishWorkLoopProfile"
+            );
+            assert!(
+                PrivilegedMessageType::PublishWorkLoopProfile.is_client_request(),
+                "PublishWorkLoopProfile must be a client request"
+            );
+        }
+
+        #[test]
+        fn test_publish_work_loop_profile_hsi_manifest() {
+            let variant = PrivilegedMessageType::PublishWorkLoopProfile;
+            assert_eq!(variant.hsi_route(), "hsi.work_loop_profile.publish");
+            assert_eq!(variant.hsi_route_id(), "PUBLISH_WORK_LOOP_PROFILE");
+            assert_eq!(
+                variant.hsi_request_schema(),
+                "apm2.publish_work_loop_profile_request.v1"
+            );
+            assert_eq!(
+                variant.hsi_response_schema(),
+                "apm2.publish_work_loop_profile_response.v1"
+            );
+            assert!(
+                PrivilegedMessageType::all_request_variants()
+                    .contains(&PrivilegedMessageType::PublishWorkLoopProfile),
+                "all_request_variants must include PublishWorkLoopProfile"
+            );
+        }
+
+        #[test]
+        fn test_publish_work_loop_profile_rejects_empty_dedupe_key() {
+            let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher();
+
+            let request = PublishWorkLoopProfileRequest {
+                work_id: work_id.clone(),
+                dedupe_key: String::new(),
+                profile_json: make_profile_json(&work_id, ""),
+                lease_id,
+            };
+            let frame = encode_publish_work_loop_profile_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(err.code, PrivilegedErrorCode::InvalidArgument as i32);
+                    assert!(
+                        err.message.contains("dedupe_key must not be empty"),
+                        "Expected dedupe_key validation error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_publish_work_loop_profile_end_to_end_idempotent() {
+            let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher();
+
+            let request = PublishWorkLoopProfileRequest {
+                work_id: work_id.clone(),
+                dedupe_key: "default".to_string(),
+                profile_json: make_profile_json(&work_id, "default"),
+                lease_id,
+            };
+            let frame = encode_publish_work_loop_profile_request(&request);
+
+            let first = match dispatcher.dispatch(&frame, &ctx).unwrap() {
+                PrivilegedResponse::PublishWorkLoopProfile(resp) => resp,
+                other => panic!("Expected PublishWorkLoopProfile response, got: {other:?}"),
+            };
+            assert_eq!(first.work_id, work_id);
+            assert_eq!(first.dedupe_key, "default");
+            assert!(first.evidence_id.starts_with("WLP-"));
+            assert!(!first.cas_hash.is_empty());
+
+            let second = match dispatcher.dispatch(&frame, &ctx).unwrap() {
+                PrivilegedResponse::PublishWorkLoopProfile(resp) => resp,
+                other => panic!("Expected PublishWorkLoopProfile response, got: {other:?}"),
+            };
+            assert_eq!(second.evidence_id, first.evidence_id);
+            assert_eq!(second.cas_hash, first.cas_hash);
+            assert_eq!(second.work_id, first.work_id);
+            assert_eq!(second.dedupe_key, first.dedupe_key);
+
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let evidence_events = events
+                .iter()
+                .filter(|event| event.event_type == "evidence.published")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                evidence_events.len(),
+                1,
+                "idempotent replay must not emit duplicate evidence.published events"
+            );
+
+            let published = decode_published_event(evidence_events[0]);
+            assert_eq!(published.category, "WORK_LOOP_PROFILE");
+            assert_eq!(published.work_id, work_id);
+            assert_eq!(published.evidence_id, first.evidence_id);
+            assert!(
+                published.metadata.iter().any(|m| m == "dedupe_key=default"),
+                "published metadata must contain dedupe_key"
+            );
+            assert!(
+                published
+                    .metadata
+                    .iter()
+                    .any(|m| m.starts_with("pcac_ajc_id=")),
+                "published metadata must contain PCAC AJC selector"
+            );
+            assert!(
+                published
+                    .metadata
+                    .iter()
+                    .any(|m| m.starts_with("pcac_intent_digest=")),
+                "published metadata must contain PCAC intent selector"
+            );
+            assert!(
+                published
+                    .metadata
+                    .iter()
+                    .any(|m| m.starts_with("pcac_consume_selector_digest=")),
+                "published metadata must contain PCAC consume selector"
+            );
+        }
+
+        #[test]
+        fn test_publish_work_loop_profile_role_scoped_claim_resolution_by_lease_id() {
+            let (
+                dispatcher,
+                implementer_ctx,
+                reviewer_ctx,
+                work_id,
+                _impl_lease_id,
+                reviewer_lease_id,
+            ) = setup_multi_role_dispatcher();
+            let request = PublishWorkLoopProfileRequest {
+                work_id: work_id.clone(),
+                dedupe_key: "reviewer-default".to_string(),
+                profile_json: make_profile_json(&work_id, "reviewer-default"),
+                lease_id: reviewer_lease_id.clone(),
+            };
+            let frame = encode_publish_work_loop_profile_request(&request);
+
+            match dispatcher.dispatch(&frame, &reviewer_ctx).unwrap() {
+                PrivilegedResponse::PublishWorkLoopProfile(resp) => {
+                    assert_eq!(resp.work_id, work_id);
+                    assert_eq!(resp.dedupe_key, "reviewer-default");
+                },
+                other => panic!("Expected reviewer publish success, got: {other:?}"),
+            }
+
+            match dispatcher.dispatch(&frame, &implementer_ctx).unwrap() {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::PermissionDenied),
+                        "wrong-role actor must be denied"
+                    );
+                    assert!(
+                        err.message.contains("does not own work claim"),
+                        "expected role-scoped actor mismatch error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected permission-denied response, got: {other:?}"),
             }
         }
     }
