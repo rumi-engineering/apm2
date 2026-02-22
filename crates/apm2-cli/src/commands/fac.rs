@@ -660,6 +660,13 @@ pub enum WorkSubcommand {
 
     /// List projection-known work items from daemon authority.
     List(WorkListArgs),
+
+    /// Resolve a ticket alias to a canonical `work_id` via projections.
+    ///
+    /// Uses `AliasReconciliationGate::resolve_ticket_alias` for CAS-backed
+    /// `WorkSpec` lookup. Returns the canonical `work_id` when exactly one
+    /// match is found, or reports not-found / ambiguity (fail-closed).
+    ResolveAlias(ResolveAliasArgs),
 }
 
 /// Arguments for `apm2 fac work status`.
@@ -675,6 +682,14 @@ pub struct WorkListArgs {
     /// Return only claimable work items.
     #[arg(long, default_value_t = false)]
     pub claimable_only: bool,
+}
+
+/// Arguments for `apm2 fac work resolve-alias`.
+#[derive(Debug, Args)]
+pub struct ResolveAliasArgs {
+    /// Ticket alias to resolve (e.g. "TCK-00636").
+    #[arg(long = "ticket-alias")]
+    pub ticket_alias: String,
 }
 
 /// Arguments for `apm2 fac episode`.
@@ -3265,6 +3280,9 @@ pub fn run_fac(
             WorkSubcommand::List(list_args) => {
                 run_work_list(list_args, operator_socket, json_output)
             },
+            WorkSubcommand::ResolveAlias(resolve_args) => {
+                run_resolve_alias(resolve_args, operator_socket, json_output)
+            },
         },
         FacSubcommand::Install(args) => crate::commands::fac_install::run_install(
             json_output,
@@ -3822,6 +3840,73 @@ fn run_work_list(args: &WorkListArgs, operator_socket: &Path, json_output: bool)
                 claimable_only: args.claimable_only,
                 total: rows.len(),
                 items: &rows,
+            };
+
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
+            );
+
+            exit_codes::SUCCESS
+        },
+        Err(error) => handle_protocol_error(json_output, &error),
+    }
+}
+
+/// Execute the work resolve-alias command (TCK-00636).
+///
+/// Resolves a ticket alias to a canonical `work_id` via daemon
+/// `AliasReconciliationGate::resolve_ticket_alias`.
+fn run_resolve_alias(args: &ResolveAliasArgs, operator_socket: &Path, json_output: bool) -> u8 {
+    // Validate ticket alias
+    if args.ticket_alias.is_empty() {
+        return output_error(
+            json_output,
+            "invalid_ticket_alias",
+            "Ticket alias cannot be empty",
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    // Build async runtime
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let result = rt.block_on(async {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.resolve_ticket_alias(&args.ticket_alias).await
+    });
+
+    match result {
+        Ok(response) => {
+            #[derive(Serialize)]
+            struct ResolveAliasJson {
+                ticket_alias: String,
+                found: bool,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                work_id: Option<String>,
+            }
+
+            let output = ResolveAliasJson {
+                ticket_alias: response.ticket_alias,
+                found: response.found,
+                work_id: if response.found {
+                    Some(response.work_id)
+                } else {
+                    None
+                },
             };
 
             println!(

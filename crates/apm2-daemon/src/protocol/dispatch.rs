@@ -150,6 +150,9 @@ use super::messages::{
     RemoveCredentialResponse,
     RequestUnfreezeRequest,
     RequestUnfreezeResponse,
+    // TCK-00636: Ticket alias resolution (RFC-0032 Phase 1)
+    ResolveTicketAliasRequest,
+    ResolveTicketAliasResponse,
     RestartProcessRequest,
     RestartProcessResponse,
     ReviewReceiptVerdict,
@@ -6736,6 +6739,9 @@ pub enum PrivilegedMessageType {
     // --- Work PR Association (RFC-0032, TCK-00639) ---
     /// `RecordWorkPrAssociation` request (IPC-PRIV-079)
     RecordWorkPrAssociation = 30,
+    // --- Ticket Alias Resolution (RFC-0032, TCK-00636) ---
+    /// `ResolveTicketAlias` request (IPC-PRIV-080)
+    ResolveTicketAlias  = 31,
 }
 
 impl PrivilegedMessageType {
@@ -6786,6 +6792,8 @@ impl PrivilegedMessageType {
             29 => Some(Self::ClaimWorkV2),
             // TCK-00639: RecordWorkPrAssociation (RFC-0032 Phase 2)
             30 => Some(Self::RecordWorkPrAssociation),
+            // TCK-00636: ResolveTicketAlias (RFC-0032 Phase 1)
+            31 => Some(Self::ResolveTicketAlias),
             // HEF tags (64-68)
             64 => Some(Self::SubscribePulse),
             66 => Some(Self::UnsubscribePulse),
@@ -6861,6 +6869,7 @@ impl PrivilegedMessageType {
             Self::PublishWorkContextEntry,
             Self::PublishWorkLoopProfile,
             Self::RecordWorkPrAssociation,
+            Self::ResolveTicketAlias,
         ]
     }
 
@@ -6916,7 +6925,8 @@ impl PrivilegedMessageType {
             | Self::ClaimWorkV2
             | Self::PublishWorkContextEntry
             | Self::PublishWorkLoopProfile
-            | Self::RecordWorkPrAssociation => true,
+            | Self::RecordWorkPrAssociation
+            | Self::ResolveTicketAlias => true,
             // Server-to-client notification only — not a client request.
             Self::PulseEvent => false,
         }
@@ -6969,6 +6979,7 @@ impl PrivilegedMessageType {
             Self::PublishWorkContextEntry => "hsi.work_context.publish",
             Self::PublishWorkLoopProfile => "hsi.work_loop_profile.publish",
             Self::RecordWorkPrAssociation => "hsi.work.record_pr_association",
+            Self::ResolveTicketAlias => "hsi.work.resolve_ticket_alias",
             Self::PulseEvent => "hsi.pulse.event",
         }
     }
@@ -7016,6 +7027,7 @@ impl PrivilegedMessageType {
             Self::PublishWorkContextEntry => "PUBLISH_WORK_CONTEXT_ENTRY",
             Self::PublishWorkLoopProfile => "PUBLISH_WORK_LOOP_PROFILE",
             Self::RecordWorkPrAssociation => "RECORD_WORK_PR_ASSOCIATION",
+            Self::ResolveTicketAlias => "RESOLVE_TICKET_ALIAS",
             Self::PulseEvent => "PULSE_EVENT",
         }
     }
@@ -7063,6 +7075,7 @@ impl PrivilegedMessageType {
             Self::PublishWorkContextEntry => "apm2.publish_work_context_entry_request.v1",
             Self::PublishWorkLoopProfile => "apm2.publish_work_loop_profile_request.v1",
             Self::RecordWorkPrAssociation => "apm2.record_work_pr_association_request.v1",
+            Self::ResolveTicketAlias => "apm2.resolve_ticket_alias_request.v1",
             Self::PulseEvent => "apm2.pulse_event_request.v1",
         }
     }
@@ -7110,6 +7123,7 @@ impl PrivilegedMessageType {
             Self::PublishWorkContextEntry => "apm2.publish_work_context_entry_response.v1",
             Self::PublishWorkLoopProfile => "apm2.publish_work_loop_profile_response.v1",
             Self::RecordWorkPrAssociation => "apm2.record_work_pr_association_response.v1",
+            Self::ResolveTicketAlias => "apm2.resolve_ticket_alias_response.v1",
             Self::PulseEvent => "apm2.pulse_event_response.v1",
         }
     }
@@ -7204,6 +7218,8 @@ pub enum PrivilegedResponse {
     PublishWorkLoopProfile(PublishWorkLoopProfileResponse),
     /// Successful `RecordWorkPrAssociation` response (TCK-00639).
     RecordWorkPrAssociation(RecordWorkPrAssociationResponse),
+    /// Successful `ResolveTicketAlias` response (TCK-00636).
+    ResolveTicketAlias(ResolveTicketAliasResponse),
     /// Error response.
     Error(PrivilegedError),
 }
@@ -7424,6 +7440,10 @@ impl PrivilegedResponse {
             },
             Self::RecordWorkPrAssociation(resp) => {
                 buf.push(PrivilegedMessageType::RecordWorkPrAssociation.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::ResolveTicketAlias(resp) => {
+                buf.push(PrivilegedMessageType::ResolveTicketAlias.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::Error(err) => {
@@ -9718,11 +9738,18 @@ impl PrivilegedDispatcher {
     /// (TCK-00394).
     ///
     /// When set, `PublishChangeSet` stores the canonical bundle bytes in CAS
-    /// and returns the content hash for ledger event binding. When not set,
-    /// the handler returns an error indicating CAS is not configured.
+    /// and returns the content hash for ledger event binding. This also wires
+    /// the alias reconciliation gate to the same CAS backend so
+    /// `ResolveTicketAlias`/`SpawnEpisode` promotion checks can resolve
+    /// `ticket_alias -> work_id` from projection-backed `WorkSpec` documents
+    /// (TCK-00636). When not set, handlers return an error indicating CAS is
+    /// not configured.
     #[must_use]
     pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
-        self.cas = Some(cas);
+        self.cas = Some(Arc::clone(&cas));
+        self.alias_reconciliation_gate = Arc::new(
+            ProjectionAliasReconciliationGate::new(Arc::clone(&self.event_emitter)).with_cas(cas),
+        );
         self
     }
 
@@ -9736,6 +9763,9 @@ impl PrivilegedDispatcher {
     #[cfg(test)]
     pub fn without_cas(mut self) -> Self {
         self.cas = None;
+        self.alias_reconciliation_gate = Arc::new(ProjectionAliasReconciliationGate::new(
+            Arc::clone(&self.event_emitter),
+        ));
         self
     }
 
@@ -11350,6 +11380,10 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::RecordWorkPrAssociation => {
                 self.handle_record_work_pr_association(payload, ctx)
             },
+            // TCK-00636: Ticket alias resolution (RFC-0032 Phase 1)
+            PrivilegedMessageType::ResolveTicketAlias => {
+                self.handle_resolve_ticket_alias(payload, ctx)
+            },
         };
 
         // TCK-00268: Emit IPC request completion metrics
@@ -11416,6 +11450,8 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::PublishWorkLoopProfile => "PublishWorkLoopProfile",
                 // TCK-00639
                 PrivilegedMessageType::RecordWorkPrAssociation => "RecordWorkPrAssociation",
+                // TCK-00636
+                PrivilegedMessageType::ResolveTicketAlias => "ResolveTicketAlias",
             };
             let status = match &result {
                 Ok(PrivilegedResponse::Error(_)) => "error",
@@ -13329,10 +13365,11 @@ impl PrivilegedDispatcher {
         // canonical projection. Infrastructure errors (lock failures,
         // projection rebuild errors) also fail-closed per CTR-2617.
         //
-        // Current limitation: ClaimWork registers identity-mapped aliases
-        // only (work_id -> work_id). Real TCK-* alias bindings require
-        // operator-layer or policy-resolver wire-up.
-        // TODO(TCK-00425): Wire real ticket aliases through policy resolution.
+        // TCK-00636: Wire real ticket alias resolution through
+        // AliasReconciliationGate::resolve_ticket_alias. If resolution
+        // succeeds, use the resolved work_id for the binding; if it
+        // returns None, fall back to identity mapping; if it returns
+        // Err (ambiguity/infrastructure), fail-closed and deny.
         // =====================================================================
         {
             use apm2_core::events::alias_reconcile::TicketAliasBinding;
@@ -13355,15 +13392,55 @@ impl PrivilegedDispatcher {
                 },
             };
 
+            // TCK-00636: Attempt to resolve request.work_id as a ticket alias
+            // through projection-backed CAS lookup. This enables real TCK-*
+            // aliases to resolve to canonical work_ids.
+            let (ticket_alias, canonical_work_id) = match self
+                .alias_reconciliation_gate
+                .resolve_ticket_alias(&request.work_id)
+            {
+                Ok(Some(resolved_work_id)) => {
+                    // Real alias resolution succeeded: the request.work_id is
+                    // a ticket alias that resolved to a canonical work_id.
+                    debug!(
+                        request_work_id = %request.work_id,
+                        resolved_work_id = %resolved_work_id,
+                        "Alias reconciliation: ticket alias resolved via projection"
+                    );
+                    (request.work_id.clone(), work_id_to_hash(&resolved_work_id))
+                },
+                Ok(None) => {
+                    // No alias found — fall back to identity mapping.
+                    // This is the common path for work_ids that are not
+                    // ticket aliases (e.g., W-{uuid} canonical identifiers).
+                    (request.work_id.clone(), work_id_to_hash(&request.work_id))
+                },
+                Err(e) => {
+                    // Ambiguous or infrastructure failure — fail-closed.
+                    // Deny promotion when alias resolution is ambiguous
+                    // (multiple work items match the alias) or when CAS/
+                    // projection infrastructure is unavailable.
+                    warn!(
+                        work_id = %request.work_id,
+                        error = %e,
+                        "SpawnEpisode rejected: alias resolution failed (fail-closed)"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "alias reconciliation gate: alias resolution failed (fail-closed): {e}"
+                        ),
+                    ));
+                },
+            };
+
             // Read observation window from the gate's configuration rather
             // than using hardcoded values.
             let obs_window = self.alias_reconciliation_gate.observation_window();
 
             let binding = TicketAliasBinding {
-                // Identity mapping: ticket_alias == work_id for now.
-                // TODO(TCK-00425): Use real ticket alias from policy resolution.
-                ticket_alias: request.work_id.clone(),
-                canonical_work_id: work_id_to_hash(&request.work_id),
+                ticket_alias,
+                canonical_work_id,
                 observed_at_tick: current_tick,
                 observation_window_start: obs_window.start_tick,
                 observation_window_end: obs_window.end_tick,
@@ -13374,16 +13451,13 @@ impl PrivilegedDispatcher {
                 .check_promotion(&[binding], current_tick)
             {
                 Ok(result) => {
-                    // For identity-mapped aliases (ticket_alias == work_id),
-                    // NotFound defects are expected when the projection has
-                    // not been populated with work events yet (e.g., first
-                    // spawn, or when ClaimWork uses a stub registry in tests).
-                    // Only Mismatch, Ambiguous, and Stale defects indicate
-                    // real reconciliation failures that must block promotion.
-                    //
-                    // TODO(TCK-00425): When real ticket aliases are wired
-                    // through policy resolution, NotFound defects for real
-                    // aliases MUST also block promotion.
+                    // TCK-00636: With alias resolution wired, NotFound
+                    // defects are still expected in identity-mapping
+                    // fallback when the projection has not been populated
+                    // with work events yet (e.g., first spawn, or when
+                    // ClaimWork uses a stub registry in tests). Only
+                    // Mismatch, Ambiguous, and Stale defects indicate real
+                    // reconciliation failures that must block promotion.
                     let blocking_defects: Vec<_> = result
                         .unresolved_defects
                         .iter()
@@ -21252,6 +21326,100 @@ impl PrivilegedDispatcher {
     }
 
     // =========================================================================
+    // TCK-00636: ResolveTicketAlias Handler (RFC-0032 Phase 1)
+    // =========================================================================
+
+    /// Handles `ResolveTicketAlias` requests (IPC-PRIV-080, TCK-00636).
+    ///
+    /// Resolves a ticket alias to a canonical `work_id` via projection state
+    /// using [`AliasReconciliationGate::resolve_ticket_alias`]. Returns the
+    /// canonical `work_id` when exactly one match is found, or an error on
+    /// ambiguity/infrastructure failure (fail-closed).
+    ///
+    /// # Security Invariants
+    ///
+    /// - **Fail-closed**: Infrastructure errors and ambiguous resolution reject
+    ///   the request.
+    /// - **Bounded input**: `ticket_alias` length is validated against
+    ///   `MAX_ID_LENGTH` (CTR-1603).
+    #[allow(clippy::unnecessary_wraps)]
+    fn handle_resolve_ticket_alias(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request = ResolveTicketAliasRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid ResolveTicketAliasRequest: {e}"),
+            })?;
+
+        // CTR-1603: Validate ticket_alias length to prevent DoS.
+        if request.ticket_alias.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("ticket_alias exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        if request.ticket_alias.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "ticket_alias cannot be empty",
+            ));
+        }
+
+        debug!(
+            ticket_alias = %request.ticket_alias,
+            "Processing ResolveTicketAlias request via alias reconciliation gate"
+        );
+
+        match self
+            .alias_reconciliation_gate
+            .resolve_ticket_alias(&request.ticket_alias)
+        {
+            Ok(Some(work_id)) => {
+                info!(
+                    ticket_alias = %request.ticket_alias,
+                    work_id = %work_id,
+                    "ResolveTicketAlias: alias resolved to canonical work_id"
+                );
+                Ok(PrivilegedResponse::ResolveTicketAlias(
+                    ResolveTicketAliasResponse {
+                        work_id,
+                        found: true,
+                        ticket_alias: request.ticket_alias,
+                    },
+                ))
+            },
+            Ok(None) => {
+                debug!(
+                    ticket_alias = %request.ticket_alias,
+                    "ResolveTicketAlias: no matching work item found"
+                );
+                Ok(PrivilegedResponse::ResolveTicketAlias(
+                    ResolveTicketAliasResponse {
+                        work_id: String::new(),
+                        found: false,
+                        ticket_alias: request.ticket_alias,
+                    },
+                ))
+            },
+            Err(e) => {
+                // Infrastructure failure or ambiguous resolution — fail-closed.
+                warn!(
+                    ticket_alias = %request.ticket_alias,
+                    error = %e,
+                    "ResolveTicketAlias: alias resolution failed (fail-closed)"
+                );
+                Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("ticket alias resolution failed (fail-closed): {e}"),
+                ))
+            },
+        }
+    }
+
+    // =========================================================================
     // TCK-00340: DelegateSublease Handler
     // =========================================================================
 
@@ -23579,6 +23747,14 @@ pub fn encode_record_work_pr_association_request(
     request: &RecordWorkPrAssociationRequest,
 ) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::RecordWorkPrAssociation.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `ResolveTicketAlias` request to bytes for sending (TCK-00636).
+#[must_use]
+pub fn encode_resolve_ticket_alias_request(request: &ResolveTicketAliasRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::ResolveTicketAlias.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }

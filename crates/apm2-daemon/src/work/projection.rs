@@ -546,14 +546,16 @@ fn translate_signed_event(
         // Native reducer event family (already canonical names).
         "work.opened" | "work.transitioned" | "work.completed" | "work.aborted"
         | "work.pr_associated" => {
-            if let Some(work_id) = extract_work_id_from_work_event(&event.payload) {
+            let reducer_payload =
+                decode_canonical_work_event_payload(&event.payload, &event.event_type)?;
+            if let Some(work_id) = extract_work_id_from_work_event(&reducer_payload) {
                 opened_work_ids.insert(work_id);
             }
             push_event(
                 &event.event_type,
                 &event.work_id,
                 &event.actor_id,
-                event.payload.clone(),
+                reducer_payload,
                 event.timestamp_ns,
             );
         },
@@ -626,6 +628,43 @@ fn translate_signed_event(
     }
 
     Ok(translated)
+}
+
+fn decode_canonical_work_event_payload(
+    payload: &[u8],
+    event_type: &str,
+) -> Result<Vec<u8>, WorkProjectionError> {
+    if WorkEvent::decode(payload).is_ok() {
+        return Ok(payload.to_vec());
+    }
+
+    let value = serde_json::from_slice::<serde_json::Value>(payload).map_err(|error| {
+        WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: format!("work.* payload is not protobuf or JSON envelope: {error}"),
+        }
+    })?;
+
+    let wrapped_payload = value
+        .get("payload")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: "wrapped work.* payload missing 'payload' hex field".to_string(),
+        })?;
+
+    let decoded =
+        hex::decode(wrapped_payload).map_err(|error| WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: format!("wrapped work.* payload hex decode failed: {error}"),
+        })?;
+
+    WorkEvent::decode(decoded.as_slice()).map_err(|error| WorkProjectionError::InvalidPayload {
+        event_type: event_type.to_string(),
+        reason: format!("wrapped work.* payload does not decode as WorkEvent: {error}"),
+    })?;
+
+    Ok(decoded)
 }
 
 fn decode_work_graph_event(
