@@ -3642,8 +3642,10 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
     }
 
     fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent> {
-        let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
         let guard = self.events.read().expect("lock poisoned");
+        // Lock ordering invariant: always acquire `events` before
+        // `events_by_work_id` to avoid ABBA deadlocks with write paths.
+        let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
 
         events_by_work
             .get(work_id)
@@ -3661,8 +3663,10 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         work_id: &str,
         event_type: &str,
     ) -> Option<SignedLedgerEvent> {
-        let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
         let guard = self.events.read().expect("lock poisoned");
+        // Lock ordering invariant: always acquire `events` before
+        // `events_by_work_id` to avoid ABBA deadlocks with write paths.
+        let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
 
         events_by_work.get(work_id).and_then(|event_ids| {
             event_ids.iter().find_map(|id| {
@@ -3842,8 +3846,10 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
     }
 
     fn get_work_transition_count(&self, work_id: &str) -> u32 {
-        let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
         let guard = self.events.read().expect("lock poisoned");
+        // Lock ordering invariant: always acquire `events` before
+        // `events_by_work_id` to avoid ABBA deadlocks with write paths.
+        let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
 
         events_by_work.get(work_id).map_or(0, |event_ids| {
             #[allow(clippy::cast_possible_truncation)]
@@ -33669,7 +33675,8 @@ mod tests {
             // thread's event changes the ledger between PCAC join and
             // revalidation). Both outcomes are valid — the key invariant
             // is: exactly one event is persisted, and no duplicates exist.
-            use std::sync::Arc;
+            use std::sync::{Arc, mpsc};
+            use std::time::{Duration, Instant};
 
             let dispatcher = Arc::new(open_work_dispatcher_with_cas());
             let ctx = test_open_work_ctx();
@@ -33683,25 +33690,49 @@ mod tests {
             request.encode(&mut buf).expect("encode");
             let shared_buf = Arc::new(buf);
 
-            let barrier = Arc::new(std::sync::Barrier::new(4));
+            const WORKER_COUNT: usize = 4;
+            const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+            // Deterministic start gate: include coordinator thread as a participant
+            // so all workers begin the race at the same synchronization point.
+            let start_gate = Arc::new(std::sync::Barrier::new(WORKER_COUNT + 1));
+            let (result_tx, result_rx) = mpsc::channel();
             let mut handles = Vec::new();
 
-            for _ in 0..4 {
+            for _ in 0..WORKER_COUNT {
                 let d = Arc::clone(&dispatcher);
                 let b = Arc::clone(&shared_buf);
                 let c = ctx.clone();
-                let bar = Arc::clone(&barrier);
+                let gate = Arc::clone(&start_gate);
+                let tx = result_tx.clone();
                 handles.push(std::thread::spawn(move || {
-                    bar.wait(); // synchronize all threads
-                    d.handle_open_work(&b, &c)
+                    gate.wait();
+                    let _ = tx.send(d.handle_open_work(&b, &c));
                 }));
             }
+            drop(result_tx);
+
+            // Release all worker threads together.
+            start_gate.wait();
 
             let mut created_count = 0u32;
             let mut idempotent_count = 0u32;
             let mut pcac_rejected_count = 0u32;
-            for handle in handles {
-                let result = handle.join().expect("thread panicked");
+            let deadline = Instant::now() + TEST_TIMEOUT;
+            for worker_idx in 0..WORKER_COUNT {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "OpenWork race test timed out waiting for worker outcomes \
+                     (received {worker_idx}/{WORKER_COUNT})"
+                );
+                let result = result_rx.recv_timeout(remaining).unwrap_or_else(|e| {
+                    panic!(
+                        "OpenWork race test did not complete within {:?} \
+                             (received {worker_idx}/{WORKER_COUNT} outcomes): {e}",
+                        TEST_TIMEOUT
+                    )
+                });
                 let response = result.expect("handler returned Err");
                 match response {
                     PrivilegedResponse::OpenWork(resp) => {
@@ -33728,13 +33759,17 @@ mod tests {
                 }
             }
 
+            for handle in handles {
+                handle.join().expect("thread panicked");
+            }
+
             assert_eq!(
                 created_count, 1,
                 "Exactly one thread must create the work.opened event (got {created_count})"
             );
             assert_eq!(
                 idempotent_count + pcac_rejected_count,
-                3,
+                (WORKER_COUNT - 1) as u32,
                 "Remaining threads must return idempotent success or PCAC rejection \
                  (idempotent={idempotent_count}, pcac_rejected={pcac_rejected_count})"
             );
