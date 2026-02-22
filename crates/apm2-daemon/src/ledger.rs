@@ -14,8 +14,10 @@
 //! The `work_claims` table has columns: `work_id`, `lease_id`, `actor_id`,
 //! `role`, `claim_json`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
@@ -26,6 +28,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
 
+use crate::protocol::WorkRole;
 use crate::protocol::dispatch::{
     CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX, DEFECT_RECORDED_DOMAIN_PREFIX,
     EPISODE_EVENT_DOMAIN_PREFIX, EventTypeClass, GATE_LEASE_ISSUED_LEDGER_DOMAIN_PREFIX,
@@ -84,16 +87,24 @@ struct EventHashInput<'a> {
 
 const REDUNDANCY_RECEIPT_CONSUMED_EVENT: &str = "redundancy_receipt_consumed";
 
-/// Hard scan limit for `get_event_by_evidence_identity` and
-/// `canonical_get_evidence_by_identity`. Without a `LIMIT` the query iterates
-/// over **all** `evidence.published` events for a `work_id`, performing per-row
-/// JSON + Protobuf deserialization — an `O(N)` `DoS` vector.
+/// Hard scan limit for bounded reverse-scan lookups such as
+/// `get_event_by_evidence_identity` and `canonical_get_evidence_by_identity`.
+/// Without a `LIMIT` the query iterates over **all** `evidence.published`
+/// events for a `work_id`, performing per-row JSON + Protobuf
+/// deserialization — an `O(N)` `DoS` vector.
 ///
 /// TCK-00638: This constant is no longer used in production code — the
 /// scan-bounded lookups were replaced with O(1) indexed lookups via
-/// `json_extract(CAST(payload AS TEXT), '$.evidence_id')`. Retained for the
-/// regression test `test_evidence_lookup_is_indexed_not_scan_bounded` which
-/// verifies the indexed path handles more events than the old scan limit.
+/// `UNIQUE` constraints on `evidence.published`.
+///
+/// **IMPORTANT**: This limit is NOT appropriate for `get_events_by_work_id`,
+/// which is a foundational history replay method used by the projection
+/// bridge. Applying a LIMIT there would silently drop recent events for
+/// work items exceeding the cap, permanently freezing observed state.
+///
+/// Also used by the regression test
+/// `test_evidence_lookup_is_indexed_not_scan_bounded` which verifies
+/// the indexed path handles more events than this limit.
 #[cfg(test)]
 const MAX_EVIDENCE_SCAN_ROWS: u32 = 1_000;
 
@@ -717,6 +728,19 @@ impl SqliteLedgerEventEmitter {
             [],
         )?;
 
+        // TCK-00637 SECURITY BLOCKER: At-most-one work_transitioned per
+        // (work_id, previous_transition_count) to prevent ledger equivocation.
+        // Concurrent ClaimWorkV2 requests that observe the same transition_count
+        // will be serialized by the UNIQUE constraint — only one succeeds, the
+        // other receives a constraint violation and must recover or fail.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_transitioned_unique \
+             ON ledger_events(work_id, json_extract(CAST(payload AS TEXT), \
+             '$.previous_transition_count')) \
+             WHERE event_type = 'work_transitioned'",
+            [],
+        )?;
+
         // SECURITY (f-781-security-1771692992655093-0 — Canonical Events
         // Uniqueness Constraint):
         //
@@ -794,6 +818,18 @@ impl SqliteLedgerEventEmitter {
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_evidence_published_unique \
                  ON events(json_extract(CAST(payload AS TEXT), '$.evidence_id')) \
                  WHERE event_type = 'evidence.published'",
+                [],
+            )?;
+
+            // TCK-00637 SECURITY BLOCKER: At-most-one work_transitioned per
+            // (session_id, previous_transition_count) on the canonical events
+            // table. Mirrors idx_work_transitioned_unique on the legacy table.
+            // Note: canonical events use session_id where legacy uses work_id.
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_work_transitioned_unique \
+                 ON events(session_id, json_extract(CAST(payload AS TEXT), \
+                 '$.previous_transition_count')) \
+                 WHERE event_type = 'work_transitioned'",
                 [],
             )?;
         }
@@ -2604,7 +2640,15 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
         let mut events = Vec::new();
 
-        // Legacy events.
+        // Foundational history replay: returns ALL events for a work_id.
+        // This method is used by the projection bridge to rebuild state
+        // (e.g. ProjectionWorkAuthority). A LIMIT clause here would
+        // silently discard recent events for work items with large
+        // histories, permanently freezing the observed state.
+        //
+        // NOTE: MAX_EVIDENCE_SCAN_ROWS is intended for bounded reverse-
+        // scan lookups (e.g. get_event_by_evidence_identity), NOT for
+        // this foundational history replay method.
         if let Ok(mut stmt) = conn.prepare(
             "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
              FROM ledger_events WHERE work_id = ?1 ORDER BY timestamp_ns ASC, rowid ASC",
@@ -2625,6 +2669,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         }
 
         // TCK-00631 / Finding 1: append canonical events when frozen.
+        // No LIMIT — foundational replay requires complete history.
         if self.is_frozen_internal() {
             if let Ok(mut stmt) = conn.prepare(
                 "SELECT seq_id, event_type, session_id, actor_id, payload, \
@@ -2683,6 +2728,138 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             ) {
                 if let Ok(mut rows) =
                     stmt.query_map(params![work_id, event_type], Self::canonical_row_to_event)
+                {
+                    if let Some(Ok(event)) = rows.next() {
+                        return Some(event);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// TCK-00637 SECURITY FIX (Findings 5/8): Bounded SQL query for the
+    /// most recent `work_transitioned` event matching a `rationale_code`.
+    /// Uses `json_extract` at the database level to avoid O(N)
+    /// application-level JSON parsing.
+    fn get_latest_work_transition_by_rationale(
+        &self,
+        work_id: &str,
+        rationale_code: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let Ok(conn) = self.conn.lock() else {
+            return None;
+        };
+
+        let legacy_event = conn
+            .query_row(
+                "SELECT event_id, event_type, work_id, actor_id, payload, \
+                        signature, timestamp_ns \
+                 FROM ledger_events \
+                 WHERE work_id = ?1 AND event_type = 'work_transitioned' \
+                   AND json_extract(CAST(payload AS TEXT), '$.rationale_code') = ?2 \
+                 ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
+                params![work_id, rationale_code],
+                |row| {
+                    Ok(SignedLedgerEvent {
+                        event_id: row.get(0)?,
+                        event_type: row.get(1)?,
+                        work_id: row.get(2)?,
+                        actor_id: row.get(3)?,
+                        payload: row.get(4)?,
+                        signature: row.get(5)?,
+                        timestamp_ns: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .ok()
+            .flatten();
+
+        let canonical_event = if self.is_frozen_internal() {
+            conn.query_row(
+                "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                        COALESCE(signature, X''), timestamp_ns \
+                 FROM events \
+                 WHERE session_id = ?1 AND event_type = 'work_transitioned' \
+                   AND json_extract(CAST(payload AS TEXT), '$.rationale_code') = ?2 \
+                 ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
+                params![work_id, rationale_code],
+                Self::canonical_row_to_event,
+            )
+            .optional()
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+
+        match (legacy_event, canonical_event) {
+            (Some(legacy), Some(canonical)) => {
+                if canonical.timestamp_ns >= legacy.timestamp_ns {
+                    Some(canonical)
+                } else {
+                    Some(legacy)
+                }
+            },
+            (Some(legacy), None) => Some(legacy),
+            (None, Some(canonical)) => Some(canonical),
+            (None, None) => None,
+        }
+    }
+
+    /// TCK-00637 SECURITY FIX (Findings 5/8): Bounded SQL query for an
+    /// `evidence.published` event by its deterministic `evidence_id`.
+    /// Uses `json_extract` at the database level to avoid O(N)
+    /// application-level JSON parsing.
+    fn get_evidence_by_evidence_id(
+        &self,
+        work_id: &str,
+        evidence_id: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let Ok(conn) = self.conn.lock() else {
+            return None;
+        };
+
+        // Legacy table: direct lookup via json_extract on evidence_id.
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT event_id, event_type, work_id, actor_id, payload, \
+                    signature, timestamp_ns \
+             FROM ledger_events \
+             WHERE work_id = ?1 AND event_type = 'evidence.published' \
+               AND json_extract(CAST(payload AS TEXT), '$.evidence_id') = ?2 \
+             ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
+        ) {
+            if let Ok(mut rows) = stmt.query_map(params![work_id, evidence_id], |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            }) {
+                if let Some(Ok(event)) = rows.next() {
+                    return Some(event);
+                }
+            }
+        }
+
+        // TCK-00631: check canonical events table when frozen.
+        if self.is_frozen_internal() {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                        COALESCE(signature, X''), timestamp_ns \
+                 FROM events \
+                 WHERE session_id = ?1 AND event_type = 'evidence.published' \
+                   AND json_extract(CAST(payload AS TEXT), '$.evidence_id') = ?2 \
+                 ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
+            ) {
+                if let Ok(mut rows) =
+                    stmt.query_map(params![work_id, evidence_id], Self::canonical_row_to_event)
                 {
                     if let Some(Ok(event)) = rows.next() {
                         return Some(event);
@@ -4160,25 +4337,171 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 #[derive(Debug)]
 pub struct SqliteWorkRegistry {
     conn: Arc<Mutex<Connection>>,
+    claim_inserted_at: std::sync::RwLock<HashMap<(String, i32), Instant>>,
 }
 
 impl SqliteWorkRegistry {
     /// Creates a new registry with the given `SQLite` connection.
     #[must_use]
-    pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
+        Self {
+            conn,
+            claim_inserted_at: std::sync::RwLock::new(HashMap::new()),
+        }
     }
 
     /// Initializes the database schema.
+    ///
+    /// Claims are keyed by `(work_id, role)` to support Phase 2 multi-role
+    /// workflows where Implementer and Reviewer each claim the same `work_id`.
+    ///
+    /// # Migration (Finding 2, round 5; Finding 1, round 7)
+    ///
+    /// Pre-existing databases may have the legacy schema with
+    /// `work_id TEXT PRIMARY KEY` (single-role uniqueness). Two legacy
+    /// variants exist:
+    ///
+    ///   (a) `work_id TEXT PRIMARY KEY` with no `role` column.
+    ///   (b) `work_id TEXT PRIMARY KEY` with `role INTEGER` (intermediate
+    ///       revision that added the role column but kept the single-column
+    ///       PK — multi-role inserts still fail with `SQLITE_CONSTRAINT`).
+    ///
+    /// This method detects the legacy schema by **key/index topology**:
+    /// if `work_id` is the sole PRIMARY KEY column, the table requires
+    /// migration regardless of whether a `role` column is present.
+    ///
+    /// Migration steps:
+    ///
+    /// 1. Detect whether `work_claims` already exists with `work_id` as the
+    ///    sole PRIMARY KEY column (via `PRAGMA table_info` pk flag).
+    /// 2. If legacy schema: rename old table to `work_claims_legacy`, create
+    ///    new table with composite uniqueness, copy data (preserving role if
+    ///    present, defaulting to `1` = Implementer otherwise), drop the legacy
+    ///    backup.
+    /// 3. If new schema or fresh DB: use `CREATE TABLE IF NOT EXISTS`.
+    ///
+    /// The migration is idempotent: running it multiple times on the same
+    /// database is safe.
     pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
+        // Check whether the work_claims table already exists.
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_claims'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+
+        if table_exists {
+            // Detect legacy schema by key/index topology, not just column
+            // presence.
+            //
+            // Legacy schema variants that require migration:
+            //   (a) `work_id TEXT PRIMARY KEY` with NO `role` column
+            //   (b) `work_id TEXT PRIMARY KEY` WITH `role INTEGER` column
+            //       (intermediate revision that added role but kept the
+            //       single-column PK)
+            //
+            // The authoritative signal is whether `work_id` is the sole
+            // PRIMARY KEY column. In SQLite, `PRAGMA table_info` returns
+            // column index 5 (`pk`) as >0 for columns in the PRIMARY KEY.
+            // If `work_id` has pk>0 and no other column has pk>0, the table
+            // enforces single-row-per-work_id and MUST be migrated.
+            let mut has_role_column = false;
+            let mut work_id_is_pk = false;
+            let mut pk_column_count: usize = 0;
+
+            {
+                let mut stmt = conn.prepare("PRAGMA table_info(work_claims)")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let col_name: String = row.get(1)?;
+                    let pk_flag: i32 = row.get(5)?;
+
+                    if col_name == "role" {
+                        has_role_column = true;
+                    }
+                    if pk_flag > 0 {
+                        pk_column_count += 1;
+                        if col_name == "work_id" {
+                            work_id_is_pk = true;
+                        }
+                    }
+                }
+            }
+
+            // Migration required when work_id is the SOLE PRIMARY KEY
+            // column. This covers both legacy variants: (a) no role column
+            // at all, and (b) role column present but PK still enforces
+            // uniqueness on work_id alone.
+            let needs_migration = work_id_is_pk && pk_column_count == 1;
+
+            if needs_migration {
+                // Legacy schema detected: work_claims has work_id TEXT
+                // PRIMARY KEY (single-column PK). Migrate atomically.
+                //
+                // Strategy: rename → create new → copy → drop old.
+                // All within a single transaction for atomicity.
+                //
+                // If the legacy table has a `role` column, preserve it.
+                // If not, default to role=1 (Implementer).
+                if has_role_column {
+                    conn.execute_batch(
+                        "BEGIN IMMEDIATE;
+                         ALTER TABLE work_claims RENAME TO work_claims_legacy;
+                         CREATE TABLE work_claims (
+                             work_id TEXT NOT NULL,
+                             lease_id TEXT NOT NULL,
+                             actor_id TEXT NOT NULL,
+                             role INTEGER NOT NULL DEFAULT 1,
+                             claim_json BLOB NOT NULL
+                         );
+                         INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json)
+                             SELECT work_id, lease_id, actor_id, role, claim_json
+                             FROM work_claims_legacy;
+                         DROP TABLE work_claims_legacy;
+                         COMMIT;",
+                    )?;
+                } else {
+                    conn.execute_batch(
+                        "BEGIN IMMEDIATE;
+                         ALTER TABLE work_claims RENAME TO work_claims_legacy;
+                         CREATE TABLE work_claims (
+                             work_id TEXT NOT NULL,
+                             lease_id TEXT NOT NULL,
+                             actor_id TEXT NOT NULL,
+                             role INTEGER NOT NULL DEFAULT 1,
+                             claim_json BLOB NOT NULL
+                         );
+                         INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json)
+                             SELECT work_id, lease_id, actor_id, 1, claim_json
+                             FROM work_claims_legacy;
+                         DROP TABLE work_claims_legacy;
+                         COMMIT;",
+                    )?;
+                }
+            }
+        } else {
+            // Fresh database: create the table with the Phase 2 schema.
+            conn.execute(
+                "CREATE TABLE work_claims (
+                    work_id TEXT NOT NULL,
+                    lease_id TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    role INTEGER NOT NULL,
+                    claim_json BLOB NOT NULL
+                )",
+                [],
+            )?;
+        }
+
+        // Multi-role UNIQUE constraint: (work_id, role) instead of just work_id.
+        // Different roles for the same work_id are allowed and expected.
+        // CREATE UNIQUE INDEX IF NOT EXISTS is idempotent.
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS work_claims (
-                work_id TEXT PRIMARY KEY,
-                lease_id TEXT NOT NULL,
-                actor_id TEXT NOT NULL,
-                role INTEGER NOT NULL,
-                claim_json BLOB NOT NULL
-            )",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_claims_work_role \
+             ON work_claims(work_id, role)",
             [],
         )?;
         Ok(())
@@ -4194,11 +4517,12 @@ impl WorkRegistry for SqliteWorkRegistry {
                 message: "connection lock poisoned".to_string(),
             })?;
 
-        // Check for duplicate
+        // Check for duplicate (work_id, role) pair — multi-role support.
+        // Different roles for the same work_id are allowed and expected.
         let exists: bool = conn
             .query_row(
-                "SELECT 1 FROM work_claims WHERE work_id = ?1",
-                params![claim.work_id],
+                "SELECT 1 FROM work_claims WHERE work_id = ?1 AND role = ?2",
+                params![claim.work_id, claim.role as i32],
                 |_| Ok(true),
             )
             .optional()
@@ -4231,14 +4555,21 @@ impl WorkRegistry for SqliteWorkRegistry {
             message: format!("sqlite insert failed: {e}"),
         })?;
 
+        if let Ok(mut ages) = self.claim_inserted_at.write() {
+            ages.insert((claim.work_id.clone(), claim.role as i32), Instant::now());
+        }
+
         Ok(claim)
     }
 
     fn get_claim(&self, work_id: &str) -> Option<WorkClaim> {
         let conn = self.conn.lock().ok()?;
+        // Return the first claim registered for this work_id (any role),
+        // ordered by role for deterministic results.
         let claim_json: Vec<u8> = conn
             .query_row(
-                "SELECT claim_json FROM work_claims WHERE work_id = ?1",
+                "SELECT claim_json FROM work_claims WHERE work_id = ?1 \
+                 ORDER BY role ASC LIMIT 1",
                 params![work_id],
                 |row| row.get(0),
             )
@@ -4247,6 +4578,64 @@ impl WorkRegistry for SqliteWorkRegistry {
             .flatten()?;
 
         serde_json::from_slice(&claim_json).ok()
+    }
+
+    fn get_claim_for_role(&self, work_id: &str, role: WorkRole) -> Option<WorkClaim> {
+        let conn = self.conn.lock().ok()?;
+        let claim_json: Vec<u8> = conn
+            .query_row(
+                "SELECT claim_json FROM work_claims WHERE work_id = ?1 AND role = ?2",
+                params![work_id, role as i32],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+
+        serde_json::from_slice(&claim_json).ok()
+    }
+
+    fn get_claim_by_lease_id(&self, work_id: &str, lease_id: &str) -> Option<WorkClaim> {
+        let conn = self.conn.lock().ok()?;
+        // Direct SQL lookup by (work_id, lease_id) — O(1) with index.
+        // This is more efficient than the default trait implementation
+        // which iterates through roles.
+        let claim_json: Vec<u8> = conn
+            .query_row(
+                "SELECT claim_json FROM work_claims \
+                 WHERE work_id = ?1 AND lease_id = ?2 \
+                 LIMIT 1",
+                params![work_id, lease_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+
+        serde_json::from_slice(&claim_json).ok()
+    }
+
+    fn get_claim_age_for_role(&self, work_id: &str, role: WorkRole) -> Option<Duration> {
+        self.claim_inserted_at.read().ok().and_then(|ages| {
+            ages.get(&(work_id.to_string(), role as i32))
+                .map(Instant::elapsed)
+        })
+    }
+
+    fn clear_claim_age(&self, work_id: &str, role: WorkRole) {
+        if let Ok(mut ages) = self.claim_inserted_at.write() {
+            ages.remove(&(work_id.to_string(), role as i32));
+        }
+    }
+
+    fn remove_claim_for_role(&self, work_id: &str, role: WorkRole) {
+        if let Ok(conn) = self.conn.lock() {
+            let _ = conn.execute(
+                "DELETE FROM work_claims WHERE work_id = ?1 AND role = ?2",
+                params![work_id, role as i32],
+            );
+        }
+        self.clear_claim_age(work_id, role);
     }
 }
 
@@ -4394,6 +4783,96 @@ impl SqliteLeaseValidator {
     #[must_use]
     pub fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
         self.signing_key.verifying_key()
+    }
+
+    fn select_newest_by_timestamp<T>(
+        legacy: Option<(T, i64)>,
+        canonical: Option<(T, i64)>,
+    ) -> Option<T> {
+        match (legacy, canonical) {
+            (Some((legacy_value, legacy_ts)), Some((canonical_value, canonical_ts))) => {
+                if canonical_ts >= legacy_ts {
+                    Some(canonical_value)
+                } else {
+                    Some(legacy_value)
+                }
+            },
+            (Some((legacy_value, _)), None) => Some(legacy_value),
+            (None, Some((canonical_value, _))) => Some(canonical_value),
+            (None, None) => None,
+        }
+    }
+
+    fn latest_legacy_lease_work_id(
+        conn: &Connection,
+        lease_id: &str,
+    ) -> rusqlite::Result<Option<(String, i64)>> {
+        conn.query_row(
+            "SELECT work_id, timestamp_ns FROM ledger_events \
+             WHERE event_type = 'gate_lease_issued' \
+             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+             ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
+            params![lease_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+    }
+
+    fn latest_canonical_lease_work_id(
+        conn: &Connection,
+        lease_id: &str,
+    ) -> rusqlite::Result<Option<(String, i64)>> {
+        conn.query_row(
+            "SELECT session_id, timestamp_ns FROM events \
+             WHERE event_type = 'gate_lease_issued' \
+             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+             ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
+            params![lease_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+    }
+
+    fn latest_legacy_lease_payload(
+        conn: &Connection,
+        lease_id: &str,
+        require_full_lease: bool,
+    ) -> rusqlite::Result<Option<(Vec<u8>, i64)>> {
+        let sql = if require_full_lease {
+            "SELECT payload, timestamp_ns FROM ledger_events \
+             WHERE event_type = 'gate_lease_issued' \
+             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+             AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL \
+             ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1"
+        } else {
+            "SELECT payload, timestamp_ns FROM ledger_events \
+             WHERE event_type = 'gate_lease_issued' \
+             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+             ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1"
+        };
+        conn.query_row(sql, params![lease_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+    }
+
+    fn latest_canonical_lease_payload(
+        conn: &Connection,
+        lease_id: &str,
+        require_full_lease: bool,
+    ) -> rusqlite::Result<Option<(Vec<u8>, i64)>> {
+        let sql = if require_full_lease {
+            "SELECT payload, timestamp_ns FROM events \
+             WHERE event_type = 'gate_lease_issued' \
+             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+             AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL \
+             ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1"
+        } else {
+            "SELECT payload, timestamp_ns FROM events \
+             WHERE event_type = 'gate_lease_issued' \
+             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+             ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1"
+        };
+        conn.query_row(sql, params![lease_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
     }
 
     fn canonicalize_lease_payload(payload: &serde_json::Value) -> Result<Vec<u8>, String> {
@@ -4662,79 +5141,54 @@ impl LeaseValidator for SqliteLeaseValidator {
                 message: "connection lock poisoned".to_string(),
             })?;
 
-        // We search for a 'gate_lease_issued' event where the payload contains the
-        // lease_id and work_id. This is a scan if not indexed, but for now we
-        // rely on the event_type index and payload parsing. Optimization: In a
-        // real system, we'd have a `gate_leases` table. Here, we scan recent
-        // events or rely on the fact that we might have indexed it if we had a
-        // dedicated table.
-
-        // Strategy: Query events of type 'gate_lease_issued' and filter in application
-        // logic (slow but correct for now). Since SQLite JSON extract is not
-        // guaranteed to be available, we load payload. Warning: This could be
-        // slow.
-
-        // Better Strategy: `LeaseValidator` also has `register_lease` method.
-        // We can create a `gate_leases` table that `register_lease` populates, and
-        // `validate_gate_lease` queries. This assumes `register_lease` is
-        // called when the event is emitted (e.g. by the emitter).
-        // But `register_lease` is currently for "testing purposes".
-
-        // If we want "real" validation against the ledger, we must query the ledger.
-
-        // TCK-00289 BLOCKER 1: Filter by work_id in SQL to avoid O(N) scan.
-        // The table has an index on work_id (idx_ledger_events_work_id).
-        let mut stmt = conn
-            .prepare("SELECT payload FROM ledger_events WHERE event_type = 'gate_lease_issued' AND work_id = ?1")
-            .map_err(|e| LeaseValidationError::LedgerQueryFailed {
+        let legacy_lookup = Self::latest_legacy_lease_work_id(&conn, lease_id).map_err(|e| {
+            LeaseValidationError::LedgerQueryFailed {
                 message: e.to_string(),
-            })?;
-
-        let rows = stmt
-            .query_map(params![work_id], |row| {
-                let payload: Vec<u8> = row.get(0)?;
-                Ok(payload)
-            })
-            .map_err(|e| LeaseValidationError::LedgerQueryFailed {
-                message: e.to_string(),
-            })?;
-
-        for payload_bytes in rows.flatten() {
-            if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) {
-                if let Some(l) = payload.get("lease_id").and_then(|v| v.as_str()) {
-                    if l == lease_id {
-                        // work_id already matched via SQL WHERE clause
-                        return Ok(());
-                    }
-                }
             }
-        }
+        })?;
+        let canonical_lookup = if self.is_frozen() {
+            Self::latest_canonical_lease_work_id(&conn, lease_id).map_err(|e| {
+                LeaseValidationError::LedgerQueryFailed {
+                    message: e.to_string(),
+                }
+            })?
+        } else {
+            None
+        };
 
-        Err(LeaseValidationError::LeaseNotFound {
-            lease_id: lease_id.to_string(),
-        })
+        let Some(resolved_work_id) =
+            Self::select_newest_by_timestamp(legacy_lookup, canonical_lookup)
+        else {
+            return Err(LeaseValidationError::LeaseNotFound {
+                lease_id: lease_id.to_string(),
+            });
+        };
+
+        let work_id_matches = resolved_work_id.len() == work_id.len()
+            && bool::from(resolved_work_id.as_bytes().ct_eq(work_id.as_bytes()));
+        if work_id_matches {
+            Ok(())
+        } else {
+            Err(LeaseValidationError::WorkIdMismatch {
+                actual: work_id.to_string(),
+            })
+        }
     }
 
     fn get_lease_executor_actor_id(&self, lease_id: &str) -> Option<String> {
         let conn = self.conn.lock().ok()?;
 
-        // TCK-00340 Security MAJOR: Use targeted WHERE clause with
-        // json_extract instead of O(N) full table scan with per-row JSON
-        // parse. Filters by event_type and lease_id in SQL, with ORDER BY
-        // rowid DESC LIMIT 1 for deterministic latest-row selection.
-        //
-        // NOTE: payload is stored as BLOB, so we CAST to TEXT for
-        // json_extract to work on the binary JSON data.
-        let mut stmt = conn
-            .prepare(
-                "SELECT payload FROM ledger_events \
-                 WHERE event_type = 'gate_lease_issued' \
-                 AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
-                 ORDER BY rowid DESC LIMIT 1",
-            )
-            .ok()?;
-
-        let payload_bytes: Vec<u8> = stmt.query_row(params![lease_id], |row| row.get(0)).ok()?;
+        let legacy_payload = Self::latest_legacy_lease_payload(&conn, lease_id, false)
+            .ok()
+            .flatten();
+        let canonical_payload = if self.is_frozen() {
+            Self::latest_canonical_lease_payload(&conn, lease_id, false)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let payload_bytes = Self::select_newest_by_timestamp(legacy_payload, canonical_payload)?;
 
         let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
         payload
@@ -4900,24 +5354,18 @@ impl LeaseValidator for SqliteLeaseValidator {
     fn get_lease_work_id(&self, lease_id: &str) -> Option<String> {
         let conn = self.conn.lock().ok()?;
 
-        // TCK-00340 Quality BLOCKER 1: Use targeted WHERE clause with
-        // json_extract instead of O(N) full table scan with per-row JSON
-        // parse. Filters by event_type first (reduces scan scope), then
-        // uses json_extract for indexed field filtering, with ORDER BY
-        // rowid DESC LIMIT 1 for deterministic latest-row selection.
-        //
-        // NOTE: payload is stored as BLOB, so we CAST to TEXT for
-        // json_extract to work on the binary JSON data.
-        let mut stmt = conn
-            .prepare(
-                "SELECT work_id FROM ledger_events \
-                 WHERE event_type = 'gate_lease_issued' \
-                 AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
-                 ORDER BY rowid DESC LIMIT 1",
-            )
-            .ok()?;
+        let legacy_lookup = Self::latest_legacy_lease_work_id(&conn, lease_id)
+            .ok()
+            .flatten();
+        let canonical_lookup = if self.is_frozen() {
+            Self::latest_canonical_lease_work_id(&conn, lease_id)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
 
-        stmt.query_row(params![lease_id], |row| row.get(0)).ok()
+        Self::select_newest_by_timestamp(legacy_lookup, canonical_lookup)
     }
 
     // Full leases are persisted in signed ledger rows. Reads remain
@@ -4925,33 +5373,17 @@ impl LeaseValidator for SqliteLeaseValidator {
     fn get_gate_lease(&self, lease_id: &str) -> Option<apm2_core::fac::GateLease> {
         let conn = self.conn.lock().ok()?;
 
-        // TCK-00340 Quality BLOCKER 2 / Security MAJOR: Use targeted WHERE
-        // clause with json_extract instead of O(N) full table scan with
-        // per-row JSON parse. Filters by event_type, lease_id, AND
-        // full_lease presence in SQL via json_extract on CAST(payload AS
-        // TEXT), with ORDER BY rowid DESC LIMIT 1 for deterministic
-        // latest-row selection.
-        //
-        // NOTE: payload is stored as BLOB (Vec<u8> from serde_json::to_vec),
-        // so we CAST to TEXT for json_extract compatibility.
-        //
-        // The full_lease IS NOT NULL guard ensures we only match events
-        // that actually embed the full GateLease struct, skipping any
-        // events that share the same lease_id but lack the full_lease
-        // field (e.g. executor-only registration events).
-        let result: Result<Vec<u8>, _> = conn.query_row(
-            "SELECT payload FROM ledger_events \
-             WHERE event_type = 'gate_lease_issued' \
-             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
-             AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL \
-             ORDER BY rowid DESC LIMIT 1",
-            params![lease_id],
-            |row| row.get(0),
-        );
-
-        let Ok(payload_bytes) = result else {
-            return None;
+        let legacy_payload = Self::latest_legacy_lease_payload(&conn, lease_id, true)
+            .ok()
+            .flatten();
+        let canonical_payload = if self.is_frozen() {
+            Self::latest_canonical_lease_payload(&conn, lease_id, true)
+                .ok()
+                .flatten()
+        } else {
+            None
         };
+        let payload_bytes = Self::select_newest_by_timestamp(legacy_payload, canonical_payload)?;
 
         let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
 
@@ -6346,6 +6778,154 @@ mod tests {
             work_id.as_deref(),
             Some("W-WID-001"),
             "get_lease_work_id must return the stored work_id"
+        );
+    }
+
+    /// Regression (TCK-00637): lease read APIs must resolve leases that were
+    /// written to canonical `events` while the validator is frozen.
+    #[test]
+    fn sqlite_lease_validator_frozen_reads_from_canonical_events() {
+        use apm2_core::ledger::init_canonical_schema;
+
+        use crate::protocol::dispatch::LeaseValidator;
+
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
+        init_canonical_schema(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let validator = SqliteLeaseValidator::new(Arc::clone(&conn));
+
+        validator
+            .freeze_legacy_writes_inner()
+            .expect("freeze_legacy_writes must succeed in test");
+        assert!(validator.is_frozen(), "validator must be frozen");
+
+        validator.register_lease_with_executor(
+            "lease-frozen-read-001",
+            "W-FROZEN-READ-001",
+            "gate-frozen-read",
+            "actor-frozen-read",
+        );
+
+        assert_eq!(
+            validator
+                .get_lease_work_id("lease-frozen-read-001")
+                .as_deref(),
+            Some("W-FROZEN-READ-001"),
+            "get_lease_work_id must read canonical gate_lease_issued rows when frozen"
+        );
+        assert_eq!(
+            validator
+                .get_lease_executor_actor_id("lease-frozen-read-001")
+                .as_deref(),
+            Some("actor-frozen-read"),
+            "get_lease_executor_actor_id must read canonical gate_lease_issued rows when frozen"
+        );
+        assert!(
+            validator
+                .validate_gate_lease("lease-frozen-read-001", "W-FROZEN-READ-001")
+                .is_ok(),
+            "validate_gate_lease must succeed for canonical rows when frozen"
+        );
+
+        let signer = apm2_core::crypto::Signer::generate();
+        let full_lease = apm2_core::fac::GateLeaseBuilder::new(
+            "lease-frozen-full-001",
+            "W-FROZEN-FULL-001",
+            "gate-frozen-full",
+        )
+        .changeset_digest([0x11; 32])
+        .executor_actor_id("actor-frozen-full")
+        .issued_at(1_500_000)
+        .expires_at(2_500_000)
+        .policy_hash([0x22; 32])
+        .issuer_actor_id("issuer-frozen")
+        .time_envelope_ref("htf:tick:frozen")
+        .build_and_sign(&signer);
+        validator
+            .register_full_lease(&full_lease)
+            .expect("register_full_lease must succeed in frozen mode");
+
+        let recovered_full = validator
+            .get_gate_lease("lease-frozen-full-001")
+            .expect("get_gate_lease must read canonical full_lease rows when frozen");
+        assert_eq!(recovered_full.lease_id, "lease-frozen-full-001");
+        assert_eq!(recovered_full.work_id, "W-FROZEN-FULL-001");
+        assert_eq!(recovered_full.executor_actor_id, "actor-frozen-full");
+
+        let conn_guard = conn.lock().unwrap();
+        let legacy_rows: i64 = conn_guard
+            .query_row(
+                "SELECT COUNT(*) FROM ledger_events WHERE event_type = 'gate_lease_issued'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy_rows, 0,
+            "frozen validator writes must not append gate_lease_issued rows to legacy table"
+        );
+    }
+
+    /// Regression (TCK-00637): when frozen and both tables may contain matching
+    /// transitions, `get_latest_work_transition_by_rationale` must return the
+    /// newest event by timestamp across legacy + canonical tables.
+    #[test]
+    fn sqlite_work_transition_rationale_lookup_prefers_newer_canonical_event() {
+        use apm2_core::ledger::init_canonical_schema;
+
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
+        init_canonical_schema(&conn).unwrap();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let conn = Arc::new(Mutex::new(conn));
+        let emitter = SqliteLedgerEventEmitter::new(Arc::clone(&conn), signing_key);
+
+        let work_id = "W-transition-freeze-001";
+        let rationale = "claim_work_v2_implementer";
+
+        emitter
+            .emit_work_transitioned(&WorkTransition {
+                work_id,
+                from_state: "Open",
+                to_state: "Claimed",
+                rationale_code: rationale,
+                previous_transition_count: 0,
+                actor_id: "legacy-actor",
+                timestamp_ns: 1_000_000,
+            })
+            .expect("legacy work_transitioned insert should succeed");
+
+        {
+            let conn_guard = conn.lock().unwrap();
+            emitter
+                .freeze_legacy_writes(&conn_guard)
+                .expect("freeze_legacy_writes must succeed");
+        }
+        assert!(emitter.is_frozen(), "emitter must be frozen");
+
+        emitter
+            .emit_work_transitioned(&WorkTransition {
+                work_id,
+                from_state: "Open",
+                to_state: "Claimed",
+                rationale_code: rationale,
+                previous_transition_count: 1,
+                actor_id: "canonical-actor",
+                timestamp_ns: 2_000_000,
+            })
+            .expect("canonical work_transitioned insert should succeed");
+
+        let latest = emitter
+            .get_latest_work_transition_by_rationale(work_id, rationale)
+            .expect("latest matching transition must exist");
+        assert_eq!(
+            latest.actor_id, "canonical-actor",
+            "lookup must return newer canonical transition instead of legacy-first match"
+        );
+        assert_eq!(
+            latest.timestamp_ns, 2_000_000,
+            "lookup must return the highest timestamp across both tables"
         );
     }
 
@@ -8459,6 +9039,440 @@ mod tests {
             found_third.as_ref().map(|e| &e.event_id),
             Some(&third.event_id),
             "lookup must return the third persisted event"
+        );
+    }
+
+    // ====================================================================
+    // TCK-00637 Finding 2: Schema migration for legacy work_claims PK
+    // ====================================================================
+
+    /// Verify that `SqliteWorkRegistry::init_schema` migrates a legacy
+    /// `work_claims` table (with `work_id TEXT PRIMARY KEY` and no `role`
+    /// column) to the Phase 2 schema with composite `(work_id, role)`
+    /// uniqueness. The migration must:
+    ///
+    /// 1. Preserve existing claim data with a default `role = 1` (Implementer).
+    /// 2. Allow multi-role inserts after migration.
+    /// 3. Be idempotent (running `init_schema` twice is safe).
+    #[test]
+    fn test_work_claims_legacy_schema_migration() {
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Create the LEGACY schema: work_id TEXT PRIMARY KEY, no role column.
+        conn.execute(
+            "CREATE TABLE work_claims (
+                work_id TEXT PRIMARY KEY,
+                lease_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                claim_json BLOB NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        // Insert a legacy claim (no role column).
+        let claim = WorkClaim {
+            work_id: "W-legacy-001".to_string(),
+            lease_id: "L-legacy-001".to_string(),
+            actor_id: "actor-legacy".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        let claim_json = serde_json::to_vec(&claim).unwrap();
+        conn.execute(
+            "INSERT INTO work_claims (work_id, lease_id, actor_id, claim_json) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params!["W-legacy-001", "L-legacy-001", "actor-legacy", claim_json],
+        )
+        .unwrap();
+
+        // Run the migration via init_schema.
+        SqliteWorkRegistry::init_schema(&conn).expect("migration should succeed");
+
+        // Verify the legacy claim was preserved with role = 1 (Implementer).
+        let role: i32 = conn
+            .query_row(
+                "SELECT role FROM work_claims WHERE work_id = 'W-legacy-001'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy claim should exist after migration");
+        assert_eq!(
+            role, 1,
+            "legacy claims should be assigned role=1 (Implementer)"
+        );
+
+        // Verify multi-role inserts now work (different role for same work_id).
+        let reviewer_claim_json = serde_json::to_vec(&WorkClaim {
+            work_id: "W-legacy-001".to_string(),
+            lease_id: "L-reviewer-001".to_string(),
+            actor_id: "actor-reviewer".to_string(),
+            role: WorkRole::Reviewer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        })
+        .unwrap();
+        conn.execute(
+            "INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "W-legacy-001",
+                "L-reviewer-001",
+                "actor-reviewer",
+                WorkRole::Reviewer as i32,
+                reviewer_claim_json,
+            ],
+        )
+        .expect("multi-role insert should succeed after migration");
+
+        // Verify the UNIQUE index on (work_id, role) rejects duplicates.
+        let dup_result = conn.execute(
+            "INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["W-legacy-001", "L-dup", "actor-dup", 1_i32, claim_json],
+        );
+        assert!(
+            dup_result.is_err(),
+            "duplicate (work_id, role) must be rejected"
+        );
+    }
+
+    /// Verify that `SqliteWorkRegistry::init_schema` is idempotent on the
+    /// new Phase 2 schema (no-op when called twice).
+    #[test]
+    fn test_work_claims_init_schema_idempotent() {
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+
+        // First call: creates the table fresh.
+        SqliteWorkRegistry::init_schema(&conn).expect("first init should succeed");
+
+        // Insert a claim.
+        let claim = WorkClaim {
+            work_id: "W-idem-001".to_string(),
+            lease_id: "L-idem-001".to_string(),
+            actor_id: "actor-idem".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        let claim_json = serde_json::to_vec(&claim).unwrap();
+        conn.execute(
+            "INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "W-idem-001",
+                "L-idem-001",
+                "actor-idem",
+                WorkRole::Implementer as i32,
+                claim_json,
+            ],
+        )
+        .unwrap();
+
+        // Second call: must be a no-op (table exists with role column).
+        SqliteWorkRegistry::init_schema(&conn).expect("second init should succeed (idempotent)");
+
+        // Verify data is preserved.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM work_claims", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "data must be preserved after idempotent re-init");
+    }
+
+    /// Regression test for BLOCKER: legacy PK schema WITH role column.
+    ///
+    /// The intermediate schema revision had `work_id TEXT PRIMARY KEY` plus
+    /// `role INTEGER` but kept the single-column PK. Migration must detect
+    /// this by key/index topology (not just column presence) and rebuild
+    /// the table so multi-role inserts succeed.
+    #[test]
+    fn test_work_claims_legacy_pk_with_role_column_migration() {
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Create the intermediate legacy schema: work_id PK + role column.
+        // This is the schema that existed between the original (no role) and
+        // the final Phase 2 schema (no single-column PK on work_id).
+        conn.execute(
+            "CREATE TABLE work_claims (
+                work_id TEXT PRIMARY KEY,
+                lease_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                role INTEGER NOT NULL DEFAULT 1,
+                claim_json BLOB NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        // Insert an implementer claim.
+        let impl_claim = WorkClaim {
+            work_id: "W-pk-role-001".to_string(),
+            lease_id: "L-impl-001".to_string(),
+            actor_id: "actor-impl".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        let impl_json = serde_json::to_vec(&impl_claim).unwrap();
+        conn.execute(
+            "INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "W-pk-role-001",
+                "L-impl-001",
+                "actor-impl",
+                WorkRole::Implementer as i32,
+                impl_json,
+            ],
+        )
+        .unwrap();
+
+        // Before migration: inserting a REVIEWER for the same work_id must
+        // FAIL because the PRIMARY KEY(work_id) enforces single-row-per-work_id.
+        let reviewer_claim = WorkClaim {
+            work_id: "W-pk-role-001".to_string(),
+            lease_id: "L-reviewer-001".to_string(),
+            actor_id: "actor-reviewer".to_string(),
+            role: WorkRole::Reviewer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        let reviewer_json = serde_json::to_vec(&reviewer_claim).unwrap();
+        let pre_migration_result = conn.execute(
+            "INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "W-pk-role-001",
+                "L-reviewer-001",
+                "actor-reviewer",
+                WorkRole::Reviewer as i32,
+                reviewer_json,
+            ],
+        );
+        assert!(
+            pre_migration_result.is_err(),
+            "pre-migration: same work_id with different role must fail \
+             due to PRIMARY KEY(work_id)"
+        );
+
+        // Run migration.
+        SqliteWorkRegistry::init_schema(&conn)
+            .expect("migration of legacy PK + role schema should succeed");
+
+        // Verify the implementer claim was preserved with its original role.
+        let preserved_role: i32 = conn
+            .query_row(
+                "SELECT role FROM work_claims WHERE work_id = 'W-pk-role-001'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("implementer claim should exist after migration");
+        assert_eq!(
+            preserved_role,
+            WorkRole::Implementer as i32,
+            "implementer claim role must be preserved"
+        );
+
+        // After migration: inserting a REVIEWER for the same work_id must
+        // SUCCEED because the single-column PK on work_id was removed.
+        let reviewer_json2 = serde_json::to_vec(&reviewer_claim).unwrap();
+        conn.execute(
+            "INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "W-pk-role-001",
+                "L-reviewer-001",
+                "actor-reviewer",
+                WorkRole::Reviewer as i32,
+                reviewer_json2,
+            ],
+        )
+        .expect(
+            "post-migration: same work_id with different role must succeed \
+             (multi-role support)",
+        );
+
+        // Verify both claims exist.
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM work_claims WHERE work_id = 'W-pk-role-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            total, 2,
+            "both implementer and reviewer claims must coexist"
+        );
+
+        // Verify the UNIQUE index on (work_id, role) rejects true duplicates.
+        let dup_result = conn.execute(
+            "INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "W-pk-role-001",
+                "L-dup",
+                "actor-dup",
+                WorkRole::Implementer as i32,
+                impl_json,
+            ],
+        );
+        assert!(
+            dup_result.is_err(),
+            "duplicate (work_id, role) must still be rejected"
+        );
+    }
+
+    /// Verify `remove_claim_for_role` removes a specific (`work_id`, role)
+    /// claim from `SqliteWorkRegistry`.
+    #[test]
+    fn test_sqlite_work_registry_remove_claim_for_role() {
+        use std::sync::{Arc, Mutex};
+
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteWorkRegistry::init_schema(&conn).unwrap();
+        let registry = SqliteWorkRegistry::new(Arc::new(Mutex::new(conn)));
+
+        // Register two claims for the same work_id (different roles).
+        let impl_claim = WorkClaim {
+            work_id: "W-rm-001".to_string(),
+            lease_id: "L-rm-impl".to_string(),
+            actor_id: "actor-rm".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        let reviewer_claim = WorkClaim {
+            work_id: "W-rm-001".to_string(),
+            lease_id: "L-rm-reviewer".to_string(),
+            actor_id: "actor-rm-2".to_string(),
+            role: WorkRole::Reviewer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+
+        registry
+            .register_claim(impl_claim)
+            .expect("register implementer");
+        registry
+            .register_claim(reviewer_claim)
+            .expect("register reviewer");
+
+        // Both claims must exist.
+        assert!(
+            registry
+                .get_claim_for_role("W-rm-001", WorkRole::Implementer)
+                .is_some(),
+            "implementer claim must exist before removal"
+        );
+        assert!(
+            registry
+                .get_claim_for_role("W-rm-001", WorkRole::Reviewer)
+                .is_some(),
+            "reviewer claim must exist before removal"
+        );
+
+        // Remove the implementer claim only.
+        registry.remove_claim_for_role("W-rm-001", WorkRole::Implementer);
+
+        // Implementer claim must be gone.
+        assert!(
+            registry
+                .get_claim_for_role("W-rm-001", WorkRole::Implementer)
+                .is_none(),
+            "implementer claim must be removed"
+        );
+        // Reviewer claim must still exist.
+        assert!(
+            registry
+                .get_claim_for_role("W-rm-001", WorkRole::Reviewer)
+                .is_some(),
+            "reviewer claim must survive targeted removal"
+        );
+
+        // Re-registering the same (work_id, role) must succeed after removal.
+        let re_claim = WorkClaim {
+            work_id: "W-rm-001".to_string(),
+            lease_id: "L-rm-impl-2".to_string(),
+            actor_id: "actor-rm".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        registry
+            .register_claim(re_claim)
+            .expect("re-register after removal must succeed");
+    }
+
+    #[test]
+    fn test_sqlite_work_registry_clear_claim_age_keeps_claim() {
+        use std::sync::{Arc, Mutex};
+
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteWorkRegistry::init_schema(&conn).unwrap();
+        let registry = SqliteWorkRegistry::new(Arc::new(Mutex::new(conn)));
+
+        let claim = WorkClaim {
+            work_id: "W-clear-age-001".to_string(),
+            lease_id: "L-clear-age-001".to_string(),
+            actor_id: "actor-clear-age".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+
+        registry
+            .register_claim(claim.clone())
+            .expect("register implementer");
+        assert!(
+            registry
+                .get_claim_age_for_role(&claim.work_id, claim.role)
+                .is_some(),
+            "age metadata should be present after register_claim"
+        );
+
+        registry.clear_claim_age(&claim.work_id, claim.role);
+
+        assert!(
+            registry
+                .get_claim_for_role(&claim.work_id, claim.role)
+                .is_some(),
+            "clear_claim_age must not remove the persisted claim row"
+        );
+        assert!(
+            registry
+                .get_claim_age_for_role(&claim.work_id, claim.role)
+                .is_none(),
+            "clear_claim_age must remove age metadata after success"
         );
     }
 }

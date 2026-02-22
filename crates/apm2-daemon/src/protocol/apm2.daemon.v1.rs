@@ -1883,6 +1883,43 @@ pub struct PublishWorkContextEntryResponse {
     #[prost(string, tag = "4")]
     pub work_id: ::prost::alloc::string::String,
 }
+/// IPC-PRIV-078: ClaimWorkV2 (RFC-0032, TCK-00637)
+/// Claims an EXISTING work item (opened via OpenWork). Does not create a new
+/// work_id. Transitions Open -> Claimed (IMPLEMENTER/COORDINATOR) or
+/// ReadyForReview -> Review (REVIEWER). Issues a lease and publishes
+/// WorkAuthorityBindings to CAS anchored via evidence.published.
+/// Actor ID is derived from peer credentials (never from client input).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ClaimWorkV2Request {
+    /// Canonical work identifier from a prior OpenWork. Must already exist.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Role for this claim (IMPLEMENTER, REVIEWER, COORDINATOR).
+    #[prost(enumeration = "WorkRole", tag = "2")]
+    pub role: i32,
+    /// Governing lease ID for PCAC lifecycle enforcement.
+    /// Required when PCAC lifecycle gate is wired (fail-closed if empty).
+    #[prost(string, tag = "3")]
+    pub lease_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ClaimWorkV2Response {
+    /// Echoed canonical work identifier.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Newly issued lease identifier for this claim.
+    #[prost(string, tag = "2")]
+    pub issued_lease_id: ::prost::alloc::string::String,
+    /// BLAKE3 hash of the WorkAuthorityBindings CAS document (hex-encoded).
+    #[prost(string, tag = "3")]
+    pub authority_bindings_hash: ::prost::alloc::string::String,
+    /// Evidence ID anchoring the authority bindings (WAB- prefix).
+    #[prost(string, tag = "4")]
+    pub evidence_id: ::prost::alloc::string::String,
+    /// Whether this was an idempotent re-claim by the same actor.
+    #[prost(bool, tag = "5")]
+    pub already_claimed: bool,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StopReason {
@@ -2413,6 +2450,8 @@ pub enum PrivilegedErrorCode {
     InvalidArgument = 19,
     /// Work item already exists with a different spec hash (TCK-00635).
     WorkAlreadyExists = 20,
+    /// Precondition failed (e.g., work is in wrong state for the requested operation).
+    FailedPrecondition = 21,
 }
 impl PrivilegedErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2438,6 +2477,7 @@ impl PrivilegedErrorCode {
             Self::CredentialInvalidConfig => "CREDENTIAL_INVALID_CONFIG",
             Self::InvalidArgument => "INVALID_ARGUMENT",
             Self::WorkAlreadyExists => "WORK_ALREADY_EXISTS",
+            Self::FailedPrecondition => "FAILED_PRECONDITION",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2462,6 +2502,7 @@ impl PrivilegedErrorCode {
             "CREDENTIAL_INVALID_CONFIG" => Some(Self::CredentialInvalidConfig),
             "INVALID_ARGUMENT" => Some(Self::InvalidArgument),
             "WORK_ALREADY_EXISTS" => Some(Self::WorkAlreadyExists),
+            "FAILED_PRECONDITION" => Some(Self::FailedPrecondition),
             _ => None,
         }
     }
