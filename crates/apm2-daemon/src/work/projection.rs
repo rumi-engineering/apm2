@@ -10,6 +10,7 @@ use apm2_core::reducer::{Reducer, ReducerContext};
 use apm2_core::work::{Work, WorkError, WorkReducer, WorkState, helpers};
 use ed25519_dalek::Verifier;
 use prost::Message;
+use serde::Deserialize;
 use thiserror::Error;
 
 use crate::protocol::dispatch::{
@@ -18,6 +19,9 @@ use crate::protocol::dispatch::{
 };
 
 const DEFAULT_SYNTHETIC_WORK_TYPE: &str = "TICKET";
+const MAX_CANONICAL_WORK_EVENT_JSON_BYTES: usize = 64 * 1024;
+const MAX_CANONICAL_WORK_EVENT_DECODED_BYTES: usize = 64 * 1024;
+const MAX_CANONICAL_WORK_EVENT_HEX_CHARS: usize = MAX_CANONICAL_WORK_EVENT_DECODED_BYTES * 2;
 const MAX_WORK_GRAPH_EVENT_BYTES: usize = 64 * 1024;
 const MAX_WORK_GRAPH_JSON_DEPTH: usize = 2;
 const GRAPH_EDGE_ID_DOMAIN_PREFIX: &[u8] = b"apm2.work_graph.edge.v1";
@@ -273,6 +277,19 @@ impl WorkObjectProjection {
     #[must_use]
     pub fn list_work(&self) -> Vec<&Work> {
         self.ordered_work.values().collect()
+    }
+
+    /// Returns an iterator over all known work items in deterministic ID
+    /// order.
+    pub fn iter_work(&self) -> impl Iterator<Item = &Work> + '_ {
+        self.ordered_work.values()
+    }
+
+    /// Returns the number of work items currently materialized in projection
+    /// state.
+    #[must_use]
+    pub fn work_count(&self) -> usize {
+        self.ordered_work.len()
     }
 
     /// Returns claimable work items in deterministic ID order.
@@ -630,6 +647,11 @@ fn translate_signed_event(
     Ok(translated)
 }
 
+#[derive(Debug, Deserialize)]
+struct CanonicalWorkEventEnvelopeJson {
+    payload: String,
+}
+
 fn decode_canonical_work_event_payload(
     payload: &[u8],
     event_type: &str,
@@ -638,26 +660,47 @@ fn decode_canonical_work_event_payload(
         return Ok(payload.to_vec());
     }
 
-    let value = serde_json::from_slice::<serde_json::Value>(payload).map_err(|error| {
-        WorkProjectionError::InvalidPayload {
+    if payload.len() > MAX_CANONICAL_WORK_EVENT_JSON_BYTES {
+        return Err(WorkProjectionError::InvalidPayload {
             event_type: event_type.to_string(),
-            reason: format!("work.* payload is not protobuf or JSON envelope: {error}"),
-        }
-    })?;
+            reason: format!(
+                "payload exceeds maximum {MAX_CANONICAL_WORK_EVENT_JSON_BYTES} bytes for JSON \
+                 envelope decode"
+            ),
+        });
+    }
 
-    let wrapped_payload = value
-        .get("payload")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| WorkProjectionError::InvalidPayload {
+    let envelope: CanonicalWorkEventEnvelopeJson =
+        serde_json::from_slice(payload).map_err(|error| WorkProjectionError::InvalidPayload {
             event_type: event_type.to_string(),
-            reason: "wrapped work.* payload missing 'payload' hex field".to_string(),
+            reason: format!("work.* payload is not protobuf or strict JSON envelope: {error}"),
         })?;
 
+    if envelope.payload.len() > MAX_CANONICAL_WORK_EVENT_HEX_CHARS {
+        return Err(WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: format!(
+                "wrapped work.* payload hex exceeds maximum {MAX_CANONICAL_WORK_EVENT_HEX_CHARS} \
+                 characters"
+            ),
+        });
+    }
+
     let decoded =
-        hex::decode(wrapped_payload).map_err(|error| WorkProjectionError::InvalidPayload {
+        hex::decode(&envelope.payload).map_err(|error| WorkProjectionError::InvalidPayload {
             event_type: event_type.to_string(),
             reason: format!("wrapped work.* payload hex decode failed: {error}"),
         })?;
+
+    if decoded.len() > MAX_CANONICAL_WORK_EVENT_DECODED_BYTES {
+        return Err(WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: format!(
+                "wrapped work.* payload exceeds maximum {MAX_CANONICAL_WORK_EVENT_DECODED_BYTES} \
+                 bytes after hex decode"
+            ),
+        });
+    }
 
     WorkEvent::decode(decoded.as_slice()).map_err(|error| WorkProjectionError::InvalidPayload {
         event_type: event_type.to_string(),
@@ -1383,6 +1426,22 @@ mod tests {
         .expect("WorkEdgeWaived protobuf should encode");
 
         signed_event("work_graph.edge.waived", to_work_id, payload, timestamp_ns)
+    }
+
+    #[test]
+    fn decode_canonical_work_event_payload_rejects_oversized_json_envelope() {
+        let oversized = vec![b'x'; MAX_CANONICAL_WORK_EVENT_JSON_BYTES + 1];
+        let result = decode_canonical_work_event_payload(&oversized, "work.opened");
+
+        assert!(
+            matches!(
+                result,
+                Err(WorkProjectionError::InvalidPayload { event_type, reason })
+                    if event_type == "work.opened"
+                        && reason.contains("payload exceeds maximum")
+            ),
+            "oversized JSON envelopes must be rejected before deserialization"
+        );
     }
 
     #[test]

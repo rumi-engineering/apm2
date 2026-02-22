@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -465,6 +465,12 @@ pub const DEFAULT_MAX_STALENESS_TICKS: u64 = 100;
 /// Default minimum consecutive clean ticks for snapshot-emitter sunset.
 pub const DEFAULT_MIN_RECONCILED_TICKS: u64 = 50;
 
+/// Maximum number of work entries tracked in the in-memory ticket-alias index.
+///
+/// The index is bounded with deterministic eviction (oldest work ID first)
+/// per RS-27 to prevent unbounded growth from ledger replay churn.
+pub const MAX_TICKET_ALIAS_INDEX_WORK_ITEMS: usize = 2_048;
+
 /// Alias reconciliation gate contract for the work authority layer.
 ///
 /// This trait provides the production wiring between the alias reconciliation
@@ -572,6 +578,103 @@ pub struct ProjectionAliasReconciliationGate {
     /// `spec_snapshot_hash`. When set, enables CAS-backed ticket alias
     /// resolution (TCK-00636, RFC-0032 Phase 1).
     cas: Option<Arc<dyn apm2_core::evidence::ContentAddressedStore>>,
+
+    /// Bounded in-memory index for `ticket_alias -> work_id` lookups.
+    ///
+    /// Synchronization protocol:
+    /// 1. Writers: only `refresh_projection()` mutates index contents while
+    ///    holding the projection write lock and then this index write lock.
+    /// 2. Readers: `build_canonical_projections()` and `resolve_ticket_alias()`
+    ///    take read locks only.
+    /// 3. No async suspension occurs while guards are held.
+    ticket_alias_index: Arc<RwLock<TicketAliasIndex>>,
+}
+
+#[derive(Debug, Default)]
+struct TicketAliasIndex {
+    alias_to_work_ids: HashMap<String, BTreeSet<String>>,
+    work_id_to_alias: HashMap<String, String>,
+    spec_hash_by_work_id: HashMap<String, [u8; 32]>,
+    insertion_order: VecDeque<String>,
+    evicted_aliases: HashSet<String>,
+}
+
+impl TicketAliasIndex {
+    fn clear(&mut self) {
+        self.alias_to_work_ids.clear();
+        self.work_id_to_alias.clear();
+        self.spec_hash_by_work_id.clear();
+        self.insertion_order.clear();
+        self.evicted_aliases.clear();
+    }
+
+    fn remove_work(&mut self, work_id: &str, mark_alias_evicted: bool) {
+        self.spec_hash_by_work_id.remove(work_id);
+        self.insertion_order.retain(|entry| entry != work_id);
+
+        if let Some(alias) = self.work_id_to_alias.remove(work_id) {
+            if let Some(work_ids) = self.alias_to_work_ids.get_mut(&alias) {
+                work_ids.remove(work_id);
+                if work_ids.is_empty() {
+                    self.alias_to_work_ids.remove(&alias);
+                }
+            }
+            if mark_alias_evicted {
+                self.evicted_aliases.insert(alias);
+            }
+        }
+    }
+
+    fn upsert_spec_hash(&mut self, work_id: &str, spec_hash: [u8; 32]) -> bool {
+        if self.spec_hash_by_work_id.get(work_id) == Some(&spec_hash) {
+            return false;
+        }
+
+        let is_new = self
+            .spec_hash_by_work_id
+            .insert(work_id.to_string(), spec_hash)
+            .is_none();
+        if is_new {
+            self.insertion_order.push_back(work_id.to_string());
+        }
+        true
+    }
+
+    fn upsert_alias(&mut self, work_id: &str, alias: Option<String>) {
+        if let Some(previous_alias) = self.work_id_to_alias.remove(work_id) {
+            if let Some(work_ids) = self.alias_to_work_ids.get_mut(&previous_alias) {
+                work_ids.remove(work_id);
+                if work_ids.is_empty() {
+                    self.alias_to_work_ids.remove(&previous_alias);
+                }
+            }
+        }
+
+        if let Some(alias) = alias {
+            self.alias_to_work_ids
+                .entry(alias.clone())
+                .or_default()
+                .insert(work_id.to_string());
+            self.work_id_to_alias.insert(work_id.to_string(), alias);
+        }
+    }
+
+    fn enforce_capacity(&mut self) {
+        while self.spec_hash_by_work_id.len() > MAX_TICKET_ALIAS_INDEX_WORK_ITEMS {
+            let Some(oldest_work_id) = self.insertion_order.pop_front() else {
+                break;
+            };
+            if !self.spec_hash_by_work_id.contains_key(&oldest_work_id) {
+                continue;
+            }
+            self.remove_work(&oldest_work_id, true);
+            warn!(
+                work_id = %oldest_work_id,
+                max_entries = MAX_TICKET_ALIAS_INDEX_WORK_ITEMS,
+                "ticket alias index reached capacity; evicted oldest work binding"
+            );
+        }
+    }
 }
 
 impl ProjectionAliasReconciliationGate {
@@ -594,6 +697,7 @@ impl ProjectionAliasReconciliationGate {
                 zero_defects_required: true,
             },
             cas: None,
+            ticket_alias_index: Arc::new(RwLock::new(TicketAliasIndex::default())),
         }
     }
 
@@ -611,6 +715,7 @@ impl ProjectionAliasReconciliationGate {
             observation_window,
             sunset_criteria,
             cas: None,
+            ticket_alias_index: Arc::new(RwLock::new(TicketAliasIndex::default())),
         }
     }
 
@@ -621,6 +726,9 @@ impl ProjectionAliasReconciliationGate {
     #[must_use]
     pub fn with_cas(mut self, cas: Arc<dyn apm2_core::evidence::ContentAddressedStore>) -> Self {
         self.cas = Some(cas);
+        if let Ok(mut alias_index) = self.ticket_alias_index.write() {
+            alias_index.clear();
+        }
         self
     }
 
@@ -663,6 +771,17 @@ impl ProjectionAliasReconciliationGate {
 
         match projection.rebuild_from_signed_events(&work_events) {
             Ok(()) => {
+                if let Some(cas) = self.cas.as_ref() {
+                    self.refresh_ticket_alias_index(&projection, cas.as_ref())?;
+                } else {
+                    let mut alias_index = self.ticket_alias_index.write().map_err(|err| {
+                        WorkAuthorityError::ProjectionLock {
+                            message: err.to_string(),
+                        }
+                    })?;
+                    alias_index.clear();
+                }
+
                 if let Ok(mut cached) = self.last_event_count.write() {
                     *cached = current_count;
                 }
@@ -683,6 +802,106 @@ impl ProjectionAliasReconciliationGate {
         Ok(())
     }
 
+    fn refresh_ticket_alias_index(
+        &self,
+        projection: &WorkObjectProjection,
+        cas: &dyn apm2_core::evidence::ContentAddressedStore,
+    ) -> Result<(), WorkAuthorityError> {
+        let mut alias_index =
+            self.ticket_alias_index
+                .write()
+                .map_err(|err| WorkAuthorityError::ProjectionLock {
+                    message: err.to_string(),
+                })?;
+
+        // Clear lossy markers once the projection can fully fit in-memory.
+        if projection.work_count() <= MAX_TICKET_ALIAS_INDEX_WORK_ITEMS {
+            alias_index.evicted_aliases.clear();
+        }
+
+        // Drop entries for work IDs no longer present in projection.
+        let tracked_work_ids: Vec<String> =
+            alias_index.spec_hash_by_work_id.keys().cloned().collect();
+        for work_id in tracked_work_ids {
+            if projection.get_work(&work_id).is_none() {
+                alias_index.remove_work(&work_id, false);
+            }
+        }
+
+        // Incrementally process only work IDs whose spec hash is new/changed.
+        for work in projection.iter_work() {
+            let spec_hash = match Self::extract_spec_snapshot_hash(work) {
+                Ok(spec_hash) => spec_hash,
+                Err(error) => {
+                    warn!(
+                        work_id = %work.work_id,
+                        error = %error,
+                        "ticket alias index: invalid spec_snapshot_hash; removing stale alias mapping"
+                    );
+                    alias_index.remove_work(&work.work_id, false);
+                    continue;
+                },
+            };
+
+            let Some(spec_hash) = spec_hash else {
+                alias_index.remove_work(&work.work_id, false);
+                continue;
+            };
+
+            if !alias_index.upsert_spec_hash(&work.work_id, spec_hash) {
+                continue;
+            }
+
+            let ticket_alias =
+                match Self::resolve_ticket_alias_from_spec_hash(cas, &work.work_id, spec_hash) {
+                    Ok(alias) => alias,
+                    Err(error) => {
+                        warn!(
+                            work_id = %work.work_id,
+                            error = %error,
+                            "ticket alias index: CAS/WorkSpec decode failed; removing alias mapping"
+                        );
+                        None
+                    },
+                };
+            alias_index.upsert_alias(&work.work_id, ticket_alias);
+            alias_index.enforce_capacity();
+        }
+
+        Ok(())
+    }
+
+    fn extract_spec_snapshot_hash(work: &Work) -> Result<Option<[u8; 32]>, WorkAuthorityError> {
+        if work.spec_snapshot_hash.is_empty() {
+            return Ok(None);
+        }
+
+        work.spec_snapshot_hash
+            .as_slice()
+            .try_into()
+            .map(Some)
+            .map_err(|_| WorkAuthorityError::ProjectionLock {
+                message: format!("spec_snapshot_hash for {} is not 32 bytes", work.work_id),
+            })
+    }
+
+    fn resolve_ticket_alias_from_spec_hash(
+        cas: &dyn apm2_core::evidence::ContentAddressedStore,
+        work_id: &str,
+        spec_hash: [u8; 32],
+    ) -> Result<Option<String>, WorkAuthorityError> {
+        let spec_bytes =
+            cas.retrieve(&spec_hash)
+                .map_err(|e| WorkAuthorityError::ProjectionLock {
+                    message: format!("CAS retrieval failed for work_id={work_id}: {e}"),
+                })?;
+        let work_spec = apm2_core::fac::work_cas_schemas::bounded_decode_work_spec(&spec_bytes)
+            .map_err(|e| WorkAuthorityError::ProjectionLock {
+                message: format!("WorkSpec decode failed for work_id={work_id}: {e}"),
+            })?;
+        Ok(work_spec.ticket_alias)
+    }
+
     /// Builds canonical projections from the current work object state.
     ///
     /// Returns `HashMap<alias, Vec<Hash>>` where each alias maps to one or
@@ -699,7 +918,7 @@ impl ProjectionAliasReconciliationGate {
                 })?;
 
         let mut projections: HashMap<String, Vec<alias_reconcile::Hash>> = HashMap::new();
-        for work in projection.list_work() {
+        for work in projection.iter_work() {
             // The work_id itself is the canonical identity. We use a SHA-256
             // hash of the work_id string as the alias_reconcile::Hash.
             let hash = work_id_to_hash(&work.work_id);
@@ -707,49 +926,35 @@ impl ProjectionAliasReconciliationGate {
                 .entry(work.work_id.clone())
                 .or_default()
                 .push(hash);
+        }
 
-            // TCK-00636: When CAS is available, also register ticket_alias ->
-            // work_id_hash mappings so that alias reconciliation can check
-            // real TCK-* aliases in addition to identity mappings.
-            if let Some(cas) = self.cas.as_ref() {
-                if let Ok(Some(ticket_alias)) =
-                    Self::resolve_ticket_alias_for_work(cas.as_ref(), work)
-                {
-                    projections.entry(ticket_alias).or_default().push(hash);
+        if self.cas.is_some() {
+            let alias_index = self.ticket_alias_index.read().map_err(|err| {
+                WorkAuthorityError::ProjectionLock {
+                    message: err.to_string(),
+                }
+            })?;
+
+            for (alias, work_ids) in &alias_index.alias_to_work_ids {
+                // Evicted aliases are considered lossy and omitted so
+                // reconciliation remains fail-closed (missing alias -> defect).
+                if alias_index.evicted_aliases.contains(alias) {
+                    continue;
+                }
+
+                let entry = projections.entry(alias.clone()).or_default();
+                for work_id in work_ids {
+                    entry.push(work_id_to_hash(work_id));
                 }
             }
         }
-        Ok(projections)
-    }
 
-    /// Resolves the `ticket_alias` from a work item's `WorkSpecV1` in CAS.
-    ///
-    /// Returns `Ok(Some(alias))` if the spec has a ticket alias, `Ok(None)`
-    /// if the spec has no alias or the hash is empty, and `Err` only on
-    /// CAS/decode failure (which callers can ignore for best-effort
-    /// enrichment).
-    fn resolve_ticket_alias_for_work(
-        cas: &dyn apm2_core::evidence::ContentAddressedStore,
-        work: &Work,
-    ) -> Result<Option<String>, WorkAuthorityError> {
-        if work.spec_snapshot_hash.is_empty() {
-            return Ok(None);
+        for hashes in projections.values_mut() {
+            hashes.sort_unstable();
+            hashes.dedup();
         }
-        let hash: [u8; 32] = work.spec_snapshot_hash.as_slice().try_into().map_err(|_| {
-            WorkAuthorityError::ProjectionLock {
-                message: format!("spec_snapshot_hash for {} is not 32 bytes", work.work_id),
-            }
-        })?;
-        let spec_bytes = cas
-            .retrieve(&hash)
-            .map_err(|e| WorkAuthorityError::ProjectionLock {
-                message: format!("CAS retrieval failed for work_id={}: {e}", work.work_id),
-            })?;
-        let work_spec = apm2_core::fac::work_cas_schemas::bounded_decode_work_spec(&spec_bytes)
-            .map_err(|e| WorkAuthorityError::ProjectionLock {
-                message: format!("WorkSpec decode failed for work_id={}: {e}", work.work_id),
-            })?;
-        Ok(work_spec.ticket_alias)
+
+        Ok(projections)
     }
 }
 
@@ -834,62 +1039,62 @@ impl AliasReconciliationGate for ProjectionAliasReconciliationGate {
         evaluate_sunset(&self.sunset_criteria, consecutive_clean_ticks, has_defects)
     }
 
-    /// Resolves a ticket alias to a canonical `work_id` by scanning the
-    /// projection's work items and looking up each one's `WorkSpecV1`
-    /// `ticket_alias` field via CAS (TCK-00636, RFC-0032 Phase 1).
+    /// Resolves a ticket alias to a canonical `work_id` using the in-memory
+    /// alias index maintained during projection refresh (TCK-00636, RFC-0032
+    /// Phase 1).
     ///
     /// # Fail-closed semantics
     ///
     /// - No CAS store configured: returns `Ok(None)` (feature not wired)
-    /// - CAS miss for a work item: that item is skipped
-    /// - Malformed `WorkSpec`: that item is skipped
+    /// - CAS miss/malformed `WorkSpec` during index refresh: item omitted
+    /// - Alias evicted from bounded index: returns `Err` (lossy -> deny)
     /// - Ambiguous (multiple matches): returns `Err` (fail-closed)
     fn resolve_ticket_alias(
         &self,
         ticket_alias: &str,
     ) -> Result<Option<String>, WorkAuthorityError> {
-        let Some(cas) = self.cas.as_ref() else {
+        if self.cas.is_none() {
             return Ok(None);
-        };
+        }
 
         self.refresh_projection()?;
 
-        let projection =
-            self.projection
+        let alias_index =
+            self.ticket_alias_index
                 .read()
                 .map_err(|err| WorkAuthorityError::ProjectionLock {
                     message: err.to_string(),
                 })?;
 
-        let mut matches: Vec<String> = Vec::new();
-
-        // Deterministic full coverage: scan the entire projection (sorted by
-        // work_id) so alias resolution cannot silently truncate when row count
-        // exceeds MAX_WORK_LIST_ROWS.
-        for work in projection.list_work() {
-            let Ok(Some(resolved_alias)) = Self::resolve_ticket_alias_for_work(cas.as_ref(), work)
-            else {
-                continue;
-            };
-            if resolved_alias == ticket_alias {
-                matches.push(work.work_id.clone());
-            }
+        if alias_index.evicted_aliases.contains(ticket_alias) {
+            return Err(WorkAuthorityError::ProjectionLock {
+                message: format!(
+                    "ticket alias '{ticket_alias}' was evicted from bounded index (max \
+                     {MAX_TICKET_ALIAS_INDEX_WORK_ITEMS} work items); refusing lossy resolution"
+                ),
+            });
         }
 
-        match matches.len() {
-            0 => Ok(None),
-            1 => Ok(Some(matches.into_iter().next().expect("checked len == 1"))),
-            n => {
+        let Some(work_ids) = alias_index.alias_to_work_ids.get(ticket_alias) else {
+            return Ok(None);
+        };
+        let matches: Vec<String> = work_ids.iter().cloned().collect();
+
+        match matches.as_slice() {
+            [] => Ok(None),
+            [work_id] => Ok(Some(work_id.clone())),
+            _ => {
                 warn!(
                     ticket_alias = %ticket_alias,
-                    match_count = n,
+                    match_count = matches.len(),
                     work_ids = ?matches,
                     "Ambiguous ticket alias resolution (fail-closed)"
                 );
                 Err(WorkAuthorityError::ProjectionLock {
                     message: format!(
-                        "ambiguous ticket alias '{ticket_alias}' resolves to {n} work items: \
-                         {matches:?} (fail-closed: alias reconciliation requires unique resolution)"
+                        "ambiguous ticket alias '{ticket_alias}' resolves to {} work items: \
+                         {matches:?} (fail-closed: alias reconciliation requires unique resolution)",
+                        matches.len()
                     ),
                 })
             },
@@ -926,7 +1131,10 @@ pub fn work_id_to_hash(work_id: &str) -> alias_reconcile::Hash {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use apm2_core::events::{WorkEdgeAdded, WorkEdgeType};
+    use apm2_core::evidence::{CasError, ContentAddressedStore, StoreResult};
     use prost::Message;
 
     use super::*;
@@ -1134,12 +1342,79 @@ mod tests {
         work_id: &str,
         ticket_alias: Option<&str>,
     ) -> (Arc<apm2_core::evidence::MemoryCas>, [u8; 32]) {
-        use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+        use apm2_core::evidence::MemoryCas;
         use apm2_core::fac::work_cas_schemas::{
             WORK_SPEC_V1_SCHEMA, WorkSpecType, WorkSpecV1, canonicalize_for_cas,
         };
 
         let cas = Arc::new(MemoryCas::new());
+        let spec = WorkSpecV1 {
+            schema: WORK_SPEC_V1_SCHEMA.to_string(),
+            work_id: work_id.to_string(),
+            ticket_alias: ticket_alias.map(str::to_string),
+            title: format!("Test work {work_id}"),
+            summary: None,
+            work_type: WorkSpecType::Ticket,
+            repo: None,
+            requirement_ids: Vec::new(),
+            labels: Vec::new(),
+            rfc_id: None,
+            parent_work_ids: Vec::new(),
+            created_at_ns: Some(1_000_000_000),
+        };
+        let spec_json = serde_json::to_string(&spec).expect("spec serializes");
+        let canonical = canonicalize_for_cas(&spec_json).expect("canonical JSON");
+        let stored = cas.store(canonical.as_bytes()).expect("CAS store");
+        (cas, stored.hash)
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingCas {
+        inner: apm2_core::evidence::MemoryCas,
+        retrieve_count: AtomicUsize,
+    }
+
+    impl CountingCas {
+        fn new() -> Self {
+            Self {
+                inner: apm2_core::evidence::MemoryCas::new(),
+                retrieve_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn retrieve_count(&self) -> usize {
+            self.retrieve_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ContentAddressedStore for CountingCas {
+        fn store(&self, content: &[u8]) -> Result<StoreResult, CasError> {
+            self.inner.store(content)
+        }
+
+        fn retrieve(&self, hash: &[u8; 32]) -> Result<Vec<u8>, CasError> {
+            self.retrieve_count.fetch_add(1, Ordering::SeqCst);
+            self.inner.retrieve(hash)
+        }
+
+        fn exists(&self, hash: &[u8; 32]) -> Result<bool, CasError> {
+            self.inner.exists(hash)
+        }
+
+        fn size(&self, hash: &[u8; 32]) -> Result<usize, CasError> {
+            self.inner.size(hash)
+        }
+    }
+
+    fn setup_counting_cas_with_work_spec(
+        work_id: &str,
+        ticket_alias: Option<&str>,
+    ) -> (Arc<CountingCas>, [u8; 32]) {
+        use apm2_core::fac::work_cas_schemas::{
+            WORK_SPEC_V1_SCHEMA, WorkSpecType, WorkSpecV1, canonicalize_for_cas,
+        };
+
+        let cas = Arc::new(CountingCas::new());
         let spec = WorkSpecV1 {
             schema: WORK_SPEC_V1_SCHEMA.to_string(),
             work_id: work_id.to_string(),
@@ -1208,6 +1483,36 @@ mod tests {
     }
 
     #[test]
+    fn resolve_ticket_alias_uses_index_without_repeated_cas_reads() {
+        let (cas, spec_hash) = setup_counting_cas_with_work_spec("W-636-INDEX-001", Some("TCK-IX"));
+        let emitter = make_emitter_with_work(&[("W-636-INDEX-001", spec_hash.to_vec())]);
+
+        let gate = ProjectionAliasReconciliationGate::new(emitter)
+            .with_cas(cas.clone() as Arc<dyn ContentAddressedStore>);
+
+        let first = gate
+            .resolve_ticket_alias("TCK-IX")
+            .expect("first lookup should succeed");
+        assert_eq!(first, Some("W-636-INDEX-001".to_string()));
+
+        let retrieves_after_first = cas.retrieve_count();
+        assert!(
+            retrieves_after_first >= 1,
+            "initial lookup should populate index from CAS at least once"
+        );
+
+        let second = gate
+            .resolve_ticket_alias("TCK-IX")
+            .expect("second lookup should succeed");
+        assert_eq!(second, Some("W-636-INDEX-001".to_string()));
+        assert_eq!(
+            cas.retrieve_count(),
+            retrieves_after_first,
+            "repeated lookup on unchanged projection must not hit CAS again"
+        );
+    }
+
+    #[test]
     fn resolve_ticket_alias_returns_none_for_unknown() {
         let (cas, spec_hash) = setup_cas_with_work_spec("W-636-002", Some("TCK-00999"));
 
@@ -1240,7 +1545,6 @@ mod tests {
 
     #[test]
     fn resolve_ticket_alias_fails_on_ambiguity() {
-        use apm2_core::evidence::ContentAddressedStore;
         use apm2_core::fac::work_cas_schemas::{
             WORK_SPEC_V1_SCHEMA, WorkSpecType, WorkSpecV1, canonicalize_for_cas,
         };
@@ -1277,6 +1581,58 @@ mod tests {
         assert!(
             result.is_err(),
             "ambiguous ticket alias resolution must be fail-closed"
+        );
+    }
+
+    #[test]
+    fn resolve_ticket_alias_fails_closed_for_evicted_alias_entries() {
+        let cas = Arc::new(apm2_core::evidence::MemoryCas::new());
+        let gate = ProjectionAliasReconciliationGate::new(make_emitter_with_work(&[]))
+            .with_cas(cas as Arc<dyn ContentAddressedStore>);
+
+        {
+            let mut alias_index = gate
+                .ticket_alias_index
+                .write()
+                .expect("alias index lock should be available");
+            alias_index
+                .alias_to_work_ids
+                .entry("TCK-EVICTED".to_string())
+                .or_default()
+                .insert("W-636-LOSSY-001".to_string());
+            alias_index
+                .evicted_aliases
+                .insert("TCK-EVICTED".to_string());
+        }
+
+        let result = gate.resolve_ticket_alias("TCK-EVICTED");
+        assert!(
+            result.is_err(),
+            "aliases marked lossy by bounded-index eviction must fail closed"
+        );
+    }
+
+    #[test]
+    fn ticket_alias_index_enforces_capacity_with_oldest_eviction() {
+        let mut alias_index = TicketAliasIndex::default();
+
+        for i in 0..=MAX_TICKET_ALIAS_INDEX_WORK_ITEMS {
+            let work_id = format!("W-636-CAP-{i}");
+            let alias = format!("TCK-CAP-{i}");
+            let spec_hash = work_id_to_hash(&work_id);
+            alias_index.upsert_spec_hash(&work_id, spec_hash);
+            alias_index.upsert_alias(&work_id, Some(alias));
+            alias_index.enforce_capacity();
+        }
+
+        assert_eq!(
+            alias_index.spec_hash_by_work_id.len(),
+            MAX_TICKET_ALIAS_INDEX_WORK_ITEMS,
+            "index must remain capped after insertion beyond capacity"
+        );
+        assert!(
+            alias_index.evicted_aliases.contains("TCK-CAP-0"),
+            "oldest alias must be marked lossy after eviction"
         );
     }
 

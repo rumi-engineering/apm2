@@ -113,7 +113,7 @@ Wires the `apm2_core::events::alias_reconcile` module into the daemon work autho
 **Methods:**
 
 - `check_promotion()` -- Validates alias bindings for promotion eligibility (fail-closed on ambiguity)
-- `resolve_ticket_alias()` -- Resolves a ticket alias to a canonical `work_id` via projection state (TCK-00636). Default implementation returns `Ok(None)` for backward compatibility. `ProjectionAliasReconciliationGate` overrides with CAS-backed `WorkSpec` lookup when a CAS store is configured.
+- `resolve_ticket_alias()` -- Resolves a ticket alias to a canonical `work_id` via a bounded in-memory alias index derived from projection + CAS state (TCK-00636). Default implementation returns `Ok(None)` for backward compatibility.
 
 ### `ProjectionAliasReconciliationGate`
 
@@ -124,12 +124,14 @@ Projection-backed alias reconciliation gate implementation. Bridges the alias re
 - `projection` -- Shared `WorkObjectProjection` rebuilt from ledger events
 - `event_emitter` -- Ledger event emitter for projection refresh
 - `cas` -- Optional CAS store for `WorkSpec` retrieval (TCK-00636)
+- `ticket_alias_index` -- Bounded in-memory `ticket_alias -> work_id` index with deterministic oldest-entry eviction (`MAX_TICKET_ALIAS_INDEX_WORK_ITEMS`)
 
 **Contracts:**
 
-- [CTR-AG01] `build_canonical_projections()` enriches alias projections with CAS-backed `ticket_alias` -> `work_id_hash` mappings when CAS is available (TCK-00636).
-- [CTR-AG02] `resolve_ticket_alias()` scans work items (bounded by `MAX_WORK_LIST_ROWS`), performs CAS lookup for each `spec_snapshot_hash`, and returns the matching `work_id` or `Err` on ambiguity (fail-closed).
-- [CTR-AG03] CAS miss or malformed `WorkSpec` for individual work items is treated as skip (not hard error), maintaining fail-closed semantics at the aggregate level.
+- [CTR-AG01] `refresh_projection()` incrementally refreshes `ticket_alias_index` only for new/changed `spec_snapshot_hash` values; steady-state lookups avoid per-request CAS I/O (TCK-00636 security hardening).
+- [CTR-AG02] `resolve_ticket_alias()` performs O(1) alias-index lookups and returns `Err` on ambiguity or lossy/evicted alias state (fail-closed).
+- [CTR-AG03] `build_canonical_projections()` uses index-backed alias mappings (no projection-wide CAS scans); aliases marked lossy by eviction are omitted so reconciliation yields unresolved defects (fail-closed).
+- [CTR-AG04] Alias index collections are hard-capped by `MAX_TICKET_ALIAS_INDEX_WORK_ITEMS` with deterministic oldest-work eviction per RS-27.
 
 ## Public API
 
