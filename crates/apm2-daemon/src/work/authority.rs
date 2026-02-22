@@ -121,6 +121,15 @@ impl ProjectionWorkAuthority {
         }
     }
 
+    /// Returns a shared handle to the underlying `WorkObjectProjection`.
+    ///
+    /// Used by related authority components (for example alias reconciliation)
+    /// to avoid maintaining redundant projection state from the same emitter.
+    #[must_use]
+    pub(crate) fn shared_projection(&self) -> Arc<RwLock<WorkObjectProjection>> {
+        Arc::clone(&self.projection)
+    }
+
     fn refresh_projection(&self) -> Result<(), WorkAuthorityError> {
         // O(1) pre-check: query event count without fetching all rows.
         // Only proceed to the full fetch when the count has changed.
@@ -786,13 +795,18 @@ impl TicketAliasIndex {
 }
 
 impl ProjectionAliasReconciliationGate {
-    /// Creates a new alias reconciliation gate backed by the given emitter.
+    /// Creates a new alias reconciliation gate using an existing projection.
     ///
-    /// Uses default observation window and sunset criteria.
+    /// This allows the dispatcher to share projection state with
+    /// [`ProjectionWorkAuthority`] instead of maintaining a parallel
+    /// `WorkObjectProjection` for the same event emitter.
     #[must_use]
-    pub fn new(event_emitter: Arc<dyn LedgerEventEmitter>) -> Self {
+    pub(crate) fn new_with_projection(
+        event_emitter: Arc<dyn LedgerEventEmitter>,
+        projection: Arc<RwLock<WorkObjectProjection>>,
+    ) -> Self {
         Self {
-            projection: Arc::new(RwLock::new(WorkObjectProjection::new())),
+            projection,
             event_emitter,
             last_event_count: Arc::new(RwLock::new(0)),
             observation_window: ObservationWindow {
@@ -807,6 +821,17 @@ impl ProjectionAliasReconciliationGate {
             cas: None,
             ticket_alias_index: Arc::new(RwLock::new(TicketAliasIndex::default())),
         }
+    }
+
+    /// Creates a new alias reconciliation gate backed by the given emitter.
+    ///
+    /// Uses default observation window and sunset criteria.
+    #[must_use]
+    pub fn new(event_emitter: Arc<dyn LedgerEventEmitter>) -> Self {
+        Self::new_with_projection(
+            event_emitter,
+            Arc::new(RwLock::new(WorkObjectProjection::new())),
+        )
     }
 
     /// Creates a gate with custom observation window and sunset criteria.
