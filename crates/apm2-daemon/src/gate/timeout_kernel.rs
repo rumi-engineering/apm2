@@ -1754,7 +1754,8 @@ impl SqliteTimeoutIntentStore {
         guard
             .execute(
                 "UPDATE gate_timeout_intents
-                 SET state = 'pending', blocked_reason = NULL, updated_at_ns = ?2
+                 SET state = 'pending', blocked_reason = NULL,
+                     created_at_ns = ?2, updated_at_ns = ?2
                  WHERE intent_key = ?1",
                 params![key, now_ns],
             )
@@ -2247,6 +2248,63 @@ mod tests {
                 .expect("sqlite load should succeed after remove")
                 .is_empty(),
             "removed lease should not remain in sqlite store"
+        );
+    }
+
+    #[test]
+    fn sqlite_intent_store_retryable_moves_intent_to_back() {
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory sqlite open should succeed"),
+        ));
+        let store =
+            SqliteTimeoutIntentStore::new(Arc::clone(&conn)).expect("intent store init succeeds");
+        let intent_a = GateTimeoutIntent {
+            lease: sample_gate_lease("lease-retry-a", 1_000),
+            gate_type: GateType::Quality,
+        };
+        let intent_b = GateTimeoutIntent {
+            lease: sample_gate_lease("lease-retry-b", 1_000),
+            gate_type: GateType::Security,
+        };
+        let key_a = intent_a.key();
+        let key_b = intent_b.key();
+
+        store
+            .enqueue_many(&[intent_a, intent_b])
+            .expect("enqueue_many succeeds");
+        {
+            let guard = conn.lock().expect("sqlite lock should succeed");
+            guard
+                .execute(
+                    "UPDATE gate_timeout_intents SET created_at_ns = ?2 WHERE intent_key = ?1",
+                    params![&key_a, 10_i64],
+                )
+                .expect("seed created_at_ns for intent_a");
+            guard
+                .execute(
+                    "UPDATE gate_timeout_intents SET created_at_ns = ?2 WHERE intent_key = ?1",
+                    params![&key_b, 20_i64],
+                )
+                .expect("seed created_at_ns for intent_b");
+        }
+
+        let first = store.dequeue_batch(1).expect("dequeue first intent");
+        assert_eq!(first.len(), 1, "exactly one intent dequeued");
+        assert_eq!(
+            first[0].key(),
+            key_a,
+            "intent_a should be first before retry update"
+        );
+
+        store
+            .mark_retryable(&key_a, "retry")
+            .expect("mark_retryable succeeds");
+        let second = store.dequeue_batch(1).expect("dequeue second intent");
+        assert_eq!(second.len(), 1, "exactly one intent dequeued");
+        assert_eq!(
+            second[0].key(),
+            key_b,
+            "retryable intent should move behind older pending intents"
         );
     }
 

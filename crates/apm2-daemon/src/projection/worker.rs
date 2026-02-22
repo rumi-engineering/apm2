@@ -71,6 +71,10 @@ use apm2_core::economics::{
     ProjectionSinkContinuityProfileV1, evaluate_projection_continuity,
 };
 use apm2_core::evidence::ContentAddressedStore;
+use apm2_core::orchestrator_kernel::{
+    CompositeCursor, CursorEvent, advance_cursor_with_event, is_after_cursor,
+    sort_and_truncate_events,
+};
 use apm2_core::pcac::{
     AuthorityDenyClass, AuthorityJoinInputV1, BoundaryIntentClass, DeterminismClass,
     IdentityEvidenceLevel, PcacPolicyKnobs, RiskTier,
@@ -1631,6 +1635,31 @@ pub struct PrMetadata {
 /// Default tailer ID for the projection worker.
 const DEFAULT_TAILER_ID: &str = "projection_worker";
 
+impl CursorEvent for SignedLedgerEvent {
+    fn timestamp_ns(&self) -> u64 {
+        self.timestamp_ns
+    }
+
+    fn event_id(&self) -> &str {
+        &self.event_id
+    }
+}
+
+struct CursorPoint<'a> {
+    timestamp_ns: u64,
+    event_id: &'a str,
+}
+
+impl CursorEvent for CursorPoint<'_> {
+    fn timestamp_ns(&self) -> u64 {
+        self.timestamp_ns
+    }
+
+    fn event_id(&self) -> &str {
+        self.event_id
+    }
+}
+
 /// Ledger tailer for watching events.
 ///
 /// Tracks the last processed event sequence and polls for new events.
@@ -1709,6 +1738,13 @@ impl LedgerTailer {
             last_event_id,
             tailer_id: tailer_id.to_string(),
             canonical_mode: std::sync::atomic::AtomicU8::new(0),
+        }
+    }
+
+    fn cursor(&self) -> CompositeCursor {
+        CompositeCursor {
+            timestamp_ns: self.last_processed_ns,
+            event_id: self.last_event_id.clone(),
         }
     }
 
@@ -2016,15 +2052,8 @@ impl LedgerTailer {
             )?;
             if !canonical.is_empty() {
                 events.extend(canonical);
-                // Sort merged events by (timestamp_ns, event_id) for
-                // deterministic cursor-compatible ordering.
-                events.sort_by(|a, b| {
-                    a.timestamp_ns
-                        .cmp(&b.timestamp_ns)
-                        .then_with(|| a.event_id.cmp(&b.event_id))
-                });
-                // Enforce the batch limit after merge.
-                events.truncate(limit);
+                // Reuse kernel cursor ordering helper after legacy+canonical merge.
+                events = sort_and_truncate_events(events, limit);
             }
         }
 
@@ -2058,14 +2087,16 @@ impl LedgerTailer {
         timestamp_ns: u64,
         event_id: &str,
     ) -> Result<(), ProjectionWorkerError> {
-        // Advance watermark if this event is strictly after the current cursor.
-        // Use composite comparison: (ts, event_id) > (last_ts, last_event_id)
-        let should_advance = timestamp_ns > self.last_processed_ns
-            || (timestamp_ns == self.last_processed_ns && event_id > self.last_event_id.as_str());
+        let cursor = self.cursor();
+        let event = CursorPoint {
+            timestamp_ns,
+            event_id,
+        };
 
-        if should_advance {
-            self.last_processed_ns = timestamp_ns;
-            self.last_event_id = event_id.to_string();
+        if is_after_cursor(&event, &cursor) {
+            let next_cursor = advance_cursor_with_event(&cursor, &event);
+            self.last_processed_ns = next_cursor.timestamp_ns;
+            self.last_event_id = next_cursor.event_id;
             self.persist_watermark()?;
         }
         Ok(())
@@ -2205,12 +2236,7 @@ impl LedgerTailer {
                 )?;
                 if !canonical.is_empty() {
                     events.extend(canonical);
-                    events.sort_by(|a, b| {
-                        a.timestamp_ns
-                            .cmp(&b.timestamp_ns)
-                            .then_with(|| a.event_id.cmp(&b.event_id))
-                    });
-                    events.truncate(limit);
+                    events = sort_and_truncate_events(events, limit);
                 }
             }
 
@@ -2243,13 +2269,16 @@ impl LedgerTailer {
         timestamp_ns: u64,
         event_id: &str,
     ) -> Result<(), ProjectionWorkerError> {
-        // Advance watermark if this event is strictly after the current cursor.
-        let should_advance = timestamp_ns > self.last_processed_ns
-            || (timestamp_ns == self.last_processed_ns && event_id > self.last_event_id.as_str());
+        let cursor = self.cursor();
+        let event = CursorPoint {
+            timestamp_ns,
+            event_id,
+        };
 
-        if should_advance {
-            self.last_processed_ns = timestamp_ns;
-            self.last_event_id = event_id.to_string();
+        if is_after_cursor(&event, &cursor) {
+            let next_cursor = advance_cursor_with_event(&cursor, &event);
+            self.last_processed_ns = next_cursor.timestamp_ns;
+            self.last_event_id = next_cursor.event_id;
 
             let conn = Arc::clone(&self.conn);
             let tailer_id = self.tailer_id.clone();
