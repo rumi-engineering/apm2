@@ -47,6 +47,45 @@ pub enum WorkError {
         work_id: String,
     },
 
+    /// Merge receipt ID placed into `gate_receipt_id` field.
+    ///
+    /// The `gate_receipt_id` field is reserved for gate-level receipts.
+    /// Merge receipts must be stored in the dedicated `merge_receipt_id`
+    /// field to avoid semantic confusion.
+    ///
+    /// # Security (INV-0113)
+    ///
+    /// This is the fail-closed gate for domain separation: any value in
+    /// `gate_receipt_id` that structurally matches a merge receipt prefix
+    /// is rejected outright.
+    #[error("gate_receipt_id contains a merge receipt identifier for work_id {work_id}: '{value}'")]
+    MergeReceiptInGateReceiptField {
+        /// The work ID.
+        work_id: String,
+        /// The invalid value that was placed in `gate_receipt_id`.
+        value: String,
+    },
+
+    /// Invalid `merge_receipt_id` value — does not match the required
+    /// `merge-receipt-` prefix.
+    ///
+    /// # Security (INV-0114)
+    ///
+    /// The `merge_receipt_id` field MUST start with `merge-receipt-` when
+    /// non-empty.  This positive allowlist prevents gate receipt identifiers
+    /// from being injected into the merge receipt field, enforcing
+    /// bidirectional domain separation together with
+    /// [`MergeReceiptInGateReceiptField`](Self::MergeReceiptInGateReceiptField).
+    #[error(
+        "merge_receipt_id for work_id {work_id} does not start with 'merge-receipt-': '{value}'"
+    )]
+    InvalidMergeReceiptId {
+        /// The work ID.
+        work_id: String,
+        /// The invalid value that was placed in `merge_receipt_id`.
+        value: String,
+    },
+
     /// Invalid work state string.
     #[error("invalid work state: {value}")]
     InvalidWorkState {

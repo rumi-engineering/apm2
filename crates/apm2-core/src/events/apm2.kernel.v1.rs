@@ -42,7 +42,7 @@ pub struct KernelEvent {
     /// Event payload (oneof)
     #[prost(
         oneof = "kernel_event::Payload",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35"
     )]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
@@ -102,6 +102,8 @@ pub mod kernel_event {
         ReviewReceiptRecorded(super::ReviewReceiptRecorded),
         #[prost(message, tag = "34")]
         ProjectionReceiptRecorded(super::ProjectionReceiptRecorded),
+        #[prost(message, tag = "35")]
+        WorkGraph(super::WorkGraphEvent),
     }
 }
 /// ============================================================
@@ -346,6 +348,11 @@ pub struct WorkCompleted {
     pub evidence_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, tag = "4")]
     pub gate_receipt_id: ::prost::alloc::string::String,
+    /// Dedicated merge receipt identifier, separate from gate_receipt_id.
+    /// Populated when work completes via merge executor.  The merge receipt
+    /// atomically binds gate outcomes to the observed merge result.
+    #[prost(string, tag = "5")]
+    pub merge_receipt_id: ::prost::alloc::string::String,
 }
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1994,6 +2001,92 @@ pub struct ProjectionReceiptRecorded {
     #[prost(bytes = "vec", tag = "6")]
     pub projector_signature: ::prost::alloc::vec::Vec<u8>,
 }
+/// Envelope for work graph edge events.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkGraphEvent {
+    #[prost(oneof = "work_graph_event::Event", tags = "1, 2, 3")]
+    pub event: ::core::option::Option<work_graph_event::Event>,
+}
+/// Nested message and enum types in `WorkGraphEvent`.
+pub mod work_graph_event {
+    #[derive(Eq, Hash)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "1")]
+        Added(super::WorkEdgeAdded),
+        #[prost(message, tag = "2")]
+        Removed(super::WorkEdgeRemoved),
+        #[prost(message, tag = "3")]
+        Waived(super::WorkEdgeWaived),
+    }
+}
+/// Emitted when a dependency edge is added between two work items.
+///
+/// This event establishes a directional relationship in the work graph.
+/// The edge_type classifies the nature of the dependency.
+///
+/// Topic derivation produces topics for BOTH from_work_id and to_work_id
+/// so that subscribers to either work item receive the notification.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkEdgeAdded {
+    /// Source work item in the edge.
+    #[prost(string, tag = "1")]
+    pub from_work_id: ::prost::alloc::string::String,
+    /// Target work item in the edge.
+    #[prost(string, tag = "2")]
+    pub to_work_id: ::prost::alloc::string::String,
+    /// Type of dependency relationship.
+    #[prost(enumeration = "WorkEdgeType", tag = "3")]
+    pub edge_type: i32,
+    /// Human-readable rationale for why this edge exists.
+    #[prost(string, tag = "4")]
+    pub rationale: ::prost::alloc::string::String,
+}
+/// Emitted when a dependency edge is removed between two work items.
+///
+/// This event removes a previously established edge from the work graph.
+///
+/// Topic derivation produces topics for BOTH from_work_id and to_work_id.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkEdgeRemoved {
+    /// Source work item in the edge.
+    #[prost(string, tag = "1")]
+    pub from_work_id: ::prost::alloc::string::String,
+    /// Target work item in the edge.
+    #[prost(string, tag = "2")]
+    pub to_work_id: ::prost::alloc::string::String,
+    /// Reason for edge removal.
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// Emitted when a dependency edge is waived (intentionally overridden).
+///
+/// A waiver records that a dependency was acknowledged but intentionally
+/// skipped, with audit evidence for the override decision.
+///
+/// Topic derivation produces topics for BOTH from_work_id and to_work_id.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkEdgeWaived {
+    /// Source work item in the edge.
+    #[prost(string, tag = "1")]
+    pub from_work_id: ::prost::alloc::string::String,
+    /// Target work item in the edge.
+    #[prost(string, tag = "2")]
+    pub to_work_id: ::prost::alloc::string::String,
+    /// Type of the original edge being waived.
+    #[prost(enumeration = "WorkEdgeType", tag = "3")]
+    pub original_edge_type: i32,
+    /// Justification for the waiver.
+    #[prost(string, tag = "4")]
+    pub waiver_justification: ::prost::alloc::string::String,
+    /// Actor who authorized the waiver.
+    #[prost(string, tag = "5")]
+    pub waiver_actor_id: ::prost::alloc::string::String,
+}
 /// Determinism status for AAT runs.
 /// Indicates whether multiple runs produced consistent terminal evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -2514,6 +2607,47 @@ impl ReviewBlockedReasonCode {
             "REVIEW_BLOCKED_REASON_CONTEXT_PACK_INVALID" => {
                 Some(Self::ReviewBlockedReasonContextPackInvalid)
             }
+            _ => None,
+        }
+    }
+}
+/// Type of dependency edge between work items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum WorkEdgeType {
+    /// Unspecified edge type (invalid).
+    Unspecified = 0,
+    /// from_work_id depends on to_work_id (must complete first).
+    Dependency = 1,
+    /// from_work_id blocks to_work_id (prevents progress).
+    Blocks = 2,
+    /// from_work_id enables to_work_id (prerequisite capability).
+    Enables = 3,
+    /// from_work_id must complete before to_work_id starts (ordering).
+    Sequence = 4,
+}
+impl WorkEdgeType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "WORK_EDGE_TYPE_UNSPECIFIED",
+            Self::Dependency => "WORK_EDGE_TYPE_DEPENDENCY",
+            Self::Blocks => "WORK_EDGE_TYPE_BLOCKS",
+            Self::Enables => "WORK_EDGE_TYPE_ENABLES",
+            Self::Sequence => "WORK_EDGE_TYPE_SEQUENCE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "WORK_EDGE_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "WORK_EDGE_TYPE_DEPENDENCY" => Some(Self::Dependency),
+            "WORK_EDGE_TYPE_BLOCKS" => Some(Self::Blocks),
+            "WORK_EDGE_TYPE_ENABLES" => Some(Self::Enables),
+            "WORK_EDGE_TYPE_SEQUENCE" => Some(Self::Sequence),
             _ => None,
         }
     }

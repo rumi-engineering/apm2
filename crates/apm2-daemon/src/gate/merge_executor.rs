@@ -265,8 +265,15 @@ pub enum MergeExecutorEvent {
     WorkCompleted {
         /// The work ID.
         work_id: String,
-        /// The merge receipt that serves as evidence.
-        gate_receipt_id: String,
+        /// Dedicated merge receipt identifier (e.g., `merge-receipt-<sha>`).
+        ///
+        /// This value is stored in the `merge_receipt_id` proto field, NOT in
+        /// `gate_receipt_id`.  The gate receipt IDs that authorized the merge
+        /// are carried separately in `evidence_ids`.
+        merge_receipt_id: String,
+        /// Gate receipt IDs that authorized this merge, carried as evidence
+        /// references on the `work.completed` event.
+        evidence_gate_receipt_ids: Vec<String>,
         /// Timestamp (ms since epoch).
         timestamp_ms: u64,
     },
@@ -657,11 +664,19 @@ impl MergeExecutor {
         );
 
         // Step 6: Emit WorkCompleted event
-        // The merge receipt ID is derived from the result selector for traceability
-        let gate_receipt_id = format!("merge-receipt-{}", merge_result.result_sha);
+        // The merge receipt ID is derived from the result selector for traceability.
+        // IMPORTANT: This goes into merge_receipt_id, NOT gate_receipt_id.
+        // The gate_receipt_ids are carried as evidence references.
+        let merge_receipt_id = format!("merge-receipt-{}", merge_result.result_sha);
+        let evidence_gate_receipt_ids: Vec<String> = input
+            .gate_outcomes
+            .iter()
+            .filter_map(|o| o.receipt_id.clone())
+            .collect();
         events.push(MergeExecutorEvent::WorkCompleted {
             work_id: input.work_id.clone(),
-            gate_receipt_id,
+            merge_receipt_id,
+            evidence_gate_receipt_ids,
             timestamp_ms: now_ms,
         });
 
@@ -1782,5 +1797,99 @@ mod tests {
         };
         let result = executor.execute_merge(&input, &adapter);
         assert!(result.is_ok());
+    }
+
+    // =========================================================================
+    // TCK-00650 regression tests: merge_receipt_id / gate_receipt_id separation
+    // =========================================================================
+
+    #[test]
+    fn test_work_completed_event_uses_merge_receipt_id_not_gate_receipt_id() {
+        let signer = Arc::new(Signer::generate());
+        let clock = Arc::new(MockClock {
+            now_ms: 1_704_067_200_000,
+        });
+        let executor = MergeExecutor::with_clock(Arc::clone(&signer), "merge-executor", clock);
+
+        let input = create_test_input(&signer);
+        let adapter = SuccessAdapter {
+            result_sha: "abc123def456".to_string(),
+        };
+
+        let (_receipt, events) = executor.execute_merge(&input, &adapter).unwrap();
+
+        // The third event should be WorkCompleted with merge_receipt_id, not
+        // gate_receipt_id
+        let work_completed = &events[2];
+        match work_completed {
+            MergeExecutorEvent::WorkCompleted {
+                work_id,
+                merge_receipt_id,
+                evidence_gate_receipt_ids,
+                ..
+            } => {
+                assert_eq!(work_id, "work-001");
+
+                // merge_receipt_id carries the merge receipt identifier
+                assert_eq!(
+                    merge_receipt_id, "merge-receipt-abc123def456",
+                    "merge_receipt_id must contain the merge receipt identifier"
+                );
+
+                // evidence_gate_receipt_ids carries the individual gate receipt IDs
+                assert_eq!(
+                    evidence_gate_receipt_ids.len(),
+                    3,
+                    "evidence_gate_receipt_ids should carry all 3 gate receipt IDs"
+                );
+                assert!(
+                    evidence_gate_receipt_ids.contains(&"receipt-aat-001".to_string()),
+                    "should include AAT receipt ID"
+                );
+                assert!(
+                    evidence_gate_receipt_ids.contains(&"receipt-quality-001".to_string()),
+                    "should include Quality receipt ID"
+                );
+                assert!(
+                    evidence_gate_receipt_ids.contains(&"receipt-security-001".to_string()),
+                    "should include Security receipt ID"
+                );
+
+                // Verify merge_receipt_id is NOT in evidence_gate_receipt_ids
+                assert!(
+                    !evidence_gate_receipt_ids.contains(merge_receipt_id),
+                    "merge receipt ID must not appear in evidence_gate_receipt_ids"
+                );
+            },
+            other => panic!("expected MergeExecutorEvent::WorkCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_work_completed_merge_receipt_id_derived_from_result_sha() {
+        let signer = Arc::new(Signer::generate());
+        let clock = Arc::new(MockClock { now_ms: 1_000_000 });
+        let executor = MergeExecutor::with_clock(Arc::clone(&signer), "merge-executor", clock);
+
+        let input = create_test_input(&signer);
+        let result_sha = "deadbeef1234";
+        let adapter = SuccessAdapter {
+            result_sha: result_sha.to_string(),
+        };
+
+        let (_receipt, events) = executor.execute_merge(&input, &adapter).unwrap();
+
+        match &events[2] {
+            MergeExecutorEvent::WorkCompleted {
+                merge_receipt_id, ..
+            } => {
+                assert_eq!(
+                    merge_receipt_id,
+                    &format!("merge-receipt-{result_sha}"),
+                    "merge_receipt_id should be derived from the merge result SHA"
+                );
+            },
+            other => panic!("expected MergeExecutorEvent::WorkCompleted, got {other:?}"),
+        }
     }
 }

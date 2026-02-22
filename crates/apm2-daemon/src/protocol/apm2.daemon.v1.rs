@@ -1842,6 +1842,47 @@ pub struct OpenWorkResponse {
     #[prost(bool, tag = "3")]
     pub already_existed: bool,
 }
+/// IPC-PRIV-077: PublishWorkContextEntry (TCK-00638, RFC-0032 Phase 2)
+/// Publishes a work context entry to CAS and anchors it in the ledger via
+/// evidence.published with category WORK_CONTEXT_ENTRY.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublishWorkContextEntryRequest {
+    /// Canonical work identifier. Must match an existing work claim.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Entry kind discriminant from closed WorkContextKind allowlist.
+    /// Accepted values: HandoffNote, ImplementerTerminal, Diagnosis,
+    /// ReviewFinding, ReviewVerdict, GateNote, Linkout.
+    #[prost(string, tag = "2")]
+    pub kind: ::prost::alloc::string::String,
+    /// Deduplication key for idempotent publishing.
+    /// Must not be empty. Uniqueness is enforced on (work_id, kind, dedupe_key).
+    #[prost(string, tag = "3")]
+    pub dedupe_key: ::prost::alloc::string::String,
+    /// JSON-encoded WorkContextEntryV1 payload (max 256 KiB).
+    /// The daemon overwrites entry_id, actor_id, and created_at_ns with
+    /// daemon-authoritative values before CAS storage.
+    #[prost(bytes = "vec", tag = "4")]
+    pub entry_json: ::prost::alloc::vec::Vec<u8>,
+    /// Lease ID for PCAC lifecycle enforcement. Required.
+    #[prost(string, tag = "5")]
+    pub lease_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublishWorkContextEntryResponse {
+    /// Deterministically derived entry_id (CTX- followed by blake3 hex).
+    #[prost(string, tag = "1")]
+    pub entry_id: ::prost::alloc::string::String,
+    /// Evidence ID (same as entry_id per ticket spec).
+    #[prost(string, tag = "2")]
+    pub evidence_id: ::prost::alloc::string::String,
+    /// CAS hash of the canonical entry bytes (hex-encoded BLAKE3).
+    #[prost(string, tag = "3")]
+    pub cas_hash: ::prost::alloc::string::String,
+    /// Work ID echoed back.
+    #[prost(string, tag = "4")]
+    pub work_id: ::prost::alloc::string::String,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StopReason {

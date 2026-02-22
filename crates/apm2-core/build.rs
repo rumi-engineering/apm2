@@ -42,6 +42,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ".apm2.kernel.v1.GitHubLeaseEvent.event",
             "#[derive(Eq, Hash)]",
         )
+        .type_attribute(
+            ".apm2.kernel.v1.WorkGraphEvent.event",
+            "#[derive(Eq, Hash)]",
+        )
         // Output to src/events/
         .out_dir("src/events")
         .compile_protos(&["../../proto/kernel_events.proto"], &["../../proto"])?;

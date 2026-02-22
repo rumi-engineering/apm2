@@ -1875,3 +1875,35 @@ message OpenWorkResponse {
   // Whether this was an idempotent no-op (work already existed with same hash).
   bool already_existed = 3;
 }
+
+// IPC-PRIV-077: PublishWorkContextEntry (TCK-00638, RFC-0032 Phase 2)
+// Publishes a work context entry to CAS and anchors it in the ledger via
+// evidence.published with category WORK_CONTEXT_ENTRY.
+message PublishWorkContextEntryRequest {
+  // Canonical work identifier. Must match an existing work claim.
+  string work_id = 1;
+  // Entry kind discriminant from closed WorkContextKind allowlist.
+  // Accepted values: HandoffNote, ImplementerTerminal, Diagnosis,
+  // ReviewFinding, ReviewVerdict, GateNote, Linkout.
+  string kind = 2;
+  // Deduplication key for idempotent publishing.
+  // Must not be empty. Uniqueness is enforced on (work_id, kind, dedupe_key).
+  string dedupe_key = 3;
+  // JSON-encoded WorkContextEntryV1 payload (max 256 KiB).
+  // The daemon overwrites entry_id, actor_id, and created_at_ns with
+  // daemon-authoritative values before CAS storage.
+  bytes entry_json = 4;
+  // Lease ID for PCAC lifecycle enforcement. Required.
+  string lease_id = 5;
+}
+
+message PublishWorkContextEntryResponse {
+  // Deterministically derived entry_id (CTX- followed by blake3 hex).
+  string entry_id = 1;
+  // Evidence ID (same as entry_id per ticket spec).
+  string evidence_id = 2;
+  // CAS hash of the canonical entry bytes (hex-encoded BLAKE3).
+  string cas_hash = 3;
+  // Work ID echoed back.
+  string work_id = 4;
+}

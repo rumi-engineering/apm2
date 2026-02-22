@@ -19,6 +19,10 @@ The `apm2-daemon` crate implements the persistent daemon process in APM2's four-
 
 **Legacy Ledger Freeze Guard (TCK-00631):** After RFC-0032 Phase 0 migration, both `SqliteLedgerEventEmitter` and `SqliteLeaseValidator` are frozen at daemon startup via `DispatcherState::freeze_legacy_writes()`. Once frozen, all write methods route to the canonical `events` table with BLAKE3 hash chain continuity instead of the legacy `ledger_events` table. Both types use an `AtomicBool` with `Acquire`/`Release` ordering. The freeze is wired in `main.rs` (`async_main`) after `DispatcherState` construction, gated on `sqlite_conn.is_some()`. The `LedgerEventEmitter` and `LeaseValidator` traits expose `freeze_legacy_writes()` with default no-op implementations for in-memory/stub validators.
 
+**Freeze-Aware Reads (TCK-00638):** Read paths that were introduced before the freeze guard also query the canonical `events` table when frozen. `get_event_by_evidence_identity` (idempotent replay detection for `PublishWorkContextEntry`) checks canonical events via `canonical_get_evidence_by_identity` before falling back to legacy. `LedgerTailer::poll_events` and `poll_events_async` merge canonical and legacy results using lazy `sqlite_master` detection cached in an `AtomicU8`.
+
+**Bounded Evidence Scans (TCK-00638):** `get_event_by_evidence_identity` and `canonical_get_evidence_by_identity` enforce `LIMIT MAX_EVIDENCE_SCAN_ROWS` (1 000) on their SQL queries to prevent O(N) iteration with per-row JSON + Protobuf deserialization. Without this bound, an attacker with a valid lease could publish evidence to grow the event count for a work_id, causing subsequent lookups to exhaust CPU and memory.
+
 ```
 ┌─────────────────┐
 │   apm2-cli      │  CLI client
