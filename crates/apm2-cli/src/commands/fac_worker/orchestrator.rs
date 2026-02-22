@@ -36,12 +36,14 @@ pub(super) enum StepOutcome {
 
 pub(super) struct WorkerOrchestrator {
     state: OrchestratorState,
+    terminal_outcome: Option<JobOutcome>,
 }
 
 impl WorkerOrchestrator {
     pub(super) const fn new() -> Self {
         Self {
             state: OrchestratorState::Idle,
+            terminal_outcome: None,
         }
     }
 
@@ -51,13 +53,28 @@ impl WorkerOrchestrator {
 
     pub(super) fn transition(&mut self, next: OrchestratorState) {
         self.state = next;
+        if !matches!(self.state, OrchestratorState::Completed { .. }) {
+            self.terminal_outcome = None;
+        }
     }
 
+    pub(super) fn complete_with_outcome(&mut self, job_id: String, outcome: JobOutcome) {
+        self.state = OrchestratorState::Completed {
+            job_id,
+            outcome: job_outcome_label(&outcome).to_string(),
+        };
+        self.terminal_outcome = Some(outcome);
+    }
+
+    #[cfg(test)]
     pub(super) const fn is_terminal(&self) -> bool {
         matches!(self.state, OrchestratorState::Completed { .. })
     }
 
     pub(super) fn step(&self) -> StepOutcome {
+        if let Some(outcome) = self.terminal_outcome.clone() {
+            return StepOutcome::Done(outcome);
+        }
         match &self.state {
             OrchestratorState::Completed { job_id, outcome } => match outcome.as_str() {
                 "completed" => StepOutcome::Done(JobOutcome::Completed {
@@ -84,18 +101,6 @@ const fn job_outcome_label(outcome: &JobOutcome) -> &'static str {
         JobOutcome::Completed { .. } => "completed",
         JobOutcome::Aborted { .. } => "aborted",
         JobOutcome::Skipped { .. } => "skipped",
-    }
-}
-
-fn observe_step_outcome(outcome: StepOutcome) {
-    match outcome {
-        StepOutcome::Advanced => {},
-        StepOutcome::Done(job_outcome) => {
-            let _ = job_outcome_label(&job_outcome);
-        },
-        StepOutcome::Skipped(reason) => {
-            let _ = reason.len();
-        },
     }
 }
 
@@ -128,8 +133,6 @@ pub(super) fn process_job(
     toolchain_fingerprint: Option<&str>,
 ) -> JobOutcome {
     let job_wall_start = Instant::now();
-    let mut orchestrator = WorkerOrchestrator::new();
-    observe_step_outcome(orchestrator.step());
 
     let path = &candidate.path;
     let file_name = match path.file_name().and_then(|n| n.to_str()) {
@@ -150,7 +153,6 @@ pub(super) fn process_job(
     // cancelled, quarantine). This is outcome-aware to prevent denied jobs
     // from being routed to completed/ (TCK-00564 MAJOR-1 fix round 4).
     let spec = &candidate.spec;
-    let _ = orchestrator.state();
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
     if let Some(existing_receipt) =
         apm2_core::fac::find_receipt_for_job(&receipts_dir, &spec.job_id)
@@ -1569,9 +1571,6 @@ pub(super) fn process_job(
     let claimed_file_name = claimed_path
         .file_name()
         .map_or_else(|| file_name.clone(), |n| n.to_string_lossy().to_string());
-    orchestrator.transition(OrchestratorState::Claimed {
-        job_id: spec.job_id.clone(),
-    });
 
     // PCAC lifecycle: durable consume after atomic claim; if this fails the claimed
     // job is committed to denied/ via pipeline.
@@ -1617,10 +1616,6 @@ pub(super) fn process_job(
     // Avoid acquiring a second worker lane here: `fac gates` already uses its
     // own lane lock/containment strategy for heavy phases.
     if spec.kind == "gates" {
-        orchestrator.transition(OrchestratorState::Executing {
-            job_id: spec.job_id.clone(),
-            lane_id: FAC_GATES_SYNTHETIC_LANE_ID.to_string(),
-        });
         // TCK-00574 MAJOR-2: Use the resolved net hash computed at the top
         // of process_job (same resolve_network_policy call, now deduplicated).
         let gates_outcome = execute_queued_gates_job(
@@ -1642,11 +1637,6 @@ pub(super) fn process_job(
             heartbeat_jobs_quarantined,
             toolchain_fingerprint,
         );
-        orchestrator.transition(OrchestratorState::Completed {
-            job_id: spec.job_id.clone(),
-            outcome: job_outcome_label(&gates_outcome).to_string(),
-        });
-        observe_step_outcome(orchestrator.step());
         return gates_outcome;
     }
 
@@ -1683,10 +1673,6 @@ pub(super) fn process_job(
         }
         return JobOutcome::skipped_no_lane("no lane available, returning to pending");
     };
-    orchestrator.transition(OrchestratorState::LaneAcquired {
-        job_id: spec.job_id.clone(),
-        lane_id: acquired_lane_id.clone(),
-    });
 
     if let Err(error) = run_preflight(
         fac_root,
@@ -1893,10 +1879,6 @@ pub(super) fn process_job(
         }
         return JobOutcome::Denied { reason };
     }
-    orchestrator.transition(OrchestratorState::LeasePersisted {
-        job_id: spec.job_id.clone(),
-        lane_id: acquired_lane_id.clone(),
-    });
 
     // Step 7: Execute job under containment.
     //
@@ -1918,10 +1900,6 @@ pub(super) fn process_job(
 
     // Handle stop_revoke jobs: kill the target unit and cancel the target job.
     if spec.kind == "stop_revoke" {
-        orchestrator.transition(OrchestratorState::Executing {
-            job_id: spec.job_id.clone(),
-            lane_id: acquired_lane_id,
-        });
         let _ = LaneLeaseV1::remove(&lane_dir);
         let stop_revoke_outcome = handle_stop_revoke(
             spec,
@@ -1940,11 +1918,6 @@ pub(super) fn process_job(
             None, // Non-control-lane stop_revoke: standard admission path
             toolchain_fingerprint,
         );
-        orchestrator.transition(OrchestratorState::Completed {
-            job_id: spec.job_id.clone(),
-            outcome: job_outcome_label(&stop_revoke_outcome).to_string(),
-        });
-        observe_step_outcome(orchestrator.step());
         return stop_revoke_outcome;
     }
 
@@ -2534,10 +2507,6 @@ pub(super) fn process_job(
     // lane workspace and lane-managed CARGO_HOME/CARGO_TARGET_DIR. The warm
     // receipt is persisted to the FAC receipts directory alongside the job receipt.
     if spec.kind == "warm" {
-        orchestrator.transition(OrchestratorState::Executing {
-            job_id: spec.job_id.clone(),
-            lane_id: acquired_lane_id.clone(),
-        });
         // TCK-00554 BLOCKER-1 fix: Derive effective sccache enablement from
         // server containment protocol result. If the containment protocol
         // auto-disabled sccache, the warm execution environment MUST NOT
@@ -2590,11 +2559,6 @@ pub(super) fn process_job(
             let stopped = apm2_core::fac::stop_sccache_server(&sccache_server_env);
             eprintln!("worker: sccache server stop (warm unit end): stopped={stopped}");
         }
-        orchestrator.transition(OrchestratorState::Completed {
-            job_id: spec.job_id.clone(),
-            outcome: job_outcome_label(&warm_outcome).to_string(),
-        });
-        observe_step_outcome(orchestrator.step());
         return warm_outcome;
     }
 
@@ -2629,14 +2593,6 @@ pub(super) fn process_job(
     // in a crash-safe order via a single ReceiptWritePipeline::commit() call.
     // Persist the gate receipt alongside the completed job (before atomic commit).
     write_gate_receipt(queue_root, &claimed_file_name, &gate_receipt);
-    orchestrator.transition(OrchestratorState::Executing {
-        job_id: spec.job_id.clone(),
-        lane_id: acquired_lane_id.clone(),
-    });
-    orchestrator.transition(OrchestratorState::Committing {
-        job_id: spec.job_id.clone(),
-        lane_id: acquired_lane_id.clone(),
-    });
 
     // TCK-00538: Include toolchain fingerprint in the completed job receipt.
     if let Err(commit_err) = commit_claimed_job_via_pipeline(
@@ -2718,12 +2674,6 @@ pub(super) fn process_job(
 
     // Lane guard is dropped here (RAII), releasing the lane lock.
     let _ = acquired_lane_id;
-    orchestrator.transition(OrchestratorState::Completed {
-        job_id: spec.job_id.clone(),
-        outcome: "completed".to_string(),
-    });
-    let _ = orchestrator.is_terminal();
-    observe_step_outcome(orchestrator.step());
 
     JobOutcome::Completed {
         job_id: spec.job_id.clone(),
