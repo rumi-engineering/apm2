@@ -15716,7 +15716,7 @@ impl PrivilegedDispatcher {
                         ),
                     ));
                 }
-                ("OPEN", "CLAIMED", "claim_work_v2_implementer")
+                ("Open", "Claimed", "claim_work_v2_implementer")
             },
             WorkRole::Reviewer => {
                 if work_status.state != apm2_core::work::WorkState::ReadyForReview {
@@ -15738,7 +15738,7 @@ impl PrivilegedDispatcher {
                         ),
                     ));
                 }
-                ("READY_FOR_REVIEW", "REVIEW", "claim_work_v2_reviewer")
+                ("ReadyForReview", "Review", "claim_work_v2_reviewer")
             },
             _ => {
                 return Ok(PrivilegedResponse::error(
@@ -16148,11 +16148,11 @@ impl PrivilegedDispatcher {
     /// 2. **Partial durability recovery (claim-state fallback)** — The
     ///    `work_transitioned` event is missing (partial failure after
     ///    `register_claim` but before `emit_work_transitioned`), but the claim
-    ///    was persisted in `WorkRegistry`. The persisted claim's `lease_id` and
-    ///    `actor_id` are used as the recovery source. The caller is expected to
-    ///    retry, which will re-emit the missing ledger events. In this case,
-    ///    the stale claim row is compensated: it is removed so the retry can
-    ///    proceed from scratch through the full durability chain.
+    ///    was persisted in `WorkRegistry`. If no matching `evidence.published`
+    ///    event exists yet, the stale claim row is compensated (removed) so a
+    ///    retry can complete the full durability chain. If `evidence.published`
+    ///    exists but is malformed/incomplete, recovery fails closed with
+    ///    `FAILED_PRECONDITION` to prevent split-brain.
     ///
     /// 3. **Different-actor rejection** — The claim exists for a different
     ///    actor, so the request is rejected with `FAILED_PRECONDITION`.
@@ -16449,26 +16449,47 @@ impl PrivilegedDispatcher {
                             }));
                         }
                         // evidence.published exists but fields are empty/
-                        // malformed. Fall through to stale-claim removal
-                        // below (safe: the retry will hit the UNIQUE
-                        // constraint on evidence.published and swallow it,
-                        // but the NEW lease_id generated on retry will be
-                        // the authoritative one since the evidence record
-                        // is non-reconstructible).
+                        // malformed. Fail closed below: this ledger anchor
+                        // is corrupt/incomplete and cannot be used for
+                        // idempotent recovery.
                         warn!(
                             work_id = %work_id,
                             evidence_id = %expected_evidence_id,
                             "ClaimWorkV2 partial-recovery: evidence.published \
                              exists but lease_id/cas_hash are empty — cannot \
-                             recover, falling through to stale-claim removal"
+                             recover, failing closed"
                         );
                     }
                 }
 
-                // No evidence.published exists (or it was malformed).
-                // Safe to remove the stale claim — the prior attempt
-                // only produced a WorkRegistry row and nothing in the
-                // immutable ledger.
+                if existing_evidence.is_some() {
+                    // evidence.published exists but fields are empty/malformed.
+                    // Fail closed: do NOT remove the persisted claim and do
+                    // NOT continue with retry semantics. The immutable ledger
+                    // contains a corrupt authority anchor that cannot be used
+                    // for idempotent reconstruction.
+                    warn!(
+                        work_id = %work_id,
+                        actor_id = %actor_id,
+                        role = ?role,
+                        evidence_id = %expected_evidence_id,
+                        "ClaimWorkV2 partial-recovery: evidence.published exists \
+                         but lease_id/cas_hash are irrecoverable; failing closed"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::FailedPrecondition,
+                        format!(
+                            "ClaimWorkV2 rejected: work_id '{work_id}' has corrupt \
+                             evidence.published for role={role_str}; authority \
+                             bindings cannot be idempotently recovered from ledger"
+                        ),
+                    ));
+                }
+
+                // No evidence.published exists.
+                // Safe to remove the stale claim — the prior attempt only
+                // produced a WorkRegistry row and nothing in the immutable
+                // ledger.
                 info!(
                     work_id = %work_id,
                     actor_id = %actor_id,
@@ -36890,6 +36911,122 @@ mod tests {
                 },
                 other => panic!("Expected ClaimWorkV2 or Error, got: {other:?}"),
             }
+        }
+
+        #[test]
+        fn partial_recovery_with_corrupt_evidence_fails_closed_without_claim_removal() {
+            // BLOCKER fix: when evidence.published exists but lease_id/cas_hash
+            // are unrecoverable, idempotency must fail closed and keep the
+            // persisted claim row (no stale-claim compensation).
+            let dispatcher = claim_v2_dispatcher();
+            let ctx = test_ctx();
+            let work_id = "W-test-corrupt-evidence-001";
+            inject_work_opened(&dispatcher, work_id);
+
+            let actor_id = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
+            let policy_resolution = dispatcher
+                .work_registry
+                .get_claim(TEST_GOV_WORK_ID)
+                .expect("governing claim should exist")
+                .policy_resolution;
+
+            let stale_claim = WorkClaim {
+                work_id: work_id.to_string(),
+                lease_id: "L-stale-claim-001".to_string(),
+                actor_id: actor_id.clone(),
+                role: WorkRole::Implementer,
+                policy_resolution,
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+            dispatcher
+                .work_registry
+                .register_claim(stale_claim)
+                .expect("stale claim registration should succeed");
+
+            let expected_evidence_id = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"WAB:");
+                hasher.update(work_id.as_bytes());
+                hasher.update(b":");
+                hasher.update(b"IMPLEMENTER");
+                hasher.update(b":");
+                hasher.update(actor_id.as_bytes());
+                let hash = hasher.finalize();
+                format!("WAB-{}", &hash.to_hex()[..32])
+            };
+
+            // Intentionally omit lease_id/cas_hash in the inner payload so
+            // recovery cannot reconstruct authority pins from ledger bytes.
+            let malformed_payload = serde_json::json!({
+                "event_type": "evidence.published",
+                "evidence_id": expected_evidence_id,
+                "category": "WORK_AUTHORITY_BINDINGS",
+                "work_id": work_id,
+            });
+            let malformed_payload_bytes =
+                serde_json::to_vec(&malformed_payload).expect("malformed payload encodes");
+            dispatcher
+                .event_emitter
+                .emit_evidence_published_event(
+                    work_id,
+                    &malformed_payload_bytes,
+                    &actor_id,
+                    1_234_567_890,
+                    &expected_evidence_id,
+                )
+                .expect("evidence.published injection should succeed");
+
+            let request = ClaimWorkV2Request {
+                work_id: work_id.to_string(),
+                role: i32::from(WorkRole::Implementer),
+                lease_id: TEST_GOV_LEASE_ID.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let response = dispatcher
+                .handle_claim_work_v2(&buf, &ctx)
+                .expect("handler should return protocol response");
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::FailedPrecondition),
+                        "Corrupt evidence.published must fail closed with FAILED_PRECONDITION",
+                    );
+                    assert!(
+                        err.message.contains("corrupt evidence.published"),
+                        "Error should report unrecoverable/corrupt ledger anchor, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "Expected FAILED_PRECONDITION for corrupt evidence recovery, got: {other:?}"
+                ),
+            }
+
+            let persisted_claim = dispatcher
+                .work_registry
+                .get_claim_for_role(work_id, WorkRole::Implementer);
+            assert!(
+                persisted_claim.is_some(),
+                "Claim row must remain when evidence exists but is corrupt"
+            );
+            assert_eq!(
+                persisted_claim
+                    .expect("persisted claim should still exist")
+                    .lease_id,
+                "L-stale-claim-001",
+                "Handler must not remove stale claim when evidence.published exists"
+            );
         }
     }
 
