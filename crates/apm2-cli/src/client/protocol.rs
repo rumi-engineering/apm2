@@ -194,6 +194,7 @@ pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 const DAEMON_SIGNING_PUBLIC_KEY_LEN: usize = 32;
 const SUBSCRIBE_PULSE_RESPONSE_TAG: u8 = 65;
 const UNSUBSCRIBE_PULSE_RESPONSE_TAG: u8 = 67;
+const MAX_PENDING_PULSE_EVENTS: usize = 256;
 
 #[derive(Debug, Clone)]
 struct HandshakeInfo {
@@ -1277,6 +1278,13 @@ impl OperatorClient {
     // TCK-00654: HEF Pulse Wait Integration (RFC-0032 section 12.5)
     // =========================================================================
 
+    fn enqueue_pending_pulse(pending_pulses: &mut VecDeque<PulseEvent>, event: PulseEvent) {
+        if pending_pulses.len() >= MAX_PENDING_PULSE_EVENTS {
+            pending_pulses.pop_front();
+        }
+        pending_pulses.push_back(event);
+    }
+
     /// Subscribes the operator connection to HEF pulse topics.
     ///
     /// Operator subscriptions use socket-authenticated privileges and therefore
@@ -1319,7 +1327,7 @@ impl OperatorClient {
 
             match Self::decode_operator_pulse_frame(&frame)? {
                 OperatorPulseFrame::Pulse(event) => {
-                    self.pending_pulses.push_back(event);
+                    Self::enqueue_pending_pulse(&mut self.pending_pulses, event);
                 },
                 OperatorPulseFrame::Subscribe(response) => return Ok(response),
                 OperatorPulseFrame::Unsubscribe(_) => {
@@ -1403,7 +1411,7 @@ impl OperatorClient {
 
             match Self::decode_operator_pulse_frame(&frame)? {
                 OperatorPulseFrame::Pulse(event) => {
-                    self.pending_pulses.push_back(event);
+                    Self::enqueue_pending_pulse(&mut self.pending_pulses, event);
                 },
                 OperatorPulseFrame::Unsubscribe(response) => return Ok(response),
                 OperatorPulseFrame::Subscribe(_) => {
@@ -3238,6 +3246,38 @@ mod tests {
             },
             other => panic!("expected daemon error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_operator_pending_pulse_queue_is_bounded() {
+        let mut pending = VecDeque::new();
+
+        for idx in 0..(MAX_PENDING_PULSE_EVENTS + 10) {
+            let pulse = PulseEvent {
+                envelope: Some(apm2_daemon::protocol::PulseEnvelopeV1 {
+                    schema_version: 1,
+                    pulse_id: format!("pulse-{idx}"),
+                    topic: "work.W-123.events".to_string(),
+                    ledger_cursor: idx as u64,
+                    ledger_head: idx as u64,
+                    event_hash: None,
+                    event_type: "work.transitioned".to_string(),
+                    entities: Vec::new(),
+                    cas_refs: Vec::new(),
+                    time_envelope_hash: None,
+                    hlc: None,
+                    wall: None,
+                }),
+            };
+            OperatorClient::enqueue_pending_pulse(&mut pending, pulse);
+        }
+
+        assert_eq!(pending.len(), MAX_PENDING_PULSE_EVENTS);
+        let oldest = pending
+            .front()
+            .and_then(|event| event.envelope.as_ref())
+            .map(|envelope| envelope.pulse_id.as_str());
+        assert_eq!(oldest, Some("pulse-10"));
     }
 
     // =========================================================================

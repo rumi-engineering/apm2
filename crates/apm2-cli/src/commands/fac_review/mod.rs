@@ -51,6 +51,7 @@ mod timeout_policy;
 mod types;
 mod verdict_projection;
 
+use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -111,6 +112,7 @@ const DOCTOR_WAIT_POLL_INTERVAL_SECONDS: u64 = 1;
 const DOCTOR_WAIT_PULSE_CHECK_INTERVAL_MILLIS: u64 = 1000;
 const DOCTOR_WAIT_PULSE_MAX_PULSES_PER_SEC: u32 = 24;
 const DOCTOR_WAIT_PULSE_CLIENT_SUB_ID_MAX_LEN: usize = 64;
+const DOCTOR_WAIT_PULSE_DEDUPE_CAPACITY: usize = 512;
 const DOCTOR_WAIT_PULSE_RECONNECT_MAX_ATTEMPTS: usize = 3;
 const DOCTOR_WAIT_PULSE_RECONNECT_BACKOFF_MILLIS: u64 = 250;
 const DOCTOR_WAIT_TIMEOUT_EXIT_CODE: u8 = 2;
@@ -1291,9 +1293,62 @@ fn exit_signal(status: std::process::ExitStatus) -> Option<i32> {
 
 #[derive(Debug, Clone, Default)]
 struct DoctorPulseMetadata {
+    pulse_id: Option<String>,
     topic: Option<String>,
     event_type: Option<String>,
     ledger_cursor: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DoctorPulseFingerprint {
+    pulse_id: Option<String>,
+    ledger_cursor: Option<u64>,
+}
+
+#[derive(Debug)]
+struct DoctorPulseDeduper {
+    capacity: usize,
+    entries: VecDeque<DoctorPulseFingerprint>,
+    index: HashSet<DoctorPulseFingerprint>,
+}
+
+impl DoctorPulseDeduper {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: VecDeque::new(),
+            index: HashSet::new(),
+        }
+    }
+
+    fn insert_if_new(&mut self, pulse: &DoctorPulseMetadata) -> bool {
+        let Some(fingerprint) = pulse.fingerprint() else {
+            return true;
+        };
+        if self.index.contains(&fingerprint) {
+            return false;
+        }
+        if self.entries.len() >= self.capacity
+            && let Some(oldest) = self.entries.pop_front()
+        {
+            self.index.remove(&oldest);
+        }
+        self.index.insert(fingerprint.clone());
+        self.entries.push_back(fingerprint);
+        true
+    }
+}
+
+impl DoctorPulseMetadata {
+    fn fingerprint(&self) -> Option<DoctorPulseFingerprint> {
+        if self.pulse_id.is_none() && self.ledger_cursor.is_none() {
+            return None;
+        }
+        Some(DoctorPulseFingerprint {
+            pulse_id: self.pulse_id.clone(),
+            ledger_cursor: self.ledger_cursor,
+        })
+    }
 }
 
 struct DoctorPulseSubscription {
@@ -1367,6 +1422,7 @@ impl DoctorPulseSubscription {
         let mut metadata = DoctorPulseMetadata::default();
         if let Some(envelope) = event.envelope {
             self.since_ledger_cursor = self.since_ledger_cursor.max(envelope.ledger_cursor);
+            metadata.pulse_id = (!envelope.pulse_id.is_empty()).then_some(envelope.pulse_id);
             metadata.topic = (!envelope.topic.is_empty()).then_some(envelope.topic);
             metadata.event_type = (!envelope.event_type.is_empty()).then_some(envelope.event_type);
             metadata.ledger_cursor = Some(envelope.ledger_cursor);
@@ -1540,6 +1596,60 @@ fn emit_doctor_pulse_reconnect_event(
             "doctor wait: pulse reconnect attempt {attempt} outcome={outcome} reason={reason}"
         );
     }
+}
+
+fn emit_doctor_pulse_skipped_event(
+    json_output: bool,
+    pr_number: u32,
+    reason: &str,
+    pulse: &DoctorPulseMetadata,
+) {
+    if json_output {
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_pulse_skipped".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "pr_number": pr_number,
+                "reason": reason,
+                "pulse_id": pulse.pulse_id,
+                "topic": pulse.topic,
+                "event_type": pulse.event_type,
+                "ledger_cursor": pulse.ledger_cursor,
+            }),
+        }) {
+            eprintln!("WARNING: failed to emit doctor pulse skipped event: {err}");
+        }
+    }
+}
+
+fn doctor_wait_pulse_is_relevant(pulse: &DoctorPulseMetadata) -> bool {
+    if let Some(topic) = pulse.topic.as_deref()
+        && (topic == "ledger.head"
+            || topic.starts_with("work.")
+            || topic.starts_with("work_graph.")
+            || topic.starts_with("gate."))
+    {
+        return true;
+    }
+
+    let Some(event_type) = pulse.event_type.as_deref() else {
+        return false;
+    };
+    let normalized = event_type.to_ascii_lowercase();
+    normalized.starts_with("work.")
+        || normalized.starts_with("work_graph.")
+        || normalized.starts_with("gate.")
+        || matches!(
+            normalized.as_str(),
+            "ledger.head"
+                | "kernelevent"
+                | "workopened"
+                | "worktransitioned"
+                | "workedgeadded"
+                | "workedgeremoved"
+                | "workedgewaived"
+                | "gatereceipt"
+        )
 }
 
 fn close_doctor_pulse_subscription(subscription: &mut DoctorPulseSubscription) {
@@ -1900,6 +2010,7 @@ fn run_doctor_wait_pulse_loop(
     pulse_subscription: &mut DoctorPulseSubscription,
 ) -> DoctorWaitLoopControl {
     let mut tick = initial_tick;
+    let mut pulse_deduper = DoctorPulseDeduper::new(DOCTOR_WAIT_PULSE_DEDUPE_CAPACITY);
 
     loop {
         if let Some(result) = doctor_wait_maybe_exit(
@@ -1945,31 +2056,44 @@ fn run_doctor_wait_pulse_loop(
             continue;
         }
 
+        let Some(pulse) = pulse_metadata else {
+            continue;
+        };
+
+        if !doctor_wait_pulse_is_relevant(&pulse) {
+            emit_doctor_pulse_skipped_event(json_output, pr_number, "out_of_scope", &pulse);
+            continue;
+        }
+
+        if !pulse_deduper.insert_if_new(&pulse) {
+            emit_doctor_pulse_skipped_event(json_output, pr_number, "duplicate", &pulse);
+            continue;
+        }
+
         tick = tick.saturating_add(1);
-        if let Some(pulse) = pulse_metadata {
-            if json_output {
-                if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
-                    event: "doctor_pulse".to_string(),
-                    ts: jsonl::ts_now(),
-                    extra: serde_json::json!({
-                        "tick": tick,
-                        "pr_number": pr_number,
-                        "topic": pulse.topic,
-                        "event_type": pulse.event_type,
-                        "ledger_cursor": pulse.ledger_cursor,
-                        "action": summary.recommended_action.action.as_str(),
-                    }),
-                }) {
-                    eprintln!("WARNING: failed to emit doctor pulse event: {err}");
-                }
-            } else {
-                let topic = pulse.topic.as_deref().unwrap_or("unknown");
-                let event_type = pulse.event_type.as_deref().unwrap_or("unknown");
-                eprintln!(
-                    "doctor wait: pulse tick={tick} topic={topic} event_type={event_type} elapsed={}s",
-                    started.elapsed().as_secs()
-                );
+        if json_output {
+            if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+                event: "doctor_pulse".to_string(),
+                ts: jsonl::ts_now(),
+                extra: serde_json::json!({
+                    "tick": tick,
+                    "pr_number": pr_number,
+                    "pulse_id": pulse.pulse_id,
+                    "topic": pulse.topic,
+                    "event_type": pulse.event_type,
+                    "ledger_cursor": pulse.ledger_cursor,
+                    "action": summary.recommended_action.action.as_str(),
+                }),
+            }) {
+                eprintln!("WARNING: failed to emit doctor pulse event: {err}");
             }
+        } else {
+            let topic = pulse.topic.as_deref().unwrap_or("unknown");
+            let event_type = pulse.event_type.as_deref().unwrap_or("unknown");
+            eprintln!(
+                "doctor wait: pulse tick={tick} topic={topic} event_type={event_type} elapsed={}s",
+                started.elapsed().as_secs()
+            );
         }
 
         // Every 5th pulse-triggered reevaluation uses full mode so merge state
@@ -9845,6 +9969,69 @@ mod tests {
             "client_sub_id exceeded max length: {}",
             sub_id.len()
         );
+    }
+
+    #[test]
+    fn doctor_pulse_deduper_rejects_duplicate_fingerprint() {
+        let mut deduper = super::DoctorPulseDeduper::new(4);
+        let pulse = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-1".to_string()),
+            topic: Some("work.W-1.events".to_string()),
+            event_type: Some("work.transitioned".to_string()),
+            ledger_cursor: Some(10),
+        };
+
+        assert!(deduper.insert_if_new(&pulse));
+        assert!(!deduper.insert_if_new(&pulse));
+    }
+
+    #[test]
+    fn doctor_pulse_deduper_evicts_oldest_entry_when_capacity_reached() {
+        let mut deduper = super::DoctorPulseDeduper::new(2);
+        let pulse_1 = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-1".to_string()),
+            topic: Some("work.W-1.events".to_string()),
+            event_type: Some("work.transitioned".to_string()),
+            ledger_cursor: Some(10),
+        };
+        let pulse_2 = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-2".to_string()),
+            topic: Some("work.W-2.events".to_string()),
+            event_type: Some("work.transitioned".to_string()),
+            ledger_cursor: Some(11),
+        };
+        let pulse_3 = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-3".to_string()),
+            topic: Some("work.W-3.events".to_string()),
+            event_type: Some("work.transitioned".to_string()),
+            ledger_cursor: Some(12),
+        };
+
+        assert!(deduper.insert_if_new(&pulse_1));
+        assert!(deduper.insert_if_new(&pulse_2));
+        assert!(deduper.insert_if_new(&pulse_3));
+
+        // pulse_1 should have been evicted when pulse_3 was inserted.
+        assert!(deduper.insert_if_new(&pulse_1));
+    }
+
+    #[test]
+    fn doctor_wait_pulse_scope_filters_unrelated_events() {
+        let relevant = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-work".to_string()),
+            topic: Some("work.W-123.events".to_string()),
+            event_type: Some("work.transitioned".to_string()),
+            ledger_cursor: Some(42),
+        };
+        assert!(super::doctor_wait_pulse_is_relevant(&relevant));
+
+        let unrelated = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-session".to_string()),
+            topic: Some("session.S-1.lifecycle".to_string()),
+            event_type: Some("session.started".to_string()),
+            ledger_cursor: Some(43),
+        };
+        assert!(!super::doctor_wait_pulse_is_relevant(&unrelated));
     }
 
     #[test]
