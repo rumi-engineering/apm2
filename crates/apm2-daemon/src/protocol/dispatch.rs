@@ -1701,6 +1701,20 @@ pub const CLAIM_WIRE_FRAMING_OVERHEAD_BYTES: usize = 128;
 /// silently undercount and bypass byte quotas (fail-closed).
 pub const CLAIM_SERIALIZATION_FALLBACK_BYTES: usize = 8192;
 
+/// Timeout used to decide when a no-evidence partial-claim row is stale.
+///
+/// Fresh rows may belong to a concurrent in-flight request that has not
+/// reached ledger emission yet and therefore must not be deleted.
+/// Rows older than this timeout are considered stale retry debris and may be
+/// purged to prevent retry deadlock.
+pub const CLAIM_WORK_V2_STALE_CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Suggested retry delay when a fresh no-evidence claim is observed.
+///
+/// Returned in error messages to nudge clients away from hot-looping retries
+/// while an in-flight request is finishing its durability chain.
+pub const CLAIM_WORK_V2_RETRY_DELAY: Duration = Duration::from_millis(500);
+
 /// Maximum supported delegation depth for `DelegateSublease` lineage.
 ///
 /// Keep this aligned with the core delegation ceiling so recursion-depth
@@ -5398,6 +5412,16 @@ pub trait WorkRegistry: Send + Sync {
         None
     }
 
+    /// Returns the elapsed age of a persisted `(work_id, role)` claim.
+    ///
+    /// Implementations should measure age from the successful `register_claim`
+    /// write point using a monotonic source (`Instant` or equivalent).
+    /// Returns `None` when age metadata is unavailable.
+    fn get_claim_age_for_role(&self, work_id: &str, role: WorkRole) -> Option<Duration> {
+        let _ = (work_id, role);
+        None
+    }
+
     /// Removes a claim for the given `(work_id, role)` pair.
     ///
     /// Used by the partial-durability-failure recovery path: when
@@ -5480,7 +5504,7 @@ pub struct StubWorkRegistry {
     #[allow(clippy::type_complexity)]
     claims: std::sync::RwLock<(
         VecDeque<(String, i32)>,
-        std::collections::HashMap<(String, i32), WorkClaim>,
+        std::collections::HashMap<(String, i32), (WorkClaim, std::time::Instant)>,
     )>,
 }
 
@@ -5522,7 +5546,7 @@ impl WorkRegistry for StubWorkRegistry {
         }
 
         order.push_back(key.clone());
-        claims.insert(key, claim.clone());
+        claims.insert(key, (claim.clone(), std::time::Instant::now()));
         Ok(claim)
     }
 
@@ -5534,12 +5558,23 @@ impl WorkRegistry for StubWorkRegistry {
             .0
             .iter()
             .find(|(wid, _)| wid == work_id)
-            .and_then(|key| guard.1.get(key).cloned())
+            .and_then(|key| guard.1.get(key).map(|(claim, _)| claim.clone()))
     }
 
     fn get_claim_for_role(&self, work_id: &str, role: WorkRole) -> Option<WorkClaim> {
         let guard = self.claims.read().expect("lock poisoned");
-        guard.1.get(&(work_id.to_string(), role as i32)).cloned()
+        guard
+            .1
+            .get(&(work_id.to_string(), role as i32))
+            .map(|(claim, _)| claim.clone())
+    }
+
+    fn get_claim_age_for_role(&self, work_id: &str, role: WorkRole) -> Option<Duration> {
+        let guard = self.claims.read().expect("lock poisoned");
+        guard
+            .1
+            .get(&(work_id.to_string(), role as i32))
+            .map(|(_, claimed_at)| claimed_at.elapsed())
     }
 
     fn remove_claim_for_role(&self, work_id: &str, role: WorkRole) {
@@ -7677,6 +7712,13 @@ pub struct PrivilegedDispatcher {
     /// Work registry for claim persistence (TCK-00253).
     work_registry: Arc<dyn WorkRegistry>,
 
+    /// Staleness threshold for no-evidence `ClaimWorkV2` partial-recovery
+    /// rows.
+    ///
+    /// Younger rows are treated as potentially in-flight and are retained.
+    /// Older rows are purged as stale retry debris.
+    claim_work_v2_stale_claim_timeout: Duration,
+
     /// Ledger event emitter for signed event persistence (TCK-00253).
     event_emitter: Arc<dyn LedgerEventEmitter>,
 
@@ -8864,6 +8906,7 @@ impl PrivilegedDispatcher {
             decode_config: DecodeConfig::default(),
             policy_resolver: Arc::new(StubPolicyResolver),
             work_registry: Arc::new(StubWorkRegistry::default()),
+            claim_work_v2_stale_claim_timeout: CLAIM_WORK_V2_STALE_CLAIM_TIMEOUT,
             event_emitter,
             work_authority,
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
@@ -8960,6 +9003,7 @@ impl PrivilegedDispatcher {
             decode_config,
             policy_resolver: Arc::new(StubPolicyResolver),
             work_registry: Arc::new(StubWorkRegistry::default()),
+            claim_work_v2_stale_claim_timeout: CLAIM_WORK_V2_STALE_CLAIM_TIMEOUT,
             event_emitter,
             work_authority,
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
@@ -9075,6 +9119,7 @@ impl PrivilegedDispatcher {
             decode_config,
             policy_resolver,
             work_registry,
+            claim_work_v2_stale_claim_timeout: CLAIM_WORK_V2_STALE_CLAIM_TIMEOUT,
             event_emitter,
             work_authority,
             episode_runtime,
@@ -9165,6 +9210,7 @@ impl PrivilegedDispatcher {
             decode_config: DecodeConfig::default(),
             policy_resolver: Arc::new(StubPolicyResolver),
             work_registry: Arc::new(StubWorkRegistry::default()),
+            claim_work_v2_stale_claim_timeout: CLAIM_WORK_V2_STALE_CLAIM_TIMEOUT,
             event_emitter,
             work_authority,
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
@@ -9214,6 +9260,16 @@ impl PrivilegedDispatcher {
                 .expect("default ControlPlaneLimits always valid"),
             ),
         }
+    }
+
+    /// Overrides stale-claim timeout used by `ClaimWorkV2` partial recovery.
+    ///
+    /// Primarily useful for deterministic tests that need to force stale
+    /// cleanup without sleeping.
+    #[must_use]
+    pub const fn with_claim_work_v2_stale_claim_timeout(mut self, timeout: Duration) -> Self {
+        self.claim_work_v2_stale_claim_timeout = timeout;
+        self
     }
 
     /// Opens or closes the admission health gate (INV-BRK-HEALTH-GATE-001).
@@ -16170,10 +16226,13 @@ impl PrivilegedDispatcher {
     ///    event exists, the handler reconstructs lease/cas/actor fields from
     ///    the immutable ledger record and emits the missing `work_transitioned`
     ///    event before returning success. If no matching evidence exists yet,
-    ///    the handler removes the stale claim row and returns a retriable error
-    ///    so the next attempt can recreate the claim. If `evidence.published`
-    ///    exists but is malformed/ incomplete, recovery fails closed with
-    ///    `FAILED_PRECONDITION` to prevent split-brain.
+    ///    cleanup is guarded by claim age:
+    ///    - fresh claim (< timeout): return retriable error **without delete**
+    ///      (likely in-flight concurrent request)
+    ///    - stale claim (>= timeout): delete stale row and return retriable
+    ///      error so the next attempt can recreate the claim If
+    ///      `evidence.published` exists but is malformed/incomplete, recovery
+    ///      fails closed with `FAILED_PRECONDITION` to prevent split-brain.
     ///
     /// 3. **Different-actor rejection** — The claim exists for a different
     ///    actor, so the request is rejected with `FAILED_PRECONDITION`.
@@ -16628,18 +16687,52 @@ impl PrivilegedDispatcher {
                     ));
                 }
 
-                // No evidence.published exists. The prior claim row is stale
-                // and must be removed before returning retriable error, or the
-                // same DuplicateWorkId branch will deadlock retries forever.
-                self.work_registry.remove_claim_for_role(work_id, role);
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!(
-                        "ClaimWorkV2: partial durability failure detected for \
-                         work_id '{work_id}' (role={role_str}). Stale claim was \
-                         cleared; please retry."
-                    ),
-                ));
+                // No evidence.published exists. Guard cleanup with claim age:
+                // - Young claim: likely an in-flight concurrent request; do not delete.
+                // - Stale claim: safe to purge and allow retry progression.
+                let claim_age = self.work_registry.get_claim_age_for_role(work_id, role);
+                match claim_age {
+                    Some(age) if age >= self.claim_work_v2_stale_claim_timeout => {
+                        self.work_registry.remove_claim_for_role(work_id, role);
+                        return Ok(PrivilegedResponse::error(
+                            PrivilegedErrorCode::CapabilityRequestRejected,
+                            format!(
+                                "ClaimWorkV2: partial durability failure detected for \
+                                 work_id '{work_id}' (role={role_str}). Stale claim \
+                                 (age={}s, timeout={}s) was cleared; please retry.",
+                                age.as_secs(),
+                                self.claim_work_v2_stale_claim_timeout.as_secs()
+                            ),
+                        ));
+                    },
+                    Some(age) => {
+                        return Ok(PrivilegedResponse::error(
+                            PrivilegedErrorCode::CapabilityRequestRejected,
+                            format!(
+                                "ClaimWorkV2: partial durability chain still in-flight for \
+                                 work_id '{work_id}' (role={role_str}, age={}ms < timeout={}ms). \
+                                 Retry after ~{}ms.",
+                                age.as_millis(),
+                                self.claim_work_v2_stale_claim_timeout.as_millis(),
+                                CLAIM_WORK_V2_RETRY_DELAY.as_millis()
+                            ),
+                        ));
+                    },
+                    None => {
+                        // Fail-safe cleanup: without age metadata, retries
+                        // cannot distinguish stale rows from partial failures.
+                        // Clear row to avoid infinite retry deadlock.
+                        self.work_registry.remove_claim_for_role(work_id, role);
+                        return Ok(PrivilegedResponse::error(
+                            PrivilegedErrorCode::CapabilityRequestRejected,
+                            format!(
+                                "ClaimWorkV2: partial durability failure detected for \
+                                 work_id '{work_id}' (role={role_str}). Claim age metadata \
+                                 unavailable; claim was cleared defensively. Please retry."
+                            ),
+                        ));
+                    },
+                }
             }
 
             // Different actor holds the persisted claim — reject.
@@ -37375,7 +37468,7 @@ mod tests {
         }
 
         #[test]
-        fn partial_recovery_without_evidence_removes_stale_claim_before_retry() {
+        fn partial_recovery_without_evidence_keeps_fresh_claim_for_retry() {
             let dispatcher = claim_v2_dispatcher();
             let ctx = test_ctx();
             let work_id = "W-test-partial-no-evidence-001";
@@ -37424,8 +37517,8 @@ mod tests {
                         "no-evidence partial recovery should return retriable error"
                     );
                     assert!(
-                        err.message.contains("Stale claim was"),
-                        "error should mention stale-claim cleanup retry path, got: {}",
+                        err.message.contains("still in-flight"),
+                        "error should indicate fresh in-flight claim retention, got: {}",
                         err.message
                     );
                 },
@@ -37438,8 +37531,78 @@ mod tests {
                 .work_registry
                 .get_claim_for_role(work_id, WorkRole::Implementer);
             assert!(
+                persisted_claim.is_some(),
+                "fresh no-evidence claim must be retained to avoid deleting in-flight claims"
+            );
+        }
+
+        #[test]
+        fn partial_recovery_without_evidence_removes_stale_claim_after_timeout() {
+            let dispatcher =
+                claim_v2_dispatcher().with_claim_work_v2_stale_claim_timeout(Duration::ZERO);
+            let ctx = test_ctx();
+            let work_id = "W-test-partial-no-evidence-stale-001";
+            inject_work_opened(&dispatcher, work_id);
+
+            let actor_id = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+            let policy_resolution = dispatcher
+                .work_registry
+                .get_claim(TEST_GOV_WORK_ID)
+                .expect("governing claim should exist")
+                .policy_resolution;
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: work_id.to_string(),
+                    lease_id: "L-partial-no-evidence-stale-001".to_string(),
+                    actor_id,
+                    role: WorkRole::Implementer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("stale claim registration should succeed");
+
+            let request = ClaimWorkV2Request {
+                work_id: work_id.to_string(),
+                role: i32::from(WorkRole::Implementer),
+                lease_id: TEST_GOV_LEASE_ID.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let response = dispatcher
+                .handle_claim_work_v2(&buf, &ctx)
+                .expect("handler should return protocol response");
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                        "stale no-evidence partial recovery should return retriable error"
+                    );
+                    assert!(
+                        err.message.contains("Stale claim"),
+                        "error should mention stale-claim cleanup, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "Expected retriable error for stale no-evidence partial recovery, got: {other:?}"
+                ),
+            }
+
+            let persisted_claim = dispatcher
+                .work_registry
+                .get_claim_for_role(work_id, WorkRole::Implementer);
+            assert!(
                 persisted_claim.is_none(),
-                "partial recovery must delete stale claim rows in no-evidence path"
+                "stale no-evidence claim must be removed to prevent infinite retry DoS"
             );
         }
 

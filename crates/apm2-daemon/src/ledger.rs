@@ -14,8 +14,10 @@
 //! The `work_claims` table has columns: `work_id`, `lease_id`, `actor_id`,
 //! `role`, `claim_json`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
@@ -4335,13 +4337,17 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 #[derive(Debug)]
 pub struct SqliteWorkRegistry {
     conn: Arc<Mutex<Connection>>,
+    claim_inserted_at: std::sync::RwLock<HashMap<(String, i32), Instant>>,
 }
 
 impl SqliteWorkRegistry {
     /// Creates a new registry with the given `SQLite` connection.
     #[must_use]
-    pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
+        Self {
+            conn,
+            claim_inserted_at: std::sync::RwLock::new(HashMap::new()),
+        }
     }
 
     /// Initializes the database schema.
@@ -4549,6 +4555,10 @@ impl WorkRegistry for SqliteWorkRegistry {
             message: format!("sqlite insert failed: {e}"),
         })?;
 
+        if let Ok(mut ages) = self.claim_inserted_at.write() {
+            ages.insert((claim.work_id.clone(), claim.role as i32), Instant::now());
+        }
+
         Ok(claim)
     }
 
@@ -4605,12 +4615,22 @@ impl WorkRegistry for SqliteWorkRegistry {
         serde_json::from_slice(&claim_json).ok()
     }
 
+    fn get_claim_age_for_role(&self, work_id: &str, role: WorkRole) -> Option<Duration> {
+        self.claim_inserted_at.read().ok().and_then(|ages| {
+            ages.get(&(work_id.to_string(), role as i32))
+                .map(Instant::elapsed)
+        })
+    }
+
     fn remove_claim_for_role(&self, work_id: &str, role: WorkRole) {
         if let Ok(conn) = self.conn.lock() {
             let _ = conn.execute(
                 "DELETE FROM work_claims WHERE work_id = ?1 AND role = ?2",
                 params![work_id, role as i32],
             );
+        }
+        if let Ok(mut ages) = self.claim_inserted_at.write() {
+            ages.remove(&(work_id.to_string(), role as i32));
         }
     }
 }
