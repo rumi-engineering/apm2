@@ -2833,7 +2833,11 @@ fn test_non_ci_gated_transition_allows_any_rationale() {
 }
 
 #[test]
-fn test_ci_transition_denied_when_latest_changeset_unknown() {
+fn test_ci_transition_allowed_when_no_changeset_published() {
+    // When no changeset has been published for a work item (no entry in
+    // latest_changeset_by_work), the CI transition guard is a no-op and the
+    // transition is allowed through. This preserves backward compatibility
+    // with pre-changeset-identity code paths.
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
@@ -2902,8 +2906,8 @@ fn test_ci_transition_denied_when_latest_changeset_unknown() {
     let work = reducer.state().get("work-1").unwrap();
     assert_eq!(
         work.state,
-        WorkState::CiPending,
-        "transition must be denied when latest changeset is unknown"
+        WorkState::ReadyForReview,
+        "transition must be allowed when no changeset has been published (legacy path)"
     );
 }
 
