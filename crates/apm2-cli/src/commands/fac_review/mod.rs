@@ -110,6 +110,7 @@ const DOCTOR_DISPATCH_PENDING_WARNING_SECONDS: i64 = 120;
 const DOCTOR_WAIT_TIMEOUT_DEFAULT_SECONDS: u64 = 1200;
 const DOCTOR_WAIT_POLL_INTERVAL_SECONDS: u64 = 1;
 const DOCTOR_WAIT_PULSE_CHECK_INTERVAL_MILLIS: u64 = 1000;
+const DOCTOR_WAIT_PULSE_TIMER_BACKSTOP_SECONDS: u64 = 15;
 const DOCTOR_WAIT_PULSE_MAX_PULSES_PER_SEC: u32 = 24;
 const DOCTOR_WAIT_PULSE_CLIENT_SUB_ID_MAX_LEN: usize = 64;
 const DOCTOR_WAIT_PULSE_DEDUPE_CAPACITY: usize = 512;
@@ -1512,9 +1513,12 @@ fn build_doctor_pulse_client_sub_id(repo: &str, pr_number: u32) -> String {
 const fn doctor_wait_should_collect_summary(
     mode: DoctorWaitMode,
     wake_reason: DoctorWaitWakeReason,
+    timer_backstop_due: bool,
 ) -> bool {
     match mode {
-        DoctorWaitMode::PulsePrimary => matches!(wake_reason, DoctorWaitWakeReason::Pulse),
+        DoctorWaitMode::PulsePrimary => {
+            matches!(wake_reason, DoctorWaitWakeReason::Pulse) || timer_backstop_due
+        },
         DoctorWaitMode::PollingFallback => true,
     }
 }
@@ -1619,6 +1623,30 @@ fn emit_doctor_pulse_skipped_event(
         }) {
             eprintln!("WARNING: failed to emit doctor pulse skipped event: {err}");
         }
+    }
+}
+
+fn emit_doctor_wait_timer_backstop_event(
+    json_output: bool,
+    pr_number: u32,
+    tick: u64,
+    elapsed_seconds: u64,
+) {
+    if json_output {
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_wait_timer_backstop".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "tick": tick,
+                "pr_number": pr_number,
+                "elapsed_seconds": elapsed_seconds,
+                "interval_seconds": DOCTOR_WAIT_PULSE_TIMER_BACKSTOP_SECONDS,
+            }),
+        }) {
+            eprintln!("WARNING: failed to emit doctor wait timer backstop event: {err}");
+        }
+    } else {
+        eprintln!("doctor wait: timer backstop tick={tick} elapsed={elapsed_seconds}s");
     }
 }
 
@@ -2011,6 +2039,7 @@ fn run_doctor_wait_pulse_loop(
 ) -> DoctorWaitLoopControl {
     let mut tick = initial_tick;
     let mut pulse_deduper = DoctorPulseDeduper::new(DOCTOR_WAIT_PULSE_DEDUPE_CAPACITY);
+    let mut last_summary_collected_at = Instant::now();
 
     loop {
         if let Some(result) = doctor_wait_maybe_exit(
@@ -2051,8 +2080,31 @@ fn run_doctor_wait_pulse_loop(
         } else {
             DoctorWaitWakeReason::Timer
         };
+        let timer_backstop_due = matches!(wake_reason, DoctorWaitWakeReason::Timer)
+            && last_summary_collected_at.elapsed()
+                >= Duration::from_secs(DOCTOR_WAIT_PULSE_TIMER_BACKSTOP_SECONDS);
 
-        if !doctor_wait_should_collect_summary(DoctorWaitMode::PulsePrimary, wake_reason) {
+        if !doctor_wait_should_collect_summary(
+            DoctorWaitMode::PulsePrimary,
+            wake_reason,
+            timer_backstop_due,
+        ) {
+            continue;
+        }
+
+        if matches!(wake_reason, DoctorWaitWakeReason::Timer) {
+            tick = tick.saturating_add(1);
+            emit_doctor_wait_timer_backstop_event(
+                json_output,
+                pr_number,
+                tick,
+                started.elapsed().as_secs(),
+            );
+            // Temporal recommendation guards (idle/dispatched age) need bounded
+            // wall-clock driven reevaluation when the pulse stream is quiet.
+            let use_lightweight = tick % 5 != 0;
+            *summary = run_doctor_inner(repo, pr_number, Vec::new(), use_lightweight);
+            last_summary_collected_at = Instant::now();
             continue;
         }
 
@@ -2096,10 +2148,11 @@ fn run_doctor_wait_pulse_loop(
             );
         }
 
-        // Every 5th pulse-triggered reevaluation uses full mode so merge state
-        // can still converge if only partial local projections updated.
+        // Every 5th reevaluation uses full mode so merge state can still
+        // converge if only partial local projections updated.
         let use_lightweight = tick % 5 != 0;
         *summary = run_doctor_inner(repo, pr_number, Vec::new(), use_lightweight);
+        last_summary_collected_at = Instant::now();
     }
 }
 
@@ -2184,6 +2237,7 @@ fn run_doctor_wait_poll_loop(
                 if doctor_wait_should_collect_summary(
                     DoctorWaitMode::PollingFallback,
                     DoctorWaitWakeReason::Timer,
+                    false,
                 ) {
                     // BF-002 (TCK-00626): Every 5th tick, use non-lightweight
                     // mode to detect externally-merged PRs via GitHub API.
@@ -9939,14 +9993,25 @@ mod tests {
     }
 
     #[test]
-    fn doctor_wait_pulse_mode_rechecks_only_on_pulse_wakeups() {
+    fn doctor_wait_pulse_mode_rechecks_on_pulse_wakeups_without_timer_backstop() {
         assert!(super::doctor_wait_should_collect_summary(
             super::DoctorWaitMode::PulsePrimary,
-            super::DoctorWaitWakeReason::Pulse
+            super::DoctorWaitWakeReason::Pulse,
+            false,
         ));
         assert!(!super::doctor_wait_should_collect_summary(
             super::DoctorWaitMode::PulsePrimary,
-            super::DoctorWaitWakeReason::Timer
+            super::DoctorWaitWakeReason::Timer,
+            false,
+        ));
+    }
+
+    #[test]
+    fn doctor_wait_pulse_mode_rechecks_on_timer_backstop() {
+        assert!(super::doctor_wait_should_collect_summary(
+            super::DoctorWaitMode::PulsePrimary,
+            super::DoctorWaitWakeReason::Timer,
+            true,
         ));
     }
 
@@ -9954,7 +10019,8 @@ mod tests {
     fn doctor_wait_polling_mode_rechecks_on_timer_wakeups() {
         assert!(super::doctor_wait_should_collect_summary(
             super::DoctorWaitMode::PollingFallback,
-            super::DoctorWaitWakeReason::Timer
+            super::DoctorWaitWakeReason::Timer,
+            false,
         ));
     }
 
