@@ -571,9 +571,7 @@ fn wait_for_worker_signal(
             Err(RecvTimeoutError::Disconnected) => disconnected_backoff(),
         }
     } else {
-        wake_rx
-            .recv()
-            .unwrap_or_else(|_| disconnected_backoff())
+        wake_rx.recv().unwrap_or_else(|_| disconnected_backoff())
     }
 }
 
