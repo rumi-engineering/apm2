@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00626"
     title: "Implement cache reuse explainability: hit/miss with first mismatch dimension"
-    status: "IN_PROGRESS"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

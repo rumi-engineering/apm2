@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00633
     title: 'RFC-0032 Phase 1: add FAC CAS JSON schemas + bounded decoding allowlist (WorkSpec/Context/LoopProfile/AuthorityBindings)'
-    status: OPEN
+    status: MERGED
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032

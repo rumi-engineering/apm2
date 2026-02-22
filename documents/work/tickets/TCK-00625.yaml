@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00625"
     title: "Technical handoff: FAC push INV-PADOPT-004 debug, binary alignment, and verified recovery"
-    status: "HANDOFF_READY"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"

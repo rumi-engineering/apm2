@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: 'TCK-00657'
     title: 'FAC: Normalize LaneLease.started_at to RFC3339 (fix epoch-secs bug + legacy decode)'
-    status: 'OPEN'
+    status: 'MERGED'
   binds:
     prd_id: 'PRD-0001'
     rfc_id: 'RFC-0019'

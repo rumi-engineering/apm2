@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00631
     title: 'RFC-0032 Phase 0: daemon startup wiring + freeze legacy ledger writers'
-    status: OPEN
+    status: MERGED
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032

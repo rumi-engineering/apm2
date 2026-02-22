@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00624"
     title: "FAC doctor/review state machine unification with machine-verifiable CAC contract"
-    status: "OPEN"
+    status: "MERGED"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0019"
