@@ -25,6 +25,7 @@ use apm2_core::fac::{
 use apm2_core::github::{parse_github_remote_url, resolve_apm2_home};
 use fs2::FileExt;
 
+use super::fac_queue_lifecycle_dual_write;
 use crate::commands::{fac_key_material, fac_secure_io};
 
 /// Queue subdirectory under `$APM2_HOME`.
@@ -238,6 +239,7 @@ pub(super) fn enqueue_job(
     spec: &FacJobSpecV1,
     queue_bounds_policy: &QueueBoundsPolicy,
     write_mode: QueueWriteMode,
+    dual_write_enabled: bool,
 ) -> Result<PathBuf, String> {
     // TCK-00577: Gate 1 — service user write permission check.
     // If the gate passes, we do a direct write to pending/. If it denies,
@@ -248,7 +250,13 @@ pub(super) fn enqueue_job(
         Ok(()) => {
             // Caller is service user or UnsafeLocalWrite is active —
             // proceed with direct write to pending/.
-            enqueue_direct(queue_root, fac_root, spec, queue_bounds_policy)
+            enqueue_direct(
+                queue_root,
+                fac_root,
+                spec,
+                queue_bounds_policy,
+                dual_write_enabled,
+            )
         },
         Err(ServiceUserGateError::ServiceUserNotResolved {
             ref service_user,
@@ -305,6 +313,7 @@ fn enqueue_direct(
     fac_root: &Path,
     spec: &FacJobSpecV1,
     queue_bounds_policy: &QueueBoundsPolicy,
+    dual_write_enabled: bool,
 ) -> Result<PathBuf, String> {
     let pending_dir = queue_root.join(PENDING_DIR);
     fs::create_dir_all(&pending_dir).map_err(|err| format!("create pending dir: {err}"))?;
@@ -423,6 +432,11 @@ fn enqueue_direct(
     // Lock is released on drop (implicit flock(LOCK_UN)) after the job
     // spec file has been persisted.
     drop(lock_file);
+
+    if dual_write_enabled {
+        fac_queue_lifecycle_dual_write::emit_job_enqueued(fac_root, spec, "fac.queue_submit")
+            .map_err(|err| format!("dual-write lifecycle enqueue event failed: {err}"))?;
+    }
 
     Ok(target)
 }
@@ -1123,6 +1137,7 @@ mod tests {
             &spec,
             &policy,
             QueueWriteMode::ServiceUserOnly,
+            false,
         );
 
         // SAFETY: serialized through env_var_test_lock in test scope.
@@ -1184,6 +1199,7 @@ mod tests {
             &spec,
             &policy,
             QueueWriteMode::ServiceUserOnly,
+            false,
         );
 
         // SAFETY: serialized through env_var_test_lock in test scope.
@@ -1217,6 +1233,7 @@ mod tests {
             &spec,
             &policy,
             QueueWriteMode::UnsafeLocalWrite,
+            false,
         );
 
         assert!(
@@ -1246,7 +1263,7 @@ mod tests {
         let spec = test_job_spec("test-perms-direct-001");
         let policy = QueueBoundsPolicy::default();
 
-        let result = enqueue_direct(&queue_root, &fac_root, &spec, &policy);
+        let result = enqueue_direct(&queue_root, &fac_root, &spec, &policy, false);
         assert!(result.is_ok(), "direct enqueue should succeed: {result:?}");
 
         // Queue root should be 0711.
