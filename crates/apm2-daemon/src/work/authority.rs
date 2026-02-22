@@ -863,24 +863,15 @@ impl AliasReconciliationGate for ProjectionAliasReconciliationGate {
 
         let mut matches: Vec<String> = Vec::new();
 
-        // Bounded iteration: MAX_WORK_LIST_ROWS prevents unbounded scan.
-        for work in projection.list_work().into_iter().take(MAX_WORK_LIST_ROWS) {
-            if work.spec_snapshot_hash.is_empty() {
-                continue;
-            }
-            let Ok(hash): Result<[u8; 32], _> = work.spec_snapshot_hash.as_slice().try_into()
+        // Deterministic full coverage: scan the entire projection (sorted by
+        // work_id) so alias resolution cannot silently truncate when row count
+        // exceeds MAX_WORK_LIST_ROWS.
+        for work in projection.list_work() {
+            let Ok(Some(resolved_alias)) = Self::resolve_ticket_alias_for_work(cas.as_ref(), work)
             else {
                 continue;
             };
-            let Ok(spec_bytes) = cas.retrieve(&hash) else {
-                continue;
-            };
-            let Ok(work_spec) =
-                apm2_core::fac::work_cas_schemas::bounded_decode_work_spec(&spec_bytes)
-            else {
-                continue;
-            };
-            if work_spec.ticket_alias.as_deref() == Some(ticket_alias) {
+            if resolved_alias == ticket_alias {
                 matches.push(work.work_id.clone());
             }
         }
@@ -1286,6 +1277,60 @@ mod tests {
         assert!(
             result.is_err(),
             "ambiguous ticket alias resolution must be fail-closed"
+        );
+    }
+
+    #[test]
+    fn resolve_ticket_alias_scans_full_projection_beyond_max_work_list_rows() {
+        use apm2_core::work::helpers::work_opened_payload;
+
+        let target_work_id = "W-636-CAP-9999";
+        let target_alias = "TCK-636-BEYOND-CAP";
+        let (cas, target_hash) = setup_cas_with_work_spec(target_work_id, Some(target_alias));
+
+        let emitter = crate::protocol::dispatch::StubLedgerEventEmitter::new();
+
+        // Populate exactly MAX_WORK_LIST_ROWS work items that do NOT resolve,
+        // then place the real alias mapping after that boundary.
+        for idx in 0..MAX_WORK_LIST_ROWS {
+            let work_id = format!("W-636-CAP-{idx:04}");
+            let payload = work_opened_payload(&work_id, "TICKET", vec![0xAA; 32], vec![], vec![]);
+            emitter.inject_raw_event(SignedLedgerEvent {
+                event_id: format!("EVT-opened-cap-{idx}"),
+                event_type: "work.opened".to_string(),
+                work_id,
+                actor_id: "actor:test".to_string(),
+                payload,
+                signature: vec![0u8; 64],
+                timestamp_ns: (idx as u64 + 1) * 1_000_000_000,
+            });
+        }
+
+        let target_payload = work_opened_payload(
+            target_work_id,
+            "TICKET",
+            target_hash.to_vec(),
+            vec![],
+            vec![],
+        );
+        emitter.inject_raw_event(SignedLedgerEvent {
+            event_id: "EVT-opened-cap-target".to_string(),
+            event_type: "work.opened".to_string(),
+            work_id: target_work_id.to_string(),
+            actor_id: "actor:test".to_string(),
+            payload: target_payload,
+            signature: vec![0u8; 64],
+            timestamp_ns: (MAX_WORK_LIST_ROWS as u64 + 1) * 1_000_000_000,
+        });
+
+        let gate = ProjectionAliasReconciliationGate::new(Arc::new(emitter))
+            .with_cas(cas as Arc<dyn apm2_core::evidence::ContentAddressedStore>);
+
+        let result = gate.resolve_ticket_alias(target_alias);
+        assert_eq!(
+            result.expect("alias resolution should not error"),
+            Some(target_work_id.to_string()),
+            "alias resolution must scan beyond MAX_WORK_LIST_ROWS without truncation"
         );
     }
 

@@ -12680,11 +12680,9 @@ impl PrivilegedDispatcher {
         // clippy)
         const MAX_PATH_LENGTH: usize = 4096;
 
-        let request =
-            SpawnEpisodeRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
-                ProtocolError::Serialization {
-                    reason: format!("invalid SpawnEpisodeRequest: {e}"),
-                }
+        let mut request = SpawnEpisodeRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid SpawnEpisodeRequest: {e}"),
             })?;
 
         // SEC-SCP-FAC-0020: lease_id is redacted from logs to prevent capability
@@ -12819,6 +12817,40 @@ impl PrivilegedDispatcher {
                 "role is required",
             ));
         }
+
+        // TCK-00636 MAJOR fix: Resolve ticket aliases BEFORE any work_id-based
+        // lookup (lease validation, claim lookup, promotion checks).
+        //
+        // The resolved canonical work_id replaces request.work_id for all
+        // subsequent operations so alias inputs follow the same policy path as
+        // canonical IDs.
+        let requested_work_id = request.work_id.clone();
+        let (alias_binding_ticket_alias, resolved_work_id) = match self
+            .alias_reconciliation_gate
+            .resolve_ticket_alias(&requested_work_id)
+        {
+            Ok(Some(canonical_work_id)) => {
+                debug!(
+                    request_work_id = %requested_work_id,
+                    resolved_work_id = %canonical_work_id,
+                    "SpawnEpisode: resolved ticket alias to canonical work_id"
+                );
+                (requested_work_id.clone(), canonical_work_id)
+            },
+            Ok(None) => (requested_work_id.clone(), requested_work_id.clone()),
+            Err(e) => {
+                warn!(
+                    work_id = %requested_work_id,
+                    error = %e,
+                    "SpawnEpisode rejected: alias resolution failed (fail-closed)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("alias resolution failed (fail-closed): {e}"),
+                ));
+            },
+        };
+        request.work_id = resolved_work_id;
 
         // GATE_EXECUTOR requires lease_id
         if request.role == WorkRole::GateExecutor as i32 && request.lease_id.is_none() {
@@ -13365,11 +13397,9 @@ impl PrivilegedDispatcher {
         // canonical projection. Infrastructure errors (lock failures,
         // projection rebuild errors) also fail-closed per CTR-2617.
         //
-        // TCK-00636: Wire real ticket alias resolution through
-        // AliasReconciliationGate::resolve_ticket_alias. If resolution
-        // succeeds, use the resolved work_id for the binding; if it
-        // returns None, fall back to identity mapping; if it returns
-        // Err (ambiguity/infrastructure), fail-closed and deny.
+        // TCK-00636: Alias resolution already ran before any work_id lookup,
+        // and request.work_id now holds the canonical work_id. The promotion
+        // gate still uses the original request value as the ticket_alias field.
         // =====================================================================
         {
             use apm2_core::events::alias_reconcile::TicketAliasBinding;
@@ -13392,55 +13422,13 @@ impl PrivilegedDispatcher {
                 },
             };
 
-            // TCK-00636: Attempt to resolve request.work_id as a ticket alias
-            // through projection-backed CAS lookup. This enables real TCK-*
-            // aliases to resolve to canonical work_ids.
-            let (ticket_alias, canonical_work_id) = match self
-                .alias_reconciliation_gate
-                .resolve_ticket_alias(&request.work_id)
-            {
-                Ok(Some(resolved_work_id)) => {
-                    // Real alias resolution succeeded: the request.work_id is
-                    // a ticket alias that resolved to a canonical work_id.
-                    debug!(
-                        request_work_id = %request.work_id,
-                        resolved_work_id = %resolved_work_id,
-                        "Alias reconciliation: ticket alias resolved via projection"
-                    );
-                    (request.work_id.clone(), work_id_to_hash(&resolved_work_id))
-                },
-                Ok(None) => {
-                    // No alias found — fall back to identity mapping.
-                    // This is the common path for work_ids that are not
-                    // ticket aliases (e.g., W-{uuid} canonical identifiers).
-                    (request.work_id.clone(), work_id_to_hash(&request.work_id))
-                },
-                Err(e) => {
-                    // Ambiguous or infrastructure failure — fail-closed.
-                    // Deny promotion when alias resolution is ambiguous
-                    // (multiple work items match the alias) or when CAS/
-                    // projection infrastructure is unavailable.
-                    warn!(
-                        work_id = %request.work_id,
-                        error = %e,
-                        "SpawnEpisode rejected: alias resolution failed (fail-closed)"
-                    );
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        format!(
-                            "alias reconciliation gate: alias resolution failed (fail-closed): {e}"
-                        ),
-                    ));
-                },
-            };
-
             // Read observation window from the gate's configuration rather
             // than using hardcoded values.
             let obs_window = self.alias_reconciliation_gate.observation_window();
 
             let binding = TicketAliasBinding {
-                ticket_alias,
-                canonical_work_id,
+                ticket_alias: alias_binding_ticket_alias,
+                canonical_work_id: work_id_to_hash(&request.work_id),
                 observed_at_tick: current_tick,
                 observation_window_start: obs_window.start_tick,
                 observation_window_end: obs_window.end_tick,
@@ -28002,6 +27990,113 @@ mod tests {
                     assert!(
                         resp.session_id.is_some(),
                         "Should have session_id for spawned work"
+                    );
+                },
+                other => panic!("Expected WorkStatus response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_spawn_episode_resolves_ticket_alias_before_claim_lookup() {
+            use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+            use apm2_core::fac::work_cas_schemas::{
+                WORK_SPEC_V1_SCHEMA, WorkSpecType, WorkSpecV1, canonicalize_for_cas,
+            };
+
+            let cas = Arc::new(MemoryCas::default());
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+            let ctx = privileged_ctx();
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "team-alpha:alias".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                other => panic!("Expected ClaimWork response, got: {other:?}"),
+            };
+
+            let ticket_alias = "TCK-ALIAS-SPAWN-001";
+            let work_spec = WorkSpecV1 {
+                schema: WORK_SPEC_V1_SCHEMA.to_string(),
+                work_id: work_id.clone(),
+                ticket_alias: Some(ticket_alias.to_string()),
+                title: "Spawn alias canonicalization test".to_string(),
+                summary: None,
+                work_type: WorkSpecType::Ticket,
+                repo: None,
+                requirement_ids: vec![],
+                labels: vec![],
+                rfc_id: None,
+                parent_work_ids: vec![],
+                created_at_ns: Some(1_000_000_000),
+            };
+            let work_spec_json = serde_json::to_string(&work_spec).expect("spec serializes");
+            let canonical_spec =
+                canonicalize_for_cas(&work_spec_json).expect("spec canonicalization succeeds");
+            let stored = cas
+                .store(canonical_spec.as_bytes())
+                .expect("spec CAS store succeeds");
+
+            dispatcher
+                .event_emitter
+                .inject_raw_event(SignedLedgerEvent {
+                    event_id: "EVT-work-opened-spawn-alias".to_string(),
+                    event_type: "work.opened".to_string(),
+                    work_id: work_id.clone(),
+                    actor_id: "actor:test".to_string(),
+                    payload: apm2_core::work::helpers::work_opened_payload(
+                        &work_id,
+                        "TICKET",
+                        stored.hash.to_vec(),
+                        vec![],
+                        vec![],
+                    ),
+                    signature: vec![0u8; 64],
+                    timestamp_ns: 1_000_000_100,
+                });
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: ticket_alias.to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+                adapter_profile_hash: None,
+                max_episodes: None,
+                escalation_predicate: None,
+                permeability_receipt_hash: None,
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+
+            match spawn_response {
+                PrivilegedResponse::SpawnEpisode(resp) => {
+                    assert!(
+                        !resp.session_id.is_empty(),
+                        "spawn with ticket alias should resolve to canonical work_id and succeed"
+                    );
+                },
+                other => panic!("Expected SpawnEpisode response, got: {other:?}"),
+            }
+
+            let status_frame = encode_work_status_request(&WorkStatusRequest {
+                work_id: work_id.clone(),
+            });
+            let status_response = dispatcher.dispatch(&status_frame, &ctx).unwrap();
+            match status_response {
+                PrivilegedResponse::WorkStatus(resp) => {
+                    assert_eq!(
+                        resp.work_id, work_id,
+                        "spawn state must be recorded on canonical work_id"
+                    );
+                    assert_eq!(
+                        resp.status, "IN_PROGRESS",
+                        "spawn with ticket alias must follow canonical claim path"
                     );
                 },
                 other => panic!("Expected WorkStatus response, got: {other:?}"),
