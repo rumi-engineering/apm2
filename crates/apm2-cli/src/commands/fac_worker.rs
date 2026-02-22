@@ -575,6 +575,27 @@ fn wait_for_worker_signal(
     }
 }
 
+fn request_runtime_repair_for_wake(
+    repair_coordinator: &mut RuntimeRepairCoordinator,
+    wake_tx: &SyncSender<WorkerWakeSignal>,
+    watcher_mode: &QueueWatcherMode,
+    wake_reason: WorkerWakeReason,
+    json_output: bool,
+) {
+    match wake_reason {
+        WorkerWakeReason::ClaimedQueueChanged => {
+            repair_coordinator.request(wake_tx, json_output, "queue_claimed_fs_changed");
+        },
+        WorkerWakeReason::WatcherDegraded if watcher_mode.is_degraded() => {
+            repair_coordinator.request(wake_tx, json_output, "queue_watcher_degraded");
+        },
+        WorkerWakeReason::SafetyNudge if watcher_mode.is_degraded() => {
+            repair_coordinator.request(wake_tx, json_output, "degraded_safety_nudge");
+        },
+        _ => {},
+    }
+}
+
 fn emit_watcher_degraded_diagnostic(json_output: bool, reason: &str, safety_nudge_secs: u64) {
     if json_output {
         emit_worker_event(
@@ -1388,7 +1409,11 @@ pub fn run_fac_worker(once: bool, max_jobs: u64, json_output: bool, print_unit: 
         orphan_policy: OrphanedJobPolicy::Requeue,
         limits: QueueReconcileLimits::default(),
     });
-    let mut pending_wake_reason = Some(WorkerWakeReason::Startup);
+    let mut pending_wake_reason = Some(if watcher_mode.is_degraded() {
+        WorkerWakeReason::WatcherDegraded
+    } else {
+        WorkerWakeReason::Startup
+    });
 
     loop {
         let effective_wake_reason = pending_wake_reason.take().map_or_else(
@@ -1404,9 +1429,13 @@ pub fn run_fac_worker(once: bool, max_jobs: u64, json_output: bool, print_unit: 
             },
             std::convert::identity,
         );
-        if matches!(effective_wake_reason, WorkerWakeReason::ClaimedQueueChanged) {
-            repair_coordinator.request(&wake_tx, json_output, "queue_claimed_fs_changed");
-        }
+        request_runtime_repair_for_wake(
+            &mut repair_coordinator,
+            &wake_tx,
+            &watcher_mode,
+            effective_wake_reason,
+            json_output,
+        );
 
         cycle_count = cycle_count.saturating_add(1);
         if matches!(effective_wake_reason, WorkerWakeReason::SafetyNudge) && json_output {
@@ -13851,6 +13880,72 @@ mod tests {
                     | std::sync::mpsc::TryRecvError::Disconnected)
             ),
             "duplicate requests must coalesce and not enqueue unbounded wake events"
+        );
+    }
+
+    #[test]
+    fn runtime_repair_requests_claimed_reconcile_in_degraded_mode() {
+        let degraded_mode = QueueWatcherMode::Degraded {
+            reason: "watch unavailable".to_string(),
+        };
+
+        let mut degraded_entry = RuntimeRepairCoordinator::new(RuntimeQueueReconcileConfig {
+            orphan_policy: OrphanedJobPolicy::Requeue,
+            limits: QueueReconcileLimits::default(),
+        });
+        let (entry_tx, entry_rx) = std::sync::mpsc::sync_channel(2);
+        request_runtime_repair_for_wake(
+            &mut degraded_entry,
+            &entry_tx,
+            &degraded_mode,
+            WorkerWakeReason::WatcherDegraded,
+            false,
+        );
+        assert!(matches!(
+            entry_rx
+                .recv()
+                .expect("watcher degraded must request repair"),
+            WorkerWakeSignal::Wake(WorkerWakeReason::RepairRequested)
+        ));
+
+        let mut degraded_nudge = RuntimeRepairCoordinator::new(RuntimeQueueReconcileConfig {
+            orphan_policy: OrphanedJobPolicy::Requeue,
+            limits: QueueReconcileLimits::default(),
+        });
+        let (nudge_tx, nudge_rx) = std::sync::mpsc::sync_channel(2);
+        request_runtime_repair_for_wake(
+            &mut degraded_nudge,
+            &nudge_tx,
+            &degraded_mode,
+            WorkerWakeReason::SafetyNudge,
+            false,
+        );
+        assert!(matches!(
+            nudge_rx
+                .recv()
+                .expect("degraded safety nudge must request repair"),
+            WorkerWakeSignal::Wake(WorkerWakeReason::RepairRequested)
+        ));
+
+        let mut active_nudge = RuntimeRepairCoordinator::new(RuntimeQueueReconcileConfig {
+            orphan_policy: OrphanedJobPolicy::Requeue,
+            limits: QueueReconcileLimits::default(),
+        });
+        let (active_tx, active_rx) = std::sync::mpsc::sync_channel(2);
+        request_runtime_repair_for_wake(
+            &mut active_nudge,
+            &active_tx,
+            &QueueWatcherMode::Active,
+            WorkerWakeReason::SafetyNudge,
+            false,
+        );
+        assert!(
+            matches!(
+                active_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty
+                    | std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "active safety nudge should not request claimed reconcile"
         );
     }
 
