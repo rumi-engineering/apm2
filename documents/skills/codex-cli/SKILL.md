@@ -1,8 +1,6 @@
 ---
-name: claude-code-cli
+name: codex-code-cli
 description: CLI reference for Claude Code command-line interface. Use when you need help with Claude Code commands, flags, or CLI usage.
-user-invocable: true
-disable-model-invocation: false
 ---
 
 # Codex CLI Integration Textbook (Ubuntu 24.04)
