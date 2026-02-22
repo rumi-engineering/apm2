@@ -539,8 +539,16 @@ fn try_send_worker_signal(wake_tx: &SyncSender<WorkerWakeSignal>, signal: Worker
 }
 
 fn send_critical_worker_signal(wake_tx: &SyncSender<WorkerWakeSignal>, signal: WorkerWakeSignal) {
-    match wake_tx.send(signal) {
-        Ok(()) | Err(_) => {},
+    match wake_tx.try_send(signal) {
+        Ok(()) | Err(TrySendError::Disconnected(_)) => {},
+        Err(TrySendError::Full(signal)) => {
+            let wake_tx = wake_tx.clone();
+            let _ = std::thread::Builder::new()
+                .name("apm2-worker-critical-wake".to_string())
+                .spawn(move || {
+                    let _ = wake_tx.send(signal);
+                });
+        },
     }
 }
 
@@ -13817,29 +13825,23 @@ mod tests {
     }
 
     #[test]
-    fn critical_worker_signal_blocks_until_queue_has_capacity_and_preserves_signal() {
+    fn critical_worker_signal_does_not_block_when_queue_is_full_and_preserves_signal() {
         let (tx, rx) = std::sync::mpsc::sync_channel::<WorkerWakeSignal>(1);
         tx.send(WorkerWakeSignal::Wake(
             WorkerWakeReason::PendingQueueChanged,
         ))
         .expect("seed queue full");
 
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let sender = tx;
-        let producer = std::thread::spawn(move || {
-            send_critical_worker_signal(
-                &sender,
-                WorkerWakeSignal::WatcherOverflow {
-                    reason: "overflow".to_string(),
-                },
-            );
-            let _ = done_tx.send(());
-        });
-
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        let started = std::time::Instant::now();
+        send_critical_worker_signal(
+            &tx,
+            WorkerWakeSignal::WatcherOverflow {
+                reason: "overflow".to_string(),
+            },
+        );
         assert!(
-            done_rx.try_recv().is_err(),
-            "critical signal send should block while channel is full"
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "critical signal path must not block watcher thread when channel is full"
         );
 
         let first = rx.recv().expect("receive seeded signal");
@@ -13848,12 +13850,9 @@ mod tests {
             WorkerWakeSignal::Wake(WorkerWakeReason::PendingQueueChanged)
         ));
 
-        done_rx
+        let second = rx
             .recv_timeout(std::time::Duration::from_millis(250))
-            .expect("critical signal send should complete once capacity is available");
-        producer.join().expect("producer thread join");
-
-        let second = rx.recv().expect("receive critical signal");
+            .expect("critical signal should still be delivered once capacity is available");
         assert!(matches!(second, WorkerWakeSignal::WatcherOverflow { .. }));
     }
 
