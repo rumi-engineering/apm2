@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::warn;
 
-use super::projection::{WorkObjectProjection, WorkProjectionError};
+use super::projection::{WorkDependencyDiagnostic, WorkObjectProjection, WorkProjectionError};
 use crate::protocol::dispatch::{LedgerEventEmitter, SignedLedgerEvent};
 
 /// Hard server-side cap on the number of rows returned by `WorkList`.
@@ -36,6 +36,12 @@ pub struct WorkAuthorityStatus {
     pub transition_count: u32,
     /// Timestamp of first claim transition when derivable.
     pub claimed_at_ns: Option<u64>,
+    /// Whether implementer claim is blocked by unsatisfied incoming BLOCKS
+    /// dependencies.
+    pub implementer_claim_blocked: bool,
+    /// Structured dependency diagnostics for consumers such as doctor/work
+    /// status.
+    pub dependency_diagnostics: Vec<WorkDependencyDiagnostic>,
 }
 
 /// Authority-layer errors.
@@ -202,6 +208,11 @@ impl ProjectionWorkAuthority {
                         &event.payload,
                         WORK_TRANSITIONED_DOMAIN_PREFIX,
                     ),
+                    // Work graph edge events are authority-relevant and must
+                    // not be admitted from session-wrapped EmitEvent payloads.
+                    t if Self::is_work_graph_edge_event_type(t) => {
+                        Self::has_authoritative_work_graph_payload_structure(&event.payload)
+                    },
                     // Native protobuf work events (`work.opened`, etc.)
                     // are only emittable through the work-domain code path,
                     // not through session EmitEvent. Pass through.
@@ -213,6 +224,42 @@ impl ProjectionWorkAuthority {
             })
             .cloned()
             .collect()
+    }
+
+    /// Returns true when `event_type` denotes a work graph edge event.
+    fn is_work_graph_edge_event_type(event_type: &str) -> bool {
+        let normalized = event_type
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>()
+            .to_ascii_lowercase();
+
+        matches!(
+            normalized.as_str(),
+            "workgraphedgeadded"
+                | "workgraphedgeremoved"
+                | "workgraphedgewaived"
+                | "workedgeadded"
+                | "workedgeremoved"
+                | "workedgewaived"
+        )
+    }
+
+    /// Rejects session-wrapped JSON envelopes for work graph edge events.
+    ///
+    /// Session `EmitEvent` envelopes include both `session_id` and wrapped
+    /// `payload` fields. Authoritative graph events are either protobuf bytes
+    /// or direct JSON edge payloads without this wrapper shape.
+    fn has_authoritative_work_graph_payload_structure(payload: &[u8]) -> bool {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+            // Non-JSON payloads are expected for protobuf graph events.
+            return true;
+        };
+
+        let has_session_id = value.get("session_id").and_then(|v| v.as_str()).is_some();
+        let has_wrapped_payload = value.get("payload").and_then(|v| v.as_str()).is_some();
+
+        !(has_session_id && has_wrapped_payload)
     }
 
     /// Checks whether a JSON payload has the structural shape of a
@@ -236,7 +283,14 @@ impl ProjectionWorkAuthority {
         has_work_id && !has_session_id
     }
 
-    fn status_from_work(work: &Work) -> WorkAuthorityStatus {
+    fn status_from_work(
+        projection: &WorkObjectProjection,
+        work: &Work,
+        evaluation_time_ns: u64,
+    ) -> WorkAuthorityStatus {
+        let dependency_evaluation =
+            projection.evaluate_work_dependencies(&work.work_id, evaluation_time_ns);
+
         WorkAuthorityStatus {
             work_id: work.work_id.clone(),
             state: work.state,
@@ -245,12 +299,20 @@ impl ProjectionWorkAuthority {
             last_transition_at_ns: work.last_transition_at,
             transition_count: work.transition_count,
             claimed_at_ns: work.claimed_at,
+            implementer_claim_blocked: dependency_evaluation.implementer_claim_blocked,
+            dependency_diagnostics: dependency_evaluation.diagnostics,
         }
     }
 
     /// Clamps `limit` to `MAX_WORK_LIST_ROWS` and applies cursor-based
     /// pagination over a deterministically-ordered iterator.
-    fn bounded_collect<'a, I>(iter: I, limit: usize, cursor: &str) -> Vec<WorkAuthorityStatus>
+    fn bounded_collect<'a, I>(
+        projection: &WorkObjectProjection,
+        iter: I,
+        limit: usize,
+        cursor: &str,
+        evaluation_time_ns: u64,
+    ) -> Vec<WorkAuthorityStatus>
     where
         I: Iterator<Item = &'a Work>,
     {
@@ -265,17 +327,20 @@ impl ProjectionWorkAuthority {
         let mut items: Vec<WorkAuthorityStatus> = iter
             .skip_while(|work| skip_past_cursor && work.work_id.as_str() <= cursor)
             .take(effective_limit)
-            .map(Self::status_from_work)
+            .map(|work| Self::status_from_work(projection, work, evaluation_time_ns))
             .collect();
 
         // Ensure deterministic ordering by work_id (BTreeMap already sorted).
         items.sort_by(|a, b| a.work_id.cmp(&b.work_id));
         items
     }
-}
 
-impl WorkAuthority for ProjectionWorkAuthority {
-    fn get_work_status(&self, work_id: &str) -> Result<WorkAuthorityStatus, WorkAuthorityError> {
+    /// Returns status for a single work item at the provided evaluation time.
+    pub fn get_work_status_at_time(
+        &self,
+        work_id: &str,
+        evaluation_time_ns: u64,
+    ) -> Result<WorkAuthorityStatus, WorkAuthorityError> {
         self.refresh_projection()?;
 
         let projection =
@@ -292,7 +357,67 @@ impl WorkAuthority for ProjectionWorkAuthority {
                     work_id: work_id.to_string(),
                 })?;
 
-        Ok(Self::status_from_work(work))
+        Ok(Self::status_from_work(
+            &projection,
+            work,
+            evaluation_time_ns,
+        ))
+    }
+
+    /// Returns claimable work rows at the provided evaluation time.
+    pub fn list_claimable_at_time(
+        &self,
+        limit: usize,
+        cursor: &str,
+        evaluation_time_ns: u64,
+    ) -> Result<Vec<WorkAuthorityStatus>, WorkAuthorityError> {
+        self.refresh_projection()?;
+
+        let projection =
+            self.projection
+                .read()
+                .map_err(|err| WorkAuthorityError::ProjectionLock {
+                    message: err.to_string(),
+                })?;
+
+        Ok(Self::bounded_collect(
+            &projection,
+            projection.claimable_work().into_iter(),
+            limit,
+            cursor,
+            evaluation_time_ns,
+        ))
+    }
+
+    /// Returns all known work rows at the provided evaluation time.
+    pub fn list_all_at_time(
+        &self,
+        limit: usize,
+        cursor: &str,
+        evaluation_time_ns: u64,
+    ) -> Result<Vec<WorkAuthorityStatus>, WorkAuthorityError> {
+        self.refresh_projection()?;
+
+        let projection =
+            self.projection
+                .read()
+                .map_err(|err| WorkAuthorityError::ProjectionLock {
+                    message: err.to_string(),
+                })?;
+
+        Ok(Self::bounded_collect(
+            &projection,
+            projection.list_work().into_iter(),
+            limit,
+            cursor,
+            evaluation_time_ns,
+        ))
+    }
+}
+
+impl WorkAuthority for ProjectionWorkAuthority {
+    fn get_work_status(&self, work_id: &str) -> Result<WorkAuthorityStatus, WorkAuthorityError> {
+        self.get_work_status_at_time(work_id, 0)
     }
 
     fn list_claimable(
@@ -300,20 +425,7 @@ impl WorkAuthority for ProjectionWorkAuthority {
         limit: usize,
         cursor: &str,
     ) -> Result<Vec<WorkAuthorityStatus>, WorkAuthorityError> {
-        self.refresh_projection()?;
-
-        let projection =
-            self.projection
-                .read()
-                .map_err(|err| WorkAuthorityError::ProjectionLock {
-                    message: err.to_string(),
-                })?;
-
-        Ok(Self::bounded_collect(
-            projection.claimable_work().into_iter(),
-            limit,
-            cursor,
-        ))
+        self.list_claimable_at_time(limit, cursor, 0)
     }
 
     fn list_all(
@@ -321,20 +433,7 @@ impl WorkAuthority for ProjectionWorkAuthority {
         limit: usize,
         cursor: &str,
     ) -> Result<Vec<WorkAuthorityStatus>, WorkAuthorityError> {
-        self.refresh_projection()?;
-
-        let projection =
-            self.projection
-                .read()
-                .map_err(|err| WorkAuthorityError::ProjectionLock {
-                    message: err.to_string(),
-                })?;
-
-        Ok(Self::bounded_collect(
-            projection.list_work().into_iter(),
-            limit,
-            cursor,
-        ))
+        self.list_all_at_time(limit, cursor, 0)
     }
 
     fn is_claimable(&self, work_id: &str) -> Result<bool, WorkAuthorityError> {
@@ -679,7 +778,22 @@ pub fn work_id_to_hash(work_id: &str) -> alias_reconcile::Hash {
 
 #[cfg(test)]
 mod tests {
+    use apm2_core::events::{WorkEdgeAdded, WorkEdgeType};
+    use prost::Message;
+
     use super::*;
+
+    fn signed_event(event_type: &str, payload: Vec<u8>) -> SignedLedgerEvent {
+        SignedLedgerEvent {
+            event_id: format!("EVT-{event_type}"),
+            event_type: event_type.to_string(),
+            work_id: "W-test-001".to_string(),
+            actor_id: "actor:test".to_string(),
+            payload,
+            signature: vec![0u8; 64],
+            timestamp_ns: 1_000_000_000,
+        }
+    }
 
     #[test]
     fn work_id_to_hash_deterministic() {
@@ -787,5 +901,78 @@ mod tests {
         };
         // Fail-closed: temporal inversion must be stale
         assert!(window.is_stale(100, 50));
+    }
+
+    #[test]
+    fn filter_rejects_session_wrapped_work_graph_events() {
+        let mut edge_payload = Vec::new();
+        WorkEdgeAdded {
+            from_work_id: "W-pre-001".to_string(),
+            to_work_id: "W-target-001".to_string(),
+            edge_type: WorkEdgeType::Blocks as i32,
+            rationale: "test".to_string(),
+        }
+        .encode(&mut edge_payload)
+        .expect("WorkEdgeAdded payload should encode");
+
+        let wrapped_payload = serde_json::to_vec(&serde_json::json!({
+            "event_type": "work_graph.edge.added",
+            "session_id": "S-test-001",
+            "actor_id": "S-test-001",
+            "payload": hex::encode(&edge_payload),
+        }))
+        .expect("session wrapper should encode");
+
+        let events = vec![
+            signed_event("work_graph.edge.added", wrapped_payload),
+            signed_event("work_graph.edge.added", edge_payload),
+        ];
+        let filtered = ProjectionWorkAuthority::filter_work_domain_events(&events);
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "session-wrapped work_graph edge events must be rejected"
+        );
+    }
+
+    #[test]
+    fn filter_rejects_session_wrapped_work_graph_typed_alias() {
+        let wrapped_payload = serde_json::to_vec(&serde_json::json!({
+            "event_type": "WorkEdgeAdded",
+            "session_id": "S-test-002",
+            "actor_id": "S-test-002",
+            "payload": "deadbeef",
+        }))
+        .expect("session wrapper should encode");
+
+        let events = vec![signed_event("WorkEdgeAdded", wrapped_payload)];
+        let filtered = ProjectionWorkAuthority::filter_work_domain_events(&events);
+
+        assert!(
+            filtered.is_empty(),
+            "typed work graph aliases must reject session wrappers"
+        );
+    }
+
+    #[test]
+    fn filter_allows_direct_json_work_graph_payload() {
+        let waiver_payload = serde_json::to_vec(&serde_json::json!({
+            "from_work_id": "W-pre-003",
+            "to_work_id": "W-target-003",
+            "original_edge_type": "BLOCKS",
+            "waiver_id": "WVR-003",
+            "expires_at_ns": 12345,
+        }))
+        .expect("waiver payload should encode");
+
+        let events = vec![signed_event("work_graph.edge.waived", waiver_payload)];
+        let filtered = ProjectionWorkAuthority::filter_work_domain_events(&events);
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "direct JSON work_graph payloads without session wrapper must be accepted"
+        );
     }
 }

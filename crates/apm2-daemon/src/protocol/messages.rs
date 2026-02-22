@@ -342,7 +342,6 @@ impl_bounded_decode_simple!(
     AuditorLaunchProjectionRequest,
     OrchestratorLaunchProjectionRequest,
     WorkStatusRequest,
-    WorkStatusResponse,
     WorkListRequest,
     SessionStatusRequest,
     SessionStatusResponse,
@@ -448,6 +447,7 @@ impl_bounded_decode_with_repeated!(ListProcessesResponse, processes);
 impl_bounded_decode_with_repeated!(StreamLogsResponse, entries);
 // TCK-00415: Projection-backed work list
 impl_bounded_decode_with_repeated!(WorkListResponse, work_items);
+impl_bounded_decode_with_repeated!(WorkStatusResponse, dependency_diagnostics);
 // TCK-00452: Auditor/orchestrator projections with uncertainty flags.
 impl_bounded_decode_with_repeated!(AuditorLaunchProjectionResponse, uncertainty_flags);
 impl_bounded_decode_with_repeated!(OrchestratorLaunchProjectionResponse, uncertainty_flags);

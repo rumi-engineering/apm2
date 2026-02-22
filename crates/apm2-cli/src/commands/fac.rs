@@ -1354,6 +1354,49 @@ pub struct ReviewTerminateArgs {
 
 /// Response for work status command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum WorkDependencyDiagnosticSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+/// Structured dependency diagnostic for work status consumers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkDependencyDiagnostic {
+    /// Stable machine-readable reason code.
+    pub reason_code: String,
+    /// Severity classification.
+    pub severity: WorkDependencyDiagnosticSeverity,
+    /// Human-readable detail.
+    pub message: String,
+    /// Deterministic edge identifier.
+    pub edge_id: String,
+    /// Source work item ID.
+    pub from_work_id: String,
+    /// Target work item ID.
+    pub to_work_id: String,
+    /// Source work state, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_work_state: Option<String>,
+    /// Whether a waiver is active.
+    pub waived: bool,
+    /// Waiver identifier, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiver_id: Option<String>,
+    /// Waiver expiry timestamp, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiver_expires_at_ns: Option<u64>,
+    /// Remaining waiver lifetime, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiver_remaining_ns: Option<u64>,
+    /// Whether this edge was added late.
+    pub late_edge: bool,
+}
+
+/// Response for work status command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkStatusResponse {
     /// Work identifier.
@@ -1377,6 +1420,13 @@ pub struct WorkStatusResponse {
     /// Ledger sequence ID of the latest event.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_seq_id: Option<u64>,
+    /// Whether implementer claim is currently blocked by unsatisfied
+    /// incoming BLOCKS dependencies.
+    #[serde(default)]
+    pub implementer_claim_blocked: bool,
+    /// Structured dependency diagnostics from projection authority.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependency_diagnostics: Vec<WorkDependencyDiagnostic>,
 }
 
 /// Response for episode inspect command.
@@ -3787,20 +3837,74 @@ fn run_work_list(args: &WorkListArgs, operator_socket: &Path, json_output: bool)
 fn fac_work_status_from_daemon(
     response: apm2_daemon::protocol::WorkStatusResponse,
 ) -> WorkStatusResponse {
-    let role = response
-        .role
+    let apm2_daemon::protocol::WorkStatusResponse {
+        work_id,
+        status,
+        actor_id,
+        role,
+        session_id,
+        lease_id,
+        implementer_claim_blocked,
+        dependency_diagnostics,
+        ..
+    } = response;
+
+    let role = role
         .and_then(|value| WorkRole::try_from(value).ok())
         .map(|role| format!("{role:?}"));
 
+    let dependency_diagnostics = dependency_diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            let severity =
+                apm2_daemon::protocol::messages::WorkDependencyDiagnosticSeverity::try_from(
+                    diagnostic.severity,
+                )
+                .unwrap_or(
+                    apm2_daemon::protocol::messages::WorkDependencyDiagnosticSeverity::Error,
+                );
+
+            let severity = match severity {
+                apm2_daemon::protocol::messages::WorkDependencyDiagnosticSeverity::Info => {
+                    WorkDependencyDiagnosticSeverity::Info
+                },
+                apm2_daemon::protocol::messages::WorkDependencyDiagnosticSeverity::Warning => {
+                    WorkDependencyDiagnosticSeverity::Warning
+                },
+                apm2_daemon::protocol::messages::WorkDependencyDiagnosticSeverity::Error
+                | apm2_daemon::protocol::messages::WorkDependencyDiagnosticSeverity::Unspecified => {
+                    WorkDependencyDiagnosticSeverity::Error
+                },
+            };
+
+            WorkDependencyDiagnostic {
+                reason_code: diagnostic.reason_code,
+                severity,
+                message: diagnostic.message,
+                edge_id: diagnostic.edge_id,
+                from_work_id: diagnostic.from_work_id,
+                to_work_id: diagnostic.to_work_id,
+                from_work_state: diagnostic.from_work_state,
+                waived: diagnostic.waived,
+                waiver_id: diagnostic.waiver_id,
+                waiver_expires_at_ns: diagnostic.waiver_expires_at_ns,
+                waiver_remaining_ns: diagnostic.waiver_remaining_ns,
+                late_edge: diagnostic.late_edge,
+            }
+        })
+        .collect();
+
     WorkStatusResponse {
-        work_id: response.work_id,
-        status: response.status,
-        actor_id: response.actor_id,
+        work_id,
+        status,
+        actor_id,
         role,
-        latest_episode_id: response.session_id,
-        latest_receipt_hash: response.lease_id,
+        latest_episode_id: session_id,
+        latest_receipt_hash: lease_id,
         event_count: 1,
         latest_seq_id: None,
+        implementer_claim_blocked,
+        dependency_diagnostics,
     }
 }
 
@@ -7237,6 +7341,8 @@ mod tests {
             latest_receipt_hash: None,
             event_count: 5,
             latest_seq_id: Some(42),
+            implementer_claim_blocked: false,
+            dependency_diagnostics: vec![],
         };
 
         let json = serde_json::to_string(&response).unwrap();
