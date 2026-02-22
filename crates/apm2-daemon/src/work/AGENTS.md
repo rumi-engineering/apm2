@@ -110,6 +110,27 @@ pub enum WorkAuthorityError {
 
 Wires the `apm2_core::events::alias_reconcile` module into the daemon work authority layer for reconciliation, promotion gating, and snapshot-emitter sunset evaluation.
 
+**Methods:**
+
+- `check_promotion()` -- Validates alias bindings for promotion eligibility (fail-closed on ambiguity)
+- `resolve_ticket_alias()` -- Resolves a ticket alias to a canonical `work_id` via projection state (TCK-00636). Default implementation returns `Ok(None)` for backward compatibility. `ProjectionAliasReconciliationGate` overrides with CAS-backed `WorkSpec` lookup when a CAS store is configured.
+
+### `ProjectionAliasReconciliationGate`
+
+Projection-backed alias reconciliation gate implementation. Bridges the alias reconciliation module to the daemon work authority layer.
+
+**Fields:**
+
+- `projection` -- Shared `WorkObjectProjection` rebuilt from ledger events
+- `event_emitter` -- Ledger event emitter for projection refresh
+- `cas` -- Optional CAS store for `WorkSpec` retrieval (TCK-00636)
+
+**Contracts:**
+
+- [CTR-AG01] `build_canonical_projections()` enriches alias projections with CAS-backed `ticket_alias` -> `work_id_hash` mappings when CAS is available (TCK-00636).
+- [CTR-AG02] `resolve_ticket_alias()` scans work items (bounded by `MAX_WORK_LIST_ROWS`), performs CAS lookup for each `spec_snapshot_hash`, and returns the matching `work_id` or `Err` on ambiguity (fail-closed).
+- [CTR-AG03] CAS miss or malformed `WorkSpec` for individual work items is treated as skip (not hard error), maintaining fail-closed semantics at the aggregate level.
+
 ## Public API
 
 - `WorkAuthority` (trait), `ProjectionWorkAuthority`
@@ -130,3 +151,4 @@ Wires the `apm2_core::events::alias_reconcile` module into the daemon work autho
 - RFC-0019: Automated FAC v0 -- work claim and completion flow
 - TCK-00415: Work lifecycle authority module
 - TCK-00420: Alias reconciliation gate
+- TCK-00636: RFC-0032 Phase 1 WorkSpec projection plumbing + ticket-alias reconciliation integration (CAS-backed `resolve_ticket_alias`, `with_cas()` builder, enriched `build_canonical_projections`)
