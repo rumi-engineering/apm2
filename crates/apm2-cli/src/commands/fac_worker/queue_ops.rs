@@ -1204,12 +1204,6 @@ pub(super) fn consume_authority(
 
     let receipt_path = consume_dir.join(format!("{job_id}.consumed"));
 
-    // Fail-closed: if the receipt already exists, authority was already
-    // consumed.
-    if receipt_path.exists() {
-        return Err(format!("authority already consumed for job {job_id}"));
-    }
-
     let receipt = serde_json::json!({
         "schema": "apm2.fac.pcac_consume.v1",
         "job_id": job_id,
@@ -1219,7 +1213,28 @@ pub(super) fn consume_authority(
 
     let bytes = serde_json::to_vec_pretty(&receipt)
         .map_err(|e| format!("cannot serialize consume receipt: {e}"))?;
-    fs::write(&receipt_path, bytes).map_err(|e| format!("cannot write consume receipt: {e}"))?;
+
+    // Enforce single-use authority consumption with atomic create-only write.
+    // This closes the TOCTOU gap in `exists()` + `write()` under concurrent
+    // workers claiming the same job.
+    let mut receipt_file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&receipt_path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("authority already consumed for job {job_id}")
+            } else {
+                format!(
+                    "cannot create consume receipt {}: {e}",
+                    receipt_path.display()
+                )
+            }
+        })?;
+    receipt_file
+        .write_all(&bytes)
+        .map_err(|e| format!("cannot write consume receipt: {e}"))?;
+    let _ = receipt_file.sync_all();
 
     if let Ok(dir) = fs::File::open(&consume_dir) {
         let _ = dir.sync_all();
