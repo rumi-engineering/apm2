@@ -85,22 +85,25 @@ struct EventHashInput<'a> {
 
 const REDUNDANCY_RECEIPT_CONSUMED_EVENT: &str = "redundancy_receipt_consumed";
 
-/// Hard scan limit for `get_event_by_evidence_identity` and
-/// `canonical_get_evidence_by_identity`. Without a `LIMIT` the query iterates
-/// over **all** `evidence.published` events for a `work_id`, performing per-row
-/// JSON + Protobuf deserialization — an `O(N)` `DoS` vector.
+/// Hard scan limit for bounded reverse-scan lookups such as
+/// `get_event_by_evidence_identity` and `canonical_get_evidence_by_identity`.
+/// Without a `LIMIT` the query iterates over **all** `evidence.published`
+/// events for a `work_id`, performing per-row JSON + Protobuf
+/// deserialization — an `O(N)` `DoS` vector.
 ///
 /// TCK-00638: This constant is no longer used in production code — the
 /// scan-bounded lookups were replaced with O(1) indexed lookups via
-/// Maximum number of events returned by `get_events_by_work_id`.
+/// `UNIQUE` constraints on `evidence.published`.
 ///
-/// Prevents unbounded memory growth from O(N) event materialization.
-/// Per CTR-1302: evidence-related scans must have explicit LIMIT to
-/// prevent denial-of-service via resource exhaustion.
+/// **IMPORTANT**: This limit is NOT appropriate for `get_events_by_work_id`,
+/// which is a foundational history replay method used by the projection
+/// bridge. Applying a LIMIT there would silently drop recent events for
+/// work items exceeding the cap, permanently freezing observed state.
 ///
 /// Also used by the regression test
 /// `test_evidence_lookup_is_indexed_not_scan_bounded` which verifies
 /// the indexed path handles more events than this limit.
+#[cfg(test)]
 const MAX_EVIDENCE_SCAN_ROWS: u32 = 1_000;
 
 #[derive(Debug)]
@@ -2634,15 +2637,21 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         };
 
         let mut events = Vec::new();
-        let limit = i64::from(MAX_EVIDENCE_SCAN_ROWS);
 
-        // Legacy events (bounded by MAX_EVIDENCE_SCAN_ROWS per Finding 6).
+        // Foundational history replay: returns ALL events for a work_id.
+        // This method is used by the projection bridge to rebuild state
+        // (e.g. ProjectionWorkAuthority). A LIMIT clause here would
+        // silently discard recent events for work items with large
+        // histories, permanently freezing the observed state.
+        //
+        // NOTE: MAX_EVIDENCE_SCAN_ROWS is intended for bounded reverse-
+        // scan lookups (e.g. get_event_by_evidence_identity), NOT for
+        // this foundational history replay method.
         if let Ok(mut stmt) = conn.prepare(
             "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
-             FROM ledger_events WHERE work_id = ?1 ORDER BY timestamp_ns ASC, rowid ASC
-             LIMIT ?2",
+             FROM ledger_events WHERE work_id = ?1 ORDER BY timestamp_ns ASC, rowid ASC",
         ) {
-            if let Ok(rows) = stmt.query_map(params![work_id, limit], |row| {
+            if let Ok(rows) = stmt.query_map(params![work_id], |row| {
                 Ok(SignedLedgerEvent {
                     event_id: row.get(0)?,
                     event_type: row.get(1)?,
@@ -2658,22 +2667,16 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         }
 
         // TCK-00631 / Finding 1: append canonical events when frozen.
-        // Also bounded by MAX_EVIDENCE_SCAN_ROWS.
+        // No LIMIT — foundational replay requires complete history.
         if self.is_frozen_internal() {
-            let remaining = limit - i64::try_from(events.len()).unwrap_or(limit);
-            if remaining > 0 {
-                if let Ok(mut stmt) = conn.prepare(
-                    "SELECT seq_id, event_type, session_id, actor_id, payload, \
-                            COALESCE(signature, X''), timestamp_ns \
-                     FROM events WHERE session_id = ?1 \
-                     ORDER BY timestamp_ns ASC, rowid ASC \
-                     LIMIT ?2",
-                ) {
-                    if let Ok(rows) =
-                        stmt.query_map(params![work_id, remaining], Self::canonical_row_to_event)
-                    {
-                        events.extend(rows.filter_map(Result::ok));
-                    }
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                        COALESCE(signature, X''), timestamp_ns \
+                 FROM events WHERE session_id = ?1 \
+                 ORDER BY timestamp_ns ASC, rowid ASC",
+            ) {
+                if let Ok(rows) = stmt.query_map(params![work_id], Self::canonical_row_to_event) {
+                    events.extend(rows.filter_map(Result::ok));
                 }
             }
         }
@@ -4566,6 +4569,26 @@ impl WorkRegistry for SqliteWorkRegistry {
             .query_row(
                 "SELECT claim_json FROM work_claims WHERE work_id = ?1 AND role = ?2",
                 params![work_id, role as i32],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+
+        serde_json::from_slice(&claim_json).ok()
+    }
+
+    fn get_claim_by_lease_id(&self, work_id: &str, lease_id: &str) -> Option<WorkClaim> {
+        let conn = self.conn.lock().ok()?;
+        // Direct SQL lookup by (work_id, lease_id) — O(1) with index.
+        // This is more efficient than the default trait implementation
+        // which iterates through roles.
+        let claim_json: Vec<u8> = conn
+            .query_row(
+                "SELECT claim_json FROM work_claims \
+                 WHERE work_id = ?1 AND lease_id = ?2 \
+                 LIMIT 1",
+                params![work_id, lease_id],
                 |row| row.get(0),
             )
             .optional()

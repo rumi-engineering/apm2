@@ -5366,6 +5366,38 @@ pub trait WorkRegistry: Send + Sync {
         None
     }
 
+    /// Queries a work claim by `(work_id, lease_id)`.
+    ///
+    /// Returns `Some(claim)` only if a claim for the given `work_id` with
+    /// a matching `lease_id` exists. This is used by PCAC helpers that
+    /// only know the `lease_id` and need role-correct policy resolution
+    /// without risking cross-role policy confusion.
+    ///
+    /// # Fail-Closed Default
+    ///
+    /// The default iterates through known roles (bounded at 5) to find
+    /// the claim with matching `lease_id`. Returns `None` if no match
+    /// is found. Concrete implementations MAY override for efficiency.
+    fn get_claim_by_lease_id(&self, work_id: &str, lease_id: &str) -> Option<WorkClaim> {
+        // Iterate through the bounded set of roles to find the claim
+        // whose lease_id matches. This is O(1) since there are at most
+        // 5 WorkRole variants.
+        for role in [
+            WorkRole::Implementer,
+            WorkRole::Reviewer,
+            WorkRole::Coordinator,
+            WorkRole::GateExecutor,
+            WorkRole::Unspecified,
+        ] {
+            if let Some(claim) = self.get_claim_for_role(work_id, role) {
+                if claim.lease_id == lease_id {
+                    return Some(claim);
+                }
+            }
+        }
+        None
+    }
+
     /// Removes a claim for the given `(work_id, role)` pair.
     ///
     /// Used by the partial-durability-failure recovery path: when
@@ -10367,6 +10399,11 @@ impl PrivilegedDispatcher {
 
     /// Resolves the risk tier and policy hash associated with a lease.
     ///
+    /// Uses role-scoped claim lookup via `get_claim_by_lease_id` to prevent
+    /// cross-role policy confusion in multi-role `ClaimWorkV2` flows.
+    /// Falls back to role-agnostic `get_claim` only for legacy leases
+    /// that pre-date multi-role registration.
+    ///
     /// Fail-closed behavior:
     /// - Missing lease->work mapping => Tier4, fallback policy hash.
     /// - Missing work claim => Tier4, fallback policy hash.
@@ -10378,7 +10415,21 @@ impl PrivilegedDispatcher {
         fallback_policy_hash: [u8; 32],
     ) -> (RiskTier, [u8; 32]) {
         if let Some(work_id) = self.lease_validator.get_lease_work_id(lease_id) {
-            if let Some(claim) = self.work_registry.get_claim(&work_id) {
+            // Role-scoped lookup: find the claim whose lease_id matches
+            // exactly. This prevents cross-role policy confusion when
+            // multiple roles (implementer, reviewer, coordinator) have
+            // claims on the same work_id with different policies.
+            let claim = self
+                .work_registry
+                .get_claim_by_lease_id(&work_id, lease_id)
+                .or_else(|| {
+                    // Fallback for legacy leases that were registered
+                    // before multi-role support. Role-agnostic lookup is
+                    // acceptable here because legacy workflows only ever
+                    // had one claim per work_id.
+                    self.work_registry.get_claim(&work_id)
+                });
+            if let Some(claim) = claim {
                 let tier = RiskTier::try_from(claim.policy_resolution.resolved_risk_tier)
                     .unwrap_or_else(|_| {
                         warn!(
@@ -10434,6 +10485,9 @@ impl PrivilegedDispatcher {
 
     /// Derives fresh revalidation inputs for privileged PCAC lifecycle checks.
     ///
+    /// Uses role-scoped claim lookup via `get_claim_by_lease_id` to prevent
+    /// cross-role policy confusion in multi-role `ClaimWorkV2` flows.
+    ///
     /// Fail-closed: missing lease/work/policy bindings return an error.
     fn derive_privileged_pcac_revalidation_inputs(
         &self,
@@ -10455,9 +10509,17 @@ impl PrivilegedDispatcher {
             .lease_validator
             .get_lease_work_id(lease_id)
             .ok_or_else(|| format!("work_id missing for lease '{lease_id}'"))?;
-        let claim = self.work_registry.get_claim(&work_id).ok_or_else(|| {
-            format!("work claim missing for lease '{lease_id}' and work '{work_id}'")
-        })?;
+        // Role-scoped lookup: resolve the exact claim bound to this lease_id
+        // to prevent cross-role policy confusion when multiple roles have
+        // claims on the same work_id. Falls back to role-agnostic get_claim
+        // for legacy leases that pre-date multi-role registration.
+        let claim = self
+            .work_registry
+            .get_claim_by_lease_id(&work_id, lease_id)
+            .or_else(|| self.work_registry.get_claim(&work_id))
+            .ok_or_else(|| {
+                format!("work claim missing for lease '{lease_id}' and work '{work_id}'")
+            })?;
         if claim.policy_resolution.policy_resolved_ref.is_empty() {
             return Err(format!(
                 "policy_resolved_ref missing for lease '{lease_id}' and work '{work_id}'"
@@ -10486,6 +10548,9 @@ impl PrivilegedDispatcher {
 
     /// Enforces join -> revalidate -> revalidate-before-execution -> consume
     /// for privileged handlers before authoritative mutation.
+    ///
+    /// Uses role-scoped claim lookup via `get_claim_by_lease_id` to prevent
+    /// cross-role policy confusion in multi-role `ClaimWorkV2` flows.
     #[allow(clippy::result_large_err)]
     #[allow(clippy::too_many_arguments)]
     fn enforce_privileged_pcac_lifecycle(
@@ -10511,15 +10576,23 @@ impl PrivilegedDispatcher {
                     ),
                 )
             })?;
-        let claim = self.work_registry.get_claim(&work_id).ok_or_else(|| {
-            PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                format!(
-                    "PCAC authority denied for {operation}: work claim missing for policy lookup \
-                     (lease='{lease_id}', work_id='{work_id}')"
-                ),
-            )
-        })?;
+        // Role-scoped lookup: resolve the exact claim bound to this
+        // lease_id to prevent cross-role policy confusion when multiple
+        // roles have claims on the same work_id. Falls back to
+        // role-agnostic get_claim for legacy leases.
+        let claim = self
+            .work_registry
+            .get_claim_by_lease_id(&work_id, lease_id)
+            .or_else(|| self.work_registry.get_claim(&work_id))
+            .ok_or_else(|| {
+                PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "PCAC authority denied for {operation}: work claim missing for policy lookup \
+                         (lease='{lease_id}', work_id='{work_id}')"
+                    ),
+                )
+            })?;
 
         let mut pcac_policy = claim.policy_resolution.pcac_policy.clone().ok_or_else(|| {
             PrivilegedResponse::error(
@@ -16286,19 +16359,116 @@ impl PrivilegedDispatcher {
 
             if persisted_actor_matches {
                 // Same actor, same role, but the durability chain is
-                // incomplete (no work_transitioned or evidence.published).
+                // incomplete (no work_transitioned event).
                 // This is the partial-failure recovery path.
                 //
-                // COMPENSATION: Remove the stale claim row so the caller's
-                // retry will proceed through the full durability chain
-                // (register_claim -> evidence.published -> work_transitioned)
-                // from scratch, producing a complete ledger trail.
-                //
-                // This is safe because:
-                // - No work_transitioned was emitted, so no downstream projection has acted on
-                //   this claim yet.
-                // - The WorkRegistry row is the ONLY durable artifact from the prior attempt.
-                //   Removing it restores the pre-attempt state.
+                // SPLIT-BRAIN PREVENTION: Before deleting the stale claim,
+                // check if evidence.published already exists for the
+                // deterministic evidence_id. If it does, the prior attempt
+                // successfully emitted evidence.published but failed before
+                // work_transitioned. In that case we MUST use the lease_id
+                // and cas_hash from the immutable ledger record — generating
+                // new values would create a split-brain where the ledger
+                // stores the OLD lease but WorkRegistry stores the NEW one.
+                let existing_evidence = self
+                    .event_emitter
+                    .get_evidence_by_evidence_id(work_id, &expected_evidence_id);
+
+                if let Some(ref evidence_event) = existing_evidence {
+                    // evidence.published exists — extract lease_id and
+                    // cas_hash from the immutable ledger record.
+                    if let Ok(envelope) =
+                        serde_json::from_slice::<serde_json::Value>(&evidence_event.payload)
+                    {
+                        let recovered_lease: Option<String> = envelope
+                            .get("lease_id")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                            .or_else(|| {
+                                envelope
+                                    .get("payload")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|hex_str| hex::decode(hex_str).ok())
+                                    .and_then(|bytes| {
+                                        serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                                    })
+                                    .and_then(|inner| {
+                                        inner
+                                            .get("lease_id")
+                                            .and_then(|v| v.as_str())
+                                            .filter(|s| !s.is_empty())
+                                            .map(String::from)
+                                    })
+                            });
+
+                        let recovered_cas: Option<String> = envelope
+                            .get("cas_hash")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                            .or_else(|| {
+                                envelope
+                                    .get("payload")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|hex_str| hex::decode(hex_str).ok())
+                                    .and_then(|bytes| {
+                                        serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                                    })
+                                    .and_then(|inner| {
+                                        inner
+                                            .get("cas_hash")
+                                            .and_then(|v| v.as_str())
+                                            .filter(|s| !s.is_empty())
+                                            .map(String::from)
+                                    })
+                            });
+
+                        if let (Some(lease_from_ledger), Some(cas_from_ledger)) =
+                            (recovered_lease, recovered_cas)
+                        {
+                            // evidence.published has valid lease_id and
+                            // cas_hash. Return idempotent success using
+                            // the immutable ledger values — do NOT delete
+                            // the claim or generate new values.
+                            info!(
+                                work_id = %work_id,
+                                actor_id = %actor_id,
+                                role = ?role,
+                                recovered_lease_id = %lease_from_ledger,
+                                evidence_id = %expected_evidence_id,
+                                "ClaimWorkV2 partial-recovery: evidence.published \
+                                 exists — recovering lease from immutable ledger"
+                            );
+                            return Ok(PrivilegedResponse::ClaimWorkV2(ClaimWorkV2Response {
+                                work_id: work_id.to_string(),
+                                issued_lease_id: lease_from_ledger,
+                                authority_bindings_hash: cas_from_ledger,
+                                evidence_id: expected_evidence_id,
+                                already_claimed: true,
+                            }));
+                        }
+                        // evidence.published exists but fields are empty/
+                        // malformed. Fall through to stale-claim removal
+                        // below (safe: the retry will hit the UNIQUE
+                        // constraint on evidence.published and swallow it,
+                        // but the NEW lease_id generated on retry will be
+                        // the authoritative one since the evidence record
+                        // is non-reconstructible).
+                        warn!(
+                            work_id = %work_id,
+                            evidence_id = %expected_evidence_id,
+                            "ClaimWorkV2 partial-recovery: evidence.published \
+                             exists but lease_id/cas_hash are empty — cannot \
+                             recover, falling through to stale-claim removal"
+                        );
+                    }
+                }
+
+                // No evidence.published exists (or it was malformed).
+                // Safe to remove the stale claim — the prior attempt
+                // only produced a WorkRegistry row and nothing in the
+                // immutable ledger.
                 info!(
                     work_id = %work_id,
                     actor_id = %actor_id,
