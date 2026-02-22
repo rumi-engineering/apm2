@@ -5365,6 +5365,24 @@ pub trait WorkRegistry: Send + Sync {
         let _ = (work_id, role);
         None
     }
+
+    /// Removes a claim for the given `(work_id, role)` pair.
+    ///
+    /// Used by the partial-durability-failure recovery path: when
+    /// `register_claim` succeeded but subsequent ledger events
+    /// (`evidence.published`, `work_transitioned`) failed, the stale
+    /// claim row must be removed so the retry can proceed through the
+    /// full durability chain from scratch.
+    ///
+    /// # Default
+    ///
+    /// The default is a no-op (fail-safe: if removal is not implemented,
+    /// the retry will hit `DuplicateWorkId` again and the idempotency
+    /// path will attempt recovery again). Concrete implementations
+    /// SHOULD override this with an actual DELETE.
+    fn remove_claim_for_role(&self, work_id: &str, role: WorkRole) {
+        let _ = (work_id, role);
+    }
 }
 
 /// Error type for work registry operations.
@@ -5490,6 +5508,13 @@ impl WorkRegistry for StubWorkRegistry {
     fn get_claim_for_role(&self, work_id: &str, role: WorkRole) -> Option<WorkClaim> {
         let guard = self.claims.read().expect("lock poisoned");
         guard.1.get(&(work_id.to_string(), role as i32)).cloned()
+    }
+
+    fn remove_claim_for_role(&self, work_id: &str, role: WorkRole) {
+        let mut guard = self.claims.write().expect("lock poisoned");
+        let key = (work_id.to_string(), role as i32);
+        guard.1.remove(&key);
+        guard.0.retain(|k| k != &key);
     }
 }
 
@@ -16038,6 +16063,27 @@ impl PrivilegedDispatcher {
     /// same role. If so, returns the existing claim info. If a different actor
     /// claimed the same role, returns `FAILED_PRECONDITION`.
     ///
+    /// # Recovery Strategy (Finding 2, round 7)
+    ///
+    /// Idempotency is derived from **three** independent sources, tried in
+    /// order of completeness:
+    ///
+    /// 1. **Full ledger path** — `work_transitioned` event exists AND
+    ///    `evidence.published` event is recoverable. This is the happy path
+    ///    when the entire durability chain completed.
+    ///
+    /// 2. **Partial durability recovery (claim-state fallback)** — The
+    ///    `work_transitioned` event is missing (partial failure after
+    ///    `register_claim` but before `emit_work_transitioned`), but the claim
+    ///    was persisted in `WorkRegistry`. The persisted claim's `lease_id` and
+    ///    `actor_id` are used as the recovery source. The caller is expected to
+    ///    retry, which will re-emit the missing ledger events. In this case,
+    ///    the stale claim row is compensated: it is removed so the retry can
+    ///    proceed from scratch through the full durability chain.
+    ///
+    /// 3. **Different-actor rejection** — The claim exists for a different
+    ///    actor, so the request is rejected with `FAILED_PRECONDITION`.
+    ///
     /// # Bounded Query Design (Findings 5/8)
     ///
     /// Uses targeted SQL queries via `get_latest_work_transition_by_rationale`
@@ -16070,6 +16116,23 @@ impl PrivilegedDispatcher {
             _ => "UNKNOWN",
         };
 
+        // Compute the deterministic evidence_id upfront — used in both
+        // the full-ledger and partial-recovery paths.
+        let expected_evidence_id = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"WAB:");
+            hasher.update(work_id.as_bytes());
+            hasher.update(b":");
+            hasher.update(role_str.as_bytes());
+            hasher.update(b":");
+            hasher.update(actor_id.as_bytes());
+            let hash = hasher.finalize();
+            format!("WAB-{}", &hash.to_hex()[..32])
+        };
+
+        // -----------------------------------------------------------
+        // Path 1: Full ledger recovery (work_transitioned + evidence)
+        // -----------------------------------------------------------
         // Bounded O(1) lookup: find the most recent work_transitioned event
         // matching the requested role's rationale_code. SQL backends use
         // json_extract + LIMIT 1 instead of materializing all events.
@@ -16087,17 +16150,6 @@ impl PrivilegedDispatcher {
                 // Same actor, same role: idempotent re-claim. Look for the
                 // matching evidence.published event using the deterministic
                 // `evidence_id` (WAB- prefix + BLAKE3 of work_id:role:actor_id).
-                let expected_evidence_id = {
-                    let mut hasher = blake3::Hasher::new();
-                    hasher.update(b"WAB:");
-                    hasher.update(work_id.as_bytes());
-                    hasher.update(b":");
-                    hasher.update(role_str.as_bytes());
-                    hasher.update(b":");
-                    hasher.update(actor_id.as_bytes());
-                    let hash = hasher.finalize();
-                    format!("WAB-{}", &hash.to_hex()[..32])
-                };
 
                 // Bounded O(1) lookup: find evidence.published by its
                 // deterministic evidence_id. SQL backends use json_extract
@@ -16181,15 +16233,15 @@ impl PrivilegedDispatcher {
                 }
 
                 // Fail-closed: same actor, same role, but claim details
-                // (lease_id, authority_bindings_hash) are irrecoverable.
-                // Return an error instead of a hollow success with empty
-                // fields, which would leave the client in an unusable state.
+                // (lease_id, authority_bindings_hash) are irrecoverable
+                // from the ledger. This can happen if evidence.published
+                // was never emitted or was corrupted.
                 warn!(
                     work_id = %work_id,
                     actor_id = %actor_id,
                     role = ?role,
-                    "ClaimWorkV2 idempotency: claim exists but evidence.published \
-                     details are irrecoverable"
+                    "ClaimWorkV2 idempotency: claim exists (work_transitioned found) \
+                     but evidence.published details are irrecoverable"
                 );
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
@@ -16200,14 +16252,103 @@ impl PrivilegedDispatcher {
                     ),
                 ));
             }
+
+            // work_transitioned exists for this role but with a different
+            // actor — reject.
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::FailedPrecondition,
+                format!(
+                    "ClaimWorkV2 rejected: work_id '{work_id}' is already claimed \
+                     by a different actor (role={role_str})"
+                ),
+            ));
         }
 
-        // Different actor or no claim event found for this role: fail
+        // -----------------------------------------------------------
+        // Path 2: Partial durability recovery (claim-state fallback)
+        // -----------------------------------------------------------
+        //
+        // No work_transitioned event exists for this (work_id, rationale).
+        // This can happen when register_claim succeeded but subsequent
+        // steps (evidence.published or work_transitioned emission) failed.
+        //
+        // Consult the persisted claim in WorkRegistry to determine
+        // whether the duplicate came from the same actor (partial failure
+        // during our own prior attempt) or a different actor.
+        if let Some(persisted_claim) = self.work_registry.get_claim_for_role(work_id, role) {
+            let persisted_actor_matches = persisted_claim.actor_id.len() == actor_id.len()
+                && bool::from(
+                    persisted_claim
+                        .actor_id
+                        .as_bytes()
+                        .ct_eq(actor_id.as_bytes()),
+                );
+
+            if persisted_actor_matches {
+                // Same actor, same role, but the durability chain is
+                // incomplete (no work_transitioned or evidence.published).
+                // This is the partial-failure recovery path.
+                //
+                // COMPENSATION: Remove the stale claim row so the caller's
+                // retry will proceed through the full durability chain
+                // (register_claim -> evidence.published -> work_transitioned)
+                // from scratch, producing a complete ledger trail.
+                //
+                // This is safe because:
+                // - No work_transitioned was emitted, so no downstream projection has acted on
+                //   this claim yet.
+                // - The WorkRegistry row is the ONLY durable artifact from the prior attempt.
+                //   Removing it restores the pre-attempt state.
+                info!(
+                    work_id = %work_id,
+                    actor_id = %actor_id,
+                    role = ?role,
+                    stale_lease_id = %persisted_claim.lease_id,
+                    "ClaimWorkV2 partial-failure recovery: removing stale claim \
+                     row so retry can complete the full durability chain"
+                );
+                self.work_registry.remove_claim_for_role(work_id, role);
+
+                // Return a retriable error. The client should re-send
+                // ClaimWorkV2 and the handler will proceed through the
+                // normal (non-duplicate) path, completing the full
+                // durability chain.
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "ClaimWorkV2: partial durability failure detected for \
+                         work_id '{work_id}' (role={role_str}). Stale claim \
+                         removed — please retry to complete the claim."
+                    ),
+                ));
+            }
+
+            // Different actor holds the persisted claim — reject.
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::FailedPrecondition,
+                format!(
+                    "ClaimWorkV2 rejected: work_id '{work_id}' is already claimed \
+                     by a different actor (role={role_str})"
+                ),
+            ));
+        }
+
+        // No work_transitioned event AND no persisted claim found for
+        // this (work_id, role). This is unexpected — the caller got
+        // DuplicateWorkId but neither the ledger nor the registry has
+        // the claim. Fail-closed.
+        warn!(
+            work_id = %work_id,
+            actor_id = %actor_id,
+            role = ?role,
+            "ClaimWorkV2 idempotency: DuplicateWorkId but no persisted \
+             claim or work_transitioned found (inconsistent state)"
+        );
         Ok(PrivilegedResponse::error(
             PrivilegedErrorCode::FailedPrecondition,
             format!(
-                "ClaimWorkV2 rejected: work_id '{work_id}' is already claimed \
-                 by a different actor (role={role_str})"
+                "ClaimWorkV2 rejected: work_id '{work_id}' claim state is \
+                 inconsistent (role={role_str})"
             ),
         ))
     }
