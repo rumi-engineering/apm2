@@ -21,24 +21,26 @@ ticket_meta:
   dependencies:
     tickets:
       - 'TCK-00600' # worker service Type=notify + watchdog baseline
+      - 'TCK-00660' # event-driven runtime activation + claimed repair coordinator baseline
 
 context:
   observed_symptoms:
-    - 'Workers can remain "alive" under systemd while making no forward progress (deadlock/hang).'
-    - 'Queue stalls persist because systemd watchdog continues to be pinged even when the main loop is wedged.'
+    - 'Worker queue activation is now event-driven, but watchdog liveness remains decoupled from execution progress.'
+    - 'Workers can remain "alive" under systemd while making no queue/repair progress (deadlock/hang).'
+    - 'Queue stalls can persist because watchdog pings continue even when the main loop is wedged.'
   code_evidence:
     - |
       Worker spawns a dedicated watchdog thread that pings independently of main loop progress:
-        crates/apm2-cli/src/commands/fac_worker.rs:887-923
+        crates/apm2-cli/src/commands/fac_worker.rs:1385-1422
     - |
       WatchdogTicker itself only enforces periodicity; it has no notion of work progress:
         crates/apm2-core/src/fac/sd_notify.rs:309-377
 
 problem_statement: |
   The current watchdog design can mask deadlocks and indefinite hangs: the background thread will
-  continue pinging as long as the process is alive, even if the main loop cannot scan/claim/commit
-  jobs. This is a liveness failure. We need watchdog pings to be contingent on forward progress
-  signals from the main execution path.
+  continue pinging as long as the process is alive, even if the main loop cannot wake/process queue
+  work or runtime repair signals. This is a liveness failure. Watchdog pings must be contingent on
+  forward progress from the main execution path.
 
 root_cause_analysis:
   primary_cause: |

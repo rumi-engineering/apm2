@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: 'TCK-00660'
     title: 'FAC worker: Event-driven queue reconcile to self-heal stuck claimed jobs (no restart, no periodic sweep)'
-    status: 'OPEN'
+    status: 'MERGED'
   binds:
     prd_id: 'PRD-0001'
     rfc_id: 'RFC-0019'

@@ -103,6 +103,27 @@ impl TopicDerivationResult {
     }
 }
 
+/// Minimal routing fields extracted from bridge-period payload formats.
+///
+/// This struct lets pulse routing derive topics without requiring full
+/// `KernelEvent` decoding. All fields are optional and used on a best-effort,
+/// fail-closed basis.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BridgeTopicHints {
+    /// Work identifier for work-scoped topics.
+    pub work_id: Option<String>,
+    /// Session/episode identifier for episode-scoped topics.
+    pub session_id: Option<String>,
+    /// Changeset digest for gate-topic derivation.
+    pub changeset_digest: Option<Vec<u8>>,
+    /// Gate identifier for gate-topic derivation.
+    pub gate_id: Option<String>,
+    /// Source work identifier for work-graph multi-topic derivation.
+    pub from_work_id: Option<String>,
+    /// Target work identifier for work-graph multi-topic derivation.
+    pub to_work_id: Option<String>,
+}
+
 // ============================================================================
 // Changeset->Work Index
 // ============================================================================
@@ -275,9 +296,11 @@ impl TopicDeriver {
         notification: &CommitNotification,
         event: &KernelEvent,
     ) -> TopicDerivationResult {
+        let normalized_event_type = normalize_event_type(notification.event_type.as_str());
+
         // Fail-closed: reject multi-topic events that would silently lose the
         // secondary topic if routed through this single-topic API.
-        if is_multi_topic_event_type(notification.event_type.as_str()) {
+        if is_multi_topic_event_type(normalized_event_type) {
             warn!(
                 event_type = %notification.event_type,
                 "derive_topic called on multi-topic event; use derive_topics instead"
@@ -333,14 +356,41 @@ impl TopicDeriver {
         notification: &CommitNotification,
         event: &KernelEvent,
     ) -> Vec<TopicDerivationResult> {
+        let normalized_event_type = normalize_event_type(notification.event_type.as_str());
+
         // Check if this is a multi-topic event (work graph edges)
-        match notification.event_type.as_str() {
+        match normalized_event_type {
             t if is_multi_topic_event_type(t) => derive_work_graph_topics(event),
             _ => {
                 // Single-topic events: delegate to the existing method
                 vec![self.derive_topic(notification, event)]
             },
         }
+    }
+
+    /// Derives topics from bridge-period routing hints when `KernelEvent`
+    /// decoding is unavailable.
+    ///
+    /// This path is bounded and fail-closed: missing data yields fallback
+    /// topics or `NoTopic`, never panics.
+    #[must_use]
+    pub fn derive_topics_from_hints(
+        &self,
+        notification: &CommitNotification,
+        hints: &BridgeTopicHints,
+    ) -> Vec<TopicDerivationResult> {
+        let normalized_event_type = normalize_event_type(notification.event_type.as_str());
+
+        if is_multi_topic_event_type(normalized_event_type) {
+            return derive_work_graph_topics_from_hints(hints);
+        }
+
+        let topic =
+            self.derive_topic_from_hints_internal(notification, hints, normalized_event_type);
+        vec![validate_single_topic(
+            &topic,
+            notification.event_type.as_str(),
+        )]
     }
 
     /// Internal topic derivation without validation.
@@ -350,44 +400,49 @@ impl TopicDeriver {
         event: &KernelEvent,
     ) -> String {
         let sanitized_namespace = sanitize_segment(&notification.namespace);
+        let normalized_event_type = normalize_event_type(notification.event_type.as_str());
 
-        match notification.event_type.as_str() {
+        match normalized_event_type {
             // System events -> ledger.head
-            "KernelEvent" | "LedgerEvent" => "ledger.head".to_string(),
+            "ledger.head" => "ledger.head".to_string(),
 
             // Work events -> work.<work_id>.events (TCK-00305)
-            "WorkOpened" | "WorkTransitioned" | "WorkCompleted" | "WorkAborted"
-            | "WorkPrAssociated" => derive_work_topic(event, &sanitized_namespace),
+            "work.opened" | "work.transitioned" | "work.completed" | "work.aborted"
+            | "work.pr_associated" => derive_work_topic(event, &sanitized_namespace),
+
+            // Evidence events that impact work-scoped observability.
+            "evidence.published" => derive_evidence_topic(event, &sanitized_namespace),
 
             // Gate receipts -> gate.<work_id>.<changeset_digest>.<gate_id> (TCK-00305)
-            "GateReceipt" => self.derive_gate_topic(event, &sanitized_namespace),
+            "gate.receipt" => self.derive_gate_topic(event, &sanitized_namespace),
 
             // Session events -> episode.<episode_id>.lifecycle if episode_id present (TCK-00306)
             // Falls back to namespace.lifecycle for non-episode sessions
-            "SessionStarted" | "SessionProgress" | "SessionTerminated" | "SessionQuarantined" => {
-                derive_session_topic(event, &sanitized_namespace)
-            },
+            "session.started"
+            | "session.progress"
+            | "session.terminated"
+            | "session.quarantined" => derive_session_topic(event, &sanitized_namespace),
 
             // Episode lifecycle events (legacy compatibility)
-            "EpisodeCreated" | "EpisodeStarted" | "EpisodeStopped" => {
+            "episode.created" | "episode.started" | "episode.stopped" => {
                 format!("episode.{sanitized_namespace}.lifecycle")
             },
 
             // Tool events -> episode.<episode_id>.tool if episode_id present (TCK-00306)
             // Falls back to namespace.tool for non-episode sessions
-            "ToolRequested" | "ToolDecided" | "ToolExecuted" => {
+            "tool.requested" | "tool.decided" | "tool.executed" => {
                 derive_tool_topic(event, &sanitized_namespace)
             },
 
             // IO artifact events -> episode.<episode_id>.io (TCK-00306)
-            "IoArtifactPublished" => derive_io_artifact_topic(event, &sanitized_namespace),
+            "io.artifact.published" => derive_io_artifact_topic(event, &sanitized_namespace),
 
             // Defect events (TCK-00307)
             // DefectRecorded ledger events derive to defect.new topic
-            "DefectRecorded" => "defect.new".to_string(),
+            "defect.recorded" => "defect.new".to_string(),
 
             // PolicyResolvedForChangeSet -> work topic (for observability)
-            "PolicyResolvedForChangeSet" => {
+            "policy.resolved_for_changeset" => {
                 if let Some(Payload::PolicyResolvedForChangeset(p)) = &event.payload {
                     format!("work.{}.policy", sanitize_segment(&p.work_id))
                 } else {
@@ -434,6 +489,81 @@ impl TopicDeriver {
             format!("gate.{fallback_work_id}.receipts")
         }
     }
+
+    /// Internal topic derivation from bridge hints without `KernelEvent`.
+    fn derive_topic_from_hints_internal(
+        &self,
+        notification: &CommitNotification,
+        hints: &BridgeTopicHints,
+        normalized_event_type: &str,
+    ) -> String {
+        let sanitized_namespace = sanitize_segment(&notification.namespace);
+
+        match normalized_event_type {
+            "ledger.head" => "ledger.head".to_string(),
+
+            "work.opened" | "work.transitioned" | "work.completed" | "work.aborted"
+            | "work.pr_associated" | "evidence.published" => {
+                let work_id = hints
+                    .work_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .map_or_else(|| sanitized_namespace.clone(), sanitize_segment);
+                format!("work.{work_id}.events")
+            },
+
+            "gate.receipt" => {
+                derive_gate_topic_from_hints(&self.changeset_index, hints, &sanitized_namespace)
+            },
+
+            "session.started"
+            | "session.progress"
+            | "session.terminated"
+            | "session.quarantined" => hints
+                .session_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map_or_else(
+                    || format!("{sanitized_namespace}.lifecycle"),
+                    |session_id| format!("episode.{}.lifecycle", sanitize_segment(session_id)),
+                ),
+
+            "episode.created" | "episode.started" | "episode.stopped" => {
+                format!("episode.{sanitized_namespace}.lifecycle")
+            },
+
+            "tool.requested" | "tool.decided" | "tool.executed" => hints
+                .session_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map_or_else(
+                    || format!("{sanitized_namespace}.tool"),
+                    |session_id| format!("episode.{}.tool", sanitize_segment(session_id)),
+                ),
+
+            "io.artifact.published" => hints
+                .session_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map_or_else(
+                    || format!("{sanitized_namespace}.io"),
+                    |session_id| format!("episode.{}.io", sanitize_segment(session_id)),
+                ),
+
+            "defect.recorded" => "defect.new".to_string(),
+
+            "policy.resolved_for_changeset" => hints
+                .work_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map_or_else(
+                    || format!("{sanitized_namespace}.events"),
+                    |work_id| format!("work.{}.policy", sanitize_segment(work_id)),
+                ),
+
+            _ => format!("{sanitized_namespace}.events"),
+        }
+    }
 }
 
 // ============================================================================
@@ -463,6 +593,22 @@ fn derive_work_topic(event: &KernelEvent, fallback_namespace: &str) -> String {
         // Payload is not a Work event, fall back to namespace
         format!("work.{fallback_namespace}.events")
     }
+}
+
+/// Derives a work topic from an `EvidencePublished` event.
+///
+/// Format: `work.<work_id>.events`
+///
+/// Falls back to namespace when the payload is not `EvidencePublished`.
+fn derive_evidence_topic(event: &KernelEvent, fallback_namespace: &str) -> String {
+    if let Some(Payload::Evidence(evidence)) = &event.payload {
+        if let Some(apm2_core::events::evidence_event::Event::Published(published)) =
+            &evidence.event
+        {
+            return format!("work.{}.events", sanitize_segment(&published.work_id));
+        }
+    }
+    format!("work.{fallback_namespace}.events")
 }
 
 // ============================================================================
@@ -573,7 +719,7 @@ fn derive_io_artifact_topic(event: &KernelEvent, fallback_namespace: &str) -> St
 #[must_use]
 fn is_multi_topic_event_type(event_type: &str) -> bool {
     matches!(
-        event_type,
+        normalize_event_type(event_type),
         "work_graph.edge.added" | "work_graph.edge.removed" | "work_graph.edge.waived"
     )
 }
@@ -650,6 +796,150 @@ fn derive_work_graph_topics(event: &KernelEvent) -> Vec<TopicDerivationResult> {
     }
 
     results
+}
+
+/// Derives all work-graph topics from bridge hints.
+fn derive_work_graph_topics_from_hints(hints: &BridgeTopicHints) -> Vec<TopicDerivationResult> {
+    let Some(from_work_id) = hints.from_work_id.as_deref() else {
+        return vec![TopicDerivationResult::NoTopic];
+    };
+    let Some(to_work_id) = hints.to_work_id.as_deref() else {
+        return vec![TopicDerivationResult::NoTopic];
+    };
+
+    let from_topic = format!("work_graph.{}.edge", sanitize_segment(from_work_id));
+    let to_topic = format!("work_graph.{}.edge", sanitize_segment(to_work_id));
+
+    let mut results = vec![validate_topic_result(&from_topic)];
+    if from_topic != to_topic {
+        results.push(validate_topic_result(&to_topic));
+    }
+
+    results
+}
+
+/// Derives a gate topic from bridge hints.
+fn derive_gate_topic_from_hints(
+    index: &ChangesetWorkIndex,
+    hints: &BridgeTopicHints,
+    fallback_work_id: &str,
+) -> String {
+    let resolved_work_id = hints
+        .work_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .map_or_else(
+            || {
+                hints.changeset_digest.as_deref().map_or_else(
+                    || fallback_work_id.to_string(),
+                    |digest| {
+                        index
+                            .get(digest)
+                            .map_or_else(|| fallback_work_id.to_string(), |s| sanitize_segment(&s))
+                    },
+                )
+            },
+            sanitize_segment,
+        );
+
+    let Some(changeset_digest) = hints.changeset_digest.as_deref() else {
+        return format!("gate.{resolved_work_id}.receipts");
+    };
+    let Some(gate_id) = hints.gate_id.as_deref().filter(|id| !id.is_empty()) else {
+        return format!("gate.{resolved_work_id}.receipts");
+    };
+
+    let digest_hex = encode_digest_for_topic(changeset_digest);
+    let gate_id = sanitize_segment(gate_id);
+    format!("gate.{resolved_work_id}.{digest_hex}.{gate_id}")
+}
+
+fn validate_single_topic(topic: &str, event_type: &str) -> TopicDerivationResult {
+    match validate_topic(topic) {
+        Ok(()) => TopicDerivationResult::Success(topic.to_string()),
+        Err(e) => {
+            warn!(
+                topic = %topic,
+                error = %e,
+                event_type = %event_type,
+                "Derived topic failed validation"
+            );
+            TopicDerivationResult::ValidationFailed {
+                attempted_topic: topic.to_string(),
+                error: e.to_string(),
+            }
+        },
+    }
+}
+
+/// Normalizes typed, dotted, and legacy event names into canonical routing
+/// classes.
+#[must_use]
+pub(crate) fn normalize_event_type(event_type: &str) -> &str {
+    match event_type {
+        // System events
+        "KernelEvent" | "LedgerEvent" | "ledger.head" => "ledger.head",
+
+        // Work lifecycle parity (typed + dotted + legacy underscore)
+        "WorkOpened" | "work.opened" => "work.opened",
+        "WorkTransitioned" | "work.transitioned" | "work_transitioned" | "work_claimed" => {
+            "work.transitioned"
+        },
+        "WorkCompleted" | "work.completed" => "work.completed",
+        "WorkAborted" | "work.aborted" => "work.aborted",
+        "WorkPrAssociated" | "work.pr_associated" => "work.pr_associated",
+
+        // Evidence parity
+        "EvidencePublished" | "evidence.published" => "evidence.published",
+
+        // Gate parity
+        "GateReceipt" | "gate.receipt" | "gate_receipt" => "gate.receipt",
+
+        // Session lifecycle parity
+        "SessionStarted" | "session.started" | "session_started" => "session.started",
+        "SessionProgress" | "session.progress" | "session_progress" => "session.progress",
+        "SessionTerminated" | "session.terminated" | "session_terminated" => "session.terminated",
+        "SessionQuarantined" | "session.quarantined" | "session_quarantined" => {
+            "session.quarantined"
+        },
+
+        // Episode lifecycle parity
+        "EpisodeCreated" | "episode.created" | "episode_created" => "episode.created",
+        "EpisodeStarted" | "episode.started" | "episode_started" => "episode.started",
+        "EpisodeStopped" | "episode.stopped" | "episode_stopped" => "episode.stopped",
+
+        // Tool parity
+        "ToolRequested" | "tool.requested" | "tool_requested" => "tool.requested",
+        "ToolDecided" | "tool.decided" | "tool_decided" => "tool.decided",
+        "ToolExecuted" | "tool.executed" | "tool_executed" => "tool.executed",
+
+        // IO parity
+        "IoArtifactPublished" | "io.artifact.published" | "io_artifact_published" => {
+            "io.artifact.published"
+        },
+
+        // Defect parity
+        "DefectRecorded" | "defect.recorded" | "defect_recorded" => "defect.recorded",
+
+        // Policy parity
+        "PolicyResolvedForChangeSet"
+        | "policy.resolved_for_changeset"
+        | "policy_resolved_for_changeset" => "policy.resolved_for_changeset",
+
+        // Work graph parity
+        "work_graph.edge.added" | "WorkEdgeAdded" | "work_graph_edge_added" => {
+            "work_graph.edge.added"
+        },
+        "work_graph.edge.removed" | "WorkEdgeRemoved" | "work_graph_edge_removed" => {
+            "work_graph.edge.removed"
+        },
+        "work_graph.edge.waived" | "WorkEdgeWaived" | "work_graph_edge_waived" => {
+            "work_graph.edge.waived"
+        },
+
+        // Unknown event types keep namespace fallback behavior.
+        _ => event_type,
+    }
 }
 
 /// Validates a topic string and returns the appropriate result.
@@ -1138,6 +1428,110 @@ mod tests {
                     assert_eq!(result, first);
                 }
             }
+        }
+    }
+
+    // ========================================================================
+    // Typed/Dotted Parity Tests (TCK-00653)
+    // ========================================================================
+
+    mod typed_dotted_parity {
+        use apm2_core::events::{WorkEdgeAdded, WorkEdgeType, WorkGraphEvent, work_graph_event};
+
+        use super::*;
+
+        fn work_opened_event(work_id: &str) -> KernelEvent {
+            KernelEvent {
+                payload: Some(Payload::Work(WorkEvent {
+                    event: Some(apm2_core::events::work_event::Event::Opened(WorkOpened {
+                        work_id: work_id.to_string(),
+                        ..Default::default()
+                    })),
+                })),
+                ..Default::default()
+            }
+        }
+
+        fn work_graph_edge_added_event(from_work_id: &str, to_work_id: &str) -> KernelEvent {
+            KernelEvent {
+                payload: Some(Payload::WorkGraph(WorkGraphEvent {
+                    event: Some(work_graph_event::Event::Added(WorkEdgeAdded {
+                        from_work_id: from_work_id.to_string(),
+                        to_work_id: to_work_id.to_string(),
+                        edge_type: WorkEdgeType::Dependency as i32,
+                        rationale: "parity test".to_string(),
+                    })),
+                })),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn work_opened_typed_and_dotted_produce_identical_topic() {
+            let deriver = TopicDeriver::new();
+            let event = work_opened_event("W-PARITY-001");
+
+            let typed = CommitNotification::new(1, [0; 32], "WorkOpened", "kernel");
+            let dotted = CommitNotification::new(1, [0; 32], "work.opened", "kernel");
+
+            let typed_topic = deriver.derive_topic(&typed, &event);
+            let dotted_topic = deriver.derive_topic(&dotted, &event);
+
+            assert_eq!(typed_topic, dotted_topic);
+            assert_eq!(typed_topic.topic(), Some("work.W-PARITY-001.events"));
+        }
+
+        #[test]
+        fn work_transitioned_typed_dotted_and_legacy_match() {
+            let deriver = TopicDeriver::new();
+            let event = KernelEvent {
+                payload: Some(Payload::Work(WorkEvent {
+                    event: Some(apm2_core::events::work_event::Event::Transitioned(
+                        WorkTransitioned {
+                            work_id: "W-PARITY-TRANS".to_string(),
+                            from_state: "OPEN".to_string(),
+                            to_state: "CLAIMED".to_string(),
+                            ..Default::default()
+                        },
+                    )),
+                })),
+                ..Default::default()
+            };
+
+            let typed = CommitNotification::new(2, [0; 32], "WorkTransitioned", "kernel");
+            let dotted = CommitNotification::new(2, [0; 32], "work.transitioned", "kernel");
+            let legacy = CommitNotification::new(2, [0; 32], "work_transitioned", "kernel");
+
+            let typed_topic = deriver.derive_topic(&typed, &event);
+            let dotted_topic = deriver.derive_topic(&dotted, &event);
+            let legacy_topic = deriver.derive_topic(&legacy, &event);
+
+            assert_eq!(typed_topic, dotted_topic);
+            assert_eq!(typed_topic, legacy_topic);
+            assert_eq!(typed_topic.topic(), Some("work.W-PARITY-TRANS.events"));
+        }
+
+        #[test]
+        fn work_graph_typed_alias_matches_dotted_topic_set() {
+            let deriver = TopicDeriver::new();
+            let event = work_graph_edge_added_event("W-FROM-PARITY", "W-TO-PARITY");
+
+            let dotted = CommitNotification::new(3, [0; 32], "work_graph.edge.added", "kernel");
+            let typed = CommitNotification::new(3, [0; 32], "WorkEdgeAdded", "kernel");
+
+            let dotted_topics = deriver.derive_topics(&dotted, &event);
+            let typed_topics = deriver.derive_topics(&typed, &event);
+
+            assert_eq!(dotted_topics, typed_topics);
+            assert_eq!(dotted_topics.len(), 2);
+            assert_eq!(
+                dotted_topics[0].topic(),
+                Some("work_graph.W-FROM-PARITY.edge")
+            );
+            assert_eq!(
+                dotted_topics[1].topic(),
+                Some("work_graph.W-TO-PARITY.edge")
+            );
         }
     }
 

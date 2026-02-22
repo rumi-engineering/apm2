@@ -3,8 +3,8 @@ ticket_meta:
   template_version: '2026-01-29'
   ticket:
     id: 'TCK-00662'
-    title: 'FAC: Make lane reset + PID-based remediation PID-reuse safe (identity-verified kill)'
-    status: 'OPEN'
+    title: 'SUPERSEDED: FAC lane-reset PID kill hardening (doctor-first remediation removed lane reset path)'
+    status: 'CANCELLED'
   binds:
     prd_id: 'PRD-0001'
     rfc_id: 'RFC-0019'
@@ -22,6 +22,17 @@ ticket_meta:
   dependencies:
     tickets:
       - 'TCK-00658' # proc_start_time binding for leases
+
+supersession:
+  superseded_by_tickets:
+    - 'TCK-00658' # pid/starttime identity verification + stale lease recovery
+    - 'TCK-00659' # doctor-first remediation contract
+    - 'TCK-00660' # legacy remediation surface removal + doctor-only guidance
+  rationale: |
+    This ticket targeted safety hardening for PID-based kills in `apm2 fac lane reset`.
+    The lane-reset/remediation surface has since been removed in favor of doctor-first
+    remediation. With lane PID identity checks and stale-lease handling merged, the
+    remaining lane-reset kill-specific scope is no longer relevant.
 
 context:
   observed_symptoms:
