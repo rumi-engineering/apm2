@@ -897,6 +897,19 @@ const WORK_INDEX_SCHEMA_SQL: &str = r"
         ON work_active_loop_profile(work_id);
     CREATE INDEX IF NOT EXISTS idx_work_active_loop_profile_anchored
         ON work_active_loop_profile(anchored_at_ns);
+
+    -- TCK-00636: WorkSpec snapshot projection (RFC-0032 Phase 1)
+    -- Maps work_id -> spec_snapshot_hash derived from work.opened events.
+    -- Enables CAS-backed WorkSpec field joins (ticket_alias, repo, etc.)
+    -- without requiring WorkRegistry state.
+    CREATE TABLE IF NOT EXISTS work_spec_snapshot (
+        work_id TEXT PRIMARY KEY,
+        spec_snapshot_hash BLOB NOT NULL,
+        created_at_ns INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_work_spec_snapshot_created
+        ON work_spec_snapshot(created_at_ns);
 ";
 
 /// Work index for tracking changeset -> `work_id` -> PR associations.
@@ -1372,6 +1385,15 @@ impl WorkIndex {
             )
             .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
+        // TCK-00636: Evict expired work_spec_snapshot entries.
+        // Uses the same nanosecond cutoff as work_context.
+        total_deleted += conn
+            .execute(
+                "DELETE FROM work_spec_snapshot WHERE created_at_ns < ?1",
+                params![cutoff_ns],
+            )
+            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
         if total_deleted > 0 {
             info!(
                 deleted = total_deleted,
@@ -1457,6 +1479,14 @@ impl WorkIndex {
             total_deleted += conn_guard
                 .execute(
                     "DELETE FROM work_active_loop_profile WHERE anchored_at_ns < ?1",
+                    params![cutoff_ns],
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+            // TCK-00636: Evict expired work_spec_snapshot entries.
+            total_deleted += conn_guard
+                .execute(
+                    "DELETE FROM work_spec_snapshot WHERE created_at_ns < ?1",
                     params![cutoff_ns],
                 )
                 .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
@@ -1612,6 +1642,74 @@ impl WorkIndex {
         );
 
         Ok(())
+    }
+
+    /// Registers a `work_id -> spec_snapshot_hash` mapping in the projection
+    /// table (TCK-00636, RFC-0032 Phase 1).
+    ///
+    /// Uses `INSERT OR IGNORE` to support idempotent replays: the primary key
+    /// `work_id` ensures that duplicate entries from retries are silently
+    /// absorbed. The `spec_snapshot_hash` is immutable per work item
+    /// (INV-0104), so the first successful insert is authoritative.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_id` - Canonical work identifier
+    /// * `spec_snapshot_hash` - BLAKE3 hash of the `WorkSpec` stored in CAS (32
+    ///   bytes)
+    /// * `created_at_ns` - HTF timestamp in nanoseconds from the ledger event
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn register_work_spec_snapshot(
+        &self,
+        work_id: &str,
+        spec_snapshot_hash: &[u8; 32],
+        created_at_ns: u64,
+    ) -> Result<(), ProjectionWorkerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
+
+        conn.execute(
+            "INSERT OR IGNORE INTO work_spec_snapshot
+             (work_id, spec_snapshot_hash, created_at_ns)
+             VALUES (?1, ?2, ?3)",
+            params![work_id, spec_snapshot_hash.as_slice(), created_at_ns as i64,],
+        )
+        .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+        debug!(
+            work_id = %work_id,
+            spec_hash = %hex::encode(spec_snapshot_hash),
+            "Registered work_id -> spec_snapshot_hash in projection"
+        );
+
+        Ok(())
+    }
+
+    /// Returns the `spec_snapshot_hash` for a given `work_id`.
+    ///
+    /// Returns `None` if the work item has no registered spec snapshot
+    /// (fail-closed: callers must treat `None` as DENY for alias resolution).
+    pub fn get_spec_snapshot_hash(&self, work_id: &str) -> Option<[u8; 32]> {
+        let conn = self.conn.lock().ok()?;
+
+        let blob: Vec<u8> = conn
+            .query_row(
+                "SELECT spec_snapshot_hash FROM work_spec_snapshot WHERE work_id = ?1",
+                params![work_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+
+        let hash: [u8; 32] = blob.as_slice().try_into().ok()?;
+        Some(hash)
     }
 }
 
@@ -2446,6 +2544,9 @@ pub struct ProjectionWorker {
     /// Tailer for `evidence.published` events with `WORK_CONTEXT_ENTRY`
     /// category (TCK-00638).
     evidence_published_tailer: LedgerTailer,
+    /// Tailer for `work.opened` events to populate `work_spec_snapshot`
+    /// projection table (TCK-00636, RFC-0032 Phase 1).
+    work_opened_tailer: LedgerTailer,
     adapter: Option<GitHubProjectionAdapter>,
     authoritative_cas: Option<Arc<dyn ContentAddressedStore>>,
     /// Durable buffer for recording admission decisions (TCK-00504/00505).
@@ -2496,6 +2597,8 @@ impl ProjectionWorker {
         );
         let evidence_published_tailer =
             LedgerTailer::with_id(Arc::clone(&conn), "projection_worker:evidence_published");
+        let work_opened_tailer =
+            LedgerTailer::with_id(Arc::clone(&conn), "projection_worker:work_opened");
 
         // NOTE: Adapter is NOT created here to avoid fail-open issues.
         // The adapter MUST be injected via set_adapter() with a properly
@@ -2520,6 +2623,7 @@ impl ProjectionWorker {
             work_pr_tailer,
             review_tailer,
             evidence_published_tailer,
+            work_opened_tailer,
             adapter,
             authoritative_cas: None,
             intent_buffer: None,
@@ -2675,6 +2779,12 @@ impl ProjectionWorker {
                 warn!(error = %e, "Error processing evidence.published events");
             }
 
+            // Process work.opened events to populate work_spec_snapshot
+            // projection table (TCK-00636, RFC-0032 Phase 1)
+            if let Err(e) = self.process_work_opened().await {
+                warn!(error = %e, "Error processing work.opened events");
+            }
+
             // Periodic eviction of expired entries (Blocker fix: Unbounded State Growth)
             // Uses spawn_blocking to avoid blocking async runtime (Major fix: Thread
             // blocking)
@@ -2690,6 +2800,74 @@ impl ProjectionWorker {
         }
 
         info!("Projection worker shutting down");
+        Ok(())
+    }
+
+    /// Processes `work.opened` events to populate the `work_spec_snapshot`
+    /// projection table (TCK-00636, RFC-0032 Phase 1).
+    ///
+    /// Extracts `spec_snapshot_hash` from each `work.opened` event payload
+    /// and registers the `work_id -> spec_snapshot_hash` mapping in the
+    /// `WorkIndex`. Permanently malformed events are acknowledged and
+    /// skipped to prevent head-of-line blocking (same pattern as
+    /// `process_evidence_published`).
+    async fn process_work_opened(&mut self) -> Result<(), ProjectionWorkerError> {
+        let events = self
+            .work_opened_tailer
+            .poll_events_async("work.opened", self.config.batch_size)
+            .await?;
+
+        for event in events {
+            match self.handle_work_opened(&event) {
+                Ok(()) => {
+                    self.work_opened_tailer
+                        .acknowledge_async(event.timestamp_ns, &event.event_id)
+                        .await?;
+                },
+                Err(ProjectionWorkerError::InvalidPayload(ref msg)) => {
+                    // Permanently malformed: acknowledge to prevent head-of-line
+                    // blocking (INV-PJ15 pattern).
+                    warn!(
+                        event_id = %event.event_id,
+                        error = %msg,
+                        "Skipping permanently malformed work.opened event"
+                    );
+                    self.work_opened_tailer
+                        .acknowledge_async(event.timestamp_ns, &event.event_id)
+                        .await?;
+                },
+                Err(e) => {
+                    // Transient error: do NOT acknowledge; retry on next poll.
+                    warn!(
+                        event_id = %event.event_id,
+                        error = %e,
+                        "Transient error processing work.opened event; will retry"
+                    );
+                    return Err(e);
+                },
+            }
+        }
+        Ok(())
+    }
+
+    /// Handles a single `work.opened` event by extracting the
+    /// `spec_snapshot_hash` and registering it in the `work_spec_snapshot`
+    /// projection table.
+    fn handle_work_opened(&self, event: &SignedLedgerEvent) -> Result<(), ProjectionWorkerError> {
+        let spec_snapshot_hash = extract_work_opened_spec_snapshot_hash(&event.payload)?;
+
+        self.work_index.register_work_spec_snapshot(
+            &event.work_id,
+            &spec_snapshot_hash,
+            event.timestamp_ns,
+        )?;
+
+        debug!(
+            work_id = %event.work_id,
+            spec_hash = %hex::encode(spec_snapshot_hash),
+            "Indexed work_id -> spec_snapshot_hash from work.opened event"
+        );
+
         Ok(())
     }
 
@@ -10798,5 +10976,92 @@ mod tests {
             })
             .expect("count query should succeed");
         assert_eq!(count, 0, "Rejected event must not write projection rows");
+    }
+
+    // ====================================================================
+    // TCK-00636: WorkSpec Snapshot Projection Tests (RFC-0032 Phase 1)
+    // ====================================================================
+
+    #[test]
+    fn test_register_work_spec_snapshot_and_retrieve() {
+        let conn = create_test_db();
+        let index = WorkIndex::new(conn).unwrap();
+
+        let spec_hash = [0xAA; 32];
+        let work_id = "W-spec-001";
+
+        index
+            .register_work_spec_snapshot(work_id, &spec_hash, 1_000_000_000)
+            .expect("register should succeed");
+
+        let retrieved = index.get_spec_snapshot_hash(work_id);
+        assert_eq!(
+            retrieved,
+            Some(spec_hash),
+            "spec_snapshot_hash must be retrievable after registration"
+        );
+    }
+
+    #[test]
+    fn test_register_work_spec_snapshot_idempotent() {
+        let conn = create_test_db();
+        let index = WorkIndex::new(conn).unwrap();
+
+        let spec_hash = [0xBB; 32];
+        let work_id = "W-spec-002";
+
+        index
+            .register_work_spec_snapshot(work_id, &spec_hash, 1_000_000_000)
+            .expect("first register should succeed");
+
+        // Second registration with different hash should be ignored (INSERT
+        // OR IGNORE), preserving immutability of spec_snapshot_hash (INV-0104).
+        let different_hash = [0xCC; 32];
+        index
+            .register_work_spec_snapshot(work_id, &different_hash, 2_000_000_000)
+            .expect("duplicate register should succeed (idempotent)");
+
+        let retrieved = index.get_spec_snapshot_hash(work_id);
+        assert_eq!(
+            retrieved,
+            Some(spec_hash),
+            "first-registered hash must be preserved (immutability)"
+        );
+    }
+
+    #[test]
+    fn test_get_spec_snapshot_hash_returns_none_for_unknown() {
+        let conn = create_test_db();
+        let index = WorkIndex::new(conn).unwrap();
+
+        let retrieved = index.get_spec_snapshot_hash("W-nonexistent");
+        assert_eq!(
+            retrieved, None,
+            "unknown work_id must return None (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn test_evict_expired_removes_work_spec_snapshot() {
+        let conn = create_test_db();
+        let index = WorkIndex::new(conn).unwrap();
+
+        let spec_hash = [0xDD; 32];
+        // Created 10 days ago (in nanoseconds)
+        let old_ns = 1_000_000_000u64; // epoch + 1s (very old)
+        index
+            .register_work_spec_snapshot("W-evict-001", &spec_hash, old_ns)
+            .expect("register should succeed");
+
+        // Evict with 1-day TTL. Since our timestamp is 1 second after epoch
+        // and current time is ~2026, everything should be evicted.
+        let deleted = index.evict_expired(86400).expect("eviction should succeed");
+        assert!(
+            deleted > 0,
+            "expired work_spec_snapshot rows must be evicted"
+        );
+
+        let retrieved = index.get_spec_snapshot_hash("W-evict-001");
+        assert_eq!(retrieved, None, "evicted row must not be retrievable");
     }
 }

@@ -2038,3 +2038,24 @@ message RecordWorkPrAssociationResponse {
   // Whether this was an idempotent no-op (same association already exists).
   bool already_existed = 4;
 }
+
+// IPC-PRIV-080: ResolveTicketAlias (RFC-0032, TCK-00636)
+// Resolves a ticket alias to a canonical work_id via projection state.
+// Uses AliasReconciliationGate::resolve_ticket_alias for CAS-backed
+// WorkSpec lookup. Returns exactly one work_id on success, or an error
+// on ambiguity/infrastructure failure (fail-closed).
+message ResolveTicketAliasRequest {
+  // Ticket alias to resolve (e.g. "TCK-00636").
+  // Must not be empty; bounded to MAX_ID_LENGTH bytes.
+  string ticket_alias = 1;
+}
+
+message ResolveTicketAliasResponse {
+  // Canonical work_id resolved from the alias.
+  // Empty when no match was found (found == false).
+  string work_id = 1;
+  // True when the alias resolved to exactly one work item.
+  bool found = 2;
+  // Echoed ticket alias for response correlation.
+  string ticket_alias = 3;
+}

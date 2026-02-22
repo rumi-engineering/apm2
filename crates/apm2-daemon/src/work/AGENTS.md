@@ -110,6 +110,31 @@ pub enum WorkAuthorityError {
 
 Wires the `apm2_core::events::alias_reconcile` module into the daemon work authority layer for reconciliation, promotion gating, and snapshot-emitter sunset evaluation.
 
+**Methods:**
+
+- `check_promotion()` -- Validates alias bindings for promotion eligibility (fail-closed on ambiguity)
+- `resolve_ticket_alias()` -- Resolves a ticket alias to a canonical `work_id` via a bounded in-memory alias index derived from projection + CAS state (TCK-00636). Default implementation returns `Ok(None)` for backward compatibility.
+
+### `ProjectionAliasReconciliationGate`
+
+Projection-backed alias reconciliation gate implementation. Bridges the alias reconciliation module to the daemon work authority layer.
+
+**Fields:**
+
+- `projection` -- Shared `WorkObjectProjection` rebuilt from ledger events (wired from `ProjectionWorkAuthority` in dispatcher construction to avoid redundant state)
+- `event_emitter` -- Ledger event emitter for projection refresh
+- `cas` -- Optional CAS store for `WorkSpec` retrieval (TCK-00636)
+- `ticket_alias_index` -- Bounded in-memory alias index with deterministic oldest-`opened_at` work eviction (`MAX_TICKET_ALIAS_INDEX_WORK_ITEMS`), bounded lossy alias markers (`MAX_TICKET_ALIAS_INDEX_EVICTED_ALIASES`), and bounded resolved spec-hash cache (`MAX_TICKET_ALIAS_INDEX_RESOLVED_SPEC_HASHES`)
+
+**Contracts:**
+
+- [CTR-AG01] `refresh_projection()` refreshes `ticket_alias_index` from the event-count delta (new events since last successful refresh), then processes only touched work IDs with changed `spec_snapshot_hash` values; the resolved spec-hash cache avoids repeated CAS I/O for evicted work bindings.
+- [CTR-AG02] `resolve_ticket_alias()` performs O(1) alias-index lookups and returns `Err` on ambiguity, lossy/evicted alias state, or lossy-marker saturation (fail-closed).
+- [CTR-AG03] `build_canonical_projections()` uses index-backed alias mappings (no projection-wide CAS scans); aliases marked lossy by eviction are omitted so reconciliation yields unresolved defects (fail-closed).
+- [CTR-AG04] Alias index collections are hard-capped (`MAX_TICKET_ALIAS_INDEX_WORK_ITEMS`, `MAX_TICKET_ALIAS_INDEX_EVICTED_ALIASES`, `MAX_TICKET_ALIAS_INDEX_RESOLVED_SPEC_HASHES`) per RS-27.
+- [CTR-AG05] `spec_hash_by_work_id` is updated only after successful CAS retrieval/decode so transient CAS failures remain retryable on subsequent projection refreshes.
+- [CTR-AG06] `PrivilegedDispatcher` wires `ProjectionAliasReconciliationGate` and `ProjectionWorkAuthority` to the same projection handle so control-plane reads are sourced from one authoritative in-memory projection.
+
 ## Public API
 
 - `WorkAuthority` (trait), `ProjectionWorkAuthority`
@@ -130,3 +155,4 @@ Wires the `apm2_core::events::alias_reconcile` module into the daemon work autho
 - RFC-0019: Automated FAC v0 -- work claim and completion flow
 - TCK-00415: Work lifecycle authority module
 - TCK-00420: Alias reconciliation gate
+- TCK-00636: RFC-0032 Phase 1 WorkSpec projection plumbing + ticket-alias reconciliation integration (CAS-backed `resolve_ticket_alias`, `with_cas()` builder, enriched `build_canonical_projections`)

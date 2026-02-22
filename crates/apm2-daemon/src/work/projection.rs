@@ -10,6 +10,7 @@ use apm2_core::reducer::{Reducer, ReducerContext};
 use apm2_core::work::{Work, WorkError, WorkReducer, WorkState, helpers};
 use ed25519_dalek::Verifier;
 use prost::Message;
+use serde::Deserialize;
 use thiserror::Error;
 
 use crate::protocol::dispatch::{
@@ -18,6 +19,9 @@ use crate::protocol::dispatch::{
 };
 
 const DEFAULT_SYNTHETIC_WORK_TYPE: &str = "TICKET";
+const MAX_CANONICAL_WORK_EVENT_JSON_BYTES: usize = 64 * 1024;
+const MAX_CANONICAL_WORK_EVENT_DECODED_BYTES: usize = 64 * 1024;
+const MAX_CANONICAL_WORK_EVENT_HEX_CHARS: usize = MAX_CANONICAL_WORK_EVENT_DECODED_BYTES * 2;
 const MAX_WORK_GRAPH_EVENT_BYTES: usize = 64 * 1024;
 const MAX_WORK_GRAPH_JSON_DEPTH: usize = 2;
 const GRAPH_EDGE_ID_DOMAIN_PREFIX: &[u8] = b"apm2.work_graph.edge.v1";
@@ -273,6 +277,19 @@ impl WorkObjectProjection {
     #[must_use]
     pub fn list_work(&self) -> Vec<&Work> {
         self.ordered_work.values().collect()
+    }
+
+    /// Returns an iterator over all known work items in deterministic ID
+    /// order.
+    pub fn iter_work(&self) -> impl Iterator<Item = &Work> + '_ {
+        self.ordered_work.values()
+    }
+
+    /// Returns the number of work items currently materialized in projection
+    /// state.
+    #[must_use]
+    pub fn work_count(&self) -> usize {
+        self.ordered_work.len()
     }
 
     /// Returns claimable work items in deterministic ID order.
@@ -546,14 +563,16 @@ fn translate_signed_event(
         // Native reducer event family (already canonical names).
         "work.opened" | "work.transitioned" | "work.completed" | "work.aborted"
         | "work.pr_associated" => {
-            if let Some(work_id) = extract_work_id_from_work_event(&event.payload) {
+            let reducer_payload =
+                decode_canonical_work_event_payload(&event.payload, &event.event_type)?;
+            if let Some(work_id) = extract_work_id_from_work_event(&reducer_payload) {
                 opened_work_ids.insert(work_id);
             }
             push_event(
                 &event.event_type,
                 &event.work_id,
                 &event.actor_id,
-                event.payload.clone(),
+                reducer_payload,
                 event.timestamp_ns,
             );
         },
@@ -626,6 +645,106 @@ fn translate_signed_event(
     }
 
     Ok(translated)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalWorkEventEnvelopeJson {
+    payload: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionWorkEventEnvelopeJson {
+    event_type: String,
+    session_id: String,
+    actor_id: String,
+    payload: String,
+}
+
+fn decode_canonical_work_event_payload(
+    payload: &[u8],
+    event_type: &str,
+) -> Result<Vec<u8>, WorkProjectionError> {
+    if payload.len() > MAX_CANONICAL_WORK_EVENT_JSON_BYTES {
+        return Err(WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: format!(
+                "payload exceeds maximum {MAX_CANONICAL_WORK_EVENT_JSON_BYTES} bytes for JSON \
+                 envelope decode"
+            ),
+        });
+    }
+
+    if payload.first() != Some(&b'{') {
+        WorkEvent::decode(payload).map_err(|error| WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: format!("work.* payload is not protobuf WorkEvent: {error}"),
+        })?;
+        return Ok(payload.to_vec());
+    }
+
+    let wrapped_payload = match serde_json::from_slice::<CanonicalWorkEventEnvelopeJson>(payload) {
+        Ok(envelope) => envelope.payload,
+        Err(canonical_error) => {
+            let session_envelope = serde_json::from_slice::<SessionWorkEventEnvelopeJson>(payload)
+                .map_err(|session_error| WorkProjectionError::InvalidPayload {
+                    event_type: event_type.to_string(),
+                    reason: format!(
+                        "work.* payload is not protobuf or strict JSON envelope: canonical={canonical_error}; session={session_error}"
+                    ),
+                })?;
+            if session_envelope.event_type != event_type {
+                return Err(WorkProjectionError::InvalidPayload {
+                    event_type: event_type.to_string(),
+                    reason: format!(
+                        "session envelope event_type '{}' does not match ledger event_type '{}'",
+                        session_envelope.event_type, event_type
+                    ),
+                });
+            }
+            if session_envelope.session_id.is_empty() || session_envelope.actor_id.is_empty() {
+                return Err(WorkProjectionError::InvalidPayload {
+                    event_type: event_type.to_string(),
+                    reason: "session envelope missing required identity fields".to_string(),
+                });
+            }
+            session_envelope.payload
+        },
+    };
+
+    if wrapped_payload.len() > MAX_CANONICAL_WORK_EVENT_HEX_CHARS {
+        return Err(WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: format!(
+                "wrapped work.* payload hex exceeds maximum {MAX_CANONICAL_WORK_EVENT_HEX_CHARS} \
+                 characters"
+            ),
+        });
+    }
+
+    let decoded =
+        hex::decode(&wrapped_payload).map_err(|error| WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: format!("wrapped work.* payload hex decode failed: {error}"),
+        })?;
+
+    if decoded.len() > MAX_CANONICAL_WORK_EVENT_DECODED_BYTES {
+        return Err(WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: format!(
+                "wrapped work.* payload exceeds maximum {MAX_CANONICAL_WORK_EVENT_DECODED_BYTES} \
+                 bytes after hex decode"
+            ),
+        });
+    }
+
+    WorkEvent::decode(decoded.as_slice()).map_err(|error| WorkProjectionError::InvalidPayload {
+        event_type: event_type.to_string(),
+        reason: format!("wrapped work.* payload does not decode as WorkEvent: {error}"),
+    })?;
+
+    Ok(decoded)
 }
 
 fn decode_work_graph_event(
@@ -1344,6 +1463,109 @@ mod tests {
         .expect("WorkEdgeWaived protobuf should encode");
 
         signed_event("work_graph.edge.waived", to_work_id, payload, timestamp_ns)
+    }
+
+    #[test]
+    fn decode_canonical_work_event_payload_rejects_oversized_json_envelope() {
+        let oversized = vec![b'x'; MAX_CANONICAL_WORK_EVENT_JSON_BYTES + 1];
+        let result = decode_canonical_work_event_payload(&oversized, "work.opened");
+
+        assert!(
+            matches!(
+                result,
+                Err(WorkProjectionError::InvalidPayload { event_type, reason })
+                    if event_type == "work.opened"
+                        && reason.contains("payload exceeds maximum")
+            ),
+            "oversized JSON envelopes must be rejected before deserialization"
+        );
+    }
+
+    #[test]
+    fn decode_canonical_work_event_payload_rejects_oversized_protobuf_before_decode() {
+        let payload = helpers::work_opened_payload(
+            "W-projection-oversized-protobuf",
+            "TICKET",
+            vec![0x11; 32],
+            vec!["R".repeat(MAX_CANONICAL_WORK_EVENT_JSON_BYTES)],
+            vec![],
+        );
+        assert!(
+            payload.len() > MAX_CANONICAL_WORK_EVENT_JSON_BYTES,
+            "test fixture must exceed the canonical payload bound"
+        );
+
+        let result = decode_canonical_work_event_payload(&payload, "work.opened");
+        assert!(
+            matches!(
+                result,
+                Err(WorkProjectionError::InvalidPayload { event_type, reason })
+                    if event_type == "work.opened"
+                        && reason.contains("payload exceeds maximum")
+            ),
+            "oversized protobuf payloads must be rejected before decode attempts"
+        );
+    }
+
+    #[test]
+    fn decode_canonical_work_event_payload_accepts_raw_protobuf_when_not_json_prefixed() {
+        let payload = helpers::work_opened_payload(
+            "W-projection-raw-protobuf",
+            "TICKET",
+            vec![0x22; 32],
+            vec![],
+            vec![],
+        );
+
+        let decoded =
+            decode_canonical_work_event_payload(&payload, "work.opened").expect("decode succeeds");
+        assert_eq!(
+            decoded, payload,
+            "non-JSON-prefixed payloads must be treated as raw protobuf"
+        );
+    }
+
+    #[test]
+    fn decode_canonical_work_event_payload_decodes_json_envelope_when_prefixed_with_brace() {
+        let opened_payload = helpers::work_opened_payload(
+            "W-projection-json-envelope",
+            "TICKET",
+            vec![0x33; 32],
+            vec![],
+            vec![],
+        );
+        let envelope = serde_json::to_vec(&serde_json::json!({
+            "payload": hex::encode(&opened_payload),
+        }))
+        .expect("JSON envelope should encode");
+        assert_eq!(
+            envelope.first(),
+            Some(&b'{'),
+            "fixture must start with '{{' to exercise JSON-first format detection"
+        );
+
+        let decoded = decode_canonical_work_event_payload(&envelope, "work.opened")
+            .expect("JSON envelope should decode");
+        assert_eq!(
+            decoded, opened_payload,
+            "JSON envelopes must be unwrapped instead of treated as raw protobuf"
+        );
+    }
+
+    #[test]
+    fn decode_canonical_work_event_payload_rejects_non_json_non_protobuf_payload() {
+        let payload = b"not-a-valid-work-event".to_vec();
+        let result = decode_canonical_work_event_payload(&payload, "work.opened");
+
+        assert!(
+            matches!(
+                result,
+                Err(WorkProjectionError::InvalidPayload { event_type, reason })
+                    if event_type == "work.opened"
+                        && reason.contains("not protobuf WorkEvent")
+            ),
+            "non-JSON-prefixed payloads must fail on protobuf decode and never attempt envelope parsing"
+        );
     }
 
     #[test]
