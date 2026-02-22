@@ -114,9 +114,6 @@ apm2 fac bootstrap --system
 
 # Preview what would be created without making changes
 apm2 fac bootstrap --user --dry-run
-
-# Machine-readable output
-apm2 fac bootstrap --user --json
 ```
 
 Bootstrap runs five idempotent phases:
@@ -130,7 +127,7 @@ Bootstrap runs five idempotent phases:
 
 ## 2. FESv1 bootstrap and lane management
 
-### 2.1 Understanding lanes (PLANNED)
+### 2.1 Understanding lanes
 
 A **lane** is a bounded, cullable execution context with:
 - A dedicated workspace (clean git checkout from the node-local bare mirror)
@@ -144,11 +141,18 @@ Exceptional: `* -> CORRUPT -> RESET -> IDLE`
 The default lane count is 3 (derived from host memory policy: 96 GB / 24 GB
 per lane = 3 concurrent lanes, with headroom for OS and non-FAC processes).
 
-### 2.2 Check lane status (PLANNED)
+### 2.2 Check and manage lanes
 
-> **PLANNED -- not yet implemented.** The `apm2 fac lane` subcommand does not
-> exist in the current CLI. Lane status inspection is planned for a future
-> ticket implementing the FESv1 lane management surface.
+```bash
+# Inspect all lanes
+apm2 fac lane status
+
+# Initialize lane pool substrate (idempotent)
+apm2 fac lane init
+
+# Operator quarantine for a lane
+apm2 fac lane mark-corrupt lane-00 --reason "manual quarantine"
+```
 
 ### 2.3 Pre-warm lane targets
 
@@ -172,9 +176,6 @@ apm2 fac warm --phases fetch,build
 
 # Target a specific lane
 apm2 fac warm --lane bulk
-
-# Machine-readable output
-apm2 fac warm --json
 ```
 
 **Flags:**
@@ -185,7 +186,6 @@ apm2 fac warm --json
 | `--lane <NAME>` | `bulk` | Lane to target for the warm job |
 | `--wait` | off | Block until receipt is available |
 | `--wait-timeout-secs <N>` | `1200` | Maximum seconds to wait when `--wait` is set |
-| `--json` | off | Emit machine-readable JSON output |
 
 **Returns:** `job_id`, `phases`, `queue_lane`, `policy_hash`.
 
@@ -197,38 +197,46 @@ enqueue a warm job.
 
 ## 3. Start services
 
-### 3.1 Running gates (local execution)
+### 3.1 Running gates
 
-The `apm2 fac gates` command executes evidence gates locally in-process:
+The `apm2 fac gates` command enqueues a gates job and waits for completion by
+default (`--wait`). Execution is performed by the FAC worker runtime.
 
-1. Checks for a clean working tree (full mode) or skips the check (`--quick`)
-2. Resolves the HEAD SHA
-3. Runs the merge-conflict gate first (always recomputed)
-4. Runs evidence gates (with bounded test runner if `cargo-nextest` is available)
-5. Writes attested gate cache receipts for full runs
-6. Prints a summary table with verdict (PASS / FAIL)
+1. Validates local preconditions (clean tree in full mode, input bounds)
+2. Enqueues bounded evidence execution for the target SHA
+3. Worker claims and executes the job under FAC policy/containment
+4. Gate artifacts and receipts are written under FAC private state
+5. CLI returns a deterministic JSON result
 
 ```bash
-# Run all evidence gates locally
+# Run all evidence gates (waits for completion by default)
 apm2 fac gates
 
 # Quick mode for development iteration (skips test gate, accepts dirty tree)
 apm2 fac gates --quick
+
+# Return immediately after enqueue
+apm2 fac gates --no-wait
 ```
 
-> **PLANNED -- not yet implemented.** Queue-based execution (creating a
-> `FacJobSpecV1` job spec, obtaining an RFC-0028 channel context token from
-> the broker, enqueueing to `queue/pending/`, and waiting for a worker to
-> claim and execute) is planned for a future ticket implementing the FESv1
-> queue/worker surface. The current CLI runs all gates locally.
+### 3.2 Running worker services
 
-### 3.2 Running a worker (PLANNED)
+Use systemd services as the primary worker control surface:
 
-> **PLANNED -- not yet implemented.** The `apm2 fac worker` subcommand does not
-> exist in the current CLI. Standalone worker execution is planned for a future
-> ticket implementing the FESv1 queue/worker surface. The apm2-daemon service
-> does not currently include worker functionality; this will be added when the
-> FESv1 queue/worker surface is implemented.
+```bash
+# user mode
+systemctl --user status apm2-worker.service
+systemctl --user restart apm2-worker.service
+
+# system mode
+sudo systemctl status apm2-worker.service
+sudo systemctl restart apm2-worker.service
+```
+
+`apm2-worker.service` uses watcher wake signals on `queue/pending` and
+`queue/claimed` for steady-state activation. Degraded safety nudges use an
+internal bounded interval when watcher delivery is unavailable/overflowed.
+Direct `apm2 fac worker` invocation is diagnostics-only.
 
 ### 3.3 Running GC (garbage collection)
 
@@ -244,9 +252,6 @@ apm2 fac gc
 
 # Enforce a custom free-space floor (default: 1 GB)
 apm2 fac gc --min-free-bytes 2147483648
-
-# Machine-readable output
-apm2 fac gc --json
 ```
 
 **Flags:**
@@ -254,7 +259,6 @@ apm2 fac gc --json
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--dry-run` | off | Print GC plan without removing anything |
-| `--json` | off | Emit machine-readable JSON output |
 | `--min-free-bytes <N>` | `1073741824` (1 GB) | Minimum free bytes floor to enforce |
 
 **GC target kinds and TTLs:**
@@ -280,17 +284,11 @@ GC emits a `GcReceiptV1` persisted under `$APM2_HOME/private/fac/receipts/`.
 
 ---
 
-## 4. PLANNED — Respond to quarantine and denials (not yet implemented)
+## 4. Respond to quarantine and denials
 
-> **PLANNED -- not yet implemented.** This entire section describes planned
-> behavior for the FESv1 queue/worker surface, which is not yet implemented.
-> The current `apm2 fac gates` command executes gates locally and does not
-> produce quarantine or denial artifacts. The procedures below describe the
-> planned queue-based behavior.
+### 4.1 Understanding quarantine
 
-### 4.1 Understanding quarantine (PLANNED)
-
-When queue-based execution is implemented, a job will be moved to
+A job is moved to
 `queue/quarantine/` when it fails validation:
 
 - **RFC-0028 channel boundary check failed:** The job's `channel_context_token`
@@ -303,7 +301,7 @@ When queue-based execution is implemented, a job will be moved to
 
 **Quarantined items are preserved for forensics. Never delete them manually.**
 
-### 4.2 Diagnosing quarantined jobs (PLANNED)
+### 4.2 Diagnosing quarantined jobs
 
 ```bash
 # List quarantined items
@@ -325,9 +323,9 @@ Common causes and remediation:
 | Malformed spec | Corrupted file or incompatible schema version | Regenerate job spec |
 | Digest mismatch | File modified after creation (possible A2 attack) | Investigate, re-enqueue from trusted source |
 
-### 4.3 Understanding denials (PLANNED)
+### 4.3 Understanding denials
 
-When queue-based execution is implemented, a job will be moved to
+A job is moved to
 `queue/denied/` when it fails RFC-0029 queue admission:
 
 - **Budget exceeded:** The job's resource cost exceeds available budget
@@ -342,7 +340,7 @@ ls "${APM2_HOME:-$HOME/.apm2}/private/fac/queue/denied/"
 cat "${APM2_HOME:-$HOME/.apm2}/private/fac/queue/denied/<job_id>.reason.json"
 ```
 
-### 4.4 Recovering from quarantine/denial (PLANNED)
+### 4.4 Recovering from quarantine/denial
 
 ```bash
 # After fixing the root cause, re-run gates locally:
@@ -367,14 +365,14 @@ signals appear in services/doctor output. Common triggers:
 
 ```bash
 # Current lane state and process identity/liveness:
-apm2 fac lane status --json
+apm2 fac lane status
 ```
 
 ### 5.3 Apply deterministic remediation
 
 ```bash
 # Single host-side remediation entrypoint:
-apm2 fac doctor --fix --json
+apm2 fac doctor --fix
 ```
 
 `apm2 fac doctor --fix` provides these guarantees:
@@ -394,8 +392,8 @@ apm2 fac doctor --fix --json
 Symptom: apm2 fac gates hangs or returns immediately with no output
 ```
 
-1. Check process health: `systemctl --user status apm2-daemon`
-2. Check evidence logs: `ls "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"` and `apm2 fac --json logs`
+1. Check process health: `systemctl --user status apm2-daemon.service apm2-worker.service`
+2. Check evidence logs: `ls "${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/"` and `apm2 fac logs`
 3. Check disk space: `df -h` and `du -sh "${APM2_HOME:-$HOME/.apm2}/private/fac/"`
 
 ### 6.2 Cold-start timeout (600s exceeded)
@@ -460,64 +458,56 @@ Symptom: Builds fail with "No space left on device"
    rm -rf target/
    ```
 
-### 6.6 Stale lease (PLANNED — FESv1 future)
+### 6.6 Stale lease / claimed queue drift
 
-> **PLANNED -- not yet implemented.** Stale lease detection and recovery
-> applies to the FESv1 lane management surface. The current `apm2 fac gates`
-> command does not use lanes or leases.
+```
+Symptom: pending queue drains slowly while claimed jobs remain stuck.
+```
 
-### 6.7 Containment violation (PLANNED — FESv1 future)
+1. Check lane state: `apm2 fac lane status`
+2. Check queue state: `apm2 fac queue status`
+3. Run host reconciliation: `apm2 fac doctor --fix`
+4. Confirm worker service is active: `systemctl --user status apm2-worker.service`
 
-> **PLANNED -- not yet implemented.** Containment violation detection applies
-> to the FESv1 lane management surface. The current `apm2 fac gates` command
-> executes gates locally without cgroup-based lane isolation.
->
-> When FESv1 is implemented, check for:
-> 1. sccache daemon leaking outside cgroup boundary
-> 2. RUSTC_WRAPPER overrides in FAC execution environment
-> 3. Ambient ~/.cargo/config.toml overriding FAC policy
+### 6.7 Containment violation
+
+```
+Symptom: child processes appear outside expected FAC cgroup boundaries.
+```
+
+1. Run containment verification: `apm2 fac verify containment`
+2. Review worker logs: `journalctl --user -u apm2-worker.service -n 200`
+3. If repeated, run remediation: `apm2 fac doctor --fix`
 
 ---
 
 ## 7. Reference: CLI commands
 
-### Currently implemented
-
 | Command | Purpose |
 |---------|---------|
-| `apm2 fac gates` | Run evidence gates locally (default) |
+| `apm2 fac bootstrap` | One-shot host provisioning (`--dry-run`, `--user`, `--system`) |
+| `apm2 fac services status` | Systemd-backed daemon/worker service health |
 | `apm2 fac doctor` | Check daemon health and prerequisites |
-| `apm2 fac gates --quick` | Quick validation (skips tests, accepts dirty tree) |
-| `apm2 fac push --ticket <yaml>` | Push and create/update PR |
-| `apm2 fac --json logs` | Show log file paths |
-| `apm2 fac --json logs --pr <N>` | Show logs for a specific PR |
-| `apm2 fac review` | Run and observe FAC review orchestration |
-| `apm2 fac restart` | Restart evidence/review pipeline |
-| `apm2 fac work` | Query projection-backed work authority |
-| `apm2 fac receipt` | Show receipt from CAS |
-| `apm2 fac episode` | Inspect episode details and tool log index |
-| `apm2 fac context` | Rebuild role-scoped context deterministically |
-| `apm2 fac resume` | Show crash-only resume helpers from ledger anchor |
-| `apm2 fac role-launch` | Launch a FAC role with hash-bound admission checks |
-| `apm2 fac pr` | GitHub App credential management and PR operations |
-| `apm2 fac bootstrap` | One-shot idempotent host provisioning (`--dry-run`, `--user`, `--system`, `--json`) |
-| `apm2 fac warm` | Enqueue a lane-scoped pre-warm job (`--phases`, `--lane`, `--wait`, `--wait-timeout-secs`, `--json`) |
-| `apm2 fac gc` | Reclaim disk space across all FAC roots (`--dry-run`, `--json`, `--min-free-bytes`) |
-
-### PLANNED -- not yet implemented (FESv1 queue/worker/lane surface)
-
-| Command | Purpose |
-|---------|---------|
-| `apm2 fac lane status` | Show all lane states |
-| `apm2 fac doctor --fix` | Reconcile and recover lane/queue state with bounded remediation |
-| `apm2 fac worker --once` | Run one job claim/execute cycle |
-| `apm2 fac worker` | Run worker continuously |
-| `apm2 fac enqueue <spec>` | Enqueue a job from a spec file |
-| `apm2 fac enqueue --cancel <id>` | Cancel a pending job |
+| `apm2 fac doctor --fix` | Deterministic host remediation (doctor-first) |
+| `apm2 fac lane status` | Inspect lane lock/lease/liveness state |
+| `apm2 fac lane init` | Initialize lane substrate (idempotent) |
+| `apm2 fac lane mark-corrupt ...` | Operator quarantine for suspicious lanes |
+| `apm2 fac queue status` | Queue forensics (`pending`, `claimed`, `denied`, `quarantine`) |
+| `apm2 fac warm` | Enqueue lane pre-warm job |
+| `apm2 fac gc` | Reclaim FAC disk state (`--dry-run`, `--min-free-bytes`) |
+| `apm2 fac quarantine list|prune` | Inspect/prune denied and quarantined jobs |
+| `apm2 fac job show|cancel` | Job lifecycle operations |
+| `apm2 fac verify containment` | Check cgroup containment for FAC execution |
+| `apm2 fac logs [--pr <N>]` | Discover local pipeline/review log paths |
+| `apm2 fac push` | Push + gate + review pipeline orchestration |
+| `apm2 fac doctor --pr <N> --fix` | PR-scoped doctor-first remediation and repair convergence |
+| `apm2 fac review ...` | Review orchestration and findings/verdict operations |
+| `apm2 fac gates` | Internal/advanced gates entrypoint (queue-backed wait model) |
+| `apm2 fac worker` | Internal runtime entrypoint (service-managed by `apm2-worker.service`) |
 
 ---
 
-## 8. PLANNED — Reference: lane lifecycle state machine (FESv1 future)
+## 8. Reference: lane lifecycle state machine
 
 ```
                     +---------+
@@ -554,12 +544,9 @@ Symptom: Builds fail with "No space left on device"
 
 ---
 
-## 9. PLANNED — Reference: queue lane priority order (FESv1 future)
+## 9. Reference: queue lane priority order
 
-> **PLANNED -- not yet implemented.** Queue lanes are part of the FESv1
-> queue/worker surface and do not exist in the current implementation.
-
-When implemented, queue lanes will determine scheduling priority (highest first):
+Queue lanes determine scheduling priority (highest first):
 
 1. `stop_revoke` - Stop/revocation commands (highest priority)
 2. `control` - Control plane operations

@@ -1,7 +1,5 @@
 //! `apm2 fac review finding` - append one SHA-bound finding to local FAC truth.
 
-use std::io::{Read, Stdin};
-
 use clap::ValueEnum;
 use serde::Serialize;
 
@@ -13,9 +11,7 @@ use super::{findings_store, projection_store};
 use crate::exit_codes::codes as exit_codes;
 
 const FINDING_SCHEMA: &str = "apm2.fac.review.finding.v1";
-const COMMENT_COMPAT_SOURCE: &str = "review.comment.compat";
 const FINDING_SOURCE: &str = "review.finding";
-const MAX_STDIN_BODY_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ReviewFindingSeverityArg {
@@ -187,7 +183,7 @@ fn run_finding_inner(
 
     // Do not retarget authoritative PR identity when appending findings.
     // Findings can arrive from delayed reviewer runs bound to an older SHA.
-    // Identity progression is owned by push/restart/dispatch refresh paths.
+    // Identity progression is owned by push/doctor-fix/dispatch refresh paths.
     let _ = json_output;
     println!(
         "{}",
@@ -230,66 +226,6 @@ pub fn run_finding(
         backend_id,
         evidence_pointer,
         FINDING_SOURCE,
-        json_output,
-    )
-}
-
-fn read_bounded_stdin_body(stdin: &mut Stdin) -> Result<String, String> {
-    let mut body = String::new();
-    let mut reader = stdin.take(MAX_STDIN_BODY_BYTES + 1);
-    reader
-        .read_to_string(&mut body)
-        .map_err(|err| format!("failed to read comment body from stdin: {err}"))?;
-    if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_STDIN_BODY_BYTES {
-        return Err(format!(
-            "stdin body exceeds {MAX_STDIN_BODY_BYTES} bytes for `apm2 fac review comment`"
-        ));
-    }
-    let normalized = body.trim();
-    if normalized.is_empty() {
-        return Err("comment body is empty; pass --body or pipe non-empty stdin".to_string());
-    }
-    Ok(normalized.to_string())
-}
-
-fn resolve_comment_body(body: Option<&str>) -> Result<String, String> {
-    if let Some(value) = body {
-        let normalized = value.trim();
-        if normalized.is_empty() {
-            return Err("comment body is empty; pass non-empty --body text".to_string());
-        }
-        return Ok(normalized.to_string());
-    }
-    let mut stdin = std::io::stdin();
-    read_bounded_stdin_body(&mut stdin)
-}
-
-pub fn run_comment_compat(
-    repo: &str,
-    pr_number: Option<u32>,
-    sha: Option<&str>,
-    review_type: ReviewFindingTypeArg,
-    severity: ReviewFindingSeverityArg,
-    body: Option<&str>,
-    json_output: bool,
-) -> Result<u8, String> {
-    let summary = resolve_comment_body(body)?;
-    run_finding_inner(
-        repo,
-        pr_number,
-        sha,
-        review_type,
-        severity,
-        &summary,
-        Some(&summary),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        COMMENT_COMPAT_SOURCE,
         json_output,
     )
 }

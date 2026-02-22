@@ -17,6 +17,11 @@ prd_requirement:
     replication on reconnection.
   - The system never silently drops work; stale or unresolved work is discoverable
     via projections.
+  - Runtime queue convergence uses event-driven wake signals as the primary activation
+    path; bounded degraded safety nudges are fallback-only and emit explicit diagnostics.
+  - 'Repeated doctor remediation runs converge idempotently after first successful repair:
+    `apm2 fac doctor --fix` for host scope and `apm2 fac doctor --pr <N> --fix`
+    for PR scope.'
   evidence:
     evidence_ids:
     - EVID-0006

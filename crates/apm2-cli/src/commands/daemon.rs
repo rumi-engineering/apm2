@@ -89,6 +89,8 @@ WantedBy=default.target\n\
 /// the worker started. The worker calls `sd_notify::notify_ready()` after
 /// broker connection. `WatchdogSec=300` restarts the worker if it fails to
 /// send `WATCHDOG=1` within 5 minutes (the worker pings every ~150s).
+/// Worker activation is wake-driven; degraded safety nudges use an internal
+/// bounded interval.
 const WORKER_SERVICE_TEMPLATE: &str = "\
 [Unit]\n\
 Description=APM2 FAC Worker\n\
@@ -100,7 +102,7 @@ PartOf=apm2-daemon.service\n\
 \n\
 [Service]\n\
 Type=notify\n\
-ExecStart=%exe_path% fac worker --poll-interval-secs 10\n\
+ExecStart=%exe_path% fac worker\n\
 Restart=always\n\
 RestartSec=5\n\
 WatchdogSec=300\n\
@@ -130,7 +132,7 @@ PartOf=apm2-daemon.service\n\
 \n\
 [Service]\n\
 Type=notify\n\
-ExecStart=%exe_path% fac worker --poll-interval-secs 10\n\
+ExecStart=%exe_path% fac worker\n\
 Restart=always\n\
 RestartSec=5\n\
 WatchdogSec=300\n\
@@ -2023,12 +2025,12 @@ mod tests {
     #[test]
     fn daemon_service_templates_use_expected_worker_flag_and_rw_paths() {
         assert!(
-            WORKER_SERVICE_TEMPLATE.contains("fac worker --poll-interval-secs 10"),
-            "worker service template must use --poll-interval-secs"
+            WORKER_SERVICE_TEMPLATE.contains("ExecStart=%exe_path% fac worker"),
+            "worker service template must invoke fac worker without poll interval flags"
         );
         assert!(
-            WORKER_TEMPLATE_SERVICE_TEMPLATE.contains("fac worker --poll-interval-secs 10"),
-            "worker@ template must use --poll-interval-secs"
+            WORKER_TEMPLATE_SERVICE_TEMPLATE.contains("ExecStart=%exe_path% fac worker"),
+            "worker@ template must invoke fac worker without poll interval flags"
         );
         for worker_template in [WORKER_SERVICE_TEMPLATE, WORKER_TEMPLATE_SERVICE_TEMPLATE] {
             assert!(

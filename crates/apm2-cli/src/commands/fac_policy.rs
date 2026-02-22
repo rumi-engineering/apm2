@@ -52,21 +52,13 @@ pub enum PolicySubcommand {
 
 /// Arguments for `apm2 fac policy show`.
 #[derive(Debug, Args)]
-pub struct PolicyShowArgs {
-    /// Emit JSON output.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
+pub struct PolicyShowArgs {}
 
 /// Arguments for `apm2 fac policy validate`.
 #[derive(Debug, Args)]
 pub struct PolicyValidateArgs {
     /// Path to the policy file to validate, or "-" for stdin.
     pub path: Option<PathBuf>,
-
-    /// Emit JSON output.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac policy adopt`.
@@ -78,10 +70,6 @@ pub struct PolicyAdoptArgs {
     /// Reason for the adoption (for the receipt).
     #[arg(long, default_value = "operator adoption")]
     pub reason: String,
-
-    /// Emit JSON output.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac policy rollback`.
@@ -90,10 +78,6 @@ pub struct PolicyRollbackArgs {
     /// Reason for the rollback (for the receipt).
     #[arg(long, default_value = "operator rollback")]
     pub reason: String,
-
-    /// Emit JSON output.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 // =============================================================================
@@ -115,7 +99,8 @@ pub fn run_policy_command(args: &PolicyArgs, json_global: bool) -> u8 {
 // =============================================================================
 
 fn run_show(args: &PolicyShowArgs, json_global: bool) -> u8 {
-    let json = args.json || json_global;
+    let _ = args;
+    let json = json_global;
     let fac_root = resolve_fac_root();
 
     match load_admitted_policy_root(&fac_root) {
@@ -159,7 +144,7 @@ fn run_show(args: &PolicyShowArgs, json_global: bool) -> u8 {
 // =============================================================================
 
 fn run_validate(args: &PolicyValidateArgs, json_global: bool) -> u8 {
-    let json = args.json || json_global;
+    let json = json_global;
 
     // Read from path or stdin (CTR-1603 bounded).
     let bytes = match read_policy_input(args.path.as_deref()) {
@@ -230,7 +215,7 @@ fn run_validate(args: &PolicyValidateArgs, json_global: bool) -> u8 {
 // =============================================================================
 
 fn run_adopt(args: &PolicyAdoptArgs, json_global: bool) -> u8 {
-    let json = args.json || json_global;
+    let json = json_global;
     let fac_root = resolve_fac_root();
     let actor_id = resolve_operator_identity();
 
@@ -289,7 +274,7 @@ fn run_adopt(args: &PolicyAdoptArgs, json_global: bool) -> u8 {
 // =============================================================================
 
 fn run_rollback(args: &PolicyRollbackArgs, json_global: bool) -> u8 {
-    let json = args.json || json_global;
+    let json = json_global;
     let fac_root = resolve_fac_root();
     let actor_id = resolve_operator_identity();
 

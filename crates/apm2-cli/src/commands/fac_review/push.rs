@@ -32,7 +32,7 @@ use super::types::{
     DispatchReviewResult, ReviewKind, apm2_home_dir, ensure_parent_dir, now_iso8601,
     sanitize_for_path,
 };
-use super::{github_projection, lifecycle, projection_store, state};
+use super::{github_projection, lifecycle, projection_store, state, verdict_projection};
 use crate::commands::fac_pr::sync_required_status_ruleset;
 use crate::exit_codes::codes as exit_codes;
 
@@ -773,6 +773,100 @@ fn retry_delay_or_fail(
     Ok(delay)
 }
 
+fn dispatch_run_state_is_terminal(run_state: &str) -> bool {
+    let normalized = run_state.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "done" | "failed" | "crashed" | "completed" | "cancelled"
+    )
+}
+
+fn dispatch_results_are_all_joined_terminal(results: &[DispatchReviewResult]) -> bool {
+    !results.is_empty()
+        && results.iter().all(|result| {
+            result.mode.eq_ignore_ascii_case("joined")
+                && dispatch_run_state_is_terminal(&result.run_state)
+        })
+}
+
+fn projection_snapshot_is_terminal_approved(
+    snapshot: &verdict_projection::VerdictProjectionSnapshot,
+) -> bool {
+    if snapshot.fail_closed {
+        return false;
+    }
+
+    let security_approved = snapshot.dimensions.iter().any(|entry| {
+        entry.dimension.eq_ignore_ascii_case("security")
+            && entry.decision.eq_ignore_ascii_case("approve")
+    });
+    let quality_approved = snapshot.dimensions.iter().any(|entry| {
+        entry.dimension.eq_ignore_ascii_case("code-quality")
+            && entry.decision.eq_ignore_ascii_case("approve")
+    });
+
+    security_approved && quality_approved
+}
+
+fn should_force_projection_binding_repair(
+    dispatch_results: &[DispatchReviewResult],
+    projection_terminal_approved: bool,
+    projection_has_remote_binding: bool,
+) -> bool {
+    dispatch_results_are_all_joined_terminal(dispatch_results)
+        && projection_terminal_approved
+        && !projection_has_remote_binding
+}
+
+fn maybe_force_projection_binding_repair(
+    repo: &str,
+    pr_number: u32,
+    sha: &str,
+    dispatch_results: &[DispatchReviewResult],
+    json_output: bool,
+    emit_logs: bool,
+) -> Result<bool, String> {
+    let Some(snapshot) =
+        verdict_projection::load_verdict_projection_snapshot(repo, pr_number, sha)?
+    else {
+        return Ok(false);
+    };
+
+    let projection_terminal_approved = projection_snapshot_is_terminal_approved(&snapshot);
+    let projection_has_remote_binding = verdict_projection::has_remote_comment_binding(
+        snapshot.source_comment_id,
+        snapshot.source_comment_url.as_deref(),
+    );
+
+    if !should_force_projection_binding_repair(
+        dispatch_results,
+        projection_terminal_approved,
+        projection_has_remote_binding,
+    ) {
+        return Ok(false);
+    }
+
+    let repaired = super::dispatch_reviews_with_lifecycle(repo, pr_number, sha, true)?;
+    if emit_logs {
+        eprintln!(
+            "fac push: projection remote comment binding missing for terminal-approved sha={sha}; \
+             forced bounded reviewer redispatch (reviews={})",
+            repaired.len()
+        );
+    }
+    if json_output {
+        let _ = emit_jsonl(&serde_json::json!({
+            "event": "dispatch_projection_repair",
+            "ts": ts_now(),
+            "pr_number": pr_number,
+            "sha": sha,
+            "strategy": "force_same_sha_redispatch",
+            "dispatched_reviews": repaired.len(),
+        }));
+    }
+    Ok(true)
+}
+
 fn dispatch_reviews_with<F, R>(
     repo: &str,
     pr_number: u32,
@@ -780,7 +874,7 @@ fn dispatch_reviews_with<F, R>(
     mut dispatch_fn: F,
     mut register_dispatch_fn: R,
     emit_logs: bool,
-) -> Result<(), String>
+) -> Result<Vec<DispatchReviewResult>, String>
 where
     F: FnMut(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
     R: FnMut(
@@ -799,6 +893,7 @@ where
         .unwrap_or(0);
     let retry_budget = lifecycle::default_retry_budget();
     let mut retry_counts = BTreeMap::<(String, PushRetryClass), u32>::new();
+    let mut dispatch_results = Vec::with_capacity(2);
 
     for kind in [ReviewKind::Security, ReviewKind::Quality] {
         let review_type = kind.as_str();
@@ -838,9 +933,29 @@ where
                 // BF-001 (TCK-00626): For non-terminal "joined" results,
                 // verify the PID is still alive. A stale run-state with a
                 // dead PID should be treated as a dispatch that needs retry.
-                let is_terminal = result.run_state.eq_ignore_ascii_case("completed")
-                    || result.run_state.eq_ignore_ascii_case("failed")
-                    || result.run_state.eq_ignore_ascii_case("cancelled");
+                let is_terminal = dispatch_run_state_is_terminal(&result.run_state);
+                let joined_run_id = result
+                    .run_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                if !is_terminal && joined_run_id.is_none() {
+                    let err = format!(
+                        "{review_type} joined dispatch missing run_id in non-terminal state (run_state={})",
+                        result.run_state
+                    );
+                    let delay = retry_delay_or_fail(
+                        &mut retry_counts,
+                        retry_budget,
+                        review_type,
+                        "dispatch_contract",
+                        PushRetryClass::MissingRunIdTransient,
+                        &err,
+                        emit_logs,
+                    )?;
+                    thread::sleep(delay);
+                    continue;
+                }
                 if !is_terminal {
                     if let Some(pid) = result.pid {
                         // BF-001 (TCK-00626 round 3): Use process-identity
@@ -923,6 +1038,7 @@ where
         };
 
         if dispatch_result.mode.eq_ignore_ascii_case("joined") {
+            dispatch_results.push(dispatch_result);
             continue;
         }
 
@@ -968,9 +1084,10 @@ where
                 },
             }
         }
+        dispatch_results.push(dispatch_result);
     }
 
-    Ok(())
+    Ok(dispatch_results)
 }
 
 // ── run_push entry point ─────────────────────────────────────────────────────
@@ -2215,11 +2332,11 @@ pub fn run_push(
     //
     // Intentional: dispatch failures are non-fatal for `fac push`. Push owns
     // publication and gate validation; reviewer liveness and retry are handled
-    // by restart/recover lifecycle surfaces.
+    // by doctor-first remediation surfaces.
     let dispatch_started = Instant::now();
     emit_stage("dispatch_started", serde_json::json!({}));
     let mut emitted_reviews_dispatched = false;
-    let dispatch_warning = if let Err(e) = dispatch_reviews_with(
+    let dispatch_warning = match dispatch_reviews_with(
         repo,
         pr_number,
         &sha,
@@ -2244,35 +2361,65 @@ pub fn run_push(
         },
         !json_output,
     ) {
-        attempt.set_stage_fail(
-            "dispatch",
-            dispatch_started.elapsed().as_secs(),
-            None,
-            normalize_error_hint(&e),
-        );
-        human_log!("WARNING: review dispatch failed: {e}");
-        human_log!("  Reviewers are NOT running. Use one of:");
-        human_log!("    apm2 fac review run --pr {pr_number} --type all");
-        human_log!("    apm2 fac restart --pr {pr_number}");
-        // BF-001 (TCK-00626): Emit structured dispatch_failed event so
-        // the event stream captures the failure for automated recovery.
-        if json_output {
-            let _ = emit_jsonl(&serde_json::json!({
-                "event": "dispatch_failed",
-                "ts": ts_now(),
-                "pr_number": pr_number,
-                "sha": sha,
-                "error": e,
-                "recovery_commands": [
-                    format!("apm2 fac review run --pr {pr_number} --type all"),
-                    format!("apm2 fac restart --pr {pr_number}"),
-                ],
-            }));
-        }
-        Some(e)
-    } else {
-        attempt.set_stage_pass("dispatch", dispatch_started.elapsed().as_secs());
-        None
+        Err(e) => {
+            attempt.set_stage_fail(
+                "dispatch",
+                dispatch_started.elapsed().as_secs(),
+                None,
+                normalize_error_hint(&e),
+            );
+            human_log!("WARNING: review dispatch failed: {e}");
+            human_log!("  Reviewers are NOT running. Use:");
+            human_log!("    apm2 fac doctor --pr {pr_number} --fix");
+            // BF-001 (TCK-00626): Emit structured dispatch_failed event so
+            // the event stream captures the failure for automated recovery.
+            if json_output {
+                let _ = emit_jsonl(&serde_json::json!({
+                    "event": "dispatch_failed",
+                    "ts": ts_now(),
+                    "pr_number": pr_number,
+                    "sha": sha,
+                    "error": e,
+                    "recovery_commands": [
+                        format!("apm2 fac doctor --pr {pr_number} --fix"),
+                    ],
+                }));
+            }
+            Some(e)
+        },
+        Ok(results) => {
+            attempt.set_stage_pass("dispatch", dispatch_started.elapsed().as_secs());
+            match maybe_force_projection_binding_repair(
+                repo,
+                pr_number,
+                &sha,
+                &results,
+                json_output,
+                !json_output,
+            ) {
+                Ok(_repaired) => None,
+                Err(err) => {
+                    let warning = format!(
+                        "projection-gap dispatch repair failed after initial dispatch success: {err}"
+                    );
+                    if json_output {
+                        let _ = emit_jsonl(&serde_json::json!({
+                            "event": "dispatch_projection_repair_failed",
+                            "ts": ts_now(),
+                            "pr_number": pr_number,
+                            "sha": sha,
+                            "error": warning,
+                            "recovery_commands": [
+                                format!("apm2 fac doctor --pr {pr_number} --fix"),
+                            ],
+                        }));
+                    } else {
+                        human_log!("WARNING: {warning}");
+                    }
+                    Some(warning)
+                },
+            }
+        },
     };
     let has_dispatch_warning = dispatch_warning.is_some();
     emit_stage(
@@ -2311,9 +2458,11 @@ pub fn run_push(
 
     human_log!("fac push: done (PR #{pr_number})");
     if has_dispatch_warning {
-        human_log!("  review dispatch warning surfaced; rerun: apm2 fac restart --pr {pr_number}");
+        human_log!(
+            "  review dispatch warning surfaced; rerun: apm2 fac doctor --pr {pr_number} --fix"
+        );
     } else {
-        human_log!("  if review dispatch stalls: apm2 fac restart --pr {pr_number}");
+        human_log!("  if review dispatch stalls: apm2 fac doctor --pr {pr_number} --fix");
     }
     exit_codes::SUCCESS
 }
@@ -3328,7 +3477,8 @@ mod tests {
             false,
         );
 
-        assert!(result.is_ok());
+        let dispatched_results = result.expect("dispatch should succeed");
+        assert_eq!(dispatched_results.len(), 2);
         assert_eq!(dispatched, vec!["security", "quality"]);
         assert_eq!(registered.len(), 2);
         assert_eq!(registered[0].0, "security");
@@ -3482,10 +3632,145 @@ mod tests {
             false,
         );
 
-        assert!(result.is_ok());
+        let dispatched_results = result.expect("dispatch should succeed");
+        assert_eq!(dispatched_results.len(), 2);
         assert_eq!(security_dispatch_calls, 3);
         assert_eq!(quality_dispatch_calls, 1);
         assert_eq!(register_calls, 2);
+    }
+
+    #[test]
+    fn dispatch_reviews_with_retries_joined_non_terminal_missing_run_id_then_succeeds() {
+        let mut security_dispatch_calls = 0usize;
+        let mut quality_dispatch_calls = 0usize;
+        let mut register_calls = 0usize;
+        let result = dispatch_reviews_with(
+            "guardian-intelligence/apm2",
+            42,
+            "11".repeat(20).as_str(),
+            |_, _, kind, _, _| match kind {
+                ReviewKind::Security => {
+                    security_dispatch_calls += 1;
+                    if security_dispatch_calls == 1 {
+                        Ok(DispatchReviewResult {
+                            review_type: "security".to_string(),
+                            mode: "joined".to_string(),
+                            run_state: "running".to_string(),
+                            run_id: None,
+                            sequence_number: Some(2),
+                            terminal_reason: None,
+                            pid: None,
+                            proc_start_time: None,
+                            unit: Some("apm2-review-security@42.service".to_string()),
+                            log_file: None,
+                        })
+                    } else {
+                        Ok(DispatchReviewResult {
+                            review_type: "security".to_string(),
+                            mode: "joined".to_string(),
+                            run_state: "running".to_string(),
+                            run_id: Some("security-run-2".to_string()),
+                            sequence_number: Some(2),
+                            terminal_reason: None,
+                            pid: None,
+                            proc_start_time: None,
+                            unit: Some("apm2-review-security@42.service".to_string()),
+                            log_file: None,
+                        })
+                    }
+                },
+                ReviewKind::Quality => {
+                    quality_dispatch_calls += 1;
+                    Ok(DispatchReviewResult {
+                        review_type: "quality".to_string(),
+                        mode: "dispatched".to_string(),
+                        run_state: "pending".to_string(),
+                        run_id: Some("quality-run-1".to_string()),
+                        sequence_number: None,
+                        terminal_reason: None,
+                        pid: None,
+                        proc_start_time: None,
+                        unit: None,
+                        log_file: None,
+                    })
+                },
+            },
+            |_, _, _, _, _, _, _| {
+                register_calls += 1;
+                Ok(Some("token".to_string()))
+            },
+            false,
+        );
+
+        let dispatched_results = result.expect("dispatch should succeed");
+        assert_eq!(dispatched_results.len(), 2);
+        assert_eq!(security_dispatch_calls, 2);
+        assert_eq!(quality_dispatch_calls, 1);
+        assert_eq!(
+            register_calls, 1,
+            "joined reviewer should not attempt lifecycle registration"
+        );
+    }
+
+    #[test]
+    fn dispatch_reviews_with_joined_terminal_done_missing_run_id_does_not_retry() {
+        let mut security_dispatch_calls = 0usize;
+        let mut quality_dispatch_calls = 0usize;
+        let mut register_calls = 0usize;
+        let result = dispatch_reviews_with(
+            "guardian-intelligence/apm2",
+            42,
+            "22".repeat(20).as_str(),
+            |_, _, kind, _, _| match kind {
+                ReviewKind::Security => {
+                    security_dispatch_calls += 1;
+                    Ok(DispatchReviewResult {
+                        review_type: "security".to_string(),
+                        mode: "joined".to_string(),
+                        run_state: "done".to_string(),
+                        run_id: None,
+                        sequence_number: Some(4),
+                        terminal_reason: Some("completed".to_string()),
+                        pid: None,
+                        proc_start_time: None,
+                        unit: None,
+                        log_file: None,
+                    })
+                },
+                ReviewKind::Quality => {
+                    quality_dispatch_calls += 1;
+                    Ok(DispatchReviewResult {
+                        review_type: "quality".to_string(),
+                        mode: "dispatched".to_string(),
+                        run_state: "pending".to_string(),
+                        run_id: Some("quality-run-1".to_string()),
+                        sequence_number: None,
+                        terminal_reason: None,
+                        pid: None,
+                        proc_start_time: None,
+                        unit: None,
+                        log_file: None,
+                    })
+                },
+            },
+            |_, _, _, _, _, _, _| {
+                register_calls += 1;
+                Ok(Some("token".to_string()))
+            },
+            false,
+        );
+
+        let dispatched_results = result.expect("dispatch should succeed");
+        assert_eq!(dispatched_results.len(), 2);
+        assert_eq!(
+            security_dispatch_calls, 1,
+            "terminal joined state should not retry when run_id is missing"
+        );
+        assert_eq!(quality_dispatch_calls, 1);
+        assert_eq!(
+            register_calls, 1,
+            "only non-joined dispatch should register lifecycle"
+        );
     }
 
     #[test]
@@ -3523,7 +3808,8 @@ mod tests {
             false,
         );
 
-        assert!(result.is_ok());
+        let dispatched_results = result.expect("dispatch should succeed");
+        assert_eq!(dispatched_results.len(), 2);
         assert_eq!(dispatch_calls, 2);
         assert_eq!(security_register_calls, 3);
     }
@@ -3582,8 +3868,94 @@ mod tests {
             false,
         );
 
-        assert!(result.is_ok());
+        let dispatched_results = result.expect("dispatch should succeed");
+        assert_eq!(dispatched_results.len(), 2);
         assert_eq!(security_dispatch_calls, 3);
         assert_eq!(security_register_calls, 2);
+    }
+
+    #[test]
+    fn dispatch_results_are_all_joined_terminal_requires_all_terminal_joined() {
+        let joined_terminal = vec![
+            DispatchReviewResult {
+                review_type: "security".to_string(),
+                mode: "joined".to_string(),
+                run_state: "done".to_string(),
+                run_id: Some("security-run-4".to_string()),
+                sequence_number: Some(4),
+                terminal_reason: Some("completed".to_string()),
+                pid: None,
+                proc_start_time: None,
+                unit: None,
+                log_file: None,
+            },
+            DispatchReviewResult {
+                review_type: "quality".to_string(),
+                mode: "joined".to_string(),
+                run_state: "failed".to_string(),
+                run_id: Some("quality-run-5".to_string()),
+                sequence_number: Some(5),
+                terminal_reason: Some("gate_failed".to_string()),
+                pid: None,
+                proc_start_time: None,
+                unit: None,
+                log_file: None,
+            },
+        ];
+        assert!(dispatch_results_are_all_joined_terminal(&joined_terminal));
+
+        let mut non_terminal = joined_terminal.clone();
+        non_terminal[1].run_state = "running".to_string();
+        assert!(!dispatch_results_are_all_joined_terminal(&non_terminal));
+
+        let mut non_joined = joined_terminal;
+        non_joined[1].mode = "started".to_string();
+        assert!(!dispatch_results_are_all_joined_terminal(&non_joined));
+    }
+
+    #[test]
+    fn should_force_projection_binding_repair_only_for_missing_binding_on_terminal_join() {
+        let dispatch_results = vec![
+            DispatchReviewResult {
+                review_type: "security".to_string(),
+                mode: "joined".to_string(),
+                run_state: "done".to_string(),
+                run_id: Some("security-run-4".to_string()),
+                sequence_number: Some(4),
+                terminal_reason: Some("completed".to_string()),
+                pid: None,
+                proc_start_time: None,
+                unit: None,
+                log_file: None,
+            },
+            DispatchReviewResult {
+                review_type: "quality".to_string(),
+                mode: "joined".to_string(),
+                run_state: "done".to_string(),
+                run_id: Some("quality-run-4".to_string()),
+                sequence_number: Some(4),
+                terminal_reason: Some("completed".to_string()),
+                pid: None,
+                proc_start_time: None,
+                unit: None,
+                log_file: None,
+            },
+        ];
+
+        assert!(should_force_projection_binding_repair(
+            &dispatch_results,
+            true,
+            false
+        ));
+        assert!(!should_force_projection_binding_repair(
+            &dispatch_results,
+            true,
+            true
+        ));
+        assert!(!should_force_projection_binding_repair(
+            &dispatch_results,
+            false,
+            false
+        ));
     }
 }

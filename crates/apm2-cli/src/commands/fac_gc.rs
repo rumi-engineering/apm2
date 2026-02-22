@@ -18,9 +18,6 @@ pub struct GcArgs {
     /// Print plan only.
     #[arg(long)]
     pub dry_run: bool,
-    /// Output machine-readable JSON.
-    #[arg(long)]
-    pub json: bool,
     /// Minimum free bytes to enforce.
     #[arg(long, default_value_t = 1_073_741_824)]
     pub min_free_bytes: u64,
@@ -28,7 +25,7 @@ pub struct GcArgs {
 
 /// Run garbage collection for FAC workspace artifacts.
 pub fn run_gc(args: &GcArgs, parent_json_output: bool) -> u8 {
-    let json_output = parent_json_output || args.json;
+    let json_output = parent_json_output;
     let lane_manager = match LaneManager::from_default_home() {
         Ok(manager) => manager,
         Err(error) => {

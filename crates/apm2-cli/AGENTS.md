@@ -134,7 +134,6 @@ Credential management subcommands.
 | Command | Description |
 |---------|-------------|
 | `apm2 fac lane init` | Bootstrap a fresh lane pool with directories and default profiles |
-| `apm2 fac lane init --json` | Same, with JSON receipt output |
 | `apm2 fac lane status` | Show all lane states (lock + lease + PID identity/liveness) |
 | `apm2 fac lane status --state RUNNING` | Filter lanes by state |
 | `apm2 fac doctor --fix` | Run deterministic host reconciliation/remediation (queue+lives lanes, tmp scrub, stale log GC) |
@@ -162,7 +161,6 @@ Credential management subcommands.
 | Command | Description |
 |---------|-------------|
 | `apm2 fac install` | Install current worktree binary, re-link symlink, restart services |
-| `apm2 fac install --json` | Same, with JSON receipt output |
 | `apm2 fac install --allow-partial` | Allow non-zero exit suppression for partial failures |
 
 **Overview:** The `fac install` subcommand enforces a single canonical
@@ -195,8 +193,7 @@ services. This prevents INV-PADOPT-004-class binary drift.
 
 | Command | Description |
 |---------|-------------|
-| `apm2 fac config show` | Show resolved FAC configuration (human-readable) |
-| `apm2 fac config show --json` | Show resolved FAC configuration (JSON) |
+| `apm2 fac config show` | Show resolved FAC configuration (JSON output by default) |
 
 **Overview:** The `config show` subcommand aggregates resolved FAC policy,
 boundary identity, execution backend, lane configuration, admitted digests,

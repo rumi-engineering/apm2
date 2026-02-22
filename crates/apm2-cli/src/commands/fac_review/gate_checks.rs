@@ -696,9 +696,6 @@ fn validate_prompt_identity_constraints(prompt_path: &Path) -> Result<Vec<String
                 if !command.starts_with(prefix) {
                     errors.push(format!("commands.{name} must start with '{prefix}'"));
                 }
-                if !command.contains("--json") {
-                    errors.push(format!("commands.{name} must include '--json'"));
-                }
             },
             None => errors.push(format!("commands.{name} must be a string")),
         }
@@ -1243,9 +1240,9 @@ mod tests {
   "payload": {
     "commands": {
       "binary_prefix": "cargo run -p apm2-cli --",
-      "prepare": "cargo run -p apm2-cli -- fac review prepare --json",
-      "finding": "cargo run -p apm2-cli -- fac review finding --json",
-      "verdict": "cargo run -p apm2-cli -- fac review verdict set --json"
+      "prepare": "cargo run -p apm2-cli -- fac review prepare",
+      "finding": "cargo run -p apm2-cli -- fac review finding",
+      "verdict": "cargo run -p apm2-cli -- fac review verdict set"
     },
     "constraints": {
       "forbidden_operations": [

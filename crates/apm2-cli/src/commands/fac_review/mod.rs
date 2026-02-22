@@ -7,7 +7,7 @@
 //! - Pulse-file based SHA freshness checks and resume flow
 //! - Liveness-based stall detection and bounded model fallback
 //! - Idempotent detached dispatch + projection snapshots for GitHub surfaces
-//! - Intelligent pipeline restart (`apm2 fac restart`) with CI state analysis
+//! - Doctor-first remediation and CI state analysis
 
 mod backend;
 #[cfg(test)]
@@ -44,7 +44,7 @@ mod projection_store;
 mod push;
 mod readiness;
 mod recovery;
-mod restart;
+mod repair_cycle;
 mod state;
 mod target;
 mod timeout_policy;
@@ -65,10 +65,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 // Re-export public API for use by `fac.rs`
 use dispatch::dispatch_single_review_with_force;
 use events::review_events_path;
-pub use finding::{
-    ReviewFindingSeverityArg as ReviewCommentSeverityArg, ReviewFindingSeverityArg,
-    ReviewFindingTypeArg as ReviewCommentTypeArg, ReviewFindingTypeArg,
-};
+pub use finding::{ReviewFindingSeverityArg, ReviewFindingTypeArg};
 pub use gates::GateThroughputProfile;
 pub use lifecycle::VerdictValueArg;
 use serde::Serialize;
@@ -109,12 +106,13 @@ const DOCTOR_LOG_SCAN_CHUNK_BYTES: usize = 8 * 1024;
 const DOCTOR_ACTIVE_AGENT_IDLE_TIMEOUT_SECONDS: i64 = 300;
 const DOCTOR_DISPATCH_PENDING_WARNING_SECONDS: i64 = 120;
 const DOCTOR_WAIT_TIMEOUT_DEFAULT_SECONDS: u64 = 1200;
+const DOCTOR_WAIT_POLL_INTERVAL_SECONDS: u64 = 1;
 const DOCTOR_WAIT_TIMEOUT_EXIT_CODE: u8 = 2;
 const DOCTOR_FIX_MAX_PASSES: usize = 3;
 const FAC_REVIEW_MACHINE_TRACEABILITY_SCHEMA: &str = "apm2.fac.review.machine_traceability.v1";
 const FAC_REVIEW_MACHINE_REQUIREMENT_IDS: &[&str] = &[
     "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR",
-    "DR-002-RUNNING_GATE_SUPPRESSES_RESTART",
+    "DR-002-RUNNING_GATE_SUPPRESSES_FIX",
     "DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY",
     "DR-004-DOCTOR_RULE_ORDER_IS_STRICT",
     "DR-005-WAIT_RETURNS_ON_TERMINAL_ACTION",
@@ -356,6 +354,10 @@ pub struct DoctorRecommendedAction {
     pub priority: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    #[serde(skip)]
+    pub follow_up_fix: bool,
+    #[serde(skip)]
+    pub follow_up_force: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -420,7 +422,7 @@ struct DoctorRepairSignals {
     agent_registry_capacity_exceeded: bool,
     dead_active_agent_present: bool,
     run_state_repair_required: bool,
-    run_state_force_repair_required: bool,
+    projection_comment_binding_missing: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -597,14 +599,14 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
                 "test_build_recommended_action_dispatches_implementor_on_failed_gates_with_pending_verdicts",
                 "test_build_recommended_action_dispatches_implementor_when_lifecycle_reports_gates_failed",
                 "test_build_recommended_action_dispatches_implementor_when_push_attempt_failed_gate_stage",
-                "test_build_recommended_action_gate_failure_overrides_stale_identity_restart",
+                "test_build_recommended_action_gate_failure_overrides_stale_identity_fix",
                 "upsert_doctor_gate_snapshot_prefers_failed_over_inflight",
                 "derive_doctor_gate_progress_state_treats_lifecycle_gates_failed_as_terminal_failed",
                 "test_build_recommended_action_dispatch_implementor_has_command"
             ]
         }),
         serde_json::json!({
-            "requirement_id": "DR-002-RUNNING_GATE_SUPPRESSES_RESTART",
+            "requirement_id": "DR-002-RUNNING_GATE_SUPPRESSES_FIX",
             "implemented_by": [
                 "derive_doctor_gate_progress_state",
                 "DoctorDecisionState::WaitForGates"
@@ -1253,60 +1255,10 @@ fn exit_signal(status: std::process::ExitStatus) -> Option<i32> {
     }
 }
 
-fn emit_run_ndjson_since(
-    offset: u64,
-    pr_number: u32,
-    run_ids: &[String],
-    to_stderr: bool,
-) -> Result<(), String> {
-    let path = review_events_path()?;
-    if !path.exists() {
-        return Ok(());
-    }
-    let mut file =
-        File::open(&path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|err| format!("failed to seek {}: {err}", path.display()))?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)
-        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-
-    for line in buf.lines() {
-        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let matches_pr = parsed
-            .get("pr_number")
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|value| value == u64::from(pr_number));
-        if !matches_pr {
-            continue;
-        }
-        if run_ids.is_empty() {
-            if to_stderr {
-                eprintln!("{line}");
-            } else {
-                println!("{line}");
-            }
-            continue;
-        }
-        let run_id = parsed.get("run_id").and_then(serde_json::Value::as_str);
-        if run_id.is_some_and(|id| run_ids.iter().any(|candidate| candidate == id)) {
-            if to_stderr {
-                eprintln!("{line}");
-            } else {
-                println!("{line}");
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Run doctor diagnostics for a specific PR.
 ///
-/// Doctor remains machine-oriented by default. In wait mode, JSON output
-/// streams NDJSON heartbeats plus a final result event; text mode prints
-/// periodic status lines to stderr and emits the final summary JSON to stdout.
+/// Doctor is machine-oriented by default. In wait mode, output streams NDJSON
+/// heartbeats plus a terminal result event.
 #[allow(clippy::too_many_arguments)]
 pub fn run_doctor(
     repo: &str,
@@ -1314,7 +1266,6 @@ pub fn run_doctor(
     fix: bool,
     json_output: bool,
     wait_for_recommended_action: bool,
-    poll_interval_seconds: u64,
     wait_timeout_seconds: u64,
     exit_on: &[String],
 ) -> u8 {
@@ -1324,10 +1275,17 @@ pub fn run_doctor(
         for pass in 1..=DOCTOR_FIX_MAX_PASSES {
             let pre_repair = run_doctor_inner(repo, pr_number, Vec::new(), false);
             let plan = derive_doctor_repair_plan(&pre_repair);
-            if !plan.has_operations() {
+            let pre_follow_up_fix = doctor_recommended_action_requests_follow_up_fix(&pre_repair);
+            let pre_follow_up_force = doctor_recommended_follow_up_fix_force(&pre_repair);
+            if !plan.has_operations() && !pre_follow_up_fix {
                 break;
             }
-            let plan_fingerprint = plan.fingerprint();
+            let plan_fingerprint = format!(
+                "{} follow_up_fix={} follow_up_force={}",
+                plan.fingerprint(),
+                pre_follow_up_fix,
+                pre_follow_up_force
+            );
             if !attempted_plan_fingerprints.insert(plan_fingerprint.clone()) {
                 let err = format!(
                     "doctor fix did not converge for PR #{pr_number}; repeated repair plan `{plan_fingerprint}`"
@@ -1338,96 +1296,83 @@ pub fn run_doctor(
                 return exit_codes::GENERIC_ERROR;
             }
 
-            let force_repair = doctor_requires_force_repair(&pre_repair);
-            match recovery::run_repair_plan(
-                repo,
-                Some(pr_number),
-                force_repair,
-                plan.refresh_identity,
-                plan.reap_stale_agents,
-                plan.reset_lifecycle,
-                plan.repair_registry_integrity,
-                false,
-                plan.run_state_review_types,
-            ) {
-                Ok(summary) => {
-                    let mut doctor_repairs = summary.into_doctor_repairs();
-                    repairs_applied.append(&mut doctor_repairs);
-
-                    let post_repair = run_doctor_inner(repo, pr_number, Vec::new(), true);
-                    if doctor_recommended_action_requests_restart(&post_repair) {
-                        let force_restart = doctor_recommended_restart_force(&post_repair);
-                        match restart::run_restart_for_doctor_fix(
-                            repo,
-                            pr_number,
-                            force_restart,
-                            true,
-                        ) {
-                            Ok(restart_summary) => {
-                                let dispatched_count = restart_summary
-                                    .reviews_dispatched
-                                    .as_ref()
-                                    .map_or(0, Vec::len);
-                                repairs_applied.push(DoctorRepairApplied {
-                                    operation: "restart_reviews".to_string(),
-                                    before: Some(format!(
-                                        "force={force_restart} reason={}",
-                                        post_repair.recommended_action.reason
-                                    )),
-                                    after: Some(format!(
-                                        "strategy={} evidence_passed={} dispatched_reviews={}",
-                                        restart_summary.strategy.label(),
-                                        restart_summary.evidence_passed.map_or_else(
-                                            || "none".to_string(),
-                                            |passed| { passed.to_string() }
-                                        ),
-                                        dispatched_count
-                                    )),
-                                });
-                            },
-                            Err(err) => {
-                                if let Err(emit_err) =
-                                    jsonl::emit_json_error("fac_doctor_fix_restart_failed", &err)
-                                {
-                                    eprintln!(
-                                        "WARNING: failed to emit doctor fix restart error: {emit_err}"
-                                    );
-                                }
-                                return exit_codes::GENERIC_ERROR;
-                            },
+            if plan.has_operations() {
+                let force_repair = doctor_requires_force_repair(&pre_repair);
+                match recovery::run_repair_plan(
+                    repo,
+                    Some(pr_number),
+                    force_repair,
+                    plan.refresh_identity,
+                    plan.reap_stale_agents,
+                    plan.reset_lifecycle,
+                    plan.repair_registry_integrity,
+                    false,
+                    plan.run_state_review_types,
+                ) {
+                    Ok(summary) => {
+                        let mut doctor_repairs = summary.into_doctor_repairs();
+                        repairs_applied.append(&mut doctor_repairs);
+                    },
+                    Err(err) => {
+                        if let Err(emit_err) = jsonl::emit_json_error("fac_doctor_fix_failed", &err)
+                        {
+                            eprintln!("WARNING: failed to emit doctor fix error: {emit_err}");
                         }
-                    }
+                        return exit_codes::GENERIC_ERROR;
+                    },
+                }
 
-                    let follow_up = run_doctor_inner(repo, pr_number, Vec::new(), true);
-                    if follow_up.recommended_action.action != "fix" {
-                        break;
-                    }
-                    let follow_up_plan = derive_doctor_repair_plan(&follow_up);
-                    if !follow_up_plan.has_operations() {
-                        break;
-                    }
-                    if pass == DOCTOR_FIX_MAX_PASSES {
-                        let err = format!(
-                            "doctor fix exhausted {DOCTOR_FIX_MAX_PASSES} passes for PR #{pr_number} \
-                             while additional repair operations remain (`{}`)",
-                            follow_up_plan.fingerprint()
-                        );
+                let post_repair = run_doctor_inner(repo, pr_number, Vec::new(), true);
+                match run_doctor_follow_up_repair(repo, pr_number, &post_repair) {
+                    Ok(Some(repair)) => repairs_applied.push(repair),
+                    Ok(None) => {},
+                    Err(err) => {
                         if let Err(emit_err) =
-                            jsonl::emit_json_error("fac_doctor_fix_incomplete", &err)
+                            jsonl::emit_json_error("fac_doctor_fix_follow_up_failed", &err)
                         {
                             eprintln!(
-                                "WARNING: failed to emit doctor fix max-pass error: {emit_err}"
+                                "WARNING: failed to emit doctor fix follow-up error: {emit_err}"
                             );
                         }
                         return exit_codes::GENERIC_ERROR;
-                    }
-                },
-                Err(err) => {
-                    if let Err(emit_err) = jsonl::emit_json_error("fac_doctor_fix_failed", &err) {
-                        eprintln!("WARNING: failed to emit doctor fix error: {emit_err}");
-                    }
-                    return exit_codes::GENERIC_ERROR;
-                },
+                    },
+                }
+            } else {
+                match run_doctor_follow_up_repair(repo, pr_number, &pre_repair) {
+                    Ok(Some(repair)) => repairs_applied.push(repair),
+                    Ok(None) => {},
+                    Err(err) => {
+                        if let Err(emit_err) =
+                            jsonl::emit_json_error("fac_doctor_fix_follow_up_failed", &err)
+                        {
+                            eprintln!(
+                                "WARNING: failed to emit doctor fix follow-up error: {emit_err}"
+                            );
+                        }
+                        return exit_codes::GENERIC_ERROR;
+                    },
+                }
+            }
+
+            let follow_up = run_doctor_inner(repo, pr_number, Vec::new(), true);
+            if follow_up.recommended_action.action != "fix" {
+                break;
+            }
+            let follow_up_plan = derive_doctor_repair_plan(&follow_up);
+            let follow_up_fix = doctor_recommended_action_requests_follow_up_fix(&follow_up);
+            if !follow_up_plan.has_operations() && !follow_up_fix {
+                break;
+            }
+            if pass == DOCTOR_FIX_MAX_PASSES {
+                let err = format!(
+                    "doctor fix exhausted {DOCTOR_FIX_MAX_PASSES} passes for PR #{pr_number} \
+                     while additional repair operations remain (`{}`) follow_up_fix={follow_up_fix}",
+                    follow_up_plan.fingerprint()
+                );
+                if let Err(emit_err) = jsonl::emit_json_error("fac_doctor_fix_incomplete", &err) {
+                    eprintln!("WARNING: failed to emit doctor fix max-pass error: {emit_err}");
+                }
+                return exit_codes::GENERIC_ERROR;
             }
         }
     }
@@ -1478,7 +1423,7 @@ pub fn run_doctor(
     };
     interrupted.store(false, Ordering::SeqCst);
 
-    let poll_interval = Duration::from_secs(poll_interval_seconds.max(1));
+    let poll_interval = Duration::from_secs(DOCTOR_WAIT_POLL_INTERVAL_SECONDS);
     let started = Instant::now();
     let mut tick = 0_u64;
     let mut summary = run_doctor_inner(repo, pr_number, repairs_applied, false);
@@ -1547,6 +1492,40 @@ pub fn run_doctor(
             },
         }
     }
+}
+
+fn run_doctor_follow_up_repair(
+    repo: &str,
+    pr_number: u32,
+    summary: &DoctorPrSummary,
+) -> Result<Option<DoctorRepairApplied>, String> {
+    if !doctor_recommended_action_requests_follow_up_fix(summary) {
+        return Ok(None);
+    }
+
+    let force_follow_up_fix = doctor_recommended_follow_up_fix_force(summary);
+    let repair_summary =
+        repair_cycle::run_repair_for_doctor_fix(repo, pr_number, force_follow_up_fix, true)?;
+    let dispatched_count = repair_summary
+        .reviews_dispatched
+        .as_ref()
+        .map_or(0, Vec::len);
+
+    Ok(Some(DoctorRepairApplied {
+        operation: "follow_up_pr_fix".to_string(),
+        before: Some(format!(
+            "force={force_follow_up_fix} reason={}",
+            summary.recommended_action.reason
+        )),
+        after: Some(format!(
+            "strategy={} evidence_passed={} dispatched_reviews={}",
+            repair_summary.strategy.label(),
+            repair_summary
+                .evidence_passed
+                .map_or_else(|| "none".to_string(), |passed| passed.to_string()),
+            dispatched_count
+        )),
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -1727,7 +1706,7 @@ fn emit_doctor_wait_error(json_output: bool, error: &str, message: &str, exit_co
             }),
         });
     } else {
-        // JSON-only: emit the error as a structured JSON object.
+        // Compatibility fallback: still emit a structured JSON object.
         let payload = serde_json::json!({
             "error": error,
             "message": message,
@@ -2033,13 +2012,9 @@ fn run_doctor_inner(
             } else if snapshot.error_budget_used > 0 {
                 health.push(DoctorHealthItem {
                     severity: "medium",
-                    message: format!(
-                        "error budget used: {}/{}",
-                        snapshot.error_budget_used,
-                        10
-                    ),
-                    remediation:
-                        "run `apm2 fac doctor --pr <PR_NUMBER>` after `apm2 fac restart` to verify trend".to_string(),
+                    message: format!("error budget used: {}/{}", snapshot.error_budget_used, 10),
+                    remediation: "run `apm2 fac doctor --pr <PR_NUMBER> --fix` and verify trend"
+                        .to_string(),
                 });
             }
             if snapshot.error_budget_used >= 8 {
@@ -2239,6 +2214,18 @@ fn run_doctor_inner(
                                 .to_string(),
                     });
                 }
+                if !verdict_projection_snapshot_has_remote_comment_binding(&snapshot) {
+                    repair_signals.projection_comment_binding_missing = true;
+                    health.push(DoctorHealthItem {
+                        severity: "medium",
+                        message:
+                            "verdict projection is missing authoritative remote comment binding"
+                                .to_string(),
+                        remediation:
+                            "run `apm2 fac doctor --pr <PR_NUMBER> --fix` to replay bounded projection repair"
+                                .to_string(),
+                    });
+                }
                 collect_review_dimension_snapshots(&snapshot)
             },
             Ok(None) => {
@@ -2246,7 +2233,7 @@ fn run_doctor_inner(
                     severity: "medium",
                     message: "no verdict projection for local SHA".to_string(),
                     remediation:
-                        "run both `fac review run --pr` and `fac review verdict show --pr --sha`"
+                        "run `apm2 fac doctor --pr <PR_NUMBER> --fix` then `apm2 fac review verdict show --pr <PR_NUMBER>`"
                             .to_string(),
                 });
                 collect_default_review_dimension_snapshots(sha)
@@ -2256,7 +2243,7 @@ fn run_doctor_inner(
                     severity: "high",
                     message: format!("failed to load verdict projection: {err}"),
                     remediation:
-                        "re-run review verdict flow (`fac review set`) after integrity check"
+                        "re-run verdict flow (`apm2 fac review verdict set ...`) after integrity check"
                             .to_string(),
                 });
                 collect_default_review_dimension_snapshots(sha)
@@ -2276,12 +2263,6 @@ fn run_doctor_inner(
     repair_signals.run_state_repair_required = run_state_diagnostics
         .iter()
         .any(|entry| entry.condition.requires_repair());
-    repair_signals.run_state_force_repair_required = run_state_diagnostics.iter().any(|entry| {
-        matches!(
-            entry.condition,
-            DoctorRunStateCondition::Corrupt | DoctorRunStateCondition::Ambiguous
-        )
-    });
 
     let agents = match lifecycle::load_agent_registry_snapshot_for_pr(owner_repo, pr_number) {
         Ok(snapshot) => {
@@ -2314,7 +2295,7 @@ fn run_doctor_inner(
                             entry.pid.unwrap_or(0)
                         ),
                         remediation:
-                            "run `apm2 fac restart --pr <PR_NUMBER>` to reclaim lane state"
+                            "run `apm2 fac doctor --pr <PR_NUMBER> --fix` to reclaim lane state"
                                 .to_string(),
                     });
                 }
@@ -2328,7 +2309,7 @@ fn run_doctor_inner(
                             entry.agent_type, pr_number, entry.state
                         ),
                         remediation:
-                            "rerun `apm2 fac restart --pr <PR_NUMBER>` and watch for slot reapage"
+                            "rerun `apm2 fac doctor --pr <PR_NUMBER> --fix` and watch for slot reapage"
                                 .to_string(),
                     });
                 }
@@ -2341,7 +2322,7 @@ fn run_doctor_inner(
                     severity: "high",
                     message: "review_in_progress lifecycle state with zero active agents"
                         .to_string(),
-                    remediation: "run `apm2 fac restart --pr <PR_NUMBER>` to resume reviews"
+                    remediation: "run `apm2 fac doctor --pr <PR_NUMBER> --fix` to resume reviews"
                         .to_string(),
                 });
             }
@@ -2626,27 +2607,25 @@ fn derive_doctor_repair_plan(summary: &DoctorPrSummary) -> DoctorRepairPlan {
 
 const fn doctor_requires_force_repair(summary: &DoctorPrSummary) -> bool {
     let signals = &summary.repair_signals;
-    signals.lifecycle_load_failed
-        || signals.agent_registry_load_failed
-        || signals.run_state_force_repair_required
+    signals.lifecycle_load_failed || signals.agent_registry_load_failed
 }
 
-fn doctor_recommended_action_requests_restart(summary: &DoctorPrSummary) -> bool {
-    summary
+fn doctor_recommended_action_requests_follow_up_fix(summary: &DoctorPrSummary) -> bool {
+    if !summary
         .recommended_action
         .action
-        .eq_ignore_ascii_case("restart_reviews")
+        .eq_ignore_ascii_case("fix")
+    {
+        return false;
+    }
+    summary.recommended_action.follow_up_fix
 }
 
-fn doctor_recommended_restart_force(summary: &DoctorPrSummary) -> bool {
-    if summary.reviews.iter().any(review_requires_forced_restart) {
+fn doctor_recommended_follow_up_fix_force(summary: &DoctorPrSummary) -> bool {
+    if summary.reviews.iter().any(review_requires_forced_fix) {
         return true;
     }
-    summary
-        .recommended_action
-        .command
-        .as_deref()
-        .is_some_and(|command| command.split_whitespace().any(|token| token == "--force"))
+    summary.recommended_action.follow_up_force
 }
 
 fn build_doctor_agent_activity_summary(
@@ -3306,7 +3285,7 @@ fn collect_run_state_diagnostics(
                     severity: "low",
                     message: format!("missing {review_type} run-state file"),
                     remediation:
-                        "if review execution is expected for this dimension, run `apm2 fac restart --pr <PR_NUMBER>`"
+                        "if review execution is expected for this dimension, run `apm2 fac doctor --pr <PR_NUMBER> --fix`"
                             .to_string(),
                 });
                 reasons.insert(dimension.to_string(), None);
@@ -3631,6 +3610,15 @@ fn build_doctor_merge_readiness(
     }
 }
 
+fn verdict_projection_snapshot_has_remote_comment_binding(
+    snapshot: &verdict_projection::VerdictProjectionSnapshot,
+) -> bool {
+    verdict_projection::has_remote_comment_binding(
+        snapshot.source_comment_id,
+        snapshot.source_comment_url.as_deref(),
+    )
+}
+
 fn build_doctor_github_projection_status(
     owner_repo: &str,
     pr_number: u32,
@@ -3715,41 +3703,42 @@ fn lifecycle_retry_budget_exhausted(entry: &DoctorLifecycleSnapshot) -> bool {
         && matches!(entry.state.as_str(), "stuck" | "recovering" | "quarantined")
 }
 
-fn review_requires_forced_restart(review: &DoctorReviewSnapshot) -> bool {
+fn review_requires_forced_fix(review: &DoctorReviewSnapshot) -> bool {
     review
         .terminal_reason
         .as_deref()
         .is_some_and(|reason| reason.eq_ignore_ascii_case("max_restarts_exceeded"))
 }
 
-fn terminal_reason_requires_forced_restart(terminal_reason: Option<&String>) -> bool {
+fn terminal_reason_requires_forced_fix(terminal_reason: Option<&String>) -> bool {
     terminal_reason.is_some_and(|value| value.eq_ignore_ascii_case("max_restarts_exceeded"))
 }
 
-fn has_forced_restart_terminal_reason(
+fn has_forced_fix_terminal_reason(
     reviews: &[DoctorReviewSnapshot],
     review_terminal_reasons: &std::collections::BTreeMap<String, Option<String>>,
 ) -> bool {
-    reviews.iter().any(review_requires_forced_restart)
+    reviews.iter().any(review_requires_forced_fix)
         || review_terminal_reasons
             .values()
             .map(std::option::Option::as_ref)
-            .any(terminal_reason_requires_forced_restart)
+            .any(terminal_reason_requires_forced_fix)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoctorDecisionState {
     Fix,
     Done,
+    FixProjectionGap,
     Merge,
-    RestartStaleIdentity,
+    FixStaleIdentity,
     Approve,
     DispatchMergeConflicts,
     DispatchFailedGates,
     DispatchImplementor,
     WaitForGates,
-    RestartIdleReviewers,
-    RestartPendingNoActiveReviewers,
+    FixIdleReviewers,
+    FixPendingNoActiveReviewers,
     EscalateLifecycleBudget,
     Wait,
 }
@@ -3759,15 +3748,16 @@ impl DoctorDecisionState {
         match self {
             Self::Fix => "fix",
             Self::Done => "done",
+            Self::FixProjectionGap => "fix_projection_gap",
             Self::Merge => "merge",
-            Self::RestartStaleIdentity => "restart_stale_identity",
+            Self::FixStaleIdentity => "fix_stale_identity",
             Self::Approve => "approve",
             Self::DispatchMergeConflicts => "dispatch_merge_conflicts",
             Self::DispatchFailedGates => "dispatch_failed_gates",
             Self::DispatchImplementor => "dispatch_implementor",
             Self::WaitForGates => "wait_for_gates",
-            Self::RestartIdleReviewers => "restart_idle_reviewers",
-            Self::RestartPendingNoActiveReviewers => "restart_pending_no_active_reviewers",
+            Self::FixIdleReviewers => "fix_idle_reviewers",
+            Self::FixPendingNoActiveReviewers => "fix_pending_no_active_reviewers",
             Self::EscalateLifecycleBudget => "escalate_lifecycle_budget",
             Self::Wait => "wait",
         }
@@ -3775,12 +3765,13 @@ impl DoctorDecisionState {
 
     const fn recommended_action(self) -> &'static str {
         match self {
-            Self::Fix => "fix",
             Self::Done => "done",
             Self::Merge => "merge",
-            Self::RestartStaleIdentity
-            | Self::RestartIdleReviewers
-            | Self::RestartPendingNoActiveReviewers => "restart_reviews",
+            Self::Fix
+            | Self::FixProjectionGap
+            | Self::FixStaleIdentity
+            | Self::FixIdleReviewers
+            | Self::FixPendingNoActiveReviewers => "fix",
             Self::Approve => "approve",
             Self::DispatchMergeConflicts
             | Self::DispatchFailedGates
@@ -3816,6 +3807,7 @@ struct DoctorDecisionRule {
 enum DoctorDecisionGuard {
     HasIntegrityOrCorruption,
     LifecycleMerged,
+    ProjectionGapRequiresFix,
     MergeReady,
     ShaFreshnessStale,
     ApproveEligible,
@@ -3834,6 +3826,7 @@ impl DoctorDecisionGuard {
         match self {
             Self::HasIntegrityOrCorruption => "has_integrity_or_corruption",
             Self::LifecycleMerged => "lifecycle_merged",
+            Self::ProjectionGapRequiresFix => "projection_gap_requires_fix",
             Self::MergeReady => "merge_ready",
             Self::ShaFreshnessStale => "sha_freshness_stale",
             Self::ApproveEligible => "approve_eligible",
@@ -3854,7 +3847,7 @@ enum DoctorReasonKind {
     Template,
     PushFailureHintOrTemplate,
     FindingsRollupWithPushHint,
-    IdleRestartWithMaxIdle,
+    IdleFixWithMaxIdle,
     PendingNoActiveWithPushHint,
     WaitWithPendingHint,
 }
@@ -3865,7 +3858,7 @@ impl DoctorReasonKind {
             Self::Template => "template",
             Self::PushFailureHintOrTemplate => "push_failure_hint_or_template",
             Self::FindingsRollupWithPushHint => "findings_rollup_with_push_hint",
-            Self::IdleRestartWithMaxIdle => "idle_restart_with_max_idle",
+            Self::IdleFixWithMaxIdle => "idle_fix_with_max_idle",
             Self::PendingNoActiveWithPushHint => "pending_no_active_with_push_hint",
             Self::WaitWithPendingHint => "wait_with_pending_hint",
         }
@@ -3875,8 +3868,9 @@ impl DoctorReasonKind {
 #[derive(Debug, Clone, Copy)]
 enum DoctorCommandKind {
     RuleTemplate,
-    RestartForce,
-    RestartConditionalForce,
+    FixForce,
+    FixConditionalForce,
+    FixFollowUp,
     None,
 }
 
@@ -3884,8 +3878,9 @@ impl DoctorCommandKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::RuleTemplate => "rule_template",
-            Self::RestartForce => "restart_force",
-            Self::RestartConditionalForce => "restart_conditional_force",
+            Self::FixForce => "fix_force",
+            Self::FixConditionalForce => "fix_conditional_force",
+            Self::FixFollowUp => "fix_follow_up",
             Self::None => "none",
         }
     }
@@ -3960,6 +3955,14 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     },
     DoctorDecisionRule {
         priority: 3,
+        state: DoctorDecisionState::FixProjectionGap,
+        guard: DoctorDecisionGuard::ProjectionGapRequiresFix,
+        guard_id: "DOC-G-003P",
+        guard_predicate: "facts.projection_gap_requires_fix",
+        requirement_refs: &[],
+    },
+    DoctorDecisionRule {
+        priority: 4,
         state: DoctorDecisionState::Merge,
         guard: DoctorDecisionGuard::MergeReady,
         guard_id: "DOC-G-003",
@@ -3967,15 +3970,15 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
         requirement_refs: &["DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY"],
     },
     DoctorDecisionRule {
-        priority: 4,
-        state: DoctorDecisionState::RestartStaleIdentity,
+        priority: 5,
+        state: DoctorDecisionState::FixStaleIdentity,
         guard: DoctorDecisionGuard::ShaFreshnessStale,
         guard_id: "DOC-G-004",
         guard_predicate: "facts.sha_freshness_source == stale && !facts.has_gate_failure_signal",
         requirement_refs: &[],
     },
     DoctorDecisionRule {
-        priority: 5,
+        priority: 6,
         state: DoctorDecisionState::Approve,
         guard: DoctorDecisionGuard::ApproveEligible,
         guard_id: "DOC-G-005",
@@ -3983,7 +3986,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
         requirement_refs: &["DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY"],
     },
     DoctorDecisionRule {
-        priority: 6,
+        priority: 7,
         state: DoctorDecisionState::DispatchMergeConflicts,
         guard: DoctorDecisionGuard::MergeConflictsPresent,
         guard_id: "DOC-G-006",
@@ -3991,7 +3994,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
         requirement_refs: &["DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"],
     },
     DoctorDecisionRule {
-        priority: 7,
+        priority: 8,
         state: DoctorDecisionState::DispatchFailedGates,
         guard: DoctorDecisionGuard::GateFailureSignal,
         guard_id: "DOC-G-007",
@@ -3999,7 +4002,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
         requirement_refs: &["DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"],
     },
     DoctorDecisionRule {
-        priority: 8,
+        priority: 9,
         state: DoctorDecisionState::DispatchImplementor,
         guard: DoctorDecisionGuard::ImplementorRemediationResolved,
         guard_id: "DOC-G-008",
@@ -4007,31 +4010,31 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
         requirement_refs: &["DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"],
     },
     DoctorDecisionRule {
-        priority: 9,
+        priority: 10,
         state: DoctorDecisionState::WaitForGates,
         guard: DoctorDecisionGuard::PendingVerdictWithGateInFlight,
         guard_id: "DOC-G-009",
         guard_predicate: "facts.has_pending_verdict && facts.gate_progress_state == in_flight",
-        requirement_refs: &["DR-002-RUNNING_GATE_SUPPRESSES_RESTART"],
+        requirement_refs: &["DR-002-RUNNING_GATE_SUPPRESSES_FIX"],
     },
     DoctorDecisionRule {
-        priority: 10,
-        state: DoctorDecisionState::RestartIdleReviewers,
+        priority: 11,
+        state: DoctorDecisionState::FixIdleReviewers,
         guard: DoctorDecisionGuard::AllActiveIdle,
         guard_id: "DOC-G-010",
         guard_predicate: "facts.all_active_idle",
         requirement_refs: &[],
     },
     DoctorDecisionRule {
-        priority: 11,
-        state: DoctorDecisionState::RestartPendingNoActiveReviewers,
+        priority: 12,
+        state: DoctorDecisionState::FixPendingNoActiveReviewers,
         guard: DoctorDecisionGuard::PendingNoActive,
         guard_id: "DOC-G-011",
         guard_predicate: "facts.active_agents == 0 && facts.has_pending_verdict",
         requirement_refs: &[],
     },
     DoctorDecisionRule {
-        priority: 12,
+        priority: 13,
         state: DoctorDecisionState::EscalateLifecycleBudget,
         guard: DoctorDecisionGuard::LifecycleEscalation,
         guard_id: "DOC-G-012",
@@ -4039,7 +4042,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
         requirement_refs: &[],
     },
     DoctorDecisionRule {
-        priority: 13,
+        priority: 14,
         state: DoctorDecisionState::Wait,
         guard: DoctorDecisionGuard::Default,
         guard_id: "DOC-G-013",
@@ -4070,6 +4073,16 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         command_notes: None,
     },
     DoctorRecommendationRule {
+        state: DoctorDecisionState::FixProjectionGap,
+        action: "fix",
+        priority: "high",
+        reason_kind: DoctorReasonKind::Template,
+        reason_template: "verdict projection is missing authoritative remote comment binding for a terminal-approved SHA",
+        command_kind: DoctorCommandKind::FixFollowUp,
+        command_template: Some("apm2 fac doctor --pr {pr_number} --fix"),
+        command_notes: Some("runtime follow-up PR repair cycle runs in bounded single-flight mode"),
+    },
+    DoctorRecommendationRule {
         state: DoctorDecisionState::Merge,
         action: "merge",
         priority: "medium",
@@ -4080,14 +4093,16 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         command_notes: None,
     },
     DoctorRecommendationRule {
-        state: DoctorDecisionState::RestartStaleIdentity,
-        action: "restart_reviews",
+        state: DoctorDecisionState::FixStaleIdentity,
+        action: "fix",
         priority: "high",
         reason_kind: DoctorReasonKind::Template,
         reason_template: "local verdict/findings snapshot is stale relative to remote PR head",
-        command_kind: DoctorCommandKind::RestartForce,
-        command_template: Some("apm2 fac restart --pr {pr_number} --force --refresh-identity"),
-        command_notes: None,
+        command_kind: DoctorCommandKind::FixForce,
+        command_template: Some("apm2 fac doctor --pr {pr_number} --fix"),
+        command_notes: Some(
+            "follow-up PR repair cycle runs with forced strategy (bounded single-flight)",
+        ),
     },
     DoctorRecommendationRule {
         state: DoctorDecisionState::Approve,
@@ -4097,7 +4112,7 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         reason_template: "all review dimensions approve; awaiting auto-merge",
         command_kind: DoctorCommandKind::RuleTemplate,
         command_template: Some(
-            "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+            "apm2 fac doctor --pr {pr_number} --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
         ),
         command_notes: None,
     },
@@ -4108,7 +4123,7 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         reason_kind: DoctorReasonKind::Template,
         reason_template: "merge conflicts require implementor remediation and a fresh push",
         command_kind: DoctorCommandKind::RuleTemplate,
-        command_template: Some("apm2 fac review findings --pr {pr_number} --json"),
+        command_template: Some("apm2 fac review findings --pr {pr_number}"),
         command_notes: None,
     },
     DoctorRecommendationRule {
@@ -4118,7 +4133,7 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         reason_kind: DoctorReasonKind::PushFailureHintOrTemplate,
         reason_template: "evidence gate failure requires implementor remediation before review can continue",
         command_kind: DoctorCommandKind::RuleTemplate,
-        command_template: Some("apm2 fac review findings --pr {pr_number} --json"),
+        command_template: Some("apm2 fac review findings --pr {pr_number}"),
         command_notes: Some("reason may include latest push failure hint when available"),
     },
     DoctorRecommendationRule {
@@ -4128,7 +4143,7 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         reason_kind: DoctorReasonKind::FindingsRollupWithPushHint,
         reason_template: "review findings require implementor remediation",
         command_kind: DoctorCommandKind::RuleTemplate,
-        command_template: Some("apm2 fac review findings --pr {pr_number} --json"),
+        command_template: Some("apm2 fac review findings --pr {pr_number}"),
         command_notes: Some("reason includes findings rollup when available"),
     },
     DoctorRecommendationRule {
@@ -4136,35 +4151,35 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         action: "wait",
         priority: "medium",
         reason_kind: DoctorReasonKind::Template,
-        reason_template: "FAC gates are still in progress; reviewer restart is deferred",
+        reason_template: "FAC gates are still in progress; follow-up fix is deferred",
         command_kind: DoctorCommandKind::RuleTemplate,
         command_template: Some(
-            "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+            "apm2 fac doctor --pr {pr_number} --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
         ),
         command_notes: None,
     },
     DoctorRecommendationRule {
-        state: DoctorDecisionState::RestartIdleReviewers,
-        action: "restart_reviews",
+        state: DoctorDecisionState::FixIdleReviewers,
+        action: "fix",
         priority: "high",
-        reason_kind: DoctorReasonKind::IdleRestartWithMaxIdle,
+        reason_kind: DoctorReasonKind::IdleFixWithMaxIdle,
         reason_template: "all active reviewer agents are idle",
-        command_kind: DoctorCommandKind::RestartForce,
-        command_template: Some("apm2 fac restart --pr {pr_number} --force --refresh-identity"),
+        command_kind: DoctorCommandKind::FixForce,
+        command_template: Some("apm2 fac doctor --pr {pr_number} --fix"),
         command_notes: Some(
-            "runtime reason appends max idle age from current agent activity telemetry",
+            "runtime follow-up PR repair cycle uses forced strategy (bounded single-flight); reason appends max idle age telemetry",
         ),
     },
     DoctorRecommendationRule {
-        state: DoctorDecisionState::RestartPendingNoActiveReviewers,
-        action: "restart_reviews",
+        state: DoctorDecisionState::FixPendingNoActiveReviewers,
+        action: "fix",
         priority: "high",
         reason_kind: DoctorReasonKind::PendingNoActiveWithPushHint,
         reason_template: "no active reviewer agents and verdict remains pending",
-        command_kind: DoctorCommandKind::RestartConditionalForce,
-        command_template: Some("apm2 fac restart --pr {pr_number} --refresh-identity"),
+        command_kind: DoctorCommandKind::FixConditionalForce,
+        command_template: Some("apm2 fac doctor --pr {pr_number} --fix"),
         command_notes: Some(
-            "runtime appends --force when terminal reason indicates max_restarts_exceeded",
+            "runtime follow-up PR repair cycle toggles forced strategy (bounded single-flight) when terminal reason indicates max_restarts_exceeded",
         ),
     },
     DoctorRecommendationRule {
@@ -4174,7 +4189,7 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         reason_kind: DoctorReasonKind::Template,
         reason_template: "lifecycle retry/error budget exhausted",
         command_kind: DoctorCommandKind::RuleTemplate,
-        command_template: Some("apm2 fac doctor --pr {pr_number} --json"),
+        command_template: Some("apm2 fac doctor --pr {pr_number}"),
         command_notes: None,
     },
     DoctorRecommendationRule {
@@ -4185,7 +4200,7 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         reason_template: "reviews and findings are still in progress",
         command_kind: DoctorCommandKind::RuleTemplate,
         command_template: Some(
-            "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+            "apm2 fac doctor --pr {pr_number} --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
         ),
         command_notes: None,
     },
@@ -4214,12 +4229,6 @@ const DOCTOR_ACTION_POLICIES: &[DoctorActionPolicy] = &[
         action: "dispatch_implementor",
         default_wait_exit: true,
         wait_terminal_reason: "dispatch_implementor",
-        allow_exit_on_flag: true,
-    },
-    DoctorActionPolicy {
-        action: "restart_reviews",
-        default_wait_exit: true,
-        wait_terminal_reason: "restart_reviews",
         allow_exit_on_flag: true,
     },
     DoctorActionPolicy {
@@ -4313,6 +4322,7 @@ const DOCTOR_WAIT_TRANSITION_RULES: &[DoctorWaitTransitionRule] = &[
 struct DoctorDecisionFacts {
     has_integrity_or_corruption: bool,
     lifecycle_merged: bool,
+    projection_gap_requires_fix: bool,
     merge_ready: bool,
     all_verdicts_approve: bool,
     sha_freshness_source: DoctorShaFreshnessSource,
@@ -4327,18 +4337,13 @@ struct DoctorDecisionFacts {
     all_active_idle: bool,
     max_idle_seconds: Option<i64>,
     max_dispatched_pending_seconds: Option<i64>,
-    has_forced_restart_terminal_reason: bool,
+    has_forced_fix_terminal_reason: bool,
     lifecycle_escalation: bool,
     push_failure_hint: Option<String>,
 }
 
 impl DoctorDecisionFacts {
     fn from_input(input: &DoctorActionInputs<'_>) -> Self {
-        let has_integrity_or_corruption = input.repair_signals.lifecycle_load_failed
-            || input.repair_signals.lifecycle_missing
-            || input.repair_signals.agent_registry_load_failed
-            || input.repair_signals.run_state_repair_required;
-
         let has_actionable_findings = input
             .findings_summary
             .iter()
@@ -4369,6 +4374,17 @@ impl DoctorDecisionFacts {
             == DoctorGateProgressState::TerminalFailed
             || lifecycle_gate_failure
             || push_attempt_gate_failure;
+        let projection_gap_requires_fix = input.repair_signals.projection_comment_binding_missing
+            && input.merge_readiness.all_verdicts_approve
+            && input.merge_readiness.gates_pass
+            && input.merge_readiness.sha_fresh
+            && input.merge_readiness.merge_conflict_status
+                != DoctorMergeConflictStatus::HasConflicts
+            && !has_gate_failure_signal;
+        let has_integrity_or_corruption = input.repair_signals.lifecycle_load_failed
+            || input.repair_signals.lifecycle_missing
+            || input.repair_signals.agent_registry_load_failed
+            || input.repair_signals.run_state_repair_required;
         let lifecycle_escalation = input.lifecycle.is_some_and(|entry| {
             entry.error_budget_used >= 8 || lifecycle_retry_budget_exhausted(entry)
         });
@@ -4378,6 +4394,7 @@ impl DoctorDecisionFacts {
             lifecycle_merged: input
                 .lifecycle
                 .is_some_and(|entry| entry.state.eq_ignore_ascii_case("merged")),
+            projection_gap_requires_fix,
             merge_ready: input.merge_readiness.merge_ready,
             all_verdicts_approve: input.merge_readiness.all_verdicts_approve,
             sha_freshness_source: input.merge_readiness.sha_freshness_source,
@@ -4392,7 +4409,7 @@ impl DoctorDecisionFacts {
             all_active_idle: input.agent_activity.all_active_idle,
             max_idle_seconds: input.agent_activity.max_idle_seconds,
             max_dispatched_pending_seconds: input.agent_activity.max_dispatched_pending_seconds,
-            has_forced_restart_terminal_reason: has_forced_restart_terminal_reason(
+            has_forced_fix_terminal_reason: has_forced_fix_terminal_reason(
                 input.reviews,
                 input.review_terminal_reasons,
             ),
@@ -4408,6 +4425,7 @@ fn doctor_decision_guard_triggered(rule: &DoctorDecisionRule, facts: &DoctorDeci
     match rule.guard {
         DoctorDecisionGuard::HasIntegrityOrCorruption => facts.has_integrity_or_corruption,
         DoctorDecisionGuard::LifecycleMerged => facts.lifecycle_merged,
+        DoctorDecisionGuard::ProjectionGapRequiresFix => facts.projection_gap_requires_fix,
         DoctorDecisionGuard::MergeReady => facts.merge_ready,
         DoctorDecisionGuard::ShaFreshnessStale => {
             facts.sha_freshness_source == DoctorShaFreshnessSource::Stale
@@ -4472,12 +4490,8 @@ fn render_doctor_command_template(template: &str, pr_number: u32) -> String {
         )
 }
 
-fn restart_reviews_command(pr_number: u32, force: bool) -> String {
-    if force {
-        format!("apm2 fac restart --pr {pr_number} --force --refresh-identity")
-    } else {
-        format!("apm2 fac restart --pr {pr_number} --refresh-identity")
-    }
+fn fix_command(pr_number: u32) -> String {
+    format!("apm2 fac doctor --pr {pr_number} --fix")
 }
 
 fn render_doctor_recommendation_reason(
@@ -4503,12 +4517,12 @@ fn render_doctor_recommendation_reason(
                 format!("{findings_rollup}; {push_hint}")
             }
         },
-        DoctorReasonKind::IdleRestartWithMaxIdle => {
+        DoctorReasonKind::IdleFixWithMaxIdle => {
             let max_idle = facts
                 .max_idle_seconds
                 .unwrap_or(DOCTOR_ACTIVE_AGENT_IDLE_TIMEOUT_SECONDS);
             format!(
-                "all active reviewer agents are idle (no activity for up to {max_idle}s); recommend restart"
+                "all active reviewer agents are idle (no activity for up to {max_idle}s); recommend repair"
             )
         },
         DoctorReasonKind::PendingNoActiveWithPushHint => facts
@@ -4537,18 +4551,29 @@ fn render_doctor_recommendation_reason(
 fn render_doctor_recommendation_command(
     rule: &DoctorRecommendationRule,
     input: &DoctorActionInputs<'_>,
-    facts: &DoctorDecisionFacts,
+    _facts: &DoctorDecisionFacts,
 ) -> Option<String> {
     match rule.command_kind {
         DoctorCommandKind::None => None,
         DoctorCommandKind::RuleTemplate => rule
             .command_template
             .map(|template| render_doctor_command_template(template, input.pr_number)),
-        DoctorCommandKind::RestartForce => Some(restart_reviews_command(input.pr_number, true)),
-        DoctorCommandKind::RestartConditionalForce => Some(restart_reviews_command(
-            input.pr_number,
-            facts.has_forced_restart_terminal_reason,
-        )),
+        DoctorCommandKind::FixFollowUp => Some(fix_command(input.pr_number)),
+        DoctorCommandKind::FixForce | DoctorCommandKind::FixConditionalForce => {
+            Some(fix_command(input.pr_number))
+        },
+    }
+}
+
+const fn render_doctor_follow_up_repair_flags(
+    rule: &DoctorRecommendationRule,
+    facts: &DoctorDecisionFacts,
+) -> (bool, bool) {
+    match rule.command_kind {
+        DoctorCommandKind::None | DoctorCommandKind::RuleTemplate => (false, false),
+        DoctorCommandKind::FixForce => (true, true),
+        DoctorCommandKind::FixConditionalForce => (true, facts.has_forced_fix_terminal_reason),
+        DoctorCommandKind::FixFollowUp => (true, false),
     }
 }
 
@@ -4556,11 +4581,14 @@ fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommended
     let facts = DoctorDecisionFacts::from_input(input);
     let state = derive_doctor_decision_state(&facts);
     let rule = doctor_recommendation_rule_for_state(state);
+    let (follow_up_fix, follow_up_force) = render_doctor_follow_up_repair_flags(rule, &facts);
     DoctorRecommendedAction {
         action: rule.action.to_string(),
         reason: render_doctor_recommendation_reason(rule, input, &facts),
         priority: rule.priority.to_string(),
         command: render_doctor_recommendation_command(rule, input, &facts),
+        follow_up_fix,
+        follow_up_force,
     }
 }
 
@@ -5030,94 +5058,13 @@ fn format_freshness_age(seconds: Option<i64>) -> String {
 }
 // ── Public entry points ─────────────────────────────────────────────────────
 
-pub fn run_review(
-    repo: &str,
-    pr_number: Option<u32>,
-    review_type: ReviewRunType,
-    expected_head_sha: Option<&str>,
-    force: bool,
-    json_output: bool,
-) -> u8 {
-    let event_offset = review_events_path()
-        .ok()
-        .and_then(|path| fs::metadata(path).ok().map(|meta| meta.len()))
-        .unwrap_or(0);
-
-    let (owner_repo, resolved_pr) = match target::resolve_pr_target(repo, pr_number) {
-        Ok(value) => value,
-        Err(err) => {
-            let payload = serde_json::json!({
-                "error": "fac_review_run_target_resolution_failed",
-                "message": err,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-            );
-            return exit_codes::GENERIC_ERROR;
-        },
-    };
-
-    match orchestrator::run_review_inner(
-        &owner_repo,
-        resolved_pr,
-        review_type,
-        expected_head_sha,
-        force,
-    ) {
-        Ok(summary) => {
-            let success = summary.security.as_ref().is_none_or(|entry| entry.success)
-                && summary.quality.as_ref().is_none_or(|entry| entry.success);
-
-            let mut run_ids = Vec::new();
-            if let Some(entry) = &summary.security {
-                run_ids.push(entry.run_id.clone());
-            }
-            if let Some(entry) = &summary.quality {
-                run_ids.push(entry.run_id.clone());
-            }
-            if json_output {
-                let _ = emit_run_ndjson_since(event_offset, summary.pr_number, &run_ids, true);
-            }
-            let payload = serde_json::json!({
-                "schema": "apm2.fac.review.run.v1",
-                "summary": summary,
-            });
-            println!(
-                "{}",
-                serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
-            );
-
-            if success {
-                exit_codes::SUCCESS
-            } else {
-                exit_codes::GENERIC_ERROR
-            }
-        },
-        Err(err) => {
-            let payload = serde_json::json!({
-                "error": "fac_review_run_failed",
-                "message": err,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-            );
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
 pub fn run_findings(
     repo: &str,
     pr_number: Option<u32>,
     sha: Option<&str>,
-    refresh: bool,
     json_output: bool,
 ) -> u8 {
-    match findings::run_findings(repo, pr_number, sha, refresh, json_output) {
+    match findings::run_findings(repo, pr_number, sha, json_output) {
         Ok(code) => code,
         Err(err) => {
             let payload = serde_json::json!({
@@ -5173,40 +5120,6 @@ pub fn run_finding(
         Err(err) => {
             let payload = serde_json::json!({
                 "error": "fac_review_finding_failed",
-                "message": err,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-            );
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
-pub fn run_comment_compat(
-    repo: &str,
-    pr_number: Option<u32>,
-    sha: Option<&str>,
-    review_type: ReviewFindingTypeArg,
-    severity: ReviewFindingSeverityArg,
-    body: Option<&str>,
-    json_output: bool,
-) -> u8 {
-    match finding::run_comment_compat(
-        repo,
-        pr_number,
-        sha,
-        review_type,
-        severity,
-        body,
-        json_output,
-    ) {
-        Ok(code) => code,
-        Err(err) => {
-            let payload = serde_json::json!({
-                "error": "fac_review_comment_compat_failed",
                 "message": err,
             });
             println!(
@@ -5486,29 +5399,6 @@ fn run_terminate_inner_for_home(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
-pub fn run_recover(
-    repo: &str,
-    pr_number: Option<u32>,
-    force: bool,
-    refresh_identity: bool,
-    reap_stale_agents: bool,
-    reset_lifecycle: bool,
-    all: bool,
-    json_output: bool,
-) -> u8 {
-    recovery::run_recover(
-        repo,
-        pr_number,
-        force,
-        refresh_identity,
-        reap_stale_agents,
-        reset_lifecycle,
-        all,
-        json_output,
-    )
-}
-
 pub fn run_push(
     repo: &str,
     remote: &str,
@@ -5520,18 +5410,81 @@ pub fn run_push(
     push::run_push(repo, remote, branch, ticket, json_output, write_mode)
 }
 
-pub fn run_restart(
-    repo: &str,
-    pr: Option<u32>,
-    force: bool,
-    refresh_identity: bool,
-    json_output: bool,
-) -> u8 {
-    restart::run_restart(repo, pr, force, refresh_identity, json_output)
-}
-
 pub fn run_pipeline(repo: &str, pr_number: u32, sha: &str, json_output: bool) -> u8 {
     pipeline::run_pipeline(repo, pr_number, sha, json_output)
+}
+
+pub fn run_internal_reviewer(
+    repo: &str,
+    pr_number: u32,
+    review_type: &str,
+    expected_head_sha: &str,
+    force: bool,
+    _json_output: bool,
+) -> u8 {
+    let parsed_review_type = match review_type.trim().to_ascii_lowercase().as_str() {
+        "security" => ReviewRunType::Security,
+        "quality" => ReviewRunType::Quality,
+        other => {
+            let payload = serde_json::json!({
+                "error": "fac_review_internal_run_invalid_type",
+                "message": format!("invalid review type: {other} (expected security|quality)"),
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+            );
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+    if let Err(err) = validate_expected_head_sha(expected_head_sha) {
+        let payload = serde_json::json!({
+            "error": "fac_review_internal_run_invalid_head_sha",
+            "message": err,
+        });
+        println!(
+            "{}",
+            serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+        );
+        return exit_codes::GENERIC_ERROR;
+    }
+
+    match orchestrator::run_review_inner(
+        repo,
+        pr_number,
+        parsed_review_type,
+        Some(expected_head_sha),
+        force,
+    ) {
+        Ok(summary) => {
+            let success = summary.security.as_ref().is_none_or(|entry| entry.success)
+                && summary.quality.as_ref().is_none_or(|entry| entry.success);
+            let payload = serde_json::json!({
+                "schema": "apm2.fac.review.internal_run.v1",
+                "summary": summary,
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+            );
+            if success {
+                exit_codes::SUCCESS
+            } else {
+                exit_codes::GENERIC_ERROR
+            }
+        },
+        Err(err) => {
+            let payload = serde_json::json!({
+                "error": "fac_review_internal_run_failed",
+                "message": err,
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+            );
+            exit_codes::GENERIC_ERROR
+        },
+    }
 }
 
 pub fn run_logs(
@@ -5644,7 +5597,15 @@ pub(super) fn apply_gate_result_lifecycle_for_repo_sha(
     lifecycle::apply_gate_result_events_for_repo_sha(owner_repo, head_sha, passed)
 }
 
-// ── Internal dispatch helper (shared with pipeline/restart) ─────────────────
+// ── Internal dispatch helper (shared with pipeline/follow-up repair) ────────
+
+fn dispatch_run_state_is_terminal(run_state: &str) -> bool {
+    let normalized = run_state.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "done" | "failed" | "crashed" | "completed" | "cancelled"
+    )
+}
 
 fn run_dispatch_inner(
     owner_repo: &str,
@@ -5703,7 +5664,21 @@ fn run_dispatch_inner(
             dispatch_epoch,
             force,
         )?;
-        if !result.mode.eq_ignore_ascii_case("joined") {
+        let is_joined = result.mode.eq_ignore_ascii_case("joined");
+        let joined_is_terminal = dispatch_run_state_is_terminal(&result.run_state);
+        let joined_has_run_id = result
+            .run_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        if is_joined && !joined_is_terminal && !joined_has_run_id {
+            return Err(format!(
+                "joined {} dispatch missing run_id in non-terminal state (run_state={})",
+                kind.as_str(),
+                result.run_state
+            ));
+        }
+        if !is_joined {
             let run_id = result
                 .run_id
                 .as_deref()
@@ -5833,8 +5808,7 @@ mod tests {
     use super::state::{read_last_lines, read_pulse_file_from_path, write_pulse_file_to_path};
     use super::types::{
         EVENT_ROTATE_BYTES, FacEventContext, ReviewBackend, ReviewKind, ReviewRunState,
-        ReviewRunStatus, ReviewStateEntry, ReviewStateFile, default_model, default_review_type,
-        now_iso8601_millis,
+        ReviewRunStatus, ReviewStateEntry, ReviewStateFile, default_model, now_iso8601_millis,
     };
     static TEST_PR_COUNTER: AtomicU32 = AtomicU32::new(441_000);
 
@@ -6542,27 +6516,6 @@ mod tests {
     }
 
     #[test]
-    fn test_review_state_entry_backward_compat_defaults() {
-        let json = serde_json::json!({
-            "pid": 1234,
-            "started_at": Utc::now(),
-            "log_file": "/tmp/review.log",
-            "prompt_file": "/tmp/prompt.md",
-            "last_message_file": "/tmp/last.md",
-            "owner_repo": "owner/repo",
-            "head_sha": "0123456789abcdef0123456789abcdef01234567",
-            "restart_count": 0,
-            "temp_files": []
-        });
-        let entry: ReviewStateEntry =
-            serde_json::from_value(json).expect("deserialize review state entry");
-        assert_eq!(entry.review_type, default_review_type());
-        assert_eq!(entry.pr_number, 0);
-        assert_eq!(entry.model, default_model());
-        assert_eq!(entry.backend, ReviewBackend::Codex);
-    }
-
-    #[test]
     fn test_event_is_terminal_crash_conditions() {
         let by_restart = serde_json::json!({
             "event": "run_crash",
@@ -7224,7 +7177,7 @@ mod tests {
         }
     }
 
-    fn doctor_pr_summary_for_restart_tests(
+    fn doctor_pr_summary_for_fix_tests(
         findings_summary: Vec<super::DoctorFindingsDimensionSummary>,
         agents: Option<super::DoctorAgentSection>,
     ) -> super::DoctorPrSummary {
@@ -7264,6 +7217,8 @@ mod tests {
                 reason: "fixture".to_string(),
                 priority: "low".to_string(),
                 command: None,
+                follow_up_fix: false,
+                follow_up_force: false,
             },
             agents,
             run_state_diagnostics: Vec::new(),
@@ -7346,7 +7301,7 @@ mod tests {
     }
 
     fn doctor_summary_for_repair_plan_tests() -> super::DoctorPrSummary {
-        let mut summary = doctor_pr_summary_for_restart_tests(pending_findings_summary(), None);
+        let mut summary = doctor_pr_summary_for_fix_tests(pending_findings_summary(), None);
         summary.identity.local_sha = Some("0123456789abcdef0123456789abcdef01234567".to_string());
         summary.identity.stale = false;
         summary.lifecycle = Some(doctor_lifecycle_fixture("pushed", 3, 0, 1));
@@ -7375,6 +7330,24 @@ mod tests {
     }
 
     #[test]
+    fn test_derive_doctor_repair_plan_refreshes_identity_when_missing() {
+        let mut summary = doctor_summary_for_repair_plan_tests();
+        summary.repair_signals.identity_missing = true;
+
+        let plan = super::derive_doctor_repair_plan(&summary);
+        assert!(plan.refresh_identity);
+    }
+
+    #[test]
+    fn test_derive_doctor_repair_plan_refreshes_identity_when_stale() {
+        let mut summary = doctor_summary_for_repair_plan_tests();
+        summary.repair_signals.identity_stale = true;
+
+        let plan = super::derive_doctor_repair_plan(&summary);
+        assert!(plan.refresh_identity);
+    }
+
+    #[test]
     fn test_doctor_requires_force_repair_for_registry_integrity_issue() {
         let mut summary = doctor_summary_for_repair_plan_tests();
         summary.repair_signals.agent_registry_load_failed = true;
@@ -7383,8 +7356,18 @@ mod tests {
     }
 
     #[test]
-    fn test_build_recommended_action_uses_force_restart_for_max_restarts_exceeded_before_escalation()
-     {
+    fn test_doctor_requires_force_repair_does_not_force_on_run_state_only() {
+        let mut summary = doctor_summary_for_repair_plan_tests();
+        summary.repair_signals.run_state_repair_required = true;
+
+        assert!(
+            !super::doctor_requires_force_repair(&summary),
+            "run-state-only repair should not imply forced lifecycle reset"
+        );
+    }
+
+    #[test]
+    fn test_build_recommended_action_uses_force_fix_for_max_restarts_exceeded_before_escalation() {
         let reviews = doctor_reviews_with_terminal_reason(Some("max_restarts_exceeded"));
         let findings = pending_findings_summary();
         let action = build_recommended_action_for_tests(
@@ -7400,14 +7383,15 @@ mod tests {
             &findings,
             &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
         );
-        assert_eq!(action.action, "restart_reviews");
-        let command = action.command.expect("restart command");
-        assert!(command.contains("--force"));
-        assert!(command.contains("--refresh-identity"));
+        assert_eq!(action.action, "fix");
+        let command = action.command.expect("fix command");
+        assert_eq!(command, "apm2 fac doctor --pr 42 --fix");
+        assert!(action.follow_up_fix);
+        assert!(action.follow_up_force);
     }
 
     #[test]
-    fn test_build_recommended_action_uses_force_restart_when_terminal_reason_only_in_state_map() {
+    fn test_build_recommended_action_uses_force_fix_when_terminal_reason_only_in_state_map() {
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::from([(
             "security".to_string(),
@@ -7434,9 +7418,11 @@ mod tests {
             ),
             latest_push_attempt: None,
         });
-        assert_eq!(action.action, "restart_reviews");
-        let command = action.command.expect("restart command");
-        assert!(command.contains("--force"));
+        assert_eq!(action.action, "fix");
+        let command = action.command.expect("fix command");
+        assert_eq!(command, "apm2 fac doctor --pr 42 --fix");
+        assert!(action.follow_up_fix);
+        assert!(action.follow_up_force);
     }
 
     #[test]
@@ -7464,9 +7450,11 @@ mod tests {
             ),
             latest_push_attempt: None,
         });
-        assert_eq!(action.action, "restart_reviews");
-        let command = action.command.expect("restart command");
-        assert!(!command.contains("--force"));
+        assert_eq!(action.action, "fix");
+        let command = action.command.expect("fix command");
+        assert_eq!(command, "apm2 fac doctor --pr 42 --fix");
+        assert!(action.follow_up_fix);
+        assert!(!action.follow_up_force);
     }
 
     #[test]
@@ -7502,7 +7490,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_recommended_action_missing_run_state_does_not_force_fix() {
+    fn test_build_recommended_action_missing_run_state_does_not_force_fix_command() {
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::new();
         let action = super::build_recommended_action(&super::DoctorActionInputs {
@@ -7526,7 +7514,11 @@ mod tests {
             ),
             latest_push_attempt: None,
         });
-        assert_ne!(action.action, "fix");
+        assert_eq!(action.action, "fix");
+        let command = action.command.expect("fix command");
+        assert_eq!(command, "apm2 fac doctor --pr 42 --fix");
+        assert!(action.follow_up_fix);
+        assert!(!action.follow_up_force);
     }
 
     #[test]
@@ -7546,9 +7538,11 @@ mod tests {
             &findings,
             &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
         );
-        assert_eq!(action.action, "restart_reviews");
-        let command = action.command.expect("restart command");
-        assert!(!command.contains("--force"));
+        assert_eq!(action.action, "fix");
+        let command = action.command.expect("fix command");
+        assert_eq!(command, "apm2 fac doctor --pr 42 --fix");
+        assert!(action.follow_up_fix);
+        assert!(!action.follow_up_force);
     }
 
     #[test]
@@ -7570,7 +7564,7 @@ mod tests {
         );
         assert_eq!(action.action, "dispatch_implementor");
         let command = action.command.expect("dispatch command");
-        assert!(command.contains("apm2 fac review findings --pr 42 --json"));
+        assert!(command.contains("apm2 fac review findings --pr 42"));
     }
 
     #[test]
@@ -7618,7 +7612,7 @@ mod tests {
         );
         assert_eq!(action.action, "dispatch_implementor");
         let command = action.command.expect("dispatch command");
-        assert!(command.contains("apm2 fac review findings --pr 42 --json"));
+        assert!(command.contains("apm2 fac review findings --pr 42"));
     }
 
     #[test]
@@ -7753,6 +7747,85 @@ mod tests {
     }
 
     #[test]
+    fn test_build_recommended_action_projection_gap_triggers_fix_and_follow_up_repair() {
+        let findings = vec![
+            findings_summary_entry("security", "approve", 0, 0, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
+        let readiness = super::DoctorMergeReadiness {
+            merge_ready: true,
+            all_verdicts_approve: true,
+            gates_pass: true,
+            sha_fresh: true,
+            sha_freshness_source: super::DoctorShaFreshnessSource::RemoteMatch,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let terminal_reasons = std::collections::BTreeMap::new();
+        let repair_signals = super::DoctorRepairSignals {
+            projection_comment_binding_missing: true,
+            ..super::DoctorRepairSignals::default()
+        };
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            pr_number: 42,
+            repair_signals: &repair_signals,
+            lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 2, 0, 42)),
+            gates: &[
+                doctor_gate_snapshot("fmt", "PASS"),
+                doctor_gate_snapshot("test", "PASS"),
+            ],
+            agent_activity: super::DoctorAgentActivitySummary::default(),
+            reviews: &[],
+            review_terminal_reasons: &terminal_reasons,
+            findings_summary: &findings,
+            merge_readiness: &readiness,
+            latest_push_attempt: None,
+        });
+        assert_eq!(action.action, "fix");
+        assert_eq!(
+            action.command.as_deref(),
+            Some("apm2 fac doctor --pr 42 --fix")
+        );
+        assert!(action.follow_up_fix);
+        assert!(!action.follow_up_force);
+    }
+
+    #[test]
+    fn test_build_recommended_action_projection_gap_waits_before_terminal_gate_pass() {
+        let findings = vec![
+            findings_summary_entry("security", "approve", 0, 0, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
+        let readiness = super::DoctorMergeReadiness {
+            merge_ready: false,
+            all_verdicts_approve: true,
+            gates_pass: false,
+            sha_fresh: true,
+            sha_freshness_source: super::DoctorShaFreshnessSource::RemoteMatch,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let terminal_reasons = std::collections::BTreeMap::new();
+        let repair_signals = super::DoctorRepairSignals {
+            projection_comment_binding_missing: true,
+            ..super::DoctorRepairSignals::default()
+        };
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            pr_number: 42,
+            repair_signals: &repair_signals,
+            lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 2, 0, 42)),
+            gates: &[doctor_gate_snapshot("fmt", "RUNNING")],
+            agent_activity: super::DoctorAgentActivitySummary::default(),
+            reviews: &[],
+            review_terminal_reasons: &terminal_reasons,
+            findings_summary: &findings,
+            merge_readiness: &readiness,
+            latest_push_attempt: None,
+        });
+        assert_eq!(action.action, "approve");
+    }
+
+    #[test]
     fn test_build_recommended_action_does_not_approve_without_remote_sha_match() {
         let reviews = doctor_reviews_with_terminal_reason(None);
         let findings = vec![
@@ -7812,10 +7885,11 @@ mod tests {
         };
         let action =
             build_recommended_action_for_tests(42, None, None, &reviews, &findings, &readiness);
-        assert_eq!(action.action, "restart_reviews");
-        let command = action.command.expect("restart command");
-        assert!(command.contains("--force"));
-        assert!(command.contains("--refresh-identity"));
+        assert_eq!(action.action, "fix");
+        let command = action.command.expect("fix command");
+        assert_eq!(command, "apm2 fac doctor --pr 42 --fix");
+        assert!(action.follow_up_fix);
+        assert!(action.follow_up_force);
     }
 
     #[test]
@@ -7836,10 +7910,11 @@ mod tests {
         };
         let action =
             build_recommended_action_for_tests(42, None, None, &reviews, &findings, &readiness);
-        assert_eq!(action.action, "restart_reviews");
-        let command = action.command.expect("restart command");
-        assert!(command.contains("--force"));
-        assert!(command.contains("--refresh-identity"));
+        assert_eq!(action.action, "fix");
+        let command = action.command.expect("fix command");
+        assert_eq!(command, "apm2 fac doctor --pr 42 --fix");
+        assert!(action.follow_up_fix);
+        assert!(action.follow_up_force);
     }
 
     #[test]
@@ -7954,7 +8029,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_recommended_action_restarts_when_gates_are_terminal_and_no_reviewers() {
+    fn test_build_recommended_action_fixes_when_gates_are_terminal_and_no_reviewers() {
         let reviews = doctor_reviews_with_terminal_reason(None);
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::new();
@@ -7980,7 +8055,7 @@ mod tests {
             ),
             latest_push_attempt: None,
         });
-        assert_eq!(action.action, "restart_reviews");
+        assert_eq!(action.action, "fix");
     }
 
     #[test]
@@ -8110,7 +8185,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_recommended_action_gate_failure_overrides_stale_identity_restart() {
+    fn test_build_recommended_action_gate_failure_overrides_stale_identity_fix() {
         let reviews = doctor_reviews_with_terminal_reason(None);
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::new();
@@ -8147,8 +8222,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_recommended_action_restarts_when_gate_progress_is_unknown_without_active_reviewers()
-     {
+    fn test_build_recommended_action_fixes_when_gate_progress_is_unknown_without_active_reviewers()
+    {
         let reviews = doctor_reviews_with_terminal_reason(None);
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::new();
@@ -8174,7 +8249,7 @@ mod tests {
             ),
             latest_push_attempt: None,
         });
-        assert_eq!(action.action, "restart_reviews");
+        assert_eq!(action.action, "fix");
     }
 
     #[test]
@@ -8298,7 +8373,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_recommended_action_restarts_when_active_reviewers_are_idle() {
+    fn test_build_recommended_action_fixes_when_active_reviewers_are_idle() {
         let reviews = doctor_reviews_with_terminal_reason(None);
         let findings = pending_findings_summary();
         let agents = super::DoctorAgentSection {
@@ -8315,10 +8390,11 @@ mod tests {
             &findings,
             &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
         );
-        assert_eq!(action.action, "restart_reviews");
-        let command = action.command.expect("restart command");
-        assert!(command.contains("--force"));
-        assert!(command.contains("--refresh-identity"));
+        assert_eq!(action.action, "fix");
+        let command = action.command.expect("fix command");
+        assert_eq!(command, "apm2 fac doctor --pr 42 --fix");
+        assert!(action.follow_up_fix);
+        assert!(action.follow_up_force);
     }
 
     #[test]
@@ -8388,22 +8464,32 @@ mod tests {
         );
         assert_eq!(action.action, "escalate");
         let command = action.command.expect("escalate command");
-        assert!(command.contains("apm2 fac doctor --pr 42 --json"));
+        assert!(command.contains("apm2 fac doctor --pr 42"));
     }
 
     #[test]
-    fn test_doctor_recommended_restart_helpers_follow_recommended_action_contract() {
-        let mut summary = doctor_pr_summary_for_restart_tests(pending_findings_summary(), None);
-        assert!(!super::doctor_recommended_action_requests_restart(&summary));
-        assert!(!super::doctor_recommended_restart_force(&summary));
+    fn test_doctor_recommended_fix_helpers_follow_recommended_action_contract() {
+        let mut summary = doctor_pr_summary_for_fix_tests(pending_findings_summary(), None);
+        assert!(!super::doctor_recommended_action_requests_follow_up_fix(
+            &summary
+        ));
+        assert!(!super::doctor_recommended_follow_up_fix_force(&summary));
 
-        summary.recommended_action.action = "restart_reviews".to_string();
-        assert!(super::doctor_recommended_action_requests_restart(&summary));
-        assert!(!super::doctor_recommended_restart_force(&summary));
+        summary.recommended_action.action = "fix".to_string();
+        assert!(!super::doctor_recommended_action_requests_follow_up_fix(
+            &summary
+        ));
+        assert!(!super::doctor_recommended_follow_up_fix_force(&summary));
 
-        summary.recommended_action.command =
-            Some("apm2 fac restart --pr 42 --force --refresh-identity".to_string());
-        assert!(super::doctor_recommended_restart_force(&summary));
+        summary.recommended_action.follow_up_fix = true;
+        summary.recommended_action.follow_up_force = false;
+        assert!(super::doctor_recommended_action_requests_follow_up_fix(
+            &summary
+        ));
+        assert!(!super::doctor_recommended_follow_up_fix_force(&summary));
+
+        summary.recommended_action.follow_up_force = true;
+        assert!(super::doctor_recommended_follow_up_fix_force(&summary));
     }
 
     #[test]
@@ -8565,7 +8651,6 @@ mod tests {
         assert!(normalized.contains("escalate"));
         assert!(normalized.contains("fix"));
         assert!(normalized.contains("dispatch_implementor"));
-        assert!(normalized.contains("restart_reviews"));
         assert!(normalized.contains("merge"));
         assert!(normalized.contains("done"));
         assert!(normalized.contains("approve"));
@@ -8588,6 +8673,17 @@ mod tests {
             super::doctor_wait_terminal_reason("dispatch_implementor"),
             "dispatch_implementor"
         );
+    }
+
+    #[test]
+    fn test_dispatch_run_state_terminal_labels_include_done_and_crashed() {
+        assert!(super::dispatch_run_state_is_terminal("done"));
+        assert!(super::dispatch_run_state_is_terminal("failed"));
+        assert!(super::dispatch_run_state_is_terminal("crashed"));
+        assert!(super::dispatch_run_state_is_terminal("completed"));
+        assert!(super::dispatch_run_state_is_terminal("cancelled"));
+        assert!(!super::dispatch_run_state_is_terminal("pending"));
+        assert!(!super::dispatch_run_state_is_terminal("alive"));
     }
 
     #[test]

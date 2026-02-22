@@ -229,7 +229,6 @@ pub fn run_findings(
     repo: &str,
     pr_number: Option<u32>,
     sha: Option<&str>,
-    _refresh: bool,
     json_output: bool,
 ) -> Result<u8, String> {
     let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;

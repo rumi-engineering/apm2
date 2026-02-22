@@ -534,8 +534,10 @@ pub use receipt_pipeline::{
 // Re-export reconcile types (TCK-00534)
 pub use reconcile::{
     LaneRecoveryAction, MAX_CLAIMED_SCAN_ENTRIES, MAX_LANE_RECOVERY_ACTIONS,
-    MAX_QUEUE_RECOVERY_ACTIONS, OrphanedJobPolicy, QueueRecoveryAction, RECONCILE_RECEIPT_SCHEMA,
-    ReconcileError, ReconcileReceiptV1, reconcile_on_startup,
+    MAX_QUEUE_RECOVERY_ACTIONS, OrphanedJobPolicy, QueueReconcileLimits, QueueRecoveryAction,
+    RECONCILE_RECEIPT_SCHEMA, RUNTIME_QUEUE_RECONCILE_OUTCOME_SCHEMA, ReconcileError,
+    ReconcileReceiptV1, RuntimeQueueReconcileConfig, RuntimeQueueReconcileOutcome,
+    RuntimeQueueReconcileStatus, reconcile_claimed_runtime, reconcile_on_startup,
 };
 pub use repo_mirror::{
     CheckoutOutcome, DEFAULT_CLONE_TIMEOUT_SECS, DEFAULT_FETCH_TIMEOUT_SECS,

@@ -66,7 +66,6 @@ const BALANCED_MAX_PARALLELISM: u32 = 16;
 const CONSERVATIVE_PARALLELISM: u32 = 2;
 const DEFAULT_GATES_WAIT_TIMEOUT_SECS: u64 = 1200;
 const GATES_WAIT_POLL_INTERVAL_SECS: u64 = 5;
-const INLINE_WORKER_POLL_INTERVAL_SECS: u64 = 1;
 const GATES_QUEUE_LANE: &str = "consume";
 const GATES_SINGLE_FLIGHT_DIR: &str = "queue/singleflight";
 const GATES_QUEUE_PENDING_DIR: &str = "pending";
@@ -2397,7 +2396,7 @@ where
         return Ok(true);
     }
     Err(
-        "no live FAC worker heartbeat found after auto-start attempts; run `apm2 fac worker --poll-interval-secs 1`".to_string(),
+        "no live FAC worker heartbeat found after auto-start attempts; ensure `apm2-worker.service` is active".to_string(),
     )
 }
 
@@ -2406,7 +2405,7 @@ fn spawn_detached_worker_for_queue() -> Result<(), String> {
         std::env::current_exe().map_err(|err| format!("resolve current executable: {err}"))?;
     let mut command = Command::new(current_exe);
     command
-        .args(["fac", "worker", "--poll-interval-secs", "1"])
+        .args(["fac", "worker"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -2474,13 +2473,7 @@ fn is_pid_running(pid: u32) -> bool {
 }
 
 fn run_inline_worker_cycle() -> Result<(), String> {
-    let code = crate::commands::fac_worker::run_fac_worker(
-        true,
-        INLINE_WORKER_POLL_INTERVAL_SECS,
-        1,
-        false,
-        false,
-    );
+    let code = crate::commands::fac_worker::run_fac_worker(true, 1, false, false);
     if code == exit_codes::SUCCESS {
         Ok(())
     } else {
@@ -5865,7 +5858,7 @@ mod tests {
         let err = ensure_external_worker_bootstrap_with(temp.path(), |_| false, || Ok(()), || {})
             .expect_err("missing worker heartbeat must fail closed after auto-start");
         assert!(err.contains("after auto-start attempts"));
-        assert!(err.contains("apm2 fac worker"));
+        assert!(err.contains("apm2-worker.service"));
     }
 
     #[test]
@@ -7097,9 +7090,9 @@ time.sleep(20)\n",
             "  \"payload\": {\n",
             "    \"commands\": {\n",
             "      \"binary_prefix\": \"cargo run -p apm2-cli --\",\n",
-            "      \"prepare\": \"cargo run -p apm2-cli -- fac review prepare --json\",\n",
-            "      \"finding\": \"cargo run -p apm2-cli -- fac review finding --json\",\n",
-            "      \"verdict\": \"cargo run -p apm2-cli -- fac review verdict set --json\"\n",
+            "      \"prepare\": \"cargo run -p apm2-cli -- fac review prepare\",\n",
+            "      \"finding\": \"cargo run -p apm2-cli -- fac review finding\",\n",
+            "      \"verdict\": \"cargo run -p apm2-cli -- fac review verdict set\"\n",
             "    },\n",
             "    \"constraints\": {\n",
             "      \"forbidden_operations\": [\n",

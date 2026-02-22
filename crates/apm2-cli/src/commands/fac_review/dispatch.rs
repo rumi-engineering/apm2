@@ -1034,27 +1034,22 @@ where
             );
         },
         ReviewRunStateLoad::Present(state) => {
-            if state.head_sha.eq_ignore_ascii_case(&key.head_sha) && state.status.is_terminal() {
-                if !force_same_sha_retry && state.pid.is_some() {
-                    return Ok(DispatchReviewResult {
-                        review_type: key.review_type.clone(),
-                        mode: "joined".to_string(),
-                        run_state: state.status.as_str().to_string(),
-                        run_id: Some(state.run_id),
-                        sequence_number: Some(state.sequence_number),
-                        terminal_reason: state.terminal_reason,
-                        pid: state.pid,
-                        proc_start_time: state.proc_start_time,
-                        unit: None,
-                        log_file: None,
-                    });
-                }
-                if !force_same_sha_retry && state.pid.is_none() {
-                    eprintln!(
-                        "WARNING: terminal run-state missing pid for PR #{} type={} sha={}; dispatching new review",
-                        key.pr_number, key.review_type, key.head_sha
-                    );
-                }
+            if state.head_sha.eq_ignore_ascii_case(&key.head_sha)
+                && state.status.is_terminal()
+                && !force_same_sha_retry
+            {
+                return Ok(DispatchReviewResult {
+                    review_type: key.review_type.clone(),
+                    mode: "joined".to_string(),
+                    run_state: state.status.as_str().to_string(),
+                    run_id: Some(state.run_id),
+                    sequence_number: Some(state.sequence_number),
+                    terminal_reason: state.terminal_reason,
+                    pid: state.pid,
+                    proc_start_time: state.proc_start_time,
+                    unit: None,
+                    log_file: None,
+                });
             }
 
             if !state.status.is_terminal() && state.head_sha.eq_ignore_ascii_case(&key.head_sha) {
@@ -1549,8 +1544,7 @@ fn spawn_detached_review(
         let output = command
             .arg(&exe_path)
             .arg("fac")
-            .arg("review")
-            .arg("run")
+            .arg("reviewer")
             .arg("--pr")
             .arg(pr_number.to_string())
             .arg("--type")
@@ -1601,8 +1595,7 @@ fn spawn_detached_review(
         .map_err(|err| format!("failed to open dispatch log {}: {err}", log_path.display()))?;
     let child = Command::new(&exe_path)
         .arg("fac")
-        .arg("review")
-        .arg("run")
+        .arg("reviewer")
         .arg("--pr")
         .arg(pr_number.to_string())
         .arg("--type")
@@ -1910,7 +1903,7 @@ mod tests {
     }
 
     #[test]
-    fn test_same_sha_terminal_state_missing_pid_dispatches_new_review() {
+    fn test_same_sha_terminal_state_missing_pid_joins_existing_state() {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
 
@@ -1950,9 +1943,11 @@ mod tests {
             100,
             &spawn,
         )
-        .expect("same-sha terminal without pid should dispatch");
-        assert_eq!(result.mode, "started");
-        assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
+        .expect("same-sha terminal without pid should join");
+        assert_eq!(result.mode, "joined");
+        assert_eq!(result.run_state, "done");
+        assert_eq!(result.run_id.as_deref(), Some("pr441-security-s4-01234567"));
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 0);
     }
 
     #[test]

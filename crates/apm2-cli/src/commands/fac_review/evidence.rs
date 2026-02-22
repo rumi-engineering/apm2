@@ -3914,7 +3914,7 @@ mod tests {
     #[test]
     fn pipeline_test_command_carries_env_remove_keys() {
         // BLOCKER-2 regression: build_pipeline_test_command must propagate
-        // env_remove_keys from bounded_spec so the pipeline/restart path
+        // env_remove_keys from bounded_spec so the pipeline/doctor-fix path
         // strips sccache env vars.
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let lane_dir = temp_dir

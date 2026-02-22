@@ -63,10 +63,6 @@ pub struct PrAuthCheckCliArgs {
     /// Repository in owner/repo format.
     #[arg(long, default_value = "guardian-intelligence/apm2")]
     pub repo: String,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 #[allow(clippy::struct_excessive_bools)] // CLI flags are inherently boolean
@@ -109,10 +105,6 @@ pub struct PrAuthSetupCliArgs {
     /// `resolve_private_key` checks `$CREDENTIALS_DIRECTORY` first.
     #[arg(long, default_value_t = false)]
     pub for_systemd: bool,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -133,20 +125,15 @@ pub struct PrRulesetSyncCliArgs {
     /// Check for drift only; do not apply updates.
     #[arg(long, default_value_t = false)]
     pub check: bool,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 // ── Dispatcher ─────────────────────────────────────────────────────────────
 
 /// Dispatch `apm2 fac pr` subcommands.
 pub fn run_pr(args: &PrArgs, parent_json_output: bool) -> u8 {
-    let resolve_json = |subcommand_json: bool| -> bool { parent_json_output || subcommand_json };
     match &args.subcommand {
-        PrSubcommand::AuthCheck(a) => auth_check::run_pr_auth_check(&a.repo, resolve_json(a.json)),
-        PrSubcommand::AuthSetup(a) => auth_setup::run_pr_auth_setup(a, resolve_json(a.json)),
-        PrSubcommand::RulesetSync(a) => ruleset_sync::run_pr_ruleset_sync(a, resolve_json(a.json)),
+        PrSubcommand::AuthCheck(a) => auth_check::run_pr_auth_check(&a.repo, parent_json_output),
+        PrSubcommand::AuthSetup(a) => auth_setup::run_pr_auth_setup(a, parent_json_output),
+        PrSubcommand::RulesetSync(a) => ruleset_sync::run_pr_ruleset_sync(a, parent_json_output),
     }
 }
