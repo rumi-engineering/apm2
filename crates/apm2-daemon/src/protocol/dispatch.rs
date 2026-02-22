@@ -3706,9 +3706,9 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
     }
 
     fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent> {
+        // Lock ordering: events (B) then events_by_work_id (A), matching
+        // writer ordering in emit_* methods to prevent AB-BA deadlock.
         let guard = self.events.read().expect("lock poisoned");
-        // Lock ordering invariant: always acquire `events` before
-        // `events_by_work_id` to avoid ABBA deadlocks with write paths.
         let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
 
         events_by_work
@@ -3727,9 +3727,9 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         work_id: &str,
         event_type: &str,
     ) -> Option<SignedLedgerEvent> {
+        // Lock ordering: events (B) then events_by_work_id (A), matching
+        // writer ordering in emit_* methods to prevent AB-BA deadlock.
         let guard = self.events.read().expect("lock poisoned");
-        // Lock ordering invariant: always acquire `events` before
-        // `events_by_work_id` to avoid ABBA deadlocks with write paths.
         let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
 
         events_by_work.get(work_id).and_then(|event_ids| {
@@ -3910,9 +3910,9 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
     }
 
     fn get_work_transition_count(&self, work_id: &str) -> u32 {
+        // Lock ordering: events (B) then events_by_work_id (A), matching
+        // writer ordering in emit_* methods to prevent AB-BA deadlock.
         let guard = self.events.read().expect("lock poisoned");
-        // Lock ordering invariant: always acquire `events` before
-        // `events_by_work_id` to avoid ABBA deadlocks with write paths.
         let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
 
         events_by_work.get(work_id).map_or(0, |event_ids| {
