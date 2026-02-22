@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00644
     title: 'RFC-0032 Phase 3: enforce implementer claimability via BLOCKS edges + doctor diagnostics (waivers/late edges)'
-    status: OPEN
+    status: MERGED
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032

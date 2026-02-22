@@ -65,6 +65,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use apm2_core::crypto::Hash;
+use apm2_core::orchestrator_kernel::{
+    EffectExecutionState as KernelEffectExecutionState, OutputReleasePolicy,
+    check_output_release_permitted as kernel_check_output_release_permitted,
+};
 use serde::{Deserialize, Serialize};
 
 use super::prerequisites::LedgerAnchorV1;
@@ -1449,27 +1453,22 @@ pub fn check_output_release_permitted(
     enforcement_tier: EnforcementTier,
     request_id: &Hash,
 ) -> Result<(), EffectJournalError> {
-    match (state, enforcement_tier) {
-        (EffectExecutionState::Unknown, EnforcementTier::FailClosed) => {
-            Err(EffectJournalError::OutputReleaseDenied {
-                request_id: *request_id,
-                reason: "effect state is Unknown for fail-closed tier; \
-                         no output release permitted (containment required)"
-                    .into(),
-            })
-        },
-        (EffectExecutionState::Started, EnforcementTier::FailClosed) => {
-            // During normal operation, Started means the effect is in
-            // progress. Output is held until Completed.
-            Err(EffectJournalError::OutputReleaseDenied {
-                request_id: *request_id,
-                reason: "effect state is Started for fail-closed tier; \
-                         output held until Completed"
-                    .into(),
-            })
-        },
-        _ => Ok(()),
-    }
+    let kernel_state = match state {
+        EffectExecutionState::NotStarted => KernelEffectExecutionState::NotStarted,
+        EffectExecutionState::Started => KernelEffectExecutionState::Started,
+        EffectExecutionState::Completed => KernelEffectExecutionState::Completed,
+        EffectExecutionState::Unknown => KernelEffectExecutionState::Unknown,
+    };
+    let policy = match enforcement_tier {
+        EnforcementTier::FailClosed => OutputReleasePolicy::FailClosed,
+        EnforcementTier::Monitor => OutputReleasePolicy::Monitor,
+    };
+    kernel_check_output_release_permitted(kernel_state, policy).map_err(|err| {
+        EffectJournalError::OutputReleaseDenied {
+            request_id: *request_id,
+            reason: err.reason,
+        }
+    })
 }
 
 // =============================================================================

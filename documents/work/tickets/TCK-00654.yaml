@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00654
     title: 'RFC-0032: FAC doctor `--wait` pulse subscription integration (replace polling loop with daemon pulse-driven reevaluation)'
-    status: IN_PROGRESS
+    status: MERGED
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032

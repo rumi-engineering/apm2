@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00653
     title: 'RFC-0032: pulse plane correctness completion (event_type+payload decoding + typed/dotted parity + multi-topic routing)'
-    status: IN_PROGRESS
+    status: MERGED
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032

@@ -68,6 +68,7 @@ pub mod ledger;
 pub mod liveness;
 pub mod log;
 pub mod model_router;
+pub mod orchestrator_kernel;
 pub mod pcac;
 pub mod policy;
 pub mod process;
