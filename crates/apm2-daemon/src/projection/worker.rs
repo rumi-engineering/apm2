@@ -678,6 +678,24 @@ const WORK_INDEX_SCHEMA_SQL: &str = r"
 
     CREATE INDEX IF NOT EXISTS idx_comment_created ON comment_receipts(created_at);
     CREATE INDEX IF NOT EXISTS idx_work_pr_created ON work_pr_index(created_at);
+
+    -- TCK-00638: Work context entry projection (RFC-0032 Phase 2)
+    CREATE TABLE IF NOT EXISTS work_context (
+        work_id TEXT NOT NULL,
+        entry_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL,
+        actor_id TEXT NOT NULL DEFAULT '',
+        cas_hash TEXT NOT NULL,
+        evidence_id TEXT NOT NULL,
+        created_at_ns INTEGER NOT NULL,
+        PRIMARY KEY (work_id, entry_id)
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_work_context_dedupe
+        ON work_context(work_id, kind, dedupe_key);
+    CREATE INDEX IF NOT EXISTS idx_work_context_work_id ON work_context(work_id);
+    CREATE INDEX IF NOT EXISTS idx_work_context_created ON work_context(created_at_ns);
 ";
 
 /// Work index for tracking changeset -> `work_id` -> PR associations.
@@ -996,6 +1014,18 @@ impl WorkIndex {
             )
             .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
+        // BLOCKER FIX: Evict expired work_context entries.
+        // The `created_at_ns` column uses nanoseconds, so convert the
+        // seconds-based cutoff to nanoseconds before comparison.
+        #[allow(clippy::cast_possible_wrap)]
+        let cutoff_ns = (now.saturating_sub(ttl_secs) as i64).saturating_mul(1_000_000_000);
+        total_deleted += conn
+            .execute(
+                "DELETE FROM work_context WHERE created_at_ns < ?1",
+                params![cutoff_ns],
+            )
+            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
         if total_deleted > 0 {
             info!(
                 deleted = total_deleted,
@@ -1065,6 +1095,18 @@ impl WorkIndex {
                 )
                 .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
+            // BLOCKER FIX: Evict expired work_context entries.
+            // The `created_at_ns` column uses nanoseconds, so convert the
+            // seconds-based cutoff to nanoseconds before comparison.
+            #[allow(clippy::cast_possible_wrap)]
+            let cutoff_ns = cutoff.saturating_mul(1_000_000_000);
+            total_deleted += conn_guard
+                .execute(
+                    "DELETE FROM work_context WHERE created_at_ns < ?1",
+                    params![cutoff_ns],
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
             if total_deleted > 0 {
                 info!(
                     deleted = total_deleted,
@@ -1077,6 +1119,72 @@ impl WorkIndex {
         })
         .await
         .map_err(|e| ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}")))?
+    }
+
+    /// Registers a work context entry in the projection table (TCK-00638).
+    ///
+    /// Uses `INSERT OR IGNORE` to support idempotent replays: the primary key
+    /// `(work_id, entry_id)` and the uniqueness constraint on
+    /// `(work_id, kind, dedupe_key)` together ensure that duplicate entries
+    /// from retries are silently absorbed.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_id` - Canonical work identifier
+    /// * `entry_id` - Deterministically derived entry ID (`CTX-` prefix +
+    ///   blake3 hex)
+    /// * `kind` - Entry kind discriminant
+    /// * `dedupe_key` - Deduplication key
+    /// * `actor_id` - Actor that published the entry
+    /// * `cas_hash` - CAS hash of the canonical entry bytes (hex)
+    /// * `evidence_id` - Evidence ID (same as `entry_id`)
+    /// * `created_at_ns` - HTF timestamp in nanoseconds
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    #[allow(clippy::too_many_arguments, clippy::cast_possible_wrap)]
+    pub fn register_work_context_entry(
+        &self,
+        work_id: &str,
+        entry_id: &str,
+        kind: &str,
+        dedupe_key: &str,
+        actor_id: &str,
+        cas_hash: &str,
+        evidence_id: &str,
+        created_at_ns: u64,
+    ) -> Result<(), ProjectionWorkerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
+
+        conn.execute(
+            "INSERT OR IGNORE INTO work_context
+             (work_id, entry_id, kind, dedupe_key, actor_id, cas_hash, evidence_id, created_at_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                work_id,
+                entry_id,
+                kind,
+                dedupe_key,
+                actor_id,
+                cas_hash,
+                evidence_id,
+                created_at_ns as i64,
+            ],
+        )
+        .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+        debug!(
+            work_id = %work_id,
+            entry_id = %entry_id,
+            kind = %kind,
+            "Registered work context entry in projection"
+        );
+
+        Ok(())
     }
 }
 
@@ -1127,6 +1235,13 @@ pub struct LedgerTailer {
     last_event_id: String,
     /// Tailer identifier for watermark persistence.
     tailer_id: String,
+    /// TCK-00638 / BLOCKER fix: Whether the canonical `events` table is
+    /// active (freeze mode). Detected lazily on first poll by checking
+    /// if the `events` table exists in `sqlite_master`. Once set, the
+    /// tailer also queries canonical events to see freeze-mode writes.
+    /// Uses `std::sync::atomic::AtomicU8` with three states:
+    /// 0 = unknown, 1 = legacy-only, 2 = canonical-active.
+    canonical_mode: std::sync::atomic::AtomicU8,
 }
 
 impl LedgerTailer {
@@ -1170,6 +1285,7 @@ impl LedgerTailer {
             last_processed_ns,
             last_event_id,
             tailer_id: tailer_id.to_string(),
+            canonical_mode: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
@@ -1181,6 +1297,144 @@ impl LedgerTailer {
             last_processed_ns: timestamp_ns,
             last_event_id: String::new(),
             tailer_id: DEFAULT_TAILER_ID.to_string(),
+            canonical_mode: std::sync::atomic::AtomicU8::new(0),
+        }
+    }
+
+    /// TCK-00638 / BLOCKER fix: Detects whether the canonical `events` table
+    /// is active. Returns `true` if canonical mode is active (the `events`
+    /// table exists and has at least one row). Result is cached in an
+    /// `AtomicU8` to avoid repeated `sqlite_master` queries.
+    ///
+    /// States: 0 = unknown (probe required), 1 = legacy-only, 2 = canonical.
+    fn is_canonical_active(conn: &Connection, mode: &std::sync::atomic::AtomicU8) -> bool {
+        use std::sync::atomic::Ordering;
+        let current = mode.load(Ordering::Acquire);
+        if current == 2 {
+            return true;
+        }
+        if current == 1 {
+            return false;
+        }
+        // Probe: check if `events` table exists in sqlite_master.
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'events')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if exists {
+            mode.store(2, Ordering::Release);
+            true
+        } else {
+            mode.store(1, Ordering::Release);
+            false
+        }
+    }
+
+    /// TCK-00638 / BLOCKER fix: Polls the canonical `events` table for
+    /// events matching the given type and cursor, using the same composite
+    /// cursor semantics as the legacy poll.
+    ///
+    /// Column mapping: `events.session_id` → `work_id`,
+    /// `events.seq_id` → synthesised `"canonical-{seq_id:020}"` `event_id`.
+    ///
+    /// ## Cursor correctness (MAJOR fix: timestamp collision cursor skip)
+    ///
+    /// The synthesised `event_id` uses a **20-digit zero-padded** `seq_id`
+    /// (e.g. `canonical-00000000000000000042`) so that lexicographic ordering
+    /// matches the underlying numeric `seq_id ASC` ordering. Without zero-
+    /// padding, `"canonical-10"` would sort **before** `"canonical-9"` in
+    /// string comparison, causing the cursor to skip rows with `seq_id >= 10`
+    /// when a same-timestamp batch page boundary falls between single-digit
+    /// and multi-digit `seq_id` values.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    fn poll_canonical_events(
+        conn: &Connection,
+        event_type: &str,
+        last_processed_ns: u64,
+        last_event_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SignedLedgerEvent>, ProjectionWorkerError> {
+        // Map the canonical row to a `SignedLedgerEvent` with synthesised
+        // event_id = "canonical-{seq_id:020}" (zero-padded for
+        // lexicographic == numeric ordering).
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<SignedLedgerEvent> {
+            let seq_id: i64 = row.get(0)?;
+            Ok(SignedLedgerEvent {
+                event_id: format!("canonical-{seq_id:020}"),
+                event_type: row.get(1)?,
+                work_id: row.get(2)?, // session_id maps to work_id
+                actor_id: row.get(3)?,
+                payload: row.get(4)?,
+                signature: row.get(5)?,
+                timestamp_ns: row.get::<_, i64>(6)? as u64,
+            })
+        };
+
+        if last_event_id.is_empty() {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                            COALESCE(signature, X''), timestamp_ns \
+                     FROM events \
+                     WHERE event_type = ?1 AND timestamp_ns > ?2 \
+                     ORDER BY timestamp_ns ASC, seq_id ASC \
+                     LIMIT ?3",
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+            let events = stmt
+                .query_map(
+                    params![event_type, last_processed_ns as i64, limit as i64],
+                    map_row,
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            Ok(events)
+        } else {
+            // For composite cursor with canonical events: the last_event_id
+            // may be a legacy event_id or a "canonical-{seq_id:020}" string.
+            //
+            // MAJOR FIX (cursor skip under timestamp collision):
+            // Use zero-padded synthesised canonical event_id in SQL so
+            // string `>` comparison matches numeric `seq_id ASC` ordering.
+            // The SQL pads `seq_id` with `SUBSTR('00000000000000000000', 1,
+            // 20 - LENGTH(CAST(seq_id AS TEXT)))` to produce a 20-char
+            // zero-padded number, then prefixes `'canonical-'`.
+            let mut stmt = conn
+                .prepare(
+                    "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                            COALESCE(signature, X''), timestamp_ns \
+                     FROM events \
+                     WHERE event_type = ?1 AND ( \
+                         timestamp_ns > ?2 OR \
+                         (timestamp_ns = ?2 AND \
+                          ('canonical-' || SUBSTR('00000000000000000000', 1, \
+                              20 - LENGTH(CAST(seq_id AS TEXT))) || CAST(seq_id AS TEXT)) > ?3) \
+                     ) \
+                     ORDER BY timestamp_ns ASC, seq_id ASC \
+                     LIMIT ?4",
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+            let events = stmt
+                .query_map(
+                    params![
+                        event_type,
+                        last_processed_ns as i64,
+                        last_event_id,
+                        limit as i64
+                    ],
+                    map_row,
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            Ok(events)
         }
     }
 
@@ -1282,7 +1536,7 @@ impl LedgerTailer {
             .prepare(query)
             .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
-        let events = if self.last_event_id.is_empty() {
+        let mut events = if self.last_event_id.is_empty() {
             stmt.query_map(
                 params![event_type, self.last_processed_ns as i64, limit as i64],
                 |row| {
@@ -1324,6 +1578,32 @@ impl LedgerTailer {
             .filter_map(Result::ok)
             .collect::<Vec<_>>()
         };
+
+        // TCK-00638 / BLOCKER fix: When canonical mode is active, also
+        // poll the canonical `events` table and merge results by
+        // (timestamp_ns, event_id) ordering. This ensures the tailer
+        // observes freeze-mode writes.
+        if Self::is_canonical_active(&conn, &self.canonical_mode) {
+            let canonical = Self::poll_canonical_events(
+                &conn,
+                event_type,
+                self.last_processed_ns,
+                &self.last_event_id,
+                limit,
+            )?;
+            if !canonical.is_empty() {
+                events.extend(canonical);
+                // Sort merged events by (timestamp_ns, event_id) for
+                // deterministic cursor-compatible ordering.
+                events.sort_by(|a, b| {
+                    a.timestamp_ns
+                        .cmp(&b.timestamp_ns)
+                        .then_with(|| a.event_id.cmp(&b.event_id))
+                });
+                // Enforce the batch limit after merge.
+                events.truncate(limit);
+            }
+        }
 
         // NOTE: Watermark is NOT advanced here. Caller must call acknowledge()
         // after successful processing to ensure at-least-once delivery.
@@ -1385,8 +1665,15 @@ impl LedgerTailer {
         let event_type = event_type.to_string();
         let last_processed_ns = self.last_processed_ns;
         let last_event_id = self.last_event_id.clone();
+        // TCK-00638 / BLOCKER fix: Snapshot canonical_mode before spawning so
+        // the blocking closure can detect freeze-mode writes. The probe
+        // result is returned alongside events so we can cache it.
+        let canonical_mode_snapshot = self
+            .canonical_mode
+            .load(std::sync::atomic::Ordering::Acquire);
 
-        tokio::task::spawn_blocking(move || {
+        // Return (events, detected_canonical_mode) from spawn_blocking.
+        let result = tokio::task::spawn_blocking(move || {
             let conn_guard = conn.lock().map_err(|e| {
                 ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
             })?;
@@ -1415,7 +1702,7 @@ impl LedgerTailer {
                 .prepare(query)
                 .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
-            let events = if last_event_id.is_empty() {
+            let mut events = if last_event_id.is_empty() {
                 stmt.query_map(
                     params![event_type, last_processed_ns as i64, limit as i64],
                     |row| {
@@ -1438,7 +1725,7 @@ impl LedgerTailer {
                     params![
                         event_type,
                         last_processed_ns as i64,
-                        last_event_id,
+                        &last_event_id,
                         limit as i64
                     ],
                     |row| {
@@ -1458,10 +1745,66 @@ impl LedgerTailer {
                 .collect::<Vec<_>>()
             };
 
-            Ok(events)
+            // TCK-00638 / BLOCKER fix: When canonical mode is active (or
+            // unknown and detected by probing), also poll canonical events.
+            let canonical_active = if canonical_mode_snapshot == 2 {
+                true
+            } else if canonical_mode_snapshot == 1 {
+                false
+            } else {
+                // Probe: check if `events` table exists.
+                conn_guard
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                         WHERE type = 'table' AND name = 'events')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false)
+            };
+
+            // Encode detected mode for caching: 2 = canonical, 1 = legacy.
+            let detected: u8 = if canonical_active {
+                2
+            } else if canonical_mode_snapshot == 0 {
+                1
+            } else {
+                canonical_mode_snapshot
+            };
+
+            if canonical_active {
+                let canonical = Self::poll_canonical_events(
+                    &conn_guard,
+                    &event_type,
+                    last_processed_ns,
+                    &last_event_id,
+                    limit,
+                )?;
+                if !canonical.is_empty() {
+                    events.extend(canonical);
+                    events.sort_by(|a, b| {
+                        a.timestamp_ns
+                            .cmp(&b.timestamp_ns)
+                            .then_with(|| a.event_id.cmp(&b.event_id))
+                    });
+                    events.truncate(limit);
+                }
+            }
+
+            Ok((events, detected))
         })
         .await
-        .map_err(|e| ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}")))?
+        .map_err(|e| ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}")))?;
+
+        let (events, detected_mode) = result?;
+
+        // Cache the detected canonical mode for future polls.
+        if canonical_mode_snapshot == 0 && detected_mode != 0 {
+            self.canonical_mode
+                .store(detected_mode, std::sync::atomic::Ordering::Release);
+        }
+
+        Ok(events)
     }
 
     /// Async wrapper for `acknowledge` that uses `spawn_blocking`.
@@ -1648,6 +1991,9 @@ pub struct ProjectionWorker {
     work_pr_tailer: LedgerTailer,
     /// Tailer for `review_receipt_recorded` events.
     review_tailer: LedgerTailer,
+    /// Tailer for `evidence.published` events with `WORK_CONTEXT_ENTRY`
+    /// category (TCK-00638).
+    evidence_published_tailer: LedgerTailer,
     adapter: Option<GitHubProjectionAdapter>,
     authoritative_cas: Option<Arc<dyn ContentAddressedStore>>,
     /// Durable buffer for recording admission decisions (TCK-00504/00505).
@@ -1696,6 +2042,8 @@ impl ProjectionWorker {
             Arc::clone(&conn),
             "projection_worker:review_receipt_recorded",
         );
+        let evidence_published_tailer =
+            LedgerTailer::with_id(Arc::clone(&conn), "projection_worker:evidence_published");
 
         // NOTE: Adapter is NOT created here to avoid fail-open issues.
         // The adapter MUST be injected via set_adapter() with a properly
@@ -1719,6 +2067,7 @@ impl ProjectionWorker {
             changeset_tailer,
             work_pr_tailer,
             review_tailer,
+            evidence_published_tailer,
             adapter,
             authoritative_cas: None,
             intent_buffer: None,
@@ -1866,6 +2215,12 @@ impl ProjectionWorker {
             // (Major fix: Thread blocking in async context - uses spawn_blocking)
             if let Err(e) = self.process_review_receipts().await {
                 warn!(error = %e, "Error processing ReviewReceiptRecorded events");
+            }
+
+            // Process evidence.published events to index WORK_CONTEXT_ENTRY entries
+            // (TCK-00638: RFC-0032 Phase 2 work_context projection)
+            if let Err(e) = self.process_evidence_published().await {
+                warn!(error = %e, "Error processing evidence.published events");
             }
 
             // Periodic eviction of expired entries (Blocker fix: Unbounded State Growth)
@@ -2279,6 +2634,169 @@ impl ProjectionWorker {
                 },
             }
         }
+
+        Ok(())
+    }
+
+    /// Processes `evidence.published` events to populate the `work_context`
+    /// projection table (TCK-00638).
+    ///
+    /// Only events with category `WORK_CONTEXT_ENTRY` are indexed. All other
+    /// evidence categories are silently skipped (acknowledged without
+    /// indexing).
+    ///
+    /// Uses at-least-once delivery: events are acknowledged only after
+    /// successful projection.
+    async fn process_evidence_published(&mut self) -> Result<(), ProjectionWorkerError> {
+        let events = self
+            .evidence_published_tailer
+            .poll_events_async("evidence.published", self.config.batch_size)
+            .await?;
+
+        for event in events {
+            match self.handle_evidence_published(&event) {
+                Ok(()) => {
+                    self.evidence_published_tailer
+                        .acknowledge_async(event.timestamp_ns, &event.event_id)
+                        .await?;
+                },
+                Err(ProjectionWorkerError::InvalidPayload(ref msg)) => {
+                    // InvalidPayload is permanently unrecoverable: the event
+                    // payload is structurally malformed and will never succeed
+                    // on retry. Acknowledge (skip) the event to prevent
+                    // head-of-line blocking that would pin the tailer and
+                    // block all subsequent evidence.published events.
+                    warn!(
+                        event_id = %event.event_id,
+                        error = %msg,
+                        "Defect: permanently malformed evidence.published event \
+                         - acknowledging to prevent head-of-line blocking"
+                    );
+                    self.evidence_published_tailer
+                        .acknowledge_async(event.timestamp_ns, &event.event_id)
+                        .await?;
+                },
+                Err(e) => {
+                    // Transient errors (database, lock contention) may
+                    // succeed on retry. Break and re-poll on next cycle.
+                    warn!(
+                        event_id = %event.event_id,
+                        error = %e,
+                        "Failed to process evidence.published event - will retry"
+                    );
+                    break;
+                },
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handles a single `evidence.published` event for work context projection.
+    ///
+    /// The ledger stores session events as a JSON envelope with a hex-encoded
+    /// protobuf in the `"payload"` field (see `emit_session_event`). This
+    /// method decodes that envelope first, then the inner `EvidenceEvent`
+    /// protobuf, checks if the category is `WORK_CONTEXT_ENTRY`, and if so,
+    /// extracts metadata fields and inserts into the `work_context` projection
+    /// table.
+    ///
+    /// Non-`WORK_CONTEXT_ENTRY` events are silently skipped (return `Ok(())`).
+    fn handle_evidence_published(
+        &self,
+        event: &SignedLedgerEvent,
+    ) -> Result<(), ProjectionWorkerError> {
+        use prost::Message;
+
+        // Step 1: Parse the JSON envelope produced by emit_session_event.
+        // Format: { "event_type": "...", "session_id": "...", "actor_id": "...",
+        // "payload": "<hex>" }
+        let envelope: serde_json::Value = serde_json::from_slice(&event.payload).map_err(|e| {
+            ProjectionWorkerError::InvalidPayload(format!(
+                "failed to parse session event JSON envelope: {e}"
+            ))
+        })?;
+
+        let hex_payload = envelope
+            .get("payload")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ProjectionWorkerError::InvalidPayload(
+                    "session event JSON envelope missing 'payload' field".to_string(),
+                )
+            })?;
+
+        let inner_bytes = hex::decode(hex_payload).map_err(|e| {
+            ProjectionWorkerError::InvalidPayload(format!(
+                "failed to hex-decode inner protobuf payload: {e}"
+            ))
+        })?;
+
+        // Step 2: Decode the inner EvidenceEvent protobuf.
+        let evidence_event = apm2_core::events::EvidenceEvent::decode(inner_bytes.as_slice())
+            .map_err(|e| {
+                ProjectionWorkerError::InvalidPayload(format!(
+                    "failed to decode EvidenceEvent from inner protobuf: {e}"
+                ))
+            })?;
+
+        let Some(apm2_core::events::evidence_event::Event::Published(published)) =
+            evidence_event.event
+        else {
+            // Not a Published event — skip.
+            return Ok(());
+        };
+
+        // Only index WORK_CONTEXT_ENTRY evidence.
+        if published.category != "WORK_CONTEXT_ENTRY" {
+            return Ok(());
+        }
+
+        // Extract metadata fields from the evidence metadata list.
+        let mut entry_id = String::new();
+        let mut kind = String::new();
+        let mut dedupe_key = String::new();
+        let mut actor_id = String::new();
+
+        for meta in &published.metadata {
+            if let Some(val) = meta.strip_prefix("entry_id=") {
+                entry_id = val.to_string();
+            } else if let Some(val) = meta.strip_prefix("kind=") {
+                kind = val.to_string();
+            } else if let Some(val) = meta.strip_prefix("dedupe_key=") {
+                dedupe_key = val.to_string();
+            } else if let Some(val) = meta.strip_prefix("actor_id=") {
+                actor_id = val.to_string();
+            }
+        }
+
+        if entry_id.is_empty() || kind.is_empty() || dedupe_key.is_empty() {
+            return Err(ProjectionWorkerError::InvalidPayload(format!(
+                "evidence.published WORK_CONTEXT_ENTRY missing required metadata: \
+                 entry_id={entry_id:?}, kind={kind:?}, dedupe_key={dedupe_key:?}"
+            )));
+        }
+
+        let cas_hash_hex = hex::encode(&published.artifact_hash);
+
+        self.work_index.register_work_context_entry(
+            &published.work_id,
+            &entry_id,
+            &kind,
+            &dedupe_key,
+            &actor_id,
+            &cas_hash_hex,
+            &published.evidence_id,
+            event.timestamp_ns,
+        )?;
+
+        debug!(
+            event_id = %event.event_id,
+            work_id = %published.work_id,
+            entry_id = %entry_id,
+            kind = %kind,
+            "Projected WORK_CONTEXT_ENTRY evidence to work_context table"
+        );
 
         Ok(())
     }
@@ -7448,5 +7966,1144 @@ mod tests {
             )
             .expect("lifecycle column");
         assert!(ajc_blob.is_some(), "Lifecycle artifacts must be persisted");
+    }
+
+    // ========================================================================
+    // TCK-00638: work_context projection tests (RFC-0032 Phase 2)
+    // ========================================================================
+
+    /// BLOCKER 2a: Verify `WORK_CONTEXT_ENTRY` events are correctly indexed
+    /// in the `work_context` projection table.
+    #[test]
+    fn test_work_context_entry_projection_indexes_correctly() {
+        let conn = create_test_db();
+        let index = WorkIndex::new(Arc::clone(&conn)).unwrap();
+
+        index
+            .register_work_context_entry(
+                "W-001",
+                "CTX-abc123",
+                "HANDOFF_NOTE",
+                "dedup-key-1",
+                "actor-001",
+                "deadbeefdeadbeef",
+                "CTX-abc123",
+                1_000_000_000,
+            )
+            .unwrap();
+
+        // Query directly to verify the row was inserted.
+        let guard = conn.lock().unwrap();
+        let (entry_id, kind, dedupe_key, actor_id, cas_hash, evidence_id, created_at_ns): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+        ) = guard
+            .query_row(
+                "SELECT entry_id, kind, dedupe_key, actor_id, cas_hash, evidence_id, created_at_ns \
+                 FROM work_context WHERE work_id = ?1 AND entry_id = ?2",
+                params!["W-001", "CTX-abc123"],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("work_context row should exist");
+
+        assert_eq!(entry_id, "CTX-abc123");
+        assert_eq!(kind, "HANDOFF_NOTE");
+        assert_eq!(dedupe_key, "dedup-key-1");
+        assert_eq!(actor_id, "actor-001");
+        assert_eq!(cas_hash, "deadbeefdeadbeef");
+        assert_eq!(evidence_id, "CTX-abc123");
+        assert_eq!(created_at_ns, 1_000_000_000);
+    }
+
+    /// BLOCKER 2b: Verify duplicate events are handled idempotently via
+    /// INSERT OR IGNORE on the (`work_id`, `entry_id`) primary key.
+    #[test]
+    fn test_work_context_entry_projection_idempotent_duplicate() {
+        let conn = create_test_db();
+        let index = WorkIndex::new(Arc::clone(&conn)).unwrap();
+
+        // First insert.
+        index
+            .register_work_context_entry(
+                "W-002",
+                "CTX-dup-001",
+                "DIAGNOSIS",
+                "dedup-diag-1",
+                "actor-002",
+                "cafebabecafebabe",
+                "CTX-dup-001",
+                2_000_000_000,
+            )
+            .unwrap();
+
+        // Duplicate insert with same (work_id, entry_id) — must succeed (no error)
+        // but NOT overwrite the existing row.
+        index
+            .register_work_context_entry(
+                "W-002",
+                "CTX-dup-001",
+                "DIAGNOSIS",
+                "dedup-diag-1",
+                "actor-modified", // Different actor — should NOT overwrite.
+                "different_hash",
+                "CTX-dup-001",
+                3_000_000_000, // Different timestamp — should NOT overwrite.
+            )
+            .unwrap();
+
+        // Verify only 1 row exists (not 2).
+        let guard = conn.lock().unwrap();
+        let count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM work_context WHERE work_id = ?1 AND entry_id = ?2",
+                params!["W-002", "CTX-dup-001"],
+                |row| row.get(0),
+            )
+            .expect("count query should succeed");
+        assert_eq!(count, 1, "Duplicate insert must not create a second row");
+
+        // Verify original values are preserved (INSERT OR IGNORE keeps first).
+        let (actor_id, cas_hash, created_at_ns): (String, String, i64) = guard
+            .query_row(
+                "SELECT actor_id, cas_hash, created_at_ns FROM work_context \
+                 WHERE work_id = ?1 AND entry_id = ?2",
+                params!["W-002", "CTX-dup-001"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("row should exist");
+        assert_eq!(actor_id, "actor-002", "Original actor_id must be preserved");
+        assert_eq!(
+            cas_hash, "cafebabecafebabe",
+            "Original cas_hash must be preserved"
+        );
+        assert_eq!(
+            created_at_ns, 2_000_000_000,
+            "Original created_at_ns must be preserved"
+        );
+    }
+
+    /// BLOCKER 2c: Verify the UNIQUE constraint on (`work_id`, `kind`,
+    /// `dedupe_key`) also prevents duplicates via INSERT OR IGNORE.
+    #[test]
+    fn test_work_context_entry_projection_dedupe_key_uniqueness() {
+        let conn = create_test_db();
+        let index = WorkIndex::new(Arc::clone(&conn)).unwrap();
+
+        // First insert.
+        index
+            .register_work_context_entry(
+                "W-003",
+                "CTX-first",
+                "REVIEW_FINDING",
+                "review-key-1",
+                "actor-003",
+                "hash1111",
+                "CTX-first",
+                4_000_000_000,
+            )
+            .unwrap();
+
+        // Second insert with SAME (work_id, kind, dedupe_key) but DIFFERENT
+        // entry_id — violates the UNIQUE index on (work_id, kind, dedupe_key).
+        // INSERT OR IGNORE should silently skip.
+        index
+            .register_work_context_entry(
+                "W-003",
+                "CTX-second", // Different entry_id.
+                "REVIEW_FINDING",
+                "review-key-1", // Same dedupe_key.
+                "actor-003",
+                "hash2222",
+                "CTX-second",
+                5_000_000_000,
+            )
+            .unwrap();
+
+        // Verify total row count is 1 (the UNIQUE index prevented the second).
+        let guard = conn.lock().unwrap();
+        let count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM work_context WHERE work_id = ?1",
+                params!["W-003"],
+                |row| row.get(0),
+            )
+            .expect("count query should succeed");
+        assert_eq!(
+            count, 1,
+            "UNIQUE (work_id, kind, dedupe_key) must prevent second row"
+        );
+
+        // The surviving row should be the first one.
+        let entry_id: String = guard
+            .query_row(
+                "SELECT entry_id FROM work_context WHERE work_id = ?1",
+                params!["W-003"],
+                |row| row.get(0),
+            )
+            .expect("row should exist");
+        assert_eq!(
+            entry_id, "CTX-first",
+            "First inserted entry_id must survive"
+        );
+    }
+
+    /// Helper: builds a JSON-envelope payload matching `emit_session_event`
+    /// production format. The inner protobuf is hex-encoded in the `"payload"`
+    /// field of the JSON object.
+    fn build_session_event_envelope(inner_protobuf: &[u8]) -> Vec<u8> {
+        let envelope = serde_json::json!({
+            "event_type": "evidence.published",
+            "session_id": "test-session",
+            "actor_id": "test-actor",
+            "payload": hex::encode(inner_protobuf),
+        });
+        serde_json::to_vec(&envelope).expect("JSON serialization should not fail")
+    }
+
+    /// Helper: inserts an `evidence.published` event into the ledger with
+    /// production JSON-envelope wire format (matching `emit_session_event`).
+    fn insert_evidence_published_event(
+        conn: &Arc<Mutex<Connection>>,
+        event_id: &str,
+        work_id: &str,
+        inner_protobuf: &[u8],
+        timestamp_ns: i64,
+    ) {
+        let envelope_payload = build_session_event_envelope(inner_protobuf);
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO ledger_events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    event_id,
+                    "evidence.published",
+                    work_id,
+                    "actor-test",
+                    envelope_payload,
+                    vec![0u8; 64],
+                    timestamp_ns
+                ],
+            )
+            .expect("insert evidence.published event");
+    }
+
+    /// Helper: runs `process_evidence_published` on the worker via a
+    /// single-threaded tokio runtime (same pattern as `run_review_poll_once`).
+    fn run_evidence_published_poll_once(
+        worker: &mut ProjectionWorker,
+    ) -> Result<(), ProjectionWorkerError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async { worker.process_evidence_published().await })
+    }
+
+    /// BLOCKER: Verify `handle_evidence_published` correctly decodes the
+    /// JSON-envelope wire format (matching `emit_session_event` production
+    /// encoding), extracts metadata, and indexes `WORK_CONTEXT_ENTRY` events.
+    ///
+    /// This test calls the actual `handle_evidence_published` method on a
+    /// real `ProjectionWorker` with a properly wrapped JSON-envelope payload,
+    /// proving the production decode path works end-to-end.
+    #[test]
+    fn test_handle_evidence_published_indexes_work_context_entry() {
+        use prost::Message;
+
+        let conn = create_test_db();
+        let worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
+
+        // Build a realistic evidence.published protobuf.
+        let published = apm2_core::events::EvidencePublished {
+            evidence_id: "CTX-e2e-001".to_string(),
+            work_id: "W-E2E".to_string(),
+            category: "WORK_CONTEXT_ENTRY".to_string(),
+            artifact_hash: vec![0xAA; 32],
+            verification_command_ids: Vec::new(),
+            classification: "INTERNAL".to_string(),
+            artifact_size: 42,
+            metadata: vec![
+                "entry_id=CTX-e2e-001".to_string(),
+                "kind=HANDOFF_NOTE".to_string(),
+                "dedupe_key=e2e-dedup".to_string(),
+                "actor_id=actor-e2e".to_string(),
+            ],
+            time_envelope_ref: None,
+        };
+        let evidence_event = apm2_core::events::EvidenceEvent {
+            event: Some(apm2_core::events::evidence_event::Event::Published(
+                published,
+            )),
+        };
+        let inner_protobuf = evidence_event.encode_to_vec();
+
+        // Wrap in JSON envelope matching emit_session_event production format.
+        let envelope_payload = build_session_event_envelope(&inner_protobuf);
+
+        let event = crate::protocol::dispatch::SignedLedgerEvent {
+            event_id: "EVT-E2E-001".to_string(),
+            event_type: "evidence.published".to_string(),
+            work_id: "CTX-e2e-001".to_string(),
+            actor_id: "actor-e2e".to_string(),
+            payload: envelope_payload,
+            signature: vec![0u8; 64],
+            timestamp_ns: 6_000_000_000,
+        };
+
+        // Call the ACTUAL handle_evidence_published method on the worker.
+        worker
+            .handle_evidence_published(&event)
+            .expect("handle_evidence_published should succeed with JSON-envelope payload");
+
+        // Verify the row landed in the projection table.
+        let guard = conn.lock().unwrap();
+        let (stored_kind, stored_dedupe, stored_actor, stored_cas): (
+            String,
+            String,
+            String,
+            String,
+        ) = guard
+            .query_row(
+                "SELECT kind, dedupe_key, actor_id, cas_hash FROM work_context \
+                 WHERE work_id = ?1 AND entry_id = ?2",
+                params!["W-E2E", "CTX-e2e-001"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("work_context row should exist after handle_evidence_published");
+
+        assert_eq!(stored_kind, "HANDOFF_NOTE");
+        assert_eq!(stored_dedupe, "e2e-dedup");
+        assert_eq!(stored_actor, "actor-e2e");
+        assert_eq!(
+            stored_cas,
+            hex::encode([0xAA; 32]),
+            "cas_hash must match artifact_hash hex"
+        );
+    }
+
+    /// BLOCKER: Non-WORK_CONTEXT_ENTRY events are silently skipped by the
+    /// actual `handle_evidence_published` method. Uses production
+    /// JSON-envelope wire format and calls the real method.
+    #[test]
+    fn test_handle_evidence_published_skips_non_work_context() {
+        use prost::Message;
+
+        let conn = create_test_db();
+        let worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
+
+        let published = apm2_core::events::EvidencePublished {
+            evidence_id: "EV-other".to_string(),
+            work_id: "W-SKIP".to_string(),
+            category: "SECURITY_SCAN".to_string(),
+            artifact_hash: vec![0xBB; 32],
+            verification_command_ids: Vec::new(),
+            classification: "INTERNAL".to_string(),
+            artifact_size: 100,
+            metadata: vec![],
+            time_envelope_ref: None,
+        };
+        let evidence_event = apm2_core::events::EvidenceEvent {
+            event: Some(apm2_core::events::evidence_event::Event::Published(
+                published,
+            )),
+        };
+        let inner_protobuf = evidence_event.encode_to_vec();
+
+        // Wrap in JSON envelope matching production encoding.
+        let envelope_payload = build_session_event_envelope(&inner_protobuf);
+
+        let event = crate::protocol::dispatch::SignedLedgerEvent {
+            event_id: "EVT-SKIP-001".to_string(),
+            event_type: "evidence.published".to_string(),
+            work_id: "W-SKIP".to_string(),
+            actor_id: "actor-skip".to_string(),
+            payload: envelope_payload,
+            signature: vec![0u8; 64],
+            timestamp_ns: 7_000_000_000,
+        };
+
+        // Call the ACTUAL handle_evidence_published method — should succeed
+        // (skip) without error.
+        worker
+            .handle_evidence_published(&event)
+            .expect("non-WORK_CONTEXT_ENTRY events should be silently skipped");
+
+        // Verify no row was inserted.
+        let guard = conn.lock().unwrap();
+        let count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM work_context WHERE work_id = ?1",
+                params!["W-SKIP"],
+                |row| row.get(0),
+            )
+            .expect("count query should succeed");
+        assert_eq!(
+            count, 0,
+            "Non-WORK_CONTEXT_ENTRY events must not produce work_context rows"
+        );
+    }
+
+    /// E2E: Feeds a real wrapped ledger payload through the full
+    /// `process_evidence_published` async path (tailer poll -> decode ->
+    /// projection insert -> acknowledge) and verifies successful indexing.
+    #[test]
+    fn test_process_evidence_published_e2e_full_pipeline() {
+        use prost::Message;
+
+        let conn = create_test_db();
+        let mut worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
+
+        // Build a WORK_CONTEXT_ENTRY evidence event protobuf.
+        let published = apm2_core::events::EvidencePublished {
+            evidence_id: "CTX-pipeline-001".to_string(),
+            work_id: "W-PIPELINE".to_string(),
+            category: "WORK_CONTEXT_ENTRY".to_string(),
+            artifact_hash: vec![0xCC; 32],
+            verification_command_ids: Vec::new(),
+            classification: "INTERNAL".to_string(),
+            artifact_size: 99,
+            metadata: vec![
+                "entry_id=CTX-pipeline-001".to_string(),
+                "kind=REVIEW_FINDING".to_string(),
+                "dedupe_key=pipeline-dedup".to_string(),
+                "actor_id=actor-pipeline".to_string(),
+            ],
+            time_envelope_ref: None,
+        };
+        let evidence_event = apm2_core::events::EvidenceEvent {
+            event: Some(apm2_core::events::evidence_event::Event::Published(
+                published,
+            )),
+        };
+        let inner_protobuf = evidence_event.encode_to_vec();
+
+        // Insert the event into the ledger in production JSON-envelope format.
+        insert_evidence_published_event(
+            &conn,
+            "EVT-PIPELINE-001",
+            "W-PIPELINE",
+            &inner_protobuf,
+            8_000_000_000,
+        );
+
+        // Also insert a non-WORK_CONTEXT_ENTRY event to verify it is skipped.
+        let skip_published = apm2_core::events::EvidencePublished {
+            evidence_id: "EV-sec-scan".to_string(),
+            work_id: "W-PIPELINE".to_string(),
+            category: "SECURITY_SCAN".to_string(),
+            artifact_hash: vec![0xDD; 32],
+            verification_command_ids: Vec::new(),
+            classification: "INTERNAL".to_string(),
+            artifact_size: 50,
+            metadata: vec![],
+            time_envelope_ref: None,
+        };
+        let skip_event = apm2_core::events::EvidenceEvent {
+            event: Some(apm2_core::events::evidence_event::Event::Published(
+                skip_published,
+            )),
+        };
+        insert_evidence_published_event(
+            &conn,
+            "EVT-SKIP-002",
+            "W-PIPELINE",
+            &skip_event.encode_to_vec(),
+            9_000_000_000,
+        );
+
+        // Poll: process_evidence_published should decode both events,
+        // index the WORK_CONTEXT_ENTRY one, skip the SECURITY_SCAN one,
+        // and acknowledge both.
+        run_evidence_published_poll_once(&mut worker)
+            .expect("process_evidence_published should succeed");
+
+        // Verify: exactly 1 work_context row for the WORK_CONTEXT_ENTRY event.
+        let guard = conn.lock().unwrap();
+        let (stored_kind, stored_dedupe, stored_actor, stored_cas): (
+            String,
+            String,
+            String,
+            String,
+        ) = guard
+            .query_row(
+                "SELECT kind, dedupe_key, actor_id, cas_hash FROM work_context \
+                 WHERE work_id = ?1 AND entry_id = ?2",
+                params!["W-PIPELINE", "CTX-pipeline-001"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("work_context row should exist after full pipeline");
+
+        assert_eq!(stored_kind, "REVIEW_FINDING");
+        assert_eq!(stored_dedupe, "pipeline-dedup");
+        assert_eq!(stored_actor, "actor-pipeline");
+        assert_eq!(
+            stored_cas,
+            hex::encode([0xCC; 32]),
+            "cas_hash must match artifact_hash hex"
+        );
+
+        // Verify: no row for the SECURITY_SCAN event.
+        let skip_count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM work_context WHERE entry_id = ?1",
+                params!["EV-sec-scan"],
+                |row| row.get(0),
+            )
+            .expect("count query should succeed");
+        assert_eq!(
+            skip_count, 0,
+            "SECURITY_SCAN evidence must not produce work_context rows"
+        );
+
+        // Verify: total work_context rows for W-PIPELINE is exactly 1.
+        let total_count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM work_context WHERE work_id = ?1",
+                params!["W-PIPELINE"],
+                |row| row.get(0),
+            )
+            .expect("count query should succeed");
+        assert_eq!(
+            total_count, 1,
+            "Only the WORK_CONTEXT_ENTRY event should produce a projection row"
+        );
+    }
+
+    /// Regression: raw protobuf payload (without JSON envelope) must be
+    /// rejected by `handle_evidence_published`. This proves that the method
+    /// does NOT silently accept the old incorrect format.
+    #[test]
+    fn test_handle_evidence_published_rejects_raw_protobuf() {
+        use prost::Message;
+
+        let conn = create_test_db();
+        let worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
+
+        let published = apm2_core::events::EvidencePublished {
+            evidence_id: "CTX-raw".to_string(),
+            work_id: "W-RAW".to_string(),
+            category: "WORK_CONTEXT_ENTRY".to_string(),
+            artifact_hash: vec![0xEE; 32],
+            verification_command_ids: Vec::new(),
+            classification: "INTERNAL".to_string(),
+            artifact_size: 42,
+            metadata: vec![
+                "entry_id=CTX-raw".to_string(),
+                "kind=HANDOFF_NOTE".to_string(),
+                "dedupe_key=raw-key".to_string(),
+                "actor_id=actor-raw".to_string(),
+            ],
+            time_envelope_ref: None,
+        };
+        let evidence_event = apm2_core::events::EvidenceEvent {
+            event: Some(apm2_core::events::evidence_event::Event::Published(
+                published,
+            )),
+        };
+        // Raw protobuf bytes WITHOUT the JSON envelope wrapper.
+        let raw_protobuf = evidence_event.encode_to_vec();
+
+        let event = crate::protocol::dispatch::SignedLedgerEvent {
+            event_id: "EVT-RAW-001".to_string(),
+            event_type: "evidence.published".to_string(),
+            work_id: "W-RAW".to_string(),
+            actor_id: "actor-raw".to_string(),
+            payload: raw_protobuf,
+            signature: vec![0u8; 64],
+            timestamp_ns: 10_000_000_000,
+        };
+
+        // The method must return an error because the payload is not a valid
+        // JSON envelope.
+        let result = worker.handle_evidence_published(&event);
+        assert!(
+            result.is_err(),
+            "Raw protobuf payload (without JSON envelope) must be rejected"
+        );
+    }
+
+    /// Security regression: a permanently malformed evidence.published event
+    /// must NOT cause head-of-line blocking. The tailer must acknowledge
+    /// (skip) the defective event and continue processing subsequent valid
+    /// events.
+    ///
+    /// Scenario: insert a malformed event (raw protobuf, no JSON envelope),
+    /// followed by a valid `WORK_CONTEXT_ENTRY` event. After one poll cycle,
+    /// the malformed event is acknowledged and the valid event is indexed.
+    #[test]
+    fn test_process_evidence_published_skips_malformed_no_head_of_line_block() {
+        use prost::Message;
+
+        let conn = create_test_db();
+        let mut worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
+
+        // Event 1: malformed — raw protobuf without JSON envelope wrapper.
+        let published_bad = apm2_core::events::EvidencePublished {
+            evidence_id: "CTX-bad".to_string(),
+            work_id: "W-HOL-TEST".to_string(),
+            category: "WORK_CONTEXT_ENTRY".to_string(),
+            artifact_hash: vec![0xFF; 32],
+            verification_command_ids: Vec::new(),
+            classification: "INTERNAL".to_string(),
+            artifact_size: 42,
+            metadata: vec![
+                "entry_id=CTX-bad".to_string(),
+                "kind=HANDOFF_NOTE".to_string(),
+                "dedupe_key=bad-key".to_string(),
+                "actor_id=actor-bad".to_string(),
+            ],
+            time_envelope_ref: None,
+        };
+        let bad_event = apm2_core::events::EvidenceEvent {
+            event: Some(apm2_core::events::evidence_event::Event::Published(
+                published_bad,
+            )),
+        };
+        // Insert as raw protobuf (NOT wrapped in JSON envelope) — this is
+        // permanently malformed and will cause InvalidPayload on decode.
+        let raw_protobuf = bad_event.encode_to_vec();
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO ledger_events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "EVT-BAD-001",
+                    "evidence.published",
+                    "W-HOL-TEST",
+                    "actor-bad",
+                    raw_protobuf,
+                    vec![0u8; 64],
+                    11_000_000_000i64
+                ],
+            )
+            .expect("insert malformed event");
+
+        // Event 2: valid WORK_CONTEXT_ENTRY with correct JSON envelope.
+        let published_good = apm2_core::events::EvidencePublished {
+            evidence_id: "CTX-good".to_string(),
+            work_id: "W-HOL-TEST".to_string(),
+            category: "WORK_CONTEXT_ENTRY".to_string(),
+            artifact_hash: vec![0xAA; 32],
+            verification_command_ids: Vec::new(),
+            classification: "INTERNAL".to_string(),
+            artifact_size: 99,
+            metadata: vec![
+                "entry_id=CTX-good".to_string(),
+                "kind=DIAGNOSIS".to_string(),
+                "dedupe_key=good-key".to_string(),
+                "actor_id=actor-good".to_string(),
+            ],
+            time_envelope_ref: None,
+        };
+        let good_event = apm2_core::events::EvidenceEvent {
+            event: Some(apm2_core::events::evidence_event::Event::Published(
+                published_good,
+            )),
+        };
+        insert_evidence_published_event(
+            &conn,
+            "EVT-GOOD-001",
+            "W-HOL-TEST",
+            &good_event.encode_to_vec(),
+            12_000_000_000,
+        );
+
+        // Poll cycle 1: should acknowledge the malformed event (skip) and
+        // process the valid event. No head-of-line blocking.
+        run_evidence_published_poll_once(&mut worker)
+            .expect("process_evidence_published should not fail on malformed payload");
+
+        // If there was head-of-line blocking, we might need a second poll.
+        // Run a second poll to prove forward progress completes.
+        run_evidence_published_poll_once(&mut worker).expect("second poll should also succeed");
+
+        // Verify: the valid event was indexed.
+        let guard = conn.lock().unwrap();
+        let (stored_kind, stored_dedupe): (String, String) = guard
+            .query_row(
+                "SELECT kind, dedupe_key FROM work_context \
+                 WHERE work_id = ?1 AND entry_id = ?2",
+                params!["W-HOL-TEST", "CTX-good"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("valid WORK_CONTEXT_ENTRY must be indexed despite preceding malformed event");
+        assert_eq!(stored_kind, "DIAGNOSIS");
+        assert_eq!(stored_dedupe, "good-key");
+
+        // Verify: the malformed event did NOT produce a projection row.
+        let bad_count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM work_context WHERE entry_id = ?1",
+                params!["CTX-bad"],
+                |row| row.get(0),
+            )
+            .expect("count query should succeed");
+        assert_eq!(
+            bad_count, 0,
+            "Malformed event must not produce a work_context row"
+        );
+    }
+
+    /// TCK-00638 / BLOCKER-2 regression test: `LedgerTailer::poll_events`
+    /// discovers events written to the canonical `events` table when in
+    /// freeze mode.
+    ///
+    /// Proves: When both `ledger_events` (legacy) and `events` (canonical)
+    /// tables exist, `poll_events` merges results from both sources and
+    /// synthesises `event_id` = `"canonical-{seq_id}"` for canonical rows.
+    #[test]
+    fn test_tailer_poll_events_discovers_canonical_events() {
+        use prost::Message;
+
+        // 1. Create in-memory DB with legacy schema + work index.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ledger_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                work_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                signature BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(WORK_INDEX_SCHEMA_SQL).unwrap();
+
+        // 2. Create canonical `events` table (same schema as `init_canonical_schema`
+        //    produces).
+        conn.execute_batch(
+            "CREATE TABLE events (
+                seq_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                actor_id   TEXT NOT NULL,
+                payload    BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL,
+                prev_hash  TEXT NOT NULL DEFAULT 'genesis',
+                event_hash TEXT NOT NULL DEFAULT '',
+                signature  BLOB
+            );",
+        )
+        .unwrap();
+
+        // 3. Insert a legacy event to prove the tailer reads both sources.
+        let legacy_proto = {
+            let published = apm2_core::events::EvidencePublished {
+                evidence_id: "CTX-legacy-entry".to_string(),
+                work_id: "W-TAILER-LEGACY".to_string(),
+                category: "WORK_CONTEXT_ENTRY".to_string(),
+                artifact_hash: vec![0xAA; 32],
+                verification_command_ids: Vec::new(),
+                classification: "INTERNAL".to_string(),
+                artifact_size: 50,
+                metadata: Vec::new(),
+                time_envelope_ref: None,
+            };
+            let ev = apm2_core::events::EvidenceEvent {
+                event: Some(apm2_core::events::evidence_event::Event::Published(
+                    published,
+                )),
+            };
+            ev.encode_to_vec()
+        };
+        let legacy_envelope = build_session_event_envelope(&legacy_proto);
+        conn.execute(
+            "INSERT INTO ledger_events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "EVT-LEGACY-001",
+                "evidence.published",
+                "W-TAILER-LEGACY",
+                "actor-test",
+                legacy_envelope,
+                vec![0u8; 64],
+                1_000_000_000_i64
+            ],
+        )
+        .unwrap();
+
+        // 4. Insert a canonical event with a later timestamp.
+        let canonical_proto = {
+            let published = apm2_core::events::EvidencePublished {
+                evidence_id: "CTX-canonical-entry".to_string(),
+                work_id: "W-TAILER-CANONICAL".to_string(),
+                category: "WORK_CONTEXT_ENTRY".to_string(),
+                artifact_hash: vec![0xBB; 32],
+                verification_command_ids: Vec::new(),
+                classification: "INTERNAL".to_string(),
+                artifact_size: 75,
+                metadata: Vec::new(),
+                time_envelope_ref: None,
+            };
+            let ev = apm2_core::events::EvidenceEvent {
+                event: Some(apm2_core::events::evidence_event::Event::Published(
+                    published,
+                )),
+            };
+            ev.encode_to_vec()
+        };
+        let canonical_envelope = build_session_event_envelope(&canonical_proto);
+        conn.execute(
+            "INSERT INTO events (event_type, session_id, actor_id, payload, timestamp_ns) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "evidence.published",
+                "W-TAILER-CANONICAL",
+                "actor-canonical",
+                canonical_envelope,
+                2_000_000_000_i64
+            ],
+        )
+        .unwrap();
+
+        let conn_arc = Arc::new(Mutex::new(conn));
+
+        // 5. Create tailer and poll — must return BOTH events.
+        let mut tailer = LedgerTailer::new(Arc::clone(&conn_arc));
+        let events = tailer
+            .poll_events("evidence.published", 100)
+            .expect("poll_events must succeed");
+
+        assert_eq!(
+            events.len(),
+            2,
+            "BLOCKER-2 fix: poll_events must return events from BOTH \
+             legacy and canonical tables, got {} event(s)",
+            events.len()
+        );
+
+        // 6. Verify ordering: legacy (ts=1B) before canonical (ts=2B).
+        assert_eq!(
+            events[0].event_id, "EVT-LEGACY-001",
+            "First event must be the legacy event"
+        );
+        assert!(
+            events[1].event_id.starts_with("canonical-"),
+            "Second event must have synthesised canonical event_id, got: {}",
+            events[1].event_id
+        );
+
+        // 7. Verify canonical event fields are correctly mapped.
+        let canonical_evt = &events[1];
+        assert_eq!(canonical_evt.event_type, "evidence.published");
+        assert_eq!(
+            canonical_evt.work_id, "W-TAILER-CANONICAL",
+            "canonical session_id must map to work_id"
+        );
+        assert_eq!(canonical_evt.timestamp_ns, 2_000_000_000);
+
+        // 8. Acknowledge the first event and poll again — must return only the
+        //    canonical event.
+        tailer
+            .acknowledge(events[0].timestamp_ns, &events[0].event_id)
+            .expect("acknowledge legacy event");
+
+        let events2 = tailer
+            .poll_events("evidence.published", 100)
+            .expect("second poll must succeed");
+        assert_eq!(
+            events2.len(),
+            1,
+            "After acknowledging the legacy event, only the canonical event should remain"
+        );
+        assert!(
+            events2[0].event_id.starts_with("canonical-"),
+            "Remaining event must be the canonical event"
+        );
+
+        // 9. Acknowledge the canonical event and poll again — must be empty.
+        tailer
+            .acknowledge(events2[0].timestamp_ns, &events2[0].event_id)
+            .expect("acknowledge canonical event");
+
+        let events3 = tailer
+            .poll_events("evidence.published", 100)
+            .expect("third poll must succeed");
+        assert!(
+            events3.is_empty(),
+            "After acknowledging all events, poll must return empty"
+        );
+    }
+
+    /// TCK-00638 / BLOCKER-2 regression test: When no canonical `events`
+    /// table exists, `poll_events` only returns legacy events (no error).
+    #[test]
+    fn test_tailer_poll_events_legacy_only_when_no_canonical_table() {
+        let conn = create_test_db();
+
+        // Insert a legacy event.
+        conn.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO ledger_events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "EVT-LEGACY-ONLY",
+                    "evidence.published",
+                    "W-LEGACY",
+                    "actor-test",
+                    vec![0u8; 10],
+                    vec![0u8; 64],
+                    1_000_i64
+                ],
+            )
+            .unwrap();
+
+        let mut tailer = LedgerTailer::new(conn);
+        let events = tailer
+            .poll_events("evidence.published", 100)
+            .expect("poll must succeed without canonical table");
+
+        assert_eq!(
+            events.len(),
+            1,
+            "Legacy-only mode must return the single legacy event"
+        );
+        assert_eq!(events[0].event_id, "EVT-LEGACY-ONLY");
+    }
+
+    // =========================================================================
+    // TCK-00638 fix regression tests:
+    //   1. Canonical cursor skip under timestamp collisions (>9 events)
+    //   2. work_context eviction in evict_expired / evict_expired_async
+    // =========================================================================
+
+    /// MAJOR [Security] regression test: canonical tailer cursor must not
+    /// skip events when >9 canonical rows share the same timestamp and a
+    /// batch limit forces pagination.
+    ///
+    /// Before the fix, `"canonical-10"` sorted lexicographically BEFORE
+    /// `"canonical-9"`, causing the cursor to advance past unprocessed rows
+    /// with `seq_id >= 10`. The zero-padded `event_id` format
+    /// (`"canonical-{seq_id:020}"`) eliminates the ordering mismatch.
+    #[test]
+    fn test_canonical_cursor_no_skip_above_9_events_same_timestamp() {
+        // Setup: in-memory DB with both legacy + canonical tables.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ledger_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                work_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                signature BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(WORK_INDEX_SCHEMA_SQL).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (
+                seq_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                actor_id   TEXT NOT NULL,
+                payload    BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL,
+                prev_hash  TEXT NOT NULL DEFAULT 'genesis',
+                event_hash TEXT NOT NULL DEFAULT '',
+                signature  BLOB
+            );",
+        )
+        .unwrap();
+
+        // Insert 15 canonical events ALL sharing the same timestamp.
+        let same_ts: i64 = 5_000_000_000;
+        for i in 1..=15 {
+            conn.execute(
+                "INSERT INTO events (event_type, session_id, actor_id, payload, timestamp_ns) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "evidence.published",
+                    format!("W-CURSOR-{i}"),
+                    "actor-test",
+                    vec![0u8; 10],
+                    same_ts
+                ],
+            )
+            .unwrap();
+        }
+
+        let conn_arc = Arc::new(Mutex::new(conn));
+        let mut tailer = LedgerTailer::new(Arc::clone(&conn_arc));
+
+        // Poll with batch_size = 5 (forces 3 pagination rounds).
+        let batch1 = tailer
+            .poll_events("evidence.published", 5)
+            .expect("first poll must succeed");
+        assert_eq!(batch1.len(), 5, "First batch must return exactly 5 events");
+
+        // Acknowledge all events in batch 1.
+        for ev in &batch1 {
+            tailer
+                .acknowledge(ev.timestamp_ns, &ev.event_id)
+                .expect("acknowledge must succeed");
+        }
+
+        // Poll again — should return the NEXT 5 events (seq_id 6..10).
+        let batch2 = tailer
+            .poll_events("evidence.published", 5)
+            .expect("second poll must succeed");
+        assert_eq!(
+            batch2.len(),
+            5,
+            "Second batch must return exactly 5 events (seq_id 6..10), \
+             got {}: cursor must not skip events with seq_id >= 10",
+            batch2.len()
+        );
+
+        // Acknowledge batch 2.
+        for ev in &batch2 {
+            tailer
+                .acknowledge(ev.timestamp_ns, &ev.event_id)
+                .expect("acknowledge must succeed");
+        }
+
+        // Poll again — should return remaining 5 events (seq_id 11..15).
+        let batch3 = tailer
+            .poll_events("evidence.published", 5)
+            .expect("third poll must succeed");
+        assert_eq!(
+            batch3.len(),
+            5,
+            "Third batch must return exactly 5 events (seq_id 11..15), \
+             got {}: zero-padded cursor must not skip high seq_ids",
+            batch3.len()
+        );
+
+        // Acknowledge batch 3.
+        for ev in &batch3 {
+            tailer
+                .acknowledge(ev.timestamp_ns, &ev.event_id)
+                .expect("acknowledge must succeed");
+        }
+
+        // Final poll — must be empty (all 15 events consumed).
+        let batch4 = tailer
+            .poll_events("evidence.published", 5)
+            .expect("fourth poll must succeed");
+        assert_eq!(
+            batch4.len(),
+            0,
+            "All 15 events must have been consumed; remaining = {}",
+            batch4.len()
+        );
+
+        // Verify the zero-padded event_id format is consistent.
+        assert!(
+            batch1[0]
+                .event_id
+                .starts_with("canonical-0000000000000000000"),
+            "event_id must be zero-padded, got: {}",
+            batch1[0].event_id
+        );
+    }
+
+    /// BLOCKER [Code-quality] regression test: `evict_expired` must
+    /// delete expired rows from the `work_context` table using the
+    /// nanosecond `created_at_ns` column.
+    #[test]
+    fn test_evict_expired_includes_work_context_table() {
+        let conn = create_test_db();
+        let index = WorkIndex::new(Arc::clone(&conn)).unwrap();
+
+        // Insert an old work_context entry (created_at_ns = 0, i.e. epoch).
+        index
+            .register_work_context_entry(
+                "W-OLD",
+                "CTX-old-entry",
+                "DIAGNOSIS",
+                "dedup-old",
+                "actor-old",
+                "hash-old",
+                "CTX-old-entry",
+                0, // nanoseconds: epoch => very old
+            )
+            .expect("register old entry");
+
+        // Insert a fresh work_context entry with a recent timestamp.
+        // Use a timestamp well in the future (year ~2040 in ns).
+        let recent_ns: u64 = 2_200_000_000_000_000_000;
+        index
+            .register_work_context_entry(
+                "W-NEW",
+                "CTX-new-entry",
+                "DIAGNOSIS",
+                "dedup-new",
+                "actor-new",
+                "hash-new",
+                "CTX-new-entry",
+                recent_ns,
+            )
+            .expect("register new entry");
+
+        // Verify both rows exist before eviction.
+        {
+            let guard = conn.lock().unwrap();
+            let count: i64 = guard
+                .query_row("SELECT COUNT(*) FROM work_context", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 2, "Both entries must exist before eviction");
+        }
+
+        // Evict with 1-second TTL — the old entry (created_at_ns = 0)
+        // should be deleted, the recent entry should survive.
+        let deleted = index.evict_expired(1).unwrap();
+        assert!(
+            deleted >= 1,
+            "evict_expired must delete at least 1 entry (the old work_context row)"
+        );
+
+        // Verify: old entry is gone.
+        {
+            let guard = conn.lock().unwrap();
+            let old_count: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM work_context WHERE entry_id = ?1",
+                    params!["CTX-old-entry"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(old_count, 0, "Old work_context entry must be evicted");
+        }
+
+        // Verify: new entry survives.
+        {
+            let guard = conn.lock().unwrap();
+            let new_count: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM work_context WHERE entry_id = ?1",
+                    params!["CTX-new-entry"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                new_count, 1,
+                "Recent work_context entry must survive eviction"
+            );
+        }
     }
 }

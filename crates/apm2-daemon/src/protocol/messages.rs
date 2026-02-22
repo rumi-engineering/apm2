@@ -422,6 +422,9 @@ impl_bounded_decode_simple!(
     // TCK-00635: OpenWork (RFC-0032 Phase 1)
     OpenWorkRequest,
     OpenWorkResponse,
+    // TCK-00638: Work context entry publishing
+    PublishWorkContextEntryRequest,
+    PublishWorkContextEntryResponse,
 );
 
 // Implement BoundedDecode for messages with repeated fields

@@ -161,6 +161,7 @@ fn dotted_completed_event(
         vec![9, 9, 9, 9],
         vec!["EVID-1".to_string()],
         "GR-1",
+        "",
     );
     event_record(
         "work.completed",

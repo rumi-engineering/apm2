@@ -147,7 +147,7 @@ Handshake messages for version negotiation.
 
 Protobuf-generated message types including `BoundedDecode` and `Canonicalize` traits. Key message families:
 
-- **Privileged**: `ClaimWorkRequest/Response`, `SpawnEpisodeRequest/Response`, `ShutdownRequest/Response`, `IssueCapabilityRequest/Response`, `OpenWorkRequest/Response`
+- **Privileged**: `ClaimWorkRequest/Response`, `SpawnEpisodeRequest/Response`, `ShutdownRequest/Response`, `IssueCapabilityRequest/Response`, `OpenWorkRequest/Response`, `PublishWorkContextEntryRequest/Response`
 - **Session**: `RequestToolRequest/Response`, `EmitEventRequest/Response`, `PublishEvidenceRequest/Response`, `StreamTelemetryRequest/Response`
 - **HEF Pulse**: `SubscribePulseRequest/Response`, `PulseEnvelopeV1`, `PulseEvent`
 - **Process Mgmt**: `ListProcessesRequest/Response`, `StartProcessRequest/Response`
@@ -164,6 +164,10 @@ ACL evaluation for Pulse Plane topic subscriptions.
 ### `TopicPattern` / `TopicDeriver`
 
 Topic grammar, wildcard matching, and deterministic topic derivation.
+
+**Multi-Topic Derivation (TCK-00642):**
+
+Work graph edge events (`work_graph.edge.added/removed/waived`) produce **two** topics per event: one for `from_work_id` and one for `to_work_id`. The `derive_topics()` method handles this. `derive_topic()` returns `MultiTopicEventError` for these event types to prevent silent data loss of the secondary topic. Topic prefix is `work_graph.` (NOT `work.`) to avoid WorkReducer decoding collision (INV-TOPIC-005). Canonical event type strings use dotted notation (`work_graph.edge.added`, not `WorkEdgeAdded`).
 
 ## Public API
 
@@ -196,3 +200,4 @@ The module provides extensive re-exports. Key entries:
 - CTR-WH001: Constant-time HMAC comparison
 - TCK-00495: Consumption events carry `receipt_hash` and `admission_bundle_digest` for O(1) correlation; `RedundancyReceiptConsumption` extended with binding fields
 - TCK-00635: `OpenWork` (IPC-PRIV-076) handler persists WorkSpec to CAS and emits a canonical `work.opened` event. PCAC lifecycle enforcement runs BEFORE any idempotency queries to prevent unauthorized callers from probing work_id existence (no existence oracle). **All pre-admission rejections use uniform `CapabilityRequestRejected` error codes** -- this includes protobuf decode failures, empty/invalid WorkSpec JSON, oversized IDs, UTF-8 validation failures, canonicalization failures, and missing peer credentials. No pre-PCAC path returns `InvalidArgument` or propagates `ProtocolError::Serialization`; the uniform error code prevents side-channel differentiation of rejection causes by unauthorized callers. Idempotent on `(work_id, spec_hash)` via bounded `LIMIT 1` query (not full event scan): same hash returns success with `already_existed=true`; different hash returns `WORK_ALREADY_EXISTS`. Actor ID derived from peer credentials (never client input). CAS must be configured (fail-closed). Race-safe: partial unique indices enforce at-most-one `work.opened` per `work_id` on BOTH tables: `idx_work_opened_unique ON ledger_events(work_id) WHERE event_type = 'work.opened'` (legacy) and `idx_canonical_work_opened_unique ON events(session_id) WHERE event_type = 'work.opened'` (canonical). UNIQUE constraint violations are caught in the handler, the persisted event is re-read, and idempotent success or `WORK_ALREADY_EXISTS` is returned.
+- TCK-00638: RFC-0032 Phase 2 PublishWorkContextEntry handler (IPC-PRIV-077) -- CAS-first storage, `evidence.published` ledger anchor, deterministic `CTX-` entry ID derivation, `work_context` projection. **Invariant**: idempotent replay check runs AFTER PCAC lifecycle enforcement (join/revalidate/consume) so replayed requests are denied when the caller's lease has been revoked or policy state has changed. **Invariant (Intent Digest Binding)**: `effect_intent_digest` is computed over the canonical JSON bytes (post daemon-authoritative field overwrite of `entry_id`, `actor_id`, `created_at_ns`, `source_session_id`) rather than raw `request.entry_json`, fulfilling RFC-0027 Law 2 (Intent Equality) and Law 7 (Evidence Sufficiency).

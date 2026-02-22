@@ -91,6 +91,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_work_opened_unique
 ON events (session_id)
 WHERE event_type = 'work.opened';
 
+-- TCK-00638: At-most-one evidence.published per evidence_id in canonical events.
+-- Defense-in-depth constraint for PublishWorkContextEntry idempotency: the
+-- application-level check provides the idempotent fast-path, while this
+-- database constraint provides the authoritative uniqueness guarantee that
+-- cannot be bypassed by race conditions under concurrent dispatch.
+-- The evidence_id is surfaced in the top-level JSON envelope by
+-- emit_evidence_published_event so json_extract can access it.
+-- CAST(payload AS TEXT) is required because the payload column is BLOB and
+-- SQLite < 3.45 does not support json_extract on BLOB directly.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_evidence_published_unique
+ON events (json_extract(CAST(payload AS TEXT), '$.evidence_id'))
+WHERE event_type = 'evidence.published';
+
 -- Artifact references table: content-addressable storage references
 -- Links events to their associated artifacts stored in CAS
 CREATE TABLE IF NOT EXISTS artifact_refs (

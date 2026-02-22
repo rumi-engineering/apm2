@@ -8,7 +8,7 @@ The `projection` module implements write-only projection adapters that synchroni
 
 ### Components
 
-- **`ProjectionWorker`**: Long-running worker that tails the ledger for `ReviewReceiptRecorded` events and projects review results to GitHub. Enforces economics-gated admission plus projection lifecycle gate (`join -> revalidate -> consume`) before effects (TCK-00505). ALL events must pass through the economics gate; events without economics selectors are DENIED (fail-closed: no bypass path).
+- **`ProjectionWorker`**: Long-running worker that tails the ledger for `ReviewReceiptRecorded` events and projects review results to GitHub. Also tails `evidence.published` events for `work_context` projection (TCK-00638). The `handle_evidence_published` method decodes the production JSON-envelope wire format (`emit_session_event` stores events as `{"payload": "<hex-encoded-protobuf>", ...}`): it first parses the JSON, extracts the hex-encoded inner payload, hex-decodes it, then protobuf-decodes the `EvidenceEvent` (TCK-00638 R3 fix). Enforces economics-gated admission plus projection lifecycle gate (`join -> revalidate -> consume`) before effects (TCK-00505). ALL events must pass through the economics gate; events without economics selectors are DENIED (fail-closed: no bypass path).
 - **`AdmissionTelemetry`**: Thread-safe atomic counters for economics admit/deny decisions per subcategory (TCK-00505)
 - **`lifecycle_deny`**: Constants for denial subcategories (consumed, revoked, stale, missing_gate, missing_economics_selectors, missing_lifecycle_selectors) used in replay prevention and gate failure scenarios (TCK-00505)
 - **`GitHubProjectionAdapter`**: Write-only GitHub commit status projection with signed receipts
@@ -56,6 +56,7 @@ Long-running worker that tails ledger and projects review results to GitHub.
 - [INV-PJ12] Events without economics selectors are DENIED with `missing_economics_selectors` subcategory — no bypass path exists (TCK-00505).
 - [INV-PJ13] Already-projected intents (same `work_id + changeset_digest`) result in DENY via IntentBuffer uniqueness -- idempotent-insert replay prevention (TCK-00505).
 - [INV-PJ14] No projection side effect executes unless lifecycle gate `join -> revalidate -> consume` succeeds (TCK-00505).
+- [INV-PJ15] Permanently malformed `evidence.published` events (InvalidPayload) are acknowledged and skipped to prevent head-of-line blocking; transient errors retry on next poll cycle (TCK-00638 R4 fix).
 
 **Contracts:**
 
@@ -187,11 +188,24 @@ Tracks active intervention freezes. Freezes require adjudication-based `Interven
 
 ### `WorkIndex`
 
-Maps `changeset_digest` to `work_id` to PR metadata for projection routing.
+Maps `changeset_digest` to `work_id` to PR metadata for projection routing. Also manages the `work_context` projection table (TCK-00638) with `register_work_context_entry()` for idempotent INSERT OR IGNORE.
+
+**Tables:**
+
+- `changeset_map`, `pr_metadata` -- projection routing tables
+- `work_context` -- work context entries projected from `evidence.published` events (TCK-00638). Primary key `(work_id, entry_id)`, unique constraint on `(work_id, kind, dedupe_key)`, indexed by `work_id` and `created_at_ns`. Included in `evict_expired` / `evict_expired_async` TTL-based eviction using `created_at_ns` (nanoseconds) with seconds-to-nanoseconds conversion (BLOCKER fix: unbounded state growth).
 
 ### `LedgerTailer`
 
-Ledger event tailer that drives projection decisions.
+Ledger event tailer that drives projection decisions. Uses a composite cursor `(timestamp_ns, event_id)` for deterministic ordering and at-least-once delivery semantics.
+
+**Freeze-aware canonical reads (TCK-00638):** When the canonical `events` table exists (freeze mode active), `poll_events` and `poll_events_async` merge results from both `ledger_events` (legacy) and `events` (canonical) tables, sorted by `(timestamp_ns, event_id)` and truncated to the batch limit. Canonical events use synthesised `event_id` = `"canonical-{seq_id:020}"` (20-digit zero-padded) and map `session_id` to `work_id`. Canonical mode is lazily detected via `sqlite_master` probe and cached in an `AtomicU8` (0=unknown, 1=legacy-only, 2=canonical-active). The zero-padded format ensures lexicographic ordering matches numeric `seq_id` ordering, preventing cursor skip when >9 canonical events share the same timestamp (MAJOR fix: timestamp collision cursor skip).
+
+**Invariants:**
+
+- [INV-LT01] Canonical mode detection is cached after first probe -- no repeated `sqlite_master` queries per poll cycle.
+- [INV-LT02] Merged results are always sorted by `(timestamp_ns, event_id)` for deterministic cursor advancement.
+- [INV-LT03] When no canonical `events` table exists, the tailer operates in legacy-only mode with no error.
 
 ### `IntentBuffer` (TCK-00504)
 
@@ -350,3 +364,4 @@ Worker that drains the deferred replay backlog after sink recovery. For each rep
 - TCK-00505: Wire economics admission gate into projection worker pre-projection path
 - TCK-00507: Continuity profile and sink snapshot resolution for economics gate input assembly
 - TCK-00508: Deferred replay worker for projection intent buffer drain after outage recovery
+- TCK-00638: RFC-0032 Phase 2 `work_context` projection table and `evidence.published` tailer for work context entries

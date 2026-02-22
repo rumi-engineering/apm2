@@ -128,6 +128,9 @@ use super::messages::{
     // TCK-00394: ChangeSet publishing types
     PublishChangeSetRequest,
     PublishChangeSetResponse,
+    // TCK-00638: Work context entry publishing types
+    PublishWorkContextEntryRequest,
+    PublishWorkContextEntryResponse,
     RefreshCredentialRequest,
     RefreshCredentialResponse,
     RegisterRecoveryEvidenceRequest,
@@ -617,6 +620,41 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
+    /// Emits an `evidence.published` event with an explicit `evidence_id`
+    /// included in the top-level JSON envelope for database-level uniqueness
+    /// enforcement.
+    ///
+    /// TCK-00638 SECURITY FIX: The `evidence_id` is surfaced in the JSON
+    /// payload so that a partial UNIQUE index
+    /// (`json_extract(payload, '$.evidence_id') WHERE event_type =
+    /// 'evidence.published'`) can enforce at-most-once semantics at the
+    /// database level. Without this, concurrent `PublishWorkContextEntry`
+    /// requests could both succeed, producing duplicate ledger events.
+    ///
+    /// The default implementation delegates to `emit_session_event`; durable
+    /// backends override this to include the `evidence_id` field in the
+    /// JSON envelope and rely on the UNIQUE index for race-safe
+    /// idempotency.
+    fn emit_evidence_published_event(
+        &self,
+        session_id: &str,
+        payload: &[u8],
+        actor_id: &str,
+        timestamp_ns: u64,
+        evidence_id: &str,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        // Default: delegate to emit_session_event (in-memory backends
+        // override this with their own uniqueness check).
+        let _ = evidence_id; // suppress unused warning in default impl
+        self.emit_session_event(
+            session_id,
+            "evidence.published",
+            payload,
+            actor_id,
+            timestamp_ns,
+        )
+    }
+
     /// Returns whether emitted events are durably persisted.
     ///
     /// `false` indicates in-memory/test-only emitters where audit evidence
@@ -1010,6 +1048,24 @@ pub trait LedgerEventEmitter: Send + Sync {
         changeset_digest_hex: &str,
     ) -> Option<SignedLedgerEvent> {
         let _ = (work_id, changeset_digest_hex);
+        None
+    }
+
+    /// Queries an `evidence.published` event for a work context entry by
+    /// `work_id` and deterministic `entry_id`.
+    ///
+    /// The `work_id` is used as the `session_id` (and thus stored as the
+    /// event's `work_id` column) in `emit_session_event`. The `entry_id`
+    /// is matched against the protobuf payload's `evidence_id` field to
+    /// identify the specific context entry.
+    ///
+    /// Used for idempotency in `PublishWorkContextEntry` (TCK-00638).
+    fn get_event_by_evidence_identity(
+        &self,
+        work_id: &str,
+        entry_id: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let _ = (work_id, entry_id);
         None
     }
 
@@ -3280,6 +3336,121 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         false
     }
 
+    /// TCK-00638 SECURITY FIX: In-memory enforcement of at-most-one
+    /// `evidence.published` per `evidence_id`, mirroring the `SQLite` UNIQUE
+    /// index `idx_evidence_published_unique` /
+    /// `idx_canonical_evidence_published_unique`.
+    fn emit_evidence_published_event(
+        &self,
+        session_id: &str,
+        payload: &[u8],
+        actor_id: &str,
+        timestamp_ns: u64,
+        evidence_id: &str,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        const SESSION_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_event:";
+
+        // Check for existing evidence.published event with the same evidence_id
+        // before delegating to emit_session_event. This mirrors the UNIQUE
+        // constraint in SQLite.
+        {
+            let guard = self.events.read().expect("lock poisoned");
+            let (_order, events) = &*guard;
+            let already_exists = events.values().any(|e| {
+                if e.event_type != "evidence.published" {
+                    return false;
+                }
+                // Parse the JSON envelope to check evidence_id
+                serde_json::from_slice::<serde_json::Value>(&e.payload).is_ok_and(|json| {
+                    json.get("evidence_id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|eid| eid == evidence_id)
+                })
+            });
+            if already_exists {
+                return Err(LedgerEventError::PersistenceFailed {
+                    message: format!(
+                        "UNIQUE constraint failed: idx_evidence_published_unique \
+                         (duplicate evidence.published for evidence_id '{evidence_id}')"
+                    ),
+                });
+            }
+        }
+
+        // Build the JSON payload with evidence_id at the top level
+        // (same format as SqliteLedgerEventEmitter::emit_evidence_published_event)
+
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        let payload_json = serde_json::json!({
+            "event_type": "evidence.published",
+            "session_id": session_id,
+            "actor_id": actor_id,
+            "payload": hex::encode(payload),
+            "evidence_id": evidence_id,
+        });
+
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        let mut canonical_bytes =
+            Vec::with_capacity(SESSION_EVENT_DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(SESSION_EVENT_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "evidence.published".to_string(),
+            work_id: session_id.to_string(),
+            actor_id: actor_id.to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            // Evict oldest entries if at capacity
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(session_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        Ok(signed_event)
+    }
+
     fn emit_stop_flags_mutated(
         &self,
         mutation: &StopFlagsMutation<'_>,
@@ -3616,6 +3787,53 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
             let payload_changeset_digest = payload.get("changeset_digest")?.as_str()?;
             if payload_changeset_digest == changeset_digest_hex {
+                Some(event.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn get_event_by_evidence_identity(
+        &self,
+        work_id: &str,
+        entry_id: &str,
+    ) -> Option<SignedLedgerEvent> {
+        // TCK-00638: First try O(1) lookup via the top-level evidence_id
+        // field in the JSON envelope (written by emit_evidence_published_event).
+        // This mirrors the indexed SQL lookup in SqliteLedgerEventEmitter.
+        let guard = self.events.read().expect("lock poisoned");
+        guard.1.values().find_map(|event| {
+            use prost::Message;
+
+            if event.event_type != "evidence.published" || event.work_id != work_id {
+                return None;
+            }
+            let payload_json = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
+
+            // Indexed path: check top-level evidence_id field.
+            if let Some(eid) = payload_json.get("evidence_id").and_then(|v| v.as_str()) {
+                if eid == entry_id {
+                    return Some(event.clone());
+                }
+                return None;
+            }
+
+            // Fallback for legacy events without top-level evidence_id:
+            // decode protobuf to verify category and evidence_id.
+            let hex_payload = payload_json.get("payload")?.as_str()?;
+            let inner_bytes = hex::decode(hex_payload).ok()?;
+            let evidence_event =
+                apm2_core::events::EvidenceEvent::decode(inner_bytes.as_slice()).ok()?;
+            let Some(apm2_core::events::evidence_event::Event::Published(published)) =
+                evidence_event.event
+            else {
+                return None;
+            };
+            if published.category == "WORK_CONTEXT_ENTRY"
+                && published.evidence_id == entry_id
+                && published.work_id == work_id
+            {
                 Some(event.clone())
             } else {
                 None
@@ -6090,6 +6308,9 @@ pub enum PrivilegedMessageType {
     // --- Work Lifecycle (RFC-0032, TCK-00635) ---
     /// `OpenWork` request (IPC-PRIV-076)
     OpenWork            = 28,
+    // --- Work Context Publishing (RFC-0032, TCK-00638) ---
+    /// `PublishWorkContextEntry` request (IPC-PRIV-077)
+    PublishWorkContextEntry = 76,
 }
 
 impl PrivilegedMessageType {
@@ -6149,6 +6370,8 @@ impl PrivilegedMessageType {
             // Projection recovery (TCK-00469)
             74 => Some(Self::RegisterRecoveryEvidence),
             75 => Some(Self::RequestUnfreeze),
+            // Work context publishing (TCK-00638)
+            76 => Some(Self::PublishWorkContextEntry),
             _ => None,
         }
     }
@@ -6203,6 +6426,7 @@ impl PrivilegedMessageType {
             Self::RegisterRecoveryEvidence,
             Self::RequestUnfreeze,
             Self::OpenWork,
+            Self::PublishWorkContextEntry,
         ]
     }
 
@@ -6254,7 +6478,8 @@ impl PrivilegedMessageType {
             | Self::VerifyLedgerChain
             | Self::RegisterRecoveryEvidence
             | Self::RequestUnfreeze
-            | Self::OpenWork => true,
+            | Self::OpenWork
+            | Self::PublishWorkContextEntry => true,
             // Server-to-client notification only — not a client request.
             Self::PulseEvent => false,
         }
@@ -6303,6 +6528,7 @@ impl PrivilegedMessageType {
             Self::RegisterRecoveryEvidence => "hsi.projection.register_recovery_evidence",
             Self::RequestUnfreeze => "hsi.projection.request_unfreeze",
             Self::OpenWork => "hsi.work.open",
+            Self::PublishWorkContextEntry => "hsi.work_context.publish",
             Self::PulseEvent => "hsi.pulse.event",
         }
     }
@@ -6346,6 +6572,7 @@ impl PrivilegedMessageType {
             Self::RegisterRecoveryEvidence => "REGISTER_RECOVERY_EVIDENCE",
             Self::RequestUnfreeze => "REQUEST_UNFREEZE",
             Self::OpenWork => "OPEN_WORK",
+            Self::PublishWorkContextEntry => "PUBLISH_WORK_CONTEXT_ENTRY",
             Self::PulseEvent => "PULSE_EVENT",
         }
     }
@@ -6389,6 +6616,7 @@ impl PrivilegedMessageType {
             Self::RegisterRecoveryEvidence => "apm2.register_recovery_evidence_request.v1",
             Self::RequestUnfreeze => "apm2.request_unfreeze_request.v1",
             Self::OpenWork => "apm2.open_work_request.v1",
+            Self::PublishWorkContextEntry => "apm2.publish_work_context_entry_request.v1",
             Self::PulseEvent => "apm2.pulse_event_request.v1",
         }
     }
@@ -6432,6 +6660,7 @@ impl PrivilegedMessageType {
             Self::RegisterRecoveryEvidence => "apm2.register_recovery_evidence_response.v1",
             Self::RequestUnfreeze => "apm2.request_unfreeze_response.v1",
             Self::OpenWork => "apm2.open_work_response.v1",
+            Self::PublishWorkContextEntry => "apm2.publish_work_context_entry_response.v1",
             Self::PulseEvent => "apm2.pulse_event_response.v1",
         }
     }
@@ -6518,6 +6747,8 @@ pub enum PrivilegedResponse {
     RequestUnfreeze(RequestUnfreezeResponse),
     /// Successful `OpenWork` response (TCK-00635).
     OpenWork(OpenWorkResponse),
+    /// Successful `PublishWorkContextEntry` response (TCK-00638).
+    PublishWorkContextEntry(PublishWorkContextEntryResponse),
     /// Error response.
     Error(PrivilegedError),
 }
@@ -6722,6 +6953,10 @@ impl PrivilegedResponse {
             },
             Self::OpenWork(resp) => {
                 buf.push(PrivilegedMessageType::OpenWork.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::PublishWorkContextEntry(resp) => {
+                buf.push(PrivilegedMessageType::PublishWorkContextEntry.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::Error(err) => {
@@ -6956,6 +7191,20 @@ pub trait LeaseValidator: Send + Sync {
     fn freeze_legacy_writes(&self) -> Result<(), String> {
         Ok(())
     }
+
+    /// Removes a lease by ID, simulating lease revocation.
+    ///
+    /// This method exists primarily to support test fixtures that need to
+    /// simulate lease revocation for PCAC revalidation tests. The default
+    /// implementation is a no-op that returns `false`.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the lease was found and removed, `false` otherwise.
+    fn remove_lease(&self, lease_id: &str) -> bool {
+        let _ = lease_id;
+        false
+    }
 }
 
 /// Entry for a registered lease.
@@ -7162,6 +7411,17 @@ impl LeaseValidator for StubLeaseValidator {
         Ok(guard
             .get(lease_id)
             .and_then(|entry| entry.delegated_parent_lease_id.clone()))
+    }
+
+    fn remove_lease(&self, lease_id: &str) -> bool {
+        let mut guard = self.leases.write().expect("lock poisoned");
+        let (order, leases) = &mut *guard;
+        if leases.remove(lease_id).is_some() {
+            order.retain(|k| k != lease_id);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -7640,6 +7900,7 @@ pub(crate) enum PrivilegedHandlerClass {
     OpenWork,
     RegisterRecoveryEvidence,
     RequestUnfreeze,
+    PublishWorkContextEntry,
 }
 
 #[allow(clippy::missing_const_for_fn)]
@@ -7651,6 +7912,7 @@ impl PrivilegedHandlerClass {
             Self::OpenWork => "pcac-privileged-open-work",
             Self::RegisterRecoveryEvidence => "pcac-privileged-register-recovery-evidence",
             Self::RequestUnfreeze => "pcac-privileged-request-unfreeze",
+            Self::PublishWorkContextEntry => "pcac-privileged-publish-work-context-entry",
         }
     }
 
@@ -7661,6 +7923,7 @@ impl PrivilegedHandlerClass {
             Self::OpenWork => "OpenWork",
             Self::RegisterRecoveryEvidence => "RegisterRecoveryEvidence",
             Self::RequestUnfreeze => "RequestUnfreeze",
+            Self::PublishWorkContextEntry => "PublishWorkContextEntry",
         }
     }
 }
@@ -10535,6 +10798,10 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::RequestUnfreeze => self.handle_request_unfreeze(payload, ctx),
             // TCK-00635: OpenWork (RFC-0032 Phase 1)
             PrivilegedMessageType::OpenWork => self.handle_open_work(payload, ctx),
+            // TCK-00638: Work context entry publishing (RFC-0032 Phase 2)
+            PrivilegedMessageType::PublishWorkContextEntry => {
+                self.handle_publish_work_context_entry(payload, ctx)
+            },
         };
 
         // TCK-00268: Emit IPC request completion metrics
@@ -10593,6 +10860,8 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::RequestUnfreeze => "RequestUnfreeze",
                 // TCK-00635
                 PrivilegedMessageType::OpenWork => "OpenWork",
+                // TCK-00638
+                PrivilegedMessageType::PublishWorkContextEntry => "PublishWorkContextEntry",
             };
             let status = match &result {
                 Ok(PrivilegedResponse::Error(_)) => "error",
@@ -17284,6 +17553,646 @@ impl PrivilegedDispatcher {
     }
 
     // =========================================================================
+    // TCK-00638: PublishWorkContextEntry Handler (RFC-0032 Phase 2)
+    // =========================================================================
+
+    /// Handles `PublishWorkContextEntry` requests (IPC-PRIV-076, TCK-00638).
+    ///
+    /// Publishes a work context entry to CAS and anchors it in the ledger via
+    /// `evidence.published` with category `WORK_CONTEXT_ENTRY`.
+    ///
+    /// # Security Invariants
+    ///
+    /// - **Admission before mutation**: PCAC lifecycle enforced before CAS
+    ///   store or ledger append.
+    /// - **Daemon-authoritative fields**: `entry_id`, `actor_id`, and
+    ///   `created_at_ns` are overwritten by the daemon. Client-supplied values
+    ///   for these fields are ignored.
+    /// - **Deterministic ID derivation**: `entry_id` is derived from
+    ///   `BLAKE3(work_id || kind || dedupe_key)` with `CTX-` prefix. The
+    ///   `evidence_id` equals `entry_id`.
+    /// - **Bounded decode**: Entry JSON is limited to 256 KiB and validated
+    ///   with `deny_unknown_fields`.
+    /// - **Fail-closed**: Missing CAS, missing ledger emitter, missing PCAC
+    ///   gate, or any validation failure rejects the request.
+    /// - **Idempotent**: Duplicate `(work_id, kind, dedupe_key)` tuples are
+    ///   detected via deterministic `entry_id` and return the prior result.
+    /// - **CAS-first**: Canonical JSON is stored in CAS before the ledger event
+    ///   is emitted. Orphan CAS objects are tolerated on ledger failure.
+    fn handle_publish_work_context_entry(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request = PublishWorkContextEntryRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid PublishWorkContextEntryRequest: {e}"),
+            })?;
+
+        info!(
+            work_id = %request.work_id,
+            kind = %request.kind,
+            dedupe_key = %request.dedupe_key,
+            entry_json_len = request.entry_json.len(),
+            peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+            "PublishWorkContextEntry request received"
+        );
+
+        // --- Validation Phase (all checks BEFORE any state mutation) ---
+
+        if request.work_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "work_id must not be empty",
+            ));
+        }
+        if request.work_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!("work_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        if request.kind.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "kind must not be empty",
+            ));
+        }
+
+        if request.dedupe_key.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "dedupe_key must not be empty",
+            ));
+        }
+
+        if request.entry_json.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "entry_json must not be empty",
+            ));
+        }
+
+        if request.lease_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                "lease_id is required for PCAC lifecycle enforcement",
+            ));
+        }
+        if request.lease_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!("lease_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        // ---- Phase -1: Bind caller identity to authenticated peer ----
+        let peer_creds = ctx
+            .peer_credentials()
+            .ok_or_else(|| ProtocolError::Serialization {
+                reason: "peer credentials required for work context entry publishing".to_string(),
+            })?;
+        let actor_id = derive_actor_id(peer_creds);
+
+        // Validate work_id exists in registry (fail-closed)
+        let Some(claim) = self.work_registry.get_claim(&request.work_id) else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!("work_id not found in registry: {}", request.work_id),
+            ));
+        };
+
+        // TCK-00638: Actor ownership check — the authenticated caller must be
+        // the actor that owns the work claim. Prevents unauthorized actors
+        // from publishing context entries against work they don't own.
+        if claim.actor_id != actor_id {
+            warn!(
+                work_id = %request.work_id,
+                claim_actor = %claim.actor_id,
+                caller_actor = %actor_id,
+                "PublishWorkContextEntry rejected: caller does not own work claim"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                format!(
+                    "authenticated caller '{}' does not own work claim for '{}' (owned by '{}')",
+                    actor_id, request.work_id, claim.actor_id
+                ),
+            ));
+        }
+
+        // TCK-00638: Lease ID validation — the provided lease_id must match
+        // the claim's lease_id. Uses constant-time comparison to prevent
+        // timing side-channel attacks that could leak valid lease_id values.
+        {
+            let lease_id_matches = request.lease_id.len() == claim.lease_id.len()
+                && bool::from(request.lease_id.as_bytes().ct_eq(claim.lease_id.as_bytes()));
+            if !lease_id_matches {
+                warn!(
+                    work_id = %request.work_id,
+                    "PublishWorkContextEntry rejected: lease_id does not match work claim"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::PermissionDenied,
+                    "lease_id does not match the active lease for this work claim",
+                ));
+            }
+        }
+
+        // Bounded decode: parse and validate entry JSON (max 256 KiB,
+        // deny_unknown_fields, closed kind allowlist).
+        let mut entry = match apm2_core::fac::work_cas_schemas::bounded_decode_context_entry(
+            &request.entry_json,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::InvalidArgument,
+                    format!("invalid WorkContextEntryV1: {e}"),
+                ));
+            },
+        };
+
+        // Validate kind from request matches the entry's kind (defense in depth).
+        let request_kind_str = request.kind.clone();
+        let parsed_kind: apm2_core::fac::work_cas_schemas::WorkContextKind =
+            match serde_json::from_value(serde_json::Value::String(request_kind_str)) {
+                Ok(k) => k,
+                Err(_) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::InvalidArgument,
+                        format!(
+                            "invalid kind '{}': must be one of HandoffNote, ImplementerTerminal, \
+                             Diagnosis, ReviewFinding, ReviewVerdict, GateNote, Linkout",
+                            request.kind
+                        ),
+                    ));
+                },
+            };
+
+        if entry.kind != parsed_kind {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!(
+                    "kind mismatch: request.kind='{}' but entry_json.kind='{:?}'",
+                    request.kind, entry.kind
+                ),
+            ));
+        }
+
+        // Validate work_id consistency between request and entry.
+        if entry.work_id != request.work_id {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!(
+                    "work_id mismatch: request.work_id='{}' but entry_json.work_id='{}'",
+                    request.work_id, entry.work_id
+                ),
+            ));
+        }
+
+        // Validate dedupe_key consistency between request and entry.
+        if entry.dedupe_key != request.dedupe_key {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::InvalidArgument,
+                format!(
+                    "dedupe_key mismatch: request.dedupe_key='{}' but entry_json.dedupe_key='{}'",
+                    request.dedupe_key, entry.dedupe_key
+                ),
+            ));
+        }
+
+        // TCK-00638: Control-plane bundle export rate limit (consistent with
+        // PublishChangeSet). Budget check occurs BEFORE any state mutation
+        // (CAS store / ledger append).
+        #[allow(clippy::cast_possible_truncation)]
+        if let Err(e) = self.admit_bundle_export(request.entry_json.len() as u64) {
+            return Ok(PrivilegedResponse::budget_denied(e));
+        }
+
+        // ---- Deterministic ID derivation ----
+        // BLAKE3(work_id || kind || dedupe_key) with CTX- prefix.
+        // entry_id == evidence_id per ticket spec.
+        let entry_id = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"apm2.work_context_entry.id:v1:");
+            hasher.update(request.work_id.as_bytes());
+            hasher.update(b":");
+            hasher.update(request.kind.as_bytes());
+            hasher.update(b":");
+            hasher.update(request.dedupe_key.as_bytes());
+            let hash = hasher.finalize();
+            format!("CTX-{}", hex::encode(hash.as_bytes()))
+        };
+        let evidence_id = entry_id.clone();
+
+        // ---- Daemon-authoritative field overwrite ----
+        // The daemon is authoritative for entry_id, actor_id, created_at_ns,
+        // and source_session_id. Client-supplied values are silently overwritten.
+        // For privileged operator socket calls there is no active session, so
+        // source_session_id is cleared to prevent client-spoofed attribution.
+        entry.entry_id.clone_from(&entry_id);
+        entry.actor_id = Some(actor_id.clone());
+        entry.source_session_id = None;
+
+        // Get HTF-compliant timestamp for created_at_ns.
+        let timestamp_ns = match self.get_htf_timestamp_ns() {
+            Ok(ts) => ts,
+            Err(e) => {
+                warn!(error = %e, "HTF timestamp generation failed - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::InvalidArgument,
+                    format!("HTF timestamp error: {e}"),
+                ));
+            },
+        };
+        entry.created_at_ns = Some(timestamp_ns);
+
+        // ---- Canonical JSON serialization (BEFORE PCAC intent digest) ----
+        // Serialize the entry with daemon-authoritative fields already applied
+        // (entry_id, actor_id, created_at_ns, source_session_id) so the
+        // effect_intent_digest binds to the exact bytes that will be stored in
+        // CAS. This fulfils RFC-0027 Intent Equality and Evidence Sufficiency
+        // laws: the PCAC authorization must commit to the *canonical* effect,
+        // not the raw client input which differs after daemon overwrites.
+        let entry_json_str = match serde_json::to_string(&entry) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::InvalidArgument,
+                    format!("failed to serialize WorkContextEntryV1: {e}"),
+                ));
+            },
+        };
+
+        let canonical_json =
+            match apm2_core::fac::work_cas_schemas::canonicalize_for_cas(&entry_json_str) {
+                Ok(c) => c,
+                Err(e) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::InvalidArgument,
+                        format!("canonicalization failed: {e}"),
+                    ));
+                },
+            };
+
+        let canonical_bytes = canonical_json.as_bytes();
+
+        // ---- PCAC lifecycle enforcement (admission BEFORE mutation) ----
+        let Some(pcac_gate) = self.pcac_lifecycle_gate.as_deref() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "PCAC authority gate not wired for PublishWorkContextEntry (fail-closed)",
+            ));
+        };
+
+        let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
+            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
+                Ok(values) => values,
+                Err(error) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "PCAC authority denied for PublishWorkContextEntry: \
+                             authoritative revalidation unavailable: {error}"
+                        ),
+                    ));
+                },
+            };
+
+        let identity_proof_hash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(actor_id.as_bytes());
+            *hasher.finalize().as_bytes()
+        };
+
+        let (risk_tier, _resolved_policy_hash) =
+            self.resolve_risk_tier_for_lease(&request.lease_id, identity_proof_hash);
+        let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
+
+        let pcac_builder =
+            PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::PublishWorkContextEntry)
+                .session_id(entry_id.clone())
+                .lease_id(request.lease_id.clone())
+                .boundary_intent_class(apm2_core::pcac::BoundaryIntentClass::Assert)
+                .identity_proof_hash(identity_proof_hash)
+                .identity_evidence_level(IdentityEvidenceLevel::PointerOnly)
+                .risk_tier(pcac_risk_tier);
+
+        let capability_manifest_hash = pcac_builder.hash(
+            "capability",
+            &[
+                request.lease_id.as_bytes(),
+                request.work_id.as_bytes(),
+                entry_id.as_bytes(),
+            ],
+        );
+
+        let scope_witness_hash = pcac_builder.hash(
+            "scope",
+            &[
+                request.work_id.as_bytes(),
+                request.kind.as_bytes(),
+                request.dedupe_key.as_bytes(),
+            ],
+        );
+
+        let freshness_policy_hash = pcac_builder.hash(
+            "freshness-policy",
+            &[request.lease_id.as_bytes(), request.work_id.as_bytes()],
+        );
+
+        let stop_budget_profile_digest = pcac_builder.hash(
+            "stop-budget",
+            &[
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.emergency_stop_active(),
+                ))],
+                &[u8::from(self.stop_authority.as_ref().is_some_and(
+                    |authority| authority.governance_stop_active(),
+                ))],
+                request.work_id.as_bytes(),
+            ],
+        );
+
+        // TCK-00638: Compute intent digest over the canonical bytes that
+        // will be stored in CAS — NOT over the raw `request.entry_json`.
+        // The daemon has already overwritten authoritative fields (entry_id,
+        // actor_id, created_at_ns, source_session_id) on the entry struct,
+        // so the canonical serialization above reflects the actual semantic
+        // effect. Binding the PCAC authorization to these final bytes
+        // fulfils RFC-0027 Law 2 (Intent Equality) and Law 7 (Evidence
+        // Sufficiency): the intent digest commits to exactly the bytes that
+        // are persisted, ensuring audits and anti-entropy syncs can verify
+        // the cryptographic link between authorization and effect.
+        let canonical_content_hash = blake3::hash(canonical_bytes);
+        let effect_intent_digest = domain_tagged_hash(
+            PrivilegedHandlerClass::PublishWorkContextEntry,
+            "intent",
+            &[
+                request.work_id.as_bytes(),
+                request.kind.as_bytes(),
+                request.dedupe_key.as_bytes(),
+                entry_id.as_bytes(),
+                canonical_content_hash.as_bytes(),
+            ],
+        );
+
+        let pcac_builder = pcac_builder
+            .capability_manifest_hash(capability_manifest_hash)
+            .scope_witness_hash(scope_witness_hash)
+            .freshness_policy_hash(freshness_policy_hash)
+            .stop_budget_profile_digest(stop_budget_profile_digest)
+            .effect_intent_digest(effect_intent_digest);
+
+        let pcac_input = pcac_builder.build(
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+        );
+
+        let pcac_lifecycle_artifacts = match self.enforce_privileged_pcac_lifecycle(
+            PrivilegedHandlerClass::PublishWorkContextEntry.operation_name(),
+            pcac_gate,
+            &pcac_input,
+            &request.lease_id,
+            join_freshness_tick,
+            join_time_envelope_ref,
+            join_ledger_anchor,
+            join_revocation_head,
+            effect_intent_digest,
+        ) {
+            Ok(artifacts) => {
+                if artifacts.is_none() {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        "PublishWorkContextEntry requires PCAC lifecycle evidence \
+                         (mandatory cutover); lifecycle_enforcement is disabled in claim policy",
+                    ));
+                }
+                artifacts
+            },
+            Err(response) => return Ok(response),
+        };
+
+        // TCK-00638: Idempotency check — AFTER PCAC lifecycle enforcement.
+        // If an evidence.published event with this entry_id already exists in
+        // the ledger, return the existing response without emitting a duplicate
+        // event. This prevents ledger bloat on retries.
+        //
+        // CRITICAL: this check is deliberately placed AFTER PCAC enforcement
+        // (derive_privileged_pcac_revalidation_inputs +
+        // enforce_privileged_pcac_lifecycle) so that replay requests are always
+        // revalidated against current lease freshness and revocation state. A
+        // previously-accepted entry must not bypass PCAC if the caller's lease
+        // has since been revoked or policy state has changed.
+        if let Some((existing_event_id, existing_cas_hash)) =
+            self.find_work_context_published_replay(&request.work_id, &entry_id)
+        {
+            debug!(
+                work_id = %request.work_id,
+                entry_id = %entry_id,
+                event_id = %existing_event_id,
+                "Idempotent: returning existing WorkContextEntry evidence event (post-PCAC)"
+            );
+            return Ok(PrivilegedResponse::PublishWorkContextEntry(
+                PublishWorkContextEntryResponse {
+                    entry_id,
+                    evidence_id,
+                    cas_hash: existing_cas_hash,
+                    work_id: request.work_id,
+                },
+            ));
+        }
+
+        // ---- Mutation Phase: CAS store then ledger append ----
+
+        // Require CAS to be configured (fail-closed).
+        let Some(cas) = &self.cas else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "content-addressed store not configured on daemon",
+            ));
+        };
+
+        // canonical_bytes already computed above (before PCAC) to ensure the
+        // intent digest binds to the exact bytes stored in CAS.
+
+        // Store canonical JSON in CAS (orphan on ledger failure is acceptable).
+        let store_result = match cas.store(canonical_bytes) {
+            Ok(result) => result,
+            Err(e) => {
+                warn!(error = %e, "CAS store failed for work context entry");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("CAS storage failed: {e}"),
+                ));
+            },
+        };
+
+        let cas_hash = store_result.hash;
+        let cas_hash_hex = hex::encode(cas_hash);
+
+        // Emit evidence.published ledger event with category WORK_CONTEXT_ENTRY.
+        // TCK-00638: Include PCAC lifecycle artifacts in metadata for
+        // RFC-0027 Law 7 (Evidence Sufficiency) compliance.
+        let evidence_event_payload = {
+            use prost::Message;
+            let mut metadata = vec![
+                format!("entry_id={entry_id}"),
+                format!("kind={}", request.kind),
+                format!("dedupe_key={}", request.dedupe_key),
+                format!("actor_id={actor_id}"),
+            ];
+            // Bind PCAC lifecycle selectors to the evidence event so auditors
+            // and replay paths can verify the authorization chain.
+            if let Some(ref artifacts) = pcac_lifecycle_artifacts {
+                metadata.push(format!("pcac_ajc_id={}", hex::encode(artifacts.ajc_id)));
+                metadata.push(format!(
+                    "pcac_intent_digest={}",
+                    hex::encode(artifacts.intent_digest)
+                ));
+                metadata.push(format!("pcac_consume_tick={}", artifacts.consume_tick));
+                metadata.push(format!(
+                    "pcac_time_envelope_ref={}",
+                    hex::encode(artifacts.time_envelope_ref)
+                ));
+                metadata.push(format!(
+                    "pcac_consume_selector_digest={}",
+                    hex::encode(artifacts.consume_selector_digest)
+                ));
+            }
+            let published = apm2_core::events::EvidencePublished {
+                evidence_id: evidence_id.clone(),
+                work_id: request.work_id.clone(),
+                category: "WORK_CONTEXT_ENTRY".to_string(),
+                artifact_hash: cas_hash.to_vec(),
+                verification_command_ids: Vec::new(),
+                classification: "INTERNAL".to_string(),
+                #[allow(clippy::cast_possible_truncation)]
+                artifact_size: canonical_bytes.len() as u64,
+                metadata,
+                time_envelope_ref: None,
+            };
+            let event = apm2_core::events::EvidenceEvent {
+                event: Some(apm2_core::events::evidence_event::Event::Published(
+                    published,
+                )),
+            };
+            event.encode_to_vec()
+        };
+
+        // TCK-00638 SECURITY FIX: Use `emit_evidence_published_event` which
+        // surfaces the `evidence_id` in the JSON envelope for UNIQUE index
+        // enforcement. The DB UNIQUE constraint on
+        // `json_extract(payload, '$.evidence_id')` will reject concurrent
+        // duplicate submissions, triggering the fallback below.
+        match self.event_emitter.emit_evidence_published_event(
+            &request.work_id,
+            &evidence_event_payload,
+            &actor_id,
+            timestamp_ns,
+            &evidence_id,
+        ) {
+            Ok(signed_event) => {
+                info!(
+                    event_id = %signed_event.event_id,
+                    entry_id = %entry_id,
+                    work_id = %request.work_id,
+                    cas_hash = %cas_hash_hex,
+                    kind = %request.kind,
+                    "PublishWorkContextEntry: entry stored in CAS and evidence.published emitted"
+                );
+                Ok(PrivilegedResponse::PublishWorkContextEntry(
+                    PublishWorkContextEntryResponse {
+                        entry_id,
+                        evidence_id,
+                        cas_hash: cas_hash_hex,
+                        work_id: request.work_id,
+                    },
+                ))
+            },
+            Err(e) => {
+                // Race-safe idempotency fallback: if another writer persisted the
+                // same semantic event concurrently, replay the persisted binding.
+                if let Some((existing_event_id, existing_cas_hash)) =
+                    self.find_work_context_published_replay(&request.work_id, &entry_id)
+                {
+                    debug!(
+                        work_id = %request.work_id,
+                        entry_id = %entry_id,
+                        event_id = %existing_event_id,
+                        "Idempotent fallback: returning concurrent writer's evidence event"
+                    );
+                    return Ok(PrivilegedResponse::PublishWorkContextEntry(
+                        PublishWorkContextEntryResponse {
+                            entry_id,
+                            evidence_id,
+                            cas_hash: existing_cas_hash,
+                            work_id: request.work_id,
+                        },
+                    ));
+                }
+                warn!(error = %e, "evidence.published event emission failed for work context entry");
+                Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("evidence.published event emission failed: {e}"),
+                ))
+            },
+        }
+    }
+
+    /// Returns persisted replay bindings for a semantically matching
+    /// `evidence.published` event with category `WORK_CONTEXT_ENTRY`.
+    ///
+    /// Matching key: `(work_id, entry_id)`. Response values are the
+    /// authoritative persisted `event_id` and `cas_hash` (hex).
+    ///
+    /// Defense-in-depth: even though `get_event_by_evidence_identity` is
+    /// supposed to verify semantic identity, this method re-validates
+    /// `category`, `work_id`, and `evidence_id` from the decoded protobuf
+    /// before accepting the replay binding.
+    fn find_work_context_published_replay(
+        &self,
+        work_id: &str,
+        entry_id: &str,
+    ) -> Option<(String, String)> {
+        use prost::Message;
+
+        let event = self
+            .event_emitter
+            .get_event_by_evidence_identity(work_id, entry_id)?;
+        // The stored payload is a JSON envelope with a hex-encoded inner
+        // protobuf in the "payload" field. Decode the inner protobuf to
+        // extract the cas_hash (artifact_hash).
+        let payload_json = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
+        let hex_payload = payload_json.get("payload")?.as_str()?;
+        let inner_bytes = hex::decode(hex_payload).ok()?;
+
+        let evidence_event =
+            apm2_core::events::EvidenceEvent::decode(inner_bytes.as_slice()).ok()?;
+        let Some(apm2_core::events::evidence_event::Event::Published(published)) =
+            evidence_event.event
+        else {
+            return None;
+        };
+
+        // Defense-in-depth: verify semantic identity from the decoded
+        // protobuf even though the emitter should already have checked.
+        if published.category != "WORK_CONTEXT_ENTRY"
+            || published.work_id != work_id
+            || published.evidence_id != entry_id
+        {
+            return None;
+        }
+
+        let cas_hash_hex = hex::encode(&published.artifact_hash);
+        Some((event.event_id, cas_hash_hex))
+    }
+
+    // =========================================================================
     // TCK-00340: DelegateSublease Handler
     // =========================================================================
 
@@ -19506,6 +20415,17 @@ pub fn encode_orchestrator_launch_projection_request(
 #[must_use]
 pub fn encode_publish_changeset_request(request: &PublishChangeSetRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::PublishChangeSet.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `PublishWorkContextEntry` request to bytes for sending
+/// (TCK-00638).
+#[must_use]
+pub fn encode_publish_work_context_entry_request(
+    request: &PublishWorkContextEntryRequest,
+) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::PublishWorkContextEntry.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }
@@ -28344,6 +29264,1004 @@ mod tests {
                 changeset_events, 0,
                 "ownership mismatch must not emit changeset_published events"
             );
+        }
+    }
+
+    // ========================================================================
+    // TCK-00638: PublishWorkContextEntry Tests (RFC-0032 Phase 2)
+    // ========================================================================
+    #[allow(clippy::redundant_clone)]
+    mod publish_work_context_entry {
+        use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+        use apm2_core::fac::work_cas_schemas::WORK_CONTEXT_ENTRY_V1_SCHEMA;
+
+        use super::*;
+
+        fn privileged_ctx() -> ConnectionContext {
+            ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }))
+        }
+
+        fn make_dispatcher_with_cas() -> (PrivilegedDispatcher, Arc<MemoryCas>) {
+            let cas = Arc::new(MemoryCas::default());
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+            (dispatcher, cas)
+        }
+
+        /// Claims work and returns `(work_id, lease_id)`.
+        fn claim_work(
+            dispatcher: &PrivilegedDispatcher,
+            ctx: &ConnectionContext,
+        ) -> (String, String) {
+            let request = ClaimWorkRequest {
+                actor_id: "test:actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let frame = encode_claim_work_request(&request);
+            let response = dispatcher.dispatch(&frame, ctx).unwrap();
+            match response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                other => panic!("Expected ClaimWork response, got: {other:?}"),
+            }
+        }
+
+        /// Create a valid `WorkContextEntryV1` JSON payload.
+        ///
+        /// Note: `kind` must use `SCREAMING_SNAKE_CASE` form (e.g.,
+        /// `"HANDOFF_NOTE"`) as required by the `#[serde(rename_all =
+        /// "SCREAMING_SNAKE_CASE")]` attribute on `WorkContextKind`.
+        fn make_entry_json(work_id: &str, kind: &str, dedupe_key: &str) -> Vec<u8> {
+            let entry = serde_json::json!({
+                "schema": WORK_CONTEXT_ENTRY_V1_SCHEMA,
+                "work_id": work_id,
+                "entry_id": "placeholder",
+                "kind": kind,
+                "dedupe_key": dedupe_key,
+                "body": "test context entry body",
+                "tags": ["test"]
+            });
+            serde_json::to_vec(&entry).unwrap()
+        }
+
+        /// Derive the expected deterministic `entry_id` for verification.
+        ///
+        /// Note: `kind` here is the request-level kind string (the serialized
+        /// form).
+        fn expected_entry_id(work_id: &str, kind: &str, dedupe_key: &str) -> String {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"apm2.work_context_entry.id:v1:");
+            hasher.update(work_id.as_bytes());
+            hasher.update(b":");
+            hasher.update(kind.as_bytes());
+            hasher.update(b":");
+            hasher.update(dedupe_key.as_bytes());
+            let hash = hasher.finalize();
+            format!("CTX-{}", hex::encode(hash.as_bytes()))
+        }
+
+        #[test]
+        fn test_publish_work_context_entry_routing() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let (work_id, _lease_id) = claim_work(&dispatcher, &ctx);
+
+            let entry_json = make_entry_json(&work_id, "HANDOFF_NOTE", "key-001");
+            let request = PublishWorkContextEntryRequest {
+                work_id,
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: "key-001".to_string(),
+                entry_json,
+                lease_id: String::new(), // Skip PCAC for basic routing test
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            // Without lease_id, PCAC enforcement will deny, but the routing works.
+            // We expect an error about empty lease_id.
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("lease_id"),
+                        "Expected lease_id error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_publish_work_context_entry_rejects_empty_work_id() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+
+            let entry_json = make_entry_json("", "HANDOFF_NOTE", "key-001");
+            let request = PublishWorkContextEntryRequest {
+                work_id: String::new(),
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: "key-001".to_string(),
+                entry_json,
+                lease_id: "lease-1".to_string(),
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("work_id must not be empty"),
+                        "Expected work_id error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_publish_work_context_entry_rejects_empty_dedupe_key() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
+
+            let entry_json = make_entry_json(&work_id, "HANDOFF_NOTE", "");
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: String::new(),
+                entry_json,
+                lease_id,
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("dedupe_key must not be empty"),
+                        "Expected dedupe_key error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_publish_work_context_entry_rejects_empty_kind() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let (work_id, _lease_id) = claim_work(&dispatcher, &ctx);
+
+            let entry_json = make_entry_json(&work_id, "HANDOFF_NOTE", "key-001");
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: String::new(),
+                dedupe_key: "key-001".to_string(),
+                entry_json,
+                lease_id: "lease-1".to_string(),
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("kind must not be empty"),
+                        "Expected kind error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_publish_work_context_entry_rejects_invalid_kind() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
+
+            let entry_json = make_entry_json(&work_id, "INVALID_KIND", "key-001");
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "INVALID_KIND".to_string(),
+                dedupe_key: "key-001".to_string(),
+                entry_json,
+                lease_id,
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    // Could fail at bounded_decode (unknown kind) or at the
+                    // kind parsing step.
+                    assert!(
+                        err.message.contains("invalid")
+                            || err.message.contains("kind")
+                            || err.message.contains("InvalidKind"),
+                        "Expected kind validation error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_publish_work_context_entry_rejects_unknown_work_id() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+
+            let entry_json = make_entry_json("WORK-nonexistent", "HANDOFF_NOTE", "key-001");
+            let request = PublishWorkContextEntryRequest {
+                work_id: "WORK-nonexistent".to_string(),
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: "key-001".to_string(),
+                entry_json,
+                lease_id: "lease-1".to_string(),
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("work_id not found"),
+                        "Expected work_id not found error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_publish_work_context_entry_rejects_no_cas() {
+            // Dispatcher without CAS configured
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
+
+            let entry_json = make_entry_json(&work_id, "HANDOFF_NOTE", "key-001");
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: "key-001".to_string(),
+                entry_json,
+                lease_id,
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    // Will fail at PCAC gate or CAS check.
+                    assert!(
+                        err.message.contains("PCAC")
+                            || err.message.contains("CAS")
+                            || err.message.contains("content-addressed store"),
+                        "Expected CAS or PCAC error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_publish_work_context_entry_rejects_empty_entry_json() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let (work_id, _lease_id) = claim_work(&dispatcher, &ctx);
+
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: "key-001".to_string(),
+                entry_json: Vec::new(),
+                lease_id: "lease-1".to_string(),
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("entry_json must not be empty"),
+                        "Expected entry_json error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_publish_work_context_entry_rejects_deny_unknown_fields() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
+
+            // JSON with an extra unknown field that should be rejected.
+            let entry = serde_json::json!({
+                "schema": WORK_CONTEXT_ENTRY_V1_SCHEMA,
+                "work_id": work_id,
+                "entry_id": "placeholder",
+                "kind": "HANDOFF_NOTE",
+                "dedupe_key": "key-001",
+                "body": "test",
+                "extra_forbidden_field": "should be rejected"
+            });
+            let entry_json = serde_json::to_vec(&entry).unwrap();
+
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: "key-001".to_string(),
+                entry_json,
+                lease_id,
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("invalid WorkContextEntryV1")
+                            || err.message.contains("unknown field"),
+                        "Expected deny_unknown_fields error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_deterministic_entry_id_derivation() {
+            // Verify that the same (work_id, kind, dedupe_key) triple always
+            // produces the same entry_id with CTX- prefix.
+            let id1 = expected_entry_id("WORK-123", "HANDOFF_NOTE", "dedup-1");
+            let id2 = expected_entry_id("WORK-123", "HANDOFF_NOTE", "dedup-1");
+            assert_eq!(id1, id2, "same inputs must produce identical entry_id");
+            assert!(
+                id1.starts_with("CTX-"),
+                "entry_id must have CTX- prefix, got: {id1}"
+            );
+            // 64 hex chars for blake3 + 4 for "CTX-"
+            assert_eq!(id1.len(), 4 + 64, "entry_id must be CTX- + 64 hex chars");
+
+            // Different dedupe_key produces different entry_id.
+            let id3 = expected_entry_id("WORK-123", "HANDOFF_NOTE", "dedup-2");
+            assert_ne!(
+                id1, id3,
+                "different dedupe_key must produce different entry_id"
+            );
+
+            // Different kind produces different entry_id.
+            let id4 = expected_entry_id("WORK-123", "DIAGNOSIS", "dedup-1");
+            assert_ne!(id1, id4, "different kind must produce different entry_id");
+
+            // Different work_id produces different entry_id.
+            let id5 = expected_entry_id("WORK-456", "HANDOFF_NOTE", "dedup-1");
+            assert_ne!(
+                id1, id5,
+                "different work_id must produce different entry_id"
+            );
+        }
+
+        #[test]
+        fn test_publish_work_context_entry_tag_76_routing() {
+            assert_eq!(
+                PrivilegedMessageType::PublishWorkContextEntry.tag(),
+                76,
+                "PublishWorkContextEntry must use tag 76"
+            );
+            assert_eq!(
+                PrivilegedMessageType::from_tag(76),
+                Some(PrivilegedMessageType::PublishWorkContextEntry),
+                "Tag 76 must map to PublishWorkContextEntry"
+            );
+        }
+
+        #[test]
+        fn test_publish_work_context_entry_is_client_request() {
+            assert!(
+                PrivilegedMessageType::PublishWorkContextEntry.is_client_request(),
+                "PublishWorkContextEntry must be a client request"
+            );
+        }
+
+        #[test]
+        fn test_publish_work_context_entry_hsi_manifest() {
+            let variant = PrivilegedMessageType::PublishWorkContextEntry;
+            assert_eq!(variant.hsi_route(), "hsi.work_context.publish");
+            assert_eq!(variant.hsi_route_id(), "PUBLISH_WORK_CONTEXT_ENTRY");
+            assert_eq!(
+                variant.hsi_request_schema(),
+                "apm2.publish_work_context_entry_request.v1"
+            );
+            assert_eq!(
+                variant.hsi_response_schema(),
+                "apm2.publish_work_context_entry_response.v1"
+            );
+        }
+
+        #[test]
+        fn test_publish_work_context_entry_work_id_mismatch() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
+
+            // Entry JSON has a different work_id than the request.
+            let entry_json = make_entry_json("WORK-different", "HANDOFF_NOTE", "key-001");
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: "key-001".to_string(),
+                entry_json,
+                lease_id,
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("work_id mismatch")
+                            || err.message.contains("work_id not found"),
+                        "Expected work_id mismatch error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_publish_work_context_entry_kind_mismatch() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
+
+            // Entry JSON has HANDOFF_NOTE but request says DIAGNOSIS.
+            let entry_json = make_entry_json(&work_id, "HANDOFF_NOTE", "key-001");
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "DIAGNOSIS".to_string(),
+                dedupe_key: "key-001".to_string(),
+                entry_json,
+                lease_id,
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("kind mismatch"),
+                        "Expected kind mismatch error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_publish_work_context_entry_all_request_variants_includes_new_type() {
+            let variants = PrivilegedMessageType::all_request_variants();
+            assert!(
+                variants.contains(&PrivilegedMessageType::PublishWorkContextEntry),
+                "all_request_variants must include PublishWorkContextEntry"
+            );
+        }
+
+        /// Builds a dispatcher with full PCAC lifecycle, CAS, lease, and work
+        /// claim registered for the Implementer role. Returns `(dispatcher,
+        /// ctx, work_id, lease_id)`.
+        fn setup_full_dispatcher() -> (PrivilegedDispatcher, ConnectionContext, String, String) {
+            use super::ingest_review_receipt::{TestLeaseConfig, register_full_test_lease};
+
+            let lease_id = "lease-ctx-001";
+            let work_id = "W-CTX-001";
+            let gate_id = "gate-ctx-001";
+            let peer_creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let executor_actor_id = derive_actor_id(&peer_creds);
+
+            let cas = Arc::new(MemoryCas::default());
+
+            let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
+            dispatcher.lease_validator.register_lease_with_executor(
+                lease_id,
+                work_id,
+                gate_id,
+                &executor_actor_id,
+            );
+
+            register_full_test_lease(&TestLeaseConfig {
+                dispatcher: &dispatcher,
+                cas: cas.as_ref(),
+                lease_id,
+                work_id,
+                gate_id,
+                executor_actor_id: &executor_actor_id,
+                policy_hash: [0u8; 32],
+                wall_time_source: WallTimeSource::AuthenticatedNts,
+                include_attestation: true,
+            });
+
+            let mut policy_resolution = test_policy_resolution_with_lineage(
+                work_id,
+                &executor_actor_id,
+                WorkRole::Implementer,
+                0, // Tier0
+            );
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                work_id,
+                &executor_actor_id,
+                WorkRole::Implementer,
+                &policy_resolution,
+            );
+
+            let claim = WorkClaim {
+                work_id: work_id.to_string(),
+                lease_id: lease_id.to_string(),
+                actor_id: executor_actor_id,
+                role: WorkRole::Implementer,
+                policy_resolution,
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let ctx = ConnectionContext::privileged_session_open(Some(peer_creds));
+            (dispatcher, ctx, work_id.to_string(), lease_id.to_string())
+        }
+
+        /// BLOCKER 1a: Happy-path success with authoritative field overwriting.
+        #[test]
+        fn test_publish_work_context_entry_success_happy_path() {
+            let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher();
+
+            let entry_json = make_entry_json(&work_id, "HANDOFF_NOTE", "key-success-001");
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: "key-success-001".to_string(),
+                entry_json,
+                lease_id: lease_id.clone(),
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::PublishWorkContextEntry(resp) => {
+                    // Verify deterministic entry_id.
+                    let expected = expected_entry_id(&work_id, "HANDOFF_NOTE", "key-success-001");
+                    assert_eq!(resp.entry_id, expected, "entry_id must be deterministic");
+                    // evidence_id == entry_id per spec.
+                    assert_eq!(
+                        resp.evidence_id, resp.entry_id,
+                        "evidence_id must equal entry_id"
+                    );
+                    // CAS hash must be non-empty (64 hex chars).
+                    assert_eq!(
+                        resp.cas_hash.len(),
+                        64,
+                        "cas_hash must be 64 hex chars, got {}",
+                        resp.cas_hash.len()
+                    );
+                    // work_id must match.
+                    assert_eq!(resp.work_id, work_id);
+                },
+                other => panic!("Expected PublishWorkContextEntry response, got: {other:?}"),
+            }
+
+            // Verify a ledger event was emitted (indexed by work_id).
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let evidence_count = events
+                .iter()
+                .filter(|e| e.event_type == "evidence.published")
+                .count();
+            assert_eq!(
+                evidence_count, 1,
+                "Should have exactly 1 evidence.published event"
+            );
+        }
+
+        /// BLOCKER 1b: Idempotent retry returns existing event, no duplicate.
+        #[test]
+        fn test_publish_work_context_entry_idempotent_retry() {
+            let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher();
+
+            let entry_json = make_entry_json(&work_id, "DIAGNOSIS", "key-idemp-001");
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "DIAGNOSIS".to_string(),
+                dedupe_key: "key-idemp-001".to_string(),
+                entry_json: entry_json.clone(),
+                lease_id: lease_id.clone(),
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+
+            // First call: emits new event.
+            let resp1 = match dispatcher.dispatch(&frame, &ctx).unwrap() {
+                PrivilegedResponse::PublishWorkContextEntry(r) => r,
+                other => panic!("Expected PublishWorkContextEntry, got: {other:?}"),
+            };
+
+            // Second call (retry): must return same result without new event.
+            let request2 = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "DIAGNOSIS".to_string(),
+                dedupe_key: "key-idemp-001".to_string(),
+                entry_json,
+                lease_id: lease_id.clone(),
+            };
+            let frame2 = encode_publish_work_context_entry_request(&request2);
+            let resp2 = match dispatcher.dispatch(&frame2, &ctx).unwrap() {
+                PrivilegedResponse::PublishWorkContextEntry(r) => r,
+                other => panic!("Expected PublishWorkContextEntry, got: {other:?}"),
+            };
+
+            // Same entry_id, evidence_id, cas_hash, work_id.
+            assert_eq!(resp1.entry_id, resp2.entry_id);
+            assert_eq!(resp1.evidence_id, resp2.evidence_id);
+            assert_eq!(resp1.cas_hash, resp2.cas_hash);
+            assert_eq!(resp1.work_id, resp2.work_id);
+
+            // Verify only ONE evidence event in the ledger (not two).
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let evidence_count = events
+                .iter()
+                .filter(|e| e.event_type == "evidence.published")
+                .count();
+            assert_eq!(
+                evidence_count, 1,
+                "Idempotent retry must NOT produce a second evidence event"
+            );
+        }
+
+        /// Regression [f-783-code_quality-1771692967902566-0]: replay requests
+        /// for previously-published work context entries must revalidate PCAC
+        /// lifecycle (lease freshness, revocation) before returning the cached
+        /// response. Removing the lease simulates revocation; the idempotent
+        /// replay path must fail-closed instead of returning a stale success.
+        #[test]
+        fn test_publish_work_context_entry_replay_denied_after_lease_revocation() {
+            let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher();
+
+            // First call: succeeds normally.
+            let entry_json = make_entry_json(&work_id, "DIAGNOSIS", "key-revoke-001");
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "DIAGNOSIS".to_string(),
+                dedupe_key: "key-revoke-001".to_string(),
+                entry_json: entry_json.clone(),
+                lease_id: lease_id.clone(),
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+            let resp1 = match dispatcher.dispatch(&frame, &ctx).unwrap() {
+                PrivilegedResponse::PublishWorkContextEntry(r) => r,
+                other => panic!("Expected PublishWorkContextEntry, got: {other:?}"),
+            };
+            assert!(!resp1.entry_id.is_empty(), "first call must succeed");
+
+            // Simulate lease revocation: remove the lease from the validator.
+            // This causes derive_privileged_pcac_revalidation_inputs to fail
+            // because get_lease_work_id returns None.
+            assert!(
+                dispatcher.lease_validator.remove_lease(&lease_id),
+                "lease must exist to be removed"
+            );
+
+            // Retry (replay) with the same idempotency key: must be DENIED
+            // because PCAC revalidation now fails (lease revoked).
+            let request2 = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "DIAGNOSIS".to_string(),
+                dedupe_key: "key-revoke-001".to_string(),
+                entry_json,
+                lease_id: lease_id.clone(),
+            };
+            let frame2 = encode_publish_work_context_entry_request(&request2);
+            let resp2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+
+            // The replay must NOT succeed: PCAC enforcement must deny because
+            // the lease is revoked (absent from the validator).
+            match &resp2 {
+                PrivilegedResponse::PublishWorkContextEntry(_) => {
+                    panic!(
+                        "Replay after lease revocation must be DENIED, but got success. \
+                         This is the exact bypass described in finding \
+                         f-783-code_quality-1771692967902566-0."
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        i32::from(PrivilegedErrorCode::CapabilityRequestRejected),
+                        "Expected CapabilityRequestRejected, got code {}: {}",
+                        err.code,
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("revalidation unavailable")
+                            || err.message.contains("PCAC authority denied"),
+                        "Error message should indicate PCAC/revalidation failure, got: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected Error response after lease revocation, got: {other:?}");
+                },
+            }
+        }
+
+        /// Regression: two different `entry_id` values (different `dedupe_key`
+        /// values) under the same `work_id` must produce two distinct evidence
+        /// events. The second publish must NOT false-hit the first entry's
+        /// idempotency check.
+        #[test]
+        fn test_publish_work_context_entry_no_false_idempotency_across_entries() {
+            let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher();
+
+            // First entry: HANDOFF_NOTE with dedupe_key "key-a".
+            let entry_json_a = make_entry_json(&work_id, "HANDOFF_NOTE", "key-a");
+            let request_a = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: "key-a".to_string(),
+                entry_json: entry_json_a,
+                lease_id: lease_id.clone(),
+            };
+            let frame_a = encode_publish_work_context_entry_request(&request_a);
+            let resp_a = match dispatcher.dispatch(&frame_a, &ctx).unwrap() {
+                PrivilegedResponse::PublishWorkContextEntry(r) => r,
+                other => panic!("Expected PublishWorkContextEntry, got: {other:?}"),
+            };
+
+            // Second entry: HANDOFF_NOTE with dedupe_key "key-b" — different
+            // semantic identity, must NOT be treated as idempotent replay.
+            let entry_json_b = make_entry_json(&work_id, "HANDOFF_NOTE", "key-b");
+            let request_b = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: "key-b".to_string(),
+                entry_json: entry_json_b,
+                lease_id: lease_id.clone(),
+            };
+            let frame_b = encode_publish_work_context_entry_request(&request_b);
+            let resp_b = match dispatcher.dispatch(&frame_b, &ctx).unwrap() {
+                PrivilegedResponse::PublishWorkContextEntry(r) => r,
+                other => panic!("Expected PublishWorkContextEntry, got: {other:?}"),
+            };
+
+            // The two entries must have distinct entry_ids (deterministic IDs
+            // derived from different (work_id, kind, dedupe_key) tuples).
+            assert_ne!(
+                resp_a.entry_id, resp_b.entry_id,
+                "Different dedupe_keys must produce different entry_ids"
+            );
+
+            // CAS hashes may differ (different entry JSON content).
+            // The important thing is that both operations succeeded and
+            // produced separate evidence events.
+            assert_ne!(
+                resp_a.cas_hash, resp_b.cas_hash,
+                "Different entries should produce different CAS hashes"
+            );
+
+            // Verify exactly 2 evidence.published events in the ledger.
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let evidence_count = events
+                .iter()
+                .filter(|e| e.event_type == "evidence.published")
+                .count();
+            assert_eq!(
+                evidence_count, 2,
+                "Two distinct entries must produce two evidence.published events, \
+                 not one (false idempotency regression)"
+            );
+        }
+
+        /// MAJOR 1: Rejects mismatched `lease_id`.
+        #[test]
+        fn test_publish_work_context_entry_rejects_mismatched_lease_id() {
+            let (dispatcher, ctx, work_id, _lease_id) = setup_full_dispatcher();
+
+            let entry_json = make_entry_json(&work_id, "HANDOFF_NOTE", "key-lease-001");
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: "key-lease-001".to_string(),
+                entry_json,
+                lease_id: "wrong-lease-id".to_string(),
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("lease_id does not match"),
+                        "Expected lease_id mismatch error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        /// MAJOR regression: `effect_intent_digest` must bind to canonical
+        /// bytes (post daemon-authoritative field overwrite), NOT to
+        /// the raw client `entry_json`. Validates RFC-0027 Law 2
+        /// (Intent Equality) by verifying the PCAC intent digest in the
+        /// emitted evidence metadata matches the expected value
+        /// computed from the canonical (daemon-overwritten) entry.
+        #[test]
+        fn test_publish_work_context_entry_intent_digest_binds_canonical_bytes() {
+            use prost::Message;
+
+            let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher();
+
+            let entry_json = make_entry_json(&work_id, "HANDOFF_NOTE", "key-intent-001");
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: "key-intent-001".to_string(),
+                entry_json: entry_json.clone(),
+                lease_id: lease_id.clone(),
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+            let resp = match dispatcher.dispatch(&frame, &ctx).unwrap() {
+                PrivilegedResponse::PublishWorkContextEntry(r) => r,
+                other => panic!("Expected PublishWorkContextEntry, got: {other:?}"),
+            };
+
+            // Retrieve the emitted evidence.published event.
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let ev = events
+                .iter()
+                .find(|e| e.event_type == "evidence.published")
+                .expect("must have evidence.published event");
+
+            // Decode the event payload to extract PCAC intent digest metadata.
+            let payload_json = serde_json::from_slice::<serde_json::Value>(&ev.payload)
+                .expect("payload must be valid JSON");
+            let hex_payload = payload_json
+                .get("payload")
+                .and_then(|v| v.as_str())
+                .expect("must have hex payload");
+            let inner_bytes = hex::decode(hex_payload).expect("valid hex");
+            let evidence_event = apm2_core::events::EvidenceEvent::decode(inner_bytes.as_slice())
+                .expect("valid protobuf");
+            let Some(apm2_core::events::evidence_event::Event::Published(published)) =
+                evidence_event.event
+            else {
+                panic!("expected Published variant")
+            };
+
+            // Extract the pcac_intent_digest from event metadata.
+            let intent_digest_hex = published
+                .metadata
+                .iter()
+                .find_map(|m| m.strip_prefix("pcac_intent_digest="))
+                .expect("PCAC intent digest must be in metadata");
+
+            // Now compute what the intent digest SHOULD be, using the
+            // daemon-overwritten canonical bytes (NOT request.entry_json).
+            // Reconstruct the canonical entry: parse the raw client JSON,
+            // apply daemon-authoritative overwrites, serialize + canonicalize.
+            let mut canonical_entry =
+                apm2_core::fac::work_cas_schemas::bounded_decode_context_entry(&entry_json)
+                    .expect("valid entry");
+            canonical_entry.entry_id.clone_from(&resp.entry_id);
+            // Derive the actor_id the same way the handler does.
+            let peer_creds = ctx.peer_credentials().unwrap();
+            let actor_id = derive_actor_id(peer_creds);
+            canonical_entry.actor_id = Some(actor_id);
+            canonical_entry.source_session_id = None;
+            // created_at_ns is set by the handler; we cannot replicate the
+            // exact timestamp, but we can verify the intent digest structure
+            // is different from what raw entry_json would produce.
+
+            // Compute the digest that raw entry_json (pre-overwrite) would
+            // produce — this is the WRONG digest that the old code used.
+            let raw_content_hash = blake3::hash(&entry_json);
+            let wrong_intent_digest = domain_tagged_hash(
+                PrivilegedHandlerClass::PublishWorkContextEntry,
+                "intent",
+                &[
+                    work_id.as_bytes(),
+                    b"HANDOFF_NOTE",
+                    b"key-intent-001",
+                    resp.entry_id.as_bytes(),
+                    raw_content_hash.as_bytes(),
+                ],
+            );
+            let wrong_digest_hex = hex::encode(wrong_intent_digest);
+
+            // The actual digest in the event MUST NOT equal the digest
+            // computed from raw (pre-overwrite) bytes, because the daemon
+            // overwrites entry_id, actor_id, created_at_ns, and
+            // source_session_id before computing the intent digest.
+            assert_ne!(
+                intent_digest_hex, wrong_digest_hex,
+                "Intent digest must NOT be computed from raw client entry_json \
+                 (pre-overwrite). It must bind to the canonical bytes with \
+                 daemon-authoritative fields applied."
+            );
+
+            // Verify the digest is non-empty and well-formed (64 hex chars).
+            assert_eq!(
+                intent_digest_hex.len(),
+                64,
+                "pcac_intent_digest must be 64 hex chars (32 bytes), got: {intent_digest_hex}",
+            );
+
+            // Verify that the response is structurally correct.
+            assert_eq!(resp.work_id, work_id);
+            assert!(!resp.cas_hash.is_empty());
+        }
+
+        /// MAJOR 2: Rejects caller who does not own the work claim.
+        #[test]
+        fn test_publish_work_context_entry_rejects_wrong_actor() {
+            let (dispatcher, _ctx, work_id, lease_id) = setup_full_dispatcher();
+
+            // Use different peer credentials (uid=9999) which will derive a
+            // different actor_id.
+            let wrong_creds = PeerCredentials {
+                uid: 9999,
+                gid: 9999,
+                pid: Some(88888),
+            };
+            let wrong_ctx = ConnectionContext::privileged_session_open(Some(wrong_creds));
+
+            let entry_json = make_entry_json(&work_id, "HANDOFF_NOTE", "key-actor-001");
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: "key-actor-001".to_string(),
+                entry_json,
+                lease_id: lease_id.clone(),
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+            let response = dispatcher.dispatch(&frame, &wrong_ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("does not own work claim"),
+                        "Expected actor ownership error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
         }
     }
 

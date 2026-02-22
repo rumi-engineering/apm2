@@ -268,7 +268,18 @@ pub struct Work {
     pub evidence_ids: Vec<String>,
 
     /// Gate receipt ID (populated on completion).
+    ///
+    /// Must NOT contain merge receipt identifiers (values matching
+    /// `merge-receipt-*`).  Use `merge_receipt_id` for merge receipts.
     pub gate_receipt_id: Option<String>,
+
+    /// Merge receipt ID (populated on completion via merge executor).
+    ///
+    /// When present, MUST start with `merge-receipt-` (positive allowlist
+    /// per INV-0114).  Distinct from `gate_receipt_id`: a merge receipt
+    /// atomically binds gate outcomes to the observed merge result, while
+    /// a gate receipt attests a single gate evaluation.
+    pub merge_receipt_id: Option<String>,
 
     /// Abort reason (populated on abort).
     pub abort_reason: Option<String>,
@@ -332,6 +343,7 @@ impl Work {
             evidence_bundle_hash: None,
             evidence_ids: Vec::new(),
             gate_receipt_id: None,
+            merge_receipt_id: None,
             abort_reason: None,
             pr_number: None,
             commit_sha: None,
