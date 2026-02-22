@@ -30,9 +30,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use apm2_core::crypto::{Signer, VerifyingKey};
 use apm2_core::evidence::ContentAddressedStore;
 use apm2_core::fac::{
-    AatLeaseExtension, GateLease, GateLeaseBuilder, GateReceipt, GateReceiptBuilder,
-    PolicyInheritanceValidator, PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
-    RiskTier,
+    AatLeaseExtension, ChangesetPublication, GateLease, GateLeaseBuilder, GateReceipt,
+    GateReceiptBuilder, PolicyInheritanceValidator, PolicyResolvedForChangeSet,
+    PolicyResolvedForChangeSetBuilder, RiskTier,
 };
 use apm2_core::htf::{
     BoundedWallInterval, Canonicalizable, ClockProfile, Hlc, LedgerTime, MonotonicReading,
@@ -778,6 +778,35 @@ impl GateOrchestrator {
     /// Returns the number of active orchestrations.
     pub async fn active_count(&self) -> usize {
         self.orchestrations.read().await.len()
+    }
+
+    /// Starts gate orchestration for an authoritative published changeset.
+    ///
+    /// This is the FAC vNext gate-start entrypoint for
+    /// `ChangeSetPublished -> StartGates` wiring.
+    pub async fn start_for_changeset(
+        &self,
+        publication: ChangesetPublication,
+    ) -> Result<
+        (
+            Vec<GateType>,
+            HashMap<GateType, Arc<Signer>>,
+            Vec<GateOrchestratorEvent>,
+        ),
+        GateOrchestratorError,
+    > {
+        let info = SessionTerminatedInfo {
+            // Keep idempotency deterministic for this publication by binding
+            // to the authoritative source event id.
+            session_id: publication.changeset_published_event_id,
+            work_id: publication.work_id,
+            changeset_digest: publication.changeset_digest,
+            // Freshness for publication-driven start is governed by the
+            // orchestrator-kernel cursor + effect journal pipeline, not the
+            // session-termination stale-event guard.
+            terminated_at_ms: 0,
+        };
+        self.on_session_terminated(info).await
     }
 
     /// Returns the orchestrator's verifying key (for lease signature
