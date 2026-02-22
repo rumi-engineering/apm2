@@ -4622,6 +4622,12 @@ impl WorkRegistry for SqliteWorkRegistry {
         })
     }
 
+    fn clear_claim_age(&self, work_id: &str, role: WorkRole) {
+        if let Ok(mut ages) = self.claim_inserted_at.write() {
+            ages.remove(&(work_id.to_string(), role as i32));
+        }
+    }
+
     fn remove_claim_for_role(&self, work_id: &str, role: WorkRole) {
         if let Ok(conn) = self.conn.lock() {
             let _ = conn.execute(
@@ -4629,9 +4635,7 @@ impl WorkRegistry for SqliteWorkRegistry {
                 params![work_id, role as i32],
             );
         }
-        if let Ok(mut ages) = self.claim_inserted_at.write() {
-            ages.remove(&(work_id.to_string(), role as i32));
-        }
+        self.clear_claim_age(work_id, role);
     }
 }
 
@@ -9423,5 +9427,52 @@ mod tests {
         registry
             .register_claim(re_claim)
             .expect("re-register after removal must succeed");
+    }
+
+    #[test]
+    fn test_sqlite_work_registry_clear_claim_age_keeps_claim() {
+        use std::sync::{Arc, Mutex};
+
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteWorkRegistry::init_schema(&conn).unwrap();
+        let registry = SqliteWorkRegistry::new(Arc::new(Mutex::new(conn)));
+
+        let claim = WorkClaim {
+            work_id: "W-clear-age-001".to_string(),
+            lease_id: "L-clear-age-001".to_string(),
+            actor_id: "actor-clear-age".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+
+        registry
+            .register_claim(claim.clone())
+            .expect("register implementer");
+        assert!(
+            registry
+                .get_claim_age_for_role(&claim.work_id, claim.role)
+                .is_some(),
+            "age metadata should be present after register_claim"
+        );
+
+        registry.clear_claim_age(&claim.work_id, claim.role);
+
+        assert!(
+            registry
+                .get_claim_for_role(&claim.work_id, claim.role)
+                .is_some(),
+            "clear_claim_age must not remove the persisted claim row"
+        );
+        assert!(
+            registry
+                .get_claim_age_for_role(&claim.work_id, claim.role)
+                .is_none(),
+            "clear_claim_age must remove age metadata after success"
+        );
     }
 }
