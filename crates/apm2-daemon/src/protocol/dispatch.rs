@@ -248,7 +248,7 @@ impl SignedLedgerEvent {
     /// from the canonical `events` table.
     ///
     /// Canonical events are represented with synthesised IDs of the form
-    /// `canonical-<seq_id>`; legacy `ledger_events` rows return `None`.
+    /// `canonical-<seq_id:020>`; legacy `ledger_events` rows return `None`.
     #[must_use]
     pub fn canonical_seq_id(&self) -> Option<u64> {
         self.event_id
