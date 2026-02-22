@@ -33678,6 +33678,9 @@ mod tests {
             use std::sync::{Arc, mpsc};
             use std::time::{Duration, Instant};
 
+            const WORKER_COUNT: usize = 4;
+            const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
             let dispatcher = Arc::new(open_work_dispatcher_with_cas());
             let ctx = test_open_work_ctx();
             let spec_bytes = test_work_spec_json("W-test-race-001");
@@ -33689,9 +33692,6 @@ mod tests {
             let mut buf = Vec::new();
             request.encode(&mut buf).expect("encode");
             let shared_buf = Arc::new(buf);
-
-            const WORKER_COUNT: usize = 4;
-            const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
             // Deterministic start gate: include coordinator thread as a participant
             // so all workers begin the race at the same synchronization point.
@@ -33715,9 +33715,9 @@ mod tests {
             // Release all worker threads together.
             start_gate.wait();
 
-            let mut created_count = 0u32;
-            let mut idempotent_count = 0u32;
-            let mut pcac_rejected_count = 0u32;
+            let mut created_count = 0usize;
+            let mut idempotent_count = 0usize;
+            let mut pcac_rejected_count = 0usize;
             let deadline = Instant::now() + TEST_TIMEOUT;
             for worker_idx in 0..WORKER_COUNT {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -33728,9 +33728,8 @@ mod tests {
                 );
                 let result = result_rx.recv_timeout(remaining).unwrap_or_else(|e| {
                     panic!(
-                        "OpenWork race test did not complete within {:?} \
+                        "OpenWork race test did not complete within {TEST_TIMEOUT:?} \
                              (received {worker_idx}/{WORKER_COUNT} outcomes): {e}",
-                        TEST_TIMEOUT
                     )
                 });
                 let response = result.expect("handler returned Err");
@@ -33769,7 +33768,7 @@ mod tests {
             );
             assert_eq!(
                 idempotent_count + pcac_rejected_count,
-                (WORKER_COUNT - 1) as u32,
+                WORKER_COUNT - 1,
                 "Remaining threads must return idempotent success or PCAC rejection \
                  (idempotent={idempotent_count}, pcac_rejected={pcac_rejected_count})"
             );
