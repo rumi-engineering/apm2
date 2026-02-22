@@ -666,10 +666,6 @@ fn decode_canonical_work_event_payload(
     payload: &[u8],
     event_type: &str,
 ) -> Result<Vec<u8>, WorkProjectionError> {
-    if WorkEvent::decode(payload).is_ok() {
-        return Ok(payload.to_vec());
-    }
-
     if payload.len() > MAX_CANONICAL_WORK_EVENT_JSON_BYTES {
         return Err(WorkProjectionError::InvalidPayload {
             event_type: event_type.to_string(),
@@ -678,6 +674,10 @@ fn decode_canonical_work_event_payload(
                  envelope decode"
             ),
         });
+    }
+
+    if WorkEvent::decode(payload).is_ok() {
+        return Ok(payload.to_vec());
     }
 
     let wrapped_payload = match serde_json::from_slice::<CanonicalWorkEventEnvelopeJson>(payload) {
@@ -1474,6 +1474,32 @@ mod tests {
                         && reason.contains("payload exceeds maximum")
             ),
             "oversized JSON envelopes must be rejected before deserialization"
+        );
+    }
+
+    #[test]
+    fn decode_canonical_work_event_payload_rejects_oversized_protobuf_before_decode() {
+        let payload = helpers::work_opened_payload(
+            "W-projection-oversized-protobuf",
+            "TICKET",
+            vec![0x11; 32],
+            vec!["R".repeat(MAX_CANONICAL_WORK_EVENT_JSON_BYTES)],
+            vec![],
+        );
+        assert!(
+            payload.len() > MAX_CANONICAL_WORK_EVENT_JSON_BYTES,
+            "test fixture must exceed the canonical payload bound"
+        );
+
+        let result = decode_canonical_work_event_payload(&payload, "work.opened");
+        assert!(
+            matches!(
+                result,
+                Err(WorkProjectionError::InvalidPayload { event_type, reason })
+                    if event_type == "work.opened"
+                        && reason.contains("payload exceeds maximum")
+            ),
+            "oversized protobuf payloads must be rejected before decode attempts"
         );
     }
 

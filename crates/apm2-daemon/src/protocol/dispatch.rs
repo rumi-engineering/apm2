@@ -1748,6 +1748,18 @@ pub const MAX_REASON_LENGTH: usize = 1024;
 /// bounded before persistence to prevent oversized payload retention.
 pub const MAX_ESCALATION_PREDICATE_LEN: usize = 1024;
 
+/// Returns `true` when `work_id` is alias-like and should route through
+/// ticket-alias reconciliation.
+///
+/// Canonical work IDs (`W-*`) must bypass alias-index admission so alias-index
+/// saturation cannot deny all `SpawnEpisode` requests.
+#[must_use]
+fn is_ticket_alias_candidate(work_id: &str) -> bool {
+    work_id
+        .strip_prefix("TCK-")
+        .is_some_and(|suffix| !suffix.is_empty())
+}
+
 /// Wire-framing overhead added on top of JSON-serialized `WorkClaim`
 /// size for queue-byte accounting (TCK-00568).
 ///
@@ -12819,37 +12831,46 @@ impl PrivilegedDispatcher {
         }
 
         // TCK-00636 MAJOR fix: Resolve ticket aliases BEFORE any work_id-based
-        // lookup (lease validation, claim lookup, promotion checks).
+        // lookup (lease validation, claim lookup, promotion checks), but only
+        // when the caller provided an alias-like identifier.
         //
-        // The resolved canonical work_id replaces request.work_id for all
-        // subsequent operations so alias inputs follow the same policy path as
-        // canonical IDs.
+        // Canonical work IDs must bypass alias index resolution so a saturated
+        // alias index cannot deny all SpawnEpisode requests.
         let requested_work_id = request.work_id.clone();
-        let (alias_binding_ticket_alias, resolved_work_id) = match self
-            .alias_reconciliation_gate
-            .resolve_ticket_alias(&requested_work_id)
-        {
-            Ok(Some(canonical_work_id)) => {
+        let (alias_binding_ticket_alias, resolved_work_id) =
+            if is_ticket_alias_candidate(&requested_work_id) {
+                match self
+                    .alias_reconciliation_gate
+                    .resolve_ticket_alias(&requested_work_id)
+                {
+                    Ok(Some(canonical_work_id)) => {
+                        debug!(
+                            request_work_id = %requested_work_id,
+                            resolved_work_id = %canonical_work_id,
+                            "SpawnEpisode: resolved ticket alias to canonical work_id"
+                        );
+                        (requested_work_id.clone(), canonical_work_id)
+                    },
+                    Ok(None) => (requested_work_id.clone(), requested_work_id),
+                    Err(e) => {
+                        warn!(
+                            work_id = %requested_work_id,
+                            error = %e,
+                            "SpawnEpisode rejected: alias resolution failed (fail-closed)"
+                        );
+                        return Ok(PrivilegedResponse::error(
+                            PrivilegedErrorCode::CapabilityRequestRejected,
+                            format!("alias resolution failed (fail-closed): {e}"),
+                        ));
+                    },
+                }
+            } else {
                 debug!(
-                    request_work_id = %requested_work_id,
-                    resolved_work_id = %canonical_work_id,
-                    "SpawnEpisode: resolved ticket alias to canonical work_id"
-                );
-                (requested_work_id.clone(), canonical_work_id)
-            },
-            Ok(None) => (requested_work_id.clone(), requested_work_id.clone()),
-            Err(e) => {
-                warn!(
                     work_id = %requested_work_id,
-                    error = %e,
-                    "SpawnEpisode rejected: alias resolution failed (fail-closed)"
+                    "SpawnEpisode: canonical work_id input; skipping ticket alias resolution"
                 );
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!("alias resolution failed (fail-closed): {e}"),
-                ));
-            },
-        };
+                (requested_work_id.clone(), requested_work_id)
+            };
         request.work_id = resolved_work_id;
 
         // GATE_EXECUTOR requires lease_id
@@ -28100,6 +28121,101 @@ mod tests {
                     );
                 },
                 other => panic!("Expected WorkStatus response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_spawn_episode_canonical_work_id_bypasses_alias_resolution_failures() {
+            struct SaturatedAliasGate;
+
+            impl AliasReconciliationGate for SaturatedAliasGate {
+                fn check_promotion(
+                    &self,
+                    bindings: &[apm2_core::events::alias_reconcile::TicketAliasBinding],
+                    _current_tick: u64,
+                ) -> Result<
+                    apm2_core::events::alias_reconcile::AliasReconciliationResult,
+                    WorkAuthorityError,
+                > {
+                    Ok(
+                        apm2_core::events::alias_reconcile::AliasReconciliationResult {
+                            resolved_count: bindings.len(),
+                            unresolved_defects: Vec::new(),
+                        },
+                    )
+                }
+
+                fn observation_window(
+                    &self,
+                ) -> &apm2_core::events::alias_reconcile::ObservationWindow {
+                    static OBSERVATION_WINDOW:
+                        apm2_core::events::alias_reconcile::ObservationWindow =
+                        apm2_core::events::alias_reconcile::ObservationWindow {
+                            start_tick: 0,
+                            end_tick: u64::MAX,
+                            max_staleness_ticks: u64::MAX,
+                        };
+                    &OBSERVATION_WINDOW
+                }
+
+                fn evaluate_emitter_sunset(
+                    &self,
+                    _consecutive_clean_ticks: u64,
+                    _has_defects: bool,
+                ) -> apm2_core::events::alias_reconcile::SnapshotEmitterStatus {
+                    apm2_core::events::alias_reconcile::SnapshotEmitterStatus::Active
+                }
+
+                fn resolve_ticket_alias(
+                    &self,
+                    _ticket_alias: &str,
+                ) -> Result<Option<String>, WorkAuthorityError> {
+                    Err(WorkAuthorityError::ProjectionLock {
+                        message:
+                            "ticket alias index lossy marker capacity saturated; refusing lossy resolution"
+                                .to_string(),
+                    })
+                }
+            }
+
+            let mut dispatcher = PrivilegedDispatcher::new();
+            dispatcher.alias_reconciliation_gate = Arc::new(SaturatedAliasGate);
+            let ctx = privileged_ctx();
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "team-alpha:canonical".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                other => panic!("Expected ClaimWork response, got: {other:?}"),
+            };
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id,
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+                adapter_profile_hash: None,
+                max_episodes: None,
+                escalation_predicate: None,
+                permeability_receipt_hash: None,
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+
+            match spawn_response {
+                PrivilegedResponse::SpawnEpisode(resp) => {
+                    assert!(
+                        !resp.session_id.is_empty(),
+                        "canonical work_id spawn must bypass alias gate saturation and succeed"
+                    );
+                },
+                other => panic!("Expected SpawnEpisode response, got: {other:?}"),
             }
         }
     }

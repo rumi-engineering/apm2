@@ -608,7 +608,10 @@ struct TicketAliasIndex {
     alias_to_work_ids: HashMap<String, BTreeSet<String>>,
     work_id_to_alias: HashMap<String, String>,
     spec_hash_by_work_id: HashMap<String, [u8; 32]>,
-    insertion_order: VecDeque<String>,
+    // Eviction sort key by work_id: (created_at_ns, first_seen_sequence).
+    // Lower keys are evicted first when capacity is exceeded.
+    work_sort_keys: HashMap<String, (u64, u64)>,
+    next_work_sort_seq: u64,
     resolved_alias_by_spec_hash: HashMap<[u8; 32], Option<String>>,
     resolved_spec_hash_order: VecDeque<[u8; 32]>,
     evicted_aliases: HashSet<String>,
@@ -620,7 +623,8 @@ impl TicketAliasIndex {
         self.alias_to_work_ids.clear();
         self.work_id_to_alias.clear();
         self.spec_hash_by_work_id.clear();
-        self.insertion_order.clear();
+        self.work_sort_keys.clear();
+        self.next_work_sort_seq = 0;
         self.resolved_alias_by_spec_hash.clear();
         self.resolved_spec_hash_order.clear();
         self.evicted_aliases.clear();
@@ -633,7 +637,7 @@ impl TicketAliasIndex {
         mark_alias_evicted: bool,
     ) -> Result<(), WorkAuthorityError> {
         self.spec_hash_by_work_id.remove(work_id);
-        self.insertion_order.retain(|entry| entry != work_id);
+        self.work_sort_keys.remove(work_id);
 
         if let Some(alias) = self.work_id_to_alias.remove(work_id) {
             if let Some(work_ids) = self.alias_to_work_ids.get_mut(&alias) {
@@ -669,17 +673,35 @@ impl TicketAliasIndex {
         Ok(())
     }
 
-    fn upsert_spec_hash(&mut self, work_id: &str, spec_hash: [u8; 32]) -> bool {
+    fn upsert_spec_hash(&mut self, work_id: &str, spec_hash: [u8; 32], created_at_ns: u64) -> bool {
         if self.spec_hash_by_work_id.get(work_id) == Some(&spec_hash) {
+            if !self.work_sort_keys.contains_key(work_id) {
+                self.work_sort_keys.insert(
+                    work_id.to_string(),
+                    (created_at_ns, self.next_work_sort_seq),
+                );
+                self.next_work_sort_seq = self.next_work_sort_seq.saturating_add(1);
+            }
             return false;
         }
 
+        let work_id_key = work_id.to_string();
         let is_new = self
             .spec_hash_by_work_id
-            .insert(work_id.to_string(), spec_hash)
+            .insert(work_id_key.clone(), spec_hash)
             .is_none();
         if is_new {
-            self.insertion_order.push_back(work_id.to_string());
+            self.work_sort_keys
+                .insert(work_id_key, (created_at_ns, self.next_work_sort_seq));
+            self.next_work_sort_seq = self.next_work_sort_seq.saturating_add(1);
+        } else if let Some((existing_created_at_ns, _)) = self.work_sort_keys.get_mut(work_id) {
+            *existing_created_at_ns = created_at_ns;
+        } else {
+            self.work_sort_keys.insert(
+                work_id.to_string(),
+                (created_at_ns, self.next_work_sort_seq),
+            );
+            self.next_work_sort_seq = self.next_work_sort_seq.saturating_add(1);
         }
         true
     }
@@ -727,17 +749,36 @@ impl TicketAliasIndex {
 
     fn enforce_capacity(&mut self) -> Result<(), WorkAuthorityError> {
         while self.spec_hash_by_work_id.len() > MAX_TICKET_ALIAS_INDEX_WORK_ITEMS {
-            let Some(oldest_work_id) = self.insertion_order.pop_front() else {
+            let Some(oldest_work_id) = self
+                .spec_hash_by_work_id
+                .keys()
+                .min_by(|left, right| {
+                    let left_key = self
+                        .work_sort_keys
+                        .get(*left)
+                        .copied()
+                        .unwrap_or((u64::MAX, u64::MAX));
+                    let right_key = self
+                        .work_sort_keys
+                        .get(*right)
+                        .copied()
+                        .unwrap_or((u64::MAX, u64::MAX));
+                    left_key.cmp(&right_key).then_with(|| left.cmp(right))
+                })
+                .cloned()
+            else {
                 break;
             };
-            if !self.spec_hash_by_work_id.contains_key(&oldest_work_id) {
-                continue;
-            }
+            let evicted_created_at_ns = self
+                .work_sort_keys
+                .get(&oldest_work_id)
+                .map_or(0, |(created_at_ns, _)| *created_at_ns);
             self.remove_work(&oldest_work_id, true)?;
             warn!(
                 work_id = %oldest_work_id,
+                created_at_ns = evicted_created_at_ns,
                 max_entries = MAX_TICKET_ALIAS_INDEX_WORK_ITEMS,
-                "ticket alias index reached capacity; evicted oldest work binding"
+                "ticket alias index reached capacity; evicted oldest work binding by created_at_ns"
             );
         }
         Ok(())
@@ -810,8 +851,7 @@ impl ProjectionAliasReconciliationGate {
     /// window's `max_staleness_ticks` configuration.
     fn refresh_projection(&self) -> Result<(), WorkAuthorityError> {
         let current_count = self.event_emitter.get_event_count();
-
-        {
+        let last_refreshed_event_count = {
             let cached =
                 self.last_event_count
                     .read()
@@ -821,7 +861,8 @@ impl ProjectionAliasReconciliationGate {
             if *cached == current_count {
                 return Ok(());
             }
-        }
+            *cached
+        };
 
         let signed_events = self.event_emitter.get_all_events();
 
@@ -839,7 +880,12 @@ impl ProjectionAliasReconciliationGate {
         match projection.rebuild_from_signed_events(&work_events) {
             Ok(()) => {
                 if let Some(cas) = self.cas.as_ref() {
-                    self.refresh_ticket_alias_index(&projection, cas.as_ref())?;
+                    self.refresh_ticket_alias_index(
+                        &projection,
+                        cas.as_ref(),
+                        &signed_events,
+                        last_refreshed_event_count,
+                    )?;
                 } else {
                     let mut alias_index = self.ticket_alias_index.write().map_err(|err| {
                         WorkAuthorityError::ProjectionLock {
@@ -873,6 +919,8 @@ impl ProjectionAliasReconciliationGate {
         &self,
         projection: &WorkObjectProjection,
         cas: &dyn apm2_core::evidence::ContentAddressedStore,
+        signed_events: &[SignedLedgerEvent],
+        last_refreshed_event_count: usize,
     ) -> Result<(), WorkAuthorityError> {
         let mut alias_index =
             self.ticket_alias_index
@@ -903,8 +951,35 @@ impl ProjectionAliasReconciliationGate {
             }
         }
 
-        // Incrementally process only work IDs whose spec hash is new/changed.
-        for work in projection.iter_work() {
+        let mut work_ids_to_refresh = BTreeSet::new();
+        if last_refreshed_event_count <= signed_events.len() {
+            for event in &signed_events[last_refreshed_event_count..] {
+                if !event.work_id.is_empty() {
+                    work_ids_to_refresh.insert(event.work_id.clone());
+                }
+            }
+        } else {
+            warn!(
+                last_refreshed_event_count,
+                current_event_count = signed_events.len(),
+                "ticket alias index: event stream length regressed; falling back to full work scan"
+            );
+            for work in projection.iter_work() {
+                work_ids_to_refresh.insert(work.work_id.clone());
+            }
+        }
+
+        if work_ids_to_refresh.is_empty() {
+            return Ok(());
+        }
+
+        // Incrementally process only work IDs touched since the last refresh.
+        for work_id in work_ids_to_refresh {
+            let Some(work) = projection.get_work(&work_id) else {
+                alias_index.remove_work(&work_id, false)?;
+                continue;
+            };
+
             let spec_hash = match Self::extract_spec_snapshot_hash(work) {
                 Ok(spec_hash) => spec_hash,
                 Err(error) => {
@@ -951,7 +1026,7 @@ impl ProjectionAliasReconciliationGate {
 
             // Record the spec hash only after alias extraction succeeds so
             // transient CAS failures can retry on future projection refreshes.
-            alias_index.upsert_spec_hash(&work.work_id, spec_hash);
+            alias_index.upsert_spec_hash(&work.work_id, spec_hash, work.opened_at);
             alias_index.upsert_alias(&work.work_id, ticket_alias);
             alias_index.enforce_capacity()?;
         }
@@ -1786,7 +1861,7 @@ mod tests {
             let work_id = format!("W-636-CAP-{i}");
             let alias = format!("TCK-CAP-{i}");
             let spec_hash = work_id_to_hash(&work_id);
-            alias_index.upsert_spec_hash(&work_id, spec_hash);
+            alias_index.upsert_spec_hash(&work_id, spec_hash, i as u64 + 1);
             alias_index.upsert_alias(&work_id, Some(alias));
             alias_index
                 .enforce_capacity()
@@ -1801,6 +1876,44 @@ mod tests {
         assert!(
             alias_index.evicted_aliases.contains("TCK-CAP-0"),
             "oldest alias must be marked lossy after eviction"
+        );
+    }
+
+    #[test]
+    fn ticket_alias_index_eviction_prefers_oldest_created_at() {
+        let mut alias_index = TicketAliasIndex::default();
+
+        for i in 0..MAX_TICKET_ALIAS_INDEX_WORK_ITEMS {
+            let work_id = format!("W-636-TS-{i:04}");
+            let alias = format!("TCK-636-TS-{i:04}");
+            let spec_hash = work_id_to_hash(&work_id);
+            alias_index.upsert_spec_hash(&work_id, spec_hash, 10_000 + i as u64);
+            alias_index.upsert_alias(&work_id, Some(alias));
+        }
+
+        let oldest_work_id = "W-636-TS-OLDEST";
+        let oldest_alias = "TCK-636-TS-OLDEST";
+        alias_index.upsert_spec_hash(oldest_work_id, work_id_to_hash(oldest_work_id), 1);
+        alias_index.upsert_alias(oldest_work_id, Some(oldest_alias.to_string()));
+        alias_index
+            .enforce_capacity()
+            .expect("capacity enforcement should not fail");
+
+        assert!(
+            !alias_index
+                .spec_hash_by_work_id
+                .contains_key(oldest_work_id),
+            "capacity eviction must target the oldest created_at_ns even when inserted last"
+        );
+        assert!(
+            alias_index.evicted_aliases.contains(oldest_alias),
+            "evicted alias marker must track the oldest-created work item"
+        );
+        assert!(
+            alias_index
+                .spec_hash_by_work_id
+                .contains_key("W-636-TS-0000"),
+            "newer entries should be retained when an older-created item is present"
         );
     }
 
