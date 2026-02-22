@@ -4738,3 +4738,54 @@ fn test_orchestrator_terminal_detection() {
     });
     assert!(orch.is_terminal());
 }
+
+#[test]
+fn test_orchestrator_step_semantics_cover_done_and_skipped() {
+    let mut orch = WorkerOrchestrator::new();
+
+    assert!(
+        matches!(orch.step(), StepOutcome::Advanced),
+        "idle state must request progression"
+    );
+
+    orch.transition(OrchestratorState::Completed {
+        job_id: "j-003".to_string(),
+        outcome: "completed".to_string(),
+    });
+    match orch.step() {
+        StepOutcome::Done(JobOutcome::Completed { job_id, .. }) => {
+            assert_eq!(job_id, "j-003");
+        },
+        other => panic!("expected Done(Completed), got {other:?}"),
+    }
+
+    orch.transition(OrchestratorState::Completed {
+        job_id: "j-004".to_string(),
+        outcome: "unknown-terminal".to_string(),
+    });
+    match orch.step() {
+        StepOutcome::Skipped(reason) => {
+            assert_eq!(reason, "unknown-terminal");
+        },
+        other => panic!("expected Skipped for unknown terminal outcome, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_orchestrator_complete_with_outcome_preserves_job_outcome() {
+    let mut orch = WorkerOrchestrator::new();
+    let expected = JobOutcome::Skipped {
+        reason: "commit deferred".to_string(),
+        disposition: JobSkipDisposition::PipelineCommitFailed,
+    };
+
+    orch.complete_with_outcome("j-005".to_string(), expected.clone());
+    assert!(orch.is_terminal());
+
+    match orch.step() {
+        StepOutcome::Done(actual) => {
+            assert_eq!(actual, expected);
+        },
+        other => panic!("expected Done with preserved terminal outcome, got {other:?}"),
+    }
+}

@@ -1120,32 +1120,99 @@ pub(super) fn run_fac_worker_impl(
                     reason: format!("scheduler admission reservation failed: {e}"),
                 }
             } else {
-                let outcome = process_job(
-                    candidate,
-                    &queue_root,
-                    &fac_root,
-                    &mut completed_gates_cache,
-                    &verifying_key,
-                    &cycle_scheduler,
-                    lane,
-                    &mut broker,
-                    &signer,
-                    &policy_hash,
-                    &policy_digest,
-                    &policy,
-                    &job_spec_policy,
-                    &budget_cas,
-                    candidates.len(),
-                    print_unit,
-                    &current_tuple_digest,
-                    &boundary_id,
-                    cycle_count,
-                    summary.jobs_completed as u64,
-                    summary.jobs_denied as u64,
-                    summary.jobs_quarantined as u64,
-                    &cost_model,
-                    Some(toolchain_fingerprint.as_str()),
-                );
+                let mut orchestrator = WorkerOrchestrator::new();
+                let mut staged_outcome: Option<JobOutcome> = None;
+                let lane_id = candidate.spec.queue_lane.clone();
+                let mut transition_count = 0usize;
+                let outcome = loop {
+                    transition_count = transition_count.saturating_add(1);
+                    if transition_count > 16 {
+                        break JobOutcome::skipped(
+                            "orchestrator transition budget exceeded before completion",
+                        );
+                    }
+
+                    match orchestrator.step() {
+                        StepOutcome::Advanced => match orchestrator.state() {
+                            OrchestratorState::Idle => {
+                                orchestrator.transition(OrchestratorState::Claimed {
+                                    job_id: candidate.spec.job_id.clone(),
+                                });
+                            },
+                            OrchestratorState::Claimed { .. } => {
+                                orchestrator.transition(OrchestratorState::LaneAcquired {
+                                    job_id: candidate.spec.job_id.clone(),
+                                    lane_id: lane_id.clone(),
+                                });
+                            },
+                            OrchestratorState::LaneAcquired { .. } => {
+                                orchestrator.transition(OrchestratorState::LeasePersisted {
+                                    job_id: candidate.spec.job_id.clone(),
+                                    lane_id: lane_id.clone(),
+                                });
+                            },
+                            OrchestratorState::LeasePersisted { .. } => {
+                                orchestrator.transition(OrchestratorState::Executing {
+                                    job_id: candidate.spec.job_id.clone(),
+                                    lane_id: lane_id.clone(),
+                                });
+                            },
+                            OrchestratorState::Executing { .. } => {
+                                orchestrator.transition(OrchestratorState::Committing {
+                                    job_id: candidate.spec.job_id.clone(),
+                                    lane_id: lane_id.clone(),
+                                });
+                            },
+                            OrchestratorState::Committing { .. } => {
+                                if staged_outcome.is_none() {
+                                    staged_outcome = Some(process_job(
+                                        candidate,
+                                        &queue_root,
+                                        &fac_root,
+                                        &mut completed_gates_cache,
+                                        &verifying_key,
+                                        &cycle_scheduler,
+                                        lane,
+                                        &mut broker,
+                                        &signer,
+                                        &policy_hash,
+                                        &policy_digest,
+                                        &policy,
+                                        &job_spec_policy,
+                                        &budget_cas,
+                                        candidates.len(),
+                                        print_unit,
+                                        &current_tuple_digest,
+                                        &boundary_id,
+                                        cycle_count,
+                                        summary.jobs_completed as u64,
+                                        summary.jobs_denied as u64,
+                                        summary.jobs_quarantined as u64,
+                                        &cost_model,
+                                        Some(toolchain_fingerprint.as_str()),
+                                    ));
+                                }
+                                let committed_outcome =
+                                    staged_outcome.take().unwrap_or_else(|| {
+                                        JobOutcome::skipped(
+                                            "orchestrator reached committing without staged outcome",
+                                        )
+                                    });
+                                orchestrator.complete_with_outcome(
+                                    candidate.spec.job_id.clone(),
+                                    committed_outcome,
+                                );
+                            },
+                            OrchestratorState::Completed { .. } => {},
+                        },
+                        StepOutcome::Done(done) => break done,
+                        StepOutcome::Skipped(reason) => {
+                            break staged_outcome
+                                .take()
+                                .unwrap_or_else(|| JobOutcome::skipped(reason));
+                        },
+                    }
+                };
                 cycle_scheduler.record_completion(lane);
                 outcome
             };
