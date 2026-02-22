@@ -1,0 +1,303 @@
+{
+  "schema": "apm2.fac_worker.requirements.v1",
+  "schema_version": "1.0.0",
+  "kind": "requirements.specification",
+  "meta": {
+    "stable_id": "dcp://apm2.fac/requirements/fac-worker@1",
+    "status": "DRAFT",
+    "classification": "INTERNAL",
+    "owners": [
+      "platform",
+      "security"
+    ],
+    "source_of_truth_refs": [
+      "documents/work/tickets/TCK-00664.yaml",
+      "documents/work/tickets/TCK-00660.yaml",
+      "documents/work/tickets/TCK-00577.yaml",
+      "documents/reviews/fac_review_requirements.cac.json",
+      "documents/reviews/fac_review_state_machine.cac.json"
+    ],
+    "last_aligned_rfc": "RFC-0019",
+    "provenance": {
+      "actor_id": "HOLON-PLATFORM-GOVERNANCE",
+      "work_id": "TCK-00664-REQUIREMENTS-CODIFICATION",
+      "source_receipts": [],
+      "incident_refs": [
+        {
+          "ref": "github.com/guardian-intelligence/apm2/pull/796",
+          "type": "reviewer-hardening-followup",
+          "summary": "FAC worker queue hardening and state-machine transition correctness review findings"
+        }
+      ]
+    }
+  },
+  "payload": {
+    "title": "FAC Worker Requirements Specification",
+    "purpose": "Define the FAC worker runtime as requirements-first: state machine behavior, queue filesystem hardening, deterministic execution bounds, and fail-closed recovery contracts. Code and tests are derived artifacts from these requirements.",
+    "architectural_boundaries": {
+      "id": "ARCHW",
+      "title": "Worker Architecture and Module Boundaries",
+      "requirements": [
+        {
+          "id": "ARCHW-001",
+          "title": "Worker orchestration must be explicit-state driven",
+          "severity": "MUST",
+          "description": "Job progression MUST be represented by an explicit state machine with named states: Idle, Claimed, LaneAcquired, LeasePersisted, Executing, Committing, Completed.",
+          "rationale": "State-by-state progression prevents hidden partial transitions and makes crash handling auditable.",
+          "verification": "State enum and transition tests exist under fac_worker orchestrator and test modules."
+        },
+        {
+          "id": "ARCHW-002",
+          "title": "Module decomposition remains strict",
+          "severity": "MUST",
+          "description": "Queue operations, lane operations, execution paths, commit/receipt behavior, and the worker loop MUST remain separated into focused modules. Cross-module coupling must occur through typed interfaces, not shared mutable globals.",
+          "rationale": "Separation limits blast radius and makes adversarial review of security-critical paths tractable."
+        },
+        {
+          "id": "ARCHW-003",
+          "title": "No legacy compatibility path reintroduction",
+          "severity": "MUST",
+          "description": "Legacy worker orchestration paths and compatibility shims MUST NOT be reintroduced once replaced by the explicit orchestrator. Command/runtime flow remains single-path and deterministic.",
+          "rationale": "Dual-path behavior creates non-deterministic drift and silent policy bypass opportunities."
+        },
+        {
+          "id": "ARCHW-004",
+          "title": "Orchestrator terminal payloads are typed",
+          "severity": "MUST",
+          "description": "Terminal outcome storage in orchestrator state MUST use typed `JobOutcome` values, not string labels or ad-hoc encodings.",
+          "rationale": "Typed payloads make illegal terminal combinations structurally harder and reduce replay ambiguity.",
+          "verification": "Completed state stores `JobOutcome`; terminal replay tests enforce behavior."
+        }
+      ]
+    },
+    "orchestrator_state_machine": {
+      "id": "SM",
+      "title": "Worker Orchestrator Contracts",
+      "requirements": [
+        {
+          "id": "SM-001",
+          "title": "Undefined transitions fail closed",
+          "severity": "MUST",
+          "description": "Any missing phase context for the current state MUST terminate the job with a fail-closed skipped outcome, never silently continue.",
+          "rationale": "Missing context implies torn or malformed runtime state; continuation risks duplicate or out-of-order effects.",
+          "verification": "Transition tests assert missing claimed/lane/lease contexts produce skipped terminal outcomes."
+        },
+        {
+          "id": "SM-002",
+          "title": "Terminal replay is idempotent",
+          "severity": "MUST",
+          "description": "After a terminal outcome is set, subsequent `step` invocations MUST return the same terminal outcome without mutating phase state.",
+          "rationale": "Crash/replay safety depends on stable terminal replay semantics.",
+          "verification": "Committing/Completed replay tests assert repeated `step` calls are stable."
+        },
+        {
+          "id": "SM-003",
+          "title": "Completed-state job identity consistency",
+          "severity": "MUST",
+          "description": "If `Completed.outcome` is `JobOutcome::Completed`, the embedded outcome `job_id` MUST match `Completed.job_id`. Mismatch MUST emit fail-closed `StepOutcome::Skipped`.",
+          "rationale": "Prevents malformed terminal payloads from being accepted as authoritative success.",
+          "verification": "Mismatch regression test asserts fail-closed skipped outcome."
+        },
+        {
+          "id": "SM-004",
+          "title": "LeasePersisted to Executing is explicit",
+          "severity": "MUST",
+          "description": "Transition from LeasePersisted to Executing MUST be explicit in the machine and occur before execute-phase side effects.",
+          "rationale": "Explicit stage boundaries preserve auditability for lease-backed execution ordering."
+        },
+        {
+          "id": "SM-005",
+          "title": "Validation-only gate runs are passing when valid",
+          "severity": "MUST",
+          "description": "Validation-only gate receipt commits MUST emit `passed=true` when all validation checks succeed.",
+          "rationale": "A validation pass recorded as failed corrupts lifecycle interpretation and downstream projections.",
+          "verification": "Receipt construction path sets `.passed(true)` for validation-only success path."
+        }
+      ]
+    },
+    "queue_filesystem_security": {
+      "id": "QFS",
+      "title": "Queue Filesystem Hardening",
+      "requirements": [
+        {
+          "id": "QFS-001",
+          "title": "Deterministic queue directory modes",
+          "severity": "MUST",
+          "description": "Queue directory modes MUST be enforced on every worker startup, independent of process umask: queue root 0711, queue subdirectories 0711, broker_requests 01733.",
+          "rationale": "Umask variance and pre-existing drift must not alter security posture.",
+          "verification": "Mode regression tests assert deterministic post-ensure modes."
+        },
+        {
+          "id": "QFS-002",
+          "title": "Symlink paths are rejected fail closed",
+          "severity": "MUST",
+          "description": "Queue hardening MUST refuse queue root or subdirectory paths that resolve to symlinks.",
+          "rationale": "Symlink traversal can redirect chmod/hardening into attacker-controlled paths.",
+          "verification": "Symlink queue root/subdir tests assert explicit refusal."
+        },
+        {
+          "id": "QFS-003",
+          "title": "Non-directory paths are rejected fail closed",
+          "severity": "MUST",
+          "description": "Queue hardening MUST refuse non-directory targets for queue root and required subdirectories.",
+          "rationale": "Treating regular files/FIFOs/devices as directories creates path confusion and unsafe side effects.",
+          "verification": "Non-directory root/subdir tests assert explicit refusal."
+        },
+        {
+          "id": "QFS-004",
+          "title": "Nofollow permission application",
+          "severity": "MUST",
+          "description": "Permission application for queue directories MUST use nofollow-safe mechanisms. On Linux, mode updates MUST be fd-anchored (`O_PATH|O_NOFOLLOW|O_DIRECTORY` + `fchmodat(..., AT_EMPTY_PATH)`).",
+          "rationale": "Descriptor-anchored permission updates reduce path race exposure and final-component symlink confusion.",
+          "verification": "Queue hardening implementation uses fd-anchored Linux path with fail-closed classification."
+        },
+        {
+          "id": "QFS-005",
+          "title": "Unsafe pre-existing modes are corrected",
+          "severity": "MUST",
+          "description": "Pre-existing insecure broker_requests modes (including 0333 and 0000) MUST be hardened to 01733 during startup reconciliation.",
+          "rationale": "Mode drift between restarts must not persist insecure or inoperable queue posture.",
+          "verification": "Regression tests cover pre-existing 0333 and 0000 hardening."
+        },
+        {
+          "id": "QFS-006",
+          "title": "Unsafe usage is constrained and documented",
+          "severity": "SHOULD",
+          "description": "Any required unsafe block in queue hardening MUST be tightly scoped to OS ABI calls, contain explicit safety rationale, and be covered by tests.",
+          "rationale": "Security-sensitive filesystem paths require explicit unsafe accountability."
+        }
+      ]
+    },
+    "receipt_and_evidence": {
+      "id": "RCPT",
+      "title": "Receipt and Evidence Contracts",
+      "requirements": [
+        {
+          "id": "RCPT-001",
+          "title": "Terminal receipt commits remain authoritative",
+          "severity": "MUST",
+          "description": "Terminal job outcomes (completed/denied/quarantined/cancelled) MUST be reflected through receipt commits and terminal queue placement, preserving existing durable receipt semantics.",
+          "rationale": "Receipts are the source of truth for outcome projection and recovery logic."
+        },
+        {
+          "id": "RCPT-002",
+          "title": "Failure paths emit structured reasons",
+          "severity": "MUST",
+          "description": "Fail-closed denial/quarantine/skip paths MUST include bounded, structured reason data suitable for machine diagnosis.",
+          "rationale": "Operational recovery depends on deterministic, non-ambiguous failure signaling."
+        },
+        {
+          "id": "RCPT-003",
+          "title": "No silent success in malformed terminal states",
+          "severity": "MUST",
+          "description": "Malformed terminal payloads must never be converted into synthetic success outcomes.",
+          "rationale": "Fail-open terminal coercion can mask integrity violations and duplicate effects."
+        }
+      ]
+    },
+    "recovery_and_reconcile": {
+      "id": "REC",
+      "title": "Recovery and Runtime Reconcile",
+      "requirements": [
+        {
+          "id": "REC-001",
+          "title": "Crash windows are bounded by explicit phases",
+          "severity": "MUST",
+          "description": "Worker phase boundaries MUST make torn state diagnosable: claimed, lane lease, execution, and commit phases each map to deterministic reconcile behavior.",
+          "rationale": "Torn-state behavior is unavoidable; determinism in recovery handling is required."
+        },
+        {
+          "id": "REC-002",
+          "title": "No-lane and commit-failure dispositions remain explicit",
+          "severity": "MUST",
+          "description": "Skips due to lane unavailability or pipeline commit failures MUST retain explicit disposition classes for runtime repair routing.",
+          "rationale": "Operational repair logic needs typed skip classes, not free-form strings."
+        },
+        {
+          "id": "REC-003",
+          "title": "Fail-closed dominates on ambiguity",
+          "severity": "MUST",
+          "description": "When state/context ambiguity exists, worker behavior MUST choose non-success terminal outcomes and defer to reconcile/doctor paths.",
+          "rationale": "Ambiguous runtime state cannot safely authorize successful completion."
+        }
+      ]
+    },
+    "deterministic_execution": {
+      "id": "DET",
+      "title": "Determinism and Boundedness",
+      "requirements": [
+        {
+          "id": "DET-001",
+          "title": "Deterministic queue ordering",
+          "severity": "MUST",
+          "description": "Pending candidates MUST be processed in deterministic order: priority ASC, enqueue_time ASC, job_id ASC.",
+          "rationale": "Deterministic ordering is required for reproducible replay and bounded fairness."
+        },
+        {
+          "id": "DET-002",
+          "title": "Bounded job spec read",
+          "severity": "MUST",
+          "description": "Job spec reads remain bounded by MAX_JOB_SPEC_SIZE with fail-closed handling for oversized input.",
+          "rationale": "Prevents resource exhaustion and parser abuse in queue intake."
+        },
+        {
+          "id": "DET-003",
+          "title": "No unbounded phase growth",
+          "severity": "MUST",
+          "description": "Per-job orchestration phase data must remain bounded and cleared on terminalization.",
+          "rationale": "Prevents memory/resource leaks across repeated worker cycles."
+        }
+      ]
+    },
+    "test_and_verification": {
+      "id": "TEST",
+      "title": "Verification Requirements",
+      "requirements": [
+        {
+          "id": "TEST-001",
+          "title": "Targeted FAC worker regression suite",
+          "severity": "MUST",
+          "description": "FAC worker transition and queue-hardening regressions MUST be covered by focused unit tests in `commands::fac_worker::tests`.",
+          "rationale": "Security and correctness regressions in worker paths require tight, low-latency detection."
+        },
+        {
+          "id": "TEST-002",
+          "title": "Workspace quality gates remain mandatory",
+          "severity": "MUST",
+          "description": "Changes touching worker orchestration and queue hardening MUST pass `cargo fmt --all`, workspace clippy with warnings denied, and workspace tests.",
+          "rationale": "Prevents local-only green paths from bypassing global quality constraints."
+        },
+        {
+          "id": "TEST-003",
+          "title": "Adversarial mode hardening tests",
+          "severity": "MUST",
+          "description": "Queue hardening tests MUST include adversarial pre-existing mode cases and symlink/non-directory path rejection cases.",
+          "rationale": "Most filesystem exploits rely on pre-existing path shape/mode manipulation."
+        }
+      ]
+    },
+    "cross_references": {
+      "tickets": [
+        "TCK-00664",
+        "TCK-00660",
+        "TCK-00577"
+      ],
+      "rfcs": [
+        "RFC-0019"
+      ],
+      "related_findings": [
+        {
+          "ref": "PR-796/security",
+          "requirements_derived": [
+            "QFS-002",
+            "QFS-003",
+            "QFS-004",
+            "QFS-005",
+            "SM-003",
+            "SM-005"
+          ]
+        }
+      ]
+    }
+  }
+}

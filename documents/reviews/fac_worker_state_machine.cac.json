@@ -1,0 +1,479 @@
+{
+  "kind": "fac.worker.machine_bundle",
+  "meta": {
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "classification": "INTERNAL",
+    "last_aligned_rfc": "RFC-0019",
+    "provenance": {
+      "actor_id": "HOLON-PLATFORM-GOVERNANCE",
+      "source_receipts": [],
+      "work_id": "FAC-WORKER-STATE-MACHINE-CAC-INIT-20260222"
+    },
+    "source_of_truth_refs": [
+      "documents/reviews/fac_worker_requirements.cac.json",
+      "documents/work/tickets/TCK-00664.yaml",
+      "documents/work/tickets/TCK-00660.yaml",
+      "documents/work/tickets/TCK-00577.yaml",
+      "documents/rfcs/RFC-0019/"
+    ],
+    "stable_id": "dcp://apm2.fac/machine/fac-worker@v1",
+    "status": "DRAFT"
+  },
+  "payload": {
+    "schema": "apm2.fac_worker.machine_bundle.v1",
+    "worker_orchestrator_machine": {
+      "id": "WM-001",
+      "title": "FAC Worker Job Orchestrator",
+      "default_state": "Idle",
+      "states": [
+        {
+          "name": "Idle",
+          "kind": "initial",
+          "terminal": false,
+          "required_payload": []
+        },
+        {
+          "name": "Claimed",
+          "kind": "intermediate",
+          "terminal": false,
+          "required_payload": [
+            "claimed_context"
+          ]
+        },
+        {
+          "name": "LaneAcquired",
+          "kind": "intermediate",
+          "terminal": false,
+          "required_payload": [
+            "lane_acquired_context"
+          ]
+        },
+        {
+          "name": "LeasePersisted",
+          "kind": "intermediate",
+          "terminal": false,
+          "required_payload": [
+            "lease_persisted_context"
+          ]
+        },
+        {
+          "name": "Executing",
+          "kind": "intermediate",
+          "terminal": false,
+          "required_payload": [
+            "lease_persisted_context"
+          ]
+        },
+        {
+          "name": "Committing",
+          "kind": "intermediate",
+          "terminal": false,
+          "required_payload": [
+            "staged_outcome"
+          ]
+        },
+        {
+          "name": "Completed",
+          "kind": "terminal",
+          "terminal": true,
+          "required_payload": [
+            "terminal_outcome"
+          ]
+        }
+      ],
+      "events": [
+        "IdlePhaseAdvanced",
+        "IdlePhaseDone",
+        "ClaimedPhaseAdvanced",
+        "ClaimedPhaseDone",
+        "LanePreparedPhaseAdvanced",
+        "LanePreparedPhaseDone",
+        "PromoteExecuting",
+        "ExecutePhaseDone",
+        "CommittingWithStagedOutcome",
+        "CommittingWithoutStagedOutcome",
+        "MissingClaimedContext",
+        "MissingLaneContext",
+        "MissingLeaseContext",
+        "CompletedReplay",
+        "CompletedPayloadMismatch"
+      ],
+      "transition_table": [
+        {
+          "from": "Idle",
+          "event": "IdlePhaseAdvanced",
+          "to": "Claimed",
+          "effects": [
+            "store claimed context",
+            "bind job_id"
+          ]
+        },
+        {
+          "from": "Idle",
+          "event": "IdlePhaseDone",
+          "to": "Completed",
+          "effects": [
+            "set terminal outcome",
+            "clear phase data"
+          ]
+        },
+        {
+          "from": "Claimed",
+          "event": "ClaimedPhaseAdvanced",
+          "to": "LaneAcquired",
+          "effects": [
+            "store lane context",
+            "bind lane_id"
+          ]
+        },
+        {
+          "from": "Claimed",
+          "event": "ClaimedPhaseDone",
+          "to": "Completed",
+          "effects": [
+            "set terminal outcome",
+            "clear phase data"
+          ]
+        },
+        {
+          "from": "Claimed",
+          "event": "MissingClaimedContext",
+          "to": "Completed",
+          "effects": [
+            "emit fail_closed_skipped",
+            "clear phase data"
+          ]
+        },
+        {
+          "from": "LaneAcquired",
+          "event": "LanePreparedPhaseAdvanced",
+          "to": "LeasePersisted",
+          "effects": [
+            "store lease persisted context"
+          ]
+        },
+        {
+          "from": "LaneAcquired",
+          "event": "LanePreparedPhaseDone",
+          "to": "Completed",
+          "effects": [
+            "set terminal outcome",
+            "clear phase data"
+          ]
+        },
+        {
+          "from": "LaneAcquired",
+          "event": "MissingLaneContext",
+          "to": "Completed",
+          "effects": [
+            "emit fail_closed_skipped",
+            "clear phase data"
+          ]
+        },
+        {
+          "from": "LeasePersisted",
+          "event": "PromoteExecuting",
+          "to": "Executing",
+          "effects": [
+            "none"
+          ]
+        },
+        {
+          "from": "Executing",
+          "event": "ExecutePhaseDone",
+          "to": "Committing",
+          "effects": [
+            "stage outcome"
+          ]
+        },
+        {
+          "from": "Executing",
+          "event": "MissingLeaseContext",
+          "to": "Completed",
+          "effects": [
+            "emit fail_closed_skipped",
+            "clear phase data"
+          ]
+        },
+        {
+          "from": "Committing",
+          "event": "CommittingWithStagedOutcome",
+          "to": "Completed",
+          "effects": [
+            "commit staged outcome",
+            "clear phase data"
+          ]
+        },
+        {
+          "from": "Committing",
+          "event": "CommittingWithoutStagedOutcome",
+          "to": "Completed",
+          "effects": [
+            "emit fail_closed_skipped",
+            "clear phase data"
+          ]
+        },
+        {
+          "from": "Completed",
+          "event": "CompletedReplay",
+          "to": "Completed",
+          "effects": [
+            "return existing terminal outcome"
+          ]
+        },
+        {
+          "from": "Completed",
+          "event": "CompletedPayloadMismatch",
+          "to": "Completed",
+          "effects": [
+            "emit fail_closed_skipped",
+            "preserve completed state"
+          ]
+        }
+      ],
+      "invariants": [
+        {
+          "id": "WM-INV-001",
+          "description": "Every non-terminal state requires exactly one matching phase payload; missing payload forces fail-closed completion."
+        },
+        {
+          "id": "WM-INV-002",
+          "description": "Completed is absorbing for state mutation; replay returns the same terminal outcome."
+        },
+        {
+          "id": "WM-INV-003",
+          "description": "If completed outcome is `JobOutcome::Completed`, `outcome.job_id` must equal state job_id; mismatch is treated as malformed payload."
+        },
+        {
+          "id": "WM-INV-004",
+          "description": "Committing without staged outcome never emits success; it emits fail-closed skipped terminal outcome."
+        }
+      ],
+      "ordering_constraints": [
+        "idle/claim/lane preparation phases complete before execute phase",
+        "execute phase outcome must be staged before committing",
+        "terminal state clears phase payload memory"
+      ],
+      "test_anchors": [
+        "worker_orchestrator_step_transitions_lease_persisted_to_executing",
+        "worker_orchestrator_step_executing_without_lease_context_fails_closed",
+        "worker_orchestrator_step_committing_emits_staged_outcome_and_terminal_state",
+        "worker_orchestrator_step_completed_mismatch_fails_closed"
+      ]
+    },
+    "queue_directory_hardening_machine": {
+      "id": "QHM-001",
+      "title": "Queue Directory Mode Hardening",
+      "default_state": "InspectPath",
+      "states": [
+        {
+          "name": "InspectPath",
+          "terminal": false
+        },
+        {
+          "name": "CreateMissingDirectory",
+          "terminal": false
+        },
+        {
+          "name": "OpenDirectoryFd",
+          "terminal": false
+        },
+        {
+          "name": "RejectPath",
+          "terminal": true
+        },
+        {
+          "name": "ApplyMode",
+          "terminal": false
+        },
+        {
+          "name": "Hardened",
+          "terminal": true
+        }
+      ],
+      "events": [
+        "PathExists",
+        "PathMissing",
+        "OpenOk",
+        "OpenEnoent",
+        "OpenEloop",
+        "OpenEnotdir",
+        "OpenOtherError",
+        "ModeApplied",
+        "ModeApplyFailed"
+      ],
+      "transition_table": [
+        {
+          "from": "InspectPath",
+          "event": "PathMissing",
+          "to": "CreateMissingDirectory",
+          "effects": [
+            "create_dir_all"
+          ]
+        },
+        {
+          "from": "InspectPath",
+          "event": "PathExists",
+          "to": "OpenDirectoryFd",
+          "effects": [
+            "open with O_PATH|O_NOFOLLOW|O_DIRECTORY"
+          ]
+        },
+        {
+          "from": "CreateMissingDirectory",
+          "event": "OpenOk",
+          "to": "ApplyMode",
+          "effects": [
+            "obtain anchored directory fd"
+          ]
+        },
+        {
+          "from": "OpenDirectoryFd",
+          "event": "OpenOk",
+          "to": "ApplyMode",
+          "effects": [
+            "obtain anchored directory fd"
+          ]
+        },
+        {
+          "from": "OpenDirectoryFd",
+          "event": "OpenEloop",
+          "to": "RejectPath",
+          "effects": [
+            "fail_closed_symlink_refusal"
+          ]
+        },
+        {
+          "from": "OpenDirectoryFd",
+          "event": "OpenEnotdir",
+          "to": "RejectPath",
+          "effects": [
+            "fail_closed_non_directory_refusal"
+          ]
+        },
+        {
+          "from": "OpenDirectoryFd",
+          "event": "OpenOtherError",
+          "to": "RejectPath",
+          "effects": [
+            "emit path hardening error"
+          ]
+        },
+        {
+          "from": "ApplyMode",
+          "event": "ModeApplied",
+          "to": "Hardened",
+          "effects": [
+            "set deterministic mode"
+          ]
+        },
+        {
+          "from": "ApplyMode",
+          "event": "ModeApplyFailed",
+          "to": "RejectPath",
+          "effects": [
+            "fail_closed_mode_error"
+          ]
+        }
+      ],
+      "mode_contract": [
+        {
+          "path_class": "queue_root",
+          "required_mode_octal": "0711"
+        },
+        {
+          "path_class": "queue_subdir",
+          "required_mode_octal": "0711"
+        },
+        {
+          "path_class": "broker_requests",
+          "required_mode_octal": "01733"
+        }
+      ],
+      "invariants": [
+        {
+          "id": "QHM-INV-001",
+          "description": "Hardening never follows final-component symlinks."
+        },
+        {
+          "id": "QHM-INV-002",
+          "description": "Non-directory path classes are rejected fail closed."
+        },
+        {
+          "id": "QHM-INV-003",
+          "description": "Pre-existing unsafe or unsearchable modes are normalized to deterministic target modes."
+        }
+      ],
+      "test_anchors": [
+        "ensure_queue_dirs_rejects_symlink_queue_root_fail_closed",
+        "ensure_queue_dirs_rejects_symlink_subdir_fail_closed",
+        "ensure_queue_dirs_rejects_non_directory_queue_root_fail_closed",
+        "ensure_queue_dirs_rejects_non_directory_subdir_fail_closed",
+        "ensure_queue_dirs_hardens_preexisting_unsafe_broker_requests",
+        "ensure_queue_dirs_hardens_unsearchable_broker_requests_mode_000"
+      ]
+    },
+    "requirements_traceability": [
+      {
+        "requirement_id": "SM-001",
+        "machine": "worker_orchestrator_machine",
+        "coverage": [
+          "MissingClaimedContext",
+          "MissingLaneContext",
+          "MissingLeaseContext"
+        ]
+      },
+      {
+        "requirement_id": "SM-003",
+        "machine": "worker_orchestrator_machine",
+        "coverage": [
+          "CompletedPayloadMismatch"
+        ]
+      },
+      {
+        "requirement_id": "QFS-002",
+        "machine": "queue_directory_hardening_machine",
+        "coverage": [
+          "OpenEloop"
+        ]
+      },
+      {
+        "requirement_id": "QFS-003",
+        "machine": "queue_directory_hardening_machine",
+        "coverage": [
+          "OpenEnotdir"
+        ]
+      },
+      {
+        "requirement_id": "QFS-004",
+        "machine": "queue_directory_hardening_machine",
+        "coverage": [
+          "ApplyMode"
+        ]
+      },
+      {
+        "requirement_id": "QFS-005",
+        "machine": "queue_directory_hardening_machine",
+        "coverage": [
+          "ModeApplied"
+        ]
+      }
+    ],
+    "machine_traceability": {
+      "tickets": [
+        "TCK-00664",
+        "TCK-00660",
+        "TCK-00577"
+      ],
+      "files": [
+        "crates/apm2-cli/src/commands/fac_worker/orchestrator.rs",
+        "crates/apm2-cli/src/commands/fac_worker/queue_ops.rs",
+        "crates/apm2-cli/src/commands/fac_worker/tests.rs"
+      ]
+    }
+  }
+}
