@@ -629,6 +629,42 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
+    /// Emits a generic session event using a caller-supplied JSON envelope.
+    ///
+    /// This variant is used when handlers must persist additional top-level
+    /// audit fields (for example PCAC lifecycle selectors) alongside the
+    /// canonical `"payload"` field.
+    ///
+    /// Implementations MUST treat `event_type`, `session_id`, and `actor_id`
+    /// as authoritative and overwrite any conflicting values in the provided
+    /// envelope.
+    ///
+    /// The default implementation decodes the `"payload"` field from hex and
+    /// delegates to [`Self::emit_session_event`], which drops any extra
+    /// envelope fields. Durable backends should override to persist the full
+    /// envelope when those fields are required.
+    fn emit_session_event_with_envelope(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        payload_envelope: &serde_json::Value,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        let payload_hex = payload_envelope
+            .get("payload")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| LedgerEventError::ValidationFailed {
+                message: "session event envelope missing required 'payload' field".to_string(),
+            })?;
+
+        let payload = hex::decode(payload_hex).map_err(|e| LedgerEventError::ValidationFailed {
+            message: format!("session event envelope payload is not valid hex: {e}"),
+        })?;
+
+        self.emit_session_event(session_id, event_type, &payload, actor_id, timestamp_ns)
+    }
+
     /// Emits an `evidence.published` event with an explicit `evidence_id`
     /// included in the top-level JSON envelope for database-level uniqueness
     /// enforcement.
@@ -3302,6 +3338,29 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         actor_id: &str,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        let payload_json = serde_json::json!({
+            "event_type": event_type,
+            "session_id": session_id,
+            "actor_id": actor_id,
+            "payload": hex::encode(payload),
+        });
+        self.emit_session_event_with_envelope(
+            session_id,
+            event_type,
+            &payload_json,
+            actor_id,
+            timestamp_ns,
+        )
+    }
+
+    fn emit_session_event_with_envelope(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        payload_envelope: &serde_json::Value,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
         // Domain prefix for generic session events (TCK-00290)
@@ -3310,13 +3369,43 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
-        // Build payload as JSON with actual event type and hex-encoded payload
-        let payload_json = serde_json::json!({
-            "event_type": event_type,
-            "session_id": session_id,
-            "actor_id": actor_id,
-            "payload": hex::encode(payload),
-        });
+        // Enforce daemon-authoritative envelope identity fields.
+        let mut payload_json = payload_envelope.clone();
+        {
+            let Some(payload_object) = payload_json.as_object_mut() else {
+                return Err(LedgerEventError::ValidationFailed {
+                    message: "session event envelope must be a JSON object".to_string(),
+                });
+            };
+            payload_object.insert("event_type".to_string(), serde_json::json!(event_type));
+            payload_object.insert("session_id".to_string(), serde_json::json!(session_id));
+            payload_object.insert("actor_id".to_string(), serde_json::json!(actor_id));
+
+            // Reject envelopes that are missing the canonical payload field.
+            if payload_object
+                .get("payload")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            {
+                return Err(LedgerEventError::ValidationFailed {
+                    message: "session event envelope missing required 'payload' field".to_string(),
+                });
+            }
+        }
+
+        let pr_associated_identity = if event_type == "work.pr_associated" {
+            payload_json
+                .get("pr_number")
+                .and_then(serde_json::Value::as_u64)
+                .zip(
+                    payload_json
+                        .get("commit_sha")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                )
+        } else {
+            None
+        };
 
         // MAJOR 1 FIX (TCK-00290): Use JCS (RFC 8785) canonicalization for signing.
         // This matches the production SqliteLedgerEventEmitter and ensures
@@ -3376,6 +3465,61 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
                             ),
                         });
                     }
+                }
+            }
+
+            // TCK-00639 SECURITY FIX: Enforce at-most-one
+            // `work.pr_associated` per semantic identity
+            // (work_id, pr_number, commit_sha), mirroring SQLite UNIQUE
+            // index `idx_work_pr_associated_unique`.
+            if let Some((pr_number, commit_sha)) = pr_associated_identity.as_ref() {
+                let already_has_association = events_by_work.get(session_id).is_some_and(|ids| {
+                    ids.iter().any(|id| {
+                        events
+                            .get(id)
+                            .is_some_and(|event| event.event_type == "work.pr_associated")
+                    })
+                });
+                if already_has_association {
+                    return Err(LedgerEventError::PersistenceFailed {
+                        message: format!(
+                            "UNIQUE constraint failed: idx_work_pr_associated_singleton_unique \
+                             (duplicate work.pr_associated for work_id '{session_id}')"
+                        ),
+                    });
+                }
+
+                let duplicate = events_by_work.get(session_id).is_some_and(|existing_ids| {
+                    existing_ids.iter().any(|id| {
+                        events.get(id).is_some_and(|existing| {
+                            if existing.event_type != "work.pr_associated" {
+                                return false;
+                            }
+                            let Ok(existing_json) =
+                                serde_json::from_slice::<serde_json::Value>(&existing.payload)
+                            else {
+                                return false;
+                            };
+                            existing_json
+                                .get("pr_number")
+                                .and_then(serde_json::Value::as_u64)
+                                == Some(*pr_number)
+                                && existing_json
+                                    .get("commit_sha")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some(commit_sha.as_str())
+                        })
+                    })
+                });
+
+                if duplicate {
+                    return Err(LedgerEventError::PersistenceFailed {
+                        message: format!(
+                            "UNIQUE constraint failed: idx_work_pr_associated_unique \
+                             (duplicate work.pr_associated for work_id '{session_id}', \
+                             pr_number={pr_number}, commit_sha='{commit_sha}')"
+                        ),
+                    });
                 }
             }
 
@@ -19928,6 +20072,166 @@ impl PrivilegedDispatcher {
         Some((event.event_id, cas_hash_hex))
     }
 
+    /// Extracts `(pr_number, commit_sha)` from a stored
+    /// `work.pr_associated` event payload.
+    ///
+    /// Accepts both modern envelopes (top-level `pr_number` /
+    /// `commit_sha`) and legacy envelopes where those fields must be decoded
+    /// from the inner protobuf payload.
+    fn extract_work_pr_association_fields(payload_bytes: &[u8]) -> Option<(u64, String)> {
+        use prost::Message;
+
+        let envelope: serde_json::Value = serde_json::from_slice(payload_bytes).ok()?;
+
+        let top_level_pr = envelope
+            .get("pr_number")
+            .and_then(serde_json::Value::as_u64);
+        let top_level_sha = envelope
+            .get("commit_sha")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        if let Some((pr_number, commit_sha)) = top_level_pr.zip(top_level_sha) {
+            return Some((pr_number, commit_sha));
+        }
+
+        let payload_hex = envelope.get("payload")?.as_str()?;
+        let payload_bytes = hex::decode(payload_hex).ok()?;
+        let work_event = apm2_core::events::WorkEvent::decode(payload_bytes.as_slice()).ok()?;
+        let apm2_core::events::work_event::Event::PrAssociated(associated) = work_event.event?
+        else {
+            return None;
+        };
+
+        Some((associated.pr_number, associated.commit_sha))
+    }
+
+    /// Deterministic dedupe key for PR LINKOUT publishing.
+    ///
+    /// The key is derived from `pr_url` so retries of the same URL produce the
+    /// same `WORK_CONTEXT_ENTRY` identity.
+    fn derive_pr_linkout_dedupe_key(pr_url: &str) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.work_context.pr_linkout:v1:");
+        hasher.update(pr_url.as_bytes());
+        format!("pr-linkout-{}", hex::encode(hasher.finalize().as_bytes()))
+    }
+
+    /// Deterministically derives a `WORK_CONTEXT_ENTRY` ID using the same
+    /// derivation as `handle_publish_work_context_entry`.
+    fn derive_work_context_entry_id(work_id: &str, kind: &str, dedupe_key: &str) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.work_context_entry.id:v1:");
+        hasher.update(work_id.as_bytes());
+        hasher.update(b":");
+        hasher.update(kind.as_bytes());
+        hasher.update(b":");
+        hasher.update(dedupe_key.as_bytes());
+        format!("CTX-{}", hex::encode(hasher.finalize().as_bytes()))
+    }
+
+    /// Best-effort publication of a PR URL LINKOUT context entry.
+    ///
+    /// Idempotency for LINKOUT uses `(work_id, pr_url)` via deterministic
+    /// `dedupe_key` derivation. Existing LINKOUT evidence is detected before
+    /// delegating to `handle_publish_work_context_entry`.
+    fn publish_pr_linkout_best_effort(
+        &self,
+        request: &RecordWorkPrAssociationRequest,
+        ctx: &ConnectionContext,
+    ) {
+        if request.pr_url.is_empty() {
+            return;
+        }
+
+        let dedupe_key = Self::derive_pr_linkout_dedupe_key(&request.pr_url);
+        let entry_id = Self::derive_work_context_entry_id(&request.work_id, "LINKOUT", &dedupe_key);
+
+        if self
+            .find_work_context_published_replay(&request.work_id, &entry_id)
+            .is_some()
+        {
+            debug!(
+                work_id = %request.work_id,
+                pr_number = request.pr_number,
+                entry_id = %entry_id,
+                "RecordWorkPrAssociation: LINKOUT already published for this PR URL"
+            );
+            return;
+        }
+
+        let linkout_entry_json = serde_json::json!({
+            "schema": "apm2.work_context_entry.v1",
+            "work_id": request.work_id,
+            "kind": "LINKOUT",
+            "dedupe_key": dedupe_key,
+            "body": request.pr_url,
+            "entry_id": "client-placeholder-entry-id",
+            "actor_id": "client-placeholder-actor-id",
+            "created_at_ns": 1_u64,
+            "source_session_id": "client-placeholder-session-id",
+        });
+
+        let entry_json = match serde_json::to_vec(&linkout_entry_json) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(
+                    work_id = %request.work_id,
+                    pr_number = request.pr_number,
+                    error = %error,
+                    "RecordWorkPrAssociation: failed to serialize LINKOUT context entry (non-blocking)"
+                );
+                return;
+            },
+        };
+
+        let publish_request = PublishWorkContextEntryRequest {
+            work_id: request.work_id.clone(),
+            kind: "LINKOUT".to_string(),
+            dedupe_key,
+            entry_json,
+            lease_id: request.lease_id.clone(),
+        };
+
+        let mut publish_payload = Vec::new();
+        if let Err(error) = publish_request.encode(&mut publish_payload) {
+            warn!(
+                work_id = %request.work_id,
+                pr_number = request.pr_number,
+                error = %error,
+                "RecordWorkPrAssociation: failed to encode LINKOUT publish request (non-blocking)"
+            );
+            return;
+        }
+
+        match self.handle_publish_work_context_entry(&publish_payload, ctx) {
+            Ok(PrivilegedResponse::Error(error)) => {
+                warn!(
+                    work_id = %request.work_id,
+                    pr_number = request.pr_number,
+                    error_code = error.code,
+                    error_message = %error.message,
+                    "RecordWorkPrAssociation: LINKOUT publication rejected (non-blocking)"
+                );
+            },
+            Err(error) => {
+                warn!(
+                    work_id = %request.work_id,
+                    pr_number = request.pr_number,
+                    error = %error,
+                    "RecordWorkPrAssociation: LINKOUT publication failed with protocol error (non-blocking)"
+                );
+            },
+            Ok(_) => {
+                info!(
+                    work_id = %request.work_id,
+                    pr_number = request.pr_number,
+                    entry_id = %entry_id,
+                    "RecordWorkPrAssociation: LINKOUT context entry published"
+                );
+            },
+        }
+    }
+
     // =========================================================================
     // TCK-00639: RecordWorkPrAssociation Handler
     // =========================================================================
@@ -20212,194 +20516,177 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // 8. Idempotency check: look for an existing work.pr_associated event with the
-        //    same (work_id, pr_number, commit_sha). Run AFTER PCAC lifecycle so
-        //    unauthorized callers cannot probe PR association state.
+        // 8. Idempotency and canonical-association policy check.
         //
-        //    The payload is stored as a JSON envelope with a hex-encoded protobuf
-        //    field (same as all session events). Decode via JSON -> hex -> proto.
+        // Enforce single canonical association per `work_id`:
+        // - same tuple  => idempotent success (`already_existed=true`)
+        // - different   => reject (prevents PR flapping)
+        let mut already_existed = false;
         if let Some(existing) = self
             .event_emitter
             .get_first_event_by_work_id_and_type(&request.work_id, "work.pr_associated")
         {
-            // Strictly typed envelope for zero-copy extraction of the
-            // hex-encoded protobuf payload.
-            #[derive(serde::Deserialize)]
-            struct Envelope<'a> {
-                payload: &'a str,
-            }
-
-            if let Ok(envelope) = serde_json::from_slice::<Envelope<'_>>(&existing.payload) {
-                if let Ok(raw_bytes) = hex::decode(envelope.payload) {
-                    if let Ok(decoded) = <apm2_core::events::WorkEvent as prost::Message>::decode(
-                        raw_bytes.as_slice(),
-                    ) {
-                        if let Some(apm2_core::events::work_event::Event::PrAssociated(ref assoc)) =
-                            decoded.event
-                        {
-                            if assoc.pr_number == request.pr_number
-                                && assoc.commit_sha == request.commit_sha
-                            {
-                                info!(
-                                    work_id = %request.work_id,
-                                    pr_number = request.pr_number,
-                                    commit_sha = %request.commit_sha,
-                                    "RecordWorkPrAssociation: idempotent no-op (same association already exists)"
-                                );
-                                return Ok(PrivilegedResponse::RecordWorkPrAssociation(
-                                    RecordWorkPrAssociationResponse {
-                                        work_id: request.work_id,
-                                        pr_number: request.pr_number,
-                                        commit_sha: request.commit_sha,
-                                        already_existed: true,
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 9. Build and emit the canonical work.pr_associated event
-        let event_payload = apm2_core::work::helpers::work_pr_associated_payload(
-            &request.work_id,
-            request.pr_number,
-            &request.commit_sha,
-        );
-
-        let timestamp_ns = match self.get_htf_timestamp_ns() {
-            Ok(ts) => ts,
-            Err(e) => {
-                warn!(error = %e, "HTF timestamp generation failed - failing closed");
+            let Some((existing_pr_number, existing_commit_sha)) =
+                Self::extract_work_pr_association_fields(&existing.payload)
+            else {
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!("HTF timestamp error: {e}"),
+                    "work.pr_associated exists but payload is not decodable (fail-closed)",
                 ));
-            },
-        };
+            };
 
-        // Construct JSON envelope for the event payload with PCAC lifecycle
-        // artifacts attached for audit trail.
-        let mut event_payload_json = serde_json::json!({
-            "work_id": request.work_id,
-            "pr_number": request.pr_number,
-            "commit_sha": request.commit_sha,
-            "protobuf_payload_hex": hex::encode(&event_payload),
-        });
-
-        if let (Some(artifacts), Some(payload_object)) = (
-            pcac_lifecycle_artifacts.as_ref(),
-            event_payload_json.as_object_mut(),
-        ) {
-            append_privileged_pcac_lifecycle_fields(payload_object, artifacts);
-        }
-
-        match self.event_emitter.emit_session_event(
-            &request.work_id,
-            "work.pr_associated",
-            &event_payload,
-            &actor_id,
-            timestamp_ns,
-        ) {
-            Ok(signed_event) => {
+            if existing_pr_number == request.pr_number && existing_commit_sha == request.commit_sha
+            {
+                already_existed = true;
                 info!(
-                    event_id = %signed_event.event_id,
                     work_id = %request.work_id,
                     pr_number = request.pr_number,
                     commit_sha = %request.commit_sha,
-                    "work.pr_associated event emitted"
+                    "RecordWorkPrAssociation: idempotent no-op (same association already exists)"
                 );
-            },
-            Err(e) => {
-                // Fail-closed: event emission failure denies the operation
-                warn!(
-                    work_id = %request.work_id,
-                    error = %e,
-                    "RecordWorkPrAssociation: failed to emit work.pr_associated event"
-                );
+            } else {
                 return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    PrivilegedErrorCode::FailedPrecondition,
                     format!(
-                        "RecordWorkPrAssociation failed: could not emit work.pr_associated event: {e}"
+                        "work_id '{}' is already associated with (pr_number={}, commit_sha='{}'); \
+                         conflicting tuple (pr_number={}, commit_sha='{}') rejected",
+                        request.work_id,
+                        existing_pr_number,
+                        existing_commit_sha,
+                        request.pr_number,
+                        request.commit_sha
                     ),
                 ));
-            },
-        }
-
-        // 10. Optional: If pr_url is provided, publish a LINKOUT context entry using
-        //     the existing PublishWorkContextEntry machinery.
-        if !request.pr_url.is_empty() {
-            // Build a dedupe key from (work_id, pr_number, "linkout")
-            let dedupe_key = format!("pr-{}-linkout", request.pr_number);
-            let linkout_entry_json = serde_json::json!({
-                "schema": "apm2.work_context_entry.v1",
-                "work_id": request.work_id,
-                "kind": "Linkout",
-                "dedupe_key": dedupe_key,
-                "title": format!("PR #{}", request.pr_number),
-                "body": request.pr_url,
-                "entry_id": "",
-                "actor_id": "",
-                "created_at_ns": 0_u64,
-                "source_session_id": "",
-            });
-
-            let entry_json_bytes = serde_json::to_vec(&linkout_entry_json).unwrap_or_default();
-            if !entry_json_bytes.is_empty() {
-                // Construct a PublishWorkContextEntryRequest and dispatch internally
-                let ctx_request = PublishWorkContextEntryRequest {
-                    work_id: request.work_id.clone(),
-                    kind: "Linkout".to_string(),
-                    dedupe_key,
-                    entry_json: entry_json_bytes,
-                    lease_id: request.lease_id.clone(),
-                };
-
-                let ctx_payload = {
-                    let mut buf = Vec::new();
-                    ctx_request.encode(&mut buf).unwrap_or_default();
-                    buf
-                };
-
-                // Best-effort: LINKOUT publishing failure does not block the
-                // primary PR association. The pr_associated event is already
-                // durably committed.
-                match self.handle_publish_work_context_entry(&ctx_payload, ctx) {
-                    Ok(PrivilegedResponse::Error(e)) => {
-                        warn!(
-                            work_id = %request.work_id,
-                            pr_number = request.pr_number,
-                            error_code = e.code,
-                            error_message = %e.message,
-                            "LINKOUT context entry publishing failed (non-blocking)"
-                        );
-                    },
-                    Err(e) => {
-                        warn!(
-                            work_id = %request.work_id,
-                            pr_number = request.pr_number,
-                            error = %e,
-                            "LINKOUT context entry publishing failed with protocol error (non-blocking)"
-                        );
-                    },
-                    Ok(_) => {
-                        info!(
-                            work_id = %request.work_id,
-                            pr_number = request.pr_number,
-                            "LINKOUT context entry published for PR URL"
-                        );
-                    },
-                }
             }
         }
+
+        // 9. Emit canonical work.pr_associated when this is a new association.
+        if !already_existed {
+            let event_payload = apm2_core::work::helpers::work_pr_associated_payload(
+                &request.work_id,
+                request.pr_number,
+                &request.commit_sha,
+            );
+
+            let timestamp_ns = match self.get_htf_timestamp_ns() {
+                Ok(ts) => ts,
+                Err(e) => {
+                    warn!(error = %e, "HTF timestamp generation failed - failing closed");
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("HTF timestamp error: {e}"),
+                    ));
+                },
+            };
+
+            let mut event_payload_json = serde_json::json!({
+                "event_type": "work.pr_associated",
+                "session_id": request.work_id,
+                "actor_id": actor_id,
+                "payload": hex::encode(&event_payload),
+                "pr_number": request.pr_number,
+                "commit_sha": request.commit_sha,
+            });
+
+            if let (Some(artifacts), Some(payload_object)) = (
+                pcac_lifecycle_artifacts.as_ref(),
+                event_payload_json.as_object_mut(),
+            ) {
+                append_privileged_pcac_lifecycle_fields(payload_object, artifacts);
+            }
+
+            match self.event_emitter.emit_session_event_with_envelope(
+                &request.work_id,
+                "work.pr_associated",
+                &event_payload_json,
+                &actor_id,
+                timestamp_ns,
+            ) {
+                Ok(signed_event) => {
+                    info!(
+                        event_id = %signed_event.event_id,
+                        work_id = %request.work_id,
+                        pr_number = request.pr_number,
+                        commit_sha = %request.commit_sha,
+                        "work.pr_associated event emitted"
+                    );
+                },
+                Err(e) if e.to_string().contains("UNIQUE constraint") => {
+                    // Race-safe recovery: a concurrent writer committed first.
+                    let persisted = self.event_emitter.get_first_event_by_work_id_and_type(
+                        &request.work_id,
+                        "work.pr_associated",
+                    );
+                    let recovered = persisted
+                        .as_ref()
+                        .and_then(|event| Self::extract_work_pr_association_fields(&event.payload));
+
+                    match recovered {
+                        Some((existing_pr_number, existing_commit_sha))
+                            if existing_pr_number == request.pr_number
+                                && existing_commit_sha == request.commit_sha =>
+                        {
+                            already_existed = true;
+                            info!(
+                                work_id = %request.work_id,
+                                pr_number = request.pr_number,
+                                commit_sha = %request.commit_sha,
+                                "RecordWorkPrAssociation: UNIQUE race recovered as idempotent replay"
+                            );
+                        },
+                        Some((existing_pr_number, existing_commit_sha)) => {
+                            return Ok(PrivilegedResponse::error(
+                                PrivilegedErrorCode::FailedPrecondition,
+                                format!(
+                                    "work_id '{}' is already associated with \
+                                     (pr_number={}, commit_sha='{}'); conflicting tuple \
+                                     (pr_number={}, commit_sha='{}') rejected",
+                                    request.work_id,
+                                    existing_pr_number,
+                                    existing_commit_sha,
+                                    request.pr_number,
+                                    request.commit_sha
+                                ),
+                            ));
+                        },
+                        None => {
+                            return Ok(PrivilegedResponse::error(
+                                PrivilegedErrorCode::CapabilityRequestRejected,
+                                format!(
+                                    "work.pr_associated UNIQUE constraint violation for work_id '{}' \
+                                     but persisted payload could not be decoded (fail-closed): {e}",
+                                    request.work_id
+                                ),
+                            ));
+                        },
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        work_id = %request.work_id,
+                        error = %e,
+                        "RecordWorkPrAssociation: failed to emit work.pr_associated event"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "RecordWorkPrAssociation failed: could not emit work.pr_associated event: {e}"
+                        ),
+                    ));
+                },
+            }
+        }
+
+        // 10. Best-effort LINKOUT publishing is attempted even for idempotent
+        // replays so retries can recover from prior partial failure.
+        self.publish_pr_linkout_best_effort(&request, ctx);
 
         Ok(PrivilegedResponse::RecordWorkPrAssociation(
             RecordWorkPrAssociationResponse {
                 work_id: request.work_id,
                 pr_number: request.pr_number,
                 commit_sha: request.commit_sha,
-                already_existed: false,
+                already_existed,
             },
         ))
     }
@@ -33046,6 +33333,304 @@ mod tests {
                     );
                 },
                 other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        fn setup_full_dispatcher_for_record_pr()
+        -> (PrivilegedDispatcher, ConnectionContext, String, String) {
+            use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+
+            use super::ingest_review_receipt::{TestLeaseConfig, register_full_test_lease};
+
+            let lease_id = "lease-pr-assoc-001";
+            let work_id = "W-PR-ASSOC-001";
+            let gate_id = "gate-pr-assoc-001";
+            let peer_creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let executor_actor_id = derive_actor_id(&peer_creds);
+
+            let cas = Arc::new(MemoryCas::default());
+
+            // Seed WorkSpec so projection-side WorkSpec join paths can resolve
+            // repo identity for this work item.
+            let work_spec = apm2_core::fac::work_cas_schemas::WorkSpecV1 {
+                schema: apm2_core::fac::work_cas_schemas::WORK_SPEC_V1_SCHEMA.to_string(),
+                work_id: work_id.to_string(),
+                ticket_alias: None,
+                title: "RecordWorkPrAssociation test work".to_string(),
+                summary: None,
+                work_type: apm2_core::fac::work_cas_schemas::WorkSpecType::Ticket,
+                repo: Some(apm2_core::fac::work_cas_schemas::WorkSpecRepo {
+                    owner: "owner-pr".to_string(),
+                    name: "repo-pr".to_string(),
+                    default_branch: Some("main".to_string()),
+                }),
+                requirement_ids: vec![],
+                labels: vec![],
+                rfc_id: None,
+                parent_work_ids: vec![],
+                created_at_ns: None,
+            };
+            let work_spec_json = serde_json::to_string(&work_spec).unwrap();
+            let work_spec_canonical =
+                apm2_core::fac::work_cas_schemas::canonicalize_for_cas(&work_spec_json).unwrap();
+            let work_spec_store = cas.store(work_spec_canonical.as_bytes()).unwrap();
+
+            let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>)
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_privileged_pcac_policy(crate::protocol::dispatch::PrivilegedPcacPolicy {});
+            dispatcher.lease_validator.register_lease_with_executor(
+                lease_id,
+                work_id,
+                gate_id,
+                &executor_actor_id,
+            );
+
+            register_full_test_lease(&TestLeaseConfig {
+                dispatcher: &dispatcher,
+                cas: cas.as_ref(),
+                lease_id,
+                work_id,
+                gate_id,
+                executor_actor_id: &executor_actor_id,
+                policy_hash: [0u8; 32],
+                wall_time_source: WallTimeSource::AuthenticatedNts,
+                include_attestation: true,
+            });
+
+            let mut policy_resolution = test_policy_resolution_with_lineage(
+                work_id,
+                &executor_actor_id,
+                WorkRole::Implementer,
+                0,
+            );
+            policy_resolution.pcac_policy = Some(apm2_core::pcac::PcacPolicyKnobs::default());
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                work_id,
+                &executor_actor_id,
+                WorkRole::Implementer,
+                &policy_resolution,
+            );
+
+            let claim = WorkClaim {
+                work_id: work_id.to_string(),
+                lease_id: lease_id.to_string(),
+                actor_id: executor_actor_id,
+                role: WorkRole::Implementer,
+                policy_resolution,
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let opened_payload = apm2_core::work::helpers::work_opened_payload(
+                work_id,
+                "TICKET",
+                work_spec_store.hash.to_vec(),
+                vec![],
+                vec![],
+            );
+            let opened_envelope = serde_json::json!({
+                "event_type": "work.opened",
+                "session_id": work_id,
+                "actor_id": derive_actor_id(&peer_creds),
+                "payload": hex::encode(opened_payload),
+            });
+            let timestamp_ns = dispatcher.get_htf_timestamp_ns().unwrap_or(1_000_000_000);
+            dispatcher
+                .event_emitter
+                .emit_session_event_with_envelope(
+                    work_id,
+                    "work.opened",
+                    &opened_envelope,
+                    &derive_actor_id(&peer_creds),
+                    timestamp_ns,
+                )
+                .unwrap();
+
+            let ctx = ConnectionContext::privileged_session_open(Some(peer_creds));
+            (dispatcher, ctx, work_id.to_string(), lease_id.to_string())
+        }
+
+        fn count_linkout_work_context_events(
+            dispatcher: &PrivilegedDispatcher,
+            work_id: &str,
+        ) -> usize {
+            use prost::Message;
+
+            dispatcher
+                .event_emitter
+                .get_events_by_work_id(work_id)
+                .into_iter()
+                .filter(|event| event.event_type == "evidence.published")
+                .filter(|event| {
+                    let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(&event.payload)
+                    else {
+                        return false;
+                    };
+                    let Some(payload_hex) = envelope.get("payload").and_then(|v| v.as_str()) else {
+                        return false;
+                    };
+                    let Ok(payload_bytes) = hex::decode(payload_hex) else {
+                        return false;
+                    };
+                    let Ok(evidence_event) =
+                        apm2_core::events::EvidenceEvent::decode(payload_bytes.as_slice())
+                    else {
+                        return false;
+                    };
+                    let Some(apm2_core::events::evidence_event::Event::Published(published)) =
+                        evidence_event.event
+                    else {
+                        return false;
+                    };
+                    published.category == "WORK_CONTEXT_ENTRY"
+                        && published.metadata.iter().any(|m| m == "kind=LINKOUT")
+                })
+                .count()
+        }
+
+        #[test]
+        fn test_record_work_pr_association_idempotent_retry_still_publishes_linkout() {
+            let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher_for_record_pr();
+
+            let first = make_request(&work_id, 42, VALID_COMMIT_SHA, &lease_id);
+            let first_frame = encode_frame(&first);
+            let first_response = dispatcher.dispatch(&first_frame, &ctx).unwrap();
+            match first_response {
+                PrivilegedResponse::RecordWorkPrAssociation(resp) => {
+                    assert!(!resp.already_existed, "first write must create association");
+                },
+                other => panic!("Expected RecordWorkPrAssociation response, got: {other:?}"),
+            }
+            assert_eq!(
+                count_linkout_work_context_events(&dispatcher, &work_id),
+                0,
+                "No LINKOUT should exist before pr_url retry"
+            );
+
+            let mut retry = make_request(&work_id, 42, VALID_COMMIT_SHA, &lease_id);
+            retry.pr_url = "https://github.com/owner-pr/repo-pr/pull/42".to_string();
+            let retry_frame = encode_frame(&retry);
+            let retry_response = dispatcher.dispatch(&retry_frame, &ctx).unwrap();
+            match retry_response {
+                PrivilegedResponse::RecordWorkPrAssociation(resp) => {
+                    assert!(resp.already_existed, "retry must be idempotent");
+                },
+                other => panic!("Expected RecordWorkPrAssociation response, got: {other:?}"),
+            }
+            assert_eq!(
+                count_linkout_work_context_events(&dispatcher, &work_id),
+                1,
+                "Retry with pr_url must publish exactly one LINKOUT entry"
+            );
+        }
+
+        #[test]
+        fn test_record_work_pr_association_with_pr_url_publishes_linkout() {
+            let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher_for_record_pr();
+
+            let mut request = make_request(&work_id, 99, VALID_COMMIT_SHA, &lease_id);
+            request.pr_url = "https://github.com/owner-pr/repo-pr/pull/99".to_string();
+            let frame = encode_frame(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::RecordWorkPrAssociation(resp) => {
+                    assert!(!resp.already_existed);
+                    assert_eq!(resp.work_id, work_id);
+                    assert_eq!(resp.pr_number, 99);
+                    assert_eq!(resp.commit_sha, VALID_COMMIT_SHA);
+                },
+                other => panic!("Expected RecordWorkPrAssociation response, got: {other:?}"),
+            }
+
+            assert_eq!(
+                count_linkout_work_context_events(&dispatcher, &work_id),
+                1,
+                "Non-empty pr_url must persist a LINKOUT context entry"
+            );
+        }
+
+        #[test]
+        fn test_record_work_pr_association_rejects_flapping_pr_number() {
+            let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher_for_record_pr();
+
+            let first = make_request(&work_id, 100, VALID_COMMIT_SHA, &lease_id);
+            let first_frame = encode_frame(&first);
+            let first_response = dispatcher.dispatch(&first_frame, &ctx).unwrap();
+            assert!(
+                matches!(
+                    first_response,
+                    PrivilegedResponse::RecordWorkPrAssociation(_)
+                ),
+                "first association should succeed"
+            );
+
+            let second = make_request(&work_id, 101, VALID_COMMIT_SHA, &lease_id);
+            let second_frame = encode_frame(&second);
+            let second_response = dispatcher.dispatch(&second_frame, &ctx).unwrap();
+            match second_response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::FailedPrecondition),
+                    );
+                    assert!(
+                        err.message.contains("already associated"),
+                        "Expected flapping rejection message, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected flapping error, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_record_work_pr_association_rejects_flapping_commit_sha() {
+            let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher_for_record_pr();
+
+            let first = make_request(&work_id, 200, VALID_COMMIT_SHA, &lease_id);
+            let first_frame = encode_frame(&first);
+            let first_response = dispatcher.dispatch(&first_frame, &ctx).unwrap();
+            assert!(
+                matches!(
+                    first_response,
+                    PrivilegedResponse::RecordWorkPrAssociation(_)
+                ),
+                "first association should succeed"
+            );
+
+            let second = make_request(
+                &work_id,
+                200,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                &lease_id,
+            );
+            let second_frame = encode_frame(&second);
+            let second_response = dispatcher.dispatch(&second_frame, &ctx).unwrap();
+            match second_response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::FailedPrecondition),
+                    );
+                    assert!(
+                        err.message.contains("already associated"),
+                        "Expected flapping rejection message, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected flapping error, got: {other:?}"),
             }
         }
     }
