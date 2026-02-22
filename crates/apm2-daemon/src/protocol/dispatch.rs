@@ -9158,10 +9158,13 @@ impl PrivilegedDispatcher {
         // TCK-00415: Create shared event emitter and work authority.
         let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
-        // TCK-00420: Create alias reconciliation gate backed by shared emitter.
-        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> = Arc::new(
-            ProjectionAliasReconciliationGate::new(Arc::clone(&event_emitter)),
-        );
+        // TCK-00420: Create alias reconciliation gate backed by shared emitter
+        // and shared projection state.
+        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> =
+            Arc::new(ProjectionAliasReconciliationGate::new_with_projection(
+                Arc::clone(&event_emitter),
+                work_authority.shared_projection(),
+            ));
 
         Self {
             decode_config: DecodeConfig::default(),
@@ -9255,10 +9258,13 @@ impl PrivilegedDispatcher {
         // TCK-00415: Create shared event emitter and work authority.
         let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
-        // TCK-00420: Create alias reconciliation gate backed by shared emitter.
-        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> = Arc::new(
-            ProjectionAliasReconciliationGate::new(Arc::clone(&event_emitter)),
-        );
+        // TCK-00420: Create alias reconciliation gate backed by shared emitter
+        // and shared projection state.
+        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> =
+            Arc::new(ProjectionAliasReconciliationGate::new_with_projection(
+                Arc::clone(&event_emitter),
+                work_authority.shared_projection(),
+            ));
 
         Self {
             decode_config,
@@ -9371,10 +9377,13 @@ impl PrivilegedDispatcher {
     ) -> Self {
         // TCK-00415: Shared work authority over the provided emitter.
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
-        // TCK-00420: Create alias reconciliation gate backed by shared emitter.
-        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> = Arc::new(
-            ProjectionAliasReconciliationGate::new(Arc::clone(&event_emitter)),
-        );
+        // TCK-00420: Create alias reconciliation gate backed by shared emitter
+        // and shared projection state.
+        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> =
+            Arc::new(ProjectionAliasReconciliationGate::new_with_projection(
+                Arc::clone(&event_emitter),
+                work_authority.shared_projection(),
+            ));
 
         Self {
             decode_config,
@@ -9462,10 +9471,13 @@ impl PrivilegedDispatcher {
         // TCK-00415: Create shared event emitter and work authority.
         let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
-        // TCK-00420: Create alias reconciliation gate backed by shared emitter.
-        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> = Arc::new(
-            ProjectionAliasReconciliationGate::new(Arc::clone(&event_emitter)),
-        );
+        // TCK-00420: Create alias reconciliation gate backed by shared emitter
+        // and shared projection state.
+        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> =
+            Arc::new(ProjectionAliasReconciliationGate::new_with_projection(
+                Arc::clone(&event_emitter),
+                work_authority.shared_projection(),
+            ));
 
         Self {
             decode_config: DecodeConfig::default(),
@@ -9760,7 +9772,11 @@ impl PrivilegedDispatcher {
     pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
         self.cas = Some(Arc::clone(&cas));
         self.alias_reconciliation_gate = Arc::new(
-            ProjectionAliasReconciliationGate::new(Arc::clone(&self.event_emitter)).with_cas(cas),
+            ProjectionAliasReconciliationGate::new_with_projection(
+                Arc::clone(&self.event_emitter),
+                self.work_authority.shared_projection(),
+            )
+            .with_cas(cas),
         );
         self
     }
@@ -9775,9 +9791,11 @@ impl PrivilegedDispatcher {
     #[cfg(test)]
     pub fn without_cas(mut self) -> Self {
         self.cas = None;
-        self.alias_reconciliation_gate = Arc::new(ProjectionAliasReconciliationGate::new(
-            Arc::clone(&self.event_emitter),
-        ));
+        self.alias_reconciliation_gate =
+            Arc::new(ProjectionAliasReconciliationGate::new_with_projection(
+                Arc::clone(&self.event_emitter),
+                self.work_authority.shared_projection(),
+            ));
         self
     }
 

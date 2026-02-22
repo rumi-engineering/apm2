@@ -121,7 +121,7 @@ Projection-backed alias reconciliation gate implementation. Bridges the alias re
 
 **Fields:**
 
-- `projection` -- Shared `WorkObjectProjection` rebuilt from ledger events
+- `projection` -- Shared `WorkObjectProjection` rebuilt from ledger events (wired from `ProjectionWorkAuthority` in dispatcher construction to avoid redundant state)
 - `event_emitter` -- Ledger event emitter for projection refresh
 - `cas` -- Optional CAS store for `WorkSpec` retrieval (TCK-00636)
 - `ticket_alias_index` -- Bounded in-memory alias index with deterministic oldest-`opened_at` work eviction (`MAX_TICKET_ALIAS_INDEX_WORK_ITEMS`), bounded lossy alias markers (`MAX_TICKET_ALIAS_INDEX_EVICTED_ALIASES`), and bounded resolved spec-hash cache (`MAX_TICKET_ALIAS_INDEX_RESOLVED_SPEC_HASHES`)
@@ -133,6 +133,7 @@ Projection-backed alias reconciliation gate implementation. Bridges the alias re
 - [CTR-AG03] `build_canonical_projections()` uses index-backed alias mappings (no projection-wide CAS scans); aliases marked lossy by eviction are omitted so reconciliation yields unresolved defects (fail-closed).
 - [CTR-AG04] Alias index collections are hard-capped (`MAX_TICKET_ALIAS_INDEX_WORK_ITEMS`, `MAX_TICKET_ALIAS_INDEX_EVICTED_ALIASES`, `MAX_TICKET_ALIAS_INDEX_RESOLVED_SPEC_HASHES`) per RS-27.
 - [CTR-AG05] `spec_hash_by_work_id` is updated only after successful CAS retrieval/decode so transient CAS failures remain retryable on subsequent projection refreshes.
+- [CTR-AG06] `PrivilegedDispatcher` wires `ProjectionAliasReconciliationGate` and `ProjectionWorkAuthority` to the same projection handle so control-plane reads are sourced from one authoritative in-memory projection.
 
 ## Public API
 
