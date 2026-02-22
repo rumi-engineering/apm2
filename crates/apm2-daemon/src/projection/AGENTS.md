@@ -8,7 +8,7 @@ The `projection` module implements write-only projection adapters that synchroni
 
 ### Components
 
-- **`ProjectionWorker`**: Long-running worker that tails the ledger for `ReviewReceiptRecorded` events and projects review results to GitHub. Also tails `evidence.published` events for `work_context` projection (TCK-00638). The `handle_evidence_published` method decodes the production JSON-envelope wire format (`emit_session_event` stores events as `{"payload": "<hex-encoded-protobuf>", ...}`): it first parses the JSON, extracts the hex-encoded inner payload, hex-decodes it, then protobuf-decodes the `EvidenceEvent` (TCK-00638 R3 fix). Enforces economics-gated admission plus projection lifecycle gate (`join -> revalidate -> consume`) before effects (TCK-00505). ALL events must pass through the economics gate; events without economics selectors are DENIED (fail-closed: no bypass path).
+- **`ProjectionWorker`**: Long-running worker that tails the ledger for `ReviewReceiptRecorded` events and projects review results to GitHub. Also tails `evidence.published` events for `work_context` projection (TCK-00638) and `work_active_loop_profile` projection (TCK-00645). The `handle_evidence_published` method decodes the production JSON-envelope wire format (`emit_session_event` stores events as `{"payload": "<hex-encoded-protobuf>", ...}`): it first parses the JSON, extracts the hex-encoded inner payload, hex-decodes it, then protobuf-decodes the `EvidenceEvent`, and routes by category (`WORK_CONTEXT_ENTRY` or `WORK_LOOP_PROFILE`). Enforces economics-gated admission plus projection lifecycle gate (`join -> revalidate -> consume`) before effects (TCK-00505). ALL events must pass through the economics gate; events without economics selectors are DENIED (fail-closed: no bypass path).
 - **`AdmissionTelemetry`**: Thread-safe atomic counters for economics admit/deny decisions per subcategory (TCK-00505)
 - **`lifecycle_deny`**: Constants for denial subcategories (consumed, revoked, stale, missing_gate, missing_economics_selectors, missing_lifecycle_selectors) used in replay prevention and gate failure scenarios (TCK-00505)
 - **`GitHubProjectionAdapter`**: Write-only GitHub commit status projection with signed receipts
@@ -188,12 +188,13 @@ Tracks active intervention freezes. Freezes require adjudication-based `Interven
 
 ### `WorkIndex`
 
-Maps `changeset_digest` to `work_id` to PR metadata for projection routing. Also manages the `work_context` projection table (TCK-00638) with `register_work_context_entry()` for idempotent INSERT OR IGNORE.
+Maps `changeset_digest` to `work_id` to PR metadata for projection routing. Also manages the `work_context` projection table (TCK-00638) with `register_work_context_entry()` for idempotent INSERT OR IGNORE, and the `work_active_loop_profile` projection table (TCK-00645) with `register_work_active_loop_profile()` for latest-wins INSERT OR REPLACE.
 
 **Tables:**
 
 - `changeset_map`, `pr_metadata` -- projection routing tables
 - `work_context` -- work context entries projected from `evidence.published` events (TCK-00638). Primary key `(work_id, entry_id)`, unique constraint on `(work_id, kind, dedupe_key)`, indexed by `work_id` and `created_at_ns`. Included in `evict_expired` / `evict_expired_async` TTL-based eviction using `created_at_ns` (nanoseconds) with seconds-to-nanoseconds conversion (BLOCKER fix: unbounded state growth).
+- `work_active_loop_profile` -- active work loop profile per `(work_id, dedupe_key)` projected from `evidence.published` events with category `WORK_LOOP_PROFILE` (TCK-00645). Primary key `(work_id, dedupe_key)`, indexed by `work_id` and `anchored_at_ns`. Uses INSERT OR REPLACE for latest-wins semantics. Included in `evict_expired` / `evict_expired_async` TTL-based eviction using `anchored_at_ns` (nanoseconds).
 
 ### `LedgerTailer`
 
@@ -365,3 +366,4 @@ Worker that drains the deferred replay backlog after sink recovery. For each rep
 - TCK-00507: Continuity profile and sink snapshot resolution for economics gate input assembly
 - TCK-00508: Deferred replay worker for projection intent buffer drain after outage recovery
 - TCK-00638: RFC-0032 Phase 2 `work_context` projection table and `evidence.published` tailer for work context entries
+- TCK-00645: RFC-0032 Phase 4 `work_active_loop_profile` projection table for active loop profile selection, `PublishWorkLoopProfile` CAS + evidence anchor
