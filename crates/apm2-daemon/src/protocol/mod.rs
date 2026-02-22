@@ -200,6 +200,7 @@ pub use dispatch::{
     encode_refresh_credential_request,
     encode_reload_process_request,
     encode_remove_credential_request,
+    encode_resolve_ticket_alias_request,
     encode_restart_process_request,
     encode_shutdown_request,
     encode_spawn_episode_request,
@@ -318,6 +319,9 @@ pub use messages::{
     RemoveCredentialResponse,
     RequestToolRequest,
     RequestToolResponse,
+    // TCK-00636: ResolveTicketAlias (RFC-0032 Phase 1)
+    ResolveTicketAliasRequest,
+    ResolveTicketAliasResponse,
     RestartProcessRequest,
     RestartProcessResponse,
     ReviewReceiptVerdict,

@@ -249,7 +249,7 @@ fn build_manifest_from_descriptors(
 /// This constant MUST be updated when routes are added to or removed from
 /// `PrivilegedMessageType::all_request_variants()`. The
 /// `test_privileged_route_count` test enforces this.
-pub const EXPECTED_PRIVILEGED_ROUTE_COUNT: usize = 39;
+pub const EXPECTED_PRIVILEGED_ROUTE_COUNT: usize = 40;
 
 /// Expected number of session routes.
 ///

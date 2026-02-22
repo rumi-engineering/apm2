@@ -70,7 +70,8 @@ pub const MANIFEST_FULL_VECTOR: GoldenVector = GoldenVector {
     // authoritative+idempotent+receipt.
     // TCK-00645: PublishWorkLoopProfile (hsi.work_loop_profile.publish) added as
     // authoritative+idempotent+receipt.
-    expected_hash: "262ef6a0f58651b1ec9b9f2dde6942848c2c2ef6a64585b139d5e60c24ad0466",
+    // TCK-00636: ResolveTicketAlias (hsi.work.resolve_ticket_alias) added as advisory.
+    expected_hash: "ebd43e06929e5398fb5f3177afe5cf090a079e8bdd844a9ba87002eb9f770f18",
 };
 
 /// Golden vector: minimal manifest with a single route.

@@ -433,6 +433,9 @@ impl_bounded_decode_simple!(
     // TCK-00639: RecordWorkPrAssociation (RFC-0032 Phase 2)
     RecordWorkPrAssociationRequest,
     RecordWorkPrAssociationResponse,
+    // TCK-00636: ResolveTicketAlias (RFC-0032 Phase 1)
+    ResolveTicketAliasRequest,
+    ResolveTicketAliasResponse,
 );
 
 // Implement BoundedDecode for messages with repeated fields

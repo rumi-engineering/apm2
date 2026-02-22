@@ -150,6 +150,9 @@ use super::messages::{
     RemoveCredentialResponse,
     RequestUnfreezeRequest,
     RequestUnfreezeResponse,
+    // TCK-00636: Ticket alias resolution (RFC-0032 Phase 1)
+    ResolveTicketAliasRequest,
+    ResolveTicketAliasResponse,
     RestartProcessRequest,
     RestartProcessResponse,
     ReviewReceiptVerdict,
@@ -1744,6 +1747,18 @@ pub const MAX_REASON_LENGTH: usize = 1024;
 /// Per SEC-SCP-FAC-0020: caller-controlled free-form predicates must be
 /// bounded before persistence to prevent oversized payload retention.
 pub const MAX_ESCALATION_PREDICATE_LEN: usize = 1024;
+
+/// Returns `true` when `work_id` is alias-like and should route through
+/// ticket-alias reconciliation.
+///
+/// Canonical work IDs (`W-*`) must bypass alias-index admission so alias-index
+/// saturation cannot deny all `SpawnEpisode` requests.
+#[must_use]
+fn is_ticket_alias_candidate(work_id: &str) -> bool {
+    work_id
+        .strip_prefix("TCK-")
+        .is_some_and(|suffix| !suffix.is_empty())
+}
 
 /// Wire-framing overhead added on top of JSON-serialized `WorkClaim`
 /// size for queue-byte accounting (TCK-00568).
@@ -6736,6 +6751,9 @@ pub enum PrivilegedMessageType {
     // --- Work PR Association (RFC-0032, TCK-00639) ---
     /// `RecordWorkPrAssociation` request (IPC-PRIV-079)
     RecordWorkPrAssociation = 30,
+    // --- Ticket Alias Resolution (RFC-0032, TCK-00636) ---
+    /// `ResolveTicketAlias` request (IPC-PRIV-080)
+    ResolveTicketAlias  = 31,
 }
 
 impl PrivilegedMessageType {
@@ -6786,6 +6804,8 @@ impl PrivilegedMessageType {
             29 => Some(Self::ClaimWorkV2),
             // TCK-00639: RecordWorkPrAssociation (RFC-0032 Phase 2)
             30 => Some(Self::RecordWorkPrAssociation),
+            // TCK-00636: ResolveTicketAlias (RFC-0032 Phase 1)
+            31 => Some(Self::ResolveTicketAlias),
             // HEF tags (64-68)
             64 => Some(Self::SubscribePulse),
             66 => Some(Self::UnsubscribePulse),
@@ -6861,6 +6881,7 @@ impl PrivilegedMessageType {
             Self::PublishWorkContextEntry,
             Self::PublishWorkLoopProfile,
             Self::RecordWorkPrAssociation,
+            Self::ResolveTicketAlias,
         ]
     }
 
@@ -6916,7 +6937,8 @@ impl PrivilegedMessageType {
             | Self::ClaimWorkV2
             | Self::PublishWorkContextEntry
             | Self::PublishWorkLoopProfile
-            | Self::RecordWorkPrAssociation => true,
+            | Self::RecordWorkPrAssociation
+            | Self::ResolveTicketAlias => true,
             // Server-to-client notification only — not a client request.
             Self::PulseEvent => false,
         }
@@ -6969,6 +6991,7 @@ impl PrivilegedMessageType {
             Self::PublishWorkContextEntry => "hsi.work_context.publish",
             Self::PublishWorkLoopProfile => "hsi.work_loop_profile.publish",
             Self::RecordWorkPrAssociation => "hsi.work.record_pr_association",
+            Self::ResolveTicketAlias => "hsi.work.resolve_ticket_alias",
             Self::PulseEvent => "hsi.pulse.event",
         }
     }
@@ -7016,6 +7039,7 @@ impl PrivilegedMessageType {
             Self::PublishWorkContextEntry => "PUBLISH_WORK_CONTEXT_ENTRY",
             Self::PublishWorkLoopProfile => "PUBLISH_WORK_LOOP_PROFILE",
             Self::RecordWorkPrAssociation => "RECORD_WORK_PR_ASSOCIATION",
+            Self::ResolveTicketAlias => "RESOLVE_TICKET_ALIAS",
             Self::PulseEvent => "PULSE_EVENT",
         }
     }
@@ -7063,6 +7087,7 @@ impl PrivilegedMessageType {
             Self::PublishWorkContextEntry => "apm2.publish_work_context_entry_request.v1",
             Self::PublishWorkLoopProfile => "apm2.publish_work_loop_profile_request.v1",
             Self::RecordWorkPrAssociation => "apm2.record_work_pr_association_request.v1",
+            Self::ResolveTicketAlias => "apm2.resolve_ticket_alias_request.v1",
             Self::PulseEvent => "apm2.pulse_event_request.v1",
         }
     }
@@ -7110,6 +7135,7 @@ impl PrivilegedMessageType {
             Self::PublishWorkContextEntry => "apm2.publish_work_context_entry_response.v1",
             Self::PublishWorkLoopProfile => "apm2.publish_work_loop_profile_response.v1",
             Self::RecordWorkPrAssociation => "apm2.record_work_pr_association_response.v1",
+            Self::ResolveTicketAlias => "apm2.resolve_ticket_alias_response.v1",
             Self::PulseEvent => "apm2.pulse_event_response.v1",
         }
     }
@@ -7204,6 +7230,8 @@ pub enum PrivilegedResponse {
     PublishWorkLoopProfile(PublishWorkLoopProfileResponse),
     /// Successful `RecordWorkPrAssociation` response (TCK-00639).
     RecordWorkPrAssociation(RecordWorkPrAssociationResponse),
+    /// Successful `ResolveTicketAlias` response (TCK-00636).
+    ResolveTicketAlias(ResolveTicketAliasResponse),
     /// Error response.
     Error(PrivilegedError),
 }
@@ -7424,6 +7452,10 @@ impl PrivilegedResponse {
             },
             Self::RecordWorkPrAssociation(resp) => {
                 buf.push(PrivilegedMessageType::RecordWorkPrAssociation.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::ResolveTicketAlias(resp) => {
+                buf.push(PrivilegedMessageType::ResolveTicketAlias.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::Error(err) => {
@@ -9126,10 +9158,13 @@ impl PrivilegedDispatcher {
         // TCK-00415: Create shared event emitter and work authority.
         let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
-        // TCK-00420: Create alias reconciliation gate backed by shared emitter.
-        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> = Arc::new(
-            ProjectionAliasReconciliationGate::new(Arc::clone(&event_emitter)),
-        );
+        // TCK-00420: Create alias reconciliation gate backed by shared emitter
+        // and shared projection state.
+        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> =
+            Arc::new(ProjectionAliasReconciliationGate::new_with_projection(
+                Arc::clone(&event_emitter),
+                work_authority.shared_projection(),
+            ));
 
         Self {
             decode_config: DecodeConfig::default(),
@@ -9223,10 +9258,13 @@ impl PrivilegedDispatcher {
         // TCK-00415: Create shared event emitter and work authority.
         let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
-        // TCK-00420: Create alias reconciliation gate backed by shared emitter.
-        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> = Arc::new(
-            ProjectionAliasReconciliationGate::new(Arc::clone(&event_emitter)),
-        );
+        // TCK-00420: Create alias reconciliation gate backed by shared emitter
+        // and shared projection state.
+        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> =
+            Arc::new(ProjectionAliasReconciliationGate::new_with_projection(
+                Arc::clone(&event_emitter),
+                work_authority.shared_projection(),
+            ));
 
         Self {
             decode_config,
@@ -9339,10 +9377,13 @@ impl PrivilegedDispatcher {
     ) -> Self {
         // TCK-00415: Shared work authority over the provided emitter.
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
-        // TCK-00420: Create alias reconciliation gate backed by shared emitter.
-        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> = Arc::new(
-            ProjectionAliasReconciliationGate::new(Arc::clone(&event_emitter)),
-        );
+        // TCK-00420: Create alias reconciliation gate backed by shared emitter
+        // and shared projection state.
+        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> =
+            Arc::new(ProjectionAliasReconciliationGate::new_with_projection(
+                Arc::clone(&event_emitter),
+                work_authority.shared_projection(),
+            ));
 
         Self {
             decode_config,
@@ -9430,10 +9471,13 @@ impl PrivilegedDispatcher {
         // TCK-00415: Create shared event emitter and work authority.
         let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
-        // TCK-00420: Create alias reconciliation gate backed by shared emitter.
-        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> = Arc::new(
-            ProjectionAliasReconciliationGate::new(Arc::clone(&event_emitter)),
-        );
+        // TCK-00420: Create alias reconciliation gate backed by shared emitter
+        // and shared projection state.
+        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> =
+            Arc::new(ProjectionAliasReconciliationGate::new_with_projection(
+                Arc::clone(&event_emitter),
+                work_authority.shared_projection(),
+            ));
 
         Self {
             decode_config: DecodeConfig::default(),
@@ -9718,11 +9762,22 @@ impl PrivilegedDispatcher {
     /// (TCK-00394).
     ///
     /// When set, `PublishChangeSet` stores the canonical bundle bytes in CAS
-    /// and returns the content hash for ledger event binding. When not set,
-    /// the handler returns an error indicating CAS is not configured.
+    /// and returns the content hash for ledger event binding. This also wires
+    /// the alias reconciliation gate to the same CAS backend so
+    /// `ResolveTicketAlias`/`SpawnEpisode` promotion checks can resolve
+    /// `ticket_alias -> work_id` from projection-backed `WorkSpec` documents
+    /// (TCK-00636). When not set, handlers return an error indicating CAS is
+    /// not configured.
     #[must_use]
     pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
-        self.cas = Some(cas);
+        self.cas = Some(Arc::clone(&cas));
+        self.alias_reconciliation_gate = Arc::new(
+            ProjectionAliasReconciliationGate::new_with_projection(
+                Arc::clone(&self.event_emitter),
+                self.work_authority.shared_projection(),
+            )
+            .with_cas(cas),
+        );
         self
     }
 
@@ -9736,6 +9791,11 @@ impl PrivilegedDispatcher {
     #[cfg(test)]
     pub fn without_cas(mut self) -> Self {
         self.cas = None;
+        self.alias_reconciliation_gate =
+            Arc::new(ProjectionAliasReconciliationGate::new_with_projection(
+                Arc::clone(&self.event_emitter),
+                self.work_authority.shared_projection(),
+            ));
         self
     }
 
@@ -11350,6 +11410,10 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::RecordWorkPrAssociation => {
                 self.handle_record_work_pr_association(payload, ctx)
             },
+            // TCK-00636: Ticket alias resolution (RFC-0032 Phase 1)
+            PrivilegedMessageType::ResolveTicketAlias => {
+                self.handle_resolve_ticket_alias(payload, ctx)
+            },
         };
 
         // TCK-00268: Emit IPC request completion metrics
@@ -11416,6 +11480,8 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::PublishWorkLoopProfile => "PublishWorkLoopProfile",
                 // TCK-00639
                 PrivilegedMessageType::RecordWorkPrAssociation => "RecordWorkPrAssociation",
+                // TCK-00636
+                PrivilegedMessageType::ResolveTicketAlias => "ResolveTicketAlias",
             };
             let status = match &result {
                 Ok(PrivilegedResponse::Error(_)) => "error",
@@ -12644,11 +12710,9 @@ impl PrivilegedDispatcher {
         // clippy)
         const MAX_PATH_LENGTH: usize = 4096;
 
-        let request =
-            SpawnEpisodeRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
-                ProtocolError::Serialization {
-                    reason: format!("invalid SpawnEpisodeRequest: {e}"),
-                }
+        let mut request = SpawnEpisodeRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid SpawnEpisodeRequest: {e}"),
             })?;
 
         // SEC-SCP-FAC-0020: lease_id is redacted from logs to prevent capability
@@ -12783,6 +12847,49 @@ impl PrivilegedDispatcher {
                 "role is required",
             ));
         }
+
+        // TCK-00636 MAJOR fix: Resolve ticket aliases BEFORE any work_id-based
+        // lookup (lease validation, claim lookup, promotion checks), but only
+        // when the caller provided an alias-like identifier.
+        //
+        // Canonical work IDs must bypass alias index resolution so a saturated
+        // alias index cannot deny all SpawnEpisode requests.
+        let requested_work_id = request.work_id.clone();
+        let (alias_binding_ticket_alias, resolved_work_id) =
+            if is_ticket_alias_candidate(&requested_work_id) {
+                match self
+                    .alias_reconciliation_gate
+                    .resolve_ticket_alias(&requested_work_id)
+                {
+                    Ok(Some(canonical_work_id)) => {
+                        debug!(
+                            request_work_id = %requested_work_id,
+                            resolved_work_id = %canonical_work_id,
+                            "SpawnEpisode: resolved ticket alias to canonical work_id"
+                        );
+                        (requested_work_id.clone(), canonical_work_id)
+                    },
+                    Ok(None) => (requested_work_id.clone(), requested_work_id),
+                    Err(e) => {
+                        warn!(
+                            work_id = %requested_work_id,
+                            error = %e,
+                            "SpawnEpisode rejected: alias resolution failed (fail-closed)"
+                        );
+                        return Ok(PrivilegedResponse::error(
+                            PrivilegedErrorCode::CapabilityRequestRejected,
+                            format!("alias resolution failed (fail-closed): {e}"),
+                        ));
+                    },
+                }
+            } else {
+                debug!(
+                    work_id = %requested_work_id,
+                    "SpawnEpisode: canonical work_id input; skipping ticket alias resolution"
+                );
+                (requested_work_id.clone(), requested_work_id)
+            };
+        request.work_id = resolved_work_id;
 
         // GATE_EXECUTOR requires lease_id
         if request.role == WorkRole::GateExecutor as i32 && request.lease_id.is_none() {
@@ -13329,10 +13436,9 @@ impl PrivilegedDispatcher {
         // canonical projection. Infrastructure errors (lock failures,
         // projection rebuild errors) also fail-closed per CTR-2617.
         //
-        // Current limitation: ClaimWork registers identity-mapped aliases
-        // only (work_id -> work_id). Real TCK-* alias bindings require
-        // operator-layer or policy-resolver wire-up.
-        // TODO(TCK-00425): Wire real ticket aliases through policy resolution.
+        // TCK-00636: Alias resolution already ran before any work_id lookup,
+        // and request.work_id now holds the canonical work_id. The promotion
+        // gate still uses the original request value as the ticket_alias field.
         // =====================================================================
         {
             use apm2_core::events::alias_reconcile::TicketAliasBinding;
@@ -13360,9 +13466,7 @@ impl PrivilegedDispatcher {
             let obs_window = self.alias_reconciliation_gate.observation_window();
 
             let binding = TicketAliasBinding {
-                // Identity mapping: ticket_alias == work_id for now.
-                // TODO(TCK-00425): Use real ticket alias from policy resolution.
-                ticket_alias: request.work_id.clone(),
+                ticket_alias: alias_binding_ticket_alias,
                 canonical_work_id: work_id_to_hash(&request.work_id),
                 observed_at_tick: current_tick,
                 observation_window_start: obs_window.start_tick,
@@ -13374,16 +13478,13 @@ impl PrivilegedDispatcher {
                 .check_promotion(&[binding], current_tick)
             {
                 Ok(result) => {
-                    // For identity-mapped aliases (ticket_alias == work_id),
-                    // NotFound defects are expected when the projection has
-                    // not been populated with work events yet (e.g., first
-                    // spawn, or when ClaimWork uses a stub registry in tests).
-                    // Only Mismatch, Ambiguous, and Stale defects indicate
-                    // real reconciliation failures that must block promotion.
-                    //
-                    // TODO(TCK-00425): When real ticket aliases are wired
-                    // through policy resolution, NotFound defects for real
-                    // aliases MUST also block promotion.
+                    // TCK-00636: With alias resolution wired, NotFound
+                    // defects are still expected in identity-mapping
+                    // fallback when the projection has not been populated
+                    // with work events yet (e.g., first spawn, or when
+                    // ClaimWork uses a stub registry in tests). Only
+                    // Mismatch, Ambiguous, and Stale defects indicate real
+                    // reconciliation failures that must block promotion.
                     let blocking_defects: Vec<_> = result
                         .unresolved_defects
                         .iter()
@@ -21252,6 +21353,100 @@ impl PrivilegedDispatcher {
     }
 
     // =========================================================================
+    // TCK-00636: ResolveTicketAlias Handler (RFC-0032 Phase 1)
+    // =========================================================================
+
+    /// Handles `ResolveTicketAlias` requests (IPC-PRIV-080, TCK-00636).
+    ///
+    /// Resolves a ticket alias to a canonical `work_id` via projection state
+    /// using [`AliasReconciliationGate::resolve_ticket_alias`]. Returns the
+    /// canonical `work_id` when exactly one match is found, or an error on
+    /// ambiguity/infrastructure failure (fail-closed).
+    ///
+    /// # Security Invariants
+    ///
+    /// - **Fail-closed**: Infrastructure errors and ambiguous resolution reject
+    ///   the request.
+    /// - **Bounded input**: `ticket_alias` length is validated against
+    ///   `MAX_ID_LENGTH` (CTR-1603).
+    #[allow(clippy::unnecessary_wraps)]
+    fn handle_resolve_ticket_alias(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request = ResolveTicketAliasRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid ResolveTicketAliasRequest: {e}"),
+            })?;
+
+        // CTR-1603: Validate ticket_alias length to prevent DoS.
+        if request.ticket_alias.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("ticket_alias exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        if request.ticket_alias.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "ticket_alias cannot be empty",
+            ));
+        }
+
+        debug!(
+            ticket_alias = %request.ticket_alias,
+            "Processing ResolveTicketAlias request via alias reconciliation gate"
+        );
+
+        match self
+            .alias_reconciliation_gate
+            .resolve_ticket_alias(&request.ticket_alias)
+        {
+            Ok(Some(work_id)) => {
+                info!(
+                    ticket_alias = %request.ticket_alias,
+                    work_id = %work_id,
+                    "ResolveTicketAlias: alias resolved to canonical work_id"
+                );
+                Ok(PrivilegedResponse::ResolveTicketAlias(
+                    ResolveTicketAliasResponse {
+                        work_id,
+                        found: true,
+                        ticket_alias: request.ticket_alias,
+                    },
+                ))
+            },
+            Ok(None) => {
+                debug!(
+                    ticket_alias = %request.ticket_alias,
+                    "ResolveTicketAlias: no matching work item found"
+                );
+                Ok(PrivilegedResponse::ResolveTicketAlias(
+                    ResolveTicketAliasResponse {
+                        work_id: String::new(),
+                        found: false,
+                        ticket_alias: request.ticket_alias,
+                    },
+                ))
+            },
+            Err(e) => {
+                // Infrastructure failure or ambiguous resolution — fail-closed.
+                warn!(
+                    ticket_alias = %request.ticket_alias,
+                    error = %e,
+                    "ResolveTicketAlias: alias resolution failed (fail-closed)"
+                );
+                Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("ticket alias resolution failed (fail-closed): {e}"),
+                ))
+            },
+        }
+    }
+
+    // =========================================================================
     // TCK-00340: DelegateSublease Handler
     // =========================================================================
 
@@ -23579,6 +23774,14 @@ pub fn encode_record_work_pr_association_request(
     request: &RecordWorkPrAssociationRequest,
 ) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::RecordWorkPrAssociation.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `ResolveTicketAlias` request to bytes for sending (TCK-00636).
+#[must_use]
+pub fn encode_resolve_ticket_alias_request(request: &ResolveTicketAliasRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::ResolveTicketAlias.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }
@@ -27829,6 +28032,208 @@ mod tests {
                     );
                 },
                 other => panic!("Expected WorkStatus response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_spawn_episode_resolves_ticket_alias_before_claim_lookup() {
+            use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+            use apm2_core::fac::work_cas_schemas::{
+                WORK_SPEC_V1_SCHEMA, WorkSpecType, WorkSpecV1, canonicalize_for_cas,
+            };
+
+            let cas = Arc::new(MemoryCas::default());
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+            let ctx = privileged_ctx();
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "team-alpha:alias".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                other => panic!("Expected ClaimWork response, got: {other:?}"),
+            };
+
+            let ticket_alias = "TCK-ALIAS-SPAWN-001";
+            let work_spec = WorkSpecV1 {
+                schema: WORK_SPEC_V1_SCHEMA.to_string(),
+                work_id: work_id.clone(),
+                ticket_alias: Some(ticket_alias.to_string()),
+                title: "Spawn alias canonicalization test".to_string(),
+                summary: None,
+                work_type: WorkSpecType::Ticket,
+                repo: None,
+                requirement_ids: vec![],
+                labels: vec![],
+                rfc_id: None,
+                parent_work_ids: vec![],
+                created_at_ns: Some(1_000_000_000),
+            };
+            let work_spec_json = serde_json::to_string(&work_spec).expect("spec serializes");
+            let canonical_spec =
+                canonicalize_for_cas(&work_spec_json).expect("spec canonicalization succeeds");
+            let stored = cas
+                .store(canonical_spec.as_bytes())
+                .expect("spec CAS store succeeds");
+
+            dispatcher
+                .event_emitter
+                .inject_raw_event(SignedLedgerEvent {
+                    event_id: "EVT-work-opened-spawn-alias".to_string(),
+                    event_type: "work.opened".to_string(),
+                    work_id: work_id.clone(),
+                    actor_id: "actor:test".to_string(),
+                    payload: apm2_core::work::helpers::work_opened_payload(
+                        &work_id,
+                        "TICKET",
+                        stored.hash.to_vec(),
+                        vec![],
+                        vec![],
+                    ),
+                    signature: vec![0u8; 64],
+                    timestamp_ns: 1_000_000_100,
+                });
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: ticket_alias.to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+                adapter_profile_hash: None,
+                max_episodes: None,
+                escalation_predicate: None,
+                permeability_receipt_hash: None,
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+
+            match spawn_response {
+                PrivilegedResponse::SpawnEpisode(resp) => {
+                    assert!(
+                        !resp.session_id.is_empty(),
+                        "spawn with ticket alias should resolve to canonical work_id and succeed"
+                    );
+                },
+                other => panic!("Expected SpawnEpisode response, got: {other:?}"),
+            }
+
+            let status_frame = encode_work_status_request(&WorkStatusRequest {
+                work_id: work_id.clone(),
+            });
+            let status_response = dispatcher.dispatch(&status_frame, &ctx).unwrap();
+            match status_response {
+                PrivilegedResponse::WorkStatus(resp) => {
+                    assert_eq!(
+                        resp.work_id, work_id,
+                        "spawn state must be recorded on canonical work_id"
+                    );
+                    assert_eq!(
+                        resp.status, "IN_PROGRESS",
+                        "spawn with ticket alias must follow canonical claim path"
+                    );
+                },
+                other => panic!("Expected WorkStatus response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_spawn_episode_canonical_work_id_bypasses_alias_resolution_failures() {
+            struct SaturatedAliasGate;
+
+            impl AliasReconciliationGate for SaturatedAliasGate {
+                fn check_promotion(
+                    &self,
+                    bindings: &[apm2_core::events::alias_reconcile::TicketAliasBinding],
+                    _current_tick: u64,
+                ) -> Result<
+                    apm2_core::events::alias_reconcile::AliasReconciliationResult,
+                    WorkAuthorityError,
+                > {
+                    Ok(
+                        apm2_core::events::alias_reconcile::AliasReconciliationResult {
+                            resolved_count: bindings.len(),
+                            unresolved_defects: Vec::new(),
+                        },
+                    )
+                }
+
+                fn observation_window(
+                    &self,
+                ) -> &apm2_core::events::alias_reconcile::ObservationWindow {
+                    static OBSERVATION_WINDOW:
+                        apm2_core::events::alias_reconcile::ObservationWindow =
+                        apm2_core::events::alias_reconcile::ObservationWindow {
+                            start_tick: 0,
+                            end_tick: u64::MAX,
+                            max_staleness_ticks: u64::MAX,
+                        };
+                    &OBSERVATION_WINDOW
+                }
+
+                fn evaluate_emitter_sunset(
+                    &self,
+                    _consecutive_clean_ticks: u64,
+                    _has_defects: bool,
+                ) -> apm2_core::events::alias_reconcile::SnapshotEmitterStatus {
+                    apm2_core::events::alias_reconcile::SnapshotEmitterStatus::Active
+                }
+
+                fn resolve_ticket_alias(
+                    &self,
+                    _ticket_alias: &str,
+                ) -> Result<Option<String>, WorkAuthorityError> {
+                    Err(WorkAuthorityError::ProjectionLock {
+                        message:
+                            "ticket alias index lossy marker capacity saturated; refusing lossy resolution"
+                                .to_string(),
+                    })
+                }
+            }
+
+            let mut dispatcher = PrivilegedDispatcher::new();
+            dispatcher.alias_reconciliation_gate = Arc::new(SaturatedAliasGate);
+            let ctx = privileged_ctx();
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "team-alpha:canonical".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                other => panic!("Expected ClaimWork response, got: {other:?}"),
+            };
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id,
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+                adapter_profile_hash: None,
+                max_episodes: None,
+                escalation_predicate: None,
+                permeability_receipt_hash: None,
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+
+            match spawn_response {
+                PrivilegedResponse::SpawnEpisode(resp) => {
+                    assert!(
+                        !resp.session_id.is_empty(),
+                        "canonical work_id spawn must bypass alias gate saturation and succeed"
+                    );
+                },
+                other => panic!("Expected SpawnEpisode response, got: {other:?}"),
             }
         }
     }

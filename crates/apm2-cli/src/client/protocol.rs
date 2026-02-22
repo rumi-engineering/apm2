@@ -101,6 +101,9 @@ use apm2_daemon::protocol::{
     // Session endpoint messages
     RequestToolRequest,
     RequestToolResponse,
+    // TCK-00636: Ticket alias resolution (RFC-0032 Phase 1)
+    ResolveTicketAliasRequest,
+    ResolveTicketAliasResponse,
     RestartProcessRequest,
     RestartProcessResponse,
     SessionError,
@@ -158,6 +161,7 @@ use apm2_daemon::protocol::{
     encode_reload_process_request,
     encode_remove_credential_request,
     encode_request_tool_request,
+    encode_resolve_ticket_alias_request,
     encode_restart_process_request,
     // TCK-00344: Status query encoding
     encode_session_status_request,
@@ -1227,6 +1231,50 @@ impl OperatorClient {
     }
 
     // =========================================================================
+    // TCK-00636: ResolveTicketAlias (RFC-0032 Phase 1)
+    // =========================================================================
+
+    /// Resolves a ticket alias to a canonical `work_id` via daemon projection
+    /// state (TCK-00636).
+    ///
+    /// # Arguments
+    ///
+    /// * `ticket_alias` - Ticket alias to resolve (e.g. "TCK-00636")
+    ///
+    /// # Returns
+    ///
+    /// Resolution result containing the canonical `work_id` if found, or
+    /// `found: false` when no match exists. Infrastructure/ambiguity errors
+    /// are returned as `DaemonError`.
+    pub async fn resolve_ticket_alias(
+        &mut self,
+        ticket_alias: &str,
+    ) -> Result<ResolveTicketAliasResponse, ProtocolClientError> {
+        let request = ResolveTicketAliasRequest {
+            ticket_alias: ticket_alias.to_string(),
+        };
+        let request_bytes = encode_resolve_ticket_alias_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_resolve_ticket_alias_response(&response_frame)
+    }
+
+    // =========================================================================
     // TCK-00635: OpenWork (RFC-0032 Phase 1)
     // =========================================================================
 
@@ -2031,6 +2079,39 @@ impl OperatorClient {
         }
 
         WorkListResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Decodes a `ResolveTicketAlias` response (TCK-00636).
+    fn decode_resolve_ticket_alias_response(
+        frame: &Bytes,
+    ) -> Result<ResolveTicketAliasResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::ResolveTicketAlias.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected ResolveTicketAlias response (tag {}), got tag {tag}",
+                PrivilegedMessageType::ResolveTicketAlias.tag()
+            )));
+        }
+
+        ResolveTicketAliasResponse::decode_bounded(payload, &DecodeConfig::default())
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 

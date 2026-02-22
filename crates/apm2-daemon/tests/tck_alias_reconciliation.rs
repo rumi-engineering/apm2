@@ -702,3 +702,248 @@ fn tck_alias_reconciliation_dispatcher_gate_blocks_mismatch() {
     );
     assert!(!promotion_gate(&result));
 }
+
+// ============================================================================
+// TCK-00636: ResolveTicketAlias handler tests (IPC-PRIV-080)
+// ============================================================================
+
+#[test]
+fn tck_00636_resolve_ticket_alias_handler_returns_found_for_known_alias() {
+    // When CAS is configured with a WorkSpec that has a ticket_alias,
+    // resolve_ticket_alias should return the matching work_id.
+    use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+    use apm2_core::fac::work_cas_schemas::{
+        WORK_SPEC_V1_SCHEMA, WorkSpecType, WorkSpecV1, canonicalize_for_cas,
+    };
+    use apm2_core::work::helpers::work_opened_payload;
+
+    let work_id = "W-RESOLVE-001";
+
+    let dispatcher = PrivilegedDispatcher::new();
+    let emitter = dispatcher.event_emitter();
+
+    // Store a proper WorkSpecV1 in CAS with a ticket alias
+    let cas = Arc::new(MemoryCas::default());
+    let spec = WorkSpecV1 {
+        schema: WORK_SPEC_V1_SCHEMA.to_string(),
+        work_id: work_id.to_string(),
+        ticket_alias: Some("TCK-RESOLVE-TEST".to_string()),
+        title: format!("Test work {work_id}"),
+        summary: None,
+        work_type: WorkSpecType::Ticket,
+        repo: None,
+        requirement_ids: Vec::new(),
+        labels: Vec::new(),
+        rfc_id: None,
+        parent_work_ids: Vec::new(),
+        created_at_ns: Some(1_000_000_000),
+    };
+    let spec_json = serde_json::to_string(&spec).expect("spec serializes");
+    let canonical = canonicalize_for_cas(&spec_json).expect("canonical JSON");
+    let store_result = cas.store(canonical.as_bytes()).expect("CAS store");
+
+    // Emit a canonical work.opened event through the public emitter API.
+    let payload = work_opened_payload(
+        work_id,
+        "TICKET",
+        store_result.hash.to_vec(),
+        vec![],
+        vec![],
+    );
+    emitter
+        .emit_session_event(
+            work_id,
+            "work.opened",
+            &payload,
+            "actor:resolve-test",
+            1_000_000_000,
+        )
+        .expect("work.opened should persist");
+
+    // Build a gate with CAS configured
+    let gate = ProjectionAliasReconciliationGate::new(Arc::clone(emitter))
+        .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+
+    // Resolve the ticket alias
+    let result = gate.resolve_ticket_alias("TCK-RESOLVE-TEST");
+    assert!(
+        result.is_ok(),
+        "resolve_ticket_alias should not fail: {result:?}"
+    );
+    let resolved = result.unwrap();
+    assert!(
+        resolved.is_some(),
+        "resolve_ticket_alias should find a match"
+    );
+    assert_eq!(
+        resolved.unwrap(),
+        work_id,
+        "resolved work_id must match the canonical work_id"
+    );
+}
+
+#[test]
+fn tck_00636_dispatcher_with_cas_wires_alias_gate_for_resolution() {
+    // with_cas must wire alias reconciliation gate with the same CAS so
+    // dispatcher-level alias resolution is operational in production paths.
+    use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+    use apm2_core::fac::work_cas_schemas::{
+        WORK_SPEC_V1_SCHEMA, WorkSpecType, WorkSpecV1, canonicalize_for_cas,
+    };
+    use apm2_core::work::helpers::work_opened_payload;
+
+    let work_id = "W-RESOLVE-DISPATCHER";
+    let cas = Arc::new(MemoryCas::default());
+    let dispatcher =
+        PrivilegedDispatcher::new().with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+    let emitter = dispatcher.event_emitter();
+
+    let spec = WorkSpecV1 {
+        schema: WORK_SPEC_V1_SCHEMA.to_string(),
+        work_id: work_id.to_string(),
+        ticket_alias: Some("TCK-RESOLVE-DISPATCHER".to_string()),
+        title: format!("Test work {work_id}"),
+        summary: None,
+        work_type: WorkSpecType::Ticket,
+        repo: None,
+        requirement_ids: Vec::new(),
+        labels: Vec::new(),
+        rfc_id: None,
+        parent_work_ids: Vec::new(),
+        created_at_ns: Some(1_000_000_000),
+    };
+    let spec_json = serde_json::to_string(&spec).expect("spec serializes");
+    let canonical = canonicalize_for_cas(&spec_json).expect("canonical JSON");
+    let store_result = cas.store(canonical.as_bytes()).expect("CAS store");
+
+    let payload = work_opened_payload(
+        work_id,
+        "TICKET",
+        store_result.hash.to_vec(),
+        vec![],
+        vec![],
+    );
+    emitter
+        .emit_session_event(
+            work_id,
+            "work.opened",
+            &payload,
+            "actor:dispatcher-resolve-test",
+            1_000_000_000,
+        )
+        .expect("work.opened should persist");
+
+    let resolved = dispatcher
+        .alias_reconciliation_gate()
+        .resolve_ticket_alias("TCK-RESOLVE-DISPATCHER")
+        .expect("alias resolution should succeed");
+
+    assert_eq!(
+        resolved.as_deref(),
+        Some(work_id),
+        "dispatcher alias gate must resolve alias when CAS is configured"
+    );
+}
+
+#[test]
+fn tck_00636_resolve_ticket_alias_handler_returns_none_for_unknown_alias() {
+    // When CAS is configured but no WorkSpec matches the alias,
+    // resolve_ticket_alias should return Ok(None).
+    use apm2_core::evidence::MemoryCas;
+
+    let dispatcher = PrivilegedDispatcher::new();
+    let emitter = dispatcher.event_emitter();
+    let cas = Arc::new(MemoryCas::default());
+
+    let gate =
+        ProjectionAliasReconciliationGate::new(Arc::clone(emitter) as Arc<dyn LedgerEventEmitter>)
+            .with_cas(cas);
+
+    let result = gate.resolve_ticket_alias("TCK-NONEXISTENT");
+    assert!(result.is_ok(), "resolve_ticket_alias must not fail");
+    assert!(
+        result.unwrap().is_none(),
+        "unknown alias must return None, not an error"
+    );
+}
+
+#[test]
+fn tck_00636_resolve_ticket_alias_empty_alias_returns_none() {
+    // An empty alias should resolve to None (no match), not panic.
+    use apm2_core::evidence::MemoryCas;
+
+    let dispatcher = PrivilegedDispatcher::new();
+    let emitter = dispatcher.event_emitter();
+    let cas = Arc::new(MemoryCas::default());
+
+    let gate =
+        ProjectionAliasReconciliationGate::new(Arc::clone(emitter) as Arc<dyn LedgerEventEmitter>)
+            .with_cas(cas);
+
+    // Empty string should not panic
+    let result = gate.resolve_ticket_alias("");
+    assert!(result.is_ok(), "empty alias must not fail");
+    assert!(result.unwrap().is_none(), "empty alias must return None");
+}
+
+#[test]
+fn tck_00636_resolve_ticket_alias_ambiguous_fails_closed() {
+    // When multiple work items have the same ticket alias, resolution
+    // should return Err (ambiguous), not silently pick one.
+    use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+    use apm2_core::fac::work_cas_schemas::{
+        WORK_SPEC_V1_SCHEMA, WorkSpecType, WorkSpecV1, canonicalize_for_cas,
+    };
+    use apm2_core::work::helpers::work_opened_payload;
+
+    let cas = Arc::new(MemoryCas::default());
+    let dispatcher = PrivilegedDispatcher::new();
+    let emitter = dispatcher.event_emitter();
+
+    // Create two work items with the same ticket alias
+    for (i, work_id) in ["W-AMBIG-001", "W-AMBIG-002"].iter().enumerate() {
+        let spec = WorkSpecV1 {
+            schema: WORK_SPEC_V1_SCHEMA.to_string(),
+            work_id: work_id.to_string(),
+            ticket_alias: Some("TCK-AMBIG-SHARED".to_string()),
+            title: format!("Test work {work_id}"),
+            summary: None,
+            work_type: WorkSpecType::Ticket,
+            repo: None,
+            requirement_ids: Vec::new(),
+            labels: Vec::new(),
+            rfc_id: None,
+            parent_work_ids: Vec::new(),
+            created_at_ns: Some(((i + 1) as u64) * 1_000_000_000),
+        };
+        let spec_json = serde_json::to_string(&spec).expect("spec serializes");
+        let canonical = canonicalize_for_cas(&spec_json).expect("canonical JSON");
+        let store_result = cas.store(canonical.as_bytes()).expect("CAS store");
+
+        let payload = work_opened_payload(
+            work_id,
+            "TICKET",
+            store_result.hash.to_vec(),
+            vec![],
+            vec![],
+        );
+        emitter
+            .emit_session_event(
+                work_id,
+                "work.opened",
+                &payload,
+                "actor:ambiguity-test",
+                ((i + 1) as u64) * 1_000_000_000,
+            )
+            .expect("work.opened should persist");
+    }
+
+    let gate = ProjectionAliasReconciliationGate::new(Arc::clone(emitter))
+        .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+
+    let result = gate.resolve_ticket_alias("TCK-AMBIG-SHARED");
+    assert!(
+        result.is_err(),
+        "ambiguous alias resolution must fail-closed: {result:?}"
+    );
+}

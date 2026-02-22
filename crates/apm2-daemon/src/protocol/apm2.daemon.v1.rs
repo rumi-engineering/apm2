@@ -2043,6 +2043,31 @@ pub struct RecordWorkPrAssociationResponse {
     #[prost(bool, tag = "4")]
     pub already_existed: bool,
 }
+/// IPC-PRIV-080: ResolveTicketAlias (RFC-0032, TCK-00636)
+/// Resolves a ticket alias to a canonical work_id via projection state.
+/// Uses AliasReconciliationGate::resolve_ticket_alias for CAS-backed
+/// WorkSpec lookup. Returns exactly one work_id on success, or an error
+/// on ambiguity/infrastructure failure (fail-closed).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResolveTicketAliasRequest {
+    /// Ticket alias to resolve (e.g. "TCK-00636").
+    /// Must not be empty; bounded to MAX_ID_LENGTH bytes.
+    #[prost(string, tag = "1")]
+    pub ticket_alias: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResolveTicketAliasResponse {
+    /// Canonical work_id resolved from the alias.
+    /// Empty when no match was found (found == false).
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// True when the alias resolved to exactly one work item.
+    #[prost(bool, tag = "2")]
+    pub found: bool,
+    /// Echoed ticket alias for response correlation.
+    #[prost(string, tag = "3")]
+    pub ticket_alias: ::prost::alloc::string::String,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StopReason {
