@@ -208,14 +208,25 @@ impl WorkReducer {
                     .insert(work_id, changeset_digest);
             },
             // CI transitions are driven by gate receipts (not lease issuance).
-            // Keep the most recent receipt-bound digest as the CI candidate.
+            // Enforce latest-digest validation: only receipts whose digest
+            // matches work_latest_changeset are admissible (CSID-004).
+            // Stale receipts are silently ignored with a structured log.
             "gate.receipt_collected"
             | "gate_receipt_collected"
             | "gate.receipt"
             | "gate_receipt" => {
-                self.state
-                    .ci_receipt_digest_by_work
-                    .insert(work_id, changeset_digest);
+                if self.is_digest_latest(&work_id, changeset_digest) {
+                    self.state
+                        .ci_receipt_digest_by_work
+                        .insert(work_id, changeset_digest);
+                } else {
+                    self.log_stale_digest_observation(
+                        "gate_receipt",
+                        &event.event_type,
+                        &work_id,
+                        changeset_digest,
+                    );
+                }
             },
             "review_receipt_recorded" | "review_blocked_recorded" => {
                 if self.is_digest_latest(&work_id, changeset_digest) {
@@ -289,13 +300,23 @@ impl WorkReducer {
         self.state.latest_changeset_by_work.get(work_id).copied()
     }
 
-    /// Enforces CI transition authorization and latest-digest admission.
+    /// Enforces stage-boundary transition guards with latest-digest admission.
+    ///
+    /// Two stage boundaries are guarded (CSID-004):
+    ///
+    /// 1. **CI transition** (`CiPending -> ReadyForReview/Blocked`): the most
+    ///    recent gate receipt digest must equal `work_latest_changeset`.
+    /// 2. **Review start** (`ReadyForReview -> Review`): a latest-digest review
+    ///    receipt must exist (ensuring review is bound to the current
+    ///    changeset). When no review receipt is available yet, the transition
+    ///    is allowed because the review receipt will be validated at
+    ///    completion/merge admission.
     ///
     /// Returns:
     /// - `Ok(true)` when transition admission checks pass.
     /// - `Ok(false)` when transition must be denied as stale/unbound.
     /// - `Err(...)` for explicit unauthorized transition attempts.
-    fn enforce_ci_transition_guards(
+    fn enforce_stage_boundary_guards(
         &self,
         work_id: &str,
         from_state: WorkState,
@@ -303,57 +324,93 @@ impl WorkReducer {
         rationale: &str,
         actor_id: &str,
     ) -> Result<bool, WorkError> {
-        if from_state != WorkState::CiPending {
-            return Ok(true);
-        }
-        if rationale != "ci_passed" && rationale != "ci_failed" {
-            return Err(WorkError::CiGatedTransitionUnauthorized {
-                from_state,
-                to_state,
-                rationale_code: rationale.to_string(),
-            });
-        }
-        if actor_id != CI_SYSTEM_ACTOR_ID {
-            return Err(WorkError::CiGatedTransitionUnauthorizedActor {
-                from_state,
-                actor_id: actor_id.to_string(),
-            });
-        }
-        if !matches!(to_state, WorkState::ReadyForReview | WorkState::Blocked) {
-            return Ok(true);
+        // ---- CI stage boundary ----
+        if from_state == WorkState::CiPending {
+            if rationale != "ci_passed" && rationale != "ci_failed" {
+                return Err(WorkError::CiGatedTransitionUnauthorized {
+                    from_state,
+                    to_state,
+                    rationale_code: rationale.to_string(),
+                });
+            }
+            if actor_id != CI_SYSTEM_ACTOR_ID {
+                return Err(WorkError::CiGatedTransitionUnauthorizedActor {
+                    from_state,
+                    actor_id: actor_id.to_string(),
+                });
+            }
+            if matches!(to_state, WorkState::ReadyForReview | WorkState::Blocked) {
+                let Some(latest_digest) = self.latest_changeset_digest(work_id) else {
+                    warn!(
+                        work_id,
+                        event_type = "work.transitioned",
+                        from_state = %from_state.as_str(),
+                        to_state = %to_state.as_str(),
+                        "ci transition denied: latest changeset unknown"
+                    );
+                    return Ok(false);
+                };
+                let Some(incoming_digest) =
+                    self.state.ci_receipt_digest_by_work.get(work_id).copied()
+                else {
+                    warn!(
+                        work_id,
+                        event_type = "work.transitioned",
+                        from_state = %from_state.as_str(),
+                        to_state = %to_state.as_str(),
+                        latest_digest = %hex::encode(latest_digest),
+                        "ci transition denied: no changeset-bound gate receipt observed"
+                    );
+                    return Ok(false);
+                };
+                if incoming_digest != latest_digest {
+                    self.log_stale_digest_observation(
+                        "ci_transition",
+                        "work.transitioned",
+                        work_id,
+                        incoming_digest,
+                    );
+                    return Ok(false);
+                }
+            }
         }
 
-        let Some(latest_digest) = self.latest_changeset_digest(work_id) else {
-            warn!(
-                work_id,
-                event_type = "work.transitioned",
-                from_state = %from_state.as_str(),
-                to_state = %to_state.as_str(),
-                "ci transition denied: latest changeset unknown"
-            );
-            return Ok(false);
-        };
-        let Some(incoming_digest) = self.state.ci_receipt_digest_by_work.get(work_id).copied()
-        else {
-            warn!(
-                work_id,
-                event_type = "work.transitioned",
-                from_state = %from_state.as_str(),
-                to_state = %to_state.as_str(),
-                latest_digest = %hex::encode(latest_digest),
-                "ci transition denied: no changeset-bound gate receipt observed"
-            );
-            return Ok(false);
-        };
-        if incoming_digest != latest_digest {
-            self.log_stale_digest_observation(
-                "ci_transition",
-                "work.transitioned",
-                work_id,
-                incoming_digest,
-            );
-            return Ok(false);
+        // ---- Review start stage boundary (CSID-004) ----
+        //
+        // When transitioning ReadyForReview -> Review, verify that a latest
+        // changeset exists. If a review receipt has already been observed but
+        // its digest is stale, deny the transition (the review was for an
+        // older changeset and must be re-done).
+        if from_state == WorkState::ReadyForReview && to_state == WorkState::Review {
+            if self.latest_changeset_digest(work_id).is_none() {
+                warn!(
+                    work_id,
+                    event_type = "work.transitioned",
+                    from_state = %from_state.as_str(),
+                    to_state = %to_state.as_str(),
+                    "review start denied: latest changeset unknown"
+                );
+                return Ok(false);
+            }
+            // If a review receipt already exists but is stale, deny.
+            if let Some(review_digest) = self
+                .state
+                .review_receipt_digest_by_work
+                .get(work_id)
+                .copied()
+            {
+                if !self.is_digest_latest(work_id, review_digest) {
+                    self.log_stale_digest_observation(
+                        "review_start",
+                        "work.transitioned",
+                        work_id,
+                        review_digest,
+                    );
+                    return Ok(false);
+                }
+            }
         }
+
         Ok(true)
     }
 
@@ -535,7 +592,7 @@ impl WorkReducer {
             });
         }
 
-        if !self.enforce_ci_transition_guards(
+        if !self.enforce_stage_boundary_guards(
             work_id,
             from_state,
             to_state,

@@ -547,9 +547,9 @@ pub struct DispatcherState {
 
     /// Gate execution orchestrator for autonomous gate lifecycle (TCK-00388).
     ///
-    /// When set, the dispatcher invokes
-    /// [`GateOrchestrator::on_session_terminated`] from the production
-    /// session termination path, returning ledger events for persistence.
+    /// Gate start is publication-driven via
+    /// [`GateOrchestrator::start_for_changeset`]. Session termination only
+    /// triggers timeout polling via [`Self::poll_gate_lifecycle`] (CSID-003).
     gate_orchestrator: Option<Arc<GateOrchestrator>>,
 
     /// Merge executor for autonomous merge after gate approval (TCK-00390).
@@ -1963,9 +1963,9 @@ impl DispatcherState {
 
     /// Sets the gate orchestrator for autonomous gate lifecycle (TCK-00388).
     ///
-    /// When set, [`notify_session_terminated`](Self::notify_session_terminated)
-    /// delegates to [`GateOrchestrator::on_session_terminated`], returning
-    /// ledger events for the caller to persist.
+    /// Gate start is publication-driven via
+    /// [`GateOrchestrator::start_for_changeset`]. Session termination only
+    /// triggers lifecycle polling via [`Self::poll_gate_lifecycle`] (CSID-003).
     #[must_use]
     pub fn with_gate_orchestrator(mut self, orchestrator: Arc<GateOrchestrator>) -> Self {
         // Wire orchestrator into session dispatcher so termination triggers
@@ -2044,25 +2044,35 @@ impl DispatcherState {
         self.divergence_watchdog.as_ref()
     }
 
-    /// Notifies the gate orchestrator that a session has terminated.
+    /// Polls lifecycle progression for active gate orchestrations.
     ///
     /// This is the production entry point that wires the
-    /// `GateOrchestrator` into the daemon runtime (Quality BLOCKER 4 fix).
+    /// `GateOrchestrator` lifecycle polling into the daemon runtime.
+    /// It checks for timeout progression on already-active orchestrations.
+    /// Gate start is exclusively publication-driven via
+    /// [`GateOrchestrator::start_for_changeset`] (CSID-003).
+    ///
     /// The caller is responsible for persisting the returned events to the
     /// ledger.
     ///
     /// Returns `None` if no gate orchestrator is configured.
+    pub async fn poll_gate_lifecycle(&self) -> Option<Vec<GateOrchestratorEvent>> {
+        let orch = self.gate_orchestrator.as_ref()?;
+        Some(orch.poll_session_lifecycle().await)
+    }
+
+    /// Backwards-compatible wrapper that accepts `SessionTerminatedInfo`.
     ///
-    /// # Errors
-    ///
-    /// Returns the orchestrator error if gate setup fails.
+    /// Delegates to [`Self::poll_gate_lifecycle`]; the session info is
+    /// ignored because gate start is publication-driven (CSID-003).
+    #[deprecated(
+        note = "Use `poll_gate_lifecycle()` instead; session termination no longer triggers gate start (CSID-003)"
+    )]
     pub async fn notify_session_terminated(
         &self,
-        info: SessionTerminatedInfo,
+        _info: SessionTerminatedInfo,
     ) -> Option<Result<Vec<GateOrchestratorEvent>, crate::gate::GateOrchestratorError>> {
-        let orch = self.gate_orchestrator.as_ref()?;
-        let result = orch.on_session_terminated(info).await;
-        Some(result.map(|(_gate_types, _signers, events)| events))
+        self.poll_gate_lifecycle().await.map(Ok)
     }
 
     /// Returns a reference to the privileged dispatcher.

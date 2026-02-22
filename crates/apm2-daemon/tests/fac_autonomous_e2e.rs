@@ -35,7 +35,9 @@
 use std::sync::Arc;
 
 use apm2_core::crypto::Signer;
-use apm2_core::fac::{GateReceiptBuilder, PolicyResolvedForChangeSetBuilder, ReasonCode};
+use apm2_core::fac::{
+    ChangesetPublication, GateReceiptBuilder, PolicyResolvedForChangeSetBuilder, ReasonCode,
+};
 use apm2_core::ledger::{EventRecord, Ledger};
 use apm2_core::reducer::{Reducer, ReducerContext};
 use apm2_core::work::helpers::{
@@ -49,7 +51,7 @@ const CI_SYSTEM_ACTOR_ID: &str = "system:ci-processor";
 use apm2_daemon::gate::{
     GateOrchestrator, GateOrchestratorConfig, GateOrchestratorEvent, GateOutcome, GateType,
     GitHubMergeAdapter, MergeExecutor, MergeExecutorError, MergeExecutorEvent, MergeInput,
-    MergeResult, SessionTerminatedInfo,
+    MergeResult,
 };
 
 // =============================================================================
@@ -418,17 +420,19 @@ async fn test_fac_autonomous_full_lifecycle() {
 
     harness.advance_time_ms(30_000); // Session runs for 30s
 
-    // Trigger gate orchestration via session termination
-    let session_info = SessionTerminatedInfo {
-        session_id: format!("session-{work_id}"),
+    // Trigger gate orchestration via ChangeSetPublished (CSID-003)
+    let publication = ChangesetPublication {
         work_id: work_id.to_string(),
         changeset_digest,
-        terminated_at_ms: 0, // bypass freshness for tests
+        bundle_cas_hash: [0u8; 32],
+        published_at_ms: 0,
+        publisher_actor_id: format!("session-{work_id}"),
+        changeset_published_event_id: format!("evt-publish-{work_id}"),
     };
 
     let (gate_types, executor_signers, setup_events) = harness
         .gate_orchestrator
-        .on_session_terminated(session_info)
+        .start_for_changeset(publication)
         .await
         .expect("gate orchestration should succeed");
 
@@ -880,16 +884,18 @@ async fn test_gate_failure_halts_lifecycle() {
     let work_id = "work-gate-fail-001";
     let changeset_digest = [0x42; 32];
 
-    // Step 1: Session terminates
-    let session_info = SessionTerminatedInfo {
-        session_id: "session-gate-fail".to_string(),
+    // Step 1: Start gates from ChangeSetPublished (CSID-003)
+    let publication = ChangesetPublication {
         work_id: work_id.to_string(),
         changeset_digest,
-        terminated_at_ms: 0,
+        bundle_cas_hash: [0u8; 32],
+        published_at_ms: 0,
+        publisher_actor_id: "session-gate-fail".to_string(),
+        changeset_published_event_id: "evt-publish-gate-fail".to_string(),
     };
 
     let (gate_types, executor_signers, _events) = orch
-        .on_session_terminated(session_info)
+        .start_for_changeset(publication)
         .await
         .expect("orchestration setup");
 
@@ -1275,15 +1281,17 @@ async fn test_gate_receipt_signature_verification() {
     let work_id = "work-sig-verify-001";
     let changeset_digest = [0x42; 32];
 
-    let session_info = SessionTerminatedInfo {
-        session_id: "session-sig-verify".to_string(),
+    let publication = ChangesetPublication {
         work_id: work_id.to_string(),
         changeset_digest,
-        terminated_at_ms: 0,
+        bundle_cas_hash: [0u8; 32],
+        published_at_ms: 0,
+        publisher_actor_id: "session-sig-verify".to_string(),
+        changeset_published_event_id: "evt-publish-sig-verify".to_string(),
     };
 
     let (_gate_types, _executor_signers, _events) = orch
-        .on_session_terminated(session_info)
+        .start_for_changeset(publication)
         .await
         .expect("orchestration setup");
 

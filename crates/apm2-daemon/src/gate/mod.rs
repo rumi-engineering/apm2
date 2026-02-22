@@ -1,11 +1,12 @@
-// AGENT-AUTHORED (TCK-00388, TCK-00390)
+// AGENT-AUTHORED (TCK-00388, TCK-00390, TCK-00672)
 //! Gate execution orchestrator and merge executor for autonomous gate
 //! lifecycle.
 //!
-//! This module implements the [`GateOrchestrator`] which watches for
-//! `session_terminated` ledger events and autonomously orchestrates the
-//! gate lifecycle: policy resolution, lease issuance, gate executor
-//! spawning, and receipt collection.
+//! This module implements the [`GateOrchestrator`] which consumes
+//! authoritative `ChangeSetPublished` events and drives publication-based
+//! gate orchestration: policy resolution, lease issuance, gate executor
+//! spawning, and receipt collection. Session termination is a lifecycle-
+//! only signal for timeout polling (CSID-003).
 //!
 //! It also implements the [`MergeExecutor`] (TCK-00390) which watches for
 //! all required gate receipts reaching PASS verdict and autonomously
@@ -15,15 +16,15 @@
 //! # FAC State Machine
 //!
 //! ```text
-//! session_terminated -> RUN_GATES -> gate_receipt -> AWAIT_REVIEW
+//! ChangeSetPublished -> RUN_GATES -> gate_receipt -> AWAIT_REVIEW
 //!                                                 -> ALL_PASS -> MERGE -> Completed
 //!                                                 -> CONFLICT -> ReviewBlocked
 //! ```
 //!
-//! The `GateOrchestrator` bridges the gap between session termination and
-//! gate execution by:
+//! The `GateOrchestrator` bridges `ChangeSetPublished` events and gate
+//! execution by:
 //!
-//! 1. Watching for `session_terminated` events on the ledger
+//! 1. Consuming `ChangeSetPublished` via `start_for_changeset`
 //! 2. Resolving policy via `PolicyResolvedForChangeSet`
 //! 3. Issuing `GateLease` for each required gate (aat, quality, security)
 //! 4. Spawning gate executor episodes via `EpisodeRuntime`
@@ -39,7 +40,7 @@
 //! - **Fail-closed timeouts**: Expired leases produce FAIL verdict, not silent
 //!   expiry.
 //! - **Changeset binding**: The `changeset_digest` in each lease MUST match the
-//!   actual changeset from the terminated session.
+//!   authoritative `ChangeSetPublished` digest.
 //!
 //! # Resource Limits
 //!
