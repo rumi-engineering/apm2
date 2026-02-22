@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00653
     title: 'RFC-0032: pulse plane correctness completion (event_type+payload decoding + typed/dotted parity + multi-topic routing)'
-    status: OPEN
+    status: IN_PROGRESS
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032
@@ -45,7 +45,11 @@ ticket_meta:
     - Add a small canonicalization layer mapping typed discriminants and dotted reducer names to the same routing class.
     - 'Add tests: same semantic event is routed to identical topics regardless of naming form or bridge payload envelope'
   definition_of_done:
-    evidence_ids: []
+    evidence_ids:
+    - 'EVID-TCK-00653-01 (unit): typed/dotted/legacy event-name parity normalizes to identical topic sets, including work_graph typed aliases'
+    - 'EVID-TCK-00653-02 (unit): bridge non-KernelEvent payload (`work_transitioned` JSON) routes to work topic instead of being dropped'
+    - 'EVID-TCK-00653-03 (unit): bridge raw `WorkGraphEvent` payload preserves multi-topic routing (`from_work_id` + `to_work_id`)'
+    - 'EVID-TCK-00653-04 (unit): malformed/oversized bridge payload handling remains bounded and publish loop continues'
     criteria:
     - PulsePublisher can route bridge-period payload variants without dropping events solely because `KernelEvent` decode failed.
     - Topic derivation returns correct topic sets for work, session, and graph events and is covered by tests.

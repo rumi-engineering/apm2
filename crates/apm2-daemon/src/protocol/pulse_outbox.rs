@@ -47,8 +47,14 @@
 
 use std::sync::Arc;
 
-use apm2_core::events::KernelEvent;
-use apm2_core::ledger::{CommitNotification, CommitNotificationReceiver, LedgerBackend};
+use apm2_core::events::{
+    EvidenceEvent, GateReceipt, IoArtifactPublished, KernelEvent, PolicyResolvedForChangeSet,
+    SessionEvent, ToolEvent, WorkEvent, WorkGraphEvent, evidence_event, session_event, tool_event,
+    work_event, work_graph_event,
+};
+use apm2_core::ledger::{
+    CommitNotification, CommitNotificationReceiver, EventRecord, LedgerBackend,
+};
 use bytes::Bytes;
 use prost::Message;
 use tracing::{debug, info, trace, warn};
@@ -56,7 +62,9 @@ use uuid::Uuid;
 
 use super::messages::{EntityRef, PulseEnvelopeV1, PulseEvent};
 use super::resource_governance::SharedSubscriptionRegistry;
-use super::topic_derivation::{TopicDerivationResult, TopicDeriver};
+use super::topic_derivation::{
+    BridgeTopicHints, TopicDerivationResult, TopicDeriver, normalize_event_type,
+};
 
 // ============================================================================
 // Constants
@@ -85,6 +93,16 @@ pub const PULSE_EVENT_TAG: u8 = 68;
 ///
 /// Security: Prevents `DoS` via unbounded memory growth (TCK-00304 review).
 pub const MAX_CHANGESET_MAP_ENTRIES: usize = 10_000;
+
+/// Maximum payload bytes processed by bridge fallback routing.
+///
+/// Prevents unbounded JSON parsing or hex expansion when extracting minimal
+/// routing fields from non-`KernelEvent` payload formats.
+pub const MAX_BRIDGE_ROUTING_PAYLOAD_BYTES: usize = 256 * 1024;
+
+/// Maximum hex characters accepted for nested `payload` fields in JSON
+/// envelopes.
+const MAX_BRIDGE_ROUTING_HEX_CHARS: usize = MAX_BRIDGE_ROUTING_PAYLOAD_BYTES * 2;
 
 // ============================================================================
 // Pulse Publisher
@@ -364,24 +382,49 @@ impl PulsePublisher {
             },
         };
 
-        // Decode KernelEvent
-        let kernel_event = match KernelEvent::decode(event_record.payload.as_slice()) {
-            Ok(event) => event,
+        // Primary path: decode full KernelEvent.
+        // Bridge fallback: extract bounded routing hints from payload when the
+        // stored format is not a KernelEvent envelope.
+        let topic_results = match KernelEvent::decode(event_record.payload.as_slice()) {
+            Ok(kernel_event) => {
+                // Update index for TCK-00305 (PolicyResolvedForChangeSet lookup)
+                self.topic_deriver.update_index(&kernel_event);
+
+                // Derive topics using multi-topic derivation (TCK-00642).
+                // Most events produce a single topic; work graph edge events
+                // produce topics for both from_work_id and to_work_id.
+                self.topic_deriver
+                    .derive_topics(&notification, &kernel_event)
+            },
             Err(e) => {
-                warn!("Failed to decode event {}: {}", notification.seq_id, e);
-                return;
+                warn!(
+                    seq_id = notification.seq_id,
+                    event_type = %notification.event_type,
+                    namespace = %notification.namespace,
+                    error = %e,
+                    "KernelEvent decode failed; using bounded bridge routing hints"
+                );
+
+                let hints = Self::derive_bridge_topic_hints(&notification, &event_record);
+
+                // Preserve changeset->work index updates in bridge mode so gate
+                // routing remains coherent during mixed payload windows.
+                if normalize_event_type(notification.event_type.as_str())
+                    == "policy.resolved_for_changeset"
+                {
+                    if let (Some(changeset_digest), Some(work_id)) =
+                        (&hints.changeset_digest, &hints.work_id)
+                    {
+                        self.topic_deriver
+                            .changeset_index()
+                            .insert(changeset_digest.clone(), work_id.clone());
+                    }
+                }
+
+                self.topic_deriver
+                    .derive_topics_from_hints(&notification, &hints)
             },
         };
-
-        // Update index for TCK-00305 (PolicyResolvedForChangeSet lookup)
-        self.topic_deriver.update_index(&kernel_event);
-
-        // Derive topics using multi-topic derivation (TCK-00642).
-        // Most events produce a single topic; work graph edge events produce
-        // topics for both from_work_id and to_work_id.
-        let topic_results = self
-            .topic_deriver
-            .derive_topics(&notification, &kernel_event);
 
         // Filter to successful topics only, logging failures
         let topics: Vec<String> = topic_results
@@ -437,6 +480,273 @@ impl PulsePublisher {
         for topic in &topics {
             self.publish_to_topic(&notification, topic);
         }
+    }
+
+    fn derive_bridge_topic_hints(
+        notification: &CommitNotification,
+        event_record: &EventRecord,
+    ) -> BridgeTopicHints {
+        let normalized_event_type = normalize_event_type(notification.event_type.as_str());
+        let mut hints = BridgeTopicHints::default();
+
+        if !event_record.session_id.is_empty() {
+            hints.session_id = Some(event_record.session_id.clone());
+        }
+
+        if Self::is_work_scoped_event_type(normalized_event_type)
+            && !event_record.session_id.is_empty()
+        {
+            hints.work_id = Some(event_record.session_id.clone());
+        }
+
+        if event_record.payload.len() > MAX_BRIDGE_ROUTING_PAYLOAD_BYTES {
+            warn!(
+                event_type = %notification.event_type,
+                payload_bytes = event_record.payload.len(),
+                max_payload_bytes = MAX_BRIDGE_ROUTING_PAYLOAD_BYTES,
+                "Bridge routing skipped payload decode: payload exceeds bound"
+            );
+            return hints;
+        }
+
+        if let Ok(payload_json) = serde_json::from_slice::<serde_json::Value>(&event_record.payload)
+        {
+            Self::populate_hints_from_json(&payload_json, &mut hints);
+
+            let inner_payload = payload_json
+                .get("payload")
+                .and_then(serde_json::Value::as_str)
+                .filter(|hex_payload| {
+                    hex_payload.len() <= MAX_BRIDGE_ROUTING_HEX_CHARS && hex_payload.len() % 2 == 0
+                })
+                .and_then(|hex_payload| hex::decode(hex_payload).ok());
+
+            if let Some(inner_payload) = inner_payload {
+                Self::populate_hints_from_payload_bytes(
+                    normalized_event_type,
+                    inner_payload.as_slice(),
+                    &mut hints,
+                );
+            } else {
+                Self::populate_hints_from_payload_bytes(
+                    normalized_event_type,
+                    event_record.payload.as_slice(),
+                    &mut hints,
+                );
+            }
+        } else {
+            Self::populate_hints_from_payload_bytes(
+                normalized_event_type,
+                event_record.payload.as_slice(),
+                &mut hints,
+            );
+        }
+
+        hints
+    }
+
+    fn populate_hints_from_json(payload_json: &serde_json::Value, hints: &mut BridgeTopicHints) {
+        if hints.work_id.is_none() {
+            hints.work_id = payload_json
+                .get("work_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+        }
+
+        if hints.session_id.is_none() {
+            hints.session_id = payload_json
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+        }
+
+        if hints.gate_id.is_none() {
+            hints.gate_id = payload_json
+                .get("gate_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+        }
+
+        if hints.from_work_id.is_none() {
+            hints.from_work_id = payload_json
+                .get("from_work_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+        }
+
+        if hints.to_work_id.is_none() {
+            hints.to_work_id = payload_json
+                .get("to_work_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+        }
+
+        if hints.changeset_digest.is_none() {
+            hints.changeset_digest = payload_json
+                .get("changeset_digest")
+                .and_then(serde_json::Value::as_str)
+                .and_then(Self::decode_hex_digest_bounded);
+        }
+    }
+
+    fn populate_hints_from_payload_bytes(
+        normalized_event_type: &str,
+        payload: &[u8],
+        hints: &mut BridgeTopicHints,
+    ) {
+        match normalized_event_type {
+            "work.opened" | "work.transitioned" | "work.completed" | "work.aborted"
+            | "work.pr_associated" => {
+                if let Ok(work_event) = WorkEvent::decode(payload) {
+                    let work_id = match work_event.event {
+                        Some(work_event::Event::Opened(event)) => event.work_id,
+                        Some(work_event::Event::Transitioned(event)) => event.work_id,
+                        Some(work_event::Event::Completed(event)) => event.work_id,
+                        Some(work_event::Event::Aborted(event)) => event.work_id,
+                        Some(work_event::Event::PrAssociated(event)) => event.work_id,
+                        None => String::new(),
+                    };
+                    if hints.work_id.is_none() && !work_id.is_empty() {
+                        hints.work_id = Some(work_id);
+                    }
+                }
+            },
+            "evidence.published" => {
+                if let Ok(evidence_event) = EvidenceEvent::decode(payload)
+                    && let Some(evidence_event::Event::Published(published)) = evidence_event.event
+                    && hints.work_id.is_none()
+                    && !published.work_id.is_empty()
+                {
+                    hints.work_id = Some(published.work_id);
+                }
+            },
+            "gate.receipt" => {
+                if let Ok(gate_receipt) = GateReceipt::decode(payload) {
+                    if hints.gate_id.is_none() && !gate_receipt.gate_id.is_empty() {
+                        hints.gate_id = Some(gate_receipt.gate_id);
+                    }
+                    if hints.changeset_digest.is_none() && !gate_receipt.changeset_digest.is_empty()
+                    {
+                        hints.changeset_digest = Some(gate_receipt.changeset_digest);
+                    }
+                }
+            },
+            "policy.resolved_for_changeset" => {
+                if let Ok(policy_resolved) = PolicyResolvedForChangeSet::decode(payload) {
+                    if hints.work_id.is_none() && !policy_resolved.work_id.is_empty() {
+                        hints.work_id = Some(policy_resolved.work_id);
+                    }
+                    if hints.changeset_digest.is_none()
+                        && !policy_resolved.changeset_digest.is_empty()
+                    {
+                        hints.changeset_digest = Some(policy_resolved.changeset_digest);
+                    }
+                }
+            },
+            "work_graph.edge.added" | "work_graph.edge.removed" | "work_graph.edge.waived" => {
+                if let Ok(work_graph_event) = WorkGraphEvent::decode(payload) {
+                    match work_graph_event.event {
+                        Some(work_graph_event::Event::Added(event)) => {
+                            if hints.from_work_id.is_none() && !event.from_work_id.is_empty() {
+                                hints.from_work_id = Some(event.from_work_id);
+                            }
+                            if hints.to_work_id.is_none() && !event.to_work_id.is_empty() {
+                                hints.to_work_id = Some(event.to_work_id);
+                            }
+                        },
+                        Some(work_graph_event::Event::Removed(event)) => {
+                            if hints.from_work_id.is_none() && !event.from_work_id.is_empty() {
+                                hints.from_work_id = Some(event.from_work_id);
+                            }
+                            if hints.to_work_id.is_none() && !event.to_work_id.is_empty() {
+                                hints.to_work_id = Some(event.to_work_id);
+                            }
+                        },
+                        Some(work_graph_event::Event::Waived(event)) => {
+                            if hints.from_work_id.is_none() && !event.from_work_id.is_empty() {
+                                hints.from_work_id = Some(event.from_work_id);
+                            }
+                            if hints.to_work_id.is_none() && !event.to_work_id.is_empty() {
+                                hints.to_work_id = Some(event.to_work_id);
+                            }
+                        },
+                        None => {},
+                    }
+                }
+            },
+            "session.started"
+            | "session.progress"
+            | "session.terminated"
+            | "session.quarantined" => {
+                if let Ok(session_event) = SessionEvent::decode(payload) {
+                    let episode_id = match session_event.event {
+                        Some(session_event::Event::Started(event)) => event.episode_id,
+                        Some(session_event::Event::Progress(event)) => event.episode_id,
+                        Some(session_event::Event::Terminated(event)) => event.episode_id,
+                        Some(session_event::Event::Quarantined(event)) => event.episode_id,
+                        Some(
+                            session_event::Event::CrashDetected(_)
+                            | session_event::Event::RestartScheduled(_),
+                        )
+                        | None => String::new(),
+                    };
+                    if hints.session_id.is_none() && !episode_id.is_empty() {
+                        hints.session_id = Some(episode_id);
+                    }
+                }
+            },
+            "tool.requested" | "tool.decided" | "tool.executed" => {
+                if let Ok(tool_event) = ToolEvent::decode(payload) {
+                    let episode_id = match tool_event.event {
+                        Some(tool_event::Event::Requested(event)) => event.episode_id,
+                        Some(tool_event::Event::Decided(event)) => event.episode_id,
+                        Some(tool_event::Event::Executed(event)) => event.episode_id,
+                        None => String::new(),
+                    };
+                    if hints.session_id.is_none() && !episode_id.is_empty() {
+                        hints.session_id = Some(episode_id);
+                    }
+                }
+            },
+            "io.artifact.published" => {
+                if let Ok(io_artifact) = IoArtifactPublished::decode(payload)
+                    && hints.session_id.is_none()
+                    && !io_artifact.episode_id.is_empty()
+                {
+                    hints.session_id = Some(io_artifact.episode_id);
+                }
+            },
+            _ => {},
+        }
+    }
+
+    fn decode_hex_digest_bounded(value: &str) -> Option<Vec<u8>> {
+        if value.is_empty() || value.len() > MAX_BRIDGE_ROUTING_HEX_CHARS || value.len() % 2 != 0 {
+            return None;
+        }
+        hex::decode(value).ok()
+    }
+
+    fn is_work_scoped_event_type(normalized_event_type: &str) -> bool {
+        matches!(
+            normalized_event_type,
+            "work.opened"
+                | "work.transitioned"
+                | "work.completed"
+                | "work.aborted"
+                | "work.pr_associated"
+                | "evidence.published"
+                | "policy.resolved_for_changeset"
+                | "gate.receipt"
+                | "work_graph.edge.added"
+                | "work_graph.edge.removed"
+                | "work_graph.edge.waived"
+        )
     }
 
     /// Publishes a pulse event for a single topic.
@@ -613,6 +923,7 @@ pub fn create_commit_notification_channel() -> (
 mod tests {
     use std::collections::HashMap;
 
+    use apm2_core::events::{WorkEdgeAdded, WorkEdgeType, WorkGraphEvent, work_graph_event};
     use apm2_core::ledger::{CommitNotification, EventRecord};
 
     use super::*;
@@ -672,6 +983,14 @@ mod tests {
 
     fn test_pattern(s: &str) -> TopicPattern {
         TopicPattern::parse(s).expect("valid pattern")
+    }
+
+    fn decode_envelope_topic(frame: &Bytes) -> String {
+        let event = PulseEvent::decode(&frame[1..]).expect("pulse frame must decode");
+        event
+            .envelope
+            .expect("pulse event must include envelope")
+            .topic
     }
 
     /// Mock ledger backend for testing.
@@ -1114,6 +1433,187 @@ mod tests {
         // The stats should show 0 queue depth after failure
         let stats = registry.connection_stats("conn-1").unwrap();
         assert_eq!(stats.queue_depth, 0);
+    }
+
+    #[tokio::test]
+    async fn test_bridge_non_kernel_payload_routes_without_drop() {
+        let (sender, receiver) = create_commit_notification_channel();
+        let mock_ledger = Arc::new(MockLedgerBackend::new());
+        let bridge_payload = serde_json::json!({
+            "event_type": "work_transitioned",
+            "work_id": "W-BRIDGE-001",
+            "from_state": "OPEN",
+            "to_state": "CLAIMED",
+            "rationale_code": "bridge_test",
+            "previous_transition_count": 0u32,
+            "actor_id": "actor-bridge",
+            "timestamp_ns": 42u64
+        })
+        .to_string()
+        .into_bytes();
+        let event_record = EventRecord::new(
+            "work_transitioned",
+            "W-BRIDGE-001",
+            "actor-bridge",
+            bridge_payload,
+        );
+        mock_ledger.events.lock().unwrap().insert(1, event_record);
+
+        let registry = Arc::new(SubscriptionRegistry::new(ResourceQuotaConfig::for_testing()));
+        registry.register_connection("conn-bridge").unwrap();
+        let sub = SubscriptionState::new(
+            "sub-bridge",
+            "client-sub-bridge",
+            vec![test_pattern("work.W-BRIDGE-001.events")],
+            0,
+        );
+        registry.add_subscription("conn-bridge", sub).unwrap();
+
+        let mut publisher = PulsePublisher::new(
+            PulsePublisherConfig::for_testing(),
+            receiver,
+            mock_ledger,
+            Arc::clone(&registry),
+        );
+        let mock_sink = Arc::new(MockPulseFrameSink::new());
+        publisher.register_connection("conn-bridge", mock_sink.clone());
+
+        let notification = CommitNotification::new(1, [0x11; 32], "work_transitioned", "kernel");
+        sender.send(notification).await.unwrap();
+
+        let count = publisher.drain_batch(10).await;
+        assert_eq!(count, 1);
+
+        let frames = mock_sink.received_frames();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            decode_envelope_topic(&frames[0]),
+            "work.W-BRIDGE-001.events"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bridge_raw_work_graph_payload_preserves_multi_topic_routing() {
+        let (sender, receiver) = create_commit_notification_channel();
+        let mock_ledger = Arc::new(MockLedgerBackend::new());
+        let work_graph_event = WorkGraphEvent {
+            event: Some(work_graph_event::Event::Added(WorkEdgeAdded {
+                from_work_id: "W-FROM-BRIDGE".to_string(),
+                to_work_id: "W-TO-BRIDGE".to_string(),
+                edge_type: WorkEdgeType::Dependency as i32,
+                rationale: "bridge".to_string(),
+            })),
+        };
+        let event_record = EventRecord::new(
+            "work_graph.edge.added",
+            "kernel",
+            "actor-bridge",
+            work_graph_event.encode_to_vec(),
+        );
+        mock_ledger.events.lock().unwrap().insert(1, event_record);
+
+        let registry = Arc::new(SubscriptionRegistry::new(ResourceQuotaConfig::for_testing()));
+        registry.register_connection("conn-graph").unwrap();
+        let sub = SubscriptionState::new(
+            "sub-graph",
+            "client-sub-graph",
+            vec![test_pattern("work_graph.*.edge")],
+            0,
+        );
+        registry.add_subscription("conn-graph", sub).unwrap();
+
+        let mut publisher = PulsePublisher::new(
+            PulsePublisherConfig::for_testing(),
+            receiver,
+            mock_ledger,
+            Arc::clone(&registry),
+        );
+        let mock_sink = Arc::new(MockPulseFrameSink::new());
+        publisher.register_connection("conn-graph", mock_sink.clone());
+
+        let notification =
+            CommitNotification::new(1, [0x22; 32], "work_graph.edge.added", "kernel");
+        sender.send(notification).await.unwrap();
+
+        let count = publisher.drain_batch(10).await;
+        assert_eq!(count, 1);
+
+        let frames = mock_sink.received_frames();
+        assert_eq!(frames.len(), 2);
+        let topics: Vec<String> = frames.iter().map(decode_envelope_topic).collect();
+        assert!(topics.contains(&"work_graph.W-FROM-BRIDGE.edge".to_string()));
+        assert!(topics.contains(&"work_graph.W-TO-BRIDGE.edge".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_malformed_bridge_payload_is_bounded_and_loop_continues() {
+        let (sender, receiver) = create_commit_notification_channel();
+        let mock_ledger = Arc::new(MockLedgerBackend::new());
+
+        let oversized_payload = vec![0x41; MAX_BRIDGE_ROUTING_PAYLOAD_BYTES + 1];
+        mock_ledger.events.lock().unwrap().insert(
+            1,
+            EventRecord::new(
+                "work_transitioned",
+                "W-MALFORMED-001",
+                "actor-malformed",
+                oversized_payload,
+            ),
+        );
+        mock_ledger.events.lock().unwrap().insert(
+            2,
+            EventRecord::new(
+                "LedgerEvent",
+                "session-2",
+                "actor-2",
+                KernelEvent::default().encode_to_vec(),
+            ),
+        );
+
+        let registry = Arc::new(SubscriptionRegistry::new(ResourceQuotaConfig::for_testing()));
+        registry.register_connection("conn-bounded").unwrap();
+        let sub = SubscriptionState::new(
+            "sub-bounded",
+            "client-sub-bounded",
+            vec![test_pattern("ledger.head")],
+            0,
+        );
+        registry.add_subscription("conn-bounded", sub).unwrap();
+
+        let mut publisher = PulsePublisher::new(
+            PulsePublisherConfig::for_testing(),
+            receiver,
+            mock_ledger,
+            Arc::clone(&registry),
+        );
+        let mock_sink = Arc::new(MockPulseFrameSink::new());
+        publisher.register_connection("conn-bounded", mock_sink.clone());
+
+        sender
+            .send(CommitNotification::new(
+                1,
+                [0x33; 32],
+                "work_transitioned",
+                "kernel",
+            ))
+            .await
+            .unwrap();
+        sender
+            .send(CommitNotification::new(
+                2,
+                [0x44; 32],
+                "LedgerEvent",
+                "kernel",
+            ))
+            .await
+            .unwrap();
+
+        let count = publisher.drain_batch(10).await;
+        assert_eq!(count, 2);
+
+        let frames = mock_sink.received_frames();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(decode_envelope_topic(&frames[0]), "ledger.head");
     }
 
     #[test]

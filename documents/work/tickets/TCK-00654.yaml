@@ -27,6 +27,7 @@ ticket_meta:
     observed_state:
     - "PR-scoped FAC doctor wait currently runs a poll/sleep loop and periodically re-evaluates instead of waiting on daemon pulse subscriptions."
     - "CLI client surface has no operator pulse subscribe/wait API usage wired into doctor wait paths."
+    - "`TCK-00653` hardened daemon-side pulse routing for bridge payloads and typed/dotted event-name parity without changing the CLI wire protocol; `--wait` integration should target existing subscribe/wait semantics."
     code_evidence:
     - 'crates/apm2-cli/src/commands/fac_review/mod.rs:1426-1481 uses `DOCTOR_WAIT_POLL_INTERVAL_SECONDS` with `thread::sleep`.'
     - 'No `SubscribePulse` / `WaitForPulse` call path exists under `crates/apm2-cli/src/client`.'
