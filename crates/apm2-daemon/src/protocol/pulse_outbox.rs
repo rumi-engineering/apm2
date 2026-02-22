@@ -549,7 +549,6 @@ impl PulsePublisher {
         if is_work_scoped_event && hints.work_id.is_none() && !event_record.session_id.is_empty() {
             hints.work_id = Some(event_record.session_id.clone());
         }
-
         hints
     }
 
