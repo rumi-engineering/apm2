@@ -132,10 +132,13 @@ pub struct WorkReducerState {
 **Invariants:**
 - [INV-0108] Reducer is deterministic: same event sequence produces identical state
 - [INV-0109] Only events with `event_type.starts_with("work.")` are processed
+- [INV-0115] Stage-bound digest admission is fail-closed: CI transitions (`CiPending -> ReadyForReview/Blocked`) and `work.completed` admission require a known latest `changeset_published` digest and matching receipt-bound digest context
+- [INV-0116] Receipt events bound to stale digests are never admitted into review/merge digest projections
 
 **Contracts:**
 - [CTR-0106] `apply()` returns `Ok(())` for non-work events (no-op)
 - [CTR-0107] `reset()` clears all state to empty `WorkReducerState`
+- [CTR-0111] Non-work digest events (`changeset_published`, gate/review/merge receipt events) are observed before work-event decoding so stage boundaries can enforce latest-digest checks
 
 ### `WorkError`
 

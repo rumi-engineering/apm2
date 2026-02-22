@@ -1,5 +1,7 @@
 //! Tests for the work module.
 
+use serde_json::json;
+
 use super::error::WorkError;
 use super::reducer::{CI_SYSTEM_ACTOR_ID, WorkReducer, helpers};
 use super::state::WorkState;
@@ -17,6 +19,89 @@ fn create_event_with_actor(
     payload: Vec<u8>,
 ) -> EventRecord {
     EventRecord::with_timestamp(event_type, session_id, actor_id, payload, 1_000_000_000)
+}
+
+fn default_changeset_digest() -> [u8; 32] {
+    [0x42; 32]
+}
+
+fn apply_changeset_published(
+    reducer: &mut WorkReducer,
+    ctx: &ReducerContext,
+    work_id: &str,
+    digest: [u8; 32],
+) {
+    let payload = serde_json::to_vec(&json!({
+        "event_type": "changeset_published",
+        "work_id": work_id,
+        "changeset_digest": hex::encode(digest),
+    }))
+    .expect("serialize changeset_published payload");
+    reducer
+        .apply(
+            &create_event("changeset_published", "session-1", payload),
+            ctx,
+        )
+        .expect("apply changeset_published");
+}
+
+fn apply_gate_receipt_collected(
+    reducer: &mut WorkReducer,
+    ctx: &ReducerContext,
+    work_id: &str,
+    digest: [u8; 32],
+) {
+    let payload = serde_json::to_vec(&json!({
+        "work_id": work_id,
+        "changeset_digest": hex::encode(digest),
+    }))
+    .expect("serialize gate receipt payload");
+    reducer
+        .apply(
+            &create_event("gate.receipt_collected", "session-1", payload),
+            ctx,
+        )
+        .expect("apply gate.receipt_collected");
+}
+
+fn apply_review_receipt_recorded(
+    reducer: &mut WorkReducer,
+    ctx: &ReducerContext,
+    work_id: &str,
+    digest: [u8; 32],
+) {
+    let payload = serde_json::to_vec(&json!({
+        "event_type": "review_receipt_recorded",
+        "work_id": work_id,
+        "changeset_digest": hex::encode(digest),
+    }))
+    .expect("serialize review receipt payload");
+    reducer
+        .apply(
+            &create_event("review_receipt_recorded", "session-1", payload),
+            ctx,
+        )
+        .expect("apply review_receipt_recorded");
+}
+
+fn apply_merge_receipt_recorded(
+    reducer: &mut WorkReducer,
+    ctx: &ReducerContext,
+    work_id: &str,
+    digest: [u8; 32],
+) {
+    let payload = serde_json::to_vec(&json!({
+        "event_type": "merge_receipt_recorded",
+        "work_id": work_id,
+        "changeset_digest": hex::encode(digest),
+    }))
+    .expect("serialize merge receipt payload");
+    reducer
+        .apply(
+            &create_event("merge_receipt_recorded", "session-1", payload),
+            ctx,
+        )
+        .expect("apply merge_receipt_recorded");
 }
 
 // =============================================================================
@@ -470,6 +555,7 @@ fn test_work_completed_from_review() {
             &ctx,
         )
         .unwrap();
+    apply_merge_receipt_recorded(&mut reducer, &ctx, "work-1", default_changeset_digest());
 
     // Complete with evidence
     let complete_payload = helpers::work_completed_payload(
@@ -565,6 +651,7 @@ fn test_work_completed_rejects_merge_receipt_in_gate_receipt_id() {
 
     // Setup: Open -> Claimed -> InProgress -> Review
     setup_review_work(&mut reducer, &ctx, "work-1");
+    apply_merge_receipt_recorded(&mut reducer, &ctx, "work-1", default_changeset_digest());
 
     // Attempt to complete with a merge-receipt-* string in gate_receipt_id
     let complete_payload = helpers::work_completed_payload(
@@ -594,6 +681,7 @@ fn test_work_completed_accepts_merge_receipt_in_dedicated_field() {
 
     // Setup: Open -> Claimed -> InProgress -> Review
     setup_review_work(&mut reducer, &ctx, "work-1");
+    apply_merge_receipt_recorded(&mut reducer, &ctx, "work-1", default_changeset_digest());
 
     // Complete with merge_receipt_id in the dedicated field (gate_receipt_id left
     // empty)
@@ -624,6 +712,7 @@ fn test_work_completed_stores_both_gate_and_merge_receipt_ids() {
 
     // Setup: Open -> Claimed -> InProgress -> Review
     setup_review_work(&mut reducer, &ctx, "work-1");
+    apply_merge_receipt_recorded(&mut reducer, &ctx, "work-1", default_changeset_digest());
 
     // Complete with both gate_receipt_id (a real gate receipt) and merge_receipt_id
     let complete_payload = helpers::work_completed_payload(
@@ -1058,6 +1147,7 @@ fn test_state_counts() {
             .apply(&create_event("work.opened", "session-1", payload), &ctx)
             .unwrap();
     }
+    apply_changeset_published(&mut reducer, &ctx, "work-1", default_changeset_digest());
 
     assert_eq!(reducer.state().len(), 5);
     assert_eq!(reducer.state().active_count(), 5);
@@ -1090,6 +1180,7 @@ fn test_state_counts() {
     reducer
         .apply(&create_event("work.transitioned", "s", review1), &ctx)
         .unwrap();
+    apply_review_receipt_recorded(&mut reducer, &ctx, "work-1", default_changeset_digest());
     let complete1 =
         helpers::work_completed_payload("work-1", vec![1], vec!["E1".to_string()], "G1", "");
     reducer
@@ -1263,6 +1354,10 @@ fn setup_in_progress_work(reducer: &mut WorkReducer, ctx: &ReducerContext, work_
         .apply(&create_event("work.opened", "s", open_payload), ctx)
         .unwrap();
 
+    // Seed authoritative latest-changeset projection for fail-closed stage
+    // admission checks.
+    apply_changeset_published(reducer, ctx, work_id, default_changeset_digest());
+
     // transition_count = 0, so use previous_transition_count = 0
     let claim_payload =
         helpers::work_transitioned_payload_with_sequence(work_id, "OPEN", "CLAIMED", "claim", 0);
@@ -1299,6 +1394,9 @@ fn setup_review_work(reducer: &mut WorkReducer, ctx: &ReducerContext, work_id: &
     reducer
         .apply(&create_event("work.transitioned", "s", review_payload), ctx)
         .unwrap();
+
+    // Seed review-stage digest binding.
+    apply_review_receipt_recorded(reducer, ctx, work_id, default_changeset_digest());
 }
 
 /// Sets up a work item in the Completed state.
@@ -1317,6 +1415,9 @@ fn setup_completed_work(reducer: &mut WorkReducer, ctx: &ReducerContext, work_id
     reducer
         .apply(&create_event("work.transitioned", "s", review_payload), ctx)
         .unwrap();
+
+    // Seed review-stage digest binding required by fail-closed completion.
+    apply_review_receipt_recorded(reducer, ctx, work_id, default_changeset_digest());
 
     let complete_payload =
         helpers::work_completed_payload(work_id, vec![1], vec!["E1".to_string()], "G1", "");
@@ -2223,6 +2324,9 @@ fn setup_ci_pending_work(reducer: &mut WorkReducer, ctx: &ReducerContext, work_i
             ctx,
         )
         .unwrap();
+
+    // Seed CI-stage digest binding from gate flow.
+    apply_gate_receipt_collected(reducer, ctx, work_id, default_changeset_digest());
 }
 
 // =============================================================================
@@ -2726,4 +2830,230 @@ fn test_non_ci_gated_transition_allows_any_rationale() {
 
     let work = reducer.state().get("work-1").unwrap();
     assert_eq!(work.state, WorkState::Review);
+}
+
+#[test]
+fn test_ci_transition_denied_when_latest_changeset_unknown() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Manual setup without changeset publication projection.
+    let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
+    reducer
+        .apply(
+            &create_event("work.opened", "session-1", open_payload),
+            &ctx,
+        )
+        .unwrap();
+    let claim_payload =
+        helpers::work_transitioned_payload_with_sequence("work-1", "OPEN", "CLAIMED", "claim", 0);
+    reducer
+        .apply(
+            &create_event("work.transitioned", "session-1", claim_payload),
+            &ctx,
+        )
+        .unwrap();
+    let start_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CLAIMED",
+        "IN_PROGRESS",
+        "start",
+        1,
+    );
+    reducer
+        .apply(
+            &create_event("work.transitioned", "session-1", start_payload),
+            &ctx,
+        )
+        .unwrap();
+    let ci_pending_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "IN_PROGRESS",
+        "CI_PENDING",
+        "pr_created",
+        2,
+    );
+    reducer
+        .apply(
+            &create_event("work.transitioned", "session-1", ci_pending_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    let ready_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "READY_FOR_REVIEW",
+        "ci_passed",
+        3,
+    );
+    reducer
+        .apply(
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                ready_payload,
+            ),
+            &ctx,
+        )
+        .unwrap();
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(
+        work.state,
+        WorkState::CiPending,
+        "transition must be denied when latest changeset is unknown"
+    );
+}
+
+#[test]
+fn test_ci_transition_ignores_stale_receipt_digest() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // Publish a newer changeset after CI receipt context was established.
+    let latest_digest = [0x99; 32];
+    apply_changeset_published(&mut reducer, &ctx, "work-1", latest_digest);
+
+    // Transition based on stale digest context must be ignored.
+    let ready_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "READY_FOR_REVIEW",
+        "ci_passed",
+        3,
+    );
+    reducer
+        .apply(
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                ready_payload.clone(),
+            ),
+            &ctx,
+        )
+        .unwrap();
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(
+        work.state,
+        WorkState::CiPending,
+        "stale receipt digest must not advance CI transition"
+    );
+
+    // Once gate flow for latest digest is observed, transition may proceed.
+    apply_gate_receipt_collected(&mut reducer, &ctx, "work-1", latest_digest);
+    reducer
+        .apply(
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                ready_payload,
+            ),
+            &ctx,
+        )
+        .unwrap();
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::ReadyForReview);
+}
+
+#[test]
+fn test_review_receipt_stale_digest_is_ignored() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    setup_in_progress_work(&mut reducer, &ctx, "work-1");
+    apply_review_receipt_recorded(&mut reducer, &ctx, "work-1", [0xAB; 32]);
+
+    assert!(
+        !reducer
+            .state()
+            .review_receipt_digest_by_work
+            .contains_key("work-1"),
+        "stale review receipt digest must not be admitted"
+    );
+}
+
+#[test]
+fn test_work_completion_denied_for_stale_digest_context() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    setup_review_work(&mut reducer, &ctx, "work-1");
+
+    // Move latest digest forward; existing review receipt digest is now stale.
+    let new_digest = [0xEE; 32];
+    apply_changeset_published(&mut reducer, &ctx, "work-1", new_digest);
+
+    let complete_payload =
+        helpers::work_completed_payload("work-1", vec![1], vec!["E1".to_string()], "G1", "");
+    reducer
+        .apply(
+            &create_event("work.completed", "session-1", complete_payload.clone()),
+            &ctx,
+        )
+        .unwrap();
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(
+        work.state,
+        WorkState::Review,
+        "stale digest context must deny completion"
+    );
+
+    // Admit matching review digest, then completion succeeds.
+    apply_review_receipt_recorded(&mut reducer, &ctx, "work-1", new_digest);
+    reducer
+        .apply(
+            &create_event("work.completed", "session-1", complete_payload),
+            &ctx,
+        )
+        .unwrap();
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Completed);
+}
+
+#[test]
+fn test_work_completion_merge_receipt_uses_latest_digest_binding() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    setup_review_work(&mut reducer, &ctx, "work-1");
+
+    let complete_payload = helpers::work_completed_payload(
+        "work-1",
+        vec![1],
+        vec!["E1".to_string()],
+        "gate-receipt-quality-1",
+        "merge-receipt-sha123",
+    );
+
+    // Without merge digest context, completion is denied.
+    reducer
+        .apply(
+            &create_event("work.completed", "session-1", complete_payload.clone()),
+            &ctx,
+        )
+        .unwrap();
+    assert_eq!(
+        reducer.state().get("work-1").unwrap().state,
+        WorkState::Review
+    );
+
+    // Once merge digest matches latest, completion is admitted.
+    apply_merge_receipt_recorded(&mut reducer, &ctx, "work-1", default_changeset_digest());
+    reducer
+        .apply(
+            &create_event("work.completed", "session-1", complete_payload),
+            &ctx,
+        )
+        .unwrap();
+    assert_eq!(
+        reducer.state().get("work-1").unwrap().state,
+        WorkState::Completed
+    );
 }

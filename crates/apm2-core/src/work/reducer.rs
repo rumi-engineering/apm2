@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::error::WorkError;
 use super::state::{Work, WorkState, WorkType};
@@ -31,6 +32,15 @@ pub const CI_SYSTEM_ACTOR_ID: &str = "system:ci-processor";
 pub struct WorkReducerState {
     /// Map of work ID to work item.
     pub work_items: HashMap<String, Work>,
+    /// Latest authoritative changeset digest per work ID, derived from
+    /// `changeset_published` events.
+    pub latest_changeset_by_work: HashMap<String, [u8; 32]>,
+    /// Last observed CI-bound gate digest per work ID.
+    pub ci_receipt_digest_by_work: HashMap<String, [u8; 32]>,
+    /// Last observed review receipt digest per work ID.
+    pub review_receipt_digest_by_work: HashMap<String, [u8; 32]>,
+    /// Last observed merge receipt digest per work ID.
+    pub merge_receipt_digest_by_work: HashMap<String, [u8; 32]>,
 }
 
 impl WorkReducerState {
@@ -180,6 +190,255 @@ impl WorkReducer {
         Self::default()
     }
 
+    /// Records latest-digest projections from non-work events.
+    ///
+    /// This keeps stage-bound digest context available when processing
+    /// `work.transitioned` / `work.completed` boundaries.
+    fn observe_changeset_bound_event(&mut self, event: &EventRecord) {
+        let Some((work_id, changeset_digest)) =
+            extract_work_id_and_digest_from_payload(&event.payload)
+        else {
+            return;
+        };
+
+        match event.event_type.as_str() {
+            "changeset_published" => {
+                self.state
+                    .latest_changeset_by_work
+                    .insert(work_id, changeset_digest);
+            },
+            // CI transitions are driven by gate receipts (not lease issuance).
+            // Keep the most recent receipt-bound digest as the CI candidate.
+            "gate.receipt_collected"
+            | "gate_receipt_collected"
+            | "gate.receipt"
+            | "gate_receipt" => {
+                self.state
+                    .ci_receipt_digest_by_work
+                    .insert(work_id, changeset_digest);
+            },
+            "review_receipt_recorded" | "review_blocked_recorded" => {
+                if self.is_digest_latest(&work_id, changeset_digest) {
+                    self.state
+                        .review_receipt_digest_by_work
+                        .insert(work_id, changeset_digest);
+                } else {
+                    self.log_stale_digest_observation(
+                        "review_receipt",
+                        &event.event_type,
+                        &work_id,
+                        changeset_digest,
+                    );
+                }
+            },
+            // Merge receipt event names are currently implementation-defined.
+            // Accept any merge-receipt-shaped event_type and enforce latest
+            // digest at ingestion.
+            event_type if event_type.contains("merge_receipt") => {
+                if self.is_digest_latest(&work_id, changeset_digest) {
+                    self.state
+                        .merge_receipt_digest_by_work
+                        .insert(work_id, changeset_digest);
+                } else {
+                    self.log_stale_digest_observation(
+                        "merge_receipt",
+                        event_type,
+                        &work_id,
+                        changeset_digest,
+                    );
+                }
+            },
+            _ => {},
+        }
+    }
+
+    /// Returns `true` when `incoming` matches the latest authoritative
+    /// changeset digest for `work_id`.
+    fn is_digest_latest(&self, work_id: &str, incoming: [u8; 32]) -> bool {
+        self.state
+            .latest_changeset_by_work
+            .get(work_id)
+            .is_some_and(|latest| *latest == incoming)
+    }
+
+    /// Logs a structured stale-digest observation.
+    fn log_stale_digest_observation(
+        &self,
+        stage: &str,
+        event_type: &str,
+        work_id: &str,
+        incoming_digest: [u8; 32],
+    ) {
+        let latest = self
+            .state
+            .latest_changeset_by_work
+            .get(work_id)
+            .map_or_else(|| "unknown".to_string(), hex::encode);
+        warn!(
+            stage,
+            event_type,
+            work_id,
+            incoming_digest = %hex::encode(incoming_digest),
+            latest_digest = %latest,
+            "stale or unbound changeset digest ignored by work reducer"
+        );
+    }
+
+    /// Returns the latest authoritative changeset digest for `work_id`.
+    fn latest_changeset_digest(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.state.latest_changeset_by_work.get(work_id).copied()
+    }
+
+    /// Enforces CI transition authorization and latest-digest admission.
+    ///
+    /// Returns:
+    /// - `Ok(true)` when transition admission checks pass.
+    /// - `Ok(false)` when transition must be denied as stale/unbound.
+    /// - `Err(...)` for explicit unauthorized transition attempts.
+    fn enforce_ci_transition_guards(
+        &self,
+        work_id: &str,
+        from_state: WorkState,
+        to_state: WorkState,
+        rationale: &str,
+        actor_id: &str,
+    ) -> Result<bool, WorkError> {
+        if from_state != WorkState::CiPending {
+            return Ok(true);
+        }
+        if rationale != "ci_passed" && rationale != "ci_failed" {
+            return Err(WorkError::CiGatedTransitionUnauthorized {
+                from_state,
+                to_state,
+                rationale_code: rationale.to_string(),
+            });
+        }
+        if actor_id != CI_SYSTEM_ACTOR_ID {
+            return Err(WorkError::CiGatedTransitionUnauthorizedActor {
+                from_state,
+                actor_id: actor_id.to_string(),
+            });
+        }
+        if !matches!(to_state, WorkState::ReadyForReview | WorkState::Blocked) {
+            return Ok(true);
+        }
+
+        let Some(latest_digest) = self.latest_changeset_digest(work_id) else {
+            warn!(
+                work_id,
+                event_type = "work.transitioned",
+                from_state = %from_state.as_str(),
+                to_state = %to_state.as_str(),
+                "ci transition denied: latest changeset unknown"
+            );
+            return Ok(false);
+        };
+        let Some(incoming_digest) = self.state.ci_receipt_digest_by_work.get(work_id).copied()
+        else {
+            warn!(
+                work_id,
+                event_type = "work.transitioned",
+                from_state = %from_state.as_str(),
+                to_state = %to_state.as_str(),
+                latest_digest = %hex::encode(latest_digest),
+                "ci transition denied: no changeset-bound gate receipt observed"
+            );
+            return Ok(false);
+        };
+        if incoming_digest != latest_digest {
+            self.log_stale_digest_observation(
+                "ci_transition",
+                "work.transitioned",
+                work_id,
+                incoming_digest,
+            );
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Validates gate/merge receipt field separation for completion payloads.
+    fn validate_completion_receipt_fields(
+        work_id: &str,
+        event: &crate::events::WorkCompleted,
+    ) -> Result<(), WorkError> {
+        if event
+            .gate_receipt_id
+            .to_ascii_lowercase()
+            .starts_with("merge-receipt-")
+        {
+            return Err(WorkError::MergeReceiptInGateReceiptField {
+                work_id: work_id.to_string(),
+                value: event.gate_receipt_id.clone(),
+            });
+        }
+
+        if !event.merge_receipt_id.is_empty()
+            && !event
+                .merge_receipt_id
+                .to_ascii_lowercase()
+                .starts_with("merge-receipt-")
+        {
+            return Err(WorkError::InvalidMergeReceiptId {
+                work_id: work_id.to_string(),
+                value: event.merge_receipt_id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the digest context used for merge admission.
+    fn completion_incoming_digest(
+        &self,
+        work_id: &str,
+        merge_receipt_id: &str,
+    ) -> Option<[u8; 32]> {
+        if merge_receipt_id.is_empty() {
+            self.state
+                .review_receipt_digest_by_work
+                .get(work_id)
+                .copied()
+        } else {
+            self.state
+                .merge_receipt_digest_by_work
+                .get(work_id)
+                .copied()
+        }
+    }
+
+    /// Enforces latest-digest merge admission. Returns `true` if admissible.
+    fn completion_latest_digest_admitted(&self, work_id: &str, merge_receipt_id: &str) -> bool {
+        let Some(latest_digest) = self.latest_changeset_digest(work_id) else {
+            warn!(
+                work_id,
+                event_type = "work.completed",
+                "work completion denied: latest changeset unknown"
+            );
+            return false;
+        };
+        let Some(incoming_digest) = self.completion_incoming_digest(work_id, merge_receipt_id)
+        else {
+            warn!(
+                work_id,
+                event_type = "work.completed",
+                latest_digest = %hex::encode(latest_digest),
+                merge_receipt_id = %merge_receipt_id,
+                "work completion denied: no admissible changeset-bound receipt observed"
+            );
+            return false;
+        };
+        if incoming_digest != latest_digest {
+            self.log_stale_digest_observation(
+                "merge_admission",
+                "work.completed",
+                work_id,
+                incoming_digest,
+            );
+            return false;
+        }
+        true
+    }
+
     /// Handles a work opened event.
     fn handle_opened(
         &mut self,
@@ -225,18 +484,18 @@ impl WorkReducer {
     ) -> Result<(), WorkError> {
         let work_id = &event.work_id;
 
-        let work =
+        let current_work =
             self.state
                 .work_items
-                .get_mut(work_id)
+                .get(work_id)
                 .ok_or_else(|| WorkError::WorkNotFound {
                     work_id: work_id.clone(),
                 })?;
 
         // Verify work is not in a terminal state
-        if work.is_terminal() {
+        if current_work.is_terminal() {
             return Err(WorkError::InvalidTransition {
-                from_state: work.state.as_str().to_string(),
+                from_state: current_work.state.as_str().to_string(),
                 event_type: "work.transitioned".to_string(),
             });
         }
@@ -246,12 +505,12 @@ impl WorkReducer {
         let to_state = WorkState::parse(&event.to_state)?;
 
         // Verify the from_state matches current state
-        if work.state != from_state {
+        if current_work.state != from_state {
             return Err(WorkError::InvalidTransition {
-                from_state: work.state.as_str().to_string(),
+                from_state: current_work.state.as_str().to_string(),
                 event_type: format!(
                     "work.transitioned (expected from_state={}, got={})",
-                    work.state.as_str(),
+                    current_work.state.as_str(),
                     event.from_state
                 ),
             });
@@ -259,7 +518,7 @@ impl WorkReducer {
 
         // Replay protection: validate sequence via previous_transition_count
         // All transitions MUST provide the correct sequence to prevent replay attacks
-        let expected_count = work.transition_count;
+        let expected_count = current_work.transition_count;
         if event.previous_transition_count != expected_count {
             return Err(WorkError::SequenceMismatch {
                 work_id: work_id.clone(),
@@ -276,30 +535,23 @@ impl WorkReducer {
             });
         }
 
-        // Security check: CI-gated transitions require both:
-        // 1. Authorized rationale codes (ci_passed/ci_failed)
-        // 2. Authorized actor ID (system:ci-processor)
-        // This prevents agents from bypassing CI gating by directly emitting
-        // WorkTransitioned events.
-        if from_state == WorkState::CiPending {
-            // Check rationale code
-            let rationale = &event.rationale_code;
-            if rationale != "ci_passed" && rationale != "ci_failed" {
-                return Err(WorkError::CiGatedTransitionUnauthorized {
-                    from_state,
-                    to_state,
-                    rationale_code: rationale.clone(),
-                });
-            }
-
-            // Check actor ID - only the CI system processor can sign these events
-            if actor_id != CI_SYSTEM_ACTOR_ID {
-                return Err(WorkError::CiGatedTransitionUnauthorizedActor {
-                    from_state,
-                    actor_id: actor_id.to_string(),
-                });
-            }
+        if !self.enforce_ci_transition_guards(
+            work_id,
+            from_state,
+            to_state,
+            &event.rationale_code,
+            actor_id,
+        )? {
+            return Ok(());
         }
+
+        let work =
+            self.state
+                .work_items
+                .get_mut(work_id)
+                .ok_or_else(|| WorkError::WorkNotFound {
+                    work_id: work_id.clone(),
+                })?;
 
         // Apply the transition
         work.state = to_state;
@@ -323,18 +575,18 @@ impl WorkReducer {
     ) -> Result<(), WorkError> {
         let work_id = &event.work_id;
 
-        let work =
+        let current_work =
             self.state
                 .work_items
-                .get_mut(work_id)
+                .get(work_id)
                 .ok_or_else(|| WorkError::WorkNotFound {
                     work_id: work_id.clone(),
                 })?;
 
         // Can only complete from Review state
-        if work.state != WorkState::Review {
+        if current_work.state != WorkState::Review {
             return Err(WorkError::InvalidTransition {
-                from_state: work.state.as_str().to_string(),
+                from_state: current_work.state.as_str().to_string(),
                 event_type: "work.completed".to_string(),
             });
         }
@@ -362,28 +614,18 @@ impl WorkReducer {
         // Together these two checks enforce bidirectional domain separation
         // at the reducer boundary.
 
-        if event
-            .gate_receipt_id
-            .to_ascii_lowercase()
-            .starts_with("merge-receipt-")
-        {
-            return Err(WorkError::MergeReceiptInGateReceiptField {
-                work_id: work_id.clone(),
-                value: event.gate_receipt_id,
-            });
+        Self::validate_completion_receipt_fields(work_id, &event)?;
+        if !self.completion_latest_digest_admitted(work_id, &event.merge_receipt_id) {
+            return Ok(());
         }
 
-        if !event.merge_receipt_id.is_empty()
-            && !event
-                .merge_receipt_id
-                .to_ascii_lowercase()
-                .starts_with("merge-receipt-")
-        {
-            return Err(WorkError::InvalidMergeReceiptId {
-                work_id: work_id.clone(),
-                value: event.merge_receipt_id,
-            });
-        }
+        let work =
+            self.state
+                .work_items
+                .get_mut(work_id)
+                .ok_or_else(|| WorkError::WorkNotFound {
+                    work_id: work_id.clone(),
+                })?;
 
         // Apply completion (all deny gates passed — safe to mutate)
         work.state = WorkState::Completed;
@@ -566,6 +808,8 @@ impl Reducer for WorkReducer {
     }
 
     fn apply(&mut self, event: &EventRecord, _ctx: &ReducerContext) -> Result<(), Self::Error> {
+        self.observe_changeset_bound_event(event);
+
         // Only handle work events
         if !event.event_type.starts_with("work.") {
             return Ok(());
@@ -597,6 +841,67 @@ impl Reducer for WorkReducer {
 
     fn reset(&mut self) {
         self.state = WorkReducerState::default();
+    }
+}
+
+fn extract_work_id_and_digest_from_payload(payload: &[u8]) -> Option<(String, [u8; 32])> {
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    find_work_id_and_digest(&value)
+}
+
+fn find_work_id_and_digest(value: &serde_json::Value) -> Option<(String, [u8; 32])> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let (Some(work_id), Some(changeset_value)) = (
+                map.get("work_id").and_then(serde_json::Value::as_str),
+                map.get("changeset_digest"),
+            ) {
+                if let Some(digest) = decode_digest_value(changeset_value) {
+                    return Some((work_id.to_string(), digest));
+                }
+            }
+            for nested in map.values() {
+                if let Some(found) = find_work_id_and_digest(nested) {
+                    return Some(found);
+                }
+            }
+            None
+        },
+        serde_json::Value::Array(items) => {
+            for nested in items {
+                if let Some(found) = find_work_id_and_digest(nested) {
+                    return Some(found);
+                }
+            }
+            None
+        },
+        _ => None,
+    }
+}
+
+fn decode_digest_value(value: &serde_json::Value) -> Option<[u8; 32]> {
+    match value {
+        serde_json::Value::String(hex_value) => {
+            let raw = hex::decode(hex_value).ok()?;
+            if raw.len() != 32 {
+                return None;
+            }
+            let mut digest = [0u8; 32];
+            digest.copy_from_slice(&raw);
+            Some(digest)
+        },
+        serde_json::Value::Array(values) => {
+            if values.len() != 32 {
+                return None;
+            }
+            let mut digest = [0u8; 32];
+            for (idx, item) in values.iter().enumerate() {
+                let byte = u8::try_from(item.as_u64()?).ok()?;
+                digest[idx] = byte;
+            }
+            Some(digest)
+        },
+        _ => None,
     }
 }
 

@@ -4,12 +4,12 @@
 
 ## Overview
 
-The `gate` module implements the autonomous gate lifecycle within the Forge Admission Cycle (FAC). When a session terminates, the `GateOrchestrator` watches for `session_terminated` ledger events and drives the gate pipeline: policy resolution, lease issuance, gate executor spawning, and receipt collection. When all required gates pass, the `MergeExecutor` autonomously merges the PR via the GitHub API and emits a signed `MergeReceipt`.
+The `gate` module implements the autonomous gate lifecycle within the Forge Admission Cycle (FAC). Gate start is publication-driven: authoritative `changeset_published` ledger events feed `GateStartKernel`, which calls `GateOrchestrator::start_for_changeset` to drive policy resolution and lease issuance. Session termination remains lifecycle/accounting-only and MUST NOT bootstrap gate start. When all required gates pass, the `MergeExecutor` autonomously merges the PR via the GitHub API and emits a signed `MergeReceipt`.
 
 ### FAC Gate State Machine
 
 ```text
-session_terminated -> RUN_GATES -> gate_receipt -> AWAIT_REVIEW
+changeset_published -> RUN_GATES -> gate_receipt -> AWAIT_REVIEW
                                                 -> ALL_PASS -> MERGE -> Completed
                                                 -> CONFLICT -> ReviewBlocked
 ```
@@ -18,7 +18,7 @@ session_terminated -> RUN_GATES -> gate_receipt -> AWAIT_REVIEW
 
 ### `GateOrchestrator`
 
-Watches for `session_terminated` ledger events and autonomously orchestrates the gate lifecycle.
+Consumes authoritative changeset publication identity and autonomously orchestrates the gate lifecycle.
 
 **Invariants:**
 

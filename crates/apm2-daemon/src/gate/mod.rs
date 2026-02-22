@@ -59,9 +59,8 @@ pub use merge_executor::{
 pub use orchestrator::{
     Clock, DEFAULT_GATE_TIMEOUT_MS, GateOrchestrator, GateOrchestratorConfig,
     GateOrchestratorError, GateOrchestratorEvent, GateOutcome, GateStatus, GateType,
-    MAX_CONCURRENT_ORCHESTRATIONS, MAX_GATE_TYPES, MAX_IDEMPOTENCY_KEYS, MAX_TERMINATED_AT_AGE_MS,
-    MAX_WORK_ID_LENGTH, SessionTerminatedInfo, SystemClock, TIMEOUT_AUTHORITY_ACTOR_ID,
-    create_timeout_receipt,
+    MAX_CONCURRENT_ORCHESTRATIONS, MAX_GATE_TYPES, MAX_IDEMPOTENCY_KEYS, MAX_WORK_ID_LENGTH,
+    SessionTerminatedInfo, SystemClock, TIMEOUT_AUTHORITY_ACTOR_ID, create_timeout_receipt,
 };
 pub use start_kernel::{GateStartKernel, GateStartKernelConfig, GateStartKernelError};
 pub use timeout_kernel::{GateTimeoutKernel, GateTimeoutKernelConfig, GateTimeoutKernelError};

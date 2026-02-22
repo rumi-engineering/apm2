@@ -173,6 +173,25 @@ fn dotted_completed_event(
     )
 }
 
+fn digest_context_event(
+    event_type: &str,
+    work_id: &str,
+    actor_id: &str,
+    changeset_digest: [u8; 32],
+    timestamp_ns: u64,
+    seq_id: u64,
+) -> EventRecord {
+    let payload = serde_json::json!({
+        "event_type": event_type,
+        "work_id": work_id,
+        "changeset_digest": hex::encode(changeset_digest),
+    })
+    .to_string()
+    .into_bytes();
+
+    event_record(event_type, work_id, actor_id, payload, timestamp_ns, seq_id)
+}
+
 fn reduce_expected_state(events: &[EventRecord]) -> WorkReducerState {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
@@ -310,7 +329,23 @@ fn replay_from_checkpoint_converges_to_identical_projection() {
             2_300,
             4,
         ),
-        dotted_completed_event(work_id, actor_id, 2_400, 5),
+        digest_context_event(
+            "changeset_published",
+            work_id,
+            actor_id,
+            [0x42; 32],
+            2_350,
+            5,
+        ),
+        digest_context_event(
+            "review_receipt_recorded",
+            work_id,
+            actor_id,
+            [0x42; 32],
+            2_360,
+            6,
+        ),
+        dotted_completed_event(work_id, actor_id, 2_400, 7),
     ];
 
     let expected_state = reduce_expected_state(&events);

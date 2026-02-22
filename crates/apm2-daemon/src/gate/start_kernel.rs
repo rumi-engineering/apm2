@@ -14,7 +14,7 @@ use apm2_core::fac::{ChangeSetPublishedKernelEventPayload, ChangesetPublication,
 use apm2_core::orchestrator_kernel::{
     CompositeCursor, CursorEvent, CursorStore, EffectExecutionState, EffectJournal,
     ExecutionOutcome, InDoubtResolution, IntentStore, LedgerReader, OrchestratorDomain,
-    ReceiptWriter, TickConfig, TickReport, is_after_cursor, run_tick,
+    ReceiptWriter, TickConfig, TickReport, run_tick,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -145,7 +145,7 @@ impl GateStartKernel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GateStartObservedEvent {
     timestamp_ns: u64,
-    event_id: String,
+    cursor_event_id: String,
     publication: ChangesetPublication,
 }
 
@@ -155,7 +155,7 @@ impl CursorEvent for GateStartObservedEvent {
     }
 
     fn event_id(&self) -> &str {
-        &self.event_id
+        &self.cursor_event_id
     }
 }
 
@@ -325,88 +325,10 @@ impl SqliteGateStartLedgerReader {
             .conn
             .lock()
             .map_err(|e| format!("ledger reader lock poisoned: {e}"))?;
-
-        let mut out = Vec::new();
-        out.extend(Self::query_changeset_published_legacy(
-            &guard,
-            cursor_ts_i64,
-            &cursor.event_id,
-            limit_i64,
-        )?);
-        out.extend(Self::query_changeset_published_canonical(
-            &guard,
-            cursor_ts_i64,
-            &cursor.event_id,
-            limit_i64,
-        )?);
-        out.retain(|event| is_after_cursor(event, cursor));
-        out.sort_by(|a, b| {
-            a.timestamp_ns
-                .cmp(&b.timestamp_ns)
-                .then_with(|| a.event_id.cmp(&b.event_id))
-        });
-        out.truncate(limit);
-        Ok(out)
+        Self::query_changeset_published_unified(&guard, cursor_ts_i64, &cursor.event_id, limit_i64)
     }
 
-    fn query_changeset_published_legacy(
-        conn: &Connection,
-        cursor_ts_i64: i64,
-        cursor_event_id: &str,
-        limit_i64: i64,
-    ) -> Result<Vec<GateStartObservedEvent>, String> {
-        let query = if cursor_event_id.is_empty() {
-            "SELECT event_id, payload, timestamp_ns
-             FROM ledger_events
-             WHERE event_type = 'changeset_published' AND timestamp_ns > ?1
-             ORDER BY timestamp_ns ASC, event_id ASC
-             LIMIT ?2"
-        } else {
-            "SELECT event_id, payload, timestamp_ns
-             FROM ledger_events
-             WHERE event_type = 'changeset_published'
-               AND (timestamp_ns > ?1 OR (timestamp_ns = ?1 AND event_id > ?2))
-             ORDER BY timestamp_ns ASC, event_id ASC
-             LIMIT ?3"
-        };
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| format!("failed to prepare legacy changeset query: {e}"))?;
-        let mut rows = if cursor_event_id.is_empty() {
-            stmt.query(params![cursor_ts_i64, limit_i64])
-        } else {
-            stmt.query(params![cursor_ts_i64, cursor_event_id, limit_i64])
-        }
-        .map_err(|e| format!("failed to execute legacy changeset query: {e}"))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| format!("failed to iterate legacy changeset rows: {e}"))?
-        {
-            let event_id: String = row
-                .get(0)
-                .map_err(|e| format!("failed to decode legacy event_id: {e}"))?;
-            let payload: Vec<u8> = row
-                .get(1)
-                .map_err(|e| format!("failed to decode legacy payload: {e}"))?;
-            let ts_i64: i64 = row
-                .get(2)
-                .map_err(|e| format!("failed to decode legacy timestamp: {e}"))?;
-            let timestamp_ns =
-                u64::try_from(ts_i64).map_err(|_| "legacy timestamp is negative".to_string())?;
-            let publication =
-                parse_changeset_publication_payload(&payload, timestamp_ns, &event_id)?;
-            out.push(GateStartObservedEvent {
-                timestamp_ns,
-                event_id,
-                publication,
-            });
-        }
-        Ok(out)
-    }
-
-    fn query_changeset_published_canonical(
+    fn query_changeset_published_unified(
         conn: &Connection,
         cursor_ts_i64: i64,
         cursor_event_id: &str,
@@ -420,60 +342,113 @@ impl SqliteGateStartLedgerReader {
             )
             .optional()
             .map_err(|e| format!("failed to detect canonical events table: {e}"))?;
-        if table_exists.is_none() {
-            return Ok(Vec::new());
-        }
-
-        let query = if cursor_event_id.is_empty() {
-            "SELECT seq_id, payload, timestamp_ns
-             FROM events
-             WHERE event_type = 'changeset_published' AND timestamp_ns > ?1
-             ORDER BY timestamp_ns ASC, seq_id ASC
+        let query = if table_exists.is_some() {
+            // Ordering invariant:
+            // - Every observed event has a deterministic `cursor_event_id` namespaced by
+            //   source table (`legacy:` or `canonical:`).
+            // - Observe ordering is total by `(timestamp_ns, cursor_event_id)`.
+            // - The durable cursor stores this exact ordering key.
+            //
+            // This avoids mixed-table tie-break drift where legacy and
+            // canonical rows sharing a timestamp could be skipped when each
+            // table applied incompatible local ordering.
+            if cursor_event_id.is_empty() {
+                "SELECT cursor_event_id, source_event_id, payload, timestamp_ns
+                 FROM (
+                   SELECT ('legacy:' || event_id) AS cursor_event_id,
+                          event_id AS source_event_id,
+                          payload,
+                          timestamp_ns
+                   FROM ledger_events
+                   WHERE event_type = 'changeset_published'
+                   UNION ALL
+                   SELECT ('canonical:' || printf('%020d', seq_id)) AS cursor_event_id,
+                          ('canonical-' || printf('%020d', seq_id)) AS source_event_id,
+                          payload,
+                          timestamp_ns
+                   FROM events
+                   WHERE event_type = 'changeset_published'
+                 )
+                 WHERE timestamp_ns > ?1
+                 ORDER BY timestamp_ns ASC, cursor_event_id ASC
+                 LIMIT ?2"
+            } else {
+                "SELECT cursor_event_id, source_event_id, payload, timestamp_ns
+                 FROM (
+                   SELECT ('legacy:' || event_id) AS cursor_event_id,
+                          event_id AS source_event_id,
+                          payload,
+                          timestamp_ns
+                   FROM ledger_events
+                   WHERE event_type = 'changeset_published'
+                   UNION ALL
+                   SELECT ('canonical:' || printf('%020d', seq_id)) AS cursor_event_id,
+                          ('canonical-' || printf('%020d', seq_id)) AS source_event_id,
+                          payload,
+                          timestamp_ns
+                   FROM events
+                   WHERE event_type = 'changeset_published'
+                 )
+                 WHERE timestamp_ns > ?1
+                    OR (timestamp_ns = ?1 AND cursor_event_id > ?2)
+                 ORDER BY timestamp_ns ASC, cursor_event_id ASC
+                 LIMIT ?3"
+            }
+        } else if cursor_event_id.is_empty() {
+            "SELECT ('legacy:' || event_id) AS cursor_event_id,
+                    event_id AS source_event_id,
+                    payload,
+                    timestamp_ns
+             FROM ledger_events
+             WHERE event_type = 'changeset_published'
+               AND timestamp_ns > ?1
+             ORDER BY timestamp_ns ASC, cursor_event_id ASC
              LIMIT ?2"
         } else {
-            "SELECT seq_id, payload, timestamp_ns
-             FROM events
+            "SELECT ('legacy:' || event_id) AS cursor_event_id,
+                    event_id AS source_event_id,
+                    payload,
+                    timestamp_ns
+             FROM ledger_events
              WHERE event_type = 'changeset_published'
-               AND (
-                 timestamp_ns > ?1 OR
-                 (timestamp_ns = ?1 AND
-                  ('canonical-' || SUBSTR('00000000000000000000', 1, 20 - LENGTH(CAST(seq_id AS TEXT))) || CAST(seq_id AS TEXT)) > ?2)
-               )
-             ORDER BY timestamp_ns ASC, seq_id ASC
+               AND (timestamp_ns > ?1 OR (timestamp_ns = ?1 AND ('legacy:' || event_id) > ?2))
+             ORDER BY timestamp_ns ASC, cursor_event_id ASC
              LIMIT ?3"
         };
         let mut stmt = conn
             .prepare(query)
-            .map_err(|e| format!("failed to prepare canonical changeset query: {e}"))?;
+            .map_err(|e| format!("failed to prepare unified changeset query: {e}"))?;
         let mut rows = if cursor_event_id.is_empty() {
             stmt.query(params![cursor_ts_i64, limit_i64])
         } else {
             stmt.query(params![cursor_ts_i64, cursor_event_id, limit_i64])
         }
-        .map_err(|e| format!("failed to execute canonical changeset query: {e}"))?;
+        .map_err(|e| format!("failed to execute unified changeset query: {e}"))?;
 
         let mut out = Vec::new();
         while let Some(row) = rows
             .next()
-            .map_err(|e| format!("failed to iterate canonical changeset rows: {e}"))?
+            .map_err(|e| format!("failed to iterate unified changeset rows: {e}"))?
         {
-            let seq_id: i64 = row
+            let cursor_event_id: String = row
                 .get(0)
-                .map_err(|e| format!("failed to decode canonical seq_id: {e}"))?;
-            let payload: Vec<u8> = row
+                .map_err(|e| format!("failed to decode unified cursor_event_id: {e}"))?;
+            let source_event_id: String = row
                 .get(1)
-                .map_err(|e| format!("failed to decode canonical payload: {e}"))?;
-            let ts_i64: i64 = row
+                .map_err(|e| format!("failed to decode unified source_event_id: {e}"))?;
+            let payload: Vec<u8> = row
                 .get(2)
-                .map_err(|e| format!("failed to decode canonical timestamp: {e}"))?;
+                .map_err(|e| format!("failed to decode unified payload: {e}"))?;
+            let ts_i64: i64 = row
+                .get(3)
+                .map_err(|e| format!("failed to decode unified timestamp: {e}"))?;
             let timestamp_ns =
-                u64::try_from(ts_i64).map_err(|_| "canonical timestamp is negative".to_string())?;
-            let event_id = format!("canonical-{seq_id:020}");
+                u64::try_from(ts_i64).map_err(|_| "unified timestamp is negative".to_string())?;
             let publication =
-                parse_changeset_publication_payload(&payload, timestamp_ns, &event_id)?;
+                parse_changeset_publication_payload(&payload, timestamp_ns, &source_event_id)?;
             out.push(GateStartObservedEvent {
                 timestamp_ns,
-                event_id,
+                cursor_event_id,
                 publication,
             });
         }
@@ -1223,11 +1198,97 @@ fn epoch_now_ns_i64() -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::gate_start_intent_key;
+    use std::sync::{Arc, Mutex};
+
+    use apm2_core::orchestrator_kernel::CompositeCursor;
+    use rusqlite::Connection;
+    use serde_json::json;
+
+    use super::{SqliteGateStartLedgerReader, gate_start_intent_key};
 
     #[test]
     fn gate_start_intent_key_matches_contract() {
         let key = gate_start_intent_key("W-123", &[0xAB; 32]);
         assert_eq!(key, format!("gate_start:W-123:{}", "ab".repeat(32)));
+    }
+
+    #[test]
+    fn poll_same_timestamp_interleaving_does_not_skip_legacy_after_canonical_cursor() {
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("open in-memory sqlite"),
+        ));
+        {
+            let guard = conn.lock().expect("lock sqlite");
+            guard
+                .execute(
+                    "CREATE TABLE ledger_events (
+                        event_id TEXT PRIMARY KEY,
+                        event_type TEXT NOT NULL,
+                        payload BLOB NOT NULL,
+                        timestamp_ns INTEGER NOT NULL
+                    )",
+                    [],
+                )
+                .expect("create legacy table");
+            guard
+                .execute(
+                    "CREATE TABLE events (
+                        seq_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_type TEXT NOT NULL,
+                        payload BLOB NOT NULL,
+                        timestamp_ns INTEGER NOT NULL
+                    )",
+                    [],
+                )
+                .expect("create canonical table");
+            let ts = 1_706_000_000_999_000_000_i64;
+            let legacy_payload = serde_json::to_vec(&json!({
+                "work_id": "work-legacy",
+                "changeset_digest": hex::encode([0x11; 32]),
+                "cas_hash": hex::encode([0x21; 32]),
+                "actor_id": "actor:legacy",
+                "timestamp_ns": ts,
+            }))
+            .expect("serialize legacy payload");
+            let canonical_payload = serde_json::to_vec(&json!({
+                "work_id": "work-canonical",
+                "changeset_digest": hex::encode([0x12; 32]),
+                "cas_hash": hex::encode([0x22; 32]),
+                "actor_id": "actor:canonical",
+                "timestamp_ns": ts,
+            }))
+            .expect("serialize canonical payload");
+            guard
+                .execute(
+                    "INSERT INTO ledger_events (event_id, event_type, payload, timestamp_ns)
+                     VALUES (?1, 'changeset_published', ?2, ?3)",
+                    rusqlite::params!["a-legacy", legacy_payload, ts],
+                )
+                .expect("insert legacy changeset");
+            guard
+                .execute(
+                    "INSERT INTO events (event_type, payload, timestamp_ns)
+                     VALUES ('changeset_published', ?1, ?2)",
+                    rusqlite::params![canonical_payload, ts],
+                )
+                .expect("insert canonical changeset");
+        }
+
+        let reader = SqliteGateStartLedgerReader::new(Arc::clone(&conn));
+        let first = reader
+            .poll(&CompositeCursor::default(), 1)
+            .expect("first poll should succeed");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].publication.work_id, "work-canonical");
+
+        let cursor = CompositeCursor {
+            timestamp_ns: first[0].timestamp_ns,
+            event_id: first[0].cursor_event_id.clone(),
+        };
+        let second = reader
+            .poll(&cursor, 10)
+            .expect("second poll should succeed");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].publication.work_id, "work-legacy");
     }
 }

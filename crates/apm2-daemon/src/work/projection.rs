@@ -553,9 +553,12 @@ impl WorkObjectProjection {
 
 /// Converts daemon signed events into canonical `work.*` reducer events.
 ///
-/// Non-work events are ignored. Transitional daemon legacy events
-/// (`work_claimed`, `work_transitioned`) are normalized into `work.*` protobuf
-/// payloads consumed by `WorkReducer`.
+/// Transitional daemon legacy events (`work_claimed`, `work_transitioned`) are
+/// normalized into `work.*` protobuf payloads consumed by `WorkReducer`.
+///
+/// Digest-context non-work events (for example `changeset_published` and
+/// gate/review/merge receipt events) are forwarded unchanged so the reducer can
+/// enforce latest-changeset stage admission.
 pub fn translate_signed_events(
     events: &[SignedLedgerEvent],
 ) -> Result<Vec<EventRecord>, WorkProjectionError> {
@@ -671,6 +674,33 @@ fn translate_signed_event(
                     &transition.rationale_code,
                     transition.previous_transition_count,
                 ),
+                event.timestamp_ns,
+            );
+        },
+
+        // Forward digest-bound non-work events so WorkReducer can maintain
+        // latest changeset + stage receipt context (CSID-004).
+        "changeset_published"
+        | "gate.receipt_collected"
+        | "gate_receipt_collected"
+        | "gate.receipt"
+        | "gate_receipt"
+        | "review_receipt_recorded"
+        | "review_blocked_recorded" => {
+            push_event(
+                &event.event_type,
+                &event.work_id,
+                &event.actor_id,
+                event.payload.clone(),
+                event.timestamp_ns,
+            );
+        },
+        event_type if event_type.contains("merge_receipt") => {
+            push_event(
+                event_type,
+                &event.work_id,
+                &event.actor_id,
+                event.payload.clone(),
                 event.timestamp_ns,
             );
         },
