@@ -427,6 +427,9 @@ impl_bounded_decode_simple!(
     // TCK-00637: ClaimWorkV2 (RFC-0032 Phase 2)
     ClaimWorkV2Request,
     ClaimWorkV2Response,
+    // TCK-00639: RecordWorkPrAssociation (RFC-0032 Phase 2)
+    RecordWorkPrAssociationRequest,
+    RecordWorkPrAssociationResponse,
 );
 
 // Implement BoundedDecode for messages with repeated fields
