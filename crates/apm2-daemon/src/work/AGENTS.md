@@ -124,14 +124,15 @@ Projection-backed alias reconciliation gate implementation. Bridges the alias re
 - `projection` -- Shared `WorkObjectProjection` rebuilt from ledger events
 - `event_emitter` -- Ledger event emitter for projection refresh
 - `cas` -- Optional CAS store for `WorkSpec` retrieval (TCK-00636)
-- `ticket_alias_index` -- Bounded in-memory `ticket_alias -> work_id` index with deterministic oldest-entry eviction (`MAX_TICKET_ALIAS_INDEX_WORK_ITEMS`)
+- `ticket_alias_index` -- Bounded in-memory alias index with deterministic oldest-entry work eviction (`MAX_TICKET_ALIAS_INDEX_WORK_ITEMS`), bounded lossy alias markers (`MAX_TICKET_ALIAS_INDEX_EVICTED_ALIASES`), and bounded resolved spec-hash cache (`MAX_TICKET_ALIAS_INDEX_RESOLVED_SPEC_HASHES`)
 
 **Contracts:**
 
-- [CTR-AG01] `refresh_projection()` incrementally refreshes `ticket_alias_index` only for new/changed `spec_snapshot_hash` values; steady-state lookups avoid per-request CAS I/O (TCK-00636 security hardening).
-- [CTR-AG02] `resolve_ticket_alias()` performs O(1) alias-index lookups and returns `Err` on ambiguity or lossy/evicted alias state (fail-closed).
+- [CTR-AG01] `refresh_projection()` incrementally refreshes `ticket_alias_index` only for new/changed `spec_snapshot_hash` values and reuses the resolved spec-hash cache to avoid repeated CAS I/O for evicted work bindings.
+- [CTR-AG02] `resolve_ticket_alias()` performs O(1) alias-index lookups and returns `Err` on ambiguity, lossy/evicted alias state, or lossy-marker saturation (fail-closed).
 - [CTR-AG03] `build_canonical_projections()` uses index-backed alias mappings (no projection-wide CAS scans); aliases marked lossy by eviction are omitted so reconciliation yields unresolved defects (fail-closed).
-- [CTR-AG04] Alias index collections are hard-capped by `MAX_TICKET_ALIAS_INDEX_WORK_ITEMS` with deterministic oldest-work eviction per RS-27.
+- [CTR-AG04] Alias index collections are hard-capped (`MAX_TICKET_ALIAS_INDEX_WORK_ITEMS`, `MAX_TICKET_ALIAS_INDEX_EVICTED_ALIASES`, `MAX_TICKET_ALIAS_INDEX_RESOLVED_SPEC_HASHES`) per RS-27.
+- [CTR-AG05] `spec_hash_by_work_id` is updated only after successful CAS retrieval/decode so transient CAS failures remain retryable on subsequent projection refreshes.
 
 ## Public API
 

@@ -648,7 +648,17 @@ fn translate_signed_event(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CanonicalWorkEventEnvelopeJson {
+    payload: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionWorkEventEnvelopeJson {
+    event_type: String,
+    session_id: String,
+    actor_id: String,
     payload: String,
 }
 
@@ -670,13 +680,36 @@ fn decode_canonical_work_event_payload(
         });
     }
 
-    let envelope: CanonicalWorkEventEnvelopeJson =
-        serde_json::from_slice(payload).map_err(|error| WorkProjectionError::InvalidPayload {
-            event_type: event_type.to_string(),
-            reason: format!("work.* payload is not protobuf or strict JSON envelope: {error}"),
-        })?;
+    let wrapped_payload = match serde_json::from_slice::<CanonicalWorkEventEnvelopeJson>(payload) {
+        Ok(envelope) => envelope.payload,
+        Err(canonical_error) => {
+            let session_envelope = serde_json::from_slice::<SessionWorkEventEnvelopeJson>(payload)
+                .map_err(|session_error| WorkProjectionError::InvalidPayload {
+                    event_type: event_type.to_string(),
+                    reason: format!(
+                        "work.* payload is not protobuf or strict JSON envelope: canonical={canonical_error}; session={session_error}"
+                    ),
+                })?;
+            if session_envelope.event_type != event_type {
+                return Err(WorkProjectionError::InvalidPayload {
+                    event_type: event_type.to_string(),
+                    reason: format!(
+                        "session envelope event_type '{}' does not match ledger event_type '{}'",
+                        session_envelope.event_type, event_type
+                    ),
+                });
+            }
+            if session_envelope.session_id.is_empty() || session_envelope.actor_id.is_empty() {
+                return Err(WorkProjectionError::InvalidPayload {
+                    event_type: event_type.to_string(),
+                    reason: "session envelope missing required identity fields".to_string(),
+                });
+            }
+            session_envelope.payload
+        },
+    };
 
-    if envelope.payload.len() > MAX_CANONICAL_WORK_EVENT_HEX_CHARS {
+    if wrapped_payload.len() > MAX_CANONICAL_WORK_EVENT_HEX_CHARS {
         return Err(WorkProjectionError::InvalidPayload {
             event_type: event_type.to_string(),
             reason: format!(
@@ -687,7 +720,7 @@ fn decode_canonical_work_event_payload(
     }
 
     let decoded =
-        hex::decode(&envelope.payload).map_err(|error| WorkProjectionError::InvalidPayload {
+        hex::decode(&wrapped_payload).map_err(|error| WorkProjectionError::InvalidPayload {
             event_type: event_type.to_string(),
             reason: format!("wrapped work.* payload hex decode failed: {error}"),
         })?;
