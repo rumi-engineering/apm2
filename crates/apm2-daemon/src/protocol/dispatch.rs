@@ -15533,31 +15533,49 @@ impl PrivilegedDispatcher {
         // Uses constant-time comparison to prevent timing side-channel
         // attacks that could leak information about valid actor bindings.
         //
-        // If the lease has no executor binding (empty string or None),
-        // skip the check — the lease was registered via a legacy governance
-        // path that predates executor binding. PCAC lifecycle enforcement
-        // downstream will still gate the operation.
-        if let Some(lease_owner) = self
+        let Some(lease_owner) = self
             .lease_validator
             .get_lease_executor_actor_id(&request.lease_id)
-        {
-            if !lease_owner.is_empty() {
-                let owner_matches = lease_owner.len() == actor_id.len()
-                    && bool::from(lease_owner.as_bytes().ct_eq(actor_id.as_bytes()));
-                if !owner_matches {
-                    warn!(
-                        lease_id = %request.lease_id,
-                        derived_actor_id = %actor_id,
-                        "ClaimWorkV2 rejected: actor-lease ownership mismatch \
-                         (authorization bypass attempt)"
-                    );
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        "ClaimWorkV2 request rejected: lease_id is not owned \
-                         by the requesting actor",
-                    ));
-                }
-            }
+        else {
+            warn!(
+                lease_id = %request.lease_id,
+                "ClaimWorkV2 rejected: lease has no executor actor binding \
+                 (fail-closed)"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "ClaimWorkV2 request rejected: lease_id is missing executor \
+                 actor binding",
+            ));
+        };
+
+        if lease_owner.is_empty() {
+            warn!(
+                lease_id = %request.lease_id,
+                "ClaimWorkV2 rejected: lease has empty executor actor binding \
+                 (fail-closed)"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "ClaimWorkV2 request rejected: lease_id has empty executor \
+                 actor binding",
+            ));
+        }
+
+        let owner_matches = lease_owner.len() == actor_id.len()
+            && bool::from(lease_owner.as_bytes().ct_eq(actor_id.as_bytes()));
+        if !owner_matches {
+            warn!(
+                lease_id = %request.lease_id,
+                derived_actor_id = %actor_id,
+                "ClaimWorkV2 rejected: actor-lease ownership mismatch \
+                 (authorization bypass attempt)"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "ClaimWorkV2 request rejected: lease_id is not owned \
+                 by the requesting actor",
+            ));
         }
 
         let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
@@ -16148,10 +16166,13 @@ impl PrivilegedDispatcher {
     /// 2. **Partial durability recovery (claim-state fallback)** — The
     ///    `work_transitioned` event is missing (partial failure after
     ///    `register_claim` but before `emit_work_transitioned`), but the claim
-    ///    was persisted in `WorkRegistry`. If no matching `evidence.published`
-    ///    event exists yet, the stale claim row is compensated (removed) so a
-    ///    retry can complete the full durability chain. If `evidence.published`
-    ///    exists but is malformed/incomplete, recovery fails closed with
+    ///    was persisted in `WorkRegistry`. If a matching `evidence.published`
+    ///    event exists, the handler reconstructs lease/cas/actor fields from
+    ///    the immutable ledger record and emits the missing `work_transitioned`
+    ///    event before returning success. If no matching evidence exists yet,
+    ///    the handler returns a retriable error without deleting the claim row
+    ///    (concurrency-safe fail-closed behavior). If `evidence.published`
+    ///    exists but is malformed/ incomplete, recovery fails closed with
     ///    `FAILED_PRECONDITION` to prevent split-brain.
     ///
     /// 3. **Different-actor rejection** — The claim exists for a different
@@ -16424,13 +16445,134 @@ impl PrivilegedDispatcher {
                                     })
                             });
 
-                        if let (Some(lease_from_ledger), Some(cas_from_ledger)) =
-                            (recovered_lease, recovered_cas)
+                        // Prefer the actor recorded inside the immutable
+                        // evidence payload (authority-binding anchor), then
+                        // fall back to envelope actor_id for legacy rows.
+                        let recovered_actor: Option<String> = envelope
+                            .get("payload")
+                            .and_then(|v| v.as_str())
+                            .and_then(|hex_str| hex::decode(hex_str).ok())
+                            .and_then(|bytes| {
+                                serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                            })
+                            .and_then(|inner| {
+                                inner
+                                    .get("actor_id")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .map(String::from)
+                            })
+                            .or_else(|| {
+                                envelope
+                                    .get("actor_id")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .map(String::from)
+                            });
+
+                        if let (
+                            Some(lease_from_ledger),
+                            Some(cas_from_ledger),
+                            Some(actor_from_ledger),
+                        ) = (recovered_lease, recovered_cas, recovered_actor)
                         {
-                            // evidence.published has valid lease_id and
-                            // cas_hash. Return idempotent success using
-                            // the immutable ledger values — do NOT delete
-                            // the claim or generate new values.
+                            // evidence.published has valid lease_id/cas_hash
+                            // and actor_id. Complete the missing
+                            // work_transitioned commit before returning
+                            // idempotent success.
+                            let (
+                                from_state_str,
+                                to_state_str,
+                                expected_from_state,
+                                expected_to_state,
+                            ) = match role {
+                                WorkRole::Implementer | WorkRole::Coordinator => (
+                                    "Open",
+                                    "Claimed",
+                                    apm2_core::work::WorkState::Open,
+                                    apm2_core::work::WorkState::Claimed,
+                                ),
+                                WorkRole::Reviewer => (
+                                    "ReadyForReview",
+                                    "Review",
+                                    apm2_core::work::WorkState::ReadyForReview,
+                                    apm2_core::work::WorkState::Review,
+                                ),
+                                _ => {
+                                    return Ok(PrivilegedResponse::error(
+                                        PrivilegedErrorCode::CapabilityRequestRejected,
+                                        format!(
+                                            "ClaimWorkV2 partial-recovery: unsupported role {role:?}"
+                                        ),
+                                    ));
+                                },
+                            };
+
+                            let authority = self.projection_work_authority();
+                            let work_status = match authority.get_work_status(work_id) {
+                                Ok(status) => status,
+                                Err(error) => return Ok(Self::map_work_authority_error(error)),
+                            };
+
+                            if work_status.state == expected_from_state {
+                                match self.event_emitter.emit_work_transitioned(&WorkTransition {
+                                    work_id,
+                                    from_state: from_state_str,
+                                    to_state: to_state_str,
+                                    rationale_code: expected_rationale,
+                                    previous_transition_count: work_status.transition_count,
+                                    actor_id: &actor_from_ledger,
+                                    timestamp_ns: evidence_event.timestamp_ns,
+                                }) {
+                                    Ok(_) => {
+                                        info!(
+                                            work_id = %work_id,
+                                            role = ?role,
+                                            recovered_actor_id = %actor_from_ledger,
+                                            evidence_id = %expected_evidence_id,
+                                            "ClaimWorkV2 partial-recovery: emitted missing \
+                                             work_transitioned after recovering evidence anchor"
+                                        );
+                                    },
+                                    Err(e) if e.to_string().contains("UNIQUE constraint") => {
+                                        info!(
+                                            work_id = %work_id,
+                                            role = ?role,
+                                            evidence_id = %expected_evidence_id,
+                                            "ClaimWorkV2 partial-recovery: missing \
+                                             work_transitioned was already committed concurrently"
+                                        );
+                                    },
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            work_id = %work_id,
+                                            role = ?role,
+                                            "ClaimWorkV2 partial-recovery: failed to emit \
+                                             missing work_transitioned"
+                                        );
+                                        return Ok(PrivilegedResponse::error(
+                                            PrivilegedErrorCode::CapabilityRequestRejected,
+                                            format!(
+                                                "ClaimWorkV2 partial-recovery failed while \
+                                                 emitting missing work_transitioned: {e}"
+                                            ),
+                                        ));
+                                    },
+                                }
+                            } else if work_status.state != expected_to_state {
+                                return Ok(PrivilegedResponse::error(
+                                    PrivilegedErrorCode::FailedPrecondition,
+                                    format!(
+                                        "ClaimWorkV2 partial-recovery rejected: work_id \
+                                         '{work_id}' is in state '{}' (expected '{}' or '{}')",
+                                        work_status.state.as_str(),
+                                        expected_from_state.as_str(),
+                                        expected_to_state.as_str(),
+                                    ),
+                                ));
+                            }
+
                             info!(
                                 work_id = %work_id,
                                 actor_id = %actor_id,
@@ -16486,30 +16628,17 @@ impl PrivilegedDispatcher {
                     ));
                 }
 
-                // No evidence.published exists.
-                // Safe to remove the stale claim — the prior attempt only
-                // produced a WorkRegistry row and nothing in the immutable
-                // ledger.
-                info!(
-                    work_id = %work_id,
-                    actor_id = %actor_id,
-                    role = ?role,
-                    stale_lease_id = %persisted_claim.lease_id,
-                    "ClaimWorkV2 partial-failure recovery: removing stale claim \
-                     row so retry can complete the full durability chain"
-                );
-                self.work_registry.remove_claim_for_role(work_id, role);
-
-                // Return a retriable error. The client should re-send
-                // ClaimWorkV2 and the handler will proceed through the
-                // normal (non-duplicate) path, completing the full
-                // durability chain.
+                // No evidence.published exists. This can be an in-flight
+                // concurrent claim where another request already registered the
+                // claim and has not yet persisted evidence/work_transitioned.
+                // Do NOT remove the claim row here — that can erase an
+                // in-flight successful claim from a concurrent request.
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
                     format!(
                         "ClaimWorkV2: partial durability failure detected for \
-                         work_id '{work_id}' (role={role_str}). Stale claim \
-                         removed — please retry to complete the claim."
+                         work_id '{work_id}' (role={role_str}). Claim state is \
+                         retained for concurrency safety; please retry."
                     ),
                 ));
             }
@@ -36021,6 +36150,129 @@ mod tests {
             dispatcher
         }
 
+        /// Helper: claim dispatcher using a frozen `SqliteLeaseValidator`.
+        /// This exercises `ClaimWorkV2` against canonical lease rows.
+        fn claim_v2_dispatcher_with_frozen_sqlite_lease_validator() -> PrivilegedDispatcher {
+            use apm2_core::ledger::init_canonical_schema;
+            use rusqlite::Connection;
+
+            let stub_emitter = Arc::new(StubLedgerEventEmitter::new());
+            let event_emitter: Arc<dyn LedgerEventEmitter> =
+                Arc::clone(&stub_emitter) as Arc<dyn LedgerEventEmitter>;
+
+            let sqlite_conn = Connection::open_in_memory().expect("sqlite connection");
+            crate::ledger::SqliteLedgerEventEmitter::init_schema_for_test(&sqlite_conn)
+                .expect("sqlite ledger schema");
+            init_canonical_schema(&sqlite_conn).expect("canonical events schema");
+            let sqlite_conn = Arc::new(Mutex::new(sqlite_conn));
+            let sqlite_validator = Arc::new(crate::ledger::SqliteLeaseValidator::new(Arc::clone(
+                &sqlite_conn,
+            )));
+            sqlite_validator
+                .freeze_legacy_writes()
+                .expect("freeze_legacy_writes must succeed");
+            assert!(
+                sqlite_validator.is_frozen(),
+                "sqlite lease validator must be frozen in this fixture"
+            );
+
+            let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                Arc::new(crate::pcac::InProcessKernel::new(1));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None)
+                    .expect("default ClockConfig should always succeed"),
+            );
+            let subscription_registry = Arc::new(SubscriptionRegistry::with_defaults());
+            let dispatcher = PrivilegedDispatcher::with_dependencies(
+                DecodeConfig::default(),
+                Arc::new(StubPolicyResolver),
+                Arc::new(StubWorkRegistry::default()),
+                event_emitter,
+                Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
+                Arc::new(InMemorySessionRegistry::default()),
+                sqlite_validator as Arc<dyn LeaseValidator>,
+                clock,
+                Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
+                Arc::new(InMemoryManifestStore::new()),
+                Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
+                subscription_registry,
+            );
+            let dispatcher = PrivilegedDispatcher {
+                cas: Some(Arc::new(MemoryCas::default())),
+                ..dispatcher
+            };
+            let dispatcher = dispatcher
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_privileged_pcac_policy(PrivilegedPcacPolicy {});
+
+            let test_actor_id = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+            dispatcher.lease_validator.register_lease_with_executor(
+                TEST_GOV_LEASE_ID,
+                TEST_GOV_WORK_ID,
+                TEST_GOV_GATE_ID,
+                &test_actor_id,
+            );
+            assert_eq!(
+                dispatcher
+                    .lease_validator
+                    .get_lease_work_id(TEST_GOV_LEASE_ID)
+                    .as_deref(),
+                Some(TEST_GOV_WORK_ID),
+                "frozen sqlite lease setup must be readable through lease API"
+            );
+
+            let policy_resolution = PolicyResolution {
+                policy_resolved_ref: "test-policy-ref".to_string(),
+                resolved_policy_hash: [0xAA; 32],
+                capability_manifest_hash: [0xBB; 32],
+                context_pack_hash: [0xCC; 32],
+                resolved_risk_tier: 0,
+                resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
+                pcac_policy: Some(apm2_core::pcac::PcacPolicyKnobs::default()),
+                pointer_only_waiver: None,
+                role_spec_hash: [0xDD; 32],
+                context_pack_recipe_hash: [0xEE; 32],
+            };
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: TEST_GOV_WORK_ID.to_string(),
+                    lease_id: TEST_GOV_LEASE_ID.to_string(),
+                    actor_id: "test-actor".to_string(),
+                    role: WorkRole::Implementer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("governing claim registration should succeed");
+
+            let opened_payload = apm2_core::work::helpers::work_opened_payload(
+                TEST_GOV_WORK_ID,
+                "TICKET",
+                vec![0xAA; 32],
+                vec![],
+                vec![],
+            );
+            stub_emitter.inject_raw_event(SignedLedgerEvent {
+                event_id: format!("EVT-gov-{TEST_GOV_WORK_ID}"),
+                event_type: "work.opened".to_string(),
+                work_id: TEST_GOV_WORK_ID.to_string(),
+                actor_id: "test-actor".to_string(),
+                payload: opened_payload,
+                signature: vec![0u8; 64],
+                timestamp_ns: 1_000_000_000,
+            });
+
+            dispatcher
+        }
+
         /// Helper: builds a test `PeerCredentials` context.
         fn test_ctx() -> ConnectionContext {
             ConnectionContext::privileged_session_open(Some(PeerCredentials {
@@ -36762,6 +37014,94 @@ mod tests {
         }
 
         #[test]
+        fn claim_work_v2_rejects_missing_executor_binding_fail_closed() {
+            let dispatcher = claim_v2_dispatcher();
+            let work_id = "W-test-unbound-lease-001";
+            inject_work_opened(&dispatcher, work_id);
+
+            // Register a legacy/bearer-style lease with an empty
+            // executor_actor_id.
+            let unbound_lease_id = "L-unbound-lease-001";
+            dispatcher.lease_validator.register_lease(
+                unbound_lease_id,
+                "W-unbound-work",
+                "G-unbound-gate",
+            );
+
+            let ctx = test_ctx();
+            let request = ClaimWorkV2Request {
+                work_id: work_id.to_string(),
+                role: i32::from(WorkRole::Implementer),
+                lease_id: unbound_lease_id.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let result = dispatcher.handle_claim_work_v2(&buf, &ctx);
+            assert!(result.is_ok());
+            match result.unwrap() {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                        "missing executor binding must fail closed"
+                    );
+                    assert!(
+                        err.message.contains("executor actor binding"),
+                        "error should mention missing executor binding, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected fail-closed rejection for unbound lease, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn claim_work_v2_succeeds_with_frozen_sqlite_lease_validator() {
+            let dispatcher = claim_v2_dispatcher_with_frozen_sqlite_lease_validator();
+            let ctx = test_ctx();
+            let work_id = "W-test-frozen-sqlite-claim-001".to_string();
+            inject_work_opened(&dispatcher, &work_id);
+
+            let request = ClaimWorkV2Request {
+                work_id: work_id.clone(),
+                role: i32::from(WorkRole::Implementer),
+                lease_id: TEST_GOV_LEASE_ID.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let response = dispatcher
+                .handle_claim_work_v2(&buf, &ctx)
+                .expect("ClaimWorkV2 should return protocol response");
+            let issued_lease_id = match response {
+                PrivilegedResponse::ClaimWorkV2(resp) => {
+                    assert!(
+                        !resp.already_claimed,
+                        "first claim should not be idempotent"
+                    );
+                    assert!(
+                        !resp.issued_lease_id.is_empty(),
+                        "response must include issued lease id"
+                    );
+                    resp.issued_lease_id
+                },
+                other => panic!(
+                    "Expected ClaimWorkV2 success with frozen sqlite validator, got: {other:?}"
+                ),
+            };
+
+            let resolved_work = dispatcher
+                .lease_validator
+                .get_lease_work_id(&issued_lease_id);
+            assert_eq!(
+                resolved_work.as_deref(),
+                Some(work_id.as_str()),
+                "issued claim lease must be readable from canonical lease rows"
+            );
+        }
+
+        #[test]
         fn multi_role_claim_registry() {
             // CODE-QUALITY BLOCKER fix: verify that Implementer and Reviewer
             // can both register claims for the same work_id.
@@ -36911,6 +37251,197 @@ mod tests {
                 },
                 other => panic!("Expected ClaimWorkV2 or Error, got: {other:?}"),
             }
+        }
+
+        #[test]
+        fn partial_recovery_with_evidence_emits_missing_work_transitioned() {
+            let dispatcher = claim_v2_dispatcher();
+            let ctx = test_ctx();
+            let work_id = "W-test-partial-recover-transition-001";
+            inject_work_opened(&dispatcher, work_id);
+
+            let request_actor_id = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+            let recovered_actor_id = "actor-from-evidence-anchor";
+
+            let policy_resolution = dispatcher
+                .work_registry
+                .get_claim(TEST_GOV_WORK_ID)
+                .expect("governing claim should exist")
+                .policy_resolution;
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: work_id.to_string(),
+                    lease_id: "L-partial-stale-001".to_string(),
+                    actor_id: request_actor_id.clone(),
+                    role: WorkRole::Implementer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("stale claim registration should succeed");
+
+            let expected_evidence_id = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"WAB:");
+                hasher.update(work_id.as_bytes());
+                hasher.update(b":");
+                hasher.update(b"IMPLEMENTER");
+                hasher.update(b":");
+                hasher.update(request_actor_id.as_bytes());
+                let hash = hasher.finalize();
+                format!("WAB-{}", &hash.to_hex()[..32])
+            };
+            let evidence_payload = serde_json::json!({
+                "event_type": "evidence.published",
+                "evidence_id": expected_evidence_id.as_str(),
+                "category": "WORK_AUTHORITY_BINDINGS",
+                "work_id": work_id,
+                "lease_id": "L-ledger-recovered-001",
+                "cas_hash": "deadbeefcafebabe",
+                "actor_id": recovered_actor_id,
+            });
+            let evidence_payload_bytes =
+                serde_json::to_vec(&evidence_payload).expect("evidence payload encodes");
+            dispatcher
+                .event_emitter
+                .emit_evidence_published_event(
+                    work_id,
+                    &evidence_payload_bytes,
+                    &request_actor_id,
+                    2_345_678_901,
+                    &expected_evidence_id,
+                )
+                .expect("evidence.published should be injected");
+
+            let request = ClaimWorkV2Request {
+                work_id: work_id.to_string(),
+                role: i32::from(WorkRole::Implementer),
+                lease_id: TEST_GOV_LEASE_ID.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let response = dispatcher
+                .handle_claim_work_v2(&buf, &ctx)
+                .expect("handler should return protocol response");
+            match response {
+                PrivilegedResponse::ClaimWorkV2(resp) => {
+                    assert!(
+                        resp.already_claimed,
+                        "partial recovery should return idempotent success"
+                    );
+                    assert_eq!(resp.issued_lease_id, "L-ledger-recovered-001");
+                    assert_eq!(resp.authority_bindings_hash, "deadbeefcafebabe");
+                },
+                other => panic!(
+                    "Expected idempotent recovery success for evidence-backed \
+                     partial recovery, got: {other:?}"
+                ),
+            }
+
+            let work_transition_events: Vec<SignedLedgerEvent> = dispatcher
+                .event_emitter
+                .get_events_by_work_id(work_id)
+                .into_iter()
+                .filter(|event| event.event_type == "work_transitioned")
+                .collect();
+            assert_eq!(
+                work_transition_events.len(),
+                1,
+                "partial recovery must emit the missing work_transitioned event"
+            );
+            let transition_payload =
+                serde_json::from_slice::<serde_json::Value>(&work_transition_events[0].payload)
+                    .expect("work_transitioned payload should be valid JSON");
+            assert_eq!(
+                transition_payload
+                    .get("actor_id")
+                    .and_then(serde_json::Value::as_str),
+                Some(recovered_actor_id),
+                "recovered transition must use actor_id recovered from evidence anchor"
+            );
+            assert_eq!(
+                transition_payload
+                    .get("rationale_code")
+                    .and_then(serde_json::Value::as_str),
+                Some("claim_work_v2_implementer"),
+                "recovered transition must use claim_work_v2 rationale"
+            );
+        }
+
+        #[test]
+        fn partial_recovery_without_evidence_keeps_claim_for_concurrency_safety() {
+            let dispatcher = claim_v2_dispatcher();
+            let ctx = test_ctx();
+            let work_id = "W-test-partial-no-evidence-001";
+            inject_work_opened(&dispatcher, work_id);
+
+            let actor_id = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+            let policy_resolution = dispatcher
+                .work_registry
+                .get_claim(TEST_GOV_WORK_ID)
+                .expect("governing claim should exist")
+                .policy_resolution;
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: work_id.to_string(),
+                    lease_id: "L-partial-no-evidence-001".to_string(),
+                    actor_id,
+                    role: WorkRole::Implementer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("stale claim registration should succeed");
+
+            let request = ClaimWorkV2Request {
+                work_id: work_id.to_string(),
+                role: i32::from(WorkRole::Implementer),
+                lease_id: TEST_GOV_LEASE_ID.to_string(),
+            };
+            let mut buf = Vec::new();
+            request.encode(&mut buf).expect("encode");
+
+            let response = dispatcher
+                .handle_claim_work_v2(&buf, &ctx)
+                .expect("handler should return protocol response");
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                        "no-evidence partial recovery should return retriable error"
+                    );
+                    assert!(
+                        err.message.contains("concurrency safety"),
+                        "error should mention concurrency-safe retry path, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "Expected retriable error for no-evidence partial recovery, got: {other:?}"
+                ),
+            }
+
+            let persisted_claim = dispatcher
+                .work_registry
+                .get_claim_for_role(work_id, WorkRole::Implementer);
+            assert!(
+                persisted_claim.is_some(),
+                "partial recovery must not delete claim rows in no-evidence path"
+            );
         }
 
         #[test]

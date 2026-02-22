@@ -2750,54 +2750,61 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             return None;
         };
 
-        // Legacy table: bounded LIMIT 1 with json_extract filtering.
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT event_id, event_type, work_id, actor_id, payload, \
-                    signature, timestamp_ns \
-             FROM ledger_events \
-             WHERE work_id = ?1 AND event_type = 'work_transitioned' \
-               AND json_extract(CAST(payload AS TEXT), '$.rationale_code') = ?2 \
-             ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
-        ) {
-            if let Ok(mut rows) = stmt.query_map(params![work_id, rationale_code], |row| {
-                Ok(SignedLedgerEvent {
-                    event_id: row.get(0)?,
-                    event_type: row.get(1)?,
-                    work_id: row.get(2)?,
-                    actor_id: row.get(3)?,
-                    payload: row.get(4)?,
-                    signature: row.get(5)?,
-                    timestamp_ns: row.get(6)?,
-                })
-            }) {
-                if let Some(Ok(event)) = rows.next() {
-                    return Some(event);
-                }
-            }
-        }
+        let legacy_event = conn
+            .query_row(
+                "SELECT event_id, event_type, work_id, actor_id, payload, \
+                        signature, timestamp_ns \
+                 FROM ledger_events \
+                 WHERE work_id = ?1 AND event_type = 'work_transitioned' \
+                   AND json_extract(CAST(payload AS TEXT), '$.rationale_code') = ?2 \
+                 ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
+                params![work_id, rationale_code],
+                |row| {
+                    Ok(SignedLedgerEvent {
+                        event_id: row.get(0)?,
+                        event_type: row.get(1)?,
+                        work_id: row.get(2)?,
+                        actor_id: row.get(3)?,
+                        payload: row.get(4)?,
+                        signature: row.get(5)?,
+                        timestamp_ns: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .ok()
+            .flatten();
 
-        // TCK-00631: check canonical events table when frozen.
-        if self.is_frozen_internal() {
-            if let Ok(mut stmt) = conn.prepare(
+        let canonical_event = if self.is_frozen_internal() {
+            conn.query_row(
                 "SELECT seq_id, event_type, session_id, actor_id, payload, \
                         COALESCE(signature, X''), timestamp_ns \
                  FROM events \
                  WHERE session_id = ?1 AND event_type = 'work_transitioned' \
                    AND json_extract(CAST(payload AS TEXT), '$.rationale_code') = ?2 \
                  ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
-            ) {
-                if let Ok(mut rows) = stmt.query_map(
-                    params![work_id, rationale_code],
-                    Self::canonical_row_to_event,
-                ) {
-                    if let Some(Ok(event)) = rows.next() {
-                        return Some(event);
-                    }
-                }
-            }
-        }
+                params![work_id, rationale_code],
+                Self::canonical_row_to_event,
+            )
+            .optional()
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
 
-        None
+        match (legacy_event, canonical_event) {
+            (Some(legacy), Some(canonical)) => {
+                if canonical.timestamp_ns >= legacy.timestamp_ns {
+                    Some(canonical)
+                } else {
+                    Some(legacy)
+                }
+            },
+            (Some(legacy), None) => Some(legacy),
+            (None, Some(canonical)) => Some(canonical),
+            (None, None) => None,
+        }
     }
 
     /// TCK-00637 SECURITY FIX (Findings 5/8): Bounded SQL query for an
@@ -4754,6 +4761,96 @@ impl SqliteLeaseValidator {
         self.signing_key.verifying_key()
     }
 
+    fn select_newest_by_timestamp<T>(
+        legacy: Option<(T, i64)>,
+        canonical: Option<(T, i64)>,
+    ) -> Option<T> {
+        match (legacy, canonical) {
+            (Some((legacy_value, legacy_ts)), Some((canonical_value, canonical_ts))) => {
+                if canonical_ts >= legacy_ts {
+                    Some(canonical_value)
+                } else {
+                    Some(legacy_value)
+                }
+            },
+            (Some((legacy_value, _)), None) => Some(legacy_value),
+            (None, Some((canonical_value, _))) => Some(canonical_value),
+            (None, None) => None,
+        }
+    }
+
+    fn latest_legacy_lease_work_id(
+        conn: &Connection,
+        lease_id: &str,
+    ) -> rusqlite::Result<Option<(String, i64)>> {
+        conn.query_row(
+            "SELECT work_id, timestamp_ns FROM ledger_events \
+             WHERE event_type = 'gate_lease_issued' \
+             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+             ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
+            params![lease_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+    }
+
+    fn latest_canonical_lease_work_id(
+        conn: &Connection,
+        lease_id: &str,
+    ) -> rusqlite::Result<Option<(String, i64)>> {
+        conn.query_row(
+            "SELECT session_id, timestamp_ns FROM events \
+             WHERE event_type = 'gate_lease_issued' \
+             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+             ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
+            params![lease_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+    }
+
+    fn latest_legacy_lease_payload(
+        conn: &Connection,
+        lease_id: &str,
+        require_full_lease: bool,
+    ) -> rusqlite::Result<Option<(Vec<u8>, i64)>> {
+        let sql = if require_full_lease {
+            "SELECT payload, timestamp_ns FROM ledger_events \
+             WHERE event_type = 'gate_lease_issued' \
+             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+             AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL \
+             ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1"
+        } else {
+            "SELECT payload, timestamp_ns FROM ledger_events \
+             WHERE event_type = 'gate_lease_issued' \
+             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+             ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1"
+        };
+        conn.query_row(sql, params![lease_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+    }
+
+    fn latest_canonical_lease_payload(
+        conn: &Connection,
+        lease_id: &str,
+        require_full_lease: bool,
+    ) -> rusqlite::Result<Option<(Vec<u8>, i64)>> {
+        let sql = if require_full_lease {
+            "SELECT payload, timestamp_ns FROM events \
+             WHERE event_type = 'gate_lease_issued' \
+             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+             AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL \
+             ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1"
+        } else {
+            "SELECT payload, timestamp_ns FROM events \
+             WHERE event_type = 'gate_lease_issued' \
+             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+             ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1"
+        };
+        conn.query_row(sql, params![lease_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+    }
+
     fn canonicalize_lease_payload(payload: &serde_json::Value) -> Result<Vec<u8>, String> {
         let payload_json = payload.to_string();
         let canonical_payload = canonicalize_json(&payload_json)
@@ -5020,79 +5117,54 @@ impl LeaseValidator for SqliteLeaseValidator {
                 message: "connection lock poisoned".to_string(),
             })?;
 
-        // We search for a 'gate_lease_issued' event where the payload contains the
-        // lease_id and work_id. This is a scan if not indexed, but for now we
-        // rely on the event_type index and payload parsing. Optimization: In a
-        // real system, we'd have a `gate_leases` table. Here, we scan recent
-        // events or rely on the fact that we might have indexed it if we had a
-        // dedicated table.
-
-        // Strategy: Query events of type 'gate_lease_issued' and filter in application
-        // logic (slow but correct for now). Since SQLite JSON extract is not
-        // guaranteed to be available, we load payload. Warning: This could be
-        // slow.
-
-        // Better Strategy: `LeaseValidator` also has `register_lease` method.
-        // We can create a `gate_leases` table that `register_lease` populates, and
-        // `validate_gate_lease` queries. This assumes `register_lease` is
-        // called when the event is emitted (e.g. by the emitter).
-        // But `register_lease` is currently for "testing purposes".
-
-        // If we want "real" validation against the ledger, we must query the ledger.
-
-        // TCK-00289 BLOCKER 1: Filter by work_id in SQL to avoid O(N) scan.
-        // The table has an index on work_id (idx_ledger_events_work_id).
-        let mut stmt = conn
-            .prepare("SELECT payload FROM ledger_events WHERE event_type = 'gate_lease_issued' AND work_id = ?1")
-            .map_err(|e| LeaseValidationError::LedgerQueryFailed {
+        let legacy_lookup = Self::latest_legacy_lease_work_id(&conn, lease_id).map_err(|e| {
+            LeaseValidationError::LedgerQueryFailed {
                 message: e.to_string(),
-            })?;
-
-        let rows = stmt
-            .query_map(params![work_id], |row| {
-                let payload: Vec<u8> = row.get(0)?;
-                Ok(payload)
-            })
-            .map_err(|e| LeaseValidationError::LedgerQueryFailed {
-                message: e.to_string(),
-            })?;
-
-        for payload_bytes in rows.flatten() {
-            if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) {
-                if let Some(l) = payload.get("lease_id").and_then(|v| v.as_str()) {
-                    if l == lease_id {
-                        // work_id already matched via SQL WHERE clause
-                        return Ok(());
-                    }
-                }
             }
-        }
+        })?;
+        let canonical_lookup = if self.is_frozen() {
+            Self::latest_canonical_lease_work_id(&conn, lease_id).map_err(|e| {
+                LeaseValidationError::LedgerQueryFailed {
+                    message: e.to_string(),
+                }
+            })?
+        } else {
+            None
+        };
 
-        Err(LeaseValidationError::LeaseNotFound {
-            lease_id: lease_id.to_string(),
-        })
+        let Some(resolved_work_id) =
+            Self::select_newest_by_timestamp(legacy_lookup, canonical_lookup)
+        else {
+            return Err(LeaseValidationError::LeaseNotFound {
+                lease_id: lease_id.to_string(),
+            });
+        };
+
+        let work_id_matches = resolved_work_id.len() == work_id.len()
+            && bool::from(resolved_work_id.as_bytes().ct_eq(work_id.as_bytes()));
+        if work_id_matches {
+            Ok(())
+        } else {
+            Err(LeaseValidationError::WorkIdMismatch {
+                actual: work_id.to_string(),
+            })
+        }
     }
 
     fn get_lease_executor_actor_id(&self, lease_id: &str) -> Option<String> {
         let conn = self.conn.lock().ok()?;
 
-        // TCK-00340 Security MAJOR: Use targeted WHERE clause with
-        // json_extract instead of O(N) full table scan with per-row JSON
-        // parse. Filters by event_type and lease_id in SQL, with ORDER BY
-        // rowid DESC LIMIT 1 for deterministic latest-row selection.
-        //
-        // NOTE: payload is stored as BLOB, so we CAST to TEXT for
-        // json_extract to work on the binary JSON data.
-        let mut stmt = conn
-            .prepare(
-                "SELECT payload FROM ledger_events \
-                 WHERE event_type = 'gate_lease_issued' \
-                 AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
-                 ORDER BY rowid DESC LIMIT 1",
-            )
-            .ok()?;
-
-        let payload_bytes: Vec<u8> = stmt.query_row(params![lease_id], |row| row.get(0)).ok()?;
+        let legacy_payload = Self::latest_legacy_lease_payload(&conn, lease_id, false)
+            .ok()
+            .flatten();
+        let canonical_payload = if self.is_frozen() {
+            Self::latest_canonical_lease_payload(&conn, lease_id, false)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let payload_bytes = Self::select_newest_by_timestamp(legacy_payload, canonical_payload)?;
 
         let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
         payload
@@ -5258,24 +5330,18 @@ impl LeaseValidator for SqliteLeaseValidator {
     fn get_lease_work_id(&self, lease_id: &str) -> Option<String> {
         let conn = self.conn.lock().ok()?;
 
-        // TCK-00340 Quality BLOCKER 1: Use targeted WHERE clause with
-        // json_extract instead of O(N) full table scan with per-row JSON
-        // parse. Filters by event_type first (reduces scan scope), then
-        // uses json_extract for indexed field filtering, with ORDER BY
-        // rowid DESC LIMIT 1 for deterministic latest-row selection.
-        //
-        // NOTE: payload is stored as BLOB, so we CAST to TEXT for
-        // json_extract to work on the binary JSON data.
-        let mut stmt = conn
-            .prepare(
-                "SELECT work_id FROM ledger_events \
-                 WHERE event_type = 'gate_lease_issued' \
-                 AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
-                 ORDER BY rowid DESC LIMIT 1",
-            )
-            .ok()?;
+        let legacy_lookup = Self::latest_legacy_lease_work_id(&conn, lease_id)
+            .ok()
+            .flatten();
+        let canonical_lookup = if self.is_frozen() {
+            Self::latest_canonical_lease_work_id(&conn, lease_id)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
 
-        stmt.query_row(params![lease_id], |row| row.get(0)).ok()
+        Self::select_newest_by_timestamp(legacy_lookup, canonical_lookup)
     }
 
     // Full leases are persisted in signed ledger rows. Reads remain
@@ -5283,33 +5349,17 @@ impl LeaseValidator for SqliteLeaseValidator {
     fn get_gate_lease(&self, lease_id: &str) -> Option<apm2_core::fac::GateLease> {
         let conn = self.conn.lock().ok()?;
 
-        // TCK-00340 Quality BLOCKER 2 / Security MAJOR: Use targeted WHERE
-        // clause with json_extract instead of O(N) full table scan with
-        // per-row JSON parse. Filters by event_type, lease_id, AND
-        // full_lease presence in SQL via json_extract on CAST(payload AS
-        // TEXT), with ORDER BY rowid DESC LIMIT 1 for deterministic
-        // latest-row selection.
-        //
-        // NOTE: payload is stored as BLOB (Vec<u8> from serde_json::to_vec),
-        // so we CAST to TEXT for json_extract compatibility.
-        //
-        // The full_lease IS NOT NULL guard ensures we only match events
-        // that actually embed the full GateLease struct, skipping any
-        // events that share the same lease_id but lack the full_lease
-        // field (e.g. executor-only registration events).
-        let result: Result<Vec<u8>, _> = conn.query_row(
-            "SELECT payload FROM ledger_events \
-             WHERE event_type = 'gate_lease_issued' \
-             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
-             AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL \
-             ORDER BY rowid DESC LIMIT 1",
-            params![lease_id],
-            |row| row.get(0),
-        );
-
-        let Ok(payload_bytes) = result else {
-            return None;
+        let legacy_payload = Self::latest_legacy_lease_payload(&conn, lease_id, true)
+            .ok()
+            .flatten();
+        let canonical_payload = if self.is_frozen() {
+            Self::latest_canonical_lease_payload(&conn, lease_id, true)
+                .ok()
+                .flatten()
+        } else {
+            None
         };
+        let payload_bytes = Self::select_newest_by_timestamp(legacy_payload, canonical_payload)?;
 
         let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
 
@@ -6704,6 +6754,154 @@ mod tests {
             work_id.as_deref(),
             Some("W-WID-001"),
             "get_lease_work_id must return the stored work_id"
+        );
+    }
+
+    /// Regression (TCK-00637): lease read APIs must resolve leases that were
+    /// written to canonical `events` while the validator is frozen.
+    #[test]
+    fn sqlite_lease_validator_frozen_reads_from_canonical_events() {
+        use apm2_core::ledger::init_canonical_schema;
+
+        use crate::protocol::dispatch::LeaseValidator;
+
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
+        init_canonical_schema(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let validator = SqliteLeaseValidator::new(Arc::clone(&conn));
+
+        validator
+            .freeze_legacy_writes_inner()
+            .expect("freeze_legacy_writes must succeed in test");
+        assert!(validator.is_frozen(), "validator must be frozen");
+
+        validator.register_lease_with_executor(
+            "lease-frozen-read-001",
+            "W-FROZEN-READ-001",
+            "gate-frozen-read",
+            "actor-frozen-read",
+        );
+
+        assert_eq!(
+            validator
+                .get_lease_work_id("lease-frozen-read-001")
+                .as_deref(),
+            Some("W-FROZEN-READ-001"),
+            "get_lease_work_id must read canonical gate_lease_issued rows when frozen"
+        );
+        assert_eq!(
+            validator
+                .get_lease_executor_actor_id("lease-frozen-read-001")
+                .as_deref(),
+            Some("actor-frozen-read"),
+            "get_lease_executor_actor_id must read canonical gate_lease_issued rows when frozen"
+        );
+        assert!(
+            validator
+                .validate_gate_lease("lease-frozen-read-001", "W-FROZEN-READ-001")
+                .is_ok(),
+            "validate_gate_lease must succeed for canonical rows when frozen"
+        );
+
+        let signer = apm2_core::crypto::Signer::generate();
+        let full_lease = apm2_core::fac::GateLeaseBuilder::new(
+            "lease-frozen-full-001",
+            "W-FROZEN-FULL-001",
+            "gate-frozen-full",
+        )
+        .changeset_digest([0x11; 32])
+        .executor_actor_id("actor-frozen-full")
+        .issued_at(1_500_000)
+        .expires_at(2_500_000)
+        .policy_hash([0x22; 32])
+        .issuer_actor_id("issuer-frozen")
+        .time_envelope_ref("htf:tick:frozen")
+        .build_and_sign(&signer);
+        validator
+            .register_full_lease(&full_lease)
+            .expect("register_full_lease must succeed in frozen mode");
+
+        let recovered_full = validator
+            .get_gate_lease("lease-frozen-full-001")
+            .expect("get_gate_lease must read canonical full_lease rows when frozen");
+        assert_eq!(recovered_full.lease_id, "lease-frozen-full-001");
+        assert_eq!(recovered_full.work_id, "W-FROZEN-FULL-001");
+        assert_eq!(recovered_full.executor_actor_id, "actor-frozen-full");
+
+        let conn_guard = conn.lock().unwrap();
+        let legacy_rows: i64 = conn_guard
+            .query_row(
+                "SELECT COUNT(*) FROM ledger_events WHERE event_type = 'gate_lease_issued'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy_rows, 0,
+            "frozen validator writes must not append gate_lease_issued rows to legacy table"
+        );
+    }
+
+    /// Regression (TCK-00637): when frozen and both tables may contain matching
+    /// transitions, `get_latest_work_transition_by_rationale` must return the
+    /// newest event by timestamp across legacy + canonical tables.
+    #[test]
+    fn sqlite_work_transition_rationale_lookup_prefers_newer_canonical_event() {
+        use apm2_core::ledger::init_canonical_schema;
+
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
+        init_canonical_schema(&conn).unwrap();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let conn = Arc::new(Mutex::new(conn));
+        let emitter = SqliteLedgerEventEmitter::new(Arc::clone(&conn), signing_key);
+
+        let work_id = "W-transition-freeze-001";
+        let rationale = "claim_work_v2_implementer";
+
+        emitter
+            .emit_work_transitioned(&WorkTransition {
+                work_id,
+                from_state: "Open",
+                to_state: "Claimed",
+                rationale_code: rationale,
+                previous_transition_count: 0,
+                actor_id: "legacy-actor",
+                timestamp_ns: 1_000_000,
+            })
+            .expect("legacy work_transitioned insert should succeed");
+
+        {
+            let conn_guard = conn.lock().unwrap();
+            emitter
+                .freeze_legacy_writes(&conn_guard)
+                .expect("freeze_legacy_writes must succeed");
+        }
+        assert!(emitter.is_frozen(), "emitter must be frozen");
+
+        emitter
+            .emit_work_transitioned(&WorkTransition {
+                work_id,
+                from_state: "Open",
+                to_state: "Claimed",
+                rationale_code: rationale,
+                previous_transition_count: 1,
+                actor_id: "canonical-actor",
+                timestamp_ns: 2_000_000,
+            })
+            .expect("canonical work_transitioned insert should succeed");
+
+        let latest = emitter
+            .get_latest_work_transition_by_rationale(work_id, rationale)
+            .expect("latest matching transition must exist");
+        assert_eq!(
+            latest.actor_id, "canonical-actor",
+            "lookup must return newer canonical transition instead of legacy-first match"
+        );
+        assert_eq!(
+            latest.timestamp_ns, 2_000_000,
+            "lookup must return the highest timestamp across both tables"
         );
     }
 
