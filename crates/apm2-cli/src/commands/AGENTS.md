@@ -587,7 +587,7 @@ Security invariants:
 ## Binary Alignment Controls (TCK-00625, INV-PADOPT-004 followup)
 
 Three engineering controls to prevent binary drift between interactive CLI and
-systemd service executables:
+daemon runtime executables:
 
 ### FU-001: Doctor binary_alignment check (`daemon.rs`)
 
@@ -595,20 +595,27 @@ systemd service executables:
   - Resolves `which apm2` to canonical path
   - Resolves `ExecStart` binary path for each systemd user unit via `systemctl --user show`
   - Computes SHA-256 digests of all resolved binary paths (bounded to 256 MiB, CTR-1603)
-  - Emits `WARN` if any digest mismatches with remediation pointing to `apm2 fac install`
-  - Emits `WARN` (never `OK`) if no service binary could be resolved (fail-closed)
+  - Emits `ERROR` if any digest mismatches with remediation pointing to `apm2 fac install`
+  - Emits `ERROR` if no service binary could be resolved (fail-closed)
   - Emits `WARN` for partial verification (some units resolved, others failed)
   - Emits `OK` only when at least one service binary was successfully resolved AND matched
   - Tracks per-unit resolution errors and digest failures separately
+- `collect_doctor_checks` also includes a `daemon_runtime_contract` check that:
+  - Resolves the daemon child runtime binary used by `apm2 daemon`
+  - Reads daemon contract hash via `apm2-daemon --print-hsi-contract-hash`
+  - Compares it to the wrapper's local HSI contract hash
+  - Emits `ERROR` on mismatch or probe failure (fail-closed)
 
 ### FU-002: `apm2 fac install` subcommand (`fac_install.rs`)
 
 - `apm2 fac install [--allow-partial] [--workspace-root <PATH>]` performs:
   1. Resolves workspace root from `--workspace-root` flag or from `current_exe()` path (never cwd)
   2. `cargo install --path crates/apm2-cli --force` from trusted workspace root
-  3. Symlink `~/.local/bin/apm2 -> ~/.cargo/bin/apm2` (atomic replace via create-temp-then-rename(2))
-  4. `systemctl --user restart apm2-daemon.service apm2-worker.service`
-  5. Structured output: workspace root, installed path, SHA-256 digest, per-service restart status, restart_failures array
+  3. `cargo install --path crates/apm2-daemon --force` from trusted workspace root
+  4. Symlink `~/.local/bin/apm2 -> ~/.cargo/bin/apm2` (atomic replace via create-temp-then-rename(2))
+  5. Symlink `~/.local/bin/apm2-daemon -> ~/.cargo/bin/apm2-daemon` (same atomic replace semantics)
+  6. `systemctl --user restart apm2-daemon.service apm2-worker.service`
+  7. Structured output: workspace root, installed paths, SHA-256 digests, per-service restart status, restart_failures array
 - Fail-closed restart semantics: required service restart failures cause non-zero exit and `success: false`
 - `--allow-partial` flag: exits 0 even when restarts fail, but `success` remains false and `restart_failures` populated
 - Workspace root discovery: derived from `std::env::current_exe()` (trusted) with 16-level bounded traversal; cwd never used
