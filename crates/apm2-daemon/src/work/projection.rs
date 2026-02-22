@@ -676,7 +676,11 @@ fn decode_canonical_work_event_payload(
         });
     }
 
-    if WorkEvent::decode(payload).is_ok() {
+    if payload.first() != Some(&b'{') {
+        WorkEvent::decode(payload).map_err(|error| WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: format!("work.* payload is not protobuf WorkEvent: {error}"),
+        })?;
         return Ok(payload.to_vec());
     }
 
@@ -1500,6 +1504,67 @@ mod tests {
                         && reason.contains("payload exceeds maximum")
             ),
             "oversized protobuf payloads must be rejected before decode attempts"
+        );
+    }
+
+    #[test]
+    fn decode_canonical_work_event_payload_accepts_raw_protobuf_when_not_json_prefixed() {
+        let payload = helpers::work_opened_payload(
+            "W-projection-raw-protobuf",
+            "TICKET",
+            vec![0x22; 32],
+            vec![],
+            vec![],
+        );
+
+        let decoded =
+            decode_canonical_work_event_payload(&payload, "work.opened").expect("decode succeeds");
+        assert_eq!(
+            decoded, payload,
+            "non-JSON-prefixed payloads must be treated as raw protobuf"
+        );
+    }
+
+    #[test]
+    fn decode_canonical_work_event_payload_decodes_json_envelope_when_prefixed_with_brace() {
+        let opened_payload = helpers::work_opened_payload(
+            "W-projection-json-envelope",
+            "TICKET",
+            vec![0x33; 32],
+            vec![],
+            vec![],
+        );
+        let envelope = serde_json::to_vec(&serde_json::json!({
+            "payload": hex::encode(&opened_payload),
+        }))
+        .expect("JSON envelope should encode");
+        assert_eq!(
+            envelope.first(),
+            Some(&b'{'),
+            "fixture must start with '{{' to exercise JSON-first format detection"
+        );
+
+        let decoded = decode_canonical_work_event_payload(&envelope, "work.opened")
+            .expect("JSON envelope should decode");
+        assert_eq!(
+            decoded, opened_payload,
+            "JSON envelopes must be unwrapped instead of treated as raw protobuf"
+        );
+    }
+
+    #[test]
+    fn decode_canonical_work_event_payload_rejects_non_json_non_protobuf_payload() {
+        let payload = b"not-a-valid-work-event".to_vec();
+        let result = decode_canonical_work_event_payload(&payload, "work.opened");
+
+        assert!(
+            matches!(
+                result,
+                Err(WorkProjectionError::InvalidPayload { event_type, reason })
+                    if event_type == "work.opened"
+                        && reason.contains("not protobuf WorkEvent")
+            ),
+            "non-JSON-prefixed payloads must fail on protobuf decode and never attempt envelope parsing"
         );
     }
 
