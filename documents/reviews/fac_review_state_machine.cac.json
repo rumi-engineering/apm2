@@ -236,7 +236,7 @@
           "command_template": "apm2 fac doctor --pr {pr_number} --fix",
           "guard_id": "DOC-G-004",
           "guard_kind": "sha_freshness_stale",
-          "guard_predicate": "facts.sha_freshness_source == stale && !facts.has_gate_failure_signal",
+          "guard_predicate": "facts.sha_freshness_source == stale && facts.gate_failure_signal != aligned_terminal_failure",
           "priority": 5,
           "reason_kind": "template",
           "reason_template": "local verdict/findings snapshot is stale relative to remote PR head",
@@ -251,7 +251,7 @@
           "command_template": "apm2 fac doctor --pr {pr_number} --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
           "guard_id": "DOC-G-005",
           "guard_kind": "approve_eligible",
-          "guard_predicate": "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts && !facts.has_gate_failure_signal",
+          "guard_predicate": "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts && facts.gate_failure_signal != aligned_terminal_failure",
           "priority": 6,
           "reason_kind": "template",
           "reason_template": "all review dimensions approve; awaiting auto-merge",
@@ -285,7 +285,7 @@
           "command_template": "apm2 fac review findings --pr {pr_number}",
           "guard_id": "DOC-G-007",
           "guard_kind": "gate_failure_signal",
-          "guard_predicate": "facts.has_gate_failure_signal",
+          "guard_predicate": "facts.gate_failure_signal == aligned_terminal_failure",
           "priority": 8,
           "reason_kind": "push_failure_hint_or_template",
           "reason_template": "evidence gate failure requires implementor remediation before review can continue",
@@ -1146,7 +1146,7 @@
     "machine_traceability": {
       "counts": {
         "artifact_level_total": 3,
-        "covered_total": 8,
+        "covered_total": 15,
         "doctor_decision_rules": 14,
         "doctor_recommendations": 14,
         "gate_progress_rules": 4,
@@ -1155,8 +1155,8 @@
         "lifecycle_transitions": 19,
         "machine_traceability_requirements": 5,
         "reviewer_missing_verdict_rules": 3,
-        "ticket_in_scope_requirements": 8,
-        "traceability_entry_only_total": 1,
+        "ticket_in_scope_requirements": 15,
+        "traceability_entry_only_total": 8,
         "wait_action_policy_actions": 7,
         "wait_rules": 7
       },
@@ -1217,7 +1217,7 @@
           "command_template": "apm2 fac doctor --pr {pr_number} --fix",
           "guard_id": "DOC-G-004",
           "guard_kind": "sha_freshness_stale",
-          "guard_predicate": "facts.sha_freshness_source == stale && !facts.has_gate_failure_signal",
+          "guard_predicate": "facts.sha_freshness_source == stale && facts.gate_failure_signal != aligned_terminal_failure",
           "priority": 5,
           "reason_template": "local verdict/findings snapshot is stale relative to remote PR head",
           "requirement_refs": [],
@@ -1229,7 +1229,7 @@
           "command_template": "apm2 fac doctor --pr {pr_number} --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
           "guard_id": "DOC-G-005",
           "guard_kind": "approve_eligible",
-          "guard_predicate": "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts && !facts.has_gate_failure_signal",
+          "guard_predicate": "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts && facts.gate_failure_signal != aligned_terminal_failure",
           "priority": 6,
           "reason_template": "all review dimensions approve; awaiting auto-merge",
           "requirement_refs": [
@@ -1257,7 +1257,7 @@
           "command_template": "apm2 fac review findings --pr {pr_number}",
           "guard_id": "DOC-G-007",
           "guard_kind": "gate_failure_signal",
-          "guard_predicate": "facts.has_gate_failure_signal",
+          "guard_predicate": "facts.gate_failure_signal == aligned_terminal_failure",
           "priority": 8,
           "reason_template": "evidence gate failure requires implementor remediation before review can continue",
           "requirement_refs": [
@@ -1380,7 +1380,7 @@
           },
           "DOC-G-004": {
             "guard_kind": "sha_freshness_stale",
-            "guard_predicate": "facts.sha_freshness_source == stale && !facts.has_gate_failure_signal",
+            "guard_predicate": "facts.sha_freshness_source == stale && facts.gate_failure_signal != aligned_terminal_failure",
             "priority": 5,
             "recommended_action": "fix",
             "requirement_refs": [],
@@ -1388,7 +1388,7 @@
           },
           "DOC-G-005": {
             "guard_kind": "approve_eligible",
-            "guard_predicate": "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts && !facts.has_gate_failure_signal",
+            "guard_predicate": "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts && facts.gate_failure_signal != aligned_terminal_failure",
             "priority": 6,
             "recommended_action": "approve",
             "requirement_refs": [
@@ -1408,7 +1408,7 @@
           },
           "DOC-G-007": {
             "guard_kind": "gate_failure_signal",
-            "guard_predicate": "facts.has_gate_failure_signal",
+            "guard_predicate": "facts.gate_failure_signal == aligned_terminal_failure",
             "priority": 8,
             "recommended_action": "dispatch_implementor",
             "requirement_refs": [
@@ -2032,6 +2032,100 @@
         },
         {
           "artifact_evidence_refs": [],
+          "coverage_mode": "traceability_entry_only",
+          "covered": true,
+          "implemented_by": [
+            "DoctorDecisionFacts::from_input",
+            "DoctorGateFailureSignal"
+          ],
+          "in_machine_traceability": true,
+          "in_ticket_scope": true,
+          "regression_tests": [
+            "test_build_recommended_action_waits_when_lifecycle_reports_gates_failed_but_sha_stale"
+          ],
+          "requirement_id": "DRA-001",
+          "rule_links": []
+        },
+        {
+          "artifact_evidence_refs": [],
+          "coverage_mode": "traceability_entry_only",
+          "covered": true,
+          "implemented_by": [
+            "DoctorDecisionGuard::ShaFreshnessStale",
+            "DoctorDecisionGuard::ApproveEligible"
+          ],
+          "in_machine_traceability": true,
+          "in_ticket_scope": true,
+          "regression_tests": [],
+          "requirement_id": "DRA-002",
+          "rule_links": []
+        },
+        {
+          "artifact_evidence_refs": [],
+          "coverage_mode": "traceability_entry_only",
+          "covered": true,
+          "implemented_by": [
+            "DoctorDecisionGuard::GateFailureSignal"
+          ],
+          "in_machine_traceability": true,
+          "in_ticket_scope": true,
+          "regression_tests": [],
+          "requirement_id": "DRA-003",
+          "rule_links": []
+        },
+        {
+          "artifact_evidence_refs": [],
+          "coverage_mode": "traceability_entry_only",
+          "covered": true,
+          "implemented_by": [
+            "DoctorPrSummary::gate_failure_signal",
+            "DoctorTrackedPrSummary::gate_failure_signal"
+          ],
+          "in_machine_traceability": true,
+          "in_ticket_scope": true,
+          "regression_tests": [],
+          "requirement_id": "DRA-004",
+          "rule_links": []
+        },
+        {
+          "artifact_evidence_refs": [],
+          "coverage_mode": "traceability_entry_only",
+          "covered": true,
+          "implemented_by": [
+            "DoctorDecisionFacts::from_input"
+          ],
+          "in_machine_traceability": true,
+          "in_ticket_scope": true,
+          "regression_tests": [
+            "test_build_recommended_action_waits_when_lifecycle_reports_gates_failed_but_sha_stale"
+          ],
+          "requirement_id": "DRA-005",
+          "rule_links": []
+        },
+        {
+          "artifact_evidence_refs": [],
+          "coverage_mode": "traceability_entry_only",
+          "covered": true,
+          "implemented_by": [],
+          "in_machine_traceability": true,
+          "in_ticket_scope": true,
+          "regression_tests": [],
+          "requirement_id": "DRA-006",
+          "rule_links": []
+        },
+        {
+          "artifact_evidence_refs": [],
+          "coverage_mode": "traceability_entry_only",
+          "covered": true,
+          "implemented_by": [],
+          "in_machine_traceability": true,
+          "in_ticket_scope": true,
+          "regression_tests": [],
+          "requirement_id": "DRA-007",
+          "rule_links": []
+        },
+        {
+          "artifact_evidence_refs": [],
           "coverage_mode": "rule_linked",
           "covered": false,
           "implemented_by": [],
@@ -2053,7 +2147,14 @@
         "DR-005-WAIT_RETURNS_ON_TERMINAL_ACTION",
         "DR-006-EVERGREEN_CAC_STATE_MACHINE_SOURCE",
         "DR-007-CLI_EXIT_ON_ACTION_SET_IS_CANONICAL",
-        "DR-008-MACHINE_VERIFIABLE_ARTIFACTS"
+        "DR-008-MACHINE_VERIFIABLE_ARTIFACTS",
+        "DRA-001",
+        "DRA-002",
+        "DRA-003",
+        "DRA-004",
+        "DRA-005",
+        "DRA-006",
+        "DRA-007"
       ],
       "wait_action_policy": {
         "by_action": {
@@ -2179,6 +2280,58 @@
           "doctor_wait_machine_exits_on_timeout_when_not_interrupted"
         ],
         "requirement_id": "DR-005-WAIT_RETURNS_ON_TERMINAL_ACTION"
+      },
+      {
+        "implemented_by": [
+          "DoctorDecisionFacts::from_input",
+          "DoctorGateFailureSignal"
+        ],
+        "regression_tests": [
+          "test_build_recommended_action_waits_when_lifecycle_reports_gates_failed_but_sha_stale"
+        ],
+        "requirement_id": "DRA-001"
+      },
+      {
+        "implemented_by": [
+          "DoctorDecisionGuard::ShaFreshnessStale",
+          "DoctorDecisionGuard::ApproveEligible"
+        ],
+        "regression_tests": [],
+        "requirement_id": "DRA-002"
+      },
+      {
+        "implemented_by": [
+          "DoctorDecisionGuard::GateFailureSignal"
+        ],
+        "regression_tests": [],
+        "requirement_id": "DRA-003"
+      },
+      {
+        "implemented_by": [
+          "DoctorPrSummary::gate_failure_signal",
+          "DoctorTrackedPrSummary::gate_failure_signal"
+        ],
+        "regression_tests": [],
+        "requirement_id": "DRA-004"
+      },
+      {
+        "implemented_by": [
+          "DoctorDecisionFacts::from_input"
+        ],
+        "regression_tests": [
+          "test_build_recommended_action_waits_when_lifecycle_reports_gates_failed_but_sha_stale"
+        ],
+        "requirement_id": "DRA-005"
+      },
+      {
+        "implemented_by": [],
+        "regression_tests": [],
+        "requirement_id": "DRA-006"
+      },
+      {
+        "implemented_by": [],
+        "regression_tests": [],
+        "requirement_id": "DRA-007"
       }
     ],
     "reviewer_missing_verdict_machine": {

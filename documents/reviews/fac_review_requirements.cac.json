@@ -6,7 +6,10 @@
     "stable_id": "dcp://apm2.fac/requirements/fac-review@1",
     "status": "DRAFT",
     "classification": "INTERNAL",
-    "owners": ["platform", "security"],
+    "owners": [
+      "platform",
+      "security"
+    ],
     "source_of_truth_refs": [
       "documents/work/tickets/TCK-00604.yaml",
       "documents/reviews/SECURITY_REVIEW_PROMPT.cac.json",
@@ -29,7 +32,6 @@
   "payload": {
     "title": "FAC Review Requirements Specification",
     "purpose": "Define invariants, state machine constraints, architectural boundaries, and operational requirements for the FAC review subsystem. This is the single source of truth from which implementation, tests, and reviewer prompts are derived.",
-
     "architectural_boundaries": {
       "id": "ARCH",
       "title": "Core / Projection Separation",
@@ -65,7 +67,6 @@
         }
       ]
     },
-
     "verdict_invariants": {
       "id": "VERD",
       "title": "Verdict Integrity",
@@ -75,7 +76,7 @@
           "title": "Deny is sticky per SHA",
           "severity": "MUST",
           "description": "Once any review attempt sets a deny verdict for a (PR, SHA, dimension) tuple, no subsequent operation MAY overwrite that verdict to approve for the same tuple. Only a new SHA (fix commit) resets the verdict for that dimension. persist_verdict_projection MUST check for existing deny before upserting.",
-          "rationale": "PR #656 incident: a restarted security review hallucinated a PASS and overwrote a legitimate BLOCKER deny. Deny verdicts represent discovered defects — they cannot be erased by re-rolling the dice.",
+          "rationale": "PR #656 incident: a restarted security review hallucinated a PASS and overwrote a legitimate BLOCKER deny. Deny verdicts represent discovered defects \u2014 they cannot be erased by re-rolling the dice.",
           "verification": "Unit test: persist_verdict_projection with existing deny returns error on approve attempt for same SHA."
         },
         {
@@ -110,7 +111,6 @@
         }
       ]
     },
-
     "lifecycle_state_machine": {
       "id": "LIFE",
       "title": "PR/SHA Lifecycle State Machine",
@@ -159,7 +159,6 @@
         }
       ]
     },
-
     "agent_lifecycle": {
       "id": "AGNT",
       "title": "Agent Lifecycle and Concurrency",
@@ -208,7 +207,6 @@
         }
       ]
     },
-
     "state_persistence": {
       "id": "PERS",
       "title": "State Persistence and Integrity",
@@ -224,7 +222,7 @@
           "id": "PERS-002",
           "title": "Projection identity update is last step in push",
           "severity": "MUST",
-          "description": "Local PR identity/projection update MUST be the LAST step in the push flow — after git push, after gates pass, after review dispatch completes. The local SHA MUST only be persisted once the full pipeline for that SHA has been confirmed.",
+          "description": "Local PR identity/projection update MUST be the LAST step in the push flow \u2014 after git push, after gates pass, after review dispatch completes. The local SHA MUST only be persisted once the full pipeline for that SHA has been confirmed.",
           "rationale": "Premature identity writes cause stale-identity repair loops when the pipeline fails mid-flight."
         },
         {
@@ -243,7 +241,6 @@
         }
       ]
     },
-
     "projection_requirements": {
       "id": "PROJ",
       "title": "Projection Layer",
@@ -271,7 +268,6 @@
         }
       ]
     },
-
     "error_handling": {
       "id": "ERR",
       "title": "Error Handling and Recovery",
@@ -327,7 +323,6 @@
         }
       ]
     },
-
     "compatibility": {
       "id": "COMPAT",
       "title": "Command Surface and Migration",
@@ -376,14 +371,72 @@
         }
       ]
     },
-
     "cross_references": {
-      "tickets": ["TCK-00604", "TCK-00603"],
-      "rfcs": ["RFC-0019"],
+      "tickets": [
+        "TCK-00604",
+        "TCK-00603"
+      ],
+      "rfcs": [
+        "RFC-0019"
+      ],
       "incidents": [
         {
           "ref": "PR #656 verdict override",
-          "requirements_derived": ["VERD-001", "VERD-003", "AGNT-003", "AGNT-006", "LIFE-003"]
+          "requirements_derived": [
+            "VERD-001",
+            "VERD-003",
+            "AGNT-003",
+            "AGNT-006",
+            "LIFE-003"
+          ]
+        }
+      ]
+    },
+    "doctor_decision_logic": {
+      "id": "DRA",
+      "title": "Doctor Recommended Actions",
+      "requirements": [
+        {
+          "id": "DRA-001",
+          "title": "Make gate-failure detection SHA-scoped in DoctorDecisionFacts",
+          "severity": "MUST",
+          "description": "Refactor `has_gate_failure_signal` and gate progress derivation in\n`crates/apm2-cli/src/commands/fac_review/mod.rs` so lifecycle/push/gate failure evidence\nis counted only when it is attributable to the authoritative SHA context.\n\nMinimum rules:\n  - lifecycle `gates_failed` only contributes when lifecycle SHA matches local/remote head\n    (or another explicit authoritative target SHA defined by doctor inputs).\n  - push-attempt failed-stage evidence only contributes when failed attempt SHA matches\n    authoritative SHA.\n  - missing SHA alignment downgrades the signal to non-terminal (health warning only)."
+        },
+        {
+          "id": "DRA-002",
+          "title": "Fix decision precedence so stale failure cannot outrank pending review wait",
+          "severity": "MUST",
+          "description": "Update recommendation precedence (`DOCTOR_DECISION_RULES`) so stale/misaligned gate failure\nsignals do not trigger `DOC-G-007` (`dispatch_failed_gates`).\n\nTarget behavior:\n  - if verdicts are pending and no SHA-aligned terminal gate failure exists,\n    recommended action must be `wait` (or `fix` only when integrity/corruption/projection\n    repair predicates are true)."
+        },
+        {
+          "id": "DRA-003",
+          "title": "Harden dispatch_implementor criteria",
+          "severity": "MUST",
+          "description": "Ensure `dispatch_implementor` requires at least one actionable, SHA-aligned trigger:\n  - blocker/major findings or formal deny for authoritative SHA, OR\n  - gate failure conclusively bound to authoritative SHA, OR\n  - explicit merge conflicts.\n\nDisallow `dispatch_implementor` when all dimensions are pending and findings are empty."
+        },
+        {
+          "id": "DRA-004",
+          "title": "Improve machine-readable diagnostics for action provenance",
+          "severity": "MUST",
+          "description": "Extend doctor JSON with clear provenance for decision-critical gate-failure signals,\nincluding whether each signal is SHA-aligned or ignored as stale.\n\nThis must make incorrect action selection auditable without reading source code."
+        },
+        {
+          "id": "DRA-005",
+          "title": "Regression coverage for stale-lifecycle and wait-loop correctness",
+          "severity": "MUST",
+          "description": "Add/adjust tests in `crates/apm2-cli/src/commands/fac_review/mod.rs` to cover:\n  - lifecycle `gates_failed` with mismatched SHA -> action `wait` under pending verdicts,\n  - push attempt failed gate stage for different SHA -> does not trigger dispatch,\n  - `--wait-for-recommended-action` does not exit on false `dispatch_implementor`,\n  - positive control: SHA-aligned failed gates still produce `dispatch_implementor`."
+        },
+        {
+          "id": "DRA-006",
+          "title": "Fix findings command to return all findings",
+          "severity": "MUST",
+          "description": "The `apm2 fac review findings --pr <N>` command currently returns only the latest findings instead of all accumulated findings. It must be updated to aggregate and return the complete history of findings for the PR."
+        },
+        {
+          "id": "DRA-007",
+          "title": "Fix doctor tracked-prs command to exclude test data",
+          "severity": "MUST",
+          "description": "The `apm2 fac doctor --tracked-prs` command currently includes mock/test data in its output. It must be filtered to exclusively return legitimate tracked PR data."
         }
       ]
     }
