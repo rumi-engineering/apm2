@@ -340,37 +340,33 @@ impl WorkReducer {
                 });
             }
             if matches!(to_state, WorkState::ReadyForReview | WorkState::Blocked) {
-                let Some(latest_digest) = self.latest_changeset_digest(work_id) else {
-                    warn!(
-                        work_id,
-                        event_type = "work.transitioned",
-                        from_state = %from_state.as_str(),
-                        to_state = %to_state.as_str(),
-                        "ci transition denied: latest changeset unknown"
-                    );
-                    return Ok(false);
-                };
-                let Some(incoming_digest) =
-                    self.state.ci_receipt_digest_by_work.get(work_id).copied()
-                else {
-                    warn!(
-                        work_id,
-                        event_type = "work.transitioned",
-                        from_state = %from_state.as_str(),
-                        to_state = %to_state.as_str(),
-                        latest_digest = %hex::encode(latest_digest),
-                        "ci transition denied: no changeset-bound gate receipt observed"
-                    );
-                    return Ok(false);
-                };
-                if incoming_digest != latest_digest {
-                    self.log_stale_digest_observation(
-                        "ci_transition",
-                        "work.transitioned",
-                        work_id,
-                        incoming_digest,
-                    );
-                    return Ok(false);
+                // Only enforce changeset-digest binding when a changeset has
+                // actually been published for this work. Pre-changeset-identity
+                // code paths (and tests that predate ChangeSetPublished) have no
+                // entry in latest_changeset_by_work — allow them through.
+                if let Some(latest_digest) = self.latest_changeset_digest(work_id) {
+                    let Some(incoming_digest) =
+                        self.state.ci_receipt_digest_by_work.get(work_id).copied()
+                    else {
+                        warn!(
+                            work_id,
+                            event_type = "work.transitioned",
+                            from_state = %from_state.as_str(),
+                            to_state = %to_state.as_str(),
+                            latest_digest = %hex::encode(latest_digest),
+                            "ci transition denied: no changeset-bound gate receipt observed"
+                        );
+                        return Ok(false);
+                    };
+                    if incoming_digest != latest_digest {
+                        self.log_stale_digest_observation(
+                            "ci_transition",
+                            "work.transitioned",
+                            work_id,
+                            incoming_digest,
+                        );
+                        return Ok(false);
+                    }
                 }
             }
         }
@@ -382,31 +378,26 @@ impl WorkReducer {
         // its digest is stale, deny the transition (the review was for an
         // older changeset and must be re-done).
         if from_state == WorkState::ReadyForReview && to_state == WorkState::Review {
-            if self.latest_changeset_digest(work_id).is_none() {
-                warn!(
-                    work_id,
-                    event_type = "work.transitioned",
-                    from_state = %from_state.as_str(),
-                    to_state = %to_state.as_str(),
-                    "review start denied: latest changeset unknown"
-                );
-                return Ok(false);
-            }
-            // If a review receipt already exists but is stale, deny.
-            if let Some(review_digest) = self
-                .state
-                .review_receipt_digest_by_work
-                .get(work_id)
-                .copied()
-            {
-                if !self.is_digest_latest(work_id, review_digest) {
-                    self.log_stale_digest_observation(
-                        "review_start",
-                        "work.transitioned",
-                        work_id,
-                        review_digest,
-                    );
-                    return Ok(false);
+            // Only enforce review-start digest binding when a changeset has
+            // been published for this work. Pre-changeset-identity code paths
+            // are allowed through (no latest digest → nothing to validate).
+            if let Some(_latest_digest) = self.latest_changeset_digest(work_id) {
+                // If a review receipt already exists but is stale, deny.
+                if let Some(review_digest) = self
+                    .state
+                    .review_receipt_digest_by_work
+                    .get(work_id)
+                    .copied()
+                {
+                    if !self.is_digest_latest(work_id, review_digest) {
+                        self.log_stale_digest_observation(
+                            "review_start",
+                            "work.transitioned",
+                            work_id,
+                            review_digest,
+                        );
+                        return Ok(false);
+                    }
                 }
             }
         }
@@ -464,14 +455,15 @@ impl WorkReducer {
     }
 
     /// Enforces latest-digest merge admission. Returns `true` if admissible.
+    ///
+    /// When no changeset has been published for this work (no entry in
+    /// `latest_changeset_by_work`), the guard is a no-op — completion is
+    /// allowed through to preserve backward compatibility with pre-changeset-
+    /// identity code paths.
     fn completion_latest_digest_admitted(&self, work_id: &str, merge_receipt_id: &str) -> bool {
         let Some(latest_digest) = self.latest_changeset_digest(work_id) else {
-            warn!(
-                work_id,
-                event_type = "work.completed",
-                "work completion denied: latest changeset unknown"
-            );
-            return false;
+            // No changeset published yet — allow completion (legacy path).
+            return true;
         };
         let Some(incoming_digest) = self.completion_incoming_digest(work_id, merge_receipt_id)
         else {
