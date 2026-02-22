@@ -255,14 +255,18 @@ where
                     .map_err(|e| ControllerLoopError::MarkBlocked(e.to_string()))?;
                 report.blocked_intents = report.blocked_intents.saturating_add(1);
             },
-            Ok(ExecutionOutcome::Retry { .. }) => {
-                report.enqueued_intents = report.enqueued_intents.saturating_add(
-                    intent_store
-                        .enqueue_many(std::slice::from_ref(intent))
-                        .await
-                        .map_err(|e| ControllerLoopError::Enqueue(e.to_string()))?,
-                );
+            Ok(ExecutionOutcome::Retry { reason }) => {
+                intent_store
+                    .mark_blocked(
+                        &key,
+                        &format!(
+                            "retry outcome after effect dispatch is fail-closed blocked: {reason}"
+                        ),
+                    )
+                    .await
+                    .map_err(|e| ControllerLoopError::MarkBlocked(e.to_string()))?;
                 report.retryable_intents = report.retryable_intents.saturating_add(1);
+                report.blocked_intents = report.blocked_intents.saturating_add(1);
             },
             Err(e) => {
                 intent_store
@@ -288,7 +292,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -559,6 +563,267 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct PersistentIntentStore {
+        order: Mutex<Vec<String>>,
+        states: Mutex<HashMap<String, String>>,
+        blocked: Mutex<HashMap<String, String>>,
+    }
+
+    impl IntentStore<String, String> for PersistentIntentStore {
+        type Error = String;
+
+        async fn enqueue_many(&self, intents: &[String]) -> Result<usize, Self::Error> {
+            let mut order = self.order.lock().map_err(|e| e.to_string())?;
+            let mut states = self.states.lock().map_err(|e| e.to_string())?;
+            let mut inserted = 0usize;
+            for intent in intents {
+                if states.contains_key(intent) {
+                    continue;
+                }
+                states.insert(intent.clone(), "pending".to_string());
+                order.push(intent.clone());
+                inserted = inserted.saturating_add(1);
+            }
+            Ok(inserted)
+        }
+
+        async fn dequeue_batch(&self, limit: usize) -> Result<Vec<String>, Self::Error> {
+            let order = self.order.lock().map_err(|e| e.to_string())?;
+            let states = self.states.lock().map_err(|e| e.to_string())?;
+            Ok(order
+                .iter()
+                .filter(|key| states.get(*key).is_some_and(|state| state == "pending"))
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
+        async fn mark_done(&self, key: &String) -> Result<(), Self::Error> {
+            self.states
+                .lock()
+                .map_err(|e| e.to_string())?
+                .insert(key.clone(), "done".to_string());
+            Ok(())
+        }
+
+        async fn mark_blocked(&self, key: &String, reason: &str) -> Result<(), Self::Error> {
+            self.states
+                .lock()
+                .map_err(|e| e.to_string())?
+                .insert(key.clone(), "blocked".to_string());
+            self.blocked
+                .lock()
+                .map_err(|e| e.to_string())?
+                .insert(key.clone(), reason.to_string());
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RestartableJournal {
+        states: Mutex<HashMap<String, EffectExecutionState>>,
+        simulate_restart: Mutex<bool>,
+        allow_reexecution: Mutex<bool>,
+    }
+
+    impl RestartableJournal {
+        fn set_simulate_restart(&self, value: bool) {
+            if let Ok(mut guard) = self.simulate_restart.lock() {
+                *guard = value;
+            }
+        }
+
+        fn set_allow_reexecution(&self, value: bool) {
+            if let Ok(mut guard) = self.allow_reexecution.lock() {
+                *guard = value;
+            }
+        }
+    }
+
+    impl EffectJournal<String> for RestartableJournal {
+        type Error = String;
+
+        async fn query_state(&self, key: &String) -> Result<EffectExecutionState, Self::Error> {
+            let state = *self
+                .states
+                .lock()
+                .map_err(|e| e.to_string())?
+                .get(key)
+                .unwrap_or(&EffectExecutionState::NotStarted);
+            let restart = *self.simulate_restart.lock().map_err(|e| e.to_string())?;
+            if restart && state == EffectExecutionState::Started {
+                Ok(EffectExecutionState::Unknown)
+            } else {
+                Ok(state)
+            }
+        }
+
+        async fn record_started(&self, key: &String) -> Result<(), Self::Error> {
+            self.states
+                .lock()
+                .map_err(|e| e.to_string())?
+                .insert(key.clone(), EffectExecutionState::Started);
+            Ok(())
+        }
+
+        async fn record_completed(&self, key: &String) -> Result<(), Self::Error> {
+            self.states
+                .lock()
+                .map_err(|e| e.to_string())?
+                .insert(key.clone(), EffectExecutionState::Completed);
+            Ok(())
+        }
+
+        async fn resolve_in_doubt(&self, key: &String) -> Result<InDoubtResolution, Self::Error> {
+            let allow = *self.allow_reexecution.lock().map_err(|e| e.to_string())?;
+            if allow {
+                self.states
+                    .lock()
+                    .map_err(|e| e.to_string())?
+                    .insert(key.clone(), EffectExecutionState::NotStarted);
+                Ok(InDoubtResolution::AllowReExecution)
+            } else {
+                Ok(InDoubtResolution::Deny {
+                    reason: "deny unknown after restart in test".to_string(),
+                })
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FailOnceReceiptWriter {
+        fail_next: Mutex<bool>,
+        receipts: Mutex<Vec<String>>,
+    }
+
+    impl FailOnceReceiptWriter {
+        fn new_fail_once() -> Self {
+            Self {
+                fail_next: Mutex::new(true),
+                receipts: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ReceiptWriter<String> for FailOnceReceiptWriter {
+        type Error = String;
+
+        async fn persist_many(&self, receipts: &[String]) -> Result<(), Self::Error> {
+            let mut fail_next = self.fail_next.lock().map_err(|e| e.to_string())?;
+            if *fail_next {
+                *fail_next = false;
+                return Err("forced fail-once receipt persistence error".to_string());
+            }
+            drop(fail_next);
+            self.receipts
+                .lock()
+                .map_err(|e| e.to_string())?
+                .extend_from_slice(receipts);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct CursorAwareLedgerReader {
+        events: Vec<TestEvent>,
+    }
+
+    impl LedgerReader<TestEvent> for CursorAwareLedgerReader {
+        type Error = String;
+
+        async fn poll(
+            &self,
+            cursor: &CompositeCursor,
+            limit: usize,
+        ) -> Result<Vec<TestEvent>, Self::Error> {
+            let mut out: Vec<TestEvent> = self
+                .events
+                .iter()
+                .filter(|event| {
+                    event.ts > cursor.timestamp_ns
+                        || (event.ts == cursor.timestamp_ns
+                            && event.id.as_str() > cursor.event_id.as_str())
+                })
+                .cloned()
+                .collect();
+            out.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
+            out.truncate(limit);
+            Ok(out)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct DeterministicReplayDomain {
+        seen: HashSet<String>,
+        pending: VecDeque<String>,
+        applied_order: Vec<String>,
+        executed_order: Vec<String>,
+    }
+
+    impl OrchestratorDomain<TestEvent, String, String, String> for DeterministicReplayDomain {
+        type Error = String;
+
+        fn intent_key(&self, intent: &String) -> String {
+            intent.clone()
+        }
+
+        async fn apply_events(&mut self, events: &[TestEvent]) -> Result<(), Self::Error> {
+            for event in events {
+                if self.seen.insert(event.id.clone()) {
+                    self.applied_order.push(event.id.clone());
+                    self.pending.push_back(event.id.clone());
+                }
+            }
+            Ok(())
+        }
+
+        async fn plan(&mut self) -> Result<Vec<String>, Self::Error> {
+            Ok(self.pending.drain(..).collect())
+        }
+
+        async fn execute(
+            &mut self,
+            intent: &String,
+        ) -> Result<ExecutionOutcome<String>, Self::Error> {
+            self.executed_order.push(intent.clone());
+            Ok(ExecutionOutcome::Completed {
+                receipts: vec![format!("receipt-{intent}")],
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingNoPlanDomain {
+        executions: usize,
+    }
+
+    impl OrchestratorDomain<TestEvent, String, String, String> for CountingNoPlanDomain {
+        type Error = String;
+
+        fn intent_key(&self, intent: &String) -> String {
+            intent.clone()
+        }
+
+        async fn apply_events(&mut self, _events: &[TestEvent]) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn plan(&mut self) -> Result<Vec<String>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        async fn execute(
+            &mut self,
+            intent: &String,
+        ) -> Result<ExecutionOutcome<String>, Self::Error> {
+            self.executions = self.executions.saturating_add(1);
+            Ok(ExecutionOutcome::Completed {
+                receipts: vec![format!("receipt-{intent}")],
+            })
+        }
+    }
+
     #[tokio::test]
     async fn run_tick_enforces_execute_limit() {
         let mut domain = TestDomain;
@@ -641,7 +906,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tick_requeues_retry_outcomes() {
+    async fn run_tick_fail_closed_blocks_retry_outcomes() {
         let mut domain = RetryDomain;
         let ledger = TestLedgerReader::default();
         let cursor_store = TestCursorStore::default();
@@ -670,14 +935,16 @@ mod tests {
         .expect("tick should succeed");
 
         assert_eq!(report.retryable_intents, 1);
+        assert_eq!(report.blocked_intents, 1);
         assert_eq!(report.completed_intents, 0);
         assert_eq!(report.persisted_receipts, 0);
-        let pending = intent_store
-            .pending
+        let blocked = intent_store
+            .blocked
             .lock()
-            .expect("pending lock should not be poisoned");
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending.front().map(String::as_str), Some("intent-a"));
+            .expect("blocked lock should not be poisoned");
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].0, "intent-a");
+        assert!(blocked[0].1.contains("fail-closed blocked"));
     }
 
     #[tokio::test]
@@ -715,5 +982,154 @@ mod tests {
             .lock()
             .expect("done lock should not be poisoned");
         assert!(done.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_tick_replay_determinism_matches_full_replay_and_checkpoint_delta() {
+        let events = vec![
+            TestEvent {
+                ts: 1,
+                id: "event-a".to_string(),
+            },
+            TestEvent {
+                ts: 1,
+                id: "event-b".to_string(),
+            },
+            TestEvent {
+                ts: 2,
+                id: "event-c".to_string(),
+            },
+            TestEvent {
+                ts: 3,
+                id: "event-d".to_string(),
+            },
+        ];
+
+        let mut full_domain = DeterministicReplayDomain::default();
+        let full_ledger = CursorAwareLedgerReader {
+            events: events.clone(),
+        };
+        let full_cursor = TestCursorStore::default();
+        let full_intents = PersistentIntentStore::default();
+        let full_journal = RestartableJournal::default();
+        let full_receipts = TestReceiptWriter::default();
+
+        let full_report = run_tick(
+            &mut full_domain,
+            &full_ledger,
+            &full_cursor,
+            &full_intents,
+            &full_journal,
+            &full_receipts,
+            TickConfig {
+                observe_limit: 16,
+                execute_limit: 16,
+            },
+        )
+        .await
+        .expect("full replay tick should succeed");
+        assert_eq!(full_report.completed_intents, 4);
+        let full_applied = full_domain.applied_order.clone();
+        let full_executed = full_domain.executed_order.clone();
+        let full_receipt_rows = full_receipts
+            .receipts
+            .lock()
+            .expect("full receipts lock should not be poisoned")
+            .clone();
+
+        let mut delta_domain = DeterministicReplayDomain::default();
+        let delta_ledger = CursorAwareLedgerReader {
+            events: events.clone(),
+        };
+        let delta_cursor = TestCursorStore::default();
+        let delta_intents = PersistentIntentStore::default();
+        let delta_journal = RestartableJournal::default();
+        let delta_receipts = TestReceiptWriter::default();
+
+        for _ in 0..3 {
+            run_tick(
+                &mut delta_domain,
+                &delta_ledger,
+                &delta_cursor,
+                &delta_intents,
+                &delta_journal,
+                &delta_receipts,
+                TickConfig {
+                    observe_limit: 2,
+                    execute_limit: 2,
+                },
+            )
+            .await
+            .expect("checkpoint+delta tick should succeed");
+        }
+
+        assert_eq!(delta_domain.applied_order, full_applied);
+        assert_eq!(delta_domain.executed_order, full_executed);
+        let delta_receipt_rows = delta_receipts
+            .receipts
+            .lock()
+            .expect("delta receipts lock should not be poisoned")
+            .clone();
+        assert_eq!(delta_receipt_rows, full_receipt_rows);
+    }
+
+    #[tokio::test]
+    async fn run_tick_crash_replay_fail_closed_prevents_duplicate_effects() {
+        let mut domain = CountingNoPlanDomain::default();
+        let ledger = CursorAwareLedgerReader::default();
+        let cursor_store = TestCursorStore::default();
+        let intent_store = PersistentIntentStore::default();
+        let journal = RestartableJournal::default();
+        let receipts = FailOnceReceiptWriter::new_fail_once();
+        journal.set_allow_reexecution(false);
+
+        intent_store
+            .enqueue_many(&["intent-a".to_string()])
+            .await
+            .expect("enqueue should succeed");
+
+        let first_error = run_tick(
+            &mut domain,
+            &ledger,
+            &cursor_store,
+            &intent_store,
+            &journal,
+            &receipts,
+            TickConfig {
+                observe_limit: 0,
+                execute_limit: 1,
+            },
+        )
+        .await
+        .expect_err("first tick should fail on forced receipt persistence error");
+        assert!(matches!(
+            first_error,
+            ControllerLoopError::PersistReceipts(_)
+        ));
+        assert_eq!(domain.executions, 1);
+
+        journal.set_simulate_restart(true);
+        let second_report = run_tick(
+            &mut domain,
+            &ledger,
+            &cursor_store,
+            &intent_store,
+            &journal,
+            &receipts,
+            TickConfig {
+                observe_limit: 0,
+                execute_limit: 1,
+            },
+        )
+        .await
+        .expect("second tick should fail-closed block unknown effect");
+
+        assert_eq!(second_report.blocked_intents, 1);
+        assert_eq!(domain.executions, 1);
+        let states = intent_store
+            .states
+            .lock()
+            .expect("states lock should not be poisoned");
+        assert_eq!(states.get("intent-a").map(String::as_str), Some("blocked"));
     }
 }

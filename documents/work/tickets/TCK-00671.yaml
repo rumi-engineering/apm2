@@ -124,6 +124,10 @@ plan:
     - Add determinism/crash/idempotency tests for the new loop.
 
 definition_of_done:
+  evidence_ids:
+    - "EVID-TCK-00671-01: controller loop boundedness + fail-closed unknown coverage (`run_tick_enforces_execute_limit`, `run_tick_blocks_unknown_without_resolution`, `run_tick_fail_closed_blocks_retry_outcomes`)"
+    - "EVID-TCK-00671-02: deterministic replay parity coverage (`run_tick_replay_determinism_matches_full_replay_and_checkpoint_delta`)"
+    - "EVID-TCK-00671-03: crash-point replay idempotency coverage (`run_tick_crash_replay_fail_closed_prevents_duplicate_effects`)"
   criteria:
     - "apm2_core::orchestrator_kernel exists with cursor/reducer/driver/checkpoint/tick interfaces."
     - "At least one daemon orchestrator runs on the harness and passes existing tests."
