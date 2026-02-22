@@ -431,6 +431,180 @@ fn extract_hash32_field(payload: &serde_json::Value, field: &str) -> Option<[u8;
     Some(hash)
 }
 
+/// Decodes a session-event JSON envelope (`{"payload":"<hex>"}`) into the
+/// inner `WorkEvent` protobuf.
+fn decode_work_event_from_session_envelope(
+    payload_bytes: &[u8],
+) -> Result<apm2_core::events::WorkEvent, ProjectionWorkerError> {
+    use prost::Message;
+
+    let envelope: serde_json::Value = serde_json::from_slice(payload_bytes).map_err(|e| {
+        ProjectionWorkerError::InvalidPayload(format!(
+            "failed to parse session event JSON envelope: {e}"
+        ))
+    })?;
+    let payload_hex = envelope
+        .get("payload")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            ProjectionWorkerError::InvalidPayload(
+                "session event JSON envelope missing 'payload'".to_string(),
+            )
+        })?;
+    let inner = hex::decode(payload_hex).map_err(|e| {
+        ProjectionWorkerError::InvalidPayload(format!(
+            "failed to decode session event payload hex: {e}"
+        ))
+    })?;
+    apm2_core::events::WorkEvent::decode(inner.as_slice()).map_err(|e| {
+        ProjectionWorkerError::InvalidPayload(format!("failed to decode inner WorkEvent: {e}"))
+    })
+}
+
+/// Extracts the `spec_snapshot_hash` from a persisted `work.opened` event
+/// payload.
+fn extract_work_opened_spec_snapshot_hash(
+    payload_bytes: &[u8],
+) -> Result<[u8; 32], ProjectionWorkerError> {
+    let work_event = decode_work_event_from_session_envelope(payload_bytes)?;
+    let Some(apm2_core::events::work_event::Event::Opened(opened)) = work_event.event else {
+        return Err(ProjectionWorkerError::InvalidPayload(
+            "work.opened payload does not decode to WorkOpened variant".to_string(),
+        ));
+    };
+
+    let hash_slice: &[u8] = opened.spec_snapshot_hash.as_slice();
+    let hash: [u8; 32] = hash_slice.try_into().map_err(|_| {
+        ProjectionWorkerError::InvalidPayload(
+            "work.opened spec_snapshot_hash must be 32 bytes".to_string(),
+        )
+    })?;
+    Ok(hash)
+}
+
+/// Parses `(work_id, pr_number, commit_sha)` from a persisted
+/// `work.pr_associated` event envelope.
+///
+/// Supports both modern envelopes with top-level `pr_number`/`commit_sha`
+/// fields and legacy envelopes that require protobuf decode.
+fn parse_work_pr_associated_payload(
+    payload_bytes: &[u8],
+    fallback_work_id: &str,
+) -> Result<(String, u64, String), ProjectionWorkerError> {
+    let envelope: serde_json::Value = serde_json::from_slice(payload_bytes).map_err(|e| {
+        ProjectionWorkerError::InvalidPayload(format!(
+            "failed to parse work.pr_associated envelope: {e}"
+        ))
+    })?;
+
+    let work_id = envelope
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| envelope.get("work_id").and_then(serde_json::Value::as_str))
+        .unwrap_or(fallback_work_id)
+        .to_string();
+
+    let top_level_pr = envelope
+        .get("pr_number")
+        .and_then(serde_json::Value::as_u64);
+    let top_level_sha = envelope
+        .get("commit_sha")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    if let Some((pr_number, commit_sha)) = top_level_pr.zip(top_level_sha) {
+        return Ok((work_id, pr_number, commit_sha));
+    }
+
+    let work_event = decode_work_event_from_session_envelope(payload_bytes)?;
+    let Some(apm2_core::events::work_event::Event::PrAssociated(associated)) = work_event.event
+    else {
+        return Err(ProjectionWorkerError::InvalidPayload(
+            "work.pr_associated payload does not decode to WorkPrAssociated variant".to_string(),
+        ));
+    };
+
+    let parsed_work_id = if associated.work_id.is_empty() {
+        work_id
+    } else {
+        associated.work_id
+    };
+    Ok((parsed_work_id, associated.pr_number, associated.commit_sha))
+}
+
+/// Resolves `(repo_owner, repo_name)` for a `work_id` by joining through the
+/// persisted `work.opened` event and fetching the immutable `WorkSpecV1` from
+/// CAS using `spec_snapshot_hash`.
+fn resolve_repo_identity_for_work(
+    conn: &Connection,
+    cas: &dyn ContentAddressedStore,
+    work_id: &str,
+) -> Result<(String, String), ProjectionWorkerError> {
+    let legacy_payload: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT payload FROM ledger_events \
+             WHERE event_type = 'work.opened' AND work_id = ?1 \
+             ORDER BY timestamp_ns ASC, rowid ASC LIMIT 1",
+            params![work_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+    let payload = if let Some(payload) = legacy_payload {
+        payload
+    } else {
+        let canonical_events_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if !canonical_events_exists {
+            return Err(ProjectionWorkerError::InvalidPayload(format!(
+                "missing work.opened event for work_id={work_id}"
+            )));
+        }
+
+        conn.query_row(
+            "SELECT payload FROM events \
+             WHERE event_type = 'work.opened' AND session_id = ?1 \
+             ORDER BY timestamp_ns ASC, rowid ASC LIMIT 1",
+            params![work_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
+        .ok_or_else(|| {
+            ProjectionWorkerError::InvalidPayload(format!(
+                "missing canonical work.opened event for work_id={work_id}"
+            ))
+        })?
+    };
+
+    let spec_snapshot_hash = extract_work_opened_spec_snapshot_hash(&payload)?;
+    let spec_bytes = cas.retrieve(&spec_snapshot_hash).map_err(|e| {
+        ProjectionWorkerError::InvalidPayload(format!(
+            "failed to resolve WorkSpec from CAS for work_id={work_id}: {e}"
+        ))
+    })?;
+    let work_spec = apm2_core::fac::work_cas_schemas::bounded_decode_work_spec(&spec_bytes)
+        .map_err(|e| {
+            ProjectionWorkerError::InvalidPayload(format!(
+                "resolved WorkSpec for work_id={work_id} is invalid: {e}"
+            ))
+        })?;
+    let repo = work_spec.repo.ok_or_else(|| {
+        ProjectionWorkerError::InvalidPayload(format!(
+            "WorkSpec for work_id={work_id} is missing repo identity"
+        ))
+    })?;
+
+    Ok((repo.owner, repo.name))
+}
+
 fn load_authoritative_receipt_linkage_record(
     authority: &ProjectionLinkageAuthority<'_>,
     receipt_id: &str,
@@ -628,12 +802,13 @@ fn validate_projection_receipt_linkage(
 /// Work index schema SQL.
 const WORK_INDEX_SCHEMA_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS work_pr_index (
-        work_id TEXT PRIMARY KEY,
+        work_id TEXT NOT NULL UNIQUE,
         pr_number INTEGER NOT NULL,
         repo_owner TEXT NOT NULL,
         repo_name TEXT NOT NULL,
         head_sha TEXT NOT NULL,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (repo_owner, repo_name, pr_number)
     );
 
     CREATE TABLE IF NOT EXISTS changeset_work_index (
@@ -677,6 +852,7 @@ const WORK_INDEX_SCHEMA_SQL: &str = r"
     );
 
     CREATE INDEX IF NOT EXISTS idx_comment_created ON comment_receipts(created_at);
+    CREATE INDEX IF NOT EXISTS idx_work_pr_work_id ON work_pr_index(work_id);
     CREATE INDEX IF NOT EXISTS idx_work_pr_created ON work_pr_index(created_at);
 
     -- TCK-00638: Work context entry projection (RFC-0032 Phase 2)
@@ -843,6 +1019,27 @@ impl WorkIndex {
                     head_sha: row.get(3)?,
                 })
             },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// Looks up the `work_id` associated with `(repo_owner, repo_name,
+    /// pr_number)`.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    pub fn get_work_id_for_pr(
+        &self,
+        repo_owner: &str,
+        repo_name: &str,
+        pr_number: u64,
+    ) -> Option<String> {
+        let conn = self.conn.lock().ok()?;
+        conn.query_row(
+            "SELECT work_id FROM work_pr_index \
+             WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3",
+            params![repo_owner, repo_name, pr_number as i64],
+            |row| row.get(0),
         )
         .optional()
         .ok()
@@ -1987,7 +2184,7 @@ pub struct ProjectionWorker {
     work_index: WorkIndex,
     /// Tailer for `changeset_published` events.
     changeset_tailer: LedgerTailer,
-    /// Tailer for `work_pr_associated` events.
+    /// Tailer for `work.pr_associated` events.
     work_pr_tailer: LedgerTailer,
     /// Tailer for `review_receipt_recorded` events.
     review_tailer: LedgerTailer,
@@ -2346,7 +2543,7 @@ impl ProjectionWorker {
         Ok(())
     }
 
-    /// Processes `WorkPrAssociated` events to link `work_id` -> PR metadata.
+    /// Processes `work.pr_associated` events to link `work_id` -> PR metadata.
     ///
     /// This is critical for projection: without PR metadata, we cannot post
     /// status checks or comments. (Blocker fix: Missing `WorkPrAssociated`
@@ -2364,7 +2561,7 @@ impl ProjectionWorker {
     async fn process_work_pr_associated(&mut self) -> Result<(), ProjectionWorkerError> {
         let events = self
             .work_pr_tailer
-            .poll_events_async("work_pr_associated", self.config.batch_size)
+            .poll_events_async("work.pr_associated", self.config.batch_size)
             .await?;
 
         for event in events {
@@ -2403,94 +2600,73 @@ impl ProjectionWorker {
         &self,
         event: &SignedLedgerEvent,
     ) -> Result<(), ProjectionWorkerError> {
-        // Parse payload to extract PR metadata
-        let payload: serde_json::Value = serde_json::from_slice(&event.payload)
-            .map_err(|e| ProjectionWorkerError::InvalidPayload(e.to_string()))?;
+        // Parse canonical work.pr_associated envelope and fallback to inner
+        // protobuf decode when top-level projection fields are absent.
+        let (work_id, pr_number, commit_sha) =
+            parse_work_pr_associated_payload(&event.payload, &event.work_id)?;
 
-        let work_id = payload
-            .get("work_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&event.work_id);
+        validate_string_length("work_id", &work_id)?;
+        validate_string_length("commit_sha", &commit_sha)?;
 
-        // Validate string lengths (Blocker fix: Unbounded Input Consumption)
-        validate_string_length("work_id", work_id)?;
-
-        let pr_number = payload
-            .get("pr_number")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| {
-                ProjectionWorkerError::InvalidPayload("missing pr_number".to_string())
+        // Legacy payloads may include changeset_digest; keep support for
+        // status projection join when present.
+        let payload_json: serde_json::Value =
+            serde_json::from_slice(&event.payload).map_err(|e| {
+                ProjectionWorkerError::InvalidPayload(format!(
+                    "failed to parse work.pr_associated envelope: {e}"
+                ))
             })?;
-
-        let repo_owner = payload
-            .get("repo_owner")
+        let changeset_digest_opt: Option<[u8; 32]> = match payload_json
+            .get("changeset_digest")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ProjectionWorkerError::InvalidPayload("missing repo_owner".to_string())
-            })?;
+        {
+            Some(changeset_digest_hex) => {
+                validate_string_length("changeset_digest", changeset_digest_hex)?;
+                let digest_bytes = hex::decode(changeset_digest_hex).map_err(|e| {
+                    ProjectionWorkerError::InvalidPayload(format!(
+                        "changeset_digest is not valid hex: {e}"
+                    ))
+                })?;
+                let digest: [u8; 32] = digest_bytes.as_slice().try_into().map_err(|_| {
+                    ProjectionWorkerError::InvalidPayload(
+                        "changeset_digest must decode to 32 bytes".to_string(),
+                    )
+                })?;
+                Some(digest)
+            },
+            None => None,
+        };
 
-        // Validate string lengths (Blocker fix: Unbounded Input Consumption)
-        validate_string_length("repo_owner", repo_owner)?;
+        // Repo identity is authoritative from WorkSpec (work.opened ->
+        // spec_snapshot_hash -> CAS WorkSpecV1.repo), not from this event.
+        let Some(cas) = self.authoritative_cas.as_ref() else {
+            return Err(ProjectionWorkerError::InvalidPayload(
+                "authoritative CAS is required to resolve WorkSpec repo for work.pr_associated"
+                    .to_string(),
+            ));
+        };
 
-        let repo_name = payload
-            .get("repo_name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ProjectionWorkerError::InvalidPayload("missing repo_name".to_string())
-            })?;
-
-        // Validate string lengths (Blocker fix: Unbounded Input Consumption)
-        validate_string_length("repo_name", repo_name)?;
-
-        let head_sha = payload
-            .get("head_sha")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ProjectionWorkerError::InvalidPayload("missing head_sha".to_string()))?;
-
-        // Validate string lengths (Blocker fix: Unbounded Input Consumption)
-        validate_string_length("head_sha", head_sha)?;
-
-        // Extract and validate changeset_digest if present
-        let changeset_digest_opt: Option<[u8; 32]> =
-            match payload.get("changeset_digest").and_then(|v| v.as_str()) {
-                Some(changeset_digest_hex) => {
-                    // Validate string length (Blocker fix: Unbounded Input Consumption)
-                    validate_string_length("changeset_digest", changeset_digest_hex)?;
-
-                    hex::decode(changeset_digest_hex)
-                        .ok()
-                        .and_then(|digest_bytes| {
-                            if digest_bytes.len() == 32 {
-                                let mut changeset_digest = [0u8; 32];
-                                changeset_digest.copy_from_slice(&digest_bytes);
-                                Some(changeset_digest)
-                            } else {
-                                None
-                            }
-                        })
-                },
-                None => None,
-            };
-
-        // Major fix: Thread blocking in async context
-        // Wrap SQLite operations in spawn_blocking to avoid blocking the Tokio runtime
         let conn = self.work_index.connection();
-        let work_id_owned = work_id.to_string();
-        let repo_owner_owned = repo_owner.to_string();
-        let repo_name_owned = repo_name.to_string();
-        let head_sha_owned = head_sha.to_string();
+        let cas = Arc::clone(cas);
+        let work_id_owned = work_id.clone();
+        let commit_sha_owned = commit_sha.clone();
 
         tokio::task::spawn_blocking(move || {
             let conn_guard = conn.lock().map_err(|e| {
                 ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
             })?;
 
+            let (repo_owner, repo_name) =
+                resolve_repo_identity_for_work(&conn_guard, cas.as_ref(), &work_id_owned)?;
+
+            validate_string_length("repo_owner", &repo_owner)?;
+            validate_string_length("repo_name", &repo_name)?;
+
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
 
-            // Register PR metadata
             #[allow(clippy::cast_possible_wrap)]
             conn_guard
                 .execute(
@@ -2500,15 +2676,14 @@ impl ProjectionWorker {
                     params![
                         &work_id_owned,
                         pr_number as i64,
-                        &repo_owner_owned,
-                        &repo_name_owned,
-                        &head_sha_owned,
+                        &repo_owner,
+                        &repo_name,
+                        &commit_sha_owned,
                         now as i64
                     ],
                 )
                 .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
-            // Also register commit SHA for status projection if changeset_digest is present
             if let Some(changeset_digest) = changeset_digest_opt {
                 #[allow(clippy::cast_possible_wrap)]
                 conn_guard
@@ -2516,7 +2691,7 @@ impl ProjectionWorker {
                         "INSERT OR REPLACE INTO changeset_sha_index
                          (changeset_digest, commit_sha, created_at)
                          VALUES (?1, ?2, ?3)",
-                        params![changeset_digest.as_slice(), &head_sha_owned, now as i64],
+                        params![changeset_digest.as_slice(), &commit_sha_owned, now as i64],
                     )
                     .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
             }
@@ -4612,6 +4787,172 @@ mod tests {
         assert_eq!(metadata.repo_owner, "owner");
         assert_eq!(metadata.repo_name, "repo");
         assert_eq!(metadata.head_sha, "abc123");
+    }
+
+    #[test]
+    fn test_work_index_lookup_work_id_by_repo_pr_key() {
+        let conn = create_test_db();
+        let index = WorkIndex::new(conn).unwrap();
+
+        index
+            .register_pr("work-lookup-001", 321, "octo", "repo-one", "sha321")
+            .unwrap();
+
+        assert_eq!(
+            index.get_work_id_for_pr("octo", "repo-one", 321),
+            Some("work-lookup-001".to_string())
+        );
+        assert!(index.get_work_id_for_pr("octo", "repo-one", 999).is_none());
+    }
+
+    #[test]
+    fn test_work_index_same_pr_number_across_repos_maps_to_distinct_work_ids() {
+        let conn = create_test_db();
+        let index = WorkIndex::new(conn).unwrap();
+
+        index
+            .register_pr("work-repo-a", 77, "owner-a", "repo-a", "sha-a")
+            .unwrap();
+        index
+            .register_pr("work-repo-b", 77, "owner-b", "repo-b", "sha-b")
+            .unwrap();
+
+        assert_eq!(
+            index.get_work_id_for_pr("owner-a", "repo-a", 77),
+            Some("work-repo-a".to_string())
+        );
+        assert_eq!(
+            index.get_work_id_for_pr("owner-b", "repo-b", 77),
+            Some("work-repo-b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_work_pr_associated_projection_joins_repo_identity_from_work_spec() {
+        use apm2_core::fac::work_cas_schemas::{
+            WORK_SPEC_V1_SCHEMA, WorkSpecRepo, WorkSpecType, WorkSpecV1, canonicalize_for_cas,
+        };
+
+        let conn = create_test_db();
+        let mut worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker should initialize");
+        let cas = Arc::new(MemoryCas::default());
+        worker.set_authoritative_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+
+        let register_work_opened = |work_id: &str, owner: &str, repo: &str| {
+            let spec = WorkSpecV1 {
+                schema: WORK_SPEC_V1_SCHEMA.to_string(),
+                work_id: work_id.to_string(),
+                ticket_alias: None,
+                title: format!("Work {work_id}"),
+                summary: None,
+                work_type: WorkSpecType::Ticket,
+                repo: Some(WorkSpecRepo {
+                    owner: owner.to_string(),
+                    name: repo.to_string(),
+                    default_branch: Some("main".to_string()),
+                }),
+                requirement_ids: Vec::new(),
+                labels: Vec::new(),
+                rfc_id: None,
+                parent_work_ids: Vec::new(),
+                created_at_ns: None,
+            };
+            let spec_json = serde_json::to_string(&spec).expect("work spec serializes");
+            let canonical = canonicalize_for_cas(&spec_json).expect("work spec canonicalizes");
+            let stored = cas
+                .store(canonical.as_bytes())
+                .expect("work spec stores in CAS");
+
+            let opened_payload = apm2_core::work::helpers::work_opened_payload(
+                work_id,
+                "TICKET",
+                stored.hash.to_vec(),
+                Vec::new(),
+                Vec::new(),
+            );
+            let envelope = serde_json::json!({
+                "event_type": "work.opened",
+                "session_id": work_id,
+                "actor_id": "actor-test",
+                "payload": hex::encode(opened_payload),
+            });
+            let envelope_bytes = serde_json::to_vec(&envelope).expect("envelope serializes");
+
+            let conn_guard = conn.lock().expect("lock");
+            conn_guard
+                .execute(
+                    "INSERT INTO ledger_events \
+                     (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        format!("evt-opened-{work_id}"),
+                        "work.opened",
+                        work_id,
+                        "actor-test",
+                        envelope_bytes,
+                        vec![0u8; 64],
+                        1_000_i64
+                    ],
+                )
+                .expect("work.opened insert");
+        };
+
+        register_work_opened("W-JOIN-A", "owner-a", "repo-a");
+        register_work_opened("W-JOIN-B", "owner-b", "repo-b");
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let mk_event = |work_id: &str, commit_sha: &str| {
+                let payload =
+                    apm2_core::work::helpers::work_pr_associated_payload(work_id, 77, commit_sha);
+                let envelope = serde_json::json!({
+                    "event_type": "work.pr_associated",
+                    "session_id": work_id,
+                    "actor_id": "actor-test",
+                    "payload": hex::encode(payload),
+                    "pr_number": 77_u64,
+                    "commit_sha": commit_sha,
+                });
+                SignedLedgerEvent {
+                    event_id: format!("evt-pr-{work_id}"),
+                    event_type: "work.pr_associated".to_string(),
+                    work_id: work_id.to_string(),
+                    actor_id: "actor-test".to_string(),
+                    payload: serde_json::to_vec(&envelope).expect("envelope serializes"),
+                    signature: Vec::new(),
+                    timestamp_ns: 2_000,
+                }
+            };
+
+            worker
+                .handle_work_pr_associated(&mk_event(
+                    "W-JOIN-A",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ))
+                .await
+                .expect("first work.pr_associated should project");
+            worker
+                .handle_work_pr_associated(&mk_event(
+                    "W-JOIN-B",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                ))
+                .await
+                .expect("second work.pr_associated should project");
+        });
+
+        assert_eq!(
+            worker
+                .work_index()
+                .get_work_id_for_pr("owner-a", "repo-a", 77),
+            Some("W-JOIN-A".to_string())
+        );
+        assert_eq!(
+            worker
+                .work_index()
+                .get_work_id_for_pr("owner-b", "repo-b", 77),
+            Some("W-JOIN-B".to_string())
+        );
     }
 
     #[test]

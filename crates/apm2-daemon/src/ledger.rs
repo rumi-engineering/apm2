@@ -741,6 +741,72 @@ impl SqliteLedgerEventEmitter {
             [],
         )?;
 
+        // TCK-00639 SECURITY FIX: At-most-one `work.pr_associated` per
+        // semantic identity tuple `(work_id, pr_number, commit_sha)` on the
+        // legacy `ledger_events` table.
+        //
+        // The handler now emits top-level `pr_number` and `commit_sha` fields
+        // in the JSON envelope so SQLite can enforce uniqueness without
+        // decoding nested protobuf bytes.
+        let legacy_work_pr_dedup = conn.execute(
+            "DELETE FROM ledger_events WHERE rowid NOT IN ( \
+                 SELECT MIN(rowid) FROM ledger_events \
+                 WHERE event_type = 'work.pr_associated' \
+                 AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
+                 AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL \
+                 GROUP BY work_id, \
+                          json_extract(CAST(payload AS TEXT), '$.pr_number'), \
+                          json_extract(CAST(payload AS TEXT), '$.commit_sha') \
+             ) AND event_type = 'work.pr_associated' \
+             AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
+             AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL",
+            [],
+        )?;
+        if legacy_work_pr_dedup > 0 {
+            warn!(
+                count = legacy_work_pr_dedup,
+                "deduped historical work.pr_associated rows in legacy ledger_events table"
+            );
+            migration_changes_applied = true;
+        }
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_pr_associated_unique \
+             ON ledger_events( \
+                work_id, \
+                json_extract(CAST(payload AS TEXT), '$.pr_number'), \
+                json_extract(CAST(payload AS TEXT), '$.commit_sha') \
+             ) \
+             WHERE event_type = 'work.pr_associated' \
+             AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
+             AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL",
+            [],
+        )?;
+
+        // TCK-00639 CODE QUALITY FIX: enforce single canonical
+        // `work.pr_associated` event per work_id to prevent PR flapping races
+        // where concurrent conflicting tuples could both commit.
+        let legacy_work_pr_singleton_dedup = conn.execute(
+            "DELETE FROM ledger_events WHERE rowid NOT IN ( \
+                 SELECT MIN(rowid) FROM ledger_events \
+                 WHERE event_type = 'work.pr_associated' \
+                 GROUP BY work_id \
+             ) AND event_type = 'work.pr_associated'",
+            [],
+        )?;
+        if legacy_work_pr_singleton_dedup > 0 {
+            warn!(
+                count = legacy_work_pr_singleton_dedup,
+                "deduped historical conflicting work.pr_associated rows by work_id in legacy ledger_events"
+            );
+            migration_changes_applied = true;
+        }
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_pr_associated_singleton_unique \
+             ON ledger_events(work_id) \
+             WHERE event_type = 'work.pr_associated'",
+            [],
+        )?;
+
         // SECURITY (f-781-security-1771692992655093-0 — Canonical Events
         // Uniqueness Constraint):
         //
@@ -830,6 +896,65 @@ impl SqliteLedgerEventEmitter {
                  ON events(session_id, json_extract(CAST(payload AS TEXT), \
                  '$.previous_transition_count')) \
                  WHERE event_type = 'work_transitioned'",
+                [],
+            )?;
+
+            // TCK-00639 SECURITY FIX: At-most-one `work.pr_associated` per
+            // semantic identity tuple `(work_id, pr_number, commit_sha)` on
+            // canonical `events` (where `session_id` maps to `work_id`).
+            let canonical_work_pr_dedup = conn.execute(
+                "DELETE FROM events WHERE rowid NOT IN ( \
+                     SELECT MIN(rowid) FROM events \
+                     WHERE event_type = 'work.pr_associated' \
+                     AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
+                     AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL \
+                     GROUP BY session_id, \
+                              json_extract(CAST(payload AS TEXT), '$.pr_number'), \
+                              json_extract(CAST(payload AS TEXT), '$.commit_sha') \
+                 ) AND event_type = 'work.pr_associated' \
+                 AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
+                 AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL",
+                [],
+            )?;
+            if canonical_work_pr_dedup > 0 {
+                warn!(
+                    count = canonical_work_pr_dedup,
+                    "deduped historical work.pr_associated rows in canonical events table"
+                );
+                migration_changes_applied = true;
+            }
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_work_pr_associated_unique \
+                 ON events( \
+                    session_id, \
+                    json_extract(CAST(payload AS TEXT), '$.pr_number'), \
+                    json_extract(CAST(payload AS TEXT), '$.commit_sha') \
+                 ) \
+                 WHERE event_type = 'work.pr_associated' \
+                 AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
+                 AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL",
+                [],
+            )?;
+
+            let canonical_work_pr_singleton_dedup = conn.execute(
+                "DELETE FROM events WHERE rowid NOT IN ( \
+                     SELECT MIN(rowid) FROM events \
+                     WHERE event_type = 'work.pr_associated' \
+                     GROUP BY session_id \
+                 ) AND event_type = 'work.pr_associated'",
+                [],
+            )?;
+            if canonical_work_pr_singleton_dedup > 0 {
+                warn!(
+                    count = canonical_work_pr_singleton_dedup,
+                    "deduped historical conflicting work.pr_associated rows by work_id in canonical events"
+                );
+                migration_changes_applied = true;
+            }
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_work_pr_associated_singleton_unique \
+                 ON events(session_id) \
+                 WHERE event_type = 'work.pr_associated'",
                 [],
             )?;
         }
@@ -2459,6 +2584,68 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             event_type = %event_type,
             actor_id = %actor_id,
             "Persisted SessionEvent"
+        );
+
+        Ok(signed_event)
+    }
+
+    fn emit_session_event_with_envelope(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        payload_envelope: &serde_json::Value,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        // Domain prefix for generic session events (TCK-00290)
+        const SESSION_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_event:";
+
+        let mut payload_json = payload_envelope.clone();
+        let Some(payload_object) = payload_json.as_object_mut() else {
+            return Err(LedgerEventError::ValidationFailed {
+                message: "session event envelope must be a JSON object".to_string(),
+            });
+        };
+
+        // Enforce daemon-authoritative identity fields.
+        payload_object.insert("event_type".to_string(), serde_json::json!(event_type));
+        payload_object.insert("session_id".to_string(), serde_json::json!(session_id));
+        payload_object.insert("actor_id".to_string(), serde_json::json!(actor_id));
+
+        if payload_object
+            .get("payload")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            return Err(LedgerEventError::ValidationFailed {
+                message: "session event envelope missing required 'payload' field".to_string(),
+            });
+        }
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LedgerEventError::PersistenceFailed {
+                message: "connection lock poisoned".to_string(),
+            })?;
+        let prev_hash = self.latest_event_hash_routed(&conn)?;
+        let (signed_event, event_hash) = self.build_signed_event_with_prev_hash(
+            event_type,
+            session_id, // session_id maps to work_id in canonical tables
+            actor_id,
+            payload_json,
+            timestamp_ns,
+            SESSION_EVENT_DOMAIN_PREFIX,
+            &prev_hash,
+        )?;
+        self.persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
+
+        info!(
+            event_id = %signed_event.event_id,
+            session_id = %session_id,
+            event_type = %event_type,
+            actor_id = %actor_id,
+            "Persisted SessionEvent with caller-provided envelope"
         );
 
         Ok(signed_event)
@@ -8619,6 +8806,157 @@ mod tests {
         assert_eq!(
             work_opened_count, 1,
             "Exactly one work.opened must exist in canonical events for W-race-frozen-001"
+        );
+    }
+
+    /// TCK-00639 SECURITY FIX: Verify canonical UNIQUE constraint
+    /// `idx_canonical_work_pr_associated_unique` enforces at-most-one
+    /// `work.pr_associated` per `(work_id, pr_number, commit_sha)` under
+    /// concurrent writers.
+    #[test]
+    fn tck_00639_frozen_concurrent_work_pr_associated_unique_constraint() {
+        use std::sync::Arc;
+
+        use apm2_core::ledger::{init_canonical_schema, migrate_legacy_ledger_events};
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+
+        conn.execute(
+            "CREATE TABLE ledger_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                work_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                signature BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, \
+             payload, signature, timestamp_ns) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "evt-seed-pr-1",
+                "test.event",
+                "work-seed",
+                "actor-1",
+                b"{\"n\":1}",
+                b"sig",
+                1_000_000_000_u64,
+            ],
+        )
+        .unwrap();
+
+        init_canonical_schema(&conn).unwrap();
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 1);
+
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
+
+        let has_idx: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_canonical_work_pr_associated_unique'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            has_idx,
+            "idx_canonical_work_pr_associated_unique must exist on canonical events table"
+        );
+
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let conn_arc = Arc::new(Mutex::new(conn));
+        let emitter = Arc::new(SqliteLedgerEventEmitter::new(
+            Arc::clone(&conn_arc),
+            signing_key,
+        ));
+
+        let conn_guard = conn_arc.lock().unwrap();
+        emitter.freeze_legacy_writes(&conn_guard).unwrap();
+        drop(conn_guard);
+        assert!(
+            emitter.is_frozen(),
+            "emitter must be frozen for canonical writes"
+        );
+
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        let work_id = "W-race-frozen-pr-001";
+        let pr_number = 4242_u64;
+        let commit_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let payload =
+            apm2_core::work::helpers::work_pr_associated_payload(work_id, pr_number, commit_sha);
+        let payload_hex = hex::encode(payload);
+
+        for i in 0..4_u64 {
+            let e = Arc::clone(&emitter);
+            let bar = Arc::clone(&barrier);
+            let payload_hex = payload_hex.clone();
+            handles.push(std::thread::spawn(move || {
+                bar.wait();
+                let envelope = serde_json::json!({
+                    "event_type": "work.pr_associated",
+                    "session_id": work_id,
+                    "actor_id": format!("actor-{i}"),
+                    "payload": payload_hex,
+                    "pr_number": pr_number,
+                    "commit_sha": commit_sha,
+                });
+                e.emit_session_event_with_envelope(
+                    work_id,
+                    "work.pr_associated",
+                    &envelope,
+                    &format!("actor-{i}"),
+                    2_000_000_000 + i,
+                )
+            }));
+        }
+
+        let mut success_count = 0_u32;
+        let mut unique_violation_count = 0_u32;
+        for handle in handles {
+            match handle.join().expect("thread panicked") {
+                Ok(_) => success_count += 1,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("UNIQUE constraint"),
+                        "non-success emit must be UNIQUE constraint violation, got: {msg}"
+                    );
+                    unique_violation_count += 1;
+                },
+            }
+        }
+
+        assert_eq!(
+            success_count, 1,
+            "Exactly one thread must persist work.pr_associated (got {success_count})"
+        );
+        assert_eq!(
+            unique_violation_count, 3,
+            "Remaining threads must fail with UNIQUE constraint (got {unique_violation_count})"
+        );
+
+        let conn_guard = conn_arc.lock().unwrap();
+        let pr_number_i64 = i64::try_from(pr_number).expect("pr_number must fit in i64");
+        let work_pr_count: i64 = conn_guard
+            .query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE event_type = 'work.pr_associated' AND session_id = ?1 \
+                 AND json_extract(CAST(payload AS TEXT), '$.pr_number') = ?2 \
+                 AND json_extract(CAST(payload AS TEXT), '$.commit_sha') = ?3",
+                rusqlite::params![work_id, pr_number_i64, commit_sha],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            work_pr_count, 1,
+            "Exactly one canonical work.pr_associated row must exist"
         );
     }
 
