@@ -549,17 +549,31 @@ fn wait_for_worker_signal(
     watcher_mode: &QueueWatcherMode,
     safety_nudge_secs: u64,
 ) -> WorkerWakeSignal {
+    let bounded_backoff_secs = safety_nudge_secs.max(1);
+    let bounded_backoff = Duration::from_secs(bounded_backoff_secs);
+
+    let disconnected_backoff = || {
+        // Prevent tight-loop CPU spin if the wake channel disconnects while
+        // runtime remains active. We degrade to bounded safety cadence.
+        std::thread::sleep(bounded_backoff);
+        WorkerWakeSignal::WatcherUnavailable {
+            reason: format!(
+                "worker wake channel disconnected; applying bounded \
+                 {bounded_backoff_secs}s safety backoff"
+            ),
+        }
+    };
+
     if watcher_mode.is_degraded() {
-        match wake_rx.recv_timeout(Duration::from_secs(safety_nudge_secs.max(1))) {
+        match wake_rx.recv_timeout(bounded_backoff) {
             Ok(signal) => signal,
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
-                WorkerWakeSignal::Wake(WorkerWakeReason::SafetyNudge)
-            },
+            Err(RecvTimeoutError::Timeout) => WorkerWakeSignal::Wake(WorkerWakeReason::SafetyNudge),
+            Err(RecvTimeoutError::Disconnected) => disconnected_backoff(),
         }
     } else {
         wake_rx
             .recv()
-            .unwrap_or(WorkerWakeSignal::Wake(WorkerWakeReason::SafetyNudge))
+            .unwrap_or_else(|_| disconnected_backoff())
     }
 }
 
@@ -13716,16 +13730,62 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel::<WorkerWakeSignal>(1);
         drop(tx);
 
-        let signal = wait_for_worker_signal(
-            &rx,
-            &QueueWatcherMode::Degraded {
-                reason: "watch unavailable".to_string(),
-            },
-            30,
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<WorkerWakeSignal>();
+        let worker = std::thread::spawn(move || {
+            let signal = wait_for_worker_signal(
+                &rx,
+                &QueueWatcherMode::Degraded {
+                    reason: "watch unavailable".to_string(),
+                },
+                1,
+            );
+            let _ = done_tx.send(signal);
+        });
+
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "degraded disconnected channel must not return immediately (busy-loop guard)"
         );
+
+        let signal = done_rx
+            .recv_timeout(std::time::Duration::from_millis(1500))
+            .expect("signal should arrive after bounded backoff");
+        worker.join().expect("worker thread join");
+
         assert!(matches!(
             signal,
-            WorkerWakeSignal::Wake(WorkerWakeReason::SafetyNudge)
+            WorkerWakeSignal::WatcherUnavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn wait_for_worker_signal_disconnected_channel_applies_backoff_in_active_mode() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WorkerWakeSignal>(1);
+        drop(tx);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<WorkerWakeSignal>();
+        let worker = std::thread::spawn(move || {
+            let signal = wait_for_worker_signal(&rx, &QueueWatcherMode::Active, 1);
+            let _ = done_tx.send(signal);
+        });
+
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "active disconnected channel must not return immediately (busy-loop guard)"
+        );
+
+        let signal = done_rx
+            .recv_timeout(std::time::Duration::from_millis(1500))
+            .expect("signal should arrive after bounded backoff");
+        worker.join().expect("worker thread join");
+
+        assert!(matches!(
+            signal,
+            WorkerWakeSignal::WatcherUnavailable { .. }
         ));
     }
 
