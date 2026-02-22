@@ -81,7 +81,7 @@ decision_tree:
         - id: FETCH_REVIEW_FINDINGS
           action: |
             If a PR already exists for this branch, fetch current review findings:
-            `apm2 fac review findings --pr <PR_NUMBER> --json`
+            `apm2 fac review findings --pr <PR_NUMBER>`
             This shows all BLOCKER, MAJOR, MINOR, and NIT findings from prior review rounds.
             Use these findings as your fix list — each one is a concrete issue to address.
             Orchestrator handoffs may include a doctor summary string such as
@@ -252,7 +252,7 @@ decision_tree:
             Fix failures, COMMIT, and re-run `apm2 fac push` until PASS or BLOCKED.
         - id: HANDLE_BUILD_FAILURES
           action: |
-            If push fails due to build errors, check evidence logs (`apm2 fac --json logs`) for detailed output.
+            If push fails due to build errors, check evidence logs (`apm2 fac logs`) for detailed output.
         - id: ESCALATE_IF_BLOCKED
           action: |
             If gate execution cannot be restored to a passing state, mark the task BLOCKED with concrete evidence and escalate.

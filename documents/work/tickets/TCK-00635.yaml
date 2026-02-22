@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00635
     title: 'RFC-0032 Phase 1: implement OpenWork RPC (WorkSpec -> CAS + `work.opened`) and CLI `apm2 work open --from-ticket`'
-    status: OPEN
+    status: MERGED
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032

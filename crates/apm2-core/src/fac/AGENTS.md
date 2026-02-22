@@ -1846,14 +1846,17 @@ previous digest retained in `admitted_policy_root.prev.v1.json` for rollback.
 
 ### CLI Commands (fac_policy.rs)
 
-- `apm2 fac policy show [--json]`: Display the currently admitted policy root.
-- `apm2 fac policy validate [<path|->] [--json]`: Validate a policy file (schema +
+FAC CLI surfaces are machine-readable by default (JSON/NDJSON); command usage
+must not depend on a `--json` flag.
+
+- `apm2 fac policy show`: Display the currently admitted policy root.
+- `apm2 fac policy validate [<path|->]`: Validate a policy file (schema +
   hash computation) and check admission status. Accepts a file path or `-` for
   stdin. When no argument is given, reads from stdin (bounded, CTR-1603).
-- `apm2 fac policy adopt [<path|->] [--reason <reason>] [--json]`: Adopt a new
+- `apm2 fac policy adopt [<path|->] [--reason <reason>]`: Adopt a new
   policy (atomic, with receipt). Accepts a file path or `-` for stdin. When no
   argument is given, reads from stdin (bounded, CTR-1603).
-- `apm2 fac policy rollback [--reason <reason>] [--json]`: Rollback to the
+- `apm2 fac policy rollback [--reason <reason>]`: Rollback to the
   previous admitted policy (with receipt).
 
 ### Actor Identity Resolution (TCK-00561, fix round 1)
@@ -1950,14 +1953,14 @@ rollback.
 
 ### CLI Commands (fac_economics.rs)
 
-- `apm2 fac economics show [--json]`: Display the currently admitted economics
+- `apm2 fac economics show`: Display the currently admitted economics
   profile root.
-- `apm2 fac economics adopt [<hash|path|->] [--reason <reason>] [--json]`: Adopt
+- `apm2 fac economics adopt [<hash|path|->] [--reason <reason>]`: Adopt
   a new economics profile (atomic, with receipt). Accepts a `b3-256:<hex>` digest
   for hash-only adoption, a file path, or `-` for stdin. When given a digest,
   validates the format and records it directly without loading a profile file.
   Auto-detects framed vs raw JSON for file/stdin input.
-- `apm2 fac economics rollback [--reason <reason>] [--json]`: Rollback to the
+- `apm2 fac economics rollback [--reason <reason>]`: Rollback to the
   previous admitted economics profile (with receipt).
 
 ### Worker Integration (fac_worker.rs)
@@ -3260,7 +3263,7 @@ following aggregates appear in `MetricsSummary`:
 
 The `credential_gate` submodule provides fail-fast credential posture
 checking and typed credential mount descriptors for FAC workflows. It ensures
-GitHub-facing commands (`fac push`, `fac review dispatch`, `fac restart`,
+GitHub-facing commands (`fac push`, `fac doctor --pr <N> --fix`,
 `fac pipeline`) fail immediately with actionable remediation messages when
 credentials are missing, while local-only commands (`fac gates`) never
 require credentials.

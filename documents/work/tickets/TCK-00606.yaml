@@ -206,7 +206,7 @@ ticket_meta:
 
           Affected files:
           - crates/apm2-cli/src/commands/fac.rs (RestartArgs, dispatch, machine_output)
-          - crates/apm2-cli/src/commands/fac_review/restart.rs
+          - crates/apm2-cli/src/commands/fac_review/repair_cycle.rs
 
       - id: S4_LANE_JSON
         title: "`fac lane status` and `fac lane reset` — add --json flag"
@@ -601,7 +601,7 @@ ticket_meta:
           - crates/apm2-cli/src/commands/fac.rs (remove --text, remove text branches)
           - crates/apm2-cli/src/commands/fac_review/gates.rs (remove human table)
           - crates/apm2-cli/src/commands/fac_review/push.rs (remove text output)
-          - crates/apm2-cli/src/commands/fac_review/restart.rs (remove text output)
+          - crates/apm2-cli/src/commands/fac_review/repair_cycle.rs (remove text output)
           - crates/apm2-cli/src/commands/fac_review/mod.rs (remove text branches in doctor, wait, status, etc.)
           - All other fac_review/*.rs and fac_*.rs files with text-mode branches
 
@@ -756,7 +756,7 @@ ticket_meta:
           - crates/apm2-cli/src/commands/fac_review/verdict_projection.rs (remove println! error lists)
           - crates/apm2-cli/src/commands/fac_review/gates.rs (normalize error path)
           - crates/apm2-cli/src/commands/fac_review/push.rs (normalize error path)
-          - crates/apm2-cli/src/commands/fac_review/restart.rs (normalize error path)
+          - crates/apm2-cli/src/commands/fac_review/repair_cycle.rs (normalize error path)
           - crates/apm2-cli/src/commands/fac_review/mod.rs (normalize error paths)
           - crates/apm2-cli/src/commands/fac_gc.rs (normalize error path)
           - crates/apm2-cli/src/commands/fac_broker.rs (normalize error path)

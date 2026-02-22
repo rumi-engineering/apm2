@@ -712,7 +712,6 @@ mod tests {
             allow_private_key_file_fallback: false,
             keep_private_key_file: false,
             for_systemd: true,
-            json: false,
         };
 
         let exit = super::run_pr_auth_setup(&args, true);
@@ -801,7 +800,6 @@ mod tests {
             allow_private_key_file_fallback: false,
             keep_private_key_file: false, // Would delete without the fix.
             for_systemd: true,
-            json: false,
         };
 
         let exit = super::run_pr_auth_setup(&args, true);
@@ -913,7 +911,6 @@ mod tests {
             allow_private_key_file_fallback: false,
             keep_private_key_file: false,
             for_systemd: true,
-            json: false,
         };
 
         let exit = super::run_pr_auth_setup(&args, true);
@@ -1004,7 +1001,6 @@ mod tests {
             allow_private_key_file_fallback: false,
             keep_private_key_file: false,
             for_systemd: true,
-            json: false,
         };
 
         let exit = super::run_pr_auth_setup(&args, true);

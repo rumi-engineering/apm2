@@ -25,7 +25,9 @@ TimeoutStartSec=600
 RuntimeMaxSec=1800
 KillMode=control-group
 # Adjust this path to match your deployment layout if different.
-ExecStart=/usr/local/bin/apm2 fac worker --poll-interval-secs 10
+# Worker activation is event-driven; degraded safety nudges use an internal
+# bounded interval.
+ExecStart=/usr/local/bin/apm2 fac worker
 Restart=always
 RestartSec=5
 WatchdogSec=300

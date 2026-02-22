@@ -32,11 +32,7 @@ pub enum QuarantineSubcommand {
 
 /// Arguments for `apm2 fac quarantine list`.
 #[derive(Debug, Args)]
-pub struct QuarantineListArgs {
-    /// Output machine-readable JSON.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
+pub struct QuarantineListArgs {}
 
 /// Arguments for `apm2 fac quarantine prune`.
 #[derive(Debug, Args)]
@@ -47,9 +43,6 @@ pub struct QuarantinePruneArgs {
     /// Apply deletions.
     #[arg(long, default_value_t = false)]
     pub apply: bool,
-    /// Output machine-readable JSON.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Entry metadata for queue inspection.
@@ -65,12 +58,8 @@ struct QueueEntry {
 /// Run `apm2 fac quarantine` commands.
 pub fn run_quarantine(args: &QuarantineArgs, parent_json_output: bool) -> u8 {
     match &args.subcommand {
-        QuarantineSubcommand::List(args) => {
-            run_quarantine_list(args, parent_json_output || args.json)
-        },
-        QuarantineSubcommand::Prune(args) => {
-            run_quarantine_prune(args, parent_json_output || args.json)
-        },
+        QuarantineSubcommand::List(args) => run_quarantine_list(args, parent_json_output),
+        QuarantineSubcommand::Prune(args) => run_quarantine_prune(args, parent_json_output),
     }
 }
 

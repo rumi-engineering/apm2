@@ -1,7 +1,17 @@
 # FAC Daemon and Worker Systemd Services
 
-This runbook covers managed operation of the FAC broker (`apm2-daemon`) and FAC
-worker (`apm2 fac worker`) via systemd units.
+This runbook covers managed operation of the FAC daemon (`apm2-daemon`) and FAC
+worker (`apm2-worker.service`) via systemd units.
+
+`apm2 fac worker` is an internal runtime entrypoint used by systemd
+(`ExecStart`), not the primary operator surface.
+Steady-state activation is queue-event driven; fixed poll-cadence flags are not
+an operator tuning surface.
+
+Remediation scope is doctor-first and explicit:
+
+- Host/runtime scope: `apm2 fac doctor --fix`
+- PR-scoped FAC lifecycle scope: `apm2 fac doctor --pr <N> --fix`
 
 ## Prerequisites
 
@@ -146,7 +156,6 @@ processes are restarted automatically.
 
 ```bash
 apm2 fac services status
-apm2 fac services status --json
 ```
 
 The status output includes per-service fields:
@@ -155,14 +164,14 @@ The status output includes per-service fields:
 |---------------|------------------------------------------------------------|
 | `health`      | `healthy`, `degraded`, or `unhealthy` (deterministic)      |
 | `watchdog_sec`| Configured watchdog timeout in seconds (0 if disabled)     |
-| `pid`         | Main PID of the service (0 if not running)                 |
-| `uptime_sec`  | Seconds since the service started                          |
+| `main_pid`    | Main PID of the service (0 if not running)                 |
+| `uptime_seconds` | Seconds since the service started                       |
 
 Overall fields:
 
 | Field              | Description                                           |
 |--------------------|-------------------------------------------------------|
-| `overall_health`   | Worst-case health across all services                 |
+| `overall_health`   | Overall health (`healthy` or `degraded`)              |
 | `worker_heartbeat` | Worker heartbeat file status (see below)              |
 
 Health classification logic:
@@ -173,7 +182,7 @@ Health classification logic:
 
 ### 5.3 Worker heartbeat file
 
-The worker writes a JSON heartbeat file at each poll cycle:
+The worker writes a JSON heartbeat file on each wake/reconcile cycle:
 
 ```text
 ~/.apm2/private/fac/worker_heartbeat.json
@@ -182,10 +191,10 @@ The worker writes a JSON heartbeat file at each poll cycle:
 Contents include:
 
 - `pid` — process ID of the worker
-- `timestamp_unix` — Unix epoch timestamp of the last poll cycle
-- `cycle_count` — monotonically increasing poll cycle counter
+- `timestamp_unix` — Unix epoch timestamp of the last wake/reconcile cycle
+- `cycle_count` — monotonically increasing wake cycle counter
 - `jobs_completed`, `jobs_denied`, `jobs_quarantined` — cumulative job stats
-- `health_status` — self-reported status string (`ok`, etc.)
+- `health_status` — self-reported status (`healthy` or `degraded`)
 
 `apm2 fac services status` reads this file and reports:
 
@@ -204,7 +213,7 @@ worker process is alive but not making progress (stuck in a job or I/O wait).
 apm2 fac services status
 
 # JSON for automated monitoring
-apm2 fac services status --json | jq '.overall_health'
+apm2 fac services status | jq '.overall_health'
 
 # Check if watchdog is active
 systemctl --user show apm2-daemon.service -p WatchdogUSec
@@ -272,10 +281,15 @@ systemctl --user restart apm2-daemon.service
 - **`worker repeatedly restarts`**
   - Check queue/runtime permissions under `~/.apm2/private/fac/**`.
   - Check whether credentials are present and readable by the service.
-  - Run worker in foreground for diagnostics:
+  - Run host remediation first: `apm2 fac doctor --fix`.
+  - If restart symptoms are isolated to one PR lifecycle/reviewer context, run:
+    `apm2 fac doctor --pr <N> --fix`.
+  - Run the worker entrypoint in foreground only for diagnostics (not as an
+    operator control surface; normal remediation remains `apm2 fac doctor --fix`
+    or `apm2 fac doctor --pr <N> --fix`):
 
     ```bash
-    APM2_HOME=~/.apm2 apm2 fac worker --poll-interval 10
+    APM2_HOME=~/.apm2 apm2 fac worker
     ```
 
 ## 9. Failure mode diagnosis (TCK-00600)
@@ -293,7 +307,7 @@ systemctl --user restart apm2-daemon.service
    ```bash
    cat ~/.apm2/private/fac/worker_heartbeat.json
    ```
-   A stale `timestamp_unix` confirms the poll loop was stuck.
+   A stale `timestamp_unix` confirms wake/reconcile progress was stuck.
 4. Check daemon logs around the watchdog timeout timestamp for the last
    successful health evaluation cycle.
 
@@ -325,9 +339,9 @@ ls -la /run/user/"$(id -u)"/apm2/
 `worker_heartbeat.fresh=false`.
 
 **Diagnosis**: The worker process is alive (responding to systemd watchdog) but
-the poll loop is not completing cycles. Possible causes:
+the wake/reconcile loop is not completing cycles. Possible causes:
 
-- A long-running job is blocking the synchronous poll loop.
+- A long-running job is blocking the synchronous wake/reconcile loop.
 - Disk I/O is slow, causing heartbeat writes to fail silently.
 - The heartbeat write path is on a different filesystem that became read-only.
 
@@ -345,5 +359,5 @@ journalctl --user -u apm2-worker.service -n 100
 **Diagnosis**: A previous worker instance wrote the heartbeat and then crashed.
 The new instance has a different PID but has not yet overwritten the heartbeat.
 
-**Resolution**: Wait for the next poll cycle. The new worker will overwrite the
-heartbeat file with its own PID on the first cycle.
+**Resolution**: Wait for the next wake/safety-nudge cycle. The new worker will
+overwrite the heartbeat file with its own PID on the first cycle.

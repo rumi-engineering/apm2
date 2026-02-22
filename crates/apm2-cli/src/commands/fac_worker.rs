@@ -2,10 +2,12 @@
 //! FAC Worker: queue consumer with RFC-0028 authorization + RFC-0029 admission
 //! gating.
 //!
-//! Implements the `apm2 fac worker` subcommand that scans
-//! `$APM2_HOME/queue/pending/` for job specs, validates them against
-//! RFC-0028 channel context tokens and RFC-0029 queue admission, then
-//! atomically claims and executes valid jobs.
+//! Implements the `apm2 fac worker` runtime entrypoint. The worker is
+//! wake-driven on queue filesystem signals (`pending` + `claimed`) and uses a
+//! bounded degraded safety nudge interval when watcher delivery is unavailable.
+//!
+//! Claimed-queue runtime reconcile is claimed-only and lane-safe; startup and
+//! doctor remain the broad remediation paths.
 //!
 //! # Processing Pipeline
 //!
@@ -65,6 +67,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
 use apm2_core::channel::{
@@ -102,21 +105,24 @@ use apm2_core::fac::{
     FacJobReceiptV1Builder, FacPolicyV1, FacUnitLiveness, GateReceipt, GateReceiptBuilder,
     LANE_CORRUPT_MARKER_SCHEMA, LaneCleanupOutcome, LaneCleanupReceiptV1, LaneCorruptMarkerV1,
     LaneProfileV1, LogRetentionConfig, MAX_POLICY_SIZE, ORPHANED_SYSTEMD_UNIT_REASON_CODE,
-    PATCH_FORMAT_GIT_DIFF_V1, QueueAdmissionTrace as JobQueueAdmissionTrace, ReceiptPipelineError,
-    ReceiptWritePipeline, RepoMirrorManager, SystemModeConfig, SystemdUnitProperties,
-    TOOLCHAIN_MAX_CACHE_FILE_BYTES, apply_credential_mount_to_env, build_github_credential_mount,
-    build_job_environment, check_fac_unit_liveness, compute_policy_hash, deserialize_policy,
-    fingerprint_short_hex, load_or_default_boundary_id, move_job_to_terminal,
-    outcome_to_terminal_state, parse_policy_hash, persist_content_addressed_receipt,
-    persist_policy, probe_user_bus, rename_noreplace, resolve_toolchain_fingerprint_cached,
-    run_preflight, select_and_validate_backend, serialize_cache, toolchain_cache_dir,
-    toolchain_cache_file_path,
+    OrphanedJobPolicy, PATCH_FORMAT_GIT_DIFF_V1, QueueAdmissionTrace as JobQueueAdmissionTrace,
+    QueueReconcileLimits, ReceiptPipelineError, ReceiptWritePipeline, RepoMirrorManager,
+    RuntimeQueueReconcileConfig, RuntimeQueueReconcileStatus, SystemModeConfig,
+    SystemdUnitProperties, TOOLCHAIN_MAX_CACHE_FILE_BYTES, apply_credential_mount_to_env,
+    build_github_credential_mount, build_job_environment, check_fac_unit_liveness,
+    compute_policy_hash, deserialize_policy, fingerprint_short_hex, load_or_default_boundary_id,
+    move_job_to_terminal, outcome_to_terminal_state, parse_policy_hash,
+    persist_content_addressed_receipt, persist_policy, probe_user_bus, reconcile_claimed_runtime,
+    rename_noreplace, resolve_toolchain_fingerprint_cached, run_preflight,
+    select_and_validate_backend, serialize_cache, toolchain_cache_dir, toolchain_cache_file_path,
 };
 use apm2_core::github::{parse_github_remote_url, resolve_apm2_home};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use chrono::{SecondsFormat, Utc};
 use fs2::FileExt;
+#[cfg(target_os = "linux")]
+use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
@@ -141,10 +147,18 @@ mod fac_review_api {
         pub failure_summary: Option<String>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RunGatesLocalWorkerInvocation {
+        pub lease_job_id: Option<String>,
+        pub lease_toolchain_fingerprint: Option<String>,
+    }
+
     thread_local! {
         static RUN_GATES_LOCAL_WORKER_OVERRIDE: RefCell<Option<Result<LocalGatesRunResult, String>>> =
             const { RefCell::new(None) };
         static GATE_LIFECYCLE_OVERRIDE: RefCell<Option<Result<usize, String>>> =
+            const { RefCell::new(None) };
+        static LAST_RUN_GATES_LOCAL_WORKER_INVOCATION: RefCell<Option<RunGatesLocalWorkerInvocation>> =
             const { RefCell::new(None) };
     }
 
@@ -162,6 +176,10 @@ mod fac_review_api {
         });
     }
 
+    pub fn take_last_run_gates_local_worker_invocation() -> Option<RunGatesLocalWorkerInvocation> {
+        LAST_RUN_GATES_LOCAL_WORKER_INVOCATION.with(|slot| slot.borrow_mut().take())
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::unnecessary_wraps)]
     pub fn run_gates_local_worker(
@@ -174,7 +192,16 @@ mod fac_review_api {
         _gate_profile: GateThroughputProfile,
         _workspace_root: &std::path::Path,
         _bounded_unit_base: Option<&str>,
+        lease_job_id: Option<&str>,
+        lease_toolchain_fingerprint: Option<&str>,
     ) -> Result<LocalGatesRunResult, String> {
+        LAST_RUN_GATES_LOCAL_WORKER_INVOCATION.with(|slot| {
+            *slot.borrow_mut() = Some(RunGatesLocalWorkerInvocation {
+                lease_job_id: lease_job_id.map(std::string::ToString::to_string),
+                lease_toolchain_fingerprint: lease_toolchain_fingerprint
+                    .map(std::string::ToString::to_string),
+            });
+        });
         if let Some(override_result) =
             RUN_GATES_LOCAL_WORKER_OVERRIDE.with(|slot| slot.borrow().clone())
         {
@@ -278,8 +305,12 @@ const CANCELLED_DIR: &str = "cancelled";
 const BROKER_REQUESTS_DIR: &str = "broker_requests";
 const CONSUME_RECEIPTS_DIR: &str = "authority_consumed";
 
-/// Maximum poll interval to prevent misconfiguration (1 hour).
-const MAX_POLL_INTERVAL_SECS: u64 = 3600;
+/// Fixed degraded-mode safety nudge interval (seconds).
+///
+/// This is intentionally not a user-facing CLI knob: steady-state queue pickup
+/// is event-driven and this interval is only used as a bounded fallback when
+/// watcher delivery is degraded.
+const DEGRADED_SAFETY_NUDGE_SECS: u64 = 60;
 
 /// Max number of boundary defect classes retained in a trace.
 const MAX_BOUNDARY_DEFECT_CLASSES: usize = 32;
@@ -333,10 +364,404 @@ const MAX_QUEUED_GATES_UNIT_BASE_LEN: usize = 200;
 const ORPHAN_LEASE_WARNING_MULTIPLIER: u64 = 2;
 const MAX_COMPLETED_SCAN_ENTRIES: usize = 4096;
 const MAX_TERMINAL_JOB_METADATA_FILE_SIZE: usize = MAX_JOB_SPEC_SIZE * 4;
+const WORKER_WAKE_SIGNAL_BUFFER: usize = 256;
+const RUNTIME_REPAIR_STATE_SCHEMA: &str = "apm2.fac.runtime_reconcile_machine.v1";
 
 #[cfg(test)]
 pub fn env_var_test_lock() -> &'static crate::commands::EnvVarTestLock {
     crate::commands::env_var_test_lock()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeRepairState {
+    Idle,
+    RepairRequested,
+    AwaitingScanLock,
+    Reconciling,
+    Reconciled,
+    Blocked,
+    Failed,
+}
+
+const fn runtime_repair_state_label(state: RuntimeRepairState) -> &'static str {
+    match state {
+        RuntimeRepairState::Idle => "idle",
+        RuntimeRepairState::RepairRequested => "repair_requested",
+        RuntimeRepairState::AwaitingScanLock => "awaiting_scan_lock",
+        RuntimeRepairState::Reconciling => "reconciling",
+        RuntimeRepairState::Reconciled => "reconciled",
+        RuntimeRepairState::Blocked => "blocked",
+        RuntimeRepairState::Failed => "failed",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerWakeReason {
+    Startup,
+    PendingQueueChanged,
+    ClaimedQueueChanged,
+    RepairRequested,
+    SafetyNudge,
+    WatcherDegraded,
+}
+
+#[derive(Debug, Clone)]
+enum WorkerWakeSignal {
+    Wake(WorkerWakeReason),
+    WatcherUnavailable { reason: String },
+    WatcherOverflow { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueueWatcherMode {
+    Active,
+    Degraded { reason: String },
+}
+
+impl QueueWatcherMode {
+    const fn is_degraded(&self) -> bool {
+        matches!(self, Self::Degraded { .. })
+    }
+
+    fn transition_to_degraded(&mut self, reason: String) -> bool {
+        if self.is_degraded() {
+            return false;
+        }
+        *self = Self::Degraded { reason };
+        true
+    }
+
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Active => None,
+            Self::Degraded { reason } => Some(reason.as_str()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RuntimeRepairCoordinator {
+    state: RuntimeRepairState,
+    repair_requested: bool,
+    in_progress: bool,
+    config: RuntimeQueueReconcileConfig,
+}
+
+impl RuntimeRepairCoordinator {
+    const fn new(config: RuntimeQueueReconcileConfig) -> Self {
+        Self {
+            state: RuntimeRepairState::Idle,
+            repair_requested: false,
+            in_progress: false,
+            config,
+        }
+    }
+
+    const fn transition_to(&mut self, next: RuntimeRepairState) {
+        self.state = next;
+    }
+
+    fn request(
+        &mut self,
+        wake_tx: &SyncSender<WorkerWakeSignal>,
+        json_output: bool,
+        trigger: &str,
+    ) {
+        let was_requested = self.repair_requested;
+        self.repair_requested = true;
+        if !self.in_progress {
+            self.transition_to(RuntimeRepairState::RepairRequested);
+        }
+        if json_output {
+            emit_worker_event(
+                "runtime_repair_requested",
+                serde_json::json!({
+                    "schema": RUNTIME_REPAIR_STATE_SCHEMA,
+                    "trigger": trigger,
+                    "coalesced": was_requested,
+                    "state": runtime_repair_state_label(self.state),
+                }),
+            );
+        }
+        if !was_requested {
+            try_send_worker_signal(
+                wake_tx,
+                WorkerWakeSignal::Wake(WorkerWakeReason::RepairRequested),
+            );
+        }
+    }
+
+    const fn mark_scan_lock_awaiting(&mut self) {
+        if self.repair_requested && !self.in_progress {
+            self.transition_to(RuntimeRepairState::AwaitingScanLock);
+        }
+    }
+
+    fn attempt(
+        &mut self,
+        fac_root: &Path,
+        queue_root: &Path,
+        scan_lock_held: bool,
+    ) -> Option<apm2_core::fac::RuntimeQueueReconcileOutcome> {
+        if !self.repair_requested {
+            return None;
+        }
+        if !scan_lock_held {
+            self.mark_scan_lock_awaiting();
+            return None;
+        }
+        if self.in_progress {
+            return None;
+        }
+
+        self.in_progress = true;
+        self.transition_to(RuntimeRepairState::Reconciling);
+        let outcome = reconcile_claimed_runtime(fac_root, queue_root, self.config);
+        self.in_progress = false;
+        self.repair_requested = !matches!(
+            outcome.status,
+            RuntimeQueueReconcileStatus::Applied
+                | RuntimeQueueReconcileStatus::Skipped
+                | RuntimeQueueReconcileStatus::Blocked
+        );
+
+        match outcome.status {
+            RuntimeQueueReconcileStatus::Applied | RuntimeQueueReconcileStatus::Skipped => {
+                self.transition_to(RuntimeRepairState::Reconciled);
+            },
+            RuntimeQueueReconcileStatus::Blocked => {
+                self.transition_to(RuntimeRepairState::Blocked);
+            },
+            RuntimeQueueReconcileStatus::Failed => {
+                self.transition_to(RuntimeRepairState::Failed);
+            },
+        }
+
+        Some(outcome)
+    }
+
+    const fn settle_idle(&mut self) {
+        if matches!(
+            self.state,
+            RuntimeRepairState::Reconciled
+                | RuntimeRepairState::Blocked
+                | RuntimeRepairState::Failed
+        ) && !self.repair_requested
+        {
+            self.transition_to(RuntimeRepairState::Idle);
+        }
+    }
+}
+
+fn try_send_worker_signal(wake_tx: &SyncSender<WorkerWakeSignal>, signal: WorkerWakeSignal) {
+    match wake_tx.try_send(signal) {
+        Ok(()) | Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {},
+    }
+}
+
+fn send_critical_worker_signal(wake_tx: &SyncSender<WorkerWakeSignal>, signal: WorkerWakeSignal) {
+    match wake_tx.try_send(signal) {
+        Ok(()) | Err(TrySendError::Disconnected(_)) => {},
+        Err(TrySendError::Full(signal)) => {
+            let wake_tx = wake_tx.clone();
+            let _ = std::thread::Builder::new()
+                .name("apm2-worker-critical-wake".to_string())
+                .spawn(move || {
+                    let _ = wake_tx.send(signal);
+                });
+        },
+    }
+}
+
+fn wait_for_worker_signal(
+    wake_rx: &Receiver<WorkerWakeSignal>,
+    watcher_mode: &QueueWatcherMode,
+    safety_nudge_secs: u64,
+) -> WorkerWakeSignal {
+    let bounded_backoff_secs = safety_nudge_secs.max(1);
+    let bounded_backoff = Duration::from_secs(bounded_backoff_secs);
+
+    let disconnected_backoff = || {
+        // Prevent tight-loop CPU spin if the wake channel disconnects while
+        // runtime remains active. We degrade to bounded safety cadence.
+        std::thread::sleep(bounded_backoff);
+        WorkerWakeSignal::WatcherUnavailable {
+            reason: format!(
+                "worker wake channel disconnected; applying bounded \
+                 {bounded_backoff_secs}s safety backoff"
+            ),
+        }
+    };
+
+    if watcher_mode.is_degraded() {
+        match wake_rx.recv_timeout(bounded_backoff) {
+            Ok(signal) => signal,
+            Err(RecvTimeoutError::Timeout) => WorkerWakeSignal::Wake(WorkerWakeReason::SafetyNudge),
+            Err(RecvTimeoutError::Disconnected) => disconnected_backoff(),
+        }
+    } else {
+        wake_rx.recv().unwrap_or_else(|_| disconnected_backoff())
+    }
+}
+
+fn request_runtime_repair_for_wake(
+    repair_coordinator: &mut RuntimeRepairCoordinator,
+    wake_tx: &SyncSender<WorkerWakeSignal>,
+    watcher_mode: &QueueWatcherMode,
+    wake_reason: WorkerWakeReason,
+    json_output: bool,
+) {
+    match wake_reason {
+        WorkerWakeReason::ClaimedQueueChanged => {
+            repair_coordinator.request(wake_tx, json_output, "queue_claimed_fs_changed");
+        },
+        WorkerWakeReason::WatcherDegraded if watcher_mode.is_degraded() => {
+            repair_coordinator.request(wake_tx, json_output, "queue_watcher_degraded");
+        },
+        WorkerWakeReason::SafetyNudge if watcher_mode.is_degraded() => {
+            repair_coordinator.request(wake_tx, json_output, "degraded_safety_nudge");
+        },
+        _ => {},
+    }
+}
+
+fn emit_watcher_degraded_diagnostic(json_output: bool, reason: &str, safety_nudge_secs: u64) {
+    if json_output {
+        emit_worker_event(
+            "queue_watcher_degraded",
+            serde_json::json!({
+                "reason": reason,
+                "safety_nudge_secs": safety_nudge_secs,
+            }),
+        );
+    } else {
+        eprintln!(
+            "worker: queue watcher degraded ({reason}); entering bounded safety-nudge mode \
+             (interval={safety_nudge_secs}s). remediation: run `apm2 fac doctor --fix` if stuck claimed persists"
+        );
+    }
+}
+
+fn emit_runtime_reconcile_outcome(
+    json_output: bool,
+    outcome: &apm2_core::fac::RuntimeQueueReconcileOutcome,
+) {
+    let status = match outcome.status {
+        RuntimeQueueReconcileStatus::Applied => "applied",
+        RuntimeQueueReconcileStatus::Skipped => "skipped",
+        RuntimeQueueReconcileStatus::Blocked => "blocked",
+        RuntimeQueueReconcileStatus::Failed => "failed",
+    };
+    if json_output {
+        emit_worker_event(
+            "runtime_claimed_reconcile",
+            serde_json::json!({
+                "schema": outcome.schema,
+                "status": status,
+                "lanes_inspected": outcome.lanes_inspected,
+                "claimed_files_inspected": outcome.claimed_files_inspected,
+                "orphaned_jobs_requeued": outcome.orphaned_jobs_requeued,
+                "orphaned_jobs_failed": outcome.orphaned_jobs_failed,
+                "torn_states_recovered": outcome.torn_states_recovered,
+                "still_active": outcome.still_active,
+                "reason": outcome.reason,
+                "doctor_remediation": matches!(outcome.status, RuntimeQueueReconcileStatus::Blocked | RuntimeQueueReconcileStatus::Failed),
+            }),
+        );
+    } else if matches!(
+        outcome.status,
+        RuntimeQueueReconcileStatus::Blocked | RuntimeQueueReconcileStatus::Failed
+    ) {
+        let detail = outcome.reason.as_deref().unwrap_or("unknown");
+        eprintln!(
+            "worker: runtime claimed reconcile {status}: {detail}. remediation: `apm2 fac doctor --fix`"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_queue_watch_thread(
+    queue_root: &Path,
+    wake_tx: SyncSender<WorkerWakeSignal>,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    let pending_dir = queue_root.join(PENDING_DIR);
+    let claimed_dir = queue_root.join(CLAIMED_DIR);
+    let watch_mask = AddWatchFlags::IN_CREATE
+        | AddWatchFlags::IN_CLOSE_WRITE
+        | AddWatchFlags::IN_DELETE
+        | AddWatchFlags::IN_MOVED_FROM
+        | AddWatchFlags::IN_MOVED_TO;
+
+    let inotify = Inotify::init(InitFlags::IN_CLOEXEC)
+        .map_err(|error| format!("inotify init failed: {error}"))?;
+    let pending_watch = inotify
+        .add_watch(&pending_dir, watch_mask)
+        .map_err(|error| format!("inotify add watch pending failed: {error}"))?;
+    let claimed_watch = inotify
+        .add_watch(&claimed_dir, watch_mask)
+        .map_err(|error| format!("inotify add watch claimed failed: {error}"))?;
+
+    Ok(std::thread::spawn(move || {
+        let inotify = inotify;
+
+        loop {
+            let events = match inotify.read_events() {
+                Ok(events) => events,
+                Err(error) => {
+                    send_critical_worker_signal(
+                        &wake_tx,
+                        WorkerWakeSignal::WatcherUnavailable {
+                            reason: format!("inotify read failed: {error}"),
+                        },
+                    );
+                    break;
+                },
+            };
+
+            let mut pending_changed = false;
+            let mut claimed_changed = false;
+            for event in events {
+                if event.mask.contains(AddWatchFlags::IN_Q_OVERFLOW) {
+                    send_critical_worker_signal(
+                        &wake_tx,
+                        WorkerWakeSignal::WatcherOverflow {
+                            reason: "inotify queue overflow (events may be lost)".to_string(),
+                        },
+                    );
+                    return;
+                }
+                if event.wd == pending_watch {
+                    pending_changed = true;
+                } else if event.wd == claimed_watch {
+                    claimed_changed = true;
+                }
+            }
+
+            if pending_changed {
+                try_send_worker_signal(
+                    &wake_tx,
+                    WorkerWakeSignal::Wake(WorkerWakeReason::PendingQueueChanged),
+                );
+            }
+            if claimed_changed {
+                try_send_worker_signal(
+                    &wake_tx,
+                    WorkerWakeSignal::Wake(WorkerWakeReason::ClaimedQueueChanged),
+                );
+            }
+        }
+    }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_queue_watch_thread(
+    _queue_root: &Path,
+    _wake_tx: SyncSender<WorkerWakeSignal>,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    Err(
+        "queue watcher unavailable on this platform; runtime falls back to safety nudge mode"
+            .to_string(),
+    )
 }
 
 // =============================================================================
@@ -363,7 +788,40 @@ enum JobOutcome {
     /// future use by execution substrate error paths.
     Aborted { reason: String },
     /// Job was skipped (already claimed or missing).
-    Skipped { reason: String },
+    Skipped {
+        reason: String,
+        disposition: JobSkipDisposition,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobSkipDisposition {
+    Generic,
+    NoLaneAvailable,
+    PipelineCommitFailed,
+}
+
+impl JobOutcome {
+    fn skipped(reason: impl Into<String>) -> Self {
+        Self::Skipped {
+            reason: reason.into(),
+            disposition: JobSkipDisposition::Generic,
+        }
+    }
+
+    fn skipped_no_lane(reason: impl Into<String>) -> Self {
+        Self::Skipped {
+            reason: reason.into(),
+            disposition: JobSkipDisposition::NoLaneAvailable,
+        }
+    }
+
+    fn skipped_pipeline_commit(reason: impl Into<String>) -> Self {
+        Self::Skipped {
+            reason: reason.into(),
+            disposition: JobSkipDisposition::PipelineCommitFailed,
+        }
+    }
 }
 
 /// Summary output for JSON mode.
@@ -437,26 +895,20 @@ struct GatesJobOptions {
 /// # Arguments
 ///
 /// * `once` - If true, process at most one job and exit.
-/// * `poll_interval_secs` - Seconds between queue scans in continuous mode.
 /// * `max_jobs` - Maximum total jobs to process before exiting (0 = unlimited).
 /// * `json_output` - If true, emit JSON output.
 /// * `print_unit` - If true, print systemd unit directives/properties for each
 ///   job.
-pub fn run_fac_worker(
-    once: bool,
-    poll_interval_secs: u64,
-    max_jobs: u64,
-    json_output: bool,
-    print_unit: bool,
-) -> u8 {
-    let poll_interval_secs = poll_interval_secs.min(MAX_POLL_INTERVAL_SECS);
+pub fn run_fac_worker(once: bool, max_jobs: u64, json_output: bool, print_unit: bool) -> u8 {
+    let safety_nudge_secs = DEGRADED_SAFETY_NUDGE_SECS;
     if json_output {
         emit_worker_event(
             "worker_started",
             serde_json::json!({
                 "once": once,
-                "poll_interval_secs": poll_interval_secs,
+                "safety_nudge_secs": safety_nudge_secs,
                 "max_jobs": max_jobs,
+                "queue_activation_mode": "event_driven_with_degraded_safety_nudge",
             }),
         );
     }
@@ -937,7 +1389,8 @@ pub fn run_fac_worker(
     // poller task). The thread is marked as a daemon thread and will
     // exit when the main worker thread exits.
     let _ = apm2_core::fac::sd_notify::notify_ready();
-    let _ = apm2_core::fac::sd_notify::notify_status("worker ready, polling queue");
+    let _ =
+        apm2_core::fac::sd_notify::notify_status("worker ready, waiting for queue wake signals");
 
     // Spawn a background thread for watchdog pings, independent of job
     // processing. This follows the same pattern as the daemon's poller
@@ -970,9 +1423,64 @@ pub fn run_fac_worker(
         }
     };
 
+    let (wake_tx, wake_rx) = mpsc::sync_channel::<WorkerWakeSignal>(WORKER_WAKE_SIGNAL_BUFFER);
+    let mut watcher_mode = QueueWatcherMode::Active;
+    let _queue_watcher_thread = match spawn_queue_watch_thread(&queue_root, wake_tx.clone()) {
+        Ok(handle) => Some(handle),
+        Err(reason) => {
+            watcher_mode.transition_to_degraded(reason.clone());
+            emit_watcher_degraded_diagnostic(json_output, &reason, safety_nudge_secs);
+            None
+        },
+    };
+
+    let mut repair_coordinator = RuntimeRepairCoordinator::new(RuntimeQueueReconcileConfig {
+        orphan_policy: OrphanedJobPolicy::Requeue,
+        limits: QueueReconcileLimits::default(),
+    });
+    let mut pending_wake_reason = Some(if watcher_mode.is_degraded() {
+        WorkerWakeReason::WatcherDegraded
+    } else {
+        WorkerWakeReason::Startup
+    });
+
     loop {
-        let cycle_start = Instant::now();
+        let effective_wake_reason = pending_wake_reason.take().map_or_else(
+            || match wait_for_worker_signal(&wake_rx, &watcher_mode, safety_nudge_secs) {
+                WorkerWakeSignal::Wake(reason) => reason,
+                WorkerWakeSignal::WatcherUnavailable { reason }
+                | WorkerWakeSignal::WatcherOverflow { reason } => {
+                    if watcher_mode.transition_to_degraded(reason.clone()) {
+                        emit_watcher_degraded_diagnostic(json_output, &reason, safety_nudge_secs);
+                    }
+                    WorkerWakeReason::WatcherDegraded
+                },
+            },
+            std::convert::identity,
+        );
+        request_runtime_repair_for_wake(
+            &mut repair_coordinator,
+            &wake_tx,
+            &watcher_mode,
+            effective_wake_reason,
+            json_output,
+        );
+
         cycle_count = cycle_count.saturating_add(1);
+        if matches!(effective_wake_reason, WorkerWakeReason::SafetyNudge) && json_output {
+            emit_worker_event(
+                "worker_safety_nudge",
+                serde_json::json!({
+                    "reason": watcher_mode.reason(),
+                    "safety_nudge_secs": safety_nudge_secs,
+                }),
+            );
+        }
+        let heartbeat_status = if watcher_mode.is_degraded() {
+            "degraded"
+        } else {
+            "healthy"
+        };
 
         // TCK-00600: Write worker heartbeat file for `services status`.
         if let Err(e) = apm2_core::fac::worker_heartbeat::write_heartbeat(
@@ -981,7 +1489,7 @@ pub fn run_fac_worker(
             summary.jobs_completed as u64,
             summary.jobs_denied as u64,
             summary.jobs_quarantined as u64,
-            "healthy",
+            heartbeat_status,
         ) {
             // Non-fatal: heartbeat is observability, not correctness.
             if !json_output {
@@ -989,7 +1497,7 @@ pub fn run_fac_worker(
             }
         }
 
-        // S10: Proactively reap orphaned LEASED lanes each poll tick.
+        // S10: Proactively reap orphaned LEASED lanes on each wake cycle.
         reap_orphaned_leases_on_tick(&fac_root, json_output);
 
         // TCK-00586: Multi-worker fairness — try scan lock before scanning.
@@ -1033,13 +1541,14 @@ pub fn run_fac_worker(
 
                 // Skip scan this cycle; sleep with jitter to avoid thundering
                 // herd retries.
+                repair_coordinator.mark_scan_lock_awaiting();
                 if once {
                     // In --once mode we cannot skip; fall through to scan
                     // regardless (correctness via atomic rename).
                     None
                 } else {
                     let jitter =
-                        apm2_core::fac::scan_lock::scan_lock_jitter_duration(poll_interval_secs);
+                        apm2_core::fac::scan_lock::scan_lock_jitter_duration(safety_nudge_secs);
                     std::thread::sleep(jitter);
                     continue;
                 }
@@ -1060,6 +1569,13 @@ pub fn run_fac_worker(
         // queue_bounds_policy is threaded through to ensure broker
         // promotion enforces the same configured limits as enqueue_direct.
         promote_broker_requests(&queue_root, &policy.queue_bounds_policy);
+
+        if let Some(runtime_outcome) =
+            repair_coordinator.attempt(&fac_root, &queue_root, scan_lock_guard.is_some())
+        {
+            emit_runtime_reconcile_outcome(json_output, &runtime_outcome);
+            repair_coordinator.settle_idle();
+        }
 
         // Scan pending directory (quarantines malformed files inline).
         let candidates = match scan_pending(
@@ -1082,7 +1598,8 @@ pub fn run_fac_worker(
                     }
                     return exit_codes::GENERIC_ERROR;
                 }
-                sleep_remaining(cycle_start, poll_interval_secs);
+                std::thread::sleep(Duration::from_secs(safety_nudge_secs.max(1)));
+                pending_wake_reason = Some(WorkerWakeReason::SafetyNudge);
                 continue;
             },
         };
@@ -1117,7 +1634,6 @@ pub fn run_fac_worker(
                 }
                 return exit_codes::SUCCESS;
             }
-            sleep_remaining(cycle_start, poll_interval_secs);
             continue;
         }
 
@@ -1260,8 +1776,14 @@ pub fn run_fac_worker(
                         eprintln!("worker: completed {job_id}");
                     }
                 },
-                JobOutcome::Skipped { reason } => {
+                JobOutcome::Skipped {
+                    reason,
+                    disposition,
+                } => {
                     summary.jobs_skipped += 1;
+                    if *disposition == JobSkipDisposition::PipelineCommitFailed {
+                        repair_coordinator.request(&wake_tx, json_output, "commit_pipeline_failed");
+                    }
                     if json_output {
                         emit_worker_event(
                             "job_skipped",
@@ -1285,7 +1807,10 @@ pub fn run_fac_worker(
 
             if matches!(
                 &outcome,
-                JobOutcome::Skipped { reason } if reason.contains("no lane available")
+                JobOutcome::Skipped {
+                    disposition: JobSkipDisposition::NoLaneAvailable,
+                    ..
+                }
             ) {
                 break;
             }
@@ -1333,8 +1858,6 @@ pub fn run_fac_worker(
         if once {
             break;
         }
-
-        sleep_remaining(cycle_start, poll_interval_secs);
     }
 
     // Signal the background watchdog thread to stop.
@@ -1724,6 +2247,61 @@ fn acquire_enqueue_lock(queue_root: &Path) -> Result<fs::File, String> {
         .map_err(|err| format!("cannot acquire enqueue lock {}: {err}", lock_path.display()))?;
 
     Ok(lock_file)
+}
+
+/// Atomically claim a pending queue entry and hold an exclusive flock on the
+/// claimed inode for the caller's full processing lifetime.
+///
+/// Synchronization model:
+/// - Open+lock the pending inode first.
+/// - Atomically rename `pending/<file>` -> `claimed/<file>`.
+/// - Keep the returned file descriptor alive until processing/commit finishes.
+///
+/// This ensures runtime reconcile's non-blocking flock probe never treats an
+/// actively executing claimed job as orphaned.
+fn claim_pending_job_with_exclusive_lock(
+    pending_path: &Path,
+    claimed_dir: &Path,
+    file_name: &str,
+) -> Result<(PathBuf, fs::File), String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+
+    let claimed_lock_file = options.open(pending_path).map_err(|err| {
+        format!(
+            "cannot open pending job for claimed lock {}: {err}",
+            pending_path.display()
+        )
+    })?;
+    let metadata = claimed_lock_file.metadata().map_err(|err| {
+        format!(
+            "cannot stat pending job for claimed lock {}: {err}",
+            pending_path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "pending job is not a regular file (fail-closed): {}",
+            pending_path.display()
+        ));
+    }
+
+    claimed_lock_file.lock_exclusive().map_err(|err| {
+        format!(
+            "cannot acquire claimed flock for pending job {}: {err}",
+            pending_path.display()
+        )
+    })?;
+
+    let claimed_path = move_to_dir_safe(pending_path, claimed_dir, file_name)
+        .map_err(|err| format!("atomic claim failed: {err}"))?;
+
+    Ok((claimed_path, claimed_lock_file))
 }
 
 /// Promote valid job specs from `queue/broker_requests/` into `queue/pending/`
@@ -2607,6 +3185,8 @@ fn run_gates_in_workspace(
     heartbeat_jobs_quarantined: u64,
     heartbeat_job_id: &str,
     bounded_unit_base: Option<&str>,
+    lease_job_id: Option<&str>,
+    lease_toolchain_fingerprint: Option<&str>,
 ) -> Result<fac_review_api::LocalGatesRunResult, String> {
     let stop_refresh = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_refresh_bg = std::sync::Arc::clone(&stop_refresh);
@@ -2645,6 +3225,8 @@ fn run_gates_in_workspace(
         options.gate_profile,
         &options.workspace_root,
         bounded_unit_base,
+        lease_job_id,
+        lease_toolchain_fingerprint,
     );
 
     stop_refresh.store(true, std::sync::atomic::Ordering::Release);
@@ -2838,6 +3420,8 @@ fn execute_queued_gates_job(
         heartbeat_jobs_quarantined,
         &spec.job_id,
         Some(bounded_unit_base.as_str()),
+        Some(spec.job_id.as_str()),
+        toolchain_fingerprint,
     ) {
         Ok(code) => code,
         Err(err) => {
@@ -2953,9 +3537,9 @@ fn execute_queued_gates_job(
                     "worker: WARNING: failed to return claimed gates job to pending: {move_err}"
                 );
             }
-            return JobOutcome::Skipped {
-                reason: format!("pipeline commit failed for gates job: {commit_err}"),
-            };
+            return JobOutcome::skipped_pipeline_commit(format!(
+                "pipeline commit failed for gates job: {commit_err}"
+            ));
         }
 
         // TCK-00540 BLOCKER fix: After the receipt is committed, rebind
@@ -3403,9 +3987,7 @@ fn process_job(
     let file_name = match path.file_name().and_then(|n| n.to_str()) {
         Some(n) => n.to_string(),
         None => {
-            return JobOutcome::Skipped {
-                reason: "invalid filename".to_string(),
-            };
+            return JobOutcome::skipped("invalid filename");
         },
     };
 
@@ -3436,13 +4018,11 @@ fn process_job(
                  skipping move (job stays in pending/ for reconciliation)",
                 spec.job_id, existing_receipt.outcome,
             );
-            return JobOutcome::Skipped {
-                reason: format!(
-                    "receipt already exists for job {} with non-terminal outcome {:?}, \
-                     skipped (no terminal directory for this outcome)",
-                    spec.job_id, existing_receipt.outcome,
-                ),
-            };
+            return JobOutcome::skipped(format!(
+                "receipt already exists for job {} with non-terminal outcome {:?}, \
+                 skipped (no terminal directory for this outcome)",
+                spec.job_id, existing_receipt.outcome,
+            ));
         };
         let terminal_dir = queue_root.join(terminal_state.dir_name());
         // BLOCKER-2 fix (round 7): Use hardened move_job_to_terminal instead
@@ -3455,22 +4035,18 @@ fn process_job(
                     "worker: duplicate job {} detected but move to terminal failed: {move_err}",
                     spec.job_id,
                 );
-                return JobOutcome::Skipped {
-                    reason: format!(
-                        "receipt already exists for job {} but move to terminal failed: {move_err}",
-                        spec.job_id,
-                    ),
-                };
+                return JobOutcome::skipped(format!(
+                    "receipt already exists for job {} but move to terminal failed: {move_err}",
+                    spec.job_id,
+                ));
             },
         };
 
         annotate_denied_job_metadata_from_receipt(&moved_terminal_path, &existing_receipt);
-        return JobOutcome::Skipped {
-            reason: format!(
-                "receipt already exists for job {} (index lookup, outcome={:?})",
-                spec.job_id, existing_receipt.outcome,
-            ),
-        };
+        return JobOutcome::skipped(format!(
+            "receipt already exists for job {} (index lookup, outcome={:?})",
+            spec.job_id, existing_receipt.outcome,
+        ));
     }
 
     // NIT-2: Compute sandbox hardening hash once at the top of process_job
@@ -3596,11 +4172,9 @@ fn process_job(
                     "worker: WARNING: pipeline commit failed for quarantined job: {commit_err}"
                 );
                 // Job stays in pending/ for reconciliation.
-                return JobOutcome::Skipped {
-                    reason: format!(
-                        "pipeline commit failed for quarantined job (digest mismatch): {commit_err}"
-                    ),
-                };
+                return JobOutcome::skipped_pipeline_commit(format!(
+                    "pipeline commit failed for quarantined job (digest mismatch): {commit_err}"
+                ));
             }
             return JobOutcome::Quarantined { reason };
         }
@@ -3643,11 +4217,9 @@ fn process_job(
         ) {
             eprintln!("worker: WARNING: pipeline commit failed for denied job: {commit_err}");
             // Job stays in pending/ for reconciliation.
-            return JobOutcome::Skipped {
-                reason: format!(
-                    "pipeline commit failed for denied job (validation failed): {commit_err}"
-                ),
-            };
+            return JobOutcome::skipped_pipeline_commit(format!(
+                "pipeline commit failed for denied job (validation failed): {commit_err}"
+            ));
         }
         return JobOutcome::Denied { reason };
     }
@@ -3897,9 +4469,7 @@ fn process_job(
         let claimed_path = match move_to_dir_safe(path, &claimed_dir, &file_name) {
             Ok(p) => p,
             Err(e) => {
-                return JobOutcome::Skipped {
-                    reason: format!("atomic claim failed: {e}"),
-                };
+                return JobOutcome::skipped(format!("atomic claim failed: {e}"));
             },
         };
         let claimed_file_name = claimed_path
@@ -4040,11 +4610,9 @@ fn process_job(
             eprintln!(
                 "worker: WARNING: pipeline commit failed for policy-admission-denied job: {commit_err}"
             );
-            return JobOutcome::Skipped {
-                reason: format!(
-                    "pipeline commit failed for policy-admission-denied job: {commit_err}"
-                ),
-            };
+            return JobOutcome::skipped_pipeline_commit(format!(
+                "pipeline commit failed for policy-admission-denied job: {commit_err}"
+            ));
         }
         return JobOutcome::Denied { reason };
     }
@@ -4150,12 +4718,10 @@ fn process_job(
                     "worker: WARNING: pipeline commit failed for \
                      economics-admission-denied job: {commit_err}"
                 );
-                return JobOutcome::Skipped {
-                    reason: format!(
-                        "pipeline commit failed for \
-                         economics-admission-denied job: {commit_err}"
-                    ),
-                };
+                return JobOutcome::skipped_pipeline_commit(format!(
+                    "pipeline commit failed for \
+                     economics-admission-denied job: {commit_err}"
+                ));
             }
             return JobOutcome::Denied { reason };
         }
@@ -4836,17 +5402,20 @@ fn process_job(
         return JobOutcome::Denied { reason };
     }
 
-    // Step 5: Atomic claim via rename (INV-WRK-003).
+    // Step 5: Atomic claim + exclusive claimed lock.
+    //
+    // Keep this lock file alive for the entire remainder of process_job so
+    // runtime reconcile's flock probe cannot reclaim actively executing jobs.
     let claimed_dir = queue_root.join(CLAIMED_DIR);
-    let claimed_path = match move_to_dir_safe(path, &claimed_dir, &file_name) {
-        Ok(p) => p,
-        Err(e) => {
-            // If rename fails (e.g., already claimed by another worker), skip.
-            return JobOutcome::Skipped {
-                reason: format!("atomic claim failed: {e}"),
-            };
-        },
-    };
+    let (claimed_path, _claimed_lock_file) =
+        match claim_pending_job_with_exclusive_lock(path, &claimed_dir, &file_name) {
+            Ok(result) => result,
+            Err(e) => {
+                // Another worker may have claimed first, or the entry failed lock
+                // invariants; skip this candidate and continue.
+                return JobOutcome::skipped(e);
+            },
+        };
 
     let claimed_file_name = claimed_path
         .file_name()
@@ -4933,9 +5502,7 @@ fn process_job(
             ) {
                 eprintln!("worker: WARNING: failed to return claimed job to pending: {move_err}");
             }
-            return JobOutcome::Skipped {
-                reason: format!("lane manager init failed: {e}"),
-            };
+            return JobOutcome::skipped(format!("lane manager init failed: {e}"));
         },
     };
 
@@ -4952,9 +5519,7 @@ fn process_job(
         ) {
             eprintln!("worker: WARNING: failed to return claimed job to pending: {move_err}");
         }
-        return JobOutcome::Skipped {
-            reason: "no lane available, returning to pending".to_string(),
-        };
+        return JobOutcome::skipped_no_lane("no lane available, returning to pending");
     };
 
     if let Err(error) = run_preflight(
@@ -5178,9 +5743,7 @@ fn process_job(
     // `LaneLeaseV1::remove(&lane_dir)` to prevent stale lease accumulation.
     if !claimed_path.exists() {
         let _ = LaneLeaseV1::remove(&lane_dir);
-        return JobOutcome::Skipped {
-            reason: "claimed file disappeared during execution".to_string(),
-        };
+        return JobOutcome::skipped("claimed file disappeared during execution");
     }
 
     // Handle stop_revoke jobs: kill the target unit and cancel the target job.
@@ -5921,9 +6484,9 @@ fn process_job(
             let stopped = apm2_core::fac::stop_sccache_server(&sccache_server_env);
             eprintln!("worker: sccache server stop (pipeline commit failure): stopped={stopped}");
         }
-        return JobOutcome::Skipped {
-            reason: format!("pipeline commit failed: {commit_err}"),
-        };
+        return JobOutcome::skipped_pipeline_commit(format!(
+            "pipeline commit failed: {commit_err}"
+        ));
     }
 
     // Step 10: Post-completion lane cleanup.
@@ -6669,9 +7232,9 @@ fn handle_stop_revoke(
                 eprintln!(
                     "worker: pipeline commit failed for stop_revoke (target already terminal): {commit_err}"
                 );
-                return JobOutcome::Skipped {
-                    reason: format!("pipeline commit failed: {commit_err}"),
-                };
+                return JobOutcome::skipped_pipeline_commit(format!(
+                    "pipeline commit failed: {commit_err}"
+                ));
             }
             return JobOutcome::Completed {
                 job_id: spec.job_id.clone(),
@@ -7001,7 +7564,7 @@ fn handle_stop_revoke(
             spec.job_id
         );
         eprintln!("worker: {reason}");
-        return JobOutcome::Skipped { reason };
+        return JobOutcome::skipped_pipeline_commit(reason);
     }
 
     JobOutcome::Completed {
@@ -7626,9 +8189,9 @@ fn execute_warm_job(
         ) {
             eprintln!("worker: WARNING: failed to return claimed warm job to pending: {move_err}");
         }
-        return JobOutcome::Skipped {
-            reason: format!("pipeline commit failed for warm job: {commit_err}"),
-        };
+        return JobOutcome::skipped_pipeline_commit(format!(
+            "pipeline commit failed for warm job: {commit_err}"
+        ));
     }
 
     // Post-completion lane cleanup (same as standard jobs).
@@ -8796,9 +9359,9 @@ fn handle_pipeline_commit_failure(
     eprintln!("worker: pipeline commit failed for {context}: {commit_err}");
     // Job stays in claimed/ — reconcile will repair torn states or the orphan
     // policy will handle unreceipted failures.
-    JobOutcome::Skipped {
-        reason: format!("pipeline commit failed for {context}: {commit_err}"),
-    }
+    JobOutcome::skipped_pipeline_commit(format!(
+        "pipeline commit failed for {context}: {commit_err}"
+    ))
 }
 
 /// Compute observed job cost from wall-clock elapsed time.
@@ -8989,15 +9552,6 @@ fn persist_scan_lock_stuck_receipt(fac_root: &Path, receipt_json: &str) -> Resul
         .map_err(|e| format!("rename stuck receipt: {e}"))?;
 
     Ok(())
-}
-
-/// Sleeps for the remaining time in the poll interval.
-fn sleep_remaining(cycle_start: Instant, poll_interval_secs: u64) {
-    let elapsed = cycle_start.elapsed();
-    let target = Duration::from_secs(poll_interval_secs);
-    if let Some(remaining) = target.checked_sub(elapsed) {
-        std::thread::sleep(remaining);
-    }
 }
 
 /// Outputs a worker error message.
@@ -10475,6 +11029,103 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_queued_gates_job_passes_lease_binding_to_gates_worker() {
+        let _override_guard = FacReviewApiOverrideGuard::install(
+            Ok(fac_review_api::LocalGatesRunResult {
+                exit_code: exit_codes::SUCCESS,
+                failure_summary: None,
+            }),
+            Ok(1),
+        );
+        let _ = fac_review_api::take_last_run_gates_local_worker_invocation();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let queue_root = dir.path().join("queue");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        ensure_queue_dirs(&queue_root).expect("create queue dirs");
+
+        let claimed_path = queue_root
+            .join(CLAIMED_DIR)
+            .join("gates-lease-binding.json");
+        fs::write(&claimed_path, b"{}").expect("seed claimed file");
+        let claimed_file_name = "gates-lease-binding.json";
+
+        let repo_root = PathBuf::from(repo_toplevel_for_tests());
+        let current_head = resolve_workspace_head(&repo_root).expect("resolve workspace head");
+        let mut spec = make_receipt_test_spec();
+        spec.job_id = "job-gates-lease-binding".to_string();
+        spec.source.head_sha = current_head;
+        spec.source.patch = Some(serde_json::json!({
+            "schema": GATES_JOB_OPTIONS_SCHEMA,
+            "force": false,
+            "quick": false,
+            "timeout_seconds": 600,
+            "memory_max": "48G",
+            "pids_max": 1536,
+            "cpu_quota": "auto",
+            "gate_profile": "throughput",
+            "workspace_root": repo_root.to_string_lossy(),
+        }));
+
+        let boundary_trace = ChannelBoundaryTrace {
+            passed: true,
+            defect_count: 0,
+            defect_classes: Vec::new(),
+            token_fac_policy_hash: None,
+            token_canonicalizer_tuple_digest: None,
+            token_boundary_id: None,
+            token_issued_at_tick: None,
+            token_expiry_tick: None,
+        };
+        let queue_trace = JobQueueAdmissionTrace {
+            verdict: "allow".to_string(),
+            queue_lane: "consume".to_string(),
+            defect_reason: None,
+            cost_estimate_ticks: None,
+        };
+        let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
+        let hardening_hash = apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
+        let network_hash = apm2_core::fac::NetworkPolicy::deny().content_hash_hex();
+        let toolchain_fp = format!("b3-256:{}", "a".repeat(64));
+
+        let outcome = execute_queued_gates_job(
+            &spec,
+            &claimed_path,
+            claimed_file_name,
+            &queue_root,
+            &fac_root,
+            &boundary_trace,
+            &queue_trace,
+            None,
+            &tuple_digest,
+            &spec.job_spec_digest,
+            &hardening_hash,
+            &network_hash,
+            1,
+            0,
+            0,
+            0,
+            Some(toolchain_fp.as_str()),
+        );
+        assert!(
+            matches!(outcome, JobOutcome::Completed { .. }),
+            "expected queued gates completion with API override"
+        );
+
+        let invocation = fac_review_api::take_last_run_gates_local_worker_invocation()
+            .expect("queued gates call should invoke local worker");
+        assert_eq!(
+            invocation.lease_job_id.as_deref(),
+            Some(spec.job_id.as_str())
+        );
+        assert_eq!(
+            invocation.lease_toolchain_fingerprint.as_deref(),
+            Some(toolchain_fp.as_str())
+        );
+    }
+
+    #[test]
     fn test_execute_queued_gates_job_denied_reason_includes_gate_failure_summary() {
         let _override_guard = FacReviewApiOverrideGuard::install(
             Ok(fac_review_api::LocalGatesRunResult {
@@ -11701,8 +12352,14 @@ mod tests {
             "job must NOT be moved to pending/ after commit failure"
         );
         assert!(
-            matches!(outcome, JobOutcome::Skipped { .. }),
-            "outcome should be Skipped, got: {outcome:?}"
+            matches!(
+                outcome,
+                JobOutcome::Skipped {
+                    disposition: JobSkipDisposition::PipelineCommitFailed,
+                    ..
+                }
+            ),
+            "outcome should request runtime claimed repair, got: {outcome:?}"
         );
     }
 
@@ -13264,6 +13921,387 @@ mod tests {
         assert!(
             pending_dir.join("mode-0644-test.json").exists(),
             "broker request with mode 0644 must be promoted to pending/"
+        );
+    }
+
+    #[test]
+    fn wait_for_worker_signal_returns_immediately_on_pending_wake() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        tx.send(WorkerWakeSignal::Wake(
+            WorkerWakeReason::PendingQueueChanged,
+        ))
+        .expect("send wake");
+
+        let start = std::time::Instant::now();
+        let signal = wait_for_worker_signal(&rx, &QueueWatcherMode::Active, 60);
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(250),
+            "wake wait should be immediate without waiting for safety nudge interval"
+        );
+        assert!(matches!(
+            signal,
+            WorkerWakeSignal::Wake(WorkerWakeReason::PendingQueueChanged)
+        ));
+    }
+
+    #[test]
+    fn wait_for_worker_signal_uses_safety_nudge_when_degraded_and_channel_disconnected() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WorkerWakeSignal>(1);
+        drop(tx);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<WorkerWakeSignal>();
+        let worker = std::thread::spawn(move || {
+            let signal = wait_for_worker_signal(
+                &rx,
+                &QueueWatcherMode::Degraded {
+                    reason: "watch unavailable".to_string(),
+                },
+                1,
+            );
+            let _ = done_tx.send(signal);
+        });
+
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "degraded disconnected channel must not return immediately (busy-loop guard)"
+        );
+
+        let signal = done_rx
+            .recv_timeout(std::time::Duration::from_millis(1500))
+            .expect("signal should arrive after bounded backoff");
+        worker.join().expect("worker thread join");
+
+        assert!(matches!(
+            signal,
+            WorkerWakeSignal::WatcherUnavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn wait_for_worker_signal_disconnected_channel_applies_backoff_in_active_mode() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WorkerWakeSignal>(1);
+        drop(tx);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<WorkerWakeSignal>();
+        let worker = std::thread::spawn(move || {
+            let signal = wait_for_worker_signal(&rx, &QueueWatcherMode::Active, 1);
+            let _ = done_tx.send(signal);
+        });
+
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "active disconnected channel must not return immediately (busy-loop guard)"
+        );
+
+        let signal = done_rx
+            .recv_timeout(std::time::Duration::from_millis(1500))
+            .expect("signal should arrive after bounded backoff");
+        worker.join().expect("worker thread join");
+
+        assert!(matches!(
+            signal,
+            WorkerWakeSignal::WatcherUnavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn critical_worker_signal_does_not_block_when_queue_is_full_and_preserves_signal() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WorkerWakeSignal>(1);
+        tx.send(WorkerWakeSignal::Wake(
+            WorkerWakeReason::PendingQueueChanged,
+        ))
+        .expect("seed queue full");
+
+        let started = std::time::Instant::now();
+        send_critical_worker_signal(
+            &tx,
+            WorkerWakeSignal::WatcherOverflow {
+                reason: "overflow".to_string(),
+            },
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "critical signal path must not block watcher thread when channel is full"
+        );
+
+        let first = rx.recv().expect("receive seeded signal");
+        assert!(matches!(
+            first,
+            WorkerWakeSignal::Wake(WorkerWakeReason::PendingQueueChanged)
+        ));
+
+        let second = rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .expect("critical signal should still be delivered once capacity is available");
+        assert!(matches!(second, WorkerWakeSignal::WatcherOverflow { .. }));
+    }
+
+    #[test]
+    fn runtime_repair_coordinator_coalesces_duplicate_requests() {
+        let mut coordinator = RuntimeRepairCoordinator::new(RuntimeQueueReconcileConfig {
+            orphan_policy: OrphanedJobPolicy::Requeue,
+            limits: QueueReconcileLimits::default(),
+        });
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+
+        coordinator.request(&tx, false, "first");
+        coordinator.request(&tx, false, "duplicate");
+
+        assert_eq!(coordinator.state, RuntimeRepairState::RepairRequested);
+        assert!(matches!(
+            rx.recv().expect("first wake"),
+            WorkerWakeSignal::Wake(WorkerWakeReason::RepairRequested)
+        ));
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty
+                    | std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "duplicate requests must coalesce and not enqueue unbounded wake events"
+        );
+    }
+
+    #[test]
+    fn runtime_repair_requests_claimed_reconcile_in_degraded_mode() {
+        let degraded_mode = QueueWatcherMode::Degraded {
+            reason: "watch unavailable".to_string(),
+        };
+
+        let mut degraded_entry = RuntimeRepairCoordinator::new(RuntimeQueueReconcileConfig {
+            orphan_policy: OrphanedJobPolicy::Requeue,
+            limits: QueueReconcileLimits::default(),
+        });
+        let (entry_tx, entry_rx) = std::sync::mpsc::sync_channel(2);
+        request_runtime_repair_for_wake(
+            &mut degraded_entry,
+            &entry_tx,
+            &degraded_mode,
+            WorkerWakeReason::WatcherDegraded,
+            false,
+        );
+        assert!(matches!(
+            entry_rx
+                .recv()
+                .expect("watcher degraded must request repair"),
+            WorkerWakeSignal::Wake(WorkerWakeReason::RepairRequested)
+        ));
+
+        let mut degraded_nudge = RuntimeRepairCoordinator::new(RuntimeQueueReconcileConfig {
+            orphan_policy: OrphanedJobPolicy::Requeue,
+            limits: QueueReconcileLimits::default(),
+        });
+        let (nudge_tx, nudge_rx) = std::sync::mpsc::sync_channel(2);
+        request_runtime_repair_for_wake(
+            &mut degraded_nudge,
+            &nudge_tx,
+            &degraded_mode,
+            WorkerWakeReason::SafetyNudge,
+            false,
+        );
+        assert!(matches!(
+            nudge_rx
+                .recv()
+                .expect("degraded safety nudge must request repair"),
+            WorkerWakeSignal::Wake(WorkerWakeReason::RepairRequested)
+        ));
+
+        let mut active_nudge = RuntimeRepairCoordinator::new(RuntimeQueueReconcileConfig {
+            orphan_policy: OrphanedJobPolicy::Requeue,
+            limits: QueueReconcileLimits::default(),
+        });
+        let (active_tx, active_rx) = std::sync::mpsc::sync_channel(2);
+        request_runtime_repair_for_wake(
+            &mut active_nudge,
+            &active_tx,
+            &QueueWatcherMode::Active,
+            WorkerWakeReason::SafetyNudge,
+            false,
+        );
+        assert!(
+            matches!(
+                active_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty
+                    | std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "active safety nudge should not request claimed reconcile"
+        );
+    }
+
+    #[test]
+    fn runtime_repair_state_machine_transitions_blocked_then_idle() {
+        let mut coordinator = RuntimeRepairCoordinator::new(RuntimeQueueReconcileConfig {
+            orphan_policy: OrphanedJobPolicy::Requeue,
+            limits: QueueReconcileLimits {
+                max_claimed_scan_entries: 0,
+                max_queue_recovery_actions: apm2_core::fac::MAX_QUEUE_RECOVERY_ACTIONS,
+            },
+        });
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+
+        coordinator.request(&tx, false, "explicit");
+        coordinator.mark_scan_lock_awaiting();
+        assert_eq!(coordinator.state, RuntimeRepairState::AwaitingScanLock);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let queue_root = dir.path().join("queue");
+        let lanes_dir = fac_root.join("lanes");
+        let locks_dir = fac_root.join("locks").join("lanes");
+        std::fs::create_dir_all(&lanes_dir).expect("lanes dir");
+        std::fs::create_dir_all(&locks_dir).expect("locks dir");
+        std::fs::create_dir_all(queue_root.join("claimed")).expect("claimed dir");
+        std::fs::create_dir_all(queue_root.join("pending")).expect("pending dir");
+        std::fs::create_dir_all(queue_root.join("denied")).expect("denied dir");
+        let claimed_job = serde_json::json!({
+            "schema": "apm2.fac.job_spec.v1",
+            "job_id": "runtime-blocked-job",
+            "kind": "test",
+        });
+        std::fs::write(
+            queue_root.join("claimed").join("runtime-blocked-job.json"),
+            serde_json::to_vec_pretty(&claimed_job).expect("serialize claimed"),
+        )
+        .expect("write claimed job");
+
+        let outcome = coordinator
+            .attempt(&fac_root, &queue_root, true)
+            .expect("attempt should produce runtime outcome");
+        assert_eq!(outcome.status, RuntimeQueueReconcileStatus::Blocked);
+        assert_eq!(coordinator.state, RuntimeRepairState::Blocked);
+
+        coordinator.settle_idle();
+        assert_eq!(coordinator.state, RuntimeRepairState::Idle);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_repair_state_machine_retains_failed_request_until_success() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut coordinator = RuntimeRepairCoordinator::new(RuntimeQueueReconcileConfig {
+            orphan_policy: OrphanedJobPolicy::MarkFailed,
+            limits: QueueReconcileLimits::default(),
+        });
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+
+        coordinator.request(&tx, false, "explicit");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fac_root = dir.path().join("private").join("fac");
+        let queue_root = dir.path().join("queue");
+        std::fs::create_dir_all(fac_root.join("lanes")).expect("lanes dir");
+        std::fs::create_dir_all(fac_root.join("locks").join("lanes")).expect("locks dir");
+        std::fs::create_dir_all(queue_root.join("claimed")).expect("claimed dir");
+        std::fs::create_dir_all(queue_root.join("pending")).expect("pending dir");
+        std::fs::create_dir_all(queue_root.join("denied")).expect("denied dir");
+        let denied_dir = queue_root.join("denied");
+        std::fs::set_permissions(&denied_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("set denied mode");
+
+        let claimed_job = serde_json::json!({
+            "schema": "apm2.fac.job_spec.v1",
+            "job_id": "runtime-failed-job",
+            "kind": "test",
+        });
+        std::fs::write(
+            queue_root.join("claimed").join("runtime-failed-job.json"),
+            serde_json::to_vec_pretty(&claimed_job).expect("serialize claimed"),
+        )
+        .expect("write claimed job");
+
+        let failed_outcome = coordinator
+            .attempt(&fac_root, &queue_root, true)
+            .expect("attempt should produce runtime outcome");
+        assert_eq!(failed_outcome.status, RuntimeQueueReconcileStatus::Failed);
+        assert_eq!(coordinator.state, RuntimeRepairState::Failed);
+        assert!(
+            coordinator.repair_requested,
+            "failed reconcile must retain repair request for retry"
+        );
+
+        coordinator.settle_idle();
+        assert_eq!(
+            coordinator.state,
+            RuntimeRepairState::Failed,
+            "failed state should not settle to idle while repair request remains pending"
+        );
+
+        std::fs::set_permissions(&denied_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore denied mode");
+        let retry_outcome = coordinator
+            .attempt(&fac_root, &queue_root, true)
+            .expect("retry attempt should produce runtime outcome");
+        assert!(
+            matches!(
+                retry_outcome.status,
+                RuntimeQueueReconcileStatus::Applied | RuntimeQueueReconcileStatus::Skipped
+            ),
+            "retry should resolve failed latch to a non-failed terminal status, got: {:?}",
+            retry_outcome.status
+        );
+        assert!(
+            !coordinator.repair_requested,
+            "successful retry must clear repair request"
+        );
+    }
+
+    #[test]
+    fn claim_pending_job_with_exclusive_lock_holds_lock_for_job_lifecycle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let queue_root = temp.path().join("queue");
+        let pending_dir = queue_root.join(PENDING_DIR);
+        let claimed_dir = queue_root.join(CLAIMED_DIR);
+        std::fs::create_dir_all(&pending_dir).expect("create pending");
+        std::fs::create_dir_all(&claimed_dir).expect("create claimed");
+
+        let pending_path = pending_dir.join("lock-test.json");
+        std::fs::write(&pending_path, b"{\"job_id\":\"lock-test\"}").expect("write pending spec");
+
+        let (claimed_path, claimed_lock_file) =
+            claim_pending_job_with_exclusive_lock(&pending_path, &claimed_dir, "lock-test.json")
+                .expect("claim+lock pending job");
+        assert!(
+            !pending_path.exists(),
+            "pending file should move to claimed during claim"
+        );
+        assert!(claimed_path.exists(), "claimed file must exist");
+
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&claimed_path)
+            .expect("open claimed probe");
+        let lock_attempt = fs2::FileExt::try_lock_exclusive(&probe);
+        assert!(
+            lock_attempt.is_err(),
+            "second exclusive lock attempt must fail while worker lock is held"
+        );
+
+        drop(claimed_lock_file);
+
+        let probe_after_release = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&claimed_path)
+            .expect("open claimed probe after release");
+        fs2::FileExt::try_lock_exclusive(&probe_after_release)
+            .expect("exclusive lock should succeed after worker lock drops");
+    }
+
+    #[test]
+    fn queue_watcher_mode_transitions_to_degraded_once() {
+        let mut mode = QueueWatcherMode::Active;
+        assert!(mode.transition_to_degraded("overflow".to_string()));
+        assert!(mode.is_degraded());
+        assert_eq!(mode.reason(), Some("overflow"));
+        assert!(
+            !mode.transition_to_degraded("different".to_string()),
+            "degraded transition should be one-way and idempotent"
         );
     }
 }

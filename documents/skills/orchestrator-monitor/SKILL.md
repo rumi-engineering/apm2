@@ -22,13 +22,15 @@ variables:
   PR_SCOPE_OPTIONAL: "$1"
 
 notes:
-  - "Use `apm2 fac doctor --pr <N> --json` as the primary reviewer lifecycle signal (run_id, lane state, head SHA binding, terminal_reason)."
-  - "Use lane-scoped status checks for control actions: `apm2 fac doctor --pr <N> --json` for lifecycle state, `apm2 fac logs --pr <N> --json` for log discovery."
-  - "Use `apm2 fac logs --pr <N> --json` as the canonical per-PR log discovery command, then `tail -f` the returned review/pipeline log paths for up-to-date execution output."
-  - "Use `apm2 fac doctor --pr <N> --json` as the single per-PR source of findings_summary, merge_readiness, agents, and recommended_action."
+  - "FAC CLI emits JSON by default; do not require `--json` in orchestration loops."
+  - "`apm2 fac doctor --fix` (host remediation) and `apm2 fac doctor --pr <N> --fix` (PR-scoped lifecycle repair) are different control paths; orchestrator loops must use the PR-scoped form for reviewer/lifecycle recovery."
+  - "Use `apm2 fac doctor --pr <N>` as the primary reviewer lifecycle signal (run_id, lane state, head SHA binding, terminal_reason)."
+  - "Use lane-scoped status checks for control actions: `apm2 fac doctor --pr <N>` for lifecycle state, `apm2 fac logs --pr <N>` for log discovery."
+  - "Use `apm2 fac logs --pr <N>` as the canonical per-PR log discovery command, then `tail -f` the returned review/pipeline log paths for up-to-date execution output."
+  - "Use `apm2 fac doctor --pr <N>` as the single per-PR source of findings_summary, merge_readiness, agents, and recommended_action."
   - "Worktree naming/creation and branch/conflict repair are implementor-owned responsibilities; orchestrator validates outcomes via FAC gate/push telemetry."
-  - "Prefer blocking waits over polling: use `apm2 fac doctor --pr <N> --json --wait-for-recommended-action` as the primary per-PR monitoring command. It blocks until the recommended action changes or a terminal state is reached, then returns a single JSON snapshot. This is cheaper and more responsive than repeated `apm2 fac doctor --pr <N> --json` polls in a sleep loop."
-  - "Canonical control loop: `apm2 fac doctor --pr <N> --json --wait-for-recommended-action --exit-on done`, then route by `recommended_action.action`."
+  - "Prefer blocking waits over polling: use `apm2 fac doctor --pr <N> --wait-for-recommended-action` as the primary per-PR monitoring command. It blocks until the recommended action changes or a terminal state is reached, then returns a single JSON snapshot. This is cheaper and more responsive than repeated `apm2 fac doctor --pr <N>` polls in a sleep loop."
+  - "Canonical control loop: `apm2 fac doctor --pr <N> --wait-for-recommended-action --exit-on done`, then route by `recommended_action.action`."
   - "When doctor emits `recommended_action.command`, execute it verbatim instead of re-deriving command arguments."
 
 references[1]:
@@ -53,7 +55,7 @@ implementor_dispatch_defaults:
 
 decision_tree:
   entrypoint: START
-  nodes[8]:
+  nodes[9]:
     - id: START
       purpose: "Initialize scope and verify prerequisites before any side effects."
       steps[5]:
@@ -74,7 +76,7 @@ decision_tree:
             (5) `apm2 fac gc --help`
             (6) `apm2 fac warm --help`
         - id: RESOLVE_PR_SCOPE
-          action: "If explicit PR numbers were provided, use them. Otherwise run `apm2 fac doctor --json` (no --pr filter) to discover all tracked PRs from FAC review entries/recent events. This global view is for PR discovery ONLY — capacity enforcement is always per-PR."
+          action: "If explicit PR numbers were provided, use them. Otherwise run `apm2 fac doctor` (no --pr filter) to discover all tracked PRs from FAC review entries/recent events. This global view is for PR discovery ONLY — capacity enforcement is always per-PR."
         - id: ENFORCE_SCOPE_BOUND
           action: "If scoped open PR count >20, pause and request wave partitioning."
       next: HEARTBEAT_LOOP
@@ -84,16 +86,16 @@ decision_tree:
       steps[5]:
         - id: SNAPSHOT
           action: |
-            Prefer `apm2 fac doctor --pr <N> --json --wait-for-recommended-action`
+            Prefer `apm2 fac doctor --pr <N> --wait-for-recommended-action`
             over repeated polling. This blocks until the PR state changes or a
             terminal condition is reached, then returns a single JSON snapshot.
-            Only fall back to bare `apm2 fac doctor --pr <N> --json` when you
+            Only fall back to bare `apm2 fac doctor --pr <N>` when you
             need a one-shot snapshot without waiting (e.g., initial discovery or
             multi-PR fan-out where you cannot block on a single PR).
             Use fac_logs and fac_review_tail for diagnosis context.
         - id: GC_AND_DISK_HEALTH
           action: |
-            Run `apm2 fac gc --json` if any of the following hold:
+            Run `apm2 fac gc` if any of the following hold:
             (1) this is the first tick of the session,
             (2) >=10 ticks have elapsed since the last gc run,
             (3) a previous tick observed a disk-related gate failure.
@@ -102,13 +104,13 @@ decision_tree:
             background hygiene step and proceed with COLLECT_FINDINGS_FROM_FAC.
         - id: COLLECT_FINDINGS_FROM_FAC
           action: |
-            For each PR, use `apm2 fac doctor --pr <PR_NUMBER> --json` and read
+            For each PR, use `apm2 fac doctor --pr <PR_NUMBER>` and read
             `findings_summary` as the source of BLOCKER/MAJOR/MINOR/NIT counts
             and formal/computed verdict state for implementor handoff.
         - id: CLASSIFY
           action: |
             For each PR, treat `recommended_action.action` as the authoritative classification:
-            done | approve | merge | dispatch_implementor | restart_reviews | fix | escalate | wait.
+            done | approve | merge | dispatch_implementor | fix | escalate | wait.
             The legacy labels (MERGED, READY_TO_MERGE, PR_CONFLICTING, CI_FAILED, REVIEW_FAILED,
             REVIEW_MISSING, WAITING_CI, BLOCKED_UNKNOWN) are documentation aliases only.
         - id: PLAN_DISPATCH
@@ -116,9 +118,9 @@ decision_tree:
             Create this tick's action list using fixed orchestration bounds:
             (1) never more than 3 total actions per tick,
             (2) never more than 1 action for a single PR per tick,
-            (3) at most 1 implementor dispatch and at most 1 restart action per tick.
+            (3) at most 1 implementor dispatch and at most 1 doctor-fix action per tick.
             Prioritize actions in this order:
-            done, approve, merge, dispatch_implementor, restart_reviews, fix, escalate, wait.
+            done, approve, merge, dispatch_implementor, fix, escalate, wait.
       next: EXECUTE_ACTIONS
 
     - id: EXECUTE_ACTIONS
@@ -127,7 +129,7 @@ decision_tree:
         - id: TERMINAL_ACTION
           action: |
             For `recommended_action.action in {done, merge}`, mark the PR completed for this wave.
-            For `approve`, continue polling doctor with `--exit-on done` to await auto-merge completion.
+            For `approve`, continue the blocking doctor wait loop with `--exit-on done` to await auto-merge completion.
         - id: COMMAND_DRIVEN_ACTION
           action: |
             For all non-terminal actions, if `recommended_action.command` exists, execute it verbatim.
@@ -145,7 +147,7 @@ decision_tree:
           action: |
             When a PR enters monitoring scope for the first time in this session
             (first tick it appears in the doctor snapshot), enqueue a pre-warm job:
-              apm2 fac warm --json
+              apm2 fac warm
             This uses the default bulk lane and fetch,build phases. Pre-warming
             ensures lane compilation caches are populated before gate execution
             begins, reducing cold-start timeout risk. Do not block on warm
@@ -158,8 +160,8 @@ decision_tree:
         - id: ENFORCE_BACKPRESSURE
           action: |
             Apply per-PR queue guards before adding actions:
-            (1) if a specific PR's review agents are at capacity (check via `apm2 fac doctor --pr <N> --json`), skip net-new implementor dispatches for that PR this tick,
-            (2) if a review for the current SHA is already active on a given PR, do not restart it.
+            (1) if a specific PR's review agents are at capacity (check via `apm2 fac doctor --pr <N>`), skip net-new implementor dispatches for that PR this tick,
+            (2) if a review for the current SHA is already active on a given PR, do not enqueue a redundant doctor-fix action for that PR in the same tick.
             Note: backpressure is always scoped per-PR — a saturated PR does not block dispatch for other PRs.
       next: SYNC_TICK_FACTS
 
@@ -171,19 +173,19 @@ decision_tree:
         - id: SYNC_ACTION_FACTS
           action: "Persist executed/skipped action facts keyed by PR, SHA, and scheduler slot."
         - id: SYNC_BLOCKER_FACTS
-          action: "Persist BLOCKED_UNKNOWN facts with evidence selectors required for unblock."
+          action: "Persist repeated `escalate`/blocked facts with evidence selectors required for unblock."
       next: STOP_OR_CONTINUE
 
     - id: STOP_OR_CONTINUE
       purpose: "Terminate only on explicit terminal conditions."
       decisions[3]:
         - id: SUCCESS_STOP
-          if: "all scoped PRs are MERGED"
+          if: "all scoped PRs report `recommended_action.action=done`"
           then:
             next: STOP
 
         - id: PARTIAL_STOP
-          if: "all remaining PRs are BLOCKED_UNKNOWN for >=3 consecutive ticks"
+          if: "all remaining PRs report `recommended_action.action=escalate` for >=3 consecutive ticks"
           then:
             next: STOP
 
@@ -194,7 +196,7 @@ decision_tree:
 
     - id: FIX_AGENT_PROMPT_CONTRACT
       purpose: "Ensure implementor agent briefs are consistent and conservatively gated."
-      steps[6]:
+      steps[7]:
         - id: REQUIRE_DEFAULT_IMPLEMENTOR_SKILL
           action: "Prompt must start with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
         - id: REQUIRE_FINDINGS_SOURCE
@@ -230,9 +232,9 @@ decision_tree:
         - id: GATE_RULE
           action: |
             READY_TO_MERGE iff all are true on current HEAD SHA:
-            (1) `apm2 fac doctor --pr <PR_NUMBER> --json` reports `merge_readiness.all_verdicts_approve=true`,
-            (2) `apm2 fac doctor --pr <PR_NUMBER> --json` reports `merge_readiness.gates_pass=true`,
-            (3) `apm2 fac doctor --pr <PR_NUMBER> --json` reports `merge_readiness.sha_fresh=true` and `merge_readiness.no_merge_conflicts=true`.
+            (1) `apm2 fac doctor --pr <PR_NUMBER>` reports `merge_readiness.all_verdicts_approve=true`,
+            (2) `apm2 fac doctor --pr <PR_NUMBER>` reports `merge_readiness.gates_pass=true`,
+            (3) `apm2 fac doctor --pr <PR_NUMBER>` reports `merge_readiness.sha_fresh=true` and `merge_readiness.no_merge_conflicts=true`.
       next: HEARTBEAT_LOOP
 
     - id: STOP
@@ -243,37 +245,33 @@ decision_tree:
 
 operational_playbook:
   purpose: "Action table keyed to FAC CLI observations. Use this to decide what to do next."
-  scenarios[14]:
+  scenarios[13]:
     - trigger: "Doctor reports action=done"
-      observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=done`"
+      observed_via: "`apm2 fac doctor --pr <N>` returns `recommended_action.action=done`"
       action: "PR is complete. Remove it from active monitoring scope."
 
     - trigger: "Doctor reports action=approve"
-      observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=approve`"
-      action: "All review dimensions approve. Continue polling with `--exit-on done` until merge completion."
+      observed_via: "`apm2 fac doctor --pr <N>` returns `recommended_action.action=approve`"
+      action: "All review dimensions approve. Continue the blocking doctor wait loop with `--exit-on done` until merge completion."
 
     - trigger: "Doctor reports action=merge"
-      observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=merge`"
+      observed_via: "`apm2 fac doctor --pr <N>` returns `recommended_action.action=merge`"
       action: "Treat as terminal-ready in the current tick and move to done monitoring."
 
     - trigger: "Doctor reports action=dispatch_implementor"
-      observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=dispatch_implementor`"
+      observed_via: "`apm2 fac doctor --pr <N>` returns `recommended_action.action=dispatch_implementor`"
       action: "Execute `recommended_action.command` to retrieve structured findings, then dispatch one fresh implementor with `/implementor-default` and full warm handoff payload."
 
-    - trigger: "Doctor reports action=restart_reviews"
-      observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=restart_reviews`"
-      action: "Execute `recommended_action.command` verbatim. Doctor already selected `--force` and `--refresh-identity` flags when needed."
-
     - trigger: "Doctor reports action=wait"
-      observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=wait`"
-      action: "Use `apm2 fac doctor --pr <N> --json --wait-for-recommended-action` to block until the state changes. Do not hand-roll poll loops with sleep."
+      observed_via: "`apm2 fac doctor --pr <N>` returns `recommended_action.action=wait`"
+      action: "Use `apm2 fac doctor --pr <N> --wait-for-recommended-action` to block until the state changes. Do not hand-roll poll loops with sleep."
 
     - trigger: "Doctor reports action=fix"
-      observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=fix`"
-      action: "Execute `recommended_action.command` (normally `apm2 fac doctor --pr <N> --fix`) and repoll."
+      observed_via: "`apm2 fac doctor --pr <N>` returns `recommended_action.action=fix`"
+      action: "Execute `recommended_action.command` (normally `apm2 fac doctor --pr <N> --fix`) and then resume the blocking doctor wait loop."
 
     - trigger: "Doctor reports action=escalate"
-      observed_via: "`apm2 fac doctor --pr <N> --json` returns `recommended_action.action=escalate`"
+      observed_via: "`apm2 fac doctor --pr <N>` returns `recommended_action.action=escalate`"
       action: "Execute `recommended_action.command` for full context and escalate to human operator with the captured output."
 
     - trigger: "Doctor reason indicates stuck/idle reviewer agents"
@@ -282,26 +280,26 @@ operational_playbook:
 
     - trigger: "Implementor agent pushed a new commit"
       observed_via: "Agent reports `apm2 fac push` completed, or head SHA changed in doctor output"
-      action: "Resume doctor polling; review dispatch should appear automatically for the new SHA."
+      action: "Resume the blocking doctor wait loop; review dispatch should appear automatically for the new SHA."
 
     - trigger: "Evidence gates failed during push"
       observed_via: "`apm2 fac push` exits with gate failures (rustfmt, clippy, test, etc.)"
       action: "Dispatch implementor remediation; require `apm2 fac gates` before the next push."
 
     - trigger: "Stale SHA — review completed for old commit"
-      observed_via: "`apm2 fac doctor --pr <N> --json` indicates stale head binding"
-      action: "Execute doctor-provided restart recommendation for the current head SHA."
+      observed_via: "`apm2 fac doctor --pr <N>` indicates stale head binding"
+      action: "Execute doctor-provided fix recommendation for the current head SHA."
 
     - trigger: "Low disk or large cache accumulation"
       observed_via: "Gate failure mentions disk space, or gc --dry-run shows >5 GB prunable artifacts"
-      action: "Run `apm2 fac gc --json` to reclaim disk space. GC is idempotent and safe at any time. If disk is critically low (<5 GB), run gc before the next implementor dispatch."
+      action: "Run `apm2 fac gc` to reclaim disk space. GC is idempotent and safe at any time. If disk is critically low (<5 GB), run gc before the next implementor dispatch."
 
     - trigger: "New PR enters monitoring scope"
-      observed_via: "A PR number appears for the first time in `apm2 fac doctor --json` output during this session"
-      action: "Enqueue `apm2 fac warm --json` to pre-warm lane targets before gate execution. Do not block orchestration on warm completion."
+      observed_via: "A PR number appears for the first time in `apm2 fac doctor` output during this session"
+      action: "Enqueue `apm2 fac warm` to pre-warm lane targets before gate execution. Do not block orchestration on warm completion."
 
-invariants[13]:
-  - "GitHub PR status, CI check status, and GitHub review state are projections, not truth. Always use `apm2 fac doctor --pr <N> --json` as the authoritative orchestration surface."
+invariants[14]:
+  - "GitHub PR status, CI check status, and GitHub review state are projections, not truth. Always use `apm2 fac doctor --pr <N>` as the authoritative orchestration surface."
   - "Bounded search: orchestrate only 1-20 PRs per run; >20 requires explicit user partitioning into waves."
   - "When doctor provides `recommended_action.command`, execute it verbatim. Do not re-derive commands from raw JSON fields."
   - "Use `--exit-on done` as the completion detector; do not parse lifecycle internals to infer completion."
@@ -312,6 +310,6 @@ invariants[13]:
   - "All implementor dispatches include a warm handoff with implementor_warm_handoff_required_payload."
   - "Default implementor dispatch starts with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
   - "Implementor prompts use implementor-default as the primary instruction source and add only ticket/PR-specific deltas."
-  - "Run `apm2 fac gc --json` at session start and periodically (every ~10 ticks or on low-disk signal); GC is idempotent and reclaims gate cache, blobs, lane logs, and quarantine artifacts."
-  - "Enqueue `apm2 fac warm --json` when a new PR first enters monitoring scope; pre-warming populates lane compilation caches and reduces cold-start gate timeouts."
-  - "Prefer `apm2 fac doctor --pr <N> --json --wait-for-recommended-action` over poll-sleep loops. The blocking wait returns on state change or terminal condition and is both cheaper and more responsive than periodic polling."
+  - "Run `apm2 fac gc` at session start and periodically (every ~10 ticks or on low-disk signal); GC is idempotent and reclaims gate cache, blobs, lane logs, and quarantine artifacts."
+  - "Enqueue `apm2 fac warm` when a new PR first enters monitoring scope; pre-warming populates lane compilation caches and reduces cold-start gate timeouts."
+  - "Prefer `apm2 fac doctor --pr <N> --wait-for-recommended-action` over poll-sleep loops. The blocking wait returns on state change or terminal condition and is both cheaper and more responsive than periodic polling."

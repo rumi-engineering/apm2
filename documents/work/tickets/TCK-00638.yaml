@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00638
     title: 'RFC-0032 Phase 2: implement PublishWorkContextEntry (CAS + `evidence.published` anchor) + `work_context` projection'
-    status: OPEN
+    status: MERGED
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032

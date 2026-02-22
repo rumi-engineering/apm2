@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00630
     title: 'RFC-0032 Phase 0: migrate legacy `ledger_events` -> core `events` with real hash chain'
-    status: OPEN
+    status: MERGED
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032

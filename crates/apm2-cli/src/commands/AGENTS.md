@@ -4,7 +4,7 @@
 
 ## Overview
 
-The `commands` module contains the implementation of every CLI subcommand. Each file or sub-module corresponds to a command group dispatched from `main.rs`. Commands use the `client` module for daemon IPC and emit structured output (text or JSON) controlled by `--json` flags.
+The `commands` module contains the implementation of every CLI subcommand. Each file or sub-module corresponds to a command group dispatched from `main.rs`. Commands use the `client` module for daemon IPC. FAC command surfaces are JSON/NDJSON-first by default.
 
 All command functions return a `u8` exit code or `anyhow::Result<()>`, using values from `crate::exit_codes`.
 
@@ -57,8 +57,6 @@ Session-scoped commands accept session tokens via the `APM2_SESSION_TOKEN` envir
 pub struct FacCommand {
     #[command(subcommand)]
     pub subcommand: FacSubcommand,
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 ```
 
@@ -66,31 +64,10 @@ Top-level FAC command dispatcher. Routes to `fac_pr`, `fac_review`, and `factory
 
 ### `FacSubcommand` (fac.rs)
 
-```rust
-#[derive(Debug, Subcommand)]
-pub enum FacSubcommand {
-    Pr(PrArgs),
-    Review(ReviewArgs),
-    Run { spec_file: PathBuf, format: String },
-    Factory(FactoryCommand),
-    Gates(GatesArgs),
-    Work(WorkArgs),
-    Episode(EpisodeArgs),
-    Receipt(ReceiptArgs),
-    Context(ContextArgs),
-    Resume(ResumeArgs),
-    Barrier(BarrierArgs),
-    Kickoff(KickoffArgs),
-    Push(PushArgs),
-    Restart(RestartArgs),
-    Logs(LogsArgs),
-    Pipeline(PipelineArgs),
-    Lane(LaneArgs),
-    Bootstrap(BootstrapArgs),
-    Economics(EconomicsArgs),
-    Metrics(MetricsArgs),
-}
-```
+`FacSubcommand` includes the JSON-first FAC operator surface (`doctor`,
+`install`, `services`, `lane`, `push`, `logs`, `review`, `receipts`, `work`,
+`job`, `queue`, `policy`, `economics`, `metrics`, `caches`) plus internal
+hidden entrypoints (`worker`, `reviewer`, `pipeline`, `gates`, `preflight`).
 
 ### `WorkCommand` / `WorkSubcommand` (work.rs)
 
@@ -165,7 +142,8 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
 
 #### Systemd Template Invariants (TCK-00608)
 
-- Worker unit templates must invoke `apm2 fac worker --poll-interval-secs <N>`; `--poll-interval` is invalid and will fail argument parsing.
+- Worker unit templates must invoke `apm2 fac worker` (no poll-interval flags).
+- Degraded-mode safety nudges use an internal bounded interval; steady-state queue pickup remains watcher wake-driven (pending/claimed events), not fixed-interval polling latency.
 - User-mode daemon and worker templates must allow writes to both `%h/.apm2` and `%h/.local/share/apm2` when `ProtectHome=read-only` is enabled, because default ledger/CAS/state paths are XDG data-dir based.
 
 ### Process Management (process.rs)
@@ -194,15 +172,14 @@ Each check produces a `DaemonDoctorCheck` with `name`, `status` (ERROR/WARN/OK),
 | `apm2 fac lane init` | `run_lane_init()` | Bootstrap a fresh lane pool with directories and default profiles |
 | `apm2 fac doctor --fix` | `run_system_doctor_fix()` | Deterministic host reconciliation/remediation (lane+queue reconcile, tmp scrub, lane reset retry, stale log GC) |
 
-Both command paths support JSON output. `lane init` prints a human-readable
-receipt by default via `print_lane_init_receipt()`.
+Both command paths emit machine-readable output by default.
 
 **Exit code policy for `run_system_doctor_fix`**: non-zero when remediation
 actions fail or post-fix doctor checks still contain critical errors.
 
 **LaneSubcommand** enum variants added:
-- `Init(LaneInitArgs)` -- `--json` flag
-- `MarkCorrupt(LaneMarkCorruptArgs)` -- `--reason`, `--receipt-digest`, `--json` flags (TCK-00570)
+- `Init(LaneInitArgs)`
+- `MarkCorrupt(LaneMarkCorruptArgs)` -- `--reason`, `--receipt-digest` (TCK-00570)
 
 ### Lane Mark-Corrupt Command (fac.rs, TCK-00570)
 
@@ -230,7 +207,7 @@ Six-phase provisioning sequence:
 5. **Services** (optional): installs systemd templates from `contrib/systemd/` (`--user` or `--system`)
 6. **Doctor**: runs `collect_doctor_checks()` and gates exit code on result
 
-Flags: `--dry-run` (show planned actions), `--user`/`--system` (systemd install mode), `--json`.
+Flags: `--dry-run` (show planned actions), `--user`/`--system` (systemd install mode).
 
 Security invariants:
 - [INV-BOOT-001] Directories created via `create_dir_restricted` with restricted permissions at create-time (no TOCTOU chmod window). Uses 0o700 in user-mode, 0o770 in system-mode. Recursive: intermediate directories also get restricted permissions. Symlink paths rejected.
@@ -494,7 +471,7 @@ Security invariants:
   duplicates skipped, receipts copied, job_id mismatches (same digest, different job_id),
   and parse failures. Deterministic presentation ordering: `timestamp_secs` descending,
   `content_hash` ascending for tiebreaking. All reads are bounded by `MAX_MERGE_SCAN_FILES`
-  (65,536). Writes use atomic temp+rename. Supports `--json` output.
+  (65,536). Writes use atomic temp+rename. Emits machine-readable JSON output by default.
 
 ## Config Show Invariants (TCK-00590)
 
@@ -571,7 +548,7 @@ Security invariants:
 
 - **`apm2 fac metrics`** (`fac.rs`): Local-only observability command that computes
   aggregate metrics from FAC receipts. Accepts `--since <epoch_secs>`,
-  `--until <epoch_secs>`, and `--json` flags. Default window is 24 hours
+  `--until <epoch_secs>`. Default window is 24 hours
   (`DEFAULT_METRICS_WINDOW_SECS = 86_400`). Uses a two-pass approach: (1) iterate
   ALL receipt headers in the window for accurate aggregate counts and throughput,
   (2) load full receipts (capped at `MAX_METRICS_RECEIPTS = 16384`) for latency
@@ -610,7 +587,7 @@ Security invariants:
 ## Binary Alignment Controls (TCK-00625, INV-PADOPT-004 followup)
 
 Three engineering controls to prevent binary drift between interactive CLI and
-systemd service executables:
+daemon runtime executables:
 
 ### FU-001: Doctor binary_alignment check (`daemon.rs`)
 
@@ -618,20 +595,27 @@ systemd service executables:
   - Resolves `which apm2` to canonical path
   - Resolves `ExecStart` binary path for each systemd user unit via `systemctl --user show`
   - Computes SHA-256 digests of all resolved binary paths (bounded to 256 MiB, CTR-1603)
-  - Emits `WARN` if any digest mismatches with remediation pointing to `apm2 fac install`
-  - Emits `WARN` (never `OK`) if no service binary could be resolved (fail-closed)
+  - Emits `ERROR` if any digest mismatches with remediation pointing to `apm2 fac install`
+  - Emits `ERROR` if no service binary could be resolved (fail-closed)
   - Emits `WARN` for partial verification (some units resolved, others failed)
   - Emits `OK` only when at least one service binary was successfully resolved AND matched
   - Tracks per-unit resolution errors and digest failures separately
+- `collect_doctor_checks` also includes a `daemon_runtime_contract` check that:
+  - Resolves the daemon child runtime binary used by `apm2 daemon`
+  - Reads daemon contract hash via `apm2-daemon --print-hsi-contract-hash`
+  - Compares it to the wrapper's local HSI contract hash
+  - Emits `ERROR` on mismatch or probe failure (fail-closed)
 
 ### FU-002: `apm2 fac install` subcommand (`fac_install.rs`)
 
-- `apm2 fac install [--json] [--allow-partial] [--workspace-root <PATH>]` performs:
+- `apm2 fac install [--allow-partial] [--workspace-root <PATH>]` performs:
   1. Resolves workspace root from `--workspace-root` flag or from `current_exe()` path (never cwd)
   2. `cargo install --path crates/apm2-cli --force` from trusted workspace root
-  3. Symlink `~/.local/bin/apm2 -> ~/.cargo/bin/apm2` (atomic replace via create-temp-then-rename(2))
-  4. `systemctl --user restart apm2-daemon.service apm2-worker.service`
-  5. Structured output: workspace root, installed path, SHA-256 digest, per-service restart status, restart_failures array
+  3. `cargo install --path crates/apm2-daemon --force` from trusted workspace root
+  4. Symlink `~/.local/bin/apm2 -> ~/.cargo/bin/apm2` (atomic replace via create-temp-then-rename(2))
+  5. Symlink `~/.local/bin/apm2-daemon -> ~/.cargo/bin/apm2-daemon` (same atomic replace semantics)
+  6. `systemctl --user restart apm2-daemon.service apm2-worker.service`
+  7. Structured output: workspace root, installed paths, SHA-256 digests, per-service restart status, restart_failures array
 - Fail-closed restart semantics: required service restart failures cause non-zero exit and `success: false`
 - `--allow-partial` flag: exits 0 even when restarts fail, but `success` remains false and `restart_failures` populated
 - Workspace root discovery: derived from `std::env::current_exe()` (trusted) with 16-level bounded traversal; cwd never used
@@ -639,13 +623,12 @@ systemd service executables:
 
 ### FU-003: Worker binary identity event (`fac_worker.rs`)
 
-- `run_fac_worker` emits a `binary_identity` event at startup before the poll loop:
+- `run_fac_worker` emits a `binary_identity` event at startup before entering the wake-driven worker loop:
   - `binary_path`: resolved via `std::env::current_exe()` + `canonicalize()`
   - `binary_digest`: `sha256:<hex>` of the running binary (bounded read, CTR-1603)
   - `pid`: current process ID
   - `ts`: ISO-8601 timestamp
-- In JSON mode: emitted as NDJSON worker event
-- In text mode: emitted as structured key=value to stderr at INFO level
+- Emitted as NDJSON worker event on startup.
 - Non-fatal: digest failures produce error markers, not worker abort
 
 ## `fac_queue_submit.rs` — Queue Submission with Service User Gate (TCK-00577)

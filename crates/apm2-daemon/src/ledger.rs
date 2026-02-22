@@ -803,10 +803,7 @@ impl SqliteLedgerEventEmitter {
                 "ledger startup migrations mutated rows; rebuilding hash-chain links and invalidating stored checkpoint metadata before full verification"
             );
             Self::rebuild_hash_chain_columns(conn)?;
-            Self::delete_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_SIGNATURE_KEY)?;
-            Self::delete_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_ROWID_KEY)?;
-            Self::delete_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_EVENT_ID_KEY)?;
-            Self::delete_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_KEY)?;
+            Self::clear_hash_chain_checkpoint_metadata(conn)?;
         }
         Self::validate_startup_hash_chain_checkpoint(conn, signing_key, trusted_verifying_key)
             .map_err(|message| {
@@ -859,6 +856,34 @@ impl SqliteLedgerEventEmitter {
         );
         conn.execute(&sql, params![key])?;
         Ok(())
+    }
+
+    fn clear_hash_chain_checkpoint_metadata(conn: &Connection) -> rusqlite::Result<()> {
+        Self::delete_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_SIGNATURE_KEY)?;
+        Self::delete_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_ROWID_KEY)?;
+        Self::delete_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_EVENT_ID_KEY)?;
+        Self::delete_metadata_value(conn, Self::HASH_CHAIN_CHECKPOINT_KEY)?;
+        Ok(())
+    }
+
+    fn canonical_events_row_count(conn: &Connection) -> Result<u64, String> {
+        let canonical_events_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'events'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("failed to check canonical events table existence: {e}"))?;
+        if !canonical_events_exists {
+            return Ok(0);
+        }
+
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .map_err(|e| format!("failed to count canonical events rows: {e}"))?;
+        u64::try_from(row_count)
+            .map_err(|_| format!("canonical events row count is negative: {row_count}"))
     }
 
     /// Returns a deterministic signing key from the hardcoded test seed.
@@ -1114,7 +1139,7 @@ impl SqliteLedgerEventEmitter {
             },
         };
 
-        let trusted_checkpoint = match checkpoint_metadata {
+        let mut trusted_checkpoint = match checkpoint_metadata {
             Some(checkpoint) => match checkpoint_signature.as_deref() {
                 Some(signature)
                     if Self::verify_checkpoint_signature(
@@ -1144,6 +1169,25 @@ impl SqliteLedgerEventEmitter {
             },
             None => None,
         };
+
+        if let Some(checkpoint) = trusted_checkpoint.as_ref()
+            && checkpoint.rowid > chain_tip.rowid
+            && chain_tip.rowid == 0
+        {
+            let canonical_rows = Self::canonical_events_row_count(conn)?;
+            if canonical_rows > 0 {
+                warn!(
+                    checkpoint_rowid = checkpoint.rowid,
+                    chain_tip_rowid = chain_tip.rowid,
+                    canonical_rows,
+                    "stale legacy hash-chain checkpoint detected after canonical cutover; \
+                     invalidating checkpoint metadata and forcing full-chain verification"
+                );
+                Self::clear_hash_chain_checkpoint_metadata(conn)
+                    .map_err(|e| format!("failed to clear stale checkpoint metadata: {e}"))?;
+                trusted_checkpoint = None;
+            }
+        }
 
         let (derived_tip, validated_rows) = if let Some(checkpoint) = trusted_checkpoint {
             if checkpoint.rowid > chain_tip.rowid {
@@ -5562,6 +5606,125 @@ mod tests {
         assert_eq!(
             validated_rows, EXPECTED_SUFFIX_ROWS,
             "stale checkpoint must validate only the unverified suffix"
+        );
+    }
+
+    #[test]
+    fn startup_validation_recovers_stale_checkpoint_after_canonical_migration() {
+        const EVENT_COUNT: usize = 6;
+
+        let temp_dir = tempdir().expect("tempdir should create");
+        let db_path = temp_dir
+            .path()
+            .join("ledger_canonical_cutover_recover.sqlite3");
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+
+        {
+            let conn = Connection::open(&db_path).expect("sqlite file should open");
+            SqliteLedgerEventEmitter::init_schema_with_signing_key(&conn, &signing_key)
+                .expect("schema initialization should succeed");
+            let emitter =
+                SqliteLedgerEventEmitter::new(Arc::new(Mutex::new(conn)), signing_key.clone());
+
+            for idx in 0..EVENT_COUNT {
+                emitter
+                    .emit_session_event(
+                        "W-CANONICAL-CHECKPOINT-001",
+                        "session_started",
+                        format!(r#"{{"event_type":"session_started","idx":{idx}}}"#).as_bytes(),
+                        "uid:canonical-cutover-test",
+                        1_700_000_000_000_450_000 + idx as u64,
+                    )
+                    .expect("session event should persist");
+            }
+        }
+
+        {
+            let conn = Connection::open(&db_path).expect("sqlite file should reopen for migration");
+            apm2_core::ledger::init_canonical_schema(&conn)
+                .expect("canonical schema initialization should succeed");
+            let migration_stats = apm2_core::ledger::migrate_legacy_ledger_events(&conn)
+                .expect("legacy migration should succeed");
+            assert_eq!(
+                migration_stats.rows_migrated, EVENT_COUNT as u64,
+                "migration should move all legacy rows into canonical events"
+            );
+        }
+
+        let conn = Connection::open(&db_path).expect("sqlite file should reopen for validation");
+        let validated_rows = SqliteLedgerEventEmitter::validate_startup_hash_chain_checkpoint(
+            &conn,
+            &signing_key,
+            Some(&signing_key.verifying_key()),
+        )
+        .expect(
+            "startup validation should recover stale legacy checkpoint after canonical migration",
+        );
+        assert_eq!(
+            validated_rows, 0,
+            "canonical cutover recovery should validate zero legacy suffix rows"
+        );
+
+        let checkpoint_rowid = SqliteLedgerEventEmitter::get_metadata_value(
+            &conn,
+            SqliteLedgerEventEmitter::HASH_CHAIN_CHECKPOINT_ROWID_KEY,
+        )
+        .expect("checkpoint rowid metadata lookup should succeed")
+        .expect("checkpoint rowid metadata should be present");
+        assert_eq!(
+            checkpoint_rowid, "0",
+            "recovered checkpoint should be reseeded to legacy genesis"
+        );
+    }
+
+    #[test]
+    fn startup_validation_rejects_checkpoint_ahead_of_empty_legacy_tip_without_canonical_rows() {
+        const EVENT_COUNT: usize = 3;
+
+        let temp_dir = tempdir().expect("tempdir should create");
+        let db_path = temp_dir
+            .path()
+            .join("ledger_checkpoint_ahead_fail_closed.sqlite3");
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+
+        {
+            let conn = Connection::open(&db_path).expect("sqlite file should open");
+            SqliteLedgerEventEmitter::init_schema_with_signing_key(&conn, &signing_key)
+                .expect("schema initialization should succeed");
+            let emitter =
+                SqliteLedgerEventEmitter::new(Arc::new(Mutex::new(conn)), signing_key.clone());
+
+            for idx in 0..EVENT_COUNT {
+                emitter
+                    .emit_session_event(
+                        "W-CHECKPOINT-FAIL-CLOSED-001",
+                        "session_started",
+                        format!(r#"{{"event_type":"session_started","idx":{idx}}}"#).as_bytes(),
+                        "uid:checkpoint-fail-closed-test",
+                        1_700_000_000_000_460_000 + idx as u64,
+                    )
+                    .expect("session event should persist");
+            }
+        }
+
+        {
+            let conn = Connection::open(&db_path).expect("sqlite file should reopen for mutation");
+            conn.execute("DELETE FROM ledger_events", [])
+                .expect("legacy rows should be deletable for fail-closed test");
+        }
+
+        let conn = Connection::open(&db_path).expect("sqlite file should reopen for validation");
+        let err = SqliteLedgerEventEmitter::validate_startup_hash_chain_checkpoint(
+            &conn,
+            &signing_key,
+            Some(&signing_key.verifying_key()),
+        )
+        .expect_err(
+            "startup validation must fail when checkpoint is ahead of tip without canonical rows",
+        );
+        assert!(
+            err.contains("checkpoint rowid") && err.contains("ahead of chain tip"),
+            "expected explicit ahead-of-tip failure, got: {err}"
         );
     }
 

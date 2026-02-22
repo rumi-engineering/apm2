@@ -51,11 +51,7 @@ pub enum EconomicsSubcommand {
 
 /// Arguments for `apm2 fac economics show`.
 #[derive(Debug, Args)]
-pub struct EconomicsShowArgs {
-    /// Emit JSON output.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
+pub struct EconomicsShowArgs {}
 
 /// Arguments for `apm2 fac economics adopt`.
 #[derive(Debug, Args)]
@@ -72,10 +68,6 @@ pub struct EconomicsAdoptArgs {
     /// Reason for the adoption (for the receipt).
     #[arg(long, default_value = "operator adoption")]
     pub reason: String,
-
-    /// Emit JSON output.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac economics rollback`.
@@ -84,10 +76,6 @@ pub struct EconomicsRollbackArgs {
     /// Reason for the rollback (for the receipt).
     #[arg(long, default_value = "operator rollback")]
     pub reason: String,
-
-    /// Emit JSON output.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 // =============================================================================
@@ -108,7 +96,8 @@ pub fn run_economics_command(args: &EconomicsArgs, json_global: bool) -> u8 {
 // =============================================================================
 
 fn run_show(args: &EconomicsShowArgs, json_global: bool) -> u8 {
-    let json = args.json || json_global;
+    let _ = args;
+    let json = json_global;
     let fac_root = resolve_fac_root();
 
     match load_admitted_economics_profile_root(&fac_root) {
@@ -155,7 +144,7 @@ fn run_show(args: &EconomicsShowArgs, json_global: bool) -> u8 {
 // =============================================================================
 
 fn run_adopt(args: &EconomicsAdoptArgs, json_global: bool) -> u8 {
-    let json = args.json || json_global;
+    let json = json_global;
     let fac_root = resolve_fac_root();
     let actor_id = resolve_operator_identity();
 
@@ -329,7 +318,7 @@ fn emit_adopt_error(json: bool, e: &apm2_core::fac::economics_adoption::Economic
 // =============================================================================
 
 fn run_rollback(args: &EconomicsRollbackArgs, json_global: bool) -> u8 {
-    let json = args.json || json_global;
+    let json = json_global;
     let fac_root = resolve_fac_root();
     let actor_id = resolve_operator_identity();
 

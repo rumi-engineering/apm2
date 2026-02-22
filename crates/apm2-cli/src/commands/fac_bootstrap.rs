@@ -13,6 +13,7 @@
 //!   policy files and lane profiles are left untouched.
 //! - **Fail-closed**: exits non-zero with actionable output when the host
 //!   cannot support `FESv1`.
+//! - **JSON-first**: command output is structured JSON by default.
 //! - **No secrets**: bootstrap never creates, reads, or leaks secrets.
 //!   Credential mounts are stubs only.
 //! - **`--dry-run`**: shows planned filesystem and systemd actions without
@@ -117,10 +118,6 @@ pub struct BootstrapArgs {
     /// service user.
     #[arg(long, default_value_t = false, conflicts_with = "user")]
     pub system: bool,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// A planned or completed bootstrap action for reporting.
@@ -164,8 +161,13 @@ struct DoctorCheckSummary {
 // =============================================================================
 
 /// Entry point for `apm2 fac bootstrap`.
-pub fn run_bootstrap(args: &BootstrapArgs, operator_socket: &Path, config_path: &Path) -> u8 {
-    let json_output = args.json;
+pub fn run_bootstrap(
+    args: &BootstrapArgs,
+    operator_socket: &Path,
+    config_path: &Path,
+    parent_json_output: bool,
+) -> u8 {
+    let json_output = parent_json_output;
 
     // Resolve APM2_HOME.
     let apm2_home = match resolve_apm2_home() {

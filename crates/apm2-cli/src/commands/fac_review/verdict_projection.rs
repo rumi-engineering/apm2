@@ -694,7 +694,7 @@ fn persist_verdict_projection_impl(
     // Do not mutate the authoritative PR identity from verdict writes.
     // Reviewer agents may complete late for an older SHA; letting `verdict.set`
     // retarget identity can roll local state backward after a newer `fac push`.
-    // Identity is managed by push/restart/dispatch refresh paths instead.
+    // Identity is managed by push/doctor-fix/dispatch refresh paths instead.
     if persist_trusted_reviewer_id {
         projection_store::save_trusted_reviewer_id(
             &owner_repo,
@@ -769,6 +769,17 @@ const GITHUB_COMMENT_URL_PREFIX: &str = "https://github.com/";
 
 fn is_remote_comment_url(comment_url: &str) -> bool {
     comment_url.trim().starts_with(GITHUB_COMMENT_URL_PREFIX)
+}
+
+pub(super) fn has_remote_comment_binding(
+    source_comment_id: Option<u64>,
+    source_comment_url: Option<&str>,
+) -> bool {
+    let has_comment_id = source_comment_id.is_some_and(|value| value > 0);
+    let has_remote_comment_url = source_comment_url
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty() && is_remote_comment_url(value));
+    has_comment_id && has_remote_comment_url
 }
 
 fn parse_opening_fence(line: &str) -> Option<usize> {
@@ -2340,6 +2351,23 @@ mod tests {
         assert!(!super::is_remote_comment_url(
             "local://fac_projection/example/repo/pr-42/issue_comments#99"
         ));
+    }
+
+    #[test]
+    fn remote_comment_binding_requires_positive_id_and_github_url() {
+        assert!(super::has_remote_comment_binding(
+            Some(99),
+            Some("https://github.com/example/repo/issues/42#issuecomment-99")
+        ));
+        assert!(!super::has_remote_comment_binding(
+            Some(99),
+            Some("https://example.com/issuecomment-99")
+        ));
+        assert!(!super::has_remote_comment_binding(
+            Some(0),
+            Some("https://github.com")
+        ));
+        assert!(!super::has_remote_comment_binding(Some(99), None));
     }
 
     #[test]

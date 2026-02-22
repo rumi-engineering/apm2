@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use apm2_core::bootstrap::verify_bootstrap_hash;
 use apm2_core::config::{
     EcosystemConfig, normalize_operator_socket_path, normalize_pid_file_path,
@@ -89,6 +89,13 @@ struct Args {
     /// Run in foreground (don't daemonize)
     #[arg(long)]
     no_daemon: bool,
+
+    /// Print the daemon HSI contract hash and exit.
+    ///
+    /// Hidden operator probe used by wrapper-side diagnostics to verify
+    /// wrapper/daemon contract compatibility before startup.
+    #[arg(long, hide = true)]
+    print_hsi_contract_hash: bool,
 
     /// Path to PID file
     #[arg(long)]
@@ -220,10 +227,24 @@ impl DaemonConfig {
 mod daemon_config_tests {
     use super::*;
 
+    #[test]
+    fn hsi_contract_hash_probe_is_non_empty() {
+        let hash = current_hsi_contract_hash().expect("HSI contract hash should resolve");
+        assert!(
+            !hash.trim().is_empty(),
+            "HSI contract hash probe must be non-empty"
+        );
+        assert!(
+            hash.starts_with("blake3:"),
+            "HSI contract hash probe must use blake3 prefix, got: {hash}"
+        );
+    }
+
     fn args_with_config(config: PathBuf) -> Args {
         Args {
             config,
             no_daemon: true,
+            print_hsi_contract_hash: false,
             pid_file: None,
             operator_socket: None,
             session_socket: None,
@@ -941,6 +962,12 @@ fn main() -> Result<()> {
     // Parse command-line arguments (synchronous, no threads)
     let args = Args::parse();
 
+    // Hidden preflight probe for wrapper-side contract compatibility checks.
+    if args.print_hsi_contract_hash {
+        println!("{}", current_hsi_contract_hash()?);
+        return Ok(());
+    }
+
     // TCK-00595 MAJOR-1 FIX: Do NOT auto-detect GitHub owner/repo from CWD.
     //
     // The daemon is a user-singleton (fixed XDG socket path). Binding it to
@@ -979,6 +1006,22 @@ fn main() -> Result<()> {
 
     // Run the async main on the runtime
     runtime.block_on(async_main(args))
+}
+
+fn current_hsi_contract_hash() -> Result<String> {
+    let cli_version = apm2_daemon::hsi_contract::CliVersion {
+        semver: env!("CARGO_PKG_VERSION").to_string(),
+        build_hash: String::new(),
+    };
+    let manifest = apm2_daemon::hsi_contract::build_manifest(cli_version)
+        .context("failed to build HSI contract manifest")?;
+    let hash = manifest
+        .content_hash()
+        .context("failed to compute HSI contract content hash")?;
+    if hash.is_empty() {
+        bail!("HSI contract content hash is empty");
+    }
+    Ok(hash)
 }
 
 fn ensure_canonicalizer_tuple_admitted(

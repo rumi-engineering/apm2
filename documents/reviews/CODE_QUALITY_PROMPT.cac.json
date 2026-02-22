@@ -26,9 +26,9 @@
     "commands": {
       "description": "The reviewer uses exactly 3 CLI commands via `cargo run -p apm2-cli --`. This ensures the workspace-built binary is used, not a stale global install. No other commands are needed.",
       "binary_prefix": "cargo run -p apm2-cli --",
-      "prepare": "cargo run -p apm2-cli -- fac review prepare --json",
-      "finding": "cargo run -p apm2-cli -- fac review finding --type code-quality --severity <BLOCKER|MAJOR|MINOR|NIT> --summary \"...\" --risk \"...\" --impact \"...\" --location \"...\" --body \"...\" --json",
-      "verdict": "cargo run -p apm2-cli -- fac review verdict set --dimension code-quality --verdict <approve|deny> --reason \"...\" --json"
+      "prepare": "cargo run -p apm2-cli -- fac review prepare",
+      "finding": "cargo run -p apm2-cli -- fac review finding --type code-quality --severity <BLOCKER|MAJOR|MINOR|NIT> --summary \"...\" --risk \"...\" --impact \"...\" --location \"...\" --body \"...\"",
+      "verdict": "cargo run -p apm2-cli -- fac review verdict set --dimension code-quality --verdict <approve|deny> --reason \"...\""
     },
     "constraints": {
       "forbidden_operations": [
@@ -136,7 +136,7 @@
             {"action": "command", "run": "cargo run -p apm2-cli -- fac review verdict set --help"},
             {
               "action": "command",
-              "run": "cargo run -p apm2-cli -- fac review prepare --json",
+              "run": "cargo run -p apm2-cli -- fac review prepare",
               "capture_as": "prepare_json"
             },
             {
@@ -199,7 +199,7 @@
           },
           "emit_rule": {
             "action": "For each finding, classify severity (BLOCKER, MAJOR, MINOR, NIT) and call:",
-            "command": "cargo run -p apm2-cli -- fac review finding --type code-quality --severity <severity> --summary \"<one-line>\" --risk \"<why this matters>\" --impact \"<consequences if unaddressed>\" --location \"<file:line or module>\" --body \"<detailed description and required action>\" --json",
+            "command": "cargo run -p apm2-cli -- fac review finding --type code-quality --severity <severity> --summary \"<one-line>\" --risk \"<why this matters>\" --impact \"<consequences if unaddressed>\" --location \"<file:line or module>\" --body \"<detailed description and required action>\"",
             "quality_rules": [
               "Each finding MUST include: summary, risk, impact, location, and body (required action).",
               "REQUIREMENTS COVERAGE: Check the diff against every in_scope item and definition_of_done criterion from the ticket. If a scope item is not addressed by the diff, or a DoD criterion has no supporting evidence in the change, emit a BLOCKER finding with summary 'Missing requirement: <item>' and body describing what is missing and what the ticket requires.",
@@ -218,14 +218,14 @@
               "if": "blocker_count == 0 AND major_count == 0",
               "then": {
                 "action": "command",
-                "run": "cargo run -p apm2-cli -- fac review verdict set --dimension code-quality --verdict approve --reason \"PASS: no blocker or major findings\" --json"
+                "run": "cargo run -p apm2-cli -- fac review verdict set --dimension code-quality --verdict approve --reason \"PASS: no blocker or major findings\""
               }
             },
             {
               "if": "blocker_count > 0 OR major_count > 0",
               "then": {
                 "action": "command",
-                "run": "cargo run -p apm2-cli -- fac review verdict set --dimension code-quality --verdict deny --reason \"FAIL: <blocker_count> blocker, <major_count> major findings\" --json"
+                "run": "cargo run -p apm2-cli -- fac review verdict set --dimension code-quality --verdict deny --reason \"FAIL: <blocker_count> blocker, <major_count> major findings\""
               }
             }
           ],

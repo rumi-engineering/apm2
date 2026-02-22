@@ -38,7 +38,7 @@
           "id": "ARCH-001",
           "title": "Core FAC is GitHub-agnostic",
           "severity": "MUST",
-          "description": "Core FAC modules (lifecycle, dispatch, state, types, events, evidence, gates, gate_attestation, gate_cache, orchestrator, restart, liveness, detection, pipeline, model_pool, backend, merge_conflicts, projection_store, target, findings, logs, projection engine) MUST NOT shell out to `gh`, import github_projection, or depend on GitHub-specific types. All GitHub I/O is routed through projection boundary modules.",
+          "description": "Core FAC modules (lifecycle, dispatch, state, types, events, evidence, gates, gate_attestation, gate_cache, orchestrator, repair_cycle, liveness, detection, pipeline, model_pool, backend, merge_conflicts, projection_store, target, findings, logs, projection engine) MUST NOT shell out to `gh`, import github_projection, or depend on GitHub-specific types. All GitHub I/O is routed through projection boundary modules.",
           "rationale": "The local truth plane must function independently of GitHub availability. Projection failures must never block core state progression.",
           "verification": "rg 'Command::new\\(\"gh\"\\)' across all core module files returns zero matches."
         },
@@ -46,7 +46,7 @@
           "id": "ARCH-002",
           "title": "Projection boundary modules own all GitHub I/O",
           "severity": "MUST",
-          "description": "All `gh` CLI invocations, GitHub API interactions, GitHub comment rendering, reviewer identity resolution via GitHub, and GitHub comment caching MUST live exclusively in projection boundary modules: github_projection, github_auth, github_reads, verdict_projection, ci_status, comment, publish, pr_body.",
+          "description": "All `gh` CLI invocations, GitHub API interactions, GitHub comment rendering, and reviewer identity resolution via GitHub MUST live exclusively in projection boundary modules: github_projection, github_auth, github_reads, verdict_projection, and ci_status.",
           "rationale": "Single responsibility. GitHub API changes, rate limits, and auth failures are contained in the projection layer."
         },
         {
@@ -140,7 +140,7 @@
           "id": "LIFE-004",
           "title": "Bounded error budget",
           "severity": "MUST",
-          "description": "Each PR/SHA lifecycle has a bounded error budget (default: max 10 error transitions). When exhausted, the PR transitions to STUCK and requires manual intervention via `apm2 fac recover`. No unbounded retry loops.",
+          "description": "Each PR/SHA lifecycle has a bounded error budget (default: max 10 error transitions). When exhausted, the PR transitions to STUCK and requires explicit doctor-first intervention: `apm2 fac doctor --fix` for host-level repair and `apm2 fac doctor --pr <N> --fix` for PR-scoped repair. No unbounded retry loops.",
           "rationale": "Prevents infinite crash-restart cycles that consume resources without progress."
         },
         {
@@ -155,7 +155,7 @@
           "title": "Defined lifecycle states",
           "severity": "MUST",
           "description": "The PR/SHA lifecycle MUST define at minimum these states with precise entry/exit conditions: Pushed, GatesRunning, GatesPassed, GatesFailed, ReviewsDispatched, ReviewInProgress, VerdictPending, VerdictApprove, VerdictDeny, MergeReady, Merged, Stuck, Stale, Recovering.",
-          "rationale": "Every state must be explicitly defined so tooling (doctor, recover, orchestrator) can reason about the PR's position in the pipeline."
+          "rationale": "Every state must be explicitly defined so tooling (doctor, orchestrator) can reason about the PR's position in the pipeline."
         }
       ]
     },
@@ -168,7 +168,7 @@
           "id": "AGNT-001",
           "title": "Concurrency cap per PR",
           "severity": "MUST",
-          "description": "At most 2 agents MAY be active for any single PR at any time. The agent registry MUST be consulted by all dispatch paths (push, restart, review run, orchestrator). Dispatch MUST return a clear 'at capacity' signal when the cap is reached.",
+          "description": "At most 2 agents MAY be active for any single PR at any time. The agent registry MUST be consulted by all dispatch paths (push, doctor --pr --fix follow-up repair, orchestrator). Dispatch MUST return a clear 'at capacity' signal when the cap is reached.",
           "rationale": "Prevents unbounded agent accumulation from crash-restart cycles."
         },
         {
@@ -196,7 +196,7 @@
           "id": "AGNT-005",
           "title": "Agent lifecycle states",
           "severity": "MUST",
-          "description": "The agent lifecycle sub-machine MUST define at minimum: Dispatched, Running, Completed, Crashed, Reaped. Composition with PR lifecycle: Completed reviewer triggers verdict checks; Crashed reviewer may trigger restart (subject to AGNT-003 and error budget).",
+          "description": "The agent lifecycle sub-machine MUST define at minimum: Dispatched, Running, Completed, Crashed, Reaped. Composition with PR lifecycle: Completed reviewer triggers verdict checks; Crashed reviewer may trigger doctor-guided repair (subject to AGNT-003 and error budget).",
           "rationale": "Explicit agent states enable the orchestrator and doctor command to report precise status."
         },
         {
@@ -225,13 +225,13 @@
           "title": "Projection identity update is last step in push",
           "severity": "MUST",
           "description": "Local PR identity/projection update MUST be the LAST step in the push flow — after git push, after gates pass, after review dispatch completes. The local SHA MUST only be persisted once the full pipeline for that SHA has been confirmed.",
-          "rationale": "Premature identity writes cause 'stale identity' errors in restart/recovery when the pipeline fails mid-flight."
+          "rationale": "Premature identity writes cause stale-identity repair loops when the pipeline fails mid-flight."
         },
         {
           "id": "PERS-003",
           "title": "Corrupted state transitions to quarantine",
           "severity": "MUST",
-          "description": "HMAC validation failure, missing mandatory receipt, or partial/truncated write MUST transition the lifecycle to a quarantine state requiring explicit operator intervention via `apm2 fac recover`.",
+          "description": "HMAC validation failure, missing mandatory receipt, or partial/truncated write MUST transition the lifecycle to a quarantine state requiring explicit operator intervention via `apm2 fac doctor --pr N --fix`.",
           "rationale": "Proceeding on broken state risks incorrect verdicts or lost findings."
         },
         {
@@ -303,41 +303,76 @@
           "severity": "MUST",
           "description": "`apm2 fac doctor --pr N` MUST produce a comprehensive single-source report covering: identity, lifecycle state, gate status, review verdicts, agent registry, recent events, and actionable health diagnostics. The command is purely observational (read-only).",
           "rationale": "Operators and orchestrator agents need a single command to understand everything about a PR's FAC status."
+        },
+        {
+          "id": "ERR-005",
+          "title": "PR doctor follow-up repair executes even without base plan ops",
+          "severity": "MUST",
+          "description": "When `apm2 fac doctor --pr <N> --fix` recommends `action=fix` with follow-up repair semantics, the bounded follow-up PR repair cycle MUST execute even if the direct lifecycle/registry/run-state repair plan is empty for that pass.",
+          "rationale": "A no-op direct plan does not imply the PR repair cycle is healthy; skipping follow-up repair can leave reviewer dispatch unrecovered."
+        },
+        {
+          "id": "ERR-006",
+          "title": "Run-state-only repair does not imply lifecycle reset",
+          "severity": "MUST",
+          "description": "Run-state corruption/ambiguity repair signals MUST NOT implicitly trigger lifecycle reset. Lifecycle reset is only allowed when explicit lifecycle-reset conditions are present.",
+          "rationale": "Broad reset side effects from run-state-only issues can reintroduce race windows and unnecessary lifecycle churn."
+        },
+        {
+          "id": "ERR-007",
+          "title": "Projection-gap fix preempts merge recommendation",
+          "severity": "MUST",
+          "description": "When verdict projection lacks authoritative remote comment binding for a terminal-approved SHA, doctor MUST recommend `action=fix` and execute bounded follow-up repair before emitting `merge`/`approve` actions.",
+          "rationale": "Projection fanout races can leave remote comment binding missing; merge-ready guidance must not bypass deterministic projection repair."
         }
       ]
     },
 
     "compatibility": {
       "id": "COMPAT",
-      "title": "Backwards Compatibility and Migration",
+      "title": "Command Surface and Migration",
       "requirements": [
         {
           "id": "COMPAT-001",
-          "title": "CLI command surface preservation",
+          "title": "Removed legacy commands stay removed",
           "severity": "MUST",
-          "description": "All existing `apm2 fac` CLI commands, flags, and output schemas MUST continue to function. New commands (fac done, fac recover, fac review finding) are additive.",
-          "rationale": "External callers (CI workflows, reviewer prompts, operator scripts) must not break."
+          "description": "Deprecated command surfaces `apm2 fac recover`, `apm2 fac review run`, `apm2 fac restart`, and `apm2 fac review restart` MUST remain removed from CLI parsing and help output. Canonical remediation commands are `apm2 fac doctor --fix` and `apm2 fac doctor --pr <N> --fix`.",
+          "rationale": "Legacy command surfaces create ambiguous operator paths and conceal the doctor-first remediation contract."
         },
         {
           "id": "COMPAT-002",
-          "title": "Legacy finding compatibility shim",
-          "severity": "MAY",
-          "description": "`apm2 fac review comment` MAY remain functional as a hidden alias/shim for `apm2 fac review finding`. Reviewer prompts have been migrated to `finding` as of v2.0.0 prompt schema.",
-          "rationale": "Migration complete. The shim exists for any remaining external callers but is not load-bearing."
+          "title": "No hidden compatibility shims",
+          "severity": "MUST",
+          "description": "Deprecated aliases/shims (for example `apm2 fac review comment`) MUST NOT remain as hidden parser surfaces. Command removal is explicit and fail-closed.",
+          "rationale": "Back-compat shims prolong drift and undermine deterministic command contracts."
         },
         {
           "id": "COMPAT-003",
-          "title": "Deterministic state migration",
+          "title": "No legacy state migration shims",
           "severity": "MUST",
-          "description": "Existing local FAC artifacts (state files, receipts, projection store entries) MUST be migrated deterministically. Ambiguous or corrupt state during migration MUST fail closed and require explicit `fac recover` intervention.",
-          "rationale": "In-flight reviews must not be silently lost or corrupted during the transition."
+          "description": "Legacy run-state schema compatibility shims (for example `pr_url`-based state variants and implicit legacy terminal-reason normalization) MUST NOT remain in the active load path. Non-canonical state MUST fail closed with explicit diagnostics and doctor-first remediation guidance.",
+          "rationale": "Back-compat migration shims hide data-shape drift and make safety decisions nondeterministic."
         },
         {
           "id": "COMPAT-004",
-          "title": "Shadow-mode validation before cutover",
-          "severity": "SHOULD",
-          "description": "The new reducer SHOULD run in shadow mode alongside current logic, comparing projections/terminal outcomes per PR/SHA. Full cutover SHOULD be blocked until divergence is zero across burn-in runs.",
-          "rationale": "Reduces risk of behavioral regressions during the transition from ad-hoc state mutation to reducer authority."
+          "title": "Single canonical control path",
+          "severity": "MUST",
+          "description": "Dual-path command/reducer shadow execution MUST NOT remain enabled in production control flow. One canonical path governs lifecycle transitions and remediation decisions.",
+          "rationale": "Multiple live control paths create race windows and ambiguous operator outcomes."
+        },
+        {
+          "id": "COMPAT-005",
+          "title": "Doctor recommendations are executable CLI commands",
+          "severity": "MUST",
+          "description": "Any non-null `recommended_action.command` emitted by `apm2 fac doctor --pr <N>` MUST be directly executable against the current CLI surface. Deprecated/removed flags and hidden legacy parameters are not allowed in recommendation templates.",
+          "rationale": "Operators and orchestrators execute recommendation commands verbatim; stale templates create remediation drift and failed recovery loops."
+        },
+        {
+          "id": "COMPAT-006",
+          "title": "FAC CLI is JSON-first by default",
+          "severity": "MUST",
+          "description": "FAC command surfaces MUST emit machine-readable JSON/NDJSON by default. Orchestration guidance, help text, and recommendation templates MUST NOT require `--json` as a prerequisite for machine output.",
+          "rationale": "Automation loops depend on predictable machine output contracts; optional human-first defaults create parsing ambiguity."
         }
       ]
     },

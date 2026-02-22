@@ -158,8 +158,8 @@ enum Commands {
     /// Evidence commands (publish evidence artifacts via session socket)
     Evidence(commands::evidence::EvidenceCommand),
 
-    // === FAC (Forge Admission Cycle) productivity (TCK-00333) ===
-    /// FAC commands (ledger/CAS oriented debug UX)
+    // === FAC (Forge Admission Cycle) operational surface ===
+    /// FAC operations and diagnostics (JSON-first)
     Fac(commands::fac::FacCommand),
 
     // === Factory (Agent) orchestration ===

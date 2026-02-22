@@ -255,7 +255,7 @@ pub fn build_resume_spawn_command_for_backend(
 /// Build the SHA-drift update message sent to the review agent on resume.
 pub fn build_sha_update_message(pr_number: u32, old_sha: &str, new_sha: &str) -> String {
     format!(
-        "CRITICAL: The PR HEAD has moved from {old_sha} to {new_sha}. Re-run `apm2 fac review prepare --pr {pr_number} --sha {new_sha} --json` and re-read the prepared diff. Update your review and publish a new comment targeting SHA {new_sha}. Your full prior analysis is preserved in this session."
+        "CRITICAL: The PR HEAD has moved from {old_sha} to {new_sha}. Re-run `apm2 fac review prepare --pr {pr_number} --sha {new_sha}` and re-read the prepared diff. Update your review and publish a new comment targeting SHA {new_sha}. Your full prior analysis is preserved in this session."
     )
 }
 

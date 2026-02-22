@@ -206,7 +206,7 @@ const fn verdict_dimension_for_kind(review_kind: ReviewKind) -> &'static str {
 
 fn required_verdict_command(review_kind: ReviewKind) -> String {
     format!(
-        "cargo run -p apm2-cli -- fac review verdict set --dimension {} --verdict <approve|deny> --reason \"<your synthesized reasoning>\" --json",
+        "cargo run -p apm2-cli -- fac review verdict set --dimension {} --verdict <approve|deny> --reason \"<your synthesized reasoning>\"",
         verdict_dimension_for_kind(review_kind)
     )
 }

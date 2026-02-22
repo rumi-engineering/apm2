@@ -831,7 +831,7 @@ fn test_fac_worker_e2e_once_mode_processes_job() {
 
     write_spec_to_pending(&queue_root, &spec);
 
-    let exit_code = fac_worker::run_fac_worker(true, 1, 1, true, false);
+    let exit_code = fac_worker::run_fac_worker(true, 1, true, false);
     assert_eq!(exit_code, exit_codes::codes::SUCCESS);
 
     let pending_path = queue_root.join("pending").join(&file_name);

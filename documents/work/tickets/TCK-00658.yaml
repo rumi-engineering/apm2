@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: 'TCK-00658'
     title: 'FAC: PID-reuse safe lane liveness (bind LaneLease to /proc start time)'
-    status: 'OPEN'
+    status: 'MERGED'
   binds:
     prd_id: 'PRD-0001'
     rfc_id: 'RFC-0019'

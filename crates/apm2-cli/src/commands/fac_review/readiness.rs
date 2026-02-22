@@ -129,7 +129,7 @@ impl SubstrateComponent {
                 "adopt a valid economics profile hash with `apm2 fac economics adopt <b3-256:...>`"
             },
             Self::WorkerBroker => {
-                "start a FAC worker (`apm2 fac worker --poll-interval-secs 1`) and ensure broker state is healthy"
+                "ensure the FAC worker service is active (`apm2-worker.service`) and broker state is healthy"
             },
             Self::CargoDeps => {
                 "fix managed cargo home permissions under $APM2_HOME/private/fac/cargo_home"

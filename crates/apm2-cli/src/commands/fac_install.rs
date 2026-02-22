@@ -4,9 +4,12 @@
 //! Implements `apm2 fac install` which:
 //! 1. Runs `cargo install --path crates/apm2-cli --force` to install the
 //!    current worktree binary to `~/.cargo/bin/apm2`.
-//! 2. Re-links `~/.local/bin/apm2 -> ~/.cargo/bin/apm2`.
-//! 3. Restarts `apm2-daemon.service` and `apm2-worker.service` via systemd.
-//! 4. Emits structured output with installed binary path, SHA-256 digest, and
+//! 2. Runs `cargo install --path crates/apm2-daemon --force` to install
+//!    `~/.cargo/bin/apm2-daemon`.
+//! 3. Re-links `~/.local/bin/apm2` and `~/.local/bin/apm2-daemon` to their
+//!    `~/.cargo/bin/*` canonical targets.
+//! 4. Restarts `apm2-daemon.service` and `apm2-worker.service` via systemd.
+//! 5. Emits structured output with installed binary paths, SHA-256 digests, and
 //!    service restart status.
 //!
 //! # Motivation (INV-PADOPT-004)
@@ -55,6 +58,12 @@ struct InstallResult {
     /// SHA-256 digest of the installed binary.
     #[serde(skip_serializing_if = "Option::is_none")]
     sha256: Option<String>,
+    /// Installed daemon binary path (canonical).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_binary_path: Option<String>,
+    /// SHA-256 digest of the installed daemon binary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_sha256: Option<String>,
     /// Resolved workspace root used for install source (audit trail).
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace_root: Option<String>,
@@ -65,6 +74,9 @@ struct InstallResult {
     /// Symlink path and target.
     #[serde(skip_serializing_if = "Option::is_none")]
     symlink: Option<SymlinkResult>,
+    /// Daemon symlink path and target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_symlink: Option<SymlinkResult>,
     /// Error message if install failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -132,26 +144,38 @@ fn cargo_bin_path() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".cargo/bin/apm2"))
 }
 
+/// Resolve the cargo daemon binary install target path.
+fn cargo_daemon_bin_path() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
+    Ok(PathBuf::from(home).join(".cargo/bin/apm2-daemon"))
+}
+
 /// Resolve the local bin symlink path.
 fn local_bin_path() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
     Ok(PathBuf::from(home).join(".local/bin/apm2"))
 }
 
-/// Run `cargo install --path crates/apm2-cli --force` using the given
+/// Resolve the local daemon bin symlink path.
+fn local_daemon_bin_path() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
+    Ok(PathBuf::from(home).join(".local/bin/apm2-daemon"))
+}
+
+/// Run `cargo install --path <crate_path> --force` using the given
 /// workspace root.
-fn run_cargo_install(workspace_root: &Path) -> Result<(), String> {
-    let cli_crate_path = workspace_root.join("crates/apm2-cli");
-    if !cli_crate_path.join("Cargo.toml").exists() {
+fn run_cargo_install(workspace_root: &Path, crate_rel_path: &str) -> Result<(), String> {
+    let crate_path = workspace_root.join(crate_rel_path);
+    if !crate_path.join("Cargo.toml").exists() {
         return Err(format!(
-            "crates/apm2-cli not found at {}",
-            cli_crate_path.display()
+            "{crate_rel_path} not found at {}",
+            crate_path.display()
         ));
     }
 
     let status = Command::new("cargo")
         .args(["install", "--path"])
-        .arg(&cli_crate_path)
+        .arg(&crate_path)
         .arg("--force")
         .status()
         .map_err(|e| format!("failed to run cargo install: {e}"))?;
@@ -339,10 +363,13 @@ pub fn run_install(
         success: false,
         installed_binary_path: None,
         sha256: None,
+        daemon_binary_path: None,
+        daemon_sha256: None,
         workspace_root: None,
         service_restarts: Vec::with_capacity(INSTALL_SERVICE_UNITS.len()),
         restart_failures: Vec::new(),
         symlink: None,
+        daemon_symlink: None,
         error: None,
     };
 
@@ -357,24 +384,46 @@ pub fn run_install(
     };
     result.workspace_root = Some(workspace_root.display().to_string());
 
-    // Step 1: cargo install
+    // Step 1: cargo install (`apm2`)
     if !json_output {
         eprintln!(
             "Installing apm2 via cargo install (workspace: {})...",
             workspace_root.display()
         );
     }
-    if let Err(e) = run_cargo_install(&workspace_root) {
+    if let Err(e) = run_cargo_install(&workspace_root, "crates/apm2-cli") {
         result.error = Some(format!("cargo install failed: {e}"));
         emit_result(&result, json_output);
         return exit_codes::GENERIC_ERROR;
     }
 
-    // Step 2: Compute digest of installed binary
+    // Step 1b: cargo install (`apm2-daemon`) to keep wrapper/daemon runtime
+    // aligned.
+    if !json_output {
+        eprintln!(
+            "Installing apm2-daemon via cargo install (workspace: {})...",
+            workspace_root.display()
+        );
+    }
+    if let Err(e) = run_cargo_install(&workspace_root, "crates/apm2-daemon") {
+        result.error = Some(format!("cargo install failed: {e}"));
+        emit_result(&result, json_output);
+        return exit_codes::GENERIC_ERROR;
+    }
+
+    // Step 2: Compute digest of installed binaries
     let cargo_bin = match cargo_bin_path() {
         Ok(p) => p,
         Err(e) => {
             result.error = Some(format!("cannot resolve cargo bin path: {e}"));
+            emit_result(&result, json_output);
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+    let cargo_daemon_bin = match cargo_daemon_bin_path() {
+        Ok(p) => p,
+        Err(e) => {
+            result.error = Some(format!("cannot resolve cargo daemon bin path: {e}"));
             emit_result(&result, json_output);
             return exit_codes::GENERIC_ERROR;
         },
@@ -388,8 +437,17 @@ pub fn run_install(
         emit_result(&result, json_output);
         return exit_codes::GENERIC_ERROR;
     }
+    if !cargo_daemon_bin.exists() {
+        result.error = Some(format!(
+            "installed daemon binary not found at {}",
+            cargo_daemon_bin.display()
+        ));
+        emit_result(&result, json_output);
+        return exit_codes::GENERIC_ERROR;
+    }
 
     result.installed_binary_path = Some(cargo_bin.display().to_string());
+    result.daemon_binary_path = Some(cargo_daemon_bin.display().to_string());
 
     match sha256_file(&cargo_bin) {
         Ok(digest) => result.sha256 = Some(digest),
@@ -399,8 +457,17 @@ pub fn run_install(
             return exit_codes::GENERIC_ERROR;
         },
     }
+    match sha256_file(&cargo_daemon_bin) {
+        Ok(digest) => result.daemon_sha256 = Some(digest),
+        Err(e) => {
+            result.error = Some(format!("cannot compute daemon binary digest: {e}"));
+            emit_result(&result, json_output);
+            return exit_codes::GENERIC_ERROR;
+        },
+    }
 
     // Step 3: Re-link ~/.local/bin/apm2 -> ~/.cargo/bin/apm2
+    //         Re-link ~/.local/bin/apm2-daemon -> ~/.cargo/bin/apm2-daemon
     //
     // INV-INSTALL-002: Symlink alignment is a required success condition.
     // Failure to create or verify the symlink means the interactive CLI path
@@ -434,6 +501,39 @@ pub fn run_install(
             result.error = Some(format!(
                 "symlink alignment failed: cannot resolve local bin path: {e}"
             ));
+        },
+    }
+
+    match local_daemon_bin_path() {
+        Ok(link_path) => match ensure_symlink(&link_path, &cargo_daemon_bin) {
+            Ok(symlink_result) => {
+                result.daemon_symlink = Some(symlink_result);
+            },
+            Err(e) => {
+                symlink_failed = true;
+                if !json_output {
+                    eprintln!("ERROR: daemon symlink creation failed: {e}");
+                }
+                result.daemon_symlink = Some(SymlinkResult {
+                    link_path: link_path.display().to_string(),
+                    target_path: cargo_daemon_bin.display().to_string(),
+                    status: format!("failed: {e}"),
+                });
+                if result.error.is_none() {
+                    result.error = Some(format!("daemon symlink alignment failed: {e}"));
+                }
+            },
+        },
+        Err(e) => {
+            symlink_failed = true;
+            if !json_output {
+                eprintln!("ERROR: cannot resolve local daemon bin path: {e}");
+            }
+            if result.error.is_none() {
+                result.error = Some(format!(
+                    "daemon symlink alignment failed: cannot resolve local daemon bin path: {e}"
+                ));
+            }
         },
     }
 
@@ -494,9 +594,21 @@ fn emit_result(result: &InstallResult, json_output: bool) {
         if let Some(ref digest) = result.sha256 {
             println!("  SHA-256: {digest}");
         }
+        if let Some(ref path) = result.daemon_binary_path {
+            println!("  Daemon binary: {path}");
+        }
+        if let Some(ref digest) = result.daemon_sha256 {
+            println!("  Daemon SHA-256: {digest}");
+        }
         if let Some(ref symlink) = result.symlink {
             println!(
                 "  Symlink: {} -> {} ({})",
+                symlink.link_path, symlink.target_path, symlink.status
+            );
+        }
+        if let Some(ref symlink) = result.daemon_symlink {
+            println!(
+                "  Daemon symlink: {} -> {} ({})",
                 symlink.link_path, symlink.target_path, symlink.status
             );
         }
@@ -529,6 +641,12 @@ fn emit_result(result: &InstallResult, json_output: bool) {
         }
         if let Some(ref digest) = result.sha256 {
             eprintln!("  SHA-256: {digest}");
+        }
+        if let Some(ref path) = result.daemon_binary_path {
+            eprintln!("  Daemon binary: {path}");
+        }
+        if let Some(ref digest) = result.daemon_sha256 {
+            eprintln!("  Daemon SHA-256: {digest}");
         }
     }
 }
@@ -607,6 +725,8 @@ mod tests {
             success: false,
             installed_binary_path: Some("/usr/bin/apm2".to_string()),
             sha256: Some("abcdef1234567890".to_string()),
+            daemon_binary_path: Some("/usr/bin/apm2-daemon".to_string()),
+            daemon_sha256: Some("1234567890abcdef".to_string()),
             workspace_root: Some("/home/user/Projects/apm2".to_string()),
             service_restarts: vec![
                 ServiceRestartResult {
@@ -627,6 +747,11 @@ mod tests {
             symlink: Some(SymlinkResult {
                 link_path: "/home/user/.local/bin/apm2".to_string(),
                 target_path: "/home/user/.cargo/bin/apm2".to_string(),
+                status: "ok".to_string(),
+            }),
+            daemon_symlink: Some(SymlinkResult {
+                link_path: "/home/user/.local/bin/apm2-daemon".to_string(),
+                target_path: "/home/user/.cargo/bin/apm2-daemon".to_string(),
                 status: "ok".to_string(),
             }),
             error: None,
@@ -658,6 +783,8 @@ mod tests {
             success: true,
             installed_binary_path: Some("/usr/bin/apm2".to_string()),
             sha256: Some("abcdef1234567890".to_string()),
+            daemon_binary_path: Some("/usr/bin/apm2-daemon".to_string()),
+            daemon_sha256: Some("1234567890abcdef".to_string()),
             workspace_root: Some("/home/user/Projects/apm2".to_string()),
             service_restarts: vec![ServiceRestartResult {
                 unit: "apm2-daemon.service".to_string(),
@@ -666,6 +793,7 @@ mod tests {
             }],
             restart_failures: vec![],
             symlink: None,
+            daemon_symlink: None,
             error: None,
         };
         let json = serde_json::to_string(&result);
@@ -832,6 +960,8 @@ mod tests {
             success: false,
             installed_binary_path: Some("/usr/bin/apm2".to_string()),
             sha256: Some("abcdef1234567890".to_string()),
+            daemon_binary_path: Some("/usr/bin/apm2-daemon".to_string()),
+            daemon_sha256: Some("1234567890abcdef".to_string()),
             workspace_root: Some("/home/user/Projects/apm2".to_string()),
             service_restarts: vec![
                 ServiceRestartResult {
@@ -851,6 +981,7 @@ mod tests {
                 target_path: "/home/user/.cargo/bin/apm2".to_string(),
                 status: "failed: permission denied".to_string(),
             }),
+            daemon_symlink: None,
             error: Some("symlink alignment failed: permission denied".to_string()),
         };
 

@@ -110,6 +110,9 @@ pub const MAX_LANE_RECOVERY_ACTIONS: usize = 64;
 /// (INV-RECON-003).
 pub const MAX_QUEUE_RECOVERY_ACTIONS: usize = 4096;
 
+/// Schema identifier for runtime claimed-only reconciliation outcomes.
+pub const RUNTIME_QUEUE_RECONCILE_OUTCOME_SCHEMA: &str = "apm2.fac.runtime_queue_reconcile.v1";
+
 /// Maximum size of a claimed job spec file for bounded reads (64 KiB).
 const MAX_CLAIMED_FILE_SIZE: u64 = 65_536;
 
@@ -218,6 +221,86 @@ pub enum OrphanedJobPolicy {
 }
 
 // `Default` derived via `#[default]` attribute on `Requeue` variant.
+
+/// Runtime queue reconciliation bounds.
+///
+/// This is the explicit bounded config surface used by runtime claimed-only
+/// reconciliation so the worker can thread deterministic safety limits without
+/// mutating lane state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueReconcileLimits {
+    /// Maximum claimed entries inspected per run.
+    pub max_claimed_scan_entries: usize,
+    /// Maximum queue actions tracked per run.
+    pub max_queue_recovery_actions: usize,
+}
+
+impl Default for QueueReconcileLimits {
+    fn default() -> Self {
+        Self {
+            max_claimed_scan_entries: MAX_CLAIMED_SCAN_ENTRIES,
+            max_queue_recovery_actions: MAX_QUEUE_RECOVERY_ACTIONS,
+        }
+    }
+}
+
+/// Runtime claimed-only reconciliation disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeQueueReconcileStatus {
+    /// Reconciliation applied queue mutations.
+    Applied,
+    /// Reconciliation completed with no queue mutation required.
+    Skipped,
+    /// Reconciliation was blocked by fail-closed safety conditions.
+    Blocked,
+    /// Reconciliation failed due to a hard error.
+    Failed,
+}
+
+/// Runtime claimed-only reconciliation config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeQueueReconcileConfig {
+    /// Orphan policy to apply for non-receipted orphaned claimed jobs.
+    pub orphan_policy: OrphanedJobPolicy,
+    /// Deterministic bounded scan/action limits.
+    pub limits: QueueReconcileLimits,
+}
+
+impl Default for RuntimeQueueReconcileConfig {
+    fn default() -> Self {
+        Self {
+            orphan_policy: OrphanedJobPolicy::Requeue,
+            limits: QueueReconcileLimits::default(),
+        }
+    }
+}
+
+/// Structured runtime claimed-only reconciliation outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeQueueReconcileOutcome {
+    /// Outcome schema identifier.
+    pub schema: String,
+    /// Deterministic reconcile disposition.
+    pub status: RuntimeQueueReconcileStatus,
+    /// Number of lanes inspected for active-job suppression.
+    pub lanes_inspected: usize,
+    /// Number of claimed entries inspected.
+    pub claimed_files_inspected: usize,
+    /// Number of orphaned jobs requeued.
+    pub orphaned_jobs_requeued: usize,
+    /// Number of orphaned jobs moved to denied.
+    pub orphaned_jobs_failed: usize,
+    /// Number of torn states recovered from receipts.
+    pub torn_states_recovered: usize,
+    /// Number of `StillActive` actions observed.
+    pub still_active: usize,
+    /// Optional blocked/failed reason.
+    pub reason: Option<String>,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Recovery action types
@@ -670,6 +753,7 @@ pub fn reconcile_on_startup(
         &lane_result.unknown_identity_job_ids_for_orphan_suppression,
         orphan_policy,
         dry_run,
+        QueueReconcileLimits::default(),
     );
 
     if let Some(phase2_err) = queue_result.partial_error {
@@ -747,6 +831,134 @@ pub fn reconcile_on_startup(
     }
 
     Ok(receipt)
+}
+
+const fn classify_runtime_reconcile_error(error: &ReconcileError) -> RuntimeQueueReconcileStatus {
+    match error {
+        ReconcileError::TooManyEntries { .. }
+        | ReconcileError::Io { .. }
+        | ReconcileError::Lane(_) => RuntimeQueueReconcileStatus::Blocked,
+        ReconcileError::MoveFailed { .. } | ReconcileError::Serialization(_) => {
+            RuntimeQueueReconcileStatus::Failed
+        },
+    }
+}
+
+fn count_still_active_actions(actions: &[QueueRecoveryAction]) -> usize {
+    actions
+        .iter()
+        .filter(|action| matches!(action, QueueRecoveryAction::StillActive { .. }))
+        .count()
+}
+
+/// Run runtime claimed-only reconciliation without lane mutation.
+///
+/// This is the event-driven runtime repair API used by the worker loop for
+/// self-heal of `queue/claimed/` in steady state. It intentionally avoids lane
+/// mutations by collecting active-job suppression sets via `reconcile_lanes`
+/// dry-run mode (no writes), then applying only queue-side convergence.
+///
+/// Any blocked/failed outcome includes guidance to escalate broad host
+/// remediation through `apm2 fac doctor --fix`.
+#[must_use]
+pub fn reconcile_claimed_runtime(
+    fac_root: &Path,
+    queue_root: &Path,
+    config: RuntimeQueueReconcileConfig,
+) -> RuntimeQueueReconcileOutcome {
+    let mut outcome = RuntimeQueueReconcileOutcome {
+        schema: RUNTIME_QUEUE_RECONCILE_OUTCOME_SCHEMA.to_string(),
+        status: RuntimeQueueReconcileStatus::Skipped,
+        lanes_inspected: 0,
+        claimed_files_inspected: 0,
+        orphaned_jobs_requeued: 0,
+        orphaned_jobs_failed: 0,
+        torn_states_recovered: 0,
+        still_active: 0,
+        reason: None,
+    };
+
+    let manager = match LaneManager::new(fac_root.to_path_buf()) {
+        Ok(manager) => manager,
+        Err(error) => {
+            outcome.status = RuntimeQueueReconcileStatus::Blocked;
+            outcome.reason = Some(truncate_string(
+                &format!(
+                    "runtime reconcile blocked: cannot initialize lane manager ({error}); \
+                     remediate with `apm2 fac doctor --fix`"
+                ),
+                MAX_STRING_LENGTH,
+            ));
+            return outcome;
+        },
+    };
+
+    let lane_ids = LaneManager::default_lane_ids();
+    outcome.lanes_inspected = lane_ids.len();
+    let timestamp = current_timestamp_rfc3339();
+
+    // Dry-run lane phase: derive active-job suppression sets with no lane writes.
+    let lane_result = reconcile_lanes(&manager, &lane_ids, fac_root, &timestamp, true);
+    if let Some(error) = lane_result.partial_error {
+        outcome.status = classify_runtime_reconcile_error(&error);
+        let severity = if outcome.status == RuntimeQueueReconcileStatus::Blocked {
+            "blocked"
+        } else {
+            "failed"
+        };
+        outcome.reason = Some(truncate_string(
+            &format!(
+                "runtime reconcile {severity} during lane snapshot: {error}; remediate with \
+                 `apm2 fac doctor --fix`"
+            ),
+            MAX_STRING_LENGTH,
+        ));
+        return outcome;
+    }
+
+    let queue_result = reconcile_queue(
+        fac_root,
+        queue_root,
+        &lane_result.active_job_ids,
+        &lane_result.unknown_identity_job_ids_for_orphan_suppression,
+        config.orphan_policy,
+        false,
+        config.limits,
+    );
+
+    outcome.claimed_files_inspected = queue_result.claimed_files_inspected;
+    outcome.orphaned_jobs_requeued = queue_result.orphaned_jobs_requeued;
+    outcome.orphaned_jobs_failed = queue_result.orphaned_jobs_failed;
+    outcome.torn_states_recovered = queue_result.torn_states_recovered;
+    outcome.still_active = count_still_active_actions(&queue_result.actions);
+
+    if let Some(error) = queue_result.partial_error {
+        outcome.status = classify_runtime_reconcile_error(&error);
+        let severity = if outcome.status == RuntimeQueueReconcileStatus::Blocked {
+            "blocked"
+        } else {
+            "failed"
+        };
+        outcome.reason = Some(truncate_string(
+            &format!(
+                "runtime claimed reconcile {severity}: {error}; remediate with \
+                 `apm2 fac doctor --fix`"
+            ),
+            MAX_STRING_LENGTH,
+        ));
+        return outcome;
+    }
+
+    let applied_actions = outcome.orphaned_jobs_requeued
+        + outcome.orphaned_jobs_failed
+        + outcome.torn_states_recovered;
+    outcome.status = if applied_actions > 0 {
+        RuntimeQueueReconcileStatus::Applied
+    } else {
+        RuntimeQueueReconcileStatus::Skipped
+    };
+
+    outcome
 }
 
 /// Phase 1: Scan all lanes for stale leases and reconcile them.
@@ -1328,6 +1540,7 @@ fn reconcile_queue(
     unknown_identity_job_ids_for_orphan_suppression: &HashSet<String>,
     orphan_policy: OrphanedJobPolicy,
     dry_run: bool,
+    limits: QueueReconcileLimits,
 ) -> QueueReconcileResult {
     let claimed_dir = queue_root.join("claimed");
     let pending_dir = queue_root.join("pending");
@@ -1408,19 +1621,19 @@ fn reconcile_queue(
         // queue/claimed with symlinks, directories, or special files to bypass
         // the MAX_CLAIMED_SCAN_ENTRIES budget and cause unbounded traversal.
         claimed_files_inspected += 1;
-        if claimed_files_inspected > MAX_CLAIMED_SCAN_ENTRIES {
+        if claimed_files_inspected > limits.max_claimed_scan_entries {
             return queue_result!(Some(ReconcileError::TooManyEntries {
                 kind: "claimed_scan",
                 count: claimed_files_inspected,
-                limit: MAX_CLAIMED_SCAN_ENTRIES,
+                limit: limits.max_claimed_scan_entries,
             }));
         }
         let action_count = actions.len();
-        if action_count >= MAX_QUEUE_RECOVERY_ACTIONS {
+        if action_count >= limits.max_queue_recovery_actions {
             return queue_result!(Some(ReconcileError::TooManyEntries {
                 kind: "queue_recovery_actions",
                 count: action_count,
-                limit: MAX_QUEUE_RECOVERY_ACTIONS,
+                limit: limits.max_queue_recovery_actions,
             }));
         }
 
@@ -3860,5 +4073,105 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_runtime_claimed_reconcile_applies_requeue_without_lane_mutation() {
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+        write_claimed_job(&queue_root, "runtime-orphan");
+
+        let claimed_path = queue_root.join("claimed").join("runtime-orphan.json");
+        assert!(claimed_path.exists(), "seed claimed file must exist");
+
+        let outcome = reconcile_claimed_runtime(
+            &fac_root,
+            &queue_root,
+            RuntimeQueueReconcileConfig::default(),
+        );
+
+        assert_eq!(outcome.schema, RUNTIME_QUEUE_RECONCILE_OUTCOME_SCHEMA);
+        assert_eq!(outcome.status, RuntimeQueueReconcileStatus::Applied);
+        assert_eq!(outcome.orphaned_jobs_requeued, 1);
+        assert_eq!(outcome.orphaned_jobs_failed, 0);
+        assert_eq!(outcome.torn_states_recovered, 0);
+        assert!(!claimed_path.exists(), "claimed file should be requeued");
+
+        let pending_entries: Vec<_> = fs::read_dir(queue_root.join("pending"))
+            .expect("read pending")
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(
+            pending_entries.len(),
+            1,
+            "expected exactly one requeued pending file"
+        );
+
+        // Runtime path must not mutate lane state. No lane reconcile receipts
+        // should be emitted by claimed-only runtime reconcile.
+        let reconcile_receipts_dir = fac_root.join("receipts").join("reconcile");
+        if reconcile_receipts_dir.exists() {
+            let receipt_entries: Vec<_> = fs::read_dir(&reconcile_receipts_dir)
+                .expect("read reconcile receipts")
+                .filter_map(std::result::Result::ok)
+                .collect();
+            assert!(
+                receipt_entries.is_empty(),
+                "runtime claimed-only reconcile must not emit startup reconcile receipts"
+            );
+        }
+    }
+
+    #[test]
+    fn test_runtime_claimed_reconcile_skips_flock_held_file() {
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+        write_claimed_job(&queue_root, "runtime-locked");
+
+        let claimed_path = queue_root.join("claimed").join("runtime-locked.json");
+        let claimed_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&claimed_path)
+            .expect("open claimed file");
+        crate::fac::flock_util::acquire_exclusive_blocking(&claimed_file)
+            .expect("acquire worker flock");
+
+        let outcome = reconcile_claimed_runtime(
+            &fac_root,
+            &queue_root,
+            RuntimeQueueReconcileConfig::default(),
+        );
+
+        assert_eq!(outcome.status, RuntimeQueueReconcileStatus::Skipped);
+        assert_eq!(outcome.still_active, 1);
+        assert_eq!(outcome.orphaned_jobs_requeued, 0);
+        assert!(
+            claimed_path.exists(),
+            "flock-held claimed file must remain untouched"
+        );
+    }
+
+    #[test]
+    fn test_runtime_claimed_reconcile_blocks_on_bounded_scan_limit() {
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+        write_claimed_job(&queue_root, "runtime-bound-1");
+        write_claimed_job(&queue_root, "runtime-bound-2");
+
+        let config = RuntimeQueueReconcileConfig {
+            orphan_policy: OrphanedJobPolicy::Requeue,
+            limits: QueueReconcileLimits {
+                max_claimed_scan_entries: 1,
+                max_queue_recovery_actions: MAX_QUEUE_RECOVERY_ACTIONS,
+            },
+        };
+        let outcome = reconcile_claimed_runtime(&fac_root, &queue_root, config);
+
+        assert_eq!(outcome.status, RuntimeQueueReconcileStatus::Blocked);
+        assert!(
+            outcome
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("doctor --fix")),
+            "blocked outcome should include explicit doctor remediation guidance"
+        );
     }
 }
