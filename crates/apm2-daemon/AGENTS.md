@@ -23,6 +23,8 @@ The `apm2-daemon` crate implements the persistent daemon process in APM2's four-
 
 **Bounded Evidence Scans (TCK-00638):** `get_event_by_evidence_identity` and `canonical_get_evidence_by_identity` enforce `LIMIT MAX_EVIDENCE_SCAN_ROWS` (1 000) on their SQL queries to prevent O(N) iteration with per-row JSON + Protobuf deserialization. Without this bound, an attacker with a valid lease could publish evidence to grow the event count for a work_id, causing subsequent lookups to exhaust CPU and memory.
 
+**ClaimWorkV2 Multi-Role Support (TCK-00637):** `SqliteWorkRegistry` stores claims keyed by `(work_id, role)` via a UNIQUE index, enabling Implementer and Reviewer to each claim the same `work_id`. Schema migration in `SqliteWorkRegistry::init_schema` detects legacy schemas by PK topology (not column presence) and rebuilds the table if `work_id` is the sole PRIMARY KEY column. The `handle_claim_work_v2_idempotency` recovery path derives idempotency from three sources in order: (1) full ledger path (`work_transitioned` + `evidence.published`), (2) persisted claim-state fallback for partial-durability-failure recovery (removes the stale claim row via `remove_claim_for_role` so the retry completes the full durability chain), (3) different-actor rejection.
+
 ```
 ┌─────────────────┐
 │   apm2-cli      │  CLI client

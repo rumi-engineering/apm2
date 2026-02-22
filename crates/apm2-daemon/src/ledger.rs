@@ -4339,22 +4339,33 @@ impl SqliteWorkRegistry {
     /// Claims are keyed by `(work_id, role)` to support Phase 2 multi-role
     /// workflows where Implementer and Reviewer each claim the same `work_id`.
     ///
-    /// # Migration (Finding 2, round 5)
+    /// # Migration (Finding 2, round 5; Finding 1, round 7)
     ///
     /// Pre-existing databases may have the legacy schema with
-    /// `work_id TEXT PRIMARY KEY` (single-role uniqueness). This method
-    /// detects the legacy schema and migrates atomically:
+    /// `work_id TEXT PRIMARY KEY` (single-role uniqueness). Two legacy
+    /// variants exist:
     ///
-    /// 1. Detect whether `work_claims` already exists with a `work_id` primary
-    ///    key (no composite `(work_id, role)` key).
+    ///   (a) `work_id TEXT PRIMARY KEY` with no `role` column.
+    ///   (b) `work_id TEXT PRIMARY KEY` with `role INTEGER` (intermediate
+    ///       revision that added the role column but kept the single-column
+    ///       PK — multi-role inserts still fail with `SQLITE_CONSTRAINT`).
+    ///
+    /// This method detects the legacy schema by **key/index topology**:
+    /// if `work_id` is the sole PRIMARY KEY column, the table requires
+    /// migration regardless of whether a `role` column is present.
+    ///
+    /// Migration steps:
+    ///
+    /// 1. Detect whether `work_claims` already exists with `work_id` as the
+    ///    sole PRIMARY KEY column (via `PRAGMA table_info` pk flag).
     /// 2. If legacy schema: rename old table to `work_claims_legacy`, create
-    ///    new table with composite uniqueness, copy data with default `role =
-    ///    1` (Implementer), drop the legacy backup.
+    ///    new table with composite uniqueness, copy data (preserving role if
+    ///    present, defaulting to `1` = Implementer otherwise), drop the legacy
+    ///    backup.
     /// 3. If new schema or fresh DB: use `CREATE TABLE IF NOT EXISTS`.
     ///
     /// The migration is idempotent: running it multiple times on the same
-    /// database is safe. The detection query checks for the `role` column
-    /// in `PRAGMA table_info` — if it exists, no migration is needed.
+    /// database is safe.
     pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         // Check whether the work_claims table already exists.
         let table_exists: bool = conn
@@ -4367,40 +4378,93 @@ impl SqliteWorkRegistry {
             .unwrap_or(false);
 
         if table_exists {
-            // Check whether the existing table has a `role` column.
-            // If it does, the schema is already migrated (or was created
-            // fresh with the Phase 2 schema). No migration needed.
-            let has_role_column: bool = conn
-                .prepare("PRAGMA table_info(work_claims)")?
-                .query_map([], |row| {
-                    let name: String = row.get(1)?;
-                    Ok(name)
-                })?
-                .filter_map(std::result::Result::ok)
-                .any(|col_name| col_name == "role");
+            // Detect legacy schema by key/index topology, not just column
+            // presence.
+            //
+            // Legacy schema variants that require migration:
+            //   (a) `work_id TEXT PRIMARY KEY` with NO `role` column
+            //   (b) `work_id TEXT PRIMARY KEY` WITH `role INTEGER` column
+            //       (intermediate revision that added role but kept the
+            //       single-column PK)
+            //
+            // The authoritative signal is whether `work_id` is the sole
+            // PRIMARY KEY column. In SQLite, `PRAGMA table_info` returns
+            // column index 5 (`pk`) as >0 for columns in the PRIMARY KEY.
+            // If `work_id` has pk>0 and no other column has pk>0, the table
+            // enforces single-row-per-work_id and MUST be migrated.
+            let mut has_role_column = false;
+            let mut work_id_is_pk = false;
+            let mut pk_column_count: usize = 0;
 
-            if !has_role_column {
+            {
+                let mut stmt = conn.prepare("PRAGMA table_info(work_claims)")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let col_name: String = row.get(1)?;
+                    let pk_flag: i32 = row.get(5)?;
+
+                    if col_name == "role" {
+                        has_role_column = true;
+                    }
+                    if pk_flag > 0 {
+                        pk_column_count += 1;
+                        if col_name == "work_id" {
+                            work_id_is_pk = true;
+                        }
+                    }
+                }
+            }
+
+            // Migration required when work_id is the SOLE PRIMARY KEY
+            // column. This covers both legacy variants: (a) no role column
+            // at all, and (b) role column present but PK still enforces
+            // uniqueness on work_id alone.
+            let needs_migration = work_id_is_pk && pk_column_count == 1;
+
+            if needs_migration {
                 // Legacy schema detected: work_claims has work_id TEXT
-                // PRIMARY KEY but no role column. Migrate atomically.
+                // PRIMARY KEY (single-column PK). Migrate atomically.
                 //
                 // Strategy: rename → create new → copy → drop old.
                 // All within a single transaction for atomicity.
-                conn.execute_batch(
-                    "BEGIN IMMEDIATE;
-                     ALTER TABLE work_claims RENAME TO work_claims_legacy;
-                     CREATE TABLE work_claims (
-                         work_id TEXT NOT NULL,
-                         lease_id TEXT NOT NULL,
-                         actor_id TEXT NOT NULL,
-                         role INTEGER NOT NULL DEFAULT 1,
-                         claim_json BLOB NOT NULL
-                     );
-                     INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json)
-                         SELECT work_id, lease_id, actor_id, 1, claim_json
-                         FROM work_claims_legacy;
-                     DROP TABLE work_claims_legacy;
-                     COMMIT;",
-                )?;
+                //
+                // If the legacy table has a `role` column, preserve it.
+                // If not, default to role=1 (Implementer).
+                if has_role_column {
+                    conn.execute_batch(
+                        "BEGIN IMMEDIATE;
+                         ALTER TABLE work_claims RENAME TO work_claims_legacy;
+                         CREATE TABLE work_claims (
+                             work_id TEXT NOT NULL,
+                             lease_id TEXT NOT NULL,
+                             actor_id TEXT NOT NULL,
+                             role INTEGER NOT NULL DEFAULT 1,
+                             claim_json BLOB NOT NULL
+                         );
+                         INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json)
+                             SELECT work_id, lease_id, actor_id, role, claim_json
+                             FROM work_claims_legacy;
+                         DROP TABLE work_claims_legacy;
+                         COMMIT;",
+                    )?;
+                } else {
+                    conn.execute_batch(
+                        "BEGIN IMMEDIATE;
+                         ALTER TABLE work_claims RENAME TO work_claims_legacy;
+                         CREATE TABLE work_claims (
+                             work_id TEXT NOT NULL,
+                             lease_id TEXT NOT NULL,
+                             actor_id TEXT NOT NULL,
+                             role INTEGER NOT NULL DEFAULT 1,
+                             claim_json BLOB NOT NULL
+                         );
+                         INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json)
+                             SELECT work_id, lease_id, actor_id, 1, claim_json
+                             FROM work_claims_legacy;
+                         DROP TABLE work_claims_legacy;
+                         COMMIT;",
+                    )?;
+                }
             }
         } else {
             // Fresh database: create the table with the Phase 2 schema.
@@ -4509,6 +4573,15 @@ impl WorkRegistry for SqliteWorkRegistry {
             .flatten()?;
 
         serde_json::from_slice(&claim_json).ok()
+    }
+
+    fn remove_claim_for_role(&self, work_id: &str, role: WorkRole) {
+        if let Ok(conn) = self.conn.lock() {
+            let _ = conn.execute(
+                "DELETE FROM work_claims WHERE work_id = ?1 AND role = ?2",
+                params![work_id, role as i32],
+            );
+        }
     }
 }
 
@@ -8870,5 +8943,244 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM work_claims", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1, "data must be preserved after idempotent re-init");
+    }
+
+    /// Regression test for BLOCKER: legacy PK schema WITH role column.
+    ///
+    /// The intermediate schema revision had `work_id TEXT PRIMARY KEY` plus
+    /// `role INTEGER` but kept the single-column PK. Migration must detect
+    /// this by key/index topology (not just column presence) and rebuild
+    /// the table so multi-role inserts succeed.
+    #[test]
+    fn test_work_claims_legacy_pk_with_role_column_migration() {
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Create the intermediate legacy schema: work_id PK + role column.
+        // This is the schema that existed between the original (no role) and
+        // the final Phase 2 schema (no single-column PK on work_id).
+        conn.execute(
+            "CREATE TABLE work_claims (
+                work_id TEXT PRIMARY KEY,
+                lease_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                role INTEGER NOT NULL DEFAULT 1,
+                claim_json BLOB NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        // Insert an implementer claim.
+        let impl_claim = WorkClaim {
+            work_id: "W-pk-role-001".to_string(),
+            lease_id: "L-impl-001".to_string(),
+            actor_id: "actor-impl".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        let impl_json = serde_json::to_vec(&impl_claim).unwrap();
+        conn.execute(
+            "INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "W-pk-role-001",
+                "L-impl-001",
+                "actor-impl",
+                WorkRole::Implementer as i32,
+                impl_json,
+            ],
+        )
+        .unwrap();
+
+        // Before migration: inserting a REVIEWER for the same work_id must
+        // FAIL because the PRIMARY KEY(work_id) enforces single-row-per-work_id.
+        let reviewer_claim = WorkClaim {
+            work_id: "W-pk-role-001".to_string(),
+            lease_id: "L-reviewer-001".to_string(),
+            actor_id: "actor-reviewer".to_string(),
+            role: WorkRole::Reviewer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        let reviewer_json = serde_json::to_vec(&reviewer_claim).unwrap();
+        let pre_migration_result = conn.execute(
+            "INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "W-pk-role-001",
+                "L-reviewer-001",
+                "actor-reviewer",
+                WorkRole::Reviewer as i32,
+                reviewer_json,
+            ],
+        );
+        assert!(
+            pre_migration_result.is_err(),
+            "pre-migration: same work_id with different role must fail \
+             due to PRIMARY KEY(work_id)"
+        );
+
+        // Run migration.
+        SqliteWorkRegistry::init_schema(&conn)
+            .expect("migration of legacy PK + role schema should succeed");
+
+        // Verify the implementer claim was preserved with its original role.
+        let preserved_role: i32 = conn
+            .query_row(
+                "SELECT role FROM work_claims WHERE work_id = 'W-pk-role-001'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("implementer claim should exist after migration");
+        assert_eq!(
+            preserved_role,
+            WorkRole::Implementer as i32,
+            "implementer claim role must be preserved"
+        );
+
+        // After migration: inserting a REVIEWER for the same work_id must
+        // SUCCEED because the single-column PK on work_id was removed.
+        let reviewer_json2 = serde_json::to_vec(&reviewer_claim).unwrap();
+        conn.execute(
+            "INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "W-pk-role-001",
+                "L-reviewer-001",
+                "actor-reviewer",
+                WorkRole::Reviewer as i32,
+                reviewer_json2,
+            ],
+        )
+        .expect(
+            "post-migration: same work_id with different role must succeed \
+             (multi-role support)",
+        );
+
+        // Verify both claims exist.
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM work_claims WHERE work_id = 'W-pk-role-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            total, 2,
+            "both implementer and reviewer claims must coexist"
+        );
+
+        // Verify the UNIQUE index on (work_id, role) rejects true duplicates.
+        let dup_result = conn.execute(
+            "INSERT INTO work_claims (work_id, lease_id, actor_id, role, claim_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "W-pk-role-001",
+                "L-dup",
+                "actor-dup",
+                WorkRole::Implementer as i32,
+                impl_json,
+            ],
+        );
+        assert!(
+            dup_result.is_err(),
+            "duplicate (work_id, role) must still be rejected"
+        );
+    }
+
+    /// Verify `remove_claim_for_role` removes a specific (`work_id`, role)
+    /// claim from `SqliteWorkRegistry`.
+    #[test]
+    fn test_sqlite_work_registry_remove_claim_for_role() {
+        use std::sync::{Arc, Mutex};
+
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteWorkRegistry::init_schema(&conn).unwrap();
+        let registry = SqliteWorkRegistry::new(Arc::new(Mutex::new(conn)));
+
+        // Register two claims for the same work_id (different roles).
+        let impl_claim = WorkClaim {
+            work_id: "W-rm-001".to_string(),
+            lease_id: "L-rm-impl".to_string(),
+            actor_id: "actor-rm".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        let reviewer_claim = WorkClaim {
+            work_id: "W-rm-001".to_string(),
+            lease_id: "L-rm-reviewer".to_string(),
+            actor_id: "actor-rm-2".to_string(),
+            role: WorkRole::Reviewer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+
+        registry
+            .register_claim(impl_claim)
+            .expect("register implementer");
+        registry
+            .register_claim(reviewer_claim)
+            .expect("register reviewer");
+
+        // Both claims must exist.
+        assert!(
+            registry
+                .get_claim_for_role("W-rm-001", WorkRole::Implementer)
+                .is_some(),
+            "implementer claim must exist before removal"
+        );
+        assert!(
+            registry
+                .get_claim_for_role("W-rm-001", WorkRole::Reviewer)
+                .is_some(),
+            "reviewer claim must exist before removal"
+        );
+
+        // Remove the implementer claim only.
+        registry.remove_claim_for_role("W-rm-001", WorkRole::Implementer);
+
+        // Implementer claim must be gone.
+        assert!(
+            registry
+                .get_claim_for_role("W-rm-001", WorkRole::Implementer)
+                .is_none(),
+            "implementer claim must be removed"
+        );
+        // Reviewer claim must still exist.
+        assert!(
+            registry
+                .get_claim_for_role("W-rm-001", WorkRole::Reviewer)
+                .is_some(),
+            "reviewer claim must survive targeted removal"
+        );
+
+        // Re-registering the same (work_id, role) must succeed after removal.
+        let re_claim = WorkClaim {
+            work_id: "W-rm-001".to_string(),
+            lease_id: "L-rm-impl-2".to_string(),
+            actor_id: "actor-rm".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        registry
+            .register_claim(re_claim)
+            .expect("re-register after removal must succeed");
     }
 }
