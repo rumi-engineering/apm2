@@ -5422,6 +5422,21 @@ pub trait WorkRegistry: Send + Sync {
         None
     }
 
+    /// Clears age metadata for a persisted `(work_id, role)` claim.
+    ///
+    /// This is used after a claim's durability chain completes successfully
+    /// (`register_claim` -> lease registration -> `evidence.published` ->
+    /// `work_transitioned`) so partial-failure recovery metadata does not
+    /// grow without bound in long-running processes.
+    ///
+    /// # Default
+    ///
+    /// The default is a no-op for implementations that do not track age
+    /// metadata separately.
+    fn clear_claim_age(&self, work_id: &str, role: WorkRole) {
+        let _ = (work_id, role);
+    }
+
     /// Removes a claim for the given `(work_id, role)` pair.
     ///
     /// Used by the partial-durability-failure recovery path: when
@@ -5504,7 +5519,7 @@ pub struct StubWorkRegistry {
     #[allow(clippy::type_complexity)]
     claims: std::sync::RwLock<(
         VecDeque<(String, i32)>,
-        std::collections::HashMap<(String, i32), (WorkClaim, std::time::Instant)>,
+        std::collections::HashMap<(String, i32), (WorkClaim, Option<std::time::Instant>)>,
     )>,
 }
 
@@ -5546,7 +5561,7 @@ impl WorkRegistry for StubWorkRegistry {
         }
 
         order.push_back(key.clone());
-        claims.insert(key, (claim.clone(), std::time::Instant::now()));
+        claims.insert(key, (claim.clone(), Some(std::time::Instant::now())));
         Ok(claim)
     }
 
@@ -5574,7 +5589,14 @@ impl WorkRegistry for StubWorkRegistry {
         guard
             .1
             .get(&(work_id.to_string(), role as i32))
-            .map(|(_, claimed_at)| claimed_at.elapsed())
+            .and_then(|(_, claimed_at)| claimed_at.as_ref().map(std::time::Instant::elapsed))
+    }
+
+    fn clear_claim_age(&self, work_id: &str, role: WorkRole) {
+        let mut guard = self.claims.write().expect("lock poisoned");
+        if let Some((_, claimed_at)) = guard.1.get_mut(&(work_id.to_string(), role as i32)) {
+            *claimed_at = None;
+        }
     }
 
     fn remove_claim_for_role(&self, work_id: &str, role: WorkRole) {
@@ -15726,7 +15748,7 @@ impl PrivilegedDispatcher {
             join_revocation_head,
         );
 
-        let _pcac_lifecycle_artifacts = match self.enforce_privileged_pcac_lifecycle(
+        let pcac_lifecycle_artifacts = match self.enforce_privileged_pcac_lifecycle(
             PrivilegedHandlerClass::ClaimWorkV2.operation_name(),
             pcac_gate,
             &pcac_input,
@@ -15856,7 +15878,10 @@ impl PrivilegedDispatcher {
             .or_else(|| {
                 self.lease_validator
                     .get_lease_work_id(&request.lease_id)
-                    .and_then(|wid| self.work_registry.get_claim_for_role(&wid, role))
+                    .and_then(|wid| {
+                        self.work_registry
+                            .get_claim_by_lease_id(&wid, &request.lease_id)
+                    })
                     .map(|c| c.policy_resolution)
             });
         let Some(resolved_policy) = resolved_policy else {
@@ -16088,7 +16113,7 @@ impl PrivilegedDispatcher {
             format!("WAB-{}", &hash.to_hex()[..32])
         };
 
-        let evidence_payload = serde_json::json!({
+        let mut evidence_payload = serde_json::json!({
             "event_type": "evidence.published",
             "evidence_id": evidence_id,
             "category": "WORK_AUTHORITY_BINDINGS",
@@ -16100,6 +16125,12 @@ impl PrivilegedDispatcher {
             "lease_id": issued_lease_id,
             "timestamp_ns": timestamp_ns,
         });
+        if let (Some(artifacts), Some(payload_object)) = (
+            pcac_lifecycle_artifacts.as_ref(),
+            evidence_payload.as_object_mut(),
+        ) {
+            append_privileged_pcac_lifecycle_fields(payload_object, artifacts);
+        }
 
         let evidence_payload_bytes = match serde_json::to_vec(&evidence_payload) {
             Ok(b) => b,
@@ -16174,6 +16205,7 @@ impl PrivilegedDispatcher {
                     to_state = to_state_str,
                     "work_transitioned event emitted for ClaimWorkV2"
                 );
+                self.work_registry.clear_claim_age(&request.work_id, role);
             },
             Err(e) if e.to_string().contains("UNIQUE constraint") => {
                 // Concurrent race: another ClaimWorkV2 won the transition.
@@ -16202,6 +16234,82 @@ impl PrivilegedDispatcher {
             evidence_id,
             already_claimed: false,
         }))
+    }
+
+    /// Extracts bounded replay fields from `ClaimWorkV2` evidence payload.
+    ///
+    /// Supports both payload layouts:
+    /// - top-level fields (`lease_id`, `cas_hash`, `actor_id`) from `SQLite`
+    /// - hex-encoded nested JSON in `"payload"` from the in-memory emitter
+    fn parse_claim_work_v2_evidence_fields(
+        payload: &[u8],
+    ) -> Option<(Option<String>, Option<String>, Option<String>)> {
+        #[derive(serde::Deserialize)]
+        struct WabFields<'a> {
+            #[serde(default, borrow)]
+            lease_id: Option<&'a str>,
+            #[serde(default, borrow)]
+            cas_hash: Option<&'a str>,
+            #[serde(default, borrow)]
+            actor_id: Option<&'a str>,
+            #[serde(default, borrow)]
+            payload: Option<&'a str>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct WabInnerFields<'a> {
+            #[serde(default, borrow)]
+            lease_id: Option<&'a str>,
+            #[serde(default, borrow)]
+            cas_hash: Option<&'a str>,
+            #[serde(default, borrow)]
+            actor_id: Option<&'a str>,
+        }
+
+        let envelope: WabFields<'_> = serde_json::from_slice(payload).ok()?;
+        let mut lease_id = envelope
+            .lease_id
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let mut cas_hash = envelope
+            .cas_hash
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let mut actor_id = envelope
+            .actor_id
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+
+        if let Some(hex_payload) = envelope.payload {
+            if let Ok(inner_bytes) = hex::decode(hex_payload) {
+                if let Ok(inner) = serde_json::from_slice::<WabInnerFields<'_>>(&inner_bytes) {
+                    if lease_id.is_none() {
+                        lease_id = inner
+                            .lease_id
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned);
+                    }
+                    if cas_hash.is_none() {
+                        cas_hash = inner
+                            .cas_hash
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned);
+                    }
+                    if let Some(inner_actor_id) = inner
+                        .actor_id
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                    {
+                        // Preserve prior semantics: actor_id recovered from the
+                        // inner authority-binding payload takes precedence over
+                        // envelope actor_id.
+                        actor_id = Some(inner_actor_id);
+                    }
+                }
+            }
+        }
+
+        Some((lease_id, cas_hash, actor_id))
     }
 
     /// Handles idempotent re-claim in `ClaimWorkV2`.
@@ -16312,62 +16420,9 @@ impl PrivilegedDispatcher {
                     .get_evidence_by_evidence_id(work_id, &expected_evidence_id);
 
                 if let Some(wab) = wab_event {
-                    if let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(&wab.payload)
+                    if let Some((lease_id, cas_hash, _actor_id)) =
+                        Self::parse_claim_work_v2_evidence_fields(&wab.payload)
                     {
-                        // The outer envelope always contains `evidence_id`.
-                        // Detail fields (`lease_id`, `cas_hash`) may be at the
-                        // outer level (production SQLite emitter) or inside the
-                        // hex-encoded `payload` field (in-memory stub emitter).
-                        // Try outer level first, then fall back to inner payload.
-                        //
-                        // SECURITY FIX (Finding 2): Explicitly check that
-                        // recovered fields are non-empty before returning
-                        // success. Empty lease_id/cas_hash = fail-closed.
-                        let lease_id: Option<String> = envelope
-                            .get("lease_id")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                            .map(String::from)
-                            .or_else(|| {
-                                // Decode hex-encoded inner payload
-                                envelope
-                                    .get("payload")
-                                    .and_then(|v| v.as_str())
-                                    .and_then(|hex_str| hex::decode(hex_str).ok())
-                                    .and_then(|bytes| {
-                                        serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-                                    })
-                                    .and_then(|inner| {
-                                        inner
-                                            .get("lease_id")
-                                            .and_then(|v| v.as_str())
-                                            .filter(|s| !s.is_empty())
-                                            .map(String::from)
-                                    })
-                            });
-
-                        let cas_hash: Option<String> = envelope
-                            .get("cas_hash")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                            .map(String::from)
-                            .or_else(|| {
-                                envelope
-                                    .get("payload")
-                                    .and_then(|v| v.as_str())
-                                    .and_then(|hex_str| hex::decode(hex_str).ok())
-                                    .and_then(|bytes| {
-                                        serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-                                    })
-                                    .and_then(|inner| {
-                                        inner
-                                            .get("cas_hash")
-                                            .and_then(|v| v.as_str())
-                                            .filter(|s| !s.is_empty())
-                                            .map(String::from)
-                                    })
-                            });
-
                         // Fail-closed: both fields MUST be non-empty for a
                         // valid idempotent recovery. Empty fields indicate
                         // a malformed or incomplete evidence.published event.
@@ -16457,78 +16512,9 @@ impl PrivilegedDispatcher {
                 if let Some(ref evidence_event) = existing_evidence {
                     // evidence.published exists — extract lease_id and
                     // cas_hash from the immutable ledger record.
-                    if let Ok(envelope) =
-                        serde_json::from_slice::<serde_json::Value>(&evidence_event.payload)
+                    if let Some((recovered_lease, recovered_cas, recovered_actor)) =
+                        Self::parse_claim_work_v2_evidence_fields(&evidence_event.payload)
                     {
-                        let recovered_lease: Option<String> = envelope
-                            .get("lease_id")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                            .map(String::from)
-                            .or_else(|| {
-                                envelope
-                                    .get("payload")
-                                    .and_then(|v| v.as_str())
-                                    .and_then(|hex_str| hex::decode(hex_str).ok())
-                                    .and_then(|bytes| {
-                                        serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-                                    })
-                                    .and_then(|inner| {
-                                        inner
-                                            .get("lease_id")
-                                            .and_then(|v| v.as_str())
-                                            .filter(|s| !s.is_empty())
-                                            .map(String::from)
-                                    })
-                            });
-
-                        let recovered_cas: Option<String> = envelope
-                            .get("cas_hash")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                            .map(String::from)
-                            .or_else(|| {
-                                envelope
-                                    .get("payload")
-                                    .and_then(|v| v.as_str())
-                                    .and_then(|hex_str| hex::decode(hex_str).ok())
-                                    .and_then(|bytes| {
-                                        serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-                                    })
-                                    .and_then(|inner| {
-                                        inner
-                                            .get("cas_hash")
-                                            .and_then(|v| v.as_str())
-                                            .filter(|s| !s.is_empty())
-                                            .map(String::from)
-                                    })
-                            });
-
-                        // Prefer the actor recorded inside the immutable
-                        // evidence payload (authority-binding anchor), then
-                        // fall back to envelope actor_id for legacy rows.
-                        let recovered_actor: Option<String> = envelope
-                            .get("payload")
-                            .and_then(|v| v.as_str())
-                            .and_then(|hex_str| hex::decode(hex_str).ok())
-                            .and_then(|bytes| {
-                                serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-                            })
-                            .and_then(|inner| {
-                                inner
-                                    .get("actor_id")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|s| !s.is_empty())
-                                    .map(String::from)
-                            })
-                            .or_else(|| {
-                                envelope
-                                    .get("actor_id")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|s| !s.is_empty())
-                                    .map(String::from)
-                            });
-
                         if let (
                             Some(lease_from_ledger),
                             Some(cas_from_ledger),
@@ -37282,6 +37268,58 @@ mod tests {
             assert!(
                 registry.register_claim(dup).is_err(),
                 "Duplicate (work_id, role) should fail"
+            );
+        }
+
+        #[test]
+        fn stub_work_registry_clear_claim_age_keeps_claim() {
+            let registry = StubWorkRegistry::default();
+            let claim = WorkClaim {
+                work_id: "W-stub-clear-age-001".to_string(),
+                lease_id: "L-stub-clear-age-001".to_string(),
+                actor_id: "actor-stub-clear-age".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "test-ref".to_string(),
+                    resolved_policy_hash: [0xAA; 32],
+                    capability_manifest_hash: [0xBB; 32],
+                    context_pack_hash: [0xCC; 32],
+                    resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
+                },
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+
+            registry
+                .register_claim(claim.clone())
+                .expect("claim registration should succeed");
+            assert!(
+                registry
+                    .get_claim_age_for_role(&claim.work_id, claim.role)
+                    .is_some(),
+                "age metadata should be present after registration"
+            );
+
+            registry.clear_claim_age(&claim.work_id, claim.role);
+
+            assert!(
+                registry
+                    .get_claim_for_role(&claim.work_id, claim.role)
+                    .is_some(),
+                "clearing age must not remove the persisted claim"
+            );
+            assert!(
+                registry
+                    .get_claim_age_for_role(&claim.work_id, claim.role)
+                    .is_none(),
+                "age metadata should be cleared after successful durability"
             );
         }
 
