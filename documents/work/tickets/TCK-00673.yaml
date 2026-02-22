@@ -1,0 +1,147 @@
+ticket_meta:
+  schema_version: '2026-01-29'
+  template_version: '2026-01-29'
+  ticket:
+    id: 'TCK-00673'
+    title: 'FAC doctor: make recommended_action SHA-scoped and prevent false dispatch_implementor while reviews are pending'
+    status: 'OPEN'
+  binds:
+    prd_id: 'PRD-0001'
+    rfc_id: 'RFC-0019'
+    requirements:
+      - 'REQ-0037'
+      - 'REQ-0020'
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+      - 'AGENT_IMPLEMENTER'
+      - 'AGENT_REVIEWER'
+    responsibility_domains:
+      - 'DOMAIN_CLI'
+      - 'DOMAIN_ORCHESTRATION'
+      - 'DOMAIN_OBSERVABILITY'
+  dependencies:
+    tickets:
+      - ticket_id: 'TCK-00664'
+        reason: 'Recent FAC doctor/worker hardening changed action precedence and introduced/retained edge-state interactions this ticket resolves.'
+
+root_cause_analysis:
+  summary: |
+    `apm2 fac doctor --pr <N>` currently derives `has_gate_failure_signal` from mixed provenance:
+      - lifecycle state (`gates_failed`),
+      - gate cache/projection snapshots,
+      - latest push attempt failed stage.
+
+    The decision path does not consistently bind these signals to the authoritative current SHA.
+    As a result, stale failure state can outrank live pending-review state and produce an incorrect
+    terminal recommendation (`dispatch_implementor`) while reviews for the current SHA are still
+    pending or in-flight.
+
+    Reproduction observed on 2026-02-22 for PR 799:
+      - `identity.local_sha = 8f9ec3fd...`
+      - health warns `lifecycle current SHA 74ca5f... != local identity SHA 8f9ec3fd...`
+      - reviews are pending (`no verified projection loaded`)
+      - no gate status/cache for local SHA
+      - recommended_action is still `dispatch_implementor`
+
+    This breaks doctor semantics and causes `--wait-for-recommended-action` automation to exit
+    early on a false terminal action.
+
+problem_statement: |
+  Doctor action selection must be SHA-consistent and monotonic:
+    - `dispatch_implementor` may only be emitted when remediation is truly required for the
+      authoritative SHA (or when explicit actionable findings exist for that SHA).
+    - stale lifecycle/gate signals from older SHAs must not preempt `wait` for pending reviews.
+
+scope:
+  in_scope:
+    - id: 'DRA-001'
+      title: 'Make gate-failure detection SHA-scoped in DoctorDecisionFacts'
+      detail: |
+        Refactor `has_gate_failure_signal` and gate progress derivation in
+        `crates/apm2-cli/src/commands/fac_review/mod.rs` so lifecycle/push/gate failure evidence
+        is counted only when it is attributable to the authoritative SHA context.
+
+        Minimum rules:
+          - lifecycle `gates_failed` only contributes when lifecycle SHA matches local/remote head
+            (or another explicit authoritative target SHA defined by doctor inputs).
+          - push-attempt failed-stage evidence only contributes when failed attempt SHA matches
+            authoritative SHA.
+          - missing SHA alignment downgrades the signal to non-terminal (health warning only).
+
+    - id: 'DRA-002'
+      title: 'Fix decision precedence so stale failure cannot outrank pending review wait'
+      detail: |
+        Update recommendation precedence (`DOCTOR_DECISION_RULES`) so stale/misaligned gate failure
+        signals do not trigger `DOC-G-007` (`dispatch_failed_gates`).
+
+        Target behavior:
+          - if verdicts are pending and no SHA-aligned terminal gate failure exists,
+            recommended action must be `wait` (or `fix` only when integrity/corruption/projection
+            repair predicates are true).
+
+    - id: 'DRA-003'
+      title: 'Harden dispatch_implementor criteria'
+      detail: |
+        Ensure `dispatch_implementor` requires at least one actionable, SHA-aligned trigger:
+          - blocker/major findings or formal deny for authoritative SHA, OR
+          - gate failure conclusively bound to authoritative SHA, OR
+          - explicit merge conflicts.
+
+        Disallow `dispatch_implementor` when all dimensions are pending and findings are empty.
+
+    - id: 'DRA-004'
+      title: 'Improve machine-readable diagnostics for action provenance'
+      detail: |
+        Extend doctor JSON with clear provenance for decision-critical gate-failure signals,
+        including whether each signal is SHA-aligned or ignored as stale.
+
+        This must make incorrect action selection auditable without reading source code.
+
+    - id: 'DRA-005'
+      title: 'Regression coverage for stale-lifecycle and wait-loop correctness'
+      detail: |
+        Add/adjust tests in `crates/apm2-cli/src/commands/fac_review/mod.rs` to cover:
+          - lifecycle `gates_failed` with mismatched SHA -> action `wait` under pending verdicts,
+          - push attempt failed gate stage for different SHA -> does not trigger dispatch,
+          - `--wait-for-recommended-action` does not exit on false `dispatch_implementor`,
+          - positive control: SHA-aligned failed gates still produce `dispatch_implementor`.
+
+  out_of_scope:
+    - 'Changing FAC gate execution itself; this ticket is strictly doctor decision logic and diagnostics.'
+    - 'Reworking lifecycle storage model across modules beyond fields needed for SHA alignment checks.'
+    - 'Introducing new review dimensions or altering verdict semantics.'
+
+plan:
+  steps:
+    - id: 'P1'
+      description: 'Thread authoritative SHA context through decision-fact derivation and gate-progress reduction.'
+    - id: 'P2'
+      description: 'Adjust rule guards/preference ordering to suppress stale failure dispatch paths.'
+    - id: 'P3'
+      description: 'Implement JSON diagnostics for accepted vs ignored gate-failure signals.'
+    - id: 'P4'
+      description: 'Add deterministic regression tests for PR-799-class stale mismatch and wait-loop behavior.'
+    - id: 'P5'
+      description: 'Run FAC/doctor-focused test suites and validate output on a real stale-state PR fixture.'
+
+definition_of_done:
+  criteria:
+    - 'Doctor does not emit dispatch_implementor for pending-review states when failure evidence is stale or SHA-misaligned.'
+    - 'Doctor continues to emit dispatch_implementor for genuine authoritative-SHA gate failures and actionable findings.'
+    - 'wait-for-recommended-action does not terminate early on stale gate-failure artifacts.'
+    - 'Doctor JSON includes actionable provenance showing why a failure signal was accepted or ignored.'
+  evidence_ids:
+    - 'EVID-TCK-00673-01: stale lifecycle SHA mismatch regression returns wait (not dispatch_implementor)'
+    - 'EVID-TCK-00673-02: mismatched push-failure SHA regression does not trigger failed-gate dispatch'
+    - 'EVID-TCK-00673-03: positive control SHA-aligned gate failure still dispatches implementor'
+    - 'EVID-TCK-00673-04: doctor wait-loop regression proves no false terminal exit on stale failure state'
+
+notes:
+  security: 'default-deny, least privilege, fail-closed'
+  verification: |
+    Validate both unit tests and live CLI behavior with a captured stale lifecycle snapshot shape
+    equivalent to PR 799 (mismatched lifecycle SHA + pending reviews + no local gate cache).
+  general: |
+    This ticket treats doctor guidance as a control-plane contract. Incorrect terminal actions are
+    operationally significant because they steer automation and humans to the wrong remediation path.
