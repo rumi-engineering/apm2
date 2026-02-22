@@ -195,7 +195,7 @@ Maps `changeset_digest` to `work_id` to PR metadata for projection routing. Also
 - `changeset_map`, `pr_metadata` -- projection routing tables
 - `work_context` -- work context entries projected from `evidence.published` events (TCK-00638). Primary key `(work_id, entry_id)`, unique constraint on `(work_id, kind, dedupe_key)`, indexed by `work_id` and `created_at_ns`. Included in `evict_expired` / `evict_expired_async` TTL-based eviction using `created_at_ns` (nanoseconds) with seconds-to-nanoseconds conversion (BLOCKER fix: unbounded state growth).
 - `work_active_loop_profile` -- active work loop profile per `work_id` projected from `evidence.published` events with category `WORK_LOOP_PROFILE` (TCK-00645). Primary key `work_id`, indexed by `work_id` and `anchored_at_ns`. Stores `dedupe_key` plus canonical ledger `seq_id`; latest-wins semantics are `(anchored_at_ns DESC, seq_id DESC)` so same-timestamp events resolve deterministically to the higher sequence. Included in `evict_expired` / `evict_expired_async` TTL-based eviction using `anchored_at_ns` (nanoseconds).
-- `work_spec_snapshot` -- maps `work_id` to `spec_snapshot_hash` (32-byte BLAKE3 hash) derived from `work.opened` events (TCK-00636, RFC-0032 Phase 1). Primary key `work_id`, indexed by `created_at_ns`. Uses `INSERT OR IGNORE` for idempotent replay. Supports `resolve_work_id_by_ticket_alias()` which performs bounded CAS-backed lookup (bounded by `MAX_ALIAS_RESOLUTION_ROWS = 500`) to resolve `ticket_alias` -> `work_id` via `WorkSpecV1.ticket_alias`. Included in `evict_expired` / `evict_expired_async` TTL-based eviction using `created_at_ns` (nanoseconds).
+- `work_spec_snapshot` -- maps `work_id` to `spec_snapshot_hash` (32-byte BLAKE3 hash) derived from `work.opened` events (TCK-00636, RFC-0032 Phase 1). Primary key `work_id`, indexed by `created_at_ns`. Uses `INSERT OR IGNORE` for idempotent replay and is consumed by the work-authority alias reconciliation gate for CAS-backed ticket alias resolution. Included in `evict_expired` / `evict_expired_async` TTL-based eviction using `created_at_ns` (nanoseconds).
 
 ### `LedgerTailer`
 
@@ -367,5 +367,5 @@ Worker that drains the deferred replay backlog after sink recovery. For each rep
 - TCK-00507: Continuity profile and sink snapshot resolution for economics gate input assembly
 - TCK-00508: Deferred replay worker for projection intent buffer drain after outage recovery
 - TCK-00638: RFC-0032 Phase 2 `work_context` projection table and `evidence.published` tailer for work context entries
-- TCK-00636: RFC-0032 Phase 1 `work_spec_snapshot` projection table mapping `work_id` to `spec_snapshot_hash`, CAS-backed ticket alias resolution, `work.opened` event tailer
+- TCK-00636: RFC-0032 Phase 1 `work_spec_snapshot` projection table mapping `work_id` to `spec_snapshot_hash` for work-authority alias reconciliation, `work.opened` event tailer
 - TCK-00645: RFC-0032 Phase 4 `work_active_loop_profile` projection table for active loop profile selection, `PublishWorkLoopProfile` CAS + evidence anchor

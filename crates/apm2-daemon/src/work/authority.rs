@@ -471,6 +471,19 @@ pub const DEFAULT_MIN_RECONCILED_TICKS: u64 = 50;
 /// per RS-27 to prevent unbounded growth from ledger replay churn.
 pub const MAX_TICKET_ALIAS_INDEX_WORK_ITEMS: usize = 2_048;
 
+/// Maximum number of lossy alias markers retained after work-ID eviction.
+///
+/// When this cap is exceeded the index saturates and resolution fails closed
+/// until the projection shrinks enough to clear lossy state.
+pub const MAX_TICKET_ALIAS_INDEX_EVICTED_ALIASES: usize = MAX_TICKET_ALIAS_INDEX_WORK_ITEMS * 8;
+
+/// Maximum number of resolved `spec_snapshot_hash -> ticket_alias` entries.
+///
+/// This cache prevents repeated CAS retrievals for work items that were
+/// evicted from `spec_hash_by_work_id` due to bounded in-memory capacity.
+pub const MAX_TICKET_ALIAS_INDEX_RESOLVED_SPEC_HASHES: usize =
+    MAX_TICKET_ALIAS_INDEX_WORK_ITEMS * 8;
+
 /// Alias reconciliation gate contract for the work authority layer.
 ///
 /// This trait provides the production wiring between the alias reconciliation
@@ -596,7 +609,10 @@ struct TicketAliasIndex {
     work_id_to_alias: HashMap<String, String>,
     spec_hash_by_work_id: HashMap<String, [u8; 32]>,
     insertion_order: VecDeque<String>,
+    resolved_alias_by_spec_hash: HashMap<[u8; 32], Option<String>>,
+    resolved_spec_hash_order: VecDeque<[u8; 32]>,
     evicted_aliases: HashSet<String>,
+    evicted_aliases_saturated: bool,
 }
 
 impl TicketAliasIndex {
@@ -605,10 +621,17 @@ impl TicketAliasIndex {
         self.work_id_to_alias.clear();
         self.spec_hash_by_work_id.clear();
         self.insertion_order.clear();
+        self.resolved_alias_by_spec_hash.clear();
+        self.resolved_spec_hash_order.clear();
         self.evicted_aliases.clear();
+        self.evicted_aliases_saturated = false;
     }
 
-    fn remove_work(&mut self, work_id: &str, mark_alias_evicted: bool) {
+    fn remove_work(
+        &mut self,
+        work_id: &str,
+        mark_alias_evicted: bool,
+    ) -> Result<(), WorkAuthorityError> {
         self.spec_hash_by_work_id.remove(work_id);
         self.insertion_order.retain(|entry| entry != work_id);
 
@@ -620,9 +643,30 @@ impl TicketAliasIndex {
                 }
             }
             if mark_alias_evicted {
-                self.evicted_aliases.insert(alias);
+                self.mark_alias_evicted(alias)?;
             }
         }
+        Ok(())
+    }
+
+    fn mark_alias_evicted(&mut self, alias: String) -> Result<(), WorkAuthorityError> {
+        if self.evicted_aliases.contains(&alias) {
+            return Ok(());
+        }
+
+        if self.evicted_aliases.len() >= MAX_TICKET_ALIAS_INDEX_EVICTED_ALIASES {
+            self.evicted_aliases_saturated = true;
+            return Err(WorkAuthorityError::ProjectionLock {
+                message: format!(
+                    "ticket alias index lossy marker capacity exceeded: {} (max \
+                     {MAX_TICKET_ALIAS_INDEX_EVICTED_ALIASES}); refusing lossy resolution",
+                    self.evicted_aliases.len() + 1
+                ),
+            });
+        }
+
+        self.evicted_aliases.insert(alias);
+        Ok(())
     }
 
     fn upsert_spec_hash(&mut self, work_id: &str, spec_hash: [u8; 32]) -> bool {
@@ -659,7 +703,29 @@ impl TicketAliasIndex {
         }
     }
 
-    fn enforce_capacity(&mut self) {
+    fn resolved_alias_for_spec_hash(&self, spec_hash: &[u8; 32]) -> (bool, Option<String>) {
+        self.resolved_alias_by_spec_hash
+            .get(spec_hash)
+            .map_or((false, None), |alias| (true, alias.clone()))
+    }
+
+    fn cache_resolved_alias(&mut self, spec_hash: [u8; 32], alias: Option<String>) {
+        if self.resolved_alias_by_spec_hash.contains_key(&spec_hash) {
+            return;
+        }
+
+        self.resolved_alias_by_spec_hash.insert(spec_hash, alias);
+        self.resolved_spec_hash_order.push_back(spec_hash);
+
+        while self.resolved_alias_by_spec_hash.len() > MAX_TICKET_ALIAS_INDEX_RESOLVED_SPEC_HASHES {
+            let Some(oldest_hash) = self.resolved_spec_hash_order.pop_front() else {
+                break;
+            };
+            self.resolved_alias_by_spec_hash.remove(&oldest_hash);
+        }
+    }
+
+    fn enforce_capacity(&mut self) -> Result<(), WorkAuthorityError> {
         while self.spec_hash_by_work_id.len() > MAX_TICKET_ALIAS_INDEX_WORK_ITEMS {
             let Some(oldest_work_id) = self.insertion_order.pop_front() else {
                 break;
@@ -667,13 +733,14 @@ impl TicketAliasIndex {
             if !self.spec_hash_by_work_id.contains_key(&oldest_work_id) {
                 continue;
             }
-            self.remove_work(&oldest_work_id, true);
+            self.remove_work(&oldest_work_id, true)?;
             warn!(
                 work_id = %oldest_work_id,
                 max_entries = MAX_TICKET_ALIAS_INDEX_WORK_ITEMS,
                 "ticket alias index reached capacity; evicted oldest work binding"
             );
         }
+        Ok(())
     }
 }
 
@@ -817,6 +884,14 @@ impl ProjectionAliasReconciliationGate {
         // Clear lossy markers once the projection can fully fit in-memory.
         if projection.work_count() <= MAX_TICKET_ALIAS_INDEX_WORK_ITEMS {
             alias_index.evicted_aliases.clear();
+            alias_index.evicted_aliases_saturated = false;
+        } else if alias_index.evicted_aliases_saturated {
+            return Err(WorkAuthorityError::ProjectionLock {
+                message: format!(
+                    "ticket alias index lossy marker capacity saturated (max \
+                     {MAX_TICKET_ALIAS_INDEX_EVICTED_ALIASES}); refusing lossy resolution"
+                ),
+            });
         }
 
         // Drop entries for work IDs no longer present in projection.
@@ -824,7 +899,7 @@ impl ProjectionAliasReconciliationGate {
             alias_index.spec_hash_by_work_id.keys().cloned().collect();
         for work_id in tracked_work_ids {
             if projection.get_work(&work_id).is_none() {
-                alias_index.remove_work(&work_id, false);
+                alias_index.remove_work(&work_id, false)?;
             }
         }
 
@@ -838,34 +913,47 @@ impl ProjectionAliasReconciliationGate {
                         error = %error,
                         "ticket alias index: invalid spec_snapshot_hash; removing stale alias mapping"
                     );
-                    alias_index.remove_work(&work.work_id, false);
+                    alias_index.remove_work(&work.work_id, false)?;
                     continue;
                 },
             };
 
             let Some(spec_hash) = spec_hash else {
-                alias_index.remove_work(&work.work_id, false);
+                alias_index.remove_work(&work.work_id, false)?;
                 continue;
             };
 
-            if !alias_index.upsert_spec_hash(&work.work_id, spec_hash) {
+            if alias_index.spec_hash_by_work_id.get(&work.work_id) == Some(&spec_hash) {
                 continue;
             }
 
-            let ticket_alias =
+            let (has_cached_alias, cached_alias) =
+                alias_index.resolved_alias_for_spec_hash(&spec_hash);
+            let ticket_alias = if has_cached_alias {
+                cached_alias
+            } else {
                 match Self::resolve_ticket_alias_from_spec_hash(cas, &work.work_id, spec_hash) {
-                    Ok(alias) => alias,
+                    Ok(alias) => {
+                        alias_index.cache_resolved_alias(spec_hash, alias.clone());
+                        alias
+                    },
                     Err(error) => {
                         warn!(
                             work_id = %work.work_id,
                             error = %error,
                             "ticket alias index: CAS/WorkSpec decode failed; removing alias mapping"
                         );
-                        None
+                        alias_index.remove_work(&work.work_id, false)?;
+                        continue;
                     },
-                };
+                }
+            };
+
+            // Record the spec hash only after alias extraction succeeds so
+            // transient CAS failures can retry on future projection refreshes.
+            alias_index.upsert_spec_hash(&work.work_id, spec_hash);
             alias_index.upsert_alias(&work.work_id, ticket_alias);
-            alias_index.enforce_capacity();
+            alias_index.enforce_capacity()?;
         }
 
         Ok(())
@@ -934,6 +1022,16 @@ impl ProjectionAliasReconciliationGate {
                     message: err.to_string(),
                 }
             })?;
+
+            if alias_index.evicted_aliases_saturated {
+                return Err(WorkAuthorityError::ProjectionLock {
+                    message: format!(
+                        "ticket alias index lossy marker capacity saturated (max \
+                         {MAX_TICKET_ALIAS_INDEX_EVICTED_ALIASES}); refusing lossy canonical \
+                         projections"
+                    ),
+                });
+            }
 
             for (alias, work_ids) in &alias_index.alias_to_work_ids {
                 // Evicted aliases are considered lossy and omitted so
@@ -1065,6 +1163,15 @@ impl AliasReconciliationGate for ProjectionAliasReconciliationGate {
                 .map_err(|err| WorkAuthorityError::ProjectionLock {
                     message: err.to_string(),
                 })?;
+
+        if alias_index.evicted_aliases_saturated {
+            return Err(WorkAuthorityError::ProjectionLock {
+                message: format!(
+                    "ticket alias index lossy marker capacity saturated (max \
+                     {MAX_TICKET_ALIAS_INDEX_EVICTED_ALIASES}); refusing lossy resolution"
+                ),
+            });
+        }
 
         if alias_index.evicted_aliases.contains(ticket_alias) {
             return Err(WorkAuthorityError::ProjectionLock {
@@ -1406,15 +1513,64 @@ mod tests {
         }
     }
 
-    fn setup_counting_cas_with_work_spec(
+    #[derive(Debug)]
+    struct FlakyCas {
+        inner: apm2_core::evidence::MemoryCas,
+        transient_failures_remaining: AtomicUsize,
+    }
+
+    impl FlakyCas {
+        fn new(transient_failures: usize) -> Self {
+            Self {
+                inner: apm2_core::evidence::MemoryCas::new(),
+                transient_failures_remaining: AtomicUsize::new(transient_failures),
+            }
+        }
+    }
+
+    impl ContentAddressedStore for FlakyCas {
+        fn store(&self, content: &[u8]) -> Result<StoreResult, CasError> {
+            self.inner.store(content)
+        }
+
+        fn retrieve(&self, hash: &[u8; 32]) -> Result<Vec<u8>, CasError> {
+            if self
+                .transient_failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return Err(CasError::StorageError {
+                    message: "injected transient retrieve failure".to_string(),
+                });
+            }
+            self.inner.retrieve(hash)
+        }
+
+        fn exists(&self, hash: &[u8; 32]) -> Result<bool, CasError> {
+            self.inner.exists(hash)
+        }
+
+        fn size(&self, hash: &[u8; 32]) -> Result<usize, CasError> {
+            self.inner.size(hash)
+        }
+    }
+
+    fn store_work_spec_in_cas(
+        cas: &dyn ContentAddressedStore,
         work_id: &str,
         ticket_alias: Option<&str>,
-    ) -> (Arc<CountingCas>, [u8; 32]) {
+        created_at_ns: u64,
+    ) -> [u8; 32] {
         use apm2_core::fac::work_cas_schemas::{
             WORK_SPEC_V1_SCHEMA, WorkSpecType, WorkSpecV1, canonicalize_for_cas,
         };
 
-        let cas = Arc::new(CountingCas::new());
         let spec = WorkSpecV1 {
             schema: WORK_SPEC_V1_SCHEMA.to_string(),
             work_id: work_id.to_string(),
@@ -1427,12 +1583,22 @@ mod tests {
             labels: Vec::new(),
             rfc_id: None,
             parent_work_ids: Vec::new(),
-            created_at_ns: Some(1_000_000_000),
+            created_at_ns: Some(created_at_ns),
         };
         let spec_json = serde_json::to_string(&spec).expect("spec serializes");
         let canonical = canonicalize_for_cas(&spec_json).expect("canonical JSON");
-        let stored = cas.store(canonical.as_bytes()).expect("CAS store");
-        (cas, stored.hash)
+        cas.store(canonical.as_bytes())
+            .expect("CAS store should succeed")
+            .hash
+    }
+
+    fn setup_counting_cas_with_work_spec(
+        work_id: &str,
+        ticket_alias: Option<&str>,
+    ) -> (Arc<CountingCas>, [u8; 32]) {
+        let cas = Arc::new(CountingCas::new());
+        let spec_hash = store_work_spec_in_cas(cas.as_ref(), work_id, ticket_alias, 1_000_000_000);
+        (cas, spec_hash)
     }
 
     /// Builds a minimal `LedgerEventEmitter` that emits `work.opened` events
@@ -1622,7 +1788,9 @@ mod tests {
             let spec_hash = work_id_to_hash(&work_id);
             alias_index.upsert_spec_hash(&work_id, spec_hash);
             alias_index.upsert_alias(&work_id, Some(alias));
-            alias_index.enforce_capacity();
+            alias_index
+                .enforce_capacity()
+                .expect("capacity enforcement should not fail");
         }
 
         assert_eq!(
@@ -1633,6 +1801,159 @@ mod tests {
         assert!(
             alias_index.evicted_aliases.contains("TCK-CAP-0"),
             "oldest alias must be marked lossy after eviction"
+        );
+    }
+
+    #[test]
+    fn ticket_alias_index_fails_closed_when_lossy_marker_capacity_saturates() {
+        let mut alias_index = TicketAliasIndex::default();
+        for idx in 0..MAX_TICKET_ALIAS_INDEX_EVICTED_ALIASES {
+            alias_index
+                .evicted_aliases
+                .insert(format!("TCK-SATURATED-{idx}"));
+        }
+
+        let result = alias_index.mark_alias_evicted("TCK-SATURATED-OVERFLOW".to_string());
+        assert!(
+            result.is_err(),
+            "lossy marker overflow must fail closed instead of growing unboundedly"
+        );
+        assert!(
+            alias_index.evicted_aliases_saturated,
+            "overflow must leave the index in saturated fail-closed state"
+        );
+    }
+
+    #[test]
+    fn resolve_ticket_alias_retries_after_transient_cas_failure() {
+        use apm2_core::work::helpers::work_opened_payload;
+
+        let cas = Arc::new(FlakyCas::new(1));
+        let spec_hash = store_work_spec_in_cas(
+            cas.as_ref(),
+            "W-636-RETRY-001",
+            Some("TCK-RETRY-001"),
+            1_000_000_000,
+        );
+
+        let emitter = Arc::new(crate::protocol::dispatch::StubLedgerEventEmitter::new());
+        emitter.inject_raw_event(SignedLedgerEvent {
+            event_id: "EVT-retry-opened-001".to_string(),
+            event_type: "work.opened".to_string(),
+            work_id: "W-636-RETRY-001".to_string(),
+            actor_id: "actor:test".to_string(),
+            payload: work_opened_payload(
+                "W-636-RETRY-001",
+                "TICKET",
+                spec_hash.to_vec(),
+                vec![],
+                vec![],
+            ),
+            signature: vec![0u8; 64],
+            timestamp_ns: 1_000_000_000,
+        });
+
+        let gate = ProjectionAliasReconciliationGate::new(emitter.clone())
+            .with_cas(cas as Arc<dyn ContentAddressedStore>);
+
+        let first = gate
+            .resolve_ticket_alias("TCK-RETRY-001")
+            .expect("first resolution attempt should not hard-fail");
+        assert_eq!(
+            first, None,
+            "transient CAS failure must not poison index with a permanent miss"
+        );
+
+        // Trigger projection refresh with an unrelated event so the failed
+        // hash can be retried.
+        emitter.inject_raw_event(SignedLedgerEvent {
+            event_id: "EVT-retry-bump-001".to_string(),
+            event_type: "non_work.bump".to_string(),
+            work_id: "W-636-RETRY-001".to_string(),
+            actor_id: "actor:test".to_string(),
+            payload: Vec::new(),
+            signature: vec![0u8; 64],
+            timestamp_ns: 2_000_000_000,
+        });
+
+        let second = gate
+            .resolve_ticket_alias("TCK-RETRY-001")
+            .expect("second resolution attempt should not hard-fail");
+        assert_eq!(
+            second,
+            Some("W-636-RETRY-001".to_string()),
+            "alias must resolve after transient CAS failure clears"
+        );
+    }
+
+    #[test]
+    fn refresh_projection_reuses_spec_hash_cache_for_evicted_items() {
+        use apm2_core::work::helpers::work_opened_payload;
+
+        let cas = Arc::new(CountingCas::new());
+        let emitter = Arc::new(crate::protocol::dispatch::StubLedgerEventEmitter::new());
+
+        let total_work_items = MAX_TICKET_ALIAS_INDEX_WORK_ITEMS + 16;
+        for idx in 0..total_work_items {
+            let work_id = format!("W-636-EVICT-{idx:04}");
+            let ticket_alias = format!("TCK-636-EVICT-{idx:04}");
+            let spec_hash = store_work_spec_in_cas(
+                cas.as_ref(),
+                &work_id,
+                Some(&ticket_alias),
+                (idx as u64 + 1) * 1_000_000_000,
+            );
+            emitter.inject_raw_event(SignedLedgerEvent {
+                event_id: format!("EVT-evict-opened-{idx:04}"),
+                event_type: "work.opened".to_string(),
+                work_id: work_id.clone(),
+                actor_id: "actor:test".to_string(),
+                payload: work_opened_payload(
+                    &work_id,
+                    "TICKET",
+                    spec_hash.to_vec(),
+                    vec![],
+                    vec![],
+                ),
+                signature: vec![0u8; 64],
+                timestamp_ns: (idx as u64 + 1) * 1_000_000_000,
+            });
+        }
+
+        let target_idx = total_work_items - 1;
+        let target_work_id = format!("W-636-EVICT-{target_idx:04}");
+        let target_alias = format!("TCK-636-EVICT-{target_idx:04}");
+
+        let gate = ProjectionAliasReconciliationGate::new(emitter.clone())
+            .with_cas(cas.clone() as Arc<dyn ContentAddressedStore>);
+
+        let first = gate
+            .resolve_ticket_alias(&target_alias)
+            .expect("first resolution should succeed");
+        assert_eq!(first, Some(target_work_id.clone()));
+        let retrieves_after_first = cas.retrieve_count();
+        assert_eq!(
+            retrieves_after_first, total_work_items,
+            "initial refresh should decode each unique spec hash at most once"
+        );
+
+        // Force a projection refresh without changing any work spec hashes.
+        emitter.inject_raw_event(SignedLedgerEvent {
+            event_id: "EVT-evict-bump-001".to_string(),
+            event_type: "non_work.bump".to_string(),
+            work_id: target_work_id,
+            actor_id: "actor:test".to_string(),
+            payload: Vec::new(),
+            signature: vec![0u8; 64],
+            timestamp_ns: (total_work_items as u64 + 1) * 1_000_000_000,
+        });
+
+        gate.check_promotion(&[], 0)
+            .expect("refresh for unchanged hashes should succeed");
+        assert_eq!(
+            cas.retrieve_count(),
+            retrieves_after_first,
+            "refresh on unchanged hashes must not trigger repeated CAS reads for evicted work"
         );
     }
 
