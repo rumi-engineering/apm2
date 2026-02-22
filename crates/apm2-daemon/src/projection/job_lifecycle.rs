@@ -4,7 +4,7 @@
 //! queue filesystem (`pending/`, `claimed/`, `completed/`, `denied/`) as a
 //! witnessed cache.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use apm2_core::fac::job_lifecycle::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::fs_safe;
 use crate::protocol::dispatch::{LedgerEventEmitter, SignedLedgerEvent};
 
 /// Projection schema identifier.
@@ -43,12 +44,22 @@ pub const MAX_PENDING_RECONCILES: usize = 16_384;
 const CHECKPOINT_FILE_NAME: &str = ".job_lifecycle_checkpoint.v1.json";
 const MAX_CURSOR_EVENT_ID_LENGTH: usize = 256;
 const MAX_QUEUE_JOB_ID_LENGTH: usize = 256;
+const MAX_CHECKPOINT_FILE_SIZE_BYTES: u64 = 1_048_576;
+const MAX_TERMINAL_EVICTION_QUEUE_ENTRIES: usize = MAX_PROJECTED_JOBS * 2;
 
 const PENDING_DIR: &str = "pending";
 const CLAIMED_DIR: &str = "claimed";
 const COMPLETED_DIR: &str = "completed";
 const DENIED_DIR: &str = "denied";
 const QUEUE_DIRS: [&str; 4] = [PENDING_DIR, CLAIMED_DIR, COMPLETED_DIR, DENIED_DIR];
+const LIFECYCLE_EVENT_TYPES: [&str; 6] = [
+    FAC_JOB_ENQUEUED_EVENT_TYPE,
+    FAC_JOB_CLAIMED_EVENT_TYPE,
+    FAC_JOB_STARTED_EVENT_TYPE,
+    FAC_JOB_COMPLETED_EVENT_TYPE,
+    FAC_JOB_RELEASED_EVENT_TYPE,
+    FAC_JOB_FAILED_EVENT_TYPE,
+];
 
 /// Projection/reconciler errors.
 #[derive(Debug, Error)]
@@ -112,12 +123,25 @@ pub struct ProjectedJobLifecycleV1 {
     pub status: ProjectedJobStatus,
     /// Most recent applied ledger event ID.
     pub last_event_id: String,
+    /// Timestamp of the most recent applied ledger event.
+    #[serde(default)]
+    pub last_event_timestamp_ns: u64,
     /// Most recent lease ID (for claimed/running/released lineage).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_id: Option<String>,
     /// Most recent reason code for failure/release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<String>,
+}
+
+/// Terminal-job eviction queue entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalJobEvictionEntryV1 {
+    /// Canonical job identifier.
+    pub job_id: String,
+    /// Event timestamp bound to this insertion.
+    pub last_event_timestamp_ns: u64,
 }
 
 /// Full in-memory projection state.
@@ -128,6 +152,9 @@ pub struct JobLifecycleProjectionV1 {
     pub schema: String,
     /// Projection records keyed by canonical content-addressable `job_id`.
     pub jobs: BTreeMap<String, ProjectedJobLifecycleV1>,
+    /// Insertion-order queue for evictable terminal jobs.
+    #[serde(default)]
+    pub terminal_job_eviction_order: VecDeque<TerminalJobEvictionEntryV1>,
 }
 
 impl Default for JobLifecycleProjectionV1 {
@@ -135,11 +162,110 @@ impl Default for JobLifecycleProjectionV1 {
         Self {
             schema: JOB_LIFECYCLE_PROJECTION_SCHEMA_ID.to_string(),
             jobs: BTreeMap::new(),
+            terminal_job_eviction_order: VecDeque::new(),
         }
     }
 }
 
 impl JobLifecycleProjectionV1 {
+    fn validate(&self) -> Result<(), JobLifecycleProjectionError> {
+        if self.schema != JOB_LIFECYCLE_PROJECTION_SCHEMA_ID {
+            return Err(JobLifecycleProjectionError::Validation(format!(
+                "projection schema mismatch: expected {JOB_LIFECYCLE_PROJECTION_SCHEMA_ID}, got {}",
+                self.schema
+            )));
+        }
+        if self.jobs.len() > MAX_PROJECTED_JOBS {
+            return Err(JobLifecycleProjectionError::Validation(format!(
+                "projected jobs exceed max bound: {} > {MAX_PROJECTED_JOBS}",
+                self.jobs.len()
+            )));
+        }
+        if self.terminal_job_eviction_order.len() > MAX_TERMINAL_EVICTION_QUEUE_ENTRIES {
+            return Err(JobLifecycleProjectionError::Validation(format!(
+                "terminal eviction queue exceeds max bound: {} > {MAX_TERMINAL_EVICTION_QUEUE_ENTRIES}",
+                self.terminal_job_eviction_order.len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn ensure_capacity_for_new_job(&mut self) -> Result<(), JobLifecycleProjectionError> {
+        while self.jobs.len() >= MAX_PROJECTED_JOBS {
+            if !self.evict_oldest_terminal_job() {
+                return Err(JobLifecycleProjectionError::Validation(format!(
+                    "projected jobs at capacity ({MAX_PROJECTED_JOBS}) and no terminal jobs are available for eviction"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn evict_oldest_terminal_job(&mut self) -> bool {
+        self.prune_stale_terminal_head_entries();
+
+        while let Some(entry) = self.terminal_job_eviction_order.pop_front() {
+            if !self.is_current_terminal_entry(&entry) {
+                continue;
+            }
+            self.jobs.remove(&entry.job_id);
+            self.prune_stale_terminal_head_entries();
+            return true;
+        }
+
+        false
+    }
+
+    fn is_current_terminal_entry(&self, entry: &TerminalJobEvictionEntryV1) -> bool {
+        self.jobs.get(&entry.job_id).is_some_and(|record| {
+            record.status.is_terminal()
+                && record.last_event_timestamp_ns == entry.last_event_timestamp_ns
+        })
+    }
+
+    fn prune_stale_terminal_head_entries(&mut self) {
+        while self
+            .terminal_job_eviction_order
+            .front()
+            .is_some_and(|entry| !self.is_current_terminal_entry(entry))
+        {
+            self.terminal_job_eviction_order.pop_front();
+        }
+    }
+
+    fn compact_terminal_eviction_order(&mut self) {
+        if self.terminal_job_eviction_order.len() <= MAX_TERMINAL_EVICTION_QUEUE_ENTRIES {
+            return;
+        }
+
+        // Keep only the newest entry for each terminal job.
+        let mut seen = BTreeSet::new();
+        let mut compacted_reversed = Vec::new();
+
+        while let Some(entry) = self.terminal_job_eviction_order.pop_back() {
+            if !seen.insert(entry.job_id.clone()) {
+                continue;
+            }
+            if !self.is_current_terminal_entry(&entry) {
+                continue;
+            }
+            compacted_reversed.push(entry);
+        }
+
+        self.terminal_job_eviction_order = compacted_reversed.into_iter().rev().collect();
+        self.prune_stale_terminal_head_entries();
+    }
+
+    fn track_terminal_job(&mut self, job_id: &str, last_event_timestamp_ns: u64) {
+        self.terminal_job_eviction_order
+            .push_back(TerminalJobEvictionEntryV1 {
+                job_id: job_id.to_string(),
+                last_event_timestamp_ns,
+            });
+        self.prune_stale_terminal_head_entries();
+        self.compact_terminal_eviction_order();
+    }
+
     /// Applies one lifecycle event and returns the touched canonical job ID.
     ///
     /// # Errors
@@ -150,13 +276,9 @@ impl JobLifecycleProjectionV1 {
         &mut self,
         lifecycle_event: &FacJobLifecycleEventV1,
         ledger_event_id: &str,
+        ledger_event_timestamp_ns: u64,
     ) -> Result<String, JobLifecycleProjectionError> {
-        if self.schema != JOB_LIFECYCLE_PROJECTION_SCHEMA_ID {
-            return Err(JobLifecycleProjectionError::Validation(format!(
-                "projection schema mismatch: expected {JOB_LIFECYCLE_PROJECTION_SCHEMA_ID}, got {}",
-                self.schema
-            )));
-        }
+        self.validate()?;
 
         let (job_id, queue_job_id, work_id) = match &lifecycle_event.event {
             FacJobLifecycleEventData::Enqueued(payload) => (
@@ -228,24 +350,27 @@ impl JobLifecycleProjectionV1 {
             },
         };
 
+        if existing_status.is_none() && self.jobs.len() >= MAX_PROJECTED_JOBS {
+            self.ensure_capacity_for_new_job()?;
+        }
+
         let record = ProjectedJobLifecycleV1 {
             job_id: job_id.clone(),
             queue_job_id,
             work_id,
             status: new_status,
             last_event_id: ledger_event_id.to_string(),
+            last_event_timestamp_ns: ledger_event_timestamp_ns,
             lease_id,
             reason_code,
         };
 
         self.jobs.insert(job_id.clone(), record);
-        if self.jobs.len() > MAX_PROJECTED_JOBS {
-            return Err(JobLifecycleProjectionError::Validation(format!(
-                "projected jobs exceed max bound: {} > {MAX_PROJECTED_JOBS}",
-                self.jobs.len()
-            )));
+        if new_status.is_terminal() {
+            self.track_terminal_job(&job_id, ledger_event_timestamp_ns);
         }
 
+        self.validate()?;
         Ok(job_id)
     }
 }
@@ -286,6 +411,7 @@ impl JobLifecycleCheckpointV1 {
                 self.schema
             )));
         }
+        self.projection.validate()?;
         if self.cursor_event_id.len() > MAX_CURSOR_EVENT_ID_LENGTH {
             return Err(JobLifecycleProjectionError::Validation(format!(
                 "cursor_event_id exceeds bound: {} > {MAX_CURSOR_EVENT_ID_LENGTH}",
@@ -396,9 +522,11 @@ impl JobLifecycleRehydrationReconciler {
 
         for event in new_events {
             let lifecycle_event = decode_lifecycle_event(&event)?;
-            let dirty_job_id = checkpoint
-                .projection
-                .apply_event(&lifecycle_event, &event.event_id)?;
+            let dirty_job_id = checkpoint.projection.apply_event(
+                &lifecycle_event,
+                &event.event_id,
+                event.timestamp_ns,
+            )?;
             checkpoint.cursor_timestamp_ns = event.timestamp_ns;
             checkpoint.cursor_event_id = event.event_id;
             processed_events = processed_events.saturating_add(1);
@@ -449,36 +577,12 @@ impl JobLifecycleRehydrationReconciler {
         cursor_event_id: &str,
         max_events: usize,
     ) -> Vec<SignedLedgerEvent> {
-        let mut events = self
-            .ledger
-            .get_all_events()
-            .into_iter()
-            .filter(|event| {
-                matches!(
-                    event.event_type.as_str(),
-                    FAC_JOB_ENQUEUED_EVENT_TYPE
-                        | FAC_JOB_CLAIMED_EVENT_TYPE
-                        | FAC_JOB_STARTED_EVENT_TYPE
-                        | FAC_JOB_COMPLETED_EVENT_TYPE
-                        | FAC_JOB_RELEASED_EVENT_TYPE
-                        | FAC_JOB_FAILED_EVENT_TYPE
-                )
-            })
-            .collect::<Vec<_>>();
-
-        events.sort_by(|left, right| {
-            (left.timestamp_ns, &left.event_id).cmp(&(right.timestamp_ns, &right.event_id))
-        });
-
-        events
-            .into_iter()
-            .filter(|event| {
-                event.timestamp_ns > cursor_timestamp_ns
-                    || (event.timestamp_ns == cursor_timestamp_ns
-                        && event.event_id.as_str() > cursor_event_id)
-            })
-            .take(max_events)
-            .collect()
+        self.ledger.get_events_since(
+            cursor_timestamp_ns,
+            cursor_event_id,
+            &LIFECYCLE_EVENT_TYPES,
+            max_events,
+        )
     }
 
     fn ensure_queue_dirs(&self) -> Result<(), JobLifecycleProjectionError> {
@@ -559,41 +663,44 @@ impl JobLifecycleRehydrationReconciler {
         let expected_files = projection
             .jobs
             .values()
+            .filter(|record| record.status == ProjectedJobStatus::Pending)
             .filter_map(|record| safe_job_file_name(&record.queue_job_id).ok())
             .collect::<BTreeSet<_>>();
 
-        for dir in QUEUE_DIRS {
+        if *applied_fs_ops >= self.config.max_fs_ops_per_tick {
+            return Ok(());
+        }
+
+        // Unknown-file cleanup is intentionally restricted to `pending/`.
+        // Terminal witness files (`completed/`, `denied/`) must be preserved
+        // even when in-memory projection entries are evicted.
+        let pending_dir_path = self.queue_root.join(PENDING_DIR);
+        let Ok(entries) = fs::read_dir(&pending_dir_path) else {
+            return Ok(());
+        };
+        for entry in entries {
             if *applied_fs_ops >= self.config.max_fs_ops_per_tick {
                 return Ok(());
             }
-            let dir_path = self.queue_root.join(dir);
-            let Ok(entries) = fs::read_dir(&dir_path) else {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
-            };
-            for entry in entries {
-                if *applied_fs_ops >= self.config.max_fs_ops_per_tick {
-                    return Ok(());
-                }
-                let Ok(entry) = entry else { continue };
-                let path = entry.path();
-                if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                    continue;
-                }
-                let file_name = match path.file_name().and_then(|value| value.to_str()) {
-                    Some(value) => value.to_string(),
-                    None => continue,
-                };
-                if expected_files.contains(&file_name) {
-                    continue;
-                }
-                fs::remove_file(&path).map_err(|err| {
-                    JobLifecycleProjectionError::Io(format!(
-                        "remove unknown queue file {}: {err}",
-                        path.display()
-                    ))
-                })?;
-                *applied_fs_ops = applied_fs_ops.saturating_add(1);
             }
+            let file_name = match path.file_name().and_then(|value| value.to_str()) {
+                Some(value) => value.to_string(),
+                None => continue,
+            };
+            if expected_files.contains(&file_name) {
+                continue;
+            }
+            fs::remove_file(&path).map_err(|err| {
+                JobLifecycleProjectionError::Io(format!(
+                    "remove unknown queue file {}: {err}",
+                    path.display()
+                ))
+            })?;
+            *applied_fs_ops = applied_fs_ops.saturating_add(1);
         }
         Ok(())
     }
@@ -603,20 +710,20 @@ impl JobLifecycleRehydrationReconciler {
             return Ok(JobLifecycleCheckpointV1::default());
         }
 
-        let bytes = fs::read(&self.checkpoint_path).map_err(|err| {
-            JobLifecycleProjectionError::Io(format!(
-                "read checkpoint {}: {err}",
-                self.checkpoint_path.display()
-            ))
-        })?;
-
         let checkpoint: JobLifecycleCheckpointV1 =
-            serde_json::from_slice(&bytes).map_err(|err| {
-                JobLifecycleProjectionError::Serialization(format!(
-                    "deserialize checkpoint {}: {err}",
-                    self.checkpoint_path.display()
-                ))
-            })?;
+            fs_safe::bounded_read_json(&self.checkpoint_path, MAX_CHECKPOINT_FILE_SIZE_BYTES)
+                .map_err(|err| match err {
+                    fs_safe::FsSafeError::DeserializeFailed(_) => {
+                        JobLifecycleProjectionError::Serialization(format!(
+                            "deserialize checkpoint {}: {err}",
+                            self.checkpoint_path.display()
+                        ))
+                    },
+                    _ => JobLifecycleProjectionError::Io(format!(
+                        "read checkpoint {}: {err}",
+                        self.checkpoint_path.display()
+                    )),
+                })?;
         checkpoint.validate()?;
         Ok(checkpoint)
     }
@@ -625,17 +732,17 @@ impl JobLifecycleRehydrationReconciler {
         &self,
         checkpoint: &JobLifecycleCheckpointV1,
     ) -> Result<(), JobLifecycleProjectionError> {
-        let bytes = serde_json::to_vec_pretty(checkpoint).map_err(|err| {
-            JobLifecycleProjectionError::Serialization(format!(
-                "serialize checkpoint {}: {err}",
-                self.checkpoint_path.display()
-            ))
-        })?;
-        fs::write(&self.checkpoint_path, bytes).map_err(|err| {
-            JobLifecycleProjectionError::Io(format!(
+        fs_safe::atomic_write_json(&self.checkpoint_path, checkpoint).map_err(|err| match err {
+            fs_safe::FsSafeError::SerializeFailed(_) => {
+                JobLifecycleProjectionError::Serialization(format!(
+                    "serialize checkpoint {}: {err}",
+                    self.checkpoint_path.display()
+                ))
+            },
+            _ => JobLifecycleProjectionError::Io(format!(
                 "write checkpoint {}: {err}",
                 self.checkpoint_path.display()
-            ))
+            )),
         })
     }
 }
@@ -677,15 +784,15 @@ fn write_witness_file(
         "work_id": projected.work_id,
         "status": projected.status,
         "last_event_id": projected.last_event_id,
+        "last_event_timestamp_ns": projected.last_event_timestamp_ns,
     });
-    let bytes = serde_json::to_vec_pretty(&witness).map_err(|err| {
-        JobLifecycleProjectionError::Serialization(format!(
-            "serialize witness file {}: {err}",
-            path.display()
-        ))
-    })?;
-    fs::write(path, bytes).map_err(|err| {
-        JobLifecycleProjectionError::Io(format!("write witness file {}: {err}", path.display()))
+    fs_safe::atomic_write_json(path, &witness).map_err(|err| match err {
+        fs_safe::FsSafeError::SerializeFailed(_) => JobLifecycleProjectionError::Serialization(
+            format!("serialize witness file {}: {err}", path.display()),
+        ),
+        _ => {
+            JobLifecycleProjectionError::Io(format!("write witness file {}: {err}", path.display()))
+        },
     })
 }
 
@@ -819,7 +926,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let queue_root = make_queue_root(&tmp);
         fs::create_dir_all(queue_root.join(PENDING_DIR)).expect("create pending");
+        fs::create_dir_all(queue_root.join(COMPLETED_DIR)).expect("create completed");
         fs::write(queue_root.join(PENDING_DIR).join("orphan.json"), b"{}").expect("seed orphan");
+        fs::write(queue_root.join(COMPLETED_DIR).join("terminal.json"), b"{}")
+            .expect("seed completed");
 
         let stub = Arc::new(StubLedgerEventEmitter::new());
         let emitter: Arc<dyn LedgerEventEmitter> = stub;
@@ -834,6 +944,117 @@ mod tests {
         assert!(
             !queue_root.join(PENDING_DIR).join("orphan.json").exists(),
             "unknown filesystem state must be removed when ledger has no matching lifecycle event"
+        );
+        assert!(
+            queue_root
+                .join(COMPLETED_DIR)
+                .join("terminal.json")
+                .exists(),
+            "terminal witness files must not be removed by unknown-file cleanup"
+        );
+    }
+
+    #[test]
+    fn apply_event_evicts_oldest_terminal_job_at_capacity() {
+        let mut projection = JobLifecycleProjectionV1::default();
+        let base_ts = now_timestamp_ns();
+        for index in 0..MAX_PROJECTED_JOBS {
+            let queue_job_id = format!("job-terminal-{index}");
+            let job_id = format!("fj1-{queue_job_id}");
+            let ts = base_ts + index as u64;
+            projection.jobs.insert(
+                job_id.clone(),
+                ProjectedJobLifecycleV1 {
+                    job_id: job_id.clone(),
+                    queue_job_id,
+                    work_id: "W-42".to_string(),
+                    status: ProjectedJobStatus::Failed,
+                    last_event_id: format!("event-{index}"),
+                    last_event_timestamp_ns: ts,
+                    lease_id: None,
+                    reason_code: Some("test.failure".to_string()),
+                },
+            );
+            projection
+                .terminal_job_eviction_order
+                .push_back(TerminalJobEvictionEntryV1 {
+                    job_id,
+                    last_event_timestamp_ns: ts,
+                });
+        }
+
+        let fresh = FacJobLifecycleEventV1::new(
+            "intent:enqueue:fresh",
+            None,
+            FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
+                identity: identity("fresh"),
+                enqueue_epoch_ns: base_ts + MAX_PROJECTED_JOBS as u64 + 1,
+            }),
+        );
+
+        let touched_job = projection
+            .apply_event(
+                &fresh,
+                "event-fresh",
+                base_ts.saturating_add(MAX_PROJECTED_JOBS as u64 + 1),
+            )
+            .expect("capacity should be recovered by terminal eviction");
+        assert_eq!(touched_job, "fj1-fresh");
+        assert_eq!(projection.jobs.len(), MAX_PROJECTED_JOBS);
+        assert!(
+            !projection.jobs.contains_key("fj1-job-terminal-0"),
+            "oldest terminal job must be evicted first"
+        );
+        assert!(
+            projection.jobs.contains_key("fj1-fresh"),
+            "new active job must be inserted after eviction"
+        );
+    }
+
+    #[test]
+    fn apply_event_rejects_overflow_when_no_terminal_jobs_exist() {
+        let mut projection = JobLifecycleProjectionV1::default();
+        let base_ts = now_timestamp_ns();
+        for index in 0..MAX_PROJECTED_JOBS {
+            let queue_job_id = format!("job-active-{index}");
+            let job_id = format!("fj1-{queue_job_id}");
+            projection.jobs.insert(
+                job_id.clone(),
+                ProjectedJobLifecycleV1 {
+                    job_id,
+                    queue_job_id,
+                    work_id: "W-42".to_string(),
+                    status: ProjectedJobStatus::Pending,
+                    last_event_id: format!("event-{index}"),
+                    last_event_timestamp_ns: base_ts + index as u64,
+                    lease_id: None,
+                    reason_code: None,
+                },
+            );
+        }
+
+        let overflow = FacJobLifecycleEventV1::new(
+            "intent:enqueue:overflow",
+            None,
+            FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
+                identity: identity("overflow"),
+                enqueue_epoch_ns: base_ts + MAX_PROJECTED_JOBS as u64 + 1,
+            }),
+        );
+
+        let err = projection
+            .apply_event(
+                &overflow,
+                "event-overflow",
+                base_ts.saturating_add(MAX_PROJECTED_JOBS as u64 + 1),
+            )
+            .expect_err("overflow must fail when all slots are active");
+        let JobLifecycleProjectionError::Validation(message) = err else {
+            panic!("expected validation error when capacity is exhausted");
+        };
+        assert!(
+            message.contains("no terminal jobs"),
+            "error should explain that all slots are active non-terminal jobs"
         );
     }
 

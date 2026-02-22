@@ -21,6 +21,7 @@ The `projection` module implements write-only projection adapters that synchroni
 - **`ConfigBackedResolver`**: Config-backed continuity profile resolver for economics gate input assembly (TCK-00507)
 - **`ContinuityProfileResolver`**: Trait for resolving continuity profiles, sink snapshots, and continuity windows
 - **`DeferredReplayWorker`**: Worker that drains the deferred replay backlog after sink recovery, re-evaluating economics gate AND PCAC lifecycle enforcement for each replayed intent (TCK-00508)
+- **`JobLifecycleRehydrationReconciler`**: RFC-0032 queue projection reconciler that rebuilds filesystem witness state from `fac.job.*` ledger events with bounded event/fs-op budgets (TCK-00669)
 
 ### Security Model
 
@@ -36,6 +37,9 @@ The `projection` module implements write-only projection adapters that synchroni
 - **Idempotent-insert replay prevention**: Duplicate `(work_id, changeset_digest)` intents are denied, preventing double-projection (TCK-00505).
 - **Fail-closed gate defaults**: Missing gate inputs (temporal authority, profile, snapshot, window) result in DENY, never default ALLOW. Gate init failure also denies events with economics selectors (TCK-00505)
 - **Post-projection admission**: Intent is inserted as PENDING before projection, then admitted only AFTER successful projection side effects, ensuring at-least-once semantics (TCK-00505)
+- **Bounded lifecycle replay**: Job lifecycle reconciliation must use cursor-bounded event reads (`get_events_since`) with fixed `max_events_per_tick`; full-ledger materialization per tick is forbidden (TCK-00669).
+- **Terminal witness preservation**: Unknown-file cleanup for job lifecycle repair is restricted to `pending/`; `completed/` and `denied/` witness files remain durable evidence even after in-memory projection eviction (TCK-00669).
+- **Terminal projection eviction**: Job lifecycle projection keeps a bounded terminal insertion-order queue and evicts oldest terminal jobs first when `MAX_PROJECTED_JOBS` is reached; active non-terminal saturation fails closed (TCK-00669).
 
 ## Key Types
 

@@ -23,7 +23,8 @@ use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
 use apm2_core::fac::{REVIEW_RECEIPT_RECORDED_PREFIX, SelectionDecision};
 use ed25519_dalek::{Signer, Verifier};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
@@ -3056,6 +3057,98 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         }
 
         None
+    }
+
+    fn get_events_since(
+        &self,
+        cursor_timestamp_ns: u64,
+        cursor_event_id: &str,
+        event_types: &[&str],
+        limit: usize,
+    ) -> Vec<SignedLedgerEvent> {
+        if limit == 0 || event_types.is_empty() {
+            return Vec::new();
+        }
+
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+
+        let Ok(cursor_timestamp_i64) = i64::try_from(cursor_timestamp_ns) else {
+            return Vec::new();
+        };
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let placeholders = std::iter::repeat_n("?", event_types.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let build_params = || {
+            let mut params = Vec::with_capacity(event_types.len() + 4);
+            params.push(Value::Integer(cursor_timestamp_i64));
+            params.push(Value::Integer(cursor_timestamp_i64));
+            params.push(Value::Text(cursor_event_id.to_string()));
+            for event_type in event_types {
+                params.push(Value::Text((*event_type).to_string()));
+            }
+            params.push(Value::Integer(limit_i64));
+            params
+        };
+
+        let legacy_sql = format!(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns \
+             FROM ledger_events \
+             WHERE (timestamp_ns > ? OR (timestamp_ns = ? AND event_id > ?)) \
+               AND event_type IN ({placeholders}) \
+             ORDER BY timestamp_ns ASC, event_id ASC \
+             LIMIT ?"
+        );
+
+        let mut events = Vec::with_capacity(limit.saturating_mul(2));
+
+        if let Ok(mut stmt) = conn.prepare(&legacy_sql) {
+            let params = build_params();
+            if let Ok(rows) = stmt.query_map(params_from_iter(params.iter()), |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            }) {
+                events.extend(rows.filter_map(Result::ok));
+            }
+        }
+
+        if self.is_frozen_internal() {
+            let canonical_sql = format!(
+                "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                        COALESCE(signature, X''), timestamp_ns \
+                 FROM events \
+                 WHERE (timestamp_ns > ? OR (timestamp_ns = ? AND printf('canonical-%d', seq_id) > ?)) \
+                   AND event_type IN ({placeholders}) \
+                 ORDER BY timestamp_ns ASC, seq_id ASC \
+                 LIMIT ?"
+            );
+
+            if let Ok(mut stmt) = conn.prepare(&canonical_sql) {
+                let params = build_params();
+                if let Ok(rows) = stmt.query_map(
+                    params_from_iter(params.iter()),
+                    Self::canonical_row_to_event,
+                ) {
+                    events.extend(rows.filter_map(Result::ok));
+                }
+            }
+        }
+
+        events.sort_by(|left, right| {
+            (left.timestamp_ns, &left.event_id).cmp(&(right.timestamp_ns, &right.event_id))
+        });
+        events.truncate(limit);
+        events
     }
 
     fn get_all_events(&self) -> Vec<SignedLedgerEvent> {
