@@ -1023,12 +1023,13 @@ fn ensure_directory_mode_nofollow(path: &Path, mode: u32) -> Result<(), String> 
     use nix::fcntl::{OFlag, open};
     use nix::sys::stat::Mode;
 
-    // Linux-only hardening path:
-    // - O_PATH + O_NOFOLLOW + O_DIRECTORY obtains an fd anchored to the directory
-    //   itself (never dereferences a final symlink).
-    // - fchmodat(..., "", AT_EMPTY_PATH) applies mode by fd, avoiding path-based
-    //   chmod races after classification.
+    // Open without following symlinks. Linux uses `O_PATH` so we can recover
+    // mode-000 directories; other Unix targets use `O_RDONLY` and then `fchmod`
+    // directly on the opened descriptor.
+    #[cfg(target_os = "linux")]
     let open_flags = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let open_flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
 
     let classify_path = || -> Result<(), String> {
         let metadata = fs::symlink_metadata(path)
@@ -1105,16 +1106,9 @@ fn ensure_directory_mode_nofollow(path: &Path, mode: u32) -> Result<(), String> 
 
     #[cfg(not(target_os = "linux"))]
     {
-        use nix::sys::stat::{FchmodatFlags, fchmodat};
-        let cwd_fd = fs::File::open(".")
-            .map_err(|e| format!("cannot open current directory for chmodat: {e}"))?;
-        fchmodat(
-            &cwd_fd,
-            path,
-            Mode::from_bits_truncate(mode),
-            FchmodatFlags::NoFollowSymlink,
-        )
-        .map_err(|e| format!("cannot set mode {mode:#o} on {}: {e}", path.display()))?;
+        use nix::sys::stat::fchmod;
+        fchmod(&dir_fd, Mode::from_bits_truncate(mode))
+            .map_err(|e| format!("cannot set mode {mode:#o} on {}: {e}", path.display()))?;
     }
 
     Ok(())
@@ -1231,10 +1225,30 @@ pub(super) fn consume_authority(
                 )
             }
         })?;
-    receipt_file
-        .write_all(&bytes)
-        .map_err(|e| format!("cannot write consume receipt: {e}"))?;
-    let _ = receipt_file.sync_all();
+
+    if let Err(err) = receipt_file.write_all(&bytes) {
+        drop(receipt_file);
+        let cleanup_suffix = match fs::remove_file(&receipt_path) {
+            Ok(()) => String::new(),
+            Err(cleanup_err) => format!("; cleanup failed: {cleanup_err}"),
+        };
+        return Err(format!(
+            "cannot write consume receipt {}: {err}{cleanup_suffix}",
+            receipt_path.display()
+        ));
+    }
+
+    if let Err(err) = receipt_file.sync_all() {
+        drop(receipt_file);
+        let cleanup_suffix = match fs::remove_file(&receipt_path) {
+            Ok(()) => String::new(),
+            Err(cleanup_err) => format!("; cleanup failed: {cleanup_err}"),
+        };
+        return Err(format!(
+            "cannot sync consume receipt {}: {err}{cleanup_suffix}",
+            receipt_path.display()
+        ));
+    }
 
     if let Ok(dir) = fs::File::open(&consume_dir) {
         let _ = dir.sync_all();
