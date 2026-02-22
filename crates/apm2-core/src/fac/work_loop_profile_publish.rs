@@ -110,7 +110,7 @@ pub fn compute_evidence_id(work_id: &str, dedupe_key: &str) -> String {
 /// - [`PublishWorkLoopProfileError::CanonicalizationFailed`] if JSON
 ///   canonicalization fails.
 /// - [`PublishWorkLoopProfileError::CasError`] if CAS storage fails.
-pub fn publish_work_loop_profile<C: ContentAddressedStore>(
+pub fn publish_work_loop_profile<C: ContentAddressedStore + ?Sized>(
     raw_payload: &[u8],
     cas: &C,
 ) -> Result<PublishWorkLoopProfileResult, PublishWorkLoopProfileError> {

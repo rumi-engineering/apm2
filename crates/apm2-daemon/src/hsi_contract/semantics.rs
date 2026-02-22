@@ -121,7 +121,8 @@ pub fn annotate_route(route: &str) -> Option<HsiRouteSemantics> {
         | "hsi.projection.register_recovery_evidence"
         | "hsi.projection.request_unfreeze"
         | "hsi.work_context.publish"
-        | "hsi.work.record_pr_association" => Some(AUTH_IDEMPOTENT_RECEIPT),
+        | "hsi.work.record_pr_association"
+        | "hsi.work_loop_profile.publish" => Some(AUTH_IDEMPOTENT_RECEIPT),
 
         // =================================================================
         // Authoritative + best-effort idempotency + receipt-required
@@ -205,6 +206,7 @@ mod tests {
             "hsi.projection.request_unfreeze",
             "hsi.work_context.publish",
             "hsi.work.record_pr_association",
+            "hsi.work_loop_profile.publish",
         ];
         for route in &known_routes {
             assert!(
@@ -241,6 +243,7 @@ mod tests {
             "hsi.projection.request_unfreeze",
             "hsi.work_context.publish",
             "hsi.work.record_pr_association",
+            "hsi.work_loop_profile.publish",
             "hsi.process.stop",
             "hsi.process.restart",
             "hsi.process.reload",
@@ -355,6 +358,8 @@ mod tests {
             "hsi.projection.register_recovery_evidence",
             "hsi.projection.request_unfreeze",
             "hsi.work_context.publish",
+            "hsi.work.record_pr_association",
+            "hsi.work_loop_profile.publish",
             // Lifecycle operations
             "hsi.process.stop",
             "hsi.process.restart",

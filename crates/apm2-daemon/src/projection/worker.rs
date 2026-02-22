@@ -875,7 +875,8 @@ const WORK_INDEX_SCHEMA_SQL: &str = r"
 
     -- TCK-00645: Active work loop profile projection (RFC-0032 Phase 4)
     -- Selects the latest anchored profile per work_id as active, keyed by
-    -- ledger timestamp. Exactly one active row is stored per work_id.
+    -- ledger timestamp + seq_id tie-break. Exactly one active row is stored
+    -- per work_id.
     -- dedupe_key is retained as metadata for traceability, but does not
     -- contribute to uniqueness.
     CREATE TABLE IF NOT EXISTS work_active_loop_profile (
@@ -884,6 +885,7 @@ const WORK_INDEX_SCHEMA_SQL: &str = r"
         evidence_id TEXT NOT NULL,
         cas_hash TEXT NOT NULL,
         anchored_at_ns INTEGER NOT NULL,
+        seq_id INTEGER NOT NULL,
         PRIMARY KEY (work_id)
     );
 
@@ -931,11 +933,12 @@ impl WorkIndex {
     ///
     /// The migrated schema stores exactly one active row per `work_id`.
     /// If multiple legacy rows exist for a `work_id`, the row with the
-    /// greatest `anchored_at_ns` wins; ties break by latest `rowid`.
+    /// greatest `anchored_at_ns` wins; ties break by higher `seq_id` when
+    /// available, then latest `rowid`.
     fn migrate_work_active_loop_profile_schema_if_needed(
         conn: &mut Connection,
     ) -> Result<(), ProjectionWorkerError> {
-        let pk_columns = {
+        let table_columns = {
             let mut stmt = conn
                 .prepare("PRAGMA table_info(work_active_loop_profile)")
                 .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
@@ -948,20 +951,29 @@ impl WorkIndex {
             .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
-            .into_iter()
-            .filter(|(_, pk_order)| *pk_order > 0)
-            .collect::<Vec<_>>()
         };
+
+        let pk_columns = table_columns
+            .iter()
+            .filter(|(_, pk_order)| *pk_order > 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        let has_seq_id = table_columns
+            .iter()
+            .any(|(column_name, _)| column_name == "seq_id");
 
         if pk_columns.is_empty() {
             return Ok(());
         }
 
-        if pk_columns == [("work_id".to_string(), 1)] {
+        if pk_columns == [("work_id".to_string(), 1)] && has_seq_id {
             return Ok(());
         }
 
-        if pk_columns != [("work_id".to_string(), 1), ("dedupe_key".to_string(), 2)] {
+        let legacy_composite_pk = [("work_id".to_string(), 1), ("dedupe_key".to_string(), 2)];
+        let modern_pk_missing_seq = [("work_id".to_string(), 1)];
+
+        if pk_columns != legacy_composite_pk && pk_columns != modern_pk_missing_seq {
             let description = pk_columns
                 .iter()
                 .map(|(name, pk_order)| format!("{name}:{pk_order}"))
@@ -976,7 +988,10 @@ impl WorkIndex {
             .transaction()
             .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
-        tx.execute_batch(
+        let seq_id_select_expr = if has_seq_id { "legacy.seq_id" } else { "0" };
+        let tie_break_seq_order = if has_seq_id { ", pick.seq_id DESC" } else { "" };
+
+        let migration_sql = format!(
             "
             ALTER TABLE work_active_loop_profile
                 RENAME TO work_active_loop_profile_legacy;
@@ -986,22 +1001,24 @@ impl WorkIndex {
                 dedupe_key TEXT NOT NULL,
                 evidence_id TEXT NOT NULL,
                 cas_hash TEXT NOT NULL,
-                anchored_at_ns INTEGER NOT NULL
+                anchored_at_ns INTEGER NOT NULL,
+                seq_id INTEGER NOT NULL
             );
 
             INSERT INTO work_active_loop_profile
-                (work_id, dedupe_key, evidence_id, cas_hash, anchored_at_ns)
+                (work_id, dedupe_key, evidence_id, cas_hash, anchored_at_ns, seq_id)
             SELECT legacy.work_id,
                    legacy.dedupe_key,
                    legacy.evidence_id,
                    legacy.cas_hash,
-                   legacy.anchored_at_ns
+                   legacy.anchored_at_ns,
+                   {seq_id_select_expr}
             FROM work_active_loop_profile_legacy AS legacy
             WHERE legacy.rowid = (
                 SELECT pick.rowid
                 FROM work_active_loop_profile_legacy AS pick
                 WHERE pick.work_id = legacy.work_id
-                ORDER BY pick.anchored_at_ns DESC, pick.rowid DESC
+                ORDER BY pick.anchored_at_ns DESC{tie_break_seq_order}, pick.rowid DESC
                 LIMIT 1
             );
 
@@ -1011,9 +1028,11 @@ impl WorkIndex {
                 ON work_active_loop_profile(work_id);
             CREATE INDEX IF NOT EXISTS idx_work_active_loop_profile_anchored
                 ON work_active_loop_profile(anchored_at_ns);
-            ",
-        )
-        .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+            "
+        );
+
+        tx.execute_batch(&migration_sql)
+            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
         tx.commit()
             .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
@@ -1532,6 +1551,7 @@ impl WorkIndex {
     /// * `evidence_id` - Deterministic evidence ID (`WLP-` prefix)
     /// * `cas_hash` - CAS hash of the canonical profile bytes (hex)
     /// * `anchored_at_ns` - HTF timestamp in nanoseconds from the ledger event
+    /// * `seq_id` - Ledger append sequence ID for deterministic timestamp ties
     ///
     /// # Errors
     ///
@@ -1544,31 +1564,38 @@ impl WorkIndex {
         evidence_id: &str,
         cas_hash: &str,
         anchored_at_ns: u64,
+        seq_id: u64,
     ) -> Result<(), ProjectionWorkerError> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
 
-        // Monotonic latest-wins keyed on work_id: update only when the
-        // incoming anchored_at_ns is strictly newer. This prevents stale
-        // replay from rolling back already projected state.
+        // Monotonic latest-wins keyed on work_id:
+        // - newer anchored_at_ns wins
+        // - equal anchored_at_ns resolves by higher seq_id
+        // This prevents stale replay from rolling back projected state when
+        // timestamps collide.
         conn.execute(
             "INSERT INTO work_active_loop_profile
-             (work_id, dedupe_key, evidence_id, cas_hash, anchored_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+             (work_id, dedupe_key, evidence_id, cas_hash, anchored_at_ns, seq_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(work_id) DO UPDATE SET
                  dedupe_key = excluded.dedupe_key,
                  evidence_id = excluded.evidence_id,
                  cas_hash = excluded.cas_hash,
-                 anchored_at_ns = excluded.anchored_at_ns
-             WHERE excluded.anchored_at_ns > work_active_loop_profile.anchored_at_ns",
+                 anchored_at_ns = excluded.anchored_at_ns,
+                 seq_id = excluded.seq_id
+             WHERE excluded.anchored_at_ns > work_active_loop_profile.anchored_at_ns
+                OR (excluded.anchored_at_ns = work_active_loop_profile.anchored_at_ns
+                    AND excluded.seq_id > work_active_loop_profile.seq_id)",
             params![
                 work_id,
                 dedupe_key,
                 evidence_id,
                 cas_hash,
                 anchored_at_ns as i64,
+                seq_id as i64,
             ],
         )
         .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
@@ -3260,6 +3287,7 @@ impl ProjectionWorker {
                 }
 
                 let cas_hash_hex = hex::encode(&published.artifact_hash);
+                let seq_id = event.canonical_seq_id().unwrap_or(0);
 
                 self.work_index.register_work_active_loop_profile(
                     &published.work_id,
@@ -3267,6 +3295,7 @@ impl ProjectionWorker {
                     &published.evidence_id,
                     &cas_hash_hex,
                     event.timestamp_ns,
+                    seq_id,
                 )?;
 
                 debug!(
@@ -9814,25 +9843,40 @@ mod tests {
                 "WLP-abc123def456",
                 "deadbeef",
                 1_000_000_000,
+                1,
             )
             .unwrap();
 
         // Query directly to verify the row was inserted.
         let guard = conn.lock().unwrap();
-        let (dedupe_key, evidence_id, cas_hash, anchored_at_ns): (String, String, String, i64) =
-            guard
-                .query_row(
-                    "SELECT dedupe_key, evidence_id, cas_hash, anchored_at_ns \
-                     FROM work_active_loop_profile WHERE work_id = ?1",
-                    params!["W-001"],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .expect("work_active_loop_profile row should exist");
+        let (dedupe_key, evidence_id, cas_hash, anchored_at_ns, seq_id): (
+            String,
+            String,
+            String,
+            i64,
+            i64,
+        ) = guard
+            .query_row(
+                "SELECT dedupe_key, evidence_id, cas_hash, anchored_at_ns, seq_id \
+                 FROM work_active_loop_profile WHERE work_id = ?1",
+                params!["W-001"],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("work_active_loop_profile row should exist");
 
         assert_eq!(dedupe_key, "rev:1");
         assert_eq!(evidence_id, "WLP-abc123def456");
         assert_eq!(cas_hash, "deadbeef");
         assert_eq!(anchored_at_ns, 1_000_000_000);
+        assert_eq!(seq_id, 1);
     }
 
     /// Verify duplicate events with same (`work_id`, `dedupe_key`) are handled
@@ -9850,6 +9894,7 @@ mod tests {
                 "WLP-first",
                 "hash-first",
                 1_000_000_000,
+                10,
             )
             .unwrap();
 
@@ -9861,6 +9906,7 @@ mod tests {
                 "WLP-second",
                 "hash-second",
                 2_000_000_000,
+                11,
             )
             .unwrap();
 
@@ -9898,6 +9944,66 @@ mod tests {
         );
     }
 
+    /// Regression: when two events share the same `anchored_at_ns`, the
+    /// higher `seq_id` must win.
+    #[test]
+    fn test_work_active_loop_profile_same_timestamp_higher_seq_id_wins() {
+        let conn = create_test_db();
+        let index = WorkIndex::new(Arc::clone(&conn)).unwrap();
+
+        index
+            .register_work_active_loop_profile(
+                "W-SEQ-TIE",
+                "rev:1",
+                "WLP-low-seq",
+                "hash-low-seq",
+                5_000_000_000,
+                100,
+            )
+            .unwrap();
+
+        index
+            .register_work_active_loop_profile(
+                "W-SEQ-TIE",
+                "rev:2",
+                "WLP-high-seq",
+                "hash-high-seq",
+                5_000_000_000,
+                101,
+            )
+            .unwrap();
+
+        let guard = conn.lock().unwrap();
+        let (dedupe_key, evidence_id, cas_hash, anchored_at_ns, seq_id): (
+            String,
+            String,
+            String,
+            i64,
+            i64,
+        ) = guard
+            .query_row(
+                "SELECT dedupe_key, evidence_id, cas_hash, anchored_at_ns, seq_id \
+                 FROM work_active_loop_profile WHERE work_id = ?1",
+                params!["W-SEQ-TIE"],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("active row should exist");
+
+        assert_eq!(dedupe_key, "rev:2");
+        assert_eq!(evidence_id, "WLP-high-seq");
+        assert_eq!(cas_hash, "hash-high-seq");
+        assert_eq!(anchored_at_ns, 5_000_000_000);
+        assert_eq!(seq_id, 101);
+    }
+
     /// Security regression: out-of-order replay with stale `anchored_at_ns`
     /// must NOT overwrite a newer active profile row.
     #[test]
@@ -9913,6 +10019,7 @@ mod tests {
                 "WLP-newest",
                 "hash-newest",
                 9_000_000_000,
+                100,
             )
             .unwrap();
 
@@ -9924,6 +10031,7 @@ mod tests {
                 "WLP-stale",
                 "hash-stale",
                 8_000_000_000,
+                99,
             )
             .unwrap();
 
@@ -9966,6 +10074,7 @@ mod tests {
                 "WLP-rev1",
                 "hash-rev1",
                 1_000_000_000,
+                1,
             )
             .unwrap();
 
@@ -9976,6 +10085,7 @@ mod tests {
                 "WLP-rev2",
                 "hash-rev2",
                 2_000_000_000,
+                2,
             )
             .unwrap();
 
@@ -10095,20 +10205,34 @@ mod tests {
             "Legacy duplicate dedupe_key rows must collapse to one active row"
         );
 
-        let (dedupe_key, evidence_id, cas_hash, anchored_at_ns): (String, String, String, i64) =
-            guard
-                .query_row(
-                    "SELECT dedupe_key, evidence_id, cas_hash, anchored_at_ns
-                     FROM work_active_loop_profile
-                     WHERE work_id = ?1",
-                    params!["W-MIG"],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .expect("migrated active row must exist");
+        let (dedupe_key, evidence_id, cas_hash, anchored_at_ns, seq_id): (
+            String,
+            String,
+            String,
+            i64,
+            i64,
+        ) = guard
+            .query_row(
+                "SELECT dedupe_key, evidence_id, cas_hash, anchored_at_ns, seq_id
+                 FROM work_active_loop_profile
+                 WHERE work_id = ?1",
+                params!["W-MIG"],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("migrated active row must exist");
         assert_eq!(dedupe_key, "rev:2");
         assert_eq!(evidence_id, "WLP-new");
         assert_eq!(cas_hash, "hash-new");
         assert_eq!(anchored_at_ns, 2_000);
+        assert_eq!(seq_id, 0, "legacy rows migrate with seq_id=0");
 
         let total_rows: i64 = guard
             .query_row("SELECT COUNT(*) FROM work_active_loop_profile", [], |row| {
@@ -10127,14 +10251,18 @@ mod tests {
         // Insert an old entry (anchored_at_ns = 0, i.e. epoch).
         index
             .register_work_active_loop_profile(
-                "W-OLD", "rev:old", "WLP-old", "hash-old", 0, // nanoseconds: epoch => very old
+                "W-OLD", "rev:old", "WLP-old", "hash-old",
+                0, // nanoseconds: epoch => very old
+                1,
             )
             .expect("register old entry");
 
         // Insert a fresh entry with a recent timestamp.
         let recent_ns: u64 = 2_200_000_000_000_000_000;
         index
-            .register_work_active_loop_profile("W-NEW", "rev:new", "WLP-new", "hash-new", recent_ns)
+            .register_work_active_loop_profile(
+                "W-NEW", "rev:new", "WLP-new", "hash-new", recent_ns, 2,
+            )
             .expect("register new entry");
 
         // Verify both rows exist before eviction.
@@ -10243,23 +10371,35 @@ mod tests {
 
         // Verify: work_active_loop_profile row was created.
         let guard = conn.lock().unwrap();
-        let (dedupe_key, evidence_id, cas_hash, anchored_at_ns): (String, String, String, i64) =
-            guard
-                .query_row(
-                    "SELECT dedupe_key, evidence_id, cas_hash, anchored_at_ns \
-                     FROM work_active_loop_profile \
-                     WHERE work_id = ?1",
-                    params!["W-LOOP-001"],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .expect(
-                    "work_active_loop_profile row should exist after handle_evidence_published",
-                );
+        let (dedupe_key, evidence_id, cas_hash, anchored_at_ns, seq_id): (
+            String,
+            String,
+            String,
+            i64,
+            i64,
+        ) = guard
+            .query_row(
+                "SELECT dedupe_key, evidence_id, cas_hash, anchored_at_ns, seq_id \
+                 FROM work_active_loop_profile \
+                 WHERE work_id = ?1",
+                params!["W-LOOP-001"],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("work_active_loop_profile row should exist after handle_evidence_published");
 
         assert_eq!(dedupe_key, "rev:loop-1");
         assert_eq!(evidence_id, "WLP-testevid123");
         assert_eq!(cas_hash, hex::encode([0xDE, 0xAD, 0xBE, 0xEF]));
         assert_eq!(anchored_at_ns, 5_000_000_000);
+        assert_eq!(seq_id, 0);
     }
 
     /// Verify full `evidence.published` processing keeps exactly one active
@@ -10322,6 +10462,58 @@ mod tests {
         assert_eq!(dedupe_key, "rev:second");
         assert_eq!(evidence_id, "WLP-second");
         assert_eq!(anchored_at_ns, 9_100_000_000);
+    }
+
+    /// Regression: when two `WORK_LOOP_PROFILE` events share a timestamp, the
+    /// higher canonical `seq_id` must win.
+    #[test]
+    fn test_handle_evidence_published_same_timestamp_higher_seq_wins() {
+        let conn = create_test_db();
+        let worker = ProjectionWorker::new(Arc::clone(&conn), ProjectionWorkerConfig::new())
+            .expect("worker creation should succeed");
+
+        let low = build_work_loop_profile_event(
+            "canonical-00000000000000000100",
+            "W-LOOP-SAME-TS",
+            "WLP-low",
+            vec![
+                "dedupe_key=rev:low".to_string(),
+                "evidence_id=WLP-low".to_string(),
+            ],
+            9_500_000_000,
+        );
+        worker
+            .handle_evidence_published(&low)
+            .expect("low-seq event should succeed");
+
+        let high = build_work_loop_profile_event(
+            "canonical-00000000000000000101",
+            "W-LOOP-SAME-TS",
+            "WLP-high",
+            vec![
+                "dedupe_key=rev:high".to_string(),
+                "evidence_id=WLP-high".to_string(),
+            ],
+            9_500_000_000,
+        );
+        worker
+            .handle_evidence_published(&high)
+            .expect("high-seq event should succeed");
+
+        let guard = conn.lock().unwrap();
+        let (dedupe_key, evidence_id, anchored_at_ns, seq_id): (String, String, i64, i64) = guard
+            .query_row(
+                "SELECT dedupe_key, evidence_id, anchored_at_ns, seq_id \
+                     FROM work_active_loop_profile WHERE work_id = ?1",
+                params!["W-LOOP-SAME-TS"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("active row should exist");
+
+        assert_eq!(dedupe_key, "rev:high");
+        assert_eq!(evidence_id, "WLP-high");
+        assert_eq!(anchored_at_ns, 9_500_000_000);
+        assert_eq!(seq_id, 101);
     }
 
     /// Verify non-WORK_LOOP_PROFILE events do NOT produce rows in the
